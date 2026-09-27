@@ -726,3 +726,62 @@ fn accepting_the_oldest_entry_frees_room_while_later_writes_continue() {
     assert_eq!(records.len(), names.len());
     assert_eq!(admitted.load(Ordering::Relaxed), names.len());
 }
+
+#[test]
+fn an_entry_too_large_for_the_writers_is_written_while_earlier_writes_are_blocked() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let large = vec![41; crate::writers::MAX_ENTRY_BYTES + 1];
+    let archive = super::create_test_tarball_with_entries(&[
+        ("small-0", b"zero".as_slice()),
+        ("small-1", b"one".as_slice()),
+        ("large", large.as_slice()),
+        ("small-2", b"two".as_slice()),
+    ]);
+    let target = tempfile::tempdir().unwrap();
+    let gate = Arc::new(Gate::default());
+    let _release = ReleaseOnDrop(Arc::clone(&gate));
+    let large_bytes_at_admission = Arc::new(AtomicU64::new(0));
+    let hooks = TestHooks {
+        before_write: Some(Arc::new({
+            let gate = Arc::clone(&gate);
+            move |_| {
+                gate.wait();
+                Ok(())
+            }
+        })),
+        observer: Some(Arc::new({
+            let gate = Arc::clone(&gate);
+            let large_path = target.path().join("large");
+            let large_bytes_at_admission = Arc::clone(&large_bytes_at_admission);
+            move |event| {
+                // The large entry is queued third, behind two writes that
+                // cannot finish until it has been written.
+                if matches!(event, TestEvent::Admitted { entries: 3, .. }) {
+                    let written = std::fs::metadata(&large_path).map_or(0, |m| m.len());
+                    large_bytes_at_admission.store(written, Ordering::Relaxed);
+                    gate.release();
+                }
+            }
+        })),
+        ..TestHooks::default()
+    };
+    let records = extract_with_pool(
+        &archive,
+        target.path(),
+        WriterPool::new_with_hooks(2, hooks, None).unwrap(),
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(
+        large_bytes_at_admission.load(Ordering::Relaxed),
+        large.len() as u64
+    );
+    let paths: Vec<_> = records
+        .iter()
+        .map(|record| record.relative_path.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(paths, ["small-0", "small-1", "large", "small-2"]);
+    assert_eq!(records[2].blake3_digest, *blake3::hash(&large).as_bytes());
+    assert_eq!(std::fs::read(target.path().join("large")).unwrap(), large);
+}

@@ -1586,8 +1586,41 @@ where
                 let exec_bits = entry.header().mode().unwrap_or(0o644) & 0o111;
 
                 if let Some((pool, pending)) = &mut parallel {
-                    if duplicate_path || size > writers::MAX_ENTRY_BYTES as u64 {
+                    if duplicate_path {
                         pending.drain(pool, &mut extracted_files, &mut accepted_identities)?;
+                    } else if size > writers::MAX_ENTRY_BYTES as u64 {
+                        // Too large to buffer for a writer: write it here while
+                        // the writers finish the files queued ahead of it.
+                        pending.make_room(
+                            pool,
+                            0,
+                            &mut extracted_files,
+                            &mut accepted_identities,
+                        )?;
+                        let (file, digest) = write_entry_here(
+                            &output,
+                            &relative_path,
+                            false,
+                            &mut entry,
+                            EntryBytes::Stream {
+                                size,
+                                buffer: &mut copy_buffer,
+                            },
+                            exec_bits,
+                            compute_blake3,
+                        )?;
+                        let record_index = extracted_files.len() + pending.len();
+                        pending.push_written(
+                            relative_path,
+                            writers::Written {
+                                output: file.complete()?,
+                                digest,
+                            },
+                        );
+                        if let ArchivePathMatch::New { folded_hash } = path_match {
+                            seen_archive_paths.record_new(folded_hash, record_index);
+                        }
+                        return Ok(ControlFlow::<()>::Continue(()));
                     } else {
                         let length = usize::try_from(size).map_err(|_| {
                             std::io::Error::other("tarball entry exceeds address space")
@@ -1630,29 +1663,21 @@ where
                 } else {
                     None
                 };
-                let mut pending = output.create_file(&relative_path, duplicate_path)?;
-                let blake3_digest = if let Some(bytes) = &buffered_bytes {
-                    use std::io::Write;
-                    pending.file.write_all(bytes).map_err(LpmError::Io)?;
-                    compute_blake3.then(|| *blake3::hash(bytes).as_bytes())
-                } else {
-                    stream_entry_to_disk(
-                        &mut entry,
-                        &mut pending.file,
-                        compute_blake3,
-                        size,
-                        &mut copy_buffer,
-                    )?
-                };
-                #[cfg(unix)]
-                if exec_bits != 0 {
-                    use std::os::unix::fs::PermissionsExt;
-                    pending
-                        .file
-                        .set_permissions(std::fs::Permissions::from_mode(0o644 | exec_bits))?;
-                }
-                #[cfg(not(unix))]
-                let _ = exec_bits;
+                let (pending, blake3_digest) = write_entry_here(
+                    &output,
+                    &relative_path,
+                    duplicate_path,
+                    &mut entry,
+                    match &buffered_bytes {
+                        Some(bytes) => EntryBytes::Buffered(bytes),
+                        None => EntryBytes::Stream {
+                            size,
+                            buffer: &mut copy_buffer,
+                        },
+                    },
+                    exec_bits,
+                    compute_blake3,
+                )?;
 
                 let extracted_file = E::from_extracted_file(relative_path, blake3_digest)?;
                 let accepted_identity = match inspection_mode {
@@ -1723,6 +1748,44 @@ where
     }
 
     Ok(extracted_files)
+}
+
+enum EntryBytes<'a> {
+    Buffered(&'a [u8]),
+    Stream { size: u64, buffer: &'a mut [u8] },
+}
+
+/// Create, write and set the mode of an entry on the calling thread.
+fn write_entry_here(
+    output: &OutputTree,
+    relative_path: &Path,
+    duplicate_path: bool,
+    entry: &mut impl Read,
+    bytes: EntryBytes<'_>,
+    exec_bits: u32,
+    compute_blake3: bool,
+) -> Result<(output::PendingFile, Option<[u8; 32]>), LpmError> {
+    let mut pending = output.create_file(relative_path, duplicate_path)?;
+    let digest = match bytes {
+        EntryBytes::Buffered(bytes) => {
+            use std::io::Write;
+            pending.file.write_all(bytes).map_err(LpmError::Io)?;
+            compute_blake3.then(|| *blake3::hash(bytes).as_bytes())
+        }
+        EntryBytes::Stream { size, buffer } => {
+            stream_entry_to_disk(entry, &mut pending.file, compute_blake3, size, buffer)?
+        }
+    };
+    #[cfg(unix)]
+    if exec_bits != 0 {
+        use std::os::unix::fs::PermissionsExt;
+        pending
+            .file
+            .set_permissions(std::fs::Permissions::from_mode(0o644 | exec_bits))?;
+    }
+    #[cfg(not(unix))]
+    let _ = exec_bits;
+    Ok((pending, digest))
 }
 
 fn stream_entry_to_disk(
