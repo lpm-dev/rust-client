@@ -539,6 +539,12 @@ pub fn link_v2_one(
         .map(|(materialized, freshly_populated, _)| (materialized, freshly_populated))
 }
 
+#[tracing::instrument(
+    target = "lpm_install_timeline",
+    level = "trace",
+    name = "link_one",
+    skip_all
+)]
 pub fn link_v2_one_with_timings(
     plan: &LinkPlanV2,
     target: &V2Target,

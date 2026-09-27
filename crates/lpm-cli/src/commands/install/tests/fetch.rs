@@ -1,5 +1,120 @@
 use super::*;
 
+async fn assert_cancelled_blocking_route_retains_extraction_capacity(url_route: bool) {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
+
+    let body = build_test_tarball();
+    let integrity = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/archive.tgz"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let url = format!("{}/archive.tgz", server.uri());
+    let mut package = if url_route {
+        install_package_for_tarball(&url, Some(&integrity))
+    } else {
+        let mut package = fake_pkg("test-tarball-pkg", "1.0.0", true);
+        package.source = format!("registry+{}", server.uri());
+        package.integrity = Some(integrity);
+        package.tarball_url = Some(url);
+        package
+    };
+    package.metadata_checked_for_tarball = true;
+    let root = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(root.path());
+    let store_v2 = lpm_store::v2::Store::at(root.path().join("v2"));
+    let client = Arc::new(RegistryClient::new().with_npm_registry_url(server.uri()));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+    let gate = Arc::new(super::super::test_support::BlockingExtractGate {
+        started: Mutex::new(Some(started_tx)),
+        resume: Mutex::new(resume_rx),
+        finished: Mutex::new(Some(finished_tx)),
+    });
+    let capacity = Arc::new(FetchExtractCapacity::with_worker_gate(1, gate));
+    let limiter = Some(Arc::clone(&capacity));
+    let task = tokio::spawn(async move {
+        if url_route {
+            fetch_and_store_tarball_url(
+                &client,
+                &store,
+                Some(&store_v2),
+                &package,
+                0,
+                install_pkg_acquire_permit(),
+                &limiter,
+            )
+            .await
+        } else {
+            fetch_and_store_streaming(
+                &client,
+                &RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+                &store,
+                None,
+                &package,
+                0,
+                ArtifactSelection::LockfileReplay,
+                &Arc::new(GateStats::default()),
+                install_pkg_acquire_permit(),
+                &limiter,
+                ManagedInstallAccounting,
+                V2StreamingEligibility::Disabled,
+                None,
+            )
+            .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), started_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    task.abort();
+    assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+    let retained = capacity.available_permits() == 0;
+    resume_tx.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), finished_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let permit = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        handoff_file_download_to_extract(
+            install_pkg_acquire_permit(),
+            &Some(Arc::clone(&capacity)),
+            None,
+            url_route,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(permit);
+    assert_eq!(capacity.available_permits(), 1);
+    assert!(
+        retained,
+        "cancelling a waiter must retain capacity until its blocking extraction finishes"
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn cancelled_url_extraction_retains_capacity_until_worker_finishes() {
+    assert_cancelled_blocking_route_retains_extraction_capacity(true).await;
+}
+
+#[tokio::test]
+async fn cancelled_v1_extraction_retains_capacity_until_worker_finishes() {
+    assert_cancelled_blocking_route_retains_extraction_capacity(false).await;
+}
+
 #[test]
 fn event_link_target_index_preserves_same_artifact_instances() {
     let first_id = lpm_common::PackageInstanceId::derive(

@@ -2,6 +2,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::Instrument as _;
 
+use super::ready_file_admission::{ReadyClass, ReadyFileAdmission};
 use super::*;
 
 pub(super) type FetchLock = Arc<AsyncMutex<()>>;
@@ -10,6 +11,9 @@ pub(super) type FetchExtractLimiter = Option<Arc<FetchExtractCapacity>>;
 pub(super) struct FetchExtractCapacity {
     semaphore: Arc<tokio::sync::Semaphore>,
     permits: usize,
+    ready_files: Option<Arc<ReadyFileAdmission>>,
+    #[cfg(test)]
+    worker_gate: Option<Arc<super::test_support::BlockingExtractGate>>,
 }
 
 impl FetchExtractCapacity {
@@ -18,7 +22,29 @@ impl FetchExtractCapacity {
     }
 
     fn with_semaphore(semaphore: Arc<tokio::sync::Semaphore>, permits: usize) -> Self {
-        Self { semaphore, permits }
+        let ready_files = (std::env::var("LPM_INTERNAL_READY_FILE_ADMISSION").as_deref()
+            != Ok("0"))
+        .then(|| Arc::new(ReadyFileAdmission::new(Arc::clone(&semaphore))));
+        Self {
+            semaphore,
+            permits,
+            ready_files,
+            #[cfg(test)]
+            worker_gate: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_worker_gate(
+        permits: usize,
+        gate: Arc<super::test_support::BlockingExtractGate>,
+    ) -> Self {
+        let mut capacity = Self::new(permits);
+        capacity.ready_files = Some(Arc::new(ReadyFileAdmission::new(Arc::clone(
+            &capacity.semaphore,
+        ))));
+        capacity.worker_gate = Some(gate);
+        capacity
     }
 
     #[cfg(test)]
@@ -188,6 +214,22 @@ async fn acquire_fetch_extract_permit(
     acquire_fetch_extract_permits(limiter, 1).await
 }
 
+async fn acquire_ready_file_extract_permit(
+    limiter: &FetchExtractLimiter,
+    unpacked_size: Option<std::num::NonZeroU64>,
+    v2_store_active: bool,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, LpmError> {
+    if v2_store_active
+        && let Some(admission) = limiter
+            .as_ref()
+            .and_then(|limiter| limiter.ready_files.as_ref())
+    {
+        let class = ReadyClass::for_unpacked_size(unpacked_size);
+        return admission.acquire(class).await.map(Some);
+    }
+    acquire_fetch_extract_permit(limiter).await
+}
+
 async fn acquire_fetch_extract_permits(
     limiter: &FetchExtractLimiter,
     requested: usize,
@@ -352,10 +394,13 @@ pub(super) async fn handoff_buffered_download_to_extract<P>(
 pub(super) async fn handoff_file_download_to_extract<P>(
     download_permit: P,
     limiter: &FetchExtractLimiter,
+    unpacked_size: Option<std::num::NonZeroU64>,
+    v2_store_active: bool,
 ) -> Result<(Option<tokio::sync::OwnedSemaphorePermit>, u128), LpmError> {
     drop(download_permit);
     let wait_start = std::time::Instant::now();
-    let extract_permit = acquire_fetch_extract_permit(limiter).await?;
+    let extract_permit =
+        acquire_ready_file_extract_permit(limiter, unpacked_size, v2_store_active).await?;
     Ok((extract_permit, wait_start.elapsed().as_millis()))
 }
 
@@ -2602,6 +2647,96 @@ fn verify_local_packages_match_resolution(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn workspace_importers_share_ready_file_capacity_after_a_waiter_is_cancelled() {
+        let coordinator = {
+            let _env = crate::test_env::ScopedEnv::update([
+                ("LPM_FETCH_EXTRACT_PERMITS", Some("1".into())),
+                ("LPM_INTERNAL_READY_FILE_ADMISSION", None),
+            ]);
+            workspace_materialization::WorkspaceMaterializationCoordinator::default()
+        };
+        let first_importer = coordinator.fetch_extract_limiter(true);
+        let second_importer = coordinator.fetch_extract_limiter(true);
+        let capacity = first_importer.as_ref().unwrap();
+        assert!(Arc::ptr_eq(capacity, second_importer.as_ref().unwrap()));
+        assert!(capacity.ready_files.is_some());
+
+        let held = acquire_ready_file_extract_permit(&first_importer, None, true)
+            .await
+            .unwrap();
+        let mut cancelled = Box::pin(acquire_ready_file_extract_permit(
+            &first_importer,
+            std::num::NonZeroU64::new(LARGE_V2_STREAMING_OBJECT_BYTES),
+            true,
+        ));
+        assert!(futures::poll!(cancelled.as_mut()).is_pending());
+        let mut survivor = Box::pin(acquire_ready_file_extract_permit(
+            &second_importer,
+            None,
+            true,
+        ));
+        assert!(futures::poll!(survivor.as_mut()).is_pending());
+        drop(cancelled);
+        assert_eq!(capacity.available_permits(), 0);
+        drop(held);
+        let survivor = tokio::time::timeout(std::time::Duration::from_secs(2), survivor)
+            .await
+            .expect("the other importer must progress after cancellation")
+            .unwrap();
+        assert_eq!(capacity.available_permits(), 0);
+        drop(survivor);
+        let recovered = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            acquire_ready_file_extract_permit(&first_importer, None, true),
+        )
+        .await
+        .expect("shared capacity must be reusable")
+        .unwrap();
+        assert!(recovered.is_some());
+    }
+
+    #[tokio::test]
+    async fn file_handoff_releases_download_capacity_and_uses_declared_size_for_admission() {
+        use futures::poll;
+
+        let semaphore = Arc::new(Semaphore::new(1));
+        let held = semaphore.clone().acquire_owned().await.unwrap();
+        let mut capacity = FetchExtractCapacity::with_semaphore(semaphore.clone(), 1);
+        capacity.ready_files = Some(Arc::new(ReadyFileAdmission::new(semaphore.clone())));
+        let limiter = Some(Arc::new(capacity));
+        let downloads = Arc::new(Semaphore::new(2));
+        let ordinary_download = downloads.clone().acquire_owned().await.unwrap();
+        let large_download = downloads.clone().acquire_owned().await.unwrap();
+        let ordinary = handoff_file_download_to_extract(ordinary_download, &limiter, None, true);
+        tokio::pin!(ordinary);
+        assert!(poll!(&mut ordinary).is_pending());
+        assert_eq!(downloads.available_permits(), 1);
+        let large = handoff_file_download_to_extract(
+            large_download,
+            &limiter,
+            std::num::NonZeroU64::new(LARGE_V2_STREAMING_OBJECT_BYTES),
+            true,
+        );
+        tokio::pin!(large);
+        assert!(poll!(&mut large).is_pending());
+        assert_eq!(downloads.available_permits(), 2);
+        drop(held);
+        drop(
+            tokio::time::timeout(std::time::Duration::from_secs(2), large)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        drop(
+            tokio::time::timeout(std::time::Duration::from_secs(2), ordinary)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
     #[test]
     fn speculative_file_streaming_starts_at_eight_mib_unpacked() {
         assert!(!speculative_file_needs_streaming(None));
@@ -2687,6 +2822,22 @@ mod tests {
             retained,
             "blocking file extraction must retain its capacity"
         );
+    }
+
+    #[tokio::test]
+    async fn panicking_file_extraction_releases_capacity_and_preserves_error_context() {
+        let capacity = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&capacity).acquire_owned().await.unwrap();
+        let error = run_blocking_extract_with_span(
+            tracing::Span::none(),
+            Some(permit),
+            "tarball extract task panicked",
+            || -> Result<(), LpmError> { panic!("extraction failed") },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("tarball extract task panicked"));
+        assert_eq!(capacity.available_permits(), 1);
     }
 
     #[test]
@@ -3805,10 +3956,9 @@ pub(super) async fn speculative_download_and_store(
                 .await?
         };
         let download_ms = download_start.elapsed().as_millis();
-        drop(permit);
-        let extract_wait_start = std::time::Instant::now();
-        let extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
-        let extract_permit_wait_ms = extract_wait_start.elapsed().as_millis();
+        let (extract_permit, extract_permit_wait_ms) =
+            handoff_file_download_to_extract(permit, fetch_extract_limiter, unpacked_size, true)
+                .await?;
         let v2_clone = v2.clone();
         let expected_integrity = integrity.map(str::to_string);
         let stream_file =
@@ -3916,6 +4066,19 @@ where
     F: FnOnce() -> Result<T, LpmError> + Send + 'static,
 {
     let span = tracing::trace_span!(target: "lpm_install_timeline", "file_extract");
+    run_blocking_extract_with_span(span, extract_permit, "file extraction task", extract).await
+}
+
+async fn run_blocking_extract_with_span<T, F>(
+    span: tracing::Span,
+    extract_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    panic_context: &'static str,
+    extract: F,
+) -> Result<T, LpmError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, LpmError> + Send + 'static,
+{
     tracing::event!(name: "enqueue", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, {});
     let worker_span = span.clone();
     let result = tokio::task::spawn_blocking(move || {
@@ -3928,7 +4091,7 @@ where
     })
     .await;
     tracing::event!(name: "await_resume", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, success = result.is_ok());
-    result.map_err(|error| LpmError::Registry(format!("file extraction task: {error}")))?
+    result.map_err(|error| LpmError::Registry(format!("{panic_context}: {error}")))?
 }
 
 pub(super) struct ResolvedRegistryTarballUrl {
@@ -4190,10 +4353,13 @@ async fn store_downloaded_registry_tarball(
     ),
     LpmError,
 > {
-    drop(permit);
-    let extract_permit_wait_start = std::time::Instant::now();
-    let extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
-    let extract_permit_wait_ms = extract_permit_wait_start.elapsed().as_millis();
+    let (extract_permit, extract_permit_wait_ms) = handoff_file_download_to_extract(
+        permit,
+        fetch_extract_limiter,
+        p.unpacked_size,
+        store_v2.is_some(),
+    )
+    .await?;
     let integrity = p.integrity.clone();
     let name = p.name.clone();
     let version = p.version.clone();
@@ -4542,20 +4708,29 @@ pub(super) async fn fetch_and_store_tarball_url(
     // download_ms because it completes before the downloader returns.
     let integrity_ms = 0;
 
-    let (_extract_permit, extract_permit_wait_ms) =
-        handoff_file_download_to_extract(permit, fetch_extract_limiter).await?;
+    let (extract_permit, extract_permit_wait_ms) = handoff_file_download_to_extract(
+        permit,
+        fetch_extract_limiter,
+        p.unpacked_size,
+        store_v2.is_some(),
+    )
+    .await?;
 
     let store = store.clone();
     let store_v2 = store_v2.cloned();
     let expected_integrity = p.integrity.clone();
     let span = tracing::trace_span!(target: "lpm_install_timeline", "url_extract");
-    let worker_span = span.clone();
-    tracing::event!(name: "enqueue", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, {});
-    let joined =
-        tokio::task::spawn_blocking(move || -> Result<_, LpmError> {
-            let _entered = worker_span.enter();
-            tracing::event!(name: "work_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
-            let result = (|| {
+    #[cfg(test)]
+    let worker_gate = fetch_extract_limiter
+        .as_ref()
+        .and_then(|limiter| limiter.worker_gate.clone());
+    let (stage, fresh_object, result_sri) = run_blocking_extract_with_span(
+        span,
+        extract_permit,
+        "tarball extract task panicked",
+        move || -> Result<_, LpmError> {
+            #[cfg(test)]
+            let _worker_gate = worker_gate.map(|gate| gate.enter());
             if let Some(store_v2) = store_v2 {
                 let (object, sri, stage) = store_v2.extract_object_from_file_with_fresh_integrity(
                     downloaded.file.path(),
@@ -4576,13 +4751,9 @@ pub(super) async fn fetch_and_store_tarball_url(
                     downloaded.sri.clone(),
                 ))
             }
-            })();
-            tracing::event!(name: "work_end", target: "lpm_install_timeline", tracing::Level::TRACE, success = result.is_ok());
-            result
-        }).await;
-    tracing::event!(name: "await_resume", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, success = joined.is_ok());
-    let (stage, fresh_object, result_sri) = joined
-        .map_err(|error| LpmError::Registry(format!("tarball extract task panicked: {error}")))??;
+        },
+    )
+    .await?;
 
     let timings = TaskTimings::from_stage(
         queue_wait_ms,
@@ -4991,34 +5162,37 @@ pub(super) async fn fetch_and_store_streaming(
     let expected_integrity = p.integrity.clone();
     let store_owned = store.clone();
 
-    let (_extract_permit, extract_permit_wait_ms) =
+    let (extract_permit, extract_permit_wait_ms) =
         handoff_buffered_download_to_extract(permit, fetch_extract_limiter).await?;
 
     // Everything below runs on the blocking pool — frees the tokio async
     // workers to keep driving network reads. No download permit is held.
     let extract_start = std::time::Instant::now();
     let span = tracing::trace_span!(target: "lpm_install_timeline", "v1_extract");
-    let worker_span = span.clone();
-    tracing::event!(name: "enqueue", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, {});
-    let joined = tokio::task::spawn_blocking(move || {
-        let _entered = worker_span.enter();
-        tracing::event!(name: "work_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
-        let cursor = std::io::Cursor::new(body);
-        let result = store_owned
-            .stream_and_store_package(
-                &name,
-                &version,
-                cursor,
-                expected_integrity.as_deref(),
-                lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
-            )
-            .map(|(_path, sri, timings)| (sri, timings));
-        tracing::event!(name: "work_end", target: "lpm_install_timeline", tracing::Level::TRACE, success = result.is_ok());
-        result
-    }).await;
-    tracing::event!(name: "await_resume", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, success = joined.is_ok());
-    let (computed_sri, stage) = joined
-        .map_err(|e| LpmError::Registry(format!("streaming extract task panicked: {e}")))??;
+    #[cfg(test)]
+    let worker_gate = fetch_extract_limiter
+        .as_ref()
+        .and_then(|limiter| limiter.worker_gate.clone());
+    let (computed_sri, stage) = run_blocking_extract_with_span(
+        span,
+        extract_permit,
+        "streaming extract task panicked",
+        move || {
+            #[cfg(test)]
+            let _worker_gate = worker_gate.map(|gate| gate.enter());
+            let cursor = std::io::Cursor::new(body);
+            store_owned
+                .stream_and_store_package(
+                    &name,
+                    &version,
+                    cursor,
+                    expected_integrity.as_deref(),
+                    lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
+                )
+                .map(|(_path, sri, timings)| (sri, timings))
+        },
+    )
+    .await?;
     let pipeline_ms = extract_start.elapsed().as_millis();
 
     // `pipeline_ms` is the spawn_blocking wall-clock; we prefer the

@@ -8,6 +8,7 @@ use std::sync::{Arc, OnceLock};
 use futures::StreamExt;
 use lpm_common::LpmError;
 use tokio::sync::{Mutex, Notify, OnceCell, Semaphore};
+use tracing::Instrument as _;
 
 #[derive(Debug)]
 pub(super) struct Coordinated<T> {
@@ -627,23 +628,32 @@ impl WorkspaceMaterializationCoordinator {
         if performed {
             let task_operation = Arc::clone(&operation);
             let semaphore = Arc::clone(&self.v2_link_task_semaphore);
+            let span = tracing::trace_span!(target: "lpm_install_timeline", "v2_link_task");
             tokio::spawn(async move {
                 let started = std::time::Instant::now();
                 let result = async {
+                    tracing::event!(name: "admission_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
                     let _permit = semaphore.acquire_owned().await.map_err(|_| {
                         SharedMaterializationError::Registry(Arc::from(
                             "virtual-store link semaphore closed",
                         ))
                     })?;
+                    tracing::event!(name: "admission_end", target: "lpm_install_timeline", tracing::Level::TRACE, {});
+                    let worker_span = tracing::Span::current();
+                    tracing::event!(name: "enqueue", target: "lpm_install_timeline", tracing::Level::TRACE, {});
                     tokio::task::spawn_blocking(move || {
-                        lpm_linker::v2::link_v2_one_with_timings(&plan, &target, &store).map(
+                        let _entered = worker_span.enter();
+                        tracing::event!(name: "work_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
+                        let result = lpm_linker::v2::link_v2_one_with_timings(&plan, &target, &store).map(
                             |(materialized, freshly_populated, timings)| LinkMaterialization {
                                 materialized,
                                 freshly_populated,
                                 ms: started.elapsed().as_millis(),
                                 timings,
                             },
-                        )
+                        );
+                        tracing::event!(name: "work_end", target: "lpm_install_timeline", tracing::Level::TRACE, success = result.is_ok());
+                        result
                     })
                     .await
                     .map_err(|error| {
@@ -655,7 +665,7 @@ impl WorkspaceMaterializationCoordinator {
                 }
                 .await;
                 task_operation.complete(result);
-            });
+            }.instrument(span));
         }
         Ok(WorkspaceLinkHandle {
             operation,
