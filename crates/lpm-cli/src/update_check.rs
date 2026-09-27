@@ -13,7 +13,8 @@ use crate::release_lookup::{
     read_cache_at, write_cache_at,
 };
 use lpm_common::color::Painted;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Don't probe more than once a day on the success path.
@@ -40,10 +41,11 @@ pub struct UpdateCheckSnapshot {
 impl UpdateCheckSnapshot {
     pub fn load() -> Self {
         let disabled = update_checks_disabled();
-        let cache = (!disabled)
-            .then(default_cache_path)
-            .flatten()
-            .and_then(|path| read_cache_at(&path));
+        Self::load_at(disabled, (!disabled).then(default_cache_path).flatten())
+    }
+
+    fn load_at(disabled: bool, cache_path: Option<PathBuf>) -> Self {
+        let cache = cache_path.and_then(|path| read_cache_at(&path));
         Self {
             disabled,
             cache,
@@ -77,6 +79,40 @@ impl UpdateCheckSnapshot {
                 SUCCESS_TTL,
                 FAILURE_BACKOFF,
             )
+    }
+}
+
+/// The update check for a command, with its cache path resolved while the
+/// command runs. Finding the account home asks the operating system's user
+/// directory, which can take a millisecond; reading the cache stays at the
+/// end, so a long command sees the cache as it is then.
+pub(crate) struct PendingUpdateCheck {
+    cache_path: Option<JoinHandle<Option<PathBuf>>>,
+}
+
+impl PendingUpdateCheck {
+    pub(crate) fn start() -> Self {
+        let cache_path = (!update_checks_disabled())
+            .then(|| {
+                std::thread::Builder::new()
+                    .name("lpm-update-check".into())
+                    .spawn(default_cache_path)
+                    .ok()
+            })
+            .flatten();
+        Self { cache_path }
+    }
+
+    pub(crate) fn finish(self) -> UpdateCheckSnapshot {
+        let disabled = update_checks_disabled();
+        if disabled {
+            return UpdateCheckSnapshot::load_at(true, None);
+        }
+        let cache_path = match self.cache_path {
+            Some(lookup) => lookup.join().ok().flatten(),
+            None => default_cache_path(),
+        };
+        UpdateCheckSnapshot::load_at(false, cache_path)
     }
 }
 

@@ -443,6 +443,8 @@ async fn async_main(cli: Cli) -> Result<()> {
     // sees the banner.
     let is_self_update_command = matches!(command, Commands::SelfUpdate(_));
     let allow_background_update = command_allows_background_update(&command);
+    let update_check = (!matches!(command, Commands::InternalUpdateCheck))
+        .then(update_check::PendingUpdateCheck::start);
 
     // Wrap the entire dispatch in an async block so every
     // `?` inside a match arm body propagates to THIS block's
@@ -3120,7 +3122,10 @@ async fn async_main(cli: Cli) -> Result<()> {
     // on-disk cache is untouched, so the next unrelated command still
     // surfaces the banner.
     let suppress_banner = should_suppress_update_banner(is_self_update_command);
-    let update_check = update_check::UpdateCheckSnapshot::load();
+    let update_check = update_check.map_or_else(
+        update_check::UpdateCheckSnapshot::load,
+        update_check::PendingUpdateCheck::finish,
+    );
     if !cli.json
         && !suppress_banner
         && let Some(notice) = update_check.cached_notice()

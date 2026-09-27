@@ -308,6 +308,52 @@ fn no_update_check_suppresses_cached_notice_after_regular_command() {
 }
 
 #[test]
+fn cached_notice_prints_after_a_regular_command() {
+    let project = TempProject::empty(r#"{"name":"su","version":"1.0.0"}"#);
+    seed_available_update_notice(&project);
+
+    let output = lpm(&project)
+        .env_remove("LPM_NO_UPDATE_CHECK")
+        .args(["store", "path"])
+        .output()
+        .expect("run lpm store path");
+
+    assert!(output.status.success(), "store path must succeed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Update available") && stderr.contains("99999.0.0"),
+        "a cached notice must print after the command, got:\n{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_notice_cached_while_a_command_runs_prints_after_it() {
+    let project = TempProject::empty(
+        r#"{"name":"su","version":"1.0.0","scripts":{"seed":"mkdir -p \"$LPM_TEST_ACCOUNT_HOME/.lpm\" && printf '{\"latest\":\"99999.0.0\",\"lastCheck\":%s}' \"$(date +%s)\" > \"$LPM_TEST_ACCOUNT_HOME/.lpm/update-check.json\""}}"#,
+    );
+    assert!(!cache_path(&project).exists());
+
+    let output = lpm(&project)
+        .env_remove("LPM_NO_UPDATE_CHECK")
+        .env("LPM_TEST_ACCOUNT_HOME", project.home())
+        .args(["run", "seed"])
+        .output()
+        .expect("run lpm run seed");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Update available") && stderr.contains("99999.0.0"),
+        "the cache must be read after the command, got:\n{stderr}"
+    );
+}
+
+#[test]
 fn self_update_cache_hit_with_matching_latest_reports_up_to_date() {
     let project = TempProject::empty(r#"{"name":"su","version":"1.0.0"}"#);
     let current = read_current_version(&project);

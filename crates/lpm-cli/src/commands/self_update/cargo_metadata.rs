@@ -63,12 +63,13 @@ pub(super) fn modern_claims_binary(content: &str, binary: &str) -> Result<bool, 
 }
 
 pub(super) fn legacy_claims_binary(content: &str, binary: &str) -> Result<bool, String> {
+    let deserializer = toml::Deserializer::parse(content).map_err(|error| error.to_string())?;
     RootSeed {
         section: "v1",
         binary,
         format: RecordFormat::Legacy,
     }
-    .deserialize(toml::Deserializer::new(content))
+    .deserialize(deserializer)
     .map_err(|error| error.to_string())
 }
 
