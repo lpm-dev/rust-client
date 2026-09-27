@@ -586,11 +586,7 @@ async fn run_locked(
             }
             AddTarget::Npm { spec } => {
                 let route = route_table.route_for_package(spec);
-                match &route {
-                    lpm_registry::UpstreamRoute::Custom { target, auth } => client
-                        .invalidate_custom_metadata_cache(&target.base_url, spec, auth.as_deref()),
-                    _ => client.invalidate_metadata_cache(spec),
-                }
+                client.invalidate_routed_metadata_cache(&route, spec, None);
                 client.get_npm_metadata_routed(spec, route).await?
             }
         };

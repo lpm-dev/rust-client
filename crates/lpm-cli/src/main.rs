@@ -70,6 +70,8 @@ mod swift_manifest;
 mod terminal_output;
 #[cfg(test)]
 mod test_env;
+#[cfg(test)]
+mod test_tracing;
 mod tool_pin_validation;
 pub mod triage_advisor_session;
 mod trust_snapshot;

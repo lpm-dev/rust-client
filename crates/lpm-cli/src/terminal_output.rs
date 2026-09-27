@@ -66,7 +66,7 @@ mod tests {
         let malicious =
             "safe\nforged\rrewritten\u{8}\u{1b}[2J\u{1b}]52;c;AAAA\u{7}\u{0090}hidden\u{009c}end";
 
-        tracing::subscriber::with_default(subscriber, || {
+        crate::test_tracing::with_default(subscriber, || {
             tracing::info!(registry_message = %malicious, "request failed");
         });
 

@@ -30,6 +30,7 @@ mod http;
 mod install_accounting;
 mod manifest;
 mod metadata;
+mod public_npm;
 mod state;
 mod tarball;
 #[cfg(test)]
@@ -54,6 +55,7 @@ pub use self::install_accounting::{
 };
 pub use self::manifest::ManifestVersionMetadata;
 pub use self::metadata::BatchMetadataEntryStream;
+pub use self::public_npm::PublicNpmAccess;
 pub use self::state::{
     CompressedTarballSpoolReservation, DownloadedTarball, FanOutStats, HttpClients,
     PackageMetadataFetchError, PackageMetadataFetchTimings, RegistryClient, TimedPackageMetadata,

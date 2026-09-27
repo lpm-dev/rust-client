@@ -95,8 +95,12 @@ fn valid_latest(name: &str, manifest: &VersionMetadata) -> bool {
 }
 
 impl RegistryClient {
-    pub(in crate::client) fn npm_latest_metadata_cache_key(&self, name: &str) -> String {
-        self.metadata_cache_key_for_origin("npm-direct-latest", &self.npm_registry_url, name, None)
+    pub(in crate::client) fn npm_latest_metadata_cache_key(
+        &self,
+        name: &str,
+        access: PublicNpmAccess<'_>,
+    ) -> String {
+        self.npm_access_cache_key("npm-direct-latest", name, access)
     }
 
     /// Resolve a ranged request from the smallest document that can answer it.
@@ -117,6 +121,7 @@ impl RegistryClient {
     pub async fn get_npm_preferred_resolution_metadata_with_timings<F>(
         &self,
         name: &str,
+        access: PublicNpmAccess<'_>,
         accepts: F,
     ) -> Result<TimedPreferredMetadata, LpmError>
     where
@@ -124,9 +129,9 @@ impl RegistryClient {
     {
         crate::timing::record_metadata_request(name);
         let mut timings = PackageMetadataFetchTimings::default();
-        let latest_key = self.npm_latest_metadata_cache_key(name);
+        let latest_key = self.npm_latest_metadata_cache_key(name, access);
         let started = std::time::Instant::now();
-        let cached = self.read_preference_cache(name, &latest_key).await;
+        let cached = self.read_preference_cache(name, access, &latest_key).await;
         timings.cache_read_ms += started.elapsed().as_millis();
         match cached.map(|preference| select_preference(name, preference, &accepts)) {
             Some(Selection::Ready(selected)) => {
@@ -135,20 +140,24 @@ impl RegistryClient {
                 Ok(selected.with_timings(timings))
             }
             Some(Selection::CompleteHistory) => {
-                let mut fetched = self.get_npm_metadata_direct_with_timings(name).await?;
-                self.invalidate_metadata_cache_key(&self.npm_preferred_metadata_cache_key(name));
+                let mut fetched = self
+                    .get_npm_metadata_direct_inner(name, MetadataCachePolicy::UseFresh, access)
+                    .await?;
+                self.invalidate_metadata_cache_key(
+                    &self.npm_preferred_metadata_cache_key(name, access),
+                );
                 fetched.timings.add_attempt(&timings);
                 Ok(history_result((fetched, true)))
             }
             Some(Selection::History) => {
                 crate::timing::record_metadata_cache_miss();
-                self.fetch_npm_preferred_history::<_, true>(name, accepts, timings)
+                self.fetch_npm_preferred_history::<_, true>(name, access, accepts, timings)
                     .await
                     .map(history_result)
             }
             None => {
                 crate::timing::record_metadata_cache_miss();
-                self.race_latest_and_history(name, &latest_key, accepts, timings)
+                self.race_latest_and_history(name, access, &latest_key, accepts, timings)
                     .await
             }
         }
@@ -157,6 +166,7 @@ impl RegistryClient {
     async fn race_latest_and_history<F>(
         &self,
         name: &str,
+        access: PublicNpmAccess<'_>,
         latest_key: &str,
         accepts: F,
         timings: PackageMetadataFetchTimings,
@@ -168,10 +178,11 @@ impl RegistryClient {
         let history_accepts = Arc::clone(&accepts);
         let history = self.fetch_npm_preferred_history::<_, true>(
             name,
+            access,
             move |version: &str| history_accepts(version),
             PackageMetadataFetchTimings::default(),
         );
-        let latest = self.fetch_latest_leg(name, latest_key);
+        let latest = self.fetch_latest_leg(name, access, latest_key);
         tokio::pin!(history, latest);
         // Poll the latest leg first: a request queued behind another request's
         // history flight then answers from the shared latest document before it
@@ -210,14 +221,19 @@ impl RegistryClient {
         Ok(history_result((fetched, versions_complete)))
     }
 
-    async fn read_preference_cache(&self, name: &str, latest_key: &str) -> Option<Preference> {
-        let key = self.npm_preferred_metadata_cache_key(name);
+    async fn read_preference_cache(
+        &self,
+        name: &str,
+        access: PublicNpmAccess<'_>,
+        latest_key: &str,
+    ) -> Option<Preference> {
+        let key = self.npm_preferred_metadata_cache_key(name, access);
         if let Some(cached) = self.read_preferred_cache_for_use::<true>(&key).await
             && cached.value.is_valid(name)
         {
             return Some(Preference::History(Box::new(cached.value)));
         }
-        let key = self.npm_direct_metadata_cache_key(name);
+        let key = self.npm_direct_metadata_cache_key(name, access);
         if let Some((metadata, _)) = self.read_complete_cache_for_use::<true>(&key).await
             && batch_metadata_entry_matches_name(name, &metadata)
         {
@@ -258,13 +274,14 @@ impl RegistryClient {
     async fn fetch_latest_leg(
         &self,
         name: &str,
+        access: PublicNpmAccess<'_>,
         key: &str,
     ) -> (Result<Preference, LpmError>, PackageMetadataFetchTimings) {
         let mut timings = PackageMetadataFetchTimings::default();
         let _flight = self.history_cache.flight(key).await;
         let (generation, _) = self.history_cache.lookup(key);
         let started = std::time::Instant::now();
-        let cached = self.read_preference_cache(name, key).await;
+        let cached = self.read_preference_cache(name, access, key).await;
         timings.cache_read_ms += started.elapsed().as_millis();
         if let Some(cached) = cached {
             timings.cache_hit = true;
@@ -272,7 +289,7 @@ impl RegistryClient {
         }
         let rpc_start = std::time::Instant::now();
         let result = self
-            .fetch_latest_document(name, key, generation, &mut timings)
+            .fetch_latest_document(name, access, key, generation, &mut timings)
             .await;
         crate::timing::record_rpc(rpc_start.elapsed());
         (
@@ -284,6 +301,7 @@ impl RegistryClient {
     async fn fetch_latest_document(
         &self,
         name: &str,
+        access: PublicNpmAccess<'_>,
         key: &str,
         generation: u64,
         timings: &mut PackageMetadataFetchTimings,
@@ -293,14 +311,13 @@ impl RegistryClient {
         timings.validator_read_ms += started.elapsed().as_millis();
         let url = format!("{}/{name}/latest", self.npm_registry_url);
         let request = self
-            .http
-            .for_url(&url)
-            .await?
-            .get(&url)
-            .header("Accept", "application/json");
+            .npm_registry_get(&url, "application/json", access)
+            .await?;
         let request = Self::apply_cached_etag(request, validator.as_ref());
         let started = std::time::Instant::now();
-        let result = self.send_package_metadata_request(request).await;
+        let result = self
+            .send_package_metadata_request_with_npmrc_auth(request, access.auth())
+            .await;
         timings.http_ms += started.elapsed().as_millis();
         let mut response = result?;
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
@@ -344,13 +361,12 @@ impl RegistryClient {
                 return Ok(cached.value);
             }
             let request = self
-                .http
-                .for_url(&url)
-                .await?
-                .get(&url)
-                .header("Accept", "application/json");
+                .npm_registry_get(&url, "application/json", access)
+                .await?;
             let started = std::time::Instant::now();
-            let result = self.send_package_metadata_request(request).await;
+            let result = self
+                .send_package_metadata_request_with_npmrc_auth(request, access.auth())
+                .await;
             timings.http_ms += started.elapsed().as_millis();
             response = result?;
         }

@@ -11914,8 +11914,11 @@ async fn install_omit_dev_does_not_prefetch_dev_only_packages() {
     );
 }
 
-#[tokio::test]
-async fn install_fetch_overlap_skips_auth_bearing_custom_registry_tarballs() {
+/// Install one exact pin from a credentialed `.npmrc` registry with forced
+/// fetch overlap, returning the timing overlap record and the tarball requests.
+async fn credentialed_registry_overlap_install(
+    registry_is_npm: bool,
+) -> (serde_json::Value, Vec<wiremock::Request>) {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("private-pkg", "1.0.0");
     mock.with_package("private-pkg", "1.0.0", &tarball).await;
@@ -11939,7 +11942,12 @@ async fn install_fetch_overlap_skips_auth_bearing_custom_registry_tarballs() {
         ),
     );
 
-    let output = lpm_with_registry(&project, &registry_url)
+    let mut command = if registry_is_npm {
+        lpm_with_registry_and_npm(&project, &registry_url)
+    } else {
+        lpm_with_registry(&project, &registry_url)
+    };
+    let output = command
         .env("LPM_STORE_VERSION", "v2")
         .env("LPM_TIMING_DETAIL", "1")
         .env("LPM_FETCH_OVERLAP_MIN_SELECTED", "1")
@@ -11959,40 +11967,68 @@ async fn install_fetch_overlap_skips_auth_bearing_custom_registry_tarballs() {
         output.status.success(),
         "auth custom-registry install failed:\nstdout: {stdout}\nstderr: {stderr}"
     );
-
     let envelope: serde_json::Value =
         serde_json::from_str(&stdout).expect("install --json must emit parseable JSON");
-    let overlap = &envelope["timing"]["detail"]["fetch"]["overlap"];
+    let overlap = envelope["timing"]["detail"]["fetch"]["overlap"].clone();
     assert!(
         overlap["selected_count"]
             .as_u64()
             .is_some_and(|count| count >= 1),
-        "forced overlap admission should observe the selected private package; got {envelope:#}"
+        "forced overlap admission should observe the selected package; got {envelope:#}"
     );
+    let tarball_path = MockRegistry::tarball_path("private-pkg", "1.0.0");
+    let tarball_requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("wiremock request log must be available")
+        .into_iter()
+        .filter(|request| request.url.path() == tarball_path)
+        .collect();
+    (overlap, tarball_requests)
+}
+
+#[tokio::test]
+async fn install_fetch_overlap_skips_auth_bearing_custom_registry_tarballs() {
+    let (overlap, tarball_requests) = credentialed_registry_overlap_install(false).await;
     assert_eq!(
         overlap["dispatched_count"].as_u64(),
         Some(0),
-        "auth-bearing custom registries must not dispatch credentialed early fetch tasks; got {envelope:#}"
+        "auth-bearing custom registries must not dispatch credentialed early fetch tasks; got {overlap:#}"
     );
     assert_eq!(
         overlap["skipped_auth_count"].as_u64(),
         Some(1),
-        "auth-bearing custom registry selections must be attributed as overlap auth skips; got {envelope:#}"
+        "auth-bearing custom registry selections must be attributed as overlap auth skips; got {overlap:#}"
     );
-
-    let requests = mock
-        .server()
-        .received_requests()
-        .await
-        .expect("wiremock request log must be available");
-    let tarball_path = MockRegistry::tarball_path("private-pkg", "1.0.0");
-    let tarball_hits = requests
-        .iter()
-        .filter(|request| request.url.path() == tarball_path)
-        .count();
     assert_eq!(
-        tarball_hits, 1,
-        "only the authoritative fetch should request the private tarball; stdout: {stdout}\nstderr: {stderr}"
+        tarball_requests.len(),
+        1,
+        "only the authoritative fetch should request the private tarball"
+    );
+}
+
+#[tokio::test]
+async fn install_fetch_overlap_dispatches_credentialed_npm_registry_tarballs() {
+    let (overlap, tarball_requests) = credentialed_registry_overlap_install(true).await;
+    assert_eq!(
+        overlap["skipped_auth_count"].as_u64(),
+        Some(0),
+        "the public npm registry is not a private mirror; got {overlap:#}"
+    );
+    assert!(
+        overlap["dispatched_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 1),
+        "credentialed npm registry selections must overlap resolution; got {overlap:#}"
+    );
+    assert_eq!(tarball_requests.len(), 1);
+    assert_eq!(
+        tarball_requests[0]
+            .headers
+            .get("authorization")
+            .map(|value| value.to_str().unwrap()),
+        Some("Bearer test-token")
     );
 }
 

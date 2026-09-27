@@ -412,7 +412,7 @@ async fn latest_document_is_reused_while_disk_publication_is_pending() {
     let client = preferred_test_client(&server, cache.path())
         .await
         .with_synchronous_cache_writes(false);
-    let key = client.npm_latest_metadata_cache_key("pkg");
+    let key = client.npm_latest_metadata_cache_key("pkg", PublicNpmAccess::ANONYMOUS);
     let mutation = Arc::new(MetadataCacheMutation {
         revision: AtomicU64::new(0),
         operation: Mutex::new(()),
@@ -511,13 +511,15 @@ async fn latest_response_started_before_invalidation_cannot_repopulate_the_cache
         assert!(
             client
                 .history_cache
-                .lookup(&client.npm_latest_metadata_cache_key("pkg"))
+                .lookup(&client.npm_latest_metadata_cache_key("pkg", PublicNpmAccess::ANONYMOUS))
                 .1
                 .is_none()
         );
         assert!(
             !client
-                .cache_path(&client.npm_latest_metadata_cache_key("pkg"))
+                .cache_path(
+                    &client.npm_latest_metadata_cache_key("pkg", PublicNpmAccess::ANONYMOUS)
+                )
                 .unwrap()
                 .exists()
         );
@@ -557,18 +559,30 @@ async fn latest_revalidation_keeps_full_manifest_fields_and_updated_freshness() 
     let cache = tempfile::tempdir().unwrap();
     let client = preferred_test_client(&server, cache.path()).await;
     client
-        .get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true)
+        .get_npm_preferred_resolution_metadata_with_timings(
+            "pkg",
+            PublicNpmAccess::ANONYMOUS,
+            |_| true,
+        )
         .await
         .unwrap();
     let second = client
-        .get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true)
+        .get_npm_preferred_resolution_metadata_with_timings(
+            "pkg",
+            PublicNpmAccess::ANONYMOUS,
+            |_| true,
+        )
         .await
         .unwrap();
     assert!(second.fetched.timings.not_modified);
     assert!(second.platform_metadata_complete);
     assert!(!second.versions_complete);
     let third = client
-        .get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true)
+        .get_npm_preferred_resolution_metadata_with_timings(
+            "pkg",
+            PublicNpmAccess::ANONYMOUS,
+            |_| true,
+        )
         .await
         .unwrap();
     assert!(third.fetched.timings.cache_hit);
@@ -609,7 +623,7 @@ async fn unusable_latest_revalidation_refetches_without_a_validator() {
                     .unwrap();
             invalid.name = "other-package".into();
             client.write_metadata_cache_with_directive(
-                &client.npm_latest_metadata_cache_key("pkg"),
+                &client.npm_latest_metadata_cache_key("pkg", PublicNpmAccess::ANONYMOUS),
                 &invalid,
                 Some("\"old\""),
                 MetadataCacheDirective::Store {
@@ -618,7 +632,11 @@ async fn unusable_latest_revalidation_refetches_without_a_validator() {
             );
         }
         let result = client
-            .get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true)
+            .get_npm_preferred_resolution_metadata_with_timings(
+                "pkg",
+                PublicNpmAccess::ANONYMOUS,
+                |_| true,
+            )
             .await
             .unwrap();
         assert!(!result.fetched.timings.not_modified);
@@ -640,9 +658,11 @@ async fn latest_cache_is_isolated_between_registry_origins() {
             .await;
         mount_gated_history(server, &body).await;
         let client = preferred_test_client(server, cache.path()).await;
-        let result = within_deadline(
-            client.get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true),
-        )
+        let result = within_deadline(client.get_npm_preferred_resolution_metadata_with_timings(
+            "pkg",
+            PublicNpmAccess::ANONYMOUS,
+            |_| true,
+        ))
         .await
         .unwrap();
         assert!(!result.fetched.timings.cache_hit);
@@ -667,9 +687,11 @@ async fn latest_command_reuse_does_not_require_a_disk_cache() {
         .with_npm_registry_url(server.uri())
         .with_cache_dir(None);
     for expected_hit in [false, true] {
-        let result = within_deadline(
-            client.get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true),
-        )
+        let result = within_deadline(client.get_npm_preferred_resolution_metadata_with_timings(
+            "pkg",
+            PublicNpmAccess::ANONYMOUS,
+            |_| true,
+        ))
         .await
         .unwrap();
         assert_eq!(result.fetched.timings.cache_hit, expected_hit);
@@ -692,8 +714,16 @@ async fn different_ranges_share_latest_then_fall_back_to_history() {
     let cache = tempfile::tempdir().unwrap();
     let client = preferred_test_client(&server, cache.path()).await;
     let (latest, older) = tokio::join!(
-        client.get_npm_preferred_resolution_metadata_with_timings("pkg", |v| v == "2.0.0"),
-        client.get_npm_preferred_resolution_metadata_with_timings("pkg", |v| v == "1.0.0"),
+        client.get_npm_preferred_resolution_metadata_with_timings(
+            "pkg",
+            PublicNpmAccess::ANONYMOUS,
+            |v| v == "2.0.0"
+        ),
+        client.get_npm_preferred_resolution_metadata_with_timings(
+            "pkg",
+            PublicNpmAccess::ANONYMOUS,
+            |v| v == "1.0.0"
+        ),
     );
     let latest = latest.unwrap();
     assert!(!latest.versions_complete);
@@ -721,10 +751,13 @@ async fn latest_without_integrity_accepts_a_valid_shasum() {
     mount_gated_history(&server, &history).await;
     let cache = tempfile::tempdir().unwrap();
     let client = preferred_test_client(&server, cache.path()).await;
-    let result =
-        within_deadline(client.get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true))
-            .await
-            .unwrap();
+    let result = within_deadline(client.get_npm_preferred_resolution_metadata_with_timings(
+        "pkg",
+        PublicNpmAccess::ANONYMOUS,
+        |_| true,
+    ))
+    .await
+    .unwrap();
     assert!(result.platform_metadata_complete);
     let (latest, history) = request_counts(&server).await;
     assert_eq!(latest, 1);
@@ -744,15 +777,22 @@ async fn a_fresh_complete_history_precedes_an_older_latest_memory_entry() {
     let history_stalled = mount_gated_history(&server, &body).await;
     let cache = tempfile::tempdir().unwrap();
     let client = preferred_test_client(&server, cache.path()).await;
-    let first =
-        within_deadline(client.get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true))
-            .await
-            .unwrap();
+    let first = within_deadline(client.get_npm_preferred_resolution_metadata_with_timings(
+        "pkg",
+        PublicNpmAccess::ANONYMOUS,
+        |_| true,
+    ))
+    .await
+    .unwrap();
     assert!(!first.versions_complete);
     history_stalled.store(false, Ordering::SeqCst);
     client.get_npm_metadata_direct("pkg").await.unwrap();
     let result = client
-        .get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true)
+        .get_npm_preferred_resolution_metadata_with_timings(
+            "pkg",
+            PublicNpmAccess::ANONYMOUS,
+            |_| true,
+        )
         .await
         .unwrap();
     assert!(result.versions_complete);
@@ -780,11 +820,14 @@ async fn latest_zero_freshness_is_not_reused_in_memory() {
         let cache = tempfile::tempdir().unwrap();
         let client = preferred_test_client(&server, cache.path()).await;
         for _ in 0..2 {
-            let result = within_deadline(
-                client.get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true),
-            )
-            .await
-            .unwrap();
+            let result =
+                within_deadline(client.get_npm_preferred_resolution_metadata_with_timings(
+                    "pkg",
+                    PublicNpmAccess::ANONYMOUS,
+                    |_| true,
+                ))
+                .await
+                .unwrap();
             assert!(!result.fetched.timings.cache_hit);
         }
         let (latest, history) = request_counts(&server).await;
@@ -805,7 +848,7 @@ async fn latest_revalidation_does_not_override_uncacheable_directives() {
             .await;
         let cache = tempfile::tempdir().unwrap();
         let client = preferred_test_client(&server, cache.path()).await;
-        let key = client.npm_latest_metadata_cache_key("pkg");
+        let key = client.npm_latest_metadata_cache_key("pkg", PublicNpmAccess::ANONYMOUS);
         let manifest: VersionMetadata = serde_json::from_value(body).unwrap();
         client.write_metadata_cache_with_directive(
             &key,
@@ -816,7 +859,11 @@ async fn latest_revalidation_does_not_override_uncacheable_directives() {
             },
         );
         let result = client
-            .get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true)
+            .get_npm_preferred_resolution_metadata_with_timings(
+                "pkg",
+                PublicNpmAccess::ANONYMOUS,
+                |_| true,
+            )
             .await
             .unwrap();
         assert!(result.fetched.timings.not_modified);
@@ -890,7 +937,11 @@ async fn small_latest_documents_fit_the_remaining_history_budget_without_http_bu
     held.push(client.history_cache.retain(vec![0; 496 * 1024]).unwrap());
     for _ in 0..2 {
         let result = client
-            .get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true)
+            .get_npm_preferred_resolution_metadata_with_timings(
+                "pkg",
+                PublicNpmAccess::ANONYMOUS,
+                |_| true,
+            )
             .await
             .unwrap();
         assert!(result.fetched.metadata.versions.contains_key("2.0.0"));
@@ -926,16 +977,21 @@ async fn latest_retention_limits_allow_safe_refetch_without_disk_caching() {
             Vec::new()
         };
         for _ in 0..2 {
-            let result = within_deadline(
-                client.get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true),
-            )
-            .await
-            .unwrap();
+            let result =
+                within_deadline(client.get_npm_preferred_resolution_metadata_with_timings(
+                    "pkg",
+                    PublicNpmAccess::ANONYMOUS,
+                    |_| true,
+                ))
+                .await
+                .unwrap();
             assert!(result.fetched.metadata.versions.contains_key("2.0.0"));
             assert!(
                 client
                     .history_cache
-                    .lookup(&client.npm_latest_metadata_cache_key("pkg"))
+                    .lookup(
+                        &client.npm_latest_metadata_cache_key("pkg", PublicNpmAccess::ANONYMOUS)
+                    )
                     .1
                     .is_none()
             );
@@ -957,7 +1013,7 @@ async fn invalidated_latest_revalidation_cannot_modify_newer_cache_data() {
             .await;
         let cache = tempfile::tempdir().unwrap();
         let client = preferred_test_client(&server, cache.path()).await;
-        let key = client.npm_latest_metadata_cache_key("pkg");
+        let key = client.npm_latest_metadata_cache_key("pkg", PublicNpmAccess::ANONYMOUS);
         let generation = client.history_cache.lookup(&key).0;
         client.invalidate_metadata_cache("pkg");
         let manifest: VersionMetadata =
@@ -1023,7 +1079,11 @@ async fn latest_miss_continues_with_history_already_in_flight() {
     let client = preferred_test_client(&server, cache.path()).await;
     let started = std::time::Instant::now();
     let result = client
-        .get_npm_preferred_resolution_metadata_with_timings("pkg", |v| v == "1.0.0")
+        .get_npm_preferred_resolution_metadata_with_timings(
+            "pkg",
+            PublicNpmAccess::ANONYMOUS,
+            |v| v == "1.0.0",
+        )
         .await
         .unwrap();
     let elapsed = started.elapsed();
@@ -1056,11 +1116,11 @@ async fn history_answers_without_waiting_for_a_stalled_latest_document() {
     let client = preferred_test_client(&server, cache.path()).await;
     for (accepts_latest, versions_complete) in [(false, true), (true, false)] {
         client.invalidate_metadata_cache("pkg");
-        let result = within_deadline(
-            client.get_npm_preferred_resolution_metadata_with_timings("pkg", move |v| {
-                v == "1.0.0" || (accepts_latest && v == "2.0.0")
-            }),
-        )
+        let result = within_deadline(client.get_npm_preferred_resolution_metadata_with_timings(
+            "pkg",
+            PublicNpmAccess::ANONYMOUS,
+            move |v| v == "1.0.0" || (accepts_latest && v == "2.0.0"),
+        ))
         .await
         .unwrap();
         assert_eq!(result.versions_complete, versions_complete);
@@ -1089,7 +1149,11 @@ async fn latest_document_answers_when_history_fails_first() {
     let cache = tempfile::tempdir().unwrap();
     let client = preferred_test_client(&server, cache.path()).await;
     let result = client
-        .get_npm_preferred_resolution_metadata_with_timings("pkg", |_| true)
+        .get_npm_preferred_resolution_metadata_with_timings(
+            "pkg",
+            PublicNpmAccess::ANONYMOUS,
+            |_| true,
+        )
         .await
         .unwrap();
     assert!(result.platform_metadata_complete);
@@ -1119,7 +1183,11 @@ async fn history_failure_is_reported_when_latest_is_outside_the_range() {
     let cache = tempfile::tempdir().unwrap();
     let client = preferred_test_client(&server, cache.path()).await;
     let error = client
-        .get_npm_preferred_resolution_metadata_with_timings("pkg", |v| v == "1.0.0")
+        .get_npm_preferred_resolution_metadata_with_timings(
+            "pkg",
+            PublicNpmAccess::ANONYMOUS,
+            |v| v == "1.0.0",
+        )
         .await
         .unwrap_err();
     let expected = client

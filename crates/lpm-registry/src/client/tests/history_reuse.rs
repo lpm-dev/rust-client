@@ -246,7 +246,11 @@ async fn in_flight_history_cannot_restore_reuse_after_invalidation() {
     client.flush_pending_cache_writes().await;
     assert!(
         client
-            .read_metadata_cache(&client.npm_selected_history_cache_key("shared-history", "1.0.0"))
+            .read_metadata_cache(&client.npm_selected_history_cache_key(
+                "shared-history",
+                "1.0.0",
+                PublicNpmAccess::ANONYMOUS
+            ))
             .is_none(),
         "a pre-invalidation response must not recreate a selected cache entry"
     );
@@ -309,13 +313,21 @@ async fn reused_history_preserves_the_original_selected_cache_expiry() {
         .with_synchronous_cache_writes(true);
     fetch(&client, "1.0.0").await;
     let first_path = client
-        .cache_path(&client.npm_selected_history_cache_key("shared-history", "1.0.0"))
+        .cache_path(&client.npm_selected_history_cache_key(
+            "shared-history",
+            "1.0.0",
+            PublicNpmAccess::ANONYMOUS,
+        ))
         .unwrap();
     let first_expiry = std::fs::metadata(first_path).unwrap().modified().unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     fetch(&client, "2.0.0").await;
     let second_path = client
-        .cache_path(&client.npm_selected_history_cache_key("shared-history", "2.0.0"))
+        .cache_path(&client.npm_selected_history_cache_key(
+            "shared-history",
+            "2.0.0",
+            PublicNpmAccess::ANONYMOUS,
+        ))
         .unwrap();
     let second_expiry = std::fs::metadata(second_path).unwrap().modified().unwrap();
     assert!(second_expiry <= first_expiry + Duration::from_millis(50));
@@ -362,7 +374,11 @@ async fn conditional_no_store_response_invalidates_reusable_canonical_history() 
             .with_synchronous_cache_writes(true);
         fetch(&client, "1.0.0").await;
         let path = client
-            .cache_path(&client.npm_selected_history_cache_key("shared-history", "1.0.0"))
+            .cache_path(&client.npm_selected_history_cache_key(
+                "shared-history",
+                "1.0.0",
+                PublicNpmAccess::ANONYMOUS,
+            ))
             .unwrap();
         filetime::set_file_mtime(
             path,

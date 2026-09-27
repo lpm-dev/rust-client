@@ -82,7 +82,7 @@ fn lockfile_replay_warning_redacts_source_credentials_and_url_components() {
         .with_writer(output.clone())
         .finish();
 
-    tracing::subscriber::with_default(subscriber, || {
+    crate::test_tracing::with_default(subscriber, || {
         assert!(!lockfile_satisfies_fast_path_with_packages(
             &lockfile,
             &package_rows,

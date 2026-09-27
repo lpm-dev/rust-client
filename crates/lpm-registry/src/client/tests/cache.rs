@@ -583,7 +583,10 @@ async fn direct_npm_metadata_etag_304_revalidation_refreshes_cache() {
         .await;
 
     client.get_npm_metadata_direct(npm_name).await.unwrap();
-    expire_cache_entry(&client, &client.npm_direct_metadata_cache_key(npm_name));
+    expire_cache_entry(
+        &client,
+        &client.npm_direct_metadata_cache_key(npm_name, PublicNpmAccess::ANONYMOUS),
+    );
 
     server.reset().await;
     Mock::given(method("GET"))
@@ -598,7 +601,9 @@ async fn direct_npm_metadata_etag_304_revalidation_refreshes_cache() {
     assert_eq!(revalidated.name, npm_name);
     assert!(
         client
-            .read_metadata_cache(&client.npm_direct_metadata_cache_key(npm_name))
+            .read_metadata_cache(
+                &client.npm_direct_metadata_cache_key(npm_name, PublicNpmAccess::ANONYMOUS)
+            )
             .is_some(),
         "304 should refresh cache freshness for the next TTL read"
     );
@@ -622,7 +627,7 @@ async fn legacy_schema_cache_never_supplies_a_validator_to_current_metadata_fetc
     client.cache_dir = Some(tmp.path().to_path_buf());
 
     let npm_name = "legacy-schema-package";
-    let cache_key = client.npm_direct_metadata_cache_key(npm_name);
+    let cache_key = client.npm_direct_metadata_cache_key(npm_name, PublicNpmAccess::ANONYMOUS);
     let mut hasher = Sha256::new();
     hasher.update(cache_key.as_bytes());
     let legacy_cache_path = tmp.path().join(&format!("{:x}", hasher.finalize())[..16]);
@@ -771,7 +776,7 @@ async fn no_store_metadata_is_fetched_again_instead_of_entering_disk_or_memory_c
     assert_eq!(request_count.load(Ordering::SeqCst), 2);
     assert!(
         !client
-            .cache_path(&client.npm_direct_metadata_cache_key(npm_name))
+            .cache_path(&client.npm_direct_metadata_cache_key(npm_name, PublicNpmAccess::ANONYMOUS))
             .unwrap()
             .exists(),
         "no-store response must not persist a metadata cache file"
@@ -854,7 +859,7 @@ async fn response_age_does_not_shorten_the_bounded_local_freshness_window() {
     client.get_npm_metadata_direct(npm_name).await.unwrap();
     client.get_npm_metadata_direct(npm_name).await.unwrap();
 
-    let cache_key = client.npm_direct_metadata_cache_key(npm_name);
+    let cache_key = client.npm_direct_metadata_cache_key(npm_name, PublicNpmAccess::ANONYMOUS);
     let content = client
         .read_cache_content(&cache_key)
         .expect("max-age response should be cached");
@@ -908,7 +913,7 @@ async fn not_modified_response_replaces_etag_and_freshness_policy() {
     client.get_npm_metadata_direct(npm_name).await.unwrap();
     client.get_npm_metadata_direct(npm_name).await.unwrap();
 
-    let cache_key = client.npm_direct_metadata_cache_key(npm_name);
+    let cache_key = client.npm_direct_metadata_cache_key(npm_name, PublicNpmAccess::ANONYMOUS);
     let content = client
         .read_cache_content(&cache_key)
         .expect("304 should preserve the cached body");
@@ -1012,7 +1017,7 @@ async fn unsolicited_304_without_a_sent_validator_is_retried_unconditionally() {
         .with_synchronous_cache_writes(true);
     client.cache_dir = Some(tmp.path().to_path_buf());
     let npm_name = "unsolicited-304";
-    let cache_key = client.npm_direct_metadata_cache_key(npm_name);
+    let cache_key = client.npm_direct_metadata_cache_key(npm_name, PublicNpmAccess::ANONYMOUS);
     let cached: PackageMetadata =
         serde_json::from_str(&test_metadata_json_with_version(npm_name, "1.0.0")).unwrap();
     client.write_metadata_cache(&cache_key, &cached, None);
@@ -1599,7 +1604,7 @@ async fn direct_npm_304_with_undecodable_cached_payload_refetches_without_valida
 
     client.get_npm_metadata_direct(npm_name).await.unwrap();
     let cache_path = client
-        .cache_path(&client.npm_direct_metadata_cache_key(npm_name))
+        .cache_path(&client.npm_direct_metadata_cache_key(npm_name, PublicNpmAccess::ANONYMOUS))
         .expect("cache path should exist");
     let mut corrupted_content = Vec::new();
     corrupted_content.extend_from_slice(METADATA_CACHE_MAGIC);
@@ -1608,7 +1613,10 @@ async fn direct_npm_304_with_undecodable_cached_payload_refetches_without_valida
     corrupted_content.push(b'\n');
     corrupted_content.extend_from_slice(b"not-valid-metadata");
     std::fs::write(&cache_path, corrupted_content).unwrap();
-    expire_cache_entry(&client, &client.npm_direct_metadata_cache_key(npm_name));
+    expire_cache_entry(
+        &client,
+        &client.npm_direct_metadata_cache_key(npm_name, PublicNpmAccess::ANONYMOUS),
+    );
 
     server.reset().await;
     let request_count = Arc::new(AtomicUsize::new(0));
@@ -1642,7 +1650,9 @@ async fn direct_npm_304_with_undecodable_cached_payload_refetches_without_valida
     assert_eq!(request_count.load(Ordering::SeqCst), 2);
     assert_eq!(
         client
-            .read_cache_content(&client.npm_direct_metadata_cache_key(npm_name))
+            .read_cache_content(
+                &client.npm_direct_metadata_cache_key(npm_name, PublicNpmAccess::ANONYMOUS)
+            )
             .unwrap()
             .etag
             .as_deref(),
@@ -2836,12 +2846,16 @@ fn invalidate_npm_version_metadata_cache_removes_exact_doc_entry() {
         serde_json::from_str(&test_metadata_json(package_name)).expect("parse test metadata");
 
     client.write_metadata_cache(
-        &client.npm_direct_metadata_cache_key(package_name),
+        &client.npm_direct_metadata_cache_key(package_name, PublicNpmAccess::ANONYMOUS),
         &metadata,
         None,
     );
     client.write_metadata_cache(
-        &client.npm_direct_version_metadata_cache_key(package_name, version),
+        &client.npm_direct_version_metadata_cache_key(
+            package_name,
+            version,
+            PublicNpmAccess::ANONYMOUS,
+        ),
         &metadata,
         None,
     );
@@ -2850,15 +2864,19 @@ fn invalidate_npm_version_metadata_cache_removes_exact_doc_entry() {
 
     assert!(
         client
-            .read_metadata_cache(
-                &client.npm_direct_version_metadata_cache_key(package_name, version),
-            )
+            .read_metadata_cache(&client.npm_direct_version_metadata_cache_key(
+                package_name,
+                version,
+                PublicNpmAccess::ANONYMOUS
+            ),)
             .is_none(),
         "exact version metadata cache entry should be removed"
     );
     assert!(
         client
-            .read_metadata_cache(&client.npm_direct_metadata_cache_key(package_name))
+            .read_metadata_cache(
+                &client.npm_direct_metadata_cache_key(package_name, PublicNpmAccess::ANONYMOUS)
+            )
             .is_some(),
         "package metadata cache entry should remain separate"
     );

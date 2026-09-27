@@ -141,18 +141,9 @@ pub(super) struct ResolveWorkStats {
 }
 
 impl ResolveWorkStats {
-    pub(super) fn record_metadata_edge_miss(
-        &mut self,
-        canonical: &CanonicalKey,
-        range: &NpmRange,
-        route_table: &RouteTable,
-    ) {
+    pub(super) fn record_metadata_edge_miss(&mut self, range: &NpmRange, public_npm: bool) {
         self.metadata_edge_miss_count = self.metadata_edge_miss_count.saturating_add(1);
-        if matches!(
-            canonical,
-            CanonicalKey::Npm { name }
-                if matches!(route_table.route_for_package(name), UpstreamRoute::NpmDirect)
-        ) {
+        if public_npm {
             self.metadata_edge_miss_direct_count =
                 self.metadata_edge_miss_direct_count.saturating_add(1);
         }
@@ -190,11 +181,7 @@ impl ResolveWorkStats {
     }
 
     pub(super) fn record_metadata_edge_miss_latest(&mut self, miss: MetadataEdgeMissLatest<'_>) {
-        let direct = matches!(
-            miss.canonical,
-            CanonicalKey::Npm { name }
-                if matches!(miss.route_table.route_for_package(name), UpstreamRoute::NpmDirect)
-        );
+        let direct = miss.public_npm;
         let version_doc_policy_eligible =
             !miss.policy.release_age_applies_to_package(miss.canonical)
                 && !miss.policy.requires_trust_history();
@@ -267,7 +254,8 @@ pub(super) struct MetadataEdgeMissLatest<'a> {
     pub(super) range: &'a NpmRange,
     pub(super) info: &'a CachedPackageInfo,
     pub(super) latest_version: Option<&'a NpmVersion>,
-    pub(super) route_table: &'a RouteTable,
+    /// The package is read from the public npm registry.
+    pub(super) public_npm: bool,
     pub(super) policy: &'a ResolverPolicy,
     pub(super) compare_policy_pick: bool,
 }
@@ -1084,7 +1072,6 @@ mod tests {
     #[test]
     fn metadata_edge_miss_latest_records_version_doc_policy_eligibility_without_latest_tag() {
         let mut stats = ResolveWorkStats::default();
-        let route_table = RouteTable::from_mode_only(RouteMode::Direct);
         let canonical = CanonicalKey::npm("left-pad");
         let range = NpmRange::parse("1.0.0").expect("valid range");
         let info = empty_info();
@@ -1095,7 +1082,7 @@ mod tests {
             range: &range,
             info: &info,
             latest_version: None,
-            route_table: &route_table,
+            public_npm: true,
             policy: &policy,
             compare_policy_pick: true,
         });
@@ -1114,7 +1101,6 @@ mod tests {
     #[test]
     fn metadata_edge_miss_latest_skips_policy_pick_match_when_comparison_disabled() {
         let mut stats = ResolveWorkStats::default();
-        let route_table = RouteTable::from_mode_only(RouteMode::Direct);
         let canonical = CanonicalKey::npm("left-pad");
         let range = NpmRange::parse("^1.0.0").expect("valid range");
         let info = empty_info();
@@ -1126,7 +1112,7 @@ mod tests {
             range: &range,
             info: &info,
             latest_version: Some(&latest),
-            route_table: &route_table,
+            public_npm: true,
             policy: &policy,
             compare_policy_pick: false,
         });

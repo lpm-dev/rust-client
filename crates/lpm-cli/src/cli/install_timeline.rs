@@ -358,7 +358,7 @@ mod tests {
         let capture = capture(2400);
         let layer = TimelineLayer(Arc::clone(&capture))
             .with_filter(filter_fn(|metadata| metadata.target() == TARGET));
-        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+        crate::test_tracing::with_default(tracing_subscriber::registry().with(layer), || {
             lpm_extractor::extract_tarball_from_reader_streaming_digests(
                 archive.as_slice(),
                 directory.path(),
@@ -410,7 +410,7 @@ mod tests {
             .with_writer(std::io::sink)
             .with_filter(filter_fn(|meta| meta.target() != TARGET));
         let subscriber = tracing_subscriber::registry().with(ordinary).with(layer);
-        tracing::subscriber::with_default(subscriber, || {
+        crate::test_tracing::with_default(subscriber, || {
             let ordinary = tracing::info_span!(target: "ordinary", "ordinary_parent");
             let diagnostic = tracing::trace_span!(target: "lpm_install_timeline", "unrelated");
             let _entered = diagnostic.enter();
@@ -429,7 +429,7 @@ mod tests {
     fn record_limit_and_freeze_bound_late_background_events() {
         let capture = capture(2);
         let subscriber = tracing_subscriber::registry().with(TimelineLayer(Arc::clone(&capture)));
-        tracing::subscriber::with_default(subscriber, || {
+        crate::test_tracing::with_default(subscriber, || {
             let span = tracing::trace_span!(target: "lpm_install_timeline", "work");
             let _entered = span.enter();
             tracing::event!(name: "work_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
@@ -448,7 +448,7 @@ mod tests {
     fn skipped_correlations_remain_counted_after_the_record_budget_is_full() {
         let capture = capture(0);
         let subscriber = tracing_subscriber::registry().with(TimelineLayer(Arc::clone(&capture)));
-        tracing::subscriber::with_default(subscriber, || {
+        crate::test_tracing::with_default(subscriber, || {
             for _ in 0..3 {
                 tracing::event!(name: "metadata_correlation_dropped", target: "lpm_install_timeline", tracing::Level::TRACE, {});
             }
@@ -462,7 +462,7 @@ mod tests {
     fn field_allowlist_excludes_strings_and_arbitrary_numeric_fields() {
         let capture = capture(10);
         let subscriber = tracing_subscriber::registry().with(TimelineLayer(Arc::clone(&capture)));
-        tracing::subscriber::with_default(subscriber, || {
+        crate::test_tracing::with_default(subscriber, || {
             tracing::event!(name: "safe", target: "lpm_install_timeline", tracing::Level::TRACE,
                 bytes = 12u64, status = 200u64, success = true, token = "secret", path = "/private", unknown = 123u64);
         });
@@ -487,7 +487,7 @@ mod tests {
             let subscriber = tracing_subscriber::registry()
                 .with(ordinary)
                 .with(diagnostic);
-            tracing::subscriber::with_default(subscriber, || {
+            crate::test_tracing::with_default(subscriber, || {
                 tracing::event!(name: "captured", target: "lpm_install_timeline", tracing::Level::TRACE, {});
             });
             assert_eq!(capture.freeze("success").unwrap().records.len(), 1);
@@ -499,7 +499,7 @@ mod tests {
         let subscriber =
             tracing_subscriber::registry().with(tracing_subscriber::filter::LevelFilter::OFF);
         let evaluated = std::cell::Cell::new(false);
-        tracing::subscriber::with_default(subscriber, || {
+        crate::test_tracing::with_default(subscriber, || {
             tracing::trace!(target: "lpm_install_timeline", bytes = { evaluated.set(true); 1u64 });
         });
         assert!(!evaluated.get());
@@ -559,7 +559,7 @@ mod tests {
     fn blocking_work_completion_and_resume_precede_last_span_clone_drop() {
         let capture = capture(30);
         let subscriber = tracing_subscriber::registry().with(TimelineLayer(Arc::clone(&capture)));
-        tracing::subscriber::with_default(subscriber, || {
+        crate::test_tracing::with_default(subscriber, || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .max_blocking_threads(1)
                 .build()
