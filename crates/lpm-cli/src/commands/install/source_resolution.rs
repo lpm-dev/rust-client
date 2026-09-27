@@ -1898,7 +1898,7 @@ pub(super) fn read_source_dep_specs(source_dir: &Path) -> Result<Vec<SourceDep>,
     source_dep_specs_from_value(source_dir, &pkg_json)
 }
 
-fn source_dep_specs_from_value(
+pub(super) fn source_dep_specs_from_value(
     source_dir: &Path,
     pkg_json: &serde_json::Value,
 ) -> Result<Vec<SourceDep>, LpmError> {
@@ -2769,7 +2769,9 @@ pub(super) fn bind_resolved_git_source_dependencies(
     }
 }
 
-fn local_source_peer_range(spec: &SourceDep) -> Result<Option<lpm_resolver::NpmRange>, String> {
+pub(super) fn local_source_peer_range(
+    spec: &SourceDep,
+) -> Result<Option<lpm_resolver::NpmRange>, String> {
     let raw_range = match spec.kind {
         DepKind::Registry => lpm_resolver::ranges::parse_npm_alias(&spec.raw_spec)
             .map_or_else(|| spec.raw_spec.clone(), |alias| alias.range),

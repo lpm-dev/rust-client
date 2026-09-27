@@ -91,19 +91,8 @@ pub(super) fn prepare_install_setup_context(
     let pkg = lpm_workspace::read_package_json(&pkg_json_path)
         .map_err(|e| LpmError::Registry(format!("failed to read package.json: {e}")))?;
 
-    super::strict_deps::check(input.project_dir, &pkg)?;
-
-    crate::security_approval::ensure_project_policy_authorized(
-        input.policy_project_dir,
-        input.json_output,
-        crate::security_approval::ApprovalSource::ProjectConfig,
-    )?;
-    let npm_firewall_mode = crate::npm_firewall_config::resolve_runtime_mode(
+    let npm_firewall_mode = check_project_policy(
         &global_config,
-        input.policy_project_dir,
-        input.json_output,
-    )?;
-    crate::typosquat_guard::guard_manifest_direct_dependencies_in_context(
         input.project_dir,
         input.policy_project_dir,
         &pkg_json_path,
@@ -237,4 +226,33 @@ pub(super) fn prepare_install_setup_context(
         root_optional_dependency_names,
         production_dependency_names,
     })
+}
+
+pub(super) fn check_project_policy(
+    global_config: &crate::commands::config::GlobalConfig,
+    project_dir: &Path,
+    policy_project_dir: &Path,
+    manifest_path: &Path,
+    package: &lpm_workspace::PackageJson,
+    json_output: bool,
+) -> Result<crate::npm_firewall_config::NpmFirewallMode, LpmError> {
+    super::strict_deps::check(project_dir, package)?;
+    crate::security_approval::ensure_project_policy_authorized(
+        policy_project_dir,
+        json_output,
+        crate::security_approval::ApprovalSource::ProjectConfig,
+    )?;
+    let firewall_mode = crate::npm_firewall_config::resolve_runtime_mode(
+        global_config,
+        policy_project_dir,
+        json_output,
+    )?;
+    crate::typosquat_guard::guard_manifest_direct_dependencies_in_context(
+        project_dir,
+        policy_project_dir,
+        manifest_path,
+        package,
+        json_output,
+    )?;
+    Ok(firewall_mode)
 }

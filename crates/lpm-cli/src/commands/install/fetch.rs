@@ -435,6 +435,7 @@ pub(super) struct OnlineFetchPhaseInput<'a> {
     pub(super) trust_no_downgrade: bool,
     pub(super) used_lockfile: bool,
     pub(super) lockfile_peer_context_authoritative: bool,
+    pub(super) defer_link_for_peer_validation: bool,
     pub(super) force: bool,
     pub(super) force_security_floor: bool,
     pub(super) allow_new: bool,
@@ -583,6 +584,7 @@ pub(super) async fn run_online_fetch_phase(
         trust_no_downgrade,
         used_lockfile,
         lockfile_peer_context_authoritative,
+        defer_link_for_peer_validation,
         force,
         force_security_floor,
         allow_new,
@@ -719,7 +721,8 @@ pub(super) async fn run_online_fetch_phase(
     // as one batch. `LPM_SERIAL_LINK=1` reverts to the single-shot
     // `link_packages` path. The hoisted linker uses the serial path because
     // it has a different layout model.
-    let serial_link = std::env::var("LPM_SERIAL_LINK").is_ok_and(|v| v == "1");
+    let serial_link =
+        defer_link_for_peer_validation || std::env::var("LPM_SERIAL_LINK").is_ok_and(|v| v == "1");
     let v2_mode = store_v2_handle.is_some();
     if v2_mode {
         let store_v2 = store_v2_handle

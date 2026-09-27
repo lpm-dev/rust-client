@@ -646,12 +646,14 @@ fn dependency_engine_freshness_key_for_state(
     }
 }
 
-struct CachedDependencyEngineState<'a> {
-    key: &'a str,
+pub(super) struct CachedDependencyEngineState<'a> {
+    pub(super) key: &'a str,
     runtime_fingerprint: Option<&'a str>,
 }
 
-fn parse_cached_dependency_engine_state(state: &str) -> Option<CachedDependencyEngineState<'_>> {
+pub(super) fn parse_cached_dependency_engine_state(
+    state: &str,
+) -> Option<CachedDependencyEngineState<'_>> {
     let mut key = None;
     let mut runtime_fingerprint = None;
     let mut saw_runtime_fingerprint = false;

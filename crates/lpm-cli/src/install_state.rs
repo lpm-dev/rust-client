@@ -646,50 +646,11 @@ pub fn check_install_state(project_dir: &Path) -> InstallState {
         };
     };
 
-    #[cfg(test)]
-    let cfg = crate::commands::config::GlobalConfig::empty();
-    #[cfg(not(test))]
-    let cfg = crate::commands::config::GlobalConfig::load();
-    let linker_mode = match crate::linker_config::resolve_effective_linker_from_bytes(
-        None,
-        &pkg_content,
-        &cfg,
-        project_dir,
-    ) {
-        Ok(mode) => mode,
-        Err(_) => return invalid_linker_state(project_dir, &pkg_content),
-    };
-    let object_integrity_policy =
-        match crate::commands::config::resolve_object_integrity_policy(&cfg) {
-            Ok(policy) => policy,
-            Err(_) => return invalid_integrity_state(project_dir, &pkg_content, linker_mode),
-        };
-    let security_analysis_policy =
-        match crate::source_analysis_config::read_install_time_source_analysis(&cfg) {
-            Ok(true) => SecurityAnalysisPolicy::Enabled,
-            Ok(false) => SecurityAnalysisPolicy::Disabled,
-            Err(_) => return invalid_integrity_state(project_dir, &pkg_content, linker_mode),
-        };
-
-    // Single mtime probe lives inside `check_install_state_with_linker`
-    // — no pre-delegation probe here, otherwise the stale path would
-    // pay the same filesystem checks twice (once on the early bail,
-    // once after delegation re-runs them).
-    check_install_state_with_linker_integrity_dependency_engine_and_security_analysis(
-        project_dir,
-        &pkg_content,
-        linker_mode,
-        object_integrity_policy,
-        "none",
-        lpm_store::StoreVersion::from_env(),
-        security_analysis_policy,
-    )
+    check_install_state_with_content(project_dir, &pkg_content)
 }
 
 /// Same semantics as [`check_install_state`] but accepts a pre-read
-/// `package.json` content from the caller — used by the top-of-main
-/// fast lane which already read the file for the workspace-root check.
-/// Saves one redundant file read. Linker resolution still runs
+/// `package.json` content from the caller. Linker resolution still runs
 /// internally with `cli_override = None`.
 pub fn check_install_state_with_content(project_dir: &Path, pkg_content: &str) -> InstallState {
     #[cfg(test)]
@@ -847,16 +808,56 @@ pub(crate) fn check_install_state_with_linker_integrity_dependency_engine_and_se
     store_version: lpm_store::StoreVersion,
     security_analysis_policy: SecurityAnalysisPolicy,
 ) -> InstallState {
+    check_install_state_with_paths(
+        FreshnessPaths {
+            project_dir,
+            lockfile: None,
+        },
+        pkg_content,
+        linker_mode,
+        object_integrity_policy,
+        store_version,
+        InstallHashContext {
+            dependency_engine_key,
+            security_analysis_policy,
+        },
+    )
+}
+
+pub(crate) fn check_install_state_with_lockfile(
+    project_dir: &Path,
+    pkg_content: &str,
+    lockfile: &lpm_lockfile::ProjectLockfile,
+    linker_mode: lpm_linker::LinkerMode,
+    object_integrity_policy: ObjectIntegrityPolicy,
+    store_version: lpm_store::StoreVersion,
+    hash_context: InstallHashContext<'_>,
+) -> InstallState {
+    check_install_state_with_paths(
+        FreshnessPaths {
+            project_dir,
+            lockfile: Some(lockfile),
+        },
+        pkg_content,
+        linker_mode,
+        object_integrity_policy,
+        store_version,
+        hash_context,
+    )
+}
+
+fn check_install_state_with_paths(
+    paths: FreshnessPaths<'_>,
+    pkg_content: &str,
+    linker_mode: lpm_linker::LinkerMode,
+    object_integrity_policy: ObjectIntegrityPolicy,
+    store_version: lpm_store::StoreVersion,
+    hash_context: InstallHashContext<'_>,
+) -> InstallState {
+    let project_dir = paths.project_dir;
     let platform = PlatformTuple::current();
-    // mtime short-circuit also applies here. The caller may have
-    // already read pkg.json for an earlier check, but the fast path still
-    // skips the read of lpm.lock + the SHA-256 pass.
-    let hash_context = InstallHashContext {
-        dependency_engine_key,
-        security_analysis_policy,
-    };
     if let Some(state) = try_mtime_fast_path(
-        project_dir,
+        paths,
         pkg_content,
         linker_mode,
         object_integrity_policy,
@@ -867,13 +868,15 @@ pub(crate) fn check_install_state_with_linker_integrity_dependency_engine_and_se
         return state;
     }
 
-    let lock_path = crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir);
+    let lock_path = paths.lockfile_path();
     let hash_file = project_dir.join(".lpm").join("install-hash");
     let nm = project_dir.join("node_modules");
 
     // Read lockfile — empty string if missing (hash will mismatch → needs install)
-    let lock_content =
-        crate::commands::install::workspace_lockfile::active_lockfile_content(project_dir);
+    let lock_content = paths.lockfile.map_or_else(
+        || crate::commands::install::workspace_lockfile::active_lockfile_content(project_dir),
+        |project| std::sync::Arc::from(project.lockfile.to_toml().unwrap_or_default()),
+    );
     // Local directory source manifests participate in freshness. Empty
     // bytes for projects without local-source deps preserve the common
     // no-local-source path.
@@ -1018,31 +1021,29 @@ fn project_uses_other_virtual_store(project_dir: &Path, selected: lpm_store::Sto
     lpm_linker::LayoutPaths::for_project(project_dir).is_v2_install(&other_links)
 }
 
-/// mtime short-circuit for the up-to-date check.
-///
-/// Reads `.lpm/install-hash`; when it contains a v2 mtime line
-/// (`m:<pkg_ns>:<lock_ns>`) and the recorded mtimes still match the
-/// current mtimes of `package.json` and `lpm.lock`, declares the
-/// install up to date without reading either manifest or recomputing
-/// the hash. Returns `None` on ANY deviation — the caller then falls
-/// through to the full hash path, which is still correct.
-///
-/// Safety: only TRUSTS the stored hash when mtimes match. An adversary
-/// who can rewrite the file's manifest bytes also changes its mtime
-/// (any `fs::write` updates mtime); the only way to defeat this check
-/// is deliberate mtime tampering (`touch -t ...`). Acceptable tradeoff.
-///
-/// when `.lpm/has-local-sources` exists,
-/// the project has file:/link: directory deps whose `package.json`
-/// content participates in the install hash. The mtime fast path
-/// only tracks the consumer's `package.json` + `lpm.lock` mtimes,
-/// not local-source manifest mtimes — so a local-source edit would
-/// otherwise be invisible to the fast path. Bail to the slow path
-/// (which calls [`collect_file_link_manifest_bytes`] and recomputes
-/// the v3 hash) whenever the sentinel is present. The single-stat
-/// cost is negligible compared to the fast path's ~4 stats.
+#[derive(Clone, Copy)]
+struct FreshnessPaths<'a> {
+    project_dir: &'a Path,
+    lockfile: Option<&'a lpm_lockfile::ProjectLockfile>,
+}
+
+impl<'a> FreshnessPaths<'a> {
+    fn lockfile_path(self) -> std::borrow::Cow<'a, Path> {
+        self.lockfile.map_or_else(
+            || {
+                std::borrow::Cow::Owned(
+                    crate::commands::install::workspace_lockfile::active_lockfile_path(
+                        self.project_dir,
+                    ),
+                )
+            },
+            |project| std::borrow::Cow::Borrowed(project.path.as_path()),
+        )
+    }
+}
+
 fn try_mtime_fast_path(
-    project_dir: &Path,
+    paths: FreshnessPaths<'_>,
     pkg_content: &str,
     linker_mode: lpm_linker::LinkerMode,
     object_integrity_policy: ObjectIntegrityPolicy,
@@ -1050,6 +1051,7 @@ fn try_mtime_fast_path(
     store_version: lpm_store::StoreVersion,
     context: InstallHashContext<'_>,
 ) -> Option<InstallState> {
+    let project_dir = paths.project_dir;
     let nm = project_dir.join("node_modules");
     if !nm.exists() {
         return None;
@@ -1151,7 +1153,7 @@ fn try_mtime_fast_path(
     let pkg_ns = mtime_ns(&project_dir.join("package.json"))?;
     // lpm.lock may be absent on a never-installed fast-lane entry; 0
     // sentinel lines up with the writer's convention.
-    let lock_path = crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir);
+    let lock_path = paths.lockfile_path();
     let lock_ns = mtime_ns(&lock_path).unwrap_or(0);
 
     if pkg_ns != stored_pkg_ns || lock_ns != stored_lock_ns {
@@ -2473,7 +2475,10 @@ mod tests {
         let pkg_content = fs::read_to_string(p.join("package.json")).unwrap();
         let platform = PlatformTuple::current();
         let same = try_mtime_fast_path(
-            p,
+            FreshnessPaths {
+                project_dir: p,
+                lockfile: None,
+            },
             &pkg_content,
             lpm_linker::LinkerMode::Isolated,
             ObjectIntegrityPolicy::Source,
@@ -2487,7 +2492,10 @@ mod tests {
         );
         // Mtime fast path with FLIPPED linker → bails (returns None).
         let flipped = try_mtime_fast_path(
-            p,
+            FreshnessPaths {
+                project_dir: p,
+                lockfile: None,
+            },
             &pkg_content,
             lpm_linker::LinkerMode::Hoisted,
             ObjectIntegrityPolicy::Source,
@@ -2521,7 +2529,10 @@ mod tests {
 
         let pkg_content = fs::read_to_string(p.join("package.json")).unwrap();
         let fast = try_mtime_fast_path(
-            p,
+            FreshnessPaths {
+                project_dir: p,
+                lockfile: None,
+            },
             &pkg_content,
             lpm_linker::LinkerMode::Hoisted,
             ObjectIntegrityPolicy::Source,
@@ -2556,7 +2567,10 @@ mod tests {
 
         let pkg_content = fs::read_to_string(p.join("package.json")).unwrap();
         let fast = try_mtime_fast_path(
-            p,
+            FreshnessPaths {
+                project_dir: p,
+                lockfile: None,
+            },
             &pkg_content,
             lpm_linker::LinkerMode::Hoisted,
             ObjectIntegrityPolicy::Source,

@@ -52,6 +52,7 @@ mod source_resolution;
 mod state;
 mod strict_deps;
 mod swift;
+pub(crate) mod sync_noop;
 mod test_support;
 #[cfg(test)]
 mod tests;
@@ -997,6 +998,7 @@ async fn run_with_options_under_store_lock(
             prior_patch_state: prior_patch_state.as_ref(),
             patches_changed,
             auto_install_peers,
+            strict_peer_dependencies,
             omit_policy,
             root_optional_dependency_names: &root_optional_dependency_names,
             production_dependency_names: &production_dependency_names,
@@ -1524,6 +1526,7 @@ async fn run_with_options_under_store_lock(
         trust_no_downgrade: resolver_trust_policy.is_no_downgrade(),
         used_lockfile,
         lockfile_peer_context_authoritative,
+        defer_link_for_peer_validation: used_lockfile && strict_peer_dependencies,
         force,
         force_security_floor,
         allow_new,
@@ -1543,6 +1546,22 @@ async fn run_with_options_under_store_lock(
         compatibility_bin_names,
     })
     .await?;
+
+    if used_lockfile && strict_peer_dependencies {
+        enforce_replayed_peer_dependencies(
+            &packages,
+            &pkg,
+            PeerReplayContext {
+                client: &arc_client,
+                route_table: &route_table,
+                offline: false,
+                project_dir,
+                lpm_root,
+                store_version,
+            },
+        )
+        .await?;
+    }
 
     let prepared_v2_link_tasks = if workspace_resolution::active() && v2_event_driven {
         let handles = std::mem::take(&mut v2_event_link_handles);

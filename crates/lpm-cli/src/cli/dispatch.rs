@@ -79,90 +79,47 @@ pub(crate) fn run() -> Result<()> {
             || install_state::has_pnpm_workspace_yaml(&cwd);
 
         if !workspace_root_install && let Some(pkg_content) = pkg_content_opt.as_deref() {
-            let state = install_state::check_install_state_with_content(&cwd, pkg_content);
-            if state.up_to_date {
-                match check_fast_lane_admission(&cwd, pkg_content, fast_lane.json) {
-                    Ok(FastLaneAdmission::ExitAllowed) => {
-                        let elapsed_ms = start.elapsed().as_millis();
-                        if fast_lane.json {
-                            let schema_version = crate::json_contract::INSTALL_JSON_SCHEMA_VERSION;
-                            let timing_requested =
-                                crate::json_contract::install_timing_requested(fast_lane.timing);
-                            // Hand-formatted to match `serde_json::to_string_pretty`
-                            // output for the `install.rs` up-to-date object —
-                            // avoids constructing a `serde_json::Value` on the
-                            // hot path.
-                            if timing_requested {
-                                println!(
-                                    "{{\n  \"schema_version\": {schema_version},\n  \
+            match commands::install::sync_noop::is_up_to_date(&cwd, pkg_content, fast_lane.json) {
+                Ok(true) => {
+                    let elapsed_ms = start.elapsed().as_millis();
+                    if fast_lane.json {
+                        let schema_version = crate::json_contract::INSTALL_JSON_SCHEMA_VERSION;
+                        let timing_requested =
+                            crate::json_contract::install_timing_requested(fast_lane.timing);
+                        // Hand-formatted to match `serde_json::to_string_pretty`
+                        // output for the `install.rs` up-to-date object —
+                        // avoids constructing a `serde_json::Value` on the
+                        // hot path.
+                        if timing_requested {
+                            println!(
+                                "{{\n  \"schema_version\": {schema_version},\n  \
                                      \"success\": true,\n  \"up_to_date\": true,\n  \
                                      \"duration_ms\": {elapsed_ms},\n  \"timing\": {{\n    \
                                      \"resolve_ms\": 0,\n    \"fetch_ms\": 0,\n    \
                                      \"link_ms\": 0,\n    \"total_ms\": {elapsed_ms}\n  \
                                      }}\n}}"
-                                );
-                            } else {
-                                println!(
-                                    "{{\n  \"schema_version\": {schema_version},\n  \
+                            );
+                        } else {
+                            println!(
+                                "{{\n  \"schema_version\": {schema_version},\n  \
                                      \"success\": true,\n  \"up_to_date\": true,\n  \
                                      \"duration_ms\": {elapsed_ms}\n}}"
-                                );
-                            }
-                        } else {
-                            output::success(&format!("up to date ({elapsed_ms}ms)"));
+                            );
                         }
-                        std::process::exit(0);
+                    } else {
+                        output::success(&format!("up to date ({elapsed_ms}ms)"));
                     }
-                    Ok(FastLaneAdmission::NeedsInstallPipeline) => {}
-                    Err(error) => {
-                        exit_with_lpm_error(&error, fast_lane.json);
-                    }
+                    std::process::exit(0);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    exit_with_lpm_error(&error, fast_lane.json);
                 }
             }
         }
     }
 
     run_async_main()
-}
-
-enum FastLaneAdmission {
-    ExitAllowed,
-    NeedsInstallPipeline,
-}
-
-fn check_fast_lane_admission(
-    project_dir: &std::path::Path,
-    package_json: &str,
-    json_output: bool,
-) -> Result<FastLaneAdmission, lpm_common::LpmError> {
-    if crate::install_recovery::pending(project_dir) {
-        return Ok(FastLaneAdmission::NeedsInstallPipeline);
-    }
-    let global_config = crate::commands::config::GlobalConfig::load_checked()?;
-    crate::npm_firewall_config::resolve_runtime_mode(&global_config, project_dir, json_output)?;
-    let policy_extension_configs =
-        crate::commands::install::policy_extensions::load_policy_extension_configs(&global_config)?;
-    let package_skills_ready = !lpm_skills_config::LpmSkillsPreference::Config
-        .resolve(&global_config)?
-        || crate::commands::skills::package::materialization_complete(project_dir, package_json);
-    if policy_extension_configs.is_empty()
-        && package_skills_ready
-        && !lockfile_contains_lpm_package(project_dir)
-    {
-        Ok(FastLaneAdmission::ExitAllowed)
-    } else {
-        Ok(FastLaneAdmission::NeedsInstallPipeline)
-    }
-}
-
-fn lockfile_contains_lpm_package(project_dir: &std::path::Path) -> bool {
-    lpm_lockfile::Lockfile::read_for_project(project_dir).map_or(true, |project| {
-        project
-            .lockfile
-            .packages
-            .iter()
-            .any(|package| package.name.starts_with("@lpm.dev/"))
-    })
 }
 
 async fn async_main(cli: Cli) -> Result<()> {
@@ -3223,86 +3180,5 @@ fn release_selection(args: ReleaseSelectionArgs) -> commands::release::ReleaseSe
         changed_files_ignore_pattern: args.changed_files_ignore_pattern,
         test_pattern: args.test_pattern,
         fail_if_no_match: args.fail_if_no_match,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::lockfile_contains_lpm_package;
-
-    fn lockfile_with_packages(names: &[&str]) -> lpm_lockfile::Lockfile {
-        let mut lockfile = lpm_lockfile::Lockfile::new();
-        lockfile.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS;
-        for name in names {
-            lockfile.add_package(lpm_lockfile::LockedPackage {
-                instance_id: None,
-                dependency_targets: std::collections::BTreeMap::new(),
-                peer_targets: std::collections::BTreeMap::new(),
-                name: (*name).to_string(),
-                version: "1.0.0".to_string(),
-                ..lpm_lockfile::LockedPackage::default()
-            });
-        }
-        lockfile
-    }
-
-    #[test]
-    fn npm_only_toml_lockfile_allows_synchronous_fast_lane() {
-        let directory = tempfile::tempdir().unwrap();
-        lockfile_with_packages(&["react", "@types/node"])
-            .write_to_file(&directory.path().join(lpm_lockfile::LOCKFILE_NAME))
-            .unwrap();
-
-        assert!(!lockfile_contains_lpm_package(directory.path()));
-    }
-
-    #[test]
-    fn lpm_package_in_toml_lockfile_requires_install_pipeline() {
-        let directory = tempfile::tempdir().unwrap();
-        lockfile_with_packages(&["react", "@lpm.dev/alice.alpha"])
-            .write_to_file(&directory.path().join(lpm_lockfile::LOCKFILE_NAME))
-            .unwrap();
-
-        assert!(lockfile_contains_lpm_package(directory.path()));
-    }
-
-    #[test]
-    fn lpm_package_in_binary_lockfile_requires_install_pipeline() {
-        let directory = tempfile::tempdir().unwrap();
-        let lockfile = lockfile_with_packages(&["react", "@lpm.dev/bob.beta"]);
-        lockfile
-            .write_to_file(&directory.path().join(lpm_lockfile::LOCKFILE_NAME))
-            .unwrap();
-        lpm_lockfile::binary::write_binary(
-            &lockfile,
-            &directory.path().join(lpm_lockfile::BINARY_LOCKFILE_NAME),
-        )
-        .unwrap();
-
-        assert!(lockfile_contains_lpm_package(directory.path()));
-    }
-
-    #[test]
-    fn binary_lockfile_cannot_hide_lpm_package_from_authoritative_toml() {
-        let directory = tempfile::tempdir().unwrap();
-        let authoritative = lockfile_with_packages(&["react", "@lpm.dev/alice.alpha"]);
-        authoritative
-            .write_to_file(&directory.path().join(lpm_lockfile::LOCKFILE_NAME))
-            .unwrap();
-        let crafted_binary = lockfile_with_packages(&["react"]);
-        lpm_lockfile::binary::write_binary(
-            &crafted_binary,
-            &directory.path().join(lpm_lockfile::BINARY_LOCKFILE_NAME),
-        )
-        .unwrap();
-
-        assert!(lockfile_contains_lpm_package(directory.path()));
-    }
-
-    #[test]
-    fn unreadable_lockfile_requires_install_pipeline() {
-        let directory = tempfile::tempdir().unwrap();
-
-        assert!(lockfile_contains_lpm_package(directory.path()));
     }
 }

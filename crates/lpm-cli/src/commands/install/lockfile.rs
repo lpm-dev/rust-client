@@ -910,6 +910,7 @@ pub(super) struct OfflineInstallInput<'a> {
     pub(super) prior_patch_state: Option<&'a crate::patch_state::PatchState>,
     pub(super) patches_changed: bool,
     pub(super) auto_install_peers: bool,
+    pub(super) strict_peer_dependencies: bool,
     pub(super) omit_policy: InstallOmitPolicy,
     pub(super) root_optional_dependency_names: &'a HashSet<String>,
     pub(super) production_dependency_names: &'a HashSet<String>,
@@ -967,6 +968,7 @@ pub(super) async fn run_offline_install_phase(
         prior_patch_state,
         patches_changed,
         auto_install_peers,
+        strict_peer_dependencies,
         omit_policy,
         root_optional_dependency_names,
         production_dependency_names,
@@ -1260,6 +1262,8 @@ pub(super) async fn run_offline_install_phase(
         compatibility_bin_names,
         store_version,
         emit_install_report,
+        strict_peer_dependencies,
+        route_table,
     )
     .await
 }
@@ -1866,7 +1870,7 @@ fn locked_source_kind_matches_requested_spec(
     }
 }
 
-fn locked_github_source_matches_request(
+pub(super) fn locked_github_source_matches_request(
     locked_source: &str,
     requested_url: &str,
     requested_ref: Option<&str>,
@@ -2578,11 +2582,18 @@ fn locked_registry_source_matches_active_route(
         registry_source.route_table,
         registry_source.registry_client,
     );
+    locked_registry_source_matches_url(package, &expected)
+}
+
+pub(super) fn locked_registry_source_matches_url(
+    package: &lpm_lockfile::LockedPackage,
+    expected: &str,
+) -> bool {
     match package.source_kind() {
         Some(Ok(lpm_lockfile::Source::Registry { url })) => {
-            registry_base_urls_match(&url, &expected)
+            registry_base_urls_match(&url, expected)
         }
-        None => registry_base_urls_match(&expected, "https://registry.npmjs.org"),
+        None => registry_base_urls_match(expected, "https://registry.npmjs.org"),
         Some(Ok(_)) | Some(Err(_)) => true,
     }
 }
