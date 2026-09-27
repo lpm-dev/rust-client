@@ -68,7 +68,7 @@ jobs:
 
       - name: Windows extractor file-count stress tests
         run: >-
-          cargo nextest run --locked -p lpm-extractor
+          cargo nextest run --locked -p lpm-extractor --run-ignored only
           -E 'test(extract_accepts_exact_max_file_count) |
           test(extract_rejects_more_than_max_file_count)'
           --test-threads=1

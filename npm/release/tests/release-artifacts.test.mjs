@@ -368,6 +368,8 @@ test("Windows filesystem gate isolates file-count stress from lock timing tests"
     stressStep,
     /test\(extract_accepts_exact_max_file_count\) \|\s+test\(extract_rejects_more_than_max_file_count\)/,
   );
+  assert.doesNotMatch(regularStep, /--run-ignored/);
+  assert.match(stressStep, /--run-ignored only/);
   assert.match(stressStep, /--test-threads=1/);
 });
 
