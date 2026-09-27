@@ -338,12 +338,15 @@ pub(super) async fn fetch_preferred_metadata_for_resolver(
     };
     let started = Instant::now();
     let candidate_range = range.clone();
-    let (raw, versions_complete) = client
-        .get_npm_preferred_metadata_for_resolution_with_timings(name, move |version| {
+    let preferred = client
+        .get_npm_preferred_resolution_metadata_with_timings(name, move |version| {
             NpmVersion::parse(version).is_ok_and(|version| candidate_range.satisfies(&version))
         })
         .await
         .map_err(|error| metadata_fetch_error(canonical, error))?;
+    let versions_complete = preferred.versions_complete;
+    let platform_metadata_complete = preferred.platform_metadata_complete;
+    let raw = preferred.fetched;
     let raw_fetch_ms = started.elapsed().as_millis();
     let version_count = raw.metadata.versions.len() as u64;
     let latest_version = latest_version_from_metadata(&raw.metadata);
@@ -354,6 +357,7 @@ pub(super) async fn fetch_preferred_metadata_for_resolver(
     } else {
         parse_owned_partial_metadata_to_cache_info(raw.metadata)
     };
+    info.platform_metadata_complete |= platform_metadata_complete;
     let parse_ms = parse_start.elapsed().as_millis();
     if info.needs_platform_metadata() {
         fetch_platform_metadata(

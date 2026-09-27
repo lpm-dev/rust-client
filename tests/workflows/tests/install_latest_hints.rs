@@ -76,10 +76,12 @@ async fn install_latest_hint_authority(
         |tag| serde_json::json!({"latest":tag}),
     );
     metadata["latestVersion"] = serde_json::json!(native_latest);
+    // Resolution may race the latest document against history once; hints
+    // add no request of their own, and later rounds reuse the cached history.
     Mock::given(method("GET"))
         .and(path(format!("/{name}/latest")))
         .respond_with(ResponseTemplate::new(404))
-        .expect(0)
+        .expect(..=1)
         .mount(registry.server())
         .await;
     registry

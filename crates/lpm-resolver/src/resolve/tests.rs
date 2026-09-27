@@ -632,6 +632,8 @@ async fn pubgrub_rejects_malformed_required_peer_range() {
 
 #[tokio::test]
 async fn resolve_with_prefetch_preserves_platform_incompatible_optional_registry_metadata() {
+    let _lock = env_lock().lock().await;
+    let _env = GreedyEnvGuard::new();
     let platform = Platform::current();
     let compatible_optional = format!("@esbuild/{}-{}", platform.os, platform.cpu);
     let (incompatible_optional, incompatible_os, incompatible_cpu) = if platform.os == "darwin" {
@@ -755,6 +757,8 @@ async fn resolve_with_prefetch_preserves_platform_incompatible_optional_registry
 /// cross-test contamination).
 #[tokio::test]
 async fn resolve_with_prefetch_emits_stage_timing_shape() {
+    let _lock = env_lock().lock().await;
+    let _env = GreedyEnvGuard::new();
     let prefetched = HashMap::from([
         (
             "app".to_string(),
@@ -822,6 +826,8 @@ async fn resolve_with_prefetch_emits_stage_timing_shape() {
 /// forward so install-time filtering can skip it.
 #[tokio::test]
 async fn resolve_with_prefetch_selects_newest_optional_when_platform_match_is_out_of_range() {
+    let _lock = env_lock().lock().await;
+    let _env = GreedyEnvGuard::new();
     let platform = Platform::current();
     let incompatible_optional = if platform.os == "darwin" {
         "@next/swc-linux-x64-musl".to_string()
@@ -997,6 +1003,8 @@ async fn resolve_with_prefetch_handles_root_npm_alias() {
 /// `../../strip-ansi@6.0.1/node_modules/strip-ansi/`.
 #[tokio::test]
 async fn resolve_with_prefetch_handles_transitive_npm_alias() {
+    let _lock = env_lock().lock().await;
+    let _env = GreedyEnvGuard::new();
     let prefetched = HashMap::from([
         (
             "parent".to_string(),
@@ -1078,6 +1086,8 @@ async fn resolve_with_prefetch_handles_transitive_npm_alias() {
 /// lockfile.
 #[tokio::test]
 async fn resolve_regular_dep_with_no_platform_compatible_version_still_resolves() {
+    let _lock = env_lock().lock().await;
+    let _env = GreedyEnvGuard::new();
     let platform = Platform::current();
     let incompatible_dep = if platform.os == "darwin" {
         "some-linux-only-dep".to_string()

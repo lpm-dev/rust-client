@@ -17,8 +17,8 @@ pub use client::{
     MAX_MANAGED_POOL_INSTALL_EDGES, MAX_MANAGED_POOL_INSTALL_LPM_NODES,
     MAX_MANAGED_POOL_INSTALL_NODES, ManagedInstallAccounting, ManagedInstallGraph,
     ManagedInstallNode, ManagedInstallRoot, PackageMetadataFetchTimings, RegistryClient,
-    TimedPackageMetadata, TimedReleaseTimeMetadata, evaluate_cached_url, is_https_url,
-    is_localhost_url, parse_capped_api_json, reserve_compressed_tarball_spool,
+    TimedPackageMetadata, TimedPreferredMetadata, TimedReleaseTimeMetadata, evaluate_cached_url,
+    is_https_url, is_localhost_url, parse_capped_api_json, reserve_compressed_tarball_spool,
 };
 pub use npmrc::{
     NpmrcConfig, OriginKey, OriginTlsOverrides, RegistryAuth, RegistryKind, RegistryTarget,

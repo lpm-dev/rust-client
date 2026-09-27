@@ -97,6 +97,8 @@ pub fn record_release_age_check(elapsed: Duration, rejected: bool, missing_relea
     if missing_release_time {
         RELEASE_AGE_MISSING.fetch_add(1, Ordering::Relaxed);
     }
+    #[cfg(test)]
+    observe_thread_policy_check();
 }
 
 pub fn record_trust_policy_check(elapsed: Duration, rejected: bool) {
@@ -105,6 +107,25 @@ pub fn record_trust_policy_check(elapsed: Duration, rejected: bool) {
     if rejected {
         TRUST_POLICY_REJECTED.fetch_add(1, Ordering::Relaxed);
     }
+    #[cfg(test)]
+    observe_thread_policy_check();
+}
+
+#[cfg(test)]
+thread_local! {
+    static THREAD_POLICY_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn observe_thread_policy_check() {
+    THREAD_POLICY_CHECKS.with(|checks| checks.set(checks.get() + 1));
+}
+
+/// Policy checks recorded by the calling thread. Concurrent tests share the
+/// process-wide counters, so they can reset or advance them but not this count.
+#[cfg(test)]
+pub(crate) fn thread_policy_check_count() -> u64 {
+    THREAD_POLICY_CHECKS.with(std::cell::Cell::get)
 }
 
 fn reset_policy() {

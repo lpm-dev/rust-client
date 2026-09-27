@@ -322,6 +322,19 @@ impl PackageMetadataFetchTimings {
         self.cache_write_dispatch_ms += earlier.cache_write_dispatch_ms;
         self.body_bytes += earlier.body_bytes;
     }
+
+    /// Merge an attempt that overlapped this one. Transfer intervals overlap in
+    /// wall time, so they keep the longer interval; local work and bytes add.
+    pub(super) fn add_concurrent_attempt(&mut self, overlapping: &Self) {
+        self.cache_read_ms += overlapping.cache_read_ms;
+        self.validator_read_ms += overlapping.validator_read_ms;
+        self.http_ms = self.http_ms.max(overlapping.http_ms);
+        self.body_read_ms = self.body_read_ms.max(overlapping.body_read_ms);
+        self.json_decode_ms += overlapping.json_decode_ms;
+        self.cache_after_304_ms += overlapping.cache_after_304_ms;
+        self.cache_write_dispatch_ms += overlapping.cache_write_dispatch_ms;
+        self.body_bytes += overlapping.body_bytes;
+    }
 }
 
 /// Failure together with the measured work from all attempted metadata sources.
@@ -337,6 +350,16 @@ pub struct PackageMetadataFetchError {
 pub struct TimedPackageMetadata {
     pub metadata: PackageMetadata,
     pub timings: PackageMetadataFetchTimings,
+}
+
+/// Resolver metadata with independent version and platform-field coverage.
+#[derive(Debug)]
+pub struct TimedPreferredMetadata {
+    pub fetched: TimedPackageMetadata,
+    /// False when only manifests selected by a preference are available.
+    pub versions_complete: bool,
+    /// True when every retained manifest came from a full version document.
+    pub platform_metadata_complete: bool,
 }
 
 #[derive(Debug)]
