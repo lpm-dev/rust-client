@@ -746,6 +746,27 @@ impl RegistryClient {
         name = "metadata_request",
         skip_all
     )]
+    async fn send_policy_metadata_request(
+        &self,
+        request_builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, LpmError> {
+        let request = request_builder
+            .build()
+            .map_err(|error| LpmError::Network(format!("failed to build request: {error}")))?;
+        let provider = super::http::PolicyMetadataClientProvider(self.http.as_ref());
+        let response = self
+            .send_request_with_retry_and_client_provider(request, None, None, &provider)
+            .await?;
+        crate::timing::record_metadata_http_version(response.version());
+        Ok(response)
+    }
+
+    #[tracing::instrument(
+        target = "lpm_install_timeline",
+        level = "trace",
+        name = "metadata_request",
+        skip_all
+    )]
     pub(super) async fn send_package_metadata_request_with_npmrc_auth(
         &self,
         request_builder: reqwest::RequestBuilder,
@@ -3200,7 +3221,7 @@ impl RegistryClient {
             .header("Accept", "application/json");
         let req = Self::apply_cached_etag(req, cache_validator.as_ref());
         let http_start = std::time::Instant::now();
-        let mut response = match self.send_package_metadata_request(req).await {
+        let mut response = match self.send_policy_metadata_request(req).await {
             Ok(response) => {
                 timings.http_ms = timings
                     .http_ms
@@ -3235,7 +3256,7 @@ impl RegistryClient {
             timings.cache_after_304_ms = cache_304_start.elapsed().as_millis();
             let retry_http_start = std::time::Instant::now();
             response = match self
-                .send_package_metadata_request(
+                .send_policy_metadata_request(
                     self.http
                         .for_policy_metadata_url(&npm_url)
                         .await?

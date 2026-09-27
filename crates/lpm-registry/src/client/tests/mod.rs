@@ -59,6 +59,7 @@ mod history_reuse;
 mod http_tls;
 mod install_accounting;
 mod metadata;
+mod policy_transport;
 mod tarball;
 mod transport;
 mod url_gate;

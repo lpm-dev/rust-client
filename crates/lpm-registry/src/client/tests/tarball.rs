@@ -1,5 +1,116 @@
 use super::*;
 
+async fn chunked_tarball_response(
+    chunks: &'static [u8],
+) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = BufReader::new(socket);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if socket.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                break;
+            }
+        }
+        let mut response = Vec::with_capacity(128 + chunks.len());
+        response.extend_from_slice(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        );
+        response.extend_from_slice(chunks);
+        socket.get_mut().write_all(&response).await.unwrap();
+    });
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!("http://{address}/package.tgz"))
+        .send()
+        .await
+        .unwrap();
+    (response, server)
+}
+
+#[tokio::test]
+async fn buffered_tarball_accepts_chunked_bytes_exactly_at_the_limit() {
+    let (response, server) = chunked_tarball_response(b"4\r\nabcd\r\n4\r\nefgh\r\n0\r\n\r\n").await;
+    let bytes = crate::client::tarball::read_buffered_tarball_response(response, 8)
+        .await
+        .unwrap();
+    server.await.unwrap();
+    assert_eq!(bytes, b"abcdefgh");
+}
+
+#[tokio::test]
+async fn buffered_tarball_rejects_chunked_bytes_over_the_limit() {
+    let (response, server) = chunked_tarball_response(b"4\r\nabcd\r\n4\r\nefgh\r\n0\r\n\r\n").await;
+    let error = crate::client::tarball::read_buffered_tarball_response(response, 7)
+        .await
+        .unwrap_err();
+    server.await.unwrap();
+    assert!(
+        matches!(error, LpmError::Registry(message) if message.contains("maximum compressed size (7 bytes)"))
+    );
+}
+
+#[tokio::test]
+async fn buffered_tarball_preserves_body_read_errors() {
+    let (response, server) = chunked_tarball_response(b"4\r\nab").await;
+    let error = crate::client::tarball::read_buffered_tarball_response(response, 8)
+        .await
+        .unwrap_err();
+    server.await.unwrap();
+    assert!(
+        matches!(error, LpmError::Network(message) if message.contains("failed to read tarball bytes"))
+    );
+}
+
+#[tokio::test]
+async fn buffered_tarball_rejects_oversized_content_length_before_reading_body() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let declared = MAX_COMPRESSED_TARBALL_SIZE + 1;
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = BufReader::new(socket);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if socket.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                break;
+            }
+        }
+        socket
+            .get_mut()
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+    });
+    let client = RegistryClient::new().with_cache_dir(None);
+    let error = client
+        .download_tarball(&format!("http://{address}/oversized.tgz"))
+        .await
+        .unwrap_err();
+    server.await.unwrap();
+
+    let message = error.to_string();
+    assert!(
+        message.contains("Content-Length") && message.contains("exceeds maximum compressed size"),
+        "declared overflow must be rejected before the absent body is read: {message}"
+    );
+}
+
 #[tokio::test]
 async fn authenticated_tarball_download_refreshes_rejected_stored_session() {
     use wiremock::matchers::{header, method, path};

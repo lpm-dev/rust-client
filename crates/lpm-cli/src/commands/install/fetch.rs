@@ -1,5 +1,6 @@
 use indicatif::{ProgressBar, ProgressStyle};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument as _;
 
 use super::ready_file_admission::{ReadyClass, ReadyFileAdmission};
@@ -83,6 +84,7 @@ const ENV_V2_STREAMING_EXTRACT_WEIGHT: &str = "LPM_V2_STREAMING_EXTRACT_WEIGHT";
 pub(super) const DEFAULT_BOUNDED_FETCH_EXTRACT_PERMITS: usize = 4;
 const DEFAULT_LARGE_V2_STREAMING_EXTRACT_WEIGHT: usize = 3;
 pub(super) const LARGE_V2_STREAMING_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
+pub(super) const MAX_RETAINED_SPECULATIVE_TASKS: usize = 128;
 const SPECULATIVE_FILE_STREAMING_MIN_BYTES: u64 = 8 * 1024 * 1024;
 pub(super) const V2_STREAMING_SUPPLEMENTAL_PERMIT_LEASE: std::time::Duration =
     std::time::Duration::from_secs(2);
@@ -106,6 +108,11 @@ impl ArtifactSelection {
 #[derive(Default)]
 pub(super) struct FetchCoordinator {
     pub(super) locks: AsyncMutex<HashMap<String, FetchLock>>,
+    #[cfg(test)]
+    pub(super) v1_stream_gate: Option<Arc<super::test_support::BlockingExtractGate>>,
+    #[cfg(test)]
+    pub(super) speculation_task_probe:
+        Option<tokio::sync::watch::Sender<super::test_support::SpeculationTaskSnapshot>>,
 }
 
 impl FetchCoordinator {
@@ -3349,36 +3356,12 @@ pub(super) fn registry_install_pkg_key(
     key
 }
 
-/// /: stream metadata AND dispatch speculative
-/// downloads in parallel with NDJSON arrival. Returns the same complete
-/// metadata `HashMap` that `batch_metadata_deep` would — callers are
-/// semantically identical to the non-speculative path.
-///
-/// Dispatched downloads write directly into the real package store, so
-/// the post-resolve real-fetch loop sees them as plain
-/// `store.has_package()` hits. Mismatches (resolver picks a different
-/// version than our naive range-match) cost one wasted tarball each;
-/// the wrong version sits in the store until GC reclaims it.
-///
-/// transitive speculation. Roots seed a
-/// work queue; as each package's manifest arrives, its chosen version's
-/// dependencies are expanded onto the queue (capped at
-/// [`SPECULATION_MAX_DEPTH`]). Conflict-free trees (95%+ of real-world
-/// shape per npm data) see every downloaded package match what PubGrub
-/// ultimately picks. Pathological cases that mismatch still converge
-/// correctly via the real fetch loop.
-/// Bundles the still-live metadata producer, dispatcher `JoinHandle`,
-/// and dispatcher's atomic counters so `drain` at the post-fetch point
-/// folds speculation stats into the report shape.
-///
-/// Invariant: all handles are unawaited at construction. Awaiting any
-/// before `drain()` consumes the handle and makes the post-fetch drain
-/// a no-op.
+/// Owns the metadata producer and speculative dispatcher until completion.
+/// Dropping either this value or its drain future cancels both tasks.
 pub(super) struct SpeculationJoin {
-    pub(super) producer: Option<
-        tokio::task::JoinHandle<Result<lpm_resolver::WalkerSummary, lpm_resolver::WalkerError>>,
-    >,
-    pub(super) dispatcher: tokio::task::JoinHandle<()>,
+    pub(super) producer:
+        Option<AbortOnDropHandle<Result<lpm_resolver::WalkerSummary, lpm_resolver::WalkerError>>>,
+    pub(super) dispatcher: AbortOnDropHandle<()>,
     pub(super) dispatched: Arc<std::sync::atomic::AtomicU64>,
     pub(super) completed: Arc<std::sync::atomic::AtomicU64>,
     pub(super) task_ms_sum: Arc<std::sync::atomic::AtomicU64>,
@@ -3392,19 +3375,8 @@ pub(super) struct SpeculationJoin {
 }
 
 impl SpeculationJoin {
-    /// Await producer + dispatcher tails and fold dispatcher counters
-    /// into `stats`. Consumes `self` so the handles can only be
-    /// drained once.
-    ///
-    /// `stats.streaming_batch_ms` is read from the walker's
-    /// own self-measured `walker_wall_ms` (captured inside the walker
-    /// task from `run()` entry to its return). Using `started_at.elapsed()`
-    /// at drain-call time measures "spawn → drain," which includes
-    /// any post-walker fetch-overlap tail — not the metadata-producer
-    /// window the field is documented as. The walker-owned measurement
-    /// is invariant to when the caller chooses to `.await` the handle.
-    /// Fusion has no separate walker, so it reports the default summary
-    /// while still folding dispatcher counters.
+    /// Wait for both tails and report the producer's own runtime separately
+    /// from time spent waiting for completed work to be drained.
     pub(super) async fn drain(self, stats: &mut SpeculativeStats) -> lpm_resolver::WalkerSummary {
         use std::sync::atomic::Ordering::Relaxed;
         let producer_res = match self.producer {
@@ -3472,7 +3444,7 @@ pub(super) fn spawn_speculation_dispatcher(
     store_v2: Option<Arc<lpm_store::v2::Store>>,
     fetch_extract_limiter: FetchExtractLimiter,
     install_accounting: ManagedInstallAccounting,
-) -> (tokio::task::JoinHandle<()>, DispatcherCounters) {
+) -> (AbortOnDropHandle<()>, DispatcherCounters) {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
     let deps_for_spec = deps;
@@ -3526,7 +3498,13 @@ pub(super) fn spawn_speculation_dispatcher(
         // re-asks for the same pinned version from multiple parents.
         let mut already_dispatched: std::collections::HashSet<String> =
             std::collections::HashSet::new();
-        let mut spec_tasks = Vec::new();
+        let mut spec_tasks = tokio::task::JoinSet::new();
+        let report_retained = |_retained: usize| {
+            #[cfg(test)]
+            if let Some(probe) = &coord_spec.speculation_task_probe {
+                probe.send_modify(|snapshot| snapshot.retained = _retained);
+            }
+        };
 
         // Seed roots.
         for (name, range) in &deps_for_spec {
@@ -3548,7 +3526,7 @@ pub(super) fn spawn_speculation_dispatcher(
              parked: &mut HashMap<String, Vec<(String, u32, bool)>>,
              already_dispatched: &mut std::collections::HashSet<String>,
              work_queue: &mut Vec<(String, String, u32, bool)>,
-             spec_tasks: &mut Vec<tokio::task::JoinHandle<()>>| {
+             spec_tasks: &mut tokio::task::JoinSet<()>| {
                 let Some(meta) = metadata.get(&name) else {
                     parked
                         .entry(name)
@@ -3647,7 +3625,13 @@ pub(super) fn spawn_speculation_dispatcher(
                     return;
                 }
 
-                // Spawn the download.
+                // Package-lock waiters do not own network permits. Bound them without
+                // blocking metadata ingestion or suppressing dependency discovery.
+                if spec_tasks.len() >= MAX_RETAINED_SPECULATIVE_TASKS {
+                    skipped_no_permit_c.fetch_add(1, Relaxed);
+                    return;
+                }
+
                 let c = client_spec.clone();
                 let rt = route_table_spec.clone();
                 let s = store_spec.clone();
@@ -3665,7 +3649,7 @@ pub(super) fn spawn_speculation_dispatcher(
                 let install_accounting_task = install_accounting_spec;
                 let unpacked_size = meta.info.unpacked_size(&version);
                 let streaming_lane = v2_streaming_lane.clone();
-                spec_tasks.push(tokio::spawn(async move {
+                spec_tasks.spawn(async move {
                     let task_start = std::time::Instant::now();
                     match speculative_download_and_store(
                         &c,
@@ -3712,7 +3696,15 @@ pub(super) fn spawn_speculation_dispatcher(
                         }
                     }
                     task_ms_task.fetch_add(task_start.elapsed().as_millis() as u64, Relaxed);
-                }.in_current_span()));
+                }.in_current_span());
+                #[cfg(test)]
+                if let Some(probe) = &coord_spec.speculation_task_probe {
+                    probe.send_modify(|snapshot| {
+                        snapshot.spawned += 1;
+                        snapshot.retained = spec_tasks.len();
+                        snapshot.peak = snapshot.peak.max(snapshot.retained);
+                    });
+                }
             };
 
         // Main interleave loop: drain the work queue, then wait for the
@@ -3720,6 +3712,8 @@ pub(super) fn spawn_speculation_dispatcher(
         // it, and repeat.
         loop {
             while let Some((name, range, depth, is_root)) = work_queue.pop() {
+                while spec_tasks.try_join_next().is_some() {}
+                report_retained(spec_tasks.len());
                 process_item(
                     name,
                     range,
@@ -3733,8 +3727,19 @@ pub(super) fn spawn_speculation_dispatcher(
                 );
             }
 
-            match rx.recv().await {
+            let frame = tokio::select! {
+                _ = spec_tasks.join_next(), if !spec_tasks.is_empty() => {
+                    report_retained(spec_tasks.len());
+                    continue;
+                }
+                frame = rx.recv() => frame,
+            };
+            match frame {
                 Some((name, meta)) => {
+                    #[cfg(test)]
+                    if let Some(probe) = &coord_spec.speculation_task_probe {
+                        probe.send_modify(|snapshot| snapshot.metadata_frames += 1);
+                    }
                     match metadata.entry(name.clone()) {
                         std::collections::hash_map::Entry::Occupied(mut entry) => {
                             entry.get_mut().merge_snapshot(meta);
@@ -3756,22 +3761,6 @@ pub(super) fn spawn_speculation_dispatcher(
             }
         }
 
-        // Drain any remaining work (possible if a manifest arrived
-        // immediately before the sender dropped).
-        while let Some((name, range, depth, is_root)) = work_queue.pop() {
-            process_item(
-                name,
-                range,
-                depth,
-                is_root,
-                &metadata,
-                &mut parked,
-                &mut already_dispatched,
-                &mut work_queue,
-                &mut spec_tasks,
-            );
-        }
-
         // Packages still parked here were expected by some parent but
         // their manifest never arrived in the batch — the worker's
         // deep-walk didn't reach them. Report so we can tune the
@@ -3784,16 +3773,13 @@ pub(super) fn spawn_speculation_dispatcher(
         // drop — ensures store visibility for the real fetch loop's
         // `has_package` check. Losing a race to the real loop is fine:
         // the store's atomic-rename protects against corruption.
-        futures::future::join_all(spec_tasks).await;
+        while spec_tasks.join_next().await.is_some() {
+            report_retained(spec_tasks.len());
+        }
     }.instrument(dispatch_span));
 
-    // caller owns the tx side of the mpsc channel and the
-    // walker task; we return the dispatcher's `JoinHandle` +
-    // counters. The dispatcher's `rx.recv()` loop exits when the
-    // walker drops its `tx` sender — same channel-close termination
-    // shape the pre-49 streaming batch path used.
     (
-        handle,
+        AbortOnDropHandle::new(handle),
         DispatcherCounters {
             dispatched,
             completed,
@@ -3841,7 +3827,6 @@ pub(super) async fn speculative_download_and_store(
     fetch_extract_limiter: &FetchExtractLimiter,
     install_accounting: ManagedInstallAccounting,
 ) -> Result<(SpeculativeFetchOutcome, TaskTimings), LpmError> {
-    use futures::stream::TryStreamExt;
     use tokio_util::io::{StreamReader, SyncIoBridge};
 
     // + ( completion) — per-key
@@ -4005,9 +3990,12 @@ pub(super) async fn speculative_download_and_store(
         .await?;
     let download_headers_ms = download_start.elapsed().as_millis();
 
-    // v1 path: streaming straight to the per-`(name, version)` slot.
-    let byte_stream = response.bytes_stream().map_err(std::io::Error::other);
-    let async_reader = StreamReader::new(byte_stream);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let cancellation_guard = cancellation.clone().drop_guard();
+    let byte_stream = cancellable_tarball_stream(response.bytes_stream(), cancellation);
+    let async_reader = StreamReader::new(Box::pin(byte_stream));
+    let download_elapsed_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let download_elapsed_for_reader = Arc::clone(&download_elapsed_ms);
     let name_c = name.to_string();
     let version_c = version.to_string();
     let integrity_c = integrity.map(|s| s.to_string());
@@ -4017,23 +4005,35 @@ pub(super) async fn speculative_download_and_store(
     let extract_permit = acquire_fetch_extract_permit(fetch_extract_limiter).await?;
     let extract_permit_wait_ms = extract_wait_start.elapsed().as_millis();
     let pipeline_start = std::time::Instant::now();
+    #[cfg(test)]
+    let worker_gate = coord.v1_stream_gate.clone();
     let stage = run_speculative_blocking_extract(key_guard, extract_permit, move || {
         let sync_reader = SyncIoBridge::new(async_reader);
+        let reader = StreamBodyPermitReader::new(sync_reader, permit, download_elapsed_for_reader);
+        #[cfg(test)]
+        let _worker_gate = worker_gate.map(|gate| gate.enter());
         store_owned
             .stream_and_store_package(
                 &name_c,
                 &version_c,
-                sync_reader,
+                reader,
                 integrity_c.as_deref(),
                 lpm_registry::MAX_COMPRESSED_TARBALL_SIZE,
             )
             .map(|(_, _, stage)| stage)
     })
     .await?;
+    let _ = cancellation_guard.disarm();
+    let stream_body_wall_ms =
+        u128::from(download_elapsed_ms.load(std::sync::atomic::Ordering::Relaxed));
     Ok((
         SpeculativeFetchOutcome::Stored,
         TaskTimings::from_stage(queue_wait_ms, 0, 0, 0, extract_permit_wait_ms, stage)
-            .with_streaming_pipeline(download_headers_ms, 0, pipeline_start.elapsed().as_millis()),
+            .with_streaming_pipeline(
+                download_headers_ms,
+                stream_body_wall_ms,
+                pipeline_start.elapsed().as_millis(),
+            ),
     ))
 }
 

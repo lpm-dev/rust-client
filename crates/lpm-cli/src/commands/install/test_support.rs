@@ -109,3 +109,11 @@ pub(super) fn maybe_test_pause_before_local_materialization() {
         resume.display()
     );
 }
+#[cfg(test)]
+#[derive(Clone, Copy, Default, Debug)]
+pub(super) struct SpeculationTaskSnapshot {
+    pub(super) spawned: usize,
+    pub(super) retained: usize,
+    pub(super) peak: usize,
+    pub(super) metadata_frames: usize,
+}

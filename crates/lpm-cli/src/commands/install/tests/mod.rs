@@ -11,6 +11,7 @@ mod manifest;
 mod package;
 mod peer;
 mod source_resolution;
+mod speculation_lifetime;
 mod state;
 mod swift;
 mod workspace;
