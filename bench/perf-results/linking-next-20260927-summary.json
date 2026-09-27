@@ -1,0 +1,1127 @@
+{
+ "installs_dircache": {
+  "base": "lpm-main",
+  "change": "lpm-dircache",
+  "runs": [
+   {
+    "fixture": "t3",
+    "stage": "dircache.noindex",
+    "states": {
+     "first-install": {
+      "lpm-main": {
+       "median_ms": 1177.2498545,
+       "p95_ms": 1313.732708,
+       "wall_ms": [
+        1282.843541,
+        1313.732708,
+        1172.557584,
+        1218.315333,
+        1175.911917,
+        1149.322417,
+        1160.704,
+        1195.772833,
+        1178.31975,
+        1238.541333,
+        1176.179959,
+        1144.541
+       ]
+      },
+      "lpm-dircache": {
+       "median_ms": 1187.7705624999999,
+       "p95_ms": 1271.898167,
+       "wall_ms": [
+        1271.898167,
+        1247.191792,
+        1169.319292,
+        1124.223125,
+        1169.841458,
+        1220.96375,
+        1187.060042,
+        1188.481083,
+        1216.249791,
+        1198.621375,
+        1132.767167,
+        1130.900041
+       ]
+      },
+      "bun": {
+       "median_ms": 1389.793458,
+       "p95_ms": 1529.038417,
+       "wall_ms": [
+        1529.038417,
+        1393.832666,
+        1385.75425,
+        1526.868334,
+        1353.096709,
+        1408.617,
+        1373.008375,
+        1367.634792,
+        1439.187625,
+        1455.592458,
+        1357.260084,
+        1382.070834
+       ]
+      },
+      "paired_change_minus_base": {
+       "median_ms": -9.118561999999997,
+       "faster_pairs": 9,
+       "pairs": 12
+      }
+     },
+     "ci-cold-cache": {
+      "lpm-main": {
+       "median_ms": 1146.9118125,
+       "p95_ms": 1236.835541,
+       "wall_ms": [
+        1200.622375,
+        1096.516542,
+        1211.264083,
+        1174.601834,
+        1236.835541,
+        1101.837792,
+        1218.73125,
+        1151.614958,
+        1086.680834,
+        1105.2195,
+        1094.318334,
+        1142.208667
+       ]
+      },
+      "lpm-dircache": {
+       "median_ms": 1121.361146,
+       "p95_ms": 1322.533333,
+       "wall_ms": [
+        1134.755417,
+        1130.175958,
+        1146.392833,
+        1322.533333,
+        1132.106541,
+        1104.185291,
+        1112.328708,
+        1112.546334,
+        1192.990834,
+        1089.9875,
+        1087.806542,
+        1071.145042
+       ]
+      },
+      "bun": {
+       "median_ms": 1378.78925,
+       "p95_ms": 1455.456042,
+       "wall_ms": [
+        1416.882958,
+        1374.768708,
+        1455.456042,
+        1371.905875,
+        1358.011125,
+        1382.809792,
+        1400.376958,
+        1372.439125,
+        1406.638625,
+        1401.897333,
+        1366.3,
+        1356.657125
+       ]
+      },
+      "paired_change_minus_base": {
+       "median_ms": -27.150311999999985,
+       "faster_pairs": 8,
+       "pairs": 12
+      }
+     }
+    }
+   },
+   {
+    "fixture": "nest",
+    "stage": "dircache.noindex",
+    "states": {
+     "first-install": {
+      "lpm-main": {
+       "median_ms": 217.1256665,
+       "p95_ms": 223.61325,
+       "wall_ms": [
+        216.273208,
+        213.148458,
+        213.375542,
+        217.44125,
+        216.810083,
+        219.532417,
+        223.481833,
+        210.412042,
+        215.951167,
+        219.458,
+        219.936542,
+        211.165125,
+        218.207541,
+        214.358084,
+        223.61325,
+        219.278167
+       ]
+      },
+      "lpm-dircache": {
+       "median_ms": 212.350125,
+       "p95_ms": 220.644625,
+       "wall_ms": [
+        210.615083,
+        211.055667,
+        211.843791,
+        217.208,
+        211.399125,
+        215.375708,
+        210.280708,
+        220.644625,
+        211.982958,
+        209.744542,
+        212.717292,
+        218.182208,
+        213.36025,
+        218.573083,
+        208.582917,
+        218.5095
+       ]
+      },
+      "bun": {
+       "median_ms": 195.95431250000001,
+       "p95_ms": 202.305042,
+       "wall_ms": [
+        190.72525,
+        197.914833,
+        193.608417,
+        197.948083,
+        194.840542,
+        195.665583,
+        197.651041,
+        198.963167,
+        192.29225,
+        202.305042,
+        195.096708,
+        194.897667,
+        196.53175,
+        199.369,
+        196.243042,
+        195.295542
+       ]
+      },
+      "paired_change_minus_base": {
+       "median_ms": -4.062459000000004,
+       "faster_pairs": 13,
+       "pairs": 16
+      }
+     },
+     "ci-cold-cache": {
+      "lpm-main": {
+       "median_ms": 189.749125,
+       "p95_ms": 229.226084,
+       "wall_ms": [
+        188.502334,
+        186.70925,
+        188.570375,
+        186.696,
+        187.799625,
+        229.226084,
+        192.719292,
+        191.906208,
+        195.374584,
+        188.772792,
+        192.219791,
+        190.725458,
+        191.990541,
+        188.069208,
+        193.234958,
+        187.729625
+       ]
+      },
+      "lpm-dircache": {
+       "median_ms": 190.724646,
+       "p95_ms": 193.430375,
+       "wall_ms": [
+        187.2765,
+        191.886916,
+        183.234833,
+        186.872875,
+        188.794583,
+        191.79825,
+        188.709208,
+        192.760167,
+        183.286125,
+        190.828375,
+        191.610625,
+        190.620917,
+        193.430375,
+        191.215625,
+        189.554125,
+        191.71725
+       ]
+      },
+      "bun": {
+       "median_ms": 192.8241045,
+       "p95_ms": 206.632375,
+       "wall_ms": [
+        193.223375,
+        191.073083,
+        193.074667,
+        195.542958,
+        194.971333,
+        195.569875,
+        203.569292,
+        206.632375,
+        189.134959,
+        197.17825,
+        191.681625,
+        189.6755,
+        192.573542,
+        189.872166,
+        192.311167,
+        188.889917
+       ]
+      },
+      "paired_change_minus_base": {
+       "median_ms": 0.036166999999991845,
+       "faster_pairs": 8,
+       "pairs": 16
+      }
+     }
+    }
+   },
+   {
+    "fixture": "vite-react",
+    "stage": "dircache.noindex",
+    "states": {
+     "first-install": {
+      "lpm-main": {
+       "median_ms": 233.79931249999998,
+       "p95_ms": 255.844417,
+       "wall_ms": [
+        239.404667,
+        239.390291,
+        226.788417,
+        251.924875,
+        227.985916,
+        236.35075,
+        236.31125,
+        227.872375,
+        229.864542,
+        231.455334,
+        234.260125,
+        255.844417,
+        239.064875,
+        233.3385,
+        232.604417,
+        230.239583
+       ]
+      },
+      "lpm-dircache": {
+       "median_ms": 235.4205415,
+       "p95_ms": 251.297709,
+       "wall_ms": [
+        230.765583,
+        234.136958,
+        235.348042,
+        240.882417,
+        229.221125,
+        251.297709,
+        240.956708,
+        237.522916,
+        241.235959,
+        232.478,
+        231.801917,
+        227.607917,
+        232.0985,
+        235.493041,
+        242.655167,
+        236.577458
+       ]
+      },
+      "bun": {
+       "median_ms": 182.4325415,
+       "p95_ms": 211.22475,
+       "wall_ms": [
+        182.931875,
+        181.014791,
+        191.244,
+        178.296834,
+        180.648292,
+        181.933208,
+        211.22475,
+        183.618667,
+        178.1885,
+        184.214625,
+        187.166625,
+        175.228708,
+        176.499625,
+        185.7595,
+        171.131875,
+        192.707
+       ]
+      },
+      "paired_change_minus_base": {
+       "median_ms": 1.6948749999999961,
+       "faster_pairs": 6,
+       "pairs": 16
+      }
+     },
+     "ci-cold-cache": {
+      "lpm-main": {
+       "median_ms": 185.356292,
+       "p95_ms": 220.258333,
+       "wall_ms": [
+        182.9495,
+        180.919541,
+        191.898042,
+        183.4405,
+        193.501833,
+        181.877333,
+        220.258333,
+        190.2155,
+        185.193042,
+        183.179041,
+        176.769,
+        185.519542,
+        186.612334,
+        189.742042,
+        182.912833,
+        197.836333
+       ]
+      },
+      "lpm-dircache": {
+       "median_ms": 189.93627099999998,
+       "p95_ms": 222.16525,
+       "wall_ms": [
+        186.25575,
+        186.435,
+        184.58025,
+        182.414,
+        196.559834,
+        213.256834,
+        222.16525,
+        200.074417,
+        181.703916,
+        190.1985,
+        205.454125,
+        190.475833,
+        185.642125,
+        189.674042,
+        183.092459,
+        190.619625
+       ]
+      },
+      "bun": {
+       "median_ms": 158.3536875,
+       "p95_ms": 190.881709,
+       "wall_ms": [
+        156.5395,
+        155.097584,
+        160.906458,
+        158.185584,
+        146.388,
+        153.338125,
+        190.881709,
+        183.706917,
+        160.393791,
+        155.8645,
+        158.521791,
+        147.976292,
+        153.6995,
+        161.180791,
+        160.290625,
+        160.620458
+       ]
+      },
+      "paired_change_minus_base": {
+       "median_ms": 2.4824589999999915,
+       "faster_pairs": 6,
+       "pairs": 16
+      }
+     }
+    }
+   }
+  ]
+ },
+ "installs_p3": {
+  "base": "p4",
+  "change": "p3",
+  "runs": [
+   {
+    "fixture": "t3",
+    "stage": "permits.noindex",
+    "states": {
+     "ci-cold-cache": {
+      "p4": {
+       "median_ms": 1108.2936045000001,
+       "p95_ms": 1171.479459,
+       "wall_ms": [
+        1103.286792,
+        1098.352042,
+        1113.300417,
+        1134.233333,
+        1096.947375,
+        1171.479459,
+        1155.629625,
+        1087.981417
+       ]
+      },
+      "p3": {
+       "median_ms": 1096.7238545,
+       "p95_ms": 1252.936666,
+       "wall_ms": [
+        1051.963917,
+        1109.302334,
+        1068.4535,
+        1059.181,
+        1252.936666,
+        1088.24575,
+        1105.201959,
+        1193.75625
+       ]
+      },
+      "p2": {
+       "median_ms": 1137.124667,
+       "p95_ms": 1260.604875,
+       "wall_ms": [
+        1108.608625,
+        1136.602,
+        1160.378667,
+        1137.647334,
+        1119.405584,
+        1260.604875,
+        1162.490083,
+        1130.02
+       ]
+      },
+      "paired_change_minus_base": {
+       "median_ms": -47.63729149999995,
+       "faster_pairs": 5,
+       "pairs": 8
+      }
+     }
+    }
+   }
+  ]
+ },
+ "installs_p2": {
+  "base": "p4",
+  "change": "p2",
+  "runs": [
+   {
+    "fixture": "t3",
+    "stage": "permits.noindex",
+    "states": {
+     "ci-cold-cache": {
+      "p4": {
+       "median_ms": 1108.2936045000001,
+       "p95_ms": 1171.479459,
+       "wall_ms": [
+        1103.286792,
+        1098.352042,
+        1113.300417,
+        1134.233333,
+        1096.947375,
+        1171.479459,
+        1155.629625,
+        1087.981417
+       ]
+      },
+      "p3": {
+       "median_ms": 1096.7238545,
+       "p95_ms": 1252.936666,
+       "wall_ms": [
+        1051.963917,
+        1109.302334,
+        1068.4535,
+        1059.181,
+        1252.936666,
+        1088.24575,
+        1105.201959,
+        1193.75625
+       ]
+      },
+      "p2": {
+       "median_ms": 1137.124667,
+       "p95_ms": 1260.604875,
+       "wall_ms": [
+        1108.608625,
+        1136.602,
+        1160.378667,
+        1137.647334,
+        1119.405584,
+        1260.604875,
+        1162.490083,
+        1130.02
+       ]
+      },
+      "paired_change_minus_base": {
+       "median_ms": 30.354083500000115,
+       "faster_pairs": 0,
+       "pairs": 8
+      }
+     }
+    }
+   }
+  ]
+ },
+ "installs_w3": {
+  "base": "w2",
+  "change": "w3",
+  "runs": [
+   {
+    "fixture": "t3",
+    "stage": "streamw.noindex",
+    "states": {
+     "ci-cold-cache": {
+      "w2": {
+       "median_ms": 1124.6581664999999,
+       "p95_ms": 1227.454416,
+       "wall_ms": [
+        1123.133458,
+        1089.949708,
+        1129.236709,
+        1126.182875,
+        1227.454416,
+        1093.754417,
+        1169.689833,
+        1114.351417
+       ]
+      },
+      "w3": {
+       "median_ms": 1125.2699790000001,
+       "p95_ms": 1162.841625,
+       "wall_ms": [
+        1130.352875,
+        1109.511833,
+        1140.651917,
+        1162.841625,
+        1112.248875,
+        1110.522833,
+        1131.792834,
+        1120.187083
+       ]
+      },
+      "w4": {
+       "median_ms": 1138.7620625,
+       "p95_ms": 1152.475667,
+       "wall_ms": [
+        1151.064958,
+        1152.475667,
+        1147.808875,
+        1130.192291,
+        1140.605333,
+        1136.918792,
+        1130.211625,
+        1127.420916
+       ]
+      },
+      "w6": {
+       "median_ms": 1167.8471045000001,
+       "p95_ms": 1185.485792,
+       "wall_ms": [
+        1172.039375,
+        1162.548791,
+        1165.640042,
+        1180.020708,
+        1185.485792,
+        1148.170917,
+        1151.697292,
+        1170.054167
+       ]
+      },
+      "paired_change_minus_base": {
+       "median_ms": 9.317312499999957,
+       "faster_pairs": 2,
+       "pairs": 8
+      }
+     }
+    }
+   }
+  ]
+ },
+ "installs_w4": {
+  "base": "w2",
+  "change": "w4",
+  "runs": [
+   {
+    "fixture": "t3",
+    "stage": "streamw.noindex",
+    "states": {
+     "ci-cold-cache": {
+      "w2": {
+       "median_ms": 1124.6581664999999,
+       "p95_ms": 1227.454416,
+       "wall_ms": [
+        1123.133458,
+        1089.949708,
+        1129.236709,
+        1126.182875,
+        1227.454416,
+        1093.754417,
+        1169.689833,
+        1114.351417
+       ]
+      },
+      "w3": {
+       "median_ms": 1125.2699790000001,
+       "p95_ms": 1162.841625,
+       "wall_ms": [
+        1130.352875,
+        1109.511833,
+        1140.651917,
+        1162.841625,
+        1112.248875,
+        1110.522833,
+        1131.792834,
+        1120.187083
+       ]
+      },
+      "w4": {
+       "median_ms": 1138.7620625,
+       "p95_ms": 1152.475667,
+       "wall_ms": [
+        1151.064958,
+        1152.475667,
+        1147.808875,
+        1130.192291,
+        1140.605333,
+        1136.918792,
+        1130.211625,
+        1127.420916
+       ]
+      },
+      "w6": {
+       "median_ms": 1167.8471045000001,
+       "p95_ms": 1185.485792,
+       "wall_ms": [
+        1172.039375,
+        1162.548791,
+        1165.640042,
+        1180.020708,
+        1185.485792,
+        1148.170917,
+        1151.697292,
+        1170.054167
+       ]
+      },
+      "paired_change_minus_base": {
+       "median_ms": 15.820832499999938,
+       "faster_pairs": 2,
+       "pairs": 8
+      }
+     }
+    }
+   }
+  ]
+ },
+ "installs_w6": {
+  "base": "w2",
+  "change": "w6",
+  "runs": [
+   {
+    "fixture": "t3",
+    "stage": "streamw.noindex",
+    "states": {
+     "ci-cold-cache": {
+      "w2": {
+       "median_ms": 1124.6581664999999,
+       "p95_ms": 1227.454416,
+       "wall_ms": [
+        1123.133458,
+        1089.949708,
+        1129.236709,
+        1126.182875,
+        1227.454416,
+        1093.754417,
+        1169.689833,
+        1114.351417
+       ]
+      },
+      "w3": {
+       "median_ms": 1125.2699790000001,
+       "p95_ms": 1162.841625,
+       "wall_ms": [
+        1130.352875,
+        1109.511833,
+        1140.651917,
+        1162.841625,
+        1112.248875,
+        1110.522833,
+        1131.792834,
+        1120.187083
+       ]
+      },
+      "w4": {
+       "median_ms": 1138.7620625,
+       "p95_ms": 1152.475667,
+       "wall_ms": [
+        1151.064958,
+        1152.475667,
+        1147.808875,
+        1130.192291,
+        1140.605333,
+        1136.918792,
+        1130.211625,
+        1127.420916
+       ]
+      },
+      "w6": {
+       "median_ms": 1167.8471045000001,
+       "p95_ms": 1185.485792,
+       "wall_ms": [
+        1172.039375,
+        1162.548791,
+        1165.640042,
+        1180.020708,
+        1185.485792,
+        1148.170917,
+        1151.697292,
+        1170.054167
+       ]
+      },
+      "paired_change_minus_base": {
+       "median_ms": 51.371875000000045,
+       "faster_pairs": 2,
+       "pairs": 8
+      }
+     }
+    }
+   }
+  ]
+ },
+ "installs_xtcache": {
+  "base": "main",
+  "change": "cache",
+  "runs": [
+   {
+    "fixture": "t3",
+    "stage": "xtcache.noindex",
+    "states": {
+     "ci-cold-cache": {
+      "main": {
+       "median_ms": 1089.084667,
+       "p95_ms": 1123.218667,
+       "wall_ms": [
+        1073.514417,
+        1084.258417,
+        1087.622625,
+        1113.741666,
+        1090.546709,
+        1123.218667,
+        1077.397708,
+        1102.319667
+       ]
+      },
+      "cache": {
+       "median_ms": 1111.9059585,
+       "p95_ms": 1254.352709,
+       "wall_ms": [
+        1090.812625,
+        1088.982084,
+        1121.475375,
+        1116.255042,
+        1254.352709,
+        1152.499083,
+        1100.124541,
+        1107.556875
+       ]
+      },
+      "paired_change_minus_base": {
+       "median_ms": 20.012520499999937,
+       "faster_pairs": 0,
+       "pairs": 8
+      }
+     }
+    }
+   }
+  ]
+ },
+ "largest_package_timeline_ms_from_install_start": {
+  "note": "medians over runs; timeline.py over LPM_FETCH_TRACE/LPM_LINK_TRACE/LPM_TAIL_MARK",
+  "timeline.noindex": {
+   "trace": {
+    "start": 20.8,
+    "body_wall": 916.0,
+    "extract": 916.0,
+    "end": 1007.4,
+    "last_fetch_end": 1007.4,
+    "link_start": 1007.5,
+    "link_end_task": 1114.4,
+    "link_phase_end": 1120.9,
+    "others_extract_sum_during": 1990.5
+   }
+  },
+  "permits.noindex": {
+   "p4": {
+    "start": 22.2,
+    "body_wall": 884.0,
+    "extract": 884.5,
+    "end": 975.0,
+    "last_fetch_end": 975.0,
+    "link_start": 975.1,
+    "link_end_task": 1076.0,
+    "link_phase_end": 1083.2,
+    "others_extract_sum_during": 1942.5
+   },
+   "p3": {
+    "start": 22.1,
+    "body_wall": 790.5,
+    "extract": 790.5,
+    "end": 912.6,
+    "last_fetch_end": 1046.4,
+    "link_start": 912.7,
+    "link_end_task": 1032.4,
+    "link_phase_end": 1069.4,
+    "others_extract_sum_during": 1351.5
+   },
+   "p2": {
+    "start": 21.1,
+    "body_wall": 602.5,
+    "extract": 603.0,
+    "end": 727.5,
+    "last_fetch_end": 1101.3,
+    "link_start": 727.6,
+    "link_end_task": 841.7,
+    "link_phase_end": 1109.2,
+    "others_extract_sum_during": 973.5
+   }
+  },
+  "streamw.noindex": {
+   "w2": {
+    "start": 23.2,
+    "body_wall": 896.0,
+    "extract": 896.5,
+    "end": 975.7,
+    "last_fetch_end": 975.7,
+    "link_start": 975.8,
+    "link_end_task": 1088.2,
+    "link_phase_end": 1095.8,
+    "others_extract_sum_during": 1957.5
+   },
+   "w3": {
+    "start": 21.8,
+    "body_wall": 886.0,
+    "extract": 886.0,
+    "end": 987.0,
+    "last_fetch_end": 1007.1,
+    "link_start": 987.2,
+    "link_end_task": 1092.6,
+    "link_phase_end": 1099.3,
+    "others_extract_sum_during": 2126.0
+   },
+   "w4": {
+    "start": 21.8,
+    "body_wall": 890.5,
+    "extract": 891.0,
+    "end": 1002.0,
+    "last_fetch_end": 1081.3,
+    "link_start": 1002.1,
+    "link_end_task": 1102.5,
+    "link_phase_end": 1109.2,
+    "others_extract_sum_during": 2144.5
+   },
+   "w6": {
+    "start": 22.3,
+    "body_wall": 919.5,
+    "extract": 919.5,
+    "end": 1026.0,
+    "last_fetch_end": 1069.8,
+    "link_start": 1026.1,
+    "link_end_task": 1133.2,
+    "link_phase_end": 1140.0,
+    "others_extract_sum_during": 2187.5
+   }
+  }
+ },
+ "next_extraction_counters_in_install": {
+  "xt.noindex/xt": [
+   "decoder bytes=191431168 start_us=1790528753282356 end_us=1790528754187174 net=41.1 decode_incl_net=276.7 send_wait=628.0",
+   "coord files=8531 start_us=1790528753282289 end_us=1790528754191039 wall=908.7 prepare=188.9 room_wait=166.4 accept=258.9 here=191.6 read_wait=25.8",
+   "decoder bytes=191431168 start_us=1790528736762271 end_us=1790528737577583 net=41.5 decode_incl_net=274.1 send_wait=541.1",
+   "coord files=8531 start_us=1790528736762176 end_us=1790528737580738 wall=818.6 prepare=155.2 room_wait=160.9 accept=219.7 here=185.2 read_wait=30.0",
+   "decoder bytes=191431168 start_us=1790528746625742 end_us=1790528747522238 net=40.4 decode_incl_net=269.7 send_wait=626.6",
+   "coord files=8531 start_us=1790528746625651 end_us=1790528747525449 wall=899.8 prepare=178.8 room_wait=160.9 accept=276.0 here=195.6 read_wait=27.9",
+   "decoder bytes=191431168 start_us=1790528743279160 end_us=1790528744194583 net=39.4 decode_incl_net=264.5 send_wait=650.8",
+   "coord files=8531 start_us=1790528743279118 end_us=1790528744198113 wall=919.0 prepare=172.0 room_wait=196.7 accept=282.6 here=175.6 read_wait=30.5",
+   "decoder bytes=191431168 start_us=1790528739953086 end_us=1790528740856557 net=41.9 decode_incl_net=275.7 send_wait=627.6",
+   "coord files=8531 start_us=1790528739953003 end_us=1790528740859951 wall=906.9 prepare=164.2 room_wait=181.9 accept=278.0 here=188.9 read_wait=25.7",
+   "decoder bytes=191431168 start_us=1790528749938119 end_us=1790528750849797 net=41.7 decode_incl_net=273.4 send_wait=638.1",
+   "coord files=8531 start_us=1790528749938045 end_us=1790528750852753 wall=914.7 prepare=183.9 room_wait=165.5 accept=268.3 here=202.9 read_wait=23.4"
+  ],
+  "xtcache.noindex/main": [
+   "decoder bytes=191431168 start_us=1790530723588521 end_us=1790530724458781 net=40.9 decode_incl_net=274.8 send_wait=595.4",
+   "coord files=8531 start_us=1790530723588427 end_us=1790530724462112 wall=873.7 prepare=156.8 room_wait=164.7 accept=270.9 here=189.5 read_wait=23.0",
+   "decoder bytes=191431168 start_us=1790530717078953 end_us=1790530717981345 net=39.9 decode_incl_net=264.7 send_wait=637.6",
+   "coord files=8531 start_us=1790530717078853 end_us=1790530717984495 wall=905.6 prepare=175.3 room_wait=181.1 accept=283.9 here=179.8 read_wait=26.1",
+   "decoder bytes=191431168 start_us=1790530681345681 end_us=1790530682192523 net=40.3 decode_incl_net=271.9 send_wait=574.8",
+   "coord files=8531 start_us=1790530681345637 end_us=1790530682197001 wall=851.4 prepare=170.0 room_wait=155.0 accept=256.4 here=181.8 read_wait=28.6",
+   "decoder bytes=191431168 start_us=1790530726853524 end_us=1790530727742860 net=40.7 decode_incl_net=273.2 send_wait=616.0",
+   "coord files=8531 start_us=1790530726853468 end_us=1790530727746567 wall=893.1 prepare=170.7 room_wait=169.7 accept=265.7 here=191.5 read_wait=29.1",
+   "decoder bytes=191431168 start_us=1790530700573039 end_us=1790530701477991 net=40.5 decode_incl_net=271.3 send_wait=633.5",
+   "coord files=8531 start_us=1790530700572962 end_us=1790530701487703 wall=914.7 prepare=173.0 room_wait=189.5 accept=291.6 here=180.1 read_wait=29.1",
+   "decoder bytes=191431168 start_us=1790530697396356 end_us=1790530698254981 net=40.2 decode_incl_net=270.9 send_wait=587.6",
+   "coord files=8531 start_us=1790530697396190 end_us=1790530698258544 wall=862.3 prepare=150.3 room_wait=176.4 accept=259.1 here=187.0 read_wait=26.3",
+   "decoder bytes=191431168 start_us=1790530690965810 end_us=1790530691834936 net=40.2 decode_incl_net=264.9 send_wait=604.1",
+   "coord files=8531 start_us=1790530690965757 end_us=1790530691838442 wall=872.7 prepare=169.4 room_wait=169.1 accept=267.4 here=176.0 read_wait=30.7",
+   "decoder bytes=191431168 start_us=1790530707251027 end_us=1790530708017020 net=40.5 decode_incl_net=263.4 send_wait=502.5",
+   "coord files=8531 start_us=1790530707250960 end_us=1790530708020356 wall=769.4 prepare=132.7 room_wait=157.6 accept=224.8 here=183.0 read_wait=25.2"
+  ],
+  "xtcache.noindex/cache": [
+   "decoder bytes=191431168 start_us=1790530720363370 end_us=1790530721237033 net=40.9 decode_incl_net=271.8 send_wait=601.7",
+   "coord files=8531 start_us=1790530720363206 end_us=1790530721240323 wall=877.1 prepare=134.6 room_wait=202.3 accept=264.0 here=179.7 read_wait=30.3",
+   "decoder bytes=191431168 start_us=1790530713784200 end_us=1790530714698710 net=40.2 decode_incl_net=271.1 send_wait=643.3",
+   "coord files=8531 start_us=1790530713784099 end_us=1790530714702722 wall=918.6 prepare=150.1 room_wait=196.1 accept=291.4 here=185.4 read_wait=28.6",
+   "decoder bytes=191431168 start_us=1790530684584448 end_us=1790530685437046 net=40.2 decode_incl_net=265.0 send_wait=587.4",
+   "coord files=8531 start_us=1790530684584343 end_us=1790530685440230 wall=855.9 prepare=139.4 room_wait=186.1 accept=261.1 here=176.1 read_wait=31.0",
+   "decoder bytes=191431168 start_us=1790530730179870 end_us=1790530730986393 net=39.6 decode_incl_net=263.4 send_wait=543.0",
+   "coord files=8531 start_us=1790530730179752 end_us=1790530730989562 wall=809.8 prepare=136.7 room_wait=174.2 accept=224.9 here=173.5 read_wait=31.8",
+   "decoder bytes=191431168 start_us=1790530703970858 end_us=1790530704745901 net=39.3 decode_incl_net=255.9 send_wait=519.1",
+   "coord files=8531 start_us=1790530703970646 end_us=1790530704748922 wall=778.3 prepare=124.3 room_wait=185.3 accept=203.7 here=178.1 read_wait=33.3",
+   "decoder bytes=191431168 start_us=1790530694272564 end_us=1790530695072098 net=39.4 decode_incl_net=258.4 send_wait=541.0",
+   "coord files=8531 start_us=1790530694272503 end_us=1790530695075579 wall=803.1 prepare=130.4 room_wait=174.1 accept=228.0 here=188.1 read_wait=32.3",
+   "decoder bytes=191431168 start_us=1790530687757494 end_us=1790530688625862 net=41.2 decode_incl_net=277.9 send_wait=590.3",
+   "coord files=8531 start_us=1790530687757440 end_us=1790530688630955 wall=873.5 prepare=148.8 room_wait=174.9 accept=255.4 here=193.9 read_wait=28.6",
+   "decoder bytes=191431168 start_us=1790530710395517 end_us=1790530711420754 net=38.5 decode_incl_net=258.0 send_wait=767.1",
+   "coord files=8531 start_us=1790530710395444 end_us=1790530711423895 wall=1028.4 prepare=140.0 room_wait=300.0 accept=309.4 here=188.9 read_wait=26.6"
+  ]
+ },
+ "next_link_entry_steps": [
+  {
+   "state": "ci-cold-cache",
+   "trace": "name=next queued_ms=0.0 work_ms=105.6 total=105 integrity=0 materialize=89 symlink=0 snapshot=15 sidecar=0 rename=0"
+  },
+  {
+   "state": "ci-cold-cache",
+   "trace": "name=next queued_ms=0.0 work_ms=108.7 total=108 integrity=0 materialize=93 symlink=0 snapshot=14 sidecar=0 rename=0"
+  },
+  {
+   "state": "ci-cold-cache",
+   "trace": "name=next queued_ms=0.0 work_ms=108.5 total=108 integrity=0 materialize=91 symlink=1 snapshot=14 sidecar=0 rename=0"
+  },
+  {
+   "state": "ci-cold-cache",
+   "trace": "name=next queued_ms=0.0 work_ms=103.0 total=102 integrity=0 materialize=87 symlink=0 snapshot=14 sidecar=0 rename=0"
+  },
+  {
+   "state": "ci-cold-cache",
+   "trace": "name=next queued_ms=0.0 work_ms=115.0 total=114 integrity=0 materialize=94 symlink=0 snapshot=19 sidecar=0 rename=0"
+  },
+  {
+   "state": "ci-cold-cache",
+   "trace": "name=next queued_ms=0.0 work_ms=97.5 total=97 integrity=0 materialize=81 symlink=0 snapshot=15 sidecar=0 rename=0"
+  },
+  {
+   "state": "first-install",
+   "trace": "name=next queued_ms=0.0 work_ms=108.1 total=108 integrity=0 materialize=92 symlink=0 snapshot=14 sidecar=0 rename=0"
+  },
+  {
+   "state": "first-install",
+   "trace": "name=next queued_ms=0.0 work_ms=112.8 total=112 integrity=0 materialize=97 symlink=0 snapshot=14 sidecar=0 rename=0"
+  },
+  {
+   "state": "first-install",
+   "trace": "name=next queued_ms=0.0 work_ms=114.2 total=114 integrity=0 materialize=98 symlink=0 snapshot=15 sidecar=0 rename=0"
+  },
+  {
+   "state": "first-install",
+   "trace": "name=next queued_ms=0.0 work_ms=109.4 total=109 integrity=0 materialize=93 symlink=0 snapshot=15 sidecar=0 rename=0"
+  },
+  {
+   "state": "first-install",
+   "trace": "name=next queued_ms=0.0 work_ms=158.9 total=158 integrity=0 materialize=124 symlink=1 snapshot=31 sidecar=0 rename=0"
+  },
+  {
+   "state": "first-install",
+   "trace": "name=next queued_ms=0.0 work_ms=155.8 total=155 integrity=0 materialize=125 symlink=3 snapshot=25 sidecar=0 rename=0"
+  }
+ ],
+ "clone_strategies_isolated_ms": {
+  "note": "clonebench.c on next@16.3.6 object (8,534 files, 697 dirs, 198 MB), 7 rotating runs each, median/min/max",
+  "tree": [
+   89.7,
+   87.2,
+   96.0
+  ],
+  "files_1_thread": [
+   870.3,
+   812.3,
+   895.2
+  ],
+  "files_4_threads": [
+   517.2,
+   513.7,
+   534.0
+  ],
+  "files_8_threads": [
+   482.1,
+   480.7,
+   505.7
+  ],
+  "subtrees_depth3_4_threads": [
+   140.9,
+   138.3,
+   142.0
+  ],
+  "subtrees_depth3_8_threads": [
+   137.7,
+   133.6,
+   140.7
+  ],
+  "subtrees_depth4_8_threads": [
+   263.1,
+   260.4,
+   292.0
+  ],
+  "subtrees_depth5_8_threads": [
+   380.3,
+   371.4,
+   382.0
+  ]
+ },
+ "clone_freshly_written_vs_flushed_ms": {
+  "dirty": [
+   55.2,
+   55.9,
+   60.5,
+   60.6,
+   61.5,
+   63.1
+  ],
+  "flushed": [
+   77.3,
+   80.4,
+   80.8,
+   81.3,
+   83.8,
+   85.6
+  ]
+ },
+ "parent_revisit_lookup_us": {
+  "note": "8,148 parent revisits of next, warm",
+  "openat_nofollow_any_fstat_close": 2.0,
+  "first_pass": 9.3,
+  "fstatat_symlink_nofollow_any": 0.54
+ },
+ "lru_hit_rates_percent": {
+  "next": {
+   "1": 4,
+   "16": 35,
+   "64": 55,
+   "128": 67,
+   "256": 78,
+   "512": 90
+  },
+  "drizzle-orm": {
+   "1": 3,
+   "16": 49,
+   "64": 98,
+   "512": 98
+  },
+  "rxjs": {
+   "1": 0,
+   "16": 82,
+   "64": 95,
+   "512": 96
+  }
+ },
+ "isolated_extraction_with_directory_cache_ms": {
+  "base": 431.7,
+  "cache": 432.1,
+  "runs": 24
+ }
+}
