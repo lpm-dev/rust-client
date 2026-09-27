@@ -4061,7 +4061,7 @@ fn read_port_overrides_from(
             Err(_) => return HashMap::new(),
         };
 
-    let doc: toml::Value = match content.parse() {
+    let doc: toml::Table = match toml::from_str(&content) {
         Ok(v) => v,
         Err(_) => return HashMap::new(),
     };
@@ -4092,11 +4092,7 @@ fn write_port_override_to(
 ) {
     let content = lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
         .unwrap_or_default();
-    let mut doc: toml::value::Table = content
-        .parse::<toml::Value>()
-        .ok()
-        .and_then(|v| v.try_into().ok())
-        .unwrap_or_default();
+    let mut doc: toml::value::Table = toml::from_str(&content).unwrap_or_default();
 
     let project_key = project_hash(project_dir);
     let project_table = doc

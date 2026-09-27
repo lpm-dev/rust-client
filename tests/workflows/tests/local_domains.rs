@@ -1028,7 +1028,7 @@ fn assert_proxy_cert_covers_host(project: &TempProject, host: &str) {
 fn assert_port_override_persisted(project: &TempProject, service: &str, port: u64) {
     let content = std::fs::read_to_string(project.home().join(".lpm").join("ports.toml"))
         .expect("read persisted ports.toml");
-    let parsed: toml::Value = content.parse().expect("parse ports.toml");
+    let parsed: toml::Value = toml::from_str(&content).expect("parse ports.toml");
     let persisted = parsed
         .as_table()
         .expect("ports.toml should be a table")

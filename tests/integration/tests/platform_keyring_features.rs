@@ -17,8 +17,7 @@ fn keyring_features(manifest_path: &str, target: &str) -> Vec<String> {
     let path = repo_root().join(manifest_path);
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-    let manifest = content
-        .parse::<toml::Value>()
+    let manifest: toml::Value = toml::from_str(&content)
         .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()));
 
     manifest
