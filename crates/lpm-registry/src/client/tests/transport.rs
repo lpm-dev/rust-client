@@ -1,5 +1,69 @@
 use super::*;
 
+#[tokio::test]
+async fn retryable_status_retries_before_a_stalled_error_body_finishes() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (first, _) = listener.accept().await.unwrap();
+        let mut first = BufReader::new(first);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(first.read_line(&mut line).await.unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        first
+            .get_mut()
+            .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 100\r\n\r\nprefix")
+            .await
+            .unwrap();
+
+        let (second, _) = listener.accept().await.unwrap();
+        let mut second = BufReader::new(second);
+        loop {
+            line.clear();
+            assert_ne!(second.read_line(&mut line).await.unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        second
+            .get_mut()
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .await
+            .unwrap();
+        drop(first);
+    });
+    let request = reqwest::Request::new(
+        reqwest::Method::GET,
+        format!("http://{address}/metadata").parse().unwrap(),
+    );
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .read_timeout(Duration::from_secs(60))
+        .build()
+        .unwrap();
+    let client = RegistryClient::new();
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.send_request_with_retry_and_npmrc_auth(request, Some(http), None),
+    )
+    .await;
+    server.abort();
+    let server_result = server.await;
+    assert!(server_result.is_ok() || server_result.unwrap_err().is_cancelled());
+    let response = result
+        .expect("an incomplete error body must not delay the retry until the read timeout")
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+}
+
 #[test]
 fn backoff_delay_exponential() {
     assert_eq!(backoff_delay(0), Duration::from_secs(1));

@@ -60,6 +60,7 @@ mod http_tls;
 mod install_accounting;
 mod metadata;
 mod policy_transport;
+mod retry_error_body;
 mod tarball;
 mod transport;
 mod url_gate;

@@ -28,6 +28,8 @@ pub(super) const RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
 /// Maximum backoff delay (10 seconds).
 pub(super) const RETRY_MAX_DELAY: Duration = Duration::from_secs(10);
 
+const RETRY_ERROR_BODY_TIMEOUT: Duration = Duration::from_millis(500);
+
 impl RegistryClient {
     // ─── Internal: HTTP transport with retry ────────────────────────
 
@@ -830,7 +832,12 @@ impl RegistryClient {
 
                         // Retryable: server errors and timeouts
                         408 | 500 | 502 | 503 | 504 => {
-                            let body = read_request_error_text(response, &request).await;
+                            let body = tokio::time::timeout(
+                                RETRY_ERROR_BODY_TIMEOUT,
+                                read_request_error_text(response, &request),
+                            )
+                            .await
+                            .unwrap_or_default();
                             last_error = Some(LpmError::Http {
                                 status,
                                 message: body,
