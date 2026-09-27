@@ -1227,6 +1227,7 @@ async fn batch_metadata_range_aware_ndjson_merges_duplicate_package_entries() {
         chalk.dist_tags.get("latest").map(String::as_str),
         Some("5.6.2")
     );
+    assert_eq!(chalk.latest_version_hint(), Some("4.1.2"));
     assert!(
         client
             .read_metadata_cache(&client.npm_worker_metadata_cache_key("chalk").unwrap())
@@ -3938,4 +3939,38 @@ async fn selected_history_counts_http_wait_for_failed_retry_after_unusable_304()
         fetched.timings
     );
     assert!(!fetched.timings.not_modified);
+}
+
+#[tokio::test]
+async fn duplicate_batch_cache_persists_raw_metadata_without_synthetic_hint_authority() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let client = client.with_synchronous_cache_writes(true);
+    let first: serde_json::Value =
+        serde_json::from_str(&test_metadata_json_version("pkg", "1.0.0")).unwrap();
+    let mut second: serde_json::Value =
+        serde_json::from_str(&test_metadata_json_version("pkg", "3.0.0")).unwrap();
+    second["dist-tags"] = serde_json::json!({});
+    let body = format!(
+        "{}\n{}\n",
+        serde_json::json!({"name":"pkg","metadata":first}),
+        serde_json::json!({"name":"pkg","metadata":second})
+    );
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/x-ndjson"))
+        .mount(&server)
+        .await;
+    let result = client.batch_metadata(&["pkg".to_owned()]).await.unwrap();
+    assert_eq!(result["pkg"].latest_version_tag(), Some("3.0.0"));
+    assert_eq!(result["pkg"].latest_version_hint(), Some("1.0.0"));
+    let (cached, _) = client
+        .read_metadata_cache(&client.npm_worker_metadata_cache_key("pkg").unwrap())
+        .unwrap();
+    assert_eq!(cached.versions.len(), 1);
+    assert!(cached.versions.contains_key("3.0.0"));
+    assert_eq!(cached.latest_version_tag(), None);
+    assert_eq!(cached.latest_version_hint(), None);
 }

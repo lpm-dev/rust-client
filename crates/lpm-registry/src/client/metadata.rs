@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod batch_hint_tests;
+
 use super::*;
 
 mod preferred;
@@ -393,6 +396,11 @@ fn batch_metadata_entry_matches_name(name: &str, meta: &PackageMetadata) -> bool
 }
 
 fn merge_batch_package_metadata(existing: &mut PackageMetadata, incoming: PackageMetadata) {
+    let latest_hint = incoming
+        .latest_version_hint()
+        .or_else(|| existing.latest_version_hint())
+        .map(str::to_owned);
+    existing.latest_hint = crate::LatestVersionHint::Merged(latest_hint);
     let incoming_latest_version = incoming.latest_version;
     existing.description = incoming.description.or_else(|| existing.description.take());
     existing.modified = incoming.modified.or_else(|| existing.modified.take());
@@ -4312,6 +4320,7 @@ fn package_metadata_from_version_doc(
         distribution_mode: None,
         package_type: None,
         latest_version: None,
+        latest_hint: Default::default(),
         ecosystem: None,
     })
 }

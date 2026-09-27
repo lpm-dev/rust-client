@@ -28,6 +28,14 @@ pub struct PeerDependencyMeta {
 
 // ─── Package Metadata ──────────────────────────────────────────────
 
+/// Hint authority for in-memory range-batch summaries.
+#[derive(Debug, Clone, Default)]
+pub enum LatestVersionHint {
+    #[default]
+    FromMetadata,
+    Merged(Option<String>),
+}
+
 /// Full package metadata returned by GET /api/registry/@lpm.dev/owner.pkg
 ///
 /// npm-compatible format with LPM extensions.
@@ -65,6 +73,10 @@ pub struct PackageMetadata {
 
     #[serde(default, rename = "latestVersion")]
     pub latest_version: Option<String>,
+
+    // Merged summaries are never cached; serialization would discard this provenance.
+    #[serde(skip)]
+    pub latest_hint: LatestVersionHint,
 
     #[serde(default)]
     pub ecosystem: Option<String>,
@@ -516,6 +528,13 @@ pub struct AttestationRef {
 }
 
 impl PackageMetadata {
+    pub fn latest_version_hint(&self) -> Option<&str> {
+        match &self.latest_hint {
+            LatestVersionHint::FromMetadata => self.latest_version_tag(),
+            LatestVersionHint::Merged(hint) => hint.as_deref(),
+        }
+    }
+
     pub fn latest_version_tag(&self) -> Option<&str> {
         self.dist_tags
             .get("latest")

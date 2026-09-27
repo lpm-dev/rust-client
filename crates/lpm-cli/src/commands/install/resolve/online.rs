@@ -57,7 +57,7 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseResult {
     pub(in crate::commands::install) resolve_ms: u128,
     pub(in crate::commands::install) used_lockfile: bool,
     pub(in crate::commands::install) platform_skipped: usize,
-    pub(in crate::commands::install) latest_stable_versions: HashMap<String, String>,
+    pub(in crate::commands::install) latest_versions: HashMap<String, String>,
     pub(in crate::commands::install) applied_overrides: Vec<OverrideHit>,
     pub(in crate::commands::install) peer_conflicts: Vec<lpm_resolver::PeerConflictReport>,
     pub(in crate::commands::install) peer_warnings: Vec<PeerWarning>,
@@ -214,7 +214,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
     let mut linker_mode = linker_mode;
     let resolve_ahead = workspace_resolution::active();
 
-    let (mut packages, resolve_ms, used_lockfile, mut platform_skipped, latest_stable_versions) =
+    let (mut packages, resolve_ms, used_lockfile, mut platform_skipped, latest_versions) =
         match lockfile_result {
             Some(fast_path) => {
                 if !json_output {
@@ -636,10 +636,10 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     all_workspace_members,
                     project_dir,
                 )?;
-                let latest_stable = build_latest_stable_versions(&resolve_result.cache);
+                let latest = build_latest_versions(&resolve_result.cache);
                 packages.extend(tarball_url_install_pkgs.iter().cloned());
                 apply_post_resolve_directory_link_fixup(&mut packages, &non_registry_source_deps)?;
-                (packages, ms, false, platform_skipped, latest_stable)
+                (packages, ms, false, platform_skipped, latest)
             }
         };
     let wf_resolve_end_ms = start.elapsed().as_millis();
@@ -752,7 +752,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         resolve_ms,
         used_lockfile,
         platform_skipped,
-        latest_stable_versions,
+        latest_versions,
         applied_overrides,
         peer_conflicts,
         peer_warnings,

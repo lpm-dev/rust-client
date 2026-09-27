@@ -508,6 +508,7 @@ fn make_package_metadata(name: &str, versions: Vec<VersionMetadata>) -> PackageM
         distribution_mode: None,
         package_type: None,
         latest_version: Some(latest_version),
+        latest_hint: Default::default(),
         ecosystem: None,
     }
 }

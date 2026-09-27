@@ -288,6 +288,7 @@ async fn failed_install_never_sends_a_pool_accounting_report() {
         distribution_mode: None,
         package_type: None,
         latest_version: Some("1.0.0".to_string()),
+        latest_hint: Default::default(),
         ecosystem: None,
     };
     Mock::given(method("POST"))

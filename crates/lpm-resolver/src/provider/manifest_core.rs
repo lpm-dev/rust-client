@@ -64,6 +64,7 @@ pub struct CachedPackageInfo {
     pub workspace_versions: HashSet<NpmVersion>,
     pub platform_metadata_complete: bool,
     pub latest_version: Option<NpmVersion>,
+    pub latest_version_hint: Option<NpmVersion>,
     pub(crate) preferred_latest: Option<NpmVersion>,
     pub versions: Arc<[NpmVersion]>,
     dist_tags: Arc<HashMap<String, NpmVersion>>,
@@ -450,6 +451,7 @@ impl CachedPackageInfo {
             workspace_versions: HashSet::new(),
             platform_metadata_complete: false,
             latest_version: None,
+            latest_version_hint: None,
             preferred_latest: None,
             versions: Arc::from([]),
             dist_tags: Arc::new(HashMap::new()),
@@ -770,7 +772,7 @@ impl CachedPackageInfo {
             return false;
         };
         update(manifest);
-        let replacement = Self::from_manifest_versions(
+        let mut replacement = Self::from_manifest_versions(
             self.modified.clone(),
             self.trust_metadata_complete,
             self.versions_complete,
@@ -780,6 +782,7 @@ impl CachedPackageInfo {
             self.latest_version.clone(),
             manifests,
         );
+        replacement.latest_version_hint = self.latest_version_hint.clone();
         *self = replacement;
         true
     }
@@ -1119,6 +1122,7 @@ impl ManifestCacheBuilder {
             covered_ranges: self.covered_ranges,
             workspace_versions: self.workspace_versions,
             platform_metadata_complete: self.platform_metadata_complete,
+            latest_version_hint: None,
             latest_version: self.latest_version,
             preferred_latest: None,
             versions: Arc::from(versions),

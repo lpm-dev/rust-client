@@ -48,6 +48,9 @@ struct ResolverMetadataWire {
     #[serde(default, rename = "latestVersion")]
     pub latest_version: Option<String>,
 
+    #[serde(skip)]
+    pub latest_hint: crate::LatestVersionHint,
+
     #[serde(default)]
     pub ecosystem: Option<String>,
 }
@@ -77,6 +80,34 @@ fn deserialize_versions<'de, D: serde::Deserializer<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_metadata_hints_use_only_advertised_latest_values() {
+        for (authority, expected) in [
+            (
+                serde_json::json!({"dist-tags":{"latest":"2.0.0"}}),
+                Some("2.0.0"),
+            ),
+            (
+                serde_json::json!({"latestVersion":"2.0.0-beta.1"}),
+                Some("2.0.0-beta.1"),
+            ),
+            (serde_json::json!({}), None),
+        ] {
+            let mut document = serde_json::json!({
+                "name":"pkg", "versions":{"3.0.0":{"name":"pkg","version":"3.0.0"}}
+            });
+            document
+                .as_object_mut()
+                .unwrap()
+                .extend(authority.as_object().unwrap().clone());
+            let raw: PackageMetadata = serde_json::from_value(document).unwrap();
+            let bytes = rmp_serde::to_vec_named(&raw).unwrap();
+            let projected: ResolverMetadata =
+                rmp_serde::from_read(std::io::Cursor::new(bytes)).unwrap();
+            assert_eq!(projected.0.latest_version_hint(), expected);
+        }
+    }
 
     #[test]
     fn resolver_cache_projection_omits_only_development_dependencies() {
