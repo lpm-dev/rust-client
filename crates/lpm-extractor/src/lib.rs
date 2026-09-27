@@ -3238,6 +3238,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "100,000-file stress test; the Windows filesystem gate runs it serially"]
     fn extract_accepts_exact_max_file_count() {
         let tgz = create_tarball_with_n_empty_files(MAX_FILE_COUNT);
         let dir = tempfile::tempdir().unwrap();
@@ -3249,6 +3250,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "100,001-file stress test; the Windows filesystem gate runs it serially"]
     fn extract_rejects_more_than_max_file_count() {
         let tgz = create_tarball_with_n_empty_files(MAX_FILE_COUNT + 1);
         let dir = tempfile::tempdir().unwrap();
@@ -3264,6 +3266,45 @@ mod tests {
             err.contains("too many files"),
             "expected file-count limit error, got: {err}"
         );
+    }
+
+    #[test]
+    fn default_extraction_allows_one_hundred_thousand_files() {
+        assert_eq!(MAX_FILE_COUNT, 100_000);
+        assert_eq!(DEFAULT_EXTRACTION_LIMITS.max_file_count, MAX_FILE_COUNT);
+    }
+
+    /// The file-count limit accepts exactly its value and rejects one more, on
+    /// both the buffered and the streaming gzip paths.
+    #[test]
+    fn extraction_accepts_exactly_the_file_count_limit_and_rejects_one_more() {
+        const LIMIT: usize = 64;
+        for max_buffered_compressed_size in [MAX_BUFFERED_COMPRESSED_SIZE, 0] {
+            let limits = ExtractionLimits {
+                max_file_count: LIMIT,
+                max_buffered_compressed_size,
+                ..DEFAULT_EXTRACTION_LIMITS
+            };
+            let extract = |count: usize| {
+                let dir = tempfile::tempdir().unwrap();
+                extract_tarball_from_slice_with_inspector_with_limits::<_, _, PathBuf>(
+                    &create_tarball_with_n_empty_files(count),
+                    dir.path(),
+                    limits,
+                    false,
+                    |_, _| false,
+                    |_| {},
+                    InspectionMode::WithoutCallback,
+                )
+            };
+
+            assert_eq!(extract(LIMIT).unwrap().len(), LIMIT);
+            let error = extract(LIMIT + 1).unwrap_err().to_string();
+            assert!(
+                error.contains("too many files"),
+                "expected file-count limit error, got: {error}"
+            );
+        }
     }
 
     #[test]
