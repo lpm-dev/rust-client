@@ -190,6 +190,27 @@ impl DependencyEnginePolicy {
             .is_ok()
     }
 
+    /// [`Self::allows_dependency_materialization`] for tasks on the async runtime.
+    ///
+    /// The first decision that needs the Node version runs `node --version`.
+    /// On a multi-threaded runtime the worker first hands its queued tasks to
+    /// another thread, so the probe delays only this caller.
+    pub(crate) fn allows_dependency_materialization_on_runtime(
+        &self,
+        required: Option<&str>,
+    ) -> bool {
+        let probes_node =
+            self.engine_strict && required.is_some() && !self.node_resolution_is_ready();
+        let multi_thread = tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+            runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        });
+        if probes_node && multi_thread {
+            tokio::task::block_in_place(|| self.allows_dependency_materialization(required))
+        } else {
+            self.allows_dependency_materialization(required)
+        }
+    }
+
     pub(crate) fn freshness_key(&self, lockfile_content: &str) -> String {
         if lockfile_version(lockfile_content)
             .is_some_and(|version| version < lpm_lockfile::LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES)
@@ -764,6 +785,45 @@ mod tests {
             compatible_node_selector_hint("not-a-range"),
             "<matching-version>"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolving_node_on_a_runtime_worker_does_not_hold_other_tasks() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::{Duration, Instant};
+
+        let bin = tempdir().unwrap();
+        let node = bin.path().join("node");
+        fs::write(&node, "#!/bin/sh\n/bin/sleep 1\necho v22.0.0\n").unwrap();
+        fs::set_permissions(&node, fs::Permissions::from_mode(0o755)).unwrap();
+        let policy = std::sync::Arc::new(DependencyEnginePolicy::new(
+            bin.path().to_path_buf(),
+            bin.path().as_os_str().to_owned(),
+            true,
+            true,
+        ));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let checking = tokio::spawn({
+                let policy = std::sync::Arc::clone(&policy);
+                async move { policy.allows_dependency_materialization_on_runtime(Some(">=20")) }
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            let started = Instant::now();
+            tokio::spawn(async {}).await.unwrap();
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "another task waited {:?} for the Node probe",
+                started.elapsed()
+            );
+            assert!(checking.await.unwrap());
+        });
     }
 
     #[test]

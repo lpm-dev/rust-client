@@ -19,6 +19,7 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use manifest_core::ManifestProjection;
 pub use manifest_core::{
     CachedDistInfo, CachedPackageInfo, ManifestDependency, ManifestDependencyIter,
     ManifestDependencyRef, ManifestPeerDependency, ManifestPeerDependencyIter,

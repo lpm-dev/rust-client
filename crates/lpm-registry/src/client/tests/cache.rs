@@ -1,5 +1,7 @@
 use super::*;
 
+const TEST_CONTENT_ID_LINE: &[u8] = b"0123456789abcdef0123456789abcdef\n";
+
 #[test]
 fn cache_roundtrip_with_etag() {
     let (client, _tmp) = client_with_temp_cache();
@@ -149,6 +151,7 @@ fn read_cache_validator_returns_etag_without_deserializing_payload() {
     content.extend_from_slice(b"300\n");
     content.extend_from_slice(b"W/\"validator\"");
     content.push(b'\n');
+    content.extend_from_slice(TEST_CONTENT_ID_LINE);
     content.extend_from_slice(b"not-valid-metadata");
     std::fs::write(cache_path, content).unwrap();
 
@@ -1611,6 +1614,7 @@ async fn direct_npm_304_with_undecodable_cached_payload_refetches_without_valida
     corrupted_content.extend_from_slice(b"300\n");
     corrupted_content.extend_from_slice(b"\"direct-v1\"");
     corrupted_content.push(b'\n');
+    corrupted_content.extend_from_slice(TEST_CONTENT_ID_LINE);
     corrupted_content.extend_from_slice(b"not-valid-metadata");
     std::fs::write(&cache_path, corrupted_content).unwrap();
     expire_cache_entry(
@@ -1847,6 +1851,7 @@ async fn custom_metadata_304_with_lost_cached_body_refetches_with_auth_without_v
     validator_only.extend_from_slice(b"300\n");
     validator_only.extend_from_slice(b"\"custom-v1\"");
     validator_only.push(b'\n');
+    validator_only.extend_from_slice(TEST_CONTENT_ID_LINE);
     validator_only.extend_from_slice(b"lost-cache-body");
     std::fs::write(cache_path, validator_only).unwrap();
     expire_cache_entry(&client, &cache_key);
@@ -1934,6 +1939,7 @@ async fn etag_304_with_undecodable_cached_payload_refetches_lpm_metadata() {
     corrupted_content.extend_from_slice(b"300\n");
     corrupted_content.extend_from_slice(b"\"v1\"");
     corrupted_content.push(b'\n');
+    corrupted_content.extend_from_slice(TEST_CONTENT_ID_LINE);
     corrupted_content.extend_from_slice(corrupted_data);
     std::fs::write(&cache_path, corrupted_content).unwrap();
 
@@ -2045,6 +2051,7 @@ async fn npm_etag_304_with_undecodable_cached_payload_refetches_proxy_metadata()
     corrupted_content.extend_from_slice(b"300\n");
     corrupted_content.extend_from_slice(b"\"npm-v1\"");
     corrupted_content.push(b'\n');
+    corrupted_content.extend_from_slice(TEST_CONTENT_ID_LINE);
     corrupted_content.extend_from_slice(corrupted_data);
     std::fs::write(&cache_path, corrupted_content).unwrap();
 
@@ -2656,6 +2663,7 @@ fn oversized_metadata_cache_file_collapses_to_miss() {
     // the magic comparison.
     let mut padding = METADATA_CACHE_MAGIC.to_vec();
     padding.extend(b"300\n\n");
+    padding.extend(TEST_CONTENT_ID_LINE);
     padding.resize((METADATA_CACHE_FILE_CAP + 1024) as usize, b'x');
     std::fs::write(&cache_file, &padding).expect("rewrite cache file oversized");
 

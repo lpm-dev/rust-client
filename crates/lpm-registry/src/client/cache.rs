@@ -1,3 +1,6 @@
+use super::projection::{
+    MetadataProjection, ProjectionFacts, ProjectionSource, projection_path, read_projection,
+};
 use super::*;
 
 mod write_buffer;
@@ -31,11 +34,12 @@ pub(super) const METADATA_CACHE_JSON_MARKER: u8 = 0xc1;
 /// On format change, bump the trailing version number — old cache
 /// entries fail the magic match and are silently treated as misses.
 ///
-/// V6 adds per-manifest Swift metadata to the persisted
-/// metadata schema and stores each response's bounded local freshness.
+/// V7 records a content ID for each write, which binds stored projections to
+/// the exact document they were derived from.
 /// The magic also salts cache filenames, so schema-old entries cannot make
 /// the resolver's stat-only batch probe disagree with the typed reader.
-pub(super) const METADATA_CACHE_MAGIC: &[u8] = b"LPM-MD-V6\n";
+pub(super) const METADATA_CACHE_MAGIC: &[u8] = b"LPM-MD-V7\n";
+const METADATA_CACHE_CONTENT_ID_LEN: u64 = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MetadataCacheDirective {
@@ -110,7 +114,7 @@ fn set_metadata_cache_file_expiry(
     )
 }
 
-fn reserve_pending_metadata_cache_bytes(
+pub(super) fn reserve_pending_metadata_cache_bytes(
     budget: &Arc<tokio::sync::Semaphore>,
     bytes: usize,
 ) -> Option<tokio::sync::OwnedSemaphorePermit> {
@@ -142,9 +146,14 @@ fn read_bounded_cache_line<R: std::io::BufRead>(reader: &mut R, cap: u64) -> Opt
     Some(line)
 }
 
-fn read_metadata_cache_header<R: std::io::BufRead>(
-    reader: &mut R,
-) -> Option<(std::time::Duration, Option<String>)> {
+#[derive(Clone)]
+pub(super) struct MetadataCacheHeader {
+    pub(super) fresh_for: std::time::Duration,
+    pub(super) etag: Option<String>,
+    pub(super) content_id: u128,
+}
+
+fn read_metadata_cache_header<R: std::io::BufRead>(reader: &mut R) -> Option<MetadataCacheHeader> {
     let freshness_line = read_bounded_cache_line(reader, METADATA_CACHE_FRESHNESS_LINE_CAP)?;
     let fresh_for_secs = std::str::from_utf8(&freshness_line)
         .ok()?
@@ -162,7 +171,126 @@ fn read_metadata_cache_header<R: std::io::BufRead>(
     if !etag_line.is_empty() && etag.is_none() {
         return None;
     }
-    Some((std::time::Duration::from_secs(fresh_for_secs), etag))
+    let content_id = parse_content_id(&read_bounded_cache_line(
+        reader,
+        METADATA_CACHE_CONTENT_ID_LEN,
+    )?)?;
+    Some(MetadataCacheHeader {
+        fresh_for: std::time::Duration::from_secs(fresh_for_secs),
+        etag,
+        content_id,
+    })
+}
+
+fn parse_content_id(line: &[u8]) -> Option<u128> {
+    if line.len() as u64 != METADATA_CACHE_CONTENT_ID_LEN || !line.iter().all(u8::is_ascii_hexdigit)
+    {
+        return None;
+    }
+    u128::from_str_radix(std::str::from_utf8(line).ok()?, 16).ok()
+}
+
+type MetadataCacheReader = std::io::BufReader<std::io::Take<std::fs::File>>;
+
+struct OpenedMetadataCacheEntry {
+    reader: MetadataCacheReader,
+    header: MetadataCacheHeader,
+    modified: std::time::SystemTime,
+}
+
+/// Open a cache entry and read its header, leaving the reader at the payload.
+fn open_metadata_cache_entry(path: &std::path::Path) -> Option<OpenedMetadataCacheEntry> {
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(path).ok()?;
+    let file_metadata = file.metadata().ok()?;
+    if file_metadata.len() > METADATA_CACHE_FILE_CAP {
+        tracing::warn!(
+            path = %path.display(),
+            size = file_metadata.len(),
+            cap = METADATA_CACHE_FILE_CAP,
+            "metadata cache entry exceeds size cap — treating as miss"
+        );
+        return None;
+    }
+    let mut reader = std::io::BufReader::new(std::io::Read::take(file, METADATA_CACHE_FILE_CAP));
+    let mut magic = [0u8; METADATA_CACHE_MAGIC.len()];
+    reader.read_exact(&mut magic).ok()?;
+    if magic != *METADATA_CACHE_MAGIC {
+        return None;
+    }
+    let header = read_metadata_cache_header(&mut reader)?;
+    Some(OpenedMetadataCacheEntry {
+        reader,
+        header,
+        modified: file_metadata.modified().ok()?,
+    })
+}
+
+fn decode_metadata_cache_payload<T: serde::de::DeserializeOwned>(
+    reader: &mut MetadataCacheReader,
+) -> Option<T> {
+    use std::io::BufRead as _;
+
+    if reader.fill_buf().ok()?.first() == Some(&METADATA_CACHE_JSON_MARKER) {
+        reader.consume(1);
+        serde_json::from_reader(reader).ok()
+    } else {
+        rmp_serde::decode::from_read(reader).ok()
+    }
+}
+
+impl OpenedMetadataCacheEntry {
+    /// Remaining freshness, when the entry is fresh and its expiry is within
+    /// the freshness it was written with.
+    fn remaining_freshness(&self) -> Option<std::time::Duration> {
+        remaining_cache_freshness(self.modified)
+            .filter(|remaining| *remaining <= self.header.fresh_for)
+    }
+
+    /// The stored projection of this document, or else the decoded document.
+    fn resolve<T: serde::de::DeserializeOwned, P: MetadataProjection>(
+        mut self,
+        path: &std::path::Path,
+    ) -> Option<CachedResolution<T, P>> {
+        if let Some((value, facts)) = read_projection::<P>(path, self.header.content_id) {
+            return Some(CachedResolution::Projected { value, facts });
+        }
+        let value = decode_metadata_cache_payload(&mut self.reader)?;
+        Some(CachedResolution::Document {
+            value,
+            source: Some(ProjectionSource {
+                entry: path.to_path_buf(),
+                content_id: self.header.content_id,
+            }),
+        })
+    }
+}
+
+/// A cached document, or the stored projection bound to it.
+pub(super) enum CachedResolution<T, P> {
+    Document {
+        value: T,
+        /// The entry holding the document, absent when it was not persisted.
+        source: Option<ProjectionSource>,
+    },
+    Projected {
+        value: P,
+        facts: ProjectionFacts,
+    },
+}
+
+/// A resolution read of an entry regardless of its freshness.
+pub(super) struct StaleResolution<T, P> {
+    pub(super) value: CachedResolution<T, P>,
+    pub(super) header: MetadataCacheHeader,
+}
+
+/// The outcome of a dispatched metadata cache write.
+pub(super) struct MetadataCacheWrite {
+    pub(super) fresh_for: std::time::Duration,
+    /// The entry being written, absent when the write was skipped.
+    pub(super) source: Option<ProjectionSource>,
 }
 
 impl RegistryClient {
@@ -539,10 +667,12 @@ impl RegistryClient {
             .operation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => tracing::debug!(%error, "failed to invalidate metadata cache entry"),
+        for path in [path.to_path_buf(), projection_path(path)] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::debug!(%error, "failed to invalidate metadata cache entry"),
+            }
         }
     }
 
@@ -731,10 +861,11 @@ impl RegistryClient {
     /// Returns `(PackageMetadata, Option<etag>)`. The ETag (if present) can be
     /// sent as `If-None-Match` on the next request to enable 304 responses.
     ///
-    /// Cache format (v6): `LPM-MD-V6\n{freshness_seconds}\n{ETag}\n{payload}`
+    /// Cache format (v7): `LPM-MD-V7\n{freshness_seconds}\n{ETag}\n{content_id}\n{payload}`
     /// - Bytes 0..MAGIC.len(): magic header (ends in `\n`)
     /// - After magic, up to next `\n`: local freshness in seconds
     /// - Next line: ETag string (empty if absent)
+    /// - Next line: 32 hex digits naming this write, which projections bind to
     /// - Remainder: named MessagePack, or `0xc1` followed by JSON after an encoding failure
     ///
     /// Old cache files written in the `HMAC\nETag\ndata` format fail the
@@ -818,18 +949,12 @@ impl RegistryClient {
     fn read_metadata_cache_path_entry_as<T: serde::de::DeserializeOwned>(
         path: &std::path::Path,
     ) -> Option<MetadataCacheEntry<T>> {
-        let file = std::fs::File::open(path).ok()?;
-        let file_metadata = file.metadata().ok()?;
-        let remaining_freshness = remaining_cache_freshness(file_metadata.modified().ok()?)?;
-        let (value, etag, fresh_for) =
-            Self::decode_metadata_cache_file_as(path, file, &file_metadata)?;
-        if remaining_freshness > fresh_for {
-            return None;
-        }
-
+        let mut entry = open_metadata_cache_entry(path)?;
+        let remaining_freshness = entry.remaining_freshness()?;
+        let value = decode_metadata_cache_payload(&mut entry.reader)?;
         Some(MetadataCacheEntry {
             value,
-            etag,
+            etag: entry.header.etag,
             remaining_freshness,
         })
     }
@@ -837,45 +962,65 @@ impl RegistryClient {
     pub(super) fn read_stale_metadata_cache_path_as<T: serde::de::DeserializeOwned>(
         path: &std::path::Path,
     ) -> Option<(T, Option<String>, std::time::Duration)> {
-        let file = std::fs::File::open(path).ok()?;
-        let file_metadata = file.metadata().ok()?;
-        Self::decode_metadata_cache_file_as(path, file, &file_metadata)
+        let mut entry = open_metadata_cache_entry(path)?;
+        let value = decode_metadata_cache_payload(&mut entry.reader)?;
+        Some((value, entry.header.etag, entry.header.fresh_for))
     }
 
-    fn decode_metadata_cache_file_as<T: serde::de::DeserializeOwned>(
-        path: &std::path::Path,
-        file: std::fs::File,
-        file_metadata: &std::fs::Metadata,
-    ) -> Option<(T, Option<String>, std::time::Duration)> {
-        use std::io::{BufRead as _, Read as _};
+    /// Read a fresh entry as the stored projection `P` bound to it, or else
+    /// as the document `T`.
+    pub(super) async fn read_metadata_cache_resolution_async<
+        T: serde::de::DeserializeOwned + Send + 'static,
+        P: MetadataProjection,
+    >(
+        &self,
+        key: &str,
+    ) -> Option<MetadataCacheEntry<CachedResolution<T, P>>> {
+        let path = self.cache_path(key)?;
+        let span = tracing::trace_span!(target: "lpm_install_timeline", "metadata_cache_read");
+        tracing::event!(name: "enqueue", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, {});
+        let worker_span = span.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let _entered = worker_span.enter();
+            tracing::event!(name: "work_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
+            let result = open_metadata_cache_entry(&path).and_then(|entry| {
+                let remaining_freshness = entry.remaining_freshness()?;
+                let etag = entry.header.etag.clone();
+                Some(MetadataCacheEntry {
+                    value: entry.resolve(&path)?,
+                    etag,
+                    remaining_freshness,
+                })
+            });
+            tracing::event!(name: "work_end", target: "lpm_install_timeline", tracing::Level::TRACE, cached = result.is_some());
+            result
+        })
+        .await;
+        tracing::event!(name: "await_resume", target: "lpm_install_timeline", parent: &span, tracing::Level::TRACE, success = result.is_ok());
+        result.ok().flatten()
+    }
 
-        if file_metadata.len() > METADATA_CACHE_FILE_CAP {
-            tracing::warn!(
-                path = %path.display(),
-                size = file_metadata.len(),
-                cap = METADATA_CACHE_FILE_CAP,
-                "metadata cache entry exceeds size cap — treating as miss"
-            );
-            return None;
-        }
-
-        let mut reader =
-            std::io::BufReader::new(std::io::Read::take(file, METADATA_CACHE_FILE_CAP));
-
-        let mut magic = [0u8; METADATA_CACHE_MAGIC.len()];
-        reader.read_exact(&mut magic).ok()?;
-        if magic != *METADATA_CACHE_MAGIC {
-            return None;
-        }
-        let (fresh_for, etag) = read_metadata_cache_header(&mut reader)?;
-
-        let value: T = if reader.fill_buf().ok()?.first() == Some(&METADATA_CACHE_JSON_MARKER) {
-            reader.consume(1);
-            serde_json::from_reader(&mut reader).ok()?
-        } else {
-            rmp_serde::decode::from_read(&mut reader).ok()?
-        };
-        Some((value, etag, fresh_for))
+    /// Read an entry regardless of freshness as the stored projection `P`
+    /// bound to it, or else as the document `T`.
+    pub(super) async fn read_stale_metadata_cache_resolution_async<
+        T: serde::de::DeserializeOwned + Send + 'static,
+        P: MetadataProjection,
+    >(
+        &self,
+        key: &str,
+    ) -> Option<StaleResolution<T, P>> {
+        let path = self.cache_path(key)?;
+        tokio::task::spawn_blocking(move || {
+            let entry = open_metadata_cache_entry(&path)?;
+            let header = entry.header.clone();
+            Some(StaleResolution {
+                value: entry.resolve(&path)?,
+                header,
+            })
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Read the ETag and raw data bytes from a cached entry without
@@ -925,38 +1070,17 @@ impl RegistryClient {
     }
 
     pub(super) fn read_cache_validator_path(path: &std::path::Path) -> Option<CacheValidator> {
-        use std::io::Read as _;
-
-        let file = std::fs::File::open(path).ok()?;
-        let file_metadata = file.metadata().ok()?;
-        let file_size = file_metadata.len();
-        if file_size > METADATA_CACHE_FILE_CAP {
-            tracing::warn!(
-                path = %path.display(),
-                size = file_size,
-                cap = METADATA_CACHE_FILE_CAP,
-                "metadata cache entry exceeds size cap — treating as miss"
-            );
-            return None;
-        }
-
-        let mut reader =
-            std::io::BufReader::new(std::io::Read::take(file, METADATA_CACHE_FILE_CAP));
-
-        let mut magic = [0u8; METADATA_CACHE_MAGIC.len()];
-        reader.read_exact(&mut magic).ok()?;
-        if magic != *METADATA_CACHE_MAGIC {
-            return None;
-        }
-
-        let (fresh_for, etag) = read_metadata_cache_header(&mut reader)?;
-        let validated_at = file_metadata.modified().ok()?.checked_sub(fresh_for)?;
+        let entry = open_metadata_cache_entry(path)?;
+        let validated_at = entry.modified.checked_sub(entry.header.fresh_for)?;
         let age_seconds = std::time::SystemTime::now()
             .duration_since(validated_at)
             .ok()
             .map(|age| age.as_secs());
 
-        Some(CacheValidator { etag, age_seconds })
+        Some(CacheValidator {
+            etag: entry.header.etag,
+            age_seconds,
+        })
     }
 
     /// Write metadata to cache with a magic-header marker and optional ETag.
@@ -1049,6 +1173,19 @@ impl RegistryClient {
         etag: Option<&str>,
         directive: MetadataCacheDirective,
     ) -> Option<std::time::Duration> {
+        self.write_metadata_cache_entry(key, metadata, etag, directive)
+            .map(|write| write.fresh_for)
+    }
+
+    /// Write one entry and report its content ID, so the caller can bind a
+    /// projection of `metadata` to it.
+    pub(super) fn write_metadata_cache_entry<T: serde::Serialize + ?Sized>(
+        &self,
+        key: &str,
+        metadata: &T,
+        etag: Option<&str>,
+        directive: MetadataCacheDirective,
+    ) -> Option<MetadataCacheWrite> {
         use std::io::Write as _;
         use std::sync::atomic::Ordering;
 
@@ -1079,7 +1216,14 @@ impl RegistryClient {
             })
             .unwrap_or("");
         let freshness = fresh_for.as_secs().to_string();
-        let prefix_len = METADATA_CACHE_MAGIC.len() + freshness.len() + 1 + etag_str.len() + 1;
+        let content_id = rand::random::<u128>();
+        let content_id_line = format!("{content_id:032x}\n");
+        let prefix_len = METADATA_CACHE_MAGIC.len()
+            + freshness.len()
+            + 1
+            + etag_str.len()
+            + 1
+            + content_id_line.len();
         let new_buffer = || {
             MetadataCacheBuffer::new(
                 &self.pending_cache_write_bytes,
@@ -1089,6 +1233,7 @@ impl RegistryClient {
                     b"\n",
                     etag_str.as_bytes(),
                     b"\n",
+                    content_id_line.as_bytes(),
                 ],
             )
         };
@@ -1097,9 +1242,19 @@ impl RegistryClient {
                 tracing::debug!(
                     "skipping best-effort metadata cache write because the allocation budget is full"
                 );
-                Some(fresh_for)
+                Some(MetadataCacheWrite {
+                    fresh_for,
+                    source: None,
+                })
             }
             BufferLimit::FileSize => None,
+        };
+        let written = MetadataCacheWrite {
+            fresh_for,
+            source: Some(ProjectionSource {
+                entry: path.clone(),
+                content_id,
+            }),
         };
         let mut content = match new_buffer() {
             Ok(content) => content,
@@ -1146,7 +1301,7 @@ impl RegistryClient {
             {
                 tracing::warn!("failed to write metadata cache for {key_owned}: {e}");
             }
-            return Some(fresh_for);
+            return Some(written);
         }
 
         let handle = runtime_handle.unwrap();
@@ -1169,7 +1324,7 @@ impl RegistryClient {
         if let Ok(mut pending) = self.pending_cache_writes.lock() {
             pending.push(join);
         }
-        Some(fresh_for)
+        Some(written)
     }
 
     pub(super) fn refresh_metadata_cache_freshness(
@@ -1665,7 +1820,7 @@ mod cache_control_tests {
 mod metadata_cache_schema_tests {
     use super::*;
 
-    fn package_metadata_v6_fields(metadata: PackageMetadata) {
+    fn package_metadata_fields(metadata: PackageMetadata) {
         let PackageMetadata {
             name: _,
             description: _,
@@ -1682,7 +1837,7 @@ mod metadata_cache_schema_tests {
         } = metadata;
     }
 
-    fn version_metadata_v6_fields(metadata: VersionMetadata) {
+    fn version_metadata_fields(metadata: VersionMetadata) {
         let VersionMetadata {
             name: _,
             version: _,
@@ -1715,11 +1870,11 @@ mod metadata_cache_schema_tests {
         } = metadata;
     }
 
-    fn peer_dependency_meta_v6_fields(metadata: PeerDependencyMeta) {
+    fn peer_dependency_meta_fields(metadata: PeerDependencyMeta) {
         let PeerDependencyMeta { optional: _ } = metadata;
     }
 
-    fn vulnerability_v6_fields(vulnerability: Vulnerability) {
+    fn vulnerability_fields(vulnerability: Vulnerability) {
         let Vulnerability {
             id: _,
             summary: _,
@@ -1728,7 +1883,7 @@ mod metadata_cache_schema_tests {
         } = vulnerability;
     }
 
-    fn behavioral_tags_v6_fields(tags: BehavioralTags) {
+    fn behavioral_tags_fields(tags: BehavioralTags) {
         let BehavioralTags {
             eval: _,
             child_process: _,
@@ -1755,7 +1910,7 @@ mod metadata_cache_schema_tests {
         } = tags;
     }
 
-    fn security_finding_v6_fields(finding: SecurityFinding) {
+    fn security_finding_fields(finding: SecurityFinding) {
         let SecurityFinding {
             severity: _,
             description: _,
@@ -1763,7 +1918,7 @@ mod metadata_cache_schema_tests {
         } = finding;
     }
 
-    fn swift_meta_v6_fields(metadata: SwiftMeta) {
+    fn swift_meta_fields(metadata: SwiftMeta) {
         let SwiftMeta {
             products: _,
             platforms: _,
@@ -1772,13 +1927,13 @@ mod metadata_cache_schema_tests {
         } = metadata;
     }
 
-    fn swift_manifest_set_v6_fields(set: crate::SwiftManifestSet) {
+    fn swift_manifest_set_fields(set: crate::SwiftManifestSet) {
         let crate::SwiftManifestSet {
             schema_version: _,
             manifests: _,
         } = set;
     }
-    fn swift_manifest_v6_fields(manifest: crate::SwiftManifest) {
+    fn swift_manifest_fields(manifest: crate::SwiftManifest) {
         let crate::SwiftManifest {
             filename: _,
             tools_version: _,
@@ -1786,7 +1941,7 @@ mod metadata_cache_schema_tests {
             platforms: _,
         } = manifest;
     }
-    fn swift_product_v6_fields(product: SwiftProduct) {
+    fn swift_product_fields(product: SwiftProduct) {
         let SwiftProduct {
             name: _,
             product_type: _,
@@ -1794,14 +1949,14 @@ mod metadata_cache_schema_tests {
         } = product;
     }
 
-    fn swift_platform_v6_fields(platform: SwiftPlatform) {
+    fn swift_platform_fields(platform: SwiftPlatform) {
         let SwiftPlatform {
             platform_name: _,
             version: _,
         } = platform;
     }
 
-    fn dist_info_v6_fields(dist: DistInfo) {
+    fn dist_info_fields(dist: DistInfo) {
         let DistInfo {
             tarball: _,
             integrity: _,
@@ -1812,25 +1967,25 @@ mod metadata_cache_schema_tests {
         } = dist;
     }
 
-    fn npm_user_metadata_v6_fields(metadata: NpmUserMetadata) {
+    fn npm_user_metadata_fields(metadata: NpmUserMetadata) {
         let NpmUserMetadata {
             trusted_publisher: _,
             approver: _,
         } = metadata;
     }
 
-    fn registry_signature_v6_fields(signature: RegistrySignature) {
+    fn registry_signature_fields(signature: RegistrySignature) {
         let RegistrySignature { keyid: _, sig: _ } = signature;
     }
 
-    fn attestation_ref_v6_fields(attestation: AttestationRef) {
+    fn attestation_ref_fields(attestation: AttestationRef) {
         let AttestationRef {
             url: _,
             provenance: _,
         } = attestation;
     }
 
-    fn release_time_metadata_v6_fields(metadata: ReleaseTimeMetadata) {
+    fn release_time_metadata_fields(metadata: ReleaseTimeMetadata) {
         let ReleaseTimeMetadata {
             name: _,
             time: _,
@@ -1838,7 +1993,7 @@ mod metadata_cache_schema_tests {
         } = metadata;
     }
 
-    fn release_time_version_metadata_v6_fields(metadata: ReleaseTimeVersionMetadata) {
+    fn release_time_version_metadata_fields(metadata: ReleaseTimeVersionMetadata) {
         let ReleaseTimeVersionMetadata {
             os: _,
             cpu: _,
@@ -1847,25 +2002,25 @@ mod metadata_cache_schema_tests {
     }
 
     #[test]
-    fn persisted_metadata_schema_v6_fields_are_exhaustive() {
-        assert_eq!(METADATA_CACHE_MAGIC, b"LPM-MD-V6\n");
-        let _: fn(PackageMetadata) = package_metadata_v6_fields;
-        let _: fn(VersionMetadata) = version_metadata_v6_fields;
-        let _: fn(PeerDependencyMeta) = peer_dependency_meta_v6_fields;
-        let _: fn(Vulnerability) = vulnerability_v6_fields;
-        let _: fn(BehavioralTags) = behavioral_tags_v6_fields;
-        let _: fn(SecurityFinding) = security_finding_v6_fields;
-        let _: fn(SwiftMeta) = swift_meta_v6_fields;
-        let _: fn(crate::SwiftManifestSet) = swift_manifest_set_v6_fields;
-        let _: fn(crate::SwiftManifest) = swift_manifest_v6_fields;
-        let _: fn(SwiftProduct) = swift_product_v6_fields;
-        let _: fn(SwiftPlatform) = swift_platform_v6_fields;
-        let _: fn(DistInfo) = dist_info_v6_fields;
-        let _: fn(NpmUserMetadata) = npm_user_metadata_v6_fields;
-        let _: fn(RegistrySignature) = registry_signature_v6_fields;
-        let _: fn(AttestationRef) = attestation_ref_v6_fields;
-        let _: fn(ReleaseTimeMetadata) = release_time_metadata_v6_fields;
-        let _: fn(ReleaseTimeVersionMetadata) = release_time_version_metadata_v6_fields;
+    fn persisted_metadata_schema_fields_are_exhaustive() {
+        assert_eq!(METADATA_CACHE_MAGIC, b"LPM-MD-V7\n");
+        let _: fn(PackageMetadata) = package_metadata_fields;
+        let _: fn(VersionMetadata) = version_metadata_fields;
+        let _: fn(PeerDependencyMeta) = peer_dependency_meta_fields;
+        let _: fn(Vulnerability) = vulnerability_fields;
+        let _: fn(BehavioralTags) = behavioral_tags_fields;
+        let _: fn(SecurityFinding) = security_finding_fields;
+        let _: fn(SwiftMeta) = swift_meta_fields;
+        let _: fn(crate::SwiftManifestSet) = swift_manifest_set_fields;
+        let _: fn(crate::SwiftManifest) = swift_manifest_fields;
+        let _: fn(SwiftProduct) = swift_product_fields;
+        let _: fn(SwiftPlatform) = swift_platform_fields;
+        let _: fn(DistInfo) = dist_info_fields;
+        let _: fn(NpmUserMetadata) = npm_user_metadata_fields;
+        let _: fn(RegistrySignature) = registry_signature_fields;
+        let _: fn(AttestationRef) = attestation_ref_fields;
+        let _: fn(ReleaseTimeMetadata) = release_time_metadata_fields;
+        let _: fn(ReleaseTimeVersionMetadata) = release_time_version_metadata_fields;
     }
 }
 
@@ -2056,10 +2211,13 @@ pub(super) fn parse_cached_metadata_blob(
     if etag_end != 0 && etag.is_none() {
         return None;
     }
+    let after_etag = &after_freshness[etag_end + 1..];
+    let content_id_end = after_etag.iter().position(|&b| b == b'\n')?;
+    parse_content_id(&after_etag[..content_id_end])?;
     Some((
         std::time::Duration::from_secs(fresh_for_secs),
         etag,
-        &after_freshness[etag_end + 1..],
+        &after_etag[content_id_end + 1..],
     ))
 }
 

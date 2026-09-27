@@ -297,8 +297,8 @@ mod prelude {
     pub(super) use crate::package::{CanonicalKey, ResolverPackage};
     pub(super) use crate::policy::{ReleaseTimeStatus, ResolverPolicy};
     pub(super) use crate::provider::{
-        CachedPackageInfo, NotifyMap, SharedCache, StreamingBfsMetrics, WalkerDone,
-        activate_workspace_fallback, insert_or_merge_cached_package_info,
+        CachedPackageInfo, ManifestProjection, NotifyMap, SharedCache, StreamingBfsMetrics,
+        WalkerDone, activate_workspace_fallback, insert_or_merge_cached_package_info,
         merge_release_times_into_cache_info, parse_metadata_to_cache_info,
         parse_owned_full_metadata_to_cache_info, parse_owned_metadata_to_cache_info,
         parse_owned_partial_metadata_to_cache_info, release_age_status_for_version,

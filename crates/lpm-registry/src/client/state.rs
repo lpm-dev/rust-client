@@ -362,6 +362,30 @@ pub struct TimedPreferredMetadata {
     pub platform_metadata_complete: bool,
 }
 
+/// Resolver metadata answered by a document or by its stored projection.
+#[derive(Debug)]
+pub struct TimedPreferredResolution<P> {
+    pub metadata: super::ResolutionMetadata<P>,
+    pub timings: PackageMetadataFetchTimings,
+    /// False when only manifests selected by a preference are available.
+    pub versions_complete: bool,
+    /// True when every retained manifest came from a full version document.
+    pub platform_metadata_complete: bool,
+}
+
+impl From<TimedPreferredResolution<super::NoProjection>> for TimedPreferredMetadata {
+    fn from(resolution: TimedPreferredResolution<super::NoProjection>) -> Self {
+        Self {
+            fetched: TimedPackageMetadata {
+                metadata: resolution.metadata.into_document(),
+                timings: resolution.timings,
+            },
+            versions_complete: resolution.versions_complete,
+            platform_metadata_complete: resolution.platform_metadata_complete,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct TimedReleaseTimeMetadata {
     pub metadata: ReleaseTimeMetadata,

@@ -347,26 +347,56 @@ pub(super) async fn fetch_preferred_metadata_for_resolver(
     let started = Instant::now();
     let candidate_range = range.clone();
     let preferred = client
-        .get_npm_preferred_resolution_metadata_with_timings(name, access, move |version| {
-            NpmVersion::parse(version).is_ok_and(|version| candidate_range.satisfies(&version))
-        })
+        .get_npm_preferred_resolution_with_timings::<ManifestProjection, _>(
+            name,
+            access,
+            move |version| {
+                NpmVersion::parse(version).is_ok_and(|version| candidate_range.satisfies(&version))
+            },
+        )
         .await
         .map_err(|error| metadata_fetch_error(canonical, error))?;
     let versions_complete = preferred.versions_complete;
-    let platform_metadata_complete = preferred.platform_metadata_complete;
-    let raw = preferred.fetched;
     let raw_fetch_ms = started.elapsed().as_millis();
-    let version_count = raw.metadata.versions.len() as u64;
-    let latest_version = latest_version_from_metadata(&raw.metadata);
-    let dist_tags = raw.metadata.dist_tags.clone();
     let parse_start = Instant::now();
-    let mut info = if versions_complete {
-        parse_owned_metadata_to_cache_info(raw.metadata)
-    } else {
-        parse_owned_partial_metadata_to_cache_info(raw.metadata)
+    let (projection, projection_hit) = match preferred.metadata {
+        lpm_registry::ResolutionMetadata::Projected(projection) => (projection, true),
+        lpm_registry::ResolutionMetadata::Document {
+            metadata,
+            projection,
+        } => {
+            let version_count = metadata.versions.len() as u64;
+            let dist_tags = metadata.dist_tags.clone();
+            let info = if versions_complete {
+                parse_owned_metadata_to_cache_info(*metadata)
+            } else {
+                parse_owned_partial_metadata_to_cache_info(*metadata)
+            };
+            if let Some(slot) = projection {
+                client.store_metadata_projection(
+                    slot,
+                    ManifestProjection::encode(&info, &dist_tags, version_count),
+                );
+            }
+            (
+                ManifestProjection {
+                    info,
+                    dist_tags,
+                    version_count,
+                },
+                false,
+            )
+        }
     };
-    info.platform_metadata_complete |= platform_metadata_complete;
+    let ManifestProjection {
+        mut info,
+        dist_tags,
+        version_count,
+    } = projection;
+    let latest_version = info.latest_version.clone();
+    info.platform_metadata_complete |= preferred.platform_metadata_complete;
     let parse_ms = parse_start.elapsed().as_millis();
+    let registry_timings = preferred.timings;
     if info.needs_platform_metadata() {
         fetch_platform_metadata(
             client,
@@ -390,18 +420,19 @@ pub(super) async fn fetch_preferred_metadata_for_resolver(
                 route: "npm_direct",
                 total_ms: started.elapsed().as_millis(),
                 raw_fetch_ms,
-                cache_read_ms: raw.timings.cache_read_ms,
-                validator_read_ms: raw.timings.validator_read_ms,
-                http_ms: raw.timings.http_ms,
-                body_read_ms: raw.timings.body_read_ms,
-                json_decode_ms: raw.timings.json_decode_ms,
-                cache_after_304_ms: raw.timings.cache_after_304_ms,
-                cache_write_dispatch_ms: raw.timings.cache_write_dispatch_ms,
+                cache_read_ms: registry_timings.cache_read_ms,
+                validator_read_ms: registry_timings.validator_read_ms,
+                http_ms: registry_timings.http_ms,
+                body_read_ms: registry_timings.body_read_ms,
+                json_decode_ms: registry_timings.json_decode_ms,
+                cache_after_304_ms: registry_timings.cache_after_304_ms,
+                cache_write_dispatch_ms: registry_timings.cache_write_dispatch_ms,
                 cache_info_parse_ms: parse_ms,
-                body_bytes: raw.timings.body_bytes,
+                body_bytes: registry_timings.body_bytes,
                 version_count,
-                cache_hit: raw.timings.cache_hit,
-                not_modified: raw.timings.not_modified,
+                cache_hit: registry_timings.cache_hit,
+                not_modified: registry_timings.not_modified,
+                projection_hit,
                 ..Default::default()
             },
         );
@@ -728,6 +759,7 @@ fn metadata_fetch_detail_record(
         version_count: timings.version_count,
         cache_hit: timings.cache_hit,
         not_modified: timings.not_modified,
+        projection_hit: false,
     }
 }
 

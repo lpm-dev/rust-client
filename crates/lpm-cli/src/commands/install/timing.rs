@@ -1443,6 +1443,7 @@ pub(super) fn metadata_fetch_detail_json_from_snapshot(
         "batch_fetches_included": false,
         "calls": snapshot.calls,
         "cache_hit_count": snapshot.cache_hit_count,
+        "projection_hit_count": snapshot.projection_hit_count,
         "not_modified_count": snapshot.not_modified_count,
         "body_bytes_sum": snapshot.body_bytes_sum,
         "version_count_sum": snapshot.version_count_sum,
@@ -1601,6 +1602,7 @@ fn metadata_fetch_bucket_json(
                     "version_count": record.version_count,
                     "cache_hit": record.cache_hit,
                     "not_modified": record.not_modified,
+                    "projection_hit": record.projection_hit,
                 })
             })
             .collect(),
@@ -2202,10 +2204,12 @@ mod tests {
             version_count: 42,
             cache_hit: true,
             not_modified: true,
+            projection_hit: true,
         };
         let snapshot = lpm_registry::timing::MetadataFetchDetailSnapshot {
             calls: 1,
             cache_hit_count: 1,
+            projection_hit_count: 1,
             not_modified_count: 1,
             body_bytes_sum: 1024,
             version_count_sum: 42,
@@ -2268,6 +2272,7 @@ mod tests {
         let direct_row = &json["top_direct_packuments"]["by_body_bytes"][0];
 
         assert_eq!(json["calls"], 1);
+        assert_eq!(json["projection_hit_count"], 1);
         assert_eq!(json["scope"], "per_package_metadata_fetches");
         assert_eq!(json["batch_fetches_included"], false);
         assert_eq!(json["routes"]["npm_direct"], 1);
@@ -2341,6 +2346,7 @@ mod tests {
         assert_eq!(row["body_bytes"], 1024);
         assert_eq!(row["version_count"], 42);
         assert!(row["cache_hit"].as_bool().unwrap_or(false));
+        assert_eq!(row["projection_hit"], true);
         assert!(row["not_modified"].as_bool().unwrap_or(false));
         assert_eq!(
             json["top_slow_packages"]["by_body_bytes"][0]["package"],

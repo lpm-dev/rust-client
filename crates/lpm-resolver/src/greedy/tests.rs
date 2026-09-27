@@ -1,4 +1,5 @@
 mod latest_metadata;
+mod metadata_projection;
 
 use super::deps::*;
 use super::edge::*;

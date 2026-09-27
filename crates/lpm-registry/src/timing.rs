@@ -557,12 +557,15 @@ pub struct MetadataFetchDetailRecord {
     pub version_count: u64,
     pub cache_hit: bool,
     pub not_modified: bool,
+    /// The resolver used a stored projection instead of decoding the document.
+    pub projection_hit: bool,
 }
 
 #[derive(Default)]
 struct MetadataFetchDetailCounters {
     calls: AtomicU64,
     cache_hit_count: AtomicU64,
+    projection_hit_count: AtomicU64,
     not_modified_count: AtomicU64,
     body_bytes_sum: AtomicU64,
     version_count_sum: AtomicU64,
@@ -628,6 +631,7 @@ impl MetadataFetchDetailCounters {
     fn reset(&self) {
         self.calls.store(0, Ordering::Relaxed);
         self.cache_hit_count.store(0, Ordering::Relaxed);
+        self.projection_hit_count.store(0, Ordering::Relaxed);
         self.not_modified_count.store(0, Ordering::Relaxed);
         self.body_bytes_sum.store(0, Ordering::Relaxed);
         self.version_count_sum.store(0, Ordering::Relaxed);
@@ -721,6 +725,9 @@ impl MetadataFetchDetailCounters {
         self.calls.fetch_add(1, Ordering::Relaxed);
         if record.cache_hit {
             self.cache_hit_count.fetch_add(1, Ordering::Relaxed);
+        }
+        if record.projection_hit {
+            self.projection_hit_count.fetch_add(1, Ordering::Relaxed);
         }
         if record.not_modified {
             self.not_modified_count.fetch_add(1, Ordering::Relaxed);
@@ -926,6 +933,7 @@ impl MetadataFetchDetailCounters {
         MetadataFetchDetailSnapshot {
             calls: self.calls.load(Ordering::Relaxed),
             cache_hit_count: self.cache_hit_count.load(Ordering::Relaxed),
+            projection_hit_count: self.projection_hit_count.load(Ordering::Relaxed),
             not_modified_count: self.not_modified_count.load(Ordering::Relaxed),
             body_bytes_sum: self.body_bytes_sum.load(Ordering::Relaxed),
             version_count_sum: self.version_count_sum.load(Ordering::Relaxed),
@@ -1061,6 +1069,7 @@ fn u128_to_u64_saturating(value: u128) -> u64 {
 pub struct MetadataFetchDetailSnapshot {
     pub calls: u64,
     pub cache_hit_count: u64,
+    pub projection_hit_count: u64,
     pub not_modified_count: u64,
     pub body_bytes_sum: u64,
     pub version_count_sum: u64,

@@ -492,7 +492,7 @@ pub(super) fn spawn_workspace_fetch_overlap_dispatcher(
                 continue;
             }
             if !dependency_engine_policy
-                .allows_dependency_materialization(package.node_engine.as_deref())
+                .allows_dependency_materialization_on_runtime(package.node_engine.as_deref())
             {
                 stats.skipped_engine_count = stats.skipped_engine_count.saturating_add(1);
                 continue;
@@ -672,7 +672,9 @@ fn dispatch_selected_event(
         stats.skipped_optional_count = stats.skipped_optional_count.saturating_add(1);
         return;
     }
-    if !dependency_engine_policy.allows_dependency_materialization(package.node_engine.as_deref()) {
+    if !dependency_engine_policy
+        .allows_dependency_materialization_on_runtime(package.node_engine.as_deref())
+    {
         stats.skipped_engine_count = stats.skipped_engine_count.saturating_add(1);
         return;
     }
