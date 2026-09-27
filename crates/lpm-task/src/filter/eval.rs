@@ -1253,6 +1253,65 @@ mod tests {
     }
 
     #[test]
+    fn evaluator_orders_dependencies_first_when_declared_after_dependents() {
+        // app → lib → core, declared so each dependency has a higher index
+        // than its dependent.
+        let ws = Workspace {
+            root: PathBuf::from("/workspace"),
+            root_package: PackageJson::default(),
+            members: vec![
+                member("app", &["lib"]),
+                member("lib", &["core"]),
+                member("core", &[]),
+            ],
+        };
+        let graph = WorkspaceGraph::from_workspace(&ws);
+        let engine = FilterEngine::new(&graph, &ws.root);
+        let (app, lib, core) = (idx(&graph, "app"), idx(&graph, "lib"), idx(&graph, "core"));
+
+        let all = engine
+            .evaluate(&[FilterExpr::GlobName("*".into())])
+            .unwrap();
+        assert_eq!(all, vec![core, lib, app]);
+
+        let two = engine
+            .evaluate(&[
+                FilterExpr::ExactName("app".into()),
+                FilterExpr::ExactName("core".into()),
+            ])
+            .unwrap();
+        assert_eq!(two, vec![core, app]);
+    }
+
+    #[test]
+    fn evaluator_falls_back_to_index_order_when_the_graph_has_a_cycle() {
+        let ws = Workspace {
+            root: PathBuf::from("/workspace"),
+            root_package: PackageJson::default(),
+            members: vec![
+                member("b", &["a"]),
+                member("a", &["b"]),
+                member("c", &["a"]),
+            ],
+        };
+        let graph = WorkspaceGraph::from_workspace(&ws);
+        let engine = FilterEngine::new(&graph, &ws.root);
+        assert!(graph.topological_levels().is_err());
+
+        let all = engine
+            .evaluate(&[FilterExpr::GlobName("*".into())])
+            .unwrap();
+        assert_eq!(all, vec![0, 1, 2]);
+        let explain = engine
+            .explain(&[
+                FilterExpr::ExactName("c".into()),
+                FilterExpr::ExactName("b".into()),
+            ])
+            .unwrap();
+        assert_eq!(explain.selected, vec![0, 2]);
+    }
+
+    #[test]
     fn evaluator_output_is_deterministic_across_runs() {
         let (_ws, graph, root) = make_engine();
         let engine = FilterEngine::new(&graph, &root);
@@ -1718,34 +1777,41 @@ mod tests {
         }
     }
 
-    /// Run a closure repeatedly and report nanoseconds per iteration
-    /// — best-of-N rounds so a single scheduler stall on a shared CI
-    /// runner doesn't sink the measurement.
+    /// Run a closure repeatedly and report nanoseconds per iteration,
+    /// best of five rounds.
     ///
-    /// A single round of the earlier `total_elapsed / iters` shape
-    /// was very sensitive to OS scheduling on GitHub Actions: one
-    /// 500ms stall across a 500-iter loop adds 1ms to every per-op
-    /// sample, which is 2× the 500µs debug budget — the glob
-    /// eval test flaked exactly this way on a Linux CI run
-    /// (`ubuntu-latest`). Best-of-N captures
-    /// "when the scheduler cooperated, how fast can this code
-    /// run?" — the question a ns/op budget is actually asking, and
-    /// the one a regression in LPM's own code would answer with a
-    /// shift in ALL rounds (not just one).
+    /// Rounds are timed with the thread's CPU clock where the platform has
+    /// one. On a CI runner the other test processes compete for the CPUs,
+    /// and wall time also counts the time this thread waits for one: under
+    /// that load a round can take several times its CPU time, in every
+    /// round, which best-of-N can't absorb. CPU time counts only the work
+    /// the closure does. Best-of-N still absorbs cold caches and one-off
+    /// stalls; a regression in LPM's own code shifts every round.
     fn time_per_op(iters_per_round: u32, mut op: impl FnMut()) -> u128 {
         const ROUNDS: u32 = 5;
         let mut best = u128::MAX;
         for _ in 0..ROUNDS {
-            let start = std::time::Instant::now();
+            let start = thread_time();
             for _ in 0..iters_per_round {
                 op();
             }
-            let this = start.elapsed().as_nanos() / iters_per_round as u128;
-            if this < best {
-                best = this;
-            }
+            let this = (thread_time() - start).as_nanos() / iters_per_round as u128;
+            best = best.min(this);
         }
         best
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn thread_time() -> std::time::Duration {
+        use rustix::time::{ClockId, clock_gettime};
+        std::time::Duration::try_from(clock_gettime(ClockId::ThreadCPUTime))
+            .expect("the thread CPU clock is never negative")
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn thread_time() -> std::time::Duration {
+        static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        EPOCH.get_or_init(std::time::Instant::now).elapsed()
     }
 
     #[test]
