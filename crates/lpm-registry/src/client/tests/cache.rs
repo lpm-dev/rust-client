@@ -2889,3 +2889,32 @@ fn invalidate_npm_version_metadata_cache_removes_exact_doc_entry() {
         "package metadata cache entry should remain separate"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delayed_cache_write_keeps_the_expiry_of_its_response() {
+    let (client, _cache) = client_with_temp_cache();
+    let path = client.cache_path("entry").unwrap();
+    let mutation = client.metadata_cache_mutation(&path);
+    let fresh_for = std::time::Duration::from_secs(300);
+    let write_lock = mutation.operation.lock().unwrap();
+    let handed_over = std::time::SystemTime::now();
+
+    client.write_metadata_cache_with_directive(
+        "entry",
+        &test_metadata("pkg"),
+        None,
+        MetadataCacheDirective::Store { fresh_for },
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    drop(write_lock);
+    client.flush_pending_cache_writes().await;
+
+    let expiry = std::fs::metadata(&path).unwrap().modified().unwrap();
+    assert!(
+        expiry <= handed_over + fresh_for + std::time::Duration::from_millis(500),
+        "the entry expired {:?} after its response's freshness ended",
+        expiry
+            .duration_since(handed_over + fresh_for)
+            .unwrap_or_default()
+    );
+}

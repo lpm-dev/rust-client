@@ -1056,3 +1056,331 @@ async fn bare_install_keeps_compact_noop_after_semantically_unchanged_edits() {
         "expected normalized lockfile hash: {result}"
     );
 }
+
+struct ArrivalRecorder {
+    body: Vec<u8>,
+    arrivals: std::sync::Arc<std::sync::Mutex<Vec<std::time::SystemTime>>>,
+    delay: std::time::Duration,
+}
+
+impl wiremock::Respond for ArrivalRecorder {
+    fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        self.arrivals
+            .lock()
+            .unwrap()
+            .push(std::time::SystemTime::now());
+        wiremock::ResponseTemplate::new(200)
+            .set_body_bytes(self.body.clone())
+            .set_delay(self.delay)
+    }
+}
+
+#[tokio::test]
+async fn lockfile_install_downloads_while_node_is_probed() {
+    let mock = MockRegistry::start().await;
+    let manifest = serde_json::json!({
+        "name": "engine-dep", "version": "1.0.0", "engines": {"node": ">=20 <21"}
+    });
+    mock.with_manifest_package(manifest.clone(), &[]).await;
+    let arrivals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(MockRegistry::tarball_path(
+            "engine-dep",
+            "1.0.0",
+        )))
+        .respond_with(ArrivalRecorder {
+            body: make_tarball_from_pkg_json(manifest, &[]),
+            arrivals: std::sync::Arc::clone(&arrivals),
+            delay: std::time::Duration::ZERO,
+        })
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    let project =
+        TempProject::empty(r#"{"name":"consumer","dependencies":{"engine-dep":"1.0.0"}}"#);
+    write_node_shim(&project);
+    install(&project, &mock.url()).assert().success();
+
+    let probe_finished = project.path().join("probe-finished");
+    std::fs::write(
+        project.home().join("node-shim-bin/node"),
+        format!(
+            "#!/bin/sh\nsleep 1\n: > '{}'\n/bin/cat '{}'\n",
+            probe_finished.display(),
+            project.path().join("node-version").display(),
+        ),
+    )
+    .unwrap();
+    for state in [
+        project.path().join("node_modules"),
+        project.path().join(".lpm"),
+        project.store_dir(),
+        project.cache_dir(),
+    ] {
+        let _ = std::fs::remove_dir_all(state);
+    }
+    arrivals.lock().unwrap().clear();
+
+    install(&project, &mock.url()).assert().success();
+
+    let finished = std::fs::metadata(&probe_finished)
+        .expect("the reinstall probes Node")
+        .modified()
+        .unwrap();
+    let requested = *arrivals
+        .lock()
+        .unwrap()
+        .first()
+        .expect("the reinstall downloads the tarball");
+    assert!(
+        requested < finished,
+        "the tarball download waited {:?} for the Node probe",
+        requested.duration_since(finished).unwrap_or_default()
+    );
+}
+
+#[tokio::test]
+async fn lockfile_install_with_optional_engines_downloads_while_node_is_probed() {
+    let mock = MockRegistry::start().await;
+    let plain = serde_json::json!({"name": "plain-dep", "version": "1.0.0"});
+    let optional_lib = serde_json::json!({"name": "optional-lib", "version": "1.0.0"});
+    mock.with_manifest_package(plain.clone(), &[]).await;
+    mock.with_manifest_package(optional_lib.clone(), &[]).await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "optional-engine", "version": "1.0.0", "engines": {"node": ">=20 <21"}
+        }),
+        &[],
+    )
+    .await;
+    let arrivals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    for (name, manifest) in [("plain-dep", plain), ("optional-lib", optional_lib)] {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(MockRegistry::tarball_path(
+                name, "1.0.0",
+            )))
+            .respond_with(ArrivalRecorder {
+                body: make_tarball_from_pkg_json(manifest, &[]),
+                arrivals: std::sync::Arc::clone(&arrivals),
+                delay: std::time::Duration::ZERO,
+            })
+            .with_priority(1)
+            .mount(mock.server())
+            .await;
+    }
+    let project = TempProject::empty(
+        r#"{"name":"consumer","dependencies":{"plain-dep":"1.0.0"},"optionalDependencies":{"optional-engine":"1.0.0","optional-lib":"1.0.0"}}"#,
+    );
+    write_node_shim(&project);
+    install(&project, &mock.url()).assert().success();
+
+    let probe_finished = project.path().join("probe-finished");
+    std::fs::write(
+        project.home().join("node-shim-bin/node"),
+        format!(
+            "#!/bin/sh\nsleep 1\n: > '{}'\n/bin/cat '{}'\n",
+            probe_finished.display(),
+            project.path().join("node-version").display(),
+        ),
+    )
+    .unwrap();
+    for state in [
+        project.path().join("node_modules"),
+        project.path().join(".lpm"),
+        project.store_dir(),
+        project.cache_dir(),
+    ] {
+        let _ = std::fs::remove_dir_all(state);
+    }
+    arrivals.lock().unwrap().clear();
+
+    install(&project, &mock.url()).assert().success();
+
+    assert!(
+        project
+            .path()
+            .join("node_modules/optional-engine/package.json")
+            .exists(),
+        "Node 20 satisfies the optional dependency's engines"
+    );
+    let finished = std::fs::metadata(&probe_finished)
+        .expect("the reinstall probes Node")
+        .modified()
+        .unwrap();
+    let arrivals = arrivals.lock().unwrap().clone();
+    assert_eq!(arrivals.len(), 2, "the reinstall downloads both tarballs");
+    let last = *arrivals.iter().max().unwrap();
+    assert!(
+        last < finished,
+        "a tarball download waited {:?} for the Node probe",
+        last.duration_since(finished).unwrap_or_default()
+    );
+}
+
+#[tokio::test]
+async fn strict_engine_mismatch_fails_without_waiting_for_downloads() {
+    let mock = MockRegistry::start().await;
+    let manifest = serde_json::json!({
+        "name": "engine-dep", "version": "1.0.0", "engines": {"node": ">=20 <21"}
+    });
+    mock.with_manifest_package(manifest.clone(), &[]).await;
+    let project =
+        TempProject::empty(r#"{"name":"consumer","dependencies":{"engine-dep":"1.0.0"}}"#);
+    write_node_shim(&project);
+    install(&project, &mock.url()).assert().success();
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(MockRegistry::tarball_path(
+            "engine-dep",
+            "1.0.0",
+        )))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_bytes(make_tarball_from_pkg_json(manifest, &[]))
+                .set_delay(std::time::Duration::from_secs(60)),
+        )
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    project.write_file("node-version", "v18.0.0\n");
+    for state in [
+        project.path().join("node_modules"),
+        project.path().join(".lpm"),
+        project.store_dir(),
+        project.cache_dir(),
+    ] {
+        let _ = std::fs::remove_dir_all(state);
+    }
+
+    let started = std::time::Instant::now();
+    let output = install(&project, &mock.url()).output().unwrap();
+    let elapsed = started.elapsed();
+
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "Node 18 must fail engines >=20 <21:\n{report}"
+    );
+    assert!(
+        report.contains("engine-dep@1.0.0") && report.contains(">=20 <21"),
+        "the failure must name the dependency's engine range:\n{report}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "the engine mismatch waited {elapsed:?} for the tarball download"
+    );
+    assert!(
+        !project.path().join("node_modules").exists(),
+        "a failed engine check must not change the project"
+    );
+}
+
+#[tokio::test]
+async fn strict_engine_mismatch_on_the_legacy_store_fails_before_linking() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({"name": "plain-dep", "version": "1.0.0"}),
+        &[],
+    )
+    .await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "engine-dep", "version": "1.0.0", "engines": {"node": ">=20 <21"}
+        }),
+        &[],
+    )
+    .await;
+    let project = TempProject::empty(
+        r#"{"name":"consumer","dependencies":{"engine-dep":"1.0.0","plain-dep":"1.0.0"}}"#,
+    );
+    write_node_shim(&project);
+    install(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v1")
+        .args(["--linker", "isolated"])
+        .assert()
+        .success();
+
+    project.write_file("node-version", "v18.0.0\n");
+    std::fs::write(
+        project.home().join("node-shim-bin/node"),
+        format!(
+            "#!/bin/sh\nsleep 1\n/bin/cat '{}'\n",
+            project.path().join("node-version").display(),
+        ),
+    )
+    .unwrap();
+    for state in [
+        project.path().join("node_modules"),
+        project.path().join(".lpm"),
+    ] {
+        let _ = std::fs::remove_dir_all(state);
+    }
+
+    let output = install(&project, &mock.url())
+        .env("LPM_STORE_VERSION", "v1")
+        .args(["--linker", "isolated"])
+        .output()
+        .unwrap();
+
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success() && report.contains("engine-dep@1.0.0"),
+        "Node 18 must fail engines >=20 <21:\n{report}"
+    );
+    assert!(
+        !project.path().join("node_modules").exists()
+            && !project.path().join(".lpm/wrappers").exists(),
+        "a failed engine check must not change the project"
+    );
+}
+
+#[tokio::test]
+async fn first_install_creates_the_signing_secret_while_it_downloads() {
+    let mock = MockRegistry::start().await;
+    let manifest = serde_json::json!({"name": "plain-dep", "version": "1.0.0"});
+    mock.with_manifest_package(manifest.clone(), &[]).await;
+    let delay = std::time::Duration::from_secs(1);
+    let arrivals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(MockRegistry::tarball_path(
+            "plain-dep",
+            "1.0.0",
+        )))
+        .respond_with(ArrivalRecorder {
+            body: make_tarball_from_pkg_json(manifest, &[]),
+            arrivals: std::sync::Arc::clone(&arrivals),
+            delay,
+        })
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(r#"{"name":"consumer","dependencies":{"plain-dep":"1.0.0"}}"#);
+    let secret = project.home().join(".lpm/security/build-state-secret.hex");
+    let _ = std::fs::remove_file(&secret);
+
+    install(&project, &mock.url()).assert().success();
+
+    let created = std::fs::metadata(&secret)
+        .expect("the install signs its build state")
+        .modified()
+        .unwrap();
+    let served = *arrivals
+        .lock()
+        .unwrap()
+        .first()
+        .expect("the install downloads the tarball")
+        + delay;
+    assert!(
+        created < served,
+        "the signing secret was created {:?} after the download finished",
+        created.duration_since(served).unwrap_or_default()
+    );
+}

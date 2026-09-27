@@ -1773,21 +1773,7 @@ impl Store {
         result.map(|object| (object, timings))
     }
 
-    pub fn extract_object_from_stream(
-        &self,
-        reader: impl std::io::Read,
-        expected_integrity: Option<&str>,
-        max_compressed_size: u64,
-    ) -> Result<(ExtractedObject, String, StageTimings), LpmError> {
-        self.extract_object_from_stream_with_identity(
-            reader,
-            None,
-            expected_integrity,
-            max_compressed_size,
-        )
-    }
-
-    /// Stream a large archive with gzip decoding ahead of file extraction.
+    /// Stream an archive with gzip decoding ahead of file extraction.
     ///
     /// Input cancellation must unblock a pending read if extraction fails. When
     /// source inspection is enabled, extraction retains the sequential callback path.

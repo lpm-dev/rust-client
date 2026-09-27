@@ -79,6 +79,8 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseResult {
     pub(in crate::commands::install) wf_resolve_end_ms: u128,
     pub(in crate::commands::install) auto_isolated_peer_conflicts: bool,
     pub(in crate::commands::install) linker_mode: lpm_linker::LinkerMode,
+    /// Must finish before the install changes the project.
+    pub(in crate::commands::install) deferred_engine_check: Option<DeferredEngineCheck>,
 }
 
 pub(in crate::commands::install) async fn run_online_resolution_phase(
@@ -680,7 +682,47 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
             &ambient_peer_installs_for_lockfile,
         );
     }
-    filter_dependency_engine_packages(&mut packages, dependency_engine_policy.as_ref())?;
+    let engine_check_timing =
+        dependency_engine_check_timing(&packages, &dependency_engine_policy, requested_v2_mode);
+    if engine_check_timing == EngineCheckTiming::AfterNodeProbe
+        && used_lockfile
+        && fetch_overlap_join.is_none()
+        && !workspace_resolution::active()
+        && lockfile_fetch_overlap_enabled(force)
+        && !npm_firewall_mode.is_enabled()
+        && !policy_extensions_disable_tarball_prefetch(policy_extension_configs)
+    {
+        // Packages without an engine requirement download while Node is
+        // probed; one left unreachable by a skipped optional parent stays
+        // unused in the store.
+        let unconstrained = packages
+            .iter()
+            .filter(|package| package.node_engine.is_none())
+            .cloned()
+            .collect();
+        fetch_overlap_join = Some(spawn_fetch_overlap_for_packages(
+            unconstrained,
+            arc_client.clone(),
+            route_table.clone(),
+            store.clone(),
+            store_v2_handle.clone(),
+            fetch_semaphore.clone(),
+            fetch_coord.clone(),
+            project_dir.to_path_buf(),
+            gate_stats.clone(),
+            fetch_extract_limiter.clone(),
+            install_accounting,
+            streaming_fetch,
+            ArtifactSelection::from_used_lockfile(used_lockfile),
+            (streaming_fetch && streaming_candidate_is_unconstrained(&packages))
+                .then(|| v2_streaming_lane.clone()),
+        ));
+    }
+    let deferred_engine_check = filter_or_defer_dependency_engine_packages(
+        &mut packages,
+        &dependency_engine_policy,
+        engine_check_timing,
+    )?;
     platform_skipped += filter_platform_packages(&mut packages)?;
     retain_peer_issues_for_packages(&mut peer_warnings, &mut peer_conflicts, &packages);
 
@@ -776,5 +818,6 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         wf_resolve_end_ms,
         auto_isolated_peer_conflicts,
         linker_mode,
+        deferred_engine_check,
     })
 }

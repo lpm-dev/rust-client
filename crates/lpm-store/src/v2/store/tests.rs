@@ -2174,10 +2174,11 @@ fn streamed_object_accepts_declared_integrity_algorithms_and_uses_sha512_identit
         let store = Store::at(dir.path());
         let declared = Integrity::from_bytes(algorithm, &tarball).to_string();
         let (object, sri, _) = store
-            .extract_object_from_stream(
+            .extract_object_from_pipelined_stream(
                 std::io::Cursor::new(&tarball),
                 Some(&declared),
                 tarball.len() as u64,
+                || {},
             )
             .unwrap();
 
@@ -2457,7 +2458,12 @@ fn streamed_object_trust_on_first_use_returns_canonical_sha512_identity() {
     let expected_sri = crate::compute_sri_hash(&tarball);
 
     let (object, sri, _) = store
-        .extract_object_from_stream(std::io::Cursor::new(&tarball), None, tarball.len() as u64)
+        .extract_object_from_pipelined_stream(
+            std::io::Cursor::new(&tarball),
+            None,
+            tarball.len() as u64,
+            || {},
+        )
         .unwrap();
 
     assert_eq!(sri, expected_sri);
@@ -2479,10 +2485,11 @@ fn streamed_object_integrity_mismatch_removes_private_staging() {
         let wrong_integrity = crate::compute_sri_hash(b"different compressed bytes");
 
         let error = store
-            .extract_object_from_stream(
+            .extract_object_from_pipelined_stream(
                 std::io::Cursor::new(&tarball),
                 Some(&wrong_integrity),
                 tarball.len() as u64,
+                || {},
             )
             .unwrap_err();
 
@@ -2513,10 +2520,11 @@ fn streamed_object_hash_includes_bytes_after_the_gzip_member() {
         let expected_sri = crate::compute_sri_hash(&tarball);
 
         let (object, sri, _) = store
-            .extract_object_from_stream(
+            .extract_object_from_pipelined_stream(
                 std::io::Cursor::new(&tarball),
                 Some(&expected_sri),
                 tarball.len() as u64,
+                || {},
             )
             .unwrap();
 
@@ -2535,10 +2543,11 @@ fn streamed_object_enforces_compressed_size_without_content_length() {
     )]);
 
     let error = store
-        .extract_object_from_stream(
+        .extract_object_from_pipelined_stream(
             std::io::Cursor::new(&tarball),
             None,
             (tarball.len() - 1) as u64,
+            || {},
         )
         .unwrap_err();
 
@@ -2611,13 +2620,14 @@ fn streamed_object_accepts_chunked_input_and_rejects_truncation_without_staging_
     let expected_sri = crate::compute_sri_hash(&tarball);
 
     let (_, sri, _) = store
-        .extract_object_from_stream(
+        .extract_object_from_pipelined_stream(
             ChunkedReader {
                 cursor: std::io::Cursor::new(tarball.clone()),
                 max_chunk: 7,
             },
             Some(&expected_sri),
             tarball.len() as u64,
+            || {},
         )
         .unwrap();
     assert_eq!(sri, expected_sri);
@@ -2626,13 +2636,14 @@ fn streamed_object_accepts_chunked_input_and_rejects_truncation_without_staging_
     let truncated_store = Store::at(truncated_dir.path());
     let truncated = tarball[..tarball.len() / 2].to_vec();
     let error = truncated_store
-        .extract_object_from_stream(
+        .extract_object_from_pipelined_stream(
             ChunkedReader {
                 cursor: std::io::Cursor::new(truncated),
                 max_chunk: 5,
             },
             Some(&expected_sri),
             tarball.len() as u64,
+            || {},
         )
         .unwrap_err();
 
@@ -2655,12 +2666,13 @@ fn streamed_object_reader_error_removes_private_staging() {
     )]);
 
     let error = store
-        .extract_object_from_stream(
+        .extract_object_from_pipelined_stream(
             ErrorAtEofReader {
                 cursor: std::io::Cursor::new(tarball.clone()),
             },
             Some(&crate::compute_sri_hash(&tarball)),
             tarball.len() as u64,
+            || {},
         )
         .unwrap_err();
 
@@ -2726,16 +2738,22 @@ fn concurrent_streamed_object_publishers_reuse_the_same_canonical_object() {
     let first_tarball = tarball.clone();
     let first_integrity = expected_sri.clone();
     let first = std::thread::spawn(move || {
-        first_store.extract_object_from_stream(
+        first_store.extract_object_from_pipelined_stream(
             std::io::Cursor::new(first_tarball),
             Some(&first_integrity),
             u64::MAX,
+            || {},
         )
     });
 
     arrived.wait();
     let (winner, winner_sri, _) = second_store
-        .extract_object_from_stream(std::io::Cursor::new(tarball), Some(&expected_sri), u64::MAX)
+        .extract_object_from_pipelined_stream(
+            std::io::Cursor::new(tarball),
+            Some(&expected_sri),
+            u64::MAX,
+            || {},
+        )
         .unwrap();
     resume.wait();
     let (reused, reused_sri, _) = first.join().unwrap().unwrap();
@@ -2761,10 +2779,11 @@ fn streamed_object_ingest_removes_unlocked_staging_from_a_crashed_process() {
     )]);
 
     store
-        .extract_object_from_stream(
+        .extract_object_from_pipelined_stream(
             std::io::Cursor::new(&tarball),
             Some(&crate::compute_sri_hash(&tarball)),
             tarball.len() as u64,
+            || {},
         )
         .unwrap();
 
@@ -4563,10 +4582,11 @@ fn v2_input_paths_preserve_source_analysis_policy_and_extracted_content() {
                 }
                 _ => {
                     store
-                        .extract_object_from_stream(
+                        .extract_object_from_pipelined_stream(
                             std::io::Cursor::new(&tarball),
                             Some(&sri),
                             tarball.len() as u64,
+                            || {},
                         )
                         .unwrap()
                         .0

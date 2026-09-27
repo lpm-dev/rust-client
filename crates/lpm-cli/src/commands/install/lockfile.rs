@@ -2410,6 +2410,102 @@ pub(super) fn filter_platform_packages(
     Ok(skipped)
 }
 
+/// Dependency engine checks running while the install downloads.
+pub(super) struct DeferredEngineCheck {
+    task: tokio::task::JoinHandle<Result<Vec<String>, LpmError>>,
+}
+
+impl DeferredEngineCheck {
+    /// The warnings to report, or the mismatch that fails the install.
+    pub(super) async fn verdict(self) -> Result<Vec<String>, LpmError> {
+        self.task.await.map_err(|error| {
+            LpmError::Registry(format!("dependency engine check failed: {error}"))
+        })?
+    }
+}
+
+/// When an install checks its dependencies' `engines.node` requirements.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum EngineCheckTiming {
+    /// No check needs `node --version`, so it runs at once.
+    Now,
+    /// A mismatch can skip optional packages, so the check settles the fetch
+    /// plan and first waits for `node --version`.
+    AfterNodeProbe,
+    /// No decision can change the fetch plan, so the check runs alongside the
+    /// downloads, whose fetch writes only to the store: the verdict still
+    /// precedes every change to the project.
+    WhileDownloading,
+}
+
+pub(super) fn dependency_engine_check_timing(
+    packages: &[InstallPackage],
+    policy: &crate::engine_check::DependencyEnginePolicy,
+    fetch_leaves_project_untouched: bool,
+) -> EngineCheckTiming {
+    let mut constrained = false;
+    let mut optional_constrained = false;
+    for package in packages
+        .iter()
+        .filter(|package| package.node_engine.is_some())
+    {
+        constrained = true;
+        optional_constrained |= package.optional;
+    }
+    if !constrained || policy.node_resolution_is_ready() {
+        EngineCheckTiming::Now
+    } else if fetch_leaves_project_untouched
+        && !(optional_constrained && policy.skips_optional_mismatches())
+    {
+        EngineCheckTiming::WhileDownloading
+    } else {
+        EngineCheckTiming::AfterNodeProbe
+    }
+}
+
+/// Check dependency engines now, or start the checks alongside the downloads.
+pub(super) fn filter_or_defer_dependency_engine_packages(
+    packages: &mut Vec<InstallPackage>,
+    policy: &std::sync::Arc<crate::engine_check::DependencyEnginePolicy>,
+    timing: EngineCheckTiming,
+) -> Result<Option<DeferredEngineCheck>, LpmError> {
+    if timing != EngineCheckTiming::WhileDownloading {
+        filter_dependency_engine_packages(packages, policy)?;
+        return Ok(None);
+    }
+    let constrained = packages
+        .iter()
+        .filter_map(|package| {
+            let required = package.node_engine.clone()?;
+            Some((
+                package.name.clone(),
+                package.version.clone(),
+                required,
+                package.optional,
+            ))
+        })
+        .collect::<Vec<_>>();
+    let policy = std::sync::Arc::clone(policy);
+    let task = tokio::task::spawn_blocking(move || {
+        let mut warnings = Vec::new();
+        for (name, version, required, optional) in constrained {
+            match policy.decide_dependency(&name, &version, &required, optional)? {
+                crate::engine_check::DependencyEngineDecision::Keep => {}
+                crate::engine_check::DependencyEngineDecision::KeepWithWarning(warning) => {
+                    warnings.push(warning);
+                }
+                crate::engine_check::DependencyEngineDecision::Skip(_) => {
+                    return Err(LpmError::Registry(format!(
+                        "dependency engine check skipped {name}@{version} after its download started"
+                    )));
+                }
+            }
+        }
+        Ok(warnings)
+    });
+    Ok(Some(DeferredEngineCheck { task }))
+}
+
 pub(super) fn filter_dependency_engine_packages(
     packages: &mut Vec<InstallPackage>,
     policy: &crate::engine_check::DependencyEnginePolicy,

@@ -17796,6 +17796,53 @@ async fn install_config_signatures_true_blocks_mismatched_registry_signature() {
     );
 }
 
+/// A package published in 2020 and signed only by a key the registry retired
+/// on 2025-01-29, served the way registry.npmjs.org serves it.
+async fn mount_package_signed_by_a_retired_key(mock: &MockRegistry) {
+    let signer = RegistrySigningFixture::new().expiring_at("2025-01-29T00:00:00.000Z");
+    mock.with_registry_signing_keys(&signer).await;
+    let name = "retired-key-pkg";
+    let tarball = make_tarball(name, "1.0.0");
+    let mut metadata = mock.signed_package_metadata(name, "1.0.0", &tarball, &signer);
+    metadata["time"] = serde_json::json!({ "1.0.0": "2020-02-03T00:00:00.000Z" });
+    mock.with_npm_documents(&metadata).await;
+    Mock::given(method("GET"))
+        .and(path(MockRegistry::tarball_path(name, "1.0.0")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball))
+        .mount(mock.server())
+        .await;
+}
+
+#[tokio::test]
+async fn install_config_signatures_true_verifies_a_range_dependency_signed_by_a_retired_key() {
+    let project = TempProject::empty(
+        r#"{"name":"signatures-retired-key","version":"1.0.0","dependencies":{"retired-key-pkg":"^1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    write_signatures_global_config(&project, true);
+    mount_package_signed_by_a_retired_key(&mock).await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .output()
+        .expect("spawn lpm install");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "a signature made before its key expired must verify; stderr:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("Registry signatures verified · 1 verified"),
+        "got:\n{stderr}",
+    );
+}
+
 #[tokio::test]
 async fn install_config_signatures_true_accepts_signed_registry_package() {
     let project = TempProject::empty(

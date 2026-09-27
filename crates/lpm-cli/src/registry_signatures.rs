@@ -285,9 +285,7 @@ async fn verify_one_package(
     };
 
     if allow_metadata_hydration
-        && (input.signatures.is_empty()
-            || input.integrity.is_none()
-            || input.published_at.is_none())
+        && (input.signatures.is_empty() || input.integrity.is_none())
         && let Err(reason) = hydrate_from_metadata(&client, &route, &mut input, timings).await
     {
         return not_verified(input, reason);
@@ -302,6 +300,7 @@ async fn verify_one_package(
         .as_deref()
         .map(str::trim)
         .filter(|integrity| !integrity.is_empty())
+        .map(str::to_owned)
     else {
         return not_verified(input, RegistrySignatureReason::MissingIntegrity);
     };
@@ -319,12 +318,19 @@ async fn verify_one_package(
     if let Some(timings) = timings {
         timings.record_key_fetch(key_fetch_start.elapsed());
     }
+    if allow_metadata_hydration
+        && input.published_at.is_none()
+        && signed_by_an_expiring_key(&input.signatures, &keys)
+        && let Err(reason) = hydrate_publish_time(&client, &route, &mut input, timings).await
+    {
+        return not_verified(input, reason);
+    }
 
     let crypto_start = std::time::Instant::now();
     let verification = lpm_registry::verify_registry_signatures(
         &input.name,
         &input.version,
-        integrity,
+        &integrity,
         &input.signatures,
         &keys,
         input.published_at.as_deref(),
@@ -387,6 +393,41 @@ async fn hydrate_from_metadata(
         input.published_at = metadata.time.get(&input.version).cloned();
     }
 
+    Ok(())
+}
+
+/// A signature by a key with an expiry is valid only if the version was
+/// published before it, so its verification needs the publish time.
+fn signed_by_an_expiring_key(
+    signatures: &[RegistrySignature],
+    keys: &[RegistrySigningKey],
+) -> bool {
+    signatures.iter().any(|signature| {
+        keys.iter().any(|key| {
+            signature.keyid.as_deref() == Some(key.keyid.as_str()) && key.expires.is_some()
+        })
+    })
+}
+
+/// Read the version's publish time from the package's release times. npm's
+/// abbreviated documents omit it, so lockfiles resolved from them lack it.
+async fn hydrate_publish_time(
+    client: &RegistryClient,
+    route: &UpstreamRoute,
+    input: &mut RegistrySignatureInput,
+    timings: Option<&RegistrySignatureTimings>,
+) -> Result<(), RegistrySignatureReason> {
+    let hydration_start = std::time::Instant::now();
+    let release_times = lpm_registry::timing::with_metadata_purpose(
+        lpm_registry::timing::MetadataPurpose::SignatureHydration,
+        client.get_npm_release_times_routed_full(&input.name, route.clone()),
+    )
+    .await
+    .map_err(|error| RegistrySignatureReason::MetadataUnavailable(error.to_string()))?;
+    if let Some(timings) = timings {
+        timings.record_hydration(hydration_start.elapsed());
+    }
+    input.published_at = release_times.time.get(&input.version).cloned();
     Ok(())
 }
 

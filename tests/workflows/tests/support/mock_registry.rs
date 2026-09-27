@@ -539,6 +539,7 @@ pub struct RegistrySigningFixture {
     keyid: String,
     public_key: String,
     signing_key: p256::ecdsa::SigningKey,
+    expires: Option<String>,
 }
 
 pub struct FlyAppFixture<'a> {
@@ -570,7 +571,14 @@ impl RegistrySigningFixture {
             keyid: "SHA256:test".to_string(),
             public_key,
             signing_key,
+            expires: None,
         }
+    }
+
+    /// A key the registry retired at `expires`, like npm's pre-2025 key.
+    pub fn expiring_at(mut self, expires: &str) -> Self {
+        self.expires = Some(expires.to_owned());
+        self
     }
 
     pub fn signature_json(&self, name: &str, version: &str, integrity: &str) -> serde_json::Value {
@@ -588,7 +596,7 @@ impl RegistrySigningFixture {
 
     fn key_json(&self) -> serde_json::Value {
         serde_json::json!({
-            "expires": null,
+            "expires": self.expires,
             "keyid": self.keyid,
             "keytype": "ecdsa-sha2-nistp256",
             "scheme": "ecdsa-sha2-nistp256",
@@ -3028,6 +3036,32 @@ impl MockRegistry {
             },
             "time": { version: "2025-01-01T00:00:00.000Z" }
         })
+    }
+
+    /// Serve `metadata` the way registry.npmjs.org does: the abbreviated
+    /// document carries no `time`, the full document does.
+    pub async fn with_npm_documents(&self, metadata: &serde_json::Value) -> &Self {
+        let name = metadata["name"]
+            .as_str()
+            .expect("with_npm_documents: metadata must name the package");
+        let mut abbreviated = metadata.clone();
+        abbreviated
+            .as_object_mut()
+            .expect("with_npm_documents: metadata must be an object")
+            .remove("time");
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .and(header("accept", "application/vnd.npm.install-v1+json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(abbreviated))
+            .mount(&self.server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/{name}")))
+            .and(header("accept", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
+            .mount(&self.server)
+            .await;
+        self
     }
 
     pub async fn with_registry_signing_keys(&self, signer: &RegistrySigningFixture) -> &Self {

@@ -416,6 +416,46 @@ fn get_or_create_build_state_secret() -> Result<Vec<u8>, LpmError> {
     Ok(vec![0x5a; BUILD_STATE_SECRET_BYTES])
 }
 
+/// Creates the build-state signing secret in the background when this LPM
+/// home has none, so its fsyncs overlap the install instead of delaying the
+/// build-state write. Signing waits on the secret's lock for a creation still
+/// in flight, and dropping the guard waits for it to end.
+pub(crate) struct SigningSecretPreparation(Option<std::thread::JoinHandle<()>>);
+
+impl SigningSecretPreparation {
+    pub(crate) fn start() -> Self {
+        if !build_state_secret_is_missing() {
+            return Self(None);
+        }
+        let creation = std::thread::Builder::new()
+            .name("lpm-build-state-secret".into())
+            .spawn(|| {
+                // Signing retries the creation and reports its error.
+                let _ = get_or_create_build_state_secret();
+            });
+        Self(creation.ok())
+    }
+}
+
+impl Drop for SigningSecretPreparation {
+    fn drop(&mut self) {
+        if let Some(creation) = self.0.take() {
+            let _ = creation.join();
+        }
+    }
+}
+
+#[cfg(test)]
+fn build_state_secret_is_missing() -> bool {
+    false
+}
+
+#[cfg(not(test))]
+fn build_state_secret_is_missing() -> bool {
+    build_state_secret_path()
+        .is_ok_and(|path| matches!(path.symlink_metadata(), Err(error) if error.kind() == std::io::ErrorKind::NotFound))
+}
+
 #[cfg(not(test))]
 fn build_state_secret_path() -> Result<PathBuf, LpmError> {
     Ok(lpm_common::LpmRoot::from_env()?

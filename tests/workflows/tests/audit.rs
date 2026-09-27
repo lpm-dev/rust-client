@@ -419,6 +419,45 @@ async fn install_signature_fixture_project(
 }
 
 #[tokio::test]
+async fn audit_signatures_verifies_a_range_dependency_signed_by_a_retired_key() {
+    let project = TempProject::empty(
+        r#"{"name":"audit-retired-key","version":"1.0.0","dependencies":{"retired-key-pkg":"^1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    let signer = RegistrySigningFixture::new().expiring_at("2025-01-29T00:00:00.000Z");
+    mock.with_registry_signing_keys(&signer).await;
+    let tarball = make_tarball("retired-key-pkg", "1.0.0");
+    let mut metadata = mock.signed_package_metadata("retired-key-pkg", "1.0.0", &tarball, &signer);
+    metadata["time"] = serde_json::json!({ "1.0.0": "2020-02-03T00:00:00.000Z" });
+    mock.with_npm_documents(&metadata).await;
+    Mock::given(method("GET"))
+        .and(path(MockRegistry::tarball_path("retired-key-pkg", "1.0.0")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball))
+        .mount(mock.server())
+        .await;
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
+        .assert()
+        .success();
+
+    let out = run_audit_with_npm(&project, &mock, &["signatures"], true);
+
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "audit signatures --json must emit JSON: {e}\nstdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert!(out.status.success(), "{envelope}");
+    assert_eq!(envelope["verified"], serde_json::json!(1), "{envelope}");
+}
+
+#[tokio::test]
 async fn audit_signatures_json_reports_verified_and_not_verified_packages() {
     let project = TempProject::empty(
         r#"{
