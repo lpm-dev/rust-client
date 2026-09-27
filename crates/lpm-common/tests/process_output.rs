@@ -35,6 +35,19 @@ fn exact_stdout_limit_preserves_all_bytes_and_rejects_one_more() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn probe_drains_output_larger_than_a_pipe_buffer() {
+    let output = output_capped(
+        &mut shell("head -c 300000 /dev/zero", ""),
+        Duration::from_secs(5),
+        300_000,
+    )
+    .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout.len(), 300_000);
+}
+
 #[test]
 fn probe_closes_stdin_discards_stderr_and_preserves_failure_status() {
     let output = output_capped(

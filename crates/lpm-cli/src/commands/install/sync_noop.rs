@@ -129,11 +129,30 @@ pub(crate) fn is_up_to_date(
     if !extensions.is_empty() || !skills_ready {
         return Ok(false);
     }
-    let engine_policy =
-        crate::engine_check::prepare_dependency_policy(project_dir, false, json_output)?;
-    // The saved key only admits a candidate. Context-sensitive Node launchers
-    // still run before success; a changed version re-enters optional filtering.
-    Ok(engine_policy.freshness_key(&project_lockfile.content) == cached_engine.key)
+    let engine_policy = crate::engine_check::prepare_dependency_policy_with_observed_node(
+        project_dir,
+        false,
+        json_output,
+        cached_engine.observed_node(),
+    )?;
+    // The saved key only admits a candidate. Node launchers still run before
+    // success; a changed version re-enters optional filtering.
+    if engine_policy.freshness_key(&project_lockfile.content) != cached_engine.key {
+        return Ok(false);
+    }
+    if cached_engine.key != "none" {
+        let runtime_fingerprint = engine_policy.resolved_node_runtime_fingerprint();
+        if runtime_fingerprint != cached_engine.runtime_fingerprint
+            && let Err(error) = crate::install_state::refresh_install_hash_node_runtime_fingerprint(
+                project_dir,
+                cached_engine.key,
+                runtime_fingerprint,
+            )
+        {
+            tracing::debug!("failed to refresh the cached Node runtime fingerprint: {error}");
+        }
+    }
+    Ok(true)
 }
 
 fn requires_install_access(lockfile: &lpm_lockfile::Lockfile) -> bool {

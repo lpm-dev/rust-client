@@ -23,6 +23,7 @@ pub mod detect;
 pub mod download;
 pub mod effective;
 pub mod node;
+mod node_identity;
 pub mod platform;
 
 /// Result of ensuring a runtime is available before script execution.

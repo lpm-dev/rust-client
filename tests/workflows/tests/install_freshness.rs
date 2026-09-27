@@ -498,6 +498,84 @@ async fn unchanged_install_probes_once_and_rejects_changed_shim_output() {
     }
 }
 
+/// Treat the counting shim as a real Node binary, whose version can change
+/// only when the executable itself changes.
+fn as_node_binary(project: &TempProject, mut command: assert_cmd::Command) -> assert_cmd::Command {
+    command.env(
+        "LPM_TEST_NODE_BINARY",
+        project.home().join("node-shim-bin/node"),
+    );
+    command
+}
+
+fn replace_node_binary(project: &TempProject) {
+    let binary = project.home().join("node-shim-bin/node");
+    let contents = std::fs::read(&binary).unwrap();
+    std::fs::remove_file(&binary).unwrap();
+    std::fs::write(&binary, contents).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn assert_up_to_date(mut command: assert_cmd::Command) {
+    let output = command.assert().success().get_output().clone();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["up_to_date"], true, "{result}");
+}
+
+#[tokio::test]
+async fn unchanged_installs_reuse_the_recorded_version_of_an_unchanged_node_binary() {
+    let mock = MockRegistry::start().await;
+    mock.with_manifest_package(
+        serde_json::json!({
+            "name": "engine-dep", "version": "1.0.0", "engines": {"node": ">=20 <21"}
+        }),
+        &[],
+    )
+    .await;
+    let project =
+        TempProject::empty(r#"{"name":"consumer","dependencies":{"engine-dep":"1.0.0"}}"#);
+    write_node_shim(&project);
+    as_node_binary(&project, install(&project, &mock.url()))
+        .assert()
+        .success();
+    assert_eq!(probe_count(&project), 1);
+
+    assert_up_to_date(as_node_binary(&project, bare_install(&project)));
+    assert_up_to_date(as_node_binary(&project, install(&project, &mock.url())));
+    assert_eq!(probe_count(&project), 1);
+
+    as_node_binary(&project, install(&project, &mock.url()))
+        .arg("--force")
+        .assert()
+        .success();
+    assert_eq!(probe_count(&project), 2);
+
+    for mut refresh in [bare_install(&project), install(&project, &mock.url())] {
+        replace_node_binary(&project);
+        refresh = as_node_binary(&project, refresh);
+        assert_up_to_date(refresh);
+        let probes = probe_count(&project);
+        assert_up_to_date(as_node_binary(&project, bare_install(&project)));
+        assert_eq!(
+            probe_count(&project),
+            probes,
+            "the refreshed fingerprint was not reused"
+        );
+    }
+    assert_eq!(probe_count(&project), 4);
+
+    replace_node_binary(&project);
+    project.write_file("node-version", "v22.0.0\n");
+    let output = as_node_binary(&project, install(&project, &mock.url()))
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(result.to_string().contains("engine_mismatch"), "{result}");
+    assert_eq!(probe_count(&project), 5);
+}
+
 #[tokio::test]
 async fn engine_free_installs_do_not_execute_node() {
     let mock = MockRegistry::start().await;

@@ -648,7 +648,35 @@ fn dependency_engine_freshness_key_for_state(
 
 pub(super) struct CachedDependencyEngineState<'a> {
     pub(super) key: &'a str,
-    runtime_fingerprint: Option<&'a str>,
+    pub(super) runtime_fingerprint: Option<&'a str>,
+}
+
+impl CachedDependencyEngineState<'_> {
+    /// The Node version recorded in a constrained key, paired with the
+    /// fingerprint it was observed under.
+    pub(super) fn observed_node(&self) -> Option<lpm_runtime::effective::ObservedNodeVersion> {
+        let version = self
+            .key
+            .strip_prefix("1:")
+            .or_else(|| self.key.strip_prefix("0:"))?;
+        lpm_semver::Version::parse(version).ok()?;
+        Some(lpm_runtime::effective::ObservedNodeVersion::new(
+            self.runtime_fingerprint?,
+            version,
+        ))
+    }
+}
+
+/// Node version that the last install recorded for `project_dir`.
+pub(super) fn observed_node_from_install_state(
+    project_dir: &Path,
+) -> Option<lpm_runtime::effective::ObservedNodeVersion> {
+    let state = lpm_common::read_text_file_capped(
+        &project_dir.join(".lpm").join("install-hash"),
+        lpm_common::STATE_FILE_SIZE_CAP_BYTES,
+    )
+    .ok()?;
+    parse_cached_dependency_engine_state(&state)?.observed_node()
 }
 
 pub(super) fn parse_cached_dependency_engine_state(
@@ -766,6 +794,30 @@ mod dependency_engine_freshness_tests {
 
     const FINGERPRINT_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const FINGERPRINT_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn constrained_key_and_fingerprint_record_the_observed_node_version() {
+        for (key, version) in [("1:22.11.0", "22.11.0"), ("0:20.1.0", "20.1.0")] {
+            let state = format!("hash\ne:{key}\nn:{FINGERPRINT_A}\n");
+            let cached = parse_cached_dependency_engine_state(&state).unwrap();
+            assert_eq!(
+                cached.observed_node(),
+                Some(lpm_runtime::effective::ObservedNodeVersion::new(
+                    FINGERPRINT_A,
+                    version
+                ))
+            );
+        }
+        for state in [
+            "hash\ne:none\nn:none\n".to_string(),
+            "hash\ne:legacy\nn:none\n".to_string(),
+            format!("hash\ne:1:unknown\nn:{FINGERPRINT_A}\n"),
+            "hash\ne:1:22.11.0\nn:none\n".to_string(),
+        ] {
+            let cached = parse_cached_dependency_engine_state(&state).unwrap();
+            assert_eq!(cached.observed_node(), None, "{state}");
+        }
+    }
 
     #[test]
     fn matching_runtime_fingerprint_reuses_key_without_revalidation() {
