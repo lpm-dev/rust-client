@@ -428,10 +428,8 @@ async fn prepare_runner_runtime(
     if !requirements.is_empty() {
         let path =
             lpm_runner::bin_path::build_path_with_bins_bounded(project_dir, boundary, &hint)?;
-        let node = lpm_runtime::effective::resolve_node_on_path_with_fingerprint(
-            project_dir,
-            std::ffi::OsStr::new(&path),
-        );
+        let node = crate::engine_check::path_node_versions()
+            .resolve(project_dir, std::ffi::OsStr::new(&path));
         for requirement in requirements {
             crate::engine_check::enforce_resolved_node_requirement_for_run(
                 requirement.required,

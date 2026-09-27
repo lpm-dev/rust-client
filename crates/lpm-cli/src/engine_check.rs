@@ -35,8 +35,8 @@ use crate::engine_strict_config;
 use crate::output;
 use lpm_common::LpmError;
 use lpm_runtime::effective::{
-    ObservedNodeVersion, PathNodeResolution, probe_node_fingerprint_on_path,
-    resolve_node_on_path_with_observed,
+    ObservedNodeVersion, PathNodeResolution, PathNodeVersionCache, RecordedNodeVersions,
+    probe_node_fingerprint_on_path,
 };
 use lpm_workspace::{PackageJson, read_package_json};
 use std::collections::HashMap;
@@ -59,6 +59,65 @@ pub(crate) struct NodeEngineRequirement {
     pub(crate) source: String,
 }
 
+/// Earlier `node --version` results a policy may use for an unchanged Node
+/// binary. It lives as long as its policy, so recording a new version does not
+/// hold up the command.
+#[derive(Default)]
+pub(crate) struct NodeVersionReuse {
+    observed: Option<ObservedNodeVersion>,
+    versions: std::sync::Mutex<PathNodeVersionCache>,
+}
+
+impl NodeVersionReuse {
+    /// Reuse the versions recorded in the LPM home and, when given, the
+    /// version this project's last install observed.
+    pub(crate) fn recorded(observed: Option<ObservedNodeVersion>) -> Self {
+        Self {
+            observed,
+            versions: std::sync::Mutex::new(path_node_versions()),
+        }
+    }
+
+    /// Probe Node again, recording the result for later commands.
+    pub(crate) fn refreshing() -> Self {
+        let versions = recorded_node_versions()
+            .map_or_else(PathNodeVersionCache::default, |recorded| {
+                PathNodeVersionCache::with_recorded_versions(recorded.refreshing())
+            });
+        Self {
+            observed: None,
+            versions: std::sync::Mutex::new(versions),
+        }
+    }
+
+    fn resolve(&self, cwd: &Path, path: &std::ffi::OsStr) -> PathNodeResolution {
+        self.versions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resolve_with_observed(cwd, path, self.observed.as_ref())
+    }
+}
+
+/// Resolve Node for scripts, reusing and recording versions in the LPM home.
+pub(crate) fn path_node_versions() -> PathNodeVersionCache {
+    recorded_node_versions().map_or_else(
+        PathNodeVersionCache::default,
+        PathNodeVersionCache::with_recorded_versions,
+    )
+}
+
+#[cfg(not(test))]
+fn recorded_node_versions() -> Option<RecordedNodeVersions> {
+    lpm_common::LpmRoot::from_env()
+        .ok()
+        .map(|root| RecordedNodeVersions::at(root.cache_node_versions()))
+}
+
+#[cfg(test)]
+fn recorded_node_versions() -> Option<RecordedNodeVersions> {
+    None
+}
+
 pub(crate) enum DependencyEngineDecision {
     Keep,
     KeepWithWarning(String),
@@ -70,7 +129,7 @@ pub(crate) struct DependencyEnginePolicy {
     json_output: bool,
     script_cwd: PathBuf,
     script_path: OsString,
-    observed_node: Option<ObservedNodeVersion>,
+    node_versions: NodeVersionReuse,
     effective_node: OnceLock<PathNodeResolution>,
 }
 
@@ -86,15 +145,14 @@ impl DependencyEnginePolicy {
             json_output,
             script_cwd,
             script_path,
-            observed_node: None,
+            node_versions: NodeVersionReuse::default(),
             effective_node: OnceLock::new(),
         }
     }
 
-    /// Reuse a version from an earlier install while the Node binary's
-    /// fingerprint is unchanged.
-    fn with_observed_node(mut self, observed_node: Option<ObservedNodeVersion>) -> Self {
-        self.observed_node = observed_node;
+    /// Reuse earlier versions while the Node binary's fingerprint is unchanged.
+    fn with_node_versions(mut self, node_versions: NodeVersionReuse) -> Self {
+        self.node_versions = node_versions;
         self
     }
 
@@ -108,7 +166,7 @@ impl DependencyEnginePolicy {
             json_output,
             script_cwd: PathBuf::new(),
             script_path: OsString::new(),
-            observed_node: None,
+            node_versions: NodeVersionReuse::default(),
             effective_node: OnceLock::from(effective_node),
         }
     }
@@ -119,11 +177,8 @@ impl DependencyEnginePolicy {
 
     fn effective_node_resolution(&self) -> &PathNodeResolution {
         self.effective_node.get_or_init(|| {
-            resolve_node_on_path_with_observed(
-                &self.script_cwd,
-                &self.script_path,
-                self.observed_node.as_ref(),
-            )
+            self.node_versions
+                .resolve(&self.script_cwd, &self.script_path)
         })
     }
 
@@ -301,16 +356,21 @@ pub(crate) fn prepare_dependency_policy(
     cli_no_engine_strict: bool,
     json_output: bool,
 ) -> Result<DependencyEnginePolicy, LpmError> {
-    prepare_dependency_policy_with_observed_node(start_dir, cli_no_engine_strict, json_output, None)
+    prepare_dependency_policy_reusing(
+        start_dir,
+        cli_no_engine_strict,
+        json_output,
+        NodeVersionReuse::recorded(None),
+    )
 }
 
-/// Prepare the policy like [`prepare_dependency_policy`], reusing
-/// `observed_node` in place of a Node probe while its fingerprint matches.
-pub(crate) fn prepare_dependency_policy_with_observed_node(
+/// Prepare the policy like [`prepare_dependency_policy`], using
+/// `node_versions` in place of a Node probe while the binary is unchanged.
+pub(crate) fn prepare_dependency_policy_reusing(
     start_dir: &Path,
     cli_no_engine_strict: bool,
     json_output: bool,
-    observed_node: Option<ObservedNodeVersion>,
+    node_versions: NodeVersionReuse,
 ) -> Result<DependencyEnginePolicy, LpmError> {
     let Some((root_dir, root_pkg)) = resolve_root_package(start_dir)? else {
         return Ok(DependencyEnginePolicy::new(
@@ -324,7 +384,7 @@ pub(crate) fn prepare_dependency_policy_with_observed_node(
     let script_path = lpm_runner::bin_path::build_path_with_bins(&root_dir)?;
     let policy =
         DependencyEnginePolicy::new(root_dir, script_path.into(), engine_strict, json_output)
-            .with_observed_node(observed_node);
+            .with_node_versions(node_versions);
     enforce_root_with_policy(&root_pkg, &policy)?;
     Ok(policy)
 }
@@ -334,14 +394,14 @@ pub(crate) fn prepare_dependency_policy_in_context(
     policy_dir: &Path,
     cli_no_engine_strict: bool,
     json_output: bool,
-    observed_node: Option<ObservedNodeVersion>,
+    node_versions: NodeVersionReuse,
 ) -> Result<DependencyEnginePolicy, LpmError> {
     if install_dir == policy_dir {
-        return prepare_dependency_policy_with_observed_node(
+        return prepare_dependency_policy_reusing(
             install_dir,
             cli_no_engine_strict,
             json_output,
-            observed_node,
+            node_versions,
         );
     }
     let root_pkg = resolve_root_package(policy_dir)?
@@ -355,7 +415,7 @@ pub(crate) fn prepare_dependency_policy_in_context(
         engine_strict,
         json_output,
     )
-    .with_observed_node(observed_node))
+    .with_node_versions(node_versions))
 }
 
 pub(crate) fn dependency_policy_for_command(
@@ -377,7 +437,8 @@ pub(crate) fn dependency_policy_for_command(
         path.to_os_string(),
         engine_strict,
         json_output,
-    ))
+    )
+    .with_node_versions(NodeVersionReuse::recorded(None)))
 }
 
 /// Run the engine gate for `start_dir`.
@@ -1149,7 +1210,7 @@ mod tests {
         );
 
         let reusing = DependencyEnginePolicy::new(bin.path().to_path_buf(), path, true, true)
-            .with_observed_node(Some(observed));
+            .with_node_versions(NodeVersionReuse::recorded(Some(observed)));
 
         assert!(
             reusing

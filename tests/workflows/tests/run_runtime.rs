@@ -389,6 +389,48 @@ async fn run_uses_path_node_without_downloading_for_engines_constraint() {
 }
 #[cfg(unix)]
 #[test]
+fn runs_reuse_the_version_recorded_for_an_unchanged_node_binary() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = TempProject::empty(
+        r#"{"name":"recorded-node","version":"1.0.0","engines":{"node":">=18"},"scripts":{"hello":"echo hello"}}"#,
+    );
+    let bin_dir = project.home().join("node-bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let node = bin_dir.join("node");
+    let probes = project.path().join("node-probes");
+    std::fs::write(
+        &node,
+        format!(
+            "#!/bin/sh\nprintf 'probe\\n' >> '{}'\necho v20.0.0\n",
+            probes.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(std::iter::once(bin_dir).chain(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    )))
+    .unwrap();
+
+    for _ in 0..2 {
+        lpm(&project)
+            .env("PATH", &path)
+            .env("LPM_TEST_NODE_BINARY", &node)
+            .args(["run", "hello"])
+            .assert()
+            .success();
+    }
+
+    let probe_count = std::fs::read_to_string(&probes)
+        .unwrap_or_default()
+        .lines()
+        .count();
+    assert_eq!(probe_count, 1, "the second run probed Node again");
+}
+
+#[cfg(unix)]
+#[test]
 fn run_prefers_path_node_over_compatible_installed_managed_runtime() {
     let project = node_version_project(">=18");
     install_fake_managed_node(&project, "18.0.0");

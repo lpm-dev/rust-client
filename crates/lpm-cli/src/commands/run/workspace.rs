@@ -503,7 +503,7 @@ pub async fn run_workspace(
     }
     let runnable_members: Vec<bool> = member_task_plans.iter().map(Option::is_some).collect();
     let mut member_runtime_hints = vec![Arc::clone(&root_hint); ws_graph.members.len()];
-    let mut node_versions = lpm_runtime::effective::PathNodeVersionCache::default();
+    let mut node_versions = crate::engine_check::path_node_versions();
     for idx in levels
         .iter()
         .flatten()

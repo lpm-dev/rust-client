@@ -126,11 +126,11 @@ pub(crate) fn is_up_to_date(
     if !extensions.is_empty() || !skills_ready {
         return Ok(false);
     }
-    let engine_policy = crate::engine_check::prepare_dependency_policy_with_observed_node(
+    let engine_policy = crate::engine_check::prepare_dependency_policy_reusing(
         project_dir,
         false,
         json_output,
-        cached_engine.observed_node(),
+        crate::engine_check::NodeVersionReuse::recorded(cached_engine.observed_node()),
     )?;
     // The saved key only admits a candidate. Node launchers still run before
     // success; a changed version re-enters optional filtering.
