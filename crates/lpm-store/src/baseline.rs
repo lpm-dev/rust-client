@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lpm_common::LpmError;
 
@@ -88,7 +89,14 @@ pub struct V2BaselineIndex {
     graph_digest_by_package_dir: HashMap<PathBuf, (String, Arc<InstalledPackageBaseline>)>,
 }
 
+static PROJECT_INDEX_BUILDS: AtomicU64 = AtomicU64::new(0);
+
 impl V2BaselineIndex {
+    /// Project indexes this process has built with [`Self::for_project`].
+    pub fn project_index_builds() -> u64 {
+        PROJECT_INDEX_BUILDS.load(Ordering::Relaxed)
+    }
+
     /// Build a project-scoped index by walking only the link entries
     /// the project's `<project>/node_modules/` tree actually points
     /// at, BFS'd through each entry's `LinkMeta.deps` to cover
@@ -126,6 +134,7 @@ impl V2BaselineIndex {
     /// through to the v1 lookup on miss — same behavior as a
     /// freshly-built [`Self::build`] empty index.
     pub fn for_project(project_dir: &Path, lpm_root: &lpm_common::LpmRoot) -> Self {
+        PROJECT_INDEX_BUILDS.fetch_add(1, Ordering::Relaxed);
         let mut merged = Self::default();
         for version in [crate::StoreVersion::V2, crate::StoreVersion::V3] {
             let store = crate::v2::Store::from_lpm_root_for_version(lpm_root, version);

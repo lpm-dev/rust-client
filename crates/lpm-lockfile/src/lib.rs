@@ -17,6 +17,7 @@ pub mod binary;
 mod error;
 mod io;
 mod model;
+mod parse_cache;
 pub mod source;
 
 pub use binary::{BINARY_LOCKFILE_NAME, BinaryLockfileReader};
@@ -32,6 +33,7 @@ pub use model::{
     LockedRegistrySignature, LockedRootResolution, Lockfile, LockfileMetadata, LockfilePatch,
     LockfilePatches, PackageKey, RootResolutions, ValidatedLockfile, is_safe_source,
 };
+pub use parse_cache::{ParseCacheStats, parse_cache_stats};
 pub use source::{Source, SourceParseError, safe_source_identity};
 
 /// Maximum accepted size of the authoritative human-readable lockfile.

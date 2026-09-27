@@ -458,6 +458,7 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
                         wf_setup_install_state_ms.saturating_add(wf_setup_route_table_ms),
                     ),
                 },
+                "lockfile": lockfile_parse_detail_json(),
                 "metadata": metadata_detail_json_from_snapshots(
                     metadata_snapshots,
                     timing_detail_mode,
@@ -494,6 +495,7 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
                     "v2_one": v2_link_task_timings.to_json(wf_link_await_ms),
                 },
                 "tail": {
+                    "baseline_index_build_count": lpm_store::V2BaselineIndex::project_index_builds(),
                     "blocked_metadata_ms": wf_tail_blocked_metadata_ms,
                     "trust_snapshot_ms": wf_tail_trust_snapshot_ms,
                     "lockfile_write_ms": wf_tail_lockfile_write_ms,

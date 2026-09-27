@@ -8,6 +8,34 @@ use lpm_store::PackageStore;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+/// Trust predicate for a project that is its own policy root.
+#[allow(clippy::too_many_arguments)]
+fn all_scripted_packages_trusted(
+    lpm_root: &lpm_common::LpmRoot,
+    packages: &[(String, String, Option<String>)],
+    policy: &lpm_security::SecurityPolicy,
+    project_dir: &Path,
+    effective_policy: crate::script_policy_config::ScriptPolicy,
+    force_security_floor: bool,
+    requested_capabilities: &crate::capability::CapabilitySet,
+    user_bound: &crate::capability::UserBound,
+    advisor_approvals: Option<&HashSet<crate::triage_advisor_session::AdvisorApprovalKey>>,
+) -> bool {
+    all_scripted_packages_trusted_in_context(
+        lpm_root,
+        packages,
+        policy,
+        project_dir,
+        project_dir,
+        effective_policy,
+        force_security_floor,
+        requested_capabilities,
+        user_bound,
+        advisor_approvals,
+        None,
+    )
+}
+
 fn write_store_package(
     store: &PackageStore,
     name: &str,

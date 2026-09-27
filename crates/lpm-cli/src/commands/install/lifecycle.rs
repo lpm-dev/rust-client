@@ -407,6 +407,7 @@ pub(super) async fn run_online_lifecycle_prepare_phase(
             &requested_capabilities,
             &user_bound,
             advisor_session.as_ref().map(|s| s.approvals()),
+            baseline_index.as_ref(),
         );
     let auto_build_attempted = should_auto_build(
         auto_build,

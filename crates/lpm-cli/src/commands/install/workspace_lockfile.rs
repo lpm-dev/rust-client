@@ -907,7 +907,7 @@ pub(crate) fn read_metadata_shared(
                 .coordinator
                 .projection_metadata_shared(&target.importer)
         })
-        .unwrap_or_else(|_| lpm_lockfile::Lockfile::read_fast(fallback_path).map(Arc::new))
+        .unwrap_or_else(|_| lpm_lockfile::Lockfile::read_shared(fallback_path))
 }
 
 pub(crate) fn read_full_shared(
@@ -920,7 +920,7 @@ pub(crate) fn read_full_shared(
                 .projection(&target.importer)
                 .map(Arc::new)
         })
-        .unwrap_or_else(|_| lpm_lockfile::Lockfile::read_fast(fallback_path).map(Arc::new))
+        .unwrap_or_else(|_| lpm_lockfile::Lockfile::read_shared(fallback_path))
 }
 
 pub(crate) fn with_package_rows<R>(
@@ -934,7 +934,7 @@ pub(crate) fn with_package_rows<R>(
                 .with_projection_packages(&target.importer, inspect)
         });
     }
-    let lockfile = Arc::new(lpm_lockfile::Lockfile::read_fast(fallback_path)?);
+    let lockfile = lpm_lockfile::Lockfile::read_shared(fallback_path)?;
     let packages = lockfile.packages.iter().collect::<Vec<_>>();
     Ok(inspect(Arc::clone(&lockfile), &packages))
 }
