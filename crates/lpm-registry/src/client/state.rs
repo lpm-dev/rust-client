@@ -500,7 +500,9 @@ pub struct RegistryClient {
 pub(super) struct CachedClient {
     pub(super) client: reqwest::Client,
     pub(super) policy_metadata_client: reqwest::Client,
-    pub(super) manual_redirect_client: reqwest::Client,
+    /// Redirect-disabled clients that carry registry requests in turn, each
+    /// with its own connection pool. Never empty.
+    pub(super) request_lanes: Arc<[reqwest::Client]>,
     pub(super) identity_fp: Option<Arc<str>>,
 }
 
@@ -552,4 +554,5 @@ pub struct HttpClients {
     pub(super) global_identity: Option<Arc<LoadedIdentity>>,
     pub(super) tls_material_budget: Arc<TlsMaterialBudget>,
     pub(super) per_origin_identity_certs: HashMap<OriginKey, LazyIdentityCert>,
+    pub(super) next_request_lane: std::sync::atomic::AtomicUsize,
 }

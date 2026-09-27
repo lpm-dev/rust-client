@@ -119,7 +119,7 @@ async fn release_time_redirects_reselect_the_destination_policy_pool() {
             CachedClient {
                 client: marked_client("target-general"),
                 policy_metadata_client: marked_client("target-policy"),
-                manual_redirect_client: marked_client("target-manual"),
+                request_lanes: std::sync::Arc::from([marked_client("target-manual")]),
                 identity_fp: None,
             },
         );

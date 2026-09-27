@@ -1,0 +1,1390 @@
+{
+  "date": "2026-09-25",
+  "fixture": "t3-install",
+  "state": "first-install",
+  "phase1_matrix": {
+    "rtt0": {
+      "shared": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 2479.2,
+        "p95_ms": 2891.5,
+        "connections": 34.0,
+        "busy_connections": 1.0,
+        "largest_share": 1.0
+      },
+      "split": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 2306.0,
+        "p95_ms": 2385.8,
+        "paired_ms": -239.3,
+        "faster": "11/12",
+        "connections": 51.5,
+        "busy_connections": 2.0,
+        "largest_share": 0.78
+      },
+      "spread-2": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 2250.5,
+        "p95_ms": 2567.2,
+        "paired_ms": -167.1,
+        "faster": "10/12",
+        "connections": 50.0,
+        "busy_connections": 3.0,
+        "largest_share": 0.64
+      },
+      "spread-4": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 2170.2,
+        "p95_ms": 2773.5,
+        "paired_ms": -316.3,
+        "faster": "10/12",
+        "connections": 51.0,
+        "busy_connections": 5.0,
+        "largest_share": 0.36
+      },
+      "large-8mib": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 2293.8,
+        "p95_ms": 2600.1,
+        "paired_ms": -155.7,
+        "faster": "11/12",
+        "connections": 35.0,
+        "busy_connections": 2.0,
+        "largest_share": 0.71
+      },
+      "h1-pool": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 2056.6,
+        "p95_ms": 2551.6,
+        "paired_ms": -502.1,
+        "faster": "11/12",
+        "connections": 152.0,
+        "busy_connections": 24.0,
+        "largest_share": 0.27
+      }
+    },
+    "rtt100-6m": {
+      "shared": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 8487.0,
+        "p95_ms": 13042.7,
+        "connections": 34.0,
+        "busy_connections": 1.0,
+        "largest_share": 1.0
+      },
+      "split": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 8550.6,
+        "p95_ms": 16127.5,
+        "paired_ms": 207.3,
+        "faster": "5/12",
+        "connections": 53.0,
+        "busy_connections": 2.0,
+        "largest_share": 0.78
+      },
+      "spread-2": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 9049.6,
+        "p95_ms": 11362.7,
+        "paired_ms": -457.7,
+        "faster": "7/12",
+        "connections": 47.0,
+        "busy_connections": 3.0,
+        "largest_share": 0.53
+      },
+      "spread-4": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 8617.5,
+        "p95_ms": 11488.1,
+        "paired_ms": -453.4,
+        "faster": "7/12",
+        "connections": 58.0,
+        "busy_connections": 5.0,
+        "largest_share": 0.39
+      },
+      "large-8mib": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 8608.8,
+        "p95_ms": 16544.5,
+        "paired_ms": 433.5,
+        "faster": "5/12",
+        "connections": 36.0,
+        "busy_connections": 2.0,
+        "largest_share": 0.71
+      },
+      "h1-pool": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 4613.5,
+        "p95_ms": 9538.3,
+        "paired_ms": -3396.3,
+        "faster": "11/12",
+        "connections": 146.5,
+        "busy_connections": 24.0,
+        "largest_share": 0.27
+      }
+    },
+    "rtt100": {
+      "shared": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 12439.1,
+        "p95_ms": 14096.5,
+        "connections": 34.0,
+        "busy_connections": 1.0,
+        "largest_share": 1.0
+      },
+      "split": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 10874.7,
+        "p95_ms": 14979.0,
+        "paired_ms": -302.1,
+        "faster": "6/12",
+        "connections": 54.0,
+        "busy_connections": 2.0,
+        "largest_share": 0.78
+      },
+      "spread-2": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 8878.3,
+        "p95_ms": 10317.1,
+        "paired_ms": -3006.2,
+        "faster": "12/12",
+        "connections": 57.5,
+        "busy_connections": 3.0,
+        "largest_share": 0.55
+      },
+      "spread-4": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 7130.7,
+        "p95_ms": 12090.9,
+        "paired_ms": -4627.0,
+        "faster": "11/12",
+        "connections": 55.0,
+        "busy_connections": 5.0,
+        "largest_share": 0.36
+      },
+      "large-8mib": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 10239.1,
+        "p95_ms": 13012.1,
+        "paired_ms": -1077.8,
+        "faster": "10/12",
+        "connections": 36.0,
+        "busy_connections": 2.0,
+        "largest_share": 0.71
+      },
+      "h1-pool": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 5489.4,
+        "p95_ms": 8005.8,
+        "paired_ms": -6392.4,
+        "faster": "12/12",
+        "connections": 130.0,
+        "busy_connections": 23.5,
+        "largest_share": 0.27
+      }
+    },
+    "rtt20": {
+      "shared": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 3359.6,
+        "p95_ms": 4324.7,
+        "connections": 34.0,
+        "busy_connections": 1.0,
+        "largest_share": 1.0
+      },
+      "split": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 3355.7,
+        "p95_ms": 11365.5,
+        "paired_ms": -151.3,
+        "faster": "8/12",
+        "connections": 53.0,
+        "busy_connections": 2.0,
+        "largest_share": 0.78
+      },
+      "spread-2": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 3193.5,
+        "p95_ms": 5642.0,
+        "paired_ms": -238.0,
+        "faster": "8/12",
+        "connections": 54.0,
+        "busy_connections": 3.0,
+        "largest_share": 0.58
+      },
+      "spread-4": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 3267.6,
+        "p95_ms": 4858.2,
+        "paired_ms": -89.2,
+        "faster": "7/12",
+        "connections": 52.5,
+        "busy_connections": 5.0,
+        "largest_share": 0.36
+      },
+      "large-8mib": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 3537.0,
+        "p95_ms": 6720.3,
+        "paired_ms": 188.5,
+        "faster": "4/12",
+        "connections": 36.0,
+        "busy_connections": 2.0,
+        "largest_share": 0.71
+      },
+      "h1-pool": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 2578.8,
+        "p95_ms": 3159.6,
+        "paired_ms": -991.2,
+        "faster": "12/12",
+        "connections": 128.5,
+        "busy_connections": 24.5,
+        "largest_share": 0.27
+      }
+    },
+    "rtt50-100mbit": {
+      "shared": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 14869.6,
+        "p95_ms": 15476.4,
+        "connections": 34.0,
+        "busy_connections": 1.0,
+        "largest_share": 1.0
+      },
+      "split": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 15102.3,
+        "p95_ms": 15489.0,
+        "paired_ms": 203.5,
+        "faster": "4/12",
+        "connections": 53.0,
+        "busy_connections": 2.0,
+        "largest_share": 0.78
+      },
+      "spread-2": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 14795.9,
+        "p95_ms": 15417.8,
+        "paired_ms": 25.0,
+        "faster": "6/12",
+        "connections": 47.0,
+        "busy_connections": 3.0,
+        "largest_share": 0.58
+      },
+      "spread-4": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 14912.6,
+        "p95_ms": 15166.3,
+        "paired_ms": 48.0,
+        "faster": "5/12",
+        "connections": 54.0,
+        "busy_connections": 5.0,
+        "largest_share": 0.4
+      },
+      "large-8mib": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 14935.0,
+        "p95_ms": 15417.5,
+        "paired_ms": -143.4,
+        "faster": "8/12",
+        "connections": 36.0,
+        "busy_connections": 2.0,
+        "largest_share": 0.71
+      },
+      "h1-pool": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 13309.4,
+        "p95_ms": 16777.3,
+        "paired_ms": -1341.4,
+        "faster": "10/12",
+        "connections": 120.0,
+        "busy_connections": 24.0,
+        "largest_share": 0.27
+      }
+    },
+    "rtt50-6m": {
+      "shared": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 5124.8,
+        "p95_ms": 7953.6,
+        "connections": 34.0,
+        "busy_connections": 1.0,
+        "largest_share": 1.0
+      },
+      "split": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 4950.9,
+        "p95_ms": 7514.3,
+        "paired_ms": -363.1,
+        "faster": "8/12",
+        "connections": 58.0,
+        "busy_connections": 2.0,
+        "largest_share": 0.78
+      },
+      "spread-2": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 5559.4,
+        "p95_ms": 6637.5,
+        "paired_ms": -109.7,
+        "faster": "6/12",
+        "connections": 57.0,
+        "busy_connections": 3.0,
+        "largest_share": 0.59
+      },
+      "spread-4": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 5856.5,
+        "p95_ms": 8983.2,
+        "paired_ms": 1036.5,
+        "faster": "5/12",
+        "connections": 57.5,
+        "busy_connections": 5.0,
+        "largest_share": 0.39
+      },
+      "large-8mib": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 5566.7,
+        "p95_ms": 6270.2,
+        "paired_ms": -45.4,
+        "faster": "7/12",
+        "connections": 36.0,
+        "busy_connections": 2.0,
+        "largest_share": 0.71
+      },
+      "h1-pool": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 4251.4,
+        "p95_ms": 5092.9,
+        "paired_ms": -1707.2,
+        "faster": "11/12",
+        "connections": 141.0,
+        "busy_connections": 24.0,
+        "largest_share": 0.27
+      }
+    },
+    "rtt50": {
+      "shared": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 5748.2,
+        "p95_ms": 10397.9,
+        "connections": 34.0,
+        "busy_connections": 1.0,
+        "largest_share": 1.0
+      },
+      "split": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 5663.0,
+        "p95_ms": 7204.0,
+        "paired_ms": -406.9,
+        "faster": "8/12",
+        "connections": 54.0,
+        "busy_connections": 2.0,
+        "largest_share": 0.78
+      },
+      "spread-2": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 5187.6,
+        "p95_ms": 9970.7,
+        "paired_ms": -844.8,
+        "faster": "9/12",
+        "connections": 54.5,
+        "busy_connections": 3.0,
+        "largest_share": 0.43
+      },
+      "spread-4": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 4699.4,
+        "p95_ms": 6993.1,
+        "paired_ms": -1328.1,
+        "faster": "9/12",
+        "connections": 53.0,
+        "busy_connections": 5.0,
+        "largest_share": 0.36
+      },
+      "large-8mib": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 5514.4,
+        "p95_ms": 7995.1,
+        "paired_ms": -522.9,
+        "faster": "8/12",
+        "connections": 36.0,
+        "busy_connections": 2.0,
+        "largest_share": 0.71
+      },
+      "h1-pool": {
+        "n": 12,
+        "failed": 0,
+        "median_ms": 3224.7,
+        "p95_ms": 5377.9,
+        "paired_ms": -2187.8,
+        "faster": "11/12",
+        "connections": 135.0,
+        "busy_connections": 24.0,
+        "largest_share": 0.27
+      }
+    }
+  },
+  "diagnostics": {
+    "p2-rtt0-lowat": {
+      "shared": {
+        "n": 10,
+        "median_ms": 2365,
+        "p95_ms": 2474,
+        "resolve_ms": 1212,
+        "fetch_ms": 434,
+        "server_retransmits": 10.0,
+        "connections": 34.0,
+        "busy": 1.0
+      },
+      "spread-4": {
+        "n": 10,
+        "median_ms": 2100,
+        "p95_ms": 2556,
+        "resolve_ms": 688,
+        "fetch_ms": 892,
+        "server_retransmits": 38.0,
+        "connections": 53.0,
+        "busy": 5.0,
+        "paired_ms": -176,
+        "faster": "8/10"
+      },
+      "h1-pool": {
+        "n": 10,
+        "median_ms": 2088,
+        "p95_ms": 2212,
+        "resolve_ms": 620,
+        "fetch_ms": 739,
+        "server_retransmits": 101.5,
+        "connections": 140.5,
+        "busy": 23.5,
+        "paired_ms": -262,
+        "faster": "10/10"
+      },
+      "spread-all-4": {
+        "n": 10,
+        "median_ms": 2201,
+        "p95_ms": 2439,
+        "resolve_ms": 935,
+        "fetch_ms": 684,
+        "server_retransmits": 37.5,
+        "connections": 34.0,
+        "busy": 4.0,
+        "paired_ms": -199,
+        "faster": "6/10"
+      },
+      "spread-all-8": {
+        "n": 10,
+        "median_ms": 2212,
+        "p95_ms": 2525,
+        "resolve_ms": 812,
+        "fetch_ms": 720,
+        "server_retransmits": 53.0,
+        "connections": 34.0,
+        "busy": 8.0,
+        "paired_ms": -101,
+        "faster": "7/10"
+      }
+    },
+    "p2-rtt100-lowat": {
+      "shared": {
+        "n": 10,
+        "median_ms": 10396,
+        "p95_ms": 15315,
+        "resolve_ms": 8226,
+        "fetch_ms": 1382,
+        "server_retransmits": 51.5,
+        "connections": 34.0,
+        "busy": 1.0
+      },
+      "spread-4": {
+        "n": 10,
+        "median_ms": 7805,
+        "p95_ms": 9979,
+        "resolve_ms": 3629,
+        "fetch_ms": 2822,
+        "server_retransmits": 51.0,
+        "connections": 54.0,
+        "busy": 5.0,
+        "paired_ms": -2662,
+        "faster": "10/10"
+      },
+      "h1-pool": {
+        "n": 10,
+        "median_ms": 4884,
+        "p95_ms": 8547,
+        "resolve_ms": 2850,
+        "fetch_ms": 1788,
+        "server_retransmits": 124.5,
+        "connections": 134.0,
+        "busy": 24.0,
+        "paired_ms": -4896,
+        "faster": "10/10"
+      },
+      "spread-all-4": {
+        "n": 10,
+        "median_ms": 6042,
+        "p95_ms": 7989,
+        "resolve_ms": 3454,
+        "fetch_ms": 2071,
+        "server_retransmits": 49.5,
+        "connections": 34.0,
+        "busy": 4.0,
+        "paired_ms": -4206,
+        "faster": "10/10"
+      },
+      "spread-all-8": {
+        "n": 10,
+        "median_ms": 5493,
+        "p95_ms": 7685,
+        "resolve_ms": 2650,
+        "fetch_ms": 2217,
+        "server_retransmits": 45.0,
+        "connections": 34.0,
+        "busy": 8.0,
+        "paired_ms": -4237,
+        "faster": "10/10"
+      }
+    },
+    "p2-rtt20-lowat": {
+      "shared": {
+        "n": 10,
+        "median_ms": 3155,
+        "p95_ms": 3747,
+        "resolve_ms": 2102,
+        "fetch_ms": 605,
+        "server_retransmits": 38.0,
+        "connections": 34.0,
+        "busy": 1.0
+      },
+      "spread-4": {
+        "n": 10,
+        "median_ms": 3022,
+        "p95_ms": 4051,
+        "resolve_ms": 1053,
+        "fetch_ms": 1458,
+        "server_retransmits": 62.5,
+        "connections": 54.0,
+        "busy": 5.0,
+        "paired_ms": -252,
+        "faster": "6/10"
+      },
+      "h1-pool": {
+        "n": 10,
+        "median_ms": 2462,
+        "p95_ms": 2673,
+        "resolve_ms": 898,
+        "fetch_ms": 1238,
+        "server_retransmits": 133.0,
+        "connections": 131.0,
+        "busy": 24.5,
+        "paired_ms": -803,
+        "faster": "10/10"
+      },
+      "spread-all-4": {
+        "n": 10,
+        "median_ms": 2786,
+        "p95_ms": 3424,
+        "resolve_ms": 1372,
+        "fetch_ms": 879,
+        "server_retransmits": 42.0,
+        "connections": 34.0,
+        "busy": 4.0,
+        "paired_ms": -273,
+        "faster": "7/10"
+      },
+      "spread-all-8": {
+        "n": 10,
+        "median_ms": 2707,
+        "p95_ms": 3223,
+        "resolve_ms": 1247,
+        "fetch_ms": 878,
+        "server_retransmits": 48.0,
+        "connections": 34.0,
+        "busy": 8.0,
+        "paired_ms": -404,
+        "faster": "8/10"
+      }
+    },
+    "p2-rtt50-bigbuf": {
+      "shared": {
+        "n": 10,
+        "median_ms": 6058,
+        "p95_ms": 12272,
+        "resolve_ms": 4696,
+        "fetch_ms": 1006,
+        "server_retransmits": 5.5,
+        "connections": 34.0,
+        "busy": 1.0
+      },
+      "spread-4": {
+        "n": 10,
+        "median_ms": 5963,
+        "p95_ms": 9936,
+        "resolve_ms": 3638,
+        "fetch_ms": 1938,
+        "server_retransmits": 17.0,
+        "connections": 53.0,
+        "busy": 5.0,
+        "paired_ms": 194,
+        "faster": "5/10"
+      },
+      "h1-pool": {
+        "n": 10,
+        "median_ms": 3596,
+        "p95_ms": 4512,
+        "resolve_ms": 1702,
+        "fetch_ms": 1588,
+        "server_retransmits": 93.5,
+        "connections": 159.0,
+        "busy": 25.0,
+        "paired_ms": -2580,
+        "faster": "10/10"
+      },
+      "spread-all-4": {
+        "n": 10,
+        "median_ms": 4746,
+        "p95_ms": 6929,
+        "resolve_ms": 2882,
+        "fetch_ms": 1198,
+        "server_retransmits": 18.5,
+        "connections": 34.0,
+        "busy": 4.0,
+        "paired_ms": -1097,
+        "faster": "9/10"
+      },
+      "spread-all-8": {
+        "n": 10,
+        "median_ms": 3569,
+        "p95_ms": 4591,
+        "resolve_ms": 1928,
+        "fetch_ms": 1226,
+        "server_retransmits": 23.5,
+        "connections": 34.0,
+        "busy": 8.0,
+        "paired_ms": -2435,
+        "faster": "10/10"
+      }
+    },
+    "p2-rtt50-default": {
+      "shared": {
+        "n": 10,
+        "median_ms": 5783,
+        "p95_ms": 8293,
+        "resolve_ms": 4618,
+        "fetch_ms": 882,
+        "server_retransmits": 25.0,
+        "connections": 34.0,
+        "busy": 1.0
+      },
+      "spread-4": {
+        "n": 10,
+        "median_ms": 5301,
+        "p95_ms": 7242,
+        "resolve_ms": 2800,
+        "fetch_ms": 1717,
+        "server_retransmits": 22.5,
+        "connections": 54.5,
+        "busy": 5.0,
+        "paired_ms": -999,
+        "faster": "8/10"
+      },
+      "h1-pool": {
+        "n": 10,
+        "median_ms": 3236,
+        "p95_ms": 4868,
+        "resolve_ms": 1682,
+        "fetch_ms": 1270,
+        "server_retransmits": 95.0,
+        "connections": 145.5,
+        "busy": 24.0,
+        "paired_ms": -2690,
+        "faster": "10/10"
+      },
+      "spread-all-4": {
+        "n": 10,
+        "median_ms": 3844,
+        "p95_ms": 5904,
+        "resolve_ms": 2118,
+        "fetch_ms": 1302,
+        "server_retransmits": 19.5,
+        "connections": 34.0,
+        "busy": 4.0,
+        "paired_ms": -1965,
+        "faster": "9/10"
+      },
+      "spread-all-8": {
+        "n": 10,
+        "median_ms": 3612,
+        "p95_ms": 4677,
+        "resolve_ms": 1846,
+        "fetch_ms": 1375,
+        "server_retransmits": 22.5,
+        "connections": 34.0,
+        "busy": 8.0,
+        "paired_ms": -2262,
+        "faster": "10/10"
+      }
+    },
+    "p2-rtt50-lowat": {
+      "shared": {
+        "n": 10,
+        "median_ms": 6981,
+        "p95_ms": 9332,
+        "resolve_ms": 5664,
+        "fetch_ms": 870,
+        "server_retransmits": 69.5,
+        "connections": 34.0,
+        "busy": 1.0
+      },
+      "spread-4": {
+        "n": 10,
+        "median_ms": 5633,
+        "p95_ms": 7136,
+        "resolve_ms": 2794,
+        "fetch_ms": 2217,
+        "server_retransmits": 65.5,
+        "connections": 53.0,
+        "busy": 5.0,
+        "paired_ms": -1267,
+        "faster": "10/10"
+      },
+      "h1-pool": {
+        "n": 10,
+        "median_ms": 3432,
+        "p95_ms": 5058,
+        "resolve_ms": 1632,
+        "fetch_ms": 1339,
+        "server_retransmits": 141.0,
+        "connections": 141.5,
+        "busy": 24.0,
+        "paired_ms": -3616,
+        "faster": "10/10"
+      },
+      "spread-all-4": {
+        "n": 10,
+        "median_ms": 4788,
+        "p95_ms": 6566,
+        "resolve_ms": 3123,
+        "fetch_ms": 1166,
+        "server_retransmits": 52.5,
+        "connections": 34.0,
+        "busy": 4.0,
+        "paired_ms": -2481,
+        "faster": "10/10"
+      },
+      "spread-all-8": {
+        "n": 10,
+        "median_ms": 4559,
+        "p95_ms": 5290,
+        "resolve_ms": 2134,
+        "fetch_ms": 1510,
+        "server_retransmits": 58.0,
+        "connections": 34.0,
+        "busy": 8.0,
+        "paired_ms": -2687,
+        "faster": "10/10"
+      }
+    },
+    "p3-rtt100-lowat": {
+      "shared": {
+        "n": 10,
+        "median_ms": 10153,
+        "p95_ms": 13452,
+        "resolve_ms": 8100,
+        "fetch_ms": 1376,
+        "server_retransmits": 57.5,
+        "connections": 34.0,
+        "busy": 1.0
+      },
+      "h1-pool": {
+        "n": 10,
+        "median_ms": 4582,
+        "p95_ms": 5009,
+        "resolve_ms": 2978,
+        "fetch_ms": 1338,
+        "server_retransmits": 116.5,
+        "connections": 133.5,
+        "busy": 24.0,
+        "paired_ms": -5451,
+        "faster": "10/10"
+      },
+      "spread-all-8": {
+        "n": 10,
+        "median_ms": 5627,
+        "p95_ms": 8830,
+        "resolve_ms": 2745,
+        "fetch_ms": 2106,
+        "server_retransmits": 51.0,
+        "connections": 34.0,
+        "busy": 8.0,
+        "paired_ms": -4548,
+        "faster": "10/10"
+      },
+      "spread-all-16": {
+        "n": 10,
+        "median_ms": 5191,
+        "p95_ms": 7630,
+        "resolve_ms": 2978,
+        "fetch_ms": 2086,
+        "server_retransmits": 56.0,
+        "connections": 34.0,
+        "busy": 16.0,
+        "paired_ms": -4881,
+        "faster": "10/10"
+      },
+      "spread-all-32": {
+        "n": 10,
+        "median_ms": 5896,
+        "p95_ms": 6995,
+        "resolve_ms": 3342,
+        "fetch_ms": 2528,
+        "server_retransmits": 82.5,
+        "connections": 34.0,
+        "busy": 23.0,
+        "paired_ms": -4676,
+        "faster": "10/10"
+      }
+    },
+    "p3-rtt20-lowat": {
+      "shared": {
+        "n": 10,
+        "median_ms": 3134,
+        "p95_ms": 3928,
+        "resolve_ms": 2052,
+        "fetch_ms": 608,
+        "server_retransmits": 44.0,
+        "connections": 34.0,
+        "busy": 1.0
+      },
+      "h1-pool": {
+        "n": 10,
+        "median_ms": 2389,
+        "p95_ms": 2690,
+        "resolve_ms": 854,
+        "fetch_ms": 1148,
+        "server_retransmits": 126.0,
+        "connections": 126.0,
+        "busy": 24.0,
+        "paired_ms": -831,
+        "faster": "10/10"
+      },
+      "spread-all-8": {
+        "n": 10,
+        "median_ms": 2793,
+        "p95_ms": 4090,
+        "resolve_ms": 1141,
+        "fetch_ms": 1012,
+        "server_retransmits": 58.5,
+        "connections": 34.0,
+        "busy": 8.0,
+        "paired_ms": -445,
+        "faster": "7/10"
+      },
+      "spread-all-16": {
+        "n": 10,
+        "median_ms": 2667,
+        "p95_ms": 2870,
+        "resolve_ms": 1204,
+        "fetch_ms": 920,
+        "server_retransmits": 67.5,
+        "connections": 34.0,
+        "busy": 16.0,
+        "paired_ms": -439,
+        "faster": "10/10"
+      },
+      "spread-all-32": {
+        "n": 10,
+        "median_ms": 2783,
+        "p95_ms": 4485,
+        "resolve_ms": 1098,
+        "fetch_ms": 1096,
+        "server_retransmits": 84.5,
+        "connections": 34.0,
+        "busy": 23.0,
+        "paired_ms": -479,
+        "faster": "9/10"
+      }
+    },
+    "p3-rtt50-lowat": {
+      "shared": {
+        "n": 10,
+        "median_ms": 5616,
+        "p95_ms": 6417,
+        "resolve_ms": 4254,
+        "fetch_ms": 906,
+        "server_retransmits": 63.5,
+        "connections": 34.0,
+        "busy": 1.0
+      },
+      "h1-pool": {
+        "n": 10,
+        "median_ms": 3898,
+        "p95_ms": 5298,
+        "resolve_ms": 1626,
+        "fetch_ms": 2072,
+        "server_retransmits": 135.0,
+        "connections": 138.5,
+        "busy": 24.0,
+        "paired_ms": -1828,
+        "faster": "10/10"
+      },
+      "spread-all-8": {
+        "n": 10,
+        "median_ms": 3561,
+        "p95_ms": 4234,
+        "resolve_ms": 1819,
+        "fetch_ms": 1294,
+        "server_retransmits": 45.5,
+        "connections": 34.0,
+        "busy": 8.0,
+        "paired_ms": -2057,
+        "faster": "10/10"
+      },
+      "spread-all-16": {
+        "n": 10,
+        "median_ms": 3636,
+        "p95_ms": 4429,
+        "resolve_ms": 1956,
+        "fetch_ms": 1018,
+        "server_retransmits": 60.0,
+        "connections": 34.0,
+        "busy": 16.0,
+        "paired_ms": -1990,
+        "faster": "10/10"
+      },
+      "spread-all-32": {
+        "n": 10,
+        "median_ms": 3760,
+        "p95_ms": 5917,
+        "resolve_ms": 2025,
+        "fetch_ms": 1490,
+        "server_retransmits": 84.5,
+        "connections": 34.0,
+        "busy": 23.0,
+        "paired_ms": -1958,
+        "faster": "8/10"
+      }
+    },
+    "p4-rtt0-lowat": {
+      "shared": {
+        "n": 10,
+        "median_ms": 2347,
+        "p95_ms": 2523,
+        "resolve_ms": 1235,
+        "fetch_ms": 460,
+        "server_retransmits": 8.5,
+        "connections": 34.0,
+        "busy": 1.0
+      },
+      "h1-pool": {
+        "n": 10,
+        "median_ms": 2025,
+        "p95_ms": 2224,
+        "resolve_ms": 672,
+        "fetch_ms": 756,
+        "server_retransmits": 107.5,
+        "connections": 137.5,
+        "busy": 25.0,
+        "paired_ms": -328,
+        "faster": "10/10"
+      },
+      "spread-all-8": {
+        "n": 10,
+        "median_ms": 2248,
+        "p95_ms": 2785,
+        "resolve_ms": 958,
+        "fetch_ms": 712,
+        "server_retransmits": 55.0,
+        "connections": 34.0,
+        "busy": 8.0,
+        "paired_ms": -131,
+        "faster": "8/10"
+      },
+      "h1-fanout-48": {
+        "n": 10,
+        "median_ms": 2044,
+        "p95_ms": 2508,
+        "resolve_ms": 664,
+        "fetch_ms": 736,
+        "server_retransmits": 95.0,
+        "connections": 138.0,
+        "busy": 24.0,
+        "paired_ms": -327,
+        "faster": "9/10"
+      },
+      "h1-fanout-24": {
+        "n": 10,
+        "median_ms": 1983,
+        "p95_ms": 2171,
+        "resolve_ms": 688,
+        "fetch_ms": 678,
+        "server_retransmits": 97.5,
+        "connections": 139.0,
+        "busy": 24.5,
+        "paired_ms": -313,
+        "faster": "10/10"
+      }
+    },
+    "p4-rtt100-lowat": {
+      "shared": {
+        "n": 10,
+        "median_ms": 11112,
+        "p95_ms": 13864,
+        "resolve_ms": 9192,
+        "fetch_ms": 1348,
+        "server_retransmits": 54.5,
+        "connections": 34.0,
+        "busy": 1.0
+      },
+      "h1-pool": {
+        "n": 10,
+        "median_ms": 5302,
+        "p95_ms": 8032,
+        "resolve_ms": 2848,
+        "fetch_ms": 1664,
+        "server_retransmits": 137.5,
+        "connections": 147.5,
+        "busy": 23.5,
+        "paired_ms": -6031,
+        "faster": "10/10"
+      },
+      "spread-all-8": {
+        "n": 10,
+        "median_ms": 5747,
+        "p95_ms": 8467,
+        "resolve_ms": 4152,
+        "fetch_ms": 2065,
+        "server_retransmits": 60.5,
+        "connections": 34.0,
+        "busy": 8.0,
+        "paired_ms": -5282,
+        "faster": "10/10"
+      },
+      "h1-fanout-48": {
+        "n": 10,
+        "median_ms": 4722,
+        "p95_ms": 5919,
+        "resolve_ms": 3155,
+        "fetch_ms": 1296,
+        "server_retransmits": 135.5,
+        "connections": 166.0,
+        "busy": 24.0,
+        "paired_ms": -6189,
+        "faster": "10/10"
+      },
+      "h1-fanout-24": {
+        "n": 10,
+        "median_ms": 5358,
+        "p95_ms": 7477,
+        "resolve_ms": 3145,
+        "fetch_ms": 1824,
+        "server_retransmits": 132.5,
+        "connections": 163.0,
+        "busy": 22.0,
+        "paired_ms": -5902,
+        "faster": "10/10"
+      }
+    },
+    "p4-rtt20-lowat": {
+      "shared": {
+        "n": 10,
+        "median_ms": 3014,
+        "p95_ms": 3498,
+        "resolve_ms": 1904,
+        "fetch_ms": 521,
+        "server_retransmits": 44.5,
+        "connections": 34.0,
+        "busy": 1.0
+      },
+      "h1-pool": {
+        "n": 10,
+        "median_ms": 2477,
+        "p95_ms": 3282,
+        "resolve_ms": 886,
+        "fetch_ms": 1226,
+        "server_retransmits": 136.0,
+        "connections": 125.0,
+        "busy": 23.5,
+        "paired_ms": -620,
+        "faster": "9/10"
+      },
+      "spread-all-8": {
+        "n": 10,
+        "median_ms": 2587,
+        "p95_ms": 2896,
+        "resolve_ms": 1149,
+        "fetch_ms": 902,
+        "server_retransmits": 49.0,
+        "connections": 34.0,
+        "busy": 8.0,
+        "paired_ms": -468,
+        "faster": "10/10"
+      },
+      "h1-fanout-48": {
+        "n": 10,
+        "median_ms": 2475,
+        "p95_ms": 3886,
+        "resolve_ms": 902,
+        "fetch_ms": 1194,
+        "server_retransmits": 137.5,
+        "connections": 168.5,
+        "busy": 24.0,
+        "paired_ms": -575,
+        "faster": "8/10"
+      },
+      "h1-fanout-24": {
+        "n": 10,
+        "median_ms": 2405,
+        "p95_ms": 2871,
+        "resolve_ms": 1005,
+        "fetch_ms": 1079,
+        "server_retransmits": 132.5,
+        "connections": 164.5,
+        "busy": 24.0,
+        "paired_ms": -622,
+        "faster": "10/10"
+      }
+    },
+    "p4-rtt50-lowat": {
+      "shared": {
+        "n": 10,
+        "median_ms": 5969,
+        "p95_ms": 11265,
+        "resolve_ms": 4796,
+        "fetch_ms": 848,
+        "server_retransmits": 67.0,
+        "connections": 34.0,
+        "busy": 1.0
+      },
+      "h1-pool": {
+        "n": 10,
+        "median_ms": 3330,
+        "p95_ms": 4633,
+        "resolve_ms": 1596,
+        "fetch_ms": 1173,
+        "server_retransmits": 135.5,
+        "connections": 139.5,
+        "busy": 24.5,
+        "paired_ms": -2849,
+        "faster": "10/10"
+      },
+      "spread-all-8": {
+        "n": 10,
+        "median_ms": 3673,
+        "p95_ms": 4820,
+        "resolve_ms": 1862,
+        "fetch_ms": 1348,
+        "server_retransmits": 41.0,
+        "connections": 34.0,
+        "busy": 8.0,
+        "paired_ms": -2494,
+        "faster": "10/10"
+      },
+      "h1-fanout-48": {
+        "n": 10,
+        "median_ms": 3583,
+        "p95_ms": 4235,
+        "resolve_ms": 1698,
+        "fetch_ms": 1697,
+        "server_retransmits": 134.5,
+        "connections": 148.0,
+        "busy": 24.0,
+        "paired_ms": -2499,
+        "faster": "10/10"
+      },
+      "h1-fanout-24": {
+        "n": 10,
+        "median_ms": 3134,
+        "p95_ms": 4102,
+        "resolve_ms": 1591,
+        "fetch_ms": 1146,
+        "server_retransmits": 131.5,
+        "connections": 159.0,
+        "busy": 24.0,
+        "paired_ms": -2828,
+        "faster": "10/10"
+      }
+    },
+    "p5-rtt0-lowat": {
+      "baseline": {
+        "n": 16,
+        "median_ms": 2521,
+        "p95_ms": 3097,
+        "resolve_ms": 1232,
+        "fetch_ms": 454,
+        "server_retransmits": 10.0,
+        "connections": 34.0,
+        "busy": 1.0
+      },
+      "lanes": {
+        "n": 16,
+        "median_ms": 2459,
+        "p95_ms": 2911,
+        "resolve_ms": 968,
+        "fetch_ms": 682,
+        "server_retransmits": 56.5,
+        "connections": 34.0,
+        "busy": 8.0,
+        "paired_ms": -60,
+        "faster": "8/16"
+      }
+    },
+    "p5-rtt100-lowat": {
+      "baseline": {
+        "n": 16,
+        "median_ms": 11227,
+        "p95_ms": 15134,
+        "resolve_ms": 9653,
+        "fetch_ms": 1336,
+        "server_retransmits": 60.0,
+        "connections": 34.0,
+        "busy": 1.0
+      },
+      "lanes": {
+        "n": 16,
+        "median_ms": 5883,
+        "p95_ms": 8237,
+        "resolve_ms": 3553,
+        "fetch_ms": 2002,
+        "server_retransmits": 52.5,
+        "connections": 34.0,
+        "busy": 8.0,
+        "paired_ms": -5637,
+        "faster": "16/16"
+      }
+    },
+    "p5-rtt20-lowat": {
+      "baseline": {
+        "n": 16,
+        "median_ms": 3062,
+        "p95_ms": 3937,
+        "resolve_ms": 1918,
+        "fetch_ms": 654,
+        "server_retransmits": 48.5,
+        "connections": 34.0,
+        "busy": 1.0
+      },
+      "lanes": {
+        "n": 16,
+        "median_ms": 2651,
+        "p95_ms": 3056,
+        "resolve_ms": 1146,
+        "fetch_ms": 896,
+        "server_retransmits": 50.0,
+        "connections": 34.0,
+        "busy": 8.0,
+        "paired_ms": -441,
+        "faster": "15/16"
+      }
+    },
+    "p5-rtt50-lowat": {
+      "baseline": {
+        "n": 16,
+        "median_ms": 6166,
+        "p95_ms": 8126,
+        "resolve_ms": 4640,
+        "fetch_ms": 868,
+        "server_retransmits": 64.5,
+        "connections": 34.0,
+        "busy": 1.0
+      },
+      "lanes": {
+        "n": 16,
+        "median_ms": 3594,
+        "p95_ms": 5813,
+        "resolve_ms": 1909,
+        "fetch_ms": 1063,
+        "server_retransmits": 46.0,
+        "connections": 34.0,
+        "busy": 8.0,
+        "paired_ms": -2494,
+        "faster": "16/16"
+      }
+    }
+  },
+  "calibration": {
+    "calib0": "one connection, sequential x4 (bytes/s):\n64246028\n114383796\n116191726\n113861870\n2 parallel connections: 107.0 MB/s aggregate\n4 parallel connections: 113.5 MB/s aggregate\n",
+    "calib100": "one connection, sequential x4 (bytes/s):\n1495073\n18556535\n19390454\n19212587\n2 parallel connections: 9.8 MB/s aggregate\n4 parallel connections: 49.6 MB/s aggregate\n"
+  },
+  "live": {
+    "live-rows-baseline-lanes.json": {
+      "baseline": {
+        "n": 16,
+        "median_ms": 1868,
+        "resolve_median_ms": 1049.5
+      },
+      "lanes": {
+        "n": 16,
+        "median_ms": 1818,
+        "resolve_median_ms": 1178.5
+      }
+    },
+    "live-rows.json": {
+      "h1-pool": {
+        "n": 12,
+        "median_ms": 2188,
+        "resolve_median_ms": 1064.0
+      },
+      "shared": {
+        "n": 12,
+        "median_ms": 2222,
+        "resolve_median_ms": 1149.0
+      },
+      "spread-all-8": {
+        "n": 12,
+        "median_ms": 2023,
+        "resolve_median_ms": 1039.0
+      }
+    }
+  },
+  "binaries": {
+    "lpm-exp": "8310d0c01f0876fedc056ba26ff650619f1afce223e2cf75afbd94302b24362d",
+    "lpm-exp-macos": "edbae32c6824011b812679003801041dd926db48540f64e59b482db31cc6a889",
+    "lpm-exp-phase1": "ee0e5397013e5511fab6f5289d787f7013930802b76fc4982cdc176a3645dd3f",
+    "lpm-linux-base": "308e76d999f9de2896055ee06f16c8b17f1f5aa221e8d05d4fd3cc092052570d",
+    "lpm-linux-lanes": "371364251980acf6e56b2720b55751a01203d4a855248c858eb2725d85a2b1d9",
+    "lpm-macos-lanes": "31dcb2efc81681199f79c8eb90cadb8b6dedc6087941783416faec7f2fffb01d"
+  }
+}
