@@ -1477,7 +1477,11 @@ impl Store {
                     lpm_extractor::extract_tarball_digests(bytes, tmp_dir)
                 }
                 TarballInput::File(reader) if stream_file => {
-                    lpm_extractor::extract_tarball_from_reader_streaming_digests(reader, tmp_dir)
+                    lpm_extractor::extract_tarball_from_reader_pipelined_digests(
+                        reader,
+                        tmp_dir,
+                        || {},
+                    )
                 }
                 TarballInput::File(reader) => {
                     lpm_extractor::extract_tarball_from_reader_hybrid_digests(reader, tmp_dir)
@@ -1823,6 +1827,38 @@ impl Store {
             Some(canonical_sri),
             expected_integrity,
             max_compressed_size,
+        )
+    }
+
+    /// Extract an exclusively owned, fully downloaded regular file from its beginning.
+    /// The caller must preserve the bytes whose SHA-512 was computed during download.
+    /// Declared integrity, compressed size, and archive contents are still validated.
+    pub fn extract_object_from_file_with_known_sha512(
+        &self,
+        mut file: std::fs::File,
+        canonical_sri: &str,
+        expected_integrity: Option<&str>,
+        max_compressed_size: u64,
+    ) -> Result<(ExtractedObject, String, StageTimings), LpmError> {
+        use std::io::Seek;
+        if !file.metadata()?.is_file() {
+            return Err(LpmError::Store(
+                "tarball input must be a regular file".into(),
+            ));
+        }
+        file.rewind()?;
+        let staging = self.prepare_streaming_staging()?;
+        let size_limited =
+            SizeLimitedReader::new(std::io::BufReader::new(file), max_compressed_size);
+        let mut reader =
+            HashingReader::with_known_sha512(size_limited, canonical_sri, expected_integrity)?;
+        self.extract_streaming_input(
+            staging,
+            TarballInput::PipelinedStreaming {
+                reader: &mut reader,
+                expected_integrity,
+                cancel_input: &|| {},
+            },
         )
     }
 

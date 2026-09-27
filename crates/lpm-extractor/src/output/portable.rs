@@ -10,6 +10,7 @@ use std::{
     fs::File,
     io,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -28,14 +29,14 @@ struct DirectoryRecord {
 
 struct Parent {
     path: PathBuf,
-    directory: Dir,
+    directory: Arc<Dir>,
     identity: Identity,
 }
 
 pub(crate) struct OutputTree {
     root_path: PathBuf,
     visible_root_path: PathBuf,
-    root: Dir,
+    root: Arc<Dir>,
     root_identity: Identity,
     directories: HashMap<PathBuf, DirectoryRecord>,
     parent: Option<Parent>,
@@ -48,7 +49,7 @@ impl OutputTree {
         Ok(Self {
             root_path,
             visible_root_path,
-            root,
+            root: Arc::new(root),
             root_identity,
             directories: HashMap::with_capacity(64),
             parent: None,
@@ -114,7 +115,7 @@ impl OutputTree {
         if let Some(directory) = current {
             self.parent = Some(Parent {
                 path: prefix,
-                directory,
+                directory: Arc::new(directory),
                 identity,
             });
         }
@@ -125,7 +126,7 @@ impl OutputTree {
         &self,
         path: &Path,
         duplicate: bool,
-    ) -> Result<PendingFile<'_>, LpmError> {
+    ) -> Result<PendingFile, LpmError> {
         let directory = self.parent.as_ref().map_or(&self.root, |p| &p.directory);
         let name = path.file_name().ok_or_else(|| changed_directory(path))?;
         if duplicate {
@@ -152,7 +153,7 @@ impl OutputTree {
             .into_std();
         Ok(PendingFile {
             file,
-            directory,
+            directory: Arc::clone(directory),
             name: PathBuf::from(name),
             committed: false,
         })
@@ -273,14 +274,14 @@ impl OutputTree {
     }
 }
 
-pub(crate) struct PendingFile<'a> {
+pub(crate) struct PendingFile {
     pub(crate) file: File,
-    directory: &'a Dir,
+    directory: Arc<Dir>,
     name: PathBuf,
     committed: bool,
 }
 
-impl PendingFile<'_> {
+impl PendingFile {
     pub(crate) fn identity(&self) -> Result<Identity, LpmError> {
         Ok(Identity::from_cap(&cap_std::fs::Metadata::from_file(
             &self.file,
@@ -297,12 +298,19 @@ impl PendingFile<'_> {
         Ok(())
     }
 
+    pub(crate) fn complete(self) -> Result<CompletedFile, LpmError> {
+        let identity = self.identity()?;
+        Ok(CompletedFile {
+            pending: self,
+            identity,
+        })
+    }
     pub(crate) fn commit(mut self) {
         self.committed = true;
     }
 }
 
-impl Drop for PendingFile<'_> {
+impl Drop for PendingFile {
     fn drop(&mut self) {
         if !self.committed
             && let Ok(written) = cap_std::fs::Metadata::from_file(&self.file)
@@ -314,6 +322,32 @@ impl Drop for PendingFile<'_> {
         }
     }
 }
+
+pub(crate) struct CompletedFile {
+    // Pin the original file identity until ordered acceptance or rollback.
+    pending: PendingFile,
+    identity: Identity,
+}
+
+impl CompletedFile {
+    pub(crate) fn commit(self) -> Result<Identity, LpmError> {
+        let current = self
+            .pending
+            .directory
+            .symlink_metadata(&self.pending.name)?;
+        if !current.is_file() || self.identity != Identity::from_cap(&current) {
+            return Err(LpmError::Registry(
+                "tarball output file changed before acceptance".into(),
+            ));
+        }
+        self.pending.commit();
+        Ok(self.identity)
+    }
+}
+
+#[cfg(test)]
+#[path = "completed_tests.rs"]
+mod completed_tests;
 
 fn changed_directory(path: &Path) -> LpmError {
     LpmError::Registry(format!(
