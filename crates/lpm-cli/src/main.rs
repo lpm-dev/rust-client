@@ -34,6 +34,7 @@ pub mod migration_warnings;
 mod npm_firewall_config;
 mod npm_public_source;
 mod oidc;
+mod open_file_limit;
 mod output;
 pub mod overrides_state;
 pub mod patch_engine;
@@ -113,5 +114,6 @@ fn main() -> Result<()> {
     #[cfg(feature = "dhat-heap")]
     let _dhat = dhat::Profiler::new_heap();
 
+    open_file_limit::raise();
     cli::run()
 }
