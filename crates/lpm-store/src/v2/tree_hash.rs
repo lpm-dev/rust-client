@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 
 use super::integrity::{OBJECT_INTEGRITY_FILENAME, TREE_SNAPSHOT_FILENAME};
 
+mod metadata_walk;
+
 #[derive(Debug)]
 pub(crate) struct TreeIntegrities {
     pub(crate) content: String,
@@ -248,9 +250,7 @@ pub(crate) fn compute_tree_metadata_integrity(dir: &Path) -> Result<String, LpmE
 }
 
 fn compute_tree_metadata_integrity_portable(dir: &Path) -> Result<String, LpmError> {
-    let mut hasher = Sha256::new();
-    hash_object_tree_dir(dir, dir, None, &mut hasher, None)?;
-    Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
+    metadata_walk::tree_metadata_integrity(dir, metadata_walk::MetadataReader::Portable)
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -474,92 +474,7 @@ fn hash_object_tree_dir_inner(
 
 #[cfg(target_os = "macos")]
 fn compute_tree_metadata_integrity_bulk(dir: &Path) -> Result<String, LpmError> {
-    let mut hasher = Sha256::new();
-    let mut relative = Vec::new();
-    let mut buffer = vec![0_u8; 64 * 1024];
-    hash_tree_metadata_dir_bulk(dir, dir, &mut relative, &mut hasher, &mut buffer)?;
-    Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
-}
-
-#[cfg(target_os = "macos")]
-fn hash_tree_metadata_dir_bulk(
-    root: &Path,
-    dir: &Path,
-    relative: &mut Vec<u8>,
-    hasher: &mut Sha256,
-    buffer: &mut [u8],
-) -> Result<(), LpmError> {
-    let entries = read_bulk_metadata_entries(dir, buffer)?;
-    let mut path = dir.to_path_buf();
-    for entry in entries {
-        if is_object_metadata_sidecar_name(root, dir, &entry.name) {
-            continue;
-        }
-        let relative_len = relative.len();
-        if relative_len != 0 {
-            relative.push(b'/');
-        }
-        push_os_str_bytes(relative, &entry.name);
-        path.push(&entry.name);
-
-        let result = match entry.kind {
-            ObjectTreeEntryKind::Directory => {
-                hash_tree_metadata_fields(
-                    hasher,
-                    b"dir",
-                    relative,
-                    entry.mode,
-                    entry.len,
-                    entry.modified_time_nanos,
-                    entry.change_time_nanos,
-                    &[],
-                );
-                hash_tree_metadata_dir_bulk(root, &path, relative, hasher, buffer)
-            }
-            ObjectTreeEntryKind::File => {
-                hash_tree_metadata_fields(
-                    hasher,
-                    b"file",
-                    relative,
-                    entry.mode,
-                    entry.len,
-                    entry.modified_time_nanos,
-                    entry.change_time_nanos,
-                    &[],
-                );
-                Ok(())
-            }
-            ObjectTreeEntryKind::Symlink => {
-                let target = std::fs::read_link(&path).map_err(|error| {
-                    LpmError::Store(format!(
-                        "failed to read virtual-store object symlink {}: {error}",
-                        path.display()
-                    ))
-                })?;
-                let mut target_bytes = Vec::new();
-                push_os_str_bytes(&mut target_bytes, target.as_os_str());
-                hash_tree_metadata_fields(
-                    hasher,
-                    b"symlink",
-                    relative,
-                    entry.mode,
-                    target_bytes.len() as u64,
-                    entry.modified_time_nanos,
-                    entry.change_time_nanos,
-                    &target_bytes,
-                );
-                Ok(())
-            }
-            ObjectTreeEntryKind::Unsupported => Err(LpmError::Store(format!(
-                "unsupported virtual-store object entry type at {}",
-                path.display()
-            ))),
-        };
-        path.pop();
-        relative.truncate(relative_len);
-        result?;
-    }
-    Ok(())
+    metadata_walk::tree_metadata_integrity(dir, metadata_walk::MetadataReader::Bulk)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

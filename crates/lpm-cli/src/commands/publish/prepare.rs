@@ -782,13 +782,17 @@ pub(super) fn detect_publish_ecosystem(
     Ok((detected_ecosystem, swift_manifest))
 }
 
+/// Each inspection compiles Package.swift with empty module caches, which has
+/// taken 28 s for a valid manifest on hosted CI runners.
+const SWIFT_MANIFEST_INSPECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 fn dump_swift_manifest_from_publish_artifact(
     tarball_data: &[u8],
 ) -> Result<serde_json::Value, LpmError> {
     dump_swift_manifest_from_publish_artifact_with_command(
         tarball_data,
         std::ffi::OsStr::new("swift"),
-        std::time::Duration::from_secs(30),
+        SWIFT_MANIFEST_INSPECTION_TIMEOUT,
         4 * 1024 * 1024,
     )
 }
@@ -1860,6 +1864,11 @@ mod tests {
 
         assert!(manifest.is_err());
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn swift_manifest_inspection_allows_a_cold_module_cache_build() {
+        assert!(SWIFT_MANIFEST_INSPECTION_TIMEOUT >= std::time::Duration::from_secs(120));
     }
 
     #[cfg(target_os = "linux")]
