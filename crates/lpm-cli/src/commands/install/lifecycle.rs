@@ -1,4 +1,5 @@
 use super::*;
+use rayon::prelude::*;
 
 /// Decide whether `lpm install` should auto-fire `rebuild::run` after
 /// the install completes.
@@ -1069,12 +1070,16 @@ pub(super) async fn build_blocked_set_metadata(
     //
     // Only packages with lifecycle scripts can enter the blocked set and
     // consume this enrichment. Fetch those candidates concurrently.
-    let mut metadata_packages = Vec::with_capacity(packages.len());
-    for (package, capture) in packages.iter().zip(capture_packages) {
-        if package_requires_blocked_set_metadata(package, &capture.package_dir) {
-            metadata_packages.push(package);
-        }
-    }
+    // Each manifest's first read after linking waits on lookups in the
+    // directories linking just created, so the scan runs in parallel.
+    let metadata_packages: Vec<&InstallPackage> = packages
+        .par_iter()
+        .zip(capture_packages)
+        .filter(|(package, capture)| {
+            package_requires_blocked_set_metadata(package, &capture.package_dir)
+        })
+        .map(|(package, _)| package)
+        .collect();
 
     let mut groups: HashMap<(&str, bool), Vec<&str>> =
         HashMap::with_capacity(metadata_packages.len());
