@@ -240,12 +240,26 @@ impl PendingEntries {
     }
 
     pub(super) fn push(&mut self, path: PathBuf, capacity: usize) {
-        self.slots.push_back(Slot {
+        self.push_slot(Slot {
             path,
             bytes: capacity,
             result: None,
         });
-        self.bytes += capacity;
+    }
+
+    /// Queue a file this thread already wrote, so it is accepted in archive
+    /// order behind the files the writers are still writing.
+    pub(super) fn push_written(&mut self, path: PathBuf, written: Written) {
+        self.push_slot(Slot {
+            path,
+            bytes: 0,
+            result: Some(Ok(written)),
+        });
+    }
+
+    fn push_slot(&mut self, slot: Slot) {
+        self.bytes += slot.bytes;
+        self.slots.push_back(slot);
         #[cfg(test)]
         self.observe(TestEvent::Admitted {
             entries: self.slots.len(),
