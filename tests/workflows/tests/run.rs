@@ -5713,3 +5713,64 @@ fn two_hundred_fifty_six_failed_tasks_never_report_process_success() {
         "256 failures must not wrap to success"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn scripts_inherit_a_raised_open_file_limit_when_lpm_starts_with_256() {
+    use std::os::unix::process::CommandExt;
+
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit initializes this valid out pointer on success.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    if limit.rlim_max <= 256 {
+        return;
+    }
+
+    let project = TempProject::empty(
+        r#"{"name":"open-file-limit","version":"1.0.0","scripts":{"limit":"ulimit -n"}}"#,
+    );
+    let mut command = lpm_spawnable(&project);
+    command.args(["run", "limit"]);
+    // SAFETY: the closure only calls setrlimit, which is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            let mut current = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut current) == 0 {
+                let low = libc::rlimit {
+                    rlim_cur: 256,
+                    rlim_max: current.rlim_max,
+                };
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &low) == 0 {
+                    return Ok(());
+                }
+            }
+            Err(std::io::Error::last_os_error())
+        });
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let seen = stdout
+        .lines()
+        .rev()
+        .find_map(|line| match line.trim() {
+            "unlimited" => Some(u64::MAX),
+            value => value.parse::<u64>().ok(),
+        })
+        .unwrap_or_else(|| panic!("no limit printed: {stdout}"));
+    assert!(seen > 256, "the script saw a soft limit of {seen}");
+}
