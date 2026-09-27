@@ -1,7 +1,7 @@
 mod support;
 
 use support::mock_registry::{MockRegistry, make_tarball_from_pkg_json};
-use support::{TempProject, lpm_with_registry_and_npm};
+use support::{TempProject, lpm_with_registry};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -60,8 +60,7 @@ async fn install_latest(scripted: bool) {
     let project = TempProject::empty(
         r#"{"name":"latest-install","version":"1.0.0","dependencies":{"latest-package":"^1.0.0"}}"#,
     );
-    let output = lpm_with_registry_and_npm(&project, &registry.url())
-        .env("LPM_NPM_ROUTE", "direct")
+    let output = lpm_with_registry(&project, &registry.url())
         .args([
             "install",
             "--no-security-summary",
@@ -124,8 +123,7 @@ async fn optional_latest_keeps_portable_platform_metadata_without_fetching_paylo
     let project = TempProject::empty(
         r#"{"name":"optional-latest-install","version":"1.0.0","optionalDependencies":{"optional-latest":"^1.0.0"}}"#,
     );
-    lpm_with_registry_and_npm(&project, &registry.url())
-        .env("LPM_NPM_ROUTE", "direct")
+    lpm_with_registry(&project, &registry.url())
         .args([
             "install",
             "--no-security-summary",
@@ -161,7 +159,11 @@ async fn credentialed_npm_registry_install_uses_the_direct_npm_documents() {
     let registry = MockRegistry::start().await;
     let ranged_tarball =
         make_tarball_from_pkg_json(serde_json::json!({"name":"ranged","version":"1.1.0"}), &[]);
-    let ranged = registry.package_metadata("ranged", "1.1.0", &ranged_tarball);
+    let mut ranged = registry.package_metadata("ranged", "1.1.0", &ranged_tarball);
+    ranged["versions"]["1.1.0"]["dist"]["tarball"] = registry
+        .with_npm_registry_tarball("ranged", "1.1.0", &ranged_tarball)
+        .await
+        .into();
     Mock::given(method("GET"))
         .and(path("/ranged/latest"))
         .and(header("Accept", "application/json"))
@@ -193,6 +195,10 @@ async fn credentialed_npm_registry_install_uses_the_direct_npm_documents() {
     });
     let pinned_tarball = make_tarball_from_pkg_json(manifest.clone(), &[]);
     let mut pinned = registry.package_metadata("pinned", "1.2.3", &pinned_tarball);
+    pinned["versions"]["1.2.3"]["dist"]["tarball"] = registry
+        .with_npm_registry_tarball("pinned", "1.2.3", &pinned_tarball)
+        .await
+        .into();
     pinned["versions"]["1.2.3"]["scripts"] = manifest["scripts"].clone();
     pinned["time"]["1.2.3"] = serde_json::json!("2025-01-01T00:00:00Z");
     // Exact pins and their publication times come from selected history.
@@ -211,17 +217,11 @@ async fn credentialed_npm_registry_install_uses_the_direct_npm_documents() {
     let project = TempProject::empty(
         r#"{"name":"credentialed-install","version":"1.0.0","dependencies":{"pinned":"1.2.3","ranged":"^1.0.0"}}"#,
     );
-    let address = registry.server().address();
     project.write_private_file(
         ".npmrc",
-        &format!(
-            "registry={}/\n//{}:{}/:_authToken=npm-token\n",
-            registry.url(),
-            address.ip(),
-            address.port()
-        ),
+        "registry=https://registry.npmjs.org/\n//registry.npmjs.org/:_authToken=npm-token\n",
     );
-    lpm_with_registry_and_npm(&project, &registry.url())
+    lpm_with_registry(&project, &registry.url())
         .args([
             "install",
             "--no-security-summary",

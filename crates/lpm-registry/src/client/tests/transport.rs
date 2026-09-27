@@ -438,3 +438,49 @@ async fn anonymous_health_probe_refuses_url_userinfo_before_network_access() {
     let requests = server.received_requests().await.unwrap();
     assert!(requests.is_empty());
 }
+
+#[tokio::test]
+async fn npm_transport_serves_npm_registry_requests_without_renaming_the_registry() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let transport = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/pkg"))
+        .and(header("authorization", "Bearer npm-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "name": "pkg",
+            "dist-tags": {"latest": "1.0.0"},
+            "versions": {"1.0.0": {"name": "pkg", "version": "1.0.0"}}
+        })))
+        .expect(1)
+        .mount(&transport)
+        .await;
+    let cache = tempfile::tempdir().unwrap();
+    let client = RegistryClient::new()
+        .with_npm_transport_url(transport.uri())
+        .with_cache_dir(Some(cache.path().into()));
+    let routes = crate::RouteTable::new(
+        crate::RouteMode::Direct,
+        crate::NpmrcConfig::parse(
+            "//registry.npmjs.org/:_authToken=npm-token\n",
+            "test",
+            &|_| None,
+        ),
+    )
+    .unwrap();
+    let crate::UpstreamRoute::Custom { target, auth } = routes.route_for_package("pkg") else {
+        panic!("a credentialed npm registry is a custom route");
+    };
+
+    let metadata = client
+        .get_npm_metadata_from(&target.base_url, "pkg", auth.as_deref())
+        .await
+        .unwrap();
+
+    assert!(metadata.versions.contains_key("1.0.0"));
+    assert_eq!(client.npm_registry_url(), lpm_common::NPM_REGISTRY_URL);
+    assert!(client.is_configured_origin("https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz"));
+    assert!(!client.is_configured_origin(&transport.uri()));
+    transport.verify().await;
+}

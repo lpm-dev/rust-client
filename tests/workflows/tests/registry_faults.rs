@@ -473,14 +473,16 @@ async fn metadata_refresh_server_error_keeps_http_classification_and_lockfiles()
     let metadata = registry.package_metadata(package_name, version, &tarball);
     let tarball_path = FaultRegistry::tarball_path(package_name, version);
 
-    registry.with_batch_metadata(vec![metadata]).await;
     registry
-        .with_package_metadata_reply(
+        .with_package_metadata_sequence(
             package_name,
-            MetadataReply::Status {
-                code: 500,
-                body: r#"{"error":"registry unavailable"}"#.to_string(),
-            },
+            vec![
+                MetadataReply::Ok(metadata),
+                MetadataReply::Status {
+                    code: 500,
+                    body: r#"{"error":"registry unavailable"}"#.to_string(),
+                },
+            ],
         )
         .await;
     registry

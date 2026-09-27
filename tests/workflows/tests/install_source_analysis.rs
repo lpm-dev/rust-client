@@ -3,7 +3,7 @@
 mod support;
 
 use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_from_pkg_json};
-use support::{TempProject, lpm, lpm_with_registry_and_npm, write_signed_unlock};
+use support::{TempProject, lpm, lpm_with_registry, write_signed_unlock};
 
 const SCAN_TRACE: &str = "Scanning live package source for install security summary";
 
@@ -30,7 +30,7 @@ async fn assert_install_skips_source_analysis(config: &str) {
         for verbose in [false, true] {
             let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
             write_config(&project, config);
-            let mut command = lpm_with_registry_and_npm(&project, &mock.url());
+            let mut command = lpm_with_registry(&project, &mock.url());
             command
                 .env("LPM_STORE_VERSION", store)
                 .env("RUST_LOG", "lpm_rs::security_check=trace");
@@ -89,7 +89,7 @@ async fn firewall_modes_do_not_enable_disabled_source_analysis() {
             &project,
             &format!("install-time-source-analysis = false\n[firewall]\nmode = \"{mode}\"\n"),
         );
-        let output = lpm_with_registry_and_npm(&project, &mock.url())
+        let output = lpm_with_registry(&project, &mock.url())
             .env("RUST_LOG", "lpm_rs::security_check=trace")
             .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
             .output()
@@ -118,7 +118,7 @@ async fn disabling_source_analysis_skips_warm_install_scan_but_preserves_explici
         .assert()
         .success();
 
-    let enabled = lpm_with_registry_and_npm(&project, &mock.url())
+    let enabled = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
         .env("RUST_LOG", "lpm_rs::security_check=trace")
         .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
@@ -141,7 +141,7 @@ async fn disabling_source_analysis_skips_warm_install_scan_but_preserves_explici
     let cache_before = std::fs::read(&cache_path).unwrap();
     write_config(&project, "install-time-source-analysis = false\n");
 
-    let disabled = lpm_with_registry_and_npm(&project, &mock.url())
+    let disabled = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
         .env("RUST_LOG", "lpm_rs::security_check=trace")
         .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
@@ -159,7 +159,7 @@ async fn disabling_source_analysis_skips_warm_install_scan_but_preserves_explici
     assert_eq!(mock.tarball_request_count(name, "1.0.0").await, 1);
 
     std::fs::remove_file(cache_path).unwrap();
-    let audit = lpm_with_registry_and_npm(&project, &mock.url())
+    let audit = lpm_with_registry(&project, &mock.url())
         .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
         .args(["audit", "--fail-on=behavior"])
         .output()
@@ -199,7 +199,7 @@ async fn disabled_source_analysis_preserves_independent_registry_insights() {
                 "install-time-source-analysis = false\nfetch-lpm-security-insights = {insights}\n"
             ),
         );
-        let output = lpm_with_registry_and_npm(&project, &mock.url())
+        let output = lpm_with_registry(&project, &mock.url())
             .env("RUST_LOG", "lpm_rs::security_check=trace")
             .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
             .output()
@@ -228,7 +228,7 @@ async fn audit_separates_capabilities_and_preserves_explicit_policy_failures() {
         r#"{"name":"consumer","version":"1.0.0","dependencies":{"capability-evidence":"1.0.0"}}"#,
     );
     write_config(&project, "install-time-source-analysis = true\n");
-    let installed = lpm_with_registry_and_npm(&project, &mock.url())
+    let installed = lpm_with_registry(&project, &mock.url())
         .args(["install", "--no-skills", "--no-editor-setup"])
         .output()
         .unwrap();
@@ -237,7 +237,7 @@ async fn audit_separates_capabilities_and_preserves_explicit_policy_failures() {
     assert!(stderr.contains("Capabilities"), "{stderr}");
     assert!(!stderr.contains("Security summary"), "{stderr}");
 
-    let audit = lpm_with_registry_and_npm(&project, &mock.url())
+    let audit = lpm_with_registry(&project, &mock.url())
         .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
         .args(["--json", "audit"])
         .output()
@@ -261,7 +261,7 @@ async fn audit_separates_capabilities_and_preserves_explicit_policy_failures() {
         ".packages[].instance_id" => "[INSTANCE_ID]",
     });
 
-    let human = lpm_with_registry_and_npm(&project, &mock.url())
+    let human = lpm_with_registry(&project, &mock.url())
         .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
         .args(["audit"])
         .output()
@@ -273,7 +273,7 @@ async fn audit_separates_capabilities_and_preserves_explicit_policy_failures() {
     assert!(!stderr.contains("Behavioral flags"), "{stderr}");
 
     for policy in ["--fail-on=behavior", "--fail-on=all"] {
-        let explicit = lpm_with_registry_and_npm(&project, &mock.url())
+        let explicit = lpm_with_registry(&project, &mock.url())
             .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
             .args(["--json", "audit", policy])
             .output()
@@ -310,7 +310,7 @@ async fn install_cache_and_audit_agree_on_scoped_runtime_evaluation() {
             r#"{"name":"consumer","version":"1.0.0","dependencies":{"evaluation-control":"1.0.0"}}"#,
         );
         write_config(&project, "install-time-source-analysis = true\n");
-        let installed = lpm_with_registry_and_npm(&project, &mock.url())
+        let installed = lpm_with_registry(&project, &mock.url())
             .env("LPM_STORE_VERSION", "v2")
             .args(["install", "--no-skills", "--no-editor-setup"])
             .output()
@@ -328,7 +328,7 @@ async fn install_cache_and_audit_agree_on_scoped_runtime_evaluation() {
                 .unwrap();
         assert_eq!(cached["source"]["eval"], expected, "{source}");
         assert_eq!(cached["version"], lpm_security::behavioral::SCHEMA_VERSION);
-        let audit = lpm_with_registry_and_npm(&project, &mock.url())
+        let audit = lpm_with_registry(&project, &mock.url())
             .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
             .args(["--json", "audit", "--fail-on=behavior"])
             .output()
@@ -370,7 +370,7 @@ async fn install_audit_and_query_report_secret_uploads_as_critical_findings() {
         r#"{"name":"consumer","version":"1.0.0","dependencies":{"secret-upload-control":"1.0.0"}}"#,
     );
     write_config(&project, "install-time-source-analysis = true\n");
-    let installed = lpm_with_registry_and_npm(&project, &mock.url())
+    let installed = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
         .args(["install", "--no-skills", "--no-editor-setup"])
         .output()
@@ -388,7 +388,7 @@ async fn install_audit_and_query_report_secret_uploads_as_critical_findings() {
     assert_eq!(cached["supplyChain"]["credentialExfiltration"], true);
     assert_eq!(cached["version"], lpm_security::behavioral::SCHEMA_VERSION);
 
-    let audit = lpm_with_registry_and_npm(&project, &mock.url())
+    let audit = lpm_with_registry(&project, &mock.url())
         .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
         .args(["--json", "audit"])
         .output()
@@ -416,7 +416,7 @@ async fn install_audit_and_query_report_secret_uploads_as_critical_findings() {
     });
 
     for selector in [":credential-exfiltration", ":critical"] {
-        let query = lpm_with_registry_and_npm(&project, &mock.url())
+        let query = lpm_with_registry(&project, &mock.url())
             .args(["--json", "query", selector, "--assert-none"])
             .output()
             .unwrap();
@@ -464,7 +464,7 @@ async fn audit_and_query_expose_targeted_execution_and_deletion_findings() {
             r#"{"name":"consumer","version":"1.0.0","dependencies":{"targeted-source-control":"1.0.0"}}"#,
         );
         write_config(&project, "install-time-source-analysis = true\n");
-        let installed = lpm_with_registry_and_npm(&project, &mock.url())
+        let installed = lpm_with_registry(&project, &mock.url())
             .env("LPM_STORE_VERSION", "v2")
             .args(["install", "--no-skills", "--no-editor-setup"])
             .output()
@@ -474,7 +474,7 @@ async fn audit_and_query_expose_targeted_execution_and_deletion_findings() {
             "{}",
             String::from_utf8_lossy(&installed.stderr)
         );
-        let audit = lpm_with_registry_and_npm(&project, &mock.url())
+        let audit = lpm_with_registry(&project, &mock.url())
             .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
             .args(["--json", "audit", "--fail-on", "behavior"])
             .output()
@@ -502,7 +502,7 @@ async fn audit_and_query_expose_targeted_execution_and_deletion_findings() {
             });
         });
         for selector in [format!(":{rule}"), format!(":{severity}")] {
-            let query = lpm_with_registry_and_npm(&project, &mock.url())
+            let query = lpm_with_registry(&project, &mock.url())
                 .args(["--json", "query", &selector, "--assert-none"])
                 .output()
                 .unwrap();
@@ -581,7 +581,7 @@ async fn assert_summary_uses_exact_metadata(key: &str, version: &str, expected_n
         &project,
         "install-time-source-analysis = false\nfetch-lpm-security-insights = true\n",
     );
-    let output = lpm_with_registry_and_npm(&project, &mock.url())
+    let output = lpm_with_registry(&project, &mock.url())
         .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
         .output()
         .unwrap();

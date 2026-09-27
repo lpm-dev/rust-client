@@ -2891,6 +2891,29 @@ impl MockRegistry {
         format!("{}{}", self.server.uri(), Self::tarball_path(name, version))
     }
 
+    /// Serve `tarball_bytes` at registry.npmjs.org's tarball path and return
+    /// the npm URL, which workflow commands reach through this mock.
+    pub async fn with_npm_registry_tarball(
+        &self,
+        name: &str,
+        version: &str,
+        tarball_bytes: &[u8],
+    ) -> String {
+        let basename = name.rsplit('/').next().unwrap_or(name);
+        let tarball_path = format!("/{name}/-/{basename}-{version}.tgz");
+        self.register_tarball_bytes(name, version, tarball_bytes);
+        Mock::given(method("GET"))
+            .and(path(&tarball_path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(tarball_bytes.to_vec())
+                    .insert_header("content-type", "application/octet-stream"),
+            )
+            .mount(&self.server)
+            .await;
+        format!("{}{tarball_path}", lpm_common::NPM_REGISTRY_URL)
+    }
+
     pub async fn tarball_request_count(&self, name: &str, version: &str) -> usize {
         let path = Self::tarball_path(name, version);
         self.server()

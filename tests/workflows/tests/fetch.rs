@@ -391,7 +391,6 @@ async fn fetch_custom_registry_tarball_uses_its_npmrc_bearer() {
     );
 
     let output = lpm(&project)
-        .env_remove("LPM_NPM_ROUTE")
         .args(["--token", "lpm-session-secret", "fetch"])
         .output()
         .expect("fetch custom registry tarball");

@@ -15,7 +15,6 @@ use support::mock_registry::{
 };
 use support::{
     TempProject, VALID_TEST_INTEGRITY, lpm, lpm_spawnable_with_registry, lpm_with_registry,
-    lpm_with_registry_and_npm,
 };
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
@@ -125,7 +124,7 @@ fn run_audit_with_npm(
     json: bool,
 ) -> std::process::Output {
     let osv_url = format!("{}/v1/querybatch", mock.url());
-    let mut cmd = lpm_with_registry_and_npm(project, &mock.url());
+    let mut cmd = lpm_with_registry(project, &mock.url());
     cmd.env("LPM_OSV_URL", &osv_url);
     if json {
         cmd.arg("--json");
@@ -408,7 +407,7 @@ async fn install_signature_fixture_project(
 
     mock.with_batch_metadata(batch).await;
 
-    lpm_with_registry_and_npm(project, &mock.url())
+    lpm_with_registry(project, &mock.url())
         .args([
             "install",
             "--no-security-summary",

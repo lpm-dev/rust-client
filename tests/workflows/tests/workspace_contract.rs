@@ -2,7 +2,7 @@
 mod support;
 
 use support::mock_registry::MockRegistry;
-use support::{TempProject, lpm, lpm_with_registry_and_npm};
+use support::{TempProject, lpm, lpm_with_registry};
 
 fn git(project: &TempProject, args: &[&str]) {
     let output = std::process::Command::new("git")
@@ -157,7 +157,7 @@ fn missing_git_base_fails_filters_and_affected_tasks() {
 
 async fn deploy(project: &TempProject, out: &std::path::Path, json: bool) -> std::process::Output {
     let registry = MockRegistry::start().await;
-    let mut command = lpm_with_registry_and_npm(project, &registry.url());
+    let mut command = lpm_with_registry(project, &registry.url());
     if json {
         command.arg("--json");
     }
@@ -477,7 +477,7 @@ async fn scoped_workspace_version_requests_resolve_locally_before_registry_prefl
                 "packages/shared/package.json",
                 &serde_json::json!({"name":name,"version":"1.0.0"}).to_string(),
             );
-            let output = lpm_with_registry_and_npm(&project, &registry.url())
+            let output = lpm_with_registry(&project, &registry.url())
                 .env("LPM_TYPOSQUAT_GUARD", "0")
                 .args([
                     "install",
@@ -543,7 +543,7 @@ async fn deployment_preserves_workspace_self_reference_validation() {
         project.write_file("packages/app/package.json", &source);
         let registry = MockRegistry::start().await;
         let out = tempfile::tempdir().unwrap();
-        let mut command = lpm_with_registry_and_npm(&project, &registry.url());
+        let mut command = lpm_with_registry(&project, &registry.url());
         command.args(["deploy", out.path().to_str().unwrap(), "--filter", "app"]);
         if section == "devDependencies" {
             command.arg("--dev");
@@ -639,7 +639,7 @@ async fn deployment_optional_dependencies_override_regular_declarations() {
         );
         let registry = MockRegistry::start().await;
         let out = tempfile::tempdir().unwrap();
-        let mut command = lpm_with_registry_and_npm(&project, &registry.url());
+        let mut command = lpm_with_registry(&project, &registry.url());
         command.args(["deploy", out.path().to_str().unwrap(), "--filter", "app"]);
         if no_optional {
             command.arg("--no-optional");
@@ -698,7 +698,7 @@ async fn forced_deployment_rejects_an_output_ancestor_of_the_workspace() {
     );
     project.write_file("output/keep.txt", "outside workspace");
     let registry = MockRegistry::start().await;
-    let output = lpm_with_registry_and_npm(&project, &registry.url())
+    let output = lpm_with_registry(&project, &registry.url())
         .current_dir(project.path().join("output/workspace"))
         .args(["deploy", "..", "--filter", "app", "--force"])
         .output()
@@ -725,7 +725,7 @@ async fn deployment_resolves_root_catalogs_in_members_and_copied_providers() {
     project.write_file("packages/app/package.json", app);
     project.write_file("packages/shared/package.json", shared);
     let out = tempfile::tempdir().unwrap();
-    let output = lpm_with_registry_and_npm(&project, &registry.url())
+    let output = lpm_with_registry(&project, &registry.url())
         .args(["deploy", out.path().to_str().unwrap(), "--filter", "app"])
         .output()
         .unwrap();

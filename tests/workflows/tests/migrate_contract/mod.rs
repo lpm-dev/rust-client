@@ -957,7 +957,7 @@ fn migration_preview_counts_workspace_union_once_and_applies_exclusions() {
 
 #[tokio::test]
 async fn migration_installs_workspace_members_once_and_restores_their_previous_locks() {
-    use crate::support::lpm_with_registry_and_npm;
+    use crate::support::lpm_with_registry;
     use crate::support::mock_registry::{MockRegistry, make_tarball};
     let project = TempProject::empty(
         r#"{"name":"root","version":"1.0.0","private":true,"workspaces":["packages/*"],"dependencies":{"root-dep":"1.0.0"},"scripts":{"postinstall":"echo root >> order.txt"}}"#,
@@ -979,7 +979,7 @@ async fn migration_installs_workspace_members_once_and_restores_their_previous_l
             .with_package(name, "1.0.0", &make_tarball(name, "1.0.0"))
             .await;
     }
-    let output = lpm_with_registry_and_npm(&project, &registry.url())
+    let output = lpm_with_registry(&project, &registry.url())
         .env("CI", "1")
         .args([
             "migrate",

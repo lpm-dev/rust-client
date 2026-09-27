@@ -348,7 +348,7 @@ async fn deploy_excludes_mixed_case_registry_credentials() {
 }
 
 async fn assert_deploy_excludes_credentials(credential_names: &[&str]) {
-    use support::lpm_with_registry_and_npm;
+    use support::lpm_with_registry;
     use support::mock_registry::MockRegistry;
     for allowlist in [false, true] {
         let project =
@@ -399,7 +399,7 @@ async fn assert_deploy_excludes_credentials(credential_names: &[&str]) {
         }
         let registry = MockRegistry::start().await;
         let out = external_output_dir();
-        let output = lpm_with_registry_and_npm(&project, &registry.url())
+        let output = lpm_with_registry(&project, &registry.url())
             .args([
                 "deploy",
                 out.path().to_str().unwrap(),

@@ -146,7 +146,6 @@ async fn json_routing_warns_when_permissive_npmrc_credentials_are_refused() {
         .await;
 
     let output = lpm_with_registry(&project, &mock.url())
-        .env_remove("LPM_NPM_ROUTE")
         .env_remove("LPM_TOKEN")
         .args(["info", PACKAGE_NAME, "--json"])
         .output()
@@ -175,7 +174,6 @@ async fn info_json_routes_bare_package_through_project_npmrc_registry() {
     mount_auth_required_npm_package(&mock).await;
 
     let output = lpm_with_registry(&project, &mock.url())
-        .env_remove("LPM_NPM_ROUTE")
         .env_remove("LPM_TOKEN")
         .args(["info", PACKAGE_NAME, "--json"])
         .output()
@@ -207,7 +205,6 @@ async fn info_does_not_fallback_from_missing_npm_package_to_lpm() {
     write_project_npmrc(&project, &npm_registry.url());
 
     let output = lpm_with_registry(&project, &lpm_registry.url())
-        .env_remove("LPM_NPM_ROUTE")
         .env_remove("LPM_TOKEN")
         .args(["info", "never.found", "--json"])
         .output()
@@ -253,7 +250,6 @@ async fn download_json_routes_bare_package_through_project_npmrc_registry() {
     mount_auth_required_npm_package(&mock).await;
 
     let output = lpm_with_registry(&project, &mock.url())
-        .env_remove("LPM_NPM_ROUTE")
         .env_remove("LPM_TOKEN")
         .args([
             "download",
@@ -295,7 +291,6 @@ async fn resolve_json_routes_bare_package_through_project_npmrc_registry() {
     mount_auth_required_npm_package(&mock).await;
 
     let output = lpm_with_registry(&project, &mock.url())
-        .env_remove("LPM_NPM_ROUTE")
         .env_remove("LPM_TOKEN")
         .args(["resolve", PACKAGE_NAME, "--json"])
         .output()
@@ -328,7 +323,6 @@ async fn search_json_routes_query_through_project_npmrc_registry() {
     mount_auth_required_npm_search(&mock, PACKAGE_NAME, 20).await;
 
     let output = lpm_with_registry(&project, &mock.url())
-        .env_remove("LPM_NPM_ROUTE")
         .env_remove("LPM_TOKEN")
         .args(["search", PACKAGE_NAME, "--json"])
         .output()
@@ -361,7 +355,6 @@ async fn search_human_banner_names_project_npmrc_registry() {
     mount_auth_required_npm_search(&mock, PACKAGE_NAME, 20).await;
 
     let output = lpm_with_registry(&project, &mock.url())
-        .env_remove("LPM_NPM_ROUTE")
         .env_remove("LPM_TOKEN")
         .args(["search", PACKAGE_NAME])
         .output()

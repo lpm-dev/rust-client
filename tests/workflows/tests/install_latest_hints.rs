@@ -1,7 +1,7 @@
 mod support;
 
 use support::mock_registry::{MockRegistry, make_tarball_from_pkg_json};
-use support::{TempProject, lpm_with_registry_and_npm};
+use support::{TempProject, lpm_with_registry};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 
@@ -93,8 +93,7 @@ async fn install_latest_hint_authority(
             std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
             std::fs::remove_file(project.path().join("lpm.lock")).unwrap();
         }
-        let output = lpm_with_registry_and_npm(&project, &registry.url())
-            .env("LPM_NPM_ROUTE", "direct")
+        let output = lpm_with_registry(&project, &registry.url())
             .args([
                 "install",
                 "--no-security-summary",
@@ -171,8 +170,7 @@ async fn exact_fallback_and_lock_replay_do_not_retry_history_for_hints() {
         if round > 0 {
             std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
         }
-        let output = lpm_with_registry_and_npm(&project, &registry.url())
-            .env("LPM_NPM_ROUTE", "direct")
+        let output = lpm_with_registry(&project, &registry.url())
             .args([
                 "install",
                 "--no-security-summary",
@@ -244,6 +242,7 @@ async fn worker_batch_hint(tag: Option<&str>, expected_hint: Option<&str>) {
         .await;
     let project = TempProject::empty(&serde_json::json!({"name":"worker-hint-install","version":"1.0.0","dependencies":{name:"^1.0.0"}}).to_string());
     let output = support::lpm_with_registry(&project, &registry.url())
+        .env("LPM_NPM_ROUTE", "proxy")
         .env("LPM_WORKER_RANGE_AWARE_BATCH", "1")
         .env("LPM_WORKER_STREAMING_BATCH", "0")
         .args([

@@ -3,7 +3,6 @@ use serde_json::{Value, json};
 
 fn sbom_json(project: &TempProject, arguments: &[&str]) -> Value {
     let output = lpm(project)
-        .env("LPM_NPM_ROUTE", "direct")
         .args(["sbom", "--json"])
         .args(arguments)
         .output()
@@ -605,7 +604,6 @@ async fn sbom_rejects_registry_query_and_fragment_before_requests() {
     for suffix in ["?extra=1", "#fragment"] {
         let project = registry_project(&format!("{}{suffix}", registry.url()));
         let output = lpm(&project)
-            .env("LPM_NPM_ROUTE", "direct")
             .args(["sbom", "--json", "--registry-metadata"])
             .output()
             .unwrap();

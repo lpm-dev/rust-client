@@ -444,6 +444,9 @@ pub struct RegistryClient {
     pub(super) base_url: String,
     /// Base URL of the direct npm registry fallback.
     pub(super) npm_registry_url: String,
+    /// Origin that serves requests addressed to `npm_registry_url`, which
+    /// keeps its identity in lockfiles and routing.
+    pub(super) npm_transport_url: Option<String>,
     /// Bearer token for authenticated requests. None for anonymous.
     /// Wrapped in `SecretString` to prevent accidental logging/display (S5).
     pub(super) token: Option<SecretString>,

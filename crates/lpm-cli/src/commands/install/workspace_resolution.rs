@@ -405,8 +405,12 @@ where
 {
     let task = coordinator.enter(index).await;
     let result = ACTIVE_TASK.scope(Arc::clone(&task), future).await;
-    task.finish_resolution();
-    if result.is_err() {
+    if result.is_ok() {
+        // An importer that was already up to date returns without entering
+        // commit, and the importer ordered after it waits for that commit.
+        task.enter_commit();
+    } else {
+        task.finish_resolution();
         task.coordinator.fail_union();
     }
     if task.is_root() && !task.coordinator.root_provider_state.has_snapshot() {
@@ -3145,6 +3149,27 @@ mod tests {
             ]
         );
         project_state.commit();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_importer_that_finishes_without_committing_releases_its_successor() {
+        let coordinator = Arc::new(WorkspaceResolutionCoordinator::new(2, 2));
+        scope(Arc::clone(&coordinator), 0, async { Ok::<_, ()>(()) })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            scope(Arc::clone(&coordinator), 1, async {
+                finish_resolution();
+                wait_for_materialization().await;
+                enter_commit();
+                Ok::<_, ()>(())
+            }),
+        )
+        .await
+        .expect("an up-to-date importer must not block the importer after it")
+        .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -1460,6 +1460,8 @@ pub(super) fn metadata_fetch_detail_json_from_snapshot(
             "attempt_count": snapshot.exact_documents.attempt_count,
             "hit_count": snapshot.exact_documents.hit_count,
             "policy_bypass_count": snapshot.exact_documents.policy_bypass_count,
+            "oversized_history_count": snapshot.exact_documents.oversized_history_count,
+            "oversized_history_skip_count": snapshot.exact_documents.oversized_history_skip_count,
             "fallback_count": snapshot
                 .exact_documents
                 .fetch_error_fallback_count
@@ -2247,6 +2249,8 @@ mod tests {
                 attempt_count: 2,
                 hit_count: 1,
                 policy_bypass_count: 3,
+                oversized_history_count: 4,
+                oversized_history_skip_count: 5,
                 fetch_error_fallback_count: 1,
                 incomplete_distribution_fallback_count: 1,
                 body_bytes_sum: 512,
@@ -2279,6 +2283,14 @@ mod tests {
         assert_eq!(json["routes"]["npm_direct_version_document"], 2);
         assert_eq!(json["npm_direct_version_documents"]["attempt_count"], 2);
         assert_eq!(json["npm_direct_version_documents"]["hit_count"], 1);
+        assert_eq!(
+            json["npm_direct_version_documents"]["oversized_history_count"],
+            4
+        );
+        assert_eq!(
+            json["npm_direct_version_documents"]["oversized_history_skip_count"],
+            5
+        );
         assert_eq!(
             json["npm_direct_version_documents"]["policy_bypass_count"],
             3
