@@ -564,13 +564,24 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let marker = tmp.path().join("detached-pid");
         let mut cmd = Command::new("python3");
-        cmd.args(["-c", "import os,sys,time; p=os.fork(); (os.setsid(),open(sys.argv[1],'w').write(str(os.getpid())),time.sleep(5)) if p==0 else time.sleep(0.1)"])
+        cmd.args(["-c", "import os,sys,time; p=os.fork(); (os.setsid(),open(sys.argv[1],'w').write(str(os.getpid())),time.sleep(30)) if p==0 else time.sleep(0.1)"])
             .arg(&marker).stdout(Stdio::piped()).stderr(Stdio::piped());
         let child = lpm_sandbox::spawn_tracked_command(&mut cmd).unwrap();
         let start = std::time::Instant::now();
-        let result = wait_with_timeout(child, Duration::from_millis(500));
+        // The deadline only has to cover python3 starting on a loaded runner;
+        // the descendant holds the pipes open well past it.
+        let result = wait_with_timeout(child, Duration::from_secs(15));
         let elapsed = start.elapsed();
-        if let Ok(pid) = std::fs::read_to_string(marker) {
+        let pid = (0..100).find_map(|_| {
+            std::fs::read_to_string(&marker)
+                .ok()
+                .filter(|pid| !pid.is_empty())
+                .or_else(|| {
+                    std::thread::sleep(Duration::from_millis(50));
+                    None
+                })
+        });
+        if let Some(pid) = pid {
             // SAFETY: the pid belongs to this isolated test fixture.
             unsafe {
                 libc::kill(pid.parse().unwrap(), libc::SIGKILL);
@@ -578,8 +589,8 @@ mod tests {
         }
         assert!(result.is_ok(), "{result:?}");
         assert!(
-            elapsed < Duration::from_secs(3),
-            "pipe readers exceeded deadline: {elapsed:?}"
+            elapsed < Duration::from_secs(25),
+            "the probe waited for the detached descendant: {elapsed:?}"
         );
     }
 

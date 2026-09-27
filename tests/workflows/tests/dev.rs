@@ -368,9 +368,26 @@ server.listen(port, '127.0.0.1', () => {
 }
 
 #[cfg(debug_assertions)]
+/// Reserve a public port and the port above it, which `lpm dev --https`
+/// gives the child. Both stay below the ephemeral ranges that parallel
+/// fixtures and outgoing connections draw from, so the child's port stays
+/// free between the reservation and the child's bind.
+fn adjacent_fixture_ports() -> (TcpListener, TcpListener) {
+    let start = 20000 + (std::process::id() % 10000) as u16;
+    (start..32000)
+        .step_by(2)
+        .find_map(|port| {
+            let frontend = TcpListener::bind(("127.0.0.1", port)).ok()?;
+            let internal = TcpListener::bind(("127.0.0.1", port + 1)).ok()?;
+            Some((frontend, internal))
+        })
+        .expect("reserve adjacent dev fixture ports")
+}
+
+#[cfg(debug_assertions)]
 #[test]
 fn dev_stops_the_child_when_https_frontend_setup_fails() {
-    let occupied = TcpListener::bind("127.0.0.1:0").expect("occupy HTTPS frontend port");
+    let (occupied, internal) = adjacent_fixture_ports();
     let frontend_port = occupied
         .local_addr()
         .expect("read occupied HTTPS frontend port")
@@ -392,6 +409,7 @@ server.listen(port, '127.0.0.1', () => {
 "#,
     );
 
+    drop(internal);
     let output = lpm(&project)
         .env(
             "LPM_CERT_TEST_TRUST_STORE_DIR",
@@ -413,6 +431,7 @@ server.listen(port, '127.0.0.1', () => {
         ])
         .output()
         .expect("run lpm dev with an occupied HTTPS frontend port");
+    drop(occupied);
 
     assert!(!output.status.success(), "occupied HTTPS port must fail");
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1604,16 +1623,7 @@ fn dev_schema_rejects_invalid_service_overrides_before_spawn() {
 #[test]
 fn dev_https_passes_a_separate_internal_port_to_vite() {
     use std::os::unix::fs::PermissionsExt;
-    // Keep both adjacent ports outside the ephemeral range used by parallel fixtures.
-    let start = 20000 + (std::process::id() % 10000) as u16;
-    let (listener, internal_listener) = (start..40000)
-        .step_by(2)
-        .find_map(|port| {
-            let frontend = TcpListener::bind(("127.0.0.1", port)).ok()?;
-            let internal = TcpListener::bind(("127.0.0.1", port + 1)).ok()?;
-            Some((frontend, internal))
-        })
-        .expect("reserve adjacent dev fixture ports");
+    let (listener, internal_listener) = adjacent_fixture_ports();
     let frontend = listener.local_addr().unwrap().port();
     let project = TempProject::empty(
         r#"{"name":"https-vite","version":"1.0.0","scripts":{"dev":"vite"},"devDependencies":{"vite":"1.0.0"}}"#,

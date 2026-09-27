@@ -30,22 +30,33 @@ use wiremock::{Mock, Request, Respond, ResponseTemplate};
 #[derive(Clone)]
 struct RecordDelayedGlobalUpdateMetadataStart {
     starts: std::sync::Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
-    delay: std::time::Duration,
+    /// Response delay by arrival order; later requests take the last one.
+    delays: Vec<std::time::Duration>,
 }
 
 impl Respond for RecordDelayedGlobalUpdateMetadataStart {
     fn respond(&self, request: &Request) -> ResponseTemplate {
-        self.starts
-            .lock()
-            .expect("record global-update metadata request start")
-            .push(std::time::Instant::now());
+        let arrival = {
+            let mut starts = self
+                .starts
+                .lock()
+                .expect("record global-update metadata request start");
+            starts.push(std::time::Instant::now());
+            starts.len() - 1
+        };
+        let delay = self
+            .delays
+            .get(arrival)
+            .or(self.delays.last())
+            .copied()
+            .unwrap_or_default();
         let name = request
             .url
             .path()
             .strip_prefix("/api/registry/")
             .unwrap_or_default();
         ResponseTemplate::new(200)
-            .set_delay(self.delay)
+            .set_delay(delay)
             .set_body_json(serde_json::json!({
                 "name": name,
                 "dist-tags": { "latest": "1.1.0" },
@@ -1536,6 +1547,8 @@ async fn global_update_dry_run_does_not_plan_an_implicit_registry_rollback() {
 #[tokio::test]
 async fn bulk_global_update_plans_metadata_in_bounded_parallel_waves() {
     const PACKAGE_COUNT: usize = 8;
+    const QUICK: std::time::Duration = std::time::Duration::from_millis(100);
+    const SLOW: std::time::Duration = std::time::Duration::from_secs(2);
     let project = TempProject::empty(r#"{"name":"global","version":"1.0.0"}"#);
     let root = isolated_lpm_root(&project);
     let mut manifest = GlobalManifest::default();
@@ -1562,9 +1575,12 @@ async fn bulk_global_update_plans_metadata_in_bounded_parallel_waves() {
         .and(wiremock::matchers::path_regex(
             r"^/api/registry/@lpm\.dev/acme\.parallel-update-[0-9]+$",
         ))
+        // The first request answers quickly and the next three slowly, so
+        // refilling the freed slot and waiting for the whole first wave are
+        // seconds apart rather than milliseconds.
         .respond_with(RecordDelayedGlobalUpdateMetadataStart {
             starts: std::sync::Arc::clone(&starts),
-            delay: std::time::Duration::from_millis(250),
+            delays: vec![QUICK, SLOW, SLOW, SLOW, QUICK],
         })
         .mount(mock.server())
         .await;
@@ -1587,14 +1603,13 @@ async fn bulk_global_update_plans_metadata_in_bounded_parallel_waves() {
         .map(|start| start.duration_since(first))
         .collect::<Vec<_>>();
     offsets.sort();
-    assert!(offsets[3] < std::time::Duration::from_millis(150));
     assert!(
-        offsets[4] >= std::time::Duration::from_millis(200),
-        "more than four metadata requests ran in the first wave: {offsets:?}"
+        offsets[4] >= QUICK,
+        "a fifth metadata request started before any response: {offsets:?}"
     );
     assert!(
-        offsets[7] < std::time::Duration::from_millis(450),
-        "the planner did not refill promptly for the second wave: {offsets:?}"
+        offsets[4] < SLOW,
+        "the planner waited for the slow requests instead of refilling the free slot: {offsets:?}"
     );
 }
 
