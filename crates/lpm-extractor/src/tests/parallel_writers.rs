@@ -607,3 +607,122 @@ fn many_file_archives_start_writers_after_the_serial_prefix() {
         assert_eq!(writes.load(Ordering::Relaxed), expected_writes);
     }
 }
+
+#[test]
+fn writer_threads_create_the_files_they_write() {
+    let target = tempfile::tempdir().unwrap();
+    let archive = super::create_test_tarball_with_entries(&[("lib/a", b"a"), ("lib/b", b"b")]);
+    let root = target.path().to_path_buf();
+    let hooks = TestHooks {
+        before_open: Some(Arc::new(move |job| {
+            let name = if job.sequence == 0 { "lib/a" } else { "lib/b" };
+            assert!(
+                !root.join(name).exists(),
+                "{name} existed before its writer opened it"
+            );
+            assert!(
+                std::thread::current()
+                    .name()
+                    .is_some_and(|name| name.starts_with("lpm-file-"))
+            );
+            Ok(())
+        })),
+        ..TestHooks::default()
+    };
+    let records = extract_with_pool(
+        &archive,
+        target.path(),
+        WriterPool::new_with_hooks(2, hooks, None).unwrap(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(std::fs::read(target.path().join("lib/a")).unwrap(), b"a");
+    assert_eq!(std::fs::read(target.path().join("lib/b")).unwrap(), b"b");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_planted_before_a_writer_creates_its_file_is_not_followed() {
+    let target = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let victim = outside.path().join("victim");
+    std::fs::write(&victim, b"untouched").unwrap();
+    let archive = super::create_test_tarball_with_entries(&[("lib/a", b"payload")]);
+    let planted = target.path().join("lib/a");
+    let hooks = TestHooks {
+        before_open: Some(Arc::new({
+            let victim = victim.clone();
+            move |_| {
+                std::os::unix::fs::symlink(&victim, &planted)?;
+                Ok(())
+            }
+        })),
+        ..TestHooks::default()
+    };
+    let error = extract_with_pool(
+        &archive,
+        target.path(),
+        WriterPool::new_with_hooks(1, hooks, None).unwrap(),
+        true,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("path traversal detected"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+}
+
+#[test]
+fn accepting_the_oldest_entry_frees_room_while_later_writes_continue() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let names: Vec<_> = (0..crate::writers::MAX_PENDING_ENTRIES + 2)
+        .map(|i| format!("file-{i}"))
+        .collect();
+    let entries: Vec<_> = names
+        .iter()
+        .map(|name| (name.as_str(), b"data".as_slice()))
+        .collect();
+    let archive = super::create_test_tarball_with_entries(&entries);
+    let target = tempfile::tempdir().unwrap();
+    let gate = Arc::new(Gate::default());
+    let _release = ReleaseOnDrop(Arc::clone(&gate));
+    let admitted = Arc::new(AtomicUsize::new(0));
+    let hooks = TestHooks {
+        before_write: Some(Arc::new({
+            let gate = Arc::clone(&gate);
+            move |job| {
+                if job.sequence != 0 {
+                    gate.wait();
+                }
+                Ok(())
+            }
+        })),
+        observer: Some(Arc::new({
+            let gate = Arc::clone(&gate);
+            let admitted = Arc::clone(&admitted);
+            move |event| {
+                // One more entry than the window holds can be admitted only
+                // after the first entry was accepted while every later write
+                // was still blocked.
+                if matches!(event, TestEvent::Admitted { .. })
+                    && admitted.fetch_add(1, Ordering::Relaxed) + 1
+                        == crate::writers::MAX_PENDING_ENTRIES + 1
+                {
+                    gate.release();
+                }
+            }
+        })),
+        ..TestHooks::default()
+    };
+    let records = extract_with_pool(
+        &archive,
+        target.path(),
+        WriterPool::new_with_hooks(4, hooks, None).unwrap(),
+        true,
+    )
+    .unwrap();
+    assert_eq!(records.len(), names.len());
+    assert_eq!(admitted.load(Ordering::Relaxed), names.len());
+}

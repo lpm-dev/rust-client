@@ -1,5 +1,6 @@
-use crate::output::{CompletedFile, Identity, PendingFile};
+use crate::output::{CompletedFile, Identity, NewFile, PendingFile};
 use lpm_common::LpmError;
+use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -153,10 +154,33 @@ impl WriterSetup {
 
 pub(super) struct Job {
     pub sequence: usize,
+    pub target: NewFile,
+    pub bytes: Vec<u8>,
+    pub exec_bits: u32,
+    pub compute_blake3: bool,
+}
+
+/// A job whose output file the worker has created.
+pub(super) struct OpenedJob {
+    #[cfg(test)]
+    pub sequence: usize,
     pub output: PendingFile,
     pub bytes: Vec<u8>,
     pub exec_bits: u32,
     pub compute_blake3: bool,
+}
+
+impl Job {
+    fn open(self) -> Result<OpenedJob, LpmError> {
+        Ok(OpenedJob {
+            #[cfg(test)]
+            sequence: self.sequence,
+            output: self.target.create()?,
+            bytes: self.bytes,
+            exec_bits: self.exec_bits,
+            compute_blake3: self.compute_blake3,
+        })
+    }
 }
 
 pub(super) struct Written {
@@ -169,9 +193,17 @@ pub(super) struct Completion {
     pub result: Result<Written, LpmError>,
 }
 
+struct Slot {
+    path: PathBuf,
+    bytes: usize,
+    result: Option<Result<Written, LpmError>>,
+}
+
+/// Files submitted to the writers, accepted in archive order as they complete.
 pub(super) struct PendingEntries {
-    paths: Vec<PathBuf>,
-    results: Vec<Option<Result<Written, LpmError>>>,
+    slots: VecDeque<Slot>,
+    /// Sequence number of the front slot.
+    front_sequence: usize,
     bytes: usize,
     #[cfg(test)]
     observer: Option<TestObserver>,
@@ -181,8 +213,8 @@ pub(super) struct PendingEntries {
 impl PendingEntries {
     pub(super) fn new(_pool: &WriterPool) -> Self {
         Self {
-            paths: Vec::with_capacity(MAX_PENDING_ENTRIES),
-            results: Vec::with_capacity(MAX_PENDING_ENTRIES),
+            slots: VecDeque::with_capacity(MAX_PENDING_ENTRIES),
+            front_sequence: 0,
             bytes: 0,
             #[cfg(test)]
             observer: _pool.hooks.observer.clone(),
@@ -191,28 +223,71 @@ impl PendingEntries {
     }
 
     pub(super) fn len(&self) -> usize {
-        self.paths.len()
+        self.slots.len()
     }
 
     pub(super) fn path(&self, index: usize) -> Option<&Path> {
-        self.paths.get(index).map(PathBuf::as_path)
+        self.slots.get(index).map(|slot| slot.path.as_path())
+    }
+
+    pub(super) fn next_sequence(&self) -> usize {
+        self.front_sequence + self.slots.len()
     }
 
     pub(super) fn has_capacity(&self, bytes: usize) -> bool {
-        self.paths.len() < MAX_PENDING_ENTRIES
+        self.slots.len() < MAX_PENDING_ENTRIES
             && bytes <= MAX_PENDING_BYTES.saturating_sub(self.bytes)
     }
 
     pub(super) fn push(&mut self, path: PathBuf, capacity: usize) {
-        self.paths.push(path);
+        self.slots.push_back(Slot {
+            path,
+            bytes: capacity,
+            result: None,
+        });
         self.bytes += capacity;
         #[cfg(test)]
         self.observe(TestEvent::Admitted {
-            entries: self.paths.len(),
+            entries: self.slots.len(),
             bytes: self.bytes,
         });
     }
 
+    /// Accept the completed entries at the front without waiting.
+    pub(super) fn accept_ready<E: crate::ExtractionRecord>(
+        &mut self,
+        pool: &WriterPool,
+        records: &mut Vec<E>,
+        identities: &mut Vec<Identity>,
+    ) -> Result<(), LpmError> {
+        while let Some(completion) = pool.try_receive()? {
+            self.store(completion)?;
+        }
+        self.accept_front(records, identities)
+    }
+
+    /// Wait until `bytes` more fit, accepting the oldest entries as they complete.
+    pub(super) fn make_room<E: crate::ExtractionRecord>(
+        &mut self,
+        pool: &WriterPool,
+        bytes: usize,
+        records: &mut Vec<E>,
+        identities: &mut Vec<Identity>,
+    ) -> Result<(), LpmError> {
+        self.accept_ready(pool, records, identities)?;
+        if self.has_capacity(bytes) {
+            return Ok(());
+        }
+        #[cfg(test)]
+        self.observe(TestEvent::DrainStarted);
+        while !self.has_capacity(bytes) && !self.slots.is_empty() {
+            self.store(pool.receive()?)?;
+            self.accept_front(records, identities)?;
+        }
+        Ok(())
+    }
+
+    /// Wait for every entry and accept them in archive order.
     pub(super) fn drain<E: crate::ExtractionRecord>(
         &mut self,
         pool: &WriterPool,
@@ -221,46 +296,47 @@ impl PendingEntries {
     ) -> Result<(), LpmError> {
         #[cfg(test)]
         self.observe(TestEvent::DrainStarted);
-        self.results.resize_with(self.paths.len(), || None);
-        let mut error = None;
-        for _ in 0..self.paths.len() {
-            match pool.receive() {
-                Ok(completion) => {
-                    let Some(slot) = self.results.get_mut(completion.sequence) else {
-                        error.get_or_insert_with(|| {
-                            LpmError::Io(io::Error::other("invalid file writer sequence"))
-                        });
-                        continue;
-                    };
-                    if slot.is_some() {
-                        error.get_or_insert_with(|| {
-                            LpmError::Io(io::Error::other("duplicate file writer result"))
-                        });
-                    }
-                    *slot = Some(completion.result);
-                }
-                Err(failure) => {
-                    error.get_or_insert(failure);
-                    break;
-                }
-            }
+        while self.slots.iter().any(|slot| slot.result.is_none()) {
+            self.store(pool.receive()?)?;
         }
-        self.bytes = 0;
-        for (path, result) in self.paths.drain(..).zip(self.results.drain(..)) {
-            let result = result
-                .unwrap_or_else(|| Err(io::Error::other("missing file writer result").into()))
-                .and_then(|written| {
-                    let record = E::from_extracted_file(path, written.digest)?;
-                    let identity = written.output.commit()?;
-                    records.push(record);
-                    identities.push(identity);
-                    Ok(())
-                });
-            if let Err(failure) = result {
-                error.get_or_insert(failure);
-            }
+        self.accept_front(records, identities)
+    }
+
+    fn store(&mut self, completion: Completion) -> Result<(), LpmError> {
+        let slot = completion
+            .sequence
+            .checked_sub(self.front_sequence)
+            .and_then(|index| self.slots.get_mut(index))
+            .ok_or_else(|| io::Error::other("invalid file writer sequence"))?;
+        if slot.result.is_some() {
+            return Err(io::Error::other("duplicate file writer result").into());
         }
-        error.map_or(Ok(()), Err)
+        slot.result = Some(completion.result);
+        Ok(())
+    }
+
+    /// Accept front entries while their results are ready. The first failure
+    /// stops acceptance; later completed files roll back when their slots drop.
+    fn accept_front<E: crate::ExtractionRecord>(
+        &mut self,
+        records: &mut Vec<E>,
+        identities: &mut Vec<Identity>,
+    ) -> Result<(), LpmError> {
+        while let Some(Slot {
+            path,
+            bytes,
+            result: Some(result),
+        }) = self.slots.pop_front_if(|slot| slot.result.is_some())
+        {
+            self.front_sequence += 1;
+            self.bytes -= bytes;
+            let written = result?;
+            let record = E::from_extracted_file(path, written.digest)?;
+            let identity = written.output.commit()?;
+            records.push(record);
+            identities.push(identity);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -340,6 +416,11 @@ impl WriterPool {
                             let result =
                                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                     #[cfg(test)]
+                                    if let Some(before_open) = &hooks.before_open {
+                                        before_open(&job)?;
+                                    }
+                                    let job = job.open()?;
+                                    #[cfg(test)]
                                     let job = {
                                         let mut job = job;
                                         if let Some(before_write) = &hooks.before_write {
@@ -393,6 +474,16 @@ impl WriterPool {
             .map_err(|_| io::Error::other("tarball file writers stopped before completion").into())
     }
 
+    fn try_receive(&self) -> Result<Option<Completion>, LpmError> {
+        match self.ready.try_recv() {
+            Ok(completion) => Ok(Some(completion)),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err(io::Error::other("tarball file writers stopped before completion").into())
+            }
+        }
+    }
+
     pub(super) fn finish(mut self) -> Result<(), LpmError> {
         self.join()
     }
@@ -417,7 +508,7 @@ impl Drop for WriterPool {
     }
 }
 
-fn write(mut job: Job) -> Result<Written, LpmError> {
+fn write(mut job: OpenedJob) -> Result<Written, LpmError> {
     job.output.file.write_all(&job.bytes)?;
     let digest = job
         .compute_blake3
@@ -440,7 +531,9 @@ fn write(mut job: Job) -> Result<Written, LpmError> {
 #[cfg(test)]
 pub(super) type TestObserver = Arc<dyn Fn(TestEvent) + Send + Sync>;
 #[cfg(test)]
-type BeforeWrite = Arc<dyn Fn(&mut Job) -> Result<(), LpmError> + Send + Sync>;
+type BeforeOpen = Arc<dyn Fn(&Job) -> Result<(), LpmError> + Send + Sync>;
+#[cfg(test)]
+type BeforeWrite = Arc<dyn Fn(&mut OpenedJob) -> Result<(), LpmError> + Send + Sync>;
 #[cfg(test)]
 type AfterWrite = Arc<dyn Fn(&Written) -> Result<(), LpmError> + Send + Sync>;
 
@@ -456,6 +549,7 @@ pub(super) enum TestEvent {
 #[derive(Clone, Default)]
 pub(super) struct TestHooks {
     pub before_spawn: Option<Arc<dyn Fn(usize) -> io::Result<()> + Send + Sync>>,
+    pub before_open: Option<BeforeOpen>,
     pub before_write: Option<BeforeWrite>,
     pub after_write: Option<AfterWrite>,
     pub on_exit: Option<Arc<dyn Fn() + Send + Sync>>,

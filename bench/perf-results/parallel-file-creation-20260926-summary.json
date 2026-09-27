@@ -1,0 +1,127 @@
+{
+ "baseline": "#892 head d26549978, release build",
+ "profile_next_16_3_6_before": {
+  "coordinating_thread_openat_ms": 365,
+  "extraction_ms": 580
+ },
+ "profile_after_creation_move_before_continuous_acceptance": {
+  "coordinating_thread_drain_wait_ms": 148
+ },
+ "standalone_next_16_3_6_8531_files_two_writers_median_ms": {
+  "baseline": [
+   580,
+   583,
+   582
+  ],
+  "change": [
+   462,
+   469,
+   463
+  ],
+  "runs_per_round": 9
+ },
+ "standalone_next_16_0_7_7399_files_median_ms": {
+  "2": {
+   "baseline": [
+    487,
+    504
+   ],
+   "change": [
+    382,
+    388
+   ]
+  },
+  "4": {
+   "baseline": [
+    511,
+    490
+   ],
+   "change": [
+    347,
+    345
+   ]
+  },
+  "8": {
+   "baseline": [
+    483,
+    499
+   ],
+   "change": [
+    402,
+    401
+   ]
+  },
+  "runs_per_round": 7
+ },
+ "harness_t3_16_samples": {
+  "first-install": {
+   "baseline": {
+    "median_ms": 1538.8,
+    "p95_ms": 1719.5
+   },
+   "writers_2": {
+    "median_ms": 1468.9,
+    "p95_ms": 1668.9,
+    "paired_median_delta_ms": -67.4,
+    "faster": "13/16"
+   },
+   "writers_4": {
+    "median_ms": 1505.7,
+    "p95_ms": 1635.3,
+    "paired_median_delta_ms": -37.8,
+    "faster": "12/16"
+   }
+  },
+  "ci-cold-cache": {
+   "baseline": {
+    "median_ms": 1449.1,
+    "p95_ms": 1518.5
+   },
+   "writers_2": {
+    "median_ms": 1376.3,
+    "p95_ms": 1814.9,
+    "paired_median_delta_ms": -60.7,
+    "faster": "13/16"
+   },
+   "writers_4": {
+    "median_ms": 1416.6,
+    "p95_ms": 1574.2,
+    "paired_median_delta_ms": -63.4,
+    "faster": "14/16"
+   }
+  }
+ },
+ "harness_t3_12_samples_writers_4": {
+  "first-install": {
+   "paired_median_delta_ms": -58.5,
+   "faster": "8/12"
+  },
+  "ci-cold-cache": {
+   "paired_median_delta_ms": 24.5,
+   "faster": "5/12"
+  }
+ },
+ "in_install_next_extract_ms_traced": {
+  "baseline": [
+   1178,
+   1204,
+   1217,
+   936
+  ],
+  "change": [
+   1159,
+   767,
+   743,
+   783,
+   1165,
+   1071
+  ]
+ },
+ "not_adopted": {
+  "four_writer_default": "no install-level gain over two",
+  "close_on_writers": {
+   "saved_ms": 10,
+   "reason": "queued closes fall outside the per-pool descriptor budget"
+  }
+ }
+}

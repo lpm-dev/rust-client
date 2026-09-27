@@ -1592,19 +1592,24 @@ where
                         let length = usize::try_from(size).map_err(|_| {
                             std::io::Error::other("tarball entry exceeds address space")
                         })?;
-                        if !pending.has_capacity(length) {
-                            pending.drain(pool, &mut extracted_files, &mut accepted_identities)?;
-                        }
+                        pending.make_room(
+                            pool,
+                            length,
+                            &mut extracted_files,
+                            &mut accepted_identities,
+                        )?;
                         let mut bytes = vec![0; length];
-                        if !pending.has_capacity(bytes.capacity()) {
-                            pending.drain(pool, &mut extracted_files, &mut accepted_identities)?;
-                        }
+                        pending.make_room(
+                            pool,
+                            bytes.capacity(),
+                            &mut extracted_files,
+                            &mut accepted_identities,
+                        )?;
                         entry.read_exact(&mut bytes)?;
                         let capacity = bytes.capacity();
-                        let output_file = output.create_file(&relative_path, false)?;
                         pool.submit(writers::Job {
-                            sequence: pending.len(),
-                            output: output_file,
+                            sequence: pending.next_sequence(),
+                            target: output.new_file(&relative_path)?,
                             bytes,
                             exec_bits,
                             compute_blake3,
