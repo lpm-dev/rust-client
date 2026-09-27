@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {spawnSync} from 'node:child_process';
+import {runPhase} from './phase.mjs';
 const repoRoot=process.cwd();
 const config=JSON.parse(fs.readFileSync(process.argv[2],'utf8'));
 const outputDir=config.output;
@@ -62,7 +63,7 @@ for(let sample=1;sample<=samples;sample++)for(const scenario of rotate(SCENARIOS
   select(v);const root=seeds.get(`${scenario.id}:${v.id}`);
   reset(v.manager,scenario.id,root);const setup=captureState(v.manager,root);assertScenarioState(v.manager,scenario.id,setup);
   const output=path.join(artifactDir,scenario.id,v.id,String(sample));
-  await control({phase:`sample-${sample}-${v.id}`});
+  await control({phase:runPhase('sample',scenario.id,v.id,sample)});
   const result=runInstall({manager:v.manager,root,output,measured:true});
   const verification=verifyInstalledProject(root);
   retainInstalledInventory(root,output);
@@ -78,7 +79,7 @@ for(const scenario of SCENARIOS)for(const v of variants){
 
  if(v.manager==='lpm')for(let n=0;n<(config.diagnostics??3);n++){
   reset(v.manager,scenario.id,root);const output=path.join(artifactDir,'timing',scenario.id,v.id,String(n));
-  await control({phase:`diagnostic-${v.id}-${n}`});
+  await control({phase:runPhase('diagnostic',scenario.id,v.id,n)});
   const result=runInstall({manager:v.manager,root,output,measured:false,timing:true});assert(result.ok,'diagnostic install failed');
  }
 }
