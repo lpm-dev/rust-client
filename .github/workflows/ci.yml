@@ -141,7 +141,12 @@ jobs:
         run: node --test bench/scripts/cold-object-finalization-replay/proxy.test.mjs
 
       - name: T3 six-state install bench helper tests
-        run: node bench/scripts/run-t3-install-six-states.mjs --self-test
+        run: |
+          node bench/scripts/run-t3-install-six-states.mjs --self-test
+          node bench/scripts/test-t3-install-six-states.mjs
+
+      - name: Dev-command bench helper tests
+        run: node --test bench/scripts/test-dev-command-suite.mjs
 
       - name: Runtime readiness bench helper tests
         run: node bench/scripts/run-runtime-readiness.mjs --self-test

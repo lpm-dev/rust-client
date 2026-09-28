@@ -1,5 +1,109 @@
 # Install benchmark scripts
 
+## Dev-command comparison
+
+`run-dev-command-suite.mjs` measures six installed-project commands on macOS and Linux.
+It supports LPM, Bun, pnpm, npm, Aube, Nub, Deno, vlt, UPM, Yarn 6, and Vite+.
+This suite does not measure installation.
+
+The six workloads are:
+
+1. A package script that runs `echo hi`.
+2. A package script that starts Node and writes one line.
+3. The local `esbuild --version` command.
+4. A generated 10-module TSX app with a warm transform cache.
+5. A lint check of 20 generated JavaScript files.
+6. A format check of those files in the formatter's default style.
+
+The default run has 10 samples after two warmups for each command.
+Commands run sequentially. The manager order rotates and reverses between rounds.
+Wall time includes process startup and output capture, but excludes fixture checks and log writes.
+Failed commands never contribute successful samples.
+On macOS, one separate diagnostic records maximum process RSS for each command.
+This RSS value is not a median or the combined memory of the process tree.
+
+Create a JSON file with absolute executable paths. Use these keys:
+
+```json
+{
+  "lpm": "/absolute/path/to/lpm-rs",
+  "bun": "/absolute/path/to/bun",
+  "pnpm": "/absolute/path/to/pnpm",
+  "npm": "/absolute/path/to/npm",
+  "aube": "/absolute/path/to/aube",
+  "nub": "/absolute/path/to/nub",
+  "deno": "/absolute/path/to/deno",
+  "vlt": "/absolute/path/to/vlt",
+  "upm": "/absolute/path/to/upm",
+  "yarn": "/absolute/path/to/yarn-bin",
+  "vite": "/absolute/path/to/vp"
+}
+```
+
+Run the harness tests:
+
+```bash
+node --test bench/scripts/test-dev-command-suite.mjs
+```
+
+Prepare a new results directory:
+
+```bash
+node bench/scripts/run-dev-command-suite.mjs \
+  --bins /absolute/path/to/manager-bins.json \
+  --out /absolute/path/to/new-dev-results \
+  --prepare
+```
+
+After preparation, stop other CPU-intensive work. Then run the measurements:
+
+```bash
+node bench/scripts/run-dev-command-suite.mjs \
+  --out /absolute/path/to/new-dev-results \
+  --run --rounds 10 --warmups 2
+```
+
+Use `--managers lpm,bun,npm` during preparation for a smaller comparison.
+The npm executable remains required because setup uses `npm pack` for the local JSX runtime fixture.
+The harness does not build LPM or install the manager executables.
+
+Each manager gets a separate project, HOME, cache, and temporary directory.
+The harness does not copy authentication from the caller's environment.
+Preparation requires network access and installs pinned tools outside the measured interval.
+It approves only esbuild for pnpm builds and runs the pinned esbuild postinstall during setup.
+This step prepares the native executable for the local-bin row.
+vlt receives an explicit npm registry configuration.
+Deno uses npm-prepared dependencies with manual node_modules resolution.
+Vite+ also uses npm-prepared dependencies. Other managers prepare their own projects.
+Yarn keeps its default linker.
+
+LPM, Bun, Nub, and Deno use their native TSX paths.
+Other managers launch local `tsx`. The npm row includes `npm exec` overhead, unlike the historical direct-`tsx` comparison.
+LPM uses managed Oxlint and Biome. Deno uses its own lint and format commands.
+Vite+ uses its bundled Oxlint and Oxfmt. Other managers launch local Oxlint and Biome.
+These rows compare product workflows, not identical engines in every column.
+Vite+ task-result caching is disabled so every sample executes the task.
+All format samples are check-only and must leave source files unchanged.
+Preflight inserts invalid files to confirm that lint and format commands inspect the fixture.
+
+The results directory contains:
+
+- `plan.json`: versions, binary hashes, commands, setup status, and fixture hashes.
+- `fixtures/`: source and configuration snapshots for each manager.
+- `logs/`: setup, preflight, canary, and tool-version logs.
+- `run-*/results.json`: all samples, medians, p95 values, and RSS diagnostics.
+- `run-*/samples.jsonl`: incremental results, including interrupted runs.
+- `run-*/logs/`: raw output from each command.
+- `run-*/SUMMARY.md`: the median table.
+- `work/`: installed projects and caches for another warm run.
+
+The harness refuses to overwrite an existing preparation directory.
+Each `--run` creates a separate results directory.
+Keep `work/` and its temporary-directory symlinks for warm repeats.
+Exclude `work/` from a share bundle. It contains large dependency trees and caches.
+The harness also retains short `/tmp/lpm-dev-*` directories for TSX IPC sockets and transform caches.
+These paths avoid the macOS Unix-domain socket length limit.
+
 ## Ecosystem correction verification
 
 `run-ecosystem-correction.mjs` checks importer-scoped lock graphs and LPM's
@@ -115,8 +219,12 @@ The harness writes raw rows plus JSON and Markdown summaries under
 
 ## T3 six-state install benchmark
 
-`run-t3-install-six-states.mjs` compares LPM with Bun. It uses the tracked
-T3-stack manifest from the install benchmark in Bun.
+`run-t3-install-six-states.mjs` compares LPM with selected reference package
+managers. It uses the tracked T3-stack manifest from the install benchmark in
+Bun. The default manager set remains `lpm,bun`.
+The supported managers are LPM, Bun, pnpm, npm, Aube, Nub, Deno, vlt, UPM, and Yarn.
+Each state that needs preparation requires a successful preparation install.
+Policy failures remain visible and do not stop the other managers.
 
 The harness measures six states:
 
@@ -135,12 +243,22 @@ that each prepared state has the required files before the install starts.
 LPM V2 project links point into `LPM_HOME/store`. Thus, the fifth state removes
 `LPM_HOME/cache` but keeps `LPM_HOME/store`. The harness also makes sure that
 `next/package.json` resolves before and after this measured install.
+It also checks every direct dependency and records its installed version.
+pnpm metadata and content caches are cleared together.
+Nub runtime files and UPM compile caches remain separate from dependency caches.
 
-Each LPM and Bun pair is adjacent. The harness alternates the manager order and
-rotates the state order for each sample. Bun is the control for network noise.
+Release-age and security settings retain their product defaults unless an explicit option overrides them.
+Lifecycle scripts are disabled for every manager.
+Yarn uses the `node-modules` linker. Deno creates local `node_modules`.
+vlt uses the public npm registry. npm retains its default audit behavior.
+Different defaults can produce different dependency graphs, even with the same fixture.
+
+Each manager comparison group is adjacent. The harness rotates manager order
+and state order for each sample. The reference managers expose network noise.
 Scored wall-time and RSS samples do not enable LPM timing detail. After the
-scored pairs, the harness runs separate LPM-only `--json --timing` diagnostics
-with `LPM_TIMING_DETAIL=trace`. Use `--timing-samples` to set their count.
+scored groups, the harness runs separate LPM-only `--json --timing`
+diagnostics with `LPM_TIMING_DETAIL=trace`. Use `--timing-samples` to set their
+count.
 
 Build the release CLI:
 
@@ -152,6 +270,7 @@ Run the harness self-test:
 
 ```bash
 node bench/scripts/run-t3-install-six-states.mjs --self-test
+node bench/scripts/test-t3-install-six-states.mjs
 ```
 
 Run ten samples for each manager and state:
@@ -160,9 +279,65 @@ Run ten samples for each manager and state:
 node bench/scripts/run-t3-install-six-states.mjs --samples 10 --timing-samples 3
 ```
 
+Run the same six states across LPM, Bun, pnpm, and npm:
+
+```bash
+node bench/scripts/run-t3-install-six-states.mjs \
+  --samples 10 \
+  --timing-samples 3 \
+  --managers lpm,bun,pnpm,npm
+```
+
+Run LPM alone with the firewall in monitor mode:
+
+```bash
+node bench/scripts/run-t3-install-six-states.mjs \
+  --samples 10 \
+  --timing-samples 3 \
+  --managers lpm \
+  --lpm-firewall monitor \
+  --lpm-bin /path/to/lpm-rs \
+  --output /path/to/new-results \
+  --work-dir /path/to/new-work-directory
+```
+
+The `--lpm-firewall` option accepts `off`, `monitor`, or `enforce`.
+Monitor and enforce modes require authentication.
+Supply a temporary read-only token through `LPM_TOKEN` in the process environment.
+The harness passes this token only to LPM.
+Do not put a token in command arguments or result files.
+The harness isolates `HOME`, so it does not use your normal file-based login state.
+Revoke the temporary token after the benchmark.
+
+Explicit monitor and enforce runs require successful firewall requests and complete verdict counts.
+Failed or skipped requests do not contribute to the benchmark statistics, even if the install exits successfully.
+This requirement also applies to preparation installs and timing diagnostics.
+Up-to-date installs can omit new verdicts only after successful firewall-enabled preparation.
+Raw rows include the firewall report and its validation result.
+
+To use isolated tool versions, create a JSON object that maps manager names to executable paths.
+Pass this file with `--manager-bins /path/to/manager-bins.json`.
+For Yarn 6, use the native `yarn-bin` executable to exclude version-manager downloads.
+Use `--lpm-bin` separately for the LPM executable.
+
 The result directory contains scored rows, separate timing rows, each install
-output, and JSON and Markdown summaries. Set `LPM_NPM_FANOUT` only for an
-explicit concurrency test.
+output, generated lockfiles, and JSON and Markdown summaries.
+Use `--work-dir` for temporary install trees when the results directory is persistent or indexed.
+The harness also saves its source, the fixture, binary hashes, and the run plan.
+It saves partial results after each measured install.
+If a run stops, repeat the same command with `--resume` to retain completed measurements.
+Resume rejects changed versions, binary hashes, fixtures, settings, or work-directory paths.
+It saves each resumed harness and plan without replacing the original snapshots.
+Failed preparation attempts keep their logs. After three failed attempts, a manager receives a blocked row.
+The other managers continue. Blocked rows do not contribute to successful-install statistics.
+The Markdown summary lists successful installs and total attempts for each manager and state.
+On POSIX hosts, a timed-out install receives process-group cleanup outside the measured interval.
+The cleanup sends SIGTERM first.
+If the group remains after one second, the cleanup sends SIGKILL.
+The median averages the middle two values for an even sample count.
+The p95 uses the nearest rank. With ten samples, p95 equals the maximum.
+The harness waits for vlt background workers outside the measured interval before the next install or cache reset.
+Set `LPM_NPM_FANOUT` only for an explicit concurrency test.
 
 ## Production-readiness harness
 
