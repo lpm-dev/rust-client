@@ -1,6 +1,6 @@
 use lpm_common::LpmError;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -88,9 +88,27 @@ pub(super) struct CacheContext {
     pub(super) remote_cache: Option<crate::commands::remote_cache::RemoteCacheClient>,
     workspace_validation: Option<lpm_task::hasher::FilesystemValidation>,
     input_validation: lpm_task::hasher::FilesystemValidation,
-    runtime_validation: Option<lpm_runtime::task_identity::PortableRuntimeSnapshot>,
+    runtime_validation: Option<RuntimeValidation>,
     dependencies: Vec<TaskDependencyIdentity>,
     command_preference: CommandPreference,
+}
+
+struct RuntimeValidation {
+    project_dir: PathBuf,
+    bin_hint: lpm_runner::bin_path::ManagedRuntimeHint,
+    snapshot: lpm_runtime::task_identity::PortableRuntimeSnapshot,
+}
+
+impl RuntimeValidation {
+    fn is_unchanged(&self) -> Result<bool, LpmError> {
+        let path = lpm_runner::bin_path::build_path_with_bins_pre_resolved(
+            &self.project_dir,
+            &self.bin_hint,
+        )?;
+        Ok(self
+            .snapshot
+            .is_unchanged_on_path(std::ffi::OsStr::new(&path)))
+    }
 }
 
 pub(super) struct CacheStoreRequest<'a> {
@@ -294,7 +312,11 @@ fn build_task_context(
             return Ok(None);
         };
         runtime_identities.extend_from_slice(snapshot.identities());
-        Some(snapshot)
+        Some(RuntimeValidation {
+            project_dir: project_dir.to_path_buf(),
+            bin_hint: bin_hint.clone(),
+            snapshot,
+        })
     } else {
         bin_hint.append_executable_cache_identities(
             project_dir,
@@ -490,7 +512,7 @@ pub(super) fn try_cache_hit_with_context(
 
 fn cache_context_is_unchanged(context: &CacheContext) -> Result<bool, LpmError> {
     if let Some(runtime) = &context.runtime_validation
-        && !runtime.is_unchanged()
+        && !runtime.is_unchanged()?
     {
         return Ok(false);
     }

@@ -16,10 +16,18 @@ struct Artifact {
     sha: String,
 }
 
+enum RuntimeMutation {
+    TouchMetadata(std::path::PathBuf),
+    AddProjectLauncher {
+        project: std::path::PathBuf,
+        node: std::path::PathBuf,
+    },
+}
+
 #[derive(Clone, Default)]
 struct Artifacts(
     Arc<Mutex<HashMap<String, Artifact>>>,
-    Arc<Mutex<Option<std::path::PathBuf>>>,
+    Arc<Mutex<Option<RuntimeMutation>>>,
 );
 
 impl Respond for Artifacts {
@@ -44,16 +52,48 @@ impl Respond for Artifacts {
             return ResponseTemplate::new(200).set_body_json(serde_json::json!({"urls": []}));
         }
         if artifacts.contains_key(&key)
-            && let Some(binary) = self.1.lock().unwrap().take()
+            && let Some(mutation) = self.1.lock().unwrap().take()
         {
-            let modified =
-                binary.metadata().unwrap().modified().unwrap() + std::time::Duration::from_secs(10);
-            std::fs::File::options()
-                .write(true)
-                .open(binary)
-                .unwrap()
-                .set_times(std::fs::FileTimes::new().set_modified(modified))
-                .unwrap();
+            match mutation {
+                RuntimeMutation::TouchMetadata(binary) => {
+                    let modified = binary.metadata().unwrap().modified().unwrap()
+                        + std::time::Duration::from_secs(10);
+                    std::fs::File::options()
+                        .write(true)
+                        .open(binary)
+                        .unwrap()
+                        .set_times(std::fs::FileTimes::new().set_modified(modified))
+                        .unwrap();
+                }
+                RuntimeMutation::AddProjectLauncher { project, node } => {
+                    let bin = project.join("node_modules/.bin");
+                    std::fs::create_dir_all(&bin).unwrap();
+                    let node = node.to_str().unwrap();
+                    let launcher = if cfg!(windows) {
+                        bin.join("node.cmd")
+                    } else {
+                        bin.join("node")
+                    };
+                    let content = if cfg!(windows) {
+                        format!(
+                            "@echo off\r\n> runtime-marker echo selected\r\n\"{}\" %*\r\n",
+                            node.replace('%', "%%")
+                        )
+                    } else {
+                        format!(
+                            "#!/bin/sh\nprintf selected > runtime-marker\nexec '{}' \"$@\"\n",
+                            node.replace('\'', "'\"'\"'")
+                        )
+                    };
+                    std::fs::write(&launcher, content).unwrap();
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(launcher, std::fs::Permissions::from_mode(0o755))
+                            .unwrap();
+                    }
+                }
+            }
         }
         match artifacts.get(&key) {
             Some(artifact) => ResponseTemplate::new(200)
@@ -99,12 +139,18 @@ fn project(registry: &MockRegistry, portable: bool) -> TempProject {
 }
 
 fn build(project: &TempProject) {
-    lpm(project)
+    let result = lpm(project)
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["run", "build"])
         .assert()
         .success();
+    let output = result.get_output();
+    eprintln!(
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test]
@@ -300,7 +346,7 @@ async fn portable_cache_rejects_restore_when_runtime_changes_during_download() {
     let consumer = project(&registry, true);
     build(&producer);
     let (binary, path) = copied_node_path(&consumer);
-    *artifacts.1.lock().unwrap() = Some(binary);
+    *artifacts.1.lock().unwrap() = Some(RuntimeMutation::TouchMetadata(binary));
     build_with_path(&consumer, &path);
     assert!(
         artifacts.1.lock().unwrap().is_none(),
@@ -318,6 +364,43 @@ async fn portable_cache_rejects_restore_when_runtime_changes_during_download() {
         })
         .count();
     assert_eq!(uploads, 1, "a changed execution context must not publish");
+}
+
+#[tokio::test]
+async fn portable_cache_rejects_restore_when_a_new_project_bin_changes_runtime_selection() {
+    let (registry, artifacts) = remote_cache().await;
+    let producer = project(&registry, true);
+    let consumer = project(&registry, true);
+    for project in [&producer, &consumer] {
+        let mut config: serde_json::Value =
+            serde_json::from_str(&project.read_file("lpm.json")).unwrap();
+        config["tasks"]["build"]["inputs"] = serde_json::json!(["build.js", "src/**"]);
+        project.write_file("lpm.json", &config.to_string());
+    }
+    build(&producer);
+    let (node, _) = copied_node_path(&consumer);
+    *artifacts.1.lock().unwrap() = Some(RuntimeMutation::AddProjectLauncher {
+        project: consumer.path().to_path_buf(),
+        node,
+    });
+    build(&consumer);
+    assert!(artifacts.1.lock().unwrap().is_none());
+    assert!(
+        consumer.file_exists("executed-marker"),
+        "a new effective runtime selection must reject the prepared hit"
+    );
+    assert!(
+        consumer.file_exists("runtime-marker"),
+        "execution must select the new project launcher"
+    );
+    let requests = registry.server().received_requests().await.unwrap();
+    let uploads = requests
+        .iter()
+        .filter(|request| {
+            request.method == "PUT" && request.url.path().starts_with("/v8/artifacts/")
+        })
+        .count();
+    assert_eq!(uploads, 1, "a stale runtime selection must not publish");
 }
 
 #[cfg(unix)]

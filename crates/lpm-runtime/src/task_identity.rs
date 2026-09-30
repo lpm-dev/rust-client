@@ -66,7 +66,12 @@ impl PortableRuntimeSnapshot {
 
     /// Recheck PATH selection and filesystem state without reading large binaries.
     pub fn is_unchanged(&self) -> bool {
-        selected_runtimes(&self.cwd, &self.path).is_some_and(|selected| {
+        self.is_unchanged_on_path(&self.path)
+    }
+
+    /// Recheck selection against the current effective child PATH and filesystem state.
+    pub fn is_unchanged_on_path(&self, path: &OsStr) -> bool {
+        selected_runtimes(&self.cwd, path).is_some_and(|selected| {
             selected.iter().zip(&self.local).all(|(selected, local)| {
                 selected.as_ref().map(|runtime| &runtime.fingerprint) == local.as_ref()
             })
