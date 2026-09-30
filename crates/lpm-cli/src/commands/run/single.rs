@@ -446,5 +446,6 @@ fn exec_options(
         managed_runtime_hint,
         plain_node,
         runtime_cache_root: None,
+        recorded_node_versions: crate::engine_check::recorded_node_versions(),
     }
 }

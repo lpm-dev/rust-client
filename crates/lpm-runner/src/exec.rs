@@ -9,6 +9,7 @@ use crate::dotenv;
 use crate::shell;
 use lpm_common::LpmError;
 use lpm_common::paths::LpmRoot;
+use lpm_runtime::effective::{PathNodeVersionCache, RecordedNodeVersions};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,9 @@ pub struct ExecOptions {
     pub managed_runtime_hint: ManagedRuntimeHint,
     pub plain_node: bool,
     pub runtime_cache_root: Option<PathBuf>,
+    /// Node versions recorded by earlier commands, reused instead of probing
+    /// `node --version` for an unchanged Node binary.
+    pub recorded_node_versions: Option<RecordedNodeVersions>,
 }
 
 impl Default for ExecOptions {
@@ -42,6 +46,7 @@ impl Default for ExecOptions {
             managed_runtime_hint: ManagedRuntimeHint::Unknown,
             plain_node: false,
             runtime_cache_root: None,
+            recorded_node_versions: None,
         }
     }
 }
@@ -184,7 +189,8 @@ pub fn build_exec_plan(
     let file_kind = detect_file_kind(&resolved_path)?;
     let path =
         bin_path::build_path_with_bins_pre_resolved(project_dir, &options.managed_runtime_hint)?;
-    let node_version = detect_effective_node_version_with_path(&path);
+    let node_version =
+        effective_node_version(project_dir, &path, options.recorded_node_versions.as_ref());
     let strategy = choose_exec_strategy(file_kind, project_dir, node_version.as_deref(), options)?;
     let runtime = runtime_for_strategy(&strategy, node_version);
     let (command, node_launch) =
@@ -710,36 +716,24 @@ fn detect_effective_node_version(
     project_dir: &Path,
 ) -> lpm_runtime::detect::DetectionResult<Option<String>> {
     let path = bin_path::build_path_with_bins(project_dir)?;
-    Ok(detect_effective_node_version_with_path(&path))
+    Ok(effective_node_version(project_dir, &path, None))
 }
 
-fn detect_effective_node_version_with_path(path: &str) -> Option<String> {
-    let mut command = Command::new("node");
-    command
-        .arg("--version")
-        .env("PATH", path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    shell::strip_inherited_env_hooks(&mut command);
-    let output = lpm_common::process_output::output_capped(
-        &mut command,
-        std::time::Duration::from_secs(2),
-        4096,
-    )
-    .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let version = String::from_utf8(output.stdout).ok()?;
-    let trimmed = version.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+/// The version of the Node that `path` selects for a file run in
+/// `project_dir`, as `node --version` prints it.
+fn effective_node_version(
+    project_dir: &Path,
+    path: &str,
+    recorded: Option<&RecordedNodeVersions>,
+) -> Option<String> {
+    let mut versions = recorded.cloned().map_or_else(
+        PathNodeVersionCache::default,
+        PathNodeVersionCache::with_recorded_versions,
+    );
+    versions
+        .resolve(project_dir, std::ffi::OsStr::new(path))
+        .version()
+        .map(|version| format!("v{version}"))
 }
 
 /// Parse major.minor from a version string like "22.6.0" into (22, 6).
@@ -1197,6 +1191,41 @@ mod tests {
         let target = describe_exec_target_with_options(dir.path(), "hello.ts", &options).unwrap();
 
         assert_eq!(target.runtime_label, "Node.js v23.6.0 + LPM TS runtime");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_plan_uses_a_recorded_node_version_instead_of_probing() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        write_project_file(dir.path(), "hello.js");
+        let bin_dir = dir.path().join("node_modules/.bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        // Passes the Node binary checks but cannot run, so only a recorded
+        // version can name it.
+        let node = bin_dir.join("node");
+        let mut file = fs::File::create(&node).unwrap();
+        file.write_all(b"\x7fELF").unwrap();
+        file.set_len(16 * 1024 * 1024).unwrap();
+        make_executable(&node);
+        let path = bin_path::build_path_with_bins(dir.path()).unwrap();
+        let fingerprint = lpm_runtime::effective::probe_node_fingerprint_on_path(
+            dir.path(),
+            std::ffi::OsStr::new(&path),
+        )
+        .unwrap();
+        let records = dir.path().join("node-versions");
+        fs::create_dir_all(&records).unwrap();
+        fs::write(records.join(&fingerprint), "22.9.0\n").unwrap();
+        let options = ExecOptions {
+            recorded_node_versions: Some(RecordedNodeVersions::at(&records)),
+            ..test_options(dir.path())
+        };
+
+        let target = describe_exec_target_with_options(dir.path(), "hello.js", &options).unwrap();
+
+        assert_eq!(target.runtime_label, "Node.js v22.9.0");
     }
 
     #[test]

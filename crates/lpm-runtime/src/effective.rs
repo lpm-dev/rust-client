@@ -538,6 +538,7 @@ fn resolve_selected(selected: &SelectedNode) -> Effective {
 /// prefix). Returns `None` when `node` is not on `PATH` or the output
 /// is unparseable.
 fn node_version_output(command: &mut Command) -> Option<std::process::Output> {
+    lpm_common::child_env::strip_inherited_env_hooks(command);
     lpm_common::process_output::output_capped(command, std::time::Duration::from_secs(2), 4096).ok()
 }
 
