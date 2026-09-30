@@ -392,7 +392,7 @@ fn security_sensitive_client_paths_keep_shared_builders() {
     let remote_cache = read_workspace_source("crates/lpm-cli/src/commands/remote_cache.rs");
     assert_body_contains(
         &remote_cache,
-        "fn blocking_http_client()",
-        "lpm_http::blocking_client_builder()",
+        "fn http_client()",
+        "lpm_http::client_builder()",
     );
 }
