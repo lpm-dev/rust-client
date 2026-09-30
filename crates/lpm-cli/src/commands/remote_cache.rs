@@ -106,7 +106,7 @@ pub fn try_store(
     stderr: &str,
     duration_ms: u64,
     env_vars: &HashMap<String, String>,
-    inherited_env: &HashMap<String, String>,
+    inherited_env: &HashMap<std::ffi::OsString, std::ffi::OsString>,
 ) {
     if client.read_only {
         return;
@@ -1089,16 +1089,27 @@ fn decode_hmac_tag(tag: &str) -> Result<Vec<u8>, String> {
 fn upload_block_reason(
     policy: &lpm_runner::lpm_json::RemoteCacheEnvConfig,
     env_vars: &HashMap<String, String>,
-    inherited_env: &HashMap<String, String>,
+    inherited_env: &HashMap<std::ffi::OsString, std::ffi::OsString>,
     stdout: &str,
     stderr: &str,
 ) -> Option<String> {
-    for (name, value) in env_vars.iter().chain(inherited_env) {
+    // Inherited names and values are compared as raw bytes: they need not be
+    // valid UTF-8, and a lossy copy could hide a value that appears in output.
+    let entries = env_vars
+        .iter()
+        .map(|(name, value)| (name.as_bytes(), value.as_bytes()))
+        .chain(
+            inherited_env
+                .iter()
+                .map(|(name, value)| (name.as_encoded_bytes(), value.as_encoded_bytes())),
+        );
+    for (name, value) in entries {
         if !env_name_blocks_upload(policy, name) {
             continue;
         }
+        let name = String::from_utf8_lossy(name);
 
-        if value.len() >= 8 && (stdout.contains(value) || stderr.contains(value)) {
+        if value.len() >= 8 && (output_contains(stdout, value) || output_contains(stderr, value)) {
             return Some(format!(
                 "remote cache upload skipped because task output contains the value of {name}"
             ));
@@ -1111,7 +1122,15 @@ fn upload_block_reason(
     None
 }
 
-fn env_name_blocks_upload(policy: &lpm_runner::lpm_json::RemoteCacheEnvConfig, name: &str) -> bool {
+/// Task output is text, so it cannot contain a value that is not valid UTF-8.
+fn output_contains(output: &str, value: &[u8]) -> bool {
+    std::str::from_utf8(value).is_ok_and(|value| output.contains(value))
+}
+
+fn env_name_blocks_upload(
+    policy: &lpm_runner::lpm_json::RemoteCacheEnvConfig,
+    name: &[u8],
+) -> bool {
     if policy
         .exclude
         .iter()
@@ -1129,31 +1148,36 @@ fn env_name_blocks_upload(policy: &lpm_runner::lpm_json::RemoteCacheEnvConfig, n
     !policy.allow_secrets && default_secret_pattern(name)
 }
 
-fn default_secret_pattern(name: &str) -> bool {
+fn default_secret_pattern(name: &[u8]) -> bool {
     let upper = name.to_ascii_uppercase();
-    upper == "DATABASE_URL"
-        || upper.contains("TOKEN")
-        || upper.contains("SECRET")
-        || upper.contains("PASSWORD")
-        || upper.contains("PASSWD")
-        || upper.contains("PRIVATE_KEY")
-        || upper.contains("API_KEY")
-        || upper.ends_with("_KEY")
+    let contains = |part: &[u8]| upper.windows(part.len()).any(|window| window == part);
+    upper == b"DATABASE_URL"
+        || contains(b"TOKEN")
+        || contains(b"SECRET")
+        || contains(b"PASSWORD")
+        || contains(b"PASSWD")
+        || contains(b"PRIVATE_KEY")
+        || contains(b"API_KEY")
+        || upper.ends_with(b"_KEY")
 }
 
-fn pattern_matches(name: &str, pattern: &str) -> bool {
+/// Case-insensitive `*` glob over the bytes of an environment name.
+fn pattern_matches(name: &[u8], pattern: &str) -> bool {
     let name = name.to_ascii_uppercase();
-    let pattern = pattern.to_ascii_uppercase();
-    if pattern == "*" {
+    let pattern = pattern.as_bytes().to_ascii_uppercase();
+    if pattern == b"*" {
         return true;
     }
-    if !pattern.contains('*') {
+    if !pattern.contains(&b'*') {
         return name == pattern;
     }
 
-    let starts_with_star = pattern.starts_with('*');
-    let ends_with_star = pattern.ends_with('*');
-    let parts: Vec<&str> = pattern.split('*').filter(|part| !part.is_empty()).collect();
+    let starts_with_star = pattern.starts_with(b"*");
+    let ends_with_star = pattern.ends_with(b"*");
+    let parts: Vec<&[u8]> = pattern
+        .split(|&byte| byte == b'*')
+        .filter(|part| !part.is_empty())
+        .collect();
     if parts.is_empty() {
         return true;
     }
@@ -1161,7 +1185,10 @@ fn pattern_matches(name: &str, pattern: &str) -> bool {
     let mut cursor = 0usize;
     for (idx, part) in parts.iter().enumerate() {
         let haystack = &name[cursor..];
-        let Some(offset) = haystack.find(part) else {
+        let Some(offset) = haystack
+            .windows(part.len())
+            .position(|window| window == *part)
+        else {
             return false;
         };
         if idx == 0 && !starts_with_star && offset != 0 {
@@ -1338,6 +1365,40 @@ mod tests {
         assert!(upload_block_reason(&policy, &env, &HashMap::new(), "", "").is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn inherited_env_that_is_not_utf8_is_checked_byte_for_byte() {
+        use std::ffi::{OsStr, OsString};
+        use std::os::unix::ffi::OsStrExt;
+
+        let policy = lpm_runner::lpm_json::RemoteCacheEnvConfig::default();
+        let secret_name = HashMap::from([(
+            OsStr::from_bytes(b"DEPLOY_\xff_TOKEN").to_os_string(),
+            OsString::from("value"),
+        )]);
+        assert!(
+            upload_block_reason(&policy, &HashMap::new(), &secret_name, "", "").is_some(),
+            "a secret-like name must block upload even when it is not UTF-8"
+        );
+
+        let leaked = HashMap::from([(
+            OsString::from("SERVICE_PASSWORD"),
+            OsString::from("hunter2-hunter2"),
+        )]);
+        let reason = upload_block_reason(
+            &policy,
+            &HashMap::new(),
+            &leaked,
+            "connected with hunter2-hunter2",
+            "",
+        )
+        .expect("a secret value in the output must block upload");
+        assert!(
+            reason.contains("contains the value of SERVICE_PASSWORD"),
+            "{reason}"
+        );
+    }
+
     #[test]
     fn inherited_secret_like_env_blocks_remote_upload() {
         let inherited = HashMap::from([("CI_DEPLOY_PASSWORD".into(), "secret-value".into())]);
@@ -1362,6 +1423,6 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(env_name_blocks_upload(&policy, "PUBLIC_API_KEY"));
+        assert!(env_name_blocks_upload(&policy, b"PUBLIC_API_KEY"));
     }
 }

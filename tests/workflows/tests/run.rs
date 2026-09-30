@@ -2535,6 +2535,45 @@ fn run_cache_env_reuses_outputs_across_ci_jobs_but_tracks_declared_inputs() {
     assert_eq!(project.read_file("executions.txt"), "run\nrun\n");
 }
 
+#[cfg(unix)]
+#[test]
+fn run_cache_distinguishes_inherited_values_that_are_not_valid_utf8() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    for cache_env in ["", r#","cacheEnv":["BUILD_VALUE"]"#] {
+        let project = TempProject::empty(
+            r#"{"name":"non-utf8-cache-env","version":"1.0.0","scripts":{"build":"mkdir -p dist && printf %s \"$BUILD_VALUE\" | od -An -tx1 | tr -d ' \\n' > dist/value.txt && echo run >> executions.txt"}}"#,
+        );
+        project.write_file(
+            "lpm.json",
+            &format!(
+                r#"{{"tasks":{{"build":{{"cache":true,"outputs":["dist/**"]{cache_env}}}}}}}"#
+            ),
+        );
+        for (value, expected, executions) in
+            [(b"\xff", "ff", "run\n"), (b"\xfe", "fe", "run\nrun\n")]
+        {
+            let _ = std::fs::remove_dir_all(project.path().join("dist"));
+            lpm(&project)
+                .env("BUILD_VALUE", OsStr::from_bytes(value))
+                .args(["run", "build"])
+                .assert()
+                .success();
+            assert_eq!(
+                project.read_file("dist/value.txt"),
+                expected,
+                "cacheEnv selection: {cache_env:?}"
+            );
+            assert_eq!(
+                project.read_file("executions.txt"),
+                executions,
+                "cacheEnv selection: {cache_env:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn run_cache_tracks_inherited_environment_by_default() {
     let project = TempProject::empty(

@@ -82,7 +82,7 @@ pub(super) struct CacheContext {
     pub(super) cache_key: String,
     pub(super) command: String,
     pub(super) env_vars: HashMap<String, String>,
-    pub(super) inherited_env: HashMap<String, String>,
+    pub(super) inherited_env: HashMap<std::ffi::OsString, std::ffi::OsString>,
     pub(super) remote_cache: Option<crate::commands::remote_cache::RemoteCacheClient>,
     workspace_validation: Option<lpm_task::hasher::FilesystemValidation>,
     input_validation: lpm_task::hasher::FilesystemValidation,
@@ -260,21 +260,30 @@ fn build_task_context(
         config_ref,
     )?;
     let inherited_env = lpm_runner::shell::inherited_child_env();
-    let cache_env = task_config
-        .cache_env
-        .as_ref()
-        .map(|names| names.iter().collect::<HashSet<_>>());
-    let mut child_env = HashMap::with_capacity(inherited_env.len() + env_vars.len());
+    let cache_env = task_config.cache_env.as_ref().map(|names| {
+        names
+            .iter()
+            .map(|name| std::ffi::OsStr::new(name.as_str()))
+            .collect::<HashSet<_>>()
+    });
+    // The fingerprint keeps each value's exact bytes, so inherited values that
+    // are not valid UTF-8 still distinguish cache entries.
+    let mut child_env: HashMap<std::ffi::OsString, std::ffi::OsString> =
+        HashMap::with_capacity(inherited_env.len() + env_vars.len());
     child_env.extend(
         inherited_env
             .iter()
-            .filter(|(key, _)| cache_env.as_ref().is_none_or(|names| names.contains(key)))
+            .filter(|(key, _)| {
+                cache_env
+                    .as_ref()
+                    .is_none_or(|names| names.contains(key.as_os_str()))
+            })
             .map(|(key, value)| (key.clone(), value.clone())),
     );
     child_env.extend(
         env_vars
             .iter()
-            .map(|(key, value)| (key.clone(), value.clone())),
+            .map(|(key, value)| (key.into(), value.into())),
     );
     let mut runtime_identities = bin_hint.cache_identities();
     let child_path =

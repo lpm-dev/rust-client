@@ -1,10 +1,20 @@
-const childProcess = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const moduleApi = require("node:module");
 const path = require("node:path");
 const { pathToFileURL, fileURLToPath } = require("node:url");
-const { Worker } = require("node:worker_threads");
+
+// Needed only when a transform misses the cache, so a warm run never loads them.
+let childProcessModule = null;
+let workerThreadsModule = null;
+function childProcess() {
+  childProcessModule ??= require("node:child_process");
+  return childProcessModule;
+}
+function workerThreads() {
+  workerThreadsModule ??= require("node:worker_threads");
+  return workerThreadsModule;
+}
 
 const RUNTIME_VERSION = "5";
 const TRANSFORM_PROTOCOL_VERSION = 1;
@@ -223,7 +233,7 @@ function transformSource(filename, source, format, options) {
 }
 
 function transformSourceOnce(request, filename) {
-  const result = childProcess.spawnSync(TRANSFORMER, ["internal-ts-transform"], {
+  const result = childProcess().spawnSync(TRANSFORMER, ["internal-ts-transform"], {
     input: JSON.stringify(request),
     encoding: "utf8",
     maxBuffer: MAX_TRANSFORM_OUTPUT_BYTES,
@@ -365,7 +375,7 @@ function ensurePersistentTransformClient() {
     return persistentTransformClient;
   }
   if (
-    typeof Worker !== "function" ||
+    typeof workerThreads().Worker !== "function" ||
     typeof SharedArrayBuffer !== "function" ||
     typeof Atomics.wait !== "function" ||
     !fs.existsSync(WORKER_PATH)
@@ -397,7 +407,7 @@ function ensurePersistentTransformClient() {
   };
 
   try {
-    client.worker = new Worker(WORKER_PATH, {
+    client.worker = new (workerThreads().Worker)(WORKER_PATH, {
       execArgv: [],
       env: persistentWorkerEnv(),
       workerData: {

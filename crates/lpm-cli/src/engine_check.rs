@@ -107,14 +107,14 @@ pub(crate) fn path_node_versions() -> PathNodeVersionCache {
 }
 
 #[cfg(not(test))]
-fn recorded_node_versions() -> Option<RecordedNodeVersions> {
+pub(crate) fn recorded_node_versions() -> Option<RecordedNodeVersions> {
     lpm_common::LpmRoot::from_env()
         .ok()
         .map(|root| RecordedNodeVersions::at(root.cache_node_versions()))
 }
 
 #[cfg(test)]
-fn recorded_node_versions() -> Option<RecordedNodeVersions> {
+pub(crate) fn recorded_node_versions() -> Option<RecordedNodeVersions> {
     None
 }
 

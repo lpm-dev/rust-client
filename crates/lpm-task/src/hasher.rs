@@ -12,7 +12,7 @@ use cap_std::fs::Dir;
 use lpm_common::LpmError;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 
 #[cfg(unix)]
@@ -81,7 +81,7 @@ pub fn compute_cache_key(
     extra_args: &[String],
     runtime_identities: &[(String, String)],
     input_globs: &[String],
-    env_vars: &HashMap<String, String>,
+    env_vars: &HashMap<OsString, OsString>,
     package_json: &str,
 ) -> Result<String, LpmError> {
     compute_cache_key_with_workspace_root(
@@ -110,7 +110,7 @@ pub fn compute_cache_key_with_workspace_root(
     extra_args: &[String],
     runtime_identities: &[(String, String)],
     input_globs: &[String],
-    env_vars: &HashMap<String, String>,
+    env_vars: &HashMap<OsString, OsString>,
     package_json: &str,
 ) -> Result<String, LpmError> {
     let workspace_contract = workspace_root
@@ -142,7 +142,7 @@ pub fn compute_cache_key_with_workspace_contract(
     extra_args: &[String],
     runtime_identities: &[(String, String)],
     input_globs: &[String],
-    env_vars: &HashMap<String, String>,
+    env_vars: &HashMap<OsString, OsString>,
     package_json: &str,
 ) -> Result<String, LpmError> {
     Ok(compute_cache_key_snapshot_with_workspace_contract(
@@ -171,7 +171,7 @@ pub fn compute_cache_key_snapshot_with_workspace_contract(
     extra_args: &[String],
     runtime_identities: &[(String, String)],
     input_globs: &[String],
-    env_vars: &HashMap<String, String>,
+    env_vars: &HashMap<OsString, OsString>,
     package_json: &str,
 ) -> Result<CacheKeySnapshot, LpmError> {
     for _ in 0..3 {
@@ -212,7 +212,7 @@ fn compute_cache_key_inner(
     extra_args: &[String],
     runtime_identities: &[(String, String)],
     input_globs: &[String],
-    env_vars: &HashMap<String, String>,
+    env_vars: &HashMap<OsString, OsString>,
     package_json: &str,
 ) -> Result<String, LpmError> {
     let mut hasher = Sha256::new();
@@ -261,10 +261,17 @@ fn compute_cache_key_inner(
     hash_record(&mut hasher, 4, &[canonical_package.as_bytes()]);
 
     // 3. Environment variables (sorted by key)
-    let mut env_keys: Vec<&String> = env_vars.keys().collect();
+    // Hashed as raw bytes: two values that differ only in bytes that are not
+    // valid UTF-8 must not share a cache entry. For UTF-8 these are the bytes
+    // a `String` would hash.
+    let mut env_keys: Vec<&OsString> = env_vars.keys().collect();
     env_keys.sort();
     for key in env_keys {
-        hash_record(&mut hasher, 5, &[key.as_bytes(), env_vars[key].as_bytes()]);
+        hash_record(
+            &mut hasher,
+            5,
+            &[key.as_encoded_bytes(), env_vars[key].as_encoded_bytes()],
+        );
     }
 
     // 4. Source file contents matching input globs
@@ -1092,7 +1099,7 @@ mod tests {
         extra_args: &[String],
         runtime_identities: &[(String, String)],
         input_globs: &[String],
-        env_vars: &HashMap<String, String>,
+        env_vars: &HashMap<OsString, OsString>,
         deps_json: &str,
     ) -> String {
         super::compute_cache_key(
@@ -1275,6 +1282,25 @@ mod tests {
         let key1 = compute_cache_key(dir.path(), "echo", &[], &[], &[], &env1, "{}");
         let key2 = compute_cache_key(dir.path(), "echo", &[], &[], &[], &env2, "{}");
         assert_ne!(key1, key2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn env_values_that_differ_only_in_non_utf8_bytes_get_different_keys() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let value = |bytes: &[u8]| {
+            HashMap::from([(
+                OsString::from("BUILD_VALUE"),
+                OsStr::from_bytes(bytes).to_os_string(),
+            )])
+        };
+
+        let ff = compute_cache_key(dir.path(), "build", &[], &[], &[], &value(b"\xff"), "{}");
+        let fe = compute_cache_key(dir.path(), "build", &[], &[], &[], &value(b"\xfe"), "{}");
+
+        assert_ne!(ff, fe);
     }
 
     #[test]

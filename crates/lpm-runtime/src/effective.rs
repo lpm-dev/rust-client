@@ -538,6 +538,7 @@ fn resolve_selected(selected: &SelectedNode) -> Effective {
 /// prefix). Returns `None` when `node` is not on `PATH` or the output
 /// is unparseable.
 fn node_version_output(command: &mut Command) -> Option<std::process::Output> {
+    lpm_common::child_env::strip_inherited_env_hooks(command);
     lpm_common::process_output::output_capped(command, std::time::Duration::from_secs(2), 4096).ok()
 }
 
@@ -1094,6 +1095,43 @@ mod tests {
     fn record_version(records: &Path, fingerprint: &str, contents: &str) {
         fs::create_dir_all(records).unwrap();
         fs::write(records.join(fingerprint), contents).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_probes_run_in_an_environment_with_non_utf8_entries() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        const CHILD: &str = "LPM_TEST_NODE_PROBE_NON_UTF8";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "effective::tests::node_probes_run_in_an_environment_with_non_utf8_entries",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(OsStr::from_bytes(b"LPM_TEST_\xff_TOKEN"), "secret")
+                .env("LPM_TEST_PLAIN", OsStr::from_bytes(b"value-\xff"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write_test_executable(&test_node_path(dir.path()), b"#!/bin/sh\necho v18.0.0\n");
+        let path = std::env::join_paths([dir.path()]).unwrap();
+
+        let resolution = PathNodeVersionCache::default().resolve(dir.path(), &path);
+
+        assert_eq!(resolution.version(), Some("18.0.0"));
     }
 
     #[test]
