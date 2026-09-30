@@ -140,6 +140,32 @@ fn local_fingerprint(canonical: &Path) -> Option<String> {
         hasher.update(metadata.ctime().to_le_bytes());
         hasher.update(metadata.ctime_nsec().to_le_bytes());
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::{fs::OpenOptionsExt as _, io::AsRawHandle as _};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_BASIC_INFO, FILE_READ_ATTRIBUTES, FileBasicInfo, GetFileInformationByHandleEx,
+        };
+
+        let file = File::options()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .open(canonical)
+            .ok()?;
+        let mut info = FILE_BASIC_INFO::default();
+        // SAFETY: the live handle and correctly sized FILE_BASIC_INFO buffer are valid for this call.
+        let success = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileBasicInfo,
+                (&mut info as *mut FILE_BASIC_INFO).cast(),
+                std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+            )
+        };
+        if success == 0 || info.ChangeTime <= 0 {
+            return None;
+        }
+        hasher.update(info.ChangeTime.to_le_bytes());
+    }
     Some(format!("{:x}", hasher.finalize()))
 }
 
