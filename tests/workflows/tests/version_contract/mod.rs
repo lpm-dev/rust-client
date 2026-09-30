@@ -1,4 +1,5 @@
 use super::{read_package_json, run_git};
+use crate::support::assertions::assert_fault_injection_aborted;
 #[cfg(unix)]
 use crate::support::{LOCK_CONTENTION_MARKER_ENV, lpm_spawnable, wait_for_lock_contention};
 use crate::support::{TempProject, lpm};
@@ -107,7 +108,7 @@ fn nested_version_recovers_after_staging_without_dirtying_the_index() {
         .args(["version", "patch"])
         .output()
         .unwrap();
-    assert!(!out.status.success());
+    assert_fault_injection_aborted(&out);
     let out = lpm(&project)
         .current_dir(project.path().join("packages/core"))
         .args(["version", "patch"])

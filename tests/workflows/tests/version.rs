@@ -1,7 +1,7 @@
 mod support;
 mod version_contract;
 
-use support::assertions::parse_json_output;
+use support::assertions::{assert_fault_injection_aborted, parse_json_output};
 use support::{
     LOCK_CONTENTION_MARKER_ENV, TempProject, lpm, lpm_spawnable, wait_for_lock_contention,
 };
@@ -94,7 +94,7 @@ fn version_recovers_an_interrupted_manifest_transaction_before_replanning() {
         .args(["version", "major", "--no-git-tag-version"])
         .output()
         .expect("run version with crash injection");
-    assert!(!interrupted.status.success());
+    assert_fault_injection_aborted(&interrupted);
 
     let recovered = lpm(&project)
         .args(["version", "patch", "--no-git-tag-version"])
@@ -127,7 +127,7 @@ fn version_no_git_retry_after_durable_commit_does_not_bump_twice() {
         .args(["version", "patch", "--no-git-tag-version"])
         .output()
         .expect("interrupt version after durable commit");
-    assert!(!interrupted.status.success());
+    assert_fault_injection_aborted(&interrupted);
 
     let recovered = lpm(&project)
         .args(["version", "patch", "--no-git-tag-version"])
@@ -166,7 +166,7 @@ fn version_from_a_sibling_does_not_consume_another_members_completed_retry() {
         .args(["version", "patch", "--no-git-tag-version"])
         .output()
         .expect("interrupt core version after durable commit");
-    assert!(!interrupted.status.success());
+    assert_fault_injection_aborted(&interrupted);
 
     let mut app_version = lpm(&project);
     app_version.current_dir(project.path().join("packages/app"));
@@ -211,7 +211,7 @@ fn version_from_a_workspace_member_recovers_the_root_release_transaction() {
         ])
         .output()
         .expect("interrupt root release apply");
-    assert!(!interrupted.status.success());
+    assert_fault_injection_aborted(&interrupted);
     let mut command = lpm(&project);
     command.current_dir(project.path().join("packages/core"));
 
@@ -599,7 +599,7 @@ fn version_recovers_an_interruption_after_staging_without_double_bumping() {
         .args(["version", "patch"])
         .output()
         .expect("interrupt version after Git add");
-    assert!(!interrupted.status.success());
+    assert_fault_injection_aborted(&interrupted);
 
     let recovered = lpm(&project)
         .args(["version", "patch"])
@@ -629,7 +629,7 @@ fn version_recovers_an_interruption_after_commit_without_double_bumping() {
         .args(["version", "patch"])
         .output()
         .expect("interrupt version after Git commit");
-    assert!(!interrupted.status.success());
+    assert_fault_injection_aborted(&interrupted);
 
     let recovered = lpm(&project)
         .args(["version", "patch"])
@@ -658,7 +658,7 @@ fn version_recognizes_an_interruption_after_tag_without_double_bumping() {
         .args(["version", "patch"])
         .output()
         .expect("interrupt version after Git tag");
-    assert!(!interrupted.status.success());
+    assert_fault_injection_aborted(&interrupted);
 
     let recovered = lpm(&project)
         .args(["version", "patch", "--json"])

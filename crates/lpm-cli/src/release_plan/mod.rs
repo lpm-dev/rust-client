@@ -702,6 +702,7 @@ fn manifest_size_error(path: &Path, description: &str) -> LpmError {
     ))
 }
 
+pub(crate) mod fault_injection;
 mod planning;
 mod transaction;
 mod version_git;

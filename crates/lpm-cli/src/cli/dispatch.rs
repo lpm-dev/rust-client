@@ -156,7 +156,9 @@ async fn async_main(cli: Cli) -> Result<()> {
         std::process::exit(2);
     };
 
-    if let Err(error) = privilege::ensure_command_allowed(&command) {
+    if let Err(error) = privilege::ensure_command_allowed(&command)
+        .and_then(|()| crate::release_plan::fault_injection::ensure_fault_injection_supported())
+    {
         exit_with_lpm_error(&error, cli.json);
     }
 

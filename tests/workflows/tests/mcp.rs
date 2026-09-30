@@ -564,14 +564,23 @@ fn mcp_setup_writes_the_published_package_to_both_container_shapes_idempotently(
     let executable = assert_cmd::cargo::cargo_bin("lpm-rs")
         .canonicalize()
         .unwrap();
-    let expected = serde_json::json!({
-        "command": executable,
-        "args": ["mcp", "serve"],
-        "env": { "LPM_CLI_PATH": executable }
-    });
-
-    assert_eq!(claude["mcpServers"]["lpm-registry"], expected);
-    assert_eq!(vscode["servers"]["lpm-registry"], expected);
+    for server in [
+        &claude["mcpServers"]["lpm-registry"],
+        &vscode["servers"]["lpm-registry"],
+    ] {
+        let command = server["command"].as_str().expect("launcher command path");
+        // The launcher is the running binary as the OS reports it, which may
+        // reach it through a symlinked directory such as macOS `/tmp`.
+        assert_eq!(
+            std::path::Path::new(command).canonicalize().unwrap(),
+            executable
+        );
+        assert_eq!(server["args"], serde_json::json!(["mcp", "serve"]));
+        assert_eq!(
+            server["env"],
+            serde_json::json!({ "LPM_CLI_PATH": command })
+        );
+    }
     assert_eq!(claude["mcpServers"].as_object().unwrap().len(), 2);
     assert_eq!(vscode["servers"].as_object().unwrap().len(), 2);
     assert_eq!(claude["theme"], "dark");

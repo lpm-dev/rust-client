@@ -44,7 +44,7 @@ impl AppliedReleaseTransaction {
                 "release manifests were written but the durable commit marker failed: {error}; the transaction journal was preserved for recovery"
             )));
         }
-        abort_after_release_commit_for_test();
+        super::fault_injection::abort_after_release_commit();
         if let Err(error) =
             remove_committed_release_journal_in(&self.state, &self.journal_bytes, &self.commit)
         {
@@ -170,7 +170,7 @@ pub(super) fn apply_resolved_manifests_with(
                 error,
             );
         }
-        abort_after_manifest_write_for_test(index + 1);
+        super::fault_injection::abort_after_manifest_write(index + 1);
     }
     for relative in expected_member_parents.keys() {
         let result = open_manifest_target(&root, &canonical_root, relative).and_then(|target| {
