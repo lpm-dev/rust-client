@@ -2099,6 +2099,64 @@ mod tests {
             fs::read_to_string(dir.path().join("dist/index.js")).unwrap(),
             "built output"
         );
+        assert!(fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(RESTORE_TEMP_PREFIX)
+        }));
+        assert_eq!(
+            fs::read_dir(cache.root.cache_root().join(".task-restores"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn staged_restore_drop_removes_its_directory_and_recovery_record() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        let staged = StagedOutputs::new(&cache.root, project.path()).unwrap();
+        let staging = staged.temp_path().to_path_buf();
+        drop(staged);
+        assert!(!staging.exists());
+        assert_eq!(
+            fs::read_dir(cache.root.cache_root().join(".task-restores"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn restore_context_rejection_rolls_back_and_removes_recovery_data() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join("dist")).unwrap();
+        fs::write(project.path().join("dist/value.txt"), "original").unwrap();
+        let mut staged = StagedOutputs::new(&cache.root, project.path()).unwrap();
+        let staging = staged.temp_path().to_path_buf();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(6);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        staged
+            .append(&mut &b"cached"[..], &header, Path::new("dist/value.txt"))
+            .unwrap();
+        assert!(!staged.apply_if(&["dist/**".into()], || Ok(false)).unwrap());
+        assert_eq!(
+            fs::read_to_string(project.path().join("dist/value.txt")).unwrap(),
+            "original"
+        );
+        assert!(!staging.exists());
+        assert_eq!(
+            fs::read_dir(cache.root.cache_root().join(".task-restores"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[test]

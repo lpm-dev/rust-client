@@ -46,6 +46,17 @@ jobs:
       - name: Build Windows CLI
         run: cargo build --locked -p lpm-cli -p lpm-sandbox
 
+      - name: Windows task cache publication and recovery
+        run: >-
+          cargo nextest run --locked -p lpm-task --lib
+          -E 'test(store_and_restore_roundtrip) | test(cache_publication_) |
+          test(staged_restore_drop_) | test(restore_context_rejection_) |
+          test(a_new_restore_recovers_) | test(interrupted_restore_recovery_)'
+          --no-fail-fast --status-level slow --final-status-level fail
+
+      - name: Windows portable task cache contracts
+        run: cargo nextest run --locked -p lpm-workflows --test portable_task_cache --no-fail-fast --status-level slow --final-status-level fail
+
       - name: Windows standard-user sandbox setup and publish
         shell: pwsh
         run: ./scripts/ci/test-windows-sandbox-setup.ps1
@@ -106,12 +117,6 @@ jobs:
 
       - name: Windows cache pruning and registry retention
         run: cargo nextest run --locked -p lpm-workflows --test cache_prune --no-fail-fast --status-level slow --final-status-level fail
-
-      - name: Windows task cache publication and recovery
-        run: cargo nextest run --locked -p lpm-task --lib -E 'test(store_and_restore_roundtrip) | test(cache_publication_)' --no-fail-fast --status-level slow --final-status-level fail
-
-      - name: Windows portable task cache contracts
-        run: cargo nextest run --locked -p lpm-workflows --test portable_task_cache --no-fail-fast --status-level slow --final-status-level fail
 
       - name: Windows global-link ownership and recovery
         run: cargo nextest run --locked -p lpm-workflows --test global --no-fail-fast --status-level slow --final-status-level fail
