@@ -310,11 +310,14 @@ async fn portable_cache_rejects_restore_when_runtime_changes_during_download() {
         consumer.file_exists("executed-marker"),
         "runtime mutation must reject the prepared hit"
     );
-    assert_eq!(
-        artifacts.0.lock().unwrap().len(),
-        1,
-        "a changed execution context must not publish"
-    );
+    let requests = registry.server().received_requests().await.unwrap();
+    let uploads = requests
+        .iter()
+        .filter(|request| {
+            request.method == "PUT" && request.url.path().starts_with("/v8/artifacts/")
+        })
+        .count();
+    assert_eq!(uploads, 1, "a changed execution context must not publish");
 }
 
 #[cfg(unix)]
