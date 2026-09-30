@@ -1,4 +1,5 @@
 use indicatif::{ProgressBar, ProgressStyle};
+use lpm_registry::{TarballBodyError, TarballBodyRetry};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument as _;
@@ -3107,7 +3108,7 @@ mod tests {
         use futures::StreamExt;
         let cancellation = tokio_util::sync::CancellationToken::new();
         cancellation.cancel();
-        let stream = cancellable_tarball_stream(
+        let (stream, body_interrupted) = cancellable_tarball_stream(
             futures::stream::pending::<std::io::Result<Vec<u8>>>(),
             cancellation,
         );
@@ -3118,6 +3119,27 @@ mod tests {
         );
         assert!(stream.next().await.is_none());
         assert!(stream.next().await.is_none());
+        assert!(
+            !body_interrupted.load(std::sync::atomic::Ordering::Acquire),
+            "cancellation is not a body failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn tarball_stream_flags_body_failures() {
+        use futures::StreamExt;
+        let (stream, body_interrupted) = cancellable_tarball_stream(
+            futures::stream::iter([
+                Ok(vec![1_u8]),
+                Err(std::io::Error::other("connection reset")),
+            ]),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        tokio::pin!(stream);
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(!body_interrupted.load(std::sync::atomic::Ordering::Acquire));
+        assert!(stream.next().await.unwrap().is_err());
+        assert!(body_interrupted.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -3204,7 +3226,11 @@ mod tests {
                 );
             }
         };
-        assert!(result.unwrap_err().to_string().contains("traversal"));
+        assert!(
+            LpmError::from(result.unwrap_err())
+                .to_string()
+                .contains("traversal")
+        );
         assert_eq!(downloads.available_permits(), 1);
         assert_eq!(extracts.available_permits(), 4);
         assert!(key.try_lock().is_ok());
@@ -3916,7 +3942,7 @@ pub(super) async fn speculative_download_and_store(
                 .await?;
                 return Ok((SpeculativeFetchOutcome::Stored, timings));
             }
-            client.spool_tarball_response_to_file(response).await?
+            client.spool_tarball_response(response).await?
         } else {
             client
                 .download_tarball_routed_managed(route_table, name, url, install_accounting)
@@ -3974,7 +4000,7 @@ pub(super) async fn speculative_download_and_store(
 
     let cancellation = tokio_util::sync::CancellationToken::new();
     let cancellation_guard = cancellation.clone().drop_guard();
-    let byte_stream = cancellable_tarball_stream(response.bytes_stream(), cancellation);
+    let (byte_stream, _) = cancellable_tarball_stream(response.bytes_stream(), cancellation);
     let async_reader = StreamReader::new(Box::pin(byte_stream));
     let download_elapsed_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let download_elapsed_for_reader = Arc::clone(&download_elapsed_ms);
@@ -4331,7 +4357,7 @@ async fn store_downloaded_registry_tarball(
     url_lookup_ms: u128,
     download_headers_ms: u128,
     download_ms: u128,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: impl Send,
     fetch_extract_limiter: &FetchExtractLimiter,
     final_url: String,
 ) -> Result<
@@ -4404,19 +4430,82 @@ async fn store_downloaded_registry_tarball(
     Ok((result_sri, timings, final_url, fresh_object))
 }
 
+/// A registry tarball request that can be sent again after its response body
+/// fails mid-stream.
+struct RegistryTarballRequest<'a> {
+    client: &'a Arc<RegistryClient>,
+    route_table: &'a RouteTable,
+    package: &'a InstallPackage,
+    url: &'a str,
+    install_accounting: ManagedInstallAccounting,
+    artifact_selection: ArtifactSelection,
+}
+
+impl RegistryTarballRequest<'_> {
+    async fn send(&self) -> Result<reqwest::Response, LpmError> {
+        match self
+            .client
+            .download_tarball_streaming_routed_managed(
+                self.route_table,
+                &self.package.name,
+                self.url,
+                self.install_accounting,
+            )
+            .await
+        {
+            Err(LpmError::NotFound(_)) => Err(artifact_unavailable_error(
+                self.client,
+                self.route_table,
+                self.package,
+                self.artifact_selection,
+            )),
+            response => response,
+        }
+    }
+
+    async fn read_buffered_body(
+        &self,
+        mut response: reqwest::Response,
+    ) -> Result<Vec<u8>, LpmError> {
+        let mut body_retry = TarballBodyRetry::default();
+        loop {
+            match read_buffered_tarball_body(response, lpm_registry::MAX_COMPRESSED_TARBALL_SIZE)
+                .await
+            {
+                Ok(body) => return Ok(body),
+                Err(error) => body_retry.before_retry(error).await?,
+            }
+            response = self.send().await?;
+        }
+    }
+
+    async fn spool_body(
+        &self,
+        mut response: reqwest::Response,
+        mut body_retry: TarballBodyRetry,
+    ) -> Result<lpm_registry::DownloadedTarball, LpmError> {
+        loop {
+            match self.client.spool_tarball_response(response).await {
+                Ok(downloaded) => return Ok(downloaded),
+                Err(error) => body_retry.before_retry(error).await?,
+            }
+            response = self.send().await?;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn spool_open_registry_response_and_store(
-    client: &RegistryClient,
+    request: &RegistryTarballRequest<'_>,
     response: reqwest::Response,
+    body_retry: TarballBodyRetry,
     store: &PackageStore,
     store_v2: Option<&lpm_store::v2::Store>,
-    p: &InstallPackage,
     queue_wait_ms: u128,
     url_lookup_ms: u128,
     download_headers_ms: u128,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: impl Send,
     fetch_extract_limiter: &FetchExtractLimiter,
-    final_url: String,
 ) -> Result<
     (
         String,
@@ -4427,20 +4516,20 @@ async fn spool_open_registry_response_and_store(
     LpmError,
 > {
     let download_start = std::time::Instant::now();
-    let downloaded = client.spool_tarball_response_to_file(response).await?;
+    let downloaded = request.spool_body(response, body_retry).await?;
     let download_ms = download_start.elapsed().as_millis();
     store_downloaded_registry_tarball(
         downloaded,
         store,
         store_v2,
-        p,
+        request.package,
         queue_wait_ms,
         url_lookup_ms,
         download_headers_ms,
         download_ms,
         permit,
         fetch_extract_limiter,
-        final_url,
+        request.url.to_string(),
     )
     .await
 }
@@ -4770,18 +4859,30 @@ struct V2StreamInput<'a> {
     download_headers_ms: u128,
 }
 
+/// Adapts a response body for a blocking reader. The returned flag is set
+/// when the body itself fails, as opposed to the consumer cancelling it, so
+/// the caller can tell an interrupted download from an extraction failure.
 fn cancellable_tarball_stream<T, E>(
     stream: impl futures::Stream<Item = Result<T, E>>,
     cancellation: tokio_util::sync::CancellationToken,
-) -> impl futures::Stream<Item = std::io::Result<T>>
+) -> (
+    impl futures::Stream<Item = std::io::Result<T>>,
+    Arc<std::sync::atomic::AtomicBool>,
+)
 where
     E: std::error::Error + Send + Sync + 'static,
 {
     use futures::StreamExt;
+    let body_interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let response_stream = Box::pin(stream);
-    futures::stream::unfold(
-        (response_stream, cancellation, false),
-        |(mut stream, cancellation, finished)| async move {
+    let stream = futures::stream::unfold(
+        (
+            response_stream,
+            cancellation,
+            Arc::clone(&body_interrupted),
+            false,
+        ),
+        |(mut stream, cancellation, body_interrupted, finished)| async move {
             if finished {
                 return None;
             }
@@ -4792,16 +4893,33 @@ where
                         std::io::ErrorKind::Interrupted,
                         "streamed tarball download cancelled",
                     )),
-                    (stream, cancellation, true),
+                    (stream, cancellation, body_interrupted, true),
                 )),
-                chunk = stream.next() => chunk.map(|chunk| (
-                    chunk.map_err(std::io::Error::other),
-                    (stream, cancellation, false),
-                )),
+                chunk = stream.next() => chunk.map(|chunk| {
+                    let chunk = chunk.map_err(|error| {
+                        body_interrupted.store(true, std::sync::atomic::Ordering::Release);
+                        std::io::Error::other(error)
+                    });
+                    (chunk, (stream, cancellation, body_interrupted, false))
+                }),
             }
         },
     )
-    .fuse()
+    .fuse();
+    (stream, body_interrupted)
+}
+
+/// A failed streamed extraction. The per-key fetch guard comes back with the
+/// failure so a retry keeps other fetchers of the same package waiting.
+struct V2StreamFailure {
+    error: TarballBodyError,
+    key_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl From<V2StreamFailure> for LpmError {
+    fn from(failure: V2StreamFailure) -> Self {
+        failure.error.into()
+    }
 }
 
 #[tracing::instrument(
@@ -4812,7 +4930,7 @@ where
 )]
 async fn extract_v2_registry_response(
     input: V2StreamInput<'_>,
-) -> Result<(String, TaskTimings, lpm_store::v2::ExtractedObject), LpmError> {
+) -> Result<(String, TaskTimings, lpm_store::v2::ExtractedObject), V2StreamFailure> {
     use tokio_util::io::{StreamReader, SyncIoBridge};
 
     let V2StreamInput {
@@ -4828,11 +4946,16 @@ async fn extract_v2_registry_response(
         download_headers_ms,
     } = input;
     tracing::event!(name: "admission_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
+    let fatal = |error: LpmError| V2StreamFailure {
+        error: TarballBodyError::Fatal(error),
+        key_guard: None,
+    };
     let admission = acquire_v2_streaming_extract_admission(
         fetch_extract_limiter,
         v2_streaming_extract_weight(unpacked_size),
     )
-    .await?;
+    .await
+    .map_err(fatal)?;
     let V2StreamingExtractAdmission {
         base_permit,
         mut supplemental_permit,
@@ -4847,7 +4970,8 @@ async fn extract_v2_registry_response(
     let cancellation = tokio_util::sync::CancellationToken::new();
     let cancellation_guard = cancellation.clone().drop_guard();
     let cancel_decoder_input = cancellation.clone();
-    let cancellable_stream = cancellable_tarball_stream(response.bytes_stream(), cancellation);
+    let (cancellable_stream, body_interrupted) =
+        cancellable_tarball_stream(response.bytes_stream(), cancellation);
     let async_reader = StreamReader::new(Box::pin(cancellable_stream));
     let store_v2 = store_v2.clone();
     let expected_integrity = expected_integrity.map(str::to_owned);
@@ -4857,7 +4981,6 @@ async fn extract_v2_registry_response(
     let joined = tokio::task::spawn_blocking(move || {
         let _entered = worker_span.enter();
         tracing::event!(name: "work_start", target: "lpm_install_timeline", tracing::Level::TRACE, {});
-        let _key_guard = key_guard;
         let _extract_permit = base_permit;
         let sync_reader = SyncIoBridge::new(async_reader);
         let reader = StreamBodyPermitReader::new(sync_reader, permit, download_elapsed_for_reader);
@@ -4870,7 +4993,8 @@ async fn extract_v2_registry_response(
             || cancel_decoder_input.cancel(),
         );
         tracing::event!(name: "work_end", target: "lpm_install_timeline", tracing::Level::TRACE, success = result.is_ok());
-        result
+        let retained_key_guard = if result.is_err() { key_guard } else { None };
+        (result, retained_key_guard)
     });
     let (joined, supplemental_lease_expired, supplemental_hold_ms) =
         await_v2_streaming_extract_task(
@@ -4881,10 +5005,20 @@ async fn extract_v2_registry_response(
         .await;
     tracing::event!(name: "await_resume", target: "lpm_install_timeline", tracing::Level::TRACE, success = joined.is_ok());
     let joined = joined.map_err(|error| {
-        LpmError::Registry(format!("streaming object extract task panicked: {error}"))
+        fatal(LpmError::Registry(format!(
+            "streaming object extract task panicked: {error}"
+        )))
     });
     let _ = cancellation_guard.disarm();
-    let (object, computed_sri, stage) = joined??;
+    let (result, key_guard) = joined?;
+    let (object, computed_sri, stage) = result.map_err(|error| V2StreamFailure {
+        error: if body_interrupted.load(std::sync::atomic::Ordering::Acquire) {
+            TarballBodyError::Transport(error)
+        } else {
+            TarballBodyError::Fatal(error)
+        },
+        key_guard,
+    })?;
     let pipeline_wall_ms = pipeline_start.elapsed().as_millis();
     let stream_body_wall_ms =
         u128::from(download_elapsed_ms.load(std::sync::atomic::Ordering::Relaxed));
@@ -5097,26 +5231,34 @@ pub(super) async fn fetch_and_store_streaming(
         Err(e) => return Err(e),
     };
 
+    let request = RegistryTarballRequest {
+        client,
+        route_table,
+        package: p,
+        url: &final_url,
+        install_accounting,
+        artifact_selection,
+    };
+
     if let Some(store_v2) = store_v2 {
         let lane = v2_streaming_lane
             .expect("V2 streamed-object ingest requires an explicit critical lane");
         if !lane.try_claim() {
             return spool_open_registry_response_and_store(
-                client,
+                &request,
                 response,
+                TarballBodyRetry::default(),
                 store,
                 Some(store_v2),
-                p,
                 queue_wait_ms,
                 url_lookup_ms,
                 download_headers_ms,
                 permit,
                 fetch_extract_limiter,
-                final_url,
             )
             .await;
         }
-        let (computed_sri, timings, object) = extract_v2_registry_response(V2StreamInput {
+        let failure = match extract_v2_registry_response(V2StreamInput {
             response,
             store_v2,
             expected_integrity: p.integrity.as_deref(),
@@ -5128,8 +5270,36 @@ pub(super) async fn fetch_and_store_streaming(
             url_lookup_ms,
             download_headers_ms,
         })
-        .await?;
-        return Ok((computed_sri, timings, final_url, Some(object)));
+        .await
+        {
+            Ok((computed_sri, timings, object)) => {
+                return Ok((computed_sri, timings, final_url, Some(object)));
+            }
+            Err(failure) => failure,
+        };
+        // The stream consumed the download permit, so the retry goes through
+        // the file spool outside the download pool; the single streaming lane
+        // bounds that to one extra connection.
+        let V2StreamFailure { error, key_guard } = failure;
+        let _key_guard = key_guard;
+        let mut body_retry = TarballBodyRetry::default();
+        body_retry.before_retry(error).await?;
+        let retry_headers_start = std::time::Instant::now();
+        let response = request.send().await?;
+        download_headers_ms += retry_headers_start.elapsed().as_millis();
+        return spool_open_registry_response_and_store(
+            &request,
+            response,
+            body_retry,
+            store,
+            Some(store_v2),
+            queue_wait_ms,
+            url_lookup_ms,
+            download_headers_ms,
+            (),
+            fetch_extract_limiter,
+        )
+        .await;
     }
 
     // Collect the compressed body, then acquire an extraction slot before
@@ -5137,8 +5307,7 @@ pub(super) async fn fetch_and_store_streaming(
     // bodies waiting for extraction bounded by the download pool instead of
     // allowing the entire install graph to queue compressed tarballs.
     let download_start = std::time::Instant::now();
-    let body =
-        read_buffered_tarball_body(response, lpm_registry::MAX_COMPRESSED_TARBALL_SIZE).await?;
+    let body = request.read_buffered_body(response).await?;
     let download_ms = download_start.elapsed().as_millis();
 
     let name = p.name.clone();
@@ -5199,7 +5368,7 @@ pub(super) async fn fetch_and_store_streaming(
 pub(super) async fn read_buffered_tarball_body(
     response: reqwest::Response,
     max_compressed_size: u64,
-) -> Result<Vec<u8>, LpmError> {
+) -> Result<Vec<u8>, TarballBodyError> {
     use futures::StreamExt;
 
     if let Some(content_length) = response.content_length()
@@ -5207,21 +5376,26 @@ pub(super) async fn read_buffered_tarball_body(
     {
         return Err(LpmError::Registry(format!(
             "tarball Content-Length exceeds maximum compressed size ({content_length} bytes > {max_compressed_size} bytes limit)"
-        )));
+        ))
+        .into());
     }
     let initial_capacity = usize::try_from(max_compressed_size.min(64 * 1024)).unwrap_or(64 * 1024);
     let mut body = Vec::with_capacity(initial_capacity);
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|error| LpmError::Network(format!("tarball stream failed: {error}")))?;
+        let chunk = chunk.map_err(|error| {
+            TarballBodyError::Transport(LpmError::Network(format!(
+                "tarball stream failed: {error}"
+            )))
+        })?;
         let new_len = body.len().checked_add(chunk.len()).ok_or_else(|| {
             LpmError::Registry("tarball compressed size overflowed platform limits".to_string())
         })?;
         if u64::try_from(new_len).unwrap_or(u64::MAX) > max_compressed_size {
             return Err(LpmError::Registry(format!(
                 "tarball exceeds maximum compressed size of {max_compressed_size} bytes"
-            )));
+            ))
+            .into());
         }
         body.extend_from_slice(&chunk);
     }

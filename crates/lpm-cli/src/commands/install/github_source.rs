@@ -138,26 +138,76 @@ pub(crate) async fn download_github_archive_to_file(
     }
 
     let client = github_http_client()?;
+    let mut body_retry = lpm_registry::TarballBodyRetry::default();
+    let spooled = loop {
+        match spool_github_archive(&client, &url).await {
+            Ok(spooled) => break spooled,
+            Err(error) => body_retry.before_retry(error).await?,
+        }
+    };
+    let SpooledGitHubArchive {
+        file,
+        sha512_sri,
+        compressed_size,
+        spool_reservation,
+    } = spooled;
+    let sri = match expected_integrity {
+        Some(expected) => {
+            let integrity = Integrity::parse(expected)?;
+            let path = file.path().to_path_buf();
+            let integrity_for_verification = integrity.clone();
+            tokio::task::spawn_blocking(move || integrity_for_verification.verify_file(&path))
+                .await
+                .map_err(|error| {
+                    LpmError::Registry(format!("GitHub integrity task panicked: {error}"))
+                })??;
+            integrity.to_string()
+        }
+        None => sha512_sri.clone(),
+    };
+
+    lpm_registry::DownloadedTarball::new(file, sri, sha512_sri, compressed_size, spool_reservation)
+}
+
+struct SpooledGitHubArchive {
+    file: tempfile::NamedTempFile,
+    sha512_sri: String,
+    compressed_size: u64,
+    spool_reservation: lpm_registry::CompressedTarballSpoolReservation,
+}
+
+/// One request for a GitHub archive. Connection failures, server errors, and
+/// interrupted bodies are transient; everything else is final.
+async fn spool_github_archive(
+    client: &reqwest::Client,
+    url: &Url,
+) -> Result<SpooledGitHubArchive, lpm_registry::TarballBodyError> {
+    use lpm_registry::TarballBodyError;
+
     let mut response = client
-        .get(url)
+        .get(url.clone())
         .header(reqwest::header::USER_AGENT, "lpm-rs")
         .send()
         .await
         .map_err(|error| {
-            LpmError::Network(format!(
+            TarballBodyError::Transport(LpmError::Network(format!(
                 "GitHub archive request failed: {}",
                 lpm_http::display_error(&error)
-            ))
+            )))
         })?;
-    ensure_success_status(response.status(), "GitHub archive")?;
+    let status = response.status();
+    if let Err(error) = ensure_success_status(status, "GitHub archive") {
+        return Err(if status.is_server_error() {
+            TarballBodyError::Transport(error)
+        } else {
+            TarballBodyError::Fatal(error)
+        });
+    }
     if response
         .content_length()
         .is_some_and(|length| length > MAX_GITHUB_ARCHIVE_BYTES)
     {
-        return Err(response_size_error(
-            "GitHub archive",
-            MAX_GITHUB_ARCHIVE_BYTES,
-        ));
+        return Err(response_size_error("GitHub archive", MAX_GITHUB_ARCHIVE_BYTES).into());
     }
     let spool_reservation = lpm_registry::reserve_compressed_tarball_spool(
         response.content_length(),
@@ -178,16 +228,15 @@ pub(crate) async fn download_github_archive_to_file(
     let mut sha512 = sha2::Sha512::new();
     let mut compressed_size = 0_u64;
     while let Some(chunk) = response.chunk().await.map_err(|error| {
-        LpmError::Network(format!("failed to read GitHub archive response: {error}"))
+        TarballBodyError::Transport(LpmError::Network(format!(
+            "failed to read GitHub archive response: {error}"
+        )))
     })? {
         compressed_size = compressed_size
             .checked_add(chunk.len() as u64)
             .ok_or_else(|| response_size_error("GitHub archive", MAX_GITHUB_ARCHIVE_BYTES))?;
         if compressed_size > MAX_GITHUB_ARCHIVE_BYTES {
-            return Err(response_size_error(
-                "GitHub archive",
-                MAX_GITHUB_ARCHIVE_BYTES,
-            ));
+            return Err(response_size_error("GitHub archive", MAX_GITHUB_ARCHIVE_BYTES).into());
         }
         spool_reservation.ensure_size(compressed_size)?;
         sha512.update(&chunk);
@@ -199,22 +248,12 @@ pub(crate) async fn download_github_archive_to_file(
         hash: sha512.finalize().to_vec(),
     }
     .to_string();
-    let sri = match expected_integrity {
-        Some(expected) => {
-            let integrity = Integrity::parse(expected)?;
-            let path = file.path().to_path_buf();
-            let integrity_for_verification = integrity.clone();
-            tokio::task::spawn_blocking(move || integrity_for_verification.verify_file(&path))
-                .await
-                .map_err(|error| {
-                    LpmError::Registry(format!("GitHub integrity task panicked: {error}"))
-                })??;
-            integrity.to_string()
-        }
-        None => sha512_sri.clone(),
-    };
-
-    lpm_registry::DownloadedTarball::new(file, sri, sha512_sri, compressed_size, spool_reservation)
+    Ok(SpooledGitHubArchive {
+        file,
+        sha512_sri,
+        compressed_size,
+        spool_reservation,
+    })
 }
 
 async fn resolve_github_commit(
@@ -520,6 +559,55 @@ mod security_and_resolution_tests {
             .expect("matching declared integrity must succeed");
         assert_eq!(declared.sri, sha256);
         assert!(declared.sha512_sri.starts_with("sha512-"));
+    }
+
+    #[tokio::test]
+    async fn github_file_download_requests_the_archive_again_when_its_body_is_interrupted() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let archive = b"github archive fixture";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for sent in [&archive[..archive.len() / 2], &archive[..]] {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if socket.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let socket = socket.get_mut();
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            archive.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                socket.write_all(sent).await.unwrap();
+                let _ = socket.shutdown().await;
+            }
+        });
+        let _env = crate::test_env::ScopedEnv::set([(
+            "LPM_GITHUB_CODELOAD_BASE_URL",
+            endpoint.clone().into(),
+        )]);
+
+        let downloaded = download_github_archive_to_file(
+            &format!("{endpoint}owner/repository/tar.gz/{COMMIT}"),
+            None,
+        )
+        .await;
+        server.abort();
+        let downloaded = downloaded.expect("an interrupted archive body must be downloaded again");
+
+        assert_eq!(std::fs::read(downloaded.file.path()).unwrap(), archive);
     }
 }
 

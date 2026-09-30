@@ -66,8 +66,8 @@ pub use self::state::{
     TimedPreferredMetadata, TimedPreferredResolution, TimedReleaseTimeMetadata,
 };
 pub use self::tarball::{
-    MAX_COMPRESSED_TARBALL_SIZE, MAX_COMPRESSED_TARBALL_SPOOL_BYTES,
-    reserve_compressed_tarball_spool,
+    MAX_COMPRESSED_TARBALL_SIZE, MAX_COMPRESSED_TARBALL_SPOOL_BYTES, TARBALL_BODY_ATTEMPTS,
+    TarballBodyError, TarballBodyRetry, reserve_compressed_tarball_spool,
 };
 pub use self::url_gate::{
     GateDecision, evaluate_cached_url, is_http_url, is_https_url, is_localhost_url,

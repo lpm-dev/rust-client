@@ -18,7 +18,8 @@ pub use client::{
     MAX_MANAGED_POOL_INSTALL_NODES, ManagedInstallAccounting, ManagedInstallGraph,
     ManagedInstallNode, ManagedInstallRoot, MetadataProjection, NoProjection,
     PackageMetadataFetchTimings, ProjectionSlot, PublicNpmAccess, RegistryClient,
-    ResolutionMetadata, TimedPackageMetadata, TimedPreferredMetadata, TimedPreferredResolution,
+    ResolutionMetadata, TARBALL_BODY_ATTEMPTS, TarballBodyError, TarballBodyRetry,
+    TimedPackageMetadata, TimedPreferredMetadata, TimedPreferredResolution,
     TimedReleaseTimeMetadata, evaluate_cached_url, is_https_url, is_localhost_url,
     parse_capped_api_json, reserve_compressed_tarball_spool,
 };
