@@ -74,6 +74,7 @@ def run(binary, project, home, result_path, bypass=False):
     env.update({'HOME': str(home), 'LPM_HOME': str(home / '.lpm'), 'LPM_FORCE_FILE_AUTH': '1', 'LPM_FORCE_FILE_VAULT': '1', 'LPM_DISABLE_HOST_CLI_AUTH': '1', 'LPM_NO_UPDATE_CHECK': '1', 'LPM_REMOTE_CACHE_TOKEN': 'fixture-token', 'LPM_REMOTE_CACHE_SIGNATURE_KEY': 'fixture-signing-key', 'NO_COLOR': '1'})
     args = [str(binary), 'run', 'build'] + (['--no-cache'] if bypass else [])
     cmd = ['/usr/bin/time', '-l' if platform.system() == 'Darwin' else '-v', '-o', str(result_path), *args]
+    host_loadavg = os.getloadavg()
     start = time.perf_counter()
     out = subprocess.run(cmd, cwd=project, env=env, capture_output=True, text=True, check=True)
     elapsed = (time.perf_counter() - start) * 1000
@@ -84,7 +85,7 @@ def run(binary, project, home, result_path, bypass=False):
         rss = int(re.search(r'Maximum resident set size \(kbytes\):\s*(\d+)', report)[1]) * 1024
     output = project / 'dist/bundle.js'
     assert output.exists(), out
-    return {'ms': elapsed, 'rss_bytes': rss, 'executed': (project / 'executed-marker').exists(), 'output_sha256': hashlib.sha256(output.read_bytes()).hexdigest()}
+    return {'ms': elapsed, 'rss_bytes': rss, 'executed': (project / 'executed-marker').exists(), 'output_sha256': hashlib.sha256(output.read_bytes()).hexdigest(), 'host_loadavg': host_loadavg}
 
 
 def reset(project, home, local):
@@ -151,7 +152,7 @@ def main():
     summary = {state: {label: {'median_ms': statistics.median(x['ms'] for x in rows), 'median_rss_bytes': statistics.median(x['rss_bytes'] for x in rows), 'executions': sum(x['executed'] for x in rows)} for label, rows in values.items()} for state, values in raw.items()}
     all_hashes = {row['output_sha256'] for values in raw.values() for rows in values.values() for row in rows}
     assert len(all_hashes) == 1, all_hashes
-    report = {'environment': {'platform': platform.platform(), 'python': platform.python_version(), 'node': subprocess.check_output(['node', '--version'], text=True).strip(), 'samples_per_binary_per_state': args.samples, 'fixture_modules': 400, 'source_bytes': sum(p.stat().st_size for p in fixtures['before']['portable'][0][0].glob('src/*.ts')), 'esbuild': subprocess.check_output(['node', '-p', "require('esbuild/package.json').version"], cwd=args.tools, text=True).strip()}, 'summary': summary, 'raw': raw}
+    report = {'environment': {'platform': platform.platform(), 'python': platform.python_version(), 'logical_cpu_count': os.cpu_count(), 'node': subprocess.check_output(['node', '--version'], text=True).strip(), 'samples_per_binary_per_state': args.samples, 'fixture_modules': 400, 'source_bytes': sum(p.stat().st_size for p in fixtures['before']['portable'][0][0].glob('src/*.ts')), 'esbuild': subprocess.check_output(['node', '-p', "require('esbuild/package.json').version"], cwd=args.tools, text=True).strip()}, 'summary': summary, 'raw': raw}
     (args.work_dir / 'results.json').write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps({'environment': report['environment'], 'summary': summary}, indent=2))
     server.shutdown()
