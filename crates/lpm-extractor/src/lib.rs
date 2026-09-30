@@ -18,6 +18,7 @@
 )]
 mod output;
 mod pipeline;
+mod system_buffer;
 mod timeline;
 mod writers;
 
@@ -527,14 +528,14 @@ enum BufferedGzipDecode<'a> {
 }
 
 struct BufferedGzipOutput<'a> {
-    data: Vec<u8>,
+    data: system_buffer::SystemBuffer,
     _budget: AllocBudgetGuard<'a>,
 }
 
 impl BufferedGzipOutput<'_> {
     #[cfg(test)]
     fn into_vec(self) -> Vec<u8> {
-        self.data
+        self.data.to_vec()
     }
 
     #[cfg(test)]
@@ -624,7 +625,7 @@ fn decompress_gzip_libdeflate_with_limits_and_budget<'a>(
     let mut budget = extract_budget.acquire(capacity.saturating_add(compressed.len()) as u64);
     let mut decompressor = libdeflater::Decompressor::new();
     loop {
-        let mut output = vec![0u8; capacity];
+        let mut output = system_buffer::SystemBuffer::zeroed(capacity);
         match decompressor.gzip_decompress(compressed, &mut output) {
             Ok(actual) => {
                 output.truncate(actual);
@@ -1197,7 +1198,7 @@ where
     // from the original reader by the fallback decoder.
     match read_compressed_input(reader, limits.max_buffered_compressed_size)? {
         CompressedInput::Buffered(compressed) => extract_buffered_gzip_tarball(
-            std::borrow::Cow::Owned(compressed),
+            CompressedBytes::Owned(compressed),
             target_dir,
             limits,
             &EXTRACT_BUDGET,
@@ -1246,7 +1247,7 @@ where
     }
 
     extract_buffered_gzip_tarball(
-        std::borrow::Cow::Borrowed(data),
+        CompressedBytes::Borrowed(data),
         target_dir,
         limits,
         &EXTRACT_BUDGET,
@@ -1262,7 +1263,7 @@ where
     reason = "The decode paths forward independent limits, hashing, and inspection controls."
 )]
 fn extract_buffered_gzip_tarball<P, I, E>(
-    compressed: std::borrow::Cow<'_, [u8]>,
+    compressed: CompressedBytes<'_>,
     target_dir: &Path,
     limits: ExtractionLimits,
     budget: &AllocBudget,
@@ -1283,7 +1284,7 @@ where
     }?;
     match decoded {
         BufferedGzipDecode::Decoded(mut decompressed) => {
-            if matches!(compressed, std::borrow::Cow::Owned(_)) {
+            if matches!(compressed, CompressedBytes::Owned(_)) {
                 drop(compressed);
                 decompressed
                     ._budget
@@ -1312,11 +1313,40 @@ where
     }
 }
 
+/// A whole compressed tarball, read into memory or borrowed from the caller.
+enum CompressedBytes<'a> {
+    Owned(system_buffer::SystemBuffer),
+    Borrowed(&'a [u8]),
+}
+
+impl Default for CompressedBytes<'_> {
+    fn default() -> Self {
+        Self::Borrowed(&[])
+    }
+}
+
+impl AsRef<[u8]> for CompressedBytes<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Borrowed(bytes) => bytes,
+        }
+    }
+}
+
+impl std::ops::Deref for CompressedBytes<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
+
 type CompressedTail<R> = std::io::Chain<std::io::Cursor<[u8; 1]>, R>;
 
 enum CompressedInput<R> {
-    Buffered(Vec<u8>),
-    Stream(std::io::Chain<ReleasingPrefix<Vec<u8>>, CompressedTail<R>>),
+    Buffered(system_buffer::SystemBuffer),
+    Stream(std::io::Chain<ReleasingPrefix<system_buffer::SystemBuffer>, CompressedTail<R>>),
 }
 
 struct ReleasingPrefix<T>(std::io::Cursor<T>);
@@ -1344,8 +1374,7 @@ fn read_compressed_input<R: std::io::Read>(
 ) -> Result<CompressedInput<R>, LpmError> {
     const READ_CHUNK_SIZE: usize = 64 * 1024;
 
-    let initial_capacity = max_buffered_size.min(READ_CHUNK_SIZE as u64) as usize;
-    let mut compressed = Vec::with_capacity(initial_capacity);
+    let mut compressed = system_buffer::SystemBuffer::new();
     let mut chunk = [0u8; READ_CHUNK_SIZE];
 
     loop {
@@ -2163,6 +2192,12 @@ mod tests {
     mod public_writer_activation;
 
     use super::*;
+
+    fn system_buffer_from(bytes: &[u8]) -> system_buffer::SystemBuffer {
+        let mut buffer = system_buffer::SystemBuffer::new();
+        buffer.extend_from_slice(bytes);
+        buffer
+    }
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use lpm_common::integrity::HashAlgorithm;
@@ -2265,7 +2300,7 @@ mod tests {
         else {
             panic!("input at the threshold must remain buffered");
         };
-        assert_eq!(buffer, source);
+        assert_eq!(&buffer[..], source.as_slice());
     }
 
     #[test]
@@ -2359,17 +2394,16 @@ mod tests {
 
     #[test]
     fn streaming_fallback_releases_owned_complete_input_after_its_last_read() {
-        let input: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::Owned(vec![1, 2, 3]);
-        let mut reader = ReleasingPrefix(std::io::Cursor::new(input));
+        let mut owned = system_buffer::SystemBuffer::new();
+        owned.extend_from_slice(&[1, 2, 3]);
+        let mut reader = ReleasingPrefix(std::io::Cursor::new(CompressedBytes::Owned(owned)));
         assert_eq!(reader.read(&mut []).unwrap(), 0);
-        assert!(matches!(reader.get_ref(), std::borrow::Cow::Owned(_)));
+        assert!(matches!(reader.get_ref(), CompressedBytes::Owned(_)));
         let mut output = [0; 3];
         reader.read_exact(&mut output).unwrap();
         assert_eq!(output, [1, 2, 3]);
         assert!(reader.get_ref().is_empty());
-        if let std::borrow::Cow::Owned(bytes) = reader.get_ref() {
-            assert_eq!(bytes.capacity(), 0);
-        }
+        assert!(matches!(reader.get_ref(), CompressedBytes::Borrowed(_)));
     }
 
     #[test]
@@ -2383,7 +2417,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut inspected = false;
         let files: Vec<PathBuf> = extract_buffered_gzip_tarball(
-            std::borrow::Cow::Owned(tgz),
+            CompressedBytes::Owned(system_buffer_from(&tgz)),
             dir.path(),
             DEFAULT_EXTRACTION_LIMITS,
             &budget,
@@ -2415,7 +2449,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut inspected = false;
         let _: Vec<PathBuf> = extract_buffered_gzip_tarball(
-            std::borrow::Cow::Borrowed(&tgz),
+            CompressedBytes::Borrowed(&tgz),
             dir.path(),
             DEFAULT_EXTRACTION_LIMITS,
             &budget,
