@@ -458,11 +458,11 @@ impl FirewallSelectedChunk {
     }
 
     fn len(&self) -> usize {
-        self.events.len()
+        self.events.len().max(self.verdict_packages.len())
     }
 
     fn is_empty(&self) -> bool {
-        self.events.is_empty()
+        self.events.is_empty() && self.verdict_packages.is_empty()
     }
 
     fn clear(&mut self) {
@@ -558,13 +558,16 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
                 event = selected_rx.recv(), if !receiver_closed => {
                     match event {
                         Some(event) => {
-                            push_firewall_chunk_event(
+                            if let Some(released) = push_firewall_chunk_event(
                                 &mut chunk,
                                 event,
                                 &route_table,
                                 client.as_ref(),
                                 lookup_mode,
-                            );
+                                mode.disables_tarball_prefetch(),
+                            ) {
+                                let _ = fetch_tx.send(released).await;
+                            }
                             if chunk.len() >= chunk_size {
                                 spawn_or_release_firewall_chunk(
                                     &mut chunk,
@@ -636,19 +639,28 @@ pub(super) fn spawn_chunked_npm_firewall_preflight(
     }
 }
 
+/// Adds the event's verdict request to the chunk. An event that must wait for
+/// the verdict stays in the chunk; otherwise it is returned for immediate
+/// release.
 fn push_firewall_chunk_event(
     chunk: &mut FirewallSelectedChunk,
     event: lpm_resolver::SelectedPackageEvent,
     route_table: &RouteTable,
     client: &RegistryClient,
     lookup_mode: NpmFirewallLookupMode,
-) {
+    hold_for_verdict: bool,
+) -> Option<lpm_resolver::SelectedPackageEvent> {
     if let Some(verdict_package) =
         npm_firewall_package_from_selected_event(&event, route_table, client, lookup_mode)
     {
         chunk.verdict_packages.push(verdict_package);
     }
-    chunk.events.push(event);
+    if hold_for_verdict {
+        chunk.events.push(event);
+        None
+    } else {
+        Some(event)
+    }
 }
 
 async fn spawn_or_release_firewall_chunk(
@@ -905,6 +917,54 @@ pub(super) async fn request_npm_firewall_preflight(
     })
 }
 
+/// A firewall verdict that is either settled or still being requested in the
+/// background, as it is in monitor mode.
+pub(super) enum NpmFirewallOutcome {
+    Settled(Box<NpmFirewallPreflightStats>),
+    Pending(NpmFirewallPreflightJoin),
+}
+
+impl NpmFirewallOutcome {
+    pub(super) async fn settle(
+        self,
+        json_output: bool,
+    ) -> Result<NpmFirewallPreflightStats, LpmError> {
+        match self {
+            Self::Settled(stats) => Ok(*stats),
+            Self::Pending(join) => finish_npm_firewall_preflight(join.drain().await?, json_output),
+        }
+    }
+}
+
+/// Requests verdicts for `request.packages` on a background task.
+pub(super) fn spawn_npm_firewall_preflight(
+    request: NpmFirewallPreflightRequest<'_>,
+) -> NpmFirewallPreflightJoin {
+    let NpmFirewallPreflightRequest {
+        mode,
+        lookup_mode,
+        policy_profile,
+        client,
+        route_table,
+        packages,
+        offline,
+        json_output: _,
+    } = request;
+    let verdict_packages =
+        npm_firewall_packages(packages, route_table, client.as_ref(), lookup_mode);
+    let client = Arc::clone(client);
+    NpmFirewallPreflightJoin {
+        handle: Some(tokio::spawn(request_npm_firewall_preflight(
+            mode,
+            lookup_mode,
+            policy_profile,
+            client,
+            verdict_packages,
+            offline,
+        ))),
+    }
+}
+
 pub(super) fn finish_npm_firewall_preflight(
     result: NpmFirewallPreflightResult,
     json_output: bool,
@@ -1149,20 +1209,63 @@ pub(crate) fn prepare_npm_firewall_materialization_preflight(
     })
 }
 
-pub(crate) async fn run_prepared_npm_firewall_materialization_preflight(
+/// A materialization verdict that has settled, or that monitor mode is still
+/// requesting while the package downloads.
+pub(crate) struct NpmFirewallMaterializationVerdict(MaterializationVerdictState);
+
+enum MaterializationVerdictState {
+    Settled(NpmFirewallMaterializationJson),
+    Pending(NpmFirewallPreflightJoin),
+}
+
+impl NpmFirewallMaterializationVerdict {
+    /// Waits for a pending verdict and reports it.
+    pub(crate) async fn settle(
+        self,
+        json_output: bool,
+    ) -> Result<NpmFirewallMaterializationJson, LpmError> {
+        match self.0 {
+            MaterializationVerdictState::Settled(json) => Ok(json),
+            MaterializationVerdictState::Pending(join) => {
+                finish_npm_firewall_materialization(join.drain().await?, json_output)
+            }
+        }
+    }
+}
+
+/// Starts the verdict request for a materialization. Enforce mode waits for
+/// the verdict here, before any package bytes are downloaded; monitor mode
+/// requests it in the background.
+pub(crate) async fn begin_prepared_npm_firewall_materialization_preflight(
     client: &RegistryClient,
     preflight: NpmFirewallMaterializationPreflight,
     json_output: bool,
-) -> Result<NpmFirewallMaterializationJson, LpmError> {
-    let result = request_npm_firewall_preflight(
+) -> Result<NpmFirewallMaterializationVerdict, LpmError> {
+    let request = request_npm_firewall_preflight(
         preflight.mode,
         preflight.lookup_mode,
         preflight.policy_profile,
         Arc::new(client.clone_with_config()),
         preflight.verdict_packages,
         false,
-    )
-    .await?;
+    );
+    let state = if matches!(preflight.mode, NpmFirewallMode::Monitor) {
+        MaterializationVerdictState::Pending(NpmFirewallPreflightJoin {
+            handle: Some(tokio::spawn(request)),
+        })
+    } else {
+        MaterializationVerdictState::Settled(finish_npm_firewall_materialization(
+            request.await?,
+            json_output,
+        )?)
+    };
+    Ok(NpmFirewallMaterializationVerdict(state))
+}
+
+fn finish_npm_firewall_materialization(
+    result: NpmFirewallPreflightResult,
+    json_output: bool,
+) -> Result<NpmFirewallMaterializationJson, LpmError> {
     let firewall_json = npm_firewall_materialization_json(&result);
     finish_npm_firewall_preflight(result, json_output).map(|_| firewall_json)
 }

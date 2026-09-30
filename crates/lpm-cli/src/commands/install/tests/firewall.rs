@@ -102,9 +102,9 @@ fn npm_firewall_chunk_size_uses_positive_values_or_default() {
 }
 
 #[test]
-fn npm_firewall_mode_disables_tarball_prefetch_when_enabled() {
-    assert!(NpmFirewallMode::Monitor.disables_tarball_prefetch());
+fn only_enforced_firewall_disables_tarball_prefetch() {
     assert!(NpmFirewallMode::Enforce.disables_tarball_prefetch());
+    assert!(!NpmFirewallMode::Monitor.disables_tarball_prefetch());
     assert!(!NpmFirewallMode::Off.disables_tarball_prefetch());
 }
 
@@ -407,6 +407,137 @@ async fn chunked_enforce_firewall_preflight_exchanges_ci_oidc_token_once() {
     assert_eq!(result.stats.chunk_count, 2);
     assert_eq!(result.stats.allow_count, 2);
     assert_eq!(released, ["is-number", "left-pad"]);
+}
+
+fn selected_event(name: &str) -> lpm_resolver::SelectedPackageEvent {
+    lpm_resolver::SelectedPackageEvent {
+        name: name.to_string(),
+        version: "1.0.0".to_string(),
+        is_lpm: false,
+        tarball_url: None,
+        integrity: None,
+        unpacked_size: None,
+        platform: None,
+        node_engine: None,
+        optional: false,
+    }
+}
+
+async fn delayed_warn_verdict_server(delay: std::time::Duration) -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .respond_with(ResponseTemplate::new(200).set_delay(delay).set_body_json(
+            serde_json::json!({
+                "requestId": "req-delayed",
+                "policyMode": "product_default",
+                "summary": {
+                    "total": 1,
+                    "allow": 0,
+                    "warn": 1,
+                    "block": 0,
+                    "unknown": 0,
+                    "matched": 1
+                },
+                "decisions": [{
+                    "decisionId": "decision-delayed",
+                    "name": "left-pad",
+                    "version": "1.0.0",
+                    "action": "warn",
+                    "verdict": "suspicious",
+                    "reason": "test warning",
+                    "matchSource": "package",
+                    "policyMode": "product_default",
+                    "enqueueScan": false
+                }]
+            }),
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    server
+}
+
+fn chunked_config(mode: NpmFirewallMode) -> NpmFirewallChunkedPreflightConfig {
+    NpmFirewallChunkedPreflightConfig {
+        route_table: RouteTable::from_mode_only(lpm_registry::RouteMode::Direct),
+        mode,
+        lookup_mode: NpmFirewallLookupMode::PackageOnly,
+        policy_profile: lpm_registry::client::NpmFirewallPolicyProfile::default(),
+        offline: false,
+        chunk_size: 1,
+    }
+}
+
+#[tokio::test]
+async fn chunked_monitor_firewall_releases_packages_before_the_verdict_and_still_records_it() {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let server = delayed_warn_verdict_server(std::time::Duration::from_secs(5)).await;
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("firewall-token"),
+    );
+    let (selected_tx, selected_rx) = mpsc::channel(1);
+    let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+    let join = spawn_chunked_npm_firewall_preflight(
+        selected_rx,
+        fetch_tx,
+        client,
+        chunked_config(NpmFirewallMode::Monitor),
+    );
+
+    selected_tx.send(selected_event("left-pad")).await.unwrap();
+    let released = tokio::time::timeout(std::time::Duration::from_secs(2), fetch_rx.recv())
+        .await
+        .expect("monitor mode must release the package before the verdict returns")
+        .expect("fetch channel open");
+    assert_eq!(released.name, "left-pad");
+    drop(selected_tx);
+
+    let result = join.drain().await.expect("monitor preflight completes");
+    assert_eq!(result.stats.checked_count, 1);
+    assert_eq!(result.stats.warn_count, 1);
+    assert_eq!(result.decisions.len(), 1);
+    assert!(fetch_rx.recv().await.is_none());
+}
+
+#[tokio::test]
+async fn chunked_enforce_firewall_holds_packages_until_the_verdict() {
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let server = delayed_warn_verdict_server(std::time::Duration::from_secs(2)).await;
+    let client = Arc::new(
+        lpm_registry::RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("firewall-token"),
+    );
+    let (selected_tx, selected_rx) = mpsc::channel(1);
+    let (fetch_tx, mut fetch_rx) = mpsc::channel(1);
+    let join = spawn_chunked_npm_firewall_preflight(
+        selected_rx,
+        fetch_tx,
+        client,
+        chunked_config(NpmFirewallMode::Enforce),
+    );
+
+    selected_tx.send(selected_event("left-pad")).await.unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), fetch_rx.recv())
+            .await
+            .is_err(),
+        "enforce mode released a package before its verdict"
+    );
+    drop(selected_tx);
+    let (result, released) = tokio::join!(join.drain(), fetch_rx.recv());
+    assert_eq!(result.unwrap().stats.warn_count, 1);
+    assert_eq!(released.unwrap().name, "left-pad");
 }
 
 #[test]

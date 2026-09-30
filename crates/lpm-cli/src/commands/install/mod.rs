@@ -71,15 +71,14 @@ use concurrency::*;
 use fetch::*;
 use fetch_overlap::*;
 use firewall::{
-    NpmFirewallChunkedPreflightConfig, NpmFirewallLookupMode, NpmFirewallPreflightJoin,
-    NpmFirewallPreflightRequest, NpmFirewallPreflightStats, finish_npm_firewall_preflight,
-    npm_firewall_chunk_size_from_env, npm_firewall_has_packages, run_npm_firewall_preflight,
-    spawn_chunked_npm_firewall_preflight,
+    NpmFirewallChunkedPreflightConfig, NpmFirewallLookupMode, NpmFirewallMode, NpmFirewallOutcome,
+    NpmFirewallPreflightJoin, NpmFirewallPreflightRequest, NpmFirewallPreflightStats,
+    finish_npm_firewall_preflight, npm_firewall_chunk_size_from_env, npm_firewall_has_packages,
+    run_npm_firewall_preflight, spawn_chunked_npm_firewall_preflight, spawn_npm_firewall_preflight,
 };
 pub(crate) use firewall::{
-    NpmFirewallMaterializationPackage, prepare_npm_firewall_materialization_preflight,
-    registry_materialization_route_is_public_npm,
-    run_prepared_npm_firewall_materialization_preflight,
+    NpmFirewallMaterializationPackage, begin_prepared_npm_firewall_materialization_preflight,
+    prepare_npm_firewall_materialization_preflight, registry_materialization_route_is_public_npm,
 };
 pub(crate) use github_source::download_github_archive_to_file;
 pub(crate) use github_source::github_archive_url;
@@ -1422,21 +1421,30 @@ async fn run_with_options_under_store_lock(
         json_output,
     )
     .await?;
-    let npm_firewall_stats = if let Some(join) = npm_firewall_preflight_join.take() {
-        let result = join.drain().await?;
-        finish_npm_firewall_preflight(result, json_output)?
-    } else {
-        run_npm_firewall_preflight(NpmFirewallPreflightRequest {
-            mode: npm_firewall_mode,
-            lookup_mode: npm_firewall_lookup_mode,
-            policy_profile: npm_firewall_policy_profile,
-            client: &arc_client,
-            route_table: &route_table,
-            packages: &packages,
-            offline,
+    let monitor_only = matches!(npm_firewall_mode, NpmFirewallMode::Monitor);
+    let npm_firewall = match npm_firewall_preflight_join.take() {
+        Some(join) if monitor_only => NpmFirewallOutcome::Pending(join),
+        Some(join) => NpmFirewallOutcome::Settled(Box::new(finish_npm_firewall_preflight(
+            join.drain().await?,
             json_output,
-        })
-        .await?
+        )?)),
+        None => {
+            let request = NpmFirewallPreflightRequest {
+                mode: npm_firewall_mode,
+                lookup_mode: npm_firewall_lookup_mode,
+                policy_profile: npm_firewall_policy_profile,
+                client: &arc_client,
+                route_table: &route_table,
+                packages: &packages,
+                offline,
+                json_output,
+            };
+            if monitor_only {
+                NpmFirewallOutcome::Pending(spawn_npm_firewall_preflight(request))
+            } else {
+                NpmFirewallOutcome::Settled(Box::new(run_npm_firewall_preflight(request).await?))
+            }
+        }
     };
     if post_firewall_fetch_overlap_allowed
         && fetch_overlap_join.is_none()
@@ -1644,6 +1652,7 @@ async fn run_with_options_under_store_lock(
     let wf_link_root_symlinks_ms = link_phase.root_symlinks_ms;
     let wf_link_compatibility_ms = link_phase.compatibility_ms;
     let wf_link_bin_shims_ms = link_phase.bin_shims_ms;
+    let npm_firewall_stats = npm_firewall.settle(json_output).await?;
     // `link_ms` lands in the verbose footer and the JSON timing object;
     // no dedicated "Linked in Xms" line.
 
