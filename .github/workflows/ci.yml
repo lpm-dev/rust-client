@@ -584,6 +584,9 @@ jobs:
       - name: Windows port backend tests
         run: cargo test --locked -p lpm-runner ports::tests
 
+      - name: Windows portable runtime identity tests
+        run: cargo test --locked -p lpm-runtime --lib task_identity::
+
       - name: Windows environment name tests
         run: |
           cargo test --locked -p lpm-runner dotenv::
