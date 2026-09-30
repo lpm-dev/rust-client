@@ -269,22 +269,21 @@ mod tests {
             read_or_hash_digest(&binary, &before, Some(&records)).unwrap(),
             digest
         );
-        std::fs::write(&binary, b"other runtime").unwrap();
-        File::options()
-            .write(true)
-            .open(&binary)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(modified))
+        use std::io::Write as _;
+
+        let mut file = File::options().write(true).open(&binary).unwrap();
+        file.write_all(b"other runtime").unwrap();
+        file.flush().unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
             .unwrap();
-        #[cfg(unix)]
-        {
-            let after = local_fingerprint(&binary).unwrap();
-            assert_ne!(before, after);
-            assert_ne!(
-                digest,
-                read_or_hash_digest(&binary, &after, Some(&records)).unwrap()
-            );
-        }
+        drop(file);
+        assert_eq!(binary.metadata().unwrap().modified().unwrap(), modified);
+        let after = local_fingerprint(&binary).unwrap();
+        assert_ne!(before, after);
+        assert_ne!(
+            digest,
+            read_or_hash_digest(&binary, &after, Some(&records)).unwrap()
+        );
         assert!(read_or_hash_digest(&binary, "wrong fingerprint", None).is_none());
     }
 
