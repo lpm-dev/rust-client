@@ -70,13 +70,27 @@ impl NpmScriptContext {
         std::array::from_fn(|index| (KEYS[index].to_string(), std::mem::take(&mut values[index])))
     }
 
-    pub fn apply(&self, environment: &mut HashMap<String, String>, phase: &str, command: &str) {
-        environment.retain(|key, _| !KEYS.iter().any(|managed| managed_key_matches(key, managed)));
-        environment.extend(self.envs(phase, command));
+    /// Replace the npm lifecycle variables in `environment`, whose keys and
+    /// values may be `String`s or `OsString`s.
+    pub fn apply<K, V>(&self, environment: &mut HashMap<K, V>, phase: &str, command: &str)
+    where
+        K: From<String> + AsRef<std::ffi::OsStr> + Eq + std::hash::Hash,
+        V: From<String>,
+    {
+        environment.retain(|key, _| {
+            !KEYS
+                .iter()
+                .any(|managed| managed_key_matches(key.as_ref(), managed))
+        });
+        environment.extend(
+            self.envs(phase, command)
+                .into_iter()
+                .map(|(key, value)| (K::from(key), V::from(value))),
+        );
     }
 }
 
-fn managed_key_matches(key: &str, managed: &str) -> bool {
+fn managed_key_matches(key: &std::ffi::OsStr, managed: &str) -> bool {
     if cfg!(windows) {
         key.eq_ignore_ascii_case(managed)
     } else {

@@ -25,17 +25,11 @@ pub(crate) use lpm_common::child_env::{inherited_env_is_stripped, strip_inherite
 /// Return inherited environment variables that a script child can observe.
 ///
 /// Explicit project env values are handled separately because they override
-/// inherited values after the scrub. Keys and values that are not valid
-/// UTF-8 are converted lossily, so they still take part in the comparison.
-pub fn inherited_child_env() -> HashMap<String, String> {
+/// inherited values after the scrub. Entries keep their exact bytes, which
+/// need not be valid UTF-8.
+pub fn inherited_child_env() -> HashMap<std::ffi::OsString, std::ffi::OsString> {
     std::env::vars_os()
         .filter(|(key, _)| !lpm_common::child_env::inherited_env_key_is_stripped(key))
-        .map(|(key, value)| {
-            (
-                key.to_string_lossy().into_owned(),
-                value.to_string_lossy().into_owned(),
-            )
-        })
         .collect()
 }
 
@@ -863,10 +857,16 @@ mod tests {
 
         let inherited = inherited_child_env();
 
-        assert!(!inherited.keys().any(|key| key.ends_with("_TOKEN")));
+        assert!(
+            !inherited
+                .keys()
+                .any(|key| key.as_encoded_bytes().ends_with(b"_TOKEN"))
+        );
         assert_eq!(
-            inherited.get("LPM_TEST_PLAIN").map(String::as_str),
-            Some("value-\u{fffd}")
+            inherited
+                .get(OsStr::new("LPM_TEST_PLAIN"))
+                .map(|value| value.as_encoded_bytes()),
+            Some(b"value-\xff".as_slice())
         );
     }
 
