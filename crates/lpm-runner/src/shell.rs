@@ -25,10 +25,17 @@ pub(crate) use lpm_common::child_env::{inherited_env_is_stripped, strip_inherite
 /// Return inherited environment variables that a script child can observe.
 ///
 /// Explicit project env values are handled separately because they override
-/// inherited values after the scrub.
+/// inherited values after the scrub. Keys and values that are not valid
+/// UTF-8 are converted lossily, so they still take part in the comparison.
 pub fn inherited_child_env() -> HashMap<String, String> {
-    std::env::vars()
-        .filter(|(key, _)| !inherited_env_is_stripped(key))
+    std::env::vars_os()
+        .filter(|(key, _)| !lpm_common::child_env::inherited_env_key_is_stripped(key))
+        .map(|(key, value)| {
+            (
+                key.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
         .collect()
 }
 
@@ -823,6 +830,44 @@ mod tests {
 
     fn empty_envs() -> HashMap<String, String> {
         HashMap::new()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_child_env_handles_non_utf8_entries() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        const CHILD: &str = "LPM_TEST_INHERITED_ENV_NON_UTF8";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "shell::tests::inherited_child_env_handles_non_utf8_entries",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(OsStr::from_bytes(b"LPM_TEST_\xff_TOKEN"), "secret")
+                .env("LPM_TEST_PLAIN", OsStr::from_bytes(b"value-\xff"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let inherited = inherited_child_env();
+
+        assert!(!inherited.keys().any(|key| key.ends_with("_TOKEN")));
+        assert_eq!(
+            inherited.get("LPM_TEST_PLAIN").map(String::as_str),
+            Some("value-\u{fffd}")
+        );
     }
 
     #[test]
