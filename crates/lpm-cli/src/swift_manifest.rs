@@ -264,27 +264,25 @@ fn ensure_real_directory(path: &Path, label: &str) -> Result<(), LpmError> {
     Ok(())
 }
 
+/// The shared child-process scrub, plus credentials and loader hooks that
+/// Swift toolchains must not see even though script children may.
+///
+/// `GIT_SSH_COMMAND` is kept: `swift package resolve` fetches the project's
+/// git dependencies, which may need the user's SSH configuration.
 fn sensitive_swift_environment_key(key: &OsStr) -> bool {
-    let key = key.to_string_lossy().to_ascii_uppercase();
-    key == "LPM_TOKEN"
-        || key == "NPM_TOKEN"
-        || key == "NODE_AUTH_TOKEN"
-        || key == "GITHUB_TOKEN"
-        || key == "GH_TOKEN"
-        || key == "AWS_ACCESS_KEY_ID"
-        || key == "AWS_SECRET_ACCESS_KEY"
-        || key == "AWS_SESSION_TOKEN"
-        || key == "GOOGLE_APPLICATION_CREDENTIALS"
-        || key == "ACTIONS_ID_TOKEN_REQUEST_TOKEN"
+    let upper = key.to_string_lossy().to_ascii_uppercase();
+    if upper == "GIT_SSH_COMMAND" {
+        return false;
+    }
+    if lpm_common::child_env::inherited_env_key_is_stripped(key) {
+        return true;
+    }
+    let key = upper;
+    key == "GOOGLE_APPLICATION_CREDENTIALS"
         || key == "ACTIONS_ID_TOKEN_REQUEST_URL"
         || key == "CI_JOB_JWT"
         || key == "CI_JOB_JWT_V2"
-        || key == "LD_PRELOAD"
-        || key == "LD_LIBRARY_PATH"
         || key.starts_with("DYLD_")
-        || key.ends_with("_TOKEN")
-        || key.ends_with("_SECRET")
-        || key.ends_with("_PASSWORD")
         || key.ends_with("_CREDENTIAL")
 }
 
@@ -1755,6 +1753,40 @@ pub fn remove_wrapper_dependencies(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn swift_environment_scrub_covers_the_shared_baseline_and_its_own_credentials() {
+        for key in [
+            "NODE_OPTIONS",
+            "BASH_ENV",
+            "PYTHONPATH",
+            "DEPLOY_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "ACTIONS_ID_TOKEN_REQUEST_URL",
+            "CI_JOB_JWT_V2",
+            "DYLD_ANY_HOOK",
+            "REGISTRY_CREDENTIAL",
+            "npm_token",
+        ] {
+            assert!(
+                sensitive_swift_environment_key(std::ffi::OsStr::new(key)),
+                "{key} must be removed"
+            );
+        }
+        for key in [
+            "PATH",
+            "HOME",
+            "DEVELOPER_DIR",
+            "SWIFTPM_CACHE",
+            "GIT_SSH_COMMAND",
+        ] {
+            assert!(
+                !sensitive_swift_environment_key(std::ffi::OsStr::new(key)),
+                "{key} must be kept"
+            );
+        }
+    }
 
     #[test]
     fn native_install_graph_merges_a_diamond_and_preserves_git_bridges() {
