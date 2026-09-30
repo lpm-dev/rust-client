@@ -770,9 +770,32 @@ pub fn spawn_shell_prefixed(
     reason = "the Windows implementation can fail while resolving the system shell"
 )]
 pub(crate) fn shell_process(command: &str) -> Result<Command, LpmError> {
+    #[cfg(target_os = "macos")]
+    let mut process = {
+        use std::os::unix::process::CommandExt;
+
+        let mut process = Command::new(macos_selected_shell());
+        process.arg0("/bin/sh");
+        process
+    };
+    #[cfg(not(target_os = "macos"))]
     let mut process = Command::new("/bin/sh");
     process.arg("-c").arg(command);
     Ok(process)
+}
+
+/// The shell that macOS `/bin/sh` would run.
+///
+/// macOS `/bin/sh` is a launcher that re-executes the shell named by
+/// `/private/var/select/sh` with the same arguments, so running that shell
+/// with `$0` set to `/bin/sh` behaves the same and saves one exec per script.
+/// Anything other than a system shell in `/bin` keeps the launcher.
+#[cfg(target_os = "macos")]
+fn macos_selected_shell() -> std::path::PathBuf {
+    std::fs::read_link("/private/var/select/sh")
+        .ok()
+        .filter(|shell| shell.parent() == Some(Path::new("/bin")) && shell.is_file())
+        .unwrap_or_else(|| std::path::PathBuf::from("/bin/sh"))
 }
 
 #[cfg(windows)]
@@ -893,7 +916,37 @@ mod tests {
     fn shell_process_uses_absolute_system_shell() {
         let process = shell_process("exit 0").unwrap();
 
-        assert_eq!(process.get_program(), std::ffi::OsStr::new("/bin/sh"));
+        assert!(std::path::Path::new(process.get_program()).is_absolute());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shell_process_runs_the_selected_system_shell_directly() {
+        let selected = std::fs::read_link("/private/var/select/sh").unwrap();
+
+        let process = shell_process("exit 0").unwrap();
+
+        assert_eq!(process.get_program(), selected.as_os_str());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn shell_process_behaves_as_bin_sh() {
+        // `$0` and the shell's POSIX mode must match a `/bin/sh -c` run.
+        let probe = r#"printf '%s|' "$0"; case ":$SHELLOPTS:" in *:posix:*) echo posix;; *) echo default;; esac"#;
+        let expected = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(probe)
+            .output()
+            .unwrap();
+
+        let actual = shell_process(probe).unwrap().output().unwrap();
+
+        assert!(actual.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&actual.stdout),
+            String::from_utf8_lossy(&expected.stdout)
+        );
     }
 
     #[test]
