@@ -53,7 +53,7 @@ async fn buffered_tarball_rejects_chunked_bytes_over_the_limit() {
         .unwrap_err();
     server.await.unwrap();
     assert!(
-        matches!(error, LpmError::Registry(message) if message.contains("maximum compressed size (7 bytes)"))
+        matches!(error, TarballBodyError::Fatal(LpmError::Registry(message)) if message.contains("maximum compressed size (7 bytes)"))
     );
 }
 
@@ -65,7 +65,7 @@ async fn buffered_tarball_preserves_body_read_errors() {
         .unwrap_err();
     server.await.unwrap();
     assert!(
-        matches!(error, LpmError::Network(message) if message.contains("failed to read tarball bytes"))
+        matches!(error, TarballBodyError::Transport(LpmError::Network(message)) if message.contains("failed to read tarball bytes"))
     );
 }
 
@@ -948,103 +948,141 @@ async fn download_to_file_retries_500_then_succeeds() {
     assert_eq!(file_content, b"retry-500-success");
 }
 
-#[tokio::test]
-async fn download_to_file_surfaces_chunk_read_failures() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+const MALFORMED_CHUNKED_BODY: &[u8] =
+    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\nZZZ\r\n";
+const TRUNCATED_CONTENT_LENGTH_BODY: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nhello";
+const COMPLETE_BODY: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nhelloworld";
 
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("failed to bind raw http test server");
-    let addr = listener
-        .local_addr()
-        .expect("raw http test server should have a local addr");
+/// Serves one scripted raw HTTP response per connection, in order, then stops
+/// accepting. Returns the server address and the number of requests served.
+async fn scripted_raw_http_server(
+    responses: Vec<&'static [u8]>,
+) -> (
+    std::net::SocketAddr,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served_by_server = std::sync::Arc::clone(&served);
     let server = tokio::spawn(async move {
-        let (mut stream, _) = listener
-            .accept()
-            .await
-            .expect("raw http test server should accept a request");
-
-        let mut request_buf = [0u8; 1024];
-        let _ = stream.read(&mut request_buf).await;
-
-        stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\nZZZ\r\n",
-                )
-                .await
-                .expect("raw http test server should write malformed chunked body");
-        let _ = stream.shutdown().await;
+        for response in responses {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if socket.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            served_by_server.fetch_add(1, Ordering::SeqCst);
+            socket.get_mut().write_all(response).await.unwrap();
+            let _ = socket.get_mut().shutdown().await;
+        }
     });
-
-    let client = RegistryClient::new();
-    let url = format!("http://127.0.0.1:{}/tarball/broken-chunks.tgz", addr.port());
-    let result = client.download_tarball_to_file(&url).await;
-
-    server
-        .await
-        .expect("raw http test server task should complete cleanly");
-
-    assert!(
-        result.is_err(),
-        "broken chunked bodies should fail the download"
-    );
-    let message = result.unwrap_err().to_string();
-    assert!(
-        message.contains("failed to read tarball chunk"),
-        "chunked transfer parse errors should surface as tarball chunk read failures: {message}"
-    );
+    (address, served, server)
 }
 
 #[tokio::test]
-async fn download_to_file_surfaces_truncated_content_length_interruptions() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+async fn download_to_file_retries_a_body_interrupted_mid_stream() {
+    for interrupted in [MALFORMED_CHUNKED_BODY, TRUNCATED_CONTENT_LENGTH_BODY] {
+        let (address, served, server) =
+            scripted_raw_http_server(vec![interrupted, COMPLETE_BODY]).await;
 
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("failed to bind raw http interruption server");
-    let addr = listener
-        .local_addr()
-        .expect("interruption server should have a local addr");
-
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener
-            .accept()
+        let downloaded = RegistryClient::new()
+            .download_tarball_to_file(&format!("http://{address}/tarball/flaky.tgz"))
             .await
-            .expect("interruption server should accept a request");
+            .expect("a body interrupted mid-stream must be downloaded again");
+        server.await.unwrap();
 
-        let mut request_buf = [0u8; 1024];
-        let _ = stream.read(&mut request_buf).await;
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            std::fs::read(downloaded.file.path()).unwrap(),
+            b"helloworld"
+        );
+        assert_eq!(downloaded.compressed_size, 10);
+    }
+}
 
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nhello")
+#[tokio::test]
+async fn download_to_file_gives_up_after_three_interrupted_bodies() {
+    for interrupted in [MALFORMED_CHUNKED_BODY, TRUNCATED_CONTENT_LENGTH_BODY] {
+        let (address, served, server) =
+            scripted_raw_http_server(vec![interrupted, interrupted, interrupted]).await;
+
+        let error = RegistryClient::new()
+            .download_tarball_to_file(&format!("http://{address}/tarball/broken.tgz"))
             .await
-            .expect("interruption server should write partial body");
-        let _ = stream.shutdown().await;
-    });
+            .expect_err("a body that keeps failing must eventually fail the download");
+        server.abort();
 
-    let client = RegistryClient::new();
-    let url = format!(
-        "http://127.0.0.1:{}/tarball/truncated-body.tgz",
-        addr.port()
-    );
-    let result = client.download_tarball_to_file(&url).await;
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let message = error.to_string();
+        assert!(
+            message.contains("failed to read tarball chunk"),
+            "the last body failure must surface: {message}"
+        );
+    }
+}
 
-    server
+#[tokio::test]
+async fn buffered_download_retries_a_body_interrupted_mid_stream() {
+    let (address, served, server) =
+        scripted_raw_http_server(vec![TRUNCATED_CONTENT_LENGTH_BODY, COMPLETE_BODY]).await;
+
+    let bytes = RegistryClient::new()
+        .download_tarball(&format!("http://{address}/tarball/flaky.tgz"))
         .await
-        .expect("interruption server task should complete cleanly");
+        .expect("a buffered body interrupted mid-stream must be downloaded again");
+    server.await.unwrap();
 
-    assert!(
-        result.is_err(),
-        "truncated content-length bodies should fail the download"
-    );
-    let message = result.unwrap_err().to_string();
-    assert!(
-        message.contains("failed to read tarball chunk"),
-        "mid-body interruptions should surface as tarball chunk read failures: {message}"
-    );
+    assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(bytes, b"helloworld");
+}
+
+#[tokio::test]
+async fn caller_owned_spool_classifies_interrupted_bodies_as_retryable() {
+    let (response, server) = chunked_tarball_response(b"4\r\nab").await;
+    let error = RegistryClient::new()
+        .spool_tarball_response(response)
+        .await
+        .expect_err("a truncated body must fail the spool");
+    server.await.unwrap();
+    assert!(error.is_retryable(), "{error:?}");
+
+    let (response, server) = chunked_tarball_response(b"4\r\nabcd\r\n0\r\n\r\n").await;
+    let error = RegistryClient::new()
+        .spool_tarball_response_with_limit(response, 3)
+        .await
+        .expect_err("an oversized body must fail the spool");
+    server.await.unwrap();
+    assert!(!error.is_retryable(), "{error:?}");
+}
+
+#[tokio::test]
+async fn tarball_body_retry_allows_two_retries_for_transport_failures_only() {
+    let transport = || TarballBodyError::Transport(LpmError::Network("reset".into()));
+
+    let mut retry = TarballBodyRetry::default();
+    retry.before_retry(transport()).await.unwrap();
+    retry.before_retry(transport()).await.unwrap();
+    let error = retry.before_retry(transport()).await.unwrap_err();
+    assert!(matches!(error, LpmError::Network(message) if message == "reset"));
+
+    let error = TarballBodyRetry::default()
+        .before_retry(TarballBodyError::Fatal(LpmError::Registry(
+            "too big".into(),
+        )))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, LpmError::Registry(message) if message == "too big"));
 }
 
 #[test]
