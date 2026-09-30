@@ -593,7 +593,7 @@ fn node_executable_in_path(cwd: &Path, path: &OsStr) -> Option<PathBuf> {
     runtime_executable_in_path(cwd, path, detect::RuntimeKind::Node)
 }
 
-fn runtime_executable_in_path(
+pub(crate) fn runtime_executable_in_path(
     cwd: &Path,
     path: &OsStr,
     runtime: detect::RuntimeKind,
@@ -744,14 +744,14 @@ pub(crate) fn update_with_file_metadata(hasher: &mut Sha256, metadata: &std::fs:
 }
 
 #[cfg(unix)]
-fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
+pub(crate) fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
     use std::os::unix::ffi::OsStrExt;
 
     hasher.update(value.as_bytes());
 }
 
 #[cfg(windows)]
-fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
+pub(crate) fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
     use std::os::windows::ffi::OsStrExt;
 
     for unit in value.encode_wide() {
@@ -760,7 +760,7 @@ fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
+pub(crate) fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
     hasher.update(value.to_string_lossy().as_bytes());
 }
 

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub(super) struct WorkspaceCacheContract {
+    root: std::path::PathBuf,
     fingerprint: lpm_task::hasher::WorkspaceContractFingerprint,
     validation: lpm_task::hasher::FilesystemValidation,
 }
@@ -13,6 +14,7 @@ impl WorkspaceCacheContract {
     pub(super) fn capture(root: &Path) -> Result<Self, LpmError> {
         let snapshot = lpm_task::hasher::compute_workspace_contract_snapshot(root)?;
         Ok(Self {
+            root: root.to_path_buf(),
             fingerprint: snapshot.fingerprint,
             validation: snapshot.validation,
         })
@@ -86,6 +88,7 @@ pub(super) struct CacheContext {
     pub(super) remote_cache: Option<crate::commands::remote_cache::RemoteCacheClient>,
     workspace_validation: Option<lpm_task::hasher::FilesystemValidation>,
     input_validation: lpm_task::hasher::FilesystemValidation,
+    runtime_validation: Option<lpm_runtime::task_identity::PortableRuntimeSnapshot>,
     dependencies: Vec<TaskDependencyIdentity>,
     command_preference: CommandPreference,
 }
@@ -279,11 +282,27 @@ fn build_task_context(
     let mut runtime_identities = bin_hint.cache_identities();
     let child_path =
         lpm_runner::bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
-    bin_hint.append_executable_cache_identities(
-        project_dir,
-        std::ffi::OsStr::new(&child_path),
-        &mut runtime_identities,
-    );
+    let runtime_validation = if task_config.cache_portable {
+        let Some(snapshot) = lpm_runtime::task_identity::PortableRuntimeSnapshot::capture(
+            project_dir,
+            std::ffi::OsStr::new(&child_path),
+        ) else {
+            tracing::warn!(
+                "task runtime changed or could not be identified; skipping cache for '{}'",
+                lpm_common::sanitize_terminal_inline(script_name)
+            );
+            return Ok(None);
+        };
+        runtime_identities.extend_from_slice(snapshot.identities());
+        Some(snapshot)
+    } else {
+        bin_hint.append_executable_cache_identities(
+            project_dir,
+            std::ffi::OsStr::new(&child_path),
+            &mut runtime_identities,
+        );
+        None
+    };
 
     let pkg_json_path = project_dir.join("package.json");
     let (package, package_json) = if pkg_json_path.exists() {
@@ -311,13 +330,26 @@ fn build_task_context(
     .cloned()
     .unwrap_or_default();
 
-    lpm_runner::npm_context::NpmScriptContext::new(
+    let npm_context = lpm_runner::npm_context::NpmScriptContext::new(
         package.as_ref().and_then(|pkg| pkg.name.as_deref()),
         package.as_ref().and_then(|pkg| pkg.version.as_deref()),
         project_dir,
         &std::env::current_dir()?,
-    )
-    .apply(&mut child_env, script_name, &command);
+    );
+    if task_config.cache_portable {
+        let discovered_root;
+        let root = if let Some(contract) = workspace_contract {
+            &contract.root
+        } else {
+            discovered_root = lpm_workspace::find_workspace_root(project_dir)
+                .map_err(|error| LpmError::Task(error.to_string()))?
+                .unwrap_or_else(|| project_dir.to_path_buf());
+            &discovered_root
+        };
+        npm_context.apply_portable_cache_context(&mut child_env, script_name, &command, root)?;
+    } else {
+        npm_context.apply(&mut child_env, script_name, &command);
+    }
 
     let cache_inputs = effective_cache_inputs(&task_config, config_ref);
     let dependency_pairs = dependency_identity_pairs(dependency_identities);
@@ -348,6 +380,7 @@ fn build_task_context(
         },
         workspace_validation: workspace_contract.map(|contract| contract.validation.clone()),
         input_validation: cache_snapshot.validation,
+        runtime_validation,
         dependencies: dependency_identities.to_vec(),
     }))
 }
@@ -456,6 +489,11 @@ pub(super) fn try_cache_hit_with_context(
 }
 
 fn cache_context_is_unchanged(context: &CacheContext) -> Result<bool, LpmError> {
+    if let Some(runtime) = &context.runtime_validation
+        && !runtime.is_unchanged()
+    {
+        return Ok(false);
+    }
     if let Some(validation) = &context.workspace_validation
         && !validation.is_unchanged()?
     {

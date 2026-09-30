@@ -90,7 +90,7 @@ fn identity_with_environment(
     })
 }
 
-fn is_node_binary(canonical: &Path, metadata: &Metadata) -> bool {
+pub(crate) fn is_node_binary(canonical: &Path, metadata: &Metadata) -> bool {
     #[cfg(debug_assertions)]
     if let Some(test_binary) = std::env::var_os("LPM_TEST_NODE_BINARY") {
         return Path::new(&test_binary)
@@ -128,7 +128,7 @@ fn is_node_binary(canonical: &Path, metadata: &Metadata) -> bool {
     has_native_executable_header(canonical)
 }
 
-fn has_native_executable_header(path: &Path) -> bool {
+pub(crate) fn has_native_executable_header(path: &Path) -> bool {
     use std::io::Read;
 
     let mut header = [0_u8; 4];

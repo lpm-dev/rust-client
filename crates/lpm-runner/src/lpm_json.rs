@@ -578,6 +578,11 @@ pub struct TaskConfig {
     /// An empty list ignores inherited values. Project-loaded env values always remain inputs.
     #[serde(default, rename = "cacheEnv")]
     pub cache_env: Option<Vec<String>>,
+
+    /// Share relocatable outputs across checkout and native runtime installation paths.
+    /// Execution keeps its real paths; environment selection remains controlled by cacheEnv.
+    #[serde(default, rename = "cachePortable")]
+    pub cache_portable: bool,
 }
 
 impl TaskConfig {
