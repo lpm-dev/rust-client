@@ -392,7 +392,7 @@ async fn login_starts_browser_flow_when_only_access_credential_is_valid() {
 
     let mut command = lpm_spawnable(&project);
     command
-        .args(["--registry", &mock.url(), "--insecure", "login", "--json"])
+        .args(["--registry", &mock.url(), "--insecure", "login"])
         .env("BROWSER", "false");
     let mut child = command.spawn().expect("failed to spawn lpm login");
     let browser_flow_marker = project.home().join(".lpm/device-id");

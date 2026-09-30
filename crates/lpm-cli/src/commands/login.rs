@@ -4,6 +4,8 @@ use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 use std::sync::Arc;
 
+mod device;
+
 const MAX_CLI_EXCHANGE_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_CONCURRENT_CALLBACKS: usize = 16;
 
@@ -75,8 +77,13 @@ pub async fn run(
     client: &RegistryClient,
     registry_url: &str,
     json_output: bool,
+    device_flow: bool,
+    complete: Option<&str>,
 ) -> Result<(), LpmError> {
     client.validate_base_url()?;
+    if let Some(id) = complete {
+        return device::complete(client, registry_url, id, json_output).await;
+    }
     let existing_session_client = match client.session() {
         Some(session) => {
             let stored_session = Arc::new(session.stored_session_only());
@@ -117,6 +124,15 @@ pub async fn run(
             Err(LpmError::AuthRequired | LpmError::SessionExpired) => {}
             Err(error) => return Err(error),
         }
+    }
+
+    if device_flow {
+        return device::start(client, registry_url, json_output).await;
+    }
+    if json_output {
+        return Err(LpmError::Registry(
+            "Browser sign-in needs an authorization link. Use `lpm login --device --json`, then `lpm login --complete LOGIN_ID --json`.".into(),
+        ));
     }
 
     if !json_output {
@@ -218,6 +234,15 @@ pub async fn run(
     }
 
     let session = parse_cli_exchange_session(&body)?;
+    finish_session(client, registry_url, session, json_output).await
+}
+
+async fn finish_session(
+    client: &RegistryClient,
+    registry_url: &str,
+    session: CliExchangeSession,
+    json_output: bool,
+) -> Result<(), LpmError> {
     let token = session.token;
     let expires_at = session.expires_at;
     let refresh_token = session.refresh_token;
