@@ -120,9 +120,16 @@ impl ExecutionSignals {
     /// Preserve the foreground group so interactive children can read stdin.
     pub fn run(&self, command: &mut Command) -> Result<ExitStatus, LpmError> {
         self.check()?;
+        // Registered before the spawn, so an exit that happens first still
+        // leaves a wakeup behind.
+        #[cfg(unix)]
+        let wake = ChildOrStopWake::new()?;
         let mut child = command.spawn()?;
+        #[cfg(not(unix))]
         let started = std::time::Instant::now();
         loop {
+            #[cfg(unix)]
+            wake.clear();
             if self.is_stopped() {
                 #[cfg(unix)]
                 crate::ports::stop_child_process_tree(
@@ -141,12 +148,84 @@ impl ExecutionSignals {
                     return Err(error.into());
                 }
             }
-            let poll_ms = if started.elapsed() < std::time::Duration::from_millis(100) {
-                1
-            } else {
-                10
-            };
-            std::thread::sleep(std::time::Duration::from_millis(poll_ms));
+            #[cfg(unix)]
+            wake.wait();
+            #[cfg(not(unix))]
+            std::thread::sleep(std::time::Duration::from_millis(
+                if started.elapsed() < std::time::Duration::from_millis(100) {
+                    1
+                } else {
+                    10
+                },
+            ));
+        }
+    }
+}
+
+#[cfg(unix)]
+const WAKE_BACKSTOP_MS: libc::c_int = 1_000;
+
+/// Wakes a waiting thread when any child process exits or a stop signal
+/// arrives, through a self-pipe the signal handlers write to.
+#[cfg(unix)]
+struct ChildOrStopWake {
+    read: std::os::unix::net::UnixStream,
+    registrations: Vec<signal_hook::SigId>,
+}
+
+#[cfg(unix)]
+impl ChildOrStopWake {
+    fn new() -> std::io::Result<Self> {
+        let (read, write) = std::os::unix::net::UnixStream::pair()?;
+        read.set_nonblocking(true)?;
+        let mut wake = Self {
+            read,
+            registrations: Vec::with_capacity(3),
+        };
+        for signal in [
+            signal_hook::consts::SIGCHLD,
+            signal_hook::consts::SIGINT,
+            signal_hook::consts::SIGTERM,
+        ] {
+            wake.registrations
+                .push(signal_hook::low_level::pipe::register(
+                    signal,
+                    write.try_clone()?,
+                )?);
+        }
+        Ok(wake)
+    }
+
+    /// Consume pending wakeups. Callers clear before checking state, so a
+    /// signal that arrives during the check wakes the next wait.
+    fn clear(&self) {
+        let mut buffer = [0_u8; 64];
+        while matches!(std::io::Read::read(&mut &self.read, &mut buffer), Ok(read) if read > 0) {}
+    }
+
+    fn wait(&self) {
+        use std::os::fd::AsRawFd;
+
+        let mut descriptor = libc::pollfd {
+            fd: self.read.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // The timeout is a backstop for a process that inherited a signal
+        // mask blocking these signals on every thread.
+        // SAFETY: `descriptor` is a valid pollfd for the duration of the call.
+        // An interrupted or failed poll only makes the caller check again.
+        unsafe {
+            libc::poll(&mut descriptor, 1, WAKE_BACKSTOP_MS);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ChildOrStopWake {
+    fn drop(&mut self) {
+        for registration in self.registrations.drain(..) {
+            signal_hook::low_level::unregister(registration);
         }
     }
 }
@@ -157,5 +236,60 @@ impl Drop for ExecutionSignals {
         for registration in self.registrations.drain(..) {
             signal_hook::low_level::unregister(registration);
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn shell(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(script);
+        command
+    }
+
+    #[test]
+    fn run_returns_the_child_exit_status() {
+        let signals = ExecutionSignals::new().unwrap();
+
+        let status = signals.run(&mut shell("exit 7")).unwrap();
+
+        assert_eq!(status.code(), Some(7));
+    }
+
+    #[test]
+    fn run_returns_a_child_that_exits_before_the_wait_starts() {
+        let signals = ExecutionSignals::new().unwrap();
+        let mut command = shell("kill -KILL $$");
+
+        let status = signals.run(&mut command).unwrap();
+
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    #[test]
+    fn run_stops_the_child_when_a_stop_signal_arrives() {
+        let signals = ExecutionSignals::new().unwrap();
+        let flag = Arc::clone(&signals.signal);
+        // Records the stop the way the SIGTERM handler does, then wakes the
+        // wait with SIGCHLD. Raising SIGTERM itself would stop every other
+        // test sharing this process.
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            flag.store(libc::SIGTERM as usize, Ordering::Release);
+            signal_hook::low_level::raise(signal_hook::consts::SIGCHLD).unwrap();
+        });
+        let started = std::time::Instant::now();
+
+        let result = signals.run(&mut shell("sleep 30"));
+        stopper.join().unwrap();
+
+        assert!(matches!(result, Err(LpmError::ExitCode(143))), "{result:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1_300),
+            "the stop must wake the wait rather than its backstop timeout"
+        );
     }
 }
