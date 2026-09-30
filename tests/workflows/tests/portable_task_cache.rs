@@ -138,8 +138,36 @@ fn project(registry: &MockRegistry, portable: bool) -> TempProject {
     project
 }
 
+fn cache_command(project: &TempProject) -> assert_cmd::Command {
+    let mut command = lpm(project);
+    let isolated_env: Vec<_> = command
+        .get_envs()
+        .filter_map(|(name, value)| value.map(|value| (name.to_owned(), value.to_owned())))
+        .collect();
+    command.env_clear();
+    for name in [
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "TMPDIR",
+        "SystemRoot",
+        "WINDIR",
+        "SystemDrive",
+        "ComSpec",
+        "PATHEXT",
+        "TEMP",
+        "TMP",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    command.envs(isolated_env);
+    command
+}
+
 fn build(project: &TempProject) {
-    let result = lpm(project)
+    let result = cache_command(project)
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
         .args(["run", "build"])
@@ -176,7 +204,7 @@ async fn portable_cache_tracks_source_and_declared_environment_changes() {
         project.write_file("lpm.json", &config.to_string());
     }
     let run = |project: &TempProject, target: &str| {
-        lpm(project)
+        cache_command(project)
             .env("BUILD_TARGET", target)
             .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
             .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
@@ -279,7 +307,7 @@ async fn portable_workspace_cache_reuses_prerequisites_and_tracks_their_changes(
             project.write_file("packages/lib/lpm.json", &config.to_string());
         }
         let run = |project: &TempProject| {
-            lpm(project)
+            cache_command(project)
                 .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
                 .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
                 .args(["run", "build", "--filter", "app"])
@@ -330,7 +358,7 @@ fn copied_node_path(project: &TempProject) -> (std::path::PathBuf, std::ffi::OsS
 }
 
 fn build_with_path(project: &TempProject, path: &std::ffi::OsStr) {
-    lpm(project)
+    cache_command(project)
         .env("PATH", path)
         .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
         .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
