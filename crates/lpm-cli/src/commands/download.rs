@@ -1,9 +1,8 @@
 mod publication;
 
 use crate::commands::install::{
-    NpmFirewallMaterializationPackage, prepare_npm_firewall_materialization_preflight,
-    registry_materialization_route_is_public_npm,
-    run_prepared_npm_firewall_materialization_preflight,
+    NpmFirewallMaterializationPackage, begin_prepared_npm_firewall_materialization_preflight,
+    prepare_npm_firewall_materialization_preflight, registry_materialization_route_is_public_npm,
 };
 use crate::commands::registry_reads::{
     RoutedPackageRef, fetch_routed_package_metadata, normalize_package_version_input,
@@ -98,7 +97,7 @@ pub async fn run(
         ));
     }
 
-    let firewall_json = run_prepared_npm_firewall_materialization_preflight(
+    let firewall_verdict = begin_prepared_npm_firewall_materialization_preflight(
         &context.client,
         firewall_preflight,
         json_output,
@@ -128,6 +127,7 @@ pub async fn run(
                 .await?
         }
     };
+    let firewall_json = firewall_verdict.settle(json_output).await?;
     let size = downloaded.compressed_size as usize;
 
     let integrity_verified = if let Some(sri) = integrity_str.as_ref() {

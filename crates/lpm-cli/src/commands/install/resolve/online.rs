@@ -328,11 +328,11 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                     let selected_package_fetch_overlap_allowed = fetch_overlap_allowed_local
                         && !policy_extensions_disable_tarball_prefetch(policy_extension_configs);
                     let serialize_fetch_after_workspace_firewall =
-                        resolve_ahead && npm_firewall_mode.is_enabled();
+                        resolve_ahead && npm_firewall_mode.disables_tarball_prefetch();
                     let selected_package_tx = if selected_package_fetch_overlap_allowed {
                         if serialize_fetch_after_workspace_firewall {
                             None
-                        } else if npm_firewall_mode.is_enabled() {
+                        } else if npm_firewall_mode.is_enabled() && !resolve_ahead {
                             let (selected_tx, selected_rx) =
                                 selected_package_channel(&fetch_semaphore);
                             let (fetch_tx, fetch_rx) = selected_package_channel(&fetch_semaphore);

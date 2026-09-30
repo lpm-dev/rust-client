@@ -124,8 +124,10 @@ impl NpmFirewallMode {
         !matches!(self, Self::Off)
     }
 
+    /// Only enforcement has to see a verdict before package bytes arrive;
+    /// monitor mode reports verdicts without changing the install.
     pub(crate) fn disables_tarball_prefetch(self) -> bool {
-        self.is_enabled()
+        matches!(self, Self::Enforce)
     }
 
     pub(crate) fn loosens(self, floor: Self) -> bool {
