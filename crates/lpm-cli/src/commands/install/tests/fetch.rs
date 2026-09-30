@@ -2496,3 +2496,165 @@ fn speculative_picker_prefers_a_satisfying_latest_over_a_higher_version() {
         ))
     );
 }
+
+/// Serves `interrupted` responses that close after half of the tarball body,
+/// then one complete response, one connection each, and then stops accepting.
+async fn interrupted_tarball_server(
+    body: Vec<u8>,
+    interrupted: usize,
+    complete: bool,
+) -> (
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served_by_server = Arc::clone(&served);
+    let server = tokio::spawn(async move {
+        for connection in 0..interrupted + usize::from(complete) {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if socket.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            served_by_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let sent = if connection < interrupted {
+                &body[..body.len() / 2]
+            } else {
+                &body[..]
+            };
+            let socket = socket.get_mut();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(sent).await.unwrap();
+            let _ = socket.shutdown().await;
+        }
+    });
+    (format!("http://{address}"), served, server)
+}
+
+#[derive(Clone, Copy, Debug)]
+enum InterruptedFetchLane {
+    V1Buffered,
+    V2Spooled,
+    V2LaneLostToSibling,
+    V2Streamed,
+}
+
+impl InterruptedFetchLane {
+    const ALL: [Self; 4] = [
+        Self::V1Buffered,
+        Self::V2Spooled,
+        Self::V2LaneLostToSibling,
+        Self::V2Streamed,
+    ];
+}
+
+async fn fetch_from_interrupted_server(
+    lane: InterruptedFetchLane,
+    interrupted: usize,
+    complete: bool,
+) -> (
+    Result<
+        (
+            String,
+            TaskTimings,
+            String,
+            Option<lpm_store::v2::ExtractedObject>,
+        ),
+        LpmError,
+    >,
+    usize,
+) {
+    use lpm_common::integrity::{HashAlgorithm, Integrity};
+
+    let body = build_test_tarball();
+    let integrity = Integrity::from_bytes(HashAlgorithm::Sha512, &body).to_string();
+    let (base_url, served, server) = interrupted_tarball_server(body, interrupted, complete).await;
+
+    let store_root = tempfile::tempdir().unwrap();
+    let v2_root = tempfile::tempdir().unwrap();
+    let store = PackageStore::at(store_root.path());
+    let store_v2 = lpm_store::v2::Store::at(v2_root.path());
+    let client = Arc::new(RegistryClient::new().with_npm_registry_url(base_url.clone()));
+    let route_table = RouteTable::from_mode_only(lpm_registry::RouteMode::Direct);
+    let mut package = fake_pkg("test-tarball-pkg", "1.0.0", true);
+    package.source = format!("registry+{base_url}");
+    package.integrity = Some(integrity);
+    package.tarball_url = Some(format!(
+        "{base_url}/test-tarball-pkg/-/test-tarball-pkg-1.0.0.tgz"
+    ));
+    let streaming_lane = V2StreamingLane::default();
+    if matches!(lane, InterruptedFetchLane::V2LaneLostToSibling) {
+        assert!(streaming_lane.try_claim());
+    }
+    let (store_v2, eligibility) = match lane {
+        InterruptedFetchLane::V1Buffered => (None, V2StreamingEligibility::Disabled),
+        InterruptedFetchLane::V2Spooled => (Some(&store_v2), V2StreamingEligibility::Disabled),
+        InterruptedFetchLane::V2LaneLostToSibling | InterruptedFetchLane::V2Streamed => (
+            Some(&store_v2),
+            V2StreamingEligibility::CriticalCandidate(&streaming_lane),
+        ),
+    };
+
+    let result = fetch_and_store_streaming(
+        &client,
+        &route_table,
+        &store,
+        store_v2,
+        &package,
+        0,
+        ArtifactSelection::LockfileReplay,
+        &Arc::new(GateStats::default()),
+        install_pkg_acquire_permit(),
+        &None,
+        ManagedInstallAccounting,
+        eligibility,
+        None,
+    )
+    .await;
+    server.abort();
+    (result, served.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+#[tokio::test]
+async fn registry_fetch_requests_the_tarball_again_when_its_body_is_interrupted() {
+    for lane in InterruptedFetchLane::ALL {
+        let (result, served) = fetch_from_interrupted_server(lane, 1, true).await;
+        let (_, timings, _, _) = result.unwrap_or_else(|error| {
+            panic!("{lane:?}: an interrupted body must be downloaded again: {error}")
+        });
+        assert_eq!(served, 2, "{lane:?}");
+        if matches!(lane, InterruptedFetchLane::V2Streamed) {
+            assert!(
+                !timings.pipeline_wall_recorded,
+                "the retry after a failed stream must use the file spool"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn registry_fetch_fails_after_three_interrupted_bodies() {
+    for lane in InterruptedFetchLane::ALL {
+        let (result, served) = fetch_from_interrupted_server(lane, 3, false).await;
+        let error = result.expect_err("a body that keeps failing must fail the fetch");
+        assert_eq!(served, 3, "{lane:?}: {error}");
+    }
+}

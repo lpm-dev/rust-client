@@ -8,6 +8,86 @@ pub const MAX_COMPRESSED_TARBALL_SIZE: u64 = 500 * 1024 * 1024;
 pub const MAX_COMPRESSED_TARBALL_SPOOL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub(super) const COMPRESSED_TARBALL_SPOOL_PERMIT_BYTES: u64 = 64 * 1024;
 
+/// Attempts, including the first, that one tarball download gets when its
+/// body fails mid-stream. Failures before the response headers arrive are
+/// retried separately by the transport.
+pub const TARBALL_BODY_ATTEMPTS: u32 = 3;
+
+/// A failed tarball body read, split by whether requesting the tarball again
+/// can succeed.
+#[derive(Debug)]
+pub enum TarballBodyError {
+    /// The connection failed while the body was streaming.
+    Transport(LpmError),
+    /// A size limit, local I/O failure, or anything else a new request would
+    /// repeat.
+    Fatal(LpmError),
+}
+
+impl TarballBodyError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Transport(_))
+    }
+}
+
+impl std::fmt::Display for TarballBodyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(error) | Self::Fatal(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl From<LpmError> for TarballBodyError {
+    fn from(error: LpmError) -> Self {
+        Self::Fatal(error)
+    }
+}
+
+impl From<TarballBodyError> for LpmError {
+    fn from(error: TarballBodyError) -> Self {
+        match error {
+            TarballBodyError::Transport(error) | TarballBodyError::Fatal(error) => error,
+        }
+    }
+}
+
+/// Retry budget for one tarball whose body can fail mid-stream.
+///
+/// A response body is consumed once, so a retry is a new request: callers
+/// loop over "request, then drain the body" and hand every body failure to
+/// [`Self::before_retry`].
+#[derive(Debug, Default)]
+pub struct TarballBodyRetry {
+    failures: u32,
+}
+
+impl TarballBodyRetry {
+    /// Waits out the backoff and returns `Ok` when the tarball should be
+    /// requested again. Returns the failure itself when it is not a transport
+    /// failure or when [`TARBALL_BODY_ATTEMPTS`] are spent.
+    pub async fn before_retry(&mut self, error: TarballBodyError) -> Result<(), LpmError> {
+        let TarballBodyError::Transport(error) = error else {
+            return Err(error.into());
+        };
+        self.failures += 1;
+        if self.failures >= TARBALL_BODY_ATTEMPTS {
+            return Err(error);
+        }
+        let delay = super::transport::backoff_override().unwrap_or(match self.failures {
+            1 => Duration::from_millis(250),
+            _ => Duration::from_secs(1),
+        });
+        tracing::debug!(
+            failures = self.failures,
+            delay_ms = delay.as_millis() as u64,
+            "requesting tarball again after its body failed: {error}"
+        );
+        tokio::time::sleep(delay).await;
+        Ok(())
+    }
+}
+
 pub(super) fn compressed_tarball_spool_permits(bytes: u64) -> usize {
     bytes.div_ceil(COMPRESSED_TARBALL_SPOOL_PERMIT_BYTES) as usize
 }
@@ -112,9 +192,16 @@ impl RegistryClient {
     pub async fn download_tarball(&self, url: &str) -> Result<Vec<u8>, LpmError> {
         self.check_tarball_url_scheme(url)?;
 
-        let response = self.send_lpm_tarball_with_recovery(url, None).await?;
-
-        read_buffered_tarball_response(response, MAX_COMPRESSED_TARBALL_SIZE as usize).await
+        let mut retry = TarballBodyRetry::default();
+        loop {
+            let response = self.send_lpm_tarball_with_recovery(url, None).await?;
+            match read_buffered_tarball_response(response, MAX_COMPRESSED_TARBALL_SIZE as usize)
+                .await
+            {
+                Ok(bytes) => return Ok(bytes),
+                Err(error) => retry.before_retry(error).await?,
+            }
+        }
     }
 
     /// Download a tarball to a temp file, computing SHA-512 as chunks arrive.
@@ -173,11 +260,34 @@ impl RegistryClient {
         max_compressed_size: u64,
     ) -> Result<DownloadedTarball, LpmError> {
         self.check_tarball_url_scheme(url)?;
-        let req = self.http.for_url(url).await?.get(url);
-        let req = apply_npmrc_auth(req, url, auth)?;
-        let response = self.send_with_retry_with_npmrc_auth(req, auth).await?;
-        self.spool_tarball_response_to_file_with_limit(response, max_compressed_size)
-            .await
+        self.spool_with_body_retry(max_compressed_size, || async move {
+            let req = self.http.for_url(url).await?.get(url);
+            let req = apply_npmrc_auth(req, url, auth)?;
+            self.send_with_retry_with_npmrc_auth(req, auth).await
+        })
+        .await
+    }
+
+    async fn spool_with_body_retry<Request, Requested>(
+        &self,
+        max_compressed_size: u64,
+        mut send: Request,
+    ) -> Result<DownloadedTarball, LpmError>
+    where
+        Request: FnMut() -> Requested,
+        Requested: std::future::Future<Output = Result<reqwest::Response, LpmError>>,
+    {
+        let mut retry = TarballBodyRetry::default();
+        loop {
+            let response = send().await?;
+            match self
+                .spool_tarball_response_with_limit(response, max_compressed_size)
+                .await
+            {
+                Ok(downloaded) => return Ok(downloaded),
+                Err(error) => retry.before_retry(error).await?,
+            }
+        }
     }
 
     /// Streaming variant of [`Self::download_tarball_to_file_with_auth`].
@@ -213,32 +323,36 @@ impl RegistryClient {
     }
 
     /// Drain an already-authenticated tarball response into the bounded temp-file spool.
+    ///
+    /// The caller owns the request, so a [`TarballBodyError::Transport`]
+    /// failure is the caller's to retry, typically with [`TarballBodyRetry`].
     #[tracing::instrument(
         target = "lpm_install_timeline",
         level = "trace",
         name = "tarball_spool",
         skip_all
     )]
-    pub async fn spool_tarball_response_to_file(
+    pub async fn spool_tarball_response(
         &self,
         response: reqwest::Response,
-    ) -> Result<DownloadedTarball, LpmError> {
-        self.spool_tarball_response_to_file_with_limit(response, MAX_COMPRESSED_TARBALL_SIZE)
+    ) -> Result<DownloadedTarball, TarballBodyError> {
+        self.spool_tarball_response_with_limit(response, MAX_COMPRESSED_TARBALL_SIZE)
             .await
     }
 
-    async fn spool_tarball_response_to_file_with_limit(
+    pub(super) async fn spool_tarball_response_with_limit(
         &self,
         mut response: reqwest::Response,
         max_compressed_size: u64,
-    ) -> Result<DownloadedTarball, LpmError> {
+    ) -> Result<DownloadedTarball, TarballBodyError> {
         if let Some(content_length) = response.content_length()
             && content_length > max_compressed_size
         {
             return Err(LpmError::Registry(format!(
                 "tarball Content-Length exceeds maximum compressed size ({} bytes > {} bytes limit)",
                 content_length, max_compressed_size
-            )));
+            ))
+            .into());
         }
         let spool_reservation =
             reserve_compressed_tarball_spool(response.content_length(), max_compressed_size)
@@ -263,17 +377,18 @@ impl RegistryClient {
         }
 
         let mut compressed_size = 0;
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|error| LpmError::Network(format!("failed to read tarball chunk: {error}")))?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            TarballBodyError::Transport(LpmError::Network(format!(
+                "failed to read tarball chunk: {error}"
+            )))
+        })? {
             compressed_size += chunk.len() as u64;
             if compressed_size > max_compressed_size {
                 return Err(LpmError::Registry(format!(
                     "tarball exceeds maximum compressed size ({} bytes > {} bytes limit)",
                     compressed_size, max_compressed_size
-                )));
+                ))
+                .into());
             }
             spool_reservation.ensure_size(compressed_size)?;
             hasher.update(&chunk);
@@ -285,13 +400,13 @@ impl RegistryClient {
             "sha512-{}",
             base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
         );
-        DownloadedTarball::new(
+        Ok(DownloadedTarball::new(
             temp_file,
             sri.clone(),
             sri,
             compressed_size,
             spool_reservation,
-        )
+        )?)
     }
 
     /// Download a tarball to a temp file with a custom size limit.
@@ -314,10 +429,10 @@ impl RegistryClient {
         accounting: Option<ManagedInstallAccounting>,
     ) -> Result<DownloadedTarball, LpmError> {
         self.check_tarball_url_scheme(url)?;
-
-        let response = self.send_lpm_tarball_with_recovery(url, accounting).await?;
-        self.spool_tarball_response_to_file_with_limit(response, max_compressed_size)
-            .await
+        self.spool_with_body_retry(max_compressed_size, || {
+            self.send_lpm_tarball_with_recovery(url, accounting)
+        })
+        .await
     }
 
     /// Streaming tarball download — low-allocation fast path.
@@ -340,9 +455,10 @@ impl RegistryClient {
     /// - Auth + retry via `send_with_retry`, identical to
     ///   `download_tarball_to_file_with_limit`.
     ///
-    /// The retry window closes at `send_with_retry`'s return: mid-stream
-    /// failures surface to the caller as `LpmError::Network`; cleanup of
-    /// the partial staging directory is the store's responsibility (see
+    /// The retry window closes at `send_with_retry`'s return: the caller
+    /// owns mid-stream failures and retries them with a new request (see
+    /// [`TarballBodyRetry`]); cleanup of the partial staging directory is
+    /// the store's responsibility (see
     /// `lpm_store::PackageStore::stream_and_store_package`).
     pub async fn download_tarball_streaming(
         &self,
@@ -622,21 +738,23 @@ impl RegistryClient {
 pub(super) async fn read_buffered_tarball_response(
     response: reqwest::Response,
     max_compressed_size: usize,
-) -> Result<Vec<u8>, LpmError> {
+) -> Result<Vec<u8>, TarballBodyError> {
     lpm_http::read_body_capped(response, max_compressed_size)
         .await
         .map_err(|error| match error {
             lpm_http::ResponseBodyError::DeclaredTooLarge { declared, cap } => {
-                LpmError::Registry(format!(
+                TarballBodyError::Fatal(LpmError::Registry(format!(
                     "tarball Content-Length ({declared} bytes) exceeds maximum compressed size ({cap} bytes)"
-                ))
+                )))
             }
-            lpm_http::ResponseBodyError::StreamedTooLarge { cap } => LpmError::Registry(format!(
-                "tarball exceeds maximum compressed size ({cap} bytes)"
-            )),
-            lpm_http::ResponseBodyError::Read(error) => {
-                LpmError::Network(format!("failed to read tarball bytes: {error}"))
+            lpm_http::ResponseBodyError::StreamedTooLarge { cap } => {
+                TarballBodyError::Fatal(LpmError::Registry(format!(
+                    "tarball exceeds maximum compressed size ({cap} bytes)"
+                )))
             }
+            lpm_http::ResponseBodyError::Read(error) => TarballBodyError::Transport(
+                LpmError::Network(format!("failed to read tarball bytes: {error}")),
+            ),
         })
 }
 
