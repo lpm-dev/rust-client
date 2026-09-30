@@ -1166,30 +1166,6 @@ pub(in crate::release_plan) fn write_manifest_durable(
     )
 }
 
-#[cfg(feature = "internal-test-sigstore-mock")]
-pub(in crate::release_plan) fn abort_after_manifest_write_for_test(write_count: usize) {
-    if std::env::var("LPM_INTERNAL_TEST_RELEASE_ABORT_AFTER_MANIFEST_WRITES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        == Some(write_count)
-    {
-        std::process::abort();
-    }
-}
-
-#[cfg(not(feature = "internal-test-sigstore-mock"))]
-pub(in crate::release_plan) fn abort_after_manifest_write_for_test(_write_count: usize) {}
-
-#[cfg(feature = "internal-test-sigstore-mock")]
-pub(in crate::release_plan) fn abort_after_release_commit_for_test() {
-    if std::env::var_os("LPM_INTERNAL_TEST_RELEASE_ABORT_AFTER_COMMIT").is_some() {
-        std::process::abort();
-    }
-}
-
-#[cfg(not(feature = "internal-test-sigstore-mock"))]
-pub(in crate::release_plan) fn abort_after_release_commit_for_test() {}
-
 pub(in crate::release_plan) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::Digest;
 

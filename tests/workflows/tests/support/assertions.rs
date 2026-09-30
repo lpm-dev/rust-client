@@ -175,3 +175,31 @@ pub enum JsonType {
     Array,
     Object,
 }
+
+/// Assert that `output` came from a run stopped by an
+/// `LPM_INTERNAL_TEST_*_ABORT_*` fault-injection point.
+pub fn assert_fault_injection_aborted(output: &std::process::Output) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains("reserved for hermetic workflow tests")
+            && !stderr.contains("reserved for hermetic workflow tests"),
+        "this lpm-rs binary cannot inject faults; run workflow tests through \
+         scripts/ci/with-hermetic-workflow-cli.sh\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGABRT),
+            "expected the injected abort, got {:?}\nstdout: {stdout}\nstderr: {stderr}",
+            output.status
+        );
+    }
+    #[cfg(not(unix))]
+    assert!(
+        !output.status.success(),
+        "expected the injected abort\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}

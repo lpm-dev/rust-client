@@ -2,7 +2,7 @@ mod release_contract;
 mod support;
 
 use base64::Engine as _;
-use support::assertions::parse_json_output;
+use support::assertions::{assert_fault_injection_aborted, parse_json_output};
 use support::mock_registry::{MockRegistry, make_tarball};
 use support::{
     LOCK_CONTENTION_MARKER_ENV, TempProject, lpm, lpm_spawnable, lpm_with_registry,
@@ -302,7 +302,7 @@ fn interrupt_release_apply_after_first_manifest(project: &TempProject) {
         ])
         .output()
         .expect("run release apply with crash injection");
-    assert!(!interrupted.status.success());
+    assert_fault_injection_aborted(&interrupted);
 }
 
 fn redact_release_paths(json: &mut serde_json::Value) {
@@ -672,7 +672,7 @@ fn release_apply_retry_after_durable_commit_does_not_bump_twice() {
         ])
         .output()
         .expect("interrupt release apply after durable commit");
-    assert!(!interrupted.status.success());
+    assert_fault_injection_aborted(&interrupted);
 
     let recovered = lpm(&project)
         .args([
@@ -705,7 +705,7 @@ fn release_apply_runs_after_recovering_a_different_completed_operation() {
         .args(["version", "patch", "--no-git-tag-version"])
         .output()
         .expect("interrupt version after durable commit");
-    assert!(!interrupted.status.success());
+    assert_fault_injection_aborted(&interrupted);
 
     let release = lpm(&project)
         .args([
@@ -798,7 +798,7 @@ fn release_apply_recovers_an_interrupted_root_package_version() {
         .args(["version", "major", "--no-git-tag-version"])
         .output()
         .expect("interrupt root package version");
-    assert!(!interrupted.status.success());
+    assert_fault_injection_aborted(&interrupted);
 
     let recovered = lpm(&project)
         .args([
@@ -917,7 +917,7 @@ fn release_publish_recovers_an_interrupted_root_package_version_before_auth() {
         .args(["version", "major", "--no-git-tag-version"])
         .output()
         .expect("interrupt root package version");
-    assert!(!interrupted.status.success());
+    assert_fault_injection_aborted(&interrupted);
 
     let output = lpm(&project)
         .args(["release", "publish", "--all", "--npm", "--yes", "--json"])

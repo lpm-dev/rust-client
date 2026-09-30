@@ -27,7 +27,7 @@ pub(crate) fn create_version_commit_and_tag(
             manifest_pathspec.as_os_str(),
         ],
     )?;
-    abort_version_git_stage_for_test("add");
+    super::fault_injection::abort_after_git_stage("add");
     require_version_git_success_with(
         &runner,
         [
@@ -47,7 +47,7 @@ pub(crate) fn create_version_commit_and_tag(
         &created_head,
         &sha256_hex(&manifest.updated_bytes),
     )?;
-    abort_version_git_stage_for_test("commit");
+    super::fault_injection::abort_after_git_stage("commit");
 
     let actual_message = version_git_commit_message(&runner, &created_head)?;
     let tag_args = if version_git_config_bool(&runner, "tag.gpgSign")? {
@@ -96,7 +96,7 @@ pub(crate) fn create_version_commit_and_tag(
             "Git tag `{tag}` does not identify the version commit; the release journal was preserved"
         )));
     }
-    abort_version_git_stage_for_test("tag");
+    super::fault_injection::abort_after_git_stage("tag");
     Ok(actual_message)
 }
 
@@ -144,18 +144,6 @@ fn version_git_config_bool(
         _ => Err(version_git_error("config --type=bool --get", output)),
     }
 }
-
-#[cfg(feature = "internal-test-sigstore-mock")]
-pub(super) fn abort_version_git_stage_for_test(stage: &str) {
-    if std::env::var_os("LPM_INTERNAL_TEST_VERSION_ABORT_AFTER_GIT_STAGE")
-        .is_some_and(|value| value == stage)
-    {
-        std::process::abort();
-    }
-}
-
-#[cfg(not(feature = "internal-test-sigstore-mock"))]
-pub(super) fn abort_version_git_stage_for_test(_stage: &str) {}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum VersionGitRecoveryState {
