@@ -30,7 +30,7 @@ LPM has four connected parts:
 
 - **LPM CLI** - an npm-compatible package manager and dev toolkit written in Rust. It installs from npm, lpm.dev, JSR, and private registries; blocks dependency lifecycle scripts by default; and includes a task runner, dev server, test/bench runner, linter, formatter, Node version pinning, local HTTPS, tunnels, secrets, and project health checks.
 - **LPM.dev Registry** - the hosted registry and platform behind the `@lpm.dev/*` scope. Use it for private packages, Pool distribution, Marketplace sales, Swift packages, package quality analysis, generated metadata, access control, and Pro/team platform features.
-- **LPM Firewall** - a hosted verdict service for public npm package versions. It can run in monitor mode or enforcement mode before LPM materializes package bytes, helping teams catch malicious packages, critical vulnerabilities, suspicious lifecycle behavior, and policy violations during install.
+- **LPM Firewall** - a hosted verdict service for public npm package versions. Enforcement mode checks versions before LPM materializes package bytes; monitor mode reports verdicts without holding the install. Both help teams catch malicious packages, critical vulnerabilities, suspicious lifecycle behavior, and policy violations during install.
 - **LPM Vault** - a native macOS app for project environment variables and secrets. It stores secrets in the macOS Keychain, supports multiple environments, and syncs encrypted data through LPM.dev. The app shares local env data with the LPM CLI, so edits are available to `lpm env` and `lpm run`.
 
 ## Install

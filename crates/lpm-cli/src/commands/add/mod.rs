@@ -13,9 +13,8 @@ mod target;
 pub use security::{print_install_security_warnings, print_security_warnings};
 
 use crate::commands::install::{
-    NpmFirewallMaterializationPackage, prepare_npm_firewall_materialization_preflight,
-    registry_materialization_route_is_public_npm,
-    run_prepared_npm_firewall_materialization_preflight,
+    NpmFirewallMaterializationPackage, begin_prepared_npm_firewall_materialization_preflight,
+    prepare_npm_firewall_materialization_preflight, registry_materialization_route_is_public_npm,
 };
 use crate::prompt::prompt_err;
 use crate::{install_ui, output};
@@ -651,7 +650,7 @@ async fn run_locked(
         ));
     }
 
-    let firewall_json = run_prepared_npm_firewall_materialization_preflight(
+    let firewall_verdict = begin_prepared_npm_firewall_materialization_preflight(
         client,
         firewall_preflight,
         json_output,
@@ -673,6 +672,7 @@ async fn run_locked(
     let downloaded = client
         .download_tarball_routed(&route_table, &target.route_name(), tarball_url)
         .await?;
+    let firewall_json = firewall_verdict.settle(json_output).await?;
 
     // Verify integrity. Fast path: SRI compare against the
     // SHA-512 hash already computed during download. Slow path: stream-

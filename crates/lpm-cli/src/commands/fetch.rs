@@ -1,6 +1,6 @@
 use crate::commands::install::{
-    NpmFirewallMaterializationPackage, prepare_npm_firewall_materialization_preflight,
-    run_prepared_npm_firewall_materialization_preflight,
+    NpmFirewallMaterializationPackage, begin_prepared_npm_firewall_materialization_preflight,
+    prepare_npm_firewall_materialization_preflight,
 };
 use crate::install_ui;
 use futures::{StreamExt, TryStreamExt};
@@ -196,7 +196,7 @@ pub async fn run(
         ));
     }
 
-    let firewall_json = run_prepared_npm_firewall_materialization_preflight(
+    let firewall_verdict = begin_prepared_npm_firewall_materialization_preflight(
         client,
         firewall_preflight,
         json_output,
@@ -238,6 +238,7 @@ pub async fn run(
         .try_collect()
         .await?;
     results.extend(fetched.into_iter().flatten());
+    let firewall_json = firewall_verdict.settle(json_output).await?;
 
     results.sort_by(|a, b| {
         a.name
