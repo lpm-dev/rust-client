@@ -58,7 +58,11 @@ jobs:
         run: cargo nextest run --locked -p lpm-workflows --test doctor_sandbox_setup --no-fail-fast
 
       - name: Windows cross-device sign-in contracts
-        run: cargo nextest run --locked -p lpm-workflows --test device_login --no-fail-fast --status-level slow --final-status-level fail
+        run: >-
+          cargo nextest run --locked -p lpm-workflows
+          --test device_login --test auth_lifecycle
+          -E 'binary(device_login) | test(custom_registry_login_and_logout_use_the_selected_lpm_home)'
+          --no-fail-fast --status-level slow --final-status-level fail
 
       - name: Windows filesystem crate tests
         run: >-

@@ -123,6 +123,141 @@ fn start(project: &TempProject, registry: &MockRegistry) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn device_login_keeps_file_backed_state_in_the_selected_lpm_home() {
+    let project = TempProject::empty(r#"{"name":"isolated-login","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    let profile = tempfile::tempdir().unwrap();
+    let root = profile.path().join(".lpm");
+    support::auth_state::seed_sessions(
+        project.home(),
+        &[support::auth_state::SessionSeed {
+            registry_url: &registry.url(),
+            access_token: Some("unrelated-home-session"),
+            ..Default::default()
+        }],
+    );
+    let original_credentials = std::fs::read(project.home().join(".lpm/.credentials")).unwrap();
+    let original_key = std::fs::read(project.home().join(".lpm/.key")).unwrap();
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["whoami", "--json"])
+        .env("LPM_HOME", &root)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        registry
+            .server()
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| !request.headers.contains_key("authorization"))
+    );
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["login", "--device", "--json"])
+        .env("LPM_HOME", &root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let started: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let id = started["login_id"].as_str().unwrap();
+    let request_path = root.join("login-requests").join(format!("{id}.json"));
+    assert!(request_path.is_file());
+    let fingerprint =
+        std::fs::read_to_string(root.join("device-id")).expect("device identity must use LPM_HOME");
+    let uri = reqwest::Url::parse(started["verification_uri"].as_str().unwrap()).unwrap();
+    assert!(
+        uri.query_pairs()
+            .any(|(key, value)| key == "fp" && value == fingerprint)
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/api/cli/device"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "token": "isolated-access",
+            "refreshToken": "isolated-refresh",
+            "expiresIn": 3600,
+            "expiresAt": "2030-01-01T00:00:00Z",
+        })))
+        .mount(registry.server())
+        .await;
+    registry
+        .with_authenticated_whoami("isolated-access", "testuser", "test@example.com")
+        .await;
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["login", "--complete", id, "--json"])
+        .env("LPM_HOME", &root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    for file in [
+        ".credentials",
+        ".key",
+        ".credential-authority.json",
+        ".token-expiry.json",
+    ] {
+        assert!(root.join(file).is_file(), "missing {file} under LPM_HOME");
+    }
+    let encrypted = std::fs::read_to_string(root.join(".credentials")).unwrap();
+    assert!(!encrypted.contains("isolated-access"));
+    assert!(!encrypted.contains("isolated-refresh"));
+    let expiry: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(".token-expiry.json")).unwrap()).unwrap();
+    assert_eq!(
+        expiry[&registry.url()]["session_access_expires_at"],
+        "2030-01-01T00:00:00Z"
+    );
+    assert!(!request_path.exists());
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["whoami", "--json"])
+        .env("LPM_HOME", &root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let user: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(user["username"], "testuser");
+    std::fs::write(root.join(".token-check"), []).unwrap();
+    std::fs::write(project.home().join(".lpm/.token-check"), []).unwrap();
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["logout", "--json"])
+        .env("LPM_HOME", &root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(!root.join(".credentials").exists());
+    assert!(!root.join(".token-check").exists());
+    assert!(project.home().join(".lpm/.token-check").exists());
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["whoami", "--json"])
+        .env("LPM_HOME", &root)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(
+        std::fs::read(project.home().join(".lpm/.credentials")).unwrap(),
+        original_credentials
+    );
+    assert_eq!(
+        std::fs::read(project.home().join(".lpm/.key")).unwrap(),
+        original_key
+    );
+    assert!(!project.home().join(".lpm/device-id").exists());
+    assert!(!project.home().join(".lpm/.token-expiry.json").exists());
+}
+
+#[tokio::test]
 async fn device_login_does_not_save_a_session_rejected_by_whoami() {
     let project = TempProject::empty(r#"{"name":"rejected-session","version":"1.0.0"}"#);
     let registry = MockRegistry::start().await;
