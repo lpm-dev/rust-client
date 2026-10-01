@@ -79,7 +79,6 @@ use lpm_sandbox::SandboxMode;
 use lpm_security::{EXECUTED_INSTALL_PHASES, SecurityPolicy};
 use lpm_store::{PackageBaselineLayout, V2BaselineIndex};
 use rayon::prelude::*;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -928,7 +927,7 @@ async fn run_under_store_lock(
                 );
             }
         }
-        std::env::vars().collect::<HashMap<String, String>>()
+        std::env::vars_os().collect::<sandbox_env::ChildEnvironment>()
     };
 
     let lpm_root = lpm_common::paths::LpmRoot::from_env()

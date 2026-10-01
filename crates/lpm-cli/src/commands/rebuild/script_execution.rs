@@ -2,6 +2,7 @@ use super::process_tree::{wait_with_timeout, wait_with_timeout_or_cancel};
 use lpm_common::sanitize_terminal_multiline;
 use lpm_sandbox::SandboxMode;
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Child;
@@ -19,7 +20,7 @@ pub(super) fn execute_script(
     pkg_version: &str,
     package_dir: &Path,
     project_dir: &Path,
-    env: &HashMap<String, String>,
+    env: &super::sandbox_env::ChildEnvironment,
     timeout: &Duration,
     cancelled: &AtomicBool,
     sandbox_mode: SandboxMode,
@@ -97,18 +98,20 @@ pub(super) fn execute_script(
 }
 
 pub(super) fn build_lifecycle_environment(
-    env: &HashMap<String, String>,
+    env: &super::sandbox_env::ChildEnvironment,
     project_dir: &Path,
     tmpdir: &Path,
     bin_dir: Option<&Path>,
-) -> Vec<(String, String)> {
+) -> Vec<(OsString, OsString)> {
     let parent_path = find_env_case_insensitive(env, "PATH");
     let mut path_value = build_lifecycle_path(project_dir, parent_path);
     if let Some(bin_dir) = bin_dir {
-        let separator = if cfg!(windows) { ";" } else { ":" };
-        path_value = format!("{}{separator}{path_value}", bin_dir.display());
+        let mut prefixed = bin_dir.as_os_str().to_owned();
+        prefixed.push(if cfg!(windows) { ";" } else { ":" });
+        prefixed.push(&path_value);
+        path_value = prefixed;
     }
-    let mut envs: Vec<(String, String)> = env
+    let mut envs: Vec<(OsString, OsString)> = env
         .iter()
         .filter(|(k, _)| {
             !k.eq_ignore_ascii_case("PATH")
@@ -119,12 +122,12 @@ pub(super) fn build_lifecycle_environment(
         })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    envs.push(("INIT_CWD".to_string(), project_dir.display().to_string()));
-    envs.push(("PATH".to_string(), path_value));
-    let tmp = tmpdir.display().to_string();
-    envs.push(("TMPDIR".to_string(), tmp.clone()));
-    envs.push(("TMP".to_string(), tmp.clone()));
-    envs.push(("TEMP".to_string(), tmp));
+    envs.push(("INIT_CWD".into(), project_dir.as_os_str().to_owned()));
+    envs.push(("PATH".into(), path_value));
+    let tmp = tmpdir.as_os_str();
+    envs.push(("TMPDIR".into(), tmp.to_owned()));
+    envs.push(("TMP".into(), tmp.to_owned()));
+    envs.push(("TEMP".into(), tmp.to_owned()));
     envs
 }
 
@@ -163,7 +166,7 @@ pub(super) fn spawn_lifecycle_child(
     pkg_version: &str,
     package_dir: &Path,
     project_dir: &Path,
-    envs: &[(String, String)],
+    envs: &[(OsString, OsString)],
     sandbox_mode: SandboxMode,
     read_project_full: bool,
     sandbox_options: &lpm_sandbox::SandboxOptions,
@@ -304,7 +307,7 @@ pub(in crate::commands) fn execute_publish_lifecycle_script(
     package_version: &str,
     project_dir: &Path,
     retained_directory: &cap_std::fs::Dir,
-    envs: &[(String, String)],
+    envs: &[(OsString, OsString)],
     store_root: &Path,
     home_dir: &Path,
     tmpdir: &Path,
@@ -657,18 +660,18 @@ time.sleep(4)
 /// Case-insensitive env-var lookup against the sanitized env map.
 /// Returns the first value whose key matches `target` ignoring ASCII
 /// case. POSIX env keys are case-sensitive so this only ever changes
-/// behavior on Windows, where `std::env::vars()` yields `"Path"`
+/// behavior on Windows, where `std::env::vars_os()` yields `"Path"`
 /// (registry-preserved case) but the rest of the codebase looks up
 /// `"PATH"`. Without this helper, lifecycle scripts on Windows ran
 /// with the System32-only fallback PATH because the parent PATH
 /// pass-through was silently missed.
 fn find_env_case_insensitive<'a>(
-    env: &'a HashMap<String, String>,
+    env: &'a super::sandbox_env::ChildEnvironment,
     target: &str,
-) -> Option<&'a str> {
+) -> Option<&'a OsStr> {
     env.iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(target))
-        .map(|(_, v)| v.as_str())
+        .map(|(_, v)| v.as_os_str())
 }
 
 /// Compose the `PATH` env var passed to a lifecycle script. Prepends
@@ -699,33 +702,22 @@ fn find_env_case_insensitive<'a>(
 /// sandbox itself was working correctly.
 pub(in crate::commands) fn build_lifecycle_path(
     project_dir: &Path,
-    parent_path: Option<&str>,
-) -> String {
-    let bin_dir = project_dir.join("node_modules").join(".bin");
-    #[cfg(unix)]
-    {
-        format!(
-            "{}:{}",
-            bin_dir.display(),
-            parent_path.unwrap_or("/usr/bin:/bin"),
-        )
-    }
+    parent_path: Option<&OsStr>,
+) -> OsString {
     #[cfg(windows)]
-    {
-        format!(
-            "{};{}",
-            bin_dir.display(),
-            parent_path.unwrap_or(r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem"),
-        )
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        format!(
-            "{}:{}",
-            bin_dir.display(),
-            parent_path.unwrap_or("/usr/bin:/bin"),
-        )
-    }
+    let (separator, fallback) = (
+        ";",
+        r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem",
+    );
+    #[cfg(not(windows))]
+    let (separator, fallback) = (":", "/usr/bin:/bin");
+    let mut path = project_dir
+        .join("node_modules")
+        .join(".bin")
+        .into_os_string();
+    path.push(separator);
+    path.push(parent_path.unwrap_or(OsStr::new(fallback)));
+    path
 }
 
 /// Returns an absolute system shell path so package-local PATH entries cannot

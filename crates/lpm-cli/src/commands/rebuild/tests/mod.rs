@@ -580,14 +580,14 @@ fn prepare_live_package_dir_detaches_hardlinks_in_isolated_layout() {
 fn sanitized_env_strips_lpm_token() {
     let _env = crate::test_env::ScopedEnv::set([("LPM_TOKEN", "secret123".into())]);
     let env = build_sanitized_env();
-    assert!(!env.contains_key("LPM_TOKEN"));
+    assert!(!env.contains_key(std::ffi::OsStr::new("LPM_TOKEN")));
 }
 
 #[test]
 fn sanitized_env_strips_npm_token() {
     let _env = crate::test_env::ScopedEnv::set([("NPM_TOKEN", "npm_secret".into())]);
     let env = build_sanitized_env();
-    assert!(!env.contains_key("NPM_TOKEN"));
+    assert!(!env.contains_key(std::ffi::OsStr::new("NPM_TOKEN")));
 }
 
 #[test]
@@ -599,10 +599,10 @@ fn sanitized_env_strips_suffix_patterns() {
         ("SSH_PRIVATE_KEY", "val".into()),
     ]);
     let env = build_sanitized_env();
-    assert!(!env.contains_key("MY_APP_SECRET"));
-    assert!(!env.contains_key("DB_PASSWORD"));
-    assert!(!env.contains_key("SIGNING_KEY"));
-    assert!(!env.contains_key("SSH_PRIVATE_KEY"));
+    assert!(!env.contains_key(std::ffi::OsStr::new("MY_APP_SECRET")));
+    assert!(!env.contains_key(std::ffi::OsStr::new("DB_PASSWORD")));
+    assert!(!env.contains_key(std::ffi::OsStr::new("SIGNING_KEY")));
+    assert!(!env.contains_key(std::ffi::OsStr::new("SSH_PRIVATE_KEY")));
 }
 
 #[test]
@@ -636,7 +636,10 @@ fn sanitized_env_strips_token_and_connection_string_suffixes() {
         "SENTRY_DSN",
         "AWS_ACCESS_KEY_ID",
     ] {
-        assert!(!env.contains_key(key), "{key} must be stripped");
+        assert!(
+            !env.contains_key(std::ffi::OsStr::new(key)),
+            "{key} must be stripped"
+        );
     }
 }
 
@@ -695,7 +698,7 @@ fn sanitized_env_strips_runtime_hijack_carriers() {
         "RUBYLIB",
     ] {
         assert!(
-            !env.contains_key(hijack),
+            !env.contains_key(std::ffi::OsStr::new(hijack)),
             "{hijack} must be stripped from lifecycle env"
         );
     }
@@ -722,7 +725,7 @@ fn sanitized_env_strips_cargo_rustc_wrapper_variants() {
         "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
     ] {
         assert!(
-            !env.contains_key(name),
+            !env.contains_key(std::ffi::OsStr::new(name)),
             "{name} must be stripped from lifecycle env (rustc-wrapper hijack)"
         );
     }
@@ -3630,7 +3633,14 @@ fn platform_shell_invocation_uses_sh_on_unix() {
 fn build_lifecycle_path_uses_semicolon_and_system32_on_windows() {
     let project = std::path::PathBuf::from(r"C:\proj");
     // With an inherited parent PATH.
-    let with_parent = build_lifecycle_path(&project, Some(r"C:\OtherTool\bin;C:\Windows\System32"));
+    let with_parent = build_lifecycle_path(
+        &project,
+        Some(std::ffi::OsStr::new(
+            r"C:\OtherTool\bin;C:\Windows\System32",
+        )),
+    )
+    .into_string()
+    .unwrap();
     assert!(
         with_parent.starts_with(r"C:\proj\node_modules\.bin;"),
         "node_modules\\.bin must lead the PATH with a `;` separator: {with_parent}"
@@ -3641,7 +3651,7 @@ fn build_lifecycle_path_uses_semicolon_and_system32_on_windows() {
     );
 
     // Without an inherited parent PATH (fallback path).
-    let fallback = build_lifecycle_path(&project, None);
+    let fallback = build_lifecycle_path(&project, None).into_string().unwrap();
     assert!(
         fallback.starts_with(r"C:\proj\node_modules\.bin;"),
         "fallback PATH must still lead with node_modules\\.bin: {fallback}"
@@ -3660,13 +3670,18 @@ fn build_lifecycle_path_uses_semicolon_and_system32_on_windows() {
 #[test]
 fn build_lifecycle_path_uses_colon_and_usr_bin_on_unix() {
     let project = std::path::PathBuf::from("/proj");
-    let with_parent = build_lifecycle_path(&project, Some("/opt/tool/bin:/usr/local/bin"));
+    let with_parent = build_lifecycle_path(
+        &project,
+        Some(std::ffi::OsStr::new("/opt/tool/bin:/usr/local/bin")),
+    )
+    .into_string()
+    .unwrap();
     assert!(
         with_parent.starts_with("/proj/node_modules/.bin:"),
         "node_modules/.bin must lead with `:` separator: {with_parent}"
     );
 
-    let fallback = build_lifecycle_path(&project, None);
+    let fallback = build_lifecycle_path(&project, None).into_string().unwrap();
     assert!(
         fallback.starts_with("/proj/node_modules/.bin:/usr/bin:/bin"),
         "fallback must keep the historical POSIX shape: {fallback}"
@@ -3730,7 +3745,7 @@ fn publish_lifecycle_rejects_replaced_directory_before_sandbox_configuration() {
         "1.0.0",
         &member,
         &retained,
-        &[("INIT_CWD".into(), member.display().to_string())],
+        &[("INIT_CWD".into(), member.as_os_str().to_owned())],
         &runtime,
         &runtime,
         &runtime,
