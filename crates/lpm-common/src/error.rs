@@ -606,7 +606,9 @@ pub enum LpmError {
     #[error("environment validation failed:\n{0}")]
     #[diagnostic(
         code(lpm::env_validation),
-        help("Check your .env files and lpm.json schema. Run with --no-env-check to bypass.")
+        help(
+            "Resolve the reported error and retry. --no-env-check skips schema checks only. Env access checks still apply."
+        )
     )]
     EnvValidation(String),
 

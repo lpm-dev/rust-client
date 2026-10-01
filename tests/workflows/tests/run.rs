@@ -62,7 +62,12 @@ fn run_stops_before_lifecycle_hooks_when_linked_env_secrets_cannot_be_read() {
         "invalid-encrypted-fixture",
     )
     .expect("make the isolated env record unreadable");
-    for flags in [&[][..], &["--parallel"][..], &["--stream"][..]] {
+    for flags in [
+        &[][..],
+        &["--parallel"][..],
+        &["--stream"][..],
+        &["--no-env-check"][..],
+    ] {
         let output = lpm(&project)
             .args(["run", "build"])
             .args(flags)
@@ -72,6 +77,17 @@ fn run_stops_before_lifecycle_hooks_when_linked_env_secrets_cannot_be_read() {
             !output.status.success(),
             "secret retrieval failure must stop execution: {flags:?}"
         );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("Run with --no-env-check to bypass"),
+            "env access failure must not suggest bypassing approval: {stderr}"
+        );
+        if flags.is_empty() || flags.contains(&"--no-env-check") {
+            assert!(
+                stderr.contains("skips schema checks only"),
+                "env access failure must explain the schema-only flag: {stderr}"
+            );
+        }
         for phase in ["pre", "main", "post"] {
             assert!(
                 !project.file_exists(&format!("{phase}-ran")),
