@@ -4,8 +4,8 @@ use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use lpm_common::{LpmError, LpmRoot, format_bytes};
 use reqwest::StatusCode;
-use reqwest::blocking::{Body, Client};
 use reqwest::header::CONTENT_LENGTH;
+use reqwest::{Body, Client};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::File;
@@ -21,6 +21,9 @@ type HmacSha256 = Hmac<Sha256>;
 const MAX_REMOTE_ARTIFACT_BYTES: u64 = 500 * 1024 * 1024;
 const MAX_REMOTE_STATUS_BYTES: u64 = 64 * 1024;
 const REMOTE_CACHE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Each upload read moves to the blocking pool, so the stream's 4 KiB default
+/// made a 64 MiB upload about ten times slower than 64 KiB reads.
+const UPLOAD_READ_BYTES: usize = 64 * 1024;
 const ARTIFACT_TAG_HEADER: &str = "x-artifact-tag";
 const ARTIFACT_SHA_HEADER: &str = "x-artifact-sha";
 const ARTIFACT_DURATION_HEADER: &str = "x-artifact-duration";
@@ -290,39 +293,28 @@ fn cache_status_label(label: &'static str) -> install_ui::TerminalFragment {
 }
 
 impl RemoteCacheAuth {
-    fn bearer_in_blocking_context(&self) -> Result<String, String> {
+    async fn bearer(&self) -> Result<String, String> {
         match self {
             Self::Static(token) => Ok(token.clone()),
-            Self::Session(session) => block_on_session(
-                session.bearer_string_for(lpm_auth::AuthRequirement::TokenRequired),
-            )
-            .map_err(session_bearer_error),
+            Self::Session(session) => session
+                .bearer_string_for(lpm_auth::AuthRequirement::TokenRequired)
+                .await
+                .map_err(session_bearer_error),
         }
     }
 
-    fn refresh_after_rejection_in_blocking_context(&self) -> Result<Option<String>, String> {
+    async fn refresh_after_rejection(&self) -> Result<Option<String>, String> {
         match self {
             Self::Static(_) => Ok(None),
-            Self::Session(session) => block_on_session(session.refresh_now())
+            Self::Session(session) => session
+                .refresh_now()
+                .await
                 .map(|secret| {
                     use secrecy::ExposeSecret;
                     Some(secret.expose_secret().to_string())
                 })
                 .map_err(|error| format!("remote cache session refresh failed: {error}")),
         }
-    }
-}
-
-fn block_on_session<T>(future: impl Future<Output = Result<T, LpmError>>) -> Result<T, LpmError> {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => handle.block_on(future),
-        Err(_) => tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| {
-                LpmError::Network(format!("failed to initialize auth runtime: {error}"))
-            })?
-            .block_on(future),
     }
 }
 
@@ -346,19 +338,21 @@ impl RemoteCacheRequestError {
 }
 
 impl RemoteCacheClient {
-    fn send_authenticated<T>(
+    async fn send_authenticated<T>(
         &self,
         unauthorized_message: &str,
-        mut send: impl FnMut(&str) -> Result<T, RemoteCacheRequestError>,
+        send: impl AsyncFn(String) -> Result<T, RemoteCacheRequestError>,
     ) -> Result<T, String> {
-        let bearer = self.auth.bearer_in_blocking_context()?;
-        match send(&bearer) {
+        let bearer = self.auth.bearer().await?;
+        match send(bearer).await {
             Ok(value) => Ok(value),
             Err(RemoteCacheRequestError::Unauthorized) => {
-                let Some(rotated) = self.auth.refresh_after_rejection_in_blocking_context()? else {
+                let Some(rotated) = self.auth.refresh_after_rejection().await? else {
                     return Err(unauthorized_message.to_string());
                 };
-                send(&rotated).map_err(|error| error.into_message(unauthorized_message))
+                send(rotated)
+                    .await
+                    .map_err(|error| error.into_message(unauthorized_message))
             }
             Err(error) => Err(error.into_message(unauthorized_message)),
         }
@@ -371,44 +365,46 @@ impl RemoteCacheClient {
         output_globs: &[String],
         validate: impl FnOnce() -> Result<bool, lpm_common::LpmError>,
     ) -> Result<Option<lpm_task::cache::CacheHit>, String> {
-        run_blocking_http(|| self.restore_blocking(key, project_dir, output_globs, validate))
+        block_on_remote(self.restore_async(key, project_dir, output_globs, validate))
     }
 
-    fn restore_blocking(
+    async fn restore_async(
         &self,
         key: &str,
         project_dir: &Path,
         output_globs: &[String],
         validate: impl FnOnce() -> Result<bool, lpm_common::LpmError>,
     ) -> Result<Option<lpm_task::cache::CacheHit>, String> {
-        let client = blocking_http_client()?;
+        let client = http_client()?;
         let url = self.artifact_url(key)?;
-        let mut response = self.send_authenticated(
-            "remote cache authorization failed; continuing without it",
-            |bearer| {
-                let response =
-                    client
+        let mut response = self
+            .send_authenticated(
+                "remote cache authorization failed; continuing without it",
+                async |bearer: String| {
+                    let response = client
                         .get(url.clone())
                         .bearer_auth(bearer)
                         .send()
+                        .await
                         .map_err(|error| {
                             RemoteCacheRequestError::Message(format!(
                                 "remote cache lookup failed: {}",
                                 lpm_http::display_error(&error)
                             ))
                         })?;
-                if response.status() == StatusCode::UNAUTHORIZED {
-                    Err(RemoteCacheRequestError::Unauthorized)
-                } else {
-                    Ok(response)
-                }
-            },
-        )?;
+                    if response.status() == StatusCode::UNAUTHORIZED {
+                        Err(RemoteCacheRequestError::Unauthorized)
+                    } else {
+                        Ok(response)
+                    }
+                },
+            )
+            .await?;
 
         match response.status() {
             StatusCode::OK => {}
             StatusCode::NOT_FOUND => return Ok(None),
-            _ => return Err(remote_cache_http_error(response, "lookup")),
+            _ => return Err(remote_cache_http_error(response, "lookup").await),
         }
 
         if let Some(length) = response.content_length()
@@ -433,7 +429,7 @@ impl RemoteCacheClient {
         let mut temp = tempfile::NamedTempFile::new()
             .map_err(|e| format!("failed to create remote cache temp file: {e}"))?;
         let digests =
-            copy_response_to_temp(&mut response, &mut temp, self.signature_key.as_deref())?;
+            copy_response_to_temp(&mut response, &mut temp, self.signature_key.as_deref()).await?;
 
         // A downloaded artifact is extracted into the project tree only after
         // the advertised content hash passes. When a signing key is configured,
@@ -481,21 +477,19 @@ impl RemoteCacheClient {
         stderr: &str,
         duration_ms: u64,
     ) -> Result<(), String> {
-        run_blocking_http(|| {
-            self.store_blocking(
-                key,
-                project_dir,
-                command,
-                output_globs,
-                stdout,
-                stderr,
-                duration_ms,
-            )
-        })
+        block_on_remote(self.store_async(
+            key,
+            project_dir,
+            command,
+            output_globs,
+            stdout,
+            stderr,
+            duration_ms,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn store_blocking(
+    async fn store_async(
         &self,
         key: &str,
         project_dir: &Path,
@@ -505,7 +499,7 @@ impl RemoteCacheClient {
         stderr: &str,
         duration_ms: u64,
     ) -> Result<(), String> {
-        let client = blocking_http_client()?;
+        let client = http_client()?;
         let mut artifact = tempfile::NamedTempFile::new()
             .map_err(|e| format!("failed to create remote cache artifact temp file: {e}"))?;
         let artifact_path = artifact.path().to_path_buf();
@@ -540,62 +534,69 @@ impl RemoteCacheClient {
             .map_err(|e| format!("failed to retain remote cache artifact for hashing: {e}"))?;
         let digests = hash_artifact(hash_file, self.signature_key.as_deref())?;
         let url = self.artifact_url(key)?;
-        let response = self.send_authenticated(
-            "remote cache upload was not authorized; continuing without it",
-            |bearer| {
-                let mut body_file = artifact.as_file().try_clone().map_err(|error| {
-                    RemoteCacheRequestError::Message(format!(
-                        "failed to retain remote cache artifact for upload: {error}"
-                    ))
-                })?;
-                body_file.rewind().map_err(|error| {
-                    RemoteCacheRequestError::Message(format!(
-                        "failed to rewind remote cache artifact for upload: {error}"
-                    ))
-                })?;
-                let mut request = client
-                    .put(url.clone())
-                    .bearer_auth(bearer)
-                    .header(CONTENT_LENGTH, artifact_len.to_string())
-                    .header(ARTIFACT_DURATION_HEADER, duration_ms.to_string())
-                    .header(ARTIFACT_SHA_HEADER, digests.sha256_hex.as_str())
-                    .header(
-                        ARTIFACT_CLIENT_CI_HEADER,
-                        if is_ci_environment() { "1" } else { "0" },
-                    )
-                    .header(
-                        ARTIFACT_CLIENT_INTERACTIVE_HEADER,
-                        if std::io::stdout().is_terminal() {
-                            "1"
-                        } else {
-                            "0"
-                        },
-                    )
-                    .body(Body::new(body_file));
+        let response = self
+            .send_authenticated(
+                "remote cache upload was not authorized; continuing without it",
+                async |bearer: String| {
+                    let mut body_file = artifact.as_file().try_clone().map_err(|error| {
+                        RemoteCacheRequestError::Message(format!(
+                            "failed to retain remote cache artifact for upload: {error}"
+                        ))
+                    })?;
+                    body_file.rewind().map_err(|error| {
+                        RemoteCacheRequestError::Message(format!(
+                            "failed to rewind remote cache artifact for upload: {error}"
+                        ))
+                    })?;
+                    let mut request = client
+                        .put(url.clone())
+                        .bearer_auth(bearer)
+                        .header(CONTENT_LENGTH, artifact_len.to_string())
+                        .header(ARTIFACT_DURATION_HEADER, duration_ms.to_string())
+                        .header(ARTIFACT_SHA_HEADER, digests.sha256_hex.as_str())
+                        .header(
+                            ARTIFACT_CLIENT_CI_HEADER,
+                            if is_ci_environment() { "1" } else { "0" },
+                        )
+                        .header(
+                            ARTIFACT_CLIENT_INTERACTIVE_HEADER,
+                            if std::io::stdout().is_terminal() {
+                                "1"
+                            } else {
+                                "0"
+                            },
+                        )
+                        .body(Body::wrap_stream(
+                            tokio_util::io::ReaderStream::with_capacity(
+                                tokio::fs::File::from_std(body_file),
+                                UPLOAD_READ_BYTES,
+                            ),
+                        ));
 
-                if let Some(tag) = digests.hmac_tag.as_deref() {
-                    request = request.header(ARTIFACT_TAG_HEADER, tag);
-                }
+                    if let Some(tag) = digests.hmac_tag.as_deref() {
+                        request = request.header(ARTIFACT_TAG_HEADER, tag);
+                    }
 
-                let response = request.send().map_err(|error| {
-                    RemoteCacheRequestError::Message(format!(
-                        "remote cache upload failed: {}",
-                        lpm_http::display_error(&error)
-                    ))
-                })?;
-                if response.status() == StatusCode::UNAUTHORIZED {
-                    Err(RemoteCacheRequestError::Unauthorized)
-                } else {
-                    Ok(response)
-                }
-            },
-        )?;
+                    let response = request.send().await.map_err(|error| {
+                        RemoteCacheRequestError::Message(format!(
+                            "remote cache upload failed: {}",
+                            lpm_http::display_error(&error)
+                        ))
+                    })?;
+                    if response.status() == StatusCode::UNAUTHORIZED {
+                        Err(RemoteCacheRequestError::Unauthorized)
+                    } else {
+                        Ok(response)
+                    }
+                },
+            )
+            .await?;
 
         if response.status().is_success() {
             return Ok(());
         }
 
-        Err(remote_cache_http_error(response, "upload"))
+        Err(remote_cache_http_error(response, "upload").await)
     }
 
     fn artifact_url(&self, key: &str) -> Result<reqwest::Url, String> {
@@ -768,38 +769,41 @@ struct FetchedRemoteStatus {
 
 impl RemoteCacheClient {
     fn fetch_status(&self) -> Result<FetchedRemoteStatus, String> {
-        run_blocking_http(|| self.fetch_status_blocking())
+        block_on_remote(self.fetch_status_async())
     }
 
-    fn fetch_status_blocking(&self) -> Result<FetchedRemoteStatus, String> {
-        let client = blocking_http_client()?;
+    async fn fetch_status_async(&self) -> Result<FetchedRemoteStatus, String> {
+        let client = http_client()?;
         let url = self.status_url()?;
-        let response =
-            self.send_authenticated("remote cache status returned HTTP 401", |bearer| {
-                let response =
-                    client
+        let response = self
+            .send_authenticated(
+                "remote cache status returned HTTP 401",
+                async |bearer: String| {
+                    let response = client
                         .get(url.clone())
                         .bearer_auth(bearer)
                         .send()
+                        .await
                         .map_err(|error| {
                             RemoteCacheRequestError::Message(format!(
                                 "remote cache status failed: {}",
                                 lpm_http::display_error(&error)
                             ))
                         })?;
-                if response.status() == StatusCode::UNAUTHORIZED {
-                    Err(RemoteCacheRequestError::Unauthorized)
-                } else {
-                    Ok(response)
-                }
-            })?;
+                    if response.status() == StatusCode::UNAUTHORIZED {
+                        Err(RemoteCacheRequestError::Unauthorized)
+                    } else {
+                        Ok(response)
+                    }
+                },
+            )
+            .await?;
 
         if !response.status().is_success() {
-            return Err(remote_cache_http_error(response, "status"));
+            return Err(remote_cache_http_error(response, "status").await);
         }
 
-        let content_length = response.content_length();
-        let body = decode_remote_status_body(response, content_length)?;
+        let body = read_remote_status_body(response).await?;
         Ok(FetchedRemoteStatus {
             status: body
                 .get("status")
@@ -817,38 +821,41 @@ impl RemoteCacheClient {
     }
 }
 
-fn decode_remote_status_body(
-    mut response: impl Read,
-    content_length: Option<u64>,
+/// Read a status or error body of at most `MAX_REMOTE_STATUS_BYTES`.
+async fn read_remote_status_body(
+    mut response: reqwest::Response,
 ) -> Result<serde_json::Value, String> {
+    let limit = MAX_REMOTE_STATUS_BYTES as usize;
+    let content_length = response.content_length();
     if content_length.is_some_and(|length| length > MAX_REMOTE_STATUS_BYTES) {
-        return Err(format!(
-            "remote cache status response exceeds the {} limit",
-            format_bytes(MAX_REMOTE_STATUS_BYTES)
-        ));
+        return Err(status_body_too_large());
     }
-    let initial_capacity = content_length.unwrap_or(0).min(MAX_REMOTE_STATUS_BYTES) as usize;
-    let mut bytes = Vec::with_capacity(initial_capacity);
-    response
-        .by_ref()
-        .take(MAX_REMOTE_STATUS_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("failed to read remote cache status response: {error}"))?;
-    if bytes.len() as u64 > MAX_REMOTE_STATUS_BYTES {
-        return Err(format!(
-            "remote cache status response exceeds the {} limit",
-            format_bytes(MAX_REMOTE_STATUS_BYTES)
-        ));
+    let mut bytes = Vec::with_capacity(content_length.unwrap_or(0) as usize);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| format!("failed to read remote cache status response: {error}"))?
+    {
+        if bytes.len() + chunk.len() > limit {
+            return Err(status_body_too_large());
+        }
+        bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes)
         .map_err(|error| format!("remote cache status returned invalid JSON: {error}"))
 }
 
-fn remote_cache_http_error(response: reqwest::blocking::Response, operation: &str) -> String {
+fn status_body_too_large() -> String {
+    format!(
+        "remote cache status response exceeds the {} limit",
+        format_bytes(MAX_REMOTE_STATUS_BYTES)
+    )
+}
+
+async fn remote_cache_http_error(response: reqwest::Response, operation: &str) -> String {
     let status = response.status();
     let body = if matches!(status, StatusCode::FORBIDDEN | StatusCode::PAYMENT_REQUIRED) {
-        let length = response.content_length();
-        decode_remote_status_body(response, length).ok()
+        read_remote_status_body(response).await.ok()
     } else {
         None
     };
@@ -883,18 +890,26 @@ fn remote_cache_http_error(response: reqwest::blocking::Response, operation: &st
     }
 }
 
-fn blocking_http_client() -> Result<Client, String> {
-    lpm_http::blocking_client_builder()
+fn http_client() -> Result<Client, String> {
+    lpm_http::client_builder()
         .timeout(REMOTE_CACHE_TIMEOUT)
         .build()
         .map_err(|e| format!("failed to initialize remote cache HTTP client: {e}"))
 }
 
-fn run_blocking_http<T>(f: impl FnOnce() -> T) -> T {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::task::block_in_place(f)
-    } else {
-        f()
+/// Run remote-cache I/O from the synchronous task-cache paths.
+///
+/// Inside LPM's runtime this blocks in place on the runtime's own reactor,
+/// rather than using `reqwest::blocking`, whose per-client thread and runtime
+/// must not be started from inside an async runtime.
+fn block_on_remote<F: Future>(future: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(future)),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime for remote cache I/O builds")
+            .block_on(future),
     }
 }
 
@@ -975,24 +990,21 @@ fn env_flag(name: &str) -> Option<bool> {
     }
 }
 
-fn copy_response_to_temp(
-    response: &mut impl Read,
+async fn copy_response_to_temp(
+    response: &mut reqwest::Response,
     temp: &mut tempfile::NamedTempFile,
     signature_key: Option<&str>,
 ) -> Result<ArtifactDigests, String> {
     let mut total = 0u64;
-    let mut buffer = [0u8; 64 * 1024];
     let mut sha = Sha256::new();
     let mut mac = signature_key.map(new_hmac).transpose()?;
 
-    loop {
-        let read = response
-            .read(&mut buffer)
-            .map_err(|e| format!("failed to read remote cache artifact: {e}"))?;
-        if read == 0 {
-            break;
-        }
-
+    while let Some(buffer) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("failed to read remote cache artifact: {e}"))?
+    {
+        let read = buffer.len();
         total = total.saturating_add(read as u64);
         if total > MAX_REMOTE_ARTIFACT_BYTES {
             return Err(format!(
@@ -1217,6 +1229,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remote_io_runs_outside_the_runtime_and_on_its_threads() {
+        assert_eq!(block_on_remote(async { 7 }), 7);
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let on_block_on_thread = runtime.block_on(async {
+            block_on_remote(async {
+                tokio::task::yield_now().await;
+                8
+            })
+        });
+        let on_worker = runtime.block_on(async {
+            tokio::spawn(async { block_on_remote(async { 9 }) })
+                .await
+                .unwrap()
+        });
+
+        assert_eq!((on_block_on_thread, on_worker), (8, 9));
+    }
+
+    #[test]
     fn http_cache_hosts_allow_only_exact_loopback_addresses_and_localhost() {
         for host in ["localhost", "127.0.0.1", "[::1]"] {
             let url = reqwest::Url::parse(&format!("http://{host}:3000/v8")).unwrap();
@@ -1235,8 +1271,44 @@ mod tests {
         }
     }
 
-    #[test]
-    fn remote_status_body_accepts_valid_json_at_the_exact_size_limit() {
+    /// A response whose body arrives as the given chunks, without a
+    /// `Content-Length`.
+    async fn chunked_status_response(chunks: Vec<Vec<u8>>) -> reqwest::Response {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut line = String::new();
+            while socket.read_line(&mut line).await.unwrap() > 2 {
+                line.clear();
+            }
+            let socket = socket.get_mut();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .unwrap();
+            for chunk in chunks {
+                socket
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .unwrap();
+                socket.write_all(&chunk).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+            }
+            socket.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+        reqwest::Client::new()
+            .get(format!("http://{address}/status"))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn remote_status_body_accepts_valid_json_at_the_exact_size_limit() {
         let prefix = br#"{"padding":""#;
         let suffix = br#""}"#;
         let padding = MAX_REMOTE_STATUS_BYTES as usize - prefix.len() - suffix.len();
@@ -1244,21 +1316,24 @@ mod tests {
         body.extend_from_slice(prefix);
         body.resize(body.len() + padding, b'x');
         body.extend_from_slice(suffix);
+        let chunks = body.chunks(16 * 1024).map(<[u8]>::to_vec).collect();
 
-        let decoded =
-            decode_remote_status_body(std::io::Cursor::new(body), Some(MAX_REMOTE_STATUS_BYTES))
-                .unwrap();
+        let decoded = read_remote_status_body(chunked_status_response(chunks).await)
+            .await
+            .unwrap();
 
         assert_eq!(decoded["padding"].as_str().unwrap().len(), padding);
     }
 
-    #[test]
-    fn remote_status_body_rejects_chunked_content_past_the_size_limit() {
-        let body = vec![b'x'; MAX_REMOTE_STATUS_BYTES as usize + 1];
+    #[tokio::test]
+    async fn remote_status_body_rejects_a_chunk_that_crosses_the_size_limit() {
+        let chunks = vec![b"{".to_vec(), vec![b'x'; MAX_REMOTE_STATUS_BYTES as usize]];
 
-        let error = decode_remote_status_body(std::io::Cursor::new(body), None).unwrap_err();
+        let error = read_remote_status_body(chunked_status_response(chunks).await)
+            .await
+            .unwrap_err();
 
-        assert!(error.contains("exceeds"));
+        assert!(error.contains("exceeds"), "{error}");
     }
 
     #[test]
