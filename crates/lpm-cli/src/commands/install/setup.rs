@@ -50,6 +50,29 @@ pub(super) struct InstallSetupContext {
     pub(super) production_dependency_names: HashSet<String>,
 }
 
+pub(crate) fn validate_dependency_free_dev_config(project_dir: &Path) -> Result<(), LpmError> {
+    let setup = prepare_install_setup_context(InstallSetupInput {
+        project_dir,
+        policy_project_dir: project_dir,
+        json_output: false,
+        frozen_lockfile: FrozenLockfileMode::Never,
+        allow_new: false,
+        strict_peer_dependencies_override: None,
+        linker_override: None,
+        min_release_age_override: None,
+        min_release_age_exclude: &[],
+        timing: false,
+    })?;
+    crate::source_analysis_config::resolve_install_time_source_analysis(
+        &setup.global_config,
+        project_dir,
+        false,
+    )?;
+    crate::lpm_insights_config::read_fetch_lpm_security_insights(&setup.global_config)?;
+    crate::lpm_skills_config::LpmSkillsPreference::Config.resolve(&setup.global_config)?;
+    Ok(())
+}
+
 pub(super) fn prepare_install_setup_context(
     input: InstallSetupInput<'_>,
 ) -> Result<InstallSetupContext, LpmError> {

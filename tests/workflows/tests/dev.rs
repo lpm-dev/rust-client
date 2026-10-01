@@ -15,6 +15,424 @@ use support::{
 };
 
 #[test]
+fn dev_with_config_only_explains_how_to_define_the_missing_command() {
+    let project = TempProject::empty("{}");
+    std::fs::remove_file(project.path().join("package.json")).unwrap();
+    project.write_file("lpm.json", r#"{"vault":"dev-command-fixture"}"#);
+
+    let output = lpm(&project)
+        .args(["dev", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run dev with configuration but no command");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no 'dev' command configured")
+            && stderr.contains("scripts.dev")
+            && stderr.contains("tasks.dev.command"),
+        "missing-command error must explain both supported command sources:\n{stderr}"
+    );
+    assert!(!project.file_exists("lpm.lock"));
+    assert!(!project.file_exists("node_modules"));
+}
+
+#[test]
+fn dev_without_dependencies_runs_without_initializing_install_state() {
+    for dependencies in [
+        "",
+        r#", "dependencies":{}, "devDependencies":{}, "optionalDependencies":{}, "peerDependencies":{}"#,
+    ] {
+        let project = TempProject::empty(&format!(
+            r#"{{"name":"dependency-free-dev","version":"1.0.0","scripts":{{"dev":"node index.js"}}{dependencies}}}"#
+        ));
+        project.write_file("index.js", "console.log('dependency-free-dev');\n");
+
+        for _ in 0..2 {
+            let output = lpm(&project)
+                .args(["dev", "--no-open", "--no-dashboard"])
+                .output()
+                .expect("run dependency-free dev");
+
+            assert!(output.status.success(), "{:?}", output);
+            assert!(String::from_utf8_lossy(&output.stdout).contains("dependency-free-dev"));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("Deps") && stderr.contains("none"),
+                "dependency-free dev must report no dependencies:\n{stderr}"
+            );
+            assert!(!stderr.contains("Dependencies out of date"), "{stderr}");
+            assert!(!stderr.contains("installed in"), "{stderr}");
+            for artifact in ["node_modules", "lpm.lock", "lpm.lockb", ".lpm/install-hash"] {
+                assert!(!project.file_exists(artifact), "created {artifact}");
+            }
+        }
+    }
+}
+
+#[test]
+fn dev_without_dependencies_enforces_the_required_lpm_version() {
+    let project = TempProject::empty(
+        r#"{"name":"dev-lpm-engine","version":"1.0.0","engines":{"lpm":">=999.0.0"},"scripts":{"dev":"echo should-not-run"}}"#,
+    );
+    let output = lpm(&project)
+        .args(["dev", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run dev with an incompatible LPM requirement");
+
+    assert!(!output.status.success(), "{:?}", output);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("should-not-run"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("999.0.0"));
+}
+
+#[test]
+fn dev_without_dependencies_preserves_strict_dependency_validation() {
+    let project = TempProject::empty(
+        r#"{"name":"dev-strict-deps","version":"1.0.0","lpm":{"strictDeps":"strict"},"scripts":{"dev":"echo should-not-run"}}"#,
+    );
+    project.write_file("index.js", "import 'undeclared-dev-package';\n");
+    let output = lpm(&project)
+        .args(["dev", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run dev with an undeclared source dependency");
+
+    assert!(!output.status.success(), "{:?}", output);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("should-not-run"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("strictDeps") && stderr.contains("undeclared-dev-package"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn dev_without_dependencies_rejects_invalid_pending_install_recovery() {
+    let project = TempProject::empty(
+        r#"{"name":"dev-recovery","version":"1.0.0","scripts":{"dev":"echo should-not-run"}}"#,
+    );
+    project.write_file(".lpm/install-recovery/committed", "0\n");
+    let output = lpm(&project)
+        .args(["dev", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run dev with invalid pending recovery");
+
+    assert!(!output.status.success(), "{:?}", output);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("should-not-run"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("invalid install recovery commit marker")
+    );
+    assert_eq!(project.read_file(".lpm/install-recovery/committed"), "0\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_without_dependencies_rejects_unsafe_project_state_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = TempProject::empty(
+        r#"{"name":"dev-state-permissions","version":"1.0.0","scripts":{"dev":"echo should-not-run"}}"#,
+    );
+    let state = project.path().join(".lpm");
+    std::fs::create_dir(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let output = lpm(&project)
+        .args(["dev", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run dev with unsafe project state permissions");
+
+    assert!(!output.status.success(), "{:?}", output);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("should-not-run"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains(".lpm"));
+}
+
+#[test]
+fn dev_without_dependencies_rejects_invalid_linker_configuration() {
+    let project = TempProject::empty(
+        r#"{"name":"dev-invalid-linker","version":"1.0.0","lpm":{"linker":"invalid"},"scripts":{"dev":"echo should-not-run"}}"#,
+    );
+    let output = lpm(&project)
+        .args(["dev", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run dev with an invalid linker");
+
+    assert!(!output.status.success(), "{:?}", output);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("should-not-run"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("linker"));
+}
+
+#[test]
+fn dev_without_dependencies_rejects_invalid_linker_environment() {
+    let project = TempProject::empty(
+        r#"{"name":"dev-invalid-linker-env","version":"1.0.0","scripts":{"dev":"echo should-not-run"}}"#,
+    );
+    let output = lpm(&project)
+        .env("LPM_LINKER", "invalid")
+        .args(["dev", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run dev with an invalid linker environment");
+
+    assert!(!output.status.success(), "{:?}", output);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("should-not-run"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("LPM_LINKER"));
+}
+
+#[test]
+fn dev_without_dependencies_rejects_invalid_global_configuration() {
+    for (config, expected_error) in [
+        ("linker = \"invalid\"\n", "linker"),
+        ("trust-policy = \"invalid\"\n", "trust-policy"),
+        ("integrity = \"invalid\"\n", "integrity"),
+        ("release-age-policy = \"invalid\"\n", "release-age-policy"),
+        (
+            "install-time-source-analysis = \"invalid\"\n",
+            "install-time-source-analysis",
+        ),
+        (
+            "auto-install-lpm-skills = \"invalid\"\n",
+            "auto-install-lpm-skills",
+        ),
+        ("invalid = [\n", "config parse error"),
+    ] {
+        let project = TempProject::empty(
+            r#"{"name":"dev-invalid-global-config","version":"1.0.0","scripts":{"dev":"echo should-not-run"}}"#,
+        );
+        let config_dir = project.home().join(".lpm");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("config.toml"), config).unwrap();
+        let output = lpm(&project)
+            .args(["dev", "--no-open", "--no-dashboard"])
+            .output()
+            .expect("run dev with invalid global configuration");
+
+        assert!(!output.status.success(), "{config}: {output:?}");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("should-not-run"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected_error), "{config}: {stderr}");
+    }
+}
+
+#[test]
+fn dev_without_dependencies_with_valid_global_configuration_skips_install_state() {
+    let project = TempProject::empty(
+        r#"{"name":"dev-valid-global-config","version":"1.0.0","scripts":{"dev":"echo configured-dev"}}"#,
+    );
+    let config_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "linker = \"hoisted\"\nrelease-age-policy = \"strict\"\ninstall-time-source-analysis = true\n[firewall]\nmode = \"enforce\"\n",
+    )
+    .unwrap();
+
+    for _ in 0..2 {
+        let output = lpm(&project)
+            .args(["dev", "--no-open", "--no-dashboard"])
+            .output()
+            .expect("run dependency-free dev with global configuration");
+
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("configured-dev"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Deps") && stderr.contains("none"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("Dependencies out of date"), "{stderr}");
+        for artifact in ["node_modules", "lpm.lock", "lpm.lockb", ".lpm/install-hash"] {
+            assert!(!project.file_exists(artifact), "created {artifact}");
+        }
+    }
+}
+
+#[test]
+fn dev_without_dependencies_rejects_invalid_pending_release_state() {
+    let project = TempProject::empty(
+        r#"{"name":"dev-release-state","version":"1.0.0","scripts":{"dev":"echo should-not-run"}}"#,
+    );
+    project.write_file(".lpm/release-apply/journal.json", "{}\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [".lpm", ".lpm/release-apply"] {
+            std::fs::set_permissions(
+                project.path().join(path),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+        std::fs::set_permissions(
+            project.path().join(".lpm/release-apply/journal.json"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let output = lpm(&project)
+        .args(["dev", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run dev with malformed pending release state");
+
+    assert!(!output.status.success(), "{:?}", output);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("should-not-run"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("release"));
+    assert_eq!(project.read_file(".lpm/release-apply/journal.json"), "{}\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_without_dependencies_rejects_symlinked_project_state() {
+    let project = TempProject::empty(
+        r#"{"name":"dev-symlink-state","version":"1.0.0","scripts":{"dev":"echo should-not-run"}}"#,
+    );
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), project.path().join(".lpm")).unwrap();
+    let output = lpm(&project)
+        .args(["dev", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run dev with symlinked project state");
+
+    assert!(!output.status.success(), "{:?}", output);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("should-not-run"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains(".lpm"));
+    assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn dev_prints_dependency_status_when_the_script_exits_immediately() {
+    let project = TempProject::empty(
+        r#"{"name":"fast-dev","version":"1.0.0","scripts":{"dev":"echo fast-dev"}}"#,
+    );
+    for _ in 0..16 {
+        let output = lpm(&project)
+            .args(["dev", "--no-open", "--no-dashboard"])
+            .output()
+            .expect("run an immediately exiting dev script");
+
+        assert!(output.status.success(), "{:?}", output);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Deps"),
+            "startup banner was missing:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn dev_task_without_package_json_runs_and_reports_no_dependencies() {
+    let project = TempProject::empty("{}");
+    std::fs::remove_file(project.path().join("package.json")).unwrap();
+    project.write_file(
+        "lpm.json",
+        r#"{"tasks":{"dev":{"command":"node index.js"}}}"#,
+    );
+    project.write_file("index.js", "console.log('task-only-dev');\n");
+
+    let output = lpm(&project)
+        .args(["dev", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run lpm.json dev task");
+
+    assert!(output.status.success(), "{:?}", output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("task-only-dev"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Deps") && stderr.contains("none"),
+        "{stderr}"
+    );
+    assert!(!project.file_exists("node_modules"));
+    assert!(!project.file_exists("lpm.lock"));
+}
+
+#[tokio::test]
+async fn dev_installs_dependencies_from_each_installable_manifest_section() {
+    let registry = MockRegistry::start().await;
+    registry
+        .with_manifest_package(
+            serde_json::json!({"name":"dev-fixture-dep","version":"1.0.0"}),
+            &[],
+        )
+        .await;
+
+    for section in ["dependencies", "devDependencies", "optionalDependencies"] {
+        let project = TempProject::empty(&format!(
+            r#"{{"name":"dev-dependency-sections","version":"1.0.0","scripts":{{"dev":"node index.js"}},"{section}":{{"dev-fixture-dep":"1.0.0"}}}}"#
+        ));
+        project.write_file(
+            "index.js",
+            "console.log(require('dev-fixture-dep/package.json').version);\n",
+        );
+
+        let output = lpm_with_registry(&project, &registry.url())
+            .args(["dev", "--no-open", "--no-dashboard"])
+            .output()
+            .expect("run dev with a dependency");
+
+        assert!(output.status.success(), "{section}: {:?}", output);
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1.0.0"));
+        assert!(project.file_exists("node_modules/dev-fixture-dep/package.json"));
+        assert!(project.file_exists(".lpm/install-hash"));
+    }
+}
+
+#[tokio::test]
+async fn dev_cleans_installed_packages_after_the_last_dependency_is_removed() {
+    let registry = MockRegistry::start().await;
+    registry
+        .with_manifest_package(
+            serde_json::json!({"name":"dev-removed-dep","version":"1.0.0"}),
+            &[],
+        )
+        .await;
+    let project = TempProject::empty(
+        r#"{"name":"dev-remove-last","version":"1.0.0","scripts":{"dev":"node index.js"},"dependencies":{"dev-removed-dep":"1.0.0"}}"#,
+    );
+    project.write_file("index.js", "console.log('dev-removal');\n");
+    lpm_with_registry(&project, &registry.url())
+        .args(["install"])
+        .assert()
+        .success();
+    assert!(project.file_exists("node_modules/dev-removed-dep/package.json"));
+    project.write_file(
+        "package.json",
+        r#"{"name":"dev-remove-last","version":"1.0.0","scripts":{"dev":"node index.js"}}"#,
+    );
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["dev", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run dev after removing the last dependency");
+
+    assert!(output.status.success(), "{:?}", output);
+    assert!(!project.file_exists("node_modules/dev-removed-dep"));
+    assert!(project.read_file("lpm.lock").contains("packages = []"));
+    assert!(project.file_exists(".lpm/install-hash"));
+}
+
+#[tokio::test]
+async fn dev_at_a_dependency_free_workspace_root_preserves_install_reconciliation() {
+    let registry = MockRegistry::start().await;
+    registry
+        .with_manifest_package(
+            serde_json::json!({"name":"dev-workspace-dep","version":"1.0.0"}),
+            &[],
+        )
+        .await;
+    let project = TempProject::empty(
+        r#"{"name":"dev-workspace","version":"1.0.0","private":true,"workspaces":["packages/*"],"scripts":{"dev":"node index.js"}}"#,
+    );
+    project.write_file("packages/app/package.json", r#"{"name":"dev-workspace-app","version":"1.0.0","dependencies":{"dev-workspace-dep":"1.0.0"}}"#);
+    project.write_file("index.js", "console.log('workspace-dev');\n");
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["dev", "--no-open", "--no-dashboard"])
+        .output()
+        .expect("run dev at a workspace root");
+
+    assert!(output.status.success(), "{:?}", output);
+    assert!(project.file_exists("lpm.lock"));
+    assert!(project.file_exists(".lpm/install-hash"));
+}
+
+#[test]
 fn dev_rejects_an_invalid_env_schema_default_before_starting_the_service() {
     let project = TempProject::empty(
         r#"{

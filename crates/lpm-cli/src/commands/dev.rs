@@ -1,3 +1,4 @@
+mod dependencies;
 mod primary_endpoint;
 
 use super::dev_ui;
@@ -2346,6 +2347,9 @@ pub async fn run(
         script_result = &mut script_handle => {
             let script_result = script_result
                 .map_err(|error| LpmError::Script(format!("dev script task panicked: {error}")))?;
+            if script_result.is_ok() {
+                print_startup_banner(&startup, project_dir);
+            }
             let result = release_proxy_lease_after(script_result, &proxy_lease).await;
             return release_hosts_file_after(result, hosts_file_lease);
         }
@@ -3629,7 +3633,10 @@ async fn auto_install_if_stale(
 ) -> Result<String, LpmError> {
     let pkg_json = project_dir.join("package.json");
     if !pkg_json.exists() {
-        return Ok("no package.json".to_string());
+        return Ok("none".to_string());
+    }
+    if dependencies::can_skip_fresh_install(project_dir)? {
+        return Ok("none".to_string());
     }
 
     let start = std::time::Instant::now();
@@ -6466,15 +6473,8 @@ mod tests {
         assert!(hash.is_none());
     }
 
-    /// Dev composed contract: `auto_install_if_stale` leaves the same
-    /// metadata-rich `.lpm/install-hash` shape as the install pipeline.
-    /// This calls `auto_install_if_stale` against an empty-deps project
-    /// (no network needed; the install pipeline short-circuits at the
-    /// empty-deps branch), then asserts the install-hash file is v8 shape.
-    /// A future regression that reintroduces a parallel bare-hash overwrite
-    /// in `auto_install_if_stale` or the dev flow fails here immediately.
     #[tokio::test]
-    async fn auto_install_if_stale_writes_complete_install_state_for_empty_deps() {
+    async fn auto_install_if_stale_reconciles_existing_empty_install_with_complete_state() {
         // Isolate every env var the install pipeline reads so a
         // developer's exported state can't pollute the test. `LPM_HOME`
         // redirects the store + cache + global config away from the
@@ -6486,6 +6486,7 @@ mod tests {
         let p = project.path();
         let pkg = r#"{"name":"dev-auto-install-v6","version":"1.0.0","dependencies":{}}"#;
         fs::write(p.join("package.json"), pkg).unwrap();
+        fs::create_dir(p.join("node_modules")).unwrap();
 
         let _env = crate::test_env::ScopedEnv::update([
             (

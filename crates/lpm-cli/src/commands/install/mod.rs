@@ -108,6 +108,7 @@ pub(crate) use recursive::{RecursiveInstallOptions, run_recursive_workspace_inst
 use reporting::*;
 use resolve::experimental as experimental_resolver;
 use resolve::*;
+pub(crate) use setup::validate_dependency_free_dev_config;
 use setup::*;
 use skills::*;
 use source_resolution::*;
