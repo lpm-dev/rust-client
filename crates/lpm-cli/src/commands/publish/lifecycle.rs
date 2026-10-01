@@ -237,8 +237,8 @@ impl PublishLifecycle {
         project_dir: &Path,
         runtime_dir: &Path,
         script: &PublishLifecycleScript,
-    ) -> Vec<(String, String)> {
-        let inherited_path = std::env::var("PATH").ok();
+    ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        let inherited_path = std::env::var_os("PATH");
         let mut envs = Vec::with_capacity(14);
         envs.push((
             "PATH".into(),
@@ -247,18 +247,21 @@ impl PublishLifecycle {
                 inherited_path.as_deref(),
             ),
         ));
-        let runtime = runtime_dir.display().to_string();
-        envs.push(("HOME".into(), runtime.clone()));
-        envs.push(("TMPDIR".into(), runtime.clone()));
-        envs.push(("TMP".into(), runtime.clone()));
-        envs.push(("TEMP".into(), runtime));
-        envs.push(("INIT_CWD".into(), project_dir.display().to_string()));
+        let runtime = runtime_dir.as_os_str();
+        envs.push(("HOME".into(), runtime.to_owned()));
+        envs.push(("TMPDIR".into(), runtime.to_owned()));
+        envs.push(("TMP".into(), runtime.to_owned()));
+        envs.push(("TEMP".into(), runtime.to_owned()));
+        envs.push(("INIT_CWD".into(), project_dir.as_os_str().to_owned()));
         envs.push(("npm_lifecycle_event".into(), script.phase.into()));
-        envs.push(("npm_lifecycle_script".into(), script.command.clone()));
-        envs.push(("npm_package_name".into(), self.package_name.clone()));
-        envs.push(("npm_package_version".into(), self.package_version.clone()));
+        envs.push(("npm_lifecycle_script".into(), script.command.clone().into()));
+        envs.push(("npm_package_name".into(), self.package_name.clone().into()));
+        envs.push((
+            "npm_package_version".into(),
+            self.package_version.clone().into(),
+        ));
         for key in ["SYSTEMROOT", "WINDIR", "PATHEXT", "COMSPEC"] {
-            if let Ok(value) = std::env::var(key) {
+            if let Some(value) = std::env::var_os(key) {
                 envs.push((key.into(), value));
             }
         }

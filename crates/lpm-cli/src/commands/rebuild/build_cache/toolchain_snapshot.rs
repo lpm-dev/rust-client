@@ -4,7 +4,6 @@ use super::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -55,7 +54,7 @@ pub(super) struct ComputedToolchainFingerprint {
 pub(super) fn cached_toolchain_fingerprint<F>(
     cache: &ToolchainFingerprintCache,
     base_key: &str,
-    environment: &HashMap<String, String>,
+    environment: &super::super::sandbox_env::ChildEnvironment,
     project_dir: &Path,
     compute: &mut F,
 ) -> std::io::Result<String>
@@ -130,7 +129,7 @@ fn read_snapshot(path: &Path, expected_base_key: &str) -> Option<ToolchainFinger
 
 fn snapshot_paths_are_allowed(
     snapshot: &ToolchainFingerprintSnapshot,
-    environment: &HashMap<String, String>,
+    environment: &super::super::sandbox_env::ChildEnvironment,
     project_dir: &Path,
 ) -> bool {
     let configured_paths = environment
@@ -184,7 +183,7 @@ fn write_snapshot(path: &Path, snapshot: &ToolchainFingerprintSnapshot) -> std::
 }
 
 fn validation_hash(
-    environment: &HashMap<String, String>,
+    environment: &super::super::sandbox_env::ChildEnvironment,
     pkg_config_paths: &[PathBuf],
 ) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
@@ -415,10 +414,12 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
-    fn environment(temp: &tempfile::TempDir) -> HashMap<String, String> {
-        HashMap::from([(
-            "HOME".to_string(),
-            temp.path().join("home").display().to_string(),
+    fn environment(
+        temp: &tempfile::TempDir,
+    ) -> crate::commands::rebuild::sandbox_env::ChildEnvironment {
+        std::collections::HashMap::from([(
+            "HOME".into(),
+            temp.path().join("home").into_os_string(),
         )])
     }
 
@@ -571,7 +572,7 @@ mod tests {
 
         assert!(!snapshot_paths_are_allowed(
             &snapshot,
-            &HashMap::new(),
+            &std::collections::HashMap::new(),
             Path::new("/project")
         ));
     }

@@ -690,11 +690,14 @@ fn try_capture_from_vcvarsall(
     // changed is what we need to inject into the child; values
     // unchanged from our env don't need to be set (they'd be
     // inherited anyway).
-    let pre_env: HashMap<String, String> = std::env::vars().collect();
+    // An inherited value that is not valid Unicode stays inherited: the
+    // decoded dump cannot show whether vcvarsall changed it, and injecting
+    // the decoded text would replace the real value.
+    let pre_env: HashMap<OsString, OsString> = std::env::vars_os().collect();
     let mut additions = HashMap::new();
     for (k, v) in &new_env {
-        match pre_env.get(k) {
-            Some(prev) if prev == v => {}
+        match pre_env.get(std::ffi::OsStr::new(k)) {
+            Some(prev) if prev.to_str().is_none_or(|prev| prev == v) => {}
             _ => {
                 additions.insert(k.clone(), v.clone());
             }

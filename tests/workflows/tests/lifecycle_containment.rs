@@ -23,6 +23,15 @@ impl Fixture {
     }
 
     fn new_in(parent: &std::path::Path, script: &str, capabilities: serde_json::Value) -> Self {
+        Self::with_postinstall(parent, "node probe.js", script, capabilities)
+    }
+
+    fn with_postinstall(
+        parent: &std::path::Path,
+        postinstall: &str,
+        script: &str,
+        capabilities: serde_json::Value,
+    ) -> Self {
         let project = TempProject::empty_in(
             parent,
             &serde_json::json!({
@@ -47,7 +56,7 @@ impl Fixture {
             std::fs::write(
                 path.join("package.json"),
                 serde_json::json!({
-                    "name": PACKAGE, "version": "1.0.0", "scripts": {"postinstall": "node probe.js"}
+                    "name": PACKAGE, "version": "1.0.0", "scripts": {"postinstall": postinstall}
                 })
                 .to_string(),
             )
@@ -191,6 +200,33 @@ require('fs').writeFileSync('result.json',JSON.stringify(Object.fromEntries(keys
     ] {
         assert!(result[name].is_null(), "undeclared {name} leaked: {result}");
     }
+}
+
+#[test]
+fn lifecycle_environment_keeps_values_that_are_not_valid_utf8() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let home = std::env::var_os("HOME").expect("HOME for filesystem fixture");
+    let fixture = Fixture::with_postinstall(
+        std::path::Path::new(&home),
+        r#"printf %s "$QA_APPROVED_BYTES" | od -An -tx1 | tr -d ' \n' > result.txt"#,
+        "",
+        serde_json::json!({"passEnv":["QA_APPROVED_BYTES"]}),
+    );
+
+    let output = lpm(&fixture.project)
+        .arg("rebuild")
+        .env("QA_APPROVED_BYTES", OsStr::from_bytes(b"a\xffb"))
+        .env("QA_UNDECLARED", OsStr::from_bytes(b"\xfe"))
+        .output()
+        .unwrap();
+
+    assert_success(&output);
+    assert_eq!(
+        std::fs::read_to_string(fixture.package.join("result.txt")).unwrap(),
+        "61ff62"
+    );
 }
 
 struct ProcessGuard(u32);

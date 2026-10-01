@@ -55,6 +55,45 @@ fn caller_snapshot(
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(&inputs)?)))
 }
 
+/// The `LPM_*` and `npm_config_*` variables a reusable receipt depends on.
+///
+/// Entries that are valid UTF-8 are returned as text, as receipts always
+/// recorded them. Any other entry is returned separately as hex-encoded
+/// name and value bytes, so distinct values never share a receipt.
+fn receipt_environment(
+    variables: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> (
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+) {
+    let mut text = std::collections::BTreeMap::new();
+    let mut bytes = std::collections::BTreeMap::new();
+    for (name, value) in variables {
+        let raw_name = name.as_encoded_bytes();
+        let selected = raw_name.starts_with(b"LPM_")
+            || raw_name
+                .get(..b"npm_config_".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"npm_config_"));
+        if !selected {
+            continue;
+        }
+        match (name.into_string(), value.into_string()) {
+            (Ok(name), Ok(value)) => {
+                text.insert(name, value);
+            }
+            (name, value) => {
+                let name = name.map_or_else(|name| name, std::ffi::OsString::from);
+                let value = value.map_or_else(|value| value, std::ffi::OsString::from);
+                bytes.insert(
+                    hex::encode(name.as_encoded_bytes()),
+                    hex::encode(value.as_encoded_bytes()),
+                );
+            }
+        }
+    }
+    (text, bytes)
+}
+
 fn optional_config(path: &std::path::Path) -> Result<Option<String>, LpmError> {
     match lpm_common::read_text_file_capped(path, CONFIG_FILE_SIZE_CAP_BYTES) {
         Ok(text) => Ok(Some(text)),
@@ -139,11 +178,7 @@ pub(super) fn authorize(
         object.remove("updated_at");
     }
     let status = security_approval::load_security_status(Some(project_dir), false)?;
-    let environment: std::collections::BTreeMap<_, _> = std::env::vars()
-        .filter(|(key, _)| {
-            key.starts_with("LPM_") || key.to_ascii_lowercase().starts_with("npm_config_")
-        })
-        .collect();
+    let (environment, environment_bytes) = receipt_environment(std::env::vars_os());
     // External policy programs and custom TLS inputs require a fresh installation.
     // A receipt is never an authorization: every invocation checks the live grants above.
     let reusable = global.get_value("policy").is_none()
@@ -162,7 +197,7 @@ pub(super) fn authorize(
         .workspace_resolution_key()
         .filter(|_| reusable && worker_principal.is_some())
         .map(|routing| {
-            let inputs = serde_json::json!({
+            let mut inputs = serde_json::json!({
                 "schema": 1,
                 "cli": env!("CARGO_PKG_VERSION"),
                 "project": project_dir,
@@ -183,6 +218,9 @@ pub(super) fn authorize(
                 "release_policy": release.minimum_release_age_policy.as_str(),
                 "exclusions": release.minimum_release_age_exclude,
             });
+            if !environment_bytes.is_empty() {
+                inputs["environment_bytes"] = serde_json::json!(environment_bytes);
+            }
             Ok::<_, LpmError>(hex::encode(Sha256::digest(serde_json::to_vec(&inputs)?)))
         })
         .transpose()?;
@@ -191,4 +229,46 @@ pub(super) fn authorize(
         receipt,
         snapshot: caller_snapshot(client, project_dir)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receipt_environment_selects_the_same_names_as_before() {
+        let (text, bytes) = receipt_environment([
+            ("LPM_REGISTRY".into(), "https://lpm.dev".into()),
+            ("NPM_CONFIG_CACHE".into(), "/cache".into()),
+            ("npm_config_registry".into(), "https://registry".into()),
+            ("PATH".into(), "/usr/bin".into()),
+            ("lpm_lowercase".into(), "ignored".into()),
+        ]);
+
+        assert_eq!(
+            text.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["LPM_REGISTRY", "NPM_CONFIG_CACHE", "npm_config_registry"]
+        );
+        assert!(bytes.is_empty(), "UTF-8 environments keep their receipt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn receipt_environment_keeps_values_that_are_not_valid_utf8_distinct() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let receipt = |value: &[u8]| {
+            receipt_environment([("LPM_VALUE".into(), OsStr::from_bytes(value).to_os_string())])
+        };
+        let (ff_text, ff_bytes) = receipt(b"\xff");
+        let (fe_text, fe_bytes) = receipt(b"\xfe");
+
+        assert!(ff_text.is_empty() && fe_text.is_empty());
+        assert_eq!(
+            ff_bytes.get(&hex::encode("LPM_VALUE")).map(String::as_str),
+            Some("ff")
+        );
+        assert_ne!(ff_bytes, fe_bytes);
+    }
 }
