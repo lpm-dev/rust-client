@@ -21,6 +21,9 @@ type HmacSha256 = Hmac<Sha256>;
 const MAX_REMOTE_ARTIFACT_BYTES: u64 = 500 * 1024 * 1024;
 const MAX_REMOTE_STATUS_BYTES: u64 = 64 * 1024;
 const REMOTE_CACHE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Each upload read moves to the blocking pool, so the stream's 4 KiB default
+/// made a 64 MiB upload about ten times slower than 64 KiB reads.
+const UPLOAD_READ_BYTES: usize = 64 * 1024;
 const ARTIFACT_TAG_HEADER: &str = "x-artifact-tag";
 const ARTIFACT_SHA_HEADER: &str = "x-artifact-sha";
 const ARTIFACT_DURATION_HEADER: &str = "x-artifact-duration";
@@ -563,9 +566,12 @@ impl RemoteCacheClient {
                                 "0"
                             },
                         )
-                        .body(Body::wrap_stream(tokio_util::io::ReaderStream::new(
-                            tokio::fs::File::from_std(body_file),
-                        )));
+                        .body(Body::wrap_stream(
+                            tokio_util::io::ReaderStream::with_capacity(
+                                tokio::fs::File::from_std(body_file),
+                                UPLOAD_READ_BYTES,
+                            ),
+                        ));
 
                     if let Some(tag) = digests.hmac_tag.as_deref() {
                         request = request.header(ARTIFACT_TAG_HEADER, tag);
@@ -815,40 +821,14 @@ impl RemoteCacheClient {
     }
 }
 
-fn decode_remote_status_body(
-    mut response: impl Read,
-    content_length: Option<u64>,
-) -> Result<serde_json::Value, String> {
-    if content_length.is_some_and(|length| length > MAX_REMOTE_STATUS_BYTES) {
-        return Err(format!(
-            "remote cache status response exceeds the {} limit",
-            format_bytes(MAX_REMOTE_STATUS_BYTES)
-        ));
-    }
-    let initial_capacity = content_length.unwrap_or(0).min(MAX_REMOTE_STATUS_BYTES) as usize;
-    let mut bytes = Vec::with_capacity(initial_capacity);
-    response
-        .by_ref()
-        .take(MAX_REMOTE_STATUS_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("failed to read remote cache status response: {error}"))?;
-    if bytes.len() as u64 > MAX_REMOTE_STATUS_BYTES {
-        return Err(format!(
-            "remote cache status response exceeds the {} limit",
-            format_bytes(MAX_REMOTE_STATUS_BYTES)
-        ));
-    }
-    serde_json::from_slice(&bytes)
-        .map_err(|error| format!("remote cache status returned invalid JSON: {error}"))
-}
-
-/// Read a status or error body, bounded like [`decode_remote_status_body`].
+/// Read a status or error body of at most `MAX_REMOTE_STATUS_BYTES`.
 async fn read_remote_status_body(
     mut response: reqwest::Response,
 ) -> Result<serde_json::Value, String> {
+    let limit = MAX_REMOTE_STATUS_BYTES as usize;
     let content_length = response.content_length();
     if content_length.is_some_and(|length| length > MAX_REMOTE_STATUS_BYTES) {
-        return decode_remote_status_body(std::io::empty(), content_length);
+        return Err(status_body_too_large());
     }
     let mut bytes = Vec::with_capacity(content_length.unwrap_or(0) as usize);
     while let Some(chunk) = response
@@ -856,12 +836,20 @@ async fn read_remote_status_body(
         .await
         .map_err(|error| format!("failed to read remote cache status response: {error}"))?
     {
-        bytes.extend_from_slice(&chunk);
-        if bytes.len() as u64 > MAX_REMOTE_STATUS_BYTES {
-            break;
+        if bytes.len() + chunk.len() > limit {
+            return Err(status_body_too_large());
         }
+        bytes.extend_from_slice(&chunk);
     }
-    decode_remote_status_body(std::io::Cursor::new(bytes), None)
+    serde_json::from_slice(&bytes)
+        .map_err(|error| format!("remote cache status returned invalid JSON: {error}"))
+}
+
+fn status_body_too_large() -> String {
+    format!(
+        "remote cache status response exceeds the {} limit",
+        format_bytes(MAX_REMOTE_STATUS_BYTES)
+    )
 }
 
 async fn remote_cache_http_error(response: reqwest::Response, operation: &str) -> String {
@@ -1283,8 +1271,44 @@ mod tests {
         }
     }
 
-    #[test]
-    fn remote_status_body_accepts_valid_json_at_the_exact_size_limit() {
+    /// A response whose body arrives as the given chunks, without a
+    /// `Content-Length`.
+    async fn chunked_status_response(chunks: Vec<Vec<u8>>) -> reqwest::Response {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut line = String::new();
+            while socket.read_line(&mut line).await.unwrap() > 2 {
+                line.clear();
+            }
+            let socket = socket.get_mut();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .await
+                .unwrap();
+            for chunk in chunks {
+                socket
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .unwrap();
+                socket.write_all(&chunk).await.unwrap();
+                socket.write_all(b"\r\n").await.unwrap();
+            }
+            socket.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+        reqwest::Client::new()
+            .get(format!("http://{address}/status"))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn remote_status_body_accepts_valid_json_at_the_exact_size_limit() {
         let prefix = br#"{"padding":""#;
         let suffix = br#""}"#;
         let padding = MAX_REMOTE_STATUS_BYTES as usize - prefix.len() - suffix.len();
@@ -1292,21 +1316,24 @@ mod tests {
         body.extend_from_slice(prefix);
         body.resize(body.len() + padding, b'x');
         body.extend_from_slice(suffix);
+        let chunks = body.chunks(16 * 1024).map(<[u8]>::to_vec).collect();
 
-        let decoded =
-            decode_remote_status_body(std::io::Cursor::new(body), Some(MAX_REMOTE_STATUS_BYTES))
-                .unwrap();
+        let decoded = read_remote_status_body(chunked_status_response(chunks).await)
+            .await
+            .unwrap();
 
         assert_eq!(decoded["padding"].as_str().unwrap().len(), padding);
     }
 
-    #[test]
-    fn remote_status_body_rejects_chunked_content_past_the_size_limit() {
-        let body = vec![b'x'; MAX_REMOTE_STATUS_BYTES as usize + 1];
+    #[tokio::test]
+    async fn remote_status_body_rejects_a_chunk_that_crosses_the_size_limit() {
+        let chunks = vec![b"{".to_vec(), vec![b'x'; MAX_REMOTE_STATUS_BYTES as usize]];
 
-        let error = decode_remote_status_body(std::io::Cursor::new(body), None).unwrap_err();
+        let error = read_remote_status_body(chunked_status_response(chunks).await)
+            .await
+            .unwrap_err();
 
-        assert!(error.contains("exceeds"));
+        assert!(error.contains("exceeds"), "{error}");
     }
 
     #[test]
