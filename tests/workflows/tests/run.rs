@@ -34,7 +34,7 @@ fn run_validates_every_requested_task_before_starting_any_task() {
 #[test]
 fn run_stops_before_lifecycle_hooks_when_linked_env_secrets_cannot_be_read() {
     let project = TempProject::empty(
-        r#"{"name":"env-read-denial","scripts":{"prebuild":"node record.js pre","build":"node record.js main","postbuild":"node record.js post"}}"#,
+        r#"{"name":"env-read-denial","scripts":{"prebuild":"node record.js pre","build":"node record.js main","postbuild":"node record.js post","second":"node record.js second"}}"#,
     );
     let project_id = "cli-approval-fixture";
     project.write_file(
@@ -69,7 +69,7 @@ fn run_stops_before_lifecycle_hooks_when_linked_env_secrets_cannot_be_read() {
         &["--no-env-check"][..],
     ] {
         let output = lpm(&project)
-            .args(["run", "build"])
+            .args(["run", "build", "second"])
             .args(flags)
             .output()
             .expect("run with unreadable secrets");
@@ -88,12 +88,179 @@ fn run_stops_before_lifecycle_hooks_when_linked_env_secrets_cannot_be_read() {
                 "env access failure must explain the schema-only flag: {stderr}"
             );
         }
-        for phase in ["pre", "main", "post"] {
+        for phase in ["pre", "main", "post", "second"] {
             assert!(
                 !project.file_exists(&format!("{phase}-ran")),
                 "{phase} executed after secret retrieval failed: {flags:?}"
             );
         }
+    }
+}
+
+#[test]
+fn env_denial_emits_one_failed_json_envelope() {
+    for flags in [&[][..], &["--parallel"][..], &["--stream"][..]] {
+        let project = TempProject::empty(
+            r#"{"name":"env-denial-json","scripts":{"first":"echo first","second":"echo second"}}"#,
+        );
+        project.write_file("lpm.json", r#"{"vault":"json-denied"}"#);
+        assert!(
+            lpm(&project)
+                .args(["env", "set", "TOKEN=synthetic"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        std::fs::write(
+            project.home().join(".lpm/vaults/json-denied.enc"),
+            "invalid-encrypted-fixture",
+        )
+        .unwrap();
+        let output = lpm(&project)
+            .args(["run", "first", "second", "--json", "--no-cache"])
+            .args(flags)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let json: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "env denial emitted invalid JSON: {error}; {}",
+                    String::from_utf8_lossy(&output.stdout)
+                )
+            });
+        assert_eq!(json["success"], false);
+    }
+}
+
+#[test]
+fn late_env_denial_during_cache_publication_never_reports_success() {
+    for flags in [&[][..], &["--json"][..], &["--parallel", "--stream"][..]] {
+        let project = TempProject::empty(
+            r#"{"name":"cache-env-denial","scripts":{"build":"node build.js"}}"#,
+        );
+        project.write_file("lpm.json", r#"{"vault":"cache-denied","tasks":{"build":{"cache":true,"cacheEnv":[],"inputs":["build.js"],"outputs":["dist/**"]}}}"#);
+        let record = project.home().join(".lpm/vaults/cache-denied.enc");
+        project.write_file("build.js", &format!("const fs=require('fs');fs.mkdirSync('dist',{{recursive:true}});fs.writeFileSync('dist/result','ok');fs.writeFileSync({},'invalid-encrypted-fixture');",serde_json::to_string(&record.to_string_lossy()).unwrap()));
+        assert!(
+            lpm(&project)
+                .args(["env", "set", "TOKEN=synthetic"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let output = lpm(&project)
+            .args(["run", "build"])
+            .args(flags)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "cache reread denial must fail the run"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains(" · success") && !stderr.contains("1 completed"),
+            "success was reported after env denial: {stderr}"
+        );
+        if flags.contains(&"--json") {
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(json["success"], false);
+        }
+    }
+}
+
+#[test]
+fn workspace_env_denial_stops_later_members_even_with_no_bail() {
+    for flags in [&[][..], &["--parallel", "--stream"][..]] {
+        let project =
+            TempProject::empty(r#"{"name":"env-denial-workspace","workspaces":["packages/*"]}"#);
+        for name in ["a", "b"] {
+            project.write_file(&format!("packages/{name}/package.json"),
+                &serde_json::json!({"name":name,"scripts":{"prebuild":"node record.js pre","build":"node record.js main","postbuild":"node record.js post"}}).to_string());
+            project.write_file(
+                &format!("packages/{name}/record.js"),
+                "require('fs').writeFileSync(process.argv[2] + '-ran', 'yes');",
+            );
+        }
+        project.write_file("packages/a/lpm.json", r#"{"vault":"workspace-denied"}"#);
+        let denied_dir = project.path().join("packages/a");
+        let seed = lpm(&project)
+            .current_dir(&denied_dir)
+            .args(["env", "set", "TOKEN=synthetic"])
+            .output()
+            .unwrap();
+        assert!(
+            seed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&seed.stderr)
+        );
+        std::fs::write(
+            project.home().join(".lpm/vaults/workspace-denied.enc"),
+            "invalid-encrypted-fixture",
+        )
+        .unwrap();
+        let output = lpm(&project)
+            .args([
+                "run",
+                "build",
+                "--all",
+                "--workspace-concurrency",
+                "1",
+                "--no-bail",
+                "--no-cache",
+            ])
+            .args(flags)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        for name in ["a", "b"] {
+            for phase in ["pre", "main", "post"] {
+                assert!(
+                    !project.file_exists(&format!("packages/{name}/{phase}-ran")),
+                    "{name}/{phase} ran after env denial: {flags:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn watch_exits_without_hooks_when_linked_env_retrieval_is_denied() {
+    for task in ["build", "entry.js"] {
+        let project = TempProject::empty(
+            r#"{"name":"env-denial-watch","scripts":{"prebuild":"node record.js","build":"node record.js","postbuild":"node record.js"}}"#,
+        );
+        project.write_file("lpm.json", r#"{"vault":"watch-denied"}"#);
+        project.write_file("record.js", "require('fs').writeFileSync('ran', 'yes');");
+        project.write_file("entry.js", "require('fs').writeFileSync('ran', 'yes');");
+        let seed = lpm(&project)
+            .args(["env", "set", "TOKEN=synthetic"])
+            .output()
+            .unwrap();
+        assert!(seed.status.success());
+        std::fs::write(
+            project.home().join(".lpm/vaults/watch-denied.enc"),
+            "invalid-encrypted-fixture",
+        )
+        .unwrap();
+        let mut watcher = TaskWatcher::start(&project, task, &["--no-bail"]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = watcher.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watch remained active after env denial: {}",
+                std::fs::read_to_string(&watcher.diagnostics).unwrap_or_default()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(!status.success());
+        assert!(!project.file_exists("ran"));
     }
 }
 

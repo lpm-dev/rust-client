@@ -91,6 +91,8 @@ pub(crate) async fn run_with_reserved_stdout(
     session: Option<Arc<lpm_auth::SessionManager>>,
     reserve_stdout: bool,
 ) -> Result<(), LpmError> {
+    let env_access = lpm_runner::env_access::EnvAccessScope::current_or_new();
+    let _env_access_binding = env_access.bind();
     // Read lpm.json once so the cache lookup and task predicate share the same config.
     let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
     let command = script_command_for_display(project_dir, script_name, lpm_config.as_ref())?;
@@ -115,6 +117,7 @@ pub(crate) async fn run_with_reserved_stdout(
         .transpose()?
         .flatten()
     {
+        env_access.check()?;
         // Cache hit — replay output
         if !hit.stdout.is_empty() {
             if reserve_stdout {
@@ -184,6 +187,7 @@ pub(crate) async fn run_with_reserved_stdout(
         lpm_runner::script::run_script(project_dir, script_name, extra_args, env_mode, bin_hint)?;
     }
 
+    env_access.check()?;
     install_ui::done_line(crate::install_ui::terminal_line!(
         "{} · success in {}",
         install_ui::yellow(script_name),
@@ -216,7 +220,9 @@ pub fn run_watch(
     let args = extra_args.to_vec();
     let mode = env_mode.map(str::to_string);
     let dir = project_dir.to_path_buf();
-    lpm_task::watch::watch_and_run_with_filter(
+    let env_access = lpm_runner::env_access::EnvAccessScope::default();
+    let cycle_env_access = env_access.clone();
+    lpm_task::watch::watch_and_run_until(
         project_dir,
         Box::new(move || {
             let mut stderr = std::io::stderr();
@@ -224,7 +230,7 @@ pub fn run_watch(
                 let _ = write!(stderr, "\x1B[2J\x1B[1;1H");
                 let _ = stderr.flush();
             }
-            let result = (|| {
+            let result = cycle_env_access.run(|| {
                 let plan =
                     super::prepare_single_package_task_plan(&dir, std::slice::from_ref(&script))?;
                 cycle_filter.replace(task_watch_filter(&dir, &plan)?);
@@ -244,7 +250,7 @@ pub fn run_watch(
                     None,
                 )?
                 .into_result()
-            })();
+            });
             match result {
                 Ok(()) => install_ui::done_line(crate::install_ui::terminal_line!(
                     "{} completed. Waiting for changes...",
@@ -261,9 +267,10 @@ pub fn run_watch(
             }
         }),
         filter,
-        None,
+        || env_access.check().is_err(),
     )
-    .map_err(|error| LpmError::Script(format!("watch error: {error}")))
+    .map_err(|error| LpmError::Script(format!("watch error: {error}")))?;
+    env_access.check()
 }
 
 fn task_watch_filter(
@@ -388,6 +395,8 @@ pub async fn run_file_watch(
     let file = file_path.to_string();
     let watched_file = plan.resolved_path.clone();
     let plan_for_watch = plan;
+    let env_access = lpm_runner::env_access::EnvAccessScope::default();
+    let cycle_env_access = env_access.clone();
 
     lpm_task::watch::watch_file_and_run(
         &watched_file,
@@ -405,11 +414,13 @@ pub async fn run_file_watch(
             ));
             let start = std::time::Instant::now();
 
-            match lpm_runner::exec::execute_exec_plan_with_signals(
-                &dir,
-                &plan_for_watch,
-                &run_signals,
-            ) {
+            match cycle_env_access.run(|| {
+                lpm_runner::exec::execute_exec_plan_with_signals(
+                    &dir,
+                    &plan_for_watch,
+                    &run_signals,
+                )
+            }) {
                 Ok(()) => {
                     install_ui::done_line(crate::install_ui::terminal_line!(
                         "{} completed in {}. Waiting for changes...",
@@ -427,10 +438,11 @@ pub async fn run_file_watch(
                 }
             }
         }),
-        || signals.is_stopped(),
+        || signals.is_stopped() || env_access.check().is_err(),
     )
     .map_err(|e| LpmError::Script(format!("watch error: {e}")))?;
 
+    env_access.check()?;
     signals.check()
 }
 

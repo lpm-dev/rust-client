@@ -89,13 +89,24 @@ impl CaptureSession {
         &mut self,
         command: &mut Command,
         stream_limit: usize,
+        cancellation_signal: impl FnMut(u32) -> Option<i32>,
+    ) -> io::Result<Output> {
+        self.capture_output_with_spawn(command, stream_limit, cancellation_signal, Command::spawn)
+    }
+
+    /// Capture output while allowing the caller to authorize only process creation.
+    pub fn capture_output_with_spawn(
+        &mut self,
+        command: &mut Command,
+        stream_limit: usize,
         mut cancellation_signal: impl FnMut(u32) -> Option<i32>,
+        spawn: impl FnOnce(&mut Command) -> io::Result<Child>,
     ) -> io::Result<Output> {
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut process = Probe::spawn(command)?;
+        let mut process = Probe::spawn_with(command, spawn)?;
         let mut stdout_pipe = process
             .child
             .stdout
@@ -265,6 +276,13 @@ struct Probe {
 
 impl Probe {
     fn spawn(command: &mut Command) -> io::Result<Self> {
+        Self::spawn_with(command, Command::spawn)
+    }
+
+    fn spawn_with(
+        command: &mut Command,
+        spawn: impl FnOnce(&mut Command) -> io::Result<Child>,
+    ) -> io::Result<Self> {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -277,7 +295,7 @@ impl Probe {
             command.creation_flags(CREATE_SUSPENDED);
         }
         let probe = Self {
-            child: command.spawn()?,
+            child: spawn(command)?,
             reaped: false,
             #[cfg(windows)]
             job: None,

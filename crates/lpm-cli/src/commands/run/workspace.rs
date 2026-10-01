@@ -552,6 +552,8 @@ pub async fn run_workspace(
     let mut completed_task_states: Vec<Option<HashMap<String, bool>>> =
         (0..ws_graph.members.len()).map(|_| None).collect();
 
+    let env_access = lpm_runner::env_access::EnvAccessScope::current_or_new();
+
     // Run workspace levels sequentially (respects inter-package deps),
     // packages within each level in parallel.
     for level in &levels {
@@ -587,23 +589,25 @@ pub async fn run_workspace(
             );
             let initially_failed_tasks =
                 blocked_workspace_tasks(member_task_plan, &completed_task_states);
-            let report = run_workspace_package(
-                &ws_graph.members[idx].path,
-                workspace_contract.as_ref(),
-                &ws_graph.members[idx].name,
-                extra_args,
-                env_mode,
-                no_cache,
-                parallel,
-                continue_on_error,
-                stream,
-                json_output,
-                member_runtime_hints[idx].as_ref(),
-                member_task_plan,
-                &workspace_dependency_identities,
-                &initially_failed_tasks,
-                session.clone(),
-            )?;
+            let report = env_access.run(|| {
+                run_workspace_package(
+                    &ws_graph.members[idx].path,
+                    workspace_contract.as_ref(),
+                    &ws_graph.members[idx].name,
+                    extra_args,
+                    env_mode,
+                    no_cache,
+                    parallel,
+                    continue_on_error,
+                    stream,
+                    json_output,
+                    member_runtime_hints[idx].as_ref(),
+                    member_task_plan,
+                    &workspace_dependency_identities,
+                    &initially_failed_tasks,
+                    session.clone(),
+                )
+            })?;
             if !no_cache {
                 completed_task_identities[idx] = Some(required_cache_identities(
                     &report,
@@ -650,7 +654,9 @@ pub async fn run_workspace(
                             &completed_task_states,
                         );
 
+                        let worker_env_access = env_access.clone();
                         Ok((idx, scope.spawn(move || -> Result<_, LpmError> {
+                            worker_env_access.run(|| {
                             let report = run_workspace_package(
                                 &member_dir,
                                 workspace_contract.as_ref(),
@@ -677,6 +683,7 @@ pub async fn run_workspace(
                                 None
                             };
                             Ok((report, identities))
+                            })
                         })))
                     })
                     .collect::<Result<_, _>>()?;

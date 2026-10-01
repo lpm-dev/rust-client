@@ -64,8 +64,10 @@ impl ExecutionSignals {
         self.check()?;
         #[cfg(unix)]
         let mut stopped_descendants = None;
-        let result =
-            session.capture_output(command, lpm_common::TASK_OUTPUT_CAPTURE_BYTES + 1, |_pid| {
+        let result = session.capture_output_with_spawn(
+            command,
+            lpm_common::TASK_OUTPUT_CAPTURE_BYTES + 1,
+            |_pid| {
                 let signal = self.signal.load(Ordering::Acquire) as i32;
                 if signal == 0 {
                     return None;
@@ -77,7 +79,9 @@ impl ExecutionSignals {
                     stopped_descendants = Some((_pid, snapshot));
                 }
                 Some(signal)
-            });
+            },
+            crate::env_access::spawn,
+        );
         #[cfg(unix)]
         if let Some((pid, snapshot)) = stopped_descendants {
             snapshot.signal_surviving_descendants(pid, libc::SIGKILL);
@@ -124,7 +128,7 @@ impl ExecutionSignals {
         // leaves a wakeup behind.
         #[cfg(unix)]
         let wake = ChildOrStopWake::new()?;
-        let mut child = command.spawn()?;
+        let mut child = crate::env_access::spawn(command)?;
         #[cfg(not(unix))]
         let started = std::time::Instant::now();
         loop {

@@ -67,6 +67,8 @@ pub(super) fn run_tasks_parallel(
     initially_failed_tasks: &HashSet<String>,
     session: Option<Arc<lpm_auth::SessionManager>>,
 ) -> Result<TaskRunReport, LpmError> {
+    let env_access = lpm_runner::env_access::EnvAccessScope::current_or_new();
+    let _env_access_binding = env_access.bind();
     let json_output = output_policy.reserve_stdout;
     let total_start = std::time::Instant::now();
     let mut all_results: Vec<TaskResult> = Vec::new();
@@ -258,6 +260,7 @@ pub(super) fn run_tasks_parallel(
                         {
                             cache_identities.insert(task_name.clone(), identity);
                         }
+                        env_access.check()?;
                         all_results.push(TaskResult {
                             name: task_name.clone(),
                             success: true,
@@ -370,7 +373,10 @@ pub(super) fn run_tasks_parallel(
                             )
                         };
 
+                        let worker_env_access = env_access.clone();
                         std::thread::spawn(move || -> TaskWorkerResult {
+                            let _worker_env_access_binding = worker_env_access.bind();
+                            worker_env_access.check()?;
                             let start = std::time::Instant::now();
 
                             // Meta-task — skip execution
@@ -512,6 +518,7 @@ pub(super) fn run_tasks_parallel(
                                     } else {
                                         None
                                     };
+                                    worker_env_access.check()?;
                                     Ok((
                                         TaskResult {
                                             name,
@@ -665,6 +672,7 @@ pub(super) fn run_tasks_parallel(
         }
     }
 
+    env_access.check()?;
     print_results_summary(&all_results, total_start.elapsed());
 
     if output_policy.report_json {
