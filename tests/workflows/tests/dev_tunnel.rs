@@ -367,6 +367,7 @@ fn dev_help_emits_command_usage_and_flags() {
 fn dev_human_output_suppresses_nested_install_chatter_and_legacy_glyphs() {
     let project =
         TempProject::empty(r#"{"name":"dev-output","version":"1.0.0","dependencies":{}}"#);
+    project.write_file("node_modules/stale-install-marker", "");
     project.write_file(
         "output-server.js",
         r#"

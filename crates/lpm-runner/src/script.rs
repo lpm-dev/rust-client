@@ -1659,9 +1659,9 @@ fn resolve_script_command_with_config(
             .unwrap_or_default();
 
         if lpm_tasks.is_empty() {
-            Err(LpmError::Script(
-                "no package.json or lpm.json with tasks found in current directory".into(),
-            ))
+            Err(LpmError::Script(format!(
+                "no '{script_name}' command configured; add scripts.{script_name} to package.json or tasks.{script_name}.command to lpm.json"
+            )))
         } else {
             Err(script_not_found_error(script_name, &lpm_tasks))
         }

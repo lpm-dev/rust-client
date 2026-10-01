@@ -492,7 +492,9 @@ pub enum LpmError {
     #[error("script error: {0}")]
     #[diagnostic(
         code(lpm::script),
-        help("Check your package.json scripts section. Run `lpm run` to list available scripts.")
+        help(
+            "Check package.json scripts or lpm.json tasks. Run `lpm run` to list available commands."
+        )
     )]
     Script(String),
 
