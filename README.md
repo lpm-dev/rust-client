@@ -40,7 +40,7 @@ In LPM Vault, select a project. Use **CLI approval** beside **All variables**:
 - **Off:** `lpm run` injects the linked project's env values automatically.
 - **On:** Keychain requires Touch ID or your Mac login password before it releases the project's env values. If authentication fails or you cancel it, LPM stops before it runs lifecycle hooks or the main script.
 
-The setting applies to every environment in that project on this Mac. Existing `lpm.json` project links still work. The app requires authentication to change the setting. The app's **Lock** button remains separate and does not change CLI approval.
+The setting applies to every environment in that project on this Mac. Existing `lpm.json` project links still work. The sidebar shows a folder for automatic access and a lock for required approval. Change the setting while the app is unlocked; no extra authentication prompt appears. The app's **Lock** button remains separate and does not change CLI approval.
 
 Approval also protects other CLI commands that read the project's secrets. It controls secret retrieval. Processes that already received values retain them until they exit.
 
