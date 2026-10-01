@@ -32,6 +32,56 @@ fn run_validates_every_requested_task_before_starting_any_task() {
 }
 
 #[test]
+fn run_stops_before_lifecycle_hooks_when_linked_env_secrets_cannot_be_read() {
+    let project = TempProject::empty(
+        r#"{"name":"env-read-denial","scripts":{"prebuild":"node record.js pre","build":"node record.js main","postbuild":"node record.js post"}}"#,
+    );
+    let project_id = "cli-approval-fixture";
+    project.write_file(
+        "lpm.json",
+        &serde_json::json!({"vault":project_id}).to_string(),
+    );
+    project.write_file(
+        "record.js",
+        "require('fs').writeFileSync(process.argv[2] + '-ran', 'yes');",
+    );
+    let seed = lpm(&project)
+        .args(["env", "set", "TOKEN=synthetic-fixture"])
+        .output()
+        .expect("create isolated env fixture");
+    assert!(
+        seed.status.success(),
+        "fixture setup failed: {}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    std::fs::write(
+        project
+            .home()
+            .join(".lpm/vaults")
+            .join(format!("{project_id}.enc")),
+        "invalid-encrypted-fixture",
+    )
+    .expect("make the isolated env record unreadable");
+    for flags in [&[][..], &["--parallel"][..], &["--stream"][..]] {
+        let output = lpm(&project)
+            .args(["run", "build"])
+            .args(flags)
+            .output()
+            .expect("run with unreadable secrets");
+        assert!(
+            !output.status.success(),
+            "secret retrieval failure must stop execution: {flags:?}"
+        );
+        for phase in ["pre", "main", "post"] {
+            assert!(
+                !project.file_exists(&format!("{phase}-ran")),
+                "{phase} executed after secret retrieval failed: {flags:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn run_rejects_upstream_dependencies_without_workspace_selection() {
     for dependency in ["^", "^^build", "^build"] {
         for flags in [

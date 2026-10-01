@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use crate::macos_keychain::{
     delete as delete_keychain_password, read_string as try_read_keychain_password,
     with_keychain_transaction as with_raw_keychain_transaction,
-    write_string as write_keychain_password,
+    write_string as write_keychain_password, write_string_with_access_from,
 };
 
 type SecretMap = HashMap<String, String>;
@@ -238,6 +238,15 @@ trait ProjectStorage {
         }
         Ok(())
     }
+
+    fn write_verified_with_access_from(
+        &mut self,
+        account: &str,
+        value: &str,
+        _source: &str,
+    ) -> Result<(), String> {
+        self.write_verified(account, value)
+    }
 }
 
 fn with_keychain_transaction<T>(
@@ -266,6 +275,15 @@ impl ProjectStorage for KeychainProjectStorage {
 
     fn write_verified(&mut self, account: &str, value: &str) -> Result<(), String> {
         write_keychain_password(SERVICE, account, value)
+    }
+
+    fn write_verified_with_access_from(
+        &mut self,
+        account: &str,
+        value: &str,
+        source: &str,
+    ) -> Result<(), String> {
+        write_string_with_access_from(SERVICE, account, value, source)
     }
 
     fn delete(&mut self, account: &str) -> Result<bool, String> {
@@ -358,7 +376,11 @@ fn apply_project_transaction_after_recovery(
                     .staged_account
                     .as_deref()
                     .ok_or_else(|| "vault transaction write stage is missing".to_owned())?;
-                write_verified(storage, staged_account, value)?;
+                storage.write_verified_with_access_from(
+                    staged_account,
+                    value,
+                    &operation.target_account,
+                )?;
             }
         }
 
@@ -484,10 +506,24 @@ fn roll_forward_prepared_project_transaction(
         }
         match (operation.action.as_str(), mutation) {
             ("write", ProjectStorageMutation::Write { value, .. }) => {
-                write_verified(storage, &operation.target_account, value)?;
+                storage.write_verified_with_access_from(
+                    &operation.target_account,
+                    value,
+                    operation
+                        .staged_account
+                        .as_deref()
+                        .ok_or_else(|| "vault transaction stage is missing".to_owned())?,
+                )?;
             }
             ("write", ProjectStorageMutation::ValidatedVaultWrite(payload)) => {
-                write_verified(storage, &operation.target_account, payload.encoded())?;
+                storage.write_verified_with_access_from(
+                    &operation.target_account,
+                    payload.encoded(),
+                    operation
+                        .staged_account
+                        .as_deref()
+                        .ok_or_else(|| "vault transaction stage is missing".to_owned())?,
+                )?;
             }
             ("delete", ProjectStorageMutation::Delete { .. }) => {
                 delete_verified(storage, &operation.target_account)?;
@@ -520,7 +556,11 @@ fn roll_forward_persisted_project_transaction(
                         return Err("vault transaction stage is invalid".to_owned());
                     }
                     validate_transaction_target(&operation.target_account, Some(&value))?;
-                    write_verified(storage, &operation.target_account, &value)?;
+                    storage.write_verified_with_access_from(
+                        &operation.target_account,
+                        &value,
+                        stage,
+                    )?;
                 } else {
                     let target = storage.read(&operation.target_account)?.ok_or_else(|| {
                         "committed vault transaction lost both stage and target".to_owned()
@@ -1798,6 +1838,8 @@ mod tests {
 
     #[derive(Default)]
     struct MemoryProjectStorage {
+        access_sources: Vec<(String, String)>,
+        rejected_access_sources: HashSet<String>,
         values: HashMap<String, String>,
         reads: HashMap<String, usize>,
         writes: HashMap<String, usize>,
@@ -1813,6 +1855,19 @@ mod tests {
     }
 
     impl ProjectStorage for MemoryProjectStorage {
+        fn write_verified_with_access_from(
+            &mut self,
+            account: &str,
+            value: &str,
+            source: &str,
+        ) -> Result<(), String> {
+            if self.rejected_access_sources.contains(source) {
+                return Err("env access approval was cancelled".to_owned());
+            }
+            self.access_sources
+                .push((account.to_owned(), source.to_owned()));
+            self.write_verified(account, value)
+        }
         fn read(&mut self, account: &str) -> Result<Option<String>, String> {
             *self.reads.entry(account.to_owned()).or_default() += 1;
             if account == TRANSACTION_MARKER_ACCOUNT
@@ -2084,6 +2139,64 @@ mod tests {
         assert_eq!(
             storage.values.get("vault").map(String::as_str),
             Some(payload)
+        );
+    }
+
+    #[test]
+    fn project_updates_copy_access_control_to_staging_and_back_to_the_live_record() {
+        let mut storage = MemoryProjectStorage::default();
+        apply_project_transaction(
+            &mut storage,
+            vec![ProjectStorageMutation::Write {
+                account: "vault".to_owned(),
+                value: r#"{"environments":{"default":{"TOKEN":"fixture"}}}"#.to_owned(),
+            }],
+        )
+        .expect("project update should succeed");
+        let [(stage, source), (target, stage_source)] = storage.access_sources.as_slice() else {
+            panic!("expected exactly one staged write and one live write");
+        };
+        assert!(stage.starts_with(TRANSACTION_STAGE_PREFIX));
+        assert_eq!(source, "vault");
+        assert_eq!(target, "vault");
+        assert_eq!(stage_source, stage);
+    }
+
+    #[test]
+    fn committed_recovery_restores_access_control_from_the_stage_when_the_target_is_absent() {
+        let mut storage = MemoryProjectStorage::default();
+        seed_committed_payload_recovery(
+            &mut storage,
+            "vault",
+            r#"{"environments":{"default":{"TOKEN":"fixture"}}}"#,
+        );
+        recover_project_transaction(&mut storage).expect("committed update should recover");
+        let [(target, source)] = storage.access_sources.as_slice() else {
+            panic!("expected one recovered protected write");
+        };
+        assert_eq!(target, "vault");
+        assert!(source.starts_with(TRANSACTION_STAGE_PREFIX));
+    }
+
+    #[test]
+    fn denied_access_control_copy_leaves_the_original_project_and_no_staged_secret() {
+        let original = r#"{"environments":{"default":{"TOKEN":"original"}}}"#;
+        let mut storage = MemoryProjectStorage::default();
+        storage
+            .values
+            .insert("vault".to_owned(), original.to_owned());
+        storage.rejected_access_sources.insert("vault".to_owned());
+        apply_project_transaction(
+            &mut storage,
+            vec![ProjectStorageMutation::Write {
+                account: "vault".to_owned(),
+                value: r#"{"environments":{"default":{"TOKEN":"replacement"}}}"#.to_owned(),
+            }],
+        )
+        .expect_err("cancelled approval must abort the update");
+        assert_eq!(
+            storage.values,
+            HashMap::from([("vault".to_owned(), original.to_owned())])
         );
     }
 
