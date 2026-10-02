@@ -1,0 +1,2843 @@
+{
+  "environment": {
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "python": "3.14.6",
+    "logical_cpu_count": 18,
+    "node": "v24.19.0",
+    "samples_per_binary_per_state": 20,
+    "fixture_modules": 400,
+    "source_bytes": 3180084,
+    "esbuild": "0.25.12"
+  },
+  "summary": {
+    "default-local": {
+      "before": {
+        "median_ms": 114.0642914979253,
+        "median_rss_bytes": 21282816.0,
+        "executions": 0,
+        "iqr_ms": [
+          109.3051877542166,
+          128.05390625726432
+        ]
+      },
+      "after": {
+        "median_ms": 113.21018799208105,
+        "median_rss_bytes": 21471232.0,
+        "executions": 0,
+        "iqr_ms": [
+          108.81455224443926,
+          120.65520850592293
+        ]
+      }
+    },
+    "portable-local": {
+      "before": {
+        "median_ms": 113.47358299826737,
+        "median_rss_bytes": 21250048.0,
+        "executions": 0,
+        "iqr_ms": [
+          107.91089623671724,
+          121.61473975720583
+        ]
+      },
+      "after": {
+        "median_ms": 115.31277099857107,
+        "median_rss_bytes": 21512192.0,
+        "executions": 0,
+        "iqr_ms": [
+          109.33420874061994,
+          121.47310399450362
+        ]
+      }
+    },
+    "portable-remote": {
+      "before": {
+        "median_ms": 297.687666490674,
+        "median_rss_bytes": 67952640.0,
+        "executions": 20,
+        "iqr_ms": [
+          281.90586451091804,
+          318.36389549425803
+        ]
+      },
+      "after": {
+        "median_ms": 169.66495849192142,
+        "median_rss_bytes": 25010176.0,
+        "executions": 0,
+        "iqr_ms": [
+          151.44263549882453,
+          189.26937500509666
+        ]
+      }
+    },
+    "portable-remote-cold-digest": {
+      "before": {
+        "median_ms": 300.64202049106825,
+        "median_rss_bytes": 68018176.0,
+        "executions": 20,
+        "iqr_ms": [
+          281.17372877022717,
+          322.5978752525407
+        ]
+      },
+      "after": {
+        "median_ms": 247.01900000218302,
+        "median_rss_bytes": 25100288.0,
+        "executions": 0,
+        "iqr_ms": [
+          235.4383540005074,
+          258.86757273838157
+        ]
+      }
+    },
+    "portable-cold-digest": {
+      "before": {
+        "median_ms": 117.67114550457336,
+        "median_rss_bytes": 21225472.0,
+        "executions": 0,
+        "iqr_ms": [
+          110.00820799381472,
+          127.03384425549302
+        ]
+      },
+      "after": {
+        "median_ms": 197.99512550525833,
+        "median_rss_bytes": 21676032.0,
+        "executions": 0,
+        "iqr_ms": [
+          193.15215625829296,
+          213.77924951229943
+        ]
+      }
+    },
+    "uncached-build": {
+      "before": {
+        "median_ms": 132.1346250042552,
+        "median_rss_bytes": 67969024.0,
+        "executions": 20,
+        "iqr_ms": [
+          130.30153100407915,
+          141.8244692540611
+        ]
+      },
+      "after": {
+        "median_ms": 135.69695851765573,
+        "median_rss_bytes": 67977216.0,
+        "executions": 20,
+        "iqr_ms": [
+          127.3304377682507,
+          147.08130175131373
+        ]
+      }
+    }
+  },
+  "raw": {
+    "default-local": {
+      "before": [
+        {
+          "ms": 107.70566598512232,
+          "rss_bytes": 21118976,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.19970703125,
+            10.6552734375,
+            11.00341796875
+          ]
+        },
+        {
+          "ms": 117.00583301717415,
+          "rss_bytes": 21282816,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.18359375,
+            10.62744140625,
+            10.9912109375
+          ]
+        },
+        {
+          "ms": 128.9363750256598,
+          "rss_bytes": 21217280,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 122.91879099211656,
+          "rss_bytes": 21299200,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 127.75975000113249,
+          "rss_bytes": 21217280,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.26953125,
+            10.8056640625,
+            11.0498046875
+          ]
+        },
+        {
+          "ms": 180.2535419992637,
+          "rss_bytes": 21299200,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.26953125,
+            10.8056640625,
+            11.0498046875
+          ]
+        },
+        {
+          "ms": 130.21545801893808,
+          "rss_bytes": 21299200,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.24755859375,
+            10.7919921875,
+            11.04345703125
+          ]
+        },
+        {
+          "ms": 111.70437498367392,
+          "rss_bytes": 21233664,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3876953125,
+            10.81201171875,
+            11.048828125
+          ]
+        },
+        {
+          "ms": 120.71454100077972,
+          "rss_bytes": 21266432,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 135.50529201165773,
+          "rss_bytes": 21184512,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 106.50145902764052,
+          "rss_bytes": 21282816,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3212890625,
+            10.78466796875,
+            11.0361328125
+          ]
+        },
+        {
+          "ms": 109.3720420030877,
+          "rss_bytes": 21315584,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3212890625,
+            10.78466796875,
+            11.0361328125
+          ]
+        },
+        {
+          "ms": 128.94287498784252,
+          "rss_bytes": 21315584,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.21533203125,
+            10.7548828125,
+            11.02392578125
+          ]
+        },
+        {
+          "ms": 107.31041600229219,
+          "rss_bytes": 21233664,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.35791015625,
+            10.775390625,
+            11.029296875
+          ]
+        },
+        {
+          "ms": 112.83154200646095,
+          "rss_bytes": 21282816,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3291015625,
+            10.76220703125,
+            11.02294921875
+          ]
+        },
+        {
+          "ms": 114.48374998872168,
+          "rss_bytes": 21266432,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3291015625,
+            10.76220703125,
+            11.02294921875
+          ]
+        },
+        {
+          "ms": 106.93837501457892,
+          "rss_bytes": 21282816,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 109.10462500760332,
+          "rss_bytes": 21315584,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 111.40312501811422,
+          "rss_bytes": 21299200,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3583984375,
+            10.75341796875,
+            11.01611328125
+          ]
+        },
+        {
+          "ms": 113.64483300712891,
+          "rss_bytes": 21266432,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.40966796875,
+            10.75732421875,
+            11.015625
+          ]
+        }
+      ],
+      "after": [
+        {
+          "ms": 119.59054099861532,
+          "rss_bytes": 21479424,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.19970703125,
+            10.6552734375,
+            11.00341796875
+          ]
+        },
+        {
+          "ms": 116.58837500726804,
+          "rss_bytes": 21430272,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.18359375,
+            10.62744140625,
+            10.9912109375
+          ]
+        },
+        {
+          "ms": 120.49112500972115,
+          "rss_bytes": 21413888,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 114.51645899796858,
+          "rss_bytes": 21446656,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 121.14745899452828,
+          "rss_bytes": 21479424,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.26953125,
+            10.8056640625,
+            11.0498046875
+          ]
+        },
+        {
+          "ms": 131.59470801474527,
+          "rss_bytes": 21430272,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.26953125,
+            10.8056640625,
+            11.0498046875
+          ]
+        },
+        {
+          "ms": 131.39008299913257,
+          "rss_bytes": 21364736,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.24755859375,
+            10.7919921875,
+            11.04345703125
+          ]
+        },
+        {
+          "ms": 116.88812499050982,
+          "rss_bytes": 21479424,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3876953125,
+            10.81201171875,
+            11.048828125
+          ]
+        },
+        {
+          "ms": 126.6252500063274,
+          "rss_bytes": 21463040,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 109.97429199051112,
+          "rss_bytes": 21479424,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 105.78566699405201,
+          "rss_bytes": 21544960,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3212890625,
+            10.78466796875,
+            11.0361328125
+          ]
+        },
+        {
+          "ms": 111.44562499248423,
+          "rss_bytes": 21479424,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3212890625,
+            10.78466796875,
+            11.0361328125
+          ]
+        },
+        {
+          "ms": 121.15937500493601,
+          "rss_bytes": 21446656,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.21533203125,
+            10.7548828125,
+            11.02392578125
+          ]
+        },
+        {
+          "ms": 107.3712500219699,
+          "rss_bytes": 21561344,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.35791015625,
+            10.775390625,
+            11.029296875
+          ]
+        },
+        {
+          "ms": 107.34537499956787,
+          "rss_bytes": 21528576,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3291015625,
+            10.76220703125,
+            11.02294921875
+          ]
+        },
+        {
+          "ms": 107.40362500655465,
+          "rss_bytes": 21528576,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3291015625,
+            10.76220703125,
+            11.02294921875
+          ]
+        },
+        {
+          "ms": 110.08008301723748,
+          "rss_bytes": 21528576,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 111.90391698619351,
+          "rss_bytes": 21430272,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 109.18374999891967,
+          "rss_bytes": 21463040,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3583984375,
+            10.75341796875,
+            11.01611328125
+          ]
+        },
+        {
+          "ms": 107.70695898099802,
+          "rss_bytes": 21430272,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.40966796875,
+            10.75732421875,
+            11.015625
+          ]
+        }
+      ]
+    },
+    "portable-local": {
+      "before": [
+        {
+          "ms": 124.95245801983401,
+          "rss_bytes": 21168128,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.19970703125,
+            10.6552734375,
+            11.00341796875
+          ]
+        },
+        {
+          "ms": 116.85866702464409,
+          "rss_bytes": 21168128,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.18359375,
+            10.62744140625,
+            10.9912109375
+          ]
+        },
+        {
+          "ms": 114.32537500513718,
+          "rss_bytes": 21348352,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 125.47641698620282,
+          "rss_bytes": 21266432,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 109.44341699359939,
+          "rss_bytes": 21266432,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.26953125,
+            10.8056640625,
+            11.0498046875
+          ]
+        },
+        {
+          "ms": 106.36945799342357,
+          "rss_bytes": 21184512,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.26953125,
+            10.8056640625,
+            11.0498046875
+          ]
+        },
+        {
+          "ms": 107.1447089780122,
+          "rss_bytes": 21315584,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.24755859375,
+            10.7919921875,
+            11.04345703125
+          ]
+        },
+        {
+          "ms": 120.50216700299643,
+          "rss_bytes": 21233664,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3876953125,
+            10.81201171875,
+            11.048828125
+          ]
+        },
+        {
+          "ms": 128.05008300347254,
+          "rss_bytes": 21168128,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 124.97595898457803,
+          "rss_bytes": 21217280,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 116.16391598363407,
+          "rss_bytes": 21331968,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3212890625,
+            10.78466796875,
+            11.0361328125
+          ]
+        },
+        {
+          "ms": 106.53916699811816,
+          "rss_bytes": 21331968,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.21533203125,
+            10.7548828125,
+            11.02392578125
+          ]
+        },
+        {
+          "ms": 175.51608401117846,
+          "rss_bytes": 21233664,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.21533203125,
+            10.7548828125,
+            11.02392578125
+          ]
+        },
+        {
+          "ms": 114.43395802052692,
+          "rss_bytes": 21217280,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.35791015625,
+            10.775390625,
+            11.029296875
+          ]
+        },
+        {
+          "ms": 104.21312498510815,
+          "rss_bytes": 21282816,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3291015625,
+            10.76220703125,
+            11.02294921875
+          ]
+        },
+        {
+          "ms": 112.62179099139757,
+          "rss_bytes": 21266432,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 108.92100000637583,
+          "rss_bytes": 21282816,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 108.16629198961891,
+          "rss_bytes": 21233664,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 109.05408399412408,
+          "rss_bytes": 21348352,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3583984375,
+            10.75341796875,
+            11.01611328125
+          ]
+        },
+        {
+          "ms": 106.03979098959826,
+          "rss_bytes": 21217280,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.40966796875,
+            10.75732421875,
+            11.015625
+          ]
+        }
+      ],
+      "after": [
+        {
+          "ms": 124.55366700305603,
+          "rss_bytes": 21413888,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.19970703125,
+            10.6552734375,
+            11.00341796875
+          ]
+        },
+        {
+          "ms": 122.10979100200348,
+          "rss_bytes": 21544960,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.18359375,
+            10.62744140625,
+            10.9912109375
+          ]
+        },
+        {
+          "ms": 111.04791701654904,
+          "rss_bytes": 21446656,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 123.07558298925869,
+          "rss_bytes": 21463040,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 120.51212499500252,
+          "rss_bytes": 21479424,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.26953125,
+            10.8056640625,
+            11.0498046875
+          ]
+        },
+        {
+          "ms": 110.29654199955985,
+          "rss_bytes": 21528576,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.26953125,
+            10.8056640625,
+            11.0498046875
+          ]
+        },
+        {
+          "ms": 133.00854197586887,
+          "rss_bytes": 21528576,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.24755859375,
+            10.7919921875,
+            11.04345703125
+          ]
+        },
+        {
+          "ms": 120.98566701752134,
+          "rss_bytes": 21479424,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3876953125,
+            10.81201171875,
+            11.048828125
+          ]
+        },
+        {
+          "ms": 135.30345799517818,
+          "rss_bytes": 21512192,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 121.26087499200366,
+          "rss_bytes": 21561344,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 117.71424999460578,
+          "rss_bytes": 21463040,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3212890625,
+            10.78466796875,
+            11.0361328125
+          ]
+        },
+        {
+          "ms": 119.52087501413189,
+          "rss_bytes": 21430272,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.21533203125,
+            10.7548828125,
+            11.02392578125
+          ]
+        },
+        {
+          "ms": 105.14291701838374,
+          "rss_bytes": 21479424,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.21533203125,
+            10.7548828125,
+            11.02392578125
+          ]
+        },
+        {
+          "ms": 112.91129200253636,
+          "rss_bytes": 21512192,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.35791015625,
+            10.775390625,
+            11.029296875
+          ]
+        },
+        {
+          "ms": 105.74541700771078,
+          "rss_bytes": 21544960,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3291015625,
+            10.76220703125,
+            11.02294921875
+          ]
+        },
+        {
+          "ms": 105.54695798782632,
+          "rss_bytes": 21561344,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 110.91683298582211,
+          "rss_bytes": 21577728,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 107.55145800067112,
+          "rss_bytes": 21528576,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 105.57641598279588,
+          "rss_bytes": 21528576,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3583984375,
+            10.75341796875,
+            11.01611328125
+          ]
+        },
+        {
+          "ms": 109.92845898726955,
+          "rss_bytes": 21446656,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.40966796875,
+            10.75732421875,
+            11.015625
+          ]
+        }
+      ]
+    },
+    "portable-remote": {
+      "before": [
+        {
+          "ms": 288.4812080010306,
+          "rss_bytes": 67682304,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.19970703125,
+            10.6552734375,
+            11.00341796875
+          ]
+        },
+        {
+          "ms": 270.74554201681167,
+          "rss_bytes": 67846144,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.18359375,
+            10.62744140625,
+            10.9912109375
+          ]
+        },
+        {
+          "ms": 284.7122079983819,
+          "rss_bytes": 67878912,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.18359375,
+            10.62744140625,
+            10.9912109375
+          ]
+        },
+        {
+          "ms": 324.8178750218358,
+          "rss_bytes": 67633152,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 339.5896249858197,
+          "rss_bytes": 67977216,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.26953125,
+            10.8056640625,
+            11.0498046875
+          ]
+        },
+        {
+          "ms": 323.1172079977114,
+          "rss_bytes": 67993600,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.24755859375,
+            10.7919921875,
+            11.04345703125
+          ]
+        },
+        {
+          "ms": 340.0500839925371,
+          "rss_bytes": 67960832,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.24755859375,
+            10.7919921875,
+            11.04345703125
+          ]
+        },
+        {
+          "ms": 298.9393750031013,
+          "rss_bytes": 68534272,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3876953125,
+            10.81201171875,
+            11.048828125
+          ]
+        },
+        {
+          "ms": 316.7794579931069,
+          "rss_bytes": 68141056,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3876953125,
+            10.81201171875,
+            11.048828125
+          ]
+        },
+        {
+          "ms": 300.6312090146821,
+          "rss_bytes": 68272128,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3212890625,
+            10.78466796875,
+            11.0361328125
+          ]
+        },
+        {
+          "ms": 299.06420898623765,
+          "rss_bytes": 67960832,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3212890625,
+            10.78466796875,
+            11.0361328125
+          ]
+        },
+        {
+          "ms": 308.518500009086,
+          "rss_bytes": 67862528,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.21533203125,
+            10.7548828125,
+            11.02392578125
+          ]
+        },
+        {
+          "ms": 329.44175001466647,
+          "rss_bytes": 67944448,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.21533203125,
+            10.7548828125,
+            11.02392578125
+          ]
+        },
+        {
+          "ms": 285.67341598682106,
+          "rss_bytes": 67813376,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.35791015625,
+            10.775390625,
+            11.029296875
+          ]
+        },
+        {
+          "ms": 284.0952500118874,
+          "rss_bytes": 68288512,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3291015625,
+            10.76220703125,
+            11.02294921875
+          ]
+        },
+        {
+          "ms": 275.33770800800994,
+          "rss_bytes": 67911680,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 266.27004201873206,
+          "rss_bytes": 67682304,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 296.43595797824673,
+          "rss_bytes": 68435968,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3583984375,
+            10.75341796875,
+            11.01611328125
+          ]
+        },
+        {
+          "ms": 267.3829170234967,
+          "rss_bytes": 67960832,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3583984375,
+            10.75341796875,
+            11.01611328125
+          ]
+        },
+        {
+          "ms": 264.6507500030566,
+          "rss_bytes": 67944448,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.40966796875,
+            10.75732421875,
+            11.015625
+          ]
+        }
+      ],
+      "after": [
+        {
+          "ms": 140.02262501162477,
+          "rss_bytes": 25018368,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.19970703125,
+            10.6552734375,
+            11.00341796875
+          ]
+        },
+        {
+          "ms": 163.83995799697004,
+          "rss_bytes": 24756224,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.18359375,
+            10.62744140625,
+            10.9912109375
+          ]
+        },
+        {
+          "ms": 178.30987498746254,
+          "rss_bytes": 25034752,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.18359375,
+            10.62744140625,
+            10.9912109375
+          ]
+        },
+        {
+          "ms": 216.22899998328649,
+          "rss_bytes": 25001984,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 156.89145799842663,
+          "rss_bytes": 25018368,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.26953125,
+            10.8056640625,
+            11.0498046875
+          ]
+        },
+        {
+          "ms": 169.76245798286982,
+          "rss_bytes": 25083904,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.26953125,
+            10.8056640625,
+            11.0498046875
+          ]
+        },
+        {
+          "ms": 202.32224999926984,
+          "rss_bytes": 25051136,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.24755859375,
+            10.7919921875,
+            11.04345703125
+          ]
+        },
+        {
+          "ms": 169.56745900097303,
+          "rss_bytes": 24920064,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3876953125,
+            10.81201171875,
+            11.048828125
+          ]
+        },
+        {
+          "ms": 201.42554200720042,
+          "rss_bytes": 24969216,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 149.64683400467038,
+          "rss_bytes": 25116672,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3212890625,
+            10.78466796875,
+            11.0361328125
+          ]
+        },
+        {
+          "ms": 189.1216250078287,
+          "rss_bytes": 25018368,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3212890625,
+            10.78466796875,
+            11.0361328125
+          ]
+        },
+        {
+          "ms": 189.71262499690056,
+          "rss_bytes": 25444352,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.21533203125,
+            10.7548828125,
+            11.02392578125
+          ]
+        },
+        {
+          "ms": 193.964666017564,
+          "rss_bytes": 24952832,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.21533203125,
+            10.7548828125,
+            11.02392578125
+          ]
+        },
+        {
+          "ms": 172.2914169949945,
+          "rss_bytes": 24985600,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.35791015625,
+            10.775390625,
+            11.029296875
+          ]
+        },
+        {
+          "ms": 150.39304201491177,
+          "rss_bytes": 25083904,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3291015625,
+            10.76220703125,
+            11.02294921875
+          ]
+        },
+        {
+          "ms": 151.79249999346212,
+          "rss_bytes": 24952832,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 154.34212499530986,
+          "rss_bytes": 25067520,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 175.85645901272073,
+          "rss_bytes": 24936448,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3583984375,
+            10.75341796875,
+            11.01611328125
+          ]
+        },
+        {
+          "ms": 145.96112500294112,
+          "rss_bytes": 24854528,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3583984375,
+            10.75341796875,
+            11.01611328125
+          ]
+        },
+        {
+          "ms": 150.07895798771642,
+          "rss_bytes": 24903680,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.40966796875,
+            10.75732421875,
+            11.015625
+          ]
+        }
+      ]
+    },
+    "portable-remote-cold-digest": {
+      "before": [
+        {
+          "ms": 293.2812500221189,
+          "rss_bytes": 67878912,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.19970703125,
+            10.6552734375,
+            11.00341796875
+          ]
+        },
+        {
+          "ms": 282.6063330285251,
+          "rss_bytes": 67780608,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.18359375,
+            10.62744140625,
+            10.9912109375
+          ]
+        },
+        {
+          "ms": 305.81462499685585,
+          "rss_bytes": 68026368,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.18359375,
+            10.62744140625,
+            10.9912109375
+          ]
+        },
+        {
+          "ms": 303.54654099210165,
+          "rss_bytes": 67960832,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 318.9925419865176,
+          "rss_bytes": 67878912,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.26953125,
+            10.8056640625,
+            11.0498046875
+          ]
+        },
+        {
+          "ms": 287.4202919774689,
+          "rss_bytes": 68042752,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.24755859375,
+            10.7919921875,
+            11.04345703125
+          ]
+        },
+        {
+          "ms": 284.4761250016745,
+          "rss_bytes": 68419584,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.24755859375,
+            10.7919921875,
+            11.04345703125
+          ]
+        },
+        {
+          "ms": 305.4470829956699,
+          "rss_bytes": 68304896,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3876953125,
+            10.81201171875,
+            11.048828125
+          ]
+        },
+        {
+          "ms": 335.40424998500384,
+          "rss_bytes": 68468736,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 327.449208998587,
+          "rss_bytes": 67878912,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 326.0361250140704,
+          "rss_bytes": 67960832,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3212890625,
+            10.78466796875,
+            11.0361328125
+          ]
+        },
+        {
+          "ms": 321.45179199869744,
+          "rss_bytes": 68042752,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.21533203125,
+            10.7548828125,
+            11.02392578125
+          ]
+        },
+        {
+          "ms": 297.73749999003485,
+          "rss_bytes": 68075520,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.21533203125,
+            10.7548828125,
+            11.02392578125
+          ]
+        },
+        {
+          "ms": 347.3252499825321,
+          "rss_bytes": 68009984,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.35791015625,
+            10.775390625,
+            11.029296875
+          ]
+        },
+        {
+          "ms": 326.2119999853894,
+          "rss_bytes": 68386816,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3291015625,
+            10.76220703125,
+            11.02294921875
+          ]
+        },
+        {
+          "ms": 275.524749973556,
+          "rss_bytes": 67911680,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3291015625,
+            10.76220703125,
+            11.02294921875
+          ]
+        },
+        {
+          "ms": 272.3876249801833,
+          "rss_bytes": 67846144,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 276.87591599533334,
+          "rss_bytes": 68567040,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3583984375,
+            10.75341796875,
+            11.01611328125
+          ]
+        },
+        {
+          "ms": 263.18875001743436,
+          "rss_bytes": 67846144,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3583984375,
+            10.75341796875,
+            11.01611328125
+          ]
+        },
+        {
+          "ms": 272.9007920133881,
+          "rss_bytes": 121339904,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.40966796875,
+            10.75732421875,
+            11.015625
+          ]
+        }
+      ],
+      "after": [
+        {
+          "ms": 266.46670899936,
+          "rss_bytes": 25018368,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.19970703125,
+            10.6552734375,
+            11.00341796875
+          ]
+        },
+        {
+          "ms": 264.86962498165667,
+          "rss_bytes": 25001984,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.18359375,
+            10.62744140625,
+            10.9912109375
+          ]
+        },
+        {
+          "ms": 247.28579202201217,
+          "rss_bytes": 24870912,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 234.65041600866243,
+          "rss_bytes": 25034752,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 251.6154579934664,
+          "rss_bytes": 25116672,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.26953125,
+            10.8056640625,
+            11.0498046875
+          ]
+        },
+        {
+          "ms": 244.51154199778102,
+          "rss_bytes": 25100288,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.24755859375,
+            10.7919921875,
+            11.04345703125
+          ]
+        },
+        {
+          "ms": 258.7457079789601,
+          "rss_bytes": 25133056,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.24755859375,
+            10.7919921875,
+            11.04345703125
+          ]
+        },
+        {
+          "ms": 271.2099580094218,
+          "rss_bytes": 25067520,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3876953125,
+            10.81201171875,
+            11.048828125
+          ]
+        },
+        {
+          "ms": 257.7125419920776,
+          "rss_bytes": 25067520,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 231.64362501120195,
+          "rss_bytes": 25100288,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 250.50624998402782,
+          "rss_bytes": 25051136,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3212890625,
+            10.78466796875,
+            11.0361328125
+          ]
+        },
+        {
+          "ms": 240.4202079924289,
+          "rss_bytes": 25100288,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.21533203125,
+            10.7548828125,
+            11.02392578125
+          ]
+        },
+        {
+          "ms": 259.2331670166459,
+          "rss_bytes": 25165824,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.35791015625,
+            10.775390625,
+            11.029296875
+          ]
+        },
+        {
+          "ms": 275.19683400169015,
+          "rss_bytes": 25165824,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.35791015625,
+            10.775390625,
+            11.029296875
+          ]
+        },
+        {
+          "ms": 235.70099999778904,
+          "rss_bytes": 25034752,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3291015625,
+            10.76220703125,
+            11.02294921875
+          ]
+        },
+        {
+          "ms": 226.9287500239443,
+          "rss_bytes": 25231360,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3291015625,
+            10.76220703125,
+            11.02294921875
+          ]
+        },
+        {
+          "ms": 225.11154200765304,
+          "rss_bytes": 25198592,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 246.75220798235387,
+          "rss_bytes": 25149440,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3583984375,
+            10.75341796875,
+            11.01611328125
+          ]
+        },
+        {
+          "ms": 223.09208300430328,
+          "rss_bytes": 25133056,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3583984375,
+            10.75341796875,
+            11.01611328125
+          ]
+        },
+        {
+          "ms": 236.14079199614935,
+          "rss_bytes": 24870912,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.40966796875,
+            10.75732421875,
+            11.015625
+          ]
+        }
+      ]
+    },
+    "portable-cold-digest": {
+      "before": [
+        {
+          "ms": 147.90999999968335,
+          "rss_bytes": 21135360,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.19970703125,
+            10.6552734375,
+            11.00341796875
+          ]
+        },
+        {
+          "ms": 117.18141598976217,
+          "rss_bytes": 21200896,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.18359375,
+            10.62744140625,
+            10.9912109375
+          ]
+        },
+        {
+          "ms": 158.90558299724944,
+          "rss_bytes": 21200896,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 114.67179100145586,
+          "rss_bytes": 21184512,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 108.87300001922995,
+          "rss_bytes": 21217280,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.26953125,
+            10.8056640625,
+            11.0498046875
+          ]
+        },
+        {
+          "ms": 128.58466699253768,
+          "rss_bytes": 21299200,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.24755859375,
+            10.7919921875,
+            11.04345703125
+          ]
+        },
+        {
+          "ms": 128.46375000663102,
+          "rss_bytes": 21233664,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.24755859375,
+            10.7919921875,
+            11.04345703125
+          ]
+        },
+        {
+          "ms": 146.31808298872784,
+          "rss_bytes": 21233664,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3876953125,
+            10.81201171875,
+            11.048828125
+          ]
+        },
+        {
+          "ms": 125.85345900151879,
+          "rss_bytes": 21282816,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 112.12199999135919,
+          "rss_bytes": 21250048,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 118.15583301358856,
+          "rss_bytes": 21217280,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3212890625,
+            10.78466796875,
+            11.0361328125
+          ]
+        },
+        {
+          "ms": 126.55720900511369,
+          "rss_bytes": 21217280,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.21533203125,
+            10.7548828125,
+            11.02392578125
+          ]
+        },
+        {
+          "ms": 118.35083298501559,
+          "rss_bytes": 21315584,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.35791015625,
+            10.775390625,
+            11.029296875
+          ]
+        },
+        {
+          "ms": 117.18645799555816,
+          "rss_bytes": 21250048,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.35791015625,
+            10.775390625,
+            11.029296875
+          ]
+        },
+        {
+          "ms": 110.03908299608156,
+          "rss_bytes": 21200896,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3291015625,
+            10.76220703125,
+            11.02294921875
+          ]
+        },
+        {
+          "ms": 106.03183298371732,
+          "rss_bytes": 21250048,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3291015625,
+            10.76220703125,
+            11.02294921875
+          ]
+        },
+        {
+          "ms": 107.37970800255425,
+          "rss_bytes": 21184512,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 122.97158301225863,
+          "rss_bytes": 21364736,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3583984375,
+            10.75341796875,
+            11.01611328125
+          ]
+        },
+        {
+          "ms": 109.3350000155624,
+          "rss_bytes": 21315584,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.40966796875,
+            10.75732421875,
+            11.015625
+          ]
+        },
+        {
+          "ms": 109.9155829870142,
+          "rss_bytes": 21168128,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.40966796875,
+            10.75732421875,
+            11.015625
+          ]
+        }
+      ],
+      "after": [
+        {
+          "ms": 213.97750001051463,
+          "rss_bytes": 21643264,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.19970703125,
+            10.6552734375,
+            11.00341796875
+          ]
+        },
+        {
+          "ms": 191.27599999774247,
+          "rss_bytes": 21643264,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.18359375,
+            10.62744140625,
+            10.9912109375
+          ]
+        },
+        {
+          "ms": 192.62133300071582,
+          "rss_bytes": 21643264,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 207.4791670020204,
+          "rss_bytes": 21643264,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 208.98158400086686,
+          "rss_bytes": 21643264,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.26953125,
+            10.8056640625,
+            11.0498046875
+          ]
+        },
+        {
+          "ms": 197.15429199277423,
+          "rss_bytes": 21741568,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.24755859375,
+            10.7919921875,
+            11.04345703125
+          ]
+        },
+        {
+          "ms": 224.8982500168495,
+          "rss_bytes": 21659648,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3876953125,
+            10.81201171875,
+            11.048828125
+          ]
+        },
+        {
+          "ms": 252.42308399174362,
+          "rss_bytes": 21643264,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3876953125,
+            10.81201171875,
+            11.048828125
+          ]
+        },
+        {
+          "ms": 194.55570899299346,
+          "rss_bytes": 21692416,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 198.14220900298096,
+          "rss_bytes": 21708800,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 219.61558298789896,
+          "rss_bytes": 21692416,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3212890625,
+            10.78466796875,
+            11.0361328125
+          ]
+        },
+        {
+          "ms": 196.2970000167843,
+          "rss_bytes": 21741568,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.21533203125,
+            10.7548828125,
+            11.02392578125
+          ]
+        },
+        {
+          "ms": 213.71316601289436,
+          "rss_bytes": 21807104,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.35791015625,
+            10.775390625,
+            11.029296875
+          ]
+        },
+        {
+          "ms": 297.95950002153404,
+          "rss_bytes": 21676032,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.35791015625,
+            10.775390625,
+            11.029296875
+          ]
+        },
+        {
+          "ms": 197.8480420075357,
+          "rss_bytes": 21692416,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3291015625,
+            10.76220703125,
+            11.02294921875
+          ]
+        },
+        {
+          "ms": 193.3040000149049,
+          "rss_bytes": 21692416,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3291015625,
+            10.76220703125,
+            11.02294921875
+          ]
+        },
+        {
+          "ms": 184.6536249795463,
+          "rss_bytes": 21676032,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 203.97349999984726,
+          "rss_bytes": 21708800,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3583984375,
+            10.75341796875,
+            11.01611328125
+          ]
+        },
+        {
+          "ms": 192.6966249884572,
+          "rss_bytes": 21676032,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.40966796875,
+            10.75732421875,
+            11.015625
+          ]
+        },
+        {
+          "ms": 184.7938749997411,
+          "rss_bytes": 21643264,
+          "executed": false,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.40966796875,
+            10.75732421875,
+            11.015625
+          ]
+        }
+      ]
+    },
+    "uncached-build": {
+      "before": [
+        {
+          "ms": 136.6892910155002,
+          "rss_bytes": 67911680,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.19970703125,
+            10.6552734375,
+            11.00341796875
+          ]
+        },
+        {
+          "ms": 131.31754199275747,
+          "rss_bytes": 67780608,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.18359375,
+            10.62744140625,
+            10.9912109375
+          ]
+        },
+        {
+          "ms": 155.35695900325663,
+          "rss_bytes": 67928064,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 130.9882499917876,
+          "rss_bytes": 67944448,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 132.7927499951329,
+          "rss_bytes": 67977216,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.26953125,
+            10.8056640625,
+            11.0498046875
+          ]
+        },
+        {
+          "ms": 125.62262499704957,
+          "rss_bytes": 68026368,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.26953125,
+            10.8056640625,
+            11.0498046875
+          ]
+        },
+        {
+          "ms": 175.7028749852907,
+          "rss_bytes": 68304896,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3876953125,
+            10.81201171875,
+            11.048828125
+          ]
+        },
+        {
+          "ms": 155.75416601495817,
+          "rss_bytes": 68337664,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3876953125,
+            10.81201171875,
+            11.048828125
+          ]
+        },
+        {
+          "ms": 145.3018749889452,
+          "rss_bytes": 68288512,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 135.47220898908563,
+          "rss_bytes": 68173824,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 172.75012499885634,
+          "rss_bytes": 68157440,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3212890625,
+            10.78466796875,
+            11.0361328125
+          ]
+        },
+        {
+          "ms": 137.5283329980448,
+          "rss_bytes": 67600384,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3212890625,
+            10.78466796875,
+            11.0361328125
+          ]
+        },
+        {
+          "ms": 140.66533400909975,
+          "rss_bytes": 67796992,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.35791015625,
+            10.775390625,
+            11.029296875
+          ]
+        },
+        {
+          "ms": 127.95404199277982,
+          "rss_bytes": 68386816,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.35791015625,
+            10.775390625,
+            11.029296875
+          ]
+        },
+        {
+          "ms": 128.64724997780286,
+          "rss_bytes": 67928064,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3291015625,
+            10.76220703125,
+            11.02294921875
+          ]
+        },
+        {
+          "ms": 131.3716669974383,
+          "rss_bytes": 67895296,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3291015625,
+            10.76220703125,
+            11.02294921875
+          ]
+        },
+        {
+          "ms": 116.13054198096506,
+          "rss_bytes": 68091904,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 130.85295801283792,
+          "rss_bytes": 68009984,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 125.84762499318458,
+          "rss_bytes": 67862528,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.40966796875,
+            10.75732421875,
+            11.015625
+          ]
+        },
+        {
+          "ms": 131.47650001337752,
+          "rss_bytes": 67960832,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.40966796875,
+            10.75732421875,
+            11.015625
+          ]
+        }
+      ],
+      "after": [
+        {
+          "ms": 134.49866700102575,
+          "rss_bytes": 67977216,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.18359375,
+            10.62744140625,
+            10.9912109375
+          ]
+        },
+        {
+          "ms": 148.30316699226387,
+          "rss_bytes": 67567616,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.18359375,
+            10.62744140625,
+            10.9912109375
+          ]
+        },
+        {
+          "ms": 158.24941598111764,
+          "rss_bytes": 68222976,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 135.0816250196658,
+          "rss_bytes": 67911680,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            9.24853515625,
+            10.61669921875,
+            10.9853515625
+          ]
+        },
+        {
+          "ms": 123.81404198822565,
+          "rss_bytes": 67846144,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.26953125,
+            10.8056640625,
+            11.0498046875
+          ]
+        },
+        {
+          "ms": 156.51075000641868,
+          "rss_bytes": 67878912,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.26953125,
+            10.8056640625,
+            11.0498046875
+          ]
+        },
+        {
+          "ms": 133.54962502489798,
+          "rss_bytes": 68599808,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3876953125,
+            10.81201171875,
+            11.048828125
+          ]
+        },
+        {
+          "ms": 147.04958299989812,
+          "rss_bytes": 68026368,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3876953125,
+            10.81201171875,
+            11.048828125
+          ]
+        },
+        {
+          "ms": 147.17645800556056,
+          "rss_bytes": 68157440,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 145.8146660006605,
+          "rss_bytes": 68550656,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.4365234375,
+            10.81494140625,
+            11.04833984375
+          ]
+        },
+        {
+          "ms": 158.82608300307766,
+          "rss_bytes": 68337664,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3212890625,
+            10.78466796875,
+            11.0361328125
+          ]
+        },
+        {
+          "ms": 137.9228330042679,
+          "rss_bytes": 67862528,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3212890625,
+            10.78466796875,
+            11.0361328125
+          ]
+        },
+        {
+          "ms": 138.98766701458953,
+          "rss_bytes": 68517888,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.35791015625,
+            10.775390625,
+            11.029296875
+          ]
+        },
+        {
+          "ms": 131.05408300179988,
+          "rss_bytes": 67960832,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.35791015625,
+            10.775390625,
+            11.029296875
+          ]
+        },
+        {
+          "ms": 122.27308301953599,
+          "rss_bytes": 67829760,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3291015625,
+            10.76220703125,
+            11.02294921875
+          ]
+        },
+        {
+          "ms": 127.94679202488624,
+          "rss_bytes": 67878912,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.3291015625,
+            10.76220703125,
+            11.02294921875
+          ]
+        },
+        {
+          "ms": 125.48137499834411,
+          "rss_bytes": 68009984,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 119.78783400263637,
+          "rss_bytes": 68091904,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.302734375,
+            10.74951171875,
+            11.0166015625
+          ]
+        },
+        {
+          "ms": 122.05445900326595,
+          "rss_bytes": 67928064,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.40966796875,
+            10.75732421875,
+            11.015625
+          ]
+        },
+        {
+          "ms": 136.31229201564565,
+          "rss_bytes": 67977216,
+          "executed": true,
+          "output_sha256": "ef8d7ab90c8926c316c825535893a1cc504c2d53935cedae651cab19a49adc19",
+          "host_loadavg": [
+            10.40966796875,
+            10.75732421875,
+            11.015625
+          ]
+        }
+      ]
+    }
+  },
+  "measurement": {
+    "baseline_source": "9ea1a79a980e01d7867c7abab571b3836a6a70b1",
+    "implementation_source": "0417cbed66a4368a0bbe33ff00b98047d2a83cce",
+    "before_binary_sha256": "7059355a5eb5a7ae7871676a40c6d3ee362319dbf5b5110485f71db8d346efe1",
+    "after_binary_sha256": "27e2060d969b6965438846e0ab9cc0224de5531bdc342b9c00b8188a12244dd1",
+    "host_loadavg_1m": {
+      "min": 9.18359375,
+      "median": 10.3212890625,
+      "max": 10.4365234375
+    },
+    "microbenchmark": {
+      "cold_records": {
+        "first_capture_us": 94939.541,
+        "warm_median_us": 65.916,
+        "warm_samples": 1000
+      },
+      "persisted_records": {
+        "first_capture_us": 368.0,
+        "warm_median_us": 67.667,
+        "warm_samples": 1000
+      }
+    },
+    "limits": [
+      "Shared host with unrelated CPU-heavy activity; no concurrent builds or tests from this task.",
+      "Loopback cache; no hosted service or frontend latency.",
+      "Cold digest records with warm executable bytes in the OS cache.",
+      "Maximum RSS from time is not aggregate process-tree memory.",
+      "First microbenchmark captures are single observations.",
+      "Windows change-timestamp query overhead was not measured."
+    ]
+  }
+}

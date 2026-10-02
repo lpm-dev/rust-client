@@ -128,7 +128,7 @@ pub(super) struct StagedOutputs {
     temp_path: PathBuf,
     staging: Option<Dir>,
     project: Dir,
-    output: Dir,
+    output: Option<Dir>,
     canonical_project: PathBuf,
     registry_record: RestoreRegistryRecord,
     token: [u8; RESTORE_TOKEN_BYTES],
@@ -179,7 +179,7 @@ impl StagedOutputs {
             temp_path,
             staging: Some(staging),
             project,
-            output,
+            output: Some(output),
             canonical_project,
             registry_record,
             token,
@@ -204,7 +204,9 @@ impl StagedOutputs {
         }
 
         let (parent, name) = open_or_create_parent_nofollow(
-            &self.output,
+            self.output
+                .as_ref()
+                .expect("staged output directory exists"),
             &relative,
             "staged output",
             DirectoryCreationDurability::Deferred,
@@ -302,9 +304,13 @@ impl StagedOutputs {
     ) -> Result<bool, LpmError> {
         let mut this = self;
         let staging_outputs = this.temp_path.join("outputs");
-        verify_open_directory_path(&this.output, &staging_outputs, "staged task outputs")?;
+        let output = this
+            .output
+            .as_ref()
+            .expect("staged output directory exists");
+        verify_open_directory_path(output, &staging_outputs, "staged task outputs")?;
         let declared_files = collect_output_files(&staging_outputs, output_globs)?;
-        verify_open_directory_path(&this.output, &staging_outputs, "staged task outputs")?;
+        verify_open_directory_path(output, &staging_outputs, "staged task outputs")?;
         this.files.sort_unstable();
         if this.files != declared_files {
             return Err(LpmError::Task(
@@ -430,6 +436,7 @@ impl StagedOutputs {
         transaction.mark_committed();
         drop(transaction);
         this.cleanup_registry_on_drop = false;
+        drop(this.output.take());
         cleanup_open_staging(
             &this.project,
             Path::new(this.temp_path.file_name().ok_or_else(|| {
@@ -460,6 +467,8 @@ impl StagedOutputs {
 
 impl Drop for StagedOutputs {
     fn drop(&mut self) {
+        // Windows cannot remove the output directory while its handle remains open.
+        drop(self.output.take());
         if self.cleanup_registry_on_drop {
             let cleanup_succeeded = if let Some(staging) = self.staging.take()
                 && let Some(name) = self.temp_path.file_name()
@@ -1099,6 +1108,7 @@ fn recover_registered_restore(
         }
     }
 
+    drop((output, backup));
     cleanup_open_staging(&project, staging_name, staging)?;
     remove_restore_registration(record)?;
     Ok(())

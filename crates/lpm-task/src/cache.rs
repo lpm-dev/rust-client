@@ -67,6 +67,10 @@ static CACHE_STORE_STAGING_RACE_BARRIER: std::sync::Mutex<Vec<CacheRaceBarrier>>
     std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
+static CACHE_PUBLICATION_RACE_BARRIER: std::sync::Mutex<Vec<CacheRaceBarrier>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
 #[derive(Clone)]
 struct StagedFileFinalizeFailure {
     project: PathBuf,
@@ -621,28 +625,102 @@ fn store_cache_locked(
         write_private_cache_file(&staging, "meta.json", &meta_json)?;
         sync_open_directory(&staging)?;
 
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = cleanup_private_cache_directory(&cache.tasks, &staging_name, staging);
+        return result;
+    }
+    publish_cache_directory(cache, key, &staging_name, staging)?;
+    tracing::debug!("cached task output to {}", entry.display());
+    Ok(())
+}
+
+fn publish_cache_directory(
+    cache: &OpenTaskCache,
+    key: &str,
+    staging_name: &str,
+    staging: Dir,
+) -> Result<(), LpmError> {
+    let identity = retain_cache_directory_identity(&staging, &cache.path, staging_name);
+    let identity = match identity {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = cleanup_private_cache_directory(&cache.tasks, staging_name, staging);
+            return Err(error);
+        }
+    };
+    // cap-std directory handles prevent Windows renames. Keep only a delete-sharing
+    // identity handle during publication; never use it for capability path lookups.
+    #[cfg(windows)]
+    drop(staging);
+    #[cfg(test)]
+    wait_for_cache_race_barrier(&CACHE_PUBLICATION_RACE_BARRIER, &cache.path);
+    let result = (|| {
         remove_open_directory_entry(&cache.tasks, std::ffi::OsStr::new(key))?;
         cache
             .tasks
-            .rename(Path::new(&staging_name), &cache.tasks, Path::new(key))?;
+            .rename(Path::new(staging_name), &cache.tasks, Path::new(key))?;
         sync_open_directory(&cache.tasks)?;
         let published = cache.tasks.open_dir_nofollow(key)?;
-        let staged_identity = same_file::Handle::from_file(staging.try_clone()?.into_std_file())?;
         let published_identity = same_file::Handle::from_file(published.into_std_file())?;
-        if staged_identity != published_identity {
+        if identity != published_identity {
             return Err(LpmError::Task(format!(
                 "task cache entry changed while it was published: {}",
-                entry.display()
+                cache.path.join(key).display()
             )));
         }
         Ok(())
     })();
     if result.is_err() {
-        let _ = cleanup_private_cache_directory(&cache.tasks, &staging_name, staging);
+        #[cfg(not(windows))]
+        let _ = cleanup_private_cache_directory(&cache.tasks, staging_name, staging);
+        #[cfg(windows)]
+        if let Ok(staging) = cache.tasks.open_dir_nofollow(staging_name)
+            && let Ok(file) = staging.try_clone()
+            && let Ok(current) = same_file::Handle::from_file(file.into_std_file())
+            && current == identity
+        {
+            drop(current);
+            let _ = cleanup_private_cache_directory(&cache.tasks, staging_name, staging);
+        }
     }
-    result?;
-    tracing::debug!("cached task output to {}", entry.display());
-    Ok(())
+    result
+}
+
+fn retain_cache_directory_identity(
+    directory: &Dir,
+    parent: &Path,
+    name: &str,
+) -> Result<same_file::Handle, LpmError> {
+    let original = same_file::Handle::from_file(directory.try_clone()?.into_std_file())?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        let path = parent.join(name);
+        let file = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)?;
+        let retained = same_file::Handle::from_file(file)?;
+        if retained != original {
+            return Err(LpmError::Task(format!(
+                "task cache staging directory changed before publication: {}",
+                path.display()
+            )));
+        }
+        Ok(retained)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (parent, name);
+        Ok(original)
+    }
 }
 
 fn cleanup_private_cache_directory(parent: &Dir, name: &str, staging: Dir) -> Result<(), LpmError> {
@@ -2021,6 +2099,154 @@ mod tests {
             fs::read_to_string(dir.path().join("dist/index.js")).unwrap(),
             "built output"
         );
+        assert!(fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(RESTORE_TEMP_PREFIX)
+        }));
+        assert_eq!(
+            fs::read_dir(cache.root.cache_root().join(".task-restores"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn staged_restore_drop_removes_its_directory_and_recovery_record() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        let staged = StagedOutputs::new(&cache.root, project.path()).unwrap();
+        let staging = staged.temp_path().to_path_buf();
+        drop(staged);
+        assert!(!staging.exists());
+        assert_eq!(
+            fs::read_dir(cache.root.cache_root().join(".task-restores"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn restore_context_rejection_rolls_back_and_removes_recovery_data() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join("dist")).unwrap();
+        fs::write(project.path().join("dist/value.txt"), "original").unwrap();
+        let mut staged = StagedOutputs::new(&cache.root, project.path()).unwrap();
+        let staging = staged.temp_path().to_path_buf();
+        let mut header = tar::Header::new_gnu();
+        header.set_size(6);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        staged
+            .append(&mut &b"cached"[..], &header, Path::new("dist/value.txt"))
+            .unwrap();
+        assert!(!staged.apply_if(&["dist/**".into()], || Ok(false)).unwrap());
+        assert_eq!(
+            fs::read_to_string(project.path().join("dist/value.txt")).unwrap(),
+            "original"
+        );
+        assert!(!staging.exists());
+        assert_eq!(
+            fs::read_dir(cache.root.cache_root().join(".task-restores"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn cache_publication_replaces_an_invalid_entry_without_leaving_staging_directories() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join("dist")).unwrap();
+        let output = project.path().join("dist/value.txt");
+        let key = unique_key("replace-cache-entry");
+        for value in ["first", "second"] {
+            if value == "second" {
+                fs::remove_file(
+                    cache_dir_with_root(&cache.root)
+                        .join(&key)
+                        .join("meta.json"),
+                )
+                .unwrap();
+            }
+            fs::write(&output, value).unwrap();
+            cache
+                .store(
+                    &key,
+                    project.path(),
+                    "build",
+                    &["dist/**".into()],
+                    value,
+                    "",
+                    1,
+                )
+                .unwrap();
+        }
+        fs::remove_dir_all(project.path().join("dist")).unwrap();
+        let hit = cache
+            .restore(&key, project.path(), &["dist/**".into()])
+            .unwrap();
+        assert_eq!(hit.stdout, "second");
+        assert_eq!(fs::read_to_string(output).unwrap(), "second");
+        assert!(
+            fs::read_dir(cache_dir_with_root(&cache.root))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".task-cache-stage-"))
+        );
+    }
+
+    #[test]
+    fn cache_publication_rejects_a_replaced_staging_directory_before_rename() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join("dist")).unwrap();
+        fs::write(project.path().join("dist/value.txt"), "output").unwrap();
+        let cache_path = cache_dir_with_root(&cache.root);
+        let barrier = install_race_barrier(&CACHE_PUBLICATION_RACE_BARRIER, cache_path.clone());
+        let root = cache.root.clone();
+        let project_path = project.path().to_path_buf();
+        let key = unique_key("replace-publication-staging");
+        let worker_key = key.clone();
+        let worker = std::thread::spawn(move || {
+            store_cache_with_root(
+                &root,
+                &worker_key,
+                &project_path,
+                "build",
+                &["dist/**".into()],
+                "",
+                "",
+                1,
+            )
+        });
+        barrier.validated.wait();
+        let staging_name = fs::read_dir(&cache_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .find(|name| name.to_string_lossy().starts_with(".task-cache-stage-"))
+            .unwrap();
+        let staging_path = cache_path.join(&staging_name);
+        fs::rename(&staging_path, cache_path.join("moved-staging")).unwrap();
+        fs::create_dir(&staging_path).unwrap();
+        fs::write(staging_path.join("sentinel"), "replacement").unwrap();
+        barrier.resume.wait();
+        assert!(worker.join().unwrap().is_err());
+        clear_race_barrier(&CACHE_PUBLICATION_RACE_BARRIER, &barrier);
+        assert_eq!(
+            fs::read_to_string(cache_path.join(&key).join("sentinel")).unwrap(),
+            "replacement"
+        );
+        assert!(!cache.has_hit(&key));
     }
 
     #[cfg(unix)]

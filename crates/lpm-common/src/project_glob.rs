@@ -33,6 +33,21 @@ pub fn validate_project_glob(pattern: &str) -> Result<(), String> {
 /// Join a validated relative glob to a project path without interpreting
 /// metacharacters that occur in the project path itself.
 pub fn rooted_project_glob(project_dir: &Path, pattern: &str) -> String {
+    #[cfg(windows)]
+    let mut rooted = {
+        let mut components = project_dir.components();
+        if let Some(std::path::Component::Prefix(prefix)) = components.next() {
+            // glob parses the prefix as a filesystem namespace before matching names.
+            let mut rooted = prefix.as_os_str().to_string_lossy().into_owned();
+            rooted.push_str(&glob::Pattern::escape(
+                components.as_path().to_string_lossy().as_ref(),
+            ));
+            rooted
+        } else {
+            glob::Pattern::escape(project_dir.to_string_lossy().as_ref())
+        }
+    };
+    #[cfg(not(windows))]
     let mut rooted = glob::Pattern::escape(project_dir.to_string_lossy().as_ref());
     if !rooted.ends_with(std::path::MAIN_SEPARATOR) {
         rooted.push(std::path::MAIN_SEPARATOR);
@@ -93,5 +108,26 @@ mod tests {
         let pattern = glob::Pattern::new(&rooted).unwrap();
         assert!(pattern.matches_path(&Path::new("project[abc]").join("dist/value.js")));
         assert!(!pattern.matches_path(&Path::new("projecta").join("dist/value.js")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rooted_glob_finds_outputs_under_canonical_windows_project_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project[abc]");
+        std::fs::create_dir_all(project.join("dist")).unwrap();
+        let output = project.join("dist/value.js");
+        std::fs::write(&output, "cached output").unwrap();
+        let project = project.canonicalize().unwrap();
+        let rooted = rooted_project_glob(&project, "dist/*.js");
+        assert_eq!(
+            Path::new(&rooted).components().next(),
+            project.components().next()
+        );
+        let matches = glob::glob(&rooted)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(matches, [output.canonicalize().unwrap()]);
     }
 }

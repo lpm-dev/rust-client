@@ -24,6 +24,9 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 zip = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"
