@@ -223,8 +223,8 @@ pub fn spawn_shell(cmd: &ShellCommand) -> Result<ExitStatus, LpmError> {
     }
     command.env("PATH", cmd.path);
 
-    command
-        .status()
+    crate::env_access::spawn(&mut command)
+        .and_then(|mut child| child.wait())
         .map_err(|e| LpmError::Script(format!("failed to execute '{}': {e}", cmd.command)))
 }
 
@@ -240,7 +240,7 @@ pub(crate) fn spawn_shell_cancellable(
         .stderr(Stdio::inherit());
     strip_inherited_env_hooks(&mut command);
     command.envs(cmd.envs).env("PATH", cmd.path);
-    let mut child = command.spawn().map_err(|error| {
+    let mut child = crate::env_access::spawn(&mut command).map_err(|error| {
         LpmError::Script(format!("failed to execute '{}': {error}", cmd.command))
     })?;
     loop {
@@ -304,7 +304,7 @@ where
         command.process_group(0);
     }
 
-    let mut child = command.spawn().map_err(|error| {
+    let mut child = crate::env_access::spawn(&mut command).map_err(|error| {
         LpmError::Script(format!("failed to execute '{}': {error}", cmd.command))
     })?;
     let root_pid = child.id();
@@ -564,8 +564,7 @@ pub fn spawn_shell_tee_with_reserved_stdout(
     }
     command.env("PATH", cmd.path);
 
-    let mut child = command
-        .spawn()
+    let mut child = crate::env_access::spawn(&mut command)
         .map_err(|e| LpmError::Script(format!("failed to execute '{}': {e}", cmd.command)))?;
 
     // Take piped streams
@@ -648,8 +647,7 @@ pub fn spawn_command_capture(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = command
-        .spawn()
+    let mut child = crate::env_access::spawn(&mut command)
         .map_err(|e| LpmError::Script(format!("failed to execute '{display_name}': {e}")))?;
 
     // Manual piped reads (rather than `Command::output()`) so the
@@ -720,8 +718,7 @@ pub fn spawn_shell_prefixed(
     }
     command.env("PATH", cmd.path);
 
-    let mut child = command
-        .spawn()
+    let mut child = crate::env_access::spawn(&mut command)
         .map_err(|e| LpmError::Script(format!("failed to execute '{}': {e}", cmd.command)))?;
 
     let child_stdout = child.stdout.take();

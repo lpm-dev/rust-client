@@ -33,6 +33,17 @@ LPM has four connected parts:
 - **LPM Firewall** - a hosted verdict service for public npm package versions. Enforcement mode checks versions before LPM materializes package bytes; monitor mode reports verdicts without holding the install. Both help teams catch malicious packages, critical vulnerabilities, suspicious lifecycle behavior, and policy violations during install.
 - **LPM Vault** - a native macOS app for project environment variables and secrets. It stores secrets in the macOS Keychain, supports multiple environments, and syncs encrypted data through LPM.dev. The app shares local env data with the LPM CLI, so edits are available to `lpm env` and `lpm run`.
 
+## CLI env approval on macOS
+
+In LPM Vault, select a project. Use **CLI approval** beside **All variables**:
+
+- **Off:** `lpm run` injects the linked project's env values automatically.
+- **On:** Keychain requires Touch ID or your Mac login password before it releases the project's env values. If authentication fails or you cancel it, LPM stops before it runs lifecycle hooks or the main script.
+
+The setting applies to every environment in that project on this Mac. Existing `lpm.json` project links still work. The sidebar shows a folder for automatic access and a lock for required approval. Change the setting while the app is unlocked; no extra authentication prompt appears. The app's **Lock** button remains separate and does not change CLI approval.
+
+Approval also protects other CLI commands that read the project's secrets. It controls secret retrieval. Processes that already received values retain them until they exit.
+
 ## Install
 
 LPM supports macOS, Linux glibc 2.28 or newer, Linux x64 musl (including Alpine), and Windows x64 through npm. Homebrew and the standalone installer support macOS and Linux; the standalone installer selects the matching glibc or musl binary automatically on Linux x64.

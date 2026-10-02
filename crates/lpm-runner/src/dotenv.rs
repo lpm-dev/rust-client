@@ -170,12 +170,14 @@ pub(crate) fn load_project_env_details_with_config_and_schema_validation(
     }
 
     // Load vault secrets — use environment-specific vault if available
-    let vault_vars = if let Some(env_name) = env_name {
-        lpm_vault::try_get_all_env_with_default_fallback(project_dir, env_name)
-            .map_err(LpmError::EnvValidation)?
-    } else {
-        lpm_vault::try_get_all(project_dir).map_err(LpmError::EnvValidation)?
-    };
+    let vault_vars = crate::env_access::read(|| {
+        if let Some(env_name) = env_name {
+            lpm_vault::try_get_all_env_with_default_fallback(project_dir, env_name)
+        } else {
+            lpm_vault::try_get_all(project_dir)
+        }
+    })
+    .map_err(LpmError::EnvValidation)?;
 
     let vault_count = vault_vars.len();
     if vault_count > 0 {

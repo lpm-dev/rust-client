@@ -33,6 +33,8 @@ pub(super) fn run_tasks_sequential(
     initially_failed_tasks: &HashSet<String>,
     session: Option<Arc<lpm_auth::SessionManager>>,
 ) -> Result<TaskRunReport, LpmError> {
+    let env_access = lpm_runner::env_access::EnvAccessScope::current_or_new();
+    let _env_access_binding = env_access.bind();
     let json_output = output_policy.reserve_stdout;
     let mut results: Vec<TaskResult> = Vec::with_capacity(scripts.len());
     let total_start = std::time::Instant::now();
@@ -192,6 +194,7 @@ pub(super) fn run_tasks_sequential(
             run_task(project_dir, script, extra_args, env_mode, tasks, bin_hint)
         };
 
+        env_access.check()?;
         match run_result {
             Ok(()) => {
                 results.push(TaskResult {
@@ -243,6 +246,7 @@ pub(super) fn run_tasks_sequential(
         }
     }
 
+    env_access.check()?;
     print_results_summary(&results, total_start.elapsed());
 
     if output_policy.report_json {

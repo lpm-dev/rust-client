@@ -25,6 +25,7 @@ pub mod dev_endpoint;
 pub mod dev_session;
 pub mod dlx;
 pub mod dotenv;
+pub mod env_access;
 pub mod exec;
 pub mod execution;
 pub mod hooks;
