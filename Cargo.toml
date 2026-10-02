@@ -194,7 +194,7 @@ filetime = "0.2"
 
 # Unified-diff generation and strict apply for `lpm patch`.
 # Pure-Rust, GNU patch format, no fuzzy matching by default.
-diffy = "0.4"
+diffy = "0.5"
 
 # POSIX shell tokenizer for the static-gate classifier. Pure-Rust, no
 # dependencies, understands standard shell quoting so
