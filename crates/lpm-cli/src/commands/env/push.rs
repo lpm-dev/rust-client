@@ -59,12 +59,13 @@ pub(super) async fn vars_push(
         lpm_vault::try_get_all_environments_for_vault_id(&vault_id).map_err(LpmError::Script)?;
     let environment_count = all_envs.len();
     let total_keys: usize = all_envs.values().map(|e| e.len()).sum();
-    if total_keys == 0 {
-        return Err(LpmError::Script("vault is empty, nothing to push".into()));
+    if all_envs.is_empty() {
+        return Err(LpmError::Script(
+            "no environments configured, nothing to push".into(),
+        ));
     }
 
     let config = manifest.config;
-    let non_empty_envs = super::sync_payload::build_sync_environments(all_envs);
 
     let project_name = manifest.vault.project_name(project_dir);
     let expected_principal_id = manifest
@@ -95,12 +96,7 @@ pub(super) async fn vars_push(
         output::info("pushing vault to cloud...");
     }
 
-    let secrets_json = std::sync::Arc::new({
-        let mut wrapper = HashMap::new();
-        wrapper.insert("environments".to_string(), non_empty_envs);
-        serde_json::to_string(&wrapper)
-            .map_err(|e| LpmError::Script(format!("failed to serialize: {e}")))?
-    });
+    let secrets_json = std::sync::Arc::new(super::sync_payload::build_sync_payload(all_envs)?);
 
     let schema_value = std::sync::Arc::new(super::sync_payload::build_push_schema_value(
         config.as_ref(),
