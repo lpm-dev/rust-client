@@ -8,6 +8,9 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+const firewallToken = process.env.LPM_TOKEN;
+delete process.env.LPM_TOKEN;
+
 const repoRoot = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
 
 const SCENARIOS = [
@@ -43,7 +46,7 @@ const SCENARIOS = [
   },
 ];
 
-const SUPPORTED_MANAGERS = ['lpm', 'bun', 'pnpm', 'npm', 'aube', 'nub', 'deno', 'vlt', 'upm', 'yarn'];
+const SUPPORTED_MANAGERS = ['lpm', 'lpm-monitor', 'bun', 'pnpm', 'npm', 'aube', 'nub', 'deno', 'vlt', 'upm', 'yarn'];
 const DEFAULT_MANAGERS = ['lpm', 'bun'];
 class PreparationError extends Error {}
 const SCENARIO_POSITIONS = new Map(SCENARIOS.map(({ id }, index) => [id, index]));
@@ -64,6 +67,7 @@ if (argv.selfTest) {
 }
 
 const managers = parseManagerList(argv.managers ?? DEFAULT_MANAGERS.join(','));
+const timingManagers = managers.filter(isLpmManager);
 if (!managers.includes('lpm')) {
   throw new Error('--managers must include lpm because the harness records LPM timing diagnostics');
 }
@@ -109,9 +113,11 @@ const metadata = {
   harness_sha256: sha256(fs.readFileSync(fileURLToPath(import.meta.url))),
   statistics: 'Median averages the two middle samples for even counts. p95 uses nearest rank; with 10 samples it is the maximum.',
   policy: 'Product security and release-age defaults. Lifecycle scripts disabled. Direct npm registry. Yarn node-modules linker.' +
-    (lpmFirewallMode ? ` LPM firewall override: ${lpmFirewallMode}.` : ''),
+    (lpmFirewallMode ? ` LPM firewall override: ${lpmFirewallMode}.` : '') +
+    (managers.includes('lpm-monitor') ? ' lpm-monitor uses the same binary with monitor mode and an independent home/cache.' : ''),
   lpm_firewall_override: lpmFirewallMode,
-  firewall_validation: ['monitor', 'enforce'].includes(lpmFirewallMode) ? 'successful-verdicts-and-preparation-v1' : undefined,
+  firewall_validation: managers.some((manager) => ['monitor', 'enforce'].includes(firewallModeFor(manager)))
+    ? 'successful-verdicts-and-preparation-v1' : undefined,
   scenarios: SCENARIOS,
   fixture: {
     directory: fixtureDir,
@@ -159,7 +165,7 @@ fs.mkdirSync(artifactDir, { recursive: true });
 const rows = resume ? readPartialRows('rows.partial.json', true) : [];
 const timingRows = resume ? readPartialRows('timing-rows.partial.json') : [];
 const completed = completedCells(rows, managers, samples);
-const completedTiming = completedCells(timingRows, ['lpm'], timingSamples);
+const completedTiming = completedCells(timingRows, timingManagers, timingSamples);
 if (resume) {
   const id = `resume-${Date.now()}`;
   writeJson(path.join(outputDir, `${id}.json`), { ...metadata, completed_rows: rows.length, completed_timing_rows: timingRows.length });
@@ -184,7 +190,7 @@ for (let sample = 1; sample <= samples; sample += 1) {
         prepareScenario({ manager, scenario: scenario.id, root });
       } catch (error) {
         if (!(error instanceof PreparationError)) throw error;
-        const row = { sample, comparison_id: comparisonId, manager_order: managerOrder.join('-'),
+        const row = { sample, comparison_id: comparisonId, manager_order: managerOrder.join('-'), manager_order_ids: managerOrder,
           scenario: scenario.id, manager, ok: false, phase: 'preparation', error: error.message,
           verification: { ok: false }, wall_ms: null, max_rss_bytes: null };
         rows.push(row);
@@ -209,6 +215,7 @@ for (let sample = 1; sample <= samples; sample += 1) {
         sample,
         comparison_id: comparisonId,
         manager_order: managerOrder.join('-'),
+        manager_order_ids: managerOrder,
         pair_id: comparisonId,
         pair_order: managerOrder.join('-'),
         scenario: scenario.id,
@@ -227,7 +234,7 @@ for (let sample = 1; sample <= samples; sample += 1) {
       console.log(
         `[${scenario.id} ${manager}] ${sample}/${samples} ${result.ok && verification.ok ? 'ok' : 'FAIL'} ` +
           `wall=${result.wall_ms}ms rss=${formatMiB(result.max_rss_bytes)} ` +
-          `${manager === 'lpm' ? `resolve=${formatMs(result.resolve_ms)} fetch=${formatMs(result.fetch_ms)} link=${formatMs(result.link_ms)}` : ''}`,
+          `${isLpmManager(manager) ? `resolve=${formatMs(result.resolve_ms)} fetch=${formatMs(result.fetch_ms)} link=${formatMs(result.link_ms)}` : ''}`,
       );
       if (!keepWork) {
         fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
@@ -239,28 +246,28 @@ for (let sample = 1; sample <= samples; sample += 1) {
 
 for (let sample = 1; sample <= timingSamples; sample += 1) {
   const scenarioOrder = rotate(SCENARIOS, (sample - 1) % SCENARIOS.length);
-  for (const scenario of scenarioOrder) {
-    if (completedTiming.has(cellKey(sample, scenario.id, 'lpm'))) continue;
-    const root = path.join(workspaceDir, `timing-${sample}-${scenario.id}-lpm`);
+  for (const scenario of scenarioOrder) for (const manager of rotate(timingManagers, sample % timingManagers.length)) {
+    if (completedTiming.has(cellKey(sample, scenario.id, manager))) continue;
+    const root = path.join(workspaceDir, `timing-${sample}-${scenario.id}-${manager}`);
     resetInterruptedRoot(root);
-    const output = path.join(artifactDir, 'timing', scenario.id, `sample-${sample}`);
+    const output = path.join(artifactDir, 'timing', scenario.id, manager, `sample-${sample}`);
     try {
-      prepareScenario({ manager: 'lpm', scenario: scenario.id, root });
+      prepareScenario({ manager, scenario: scenario.id, root });
     } catch (error) {
       if (!(error instanceof PreparationError)) throw error;
-      const row = { sample, scenario: scenario.id, manager: 'lpm', ok: false,
+      const row = { sample, scenario: scenario.id, manager, ok: false,
         phase: 'preparation', error: error.message, verification: { ok: false } };
       timingRows.push(row);
       writeJson(path.join(output, 'metrics.json'), row);
       writeJson(path.join(outputDir, 'timing-rows.partial.json'), timingRows);
-      console.log(`[timing ${scenario.id} lpm] ${sample}/${timingSamples} BLOCKED during preparation: ${error.message}`);
+      console.log(`[timing ${scenario.id} ${manager}] ${sample}/${timingSamples} BLOCKED during preparation: ${error.message}`);
       if (!keepWork) fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       continue;
     }
-    const setup = captureState('lpm', root);
-    assertScenarioState('lpm', scenario.id, setup);
+    const setup = captureState(manager, root);
+    assertScenarioState(manager, scenario.id, setup);
     const result = runInstall({
-      manager: 'lpm',
+      manager,
       root,
       output,
       measured: false,
@@ -268,12 +275,12 @@ for (let sample = 1; sample <= timingSamples; sample += 1) {
       allowUpToDate: ['installed-cache-gone', 'up-to-date'].includes(scenario.id),
     });
     const verification = verifyInstalledProject(root);
-    const row = { sample, scenario: scenario.id, manager: 'lpm', setup, verification, ...result };
+    const row = { sample, scenario: scenario.id, manager, setup, verification, ...result };
     timingRows.push(row);
     writeJson(path.join(output, 'metrics.json'), row);
     writeJson(path.join(outputDir, 'timing-rows.partial.json'), timingRows);
     console.log(
-      `[timing ${scenario.id} lpm] ${sample}/${timingSamples} ${result.ok && verification.ok ? 'ok' : 'FAIL'} ` +
+      `[timing ${scenario.id} ${manager}] ${sample}/${timingSamples} ${result.ok && verification.ok ? 'ok' : 'FAIL'} ` +
         `pipeline=${formatMs(result.pipeline_wall_max_ms)} package=${result.streamed_package ?? 'none'}`,
     );
     if (!keepWork) {
@@ -434,7 +441,7 @@ function clearDependencyCache(manager, root) {
 
 function clearAllDependencyState(manager, root) {
   clearDependencyCache(manager, root);
-  if (manager === 'lpm') {
+  if (isLpmManager(manager)) {
     fs.rmSync(path.join(lpmHomeDir(root), 'store'), { recursive: true, force: true });
   }
 }
@@ -446,7 +453,7 @@ function captureState(manager, root) {
     node_modules: nodeModules,
     project_lpm: fs.existsSync(path.join(projectDir(root), '.lpm')),
     cache: dependencyCachePresent(manager, root),
-    package_store: manager === 'lpm' ? hasEntries(path.join(lpmHomeDir(root), 'store')) : undefined,
+    package_store: isLpmManager(manager) ? hasEntries(path.join(lpmHomeDir(root), 'store')) : undefined,
     installed_resolves: nodeModules ? verifyInstalledProject(root).ok : false,
   };
 }
@@ -470,7 +477,7 @@ function assertScenarioState(manager, scenario, state) {
     expected.node_modules,
     `${manager} ${scenario} installed graph validity`,
   );
-  if (manager === 'lpm') {
+  if (isLpmManager(manager)) {
     const storeExpected = !['first-install', 'ci-cold-cache'].includes(scenario);
     assert.equal(state.package_store, storeExpected, `lpm ${scenario} package store setup`);
   }
@@ -490,7 +497,7 @@ function dependencyCacheDirs(manager, root) {
 }
 
 function dependencyCacheDir(manager, root) {
-  switch (manager) {
+  switch (baseManager(manager)) {
     case 'lpm':
       return path.join(lpmHomeDir(root), 'cache');
     case 'bun':
@@ -529,7 +536,7 @@ function lockfilePresent(manager, project) {
 }
 
 function managerLockfileNames(manager) {
-  switch (manager) {
+  switch (baseManager(manager)) {
     case 'lpm':
       return ['lpm.lock', 'lpm.lockb'];
     case 'bun':
@@ -560,7 +567,7 @@ function runInstall({ manager, root, output, measured, timing = false, allowUpTo
   const command = installCommand(manager, root, timing);
   const env = managerEnv(manager, root, timing);
   writeJson(path.join(output, 'command.json'), { command, cwd: projectDir(root), manager,
-    lpm_firewall_override: manager === 'lpm' ? env.LPM_NPM_FIREWALL : undefined });
+    lpm_firewall_override: isLpmManager(manager) ? env.LPM_NPM_FIREWALL : undefined });
   const timePath = path.join(output, 'time.txt');
   const timed = measured ? timedCommand(command, timePath) : { command, enabled: false };
   const actual = timed.command;
@@ -578,13 +585,13 @@ function runInstall({ manager, root, output, measured, timing = false, allowUpTo
     fs.writeFileSync(path.join(output, 'spawn-error.txt'), `${result.error.stack ?? result.error}\n`);
   }
   const timeOutput = timed.enabled && fs.existsSync(timePath) ? fs.readFileSync(timePath, 'utf8') : '';
-  const parsed = manager === 'lpm' ? parseJson(result.stdout) : null;
+  const parsed = isLpmManager(manager) ? parseJson(result.stdout) : null;
   if (parsed) {
     writeJson(path.join(output, 'stdout.json'), parsed);
   }
-  const firewallValidation = verifyFirewall(parsed, manager, lpmFirewallMode, allowUpToDate);
+  const firewallValidation = verifyFirewall(parsed, manager, firewallModeFor(manager), allowUpToDate);
   return {
-    ok: result.status === 0 && !result.error && (manager !== 'lpm' || parsed !== null) && firewallValidation.ok,
+    ok: result.status === 0 && !result.error && (!isLpmManager(manager) || parsed !== null) && firewallValidation.ok,
     exit_code: result.status ?? 1,
     signal: result.signal,
     spawn_error: result.error ? String(result.error) : undefined,
@@ -623,7 +630,7 @@ function runInstall({ manager, root, output, measured, timing = false, allowUpTo
 }
 
 function verifyFirewall(parsed, manager, mode, allowUpToDate = false) {
-  if (manager !== 'lpm' || !['monitor', 'enforce'].includes(mode)) {
+  if (!isLpmManager(manager) || !['monitor', 'enforce'].includes(mode)) {
     return { ok: true, status: 'not-requested' };
   }
   const firewall = parsed?.security?.firewall ?? parsed?.firewall;
@@ -663,7 +670,7 @@ function runOwnedCommand(command, options) {
     const group = -result.pid;
     for (const signal of ['SIGTERM', 'SIGKILL']) {
       try { process.kill(group, signal); } catch (error) {
-        if (error.code !== 'ESRCH') throw error;
+        if (error.code !== 'ESRCH' && !(error.code === 'EPERM' && !processGroupExists(group))) throw error;
         break;
       }
       const deadline = Date.now() + 1000;
@@ -682,6 +689,14 @@ function processGroupExists(group) {
     process.kill(group, 0);
     return true;
   } catch (error) {
+    if (error.code === 'EPERM') {
+      const snapshot = spawnSync('ps', ['-axo', 'pgid=,stat='], { encoding: 'utf8', timeout: 5000 });
+      if (snapshot.status !== 0) throw new Error('Could not inspect timed-out process group', { cause: error });
+      return snapshot.stdout.split('\n').some(line => {
+        const match = line.trim().match(/^(\d+)\s+(\S+)$/);
+        return match && Number(match[1]) === -group && !match[2].startsWith('Z');
+      });
+    }
     if (error.code !== 'ESRCH') throw error;
     return false;
   }
@@ -717,7 +732,7 @@ function drainManagerWorkers(manager) {
 }
 
 function installCommand(manager, root, timing) {
-  switch (manager) {
+  switch (baseManager(manager)) {
     case 'lpm': {
       const command = [
         lpmBin,
@@ -763,7 +778,7 @@ function installCommand(manager, root, timing) {
   }
 }
 
-function managerEnv(manager, root, timing = false, firewallMode = lpmFirewallMode) {
+function managerEnv(manager, root, timing = false, firewallMode = firewallModeFor(manager)) {
   const keep = [
     'PATH',
     'SHELL',
@@ -812,10 +827,11 @@ function managerEnv(manager, root, timing = false, firewallMode = lpmFirewallMod
   env.YARN_NODE_LINKER = 'node-modules';
   env.YARN_ENABLE_SCRIPTS = 'false';
   env.YARN_ENABLE_IMMUTABLE_INSTALLS = 'false';
-  if (manager === 'lpm') {
-    for (const key of ['LPM_REGISTRY_URL', 'LPM_TOKEN', 'LPM_NPM_FANOUT']) {
+  if (isLpmManager(manager)) {
+    for (const key of ['LPM_REGISTRY_URL', 'LPM_NPM_FANOUT']) {
       if (process.env[key] !== undefined) env[key] = process.env[key];
     }
+    if (firewallToken !== undefined && ['monitor', 'enforce'].includes(firewallMode)) env.LPM_TOKEN = firewallToken;
     env.LPM_HOME = lpmHomeDir(root);
     env.LPM_STORE_VERSION = 'v2';
     if (firewallMode !== undefined) env.LPM_NPM_FIREWALL = firewallMode;
@@ -862,7 +878,7 @@ function summarize(rows) {
           manager,
           {
             successful_samples: group.length,
-            firewall: manager === 'lpm' && ['monitor', 'enforce'].includes(lpmFirewallMode)
+            firewall: isLpmManager(manager) && ['monitor', 'enforce'].includes(firewallModeFor(manager))
               ? summarizeFirewall(group) : undefined,
             wall_ms: stats(group.map((row) => row.wall_ms)),
             max_rss_bytes: stats(group.map((row) => row.max_rss_bytes)),
@@ -917,9 +933,9 @@ function summarizeFirewall(rows) {
 }
 
 function summarizeTiming(rows) {
-  return SCENARIOS.map((scenario) => {
+  return SCENARIOS.flatMap((scenario) => timingManagers.map((manager) => {
     const group = rows.filter(
-      (row) => row.scenario === scenario.id && row.ok && row.verification.ok,
+      (row) => row.scenario === scenario.id && row.manager === manager && row.ok && row.verification.ok,
     );
     const streamedPackages = {};
     for (const row of group) {
@@ -928,6 +944,7 @@ function summarizeTiming(rows) {
     }
     return {
       scenario: scenario.id,
+      manager,
       title: scenario.title,
       successful_samples: group.length,
       pipeline_wall_sum_ms: stats(group.map((row) => row.pipeline_wall_sum_ms)),
@@ -956,7 +973,7 @@ function summarizeTiming(rows) {
       ),
       streamed_packages: streamedPackages,
     };
-  });
+  }));
 }
 
 function stats(values) {
@@ -1011,7 +1028,7 @@ function renderMarkdown(plan, summary, timingSummary) {
     for (const [index, manager] of plan.managers.entries()) {
       const result = row.managers[manager];
       const timing =
-        manager === 'lpm'
+        isLpmManager(manager)
           ? `${formatMs(result.resolve_ms?.median)} / ${formatMs(result.fetch_ms?.median)} / ${formatMs(result.link_ms?.median)}`
           : 'n/a';
       lines.push(
@@ -1019,14 +1036,15 @@ function renderMarkdown(plan, summary, timingSummary) {
       );
     }
   }
-  if (['monitor', 'enforce'].includes(plan.lpm_firewall_override)) {
-    lines.push('', '## LPM firewall diagnostics from scored samples', '',
+  for (const manager of plan.managers.filter((manager) =>
+    manager === 'lpm-monitor' || (manager === 'lpm' && ['monitor', 'enforce'].includes(plan.lpm_firewall_override)))) {
+    lines.push('', `## LPM firewall diagnostics from scored samples (${manager})`, '',
       'Only validated requests contribute to these statistics. Unknown verdicts overlap the action counts.',
       'Up-to-date samples can skip requests after validated preparation. Request work can overlap download work.', '',
       '| Scenario | Verdict samples / up-to-date samples | Checked / allow / warn / block / unknown median | Batch wall median / p95 | Chunk work median / p95 | Client request work median / p95 | Server entitlement work median / p95 |',
       '| --- | ---: | ---: | ---: | ---: | ---: | ---: |');
     for (const row of summary) {
-      const result = row.managers.lpm.firewall;
+      const result = row.managers[manager].firewall;
       const counts = ['checked_count', 'allow_count', 'warn_count', 'block_count', 'unknown_count']
         .map((key) => formatNumber(result[key]?.median)).join(' / ');
       lines.push(`| ${row.title} | ${result.verdict_samples} / ${result.up_to_date_samples} | ${counts} | ${wallCell(result.batch_ms)} | ${wallCell(result.chunk_sum_ms)} | ${wallCell(result.client_request_ms)} | ${wallCell(result.worker_entitlement_ms)} |`);
@@ -1036,12 +1054,12 @@ function renderMarkdown(plan, summary, timingSummary) {
     '',
     `## LPM timing diagnostics (${plan.timing_samples} samples, excluded from scored wall/RSS)`,
     '',
-    '| Scenario | Pipeline / body wall median / p95 | Weight requested / acquired | Permit wait / supplemental hold | Lease expiries | Declared / actual unpacked | Streamed packages |',
-    '| --- | ---: | ---: | ---: | ---: | ---: | --- |',
+    '| Scenario | Manager | Pipeline / body wall median / p95 | Weight requested / acquired | Permit wait / supplemental hold | Lease expiries | Declared / actual unpacked | Streamed packages |',
+    '| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |',
   );
   for (const row of timingSummary) {
     lines.push(
-      `| ${row.title} | pipeline ${wallCell(row.pipeline_wall_max_ms)}<br>body ${wallCell(row.stream_body_wall_ms)} | ${formatNumber(row.streaming_weight_requested?.median)} / ${formatNumber(row.streaming_weight_acquired?.median)} | ${formatMs(row.streaming_extract_permit_wait_ms?.median)} / ${formatMs(row.supplemental_permit_hold_ms?.median)} | ${formatNumber(row.supplemental_permit_lease_expired?.median)} | ${formatMiB(row.declared_unpacked_bytes?.median)} / ${formatMiB(row.actual_unpacked_bytes?.median)} (${formatRatio(row.actual_to_declared_unpacked_ratio?.median)}) | ${Object.entries(row.streamed_packages)
+      `| ${row.title} | ${row.manager} | pipeline ${wallCell(row.pipeline_wall_max_ms)}<br>body ${wallCell(row.stream_body_wall_ms)} | ${formatNumber(row.streaming_weight_requested?.median)} / ${formatNumber(row.streaming_weight_acquired?.median)} | ${formatMs(row.streaming_extract_permit_wait_ms?.median)} / ${formatMs(row.supplemental_permit_hold_ms?.median)} | ${formatNumber(row.supplemental_permit_lease_expired?.median)} | ${formatMiB(row.declared_unpacked_bytes?.median)} / ${formatMiB(row.actual_unpacked_bytes?.median)} (${formatRatio(row.actual_to_declared_unpacked_ratio?.median)}) | ${Object.entries(row.streamed_packages)
         .map(([name, count]) => `${name} ×${count}`)
         .join(', ')} |`,
     );
@@ -1222,7 +1240,7 @@ function commandVersion(command) {
 }
 
 function describeManager(manager) {
-  if (manager === 'lpm') {
+  if (isLpmManager(manager)) {
     return {
       binary: lpmBin,
       binary_sha256: sha256(fs.readFileSync(lpmBin)),
@@ -1239,6 +1257,18 @@ function describeManager(manager) {
 
 function managerBinary(manager) {
   return binaryOverrides[manager] ?? manager;
+}
+
+function baseManager(manager) {
+  return manager === 'lpm-monitor' ? 'lpm' : manager;
+}
+
+function isLpmManager(manager) {
+  return baseManager(manager) === 'lpm';
+}
+
+function firewallModeFor(manager) {
+  return manager === 'lpm-monitor' ? 'monitor' : manager === 'lpm' ? lpmFirewallMode : undefined;
 }
 
 function installedPackageVersion(binary, name) {
@@ -1383,6 +1413,16 @@ function selfTest() {
   assert.equal(managerEnv('bun', '/tmp/test-firewall', false, 'monitor').LPM_NPM_FIREWALL, undefined);
   assert.equal(managerEnv('lpm', '/tmp/test-firewall', false, undefined).LPM_NPM_FIREWALL, undefined);
   if (process.platform !== 'win32' && fs.existsSync('/usr/bin/time')) {
+    const originalKill = process.kill;
+    try {
+      process.kill = () => { throw Object.assign(new Error('kill EPERM'), { code: 'EPERM' }); };
+      assert.equal(processGroupExists(-2147483647), false, 'EPERM must not report a departed group as alive');
+      const ownGroup = Number(spawnSync('ps', ['-o', 'pgid=', '-p', String(process.pid)], { encoding: 'utf8' }).stdout.trim());
+      assert.ok(ownGroup > 0);
+      assert.equal(processGroupExists(-ownGroup), true, 'EPERM must not hide live group members');
+    } finally {
+      process.kill = originalKill;
+    }
     let childPid;
     try {
       const { result } = runOwnedCommand(['/usr/bin/time', process.execPath, '-e',
@@ -1618,7 +1658,7 @@ function selfTest() {
       assert.equal(fs.existsSync(runtimeCache), true, `${manager} runtime remains`);
       assert.equal(hasEntries(store), true, 'installed LPM backing store remains');
       clearAllDependencyState(manager, root);
-      if (manager === 'lpm') assert.equal(hasEntries(store), false);
+      if (isLpmManager(manager)) assert.equal(hasEntries(store), false);
     }
   } finally {
     fs.rmSync(cacheTestRoot, { recursive: true, force: true });
@@ -1638,7 +1678,7 @@ function selfTest() {
         ...expected,
         installed_resolves: expected.node_modules,
         package_store:
-          manager === 'lpm' && !['first-install', 'ci-cold-cache'].includes(scenario.id),
+          isLpmManager(manager) && !['first-install', 'ci-cold-cache'].includes(scenario.id),
       });
     }
   }
@@ -1673,8 +1713,9 @@ measured install must resolve next/package.json and contain every direct depende
 Options:
   -n, --samples N      Samples per manager/state (default: 10)
       --timing-samples N  Separate LPM --timing samples per state (default: 3)
-      --managers LIST  lpm,bun,pnpm,npm,aube,nub,deno,vlt,upm,yarn
+      --managers LIST  lpm,lpm-monitor,bun,pnpm,npm,aube,nub,deno,vlt,upm,yarn
                        (default: lpm,bun; must include lpm)
+                       lpm-monitor adds an isolated monitor-mode entry to the same run
       --manager-bins FILE  JSON object mapping manager names to executable paths
       --lpm-bin PATH   LPM binary (default: target/release/lpm-rs)
       --lpm-firewall MODE  Explicit LPM firewall mode: off, monitor, or enforce
