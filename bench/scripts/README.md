@@ -301,10 +301,29 @@ node bench/scripts/run-t3-install-six-states.mjs \
   --work-dir /path/to/new-work-directory
 ```
 
+Compare both LPM modes and the reference managers in one rotating run:
+
+```bash
+node bench/scripts/run-t3-install-six-states.mjs \
+  --samples 10 \
+  --timing-samples 3 \
+  --managers lpm,lpm-monitor,bun,pnpm,npm \
+  --lpm-firewall off \
+  --lpm-bin /path/to/lpm-rs \
+  --output /path/to/new-results \
+  --work-dir /path/to/new-work-directory
+```
+
+The `lpm-monitor` entry always uses monitor mode, regardless of `--lpm-firewall`.
+Both LPM entries use the same executable, with separate projects, homes, caches, and stores.
+Each entry has separate scored rows and timing diagnostics.
+Timing artifacts include the manager name in their path, and timing summaries include a `manager` field.
+
 The `--lpm-firewall` option accepts `off`, `monitor`, or `enforce`.
 Monitor and enforce modes require authentication.
 Supply a temporary read-only token through `LPM_TOKEN` in the process environment.
-The harness passes this token only to LPM.
+The harness passes this token only to LPM install commands with explicit monitor or enforce mode.
+Baseline installs, reference managers, version probes, and helper commands do not receive it.
 Do not put a token in command arguments or result files.
 The harness isolates `HOME`, so it does not use your normal file-based login state.
 Revoke the temporary token after the benchmark.
@@ -334,6 +353,8 @@ The Markdown summary lists successful installs and total attempts for each manag
 On POSIX hosts, a timed-out install receives process-group cleanup outside the measured interval.
 The cleanup sends SIGTERM first.
 If the group remains after one second, the cleanup sends SIGKILL.
+If a process-group probe returns `EPERM`, cleanup checks the process table for live members.
+The fallback treats empty and zombie-only groups as exited. Live groups still require cleanup.
 The median averages the middle two values for an even sample count.
 The p95 uses the nearest rank. With ten samples, p95 equals the maximum.
 The harness waits for vlt background workers outside the measured interval before the next install or cache reset.

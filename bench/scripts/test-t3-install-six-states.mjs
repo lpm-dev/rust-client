@@ -14,6 +14,7 @@ const fixture = path.join(root, 'fixture');
 const lpm = path.join(root, 'fake-lpm.cjs');
 const aube = path.join(root, 'fake-aube.cjs');
 const bins = path.join(root, 'bins.json');
+const versionProbeLog = path.join(root, 'version-probes.jsonl');
 const writeJson = (name, value) => fs.writeFileSync(name, JSON.stringify(value));
 const readJson = (name) => JSON.parse(fs.readFileSync(path.join(output, name), 'utf8'));
 
@@ -23,9 +24,14 @@ try {
   fs.writeFileSync(lpm, `#!${process.execPath}
 const fs = require('node:fs');
 const path = require('node:path');
-if (process.argv.includes('--version')) { console.log('fake-lpm 1.0.0'); process.exit(0); }
-if (process.env.LPM_NPM_FIREWALL !== 'monitor') throw new Error('missing monitor override');
-if (process.env.LPM_TOKEN !== 'fixture-token-not-secret') throw new Error('missing LPM token');
+if (process.argv.includes('--version')) {
+  fs.appendFileSync(${JSON.stringify(versionProbeLog)}, JSON.stringify({ manager: 'lpm', token_present: process.env.LPM_TOKEN !== undefined }) + '\\n');
+  console.log('fake-lpm 1.0.0'); process.exit(0);
+}
+if (!['monitor', 'off'].includes(process.env.LPM_NPM_FIREWALL)) throw new Error('missing firewall override');
+const monitor = process.env.LPM_NPM_FIREWALL === 'monitor';
+if (monitor && process.env.LPM_TOKEN !== 'fixture-token-not-secret') throw new Error('missing LPM token');
+if (!monitor && process.env.LPM_TOKEN !== undefined) throw new Error('token leaked to baseline');
 const upToDate = fs.existsSync('node_modules/next/package.json');
 const rpcFailed = fs.existsSync(${JSON.stringify(path.join(root, 'fail-firewall'))});
 for (const target of ['node_modules/next', path.join(process.env.LPM_HOME, 'cache'), path.join(process.env.LPM_HOME, 'store')]) {
@@ -35,13 +41,16 @@ for (const target of ['node_modules/next', path.join(process.env.LPM_HOME, 'cach
 fs.writeFileSync('node_modules/next/package.json', JSON.stringify({ name: 'next', version: '1.0.0' }));
 fs.writeFileSync('lpm.lock', 'fixture lock');
 console.log(JSON.stringify({ duration_ms: 1, count: 1, up_to_date: upToDate,
-  security: upToDate ? undefined : { firewall: { enabled: true, mode: process.env.LPM_NPM_FIREWALL,
+  security: upToDate || !monitor ? undefined : { firewall: { enabled: true, mode: process.env.LPM_NPM_FIREWALL,
     checked_count: 1, allow_count: rpcFailed ? 0 : 1, warn_count: 0, block_count: 0, unknown_count: 0,
     rpc_failed: rpcFailed, offline_skipped: false } },
   timing: { resolve_ms: 0, fetch_ms: 0, link_ms: 0 } }));
 `, { mode: 0o755 });
   fs.writeFileSync(aube, `#!${process.execPath}
-if (process.argv.includes('--version')) { console.log('fake-aube 1.0.0'); process.exit(0); }
+if (process.argv.includes('--version')) {
+  require('node:fs').appendFileSync(${JSON.stringify(versionProbeLog)}, JSON.stringify({ manager: 'aube', token_present: process.env.LPM_TOKEN !== undefined }) + '\\n');
+  console.log('fake-aube 1.0.0'); process.exit(0);
+}
 if (process.env.LPM_NPM_FIREWALL !== undefined) throw new Error('LPM override leaked to another manager');
 if (process.env.LPM_TOKEN !== undefined) throw new Error('LPM token leaked to another manager');
 console.error('ERR_AUBE_TRUST_DOWNGRADE fixture');
@@ -60,6 +69,9 @@ process.exit(23);
     assert.match(result.stdout, /results:/, 'failures must not prevent final summaries');
   };
   run();
+  const versionProbes = fs.readFileSync(versionProbeLog, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  assert.deepEqual(versionProbes.map(probe => probe.manager).sort(), ['aube', 'lpm']);
+  assert.ok(versionProbes.every(probe => !probe.token_present), 'version probes must not inherit LPM_TOKEN');
   const rows = readJson('rows.json');
   assert.equal(rows.length, 12);
   assert.equal(rows.filter((row) => row.ok && row.verification.ok).length, 6);
@@ -89,6 +101,40 @@ process.exit(23);
   assert.equal(readJson('timing-rows.json').length, 6);
   assert.deepEqual(readJson('timing-rows.json')[0], timing[0]);
   assert.ok(fs.readdirSync(output).some((name) => /^resume-.*\.json$/.test(name)));
+
+  const combinedOutput = path.join(root, 'combined-results');
+  const combinedArgs = ['--managers', 'lpm,lpm-monitor,aube', '--lpm-firewall', 'off', '--output', combinedOutput];
+  run(combinedArgs);
+  const combinedRead = name => JSON.parse(fs.readFileSync(path.join(combinedOutput, name), 'utf8'));
+  const combinedRows = combinedRead('rows.json');
+  assert.equal(combinedRows.length, 18);
+  for (const manager of ['lpm', 'lpm-monitor']) {
+    assert.equal(combinedRows.filter(row => row.manager === manager && row.ok).length, 6);
+    assert.equal(combinedRead('timing-rows.json').filter(row => row.manager === manager && row.ok).length, 6);
+    assert.equal(combinedRead('timing-summary.json').filter(row => row.manager === manager).length, 6);
+  }
+  assert.ok(combinedRows.filter(row => row.manager === 'lpm').every(row => row.firewall === undefined));
+  assert.ok(combinedRows.filter(row => row.manager === 'lpm-monitor')
+    .every(row => row.firewall_validation.ok && row.firewall_validation.status !== 'not-requested'));
+  for (const row of combinedRows.filter(row => row.ok)) {
+    const command = JSON.parse(fs.readFileSync(path.join(combinedOutput, 'artifacts', row.scenario,
+      row.manager, 'sample-1', 'command.json'), 'utf8'));
+    assert.equal(command.lpm_firewall_override, row.manager === 'lpm-monitor' ? 'monitor' : 'off');
+    assert.ok(command.cwd.includes(`-${row.manager}/project`), 'each entry has its own installed tree and home');
+    assert.deepEqual([...row.manager_order_ids].sort(), ['aube', 'lpm', 'lpm-monitor']);
+  }
+  const combinedPlan = combinedRead('plan.json');
+  assert.deepEqual(combinedPlan.manager_info.lpm, combinedPlan.manager_info['lpm-monitor']);
+  const combinedPrefix = combinedRows.slice(0, 4);
+  writeJson(path.join(combinedOutput, 'rows.partial.json'), combinedPrefix);
+  writeJson(path.join(combinedOutput, 'timing-rows.partial.json'), combinedRead('timing-rows.json').slice(0, 3));
+  fs.unlinkSync(path.join(combinedOutput, 'summary.json'));
+  run([...combinedArgs, '--resume']);
+  assert.deepEqual(combinedRead('rows.json').slice(0, combinedPrefix.length), combinedPrefix);
+  assert.equal(combinedRead('rows.json').length, 18);
+  assert.equal(combinedRead('timing-rows.json').length, 12);
+  assert.match(fs.readFileSync(path.join(combinedOutput, 'summary.md'), 'utf8'), /scored samples \(lpm-monitor\)/);
+
   fs.writeFileSync(path.join(root, 'fail-firewall'), 'fixture');
   const failedOutput = path.join(root, 'failed-firewall-results');
   run(['--output', failedOutput]);
@@ -99,6 +145,13 @@ process.exit(23);
     assert.ok(failed.every((row) => !row.ok), 'failed firewall requests must never count as successful benchmarks');
     assert.equal(failed.filter((row) => row.phase === 'preparation').length, 5,
       'a failed firewall preparation must block no-op measurements too');
+  }
+  const failedCombined = path.join(root, 'failed-combined-results');
+  run([...combinedArgs, '--output', failedCombined]);
+  for (const name of ['rows.json', 'timing-rows.json']) {
+    const failed = JSON.parse(fs.readFileSync(path.join(failedCombined, name), 'utf8'));
+    assert.ok(failed.filter(row => row.manager === 'lpm').every(row => row.ok));
+    assert.ok(failed.filter(row => row.manager === 'lpm-monitor').every(row => !row.ok));
   }
   console.log('blocked-preparation and resume integration tests passed');
 } finally {
