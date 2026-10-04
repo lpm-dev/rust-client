@@ -78,11 +78,15 @@ fn verify_fresh_vault_id(
     Ok(())
 }
 
-pub(super) fn build_sync_environments(
-    mut all_envs: HashMap<String, HashMap<String, String>>,
-) -> HashMap<String, HashMap<String, String>> {
-    all_envs.retain(|_, secrets| !secrets.is_empty());
-    all_envs
+pub(super) fn build_sync_payload(
+    environments: HashMap<String, HashMap<String, String>>,
+) -> Result<String, LpmError> {
+    #[derive(serde::Serialize)]
+    struct SyncPayload {
+        environments: HashMap<String, HashMap<String, String>>,
+    }
+    serde_json::to_string(&SyncPayload { environments })
+        .map_err(|error| LpmError::Script(format!("failed to serialize: {error}")))
 }
 
 pub(super) fn parse_remote_pull_payload_for_overwrite(
@@ -517,14 +521,17 @@ mod tests {
     }
 
     #[test]
-    fn build_sync_environments_preserves_custom_identity_after_alias_change() {
+    fn build_sync_payload_preserves_custom_identity_after_alias_change() {
         let mut all_envs = HashMap::new();
         all_envs.insert(
             "dev".into(),
             HashMap::from([(String::from("API_KEY"), String::from("current-secret"))]),
         );
 
-        let sync_envs = build_sync_environments(all_envs);
+        let sync_envs =
+            serde_json::from_str::<RemotePullPayload>(&build_sync_payload(all_envs).unwrap())
+                .unwrap()
+                .environments;
 
         assert_eq!(
             sync_envs.len(),
@@ -542,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn build_sync_environments_keeps_distinct_current_environment_identities() {
+    fn build_sync_payload_keeps_distinct_current_environment_identities() {
         let mut all_envs = HashMap::new();
         all_envs.insert(
             "dev".into(),
@@ -559,7 +566,10 @@ mod tests {
             ]),
         );
 
-        let sync_envs = build_sync_environments(all_envs);
+        let sync_envs =
+            serde_json::from_str::<RemotePullPayload>(&build_sync_payload(all_envs).unwrap())
+                .unwrap()
+                .environments;
         assert_eq!(sync_envs.len(), 2);
         let dev = sync_envs
             .get("dev")
@@ -576,7 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn build_sync_environments_filters_empty_entries_in_place() {
+    fn build_sync_payload_preserves_named_empty_entries() {
         let environment_count = 5_000;
         let all_envs: HashMap<_, _> = (0..environment_count)
             .map(|index| {
@@ -591,14 +601,17 @@ mod tests {
             })
             .collect();
 
-        let sync_envs = build_sync_environments(all_envs);
+        let sync_envs =
+            serde_json::from_str::<RemotePullPayload>(&build_sync_payload(all_envs).unwrap())
+                .unwrap()
+                .environments;
 
-        assert_eq!(sync_envs.len(), environment_count / 2);
+        assert_eq!(sync_envs.len(), environment_count);
     }
 
     #[test]
     #[ignore = "manual deterministic performance harness"]
-    fn build_sync_environments_large_map_benchmark() {
+    fn build_sync_payload_large_map_benchmark() {
         let size = 10_000;
         let all_envs = (0..size)
             .map(|index| {
@@ -610,12 +623,16 @@ mod tests {
             .collect();
         let started = std::time::Instant::now();
 
-        let sync_envs = std::hint::black_box(build_sync_environments(all_envs));
+        let payload = std::hint::black_box(build_sync_payload(all_envs).unwrap());
+        let elapsed = started.elapsed();
+        let sync_envs = serde_json::from_str::<RemotePullPayload>(&payload)
+            .unwrap()
+            .environments;
 
         assert_eq!(sync_envs.len(), size);
         eprintln!(
-            "build_sync_environments size={size} elapsed_ns={}",
-            started.elapsed().as_nanos()
+            "build_sync_payload size={size} elapsed_ns={}",
+            elapsed.as_nanos()
         );
     }
 

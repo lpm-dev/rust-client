@@ -160,8 +160,10 @@ pub(super) async fn env_share(
         lpm_vault::try_get_all_environments_for_vault_id(&vault_id).map_err(LpmError::Script)?;
     let environment_count = all_envs.len();
     let total_keys: usize = all_envs.values().map(|e| e.len()).sum();
-    if total_keys == 0 {
-        return Err(LpmError::Script("vault is empty, nothing to share".into()));
+    if all_envs.is_empty() {
+        return Err(LpmError::Script(
+            "no environments configured, nothing to share".into(),
+        ));
     }
 
     let (private_key, member_access) =
@@ -179,13 +181,7 @@ pub(super) async fn env_share(
     let member_access = std::sync::Arc::new(member_access);
 
     let config = manifest.config;
-    let non_empty_envs = super::sync_payload::build_sync_environments(all_envs);
-    let secrets_json = std::sync::Arc::new({
-        let mut wrapper = std::collections::HashMap::new();
-        wrapper.insert("environments".to_string(), non_empty_envs);
-        serde_json::to_string(&wrapper)
-            .map_err(|e| LpmError::Script(format!("failed to serialize: {e}")))?
-    });
+    let secrets_json = std::sync::Arc::new(super::sync_payload::build_sync_payload(all_envs)?);
 
     let project_name = manifest.vault.project_name(project_dir);
     let schema_value = std::sync::Arc::new(super::sync_payload::build_push_schema_value(

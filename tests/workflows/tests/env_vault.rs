@@ -8681,3 +8681,233 @@ async fn env_oidc_org_list_and_disable_preserve_the_organization_selector() {
         }
     }
 }
+
+#[tokio::test]
+async fn env_push_preserves_named_empty_environments() {
+    assert_personal_push_environments(false).await;
+}
+
+#[tokio::test]
+async fn env_push_accepts_projects_with_only_empty_environments() {
+    assert_personal_push_environments(true).await;
+}
+
+async fn assert_personal_push_environments(all_empty: bool) {
+    let project = TempProject::empty(r#"{"name":"empty-sync","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let origin = mock.url();
+    let vault_id = "vault-empty-sync";
+    let token = "empty-sync-token";
+    let environments = serde_json::json!({
+        "default": if all_empty { serde_json::json!({}) } else { serde_json::json!({"TOKEN":"dummy"}) },
+        "staging": {},
+    });
+    project.write_file("lpm.json", &serde_json::json!({
+        "vault": vault_id,
+        "vaultSync": {"authorityCheckpoints":{"personal":{(origin.clone()):{"account-1":{"version":7,"syncedAt":"2026-09-05T00:00:00Z"}}}}},
+    }).to_string());
+    write_file_backed_vault(
+        project.home(),
+        vault_id,
+        serde_json::json!({"environments":environments}),
+    );
+    write_private_file(
+        &project.home().join(".lpm/.vault-key"),
+        hex::encode([0x81; 32]),
+    );
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &origin,
+            access_token: Some(token),
+            refresh_token: Some("empty-sync-refresh"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    mock.with_personal_pull_keys(
+        vault_id,
+        token,
+        serde_json::json!({"environments":{"default":{}}}),
+        &[0x81; 32],
+        &[0x82; 32],
+        7,
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/api/vaults/{vault_id}/sync")))
+        .respond_with(signed_sync_response(
+            serde_json::json!({"version":8,"status":"synced"}),
+            token,
+            vault_id,
+            TestSyncScope::Personal,
+        ))
+        .mount(mock.server())
+        .await;
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", &origin)
+        .args(["--json", "env", "push", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "push failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    let push = requests
+        .iter()
+        .find(|request| request.method.as_str() == "POST")
+        .expect("personal upload");
+    let body: serde_json::Value = serde_json::from_slice(&push.body).unwrap();
+    assert_eq!(body["expectedVersion"], 7);
+    assert_eq!(body["ciphertextRevision"], 8);
+    let root_file = std::fs::read_dir(project.home().join(".lpm"))
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".env-personal-root-v2-")
+        })
+        .unwrap()
+        .path();
+    let root: [u8; 32] = hex::decode(std::fs::read_to_string(root_file).unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let context = lpm_vault::crypto::personal::PersonalKeyContext {
+        registry_origin: &origin,
+        principal_id: "account-1",
+        vault_id,
+        project_key_version: 1,
+    };
+    let (nonce, ciphertext) = body["wrappedProjectKey"]
+        .as_str()
+        .unwrap()
+        .split_once(':')
+        .unwrap();
+    let mut key = BASE64.decode(ciphertext).unwrap();
+    Aes256Gcm::new_from_slice(&root)
+        .unwrap()
+        .decrypt_in_place(
+            GenericArray::from_slice(&BASE64.decode(nonce).unwrap()),
+            &lpm_vault::crypto::personal::key_associated_data(&context, None).unwrap(),
+            &mut key,
+        )
+        .unwrap();
+    let project_key = lpm_vault::crypto::personal::PersonalProjectKey {
+        key: key.try_into().unwrap(),
+        envelope: lpm_vault::crypto::personal::PersonalKeyEnvelope {
+            personal_key_scheme: 2,
+            personal_registry_origin: origin,
+            project_key_version: 1,
+            wrapped_project_key: body["wrappedProjectKey"].as_str().unwrap().to_owned(),
+        },
+    };
+    let plaintext = lpm_vault::crypto::personal::decrypt_personal_payload(
+        &project_key,
+        "account-1",
+        vault_id,
+        8,
+        lpm_vault::crypto::CURRENT_CRYPTO_VERSION,
+        body["encryptedBlob"].as_str().unwrap(),
+        body["wrappedKey"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&plaintext).unwrap()["environments"],
+        environments
+    );
+    let envelope = parse_json_output(&output.stdout);
+    assert_eq!(envelope["success"], true);
+    assert_eq!(envelope["version"], 8);
+}
+
+#[tokio::test]
+async fn env_share_preserves_named_empty_environments() {
+    assert_org_share_environments(false).await;
+}
+
+#[tokio::test]
+async fn env_share_accepts_projects_with_only_empty_environments() {
+    assert_org_share_environments(true).await;
+}
+
+async fn assert_org_share_environments(all_empty: bool) {
+    let project = TempProject::empty(r#"{"name":"empty-share","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let vault_id = "vault-empty-share";
+    let token = "empty-share-token";
+    let (private_key, public_key, fingerprint) =
+        prepare_org_share_project(&project, &mock, token, vault_id);
+    let environments = serde_json::json!({
+        "default": if all_empty { serde_json::json!({}) } else { serde_json::json!({"TOKEN":"dummy"}) },
+        "staging": {},
+    });
+    write_file_backed_vault(
+        project.home(),
+        vault_id,
+        serde_json::json!({"environments":environments}),
+    );
+    mount_org_member_keys(&mock, token, ORG_ROTATION_SLUG, &public_key, &fingerprint).await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/orgs/{ORG_ROTATION_SLUG}/vaults/{vault_id}"
+        )))
+        .respond_with(signed_sync_response(
+            serde_json::json!({"status":"shared","version":1,"contentKeyVersion":1}),
+            token,
+            vault_id,
+            TestSyncScope::Organization(ORG_ROTATION_SLUG.to_owned()),
+        ))
+        .mount(mock.server())
+        .await;
+    let acceptance = org_rotation_recipient_acceptance(&mock, &fingerprint);
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", mock.url())
+        .args([
+            "--json",
+            "env",
+            "share",
+            "--org",
+            ORG_ROTATION_SLUG,
+            "--accept-recipient-keys",
+            &acceptance,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "share failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    let push = requests
+        .iter()
+        .find(|request| request.method.as_str() == "POST")
+        .expect("organization upload");
+    let body: serde_json::Value = serde_json::from_slice(&push.body).unwrap();
+    let key = lpm_vault::crypto::unwrap_key_from_sender(
+        body["wrappedKeys"][0]["wrappedKey"].as_str().unwrap(),
+        &private_key,
+    )
+    .unwrap();
+    let plaintext = lpm_vault::crypto::decrypt_vault_payload(
+        &key,
+        body["encryptedBlob"].as_str().unwrap(),
+        lpm_vault::crypto::VaultScope::Organization(ORG_ROTATION_SLUG),
+        "00000000-0000-4000-8000-000000000001",
+        vault_id,
+        1,
+        lpm_vault::crypto::CURRENT_CRYPTO_VERSION,
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&plaintext).unwrap()["environments"],
+        environments
+    );
+    let envelope = parse_json_output(&output.stdout);
+    assert_eq!(envelope["success"], true);
+    assert_eq!(envelope["version"], 1);
+}
