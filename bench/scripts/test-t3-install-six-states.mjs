@@ -76,6 +76,10 @@ process.exit(23);
   assert.equal(rows.length, 12);
   assert.equal(rows.filter((row) => row.ok && row.verification.ok).length, 6);
   assert.equal(readJson('plan.json').lpm_firewall_override, 'monitor');
+  const plan = readJson('plan.json');
+  assert.equal(plan.manager_order, 'shuffle-reverse-pairs-v1');
+  assert.match(plan.order_seed, /^[0-9a-f]{32}$/);
+  assert.ok(fs.readFileSync(path.join(output, 'summary.md'), 'utf8').includes(`seed \`${plan.order_seed}\``));
   assert.ok(rows.filter((row) => row.manager === 'lpm' && !['installed-cache-gone', 'up-to-date'].includes(row.scenario))
     .every((row) => row.firewall.mode === 'monitor'));
   assert.equal(rows.filter((row) => row.phase === 'preparation').length, 5);
@@ -95,6 +99,7 @@ process.exit(23);
   run(['--resume']);
   const resumed = readJson('rows.json');
   assert.deepEqual(resumed.slice(0, prefix.length), prefix, 'resume must preserve previous attempts');
+  assert.equal(readJson('plan.json').order_seed, plan.order_seed, 'resume must keep the planned order seed');
   assert.equal(resumed.length, 12);
   assert.equal(new Set(resumed.map((row) => `${row.sample}:${row.scenario}:${row.manager}`)).size, 12);
   assert.equal(resumed.filter((row) => row.ok && row.verification.ok).length, 6);

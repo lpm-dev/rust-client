@@ -253,8 +253,14 @@ Yarn uses the `node-modules` linker. Deno creates local `node_modules`.
 vlt uses the public npm registry. npm retains its default audit behavior.
 Different defaults can produce different dependency graphs, even with the same fixture.
 
-Each manager comparison group is adjacent. The harness rotates manager order
-and state order for each sample. The reference managers expose network noise.
+Each manager comparison group is adjacent. Each odd sample runs its managers
+in a random order, and the following even sample runs them in reverse. No
+manager consistently runs right after another manager has warmed shared
+upstream caches, and with an even sample count every manager runs before each
+other manager equally often. The order derives from a seed that `plan.json`
+records as `order_seed`. Pass `--order-seed` to reproduce an order; `--resume`
+reuses the recorded seed. State order rotates by sample.
+The reference managers expose network noise.
 Scored wall-time and RSS samples do not enable LPM timing detail. After the
 scored groups, the harness runs separate LPM-only `--json --timing`
 diagnostics with `LPM_TIMING_DETAIL=trace`. Use `--timing-samples` to set their
@@ -301,7 +307,7 @@ node bench/scripts/run-t3-install-six-states.mjs \
   --work-dir /path/to/new-work-directory
 ```
 
-Compare both LPM modes and the reference managers in one rotating run:
+Compare both LPM modes and the reference managers in one run:
 
 ```bash
 node bench/scripts/run-t3-install-six-states.mjs \
