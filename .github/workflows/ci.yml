@@ -614,6 +614,12 @@ jobs:
           cargo test --locked -p lpm-workflows --test run_runtime workspace_resolves_windows_current_directory_node_before_path
           cargo test --locked -p lpm-workflows --test run_runtime workspace_does_not_reuse_shared_node_shim_version_across_member_cwds
 
+      - name: Windows scoped environment workflows
+        run: |
+          cargo test --locked -p lpm-workflows --test env_local sparse_and_bulk_inherited_lookup_match_windows_canonical_names
+          cargo test --locked -p lpm-workflows --test env_local scoped_direct_files_and_local_bins_use_the_canonical_environment_and_final_values
+          cargo test --locked -p lpm-workflows --test tools detected_test_runners_validate_test_scopes_for_single_and_workspace_packages
+
       - name: Windows dev environment workflow tests
         run: cargo test --locked -p lpm-workflows --test dev dev_schema_
 

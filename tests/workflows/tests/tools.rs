@@ -3647,3 +3647,61 @@ fn fmt_workspace_watch_keeps_the_workspace_failure_exit_code() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
 }
+
+#[test]
+fn detected_test_runners_validate_test_scopes_for_single_and_workspace_packages() {
+    for workspace in [false, true] {
+        let project = TempProject::empty(r#"{"name":"scoped-tests","workspaces":["packages/*"]}"#);
+        let directory = if workspace { "packages/member/" } else { "" };
+        project.write_file(
+            &format!("{directory}package.json"),
+            &serde_json::json!({"name":"scoped-member","devDependencies":{"vitest":"4.1.9"}})
+                .to_string(),
+        );
+        #[cfg(unix)]
+        write_unix_executable(
+            &project
+                .path()
+                .join(format!("{directory}node_modules/.bin/vitest")),
+            "#!/bin/sh\nexec node scoped-test.cjs\n",
+        );
+        #[cfg(windows)]
+        project.write_file(
+            &format!("{directory}node_modules/.bin/vitest.cmd"),
+            "@echo off\r\nnode scoped-test.cjs\r\n",
+        );
+        project.write_file(&format!("{directory}scoped-test.cjs"),
+            "require('node:fs').writeFileSync('test-marker',process.env.SCOPED_TEST_VALUE || 'missing')");
+        for default in [false, true] {
+            let mut rule = serde_json::json!({"requiredIn":[{"stage":["test"]}]});
+            if default {
+                rule["defaultsIn"] =
+                    serde_json::json!([{"when":{"stage":["test"]},"value":"test-scope"}]);
+            }
+            project.write_file(
+                &format!("{directory}lpm.json"),
+                &serde_json::json!({"envSchema":{"vars":{"SCOPED_TEST_VALUE":rule}}}).to_string(),
+            );
+            let mut command = lpm(&project);
+            command.env_remove("SCOPED_TEST_VALUE").arg("test");
+            if workspace {
+                command.arg("--all");
+            }
+            let output = command.output().unwrap();
+            assert_eq!(
+                output.status.success(),
+                default,
+                "workspace={workspace}, default={default}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if default {
+                assert_eq!(
+                    project.read_file(&format!("{directory}test-marker")),
+                    "test-scope"
+                );
+            } else {
+                assert!(!project.file_exists(&format!("{directory}test-marker")));
+            }
+        }
+    }
+}

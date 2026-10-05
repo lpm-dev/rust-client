@@ -237,6 +237,23 @@ pub struct EnvValidator<'a> {
 impl<'a> EnvValidator<'a> {
     /// Compile a deterministic validation plan for an environment schema.
     pub fn new(schema: &'a EnvSchema) -> Self {
+        if !crate::scopes::budgets_valid(schema) {
+            return Self {
+                schema,
+                groups: Vec::new(),
+                rules: Vec::new(),
+                patterns: Vec::new(),
+                pattern_batches: Vec::new(),
+                definition_errors: vec![ValidationError {
+                    key: "envSchema".into(),
+                    kind: ValidationErrorKind::InvalidRule {
+                        message: "scope definitions exceed 4096 selectors or 16384 dimension values",
+                    },
+                    description: None,
+                    is_secret: false,
+                }],
+            };
+        }
         let mut keys = Vec::with_capacity(schema.vars.len());
         keys.extend(schema.vars.keys().map(String::as_str));
         keys.sort_unstable();
@@ -308,6 +325,11 @@ impl<'a> EnvValidator<'a> {
         validator
     }
 
+    /// The immutable schema used to compile this plan.
+    pub fn schema(&self) -> &'a EnvSchema {
+        self.schema
+    }
+
     /// Return declaration errors independently of supplied values.
     pub fn schema_errors(&self) -> &[ValidationError] {
         &self.definition_errors
@@ -334,6 +356,14 @@ impl<'a> EnvValidator<'a> {
         for compiled in &self.rules {
             let key = compiled.key;
             let rule = compiled.rule;
+            if let Some(message) = crate::scopes::rule_error(rule) {
+                errors.push(validation_error(
+                    key,
+                    rule,
+                    ValidationErrorKind::InvalidRule { message },
+                ));
+                continue;
+            }
             if !is_valid_env_var_name(key) {
                 errors.push(validation_error(
                     key,
@@ -347,6 +377,7 @@ impl<'a> EnvValidator<'a> {
                 .iter()
                 .chain(rule.pattern.iter())
                 .chain(rule.default.iter())
+                .chain(rule.defaults_in.iter().map(|default| &default.value))
                 .chain(rule.enum_values.iter().flatten())
                 .any(|value| {
                     value.chars().any(|character| {
@@ -422,11 +453,25 @@ impl<'a> EnvValidator<'a> {
                 ));
                 continue;
             }
-            if let Some(default) = &rule.default {
+            for (default, scoped) in rule.default.iter().map(|value| (value, false)).chain(
+                rule.defaults_in
+                    .iter()
+                    .map(|default| (&default.value, true)),
+            ) {
                 if default.is_empty() && rule.empty == EmptyPolicy::Reject {
-                    errors.push(validation_error(key, rule, ValidationErrorKind::Empty));
+                    errors.push(ValidationError {
+                        key: key.into(),
+                        kind: ValidationErrorKind::Empty,
+                        description: None,
+                        is_secret: rule.secret,
+                    });
                 } else if default.is_empty() && rule.required {
-                    errors.push(validation_error(key, rule, ValidationErrorKind::Missing));
+                    errors.push(ValidationError {
+                        key: key.into(),
+                        kind: ValidationErrorKind::Missing,
+                        description: None,
+                        is_secret: rule.secret,
+                    });
                 } else {
                     validate_value(
                         key,
@@ -437,6 +482,7 @@ impl<'a> EnvValidator<'a> {
                                 self.matches_pattern(default, location, &mut matches)
                             })
                         },
+                        scoped,
                         &mut errors,
                     );
                 }
@@ -447,15 +493,46 @@ impl<'a> EnvValidator<'a> {
 
     /// Validate values and inject only defaults that satisfy their complete rule.
     pub fn validate(&self, env_vars: &mut HashMap<String, String>) -> Vec<ValidationError> {
+        self.validate_with_context(env_vars, crate::EvalContext::default())
+    }
+
+    /// Validate the same plan for a resolved environment, command stage, and service.
+    pub fn validate_with_context(
+        &self,
+        env_vars: &mut HashMap<String, String>,
+        context: crate::EvalContext<'_>,
+    ) -> Vec<ValidationError> {
+        self.validate_with_default_policy(env_vars, context, |_| true)
+    }
+
+    /// Validate values while restricting which absent keys can receive defaults.
+    pub fn validate_with_default_policy(
+        &self,
+        env_vars: &mut HashMap<String, String>,
+        context: crate::EvalContext<'_>,
+        allow_default: impl Fn(&str) -> bool,
+    ) -> Vec<ValidationError> {
         if !self.definition_errors.is_empty() {
             return self.definition_errors.clone();
+        }
+        if !context.is_valid() {
+            return vec![validation_error(
+                "envSchema",
+                &EnvVarRule::default(),
+                ValidationErrorKind::InvalidRule {
+                    message: "evaluation context requires valid environment and service names",
+                },
+            )];
         }
         for compiled in &self.rules {
             let missing = env_vars.get(compiled.key).is_none_or(|value| {
                 value.is_empty() && compiled.rule.empty == EmptyPolicy::Missing
             });
-            if missing && let Some(default) = &compiled.rule.default {
-                env_vars.insert(compiled.key.to_string(), default.clone());
+            if missing
+                && allow_default(compiled.key)
+                && let Some(default) = crate::scopes::default_for_context(compiled.rule, context)
+            {
+                env_vars.insert(compiled.key.to_string(), default.to_string());
             }
         }
         let mut errors = Vec::new();
@@ -499,6 +576,10 @@ impl<'a> EnvValidator<'a> {
                 || (value_is_empty && rule.empty == EmptyPolicy::Missing);
             let required = rule.required
                 || rule
+                    .required_in
+                    .iter()
+                    .any(|selector| selector.matches(context))
+                || rule
                     .required_when
                     .as_ref()
                     .is_some_and(|condition| condition.matches(env_vars));
@@ -520,6 +601,7 @@ impl<'a> EnvValidator<'a> {
                             self.matches_pattern(value, location, &mut matched_patterns)
                         })
                     },
+                    false,
                     &mut errors,
                 );
             }
@@ -569,48 +651,69 @@ fn validate_value(
     value: &str,
     rule: &EnvVarRule,
     pattern_matches: impl FnOnce() -> Option<bool>,
+    declaration: bool,
     errors: &mut Vec<ValidationError>,
 ) {
+    let error = |kind| ValidationError {
+        key: key.to_string(),
+        kind: if declaration {
+            ValidationErrorKind::InvalidRule {
+                message: match kind {
+                    ValidationErrorKind::InvalidFormat { .. } => {
+                        "scoped default does not satisfy its format"
+                    }
+                    ValidationErrorKind::NotInEnum { .. } => {
+                        "scoped default does not satisfy its enum"
+                    }
+                    ValidationErrorKind::PatternMismatch { .. } => {
+                        "scoped default does not satisfy its pattern"
+                    }
+                    ValidationErrorKind::ConstraintViolation { .. } => {
+                        "scoped default does not satisfy its scalar constraints"
+                    }
+                    _ => "scoped default is not a process environment value",
+                },
+            }
+        } else {
+            kind
+        },
+        description: if declaration {
+            None
+        } else {
+            rule.description.clone()
+        },
+        is_secret: rule.secret,
+    };
     if value.as_bytes().contains(&0) {
-        errors.push(validation_error(
-            key,
-            rule,
-            ValidationErrorKind::InvalidValue,
-        ));
+        errors.push(error(ValidationErrorKind::InvalidValue));
         return;
     }
     if let Some(format) = &rule.format
         && !validate_format(value, format)
     {
-        errors.push(validation_error(
-            key,
-            rule,
-            ValidationErrorKind::InvalidFormat {
-                expected: format.clone(),
-                got: retained_value(value, rule.secret),
-            },
-        ));
+        errors.push(error(ValidationErrorKind::InvalidFormat {
+            expected: format.clone(),
+            got: retained_value(value, rule.secret || declaration),
+        }));
         // Don't check further rules if format is wrong
         return;
     }
 
     if let Some(constraint) = crate::constraints::value_violation(value, rule) {
-        errors.push(validation_error(
-            key,
-            rule,
-            ValidationErrorKind::ConstraintViolation { constraint },
-        ));
+        errors.push(error(ValidationErrorKind::ConstraintViolation {
+            constraint,
+        }));
         return;
     }
     if pattern_matches() == Some(false) {
-        errors.push(validation_error(
-            key,
-            rule,
-            ValidationErrorKind::PatternMismatch {
-                pattern: rule.pattern.clone().unwrap_or_default(),
-                got: retained_value(value, rule.secret),
+        errors.push(error(ValidationErrorKind::PatternMismatch {
+            pattern: if declaration {
+                String::new()
+            } else {
+                rule.pattern.clone().unwrap_or_default()
             },
-        ));
+            got: retained_value(value, rule.secret || declaration),
+        }));
         return;
     }
 
@@ -618,18 +721,14 @@ fn validate_value(
     if let Some(allowed) = &rule.enum_values
         && !allowed.iter().any(|a| a == value)
     {
-        errors.push(validation_error(
-            key,
-            rule,
-            ValidationErrorKind::NotInEnum {
-                allowed: if rule.secret {
-                    Vec::new()
-                } else {
-                    allowed.clone()
-                },
-                got: retained_value(value, rule.secret),
+        errors.push(error(ValidationErrorKind::NotInEnum {
+            allowed: if rule.secret || declaration {
+                Vec::new()
+            } else {
+                allowed.clone()
             },
-        ));
+            got: retained_value(value, rule.secret || declaration),
+        }));
     }
 }
 
@@ -2095,5 +2194,54 @@ mod tests {
                 ValidationErrorKind::Missing
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod scope_diagnostic_budget_tests {
+    use super::*;
+    #[test]
+    fn global_scope_budget_rejects_before_compiling_rules_or_patterns() {
+        let mut vars = serde_json::Map::new();
+        for index in 0..129 {
+            let selectors: Vec<_> = (0..32)
+                .map(|value| serde_json::json!({"environment":[format!("e{value}")]}))
+                .collect();
+            vars.insert(
+                format!("V{index}"),
+                serde_json::json!({"pattern":"[a-z]+","requiredIn":selectors}),
+            );
+        }
+        let schema: EnvSchema = serde_json::from_value(serde_json::json!({"vars":vars})).unwrap();
+        let plan = EnvValidator::new(&schema);
+        assert!(!plan.schema_errors().is_empty());
+        assert!(
+            plan.rules.is_empty() && plan.pattern_batches.is_empty(),
+            "over-budget definitions continued expensive setup"
+        );
+    }
+    #[test]
+    fn invalid_scoped_defaults_do_not_multiply_description_or_allowlist_memory() {
+        let defaults:Vec<_>=(0..32).map(|value|serde_json::json!({"when":{"environment":[format!("e{value}")]},"value":"invalid"})).collect();
+        let schema:EnvSchema=serde_json::from_value(serde_json::json!({"vars":{"VALUE":{"description":"x".repeat(1024*1024),"enum":["y".repeat(1024*1024)],"defaultsIn":defaults}}})).unwrap();
+        let plan = EnvValidator::new(&schema);
+        assert!(!plan.schema_errors().is_empty());
+        let retained: usize = plan
+            .schema_errors()
+            .iter()
+            .map(|error| {
+                error.description.as_ref().map_or(0, String::len)
+                    + match &error.kind {
+                        ValidationErrorKind::NotInEnum { allowed, .. } => {
+                            allowed.iter().map(String::len).sum()
+                        }
+                        _ => 0,
+                    }
+            })
+            .sum();
+        assert!(
+            retained < 1024 * 1024,
+            "definition diagnostics retained {retained} repeated bytes"
+        );
     }
 }

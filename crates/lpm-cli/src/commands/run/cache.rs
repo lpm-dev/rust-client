@@ -253,38 +253,6 @@ fn build_task_context(
         _ => return Ok(None),
     };
 
-    let env_vars = lpm_runner::script::load_script_env_with_config(
-        project_dir,
-        script_name,
-        env_mode,
-        config_ref,
-    )?;
-    let inherited_env = lpm_runner::shell::inherited_child_env();
-    let cache_env = task_config.cache_env.as_ref().map(|names| {
-        names
-            .iter()
-            .map(|name| std::ffi::OsStr::new(name.as_str()))
-            .collect::<HashSet<_>>()
-    });
-    // The fingerprint keeps each value's exact bytes, so inherited values that
-    // are not valid UTF-8 still distinguish cache entries.
-    let mut child_env: HashMap<std::ffi::OsString, std::ffi::OsString> =
-        HashMap::with_capacity(inherited_env.len() + env_vars.len());
-    child_env.extend(
-        inherited_env
-            .iter()
-            .filter(|(key, _)| {
-                cache_env
-                    .as_ref()
-                    .is_none_or(|names| names.contains(key.as_os_str()))
-            })
-            .map(|(key, value)| (key.clone(), value.clone())),
-    );
-    child_env.extend(
-        env_vars
-            .iter()
-            .map(|(key, value)| (key.into(), value.into())),
-    );
     let mut runtime_identities = bin_hint.cache_identities();
     let child_path =
         lpm_runner::bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
@@ -320,13 +288,48 @@ fn build_task_context(
     .cloned()
     .unwrap_or_default();
 
-    lpm_runner::npm_context::NpmScriptContext::new(
+    let script_context = lpm_runner::npm_context::NpmScriptContext::new(
         package.as_ref().and_then(|pkg| pkg.name.as_deref()),
         package.as_ref().and_then(|pkg| pkg.version.as_deref()),
         project_dir,
         &std::env::current_dir()?,
-    )
-    .apply(&mut child_env, script_name, &command);
+    );
+    let env_vars = lpm_runner::script::load_script_child_env_with_config(
+        project_dir,
+        script_name,
+        env_mode,
+        config_ref,
+        &child_path,
+        &command,
+        &script_context,
+    )?;
+
+    let inherited_env = lpm_runner::shell::inherited_child_env();
+    let cache_env = task_config.cache_env.as_ref().map(|names| {
+        names
+            .iter()
+            .map(|name| std::ffi::OsStr::new(name.as_str()))
+            .collect::<HashSet<_>>()
+    });
+    // The fingerprint keeps each value's exact bytes, so inherited values that
+    // are not valid UTF-8 still distinguish cache entries.
+    let mut child_env: HashMap<std::ffi::OsString, std::ffi::OsString> =
+        HashMap::with_capacity(inherited_env.len() + env_vars.len());
+    child_env.extend(
+        inherited_env
+            .iter()
+            .filter(|(key, _)| {
+                cache_env
+                    .as_ref()
+                    .is_none_or(|names| names.contains(key.as_os_str()))
+            })
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    child_env.extend(
+        env_vars
+            .iter()
+            .map(|(key, value)| (key.into(), value.into())),
+    );
 
     let cache_inputs = effective_cache_inputs(&task_config, config_ref);
     let dependency_pairs = dependency_identity_pairs(dependency_identities);

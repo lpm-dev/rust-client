@@ -549,3 +549,34 @@ fn prefix_schema_and_runtime_agree_on_prefix_shape_and_uniqueness() {
         assert_eq!(parsed.is_ok(), valid, "{document}");
     }
 }
+
+#[test]
+fn editor_schema_accepts_scope_shapes_and_rejects_unsafe_selectors() {
+    let validator = lpm_json_validator();
+    for rule in [
+        serde_json::json!({"requiredIn":[{"environment":["production"],"stage":["build"],"service":["api"]}]}),
+        serde_json::json!({"defaultsIn":[{"when":{"stage":["test"]},"value":"line\nvalue"}]}),
+        serde_json::json!({"secret":true,"defaultsIn":[]}),
+    ] {
+        assert!(
+            validator.is_valid(&serde_json::json!({"envSchema":{"vars":{"VALUE":rule}}})),
+            "editor rejected {rule}"
+        );
+    }
+    for rule in [
+        serde_json::json!({"requiredIn":[{}]}),
+        serde_json::json!({"requiredIn":[{"stage":null}]}),
+        serde_json::json!({"requiredIn":[{"stage":[]}]}),
+        serde_json::json!({"requiredIn":[{"stage":["deploy"]}]}),
+        serde_json::json!({"requiredIn":[{"environment":["../production"]}]}),
+        serde_json::json!({"requiredIn":[{"service":["__index__"]}]}),
+        serde_json::json!({"requiredIn":[{"service":["api","api"]}]}),
+        serde_json::json!({"defaultsIn":[{"when":{"stage":["test"]},"value":"unsafe\u{0000}"}]}),
+        serde_json::json!({"secret":true,"defaultsIn":[{"when":{"stage":["test"]},"value":"private"}]}),
+    ] {
+        assert!(
+            !validator.is_valid(&serde_json::json!({"envSchema":{"vars":{"VALUE":rule}}})),
+            "editor accepted {rule}"
+        );
+    }
+}

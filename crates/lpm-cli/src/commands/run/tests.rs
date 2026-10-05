@@ -758,7 +758,7 @@ fn run_task_uses_lpm_json_command() {
         },
     );
 
-    let result = run_task(dir.path(), "codegen", &[], None, &tasks, &Unknown);
+    let result = run_task(dir.path(), "codegen", &[], None, &tasks, &Unknown, None);
     assert!(result.is_ok(), "should run lpm.json command: {result:?}");
 }
 
@@ -772,7 +772,7 @@ fn run_task_falls_back_to_script() {
     .unwrap();
 
     let tasks = std::collections::HashMap::new();
-    let result = run_task(dir.path(), "build", &[], None, &tasks, &Unknown);
+    let result = run_task(dir.path(), "build", &[], None, &tasks, &Unknown, None);
     assert!(result.is_ok(), "should fall back to package.json script");
 }
 
@@ -782,7 +782,7 @@ fn run_task_errors_for_unknown() {
     std::fs::write(dir.path().join("package.json"), r#"{"scripts": {}}"#).unwrap();
 
     let tasks = std::collections::HashMap::new();
-    let result = run_task(dir.path(), "nonexistent", &[], None, &tasks, &Unknown);
+    let result = run_task(dir.path(), "nonexistent", &[], None, &tasks, &Unknown, None);
     assert!(result.is_err());
 }
 
