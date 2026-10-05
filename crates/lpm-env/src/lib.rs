@@ -19,6 +19,7 @@
 //! }
 //! ```
 
+mod constraints;
 mod example;
 mod inheritance;
 mod object;
@@ -31,5 +32,8 @@ pub use example::generate as generate_env_example;
 pub use inheritance::{EnvDefinition, EnvironmentsConfig, list_environments, resolve_chain};
 pub use print::{PrintFormat, format_env, is_valid_env_var_name};
 pub use resolver::{EnvSource, ResolvedEnv, extract_mode_from_env_path};
-pub use schema::{CiStorage, EmptyPolicy, EnvSchema, EnvVarRule, VarFormat};
+pub use schema::{
+    CiStorage, EmptyPolicy, EnvSchema, EnvVarRule, EqualityCondition, PresenceCondition,
+    RequiredWhen, VarFormat, VarGroup, VarGroupMode,
+};
 pub use validate::{EnvValidator, ValidationError, ValidationErrorKind, validate, validate_schema};

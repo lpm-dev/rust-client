@@ -30,6 +30,14 @@ pub struct EnvSchema {
     #[schemars(length(max = 32))]
     #[schemars(extend("uniqueItems" = true, "items" = {"type":"string","pattern":"^(?:_|[A-Za-z_][A-Za-z0-9_]{0,254}_)$"}))]
     pub client_prefixes: Vec<String>,
+    /// Relationships between declared variables.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_unique_groups",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    #[schemars(extend("propertyNames" = {"pattern":"^[A-Za-z_][A-Za-z0-9_]{0,255}$"}, "maxProperties" = 128))]
+    pub groups: HashMap<String, VarGroup>,
 }
 
 /// Validation rules for a single environment variable.
@@ -75,6 +83,61 @@ pub struct EnvVarRule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ci: Option<CiStorage>,
 
+    /// Inclusive exact integer bound. Serialized as decimal text for lossless metadata.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_bound",
+        serialize_with = "serialize_bound",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "Option<NumericBound>")]
+    pub min: Option<i64>,
+    /// Inclusive exact integer bound. Serialized as decimal text for lossless metadata.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_bound",
+        serialize_with = "serialize_bound",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "Option<NumericBound>")]
+    pub max: Option<i64>,
+    /// Minimum Unicode scalar count.
+    #[serde(
+        default,
+        rename = "minLength",
+        deserialize_with = "deserialize_length",
+        serialize_with = "serialize_length",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "Option<LengthBound>")]
+    pub min_length: Option<u32>,
+    /// Maximum Unicode scalar count.
+    #[serde(
+        default,
+        rename = "maxLength",
+        deserialize_with = "deserialize_length",
+        serialize_with = "serialize_length",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(with = "Option<LengthBound>")]
+    pub max_length: Option<u32>,
+    /// Allowed lowercase URL schemes, without a colon.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_protocols",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schemars(length(min = 1, max = 32))]
+    #[schemars(extend("uniqueItems" = true, "items" = {"type":"string","pattern":"^[a-z][a-z0-9+.-]{0,255}$"}))]
+    pub protocols: Option<Vec<String>>,
+    /// Require a nonempty value when another declared variable satisfies this predicate.
+    #[serde(
+        default,
+        rename = "requiredWhen",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub required_when: Option<RequiredWhen>,
+
     /// Human-readable description (shown in error messages and .env.example).
     #[serde(default)]
     #[schemars(extend("pattern" = r"^[^\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]*$"))]
@@ -83,6 +146,237 @@ pub struct EnvVarRule {
     /// Treatment of an explicitly empty value. Missing preserves the child override.
     #[serde(default)]
     pub empty: EmptyPolicy,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+enum NumericBound {
+    Number(i64),
+    Decimal(#[schemars(extend("pattern" = r"^[+-]?[0-9]{1,19}$"))] String),
+}
+
+fn deserialize_bound<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<i64>, D::Error> {
+    Option::<NumericBound>::deserialize(deserializer)?
+        .map(|bound| match bound {
+            NumericBound::Number(value) => Ok(value),
+            NumericBound::Decimal(text) => {
+                let digits = text.strip_prefix(['+', '-']).unwrap_or(&text);
+                if digits.is_empty()
+                    || digits.len() > 19
+                    || !digits.bytes().all(|byte| byte.is_ascii_digit())
+                {
+                    return Err(serde::de::Error::custom(
+                        "integer bound must be signed decimal text with at most 19 digits",
+                    ));
+                }
+                text.parse().map_err(|_| {
+                    serde::de::Error::custom("integer bound is outside the signed 64-bit range")
+                })
+            }
+        })
+        .transpose()
+}
+
+fn serialize_bound<S: serde::Serializer>(
+    value: &Option<i64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(value) => serializer.serialize_str(&value.to_string()),
+        None => serializer.serialize_none(),
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+enum LengthBound {
+    Number(u32),
+    Decimal(#[schemars(extend("pattern" = r"^[0-9]{1,10}$"))] String),
+}
+
+fn deserialize_length<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u32>, D::Error> {
+    Option::<LengthBound>::deserialize(deserializer)?
+        .map(|bound| match bound {
+            LengthBound::Number(value) => Ok(value),
+            LengthBound::Decimal(text)
+                if !text.is_empty()
+                    && text.len() <= 10
+                    && text.bytes().all(|byte| byte.is_ascii_digit()) =>
+            {
+                text.parse().map_err(|_| {
+                    serde::de::Error::custom("length bound is outside the unsigned 32-bit range")
+                })
+            }
+            LengthBound::Decimal(_) => Err(serde::de::Error::custom(
+                "length bound must be decimal text with at most 10 digits",
+            )),
+        })
+        .transpose()
+}
+
+fn serialize_length<S: serde::Serializer>(
+    value: &Option<u32>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(value) => serializer.serialize_str(&value.to_string()),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Exactly one predicate is accepted. Presence means a nonempty effective value.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum RequiredWhen {
+    Equals(EqualityCondition),
+    Present(PresenceCondition),
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EqualityCondition {
+    #[schemars(extend("pattern" = "^[A-Za-z_][A-Za-z0-9_]{0,255}$"))]
+    pub variable: String,
+    #[schemars(extend("pattern" = r"^[^\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]*$"))]
+    pub equals: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PresenceCondition {
+    #[schemars(extend("pattern" = "^[A-Za-z_][A-Za-z0-9_]{0,255}$"))]
+    pub variable: String,
+    pub present: bool,
+}
+
+impl RequiredWhen {
+    pub fn variable(&self) -> &str {
+        match self {
+            Self::Equals(condition) => &condition.variable,
+            Self::Present(condition) => &condition.variable,
+        }
+    }
+    pub fn matches(&self, values: &HashMap<String, String>) -> bool {
+        match self {
+            Self::Equals(condition) => values
+                .get(&condition.variable)
+                .is_some_and(|value| value == &condition.equals),
+            Self::Present(condition) => {
+                values
+                    .get(&condition.variable)
+                    .is_some_and(|value| !value.is_empty())
+                    == condition.present
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VarGroup {
+    pub mode: VarGroupMode,
+    #[schemars(length(min = 1, max = 4096))]
+    #[schemars(extend("uniqueItems" = true, "items" = {"type":"string","pattern":"^[A-Za-z_][A-Za-z0-9_]{0,255}$"}))]
+    #[serde(deserialize_with = "deserialize_group_members")]
+    pub vars: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum VarGroupMode {
+    AllOrNone,
+    ExactlyOne,
+    AtLeastOne,
+}
+
+fn deserialize_unique_groups<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<HashMap<String, VarGroup>, D::Error> {
+    struct Groups;
+    impl<'de> Visitor<'de> for Groups {
+        type Value = HashMap<String, VarGroup>;
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .write_str("at most 128 unique variable groups with at most 4096 total members")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+            let mut groups = HashMap::with_capacity(access.size_hint().unwrap_or(0).min(128));
+            let mut members = 0usize;
+            while let Some(name) = access.next_key::<String>()? {
+                if groups.contains_key(&name) {
+                    return Err(serde::de::Error::custom("duplicate variable group"));
+                }
+                if groups.len() == 128 {
+                    return Err(serde::de::Error::custom(
+                        "envSchema group count exceeded 128",
+                    ));
+                }
+                let group = access.next_value::<VarGroup>()?;
+                if group.vars.len() > 4096 - members {
+                    return Err(serde::de::Error::custom(
+                        "envSchema group count or member budget exceeded",
+                    ));
+                }
+                members += group.vars.len();
+                if groups.insert(name, group).is_some() {
+                    return Err(serde::de::Error::custom("duplicate variable group"));
+                }
+            }
+            Ok(groups)
+        }
+    }
+    deserializer.deserialize_map(Groups)
+}
+
+fn deserialize_group_members<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<String>, D::Error> {
+    struct Members;
+    impl<'de> Visitor<'de> for Members {
+        type Value = Vec<String>;
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("at most 4096 group members")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+            let mut members = Vec::with_capacity(access.size_hint().unwrap_or(0).min(4096));
+            for _ in 0..4096 {
+                let Some(member) = access.next_element::<String>()? else {
+                    return Ok(members);
+                };
+                members.push(member);
+            }
+            if access.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                return Err(serde::de::Error::custom("groups exceed 4096 members"));
+            }
+            Ok(members)
+        }
+    }
+    deserializer.deserialize_seq(Members)
+}
+
+fn deserialize_protocols<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error> {
+    struct OptionalList;
+    impl<'de> Visitor<'de> for OptionalList {
+        type Value = Option<Vec<String>>;
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("null or at most 32 protocols")
+        }
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_some<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserialize_client_prefixes(deserializer).map(Some)
+        }
+    }
+    deserializer.deserialize_option(OptionalList)
 }
 
 /// Storage namespace used when synchronizing to GitHub Actions.

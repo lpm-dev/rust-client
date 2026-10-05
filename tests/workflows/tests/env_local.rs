@@ -1746,3 +1746,28 @@ fn client_only_print_requires_an_exposure_schema() {
         .assert()
         .failure();
 }
+
+#[test]
+fn env_check_counts_distinct_failed_variables_when_groups_overlap() {
+    let project = TempProject::empty(r#"{"name":"env-relational-counts"}"#);
+    project.write_file("lpm.json", r#"{"envSchema":{"vars":{"A":{"format":"integer","min":1},"B":{}},"groups":{"A":{"mode":"exactlyOne","vars":["A","B"]},"other":{"mode":"exactlyOne","vars":["A","B"]}}}}"#);
+    write_dotenv(&project, ".env", "A=0\nB=present\n");
+    let output = lpm(&project)
+        .args(["--json", "env", "check"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let result = parse_json_stdout(&output, "env check group counts");
+    assert_eq!(result["environments"][0]["total"], 2);
+    assert_eq!(result["environments"][0]["valid"], 0);
+    assert_eq!(
+        result["environments"][0]["errors"]
+            .as_array()
+            .unwrap()
+            .len(),
+        5
+    );
+    let text = lpm(&project).args(["env", "check"]).output().unwrap();
+    assert!(!text.status.success());
+    assert!(String::from_utf8_lossy(&text.stdout).contains("0/2"));
+}
