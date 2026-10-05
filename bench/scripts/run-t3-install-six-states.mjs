@@ -13,6 +13,8 @@ delete process.env.LPM_TOKEN;
 
 const repoRoot = path.resolve(fileURLToPath(new URL('../..', import.meta.url)));
 
+const MANAGER_ORDER_SCHEME = 'shuffle-reverse-pairs-v1';
+
 const SCENARIOS = [
   {
     id: 'first-install',
@@ -91,6 +93,8 @@ if (fs.existsSync(outputDir) && !resume) {
   throw new Error(`output already exists: ${outputDir}`);
 }
 const previousPlan = resume ? JSON.parse(fs.readFileSync(path.join(outputDir, 'plan.json'), 'utf8')) : null;
+// A resumed run keeps the orders it was planned with.
+const orderSeed = argv.orderSeed ?? previousPlan?.order_seed ?? newOrderSeed();
 if (resume && fs.existsSync(path.join(outputDir, 'summary.json'))) throw new Error('run already complete');
 
 const fixturePackageJson = fs.readFileSync(packageJsonPath);
@@ -116,6 +120,8 @@ const metadata = {
     (lpmFirewallMode ? ` LPM firewall override: ${lpmFirewallMode}.` : '') +
     (managers.includes('lpm-monitor') ? ' lpm-monitor uses the same binary with monitor mode and an independent home/cache.' : ''),
   lpm_firewall_override: lpmFirewallMode,
+  manager_order: MANAGER_ORDER_SCHEME,
+  order_seed: orderSeed,
   firewall_validation: managers.some((manager) => ['monitor', 'enforce'].includes(firewallModeFor(manager)))
     ? 'successful-verdicts-and-preparation-v1' : undefined,
   scenarios: SCENARIOS,
@@ -179,7 +185,7 @@ if (resume) {
 for (let sample = 1; sample <= samples; sample += 1) {
   const scenarioOrder = rotate(SCENARIOS, (sample - 1) % SCENARIOS.length);
   for (const scenario of scenarioOrder) {
-    const managerOrder = managerOrderFor(sample, scenario.id, managers);
+    const managerOrder = managerOrderFor(orderSeed, 'scored', sample, scenario.id, managers);
     const comparisonId = `${scenario.id}:sample-${sample}`;
     const pendingManagers = managers.filter((manager) => !completed.has(cellKey(sample, scenario.id, manager)));
     const prepared = new Map();
@@ -246,7 +252,7 @@ for (let sample = 1; sample <= samples; sample += 1) {
 
 for (let sample = 1; sample <= timingSamples; sample += 1) {
   const scenarioOrder = rotate(SCENARIOS, (sample - 1) % SCENARIOS.length);
-  for (const scenario of scenarioOrder) for (const manager of rotate(timingManagers, sample % timingManagers.length)) {
+  for (const scenario of scenarioOrder) for (const manager of managerOrderFor(orderSeed, 'timing', sample, scenario.id, timingManagers)) {
     if (completedTiming.has(cellKey(sample, scenario.id, manager))) continue;
     const root = path.join(workspaceDir, `timing-${sample}-${scenario.id}-${manager}`);
     resetInterruptedRoot(root);
@@ -347,7 +353,8 @@ function prepareScenario({ manager, scenario, root }) {
 function assertResumeCompatible(previous, current) {
   for (const key of ['samples', 'timing_samples', 'managers', 'work_directory', 'repository_commit',
     'statistics', 'policy', 'scenarios', 'fixture', 'manager_info', 'node', 'platform', 'os_release',
-    'cpu', 'total_memory_bytes', 'timeout_ms', 'lpm_npm_fanout_override', 'lpm_firewall_override', 'firewall_validation', 'script_policy', 'state_mapping']) {
+    'cpu', 'total_memory_bytes', 'timeout_ms', 'lpm_npm_fanout_override', 'lpm_firewall_override', 'firewall_validation', 'script_policy', 'state_mapping',
+    'manager_order', 'order_seed']) {
     assert.deepEqual(current[key], previous[key], `resume changed ${key}`);
   }
 }
@@ -1011,6 +1018,7 @@ function renderMarkdown(plan, summary, timingSummary) {
     '- Wall-time and RSS statistics include successful installs only. Success counts appear for every manager/state.',
     `- Statistics: ${plan.statistics}`,
     `- Policy: ${plan.policy}`,
+    `- Manager order: random per comparison group and reversed in the next sample, seed \`${plan.order_seed}\` (${plan.manager_order})`,
     `- Fixture SHA-256: \`${plan.fixture.package_json_sha256}\``,
     ...plan.managers.map((manager) => {
       const info = plan.manager_info[manager];
@@ -1198,12 +1206,47 @@ function rotate(values, offset) {
   return [...values.slice(offset), ...values.slice(0, offset)];
 }
 
-function managerOrderFor(sample, scenarioId, managers = DEFAULT_MANAGERS) {
-  const scenarioPosition = SCENARIO_POSITIONS.get(scenarioId);
-  if (scenarioPosition === undefined) {
-    throw new Error(`unknown scenario: ${scenarioId}`);
+/**
+ * Managers in a random order that is reproducible from `seed`.
+ *
+ * Each odd sample shuffles the comparison group and the following even sample
+ * runs that shuffle in reverse. No manager systematically runs right after
+ * another one that has just warmed shared upstream caches, and with an even
+ * sample count every manager runs before each other manager equally often.
+ */
+function managerOrderFor(seed, phase, sample, scenarioId, managers = DEFAULT_MANAGERS) {
+  if (phase !== 'scored' && phase !== 'timing') throw new Error(`unknown order phase: ${phase}`);
+  if (!Number.isSafeInteger(sample) || sample < 1) throw new Error(`invalid sample: ${sample}`);
+  if (!SCENARIO_POSITIONS.has(scenarioId)) throw new Error(`unknown scenario: ${scenarioId}`);
+  const pair = Math.ceil(sample / 2);
+  const random = seededUint32s(`${MANAGER_ORDER_SCHEME}:${seed}:${phase}:${pair}:${scenarioId}`);
+  const order = [...managers];
+  for (let index = order.length - 1; index > 0; index -= 1) {
+    const swap = uniformBelow(random, index + 1);
+    [order[index], order[swap]] = [order[swap], order[index]];
   }
-  return rotate(managers, (sample + scenarioPosition) % managers.length);
+  return sample % 2 === 0 ? order.reverse() : order;
+}
+
+/** An endless stream of uint32 values derived from SHA-256 of `key`. */
+function* seededUint32s(key) {
+  for (let block = 0; ; block += 1) {
+    const digest = crypto.createHash('sha256').update(`${key}:${block}`).digest();
+    for (let offset = 0; offset < digest.length; offset += 4) yield digest.readUInt32BE(offset);
+  }
+}
+
+/** A uniform integer in [0, bound), rejecting values that would bias the modulo. */
+function uniformBelow(random, bound) {
+  const limit = 2 ** 32 - (2 ** 32 % bound);
+  for (;;) {
+    const value = random.next().value;
+    if (value < limit) return value % bound;
+  }
+}
+
+function newOrderSeed() {
+  return crypto.randomBytes(16).toString('hex');
 }
 
 function projectDir(root) {
@@ -1365,6 +1408,7 @@ function parseArgs(values) {
       '--output': 'output',
       '--work-dir': 'workDir',
       '--timeout-ms': 'timeoutMs',
+      '--order-seed': 'orderSeed',
     }[argument];
     if (!key || values[index + 1] === undefined) {
       throw new Error(`unsupported or incomplete argument: ${argument}`);
@@ -1452,15 +1496,21 @@ function selfTest() {
   assert.deepEqual(parseArgs(['--resume']), { resume: true });
   const partialSummary = renderMarkdown({
     samples: 10, managers: ['lpm'], manager_info: { lpm: { version: 'test' } }, fixture: {},
+    manager_order: MANAGER_ORDER_SCHEME, order_seed: 'report-seed',
   }, [{ managers: { lpm: { successful_samples: 9 } }, lpm_ratios: { lpm: {} } }], []);
   assert.match(partialSummary, /9\/10/, 'the report must show successful attempts separately');
+  assert.match(partialSummary, /seed `report-seed` \(shuffle-reverse-pairs-v1\)/, 'the report must name the order seed');
   const resumablePlan = {
     samples: 10, timing_samples: 3, managers: ['lpm', 'vlt'], work_directory: '/tmp/test-run',
     fixture: { package_json_sha256: 'fixture' }, manager_info: { lpm: { binary_sha256: 'binary' } },
     policy: 'defaults', statistics: 'median', scenarios: SCENARIOS,
+    manager_order: MANAGER_ORDER_SCHEME, order_seed: 'plan-seed',
   };
   assert.doesNotThrow(() => assertResumeCompatible(resumablePlan, structuredClone(resumablePlan)));
   assert.throws(() => assertResumeCompatible(resumablePlan, { ...resumablePlan, samples: 9 }));
+  assert.throws(() => assertResumeCompatible(resumablePlan, { ...resumablePlan, order_seed: 'other-seed' }));
+  const rotatedPlan = { ...resumablePlan, manager_order: undefined, order_seed: undefined };
+  assert.throws(() => assertResumeCompatible(rotatedPlan, resumablePlan), /manager_order/);
   assert.throws(() => assertResumeCompatible(resumablePlan, { ...resumablePlan, manager_info: {} }));
   assert.throws(() => assertResumeCompatible(resumablePlan, { ...resumablePlan, lpm_firewall_override: 'monitor' }));
   assert.throws(() => assertResumeCompatible(resumablePlan, { ...resumablePlan, firewall_validation: 'successful-verdicts-and-preparation-v1' }));
@@ -1586,43 +1636,52 @@ function selfTest() {
     '/tmp/lpm-bench-self-test/home/.pnpm-store',
   ]);
   assert.equal(SCENARIOS.length, 6);
+  const seed = 'self-test-seed';
   for (const scenario of SCENARIOS) {
-    const orders = Array.from({ length: 10 }, (_, sampleIndex) => {
-      const sample = sampleIndex + 1;
-      return managerOrderFor(sample, scenario.id).join('-');
-    });
-    assert.equal(new Set(orders).size, 2, `${scenario.id} must use both manager orders`);
-    assert.equal(
-      orders.filter((order) => order === 'lpm-bun').length,
-      5,
-      `${scenario.id} manager order must be balanced`,
+    const orders = Array.from({ length: 400 }, (_, sampleIndex) =>
+      managerOrderFor(seed, 'scored', sampleIndex + 1, scenario.id, SUPPORTED_MANAGERS),
     );
-    for (let index = 1; index < orders.length; index += 1) {
-      assert.notEqual(
-        orders[index],
-        orders[index - 1],
-        `${scenario.id} manager order must alternate across samples`,
-      );
+    for (const order of orders) {
+      assert.deepEqual([...order].sort(), [...SUPPORTED_MANAGERS].sort(), `${scenario.id} order must be a permutation`);
     }
-    const managerOrders = Array.from({ length: SUPPORTED_MANAGERS.length * 2 }, (_, sampleIndex) =>
-      managerOrderFor(sampleIndex + 1, scenario.id, SUPPORTED_MANAGERS),
+    for (let index = 0; index < orders.length; index += 2) {
+      assert.deepEqual(orders[index + 1], [...orders[index]].reverse(), `${scenario.id} even samples must reverse the odd sample`);
+    }
+    assert.deepEqual(
+      managerOrderFor(seed, 'scored', 7, scenario.id, SUPPORTED_MANAGERS),
+      orders[6],
+      `${scenario.id} order must be reproducible from its seed`,
     );
-    assert.equal(
-      new Set(managerOrders.map((order) => order.join('-'))).size,
-      SUPPORTED_MANAGERS.length,
-      `${scenario.id} must rotate all manager orders`,
-    );
-    for (const manager of SUPPORTED_MANAGERS) {
-      for (let position = 0; position < SUPPORTED_MANAGERS.length; position += 1) {
-        assert.equal(
-          managerOrders.filter((order) => order[position] === manager).length,
-          2,
-          `${scenario.id} ${manager} must occupy position ${position} twice`,
-        );
+    assert.ok(new Set(orders.map((order) => order.join('-'))).size > 390, `${scenario.id} orders must vary`);
+    for (const earlier of SUPPORTED_MANAGERS) {
+      for (const later of SUPPORTED_MANAGERS) {
+        if (earlier === later) continue;
+        const count = orders.filter((order) => order.indexOf(earlier) < order.indexOf(later)).length;
+        assert.equal(count, 200, `${scenario.id} ${earlier} must run before ${later} in half the samples`);
       }
     }
+    const shuffled = orders.filter((_, index) => index % 2 === 0);
+    for (const manager of SUPPORTED_MANAGERS) {
+      for (let position = 0; position < SUPPORTED_MANAGERS.length; position += 1) {
+        const count = shuffled.filter((order) => order[position] === manager).length;
+        assert.ok(count >= 5 && count <= 40, `${scenario.id} ${manager} at position ${position}: ${count}/200`);
+      }
+    }
+    assert.notDeepEqual(
+      managerOrderFor(seed, 'timing', 1, scenario.id, SUPPORTED_MANAGERS),
+      orders[0],
+      `${scenario.id} timing samples must draw their own orders`,
+    );
   }
-  assert.throws(() => managerOrderFor(1, 'missing'), /unknown scenario/);
+  assert.notDeepEqual(
+    managerOrderFor('seed-a', 'scored', 1, 'first-install', SUPPORTED_MANAGERS),
+    managerOrderFor('seed-b', 'scored', 1, 'first-install', SUPPORTED_MANAGERS),
+  );
+  assert.throws(() => managerOrderFor(seed, 'scored', 1, 'missing'), /unknown scenario/);
+  assert.throws(() => managerOrderFor(seed, 'warmup', 1, 'first-install'), /unknown order phase/);
+  assert.throws(() => managerOrderFor(seed, 'scored', 0, 'first-install'), /invalid sample/);
+  assert.match(newOrderSeed(), /^[0-9a-f]{32}$/);
+  assert.equal(parseArgs(['--order-seed', 'abc']).orderSeed, 'abc');
   assert.equal(stats([1, 2, 3, 10]).median, 2.5);
   assert.deepEqual(backgroundWorkerPids(
     '  31 /node /tools/vlt/registry-client-src-revalidate.js\n  32 /node /other/vlt/registry-client-src-revalidate.js\n  33 /node /tools/vlt/vlt.js\n',
@@ -1707,8 +1766,9 @@ function printHelp() {
 Benchmark LPM and selected reference managers against the T3-stack manifest in
 six install states.
 Each state is prepared outside the measured interval, pre-state assertions
-must pass, manager order rotates within each comparison group, and every
-measured install must resolve next/package.json and contain every direct dependency.
+must pass, each comparison group runs its managers in a seeded random order
+that the next sample reverses, and every measured install must resolve
+next/package.json and contain every direct dependency.
 
 Options:
   -n, --samples N      Samples per manager/state (default: 10)
@@ -1723,6 +1783,8 @@ Options:
       --output DIR     Result directory (default: /tmp/lpm-t3-six-*)
       --work-dir DIR   Separate temporary install directory (default: OUTPUT/work)
       --timeout-ms N   Per-install timeout (default: 600000)
+      --order-seed S   Seed for the random manager order (default: random,
+                       recorded in plan.json and reused by --resume)
       --resume         Continue an incomplete run without replacing completed attempts
       --keep-work      Preserve prepared projects in the work directory
       --self-test      Run harness unit checks without installing packages
