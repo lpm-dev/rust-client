@@ -156,6 +156,20 @@ pub(super) fn build_push_schema_value(
                         rule.remove("default");
                         rule.remove("enum");
                     }
+                    if env_schema
+                        .vars
+                        .get(key)
+                        .and_then(|rule| rule.required_when.as_ref())
+                        .is_some_and(|condition| {
+                            matches!(condition, lpm_env::RequiredWhen::Equals(_))
+                                && env_schema
+                                    .vars
+                                    .get(condition.variable())
+                                    .is_none_or(|source| source.secret)
+                        })
+                    {
+                        rule.remove("requiredWhen");
+                    }
                     rule.retain(|field, value| {
                         !(value.is_null()
                             || matches!(value, serde_json::Value::Bool(false))
@@ -165,11 +179,18 @@ pub(super) fn build_push_schema_value(
             }
         }
         obj.insert("envSchema".into(), v);
+        let mut policy = serde_json::Map::new();
         if !env_schema.client_prefixes.is_empty() {
-            obj.insert(
-                "envSchemaConfig".into(),
-                serde_json::json!({"clientPrefixes": env_schema.client_prefixes}),
+            policy.insert(
+                "clientPrefixes".into(),
+                serde_json::json!(env_schema.client_prefixes),
             );
+        }
+        if !env_schema.groups.is_empty() {
+            policy.insert("groups".into(), serde_json::json!(env_schema.groups));
+        }
+        if !policy.is_empty() {
+            obj.insert("envSchemaConfig".into(), serde_json::Value::Object(policy));
         }
     }
 
@@ -518,6 +539,26 @@ mod tests {
         assert_eq!(
             dev.get("file"),
             Some(&serde_json::json!(".env.development"))
+        );
+    }
+
+    #[test]
+    fn sync_projection_preserves_groups_exact_bounds_and_presence_predicates_without_prefixes() {
+        let config = lpm_runner::lpm_json::LpmJsonConfig { env_schema: Some(serde_json::from_value(serde_json::json!({"vars":{"N":{"format":"integer","min":"9007199254740993","max":"9223372036854775807","requiredWhen":{"variable":"MODE","present":false}},"MODE":{}},"groups":{"g":{"mode":"exactlyOne","vars":["N","MODE"]}}})).unwrap()), ..Default::default() };
+        let wire = build_push_schema_value(Some(&config)).unwrap();
+        assert_eq!(wire["envSchema"]["N"]["min"], "9007199254740993");
+        assert_eq!(wire["envSchema"]["N"]["requiredWhen"]["present"], false);
+        assert_eq!(wire["envSchemaConfig"]["groups"]["g"]["mode"], "exactlyOne");
+    }
+
+    #[test]
+    fn sync_projection_suppresses_equality_literals_referencing_secret_sources() {
+        let config = lpm_runner::lpm_json::LpmJsonConfig { env_schema: Some(serde_json::from_value(serde_json::json!({"vars":{"SOURCE":{"secret":true},"TARGET":{"requiredWhen":{"variable":"SOURCE","equals":"private-condition"}},"PRESENT":{"requiredWhen":{"variable":"SOURCE","present":true}}}})).unwrap()), ..Default::default() };
+        let wire = build_push_schema_value(Some(&config)).unwrap();
+        assert!(!wire.to_string().contains("private-condition"));
+        assert_eq!(
+            wire["envSchema"]["PRESENT"]["requiredWhen"]["present"],
+            true
         );
     }
 

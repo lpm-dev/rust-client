@@ -53,12 +53,27 @@ pub enum ValidationErrorKind {
     PatternMismatch { pattern: String, got: String },
     /// Value is not in the allowed enum list.
     NotInEnum { allowed: Vec<String>, got: String },
+    /// A numeric, length, or URL-protocol restriction failed.
+    ConstraintViolation { constraint: &'static str },
+    /// A relationship failed; the error is associated with each affected variable.
+    GroupViolation {
+        group: String,
+        mode: crate::VarGroupMode,
+    },
 }
 
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let key = TerminalSafe(&self.key);
         match &self.kind {
+            ValidationErrorKind::ConstraintViolation { constraint } => {
+                write!(f, "{key}: violates {constraint} constraint")?
+            }
+            ValidationErrorKind::GroupViolation { group, mode } => write!(
+                f,
+                "{key}: group {} must satisfy {mode:?}",
+                TerminalSafe(group)
+            )?,
             ValidationErrorKind::InvalidRule { message } => {
                 write!(f, "{key}: invalid envSchema rule: {message}")?
             }
@@ -207,6 +222,7 @@ impl InvalidPatternReason {
 /// A reusable validator that deduplicates and compiles configured regexes in batches.
 pub struct EnvValidator<'a> {
     schema: &'a EnvSchema,
+    groups: Vec<(&'a str, &'a crate::VarGroup)>,
     rules: Vec<CompiledRule<'a>>,
     patterns: Vec<CompiledPattern>,
     pattern_batches: Vec<Regex>,
@@ -277,6 +293,7 @@ impl<'a> EnvValidator<'a> {
 
         let mut validator = Self {
             schema,
+            groups: crate::constraints::ordered_groups(schema),
             rules,
             patterns,
             pattern_batches,
@@ -292,7 +309,7 @@ impl<'a> EnvValidator<'a> {
     }
 
     fn check_definitions(&self) -> Vec<ValidationError> {
-        let mut errors = Vec::new();
+        let mut errors = crate::constraints::definition_errors(self.schema);
         let mut prefixes =
             std::collections::HashSet::with_capacity(self.schema.client_prefixes.len().min(32));
         let prefixes_invalid = self.schema.client_prefixes.len() > 32
@@ -424,6 +441,14 @@ impl<'a> EnvValidator<'a> {
         if !self.definition_errors.is_empty() {
             return self.definition_errors.clone();
         }
+        for compiled in &self.rules {
+            let missing = env_vars.get(compiled.key).is_none_or(|value| {
+                value.is_empty() && compiled.rule.empty == EmptyPolicy::Missing
+            });
+            if missing && let Some(default) = &compiled.rule.default {
+                env_vars.insert(compiled.key.to_string(), default.clone());
+            }
+        }
         let mut errors = Vec::new();
         let mut matched_patterns = PatternSet::new(MAX_PATTERN_BATCH_SIZE);
 
@@ -463,18 +488,17 @@ impl<'a> EnvValidator<'a> {
             }
             let is_missing_or_empty = !env_vars.contains_key(key)
                 || (value_is_empty && rule.empty == EmptyPolicy::Missing);
+            let required = rule.required
+                || rule
+                    .required_when
+                    .as_ref()
+                    .is_some_and(|condition| condition.matches(env_vars));
             if is_missing_or_empty {
-                if let Some(default) = &rule.default {
-                    if rule.required && default.is_empty() {
-                        errors.push(validation_error(key, rule, ValidationErrorKind::Missing));
-                        continue;
-                    }
-                    env_vars.insert(key.to_string(), default.clone());
-                } else if rule.required {
+                if required {
                     errors.push(validation_error(key, rule, ValidationErrorKind::Missing));
                 }
             } else if let Some(value) = env_vars.get(key) {
-                if value.is_empty() && rule.required {
+                if value.is_empty() && required {
                     errors.push(validation_error(key, rule, ValidationErrorKind::Missing));
                     continue;
                 }
@@ -492,6 +516,8 @@ impl<'a> EnvValidator<'a> {
             }
         }
 
+        crate::constraints::validate_groups(self.schema, &self.groups, env_vars, &mut errors);
+        errors.sort_by(|a, b| a.key.cmp(&b.key));
         errors
     }
 
@@ -559,6 +585,14 @@ fn validate_value(
         return;
     }
 
+    if let Some(constraint) = crate::constraints::value_violation(value, rule) {
+        errors.push(validation_error(
+            key,
+            rule,
+            ValidationErrorKind::ConstraintViolation { constraint },
+        ));
+        return;
+    }
     if pattern_matches() == Some(false) {
         errors.push(validation_error(
             key,
@@ -590,7 +624,11 @@ fn validate_value(
     }
 }
 
-fn validation_error(key: &str, rule: &EnvVarRule, kind: ValidationErrorKind) -> ValidationError {
+pub(crate) fn validation_error(
+    key: &str,
+    rule: &EnvVarRule,
+    kind: ValidationErrorKind,
+) -> ValidationError {
     ValidationError {
         key: key.to_string(),
         kind,
@@ -1809,6 +1847,7 @@ mod tests {
     fn oversized_programmatic_prefix_policy_skips_custom_matching() {
         let schema = EnvSchema {
             client_prefixes: vec!["".into(); 100_000],
+            groups: HashMap::new(),
             vars: (0..4096)
                 .map(|index| (format!("KEY_{index}"), EnvVarRule::default()))
                 .collect(),
