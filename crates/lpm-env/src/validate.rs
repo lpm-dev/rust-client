@@ -206,6 +206,7 @@ impl InvalidPatternReason {
 
 /// A reusable validator that deduplicates and compiles configured regexes in batches.
 pub struct EnvValidator<'a> {
+    schema: &'a EnvSchema,
     rules: Vec<CompiledRule<'a>>,
     patterns: Vec<CompiledPattern>,
     pattern_batches: Vec<Regex>,
@@ -275,6 +276,7 @@ impl<'a> EnvValidator<'a> {
             .collect();
 
         let mut validator = Self {
+            schema,
             rules,
             patterns,
             pattern_batches,
@@ -291,6 +293,21 @@ impl<'a> EnvValidator<'a> {
 
     fn check_definitions(&self) -> Vec<ValidationError> {
         let mut errors = Vec::new();
+        let mut prefixes =
+            std::collections::HashSet::with_capacity(self.schema.client_prefixes.len().min(32));
+        let prefixes_invalid = self.schema.client_prefixes.len() > 32
+            || self.schema.client_prefixes.iter().any(|prefix| {
+                !is_valid_env_var_name(prefix) || !prefix.ends_with('_') || !prefixes.insert(prefix)
+            });
+        if prefixes_invalid {
+            errors.push(validation_error(
+                "envSchema",
+                &EnvVarRule::default(),
+                ValidationErrorKind::InvalidRule {
+                    message: "clientPrefixes must contain at most 32 unique portable prefixes ending in '_'",
+                },
+            ));
+        }
         let mut matches = PatternSet::new(MAX_PATTERN_BATCH_SIZE);
         for compiled in &self.rules {
             let key = compiled.key;
@@ -339,6 +356,26 @@ impl<'a> EnvValidator<'a> {
                 }
                 None => None,
             };
+            let exposure_error = if rule.secret && rule.client {
+                Some("secret rules cannot be client-visible")
+            } else if rule.secret && rule.ci == Some(crate::CiStorage::Variable) {
+                Some("secret rules cannot use readable CI variable storage")
+            } else if (EnvSchema::has_framework_client_prefix(key)
+                || !prefixes_invalid && self.schema.has_client_prefix(key))
+                != rule.client
+            {
+                Some("client visibility must match a framework or declared client prefix")
+            } else {
+                None
+            };
+            if let Some(message) = exposure_error {
+                errors.push(validation_error(
+                    key,
+                    rule,
+                    ValidationErrorKind::InvalidRule { message },
+                ));
+                continue;
+            }
             if rule.secret && (rule.default.is_some() || rule.enum_values.is_some()) {
                 errors.push(validation_error(
                     key,
@@ -847,7 +884,10 @@ mod tests {
                 )
             })
             .collect();
-        EnvSchema { vars }
+        EnvSchema {
+            vars,
+            ..Default::default()
+        }
     }
 
     // ── Missing / Required ──
@@ -1388,7 +1428,10 @@ mod tests {
             let mut env = (0..count)
                 .map(|index| (format!("PATTERN_{index:02}"), format!("value_{index}")))
                 .collect();
-            let schema = EnvSchema { vars };
+            let schema = EnvSchema {
+                vars,
+                ..Default::default()
+            };
 
             let errors = EnvValidator::new(&schema).validate(&mut env);
 
@@ -1472,6 +1515,7 @@ mod tests {
                 "BAD\u{1b}[31m\n\u{202e}KEY".to_string(),
                 EnvVarRule::default(),
             )]),
+            ..Default::default()
         };
 
         let message = validate(&schema, &mut HashMap::new())[0].to_string();
@@ -1485,6 +1529,7 @@ mod tests {
         let key = "A".repeat(257);
         let schema = EnvSchema {
             vars: HashMap::from([(key, EnvVarRule::default())]),
+            ..Default::default()
         };
 
         let errors = validate(&schema, &mut HashMap::new());
@@ -1553,6 +1598,7 @@ mod tests {
                     ..EnvVarRule::default()
                 },
             )]),
+            ..Default::default()
         };
 
         let message = validate(&schema, &mut HashMap::new())[0].to_string();
@@ -1570,6 +1616,7 @@ mod tests {
                     ..EnvVarRule::default()
                 },
             )]),
+            ..Default::default()
         };
         let mut env = HashMap::from([("MODE".into(), "other".into())]);
 
@@ -1589,6 +1636,7 @@ mod tests {
                     ..EnvVarRule::default()
                 },
             )]),
+            ..Default::default()
         };
 
         let message = validate(&schema, &mut HashMap::new())[0].to_string();
@@ -1707,7 +1755,7 @@ mod tests {
     #[test]
     fn full_schema_integration() {
         let schema = schema_from_json(
-            r#"{"vars": {
+            r#"{"clientPrefixes":["APP_"],"vars": {
                 "DATABASE_URL": {"required": true, "format": "url", "secret": true, "description": "PostgreSQL connection string"},
                 "PORT": {"default": "3000", "format": "port"},
                 "STRIPE_SECRET_KEY": {"required": true, "secret": true, "pattern": "^sk_(test|live)_.*$"},
@@ -1754,6 +1802,71 @@ mod tests {
                 r#"{{"vars":{{"VALUE":{{"{field}":"private\u001b[31m"}}}}}}"#
             ));
             assert!(!validate_schema(&schema).is_empty(), "{field}");
+        }
+    }
+
+    #[test]
+    fn oversized_programmatic_prefix_policy_skips_custom_matching() {
+        let schema = EnvSchema {
+            client_prefixes: vec!["".into(); 100_000],
+            vars: (0..4096)
+                .map(|index| (format!("KEY_{index}"), EnvVarRule::default()))
+                .collect(),
+        };
+        let errors = validate_schema(&schema);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].key, "envSchema");
+    }
+
+    #[test]
+    fn create_react_app_public_prefix_is_case_insensitive() {
+        for name in ["react_app_token", "React_App_Token", "REACT_APP_TOKEN"] {
+            let schema = schema_from_json(&format!(r#"{{"vars":{{"{name}":{{"secret":true}}}}}}"#));
+            assert!(!validate_schema(&schema).is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn secret_client_and_public_prefix_server_rules_are_rejected() {
+        for json in [
+            r#"{"vars":{"PUBLIC_TOKEN":{"secret":true,"client":true}}}"#,
+            r#"{"vars":{"NEXT_PUBLIC_TOKEN":{"secret":true}}}"#,
+            r#"{"vars":{"VITE_ENDPOINT":{}}}"#,
+        ] {
+            assert!(
+                !validate_schema(&schema_from_json(json)).is_empty(),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_prefix_policy_does_not_hide_invalid_variable_rules() {
+        let schema = schema_from_json(
+            r#"{"clientPrefixes":[""],"vars":{"PUBLIC_TOKEN":{"client":true,"secret":true},"PORT":{"format":"port","default":"99999"}}}"#,
+        );
+        let errors = validate_schema(&schema);
+        assert_eq!(errors.len(), 3);
+        assert!(errors.iter().any(|error| error.key == "envSchema"));
+        assert!(errors.iter().any(|error| error.key == "PUBLIC_TOKEN"));
+        assert!(errors.iter().any(|error| error.key == "PORT"));
+    }
+
+    #[test]
+    fn client_prefix_and_ci_storage_policies_are_independent() {
+        for json in [
+            r#"{"vars":{"BUILD_MODE":{"ci":"variable"},"PUBLIC_API":{"client":true}}}"#,
+            r#"{"clientPrefixes":["APP_"],"vars":{"APP_API":{"client":true,"ci":"secret"}}}"#,
+        ] {
+            assert!(validate_schema(&schema_from_json(json)).is_empty());
+        }
+        for json in [
+            r#"{"vars":{"TOKEN":{"secret":true,"ci":"variable"}}}"#,
+            r#"{"vars":{"API":{"client":true}}}"#,
+            r#"{"clientPrefixes":[""],"vars":{}}"#,
+            r#"{"clientPrefixes":["APP_","APP_"],"vars":{}}"#,
+        ] {
+            assert!(!validate_schema(&schema_from_json(json)).is_empty());
         }
     }
 
@@ -1850,6 +1963,7 @@ mod tests {
             };
             let mut schema = EnvSchema {
                 vars: HashMap::from([("VALUE".into(), rule.clone())]),
+                ..Default::default()
             };
             let mut values = HashMap::from([("VALUE".into(), "".into())]);
             assert!(validate(&schema, &mut values).is_empty());

@@ -165,6 +165,12 @@ pub(super) fn build_push_schema_value(
             }
         }
         obj.insert("envSchema".into(), v);
+        if !env_schema.client_prefixes.is_empty() {
+            obj.insert(
+                "envSchemaConfig".into(),
+                serde_json::json!({"clientPrefixes": env_schema.client_prefixes}),
+            );
+        }
     }
 
     // envConfig: alias → canonical mapping from lpm.json "env" field
@@ -432,7 +438,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        cfg.env_schema = Some(lpm_env::EnvSchema { vars });
+        cfg.env_schema = Some(lpm_env::EnvSchema {
+            vars,
+            ..Default::default()
+        });
 
         let value =
             build_push_schema_value(Some(&cfg)).expect("config with envSchema emits a value");
@@ -459,12 +468,28 @@ mod tests {
     }
 
     #[test]
+    fn sync_projection_preserves_root_exposure_policy_and_ci_storage() {
+        let config = lpm_runner::lpm_json::LpmJsonConfig {
+            env_schema: Some(serde_json::from_value(serde_json::json!({"clientPrefixes":["APP_"],"vars":{"APP_API":{"client":true,"ci":"secret"},"BUILD_MODE":{"ci":"variable"}}})).unwrap()),
+            ..Default::default()
+        };
+        let wire = build_push_schema_value(Some(&config)).unwrap();
+        assert_eq!(
+            wire["envSchemaConfig"]["clientPrefixes"],
+            serde_json::json!(["APP_"])
+        );
+        assert_eq!(wire["envSchema"]["BUILD_MODE"]["ci"], "variable");
+        assert_eq!(wire["envSchema"]["APP_API"]["ci"], "secret");
+    }
+
+    #[test]
     fn maximum_variable_count_fits_the_sync_metadata_byte_limit() {
         let cfg = lpm_runner::lpm_json::LpmJsonConfig {
             env_schema: Some(lpm_env::EnvSchema {
                 vars: (0..4096)
                     .map(|index| (format!("VALUE_{index}"), Default::default()))
                     .collect(),
+                ..Default::default()
             }),
             ..Default::default()
         };

@@ -103,11 +103,13 @@ pub async fn run(
                 environment,
                 format,
                 schema_only,
+                client_only,
                 ci,
             } => schema::vars_print(
                 environment.env.as_deref(),
                 format,
                 schema_only,
+                client_only,
                 ci,
                 project_dir,
                 json_output,

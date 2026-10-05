@@ -2,7 +2,7 @@
 //!
 //! Parsed from the `envSchema` section of `lpm.json`.
 
-use serde::de::{MapAccess, Visitor};
+use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -20,13 +20,23 @@ pub struct EnvSchema {
     #[serde(default, deserialize_with = "deserialize_unique_vars")]
     #[schemars(extend("propertyNames" = {"pattern": "^[A-Za-z_][A-Za-z0-9_]{0,255}$"}, "maxProperties" = 4096))]
     pub vars: HashMap<String, EnvVarRule>,
+    /// Additional browser-visible variable prefixes. Framework prefixes remain enforced.
+    #[serde(
+        default,
+        rename = "clientPrefixes",
+        deserialize_with = "deserialize_client_prefixes",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    #[schemars(length(max = 32))]
+    #[schemars(extend("uniqueItems" = true, "items" = {"type":"string","pattern":"^(?:_|[A-Za-z_][A-Za-z0-9_]{0,254}_)$"}))]
+    pub client_prefixes: Vec<String>,
 }
 
 /// Validation rules for a single environment variable.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, remote = "Self")]
 #[schemars(deny_unknown_fields)]
-#[schemars(extend("allOf" = [{"if":{"properties":{"secret":{"const":true}},"required":["secret"]},"then":{"properties":{"default":{"type":"null"},"enum":{"type":"null"}}}}]))]
+#[schemars(extend("allOf" = [{"if":{"properties":{"secret":{"const":true}},"required":["secret"]},"then":{"properties":{"default":{"type":"null"},"enum":{"type":"null"},"client":{"const":false},"ci":{"enum":["secret",null]}}}}]))]
 pub struct EnvVarRule {
     /// Whether the variable must be set and non-empty.
     #[serde(default)]
@@ -61,6 +71,10 @@ pub struct EnvVarRule {
     #[serde(default)]
     pub client: bool,
 
+    /// GitHub Actions storage classification, independent of browser visibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci: Option<CiStorage>,
+
     /// Human-readable description (shown in error messages and .env.example).
     #[serde(default)]
     #[schemars(extend("pattern" = r"^[^\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]*$"))]
@@ -69,6 +83,14 @@ pub struct EnvVarRule {
     /// Treatment of an explicitly empty value. Missing preserves the child override.
     #[serde(default)]
     pub empty: EmptyPolicy,
+}
+
+/// Storage namespace used when synchronizing to GitHub Actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum CiStorage {
+    Secret,
+    Variable,
 }
 
 /// Empty values can trigger defaults, remain subject to validation, or be rejected.
@@ -81,6 +103,35 @@ pub enum EmptyPolicy {
     Missing,
     Allow,
     Reject,
+}
+
+fn deserialize_client_prefixes<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct Prefixes;
+    impl<'de> Visitor<'de> for Prefixes {
+        type Value = Vec<String>;
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("at most 32 client prefixes")
+        }
+        fn visit_seq<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut prefixes = Vec::with_capacity(access.size_hint().unwrap_or(0).min(32));
+            while let Some(prefix) = access.next_element::<String>()? {
+                if prefixes.len() == 32 {
+                    return Err(serde::de::Error::custom(
+                        "envSchema exceeds 32 client prefixes",
+                    ));
+                }
+                prefixes.push(prefix);
+            }
+            Ok(prefixes)
+        }
+    }
+    deserializer.deserialize_seq(Prefixes)
 }
 
 fn deserialize_unique_vars<'de, D>(deserializer: D) -> Result<HashMap<String, EnvVarRule>, D::Error>
@@ -137,6 +188,24 @@ impl EnvVarRule {
 }
 
 impl EnvSchema {
+    /// Whether a name is public under a framework or project prefix.
+    pub fn has_client_prefix(&self, name: &str) -> bool {
+        Self::has_framework_client_prefix(name)
+            || self
+                .client_prefixes
+                .iter()
+                .take(32)
+                .any(|prefix| name.starts_with(prefix))
+    }
+
+    pub(crate) fn has_framework_client_prefix(name: &str) -> bool {
+        name.get(..10)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("REACT_APP_"))
+            || ["NEXT_PUBLIC_", "VITE_", "PUBLIC_"]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+    }
+
     /// Returns true if the schema has no variable definitions.
     pub fn is_empty(&self) -> bool {
         self.vars.is_empty()
@@ -156,6 +225,12 @@ impl EnvSchema {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn more_than_32_client_prefixes_are_rejected_during_parsing() {
+        let input = serde_json::json!({"clientPrefixes": (0..33).map(|index| format!("CUSTOM_{index}_")).collect::<Vec<_>>()});
+        assert!(serde_json::from_value::<EnvSchema>(input).is_err());
+    }
 
     #[test]
     fn deserialize_minimal_rule() {
