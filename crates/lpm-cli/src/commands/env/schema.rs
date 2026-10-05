@@ -225,12 +225,14 @@ pub(super) fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Re
                 serde_json::json!({
                     "environment": name,
                     "total": total,
-                    "valid": total - errors.len(),
+                    "valid": valid_variable_count(schema, errors),
                     "errors": errors.iter().map(|e| {
-                        serde_json::json!({
-                            "key": e.key,
-                            "error": e.to_string(),
-                        })
+                        let mut diagnostic = serde_json::json!({"key": e.key, "error": e.to_string()});
+                        if let lpm_env::ValidationErrorKind::GroupViolation { group, mode } = &e.kind {
+                            diagnostic["group"] = serde_json::json!(group);
+                            diagnostic["mode"] = serde_json::json!(mode);
+                        }
+                        diagnostic
                     }).collect::<Vec<_>>(),
                 })
             })
@@ -251,7 +253,7 @@ pub(super) fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Re
 
     println!();
     for (name, total, errors) in &results {
-        let valid = total - errors.len();
+        let valid = valid_variable_count(schema, errors);
         if errors.is_empty() {
             println!(
                 "{}",
@@ -462,6 +464,19 @@ pub(super) fn vars_validate(
     } else {
         Err(LpmError::ExitCode(1))
     }
+}
+
+fn valid_variable_count(schema: &lpm_env::EnvSchema, errors: &[lpm_env::ValidationError]) -> usize {
+    let failed: std::collections::HashSet<&str> = errors
+        .iter()
+        .filter_map(|error| {
+            schema
+                .vars
+                .contains_key(&error.key)
+                .then_some(error.key.as_str())
+        })
+        .collect();
+    schema.len() - failed.len()
 }
 
 #[cfg(test)]

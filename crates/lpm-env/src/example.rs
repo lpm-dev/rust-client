@@ -2,7 +2,8 @@
 //!
 //! Produces a dotenv file with comments showing descriptions, formats, and defaults.
 
-use crate::schema::{EnvSchema, VarFormat};
+use crate::schema::{EnvSchema, RequiredWhen, VarFormat};
+use std::fmt::Write as _;
 
 /// Generate `.env.example` content from an env schema.
 ///
@@ -23,23 +24,77 @@ pub fn generate(schema: &EnvSchema) -> String {
         .iter()
         .map(|(name, rule)| {
             name.len()
-                + 96
-                + rule.description.as_ref().map_or(0, String::len)
-                + rule.pattern.as_ref().map_or(0, String::len)
+                + 384
+                + rule.description.as_deref().map_or(0, comment_text_capacity)
+                + rule.pattern.as_deref().map_or(0, comment_text_capacity)
+                + rule.protocols.as_ref().map_or(0, |values| {
+                    values.iter().map(|value| value.len() + 2).sum::<usize>()
+                })
+                + rule.required_when.as_ref().map_or(0, |condition| {
+                    condition.variable().len()
+                        + match condition {
+                            RequiredWhen::Equals(condition)
+                                if schema
+                                    .vars
+                                    .get(&condition.variable)
+                                    .is_some_and(|source| !source.secret) =>
+                            {
+                                comment_text_capacity(&condition.equals)
+                            }
+                            _ => 0,
+                        }
+                })
                 + if rule.secret {
                     0
                 } else {
-                    rule.default.as_ref().map_or(0, |value| value.len() * 2)
+                    rule.default
+                        .as_deref()
+                        .map_or(0, |value| value.len() * 2 + comment_text_capacity(value))
                         + rule.enum_values.as_ref().map_or(0, |values| {
-                            values.iter().map(|value| value.len() + 2).sum::<usize>()
+                            values
+                                .iter()
+                                .map(|value| comment_text_capacity(value) + 2)
+                                .sum::<usize>()
                         })
                 }
         })
-        .sum();
+        .sum::<usize>()
+        + schema
+            .groups
+            .iter()
+            .map(|(name, group)| {
+                name.len()
+                    + 48
+                    + group
+                        .vars
+                        .iter()
+                        .map(|member| member.len() + 2)
+                        .sum::<usize>()
+            })
+            .sum::<usize>();
     let mut output = String::with_capacity(capacity);
     let mut comment = String::with_capacity(128);
     let mut keys: Vec<&str> = schema.vars.keys().map(String::as_str).collect();
     keys.sort_unstable();
+
+    for (name, group) in crate::constraints::ordered_groups(schema) {
+        let mode = match group.mode {
+            crate::VarGroupMode::AllOrNone => "all or none",
+            crate::VarGroupMode::ExactlyOne => "exactly one",
+            crate::VarGroupMode::AtLeastOne => "at least one",
+        };
+        let _ = write!(output, "# Group {name}: {mode} of ");
+        for (index, member) in group.vars.iter().enumerate() {
+            if index > 0 {
+                output.push_str(", ");
+            }
+            output.push_str(member);
+        }
+        output.push('\n');
+    }
+    if !schema.groups.is_empty() {
+        output.push('\n');
+    }
 
     for (index, key) in keys.iter().enumerate() {
         let rule = &schema.vars[*key];
@@ -88,6 +143,51 @@ pub fn generate(schema: &EnvSchema) -> String {
             comment.push_str("default: ");
             comment.push_str(default);
         }
+        for (label, value) in [("min", rule.min), ("max", rule.max)] {
+            if let Some(value) = value {
+                comment_separator(&mut comment, &mut has_parts);
+                let _ = write!(comment, "{label}: {value}");
+            }
+        }
+        for (label, value) in [
+            ("minLength", rule.min_length),
+            ("maxLength", rule.max_length),
+        ] {
+            if let Some(value) = value {
+                comment_separator(&mut comment, &mut has_parts);
+                let _ = write!(comment, "{label}: {value} Unicode scalars");
+            }
+        }
+        if let Some(protocols) = &rule.protocols {
+            comment_separator(&mut comment, &mut has_parts);
+            comment.push_str("protocols: ");
+            for (index, protocol) in protocols.iter().enumerate() {
+                if index != 0 {
+                    comment.push_str(", ");
+                }
+                comment.push_str(protocol);
+            }
+        }
+        if let Some(condition) = &rule.required_when {
+            comment_separator(&mut comment, &mut has_parts);
+            let _ = write!(comment, "required when {}", condition.variable());
+            match condition {
+                RequiredWhen::Equals(condition)
+                    if schema
+                        .vars
+                        .get(&condition.variable)
+                        .is_some_and(|source| !source.secret) =>
+                {
+                    let _ = write!(comment, " equals {}", condition.equals);
+                }
+                RequiredWhen::Present(condition) => comment.push_str(if condition.present {
+                    " is nonempty"
+                } else {
+                    " is missing or empty"
+                }),
+                RequiredWhen::Equals(_) => comment.push_str(" satisfies its predicate"),
+            }
+        }
         for line in comment.lines().flat_map(|line| line.split('\r')) {
             output.push_str("# ");
             output.push_str(line);
@@ -106,6 +206,10 @@ pub fn generate(schema: &EnvSchema) -> String {
     }
 
     output
+}
+
+fn comment_text_capacity(value: &str) -> usize {
+    value.len() + value.bytes().filter(|byte| *byte == b'\n').count() * 2
 }
 
 fn comment_separator(comment: &mut String, has_parts: &mut bool) {
@@ -271,5 +375,17 @@ mod tests {
                 "uncommented assignment from {field}: {normalized}"
             );
         }
+    }
+    #[test]
+    fn examples_describe_constraints_and_hide_secret_condition_literals() {
+        let schema = schema_from_json(
+            r#"{"vars":{"N":{"format":"integer","min":"9007199254740993","minLength":2,"requiredWhen":{"variable":"MODE","present":false}},"MODE":{},"URL":{"format":"url","protocols":["https"]},"TOKEN":{"secret":true},"BAD":{"requiredWhen":{"variable":"TOKEN","equals":"private-condition"}}},"groups":{"g":{"mode":"atLeastOne","vars":["N","URL"]}}}"#,
+        );
+        let output = generate(&schema);
+        assert!(output.contains("min: 9007199254740993"));
+        assert!(output.contains("minLength: 2 Unicode scalars"));
+        assert!(output.contains("required when MODE is missing or empty"));
+        assert!(output.contains("Group g: at least one of N, URL"));
+        assert!(!output.contains("private-condition"));
     }
 }
