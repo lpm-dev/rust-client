@@ -3548,6 +3548,16 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tracing",
+ "url",
+]
+
+[[package]]
+name = "lpm-env-wasm"
+version = "0.79.0"
+dependencies = [
+ "lpm-env",
+ "serde_json",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3861,6 +3871,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "sha2",
  "signal-hook",
  "tempfile",

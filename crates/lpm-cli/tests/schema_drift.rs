@@ -517,3 +517,16 @@ fn service_schema_and_parser_accept_valid_service_bounds() {
     assert!(validator.is_valid(&document));
     assert!(lpm_runner::lpm_json::parse_lpm_json(&document.to_string()).is_ok());
 }
+
+#[test]
+fn env_schema_editor_rejects_secret_literal_defaults_and_enums() {
+    let validator = lpm_json_validator();
+    for literal in [
+        serde_json::json!({"default":"private"}),
+        serde_json::json!({"enum":["private"]}),
+    ] {
+        let mut rule = literal;
+        rule["secret"] = serde_json::json!(true);
+        assert!(!validator.is_valid(&serde_json::json!({"envSchema":{"vars":{"TOKEN":rule}}})));
+    }
+}

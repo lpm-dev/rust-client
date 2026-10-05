@@ -209,6 +209,7 @@ fn validate_project_env_with_case_policy(
     config: Option<&lpm_json::LpmJsonConfig>,
     case_insensitive: bool,
 ) -> Result<(), LpmError> {
+    validate_process_values(vars)?;
     if let Some(schema) = config.and_then(|config| config.env_schema.as_ref()) {
         if case_insensitive {
             let mut schema_names = std::collections::BTreeSet::new();
@@ -278,6 +279,7 @@ fn merge_env_with_case_policy(
     values: &HashMap<String, String>,
     case_insensitive: bool,
 ) -> Result<(), LpmError> {
+    validate_process_values(values)?;
     if case_insensitive {
         let mut names = std::collections::BTreeSet::new();
         for key in values.keys() {
@@ -294,6 +296,30 @@ fn merge_env_with_case_policy(
             .iter()
             .map(|(key, value)| (key.clone(), value.clone())),
     );
+    Ok(())
+}
+
+fn validate_process_values(values: &HashMap<String, String>) -> Result<(), LpmError> {
+    if let Some(key) = values
+        .keys()
+        .filter(|key| key.is_empty() || key.as_bytes().contains(&0) || key.contains('='))
+        .min()
+    {
+        return Err(LpmError::EnvValidation(format!(
+            "{}: process environment keys must be nonempty and cannot contain NUL or '='",
+            key.escape_debug()
+        )));
+    }
+    if let Some((key, _)) = values
+        .iter()
+        .filter(|(_, value)| value.as_bytes().contains(&0))
+        .min_by_key(|(key, _)| *key)
+    {
+        return Err(LpmError::EnvValidation(format!(
+            "{}: values cannot contain NUL bytes",
+            key.escape_debug()
+        )));
+    }
     Ok(())
 }
 
@@ -1033,5 +1059,36 @@ mod tests {
             err.contains("circular"),
             "error should mention circular: {err}"
         );
+    }
+    #[test]
+    fn undeclared_nul_values_are_rejected_without_a_schema() {
+        let mut values = HashMap::from([("UNDECLARED".into(), "private\0fixture".into())]);
+        let error = validate_project_env(&mut values, None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("UNDECLARED"));
+        assert!(error.contains("NUL"));
+        assert!(!error.contains("private"));
+    }
+    #[test]
+    fn dotenv_format_preserves_unicode_whitespace_in_values() {
+        for value in ["\u{00a0}hello\u{00a0}", "\u{2003}hello\u{2003}"] {
+            let vars = HashMap::from([("VALUE".into(), value.into())]);
+            let text =
+                lpm_env::format_env(&vars, lpm_env::PrintFormat::Dotenv, &Default::default());
+            assert_eq!(parse_env_str(&text), vars);
+        }
+    }
+
+    #[test]
+    fn undeclared_nul_keys_are_rejected_without_retaining_values() {
+        for key in ["BAD\0NAME", "BAD=NAME", ""] {
+            let mut values = HashMap::from([(key.into(), "private-fixture-value".into())]);
+            let error = validate_project_env(&mut values, None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("NUL"));
+            assert!(!error.contains("private-fixture-value"));
+        }
     }
 }

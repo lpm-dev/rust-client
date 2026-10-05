@@ -823,19 +823,36 @@ pub fn read_lpm_json(project_dir: &Path) -> Result<Option<LpmJsonConfig>, String
 
 /// Parse and validate an `lpm.json` document that was read by the caller.
 pub fn parse_lpm_json(content: &str) -> Result<LpmJsonConfig, String> {
-    let mut config: LpmJsonConfig = serde_json::from_str(lpm_common::strip_utf8_bom_str(content))
-        .map_err(|error| match error.classify() {
-        serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
-            format!("failed to parse lpm.json: {error}")
-        }
-        serde_json::error::Category::Data => {
-            format!("invalid lpm.json data: {error}")
-        }
-        serde_json::error::Category::Io => {
-            format!("failed to read lpm.json: {error}")
-        }
-    })?;
+    let mut deserializer =
+        serde_json::Deserializer::from_str(lpm_common::strip_utf8_bom_str(content));
+    let mut config: LpmJsonConfig = serde_path_to_error::deserialize(&mut deserializer)
+        .map_err(|failure| {
+            let path = failure.path().to_string();
+            let error = failure.inner();
+            if path == "envSchema" || path.starts_with("envSchema.") {
+                let safe_path: String = path.chars().flat_map(char::escape_default).collect();
+                return format!("invalid lpm.json data at {safe_path} (line {}, column {}): check envSchema field names and value types", error.line(), error.column());
+            }
+            match error.classify() {
+                serde_json::error::Category::Syntax | serde_json::error::Category::Eof => format!("failed to parse lpm.json: {error}"),
+                serde_json::error::Category::Data => format!("invalid lpm.json data: {error}"),
+                serde_json::error::Category::Io => format!("failed to read lpm.json: {error}"),
+            }
+        })?;
+    deserializer
+        .end()
+        .map_err(|error| format!("failed to parse lpm.json: {error}"))?;
 
+    if let Some(schema) = &config.env_schema {
+        let errors = lpm_env::validate_schema(schema);
+        if !errors.is_empty() {
+            return Err(errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"));
+        }
+    }
     validate_task_cache_globs(&config)?;
 
     if let Some(vault_id) = config.vault.as_deref()
@@ -1966,5 +1983,20 @@ mod tests {
             config.tunnel.as_ref().and_then(|t| t.domain.as_deref()),
             Some("acme.lpm.llc")
         );
+    }
+    #[test]
+    fn malformed_secret_schema_literals_never_appear_in_parse_errors() {
+        for rule in [
+            r#"{"secret":true,"default":918273645}"#,
+            r#"{"enum":[918273645],"secret":true}"#,
+            r#"{"secret":true,"format":"private-fixture-value"}"#,
+            r#"{"empty":"private-fixture-value","secret":true}"#,
+        ] {
+            let input = format!(r#"{{"envSchema":{{"vars":{{"TOKEN":{rule}}}}}}}"#);
+            let error = parse_lpm_json(&input).unwrap_err();
+            assert!(!error.contains("918273645"), "{error}");
+            assert!(!error.contains("private-fixture-value"), "{error}");
+            assert!(error.contains("envSchema"));
+        }
     }
 }

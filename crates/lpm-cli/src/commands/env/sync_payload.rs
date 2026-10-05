@@ -148,6 +148,22 @@ pub(super) fn build_push_schema_value(
     if let Some(env_schema) = &c.env_schema
         && let Ok(v) = serde_json::to_value(&env_schema.vars)
     {
+        let mut v = v;
+        if let Some(vars) = v.as_object_mut() {
+            for (key, value) in vars {
+                if let Some(rule) = value.as_object_mut() {
+                    if env_schema.is_secret(key) {
+                        rule.remove("default");
+                        rule.remove("enum");
+                    }
+                    rule.retain(|field, value| {
+                        !(value.is_null()
+                            || matches!(value, serde_json::Value::Bool(false))
+                            || field == "empty" && value == "missing")
+                    });
+                }
+            }
+        }
         obj.insert("envSchema".into(), v);
     }
 
@@ -427,6 +443,33 @@ mod tests {
             env_schema.get("DATABASE_URL").is_some(),
             "var entries must be flat, not wrapped in EnvSchema"
         );
+    }
+
+    #[test]
+    fn sync_projection_never_contains_secret_default_or_enum_literals() {
+        let cfg = lpm_runner::lpm_json::LpmJsonConfig {
+            env_schema: Some(serde_json::from_value(serde_json::json!({"vars":{"TOKEN":{"secret":true,"default":"private-default","enum":["private-enum"]}}})).unwrap()),
+            ..Default::default()
+        };
+        let value = build_push_schema_value(Some(&cfg)).unwrap();
+        let text = value.to_string();
+        assert!(!text.contains("private-default"));
+        assert!(!text.contains("private-enum"));
+        assert_eq!(value["envSchema"]["TOKEN"]["secret"], true);
+    }
+
+    #[test]
+    fn maximum_variable_count_fits_the_sync_metadata_byte_limit() {
+        let cfg = lpm_runner::lpm_json::LpmJsonConfig {
+            env_schema: Some(lpm_env::EnvSchema {
+                vars: (0..4096)
+                    .map(|index| (format!("VALUE_{index}"), Default::default()))
+                    .collect(),
+            }),
+            ..Default::default()
+        };
+        let text = build_push_schema_value(Some(&cfg)).unwrap().to_string();
+        assert!(text.len() <= 256 * 1024, "{} bytes", text.len());
     }
 
     #[test]

@@ -18,64 +18,101 @@ use crate::schema::{EnvSchema, VarFormat};
 /// LOG_LEVEL=info
 /// ```
 pub fn generate(schema: &EnvSchema) -> String {
-    let mut output = String::new();
-    let mut keys: Vec<&String> = schema.vars.keys().collect();
-    keys.sort();
+    let capacity = schema
+        .vars
+        .iter()
+        .map(|(name, rule)| {
+            name.len()
+                + 96
+                + rule.description.as_ref().map_or(0, String::len)
+                + rule.pattern.as_ref().map_or(0, String::len)
+                + if rule.secret {
+                    0
+                } else {
+                    rule.default.as_ref().map_or(0, |value| value.len() * 2)
+                        + rule.enum_values.as_ref().map_or(0, |values| {
+                            values.iter().map(|value| value.len() + 2).sum::<usize>()
+                        })
+                }
+        })
+        .sum();
+    let mut output = String::with_capacity(capacity);
+    let mut comment = String::with_capacity(128);
+    let mut keys: Vec<&str> = schema.vars.keys().map(String::as_str).collect();
+    keys.sort_unstable();
 
-    for (i, key) in keys.iter().enumerate() {
+    for (index, key) in keys.iter().enumerate() {
         let rule = &schema.vars[*key];
-
-        // Build comment line
-        let mut parts = Vec::new();
-
-        if let Some(desc) = &rule.description {
-            parts.push(desc.clone());
+        comment.clear();
+        let mut has_parts = false;
+        if let Some(description) = &rule.description {
+            comment.push_str(description);
+            has_parts = true;
         }
-
-        if rule.required {
-            parts.push("required".to_string());
+        for flag in [
+            rule.required.then_some("required"),
+            rule.secret.then_some("secret"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            comment_separator(&mut comment, &mut has_parts);
+            comment.push_str(flag);
         }
-
-        if rule.secret {
-            parts.push("secret".to_string());
-        }
-
         if let Some(format) = &rule.format {
-            parts.push(format!("format: {}", format_name(format)));
+            comment_separator(&mut comment, &mut has_parts);
+            comment.push_str("format: ");
+            comment.push_str(format_name(format));
         }
-
-        if let Some(enum_values) = &rule.enum_values {
-            parts.push(format!("one of: {}", enum_values.join(", ")));
-        }
-
-        if let Some(pattern) = &rule.pattern {
-            parts.push(format!("pattern: {pattern}"));
-        }
-
-        if let Some(default) = &rule.default {
-            parts.push(format!("default: {default}"));
-        }
-
-        if !parts.is_empty() {
-            for line in parts.join(" · ").lines() {
-                output.push_str("# ");
-                output.push_str(line);
-                output.push('\n');
+        if !rule.secret
+            && let Some(values) = &rule.enum_values
+        {
+            comment_separator(&mut comment, &mut has_parts);
+            comment.push_str("one of: ");
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    comment.push_str(", ");
+                }
+                comment.push_str(value);
             }
         }
-
-        // Value line: KEY=default_or_empty
-        let value = rule.default.as_deref().unwrap_or("");
-        output.push_str(&crate::print::format_dotenv(&[(key.as_str(), value)]));
+        if let Some(pattern) = &rule.pattern {
+            comment_separator(&mut comment, &mut has_parts);
+            comment.push_str("pattern: ");
+            comment.push_str(pattern);
+        }
+        if !rule.secret
+            && let Some(default) = &rule.default
+        {
+            comment_separator(&mut comment, &mut has_parts);
+            comment.push_str("default: ");
+            comment.push_str(default);
+        }
+        for line in comment.lines() {
+            output.push_str("# ");
+            output.push_str(line);
+            output.push('\n');
+        }
+        let value = if rule.secret {
+            ""
+        } else {
+            rule.default.as_deref().unwrap_or("")
+        };
+        crate::print::append_dotenv_entry(&mut output, key, value);
         output.push('\n');
-
-        // Blank line between entries (except after last)
-        if i < keys.len() - 1 {
+        if index + 1 < keys.len() {
             output.push('\n');
         }
     }
 
     output
+}
+
+fn comment_separator(comment: &mut String, has_parts: &mut bool) {
+    if *has_parts {
+        comment.push_str(" · ");
+    }
+    *has_parts = true;
 }
 
 fn format_name(format: &VarFormat) -> &'static str {
@@ -197,5 +234,25 @@ mod tests {
         assert!(output.contains("PORT=3000"));
         assert!(output.contains("STRIPE_SECRET_KEY="));
         assert!(output.contains("LOG_LEVEL=info"));
+    }
+    #[test]
+    fn secret_defaults_and_allowlists_never_appear_in_examples() {
+        let schema = schema_from_json(
+            r#"{"vars":{"TOKEN":{"secret":true,"default":"private-default","enum":["private-allowed"]}}}"#,
+        );
+        let output = generate(&schema);
+        assert!(!output.contains("private-default"));
+        assert!(!output.contains("private-allowed"));
+        assert!(output.contains("TOKEN=\n"));
+    }
+    #[test]
+    fn examples_preserve_empty_descriptions_and_quote_multiline_defaults() {
+        let schema = schema_from_json(
+            r#"{"vars":{"A":{"description":"","required":true},"B":{"description":"first\nsecond","default":"line1\nline2"}}}"#,
+        );
+        assert_eq!(
+            generate(&schema),
+            "#  · required\nA=\n\n# first\n# second · default: line1\n# line2\nB=\"line1\\nline2\"\n"
+        );
     }
 }

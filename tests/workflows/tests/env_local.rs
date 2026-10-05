@@ -281,10 +281,14 @@ fn env_github_output_runs_as_shell_and_masks_multiline_secrets() {
     project.write_file(
         "lpm.json",
         &serde_json::json!({"envSchema":{"vars":{"VALUE":{
-            "secret":true,"default":value
+            "secret":true
         }}}})
         .to_string(),
     );
+    lpm(&project)
+        .args(["env", "set", &format!("VALUE={value}")])
+        .assert()
+        .success();
     let output = lpm(&project)
         .args(["env", "print", "--format=github-actions"])
         .output()
@@ -1590,4 +1594,126 @@ fn env_init_without_imported_files_does_not_create_gitignore() {
         .assert()
         .success();
     assert!(!project.path().join(".gitignore").exists());
+}
+
+#[test]
+fn env_schema_typos_never_expose_supplied_secrets() {
+    let project = TempProject::empty(r#"{"name":"env-schema-typo"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"envSchema":{"vars":{"TOKEN":{"secert":true,"format":"integer"}}}}"#,
+    );
+    project.write_file(".env", "TOKEN=private-fixture-value\n");
+    let output = lpm(&project).args(["env", "check"]).output().unwrap();
+    assert!(!output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("envSchema"));
+    assert!(!text.contains("private-fixture-value"));
+}
+
+#[test]
+fn env_schema_invalid_unused_defaults_stop_checks() {
+    let project = TempProject::empty(r#"{"name":"env-schema-default"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"envSchema":{"vars":{"PORT":{"format":"port","default":"70000"}}}}"#,
+    );
+    project.write_file(".env", "PORT=3000\n");
+    lpm(&project).args(["env", "check"]).assert().failure();
+}
+
+#[test]
+fn env_schema_secret_literals_are_rejected_before_example_generation() {
+    let project = TempProject::empty(r#"{"name":"env-schema-secret"}"#);
+    for literal in [
+        r#""default":"private-fixture-value""#,
+        r#""enum":["private-fixture-value"]"#,
+    ] {
+        project.write_file(
+            "lpm.json",
+            &format!(r#"{{"envSchema":{{"vars":{{"TOKEN":{{"secret":true,{literal}}}}}}}}}"#),
+        );
+        let output = lpm(&project)
+            .args(["env", "example", "--json"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!text.contains("private-fixture-value"));
+        assert!(!project.path().join(".env.example").exists());
+    }
+}
+
+#[test]
+fn undeclared_nul_values_stop_checks_and_execution_before_hooks() {
+    let project = TempProject::empty(
+        r#"{"name":"env-nul","scripts":{"start":"echo executed > child-marker","prestart":"echo hook > hook-marker"}}"#,
+    );
+    project.write_file("lpm.json", r#"{"envSchema":{"vars":{"OPTIONAL":{}}}}"#);
+    project.write_file(".env", "UNDECLARED=private\0fixture\n");
+    for args in [
+        vec!["env", "check"],
+        vec!["run", "start"],
+        vec!["run", "start", "--no-env-check"],
+    ] {
+        let output = lpm(&project).args(args).output().unwrap();
+        assert!(!output.status.success());
+        let text = String::from_utf8_lossy(&output.stderr);
+        assert!(text.contains("NUL"), "{text}");
+        assert!(!text.contains("private"));
+        assert!(!project.path().join("hook-marker").exists());
+        assert!(!project.path().join("child-marker").exists());
+    }
+}
+
+#[test]
+fn malformed_secret_declarations_report_paths_without_literals() {
+    let project = TempProject::empty(r#"{"name":"env-private-parse"}"#);
+    for rule in [
+        r#"{"secret":true,"default":918273645}"#,
+        r#"{"enum":[918273645],"secret":true}"#,
+        r#"{"secret":true,"format":"private-fixture-value"}"#,
+    ] {
+        project.write_file(
+            "lpm.json",
+            &format!(r#"{{"envSchema":{{"vars":{{"TOKEN":{rule}}}}}}}"#),
+        );
+        let output = lpm(&project).args(["env", "check"]).output().unwrap();
+        assert!(!output.status.success());
+        for bytes in [&output.stdout, &output.stderr] {
+            let text = String::from_utf8_lossy(bytes);
+            assert!(!text.contains("918273645"));
+            assert!(!text.contains("private-fixture-value"));
+        }
+    }
+}
+
+#[test]
+fn undeclared_nul_keys_stop_checks_and_execution_before_hooks() {
+    let project = TempProject::empty(
+        r#"{"name":"env-nul","scripts":{"start":"echo executed > child-marker","prestart":"echo hook > hook-marker"}}"#,
+    );
+    project.write_file("lpm.json", r#"{"envSchema":{"vars":{"OPTIONAL":{}}}}"#);
+    project.write_file(".env", "BAD\0NAME=private-fixture-value\n");
+    for args in [
+        vec!["env", "check"],
+        vec!["run", "start"],
+        vec!["run", "start", "--no-env-check"],
+    ] {
+        let output = lpm(&project).args(args).output().unwrap();
+        assert!(!output.status.success());
+        let text = String::from_utf8_lossy(&output.stderr);
+        assert!(text.contains("NUL"), "{text}");
+        assert!(!text.contains("private"));
+        assert!(!project.path().join("hook-marker").exists());
+        assert!(!project.path().join("child-marker").exists());
+    }
 }

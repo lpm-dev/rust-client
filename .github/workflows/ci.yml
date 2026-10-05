@@ -48,6 +48,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
 
       - name: Cache cargo
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -79,6 +80,9 @@ jobs:
       # lints in build_state.rs that this stricter invocation surfaces).
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Build portable env validator
+        run: cargo build --locked --release -p lpm-env-wasm --target wasm32-unknown-unknown
 
       - name: Check formatting
         run: cargo fmt --check
