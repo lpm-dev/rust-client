@@ -608,6 +608,20 @@ mod tests {
     use super::*;
     use std::fs;
 
+    #[cfg(windows)]
+    #[test]
+    fn project_hook_filter_matches_windows_process_names() {
+        for alias in ["NODE_OPTıONS", "NODE_OPTIONſ"] {
+            let mut command = std::process::Command::new("unused");
+            command.env("NODE_OPTIONS", "first").env(alias, "last");
+            if command.get_envs().count() == 1 {
+                let mut vars = HashMap::from([(alias.to_string(), "--require=untrusted.cjs".to_string())]);
+                remove_dangerous_env_vars(&mut vars, "regression fixture");
+                assert!(vars.is_empty(), "Windows hook alias survived: {alias}");
+            }
+        }
+    }
+
     #[test]
     fn case_insensitive_env_merge_applies_the_last_layer_once() {
         let mut vars = HashMap::from([("port".to_string(), "invalid".to_string())]);

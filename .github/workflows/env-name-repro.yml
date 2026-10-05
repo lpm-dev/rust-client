@@ -1,0 +1,21 @@
+name: Windows env name reproduction
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  reproduce:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: '1.94.0'
+      - name: Reproduce project hook alias
+        run: cargo test --locked -p lpm-runner project_hook_filter_matches_windows_process_names -- --nocapture
+      - name: Reproduce inherited wildcard alias
+        if: always()
+        run: cargo test --locked -p lpm-common inherited_secret_suffix_filter_matches_windows_process_names -- --nocapture
