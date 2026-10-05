@@ -7,6 +7,25 @@ pub(super) struct Environment {
     pub env: Option<String>,
 }
 
+#[derive(Args)]
+pub(super) struct Scope {
+    /// Validate the selected command stage.
+    #[arg(long, value_parser = stage_name)]
+    pub stage: Option<lpm_env::EnvStage>,
+    /// Validate a named service within the selected environment and stage.
+    #[arg(long, value_parser = service_name)]
+    pub service: Option<String>,
+}
+
+fn stage_name(value: &str) -> Result<lpm_env::EnvStage, String> {
+    lpm_env::EnvStage::parse(value)
+        .ok_or_else(|| "stage must be development, build, runtime, ci, or test".into())
+}
+fn service_name(value: &str) -> Result<String, String> {
+    lpm_env::resolver::validate_env_name(value)?;
+    Ok(value.into())
+}
+
 #[derive(Parser)]
 #[command(name = "lpm env", disable_help_flag = true)]
 struct LocalCommand {
@@ -58,6 +77,8 @@ pub(super) enum LocalAction {
     Print {
         #[command(flatten)]
         environment: Environment,
+        #[command(flatten)]
+        scope: Scope,
         #[arg(long, value_parser = print_format)]
         format: Option<lpm_env::PrintFormat>,
         #[arg(long)]
@@ -65,14 +86,19 @@ pub(super) enum LocalAction {
         /// Print only declared browser-visible variables.
         #[arg(long)]
         client_only: bool,
-        #[arg(long, conflicts_with_all = ["format", "schema_only", "client_only"])]
+        #[arg(long, conflicts_with_all = ["format", "schema_only", "client_only", "stage", "service"])]
         ci: bool,
     },
     Example {
         #[command(flatten)]
         environment: Environment,
     },
-    Check,
+    Check {
+        #[command(flatten)]
+        environment: Environment,
+        #[command(flatten)]
+        scope: Scope,
+    },
     Validate {
         #[arg(long)]
         strict: bool,

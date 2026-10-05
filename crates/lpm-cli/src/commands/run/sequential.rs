@@ -163,6 +163,7 @@ pub(super) fn run_tasks_sequential(
                 tasks,
                 bin_hint,
                 json_output,
+                lpm_config,
             ) {
                 Ok(captured) => {
                     let duration_ms = task_start.elapsed().as_millis() as u64;
@@ -191,7 +192,15 @@ pub(super) fn run_tasks_sequential(
                 Err(e) => Err(e),
             }
         } else {
-            run_task(project_dir, script, extra_args, env_mode, tasks, bin_hint)
+            run_task(
+                project_dir,
+                script,
+                extra_args,
+                env_mode,
+                tasks,
+                bin_hint,
+                lpm_config,
+            )
         };
 
         env_access.check()?;

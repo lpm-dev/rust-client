@@ -20,9 +20,25 @@ pub(super) fn emit_project_env_for_ci(
         CiEnvDestination::Stdout => detect_ci_format(),
         CiEnvDestination::DotenvFile(_) => lpm_env::PrintFormat::Dotenv,
     };
-    let (resolved_env, _) = super::local::resolve_env_from_flag(env_mode, project_dir)?;
-    let env_vars = lpm_runner::dotenv::load_project_env(project_dir, resolved_env.as_deref())?;
-    let secret_keys = secret_keys(project_dir)?;
+    let (resolved_env, config) = super::local::resolve_env_from_flag(env_mode, project_dir)?;
+    let env_vars = lpm_runner::dotenv::load_project_env_with_config_and_context(
+        project_dir,
+        env_mode,
+        config.as_ref(),
+        lpm_env::EnvStage::Ci,
+        None,
+    )?;
+    let secret_keys: HashSet<String> = config
+        .as_ref()
+        .and_then(|config| config.env_schema.as_ref())
+        .map(|schema| {
+            schema
+                .vars
+                .iter()
+                .filter_map(|(key, rule)| rule.secret.then_some(key.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
     let output = lpm_env::format_env(&env_vars, format, &secret_keys);
 
     match destination {
@@ -59,20 +75,6 @@ pub(super) fn emit_project_env_for_ci(
     }
 
     Ok(())
-}
-
-fn secret_keys(project_dir: &Path) -> Result<HashSet<String>, LpmError> {
-    Ok(lpm_runner::lpm_json::read_lpm_json(project_dir)
-        .map_err(LpmError::Script)?
-        .and_then(|config| config.env_schema)
-        .map(|schema| {
-            schema
-                .vars
-                .into_iter()
-                .filter_map(|(key, rule)| rule.secret.then_some(key))
-                .collect()
-        })
-        .unwrap_or_default())
 }
 
 fn ci_format_label(format: lpm_env::PrintFormat) -> &'static str {

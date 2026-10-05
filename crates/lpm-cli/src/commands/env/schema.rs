@@ -80,12 +80,17 @@ pub(super) fn vars_example(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "CLI print keeps exposure, scope, and output options explicit"
+)]
 pub(super) fn vars_print(
     env_mode: Option<&str>,
     format: Option<lpm_env::PrintFormat>,
     schema_only: bool,
     client_only: bool,
     ci: bool,
+    scope: &super::arguments::Scope,
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
@@ -107,7 +112,7 @@ pub(super) fn vars_print(
     } else {
         lpm_env::PrintFormat::Dotenv
     });
-    let (resolved_mode, config) = super::local::resolve_env_from_flag(env_mode, project_dir)?;
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
     if (schema_only || client_only)
         && config
             .as_ref()
@@ -121,11 +126,12 @@ pub(super) fn vars_print(
 
     let output = format_print_env(
         project_dir,
-        resolved_mode.as_deref(),
+        env_mode,
         config.as_ref(),
         schema_only,
         client_only,
         format,
+        scope,
     )?;
     println!("{output}");
     Ok(())
@@ -138,10 +144,16 @@ fn format_print_env(
     schema_only: bool,
     client_only: bool,
     format: lpm_env::PrintFormat,
+    scope: &super::arguments::Scope,
 ) -> Result<String, LpmError> {
     // Use the unified loader (handles inheritance, vault, schema validation + defaults)
-    let mut env_vars =
-        lpm_runner::dotenv::load_project_env_with_config(project_dir, resolved_mode, config)?;
+    let mut env_vars = lpm_runner::dotenv::load_project_env_with_config_and_context(
+        project_dir,
+        resolved_mode,
+        config,
+        scope.stage.unwrap_or_default(),
+        scope.service.as_deref(),
+    )?;
     let schema = config.and_then(|c| c.env_schema.as_ref());
 
     // Collect secret keys for masking
@@ -170,7 +182,12 @@ fn format_print_env(
     Ok(lpm_env::format_env(&env_vars, format, &secret_keys))
 }
 
-pub(super) fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Result<(), LpmError> {
+pub(super) fn vars_check(
+    project_dir: &std::path::Path,
+    env_input: Option<&str>,
+    scope: &super::arguments::Scope,
+    json_output: bool,
+) -> Result<(), LpmError> {
     let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
 
     let schema = lpm_config
@@ -188,34 +205,44 @@ pub(super) fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Re
     // with legacy vault keys surfaced separately (never collapsed).
     let vault_envs = lpm_vault::try_get_all_environments(project_dir).map_err(LpmError::Script)?;
     let empty_env_map = std::collections::HashMap::new();
-    let all_envs = lpm_env::resolver::list_all(
-        lpm_config.as_ref().map_or(&empty_env_map, |c| &c.env),
-        lpm_config.as_ref().and_then(|c| c.environments.as_ref()),
-        &vault_envs,
-    );
-    let env_names: Vec<String> = all_envs.iter().map(|e| e.canonical.clone()).collect();
-
-    let mut results: Vec<(String, usize, Vec<lpm_env::ValidationError>)> = Vec::new();
+    let all_envs = if let Some(env_input) = env_input {
+        vec![lpm_runner::dotenv::resolve_project_environment(
+            Some(env_input),
+            lpm_config.as_ref(),
+        )?]
+    } else {
+        lpm_env::resolver::list_all(
+            lpm_config.as_ref().map_or(&empty_env_map, |c| &c.env),
+            lpm_config.as_ref().and_then(|c| c.environments.as_ref()),
+            &vault_envs,
+        )
+    };
+    let mut results: Vec<(String, usize, Vec<lpm_env::ValidationError>)> =
+        Vec::with_capacity(all_envs.len());
     let mut all_valid = true;
     let validator = lpm_env::EnvValidator::new(schema);
-
-    for env_name in &env_names {
-        let mode = if env_name == "default" {
-            None
-        } else {
-            Some(env_name.as_str())
-        };
-
-        // Use unified loader (handles inheritance + vault) — hard errors on cycle/missing
-        let mut env_vars =
-            lpm_runner::dotenv::load_project_env_with_schema_validation(project_dir, mode, false)?;
-
-        // Run schema validation manually to collect per-env errors
-        let errors = validator.validate(&mut env_vars);
-        if !errors.is_empty() {
-            all_valid = false;
-        }
-        results.push((env_name.clone(), schema.len(), errors));
+    for environment in &all_envs {
+        let mut env_vars = lpm_runner::dotenv::load_project_env_unvalidated_for_resolved(
+            project_dir,
+            environment,
+            lpm_config.as_ref(),
+        )?;
+        lpm_runner::dotenv::merge_configured_service_env(
+            &mut env_vars,
+            lpm_config.as_ref(),
+            scope.service.as_deref(),
+        )?;
+        let errors = lpm_runner::dotenv::evaluate_project_env(
+            &mut env_vars,
+            Some(&validator),
+            lpm_env::EvalContext {
+                environment: &environment.canonical,
+                stage: scope.stage.unwrap_or_default(),
+                service: scope.service.as_deref(),
+            },
+        )?;
+        all_valid &= errors.is_empty();
+        results.push((environment.canonical.clone(), schema.len(), errors));
     }
 
     if json_output {
@@ -506,6 +533,10 @@ mod tests {
             false,
             true,
             lpm_env::PrintFormat::Json,
+            &super::super::arguments::Scope {
+                stage: None,
+                service: None,
+            },
         )
         .unwrap();
         assert_eq!(

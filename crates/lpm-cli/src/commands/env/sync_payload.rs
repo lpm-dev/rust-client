@@ -155,6 +155,7 @@ pub(super) fn build_push_schema_value(
                     if env_schema.is_secret(key) {
                         rule.remove("default");
                         rule.remove("enum");
+                        rule.remove("defaultsIn");
                     }
                     if env_schema
                         .vars
@@ -199,15 +200,19 @@ pub(super) fn build_push_schema_value(
         let env_config: serde_json::Map<_, _> = c
             .env
             .iter()
-            .filter_map(|(alias, file_path)| {
-                let mode = lpm_env::resolver::extract_mode_from_env_path(file_path)?;
-                Some((
+            .map(|(alias, file_path)| {
+                let mode = lpm_env::resolver::resolve_canonical_name(
+                    alias,
+                    &c.env,
+                    c.environments.as_ref(),
+                );
+                (
                     alias.clone(),
                     serde_json::json!({
                         "canonical": mode,
                         "file": file_path,
                     }),
-                ))
+                )
             })
             .collect();
         obj.insert("envConfig".into(), serde_json::Value::Object(env_config));

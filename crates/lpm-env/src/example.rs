@@ -2,6 +2,7 @@
 //!
 //! Produces a dotenv file with comments showing descriptions, formats, and defaults.
 
+use crate::ScopeSelector;
 use crate::schema::{EnvSchema, RequiredWhen, VarFormat};
 use std::fmt::Write as _;
 
@@ -30,6 +31,19 @@ pub fn generate(schema: &EnvSchema) -> String {
                 + rule.protocols.as_ref().map_or(0, |values| {
                     values.iter().map(|value| value.len() + 2).sum::<usize>()
                 })
+                + rule.required_in.iter().map(scope_capacity).sum::<usize>()
+                + if rule.secret {
+                    0
+                } else {
+                    rule.defaults_in
+                        .iter()
+                        .map(|default| {
+                            scope_capacity(&default.when)
+                                + comment_text_capacity(&default.value)
+                                + 32
+                        })
+                        .sum::<usize>()
+                }
                 + rule.required_when.as_ref().map_or(0, |condition| {
                     condition.variable().len()
                         + match condition {
@@ -188,6 +202,20 @@ pub fn generate(schema: &EnvSchema) -> String {
                 RequiredWhen::Equals(_) => comment.push_str(" satisfies its predicate"),
             }
         }
+        for selector in &rule.required_in {
+            comment_separator(&mut comment, &mut has_parts);
+            comment.push_str("required for ");
+            append_scope(&mut comment, selector);
+        }
+        if !rule.secret {
+            for default in &rule.defaults_in {
+                comment_separator(&mut comment, &mut has_parts);
+                comment.push_str("default for ");
+                append_scope(&mut comment, &default.when);
+                comment.push_str(": ");
+                comment.push_str(&default.value);
+            }
+        }
         for line in comment.lines().flat_map(|line| line.split('\r')) {
             output.push_str("# ");
             output.push_str(line);
@@ -210,6 +238,45 @@ pub fn generate(schema: &EnvSchema) -> String {
 
 fn comment_text_capacity(value: &str) -> usize {
     value.len() + value.bytes().filter(|byte| *byte == b'\n').count() * 2
+}
+
+fn scope_capacity(selector: &ScopeSelector) -> usize {
+    80 + [&selector.environment, &selector.service]
+        .into_iter()
+        .flatten()
+        .flat_map(|names| names.iter())
+        .map(|name| name.len() + 2)
+        .sum::<usize>()
+}
+
+fn append_scope(output: &mut String, selector: &ScopeSelector) {
+    let mut separator = "";
+    for (dimension, names) in [
+        ("environment", &selector.environment),
+        ("service", &selector.service),
+    ] {
+        if let Some(names) = names {
+            output.push_str(separator);
+            let _ = write!(output, "{dimension}=");
+            for (index, name) in names.iter().enumerate() {
+                if index != 0 {
+                    output.push('|');
+                }
+                output.push_str(name);
+            }
+            separator = " & ";
+        }
+    }
+    if let Some(stages) = &selector.stage {
+        output.push_str(separator);
+        output.push_str("stage=");
+        for (index, stage) in stages.iter().enumerate() {
+            if index != 0 {
+                output.push('|');
+            }
+            output.push_str(stage.as_str());
+        }
+    }
 }
 
 fn comment_separator(comment: &mut String, has_parts: &mut bool) {

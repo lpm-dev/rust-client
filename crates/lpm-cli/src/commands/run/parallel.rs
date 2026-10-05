@@ -237,6 +237,7 @@ pub(super) fn run_tasks_parallel(
                     tasks,
                     bin_hint,
                     json_output,
+                    lpm_config,
                 ) {
                     Ok(output) => {
                         let duration_ms = start.elapsed().as_millis() as u64;
@@ -296,6 +297,7 @@ pub(super) fn run_tasks_parallel(
                     env_mode,
                     tasks,
                     bin_hint,
+                    lpm_config,
                 ) {
                     Ok(()) => {
                         all_results.push(TaskResult {
@@ -450,7 +452,7 @@ pub(super) fn run_tasks_parallel(
                             let result = if is_stream {
                                 // Streaming: prefixed live output, no double-print
                                 if let Some(cmd) = &command_override {
-                                    lpm_runner::script::run_task_command_prefixed(
+                                    lpm_runner::script::run_task_command_prefixed_with_config(
                                         &dir,
                                         &name,
                                         cmd,
@@ -459,9 +461,10 @@ pub(super) fn run_tasks_parallel(
                                         &name,
                                         &color,
                                         &hint_clone,
+                                        config_clone.as_deref(),
                                     )
                                 } else {
-                                    lpm_runner::script::run_script_prefixed(
+                                    lpm_runner::script::run_script_prefixed_with_config(
                                         &dir,
                                         &name,
                                         &args,
@@ -469,26 +472,29 @@ pub(super) fn run_tasks_parallel(
                                         &name,
                                         &color,
                                         &hint_clone,
+                                        config_clone.as_deref(),
                                     )
                                 }
                             } else {
                                 // Buffered: capture silently, print after completion
                                 if let Some(cmd) = &command_override {
-                                    lpm_runner::script::run_task_command_buffered(
+                                    lpm_runner::script::run_task_command_buffered_with_config(
                                         &dir,
                                         &name,
                                         cmd,
                                         &args,
                                         mode.as_deref(),
                                         &hint_clone,
+                                        config_clone.as_deref(),
                                     )
                                 } else {
-                                    lpm_runner::script::run_script_buffered(
+                                    lpm_runner::script::run_script_buffered_with_config(
                                         &dir,
                                         &name,
                                         &args,
                                         mode.as_deref(),
                                         &hint_clone,
+                                        config_clone.as_deref(),
                                     )
                                 }
                             };

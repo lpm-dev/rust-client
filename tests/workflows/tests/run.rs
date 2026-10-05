@@ -6046,3 +6046,20 @@ fn scripts_inherit_a_raised_open_file_limit_when_lpm_starts_with_256() {
         .unwrap_or_else(|| panic!("no limit printed: {stdout}"));
     assert!(seen > 256, "the script saw a soft limit of {seen}");
 }
+
+#[test]
+fn watch_reloads_canonical_scoped_defaults_after_schema_changes() {
+    let project =
+        TempProject::empty(r#"{"name":"watch-scoped-env","scripts":{"build":"node record.cjs"}}"#);
+    project.write_file("record.cjs","require('node:fs').writeFileSync('.lpm/value',process.env.WATCH_SCOPED_VALUE || 'missing');");
+    let config = |value: &str| {
+        serde_json::json!({"env":{"release":".env.production"},"tasks":{"build":{"env":"release","inputs":["src/**"]}},"envSchema":{"vars":{"WATCH_SCOPED_VALUE":{"requiredIn":[{"environment":["production"],"stage":["build"]}],"defaultsIn":[{"when":{"environment":["production"],"stage":["build"]},"value":value}]}}}}).to_string()
+    };
+    project.write_file_and_sync("lpm.json", &config("first"));
+    project.write_file("src/input", "fixture");
+    let mut watcher = TaskWatcher::start(&project, "build", &["--no-cache"]);
+    let value = || std::fs::read_to_string(project.path().join(".lpm/value")).unwrap_or_default();
+    watcher.wait_until(|| value() == "first");
+    project.write_file_and_sync("lpm.json", &config("second"));
+    watcher.wait_until(|| value() == "second");
+}

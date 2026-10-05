@@ -1332,17 +1332,23 @@ pub fn run_services_with_config(
     let cross_env =
         ports::build_cross_service_env(active_services.keys(), &port_map, options.https);
 
-    // Load .env files + vault + validate schema (unified loader)
-    let dotenv = crate::script::load_script_env_without_schema(
+    let loaded = crate::script::resolve_and_load_env_with_schema_validation(
         project_dir,
         "dev",
         options.env_mode.as_deref(),
         config,
+        false,
     )?;
+    let validate_schema = !crate::script::should_skip_env_validation();
+    let validator = config
+        .filter(|_| validate_schema)
+        .and_then(|config| config.env_schema.as_ref())
+        .map(lpm_env::EnvValidator::new);
+    let mut service_paths = HashMap::with_capacity(active_services.len());
 
     let mut service_envs = HashMap::with_capacity(active_services.len());
     for (name, service) in active_services.iter() {
-        let mut env = dotenv.clone();
+        let mut env = loaded.vars.clone();
         crate::dotenv::merge_project_env(&mut env, &service.env)?;
         crate::dotenv::remove_dangerous_env_vars(&mut env, "service env");
         if let Some(peer_env) = cross_env.get(name) {
@@ -1354,10 +1360,24 @@ pub fn run_services_with_config(
         for (key, value) in &options.extra_envs {
             crate::dotenv::insert_project_env(&mut env, key.clone(), value.clone());
         }
-        if !crate::script::should_skip_env_validation() {
-            crate::dotenv::validate_project_env(&mut env, config)
-                .map_err(|error| LpmError::EnvValidation(format!("service '{name}': {error}")))?;
-        }
+        let runtime_hint = options
+            .service_runtime_hints
+            .get(name)
+            .unwrap_or(&crate::bin_path::ManagedRuntimeHint::Unknown);
+        let service_path = service_path_for_cwd(&service_cwds[name], runtime_hint)?;
+        crate::dotenv::validate_child_env(
+            &mut env,
+            validator.as_ref(),
+            lpm_env::EvalContext {
+                environment: loaded.env_name.as_deref().unwrap_or("default"),
+                stage: lpm_env::EnvStage::Development,
+                service: Some(name),
+            },
+            &service_path.value,
+            validate_schema,
+        )
+        .map_err(|error| LpmError::EnvValidation(format!("service '{name}': {error}")))?;
+        service_paths.insert(name.clone(), service_path);
         service_envs.insert(name.clone(), env);
     }
 
@@ -1476,11 +1496,7 @@ pub fn run_services_with_config(
                     port_map.get(name).copied(),
                 )
                 .map_err(|error| LpmError::Script(format!("service '{name}': {error}")))?;
-                let service_runtime_hint = options
-                    .service_runtime_hints
-                    .get(name)
-                    .unwrap_or(&crate::bin_path::ManagedRuntimeHint::Unknown);
-                let service_path = service_path_for_cwd(&cwd, service_runtime_hint)?;
+                let service_path = &service_paths[name];
                 let assigned_port = port_map.get(name).copied();
                 // Spawn the service process
                 let mut cmd = crate::shell::shell_process(&service_command)?;
@@ -1489,13 +1505,14 @@ pub fn run_services_with_config(
                 crate::shell::strip_inherited_env_hooks(&mut cmd);
                 cmd.envs(env);
 
-                let mut child =
-                    spawn_service_command_with(&mut cmd, project_dir, &cwd, &service_path, || {
-                        Ok(())
-                    })
-                    .map_err(|e| {
-                        LpmError::Script(format!("failed to start service '{name}': {e}"))
-                    })?;
+                let mut child = spawn_service_command_with(
+                    &mut cmd,
+                    project_dir,
+                    &cwd,
+                    service_path,
+                    || Ok(()),
+                )
+                .map_err(|e| LpmError::Script(format!("failed to start service '{name}': {e}")))?;
                 let child_pid = child.id();
                 let child_stdout = child.stdout.take();
                 let child_stderr = child.stderr.take();
@@ -1723,6 +1740,9 @@ pub fn run_services_with_config(
             groups: &groups,
             service_runtime_hints: &options.service_runtime_hints,
             service_envs: &service_envs,
+            env_validator: validator.as_ref(),
+            env_name: loaded.env_name.as_deref().unwrap_or("default"),
+            validate_env_schema: validate_schema,
             port_map: &port_map,
             color_map: &color_map,
             service_names: &service_names,
