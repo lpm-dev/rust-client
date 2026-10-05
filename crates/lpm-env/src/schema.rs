@@ -233,7 +233,7 @@ pub enum RequiredWhen {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, remote = "Self")]
 pub struct EqualityCondition {
     #[schemars(extend("pattern" = "^[A-Za-z_][A-Za-z0-9_]{0,255}$"))]
     pub variable: String,
@@ -242,7 +242,7 @@ pub struct EqualityCondition {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, remote = "Self")]
 pub struct PresenceCondition {
     #[schemars(extend("pattern" = "^[A-Za-z_][A-Za-z0-9_]{0,255}$"))]
     pub variable: String,
@@ -272,7 +272,7 @@ impl RequiredWhen {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, remote = "Self")]
 pub struct VarGroup {
     pub mode: VarGroupMode,
     #[schemars(length(min = 1, max = 4096))]
@@ -706,3 +706,22 @@ mod object_shape_tests {
 
 crate::object::object_only!(EnvSchema);
 crate::object::object_only!(EnvVarRule);
+
+#[cfg(test)]
+mod relationship_object_tests {
+    use super::*;
+    #[test]
+    fn conditions_and_groups_require_json_objects() {
+        for input in [
+            r#"{"vars":{"A":{},"B":{"requiredWhen":["A",true]}}}"#,
+            r#"{"vars":{"A":{},"B":{"requiredWhen":["A","live"]}}}"#,
+            r#"{"vars":{"A":{}},"groups":{"pair":["allOrNone",["A"]]}}"#,
+        ] {
+            assert!(serde_json::from_str::<EnvSchema>(input).is_err(), "{input}");
+        }
+    }
+}
+
+crate::object::object_only!(EqualityCondition);
+crate::object::object_only!(PresenceCondition);
+crate::object::object_only!(VarGroup);
