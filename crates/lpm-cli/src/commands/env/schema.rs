@@ -84,6 +84,7 @@ pub(super) fn vars_print(
     env_mode: Option<&str>,
     format: Option<lpm_env::PrintFormat>,
     schema_only: bool,
+    client_only: bool,
     ci: bool,
     project_dir: &std::path::Path,
     json_output: bool,
@@ -107,20 +108,41 @@ pub(super) fn vars_print(
         lpm_env::PrintFormat::Dotenv
     });
     let (resolved_mode, config) = super::local::resolve_env_from_flag(env_mode, project_dir)?;
-    if schema_only
+    if (schema_only || client_only)
         && config
             .as_ref()
             .and_then(|config| config.env_schema.as_ref())
             .is_none_or(|schema| schema.is_empty())
     {
         return Err(LpmError::Script(
-            "--schema-only requires a non-empty envSchema in lpm.json".into(),
+            "--schema-only and --client-only require a non-empty envSchema in lpm.json".into(),
         ));
     }
 
+    let output = format_print_env(
+        project_dir,
+        resolved_mode.as_deref(),
+        config.as_ref(),
+        schema_only,
+        client_only,
+        format,
+    )?;
+    println!("{output}");
+    Ok(())
+}
+
+fn format_print_env(
+    project_dir: &std::path::Path,
+    resolved_mode: Option<&str>,
+    config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+    schema_only: bool,
+    client_only: bool,
+    format: lpm_env::PrintFormat,
+) -> Result<String, LpmError> {
     // Use the unified loader (handles inheritance, vault, schema validation + defaults)
-    let mut env_vars = lpm_runner::dotenv::load_project_env(project_dir, resolved_mode.as_deref())?;
-    let schema = config.as_ref().and_then(|c| c.env_schema.as_ref());
+    let mut env_vars =
+        lpm_runner::dotenv::load_project_env_with_config(project_dir, resolved_mode, config)?;
+    let schema = config.and_then(|c| c.env_schema.as_ref());
 
     // Collect secret keys for masking
     let secret_keys: std::collections::HashSet<String> = schema
@@ -134,16 +156,18 @@ pub(super) fn vars_print(
         .unwrap_or_default();
 
     // Filter to schema-only if requested
-    if schema_only && let Some(schema) = schema {
-        let schema_keys: std::collections::HashSet<&str> =
-            schema.vars.keys().map(|k| k.as_str()).collect();
-        env_vars.retain(|k, _| schema_keys.contains(k.as_str()));
+    if (schema_only || client_only)
+        && let Some(schema) = schema
+    {
+        env_vars.retain(|key, _| {
+            schema
+                .vars
+                .get(key)
+                .is_some_and(|rule| !client_only || rule.client)
+        });
     }
 
-    let output = lpm_env::format_env(&env_vars, format, &secret_keys);
-    println!("{output}");
-
-    Ok(())
+    Ok(lpm_env::format_env(&env_vars, format, &secret_keys))
 }
 
 pub(super) fn vars_check(project_dir: &std::path::Path, json_output: bool) -> Result<(), LpmError> {
@@ -437,5 +461,38 @@ pub(super) fn vars_validate(
         Ok(())
     } else {
         Err(LpmError::ExitCode(1))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_print_uses_one_manifest_snapshot_for_defaults_and_filtering() {
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("lpm.json");
+        std::fs::write(&path, r#"{"envSchema":{"clientPrefixes":["APP_"],"vars":{"APP_TOKEN":{"client":true,"default":"public-fixture"}}}}"#).unwrap();
+        let config = lpm_runner::lpm_json::read_lpm_json(project.path())
+            .unwrap()
+            .unwrap();
+        std::fs::write(
+            path,
+            r#"{"envSchema":{"vars":{"APP_TOKEN":{"secret":true}}}}"#,
+        )
+        .unwrap();
+        let printed = format_print_env(
+            project.path(),
+            None,
+            Some(&config),
+            false,
+            true,
+            lpm_env::PrintFormat::Json,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&printed).unwrap(),
+            serde_json::json!({"APP_TOKEN":"public-fixture"})
+        );
     }
 }

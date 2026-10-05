@@ -750,7 +750,7 @@ pub(super) fn partition_local_values(
         }
         let is_readable = schema
             .and_then(|schema| schema.vars.get(key))
-            .is_some_and(|rule| rule.client && !rule.secret);
+            .is_some_and(|rule| rule.ci == Some(lpm_env::CiStorage::Variable) && !rule.secret);
         if is_readable {
             partitioned.readable.insert(key.clone(), value.clone());
         } else {
@@ -1051,12 +1051,13 @@ mod tests {
     }
 
     #[test]
-    fn schema_partition_exposes_only_explicit_non_secret_client_values() {
+    fn schema_partition_exposes_only_explicit_non_secret_ci_variables() {
         let mut schema = EnvSchema::default();
         schema.vars.insert(
             "PUBLIC_ORIGIN".into(),
             EnvVarRule {
                 client: true,
+                ci: Some(lpm_env::CiStorage::Variable),
                 ..EnvVarRule::default()
             },
         );
@@ -1088,6 +1089,27 @@ mod tests {
                 ("UNDECLARED_TOKEN", "secure-default"),
             ])
         );
+    }
+
+    #[test]
+    fn browser_visibility_does_not_select_readable_ci_storage() {
+        let schema: EnvSchema = serde_json::from_value(serde_json::json!({"vars":{
+            "PUBLIC_DEFAULT":{"client":true},
+            "PUBLIC_SECRET":{"client":true,"ci":"secret"},
+            "BUILD_MODE":{"ci":"variable"},
+            "TOKEN":{"secret":true,"ci":"variable"}
+        }}))
+        .unwrap();
+        let local = values(&[
+            ("PUBLIC_DEFAULT", "public"),
+            ("PUBLIC_SECRET", "public"),
+            ("BUILD_MODE", "production"),
+            ("TOKEN", "private"),
+            ("UNKNOWN", "safe-default"),
+        ]);
+        let result = partition_local_values(&local, Some(&schema)).unwrap();
+        assert_eq!(result.readable, values(&[("BUILD_MODE", "production")]));
+        assert_eq!(result.write_only.len(), 4);
     }
 
     #[test]

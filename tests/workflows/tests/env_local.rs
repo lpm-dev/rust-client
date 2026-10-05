@@ -1717,3 +1717,32 @@ fn undeclared_nul_keys_stop_checks_and_execution_before_hooks() {
         assert!(!project.path().join("child-marker").exists());
     }
 }
+
+#[test]
+fn client_only_print_excludes_server_and_undeclared_values() {
+    let project = TempProject::empty(r#"{"name":"env-client"}"#);
+    project.write_file("lpm.json", r#"{"envSchema":{"vars":{"PUBLIC_API":{"client":true},"TOKEN":{"secret":true},"BUILD_MODE":{"ci":"variable"}}}}"#);
+    project.write_file(".env", "PUBLIC_API=https://example.test\nTOKEN=private-fixture-value\nBUILD_MODE=production\nUNDECLARED=private-other\n");
+    let output = lpm(&project)
+        .args(["env", "print", "--client-only", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    insta::assert_json_snapshot!("env_print_client_only", value);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("private"));
+}
+
+#[test]
+fn client_only_print_requires_an_exposure_schema() {
+    let project = TempProject::empty(r#"{"name":"env-client"}"#);
+    project.write_file(".env", "PUBLIC_API=value\n");
+    lpm(&project)
+        .args(["env", "print", "--client-only"])
+        .assert()
+        .failure();
+}
