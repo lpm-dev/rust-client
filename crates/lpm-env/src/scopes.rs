@@ -85,7 +85,7 @@ impl EvalContext<'_> {
 
 /// Dimensions use AND; values within one dimension use OR.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, remote = "Self")]
 #[schemars(deny_unknown_fields, extend("anyOf" = [{"required":["environment"]},{"required":["stage"]},{"required":["service"]}]))]
 pub struct ScopeSelector {
     #[serde(
@@ -233,7 +233,7 @@ fn valid_name(value: &str) -> bool {
 
 /// Select a literal default for one bounded context rectangle.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, remote = "Self")]
 #[schemars(deny_unknown_fields)]
 pub struct ScopedDefault {
     pub when: ScopeSelector,
@@ -528,3 +528,17 @@ mod selector_identity_tests {
         assert!(!crate::EnvValidator::new(&schema).schema_errors().is_empty());
     }
 }
+
+#[cfg(test)]
+mod object_shape_tests {
+    use super::*;
+    #[test]
+    fn scope_selectors_and_defaults_require_json_objects() {
+        assert!(serde_json::from_str::<ScopeSelector>(r#"[["production"]]"#).is_err());
+        assert!(serde_json::from_str::<ScopedDefault>(r#"[{"stage":["test"]},"4"]"#).is_err());
+        assert!(serde_json::from_str::<ScopeSelector>(r#"{"stage":["test"]}"#).is_ok());
+    }
+}
+
+crate::object::object_only!(ScopeSelector);
+crate::object::object_only!(ScopedDefault);
