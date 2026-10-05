@@ -530,3 +530,22 @@ fn env_schema_editor_rejects_secret_literal_defaults_and_enums() {
         assert!(!validator.is_valid(&serde_json::json!({"envSchema":{"vars":{"TOKEN":rule}}})));
     }
 }
+
+#[test]
+fn prefix_schema_and_runtime_agree_on_prefix_shape_and_uniqueness() {
+    let validator = lpm_json_validator();
+    for (prefixes, valid) in [
+        (serde_json::json!(["_"]), true),
+        (serde_json::json!(["APP_"]), true),
+        (serde_json::json!(["APP_", "APP_"]), false),
+        (serde_json::json!([""]), false),
+        (serde_json::json!(["APP"]), false),
+        (serde_json::json!(["BAD-PREFIX_"]), false),
+        (serde_json::json!(["1BAD_"]), false),
+    ] {
+        let document = serde_json::json!({"envSchema":{"clientPrefixes":prefixes,"vars":{}}});
+        assert_eq!(validator.is_valid(&document), valid, "{document}");
+        let parsed = lpm_runner::lpm_json::parse_lpm_json(&document.to_string());
+        assert_eq!(parsed.is_ok(), valid, "{document}");
+    }
+}

@@ -2457,6 +2457,28 @@ impl MockRegistry {
         self
     }
 
+    pub async fn with_github_actions_variable_create_success(
+        &self,
+        token: &str,
+        repository_id: &str,
+        environment: &str,
+        name: &str,
+        value: &str,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/repositories/{repository_id}/environments/{environment}/variables"
+            )))
+            .and(header("authorization", format!("Bearer {token}")))
+            .and(body_string_contains(format!("\"name\":\"{name}\"")))
+            .and(body_string_contains(format!("\"value\":\"{value}\"")))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     pub async fn with_github_actions_variable_update_success(
         &self,
         token: &str,
