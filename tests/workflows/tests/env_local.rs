@@ -56,7 +56,7 @@ fn env_local_arguments_reject_unknown_flags_and_extra_operands() {
         &["export", "out.env", "extra.env"],
         &["init", "--unknown"],
         &["ls", "--env=staging"],
-        &["check", "--env=staging"],
+        &["check", "--stage=unknown"],
         &["validate", "--unknown"],
         &["example", "--unknown"],
         &["copy", "default", "staging", "production"],
@@ -1805,4 +1805,630 @@ fn env_ls_checks_effective_values_defaults_conditions_and_groups() {
     );
     let result = parse_json_stdout(&output, "env ls --json");
     assert_eq!(result["environments"][0]["schemaValid"], 6);
+}
+
+#[test]
+fn env_print_and_ci_export_preserve_nested_alias_paths() {
+    let project = TempProject::empty(r#"{"name":"mapped-env","scripts":{"show":"node show.cjs"}}"#);
+    project.write_file("show.cjs", "console.log(process.env.SELECTED);");
+    project.write_file(
+        "lpm.json",
+        r#"{"env":{"show":"config/show.env"},"envSchema":{"vars":{"SELECTED":{"required":true}}}}"#,
+    );
+    project.write_file(".env", "SELECTED=base\n");
+    project.write_file("config/show.env", "SELECTED=mapped\n");
+    let printed = lpm(&project)
+        .args(["env", "print", "--env=show", "--json"])
+        .output()
+        .unwrap();
+    assert!(printed.status.success());
+    assert_eq!(
+        parse_json_stdout(&printed, "mapped print")["SELECTED"],
+        "mapped"
+    );
+    lpm(&project)
+        .args(["env", "export", "--ci", "--env=show", "export.env"])
+        .assert()
+        .success();
+    assert_eq!(project.read_file("export.env"), "SELECTED=mapped");
+}
+
+#[test]
+fn env_check_uses_inherited_declared_values_for_types_and_relationships() {
+    let project = TempProject::empty(r#"{"name":"inherited-check"}"#);
+    project.write_file("lpm.json", r#"{"envSchema":{"vars":{"INHERITED_ENV_COUNT":{"required":true,"format":"integer"},"TOKEN":{"requiredWhen":{"variable":"INHERITED_ENV_COUNT","equals":"7"}}}}}"#);
+    project.write_file(".env", "INHERITED_ENV_COUNT=invalid\nTOKEN=available\n");
+    let checked = lpm(&project)
+        .env("INHERITED_ENV_COUNT", "7")
+        .args(["env", "check", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stdout)
+    );
+    assert_eq!(
+        parse_json_stdout(&checked, "inherited check")["environments"][0]["valid"],
+        2
+    );
+}
+
+#[test]
+fn env_check_includes_configured_default_and_nested_alias_environments() {
+    let project = TempProject::empty(r#"{"name":"env-inventory"}"#);
+    project.write_file("lpm.json", r#"{"env":{"show":"config/show.env"},"environments":{"default":{"file":"config/default.env"}},"envSchema":{"vars":{"SELECTED":{"required":true,"enum":["configured"]}}}}"#);
+    project.write_file(".env", "SELECTED=wrong\n");
+    project.write_file("config/default.env", "SELECTED=configured\n");
+    project.write_file("config/show.env", "SELECTED=configured\n");
+    let checked = lpm(&project)
+        .args(["env", "check", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stdout)
+    );
+    let value = parse_json_stdout(&checked, "configured inventory");
+    let names: Vec<_> = value["environments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|env| env["environment"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["default", "show"]);
+}
+
+#[test]
+fn invalid_execution_environment_stops_before_hooks_even_without_schema_checks() {
+    for mode in ["../production", "", "__index__"] {
+        for skip in [false, true] {
+            let project = TempProject::empty(
+                r#"{"name":"invalid-selection","scripts":{"preshow":"node marker.cjs","show":"node marker.cjs"}}"#,
+            );
+            project.write_file(
+                "marker.cjs",
+                "require('node:fs').writeFileSync('started','yes');",
+            );
+            project.write_file(".env", "SELECTED=default\n");
+            let mut command = lpm(&project);
+            command.args(["run", "show", "--env", mode]);
+            if skip {
+                command.arg("--no-env-check");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                !output.status.success(),
+                "invalid selection {mode:?} executed"
+            );
+            assert!(!project.path().join("started").exists());
+        }
+    }
+}
+
+#[test]
+fn runner_owned_metadata_is_validated_before_pre_hooks() {
+    for key in ["LPM_SCRIPT_CHILD", "npm_lifecycle_event"] {
+        let project = TempProject::empty(
+            r#"{"name":"final-child-map","scripts":{"preshow":"node marker.cjs","show":"node marker.cjs"}}"#,
+        );
+        project.write_file(
+            "marker.cjs",
+            "require('node:fs').writeFileSync('started','yes');",
+        );
+        project.write_file("lpm.json",&format!(r#"{{"envSchema":{{"vars":{{"{key}":{{"default":"expected","enum":["expected"]}}}}}}}}"#));
+        let output = lpm(&project).args(["run", "show"]).output().unwrap();
+        assert!(
+            !output.status.success(),
+            "runner override for {key} escaped validation"
+        );
+        assert!(!project.path().join("started").exists());
+    }
+}
+
+#[test]
+fn script_extra_overrides_are_validated_before_pre_hooks() {
+    let project = TempProject::empty(
+        r#"{"scripts":{"prestart":"echo ran > pre.marker","start":"echo ran > main.marker"}}"#,
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{"envSchema":{"vars":{"OVERRIDDEN":{"enum":["allowed"],"default":"allowed"}}}}"#,
+    );
+    let result = lpm_runner::script::run_script_with_envs(
+        project.path(),
+        "start",
+        &[],
+        None,
+        &[("OVERRIDDEN".into(), "wrong".into())],
+        &lpm_runner::bin_path::ManagedRuntimeHint::Unknown,
+    );
+    assert!(result.is_err(), "extra override escaped validation");
+    assert!(!project.path().join("pre.marker").exists());
+}
+
+#[test]
+fn command_extra_overrides_are_validated_before_spawning() {
+    let project = TempProject::empty(r#"{"name":"override-validation"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"envSchema":{"vars":{"OVERRIDDEN":{"enum":["allowed"],"default":"allowed"}}}}"#,
+    );
+    let result = lpm_runner::script::run_command_buffered_with_envs(
+        project.path(),
+        "echo ran > child.marker",
+        &[],
+        None,
+        &[("OVERRIDDEN".into(), "wrong".into())],
+        &lpm_runner::bin_path::ManagedRuntimeHint::Unknown,
+    );
+    assert!(result.is_err(), "extra override escaped validation");
+    assert!(!project.path().join("child.marker").exists());
+}
+
+#[test]
+fn env_selection_resolves_alias_and_canonical_collisions_once() {
+    let project = TempProject::empty(
+        r#"{"name":"alias-collision","scripts":{"release":"test \"$SELECTED\" = \"production\""}}"#,
+    );
+    project.write_file(".env.production", "SELECTED=production\n");
+    project.write_file(".env.staging", "SELECTED=staging\n");
+    project.write_file("lpm.json",r#"{"env":{"release":".env.production","production":".env.staging"},"envSchema":{"vars":{"SELECTED":{"enum":["production","staging"]}}}}"#);
+    let output = lpm(&project)
+        .args(["env", "print", "--env=release", "--format=json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        parse_json_stdout(&output, "one resolution")["SELECTED"],
+        "production"
+    );
+}
+
+#[test]
+fn implicit_default_preserves_its_resolved_scope_for_scripts() {
+    let project = TempProject::empty(r#"{"scripts":{"start":"echo ran > child.marker"}}"#);
+    project.write_file("lpm.json",r#"{"env":{"default":".env.production"},"envSchema":{"vars":{"REQUIRED_FOR_PRODUCTION":{"requiredIn":[{"environment":["production"]}]}}}}"#);
+    let output = lpm(&project)
+        .args(["run", "start", "--no-cache"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "implicit production scope was bypassed"
+    );
+    assert!(!project.path().join("child.marker").exists());
+}
+
+#[test]
+fn explicit_selection_accepts_configured_script_aliases_with_colons() {
+    let project = TempProject::empty(r#"{"name":"colon-alias"}"#);
+    project.write_file(".env.test", "SELECTED=test\n");
+    project.write_file("lpm.json", r#"{"env":{"test:unit":".env.test"}}"#);
+    let output = lpm(&project)
+        .args(["env", "print", "--env=test:unit", "--format=json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        parse_json_stdout(&output, "configured alias")["SELECTED"],
+        "test"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn declared_inherited_non_utf8_values_are_rejected_without_using_defaults() {
+    use std::os::unix::ffi::OsStrExt;
+    let project = TempProject::empty(r#"{"scripts":{"start":"echo ran > child.marker"}}"#);
+    for rule in [
+        r#"{"required":true}"#,
+        r#"{"default":"fallback"}"#,
+        r#"{"format":"integer"}"#,
+    ] {
+        project.write_file(
+            "lpm.json",
+            &format!(r#"{{"envSchema":{{"vars":{{"INVALID_UTF8":{rule}}}}}}}"#),
+        );
+        let output = lpm(&project)
+            .args(["run", "start", "--no-cache"])
+            .env("INVALID_UTF8", std::ffi::OsStr::from_bytes(&[0xff]))
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("UTF-8"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!project.path().join("child.marker").exists());
+    }
+}
+
+#[test]
+fn denied_process_hooks_cannot_satisfy_requirements_through_defaults() {
+    let project = TempProject::empty(r#"{"scripts":{"start":"echo ran > child.marker"}}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"envSchema":{"vars":{"NODE_OPTIONS":{"required":true,"default":"fixture"}}}}"#,
+    );
+    let output = lpm(&project)
+        .args(["run", "start", "--no-cache"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "discarded hook default satisfied a requirement"
+    );
+    assert!(!project.path().join("child.marker").exists());
+}
+
+#[test]
+fn scoped_env_commands_merge_configured_service_overlays() {
+    let project = TempProject::empty(r#"{"name":"service-overlays"}"#);
+    project.write_file("lpm.json",r#"{"services":{"api":{"command":"node server.js","env":{"SERVICE_VALUE":"configured"}}},"envSchema":{"vars":{"SERVICE_VALUE":{"requiredIn":[{"service":["api"]}],"enum":["configured"]}}}}"#);
+    let output = lpm(&project)
+        .args(["env", "check", "--service=api", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let output = lpm(&project)
+        .args(["env", "print", "--service=api", "--format=json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        parse_json_stdout(&output, "service overlay")["SERVICE_VALUE"],
+        "configured"
+    );
+}
+
+#[test]
+fn cached_and_uncached_scripts_validate_the_same_runner_metadata() {
+    let project = TempProject::empty(r#"{"scripts":{"build":"node build.js"}}"#);
+    project.write_file("build.js","require('node:fs').mkdirSync('dist',{recursive:true}); require('node:fs').writeFileSync('dist/out','ok');\n");
+    project.write_file("lpm.json",r#"{"tasks":{"build":{"cache":true,"inputs":["build.js"],"outputs":["dist/**"]}},"envSchema":{"vars":{"npm_lifecycle_event":{"required":true,"enum":["build"]},"LPM_SCRIPT_CHILD":{"required":true,"enum":["1"]}}}}"#);
+    lpm(&project)
+        .args(["run", "build", "--no-cache"])
+        .assert()
+        .success();
+    lpm(&project).args(["run", "build"]).assert().success();
+    lpm(&project).args(["run", "build"]).assert().success();
+}
+
+#[test]
+fn project_loaders_preserve_the_implicit_default_file_cascade() {
+    let project = TempProject::empty(r#"{"name":"default-cascade"}"#);
+    project.write_file(".env", "CASCADE_VALUE=base\n");
+    project.write_file(".env.local", "CASCADE_VALUE=local\n");
+    project.write_file(".env.default", "CASCADE_VALUE=unexpected\n");
+    project.write_file(
+        "lpm.json",
+        r#"{"envSchema":{"vars":{"CASCADE_VALUE":{"enum":["local"]}}}}"#,
+    );
+    let config = lpm_runner::lpm_json::read_lpm_json(project.path()).unwrap();
+    for values in [
+        lpm_runner::dotenv::load_project_env_with_schema_validation(project.path(), None, true),
+        lpm_runner::dotenv::load_project_env_with_config(project.path(), None, config.as_ref()),
+        lpm_runner::dotenv::load_project_env_with_config_and_context(
+            project.path(),
+            None,
+            config.as_ref(),
+            Default::default(),
+            None,
+        ),
+    ] {
+        assert_eq!(values.unwrap()["CASCADE_VALUE"], "local");
+    }
+}
+
+#[test]
+fn project_loaders_honor_the_configured_default_file_and_scope() {
+    let project = TempProject::empty(r#"{"name":"configured-default"}"#);
+    project.write_file(".env", "CASCADE_VALUE=base\n");
+    project.write_file("config/default.env", "CASCADE_VALUE=configured\n");
+    project.write_file("lpm.json", r#"{"env":{"default":"config/default.env"},"envSchema":{"vars":{"CASCADE_VALUE":{"requiredIn":[{"environment":["default"]}],"enum":["configured"]}}}}"#);
+    let config = lpm_runner::lpm_json::read_lpm_json(project.path()).unwrap();
+    for values in [
+        lpm_runner::dotenv::load_project_env_with_schema_validation(project.path(), None, true),
+        lpm_runner::dotenv::load_project_env_with_config(project.path(), None, config.as_ref()),
+        lpm_runner::dotenv::load_project_env_with_config_and_context(
+            project.path(),
+            None,
+            config.as_ref(),
+            Default::default(),
+            None,
+        ),
+    ] {
+        assert_eq!(values.unwrap()["CASCADE_VALUE"], "configured");
+    }
+}
+
+#[test]
+fn explicit_default_selects_the_same_files_for_print_and_script_execution() {
+    let project = TempProject::empty(r#"{"scripts":{"show":"node show.cjs"}}"#);
+    project.write_file("show.cjs", "console.log(process.env.CASCADE_VALUE)");
+    project.write_file(".env", "CASCADE_VALUE=base\n");
+    project.write_file(".env.default", "CASCADE_VALUE=explicit\n");
+    let printed = lpm(&project)
+        .args(["env", "print", "--env=default", "--format=json"])
+        .output()
+        .unwrap();
+    assert!(printed.status.success());
+    assert_eq!(
+        parse_json_stdout(&printed, "explicit default")["CASCADE_VALUE"],
+        "explicit"
+    );
+    let executed = lpm(&project)
+        .args(["run", "show", "--env=default", "--no-cache"])
+        .output()
+        .unwrap();
+    assert!(executed.status.success());
+    assert!(
+        String::from_utf8_lossy(&executed.stdout)
+            .lines()
+            .any(|line| line == "explicit")
+    );
+}
+
+#[test]
+fn scoped_check_json_applies_environment_stage_and_service_together() {
+    let project = TempProject::empty(r#"{"name":"scoped-check"}"#);
+    project.write_file("lpm.json", r#"{"envSchema":{"vars":{"VALUE":{"requiredIn":[{"environment":["production"],"stage":["build"],"service":["api"]}],"defaultsIn":[{"when":{"stage":["test"]},"value":"fixture"}]}}}}"#);
+    let output = lpm(&project)
+        .args([
+            "env",
+            "check",
+            "--env=production",
+            "--stage=build",
+            "--service=api",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    insta::assert_json_snapshot!(
+        "env_scoped_check",
+        parse_json_stdout(&output, "scoped check")
+    );
+    for flags in [
+        ["--env=staging", "--stage=build", "--service=api"],
+        ["--env=production", "--stage=runtime", "--service=api"],
+        ["--env=production", "--stage=build", "--service=worker"],
+    ] {
+        lpm(&project)
+            .args(["env", "check"])
+            .args(flags)
+            .assert()
+            .success();
+    }
+    let printed = lpm(&project)
+        .args(["env", "print", "--stage=test", "--format=json"])
+        .output()
+        .unwrap();
+    assert!(printed.status.success());
+    assert_eq!(
+        parse_json_stdout(&printed, "scoped defaults")["VALUE"],
+        "fixture"
+    );
+}
+
+#[test]
+fn build_hooks_use_the_original_stage_for_scoped_defaults() {
+    let project = TempProject::empty(
+        r#"{"scripts":{"prebuild:api":"node show.cjs","build:api":"node show.cjs","postbuild:api":"node show.cjs"}}"#,
+    );
+    project.write_file(
+        "show.cjs",
+        "require('node:fs').appendFileSync('stages', process.env.SCOPED_VALUE + '\\n')",
+    );
+    project.write_file("lpm.json", r#"{"envSchema":{"vars":{"SCOPED_VALUE":{"requiredIn":[{"stage":["build"]}],"default":"runtime","defaultsIn":[{"when":{"stage":["build"]},"value":"build"}]}}}}"#);
+    lpm(&project)
+        .args(["run", "build:api", "--no-cache"])
+        .assert()
+        .success();
+    assert_eq!(project.read_file("stages"), "build\nbuild\nbuild\n");
+}
+
+#[test]
+fn generated_examples_describe_scopes_without_selecting_a_scoped_value() {
+    let project = TempProject::empty(r#"{"name":"scoped-example"}"#);
+    project.write_file("lpm.json", r#"{"envSchema":{"vars":{"VALUE":{"requiredIn":[{"environment":["production"],"stage":["build"]}],"defaultsIn":[{"when":{"stage":["test"]},"value":"fixture"}]},"TOKEN":{"secret":true,"requiredIn":[{"service":["api"]}]}}}}"#);
+    lpm(&project).args(["env", "example"]).assert().success();
+    let example = project.read_file(".env.example");
+    assert!(example.contains("required for environment=production & stage=build"));
+    assert!(example.contains("default for stage=test: fixture"));
+    assert!(example.contains("required for service=api"));
+    assert!(example.lines().any(|line| line == "VALUE="));
+}
+
+#[test]
+fn redirected_default_alias_retains_the_base_inventory_cascade() {
+    let project = TempProject::empty(r#"{"name":"redirected-default"}"#);
+    project.write_file(".env", "VALUE=base\n");
+    project.write_file(".env.default", "VALUE=bad\n");
+    project.write_file(".env.production", "VALUE=production\n");
+    project.write_file("lpm.json", r#"{"env":{"default":".env.production"},"envSchema":{"vars":{"VALUE":{"enum":["base","production"]}}}}"#);
+    let checked = lpm(&project)
+        .args(["env", "check", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stdout)
+    );
+    let value = parse_json_stdout(&checked, "redirected default inventory");
+    let names: Vec<_> = value["environments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["environment"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["default", "production"]);
+}
+
+#[test]
+fn large_inherited_schemas_preserve_explicit_precedence_and_empty_defaults() {
+    let project = TempProject::empty(r#"{"scripts":{"start":"node check.cjs"}}"#);
+    let mut vars = serde_json::Map::new();
+    for index in 0..32 {
+        vars.insert(
+            format!("LPM_SCOPE_{index}"),
+            serde_json::json!({"required":true,"enum":["inherited"]}),
+        );
+    }
+    vars.insert(
+        "EMPTY_SCOPED".into(),
+        serde_json::json!({"empty":"missing","default":"fallback"}),
+    );
+    vars.insert(
+        "EXPLICIT_SCOPED".into(),
+        serde_json::json!({"enum":["inherited"]}),
+    );
+    project.write_file(
+        "lpm.json",
+        &serde_json::json!({"envSchema":{"vars":vars}}).to_string(),
+    );
+    project.write_file(".env", "EXPLICIT_SCOPED=file\n");
+    project.write_file("check.cjs", "const e=process.env; if(e.EMPTY_SCOPED!=='fallback'||e.EXPLICIT_SCOPED!=='inherited'||Array.from({length:32},(_,i)=>e['LPM_SCOPE_'+i]).some(v=>v!=='inherited')) process.exit(1)");
+    let mut command = lpm(&project);
+    command
+        .args(["run", "start", "--no-cache"])
+        .env("EMPTY_SCOPED", "")
+        .env("EXPLICIT_SCOPED", "inherited");
+    for index in 0..32 {
+        command.env(format!("LPM_SCOPE_{index}"), "inherited");
+    }
+    command.assert().success();
+}
+
+#[cfg(unix)]
+#[test]
+fn large_inherited_schemas_reject_declared_non_utf8_and_ignore_undeclared_non_utf8() {
+    use std::os::unix::ffi::OsStrExt;
+    let project = TempProject::empty(r#"{"scripts":{"start":"echo ran > child.marker"}}"#);
+    let mut vars = serde_json::Map::new();
+    for index in 0..32 {
+        vars.insert(
+            format!("LPM_SCOPE_{index}"),
+            serde_json::json!({"default":"fallback"}),
+        );
+    }
+    project.write_file(
+        "lpm.json",
+        &serde_json::json!({"envSchema":{"vars":vars}}).to_string(),
+    );
+    for (name, success) in [("LPM_UNDECLARED_NON_UTF8", true), ("LPM_SCOPE_0", false)] {
+        let output = lpm(&project)
+            .args(["run", "start", "--no-cache"])
+            .env(name, std::ffi::OsStr::from_bytes(&[0xff]))
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !success {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("UTF-8"));
+        }
+    }
+}
+
+#[test]
+fn scoped_direct_files_and_local_bins_use_the_canonical_environment_and_final_values() {
+    let project = TempProject::empty(r#"{"name":"scope-runtime-matrix"}"#);
+    project.write_file("lpm.json",r#"{"env":{"release":".env.production"},"environments":{"production":{"file":"config/exact.env"}},"envSchema":{"vars":{"SCOPED_RUNTIME_VALUE":{"format":"integer","enum":["3"],"requiredIn":[{"environment":["production"],"stage":["runtime"]}],"defaultsIn":[{"when":{"stage":["runtime"]},"value":"3"}]}}}}"#);
+    project.write_file("config/exact.env", "SCOPED_RUNTIME_VALUE=3\n");
+    project.write_file(
+        ".env.production",
+        "SCOPED_RUNTIME_VALUE=wrong-derived-file\n",
+    );
+    project.write_file("entry.cjs","if(process.env.SCOPED_RUNTIME_VALUE!=='3') process.exit(1); require('node:fs').writeFileSync('child.marker','ok');");
+    if cfg!(windows) {
+        project.write_file("node_modules/.bin/scoped-tool.cmd", "@node entry.cjs\r\n");
+    } else {
+        project.write_file(
+            "node_modules/.bin/scoped-tool",
+            "#!/bin/sh\nexec node entry.cjs\n",
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                project.path().join("node_modules/.bin/scoped-tool"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+    }
+    for args in [
+        vec!["entry.cjs", "--env=release"],
+        vec!["exec", "scoped-tool", "--env=release"],
+    ] {
+        lpm(&project).args(&args).assert().success();
+        assert!(project.file_exists("child.marker"));
+        std::fs::remove_file(project.path().join("child.marker")).unwrap();
+        project.write_file("config/exact.env", "SCOPED_RUNTIME_VALUE=invalid\n");
+        let output = lpm(&project).args(&args).output().unwrap();
+        assert!(
+            !output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!project.file_exists("child.marker"));
+        project.write_file("config/exact.env", "SCOPED_RUNTIME_VALUE=3\n");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn sparse_and_bulk_inherited_lookup_match_windows_canonical_names() {
+    for count in [31, 32] {
+        let project = TempProject::empty(r#"{"name":"inherited-casing"}"#);
+        let rules = (0..count)
+            .map(|index| {
+                (
+                    format!("LPM_BULK_{index}"),
+                    serde_json::json!({"format":"integer","required":true}),
+                )
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>();
+        project.write_file(
+            "lpm.json",
+            &serde_json::json!({"envSchema":{"vars":rules}}).to_string(),
+        );
+        for valid in [true, false] {
+            let mut command = lpm(&project);
+            command.args(["env", "check", "--json"]);
+            for index in 0..count {
+                command.env(
+                    format!("lpm_bulk_{index}"),
+                    if !valid && index == 0 { "invalid" } else { "2" },
+                );
+            }
+            let output = command.output().unwrap();
+            assert_eq!(
+                output.status.success(),
+                valid,
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
 }

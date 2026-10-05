@@ -101,6 +101,7 @@ pub async fn run(
             ),
             LocalAction::Print {
                 environment,
+                scope,
                 format,
                 schema_only,
                 client_only,
@@ -111,13 +112,16 @@ pub async fn run(
                 schema_only,
                 client_only,
                 ci,
+                &scope,
                 project_dir,
                 json_output,
             ),
             LocalAction::Example { environment } => {
                 schema::vars_example(project_dir, environment.env.as_deref(), json_output)
             }
-            LocalAction::Check => schema::vars_check(project_dir, json_output),
+            LocalAction::Check { environment, scope } => {
+                schema::vars_check(project_dir, environment.env.as_deref(), &scope, json_output)
+            }
             LocalAction::Validate { strict } => {
                 schema::vars_validate(project_dir, strict, json_output)
             }

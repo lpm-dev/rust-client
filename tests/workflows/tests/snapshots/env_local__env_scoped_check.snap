@@ -1,0 +1,21 @@
+---
+source: tests/workflows/tests/env_local.rs
+assertion_line: 2168
+expression: "parse_json_stdout(&output, \"scoped check\")"
+---
+{
+  "success": false,
+  "environments": [
+    {
+      "environment": "production",
+      "total": 1,
+      "valid": 0,
+      "errors": [
+        {
+          "key": "VALUE",
+          "error": "VALUE: missing (required)"
+        }
+      ]
+    }
+  ]
+}
