@@ -62,7 +62,10 @@ pub(super) enum LocalAction {
         format: Option<lpm_env::PrintFormat>,
         #[arg(long)]
         schema_only: bool,
-        #[arg(long, conflicts_with_all = ["format", "schema_only"])]
+        /// Print only declared browser-visible variables.
+        #[arg(long)]
+        client_only: bool,
+        #[arg(long, conflicts_with_all = ["format", "schema_only", "client_only"])]
         ci: bool,
     },
     Example {

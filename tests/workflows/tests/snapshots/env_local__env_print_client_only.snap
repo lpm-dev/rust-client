@@ -1,0 +1,7 @@
+---
+source: tests/workflows/tests/env_local.rs
+expression: value
+---
+{
+  "PUBLIC_API": "https://example.test"
+}

@@ -7951,7 +7951,7 @@ async fn env_github_actions_platform_reports_names_only_and_audits_failed_pushes
                 "vault":"{vault_id}",
                 "envSchema":{{
                     "vars":{{
-                        "PUBLIC_ORIGIN":{{"client":true}},
+                        "PUBLIC_ORIGIN":{{"client":true,"ci":"variable"}},
                         "API_TOKEN":{{"secret":true}}
                     }}
                 }}
@@ -8167,7 +8167,7 @@ async fn env_github_actions_platform_snapshots_successful_push_and_clean() {
                 "vault":"{vault_id}",
                 "envSchema":{{
                     "vars":{{
-                        "PUBLIC_ORIGIN":{{"client":true}},
+                        "PUBLIC_ORIGIN":{{"client":true,"ci":"variable"}},
                         "API_TOKEN":{{"secret":true}}
                     }}
                 }},
@@ -8360,6 +8360,123 @@ async fn env_github_actions_platform_snapshots_successful_push_and_clean() {
     assert_eq!(clean_json["updated"], 1);
     assert_eq!(clean_json["removed"], 2);
     insta::assert_json_snapshot!("env_github_actions_clean_json_envelope", clean_json);
+}
+
+#[tokio::test]
+async fn github_ci_policy_migrates_both_namespaces_without_clean() {
+    let project = TempProject::empty(r#"{"name":"github-actions-migration","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let bearer = "migration-session";
+    let token = "migration-platform";
+    let vault = "vault-migration-123";
+    let repository = "lpm-dev/example";
+    let repository_id = "123456789";
+    let environment = "production";
+    let registry = mock.url();
+    project.write_file("lpm.json", &format!(r#"{{"vault":"{vault}","envSchema":{{"vars":{{"PUBLIC_ORIGIN":{{"client":true}},"BUILD_MODE":{{"ci":"variable"}}}}}},"vaultSync":{{"personalPlatformBindings":{{"{registry}":{{"registryUrl":"{registry}","principalId":"account-1"}}}}}}}}"#));
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry,
+            access_token: Some(bearer),
+            refresh_token: Some("migration-refresh"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    let seeded = lpm(&project)
+        .args([
+            "env",
+            "set",
+            "--env",
+            environment,
+            "PUBLIC_ORIGIN=https://public.example.test",
+            "BUILD_MODE=release",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        seeded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+    mock.with_platform_credentials_success_calls(bearer,vault,serde_json::json!({"connections":[{"id":"connection-migration","platform":"github-actions","token":token,"connectionConfig":{"repository":repository,"repositoryId":repository_id,"environment":environment,"linkedEnv":environment},"label":"production","lastPushAt":null}]}),1).await;
+    mock.with_github_actions_repository(token, repository, 123_456_789, 3)
+        .await;
+    mock.with_github_actions_environment_list_sequences(
+        token,
+        repository_id,
+        environment,
+        vec![
+            serde_json::json!([{"name":"PUBLIC_ORIGIN","value":"https://old.example.test"}]),
+            serde_json::json!([{"name":"BUILD_MODE","value":"release"}]),
+        ],
+        vec![
+            serde_json::json!([{"name":"BUILD_MODE"}]),
+            serde_json::json!([{"name":"PUBLIC_ORIGIN"}]),
+        ],
+    )
+    .await;
+    mock.with_github_actions_public_key(token, repository_id, environment)
+        .await;
+    mock.with_github_actions_variable_create_success(
+        token,
+        repository_id,
+        environment,
+        "BUILD_MODE",
+        "release",
+    )
+    .await;
+    mock.with_github_actions_secret_upsert_success(
+        token,
+        repository_id,
+        environment,
+        "PUBLIC_ORIGIN",
+        1,
+    )
+    .await;
+    mock.with_github_actions_variable_delete_success(
+        token,
+        repository_id,
+        environment,
+        "PUBLIC_ORIGIN",
+    )
+    .await;
+    mock.with_github_actions_secret_delete_success(token, repository_id, environment, "BUILD_MODE")
+        .await;
+    mock.with_platform_audit_success(
+        bearer,
+        vault,
+        "github-actions",
+        "push",
+        &[("added", 2), ("updated", 0), ("removed", 2)],
+    )
+    .await;
+    let pushed = lpm(&project)
+        .env("LPM_REGISTRY_URL", &registry)
+        .env("ACCEPTANCE_RUN_ID", "workflow-platform-migration")
+        .env("LPM_ACCEPTANCE_GITHUB_API_BASE_URL", &registry)
+        .args(["--json", "env", "push", "--to", "github-actions", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        pushed.status.success(),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&pushed.stdout),
+        String::from_utf8_lossy(&pushed.stderr)
+    );
+    let result = parse_clean_json_stdout(&pushed);
+    assert_eq!(result["added"], 2);
+    assert_eq!(result["removed"], 2);
+    let requests = mock.server().received_requests().await.unwrap();
+    let encrypted = requests
+        .iter()
+        .find(|request| {
+            request.method == "PUT" && request.url.path().ends_with("/secrets/PUBLIC_ORIGIN")
+        })
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&encrypted.body).unwrap();
+    assert_ne!(body["encrypted_value"], "https://public.example.test");
+    assert!(!String::from_utf8_lossy(&encrypted.body).contains("https://public.example.test"));
 }
 
 #[tokio::test]
