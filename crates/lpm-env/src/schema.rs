@@ -14,7 +14,7 @@ use std::fmt;
 /// { "envSchema": { "vars": { "DATABASE_URL": { "required": true, "format": "url" } } } }
 /// ```
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, remote = "Self")]
 #[schemars(deny_unknown_fields)]
 pub struct EnvSchema {
     #[serde(default, deserialize_with = "deserialize_unique_vars")]
@@ -24,7 +24,7 @@ pub struct EnvSchema {
 
 /// Validation rules for a single environment variable.
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, remote = "Self")]
 #[schemars(deny_unknown_fields)]
 #[schemars(extend("allOf" = [{"if":{"properties":{"secret":{"const":true}},"required":["secret"]},"then":{"properties":{"default":{"type":"null"},"enum":{"type":"null"}}}}]))]
 pub struct EnvVarRule {
@@ -300,3 +300,19 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod object_shape_tests {
+    use super::*;
+    #[test]
+    fn schema_and_rules_require_json_objects() {
+        for input in ["[]", "[{}]", r#"{"vars":{"VALUE":[]}}"#] {
+            assert!(serde_json::from_str::<EnvSchema>(input).is_err(), "{input}");
+        }
+        assert!(serde_json::from_str::<EnvVarRule>("[]").is_err());
+        assert!(serde_json::from_str::<EnvSchema>(r#"{"vars":{"VALUE":{}}}"#).is_ok());
+    }
+}
+
+crate::object::object_only!(EnvSchema);
+crate::object::object_only!(EnvVarRule);

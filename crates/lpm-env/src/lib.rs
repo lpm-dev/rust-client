@@ -21,6 +21,7 @@
 
 mod example;
 mod inheritance;
+mod object;
 mod print;
 pub mod resolver;
 mod schema;
