@@ -157,13 +157,14 @@ pub(crate) async fn run_with_reserved_stdout(
 
     if caching_enabled || reserve_stdout {
         // Run with tee capture (output streams to terminal + captured for cache)
-        let output = lpm_runner::script::run_script_captured_with_reserved_stdout(
+        let output = lpm_runner::script::run_script_captured_with_config(
             project_dir,
             script_name,
             extra_args,
             env_mode,
             bin_hint,
             reserve_stdout,
+            lpm_config.as_ref(),
         )?;
         let duration_ms = start.elapsed().as_millis() as u64;
         if let Some(context) = cache_context.as_ref() {
@@ -184,7 +185,14 @@ pub(crate) async fn run_with_reserved_stdout(
         }
     } else {
         // Run normally (inherited stdio, no capture)
-        lpm_runner::script::run_script(project_dir, script_name, extra_args, env_mode, bin_hint)?;
+        lpm_runner::script::run_script_with_config(
+            project_dir,
+            script_name,
+            extra_args,
+            env_mode,
+            bin_hint,
+            lpm_config.as_ref(),
+        )?;
     }
 
     env_access.check()?;

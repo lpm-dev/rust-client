@@ -49,20 +49,29 @@ pub(super) fn run_task(
     env_mode: Option<&str>,
     tasks: &HashMap<String, lpm_runner::lpm_json::TaskConfig>,
     bin_hint: &ManagedRuntimeHint,
+    config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
 ) -> Result<(), LpmError> {
     // Check lpm.json for command override
     if let Some(command) = tasks.get(task_name).and_then(|tc| tc.command.as_ref()) {
-        return lpm_runner::script::run_task_command(
+        return lpm_runner::script::run_task_command_with_config(
             project_dir,
             task_name,
             command,
             extra_args,
             env_mode,
             bin_hint,
+            config,
         );
     }
     // Fall back to package.json script
-    lpm_runner::script::run_script(project_dir, task_name, extra_args, env_mode, bin_hint)
+    lpm_runner::script::run_script_with_config(
+        project_dir,
+        task_name,
+        extra_args,
+        env_mode,
+        bin_hint,
+        config,
+    )
 }
 
 /// Resolve and run a task with tee-captured output (for caching).
@@ -83,9 +92,14 @@ pub(super) fn run_task_captured(
         tasks,
         bin_hint,
         false,
+        None,
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "task execution retains the caller snapshot and output policy"
+)]
 pub(super) fn run_task_captured_with_reserved_stdout(
     project_dir: &Path,
     task_name: &str,
@@ -94,10 +108,11 @@ pub(super) fn run_task_captured_with_reserved_stdout(
     tasks: &HashMap<String, lpm_runner::lpm_json::TaskConfig>,
     bin_hint: &ManagedRuntimeHint,
     reserve_stdout: bool,
+    config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
 ) -> Result<lpm_runner::script::ScriptOutput, LpmError> {
     // Check lpm.json for command override
     if let Some(command) = tasks.get(task_name).and_then(|tc| tc.command.as_ref()) {
-        return lpm_runner::script::run_task_command_captured_with_reserved_stdout(
+        return lpm_runner::script::run_task_command_captured_with_config(
             project_dir,
             task_name,
             command,
@@ -105,16 +120,18 @@ pub(super) fn run_task_captured_with_reserved_stdout(
             env_mode,
             bin_hint,
             reserve_stdout,
+            config,
         );
     }
     // Fall back to package.json script
-    lpm_runner::script::run_script_captured_with_reserved_stdout(
+    lpm_runner::script::run_script_captured_with_config(
         project_dir,
         task_name,
         extra_args,
         env_mode,
         bin_hint,
         reserve_stdout,
+        config,
     )
 }
 

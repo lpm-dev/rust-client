@@ -150,6 +150,9 @@ pub(super) struct RecoveryContext<'a> {
     pub(super) groups: &'a [Vec<String>],
     pub(super) service_runtime_hints: &'a HashMap<String, crate::bin_path::ManagedRuntimeHint>,
     pub(super) service_envs: &'a HashMap<String, HashMap<String, String>>,
+    pub(super) env_validator: Option<&'a lpm_env::EnvValidator<'a>>,
+    pub(super) env_name: &'a str,
+    pub(super) validate_env_schema: bool,
     pub(super) port_map: &'a ServicePortMap,
     pub(super) color_map: &'a HashMap<String, &'static str>,
     pub(super) service_names: &'a [String],
@@ -772,7 +775,7 @@ fn start_restart_service(
         }
     };
 
-    let env = context.service_envs.get(name)?;
+    let mut env = context.service_envs.get(name)?.clone();
 
     let service_command = match restart_command_with_managed_port(
         &config.command,
@@ -796,6 +799,39 @@ fn start_restart_service(
             return None;
         }
     };
+    if let Err(error) = crate::dotenv::validate_child_env(
+        &mut env,
+        context.env_validator,
+        lpm_env::EvalContext {
+            environment: context.env_name,
+            stage: lpm_env::EnvStage::Development,
+            service: Some(name),
+        },
+        &service_path.value,
+        context.validate_env_schema,
+    ) {
+        let error = sanitize_terminal_inline(&error.to_string()).into_owned();
+        if let Some(state) = states.get_mut(name) {
+            state.goal = ServiceGoal::Failed;
+            state.phase = ServicePhase::Stopped;
+            state.terminal_error = Some(error.clone());
+        }
+        ui_service_status(RESET, name, RED, "✗", &format!("restart failed - {error}"));
+        send_status(
+            context.event_tx,
+            context.service_names,
+            name,
+            ServiceStatus::Stopped,
+        );
+        stop_dependents(
+            context,
+            states,
+            name,
+            false,
+            "environment validation failed",
+        );
+        return None;
+    }
     let assigned_port = context.port_map.get(name).copied();
     let mut command = match crate::shell::shell_process(&service_command) {
         Ok(command) => command,
@@ -807,7 +843,7 @@ fn start_restart_service(
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     super::isolate_service_process_tree(&mut command);
     crate::shell::strip_inherited_env_hooks(&mut command);
-    command.envs(env);
+    command.envs(&env);
 
     let mut new_child = match super::spawn_service_command_with(
         &mut command,
@@ -1235,6 +1271,9 @@ mod tests {
                 groups: &groups,
                 service_runtime_hints: &HashMap::new(),
                 service_envs: &HashMap::new(),
+                env_validator: None,
+                env_name: "default",
+                validate_env_schema: false,
                 port_map: &ServicePortMap::new(),
                 color_map: &HashMap::new(),
                 service_names: &service_names,

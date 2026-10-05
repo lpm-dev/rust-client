@@ -74,14 +74,7 @@ pub fn load_project_env_with_schema_validation(
     validate_schema: bool,
 ) -> Result<HashMap<String, String>, LpmError> {
     let lpm_config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::EnvValidation)?;
-    load_project_env_details_with_config_and_schema_validation(
-        project_dir,
-        env_name,
-        None,
-        lpm_config.as_ref(),
-        validate_schema,
-    )
-    .map(|loaded| loaded.vars)
+    load_project_env_from_snapshot(project_dir, env_name, lpm_config.as_ref(), validate_schema)
 }
 
 /// Load the project environment using a configuration that the caller already parsed.
@@ -90,14 +83,109 @@ pub fn load_project_env_with_config(
     env_name: Option<&str>,
     lpm_config: Option<&lpm_json::LpmJsonConfig>,
 ) -> Result<HashMap<String, String>, LpmError> {
-    load_project_env_details_with_config_and_schema_validation(
+    load_project_env_from_snapshot(
         project_dir,
         env_name,
-        None,
         lpm_config,
         !crate::script::should_skip_env_validation(),
     )
-    .map(|loaded| loaded.vars)
+}
+
+fn load_project_env_from_snapshot(
+    project_dir: &Path,
+    env_name: Option<&str>,
+    config: Option<&lpm_json::LpmJsonConfig>,
+    validate_schema: bool,
+) -> Result<HashMap<String, String>, LpmError> {
+    let resolved = resolve_project_environment(env_name, config)?;
+    let mut vars = load_project_env_unvalidated_for_resolved(project_dir, &resolved, config)?;
+    if validate_schema {
+        let validator = config
+            .and_then(|config| config.env_schema.as_ref())
+            .map(lpm_env::EnvValidator::new);
+        validate_project_env_with_plan(
+            &mut vars,
+            validator.as_ref(),
+            lpm_env::EvalContext {
+                environment: &resolved.canonical,
+                ..Default::default()
+            },
+        )?;
+    }
+    Ok(vars)
+}
+
+/// Load and validate a scoped environment from one configuration snapshot.
+pub fn load_project_env_with_config_and_context(
+    project_dir: &Path,
+    env_name: Option<&str>,
+    config: Option<&lpm_json::LpmJsonConfig>,
+    stage: lpm_env::EnvStage,
+    service: Option<&str>,
+) -> Result<HashMap<String, String>, LpmError> {
+    let resolved = resolve_project_environment(env_name, config)?;
+    let mut vars = load_project_env_unvalidated_for_resolved(project_dir, &resolved, config)?;
+    merge_configured_service_env(&mut vars, config, service)?;
+    let validator = config
+        .and_then(|config| config.env_schema.as_ref())
+        .map(lpm_env::EnvValidator::new);
+    validate_project_env_with_plan(
+        &mut vars,
+        validator.as_ref(),
+        lpm_env::EvalContext {
+            environment: &resolved.canonical,
+            stage,
+            service,
+        },
+    )?;
+    Ok(vars)
+}
+
+/// Check the trusted child PATH together with the final explicit overrides.
+pub(crate) fn validate_child_env(
+    vars: &mut HashMap<String, String>,
+    validator: Option<&lpm_env::EnvValidator<'_>>,
+    context: lpm_env::EvalContext<'_>,
+    path: &str,
+    validate_schema: bool,
+) -> Result<(), LpmError> {
+    validate_child_env_with_overrides(vars, validator, context, path, validate_schema, &[])
+}
+
+pub(crate) fn validate_child_env_with_overrides(
+    vars: &mut HashMap<String, String>,
+    validator: Option<&lpm_env::EnvValidator<'_>>,
+    context: lpm_env::EvalContext<'_>,
+    path: &str,
+    validate_schema: bool,
+    trusted: &[(String, String)],
+) -> Result<(), LpmError> {
+    remove_dangerous_env_vars(vars, "child env");
+    for (key, value) in trusted {
+        insert_project_env(vars, key.clone(), value.clone());
+    }
+    insert_project_env(vars, "PATH".into(), path.into());
+    let errors = evaluate_project_env(
+        vars,
+        if validate_schema { validator } else { None },
+        context,
+    )?;
+    validation_result(errors)
+}
+
+/// Apply the configured static service values before scoped CLI evaluation.
+pub fn merge_configured_service_env(
+    vars: &mut HashMap<String, String>,
+    config: Option<&lpm_json::LpmJsonConfig>,
+    service: Option<&str>,
+) -> Result<(), LpmError> {
+    if let Some(service) =
+        service.and_then(|name| config.and_then(|config| config.services.get(name)))
+    {
+        merge_project_env(vars, &service.env)?;
+    }
+    remove_dangerous_env_vars(vars, "service env");
+    Ok(())
 }
 
 pub(crate) struct LoadedProjectEnv {
@@ -112,22 +200,9 @@ pub(crate) fn load_project_env_details_with_config_and_schema_validation(
     lpm_config: Option<&lpm_json::LpmJsonConfig>,
     validate_schema: bool,
 ) -> Result<LoadedProjectEnv, LpmError> {
-    // Validate env name to prevent path traversal
-    let env_name = env_name.filter(|m| {
-        if !m.is_empty()
-            && !m.contains('/')
-            && !m.contains('\\')
-            && !m.contains("..")
-            && !m.contains('\0')
-        {
-            true
-        } else {
-            tracing::warn!(
-                "ignoring invalid env mode '{m}' — must not contain path separators, '..', or null bytes"
-            );
-            false
-        }
-    });
+    if let Some(env_name) = env_name {
+        lpm_env::resolver::validate_env_name(env_name).map_err(LpmError::EnvValidation)?;
+    }
 
     let mut loaded = load_project_env_files_with_config(
         project_dir,
@@ -163,7 +238,17 @@ pub(crate) fn load_project_env_details_with_config_and_schema_validation(
     remove_dangerous_env_vars(&mut loaded, "project env");
 
     if validate_schema {
-        validate_project_env(&mut loaded, lpm_config)?;
+        let validator = lpm_config
+            .and_then(|config| config.env_schema.as_ref())
+            .map(lpm_env::EnvValidator::new);
+        validate_project_env_with_plan(
+            &mut loaded,
+            validator.as_ref(),
+            lpm_env::EvalContext {
+                environment: env_name.unwrap_or("default"),
+                ..Default::default()
+            },
+        )?;
     }
 
     Ok(LoadedProjectEnv {
@@ -224,6 +309,58 @@ pub fn merge_stored_project_env(
     Ok(())
 }
 
+/// Resolve an explicit selection or the configured default from one snapshot.
+pub fn resolve_project_environment(
+    env_name: Option<&str>,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<lpm_env::ResolvedEnv, LpmError> {
+    let empty = HashMap::new();
+    let mut resolved = lpm_env::resolver::resolve_checked(
+        env_name.unwrap_or("default"),
+        config.map_or(&empty, |config| &config.env),
+        config.and_then(|config| config.environments.as_ref()),
+    )
+    .map_err(LpmError::EnvValidation)?;
+    resolved.implicit_default = env_name.is_none() && resolved.source == lpm_env::EnvSource::Vault;
+    Ok(resolved)
+}
+
+/// Load values without schema validation using an existing configuration snapshot.
+pub fn load_project_env_unvalidated_with_config(
+    project_dir: &Path,
+    env_name: Option<&str>,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<HashMap<String, String>, LpmError> {
+    let resolved = resolve_project_environment(env_name, config)?;
+    load_project_env_unvalidated_for_resolved(project_dir, &resolved, config)
+}
+
+/// Load an inventory or command identity without reinterpreting its storage key as an alias.
+pub fn load_project_env_unvalidated_for_resolved(
+    project_dir: &Path,
+    resolved: &lpm_env::ResolvedEnv,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<HashMap<String, String>, LpmError> {
+    let mode = resolved_load_mode(resolved);
+    load_project_env_details_with_config_and_schema_validation(
+        project_dir,
+        mode,
+        resolved.file_path.as_deref(),
+        config,
+        false,
+    )
+    .map(|loaded| loaded.vars)
+}
+
+pub(crate) fn resolved_load_mode(resolved: &lpm_env::ResolvedEnv) -> Option<&str> {
+    if resolved.implicit_default {
+        None
+    } else {
+        Some(&resolved.storage_key)
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn validate_project_env(
     vars: &mut HashMap<String, String>,
     config: Option<&lpm_json::LpmJsonConfig>,
@@ -231,17 +368,49 @@ pub(crate) fn validate_project_env(
     validate_project_env_with_case_policy(vars, config, cfg!(windows))
 }
 
+#[cfg(test)]
 fn validate_project_env_with_case_policy(
     vars: &mut HashMap<String, String>,
     config: Option<&lpm_json::LpmJsonConfig>,
     case_insensitive: bool,
 ) -> Result<(), LpmError> {
+    let validator = config
+        .and_then(|config| config.env_schema.as_ref())
+        .map(lpm_env::EnvValidator::new);
+    let errors = evaluate_project_env_with_case_policy(
+        vars,
+        validator.as_ref(),
+        lpm_env::EvalContext::default(),
+        case_insensitive,
+    )?;
+    finish_project_validation(vars, errors)
+}
+
+/// Validate effective values without converting inherited values into project overrides.
+pub fn evaluate_project_env(
+    vars: &mut HashMap<String, String>,
+    validator: Option<&lpm_env::EnvValidator<'_>>,
+    context: lpm_env::EvalContext<'_>,
+) -> Result<Vec<lpm_env::ValidationError>, LpmError> {
+    evaluate_project_env_with_case_policy(vars, validator, context, cfg!(windows))
+}
+
+fn evaluate_project_env_with_case_policy(
+    vars: &mut HashMap<String, String>,
+    validator: Option<&lpm_env::EnvValidator<'_>>,
+    context: lpm_env::EvalContext<'_>,
+    case_insensitive: bool,
+) -> Result<Vec<lpm_env::ValidationError>, LpmError> {
     validate_process_values(vars)?;
-    if let Some(schema) = config.and_then(|config| config.env_schema.as_ref()) {
+    if let Some(validator) = validator {
+        let schema = validator.schema();
+        let mut schema_names = std::collections::BTreeMap::new();
         if case_insensitive {
-            let mut schema_names = std::collections::BTreeSet::new();
             for key in schema.vars.keys() {
-                if !schema_names.insert(EnvName::new(key)) {
+                if schema_names
+                    .insert(EnvName::new(key), key.as_str())
+                    .is_some()
+                {
                     return Err(LpmError::EnvValidation(format!(
                         "ambiguous environment schema variable casing for '{key}'"
                     )));
@@ -267,29 +436,93 @@ fn validate_project_env_with_case_policy(
                 }
             }
         }
-        let mut inherited_values = Vec::with_capacity(schema.vars.len());
-        for key in schema.vars.keys() {
-            if !vars.contains_key(key)
-                && !crate::shell::inherited_env_is_stripped(key)
-                && let Ok(value) = std::env::var(key)
-            {
-                inherited_values.push((key.clone(), value.clone()));
-                vars.insert(key.clone(), value);
+        let mut inherited_values = Vec::with_capacity(schema.vars.len().min(32));
+        let eligible =
+            |key: &str| !vars.contains_key(key) && !crate::shell::inherited_env_is_stripped(key);
+        if schema
+            .vars
+            .keys()
+            .filter(|key| eligible(key))
+            .take(32)
+            .count()
+            == 32
+        {
+            for (name, value) in std::env::vars_os() {
+                let Some(name) = name.to_str() else { continue };
+                let key = if case_insensitive {
+                    schema_names.get(&EnvName::new(name)).copied()
+                } else {
+                    schema.vars.get_key_value(name).map(|(key, _)| key.as_str())
+                };
+                let Some(key) = key else { continue };
+                if vars.contains_key(key) || crate::shell::inherited_env_is_stripped(key) {
+                    continue;
+                }
+                let value = value.into_string().map_err(|_| {
+                    LpmError::EnvValidation(format!(
+                        "{key}: inherited declared values must be UTF-8"
+                    ))
+                })?;
+                inherited_values.push((key, value.is_empty()));
+                vars.insert(key.to_string(), value);
+            }
+        } else {
+            for key in schema.vars.keys() {
+                if !vars.contains_key(key) && !crate::shell::inherited_env_is_stripped(key) {
+                    match std::env::var(key) {
+                        Ok(value) => {
+                            inherited_values.push((key.as_str(), value.is_empty()));
+                            vars.insert(key.clone(), value);
+                        }
+                        Err(std::env::VarError::NotPresent) => {}
+                        Err(std::env::VarError::NotUnicode(_)) => {
+                            return Err(LpmError::EnvValidation(format!(
+                                "{key}: inherited declared values must be UTF-8"
+                            )));
+                        }
+                    }
+                }
             }
         }
-        let errors = lpm_env::validate(schema, vars);
-        if !errors.is_empty() {
-            let lines: Vec<String> = errors.iter().map(|error| format!("  {error}")).collect();
-            return Err(LpmError::EnvValidation(lines.join("\n")));
-        }
-        // Validation must not turn inherited values into explicit project
-        // overrides: task cacheEnv selection depends on that distinction.
-        for (key, value) in inherited_values {
-            if vars.get(&key) == Some(&value) {
-                vars.remove(&key);
+        let errors =
+            validator.validate_with_default_policy(vars, context, |key| !is_denied_env_var(key));
+        // Keep defaults replacing inherited empties, while preserving cacheEnv provenance.
+        for (key, was_empty) in inherited_values {
+            if !was_empty || vars.get(key).is_none_or(String::is_empty) {
+                vars.remove(key);
             }
         }
+        return Ok(errors);
     }
+    Ok(Vec::new())
+}
+
+pub(crate) fn validate_project_env_with_plan(
+    vars: &mut HashMap<String, String>,
+    validator: Option<&lpm_env::EnvValidator<'_>>,
+    context: lpm_env::EvalContext<'_>,
+) -> Result<(), LpmError> {
+    let errors = evaluate_project_env(vars, validator, context)?;
+    finish_project_validation(vars, errors)
+}
+
+fn validation_result(errors: Vec<lpm_env::ValidationError>) -> Result<(), LpmError> {
+    if !errors.is_empty() {
+        return Err(LpmError::EnvValidation(
+            errors
+                .iter()
+                .map(|error| format!("  {error}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+    }
+    Ok(())
+}
+fn finish_project_validation(
+    vars: &mut HashMap<String, String>,
+    errors: Vec<lpm_env::ValidationError>,
+) -> Result<(), LpmError> {
+    validation_result(errors)?;
     remove_dangerous_env_vars(vars, "project env");
     Ok(())
 }

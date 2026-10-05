@@ -44,7 +44,7 @@ pub struct EnvSchema {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, remote = "Self")]
 #[schemars(deny_unknown_fields)]
-#[schemars(extend("allOf" = [{"if":{"properties":{"secret":{"const":true}},"required":["secret"]},"then":{"properties":{"default":{"type":"null"},"enum":{"type":"null"},"client":{"const":false},"ci":{"enum":["secret",null]}}}}]))]
+#[schemars(extend("allOf" = [{"if":{"properties":{"secret":{"const":true}},"required":["secret"]},"then":{"properties":{"defaultsIn":{"maxItems":0},"default":{"type":"null"},"enum":{"type":"null"},"client":{"const":false},"ci":{"enum":["secret",null]}}}}]))]
 pub struct EnvVarRule {
     /// Whether the variable must be set and non-empty.
     #[serde(default)]
@@ -137,6 +137,25 @@ pub struct EnvVarRule {
         skip_serializing_if = "Option::is_none"
     )]
     pub required_when: Option<RequiredWhen>,
+
+    /// Additional contexts in which this value must be nonempty.
+    #[serde(
+        default,
+        rename = "requiredIn",
+        deserialize_with = "crate::scopes::deserialize_selectors",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    #[schemars(length(max = 32))]
+    pub required_in: Vec<crate::ScopeSelector>,
+    /// Context-specific literal defaults, evaluated before the global default.
+    #[serde(
+        default,
+        rename = "defaultsIn",
+        deserialize_with = "crate::scopes::deserialize_defaults",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    #[schemars(length(max = 32))]
+    pub defaults_in: Vec<crate::ScopedDefault>,
 
     /// Human-readable description (shown in error messages and .env.example).
     #[serde(default)]

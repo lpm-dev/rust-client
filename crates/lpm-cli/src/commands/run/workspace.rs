@@ -798,6 +798,7 @@ fn run_workspace_package(
             env_mode,
             tasks,
             bin_hint,
+            lpm_config,
         ) {
             Ok(()) => true,
             Err(e) => {
