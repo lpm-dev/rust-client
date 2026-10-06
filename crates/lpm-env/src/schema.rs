@@ -129,6 +129,20 @@ pub enum VarFormat {
     Ip,
 }
 
+impl std::fmt::Display for VarFormat {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Url => "url",
+            Self::Port => "port",
+            Self::Email => "email",
+            Self::Boolean => "boolean",
+            Self::Integer => "integer",
+            Self::Hostname => "hostname",
+            Self::Ip => "ip",
+        })
+    }
+}
+
 impl EnvVarRule {
     /// Whether this variable is a secret that should be redacted in output.
     pub fn is_secret(&self) -> bool {

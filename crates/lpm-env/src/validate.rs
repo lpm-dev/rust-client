@@ -92,7 +92,7 @@ impl std::fmt::Display for ValidationError {
                 let display_value = display_value(got, self.is_secret);
                 write!(
                     f,
-                    "{}: invalid format, expected {expected:?}, got \"{}\"",
+                    "{}: invalid format, expected {expected}, got \"{}\"",
                     key,
                     TerminalSafe(display_value)
                 )?;
@@ -675,23 +675,12 @@ fn validate_url(value: &str) -> bool {
     let hosts = authority
         .rsplit_once('@')
         .map_or(authority, |(_, hosts)| hosts);
-    if hosts.is_empty() || hosts.contains(['\\', '^', '{', '}', '|']) {
+    if hosts.is_empty() || hosts.contains(['\\', '^', '{', '}', '|', '"', '<', '>', '`']) {
         return false;
     }
     let special = ["http", "https", "ftp", "file", "ws", "wss"]
         .iter()
         .any(|special| scheme.eq_ignore_ascii_case(special));
-    let allow_non_url_code_points = if special && authority.contains('@') {
-        let mut without_credentials =
-            String::with_capacity(scheme.len() + 3 + hosts.len() + tail.len() - authority_end);
-        without_credentials.push_str(scheme);
-        without_credentials.push_str("://");
-        without_credentials.push_str(hosts);
-        without_credentials.push_str(&tail[authority_end..]);
-        parsed_url_is_valid(&without_credentials, false)
-    } else {
-        !special
-    };
     let candidate;
     let value = if hosts.contains(',') {
         if special || !hosts.split(',').all(valid_database_endpoint) {
@@ -709,14 +698,15 @@ fn validate_url(value: &str) -> bool {
     } else {
         value
     };
-    parsed_url_is_valid(value, allow_non_url_code_points)
+    parsed_url_is_valid(value, authority.contains('@'))
 }
 
-fn parsed_url_is_valid(value: &str, allow_non_url_code_points: bool) -> bool {
+fn parsed_url_is_valid(value: &str, has_credentials: bool) -> bool {
     let invalid = std::cell::Cell::new(false);
     let on_violation = |violation| {
         if violation != url::SyntaxViolation::EmbeddedCredentials
-            && !(allow_non_url_code_points && violation == url::SyntaxViolation::NonUrlCodePoint)
+            && violation != url::SyntaxViolation::NonUrlCodePoint
+            && !(has_credentials && violation == url::SyntaxViolation::UnencodedAtSign)
         {
             invalid.set(true);
         }
@@ -1021,6 +1011,63 @@ mod tests {
     }
 
     #[test]
+    fn urls_accept_compatible_path_and_query_punctuation() {
+        for scheme in ["http", "https", "ws", "wss", "ftp"] {
+            for punctuation in ['|', '^', '{', '}', '"', '<', '>', '`'] {
+                for suffix in [
+                    format!("/{punctuation}value"),
+                    format!("/?q={punctuation}value"),
+                ] {
+                    let value = format!("{scheme}://example.com{suffix}");
+                    assert!(validate_url(&value), "compatible URL rejected: {value}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn urls_accept_raw_at_signs_in_passwords() {
+        for value in [
+            "postgres://user:p@ss@host/db",
+            "postgres://user:p@@ss@h1:5432,h2:5432/db",
+            "https://user:p@ss@host/path",
+            "ftp://user:p@ss@host/path",
+        ] {
+            assert!(
+                validate_url(value),
+                "credential-bearing URL rejected: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_errors_use_public_format_names_and_redact_secrets() {
+        for (format, label) in [
+            (VarFormat::Url, "url"),
+            (VarFormat::Port, "port"),
+            (VarFormat::Email, "email"),
+            (VarFormat::Boolean, "boolean"),
+            (VarFormat::Integer, "integer"),
+            (VarFormat::Hostname, "hostname"),
+            (VarFormat::Ip, "ip"),
+        ] {
+            let error = ValidationError {
+                key: "VALUE".into(),
+                kind: ValidationErrorKind::InvalidFormat {
+                    expected: format,
+                    got: "private-value".into(),
+                },
+                description: None,
+                is_secret: true,
+            };
+            assert_eq!(
+                error.to_string(),
+                format!("VALUE: invalid format, expected {label}, got \"[REDACTED]\"")
+            );
+        }
+    }
+
+    #[test]
     fn database_urls_accept_replica_sets_and_unescaped_credentials() {
         for value in [
             "mongodb://h1:27017,h2:27017/db",
@@ -1042,8 +1089,12 @@ mod tests {
             "mongodb://h1:27017,:27017/db",
             "mongodb://h1:27017,[invalid]:27017/db",
             "https://h1:443,h2:443/path",
-            "https://example.com/{raw}",
-            "https://example.com/<raw>",
+            "https://h|ost/path",
+            "https://h^st/path",
+            "https://h{st/path",
+            "https://h\"st/path",
+            "https://example.com/%zz",
+            "https://example.com/a\\b",
         ] {
             assert!(!validate_url(value), "invalid URL accepted: {value}");
         }
