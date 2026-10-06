@@ -1,0 +1,14 @@
+---
+source: tests/workflows/tests/env_local.rs
+expression: value
+---
+{
+  "schema_version": 1,
+  "success": false,
+  "error_code": "usage",
+  "kind": "value_validation",
+  "error": "invalid value 'invalid' for '--stage <STAGE>': stage must be development, build, runtime, ci, or test",
+  "argument": "--stage <STAGE>",
+  "value": "invalid",
+  "hint": "Run `lpm env check --help` for usage."
+}

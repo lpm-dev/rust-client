@@ -351,16 +351,16 @@ fn module(
     definition(&mut result, "groups", &groups)?;
     definition(&mut result, "programs", &programs)?;
     definition(&mut result, "wordRanges", &word)?;
-    let bidi = if vars
-        .values()
-        .any(|rule| rule.format == Some(lpm_env::VarFormat::Url))
-    {
-        bidi_ranges()
-    } else {
-        Vec::new()
-    };
-    definition(&mut result, "bidiRanges", &bidi)?;
     append(&mut result, include_bytes!("formats.js"))?;
+    if vars
+        .values()
+        .any(|rule| rule.format == Some(VarFormat::Url))
+    {
+        packed_ranges(&mut result, "bidiRanges", &bidi_ranges())?;
+        packed_ranges(&mut result, "joiningRanges", &joining_ranges())?;
+        packed_ranges(&mut result, "viramaRanges", &virama_ranges())?;
+        append(&mut result, include_bytes!("url.js"))?;
+    }
     append(&mut result, include_bytes!("runtime.js"))?;
     append(
         &mut result,
@@ -434,6 +434,55 @@ fn bidi_ranges() -> Vec<(u32, u32, u8)> {
         .map(|range| (*range.range.start(), *range.range.end(), range.value))
         .collect()
 }
+fn joining_ranges() -> Vec<(u32, u32, u8)> {
+    use icu_properties::{CodePointMapData, props::JoiningType};
+    CodePointMapData::<JoiningType>::new()
+        .iter_ranges_mapped(|class| match class {
+            JoiningType::LeftJoining => 1,
+            JoiningType::RightJoining => 2,
+            JoiningType::DualJoining => 3,
+            JoiningType::Transparent => 4,
+            _ => 0,
+        })
+        .filter(|range| range.value != 0)
+        .map(|range| (*range.range.start(), *range.range.end(), range.value))
+        .collect()
+}
+
+fn virama_ranges() -> Vec<(u32, u32, u8)> {
+    use icu_properties::{CodePointMapData, props::CanonicalCombiningClass};
+    CodePointMapData::<CanonicalCombiningClass>::new()
+        .iter_ranges_mapped(|class| u8::from(class == CanonicalCombiningClass::Virama))
+        .filter(|range| range.value != 0)
+        .map(|range| (*range.range.start(), *range.range.end(), range.value))
+        .collect()
+}
+
+fn packed_ranges(
+    output: &mut Output,
+    name: &str,
+    ranges: &[(u32, u32, u8)],
+) -> Result<(), GenerateError> {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut encoded = String::with_capacity(ranges.len() * 4);
+    let mut previous = 0;
+    for &(start, end, class) in ranges {
+        for mut value in [start - previous, end - start, u32::from(class)] {
+            while value >= 32 {
+                encoded.push(char::from(ALPHABET[((value & 31) | 32) as usize]));
+                value >>= 5;
+            }
+            encoded.push(char::from(ALPHABET[value as usize]));
+        }
+        previous = end + 1;
+    }
+    append(output, b"const ")?;
+    append(output, name.as_bytes())?;
+    append(output, b" = decodeRanges(")?;
+    serde_json::to_writer(&mut *output, &encoded).map_err(|_| GenerateError::Budget)?;
+    append(output, b");\n")
+}
+
 impl Output {
     fn new(capacity: usize, limit: usize) -> Self {
         Self {

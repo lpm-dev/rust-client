@@ -2844,3 +2844,36 @@ fn imported_rules_drive_examples_runtime_checks_and_definition_errors() {
         .unwrap();
     assert!(!example.status.success());
 }
+
+#[test]
+fn invalid_env_values_include_action_specific_json_help_hints() {
+    let project = TempProject::empty(r#"{"name":"usage-hints"}"#);
+    for args in [
+        vec!["check", "--stage", "invalid"],
+        vec!["generate", "--adapter", "invalid"],
+        vec!["print", "--format", "invalid"],
+        vec!["get"],
+        vec!["cp"],
+    ] {
+        let output = lpm(&project)
+            .args(["--json", "env"])
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["error_code"], "usage");
+        let action = if args[0] == "cp" { "copy" } else { args[0] };
+        assert!(
+            value["hint"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("Run `lpm env {action} --help` "))
+        );
+        if args[0] == "check" {
+            insta::with_settings!({filters => vec![(r"/[^\s]+/lpm-rs", "lpm-rs")]}, {
+                insta::assert_json_snapshot!("env_check_invalid_stage_usage", value);
+            });
+        }
+    }
+}

@@ -172,7 +172,9 @@ pub(super) fn parse(args: &[&str], json_output: bool) -> Result<Option<LocalActi
         .map_err(|error| {
             let status = if error.use_stderr() { 2 } else { 0 };
             if json_output && error.use_stderr() {
-                crate::cli::print_json_clap_error(&error, None);
+                let action = if args[0] == "cp" { "copy" } else { args[0] };
+                let hint = format!("Run `lpm env {action} --help` for usage.");
+                crate::cli::print_json_clap_error(&error, Some(&hint));
             } else {
                 let _ = error.print();
             }

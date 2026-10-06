@@ -1069,3 +1069,137 @@ fn generated_file_urls_only_reject_complete_drive_segments() {
     .map(|value| json!({"VALUE":value}));
     assert_parity(&schema, &inputs, EvalContext::default());
 }
+
+#[test]
+fn generated_url_idna_limits_and_joiners_match_native_validation() {
+    let schema = schema(json!({"vars":{"VALUE":{"format":"url"}}}));
+    let mut inputs = [
+        "https://xn---9ca.example",
+        "https://xn---a.example",
+        "https://xn--a-.example",
+        "https://a\u{200d}b.example",
+        "https://a\u{200c}b.example",
+        "https://क्\u{200d}क.example",
+        "https://क्\u{200c}क.example",
+        "https://ب\u{200c}ب.example",
+        "https://بَ\u{200c}َب.example",
+        "https://ب\u{200d}ب.example",
+        "https://\u{200c}ب.example",
+        "https://ب\u{200c}.example",
+        "postgres://a\u{200c}b.example,example.com/db",
+    ]
+    .iter()
+    .map(|value| json!({"VALUE":value}))
+    .collect::<Vec<_>>();
+    for size in [999, 1000, 1001, 2001] {
+        inputs.push(json!({"VALUE":format!("https://{}.example", "é".repeat(size))}));
+        inputs.push(json!({"VALUE":format!("https://xn--{}.example", "a".repeat(size))}));
+    }
+    assert_parity(&schema, &inputs, EvalContext::default());
+}
+
+#[test]
+fn generated_urls_bound_idna_work_before_calling_the_platform_parser() {
+    let generated = generate(
+        &schema(json!({"vars":{"VALUE":{"format":"url"}}})),
+        options(),
+    )
+    .unwrap();
+    node(
+        &generated,
+        "server",
+        &[],
+        r#"
+const NativeURL=globalThis.URL;let calls=0;
+globalThis.URL=class extends NativeURL{constructor(...args){calls++;super(...args);}};
+for(const prefix of ['https://','postgres://']){
+ const before=calls;try{createEnv({VALUE:prefix+'é'.repeat(450000)+'.example'+(prefix==='postgres://'?',example.com':'')+'/db'});}catch(error){if(!error.issues)throw error;}
+ if(calls!==before)throw new Error('oversized IDN reached the platform parser');
+}
+"#,
+    );
+}
+
+#[test]
+fn generated_modules_omit_url_code_when_no_url_rule_is_selected() {
+    let generated = generate(
+        &schema(json!({"vars":{"VITE_TEXT":{"client":true},"URL":{"format":"url"}}})),
+        options(),
+    )
+    .unwrap();
+    let client = String::from_utf8(generated.files["client.js"].clone()).unwrap();
+    assert!(!client.contains("punycodeLabel"));
+    assert!(!client.contains("bidiRanges"));
+    assert!(!client.contains("new URL"));
+    assert!(String::from_utf8_lossy(&generated.files["server.js"]).contains("punycodeLabel"));
+}
+
+#[test]
+fn generated_url_module_measurements_are_reproducible() {
+    let Some(directory) = std::env::var_os("LPM_CODEGEN_MEASUREMENT_DIR") else {
+        return;
+    };
+    std::fs::create_dir_all(&directory).unwrap();
+    for (name, rule) in [
+        ("text", json!({"client":true})),
+        ("url", json!({"client":true,"format":"url"})),
+    ] {
+        let generated = generate(&schema(json!({"vars":{"VITE_VALUE":rule}})), options()).unwrap();
+        std::fs::write(
+            std::path::Path::new(&directory).join(format!("{name}.js")),
+            &generated.files["client.js"],
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn generated_url_helpers_enforce_contextual_joiners() {
+    let mut generated = generate(
+        &schema(json!({"vars":{"VALUE":{"format":"url"}}})),
+        options(),
+    )
+    .unwrap();
+    generated
+        .files
+        .get_mut("server.js")
+        .unwrap()
+        .extend_from_slice(
+        b"\nexport function probeDomain(value){return validBidiDomain(value,{left:10000000});}\n",
+    );
+    node(
+        &generated,
+        "server",
+        &[],
+        r#"
+const {probeDomain}=await import('./server.js');
+for(const host of ['xn--ab-j1t.example','xn--ab-m1t.example'])if(probeDomain(host))throw new Error('invalid ContextJ accepted');
+for(const host of ['xn--11ba1o090g.example','xn--ngba799q.example','xn--ngba7ia3604a.example'])if(!probeDomain(host))throw new Error('valid ContextJ rejected');
+"#,
+    );
+}
+
+#[test]
+fn packed_unicode_tables_preserve_all_native_ranges() {
+    let mut generated = generate(
+        &schema(json!({"vars":{"VALUE":{"format":"url"}}})),
+        options(),
+    )
+    .unwrap();
+    generated.files.get_mut("server.js").unwrap().extend_from_slice(b"\nexport function probeTables(){return [Array.from(bidiRanges),Array.from(joiningRanges),Array.from(viramaRanges)];}\n");
+    let actual = node(
+        &generated,
+        "server",
+        &[],
+        r#"
+const {probeTables}=await import('./server.js');results.push(probeTables());
+"#,
+    );
+    let expected = [bidi_ranges(), joining_ranges(), virama_ranges()].map(|ranges| {
+        ranges
+            .into_iter()
+            .flat_map(|(start, end, class)| [start, end, u32::from(class)])
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(actual[0], serde_json::json!(expected));
+}
