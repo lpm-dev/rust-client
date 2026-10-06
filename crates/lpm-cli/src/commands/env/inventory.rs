@@ -376,13 +376,18 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
         let var_count = env_specific.map_or(0, |v| v.len());
 
         let schema_status = if let (Some(schema), Some(validator)) = (schema, &validator) {
-            let mode = (env.canonical != "default").then_some(env.canonical.as_str());
-            let mut values = lpm_runner::dotenv::load_project_env_files_with_config(
-                project_dir,
-                mode,
-                env.file_path.as_deref(),
-                config.as_ref(),
-            )?;
+            let valid_identity = lpm_env::resolver::validate_env_name(&env.canonical).is_ok();
+            let mode = (!env.implicit_default).then_some(env.storage_key.as_str());
+            let mut values = if valid_identity {
+                lpm_runner::dotenv::load_project_env_files_with_config(
+                    project_dir,
+                    mode,
+                    env.file_path.as_deref(),
+                    config.as_ref(),
+                )?
+            } else {
+                HashMap::new()
+            };
             if let Some(stored) = effective_vars {
                 lpm_runner::dotenv::merge_stored_project_env(&mut values, stored)?;
             }
@@ -405,7 +410,11 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
             }
             let total = schema.len() + schema.groups.len();
             Some((
-                total.saturating_sub(failed_variables.len() + failed_groups.len()),
+                if valid_identity {
+                    total.saturating_sub(failed_variables.len() + failed_groups.len())
+                } else {
+                    0
+                },
                 total,
             ))
         } else {

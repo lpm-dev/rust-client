@@ -6067,10 +6067,10 @@ fn watch_reloads_canonical_scoped_defaults_after_schema_changes() {
 #[cfg(unix)]
 #[test]
 fn task_cache_ignores_unselected_path_tails_with_unchanged_executables() {
-    for selected in [false, true] {
+    for (selected, declared) in [(false, false), (false, true), (true, false)] {
         let project =
             TempProject::empty(r#"{"name":"cache-path-tail","scripts":{"build":"node build.js"}}"#);
-        project.write_file("lpm.json", &serde_json::json!({"tasks":{"build":{"cache":true,"cacheEnv":if selected {vec!["PATH"]} else {vec![]},"inputs":["build.js"],"outputs":["dist/**"]}}}).to_string());
+        project.write_file("lpm.json", &serde_json::json!({"tasks":{"build":{"cache":true,"cacheEnv":if selected {vec!["PATH"]} else {vec![]},"inputs":["build.js"],"outputs":["dist/**"]}},"envSchema":if declared {serde_json::json!({"vars":{"PATH":{}}})} else {serde_json::json!(null)}}).to_string());
         project.write_file("build.js", "const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/out','ok');fs.appendFileSync('executions','run\\n');");
         let original = std::env::var("PATH").unwrap();
         for tail in ["empty-a", "empty-b"] {
@@ -6086,4 +6086,54 @@ fn task_cache_ignores_unselected_path_tails_with_unchanged_executables() {
             if selected { "run\nrun\n" } else { "run\n" }
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn task_cache_invalidates_when_a_node_launcher_selects_a_different_helper() {
+    use std::os::unix::fs::PermissionsExt;
+    let project =
+        TempProject::empty(r#"{"name":"launcher-cache","scripts":{"build":"node build.js"}}"#);
+    project.write_file("lpm.json", r#"{"tasks":{"build":{"cache":true,"cacheEnv":[],"inputs":["build.js"],"outputs":["dist/**"]}}}"#);
+    project.write_file("build.js", "const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/out',process.env.HELPER_MARKER);fs.appendFileSync('executions','run\\n');");
+    project.write_file(
+        "node_modules/.bin/node",
+        "#!/bin/sh\nexec helper-node \"$@\"\n",
+    );
+    let real_node = std::process::Command::new("node")
+        .args(["-p", "process.execPath"])
+        .output()
+        .unwrap();
+    let real_node = String::from_utf8(real_node.stdout).unwrap();
+    for helper in ["a", "b"] {
+        project.write_file(
+            &format!("{helper}/helper-node"),
+            &format!(
+                "#!/bin/sh\nexport HELPER_MARKER={helper}\nexec '{}' \"$@\"\n",
+                real_node.trim()
+            ),
+        );
+        for path in [
+            "node_modules/.bin/node".to_owned(),
+            format!("{helper}/helper-node"),
+        ] {
+            std::fs::set_permissions(
+                project.path().join(path),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            project.path().join(helper).display(),
+            std::env::var("PATH").unwrap()
+        );
+        lpm(&project)
+            .env("PATH", path)
+            .args(["run", "build"])
+            .assert()
+            .success();
+        assert_eq!(project.read_file("dist/out"), helper);
+    }
+    assert_eq!(project.read_file("executions"), "run\nrun\n");
 }
