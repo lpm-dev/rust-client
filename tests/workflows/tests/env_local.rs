@@ -13,6 +13,44 @@ mod support;
 use support::{TempProject, lpm};
 
 #[test]
+fn env_init_imports_colon_aliases_with_portable_file_suffixes() {
+    let project = TempProject::empty(r#"{"name":"colon-env-init"}"#);
+    project.write_file("lpm.json", r#"{"env":{"test:unit":".env.test"}}"#);
+    project.write_file(".env.test", "COLON_VALUE=imported\n");
+    let output = lpm(&project)
+        .args(["env", "init", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = parse_json_stdout(&output, "colon alias initialization");
+    assert_eq!(value["skipped"], serde_json::json!([]));
+    let imported = lpm(&project)
+        .args(["env", "get", "COLON_VALUE", "--env=test:unit", "--reveal"])
+        .output()
+        .unwrap();
+    assert!(imported.status.success());
+    assert!(String::from_utf8_lossy(&imported.stdout).contains("imported"));
+}
+
+#[test]
+fn env_init_skipped_inheritance_diagnostics_identify_the_invalid_parent() {
+    let project = TempProject::empty(r#"{"name":"invalid-parent-init"}"#);
+    project.write_file("lpm.json", r#"{"environments":{"b":{"extends":"c:d"}}}"#);
+    let output = lpm(&project)
+        .args(["env", "init", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = parse_json_stdout(&output, "invalid parent initialization");
+    assert!(
+        value["skipped"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("parent \"c:d\"")
+    );
+}
+
+#[test]
 fn env_init_imports_custom_path_environment_mappings() {
     let project = TempProject::empty(r#"{"name":"custom-env-init"}"#);
     project.write_file("lpm.json", r#"{"env":{"unit":"config/unit.env"}}"#);

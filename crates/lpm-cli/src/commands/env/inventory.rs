@@ -47,9 +47,7 @@ fn admitted_init_configuration(
     aliases.sort_unstable_by_key(|(alias, _)| *alias);
     for (alias, file) in aliases {
         let canonical = lpm_env::resolver::resolve_canonical_name(alias, env_map, environments);
-        if let Err(reason) = lpm_env::resolver::validate_env_name(alias)
-            .and_then(|()| lpm_env::resolver::validate_env_name(canonical))
-        {
+        if let Err(reason) = lpm_env::resolver::validate_env_name(canonical) {
             admitted.skipped.push(SkippedInitEnvironment {
                 environment: canonical.to_owned(),
                 alias: Some(alias.clone()),
@@ -63,18 +61,22 @@ fn admitted_init_configuration(
         let mut names: Vec<_> = environments.envs.iter().collect();
         names.sort_unstable_by_key(|(name, _)| *name);
         for (name, definition) in names {
-            let validation = lpm_env::resolver::validate_env_name(name).and_then(|()| {
-                definition
-                    .extends()
-                    .map_or(Ok(()), lpm_env::resolver::validate_env_name)
-            });
-            if let Err(reason) = validation {
+            let error =
+                lpm_env::resolver::validate_env_name(name)
+                    .err()
+                    .map(|reason| format!("environment {name:?}: {reason}"))
+                    .or_else(|| {
+                        definition.extends().and_then(|parent| {
+                            lpm_env::resolver::validate_env_name(parent).err().map(|reason| {
+                            format!("environment {name:?} has invalid parent {parent:?}: {reason}")
+                        })
+                        })
+                    });
+            if let Some(error) = error {
                 admitted.skipped.push(SkippedInitEnvironment {
                     environment: name.clone(),
                     alias: None,
-                    error: format!(
-                        "environment {name:?}: {reason}. Use a portable environment name"
-                    ),
+                    error: format!("{error}. Use a portable environment name"),
                 });
             } else if let Some(values) = admitted.environments.as_mut() {
                 values.envs.insert(name.clone(), definition.clone());

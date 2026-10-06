@@ -208,6 +208,7 @@ pub(super) fn build_push_schema_value(
                 );
                 if lpm_env::resolver::validate_env_name(alias).is_err()
                     || lpm_env::resolver::validate_env_name(mode).is_err()
+                    || file_path.chars().any(char::is_control)
                 {
                     return None;
                 }
@@ -233,6 +234,9 @@ pub(super) fn build_push_schema_value(
                     || definition
                         .extends()
                         .is_some_and(|parent| lpm_env::resolver::validate_env_name(parent).is_err())
+                    || definition
+                        .file()
+                        .is_some_and(|file| file.chars().any(char::is_control))
                 {
                     return None;
                 }
@@ -295,6 +299,17 @@ pub(super) fn persist_org_sync_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_omits_control_characters_in_alias_and_environment_file_paths() {
+        let config: lpm_runner::lpm_json::LpmJsonConfig = serde_json::from_str(r#"{"env":{"bad":"config/bad\n.env","good":"config/good.env"},"environments":{"bad":"config/bad\u007f.env","structured":{"file":"bad\u0085.env"},"good":"config/good.env"}}"#).unwrap();
+        let metadata = build_push_schema_value(Some(&config)).unwrap();
+        assert!(metadata["envConfig"].get("bad").is_none());
+        assert!(metadata["environments"].get("bad").is_none());
+        assert!(metadata["environments"].get("structured").is_none());
+        assert_eq!(metadata["environments"]["good"], "config/good.env");
+        assert_eq!(metadata["envConfig"]["good"]["file"], "config/good.env");
+    }
 
     #[test]
     fn metadata_omits_invalid_alias_and_canonical_names() {
