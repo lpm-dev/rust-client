@@ -1,0 +1,41 @@
+---
+source: tests/workflows/tests/env_local.rs
+expression: value
+---
+{
+  "success": true,
+  "environments": [
+    {
+      "environment": "default",
+      "alias": null,
+      "filePath": ".env",
+      "fileExists": false,
+      "fileVarCount": 0,
+      "vaultExists": false,
+      "vaultVarCount": 0
+    },
+    {
+      "environment": "unit",
+      "alias": "unit",
+      "filePath": "config/unit.env",
+      "fileExists": true,
+      "fileVarCount": 1,
+      "vaultExists": false,
+      "vaultVarCount": 0
+    }
+  ],
+  "actions": [
+    {
+      "environment": "unit",
+      "action": "imported",
+      "count": 1
+    }
+  ],
+  "skipped": [
+    {
+      "environment": "test:unit",
+      "alias": "test:unit",
+      "error": "environment alias \"test:unit\" resolves to \"test:unit\": environment name may only contain a-z, 0-9, hyphens, underscores, and dots. Use a portable alias; select it through tasks.<name>.env"
+    }
+  ]
+}

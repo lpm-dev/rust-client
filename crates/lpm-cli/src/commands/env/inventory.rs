@@ -19,26 +19,69 @@ struct InitActionResult {
     outcome: Option<InitActionOutcome>,
 }
 
-fn validate_configured_environment_names(
+#[derive(serde::Serialize)]
+struct SkippedInitEnvironment {
+    environment: String,
+    alias: Option<String>,
+    error: String,
+}
+
+struct InitConfiguration {
+    env_map: HashMap<String, String>,
+    environments: Option<lpm_env::EnvironmentsConfig>,
+    skipped: Vec<SkippedInitEnvironment>,
+}
+
+fn admitted_init_configuration(
     env_map: &HashMap<String, String>,
     environments: Option<&lpm_env::EnvironmentsConfig>,
-) -> Result<(), LpmError> {
-    for alias in env_map.keys() {
+) -> InitConfiguration {
+    let mut admitted = InitConfiguration {
+        env_map: HashMap::with_capacity(env_map.len()),
+        environments: environments.map(|values| lpm_env::EnvironmentsConfig {
+            envs: HashMap::with_capacity(values.envs.len()),
+        }),
+        skipped: Vec::new(),
+    };
+    let mut aliases: Vec<_> = env_map.iter().collect();
+    aliases.sort_unstable_by_key(|(alias, _)| *alias);
+    for (alias, file) in aliases {
         let canonical = lpm_env::resolver::resolve_canonical_name(alias, env_map, environments);
-        lpm_env::resolver::validate_env_name(canonical).map_err(|_| {
-            LpmError::EnvValidation(lpm_env::resolver::invalid_identity_message(
-                canonical,
-                Some(alias),
-            ))
-        })?;
-    }
-    if let Some(environments) = environments {
-        for canonical in environments.envs.keys() {
-            lpm_env::resolver::validate_env_name(canonical)
-                .map_err(|error| LpmError::Script(format!("invalid environment name: {error}")))?;
+        if let Err(reason) = lpm_env::resolver::validate_env_name(alias)
+            .and_then(|()| lpm_env::resolver::validate_env_name(canonical))
+        {
+            admitted.skipped.push(SkippedInitEnvironment {
+                environment: canonical.to_owned(),
+                alias: Some(alias.clone()),
+                error: format!("environment alias \"{alias}\" resolves to \"{canonical}\": {reason}. Use a portable alias; select it through tasks.<name>.env"),
+            });
+        } else {
+            admitted.env_map.insert(alias.clone(), file.clone());
         }
     }
-    Ok(())
+    if let Some(environments) = environments {
+        let mut names: Vec<_> = environments.envs.iter().collect();
+        names.sort_unstable_by_key(|(name, _)| *name);
+        for (name, definition) in names {
+            let validation = lpm_env::resolver::validate_env_name(name).and_then(|()| {
+                definition
+                    .extends()
+                    .map_or(Ok(()), lpm_env::resolver::validate_env_name)
+            });
+            if let Err(reason) = validation {
+                admitted.skipped.push(SkippedInitEnvironment {
+                    environment: name.clone(),
+                    alias: None,
+                    error: format!(
+                        "environment {name:?}: {reason}. Use a portable environment name"
+                    ),
+                });
+            } else if let Some(values) = admitted.environments.as_mut() {
+                values.envs.insert(name.clone(), definition.clone());
+            }
+        }
+    }
+    admitted
 }
 
 fn perform_init_actions(
@@ -103,7 +146,14 @@ pub(super) fn vars_init(
     let empty_env_map = HashMap::new();
     let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
     let environments = config.as_ref().and_then(|c| c.environments.as_ref());
-    validate_configured_environment_names(env_map, environments)?;
+    let admitted = admitted_init_configuration(env_map, environments);
+    let env_map = &admitted.env_map;
+    let environments = admitted.environments.as_ref();
+    if !json_output {
+        for skipped in &admitted.skipped {
+            output::warn(&format!("Skipped {}", skipped.error));
+        }
+    }
     let snapshot = lpm_vault::capture_environment_initialization_snapshot(vault_id.as_deref())
         .map_err(LpmError::Script)?;
 
@@ -237,6 +287,7 @@ pub(super) fn vars_init(
                 "success": true,
                 "environments": json_actions.unwrap_or_default(),
                 "actions": results,
+                "skipped": admitted.skipped,
             })
         );
         return Ok(());
@@ -377,8 +428,12 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
         let schema_status = if let (Some(schema), Some(validator)) = (schema, &validator) {
             let mode = (!env.implicit_default).then_some(env.storage_key.as_str());
             let evaluation = (|| -> Result<usize, LpmError> {
-                lpm_env::resolver::validate_env_name(&env.canonical)
-                    .map_err(LpmError::EnvValidation)?;
+                lpm_env::resolver::validate_env_name(&env.canonical).map_err(|_| {
+                    LpmError::EnvValidation(lpm_env::resolver::invalid_identity_message(
+                        &env.canonical,
+                        env.alias.as_deref(),
+                    ))
+                })?;
                 let mut values = lpm_runner::dotenv::load_project_env_files_with_config(
                     project_dir,
                     mode,
@@ -470,7 +525,7 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
 
     for row in &rows {
         let schema_suffix = if let Some(error) = &row.schema_error {
-            install_ui::terminal_line!(" {}", install_ui::red(error))
+            install_ui::terminal_line!(" {}", install_ui::red(&error.replace(['\n', '\r'], " ")))
         } else {
             match row.schema_status {
                 Some((valid, total)) if total > 0 => {

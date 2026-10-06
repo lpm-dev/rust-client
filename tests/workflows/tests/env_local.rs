@@ -30,6 +30,74 @@ fn env_init_imports_custom_path_environment_mappings() {
 }
 
 #[test]
+fn env_init_skips_invalid_aliases_and_imports_valid_environments() {
+    let project = TempProject::empty(r#"{"name":"mixed-env-init"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"env":{"test:unit":"config/bad.env","unit":"config/unit.env"}}"#,
+    );
+    project.write_file("config/bad.env", "VALUE=invalid-alias\n");
+    project.write_file("config/unit.env", "VALUE=valid-alias\n");
+    let output = lpm(&project)
+        .args(["env", "init", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let value = parse_json_stdout(&output, "mixed env initialization");
+    insta::assert_json_snapshot!("env_init_skips_invalid_aliases", value);
+    assert_eq!(value["skipped"][0]["alias"], "test:unit");
+    assert!(
+        value["skipped"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("portable alias")
+    );
+    let value = lpm(&project)
+        .args(["env", "get", "VALUE", "--env=unit", "--reveal"])
+        .output()
+        .unwrap();
+    assert!(value.status.success());
+    assert!(String::from_utf8_lossy(&value.stdout).contains("valid-alias"));
+    let invalid = lpm(&project)
+        .args(["env", "get", "VALUE", "--env=test:unit", "--reveal"])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+}
+
+#[test]
+fn env_ls_invalid_alias_errors_include_context_and_readable_human_separators() {
+    let project = TempProject::empty(r#"{"name":"alias-status"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"env":{"test:unit":"config/unit.env"},"envSchema":{"vars":{"VALUE":{}}}}"#,
+    );
+    let output = lpm(&project)
+        .args(["env", "ls", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value = parse_json_stdout(&output, "alias status");
+    let row = value["environments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["environment"] == "test:unit")
+        .unwrap();
+    let error = row["schemaError"].as_str().unwrap();
+    assert!(error.contains("environment alias"), "{error}");
+    assert!(error.contains("tasks.<name>.env"), "{error}");
+    let output = lpm(&project).args(["env", "ls"]).output().unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(!text.contains("failed:?"), "{text}");
+    assert!(text.contains("portable alias"), "{text}");
+}
+
+#[test]
 fn invalid_custom_path_alias_errors_name_the_alias_and_remedy() {
     let project = TempProject::empty(r#"{"name":"invalid-env-alias"}"#);
     project.write_file(
@@ -38,7 +106,6 @@ fn invalid_custom_path_alias_errors_name_the_alias_and_remedy() {
     );
     for args in [
         vec!["env", "check", "--json"],
-        vec!["env", "init", "--json"],
         vec!["env", "print", "--env=test:unit"],
     ] {
         let output = lpm(&project).args(args).output().unwrap();
@@ -838,7 +905,7 @@ fn env_init_configured_alias_and_path_cannot_inject_terminal_rows() {
 }
 
 #[test]
-fn env_init_rejects_an_invalid_configured_environment_without_mutating_the_manifest() {
+fn env_init_skips_an_invalid_configured_environment_without_mutating_the_manifest() {
     let project = TempProject::empty(r#"{"name":"env-init-invalid","version":"1.0.0"}"#);
     let manifest = serde_json::json!({
         "env": {
@@ -853,7 +920,9 @@ fn env_init_rejects_an_invalid_configured_environment_without_mutating_the_manif
         .output()
         .expect("failed to run lpm env init");
 
-    assert!(!output.status.success(), "invalid env init must fail");
+    assert!(output.status.success(), "invalid env entry must be skipped");
+    let value = parse_json_stdout(&output, "invalid init identity");
+    assert_eq!(value["skipped"].as_array().unwrap().len(), 1);
     assert_eq!(project.read_file("lpm.json"), manifest);
 }
 

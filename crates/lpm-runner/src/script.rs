@@ -1485,16 +1485,33 @@ fn build_configured_local_bin_command(
     script_name: Option<&str>,
 ) -> Result<Command, LpmError> {
     let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
-    let env_mode = env_mode.or_else(|| {
-        let name = script_name?;
-        let config = config.as_ref()?;
+    let explicit_mode = env_mode.or_else(|| {
         config
+            .as_ref()?
             .tasks
-            .get(name)
+            .get(script_name?)
             .and_then(|task| task.env.as_deref())
-            .or_else(|| config.env.contains_key(name).then_some(name))
     });
-    let resolved = dotenv::resolve_project_environment(env_mode, config.as_ref())?;
+    let resolved = if explicit_mode.is_some() {
+        dotenv::resolve_project_environment(explicit_mode, config.as_ref())?
+    } else if let Some(resolved) = config.as_ref().and_then(|config| {
+        lpm_env::resolver::resolve_from_script(
+            script_name?,
+            &config.env,
+            config.environments.as_ref(),
+        )
+    }) {
+        lpm_env::resolver::validate_env_name(&resolved.canonical).map_err(|_| {
+            LpmError::EnvValidation(lpm_env::resolver::invalid_identity_message(
+                &resolved.canonical,
+                resolved.alias.as_deref(),
+            ))
+        })?;
+        resolved
+    } else {
+        dotenv::resolve_project_environment(None, config.as_ref())?
+    };
+
     let mut env_vars =
         dotenv::load_project_env_unvalidated_for_resolved(project_dir, &resolved, config.as_ref())?;
     let validator = config
