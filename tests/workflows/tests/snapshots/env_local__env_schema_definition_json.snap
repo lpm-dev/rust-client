@@ -1,0 +1,32 @@
+---
+source: tests/workflows/tests/env_local.rs
+expression: value
+---
+{
+  "command": "env.schema",
+  "success": true,
+  "context": {
+    "kind": "definition"
+  },
+  "variables": 3,
+  "origins": {
+    "LOCAL": {
+      "source": "lpm.json",
+      "pointer": "/envSchema/vars/LOCAL"
+    },
+    "NODE_ENV": {
+      "source": "preset:node",
+      "pointer": "/vars/NODE_ENV"
+    },
+    "TOKEN": {
+      "source": "base.json",
+      "pointer": "/vars/TOKEN"
+    }
+  },
+  "groupOrigins": {},
+  "dependencies": [
+    "base.json"
+  ],
+  "fingerprint": "[fingerprint]",
+  "diagnostics": []
+}

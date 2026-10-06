@@ -17,6 +17,8 @@ pub(crate) struct PublishManifest {
     pub(crate) package_json_content: String,
     pub(crate) package_json_override: Option<Vec<u8>>,
     pub(crate) lpm_json_content: Option<String>,
+    pub(crate) lpm_json_override: Option<Vec<u8>>,
+    pub(crate) env_schema_snapshot: Option<Arc<lpm_env_source::SchemaSnapshot>>,
     pub(crate) pkg_json: serde_json::Value,
     pub(crate) name: String,
     pub(crate) version: String,
@@ -256,7 +258,40 @@ pub(crate) fn read_publish_manifest_from_source(
     )?;
     let lpm_config = lpm_json_content
         .as_deref()
-        .map(|content| lpm_json::parse_lpm_json(content).map_err(LpmError::Registry))
+        .map(|content| {
+            lpm_json::parse_lpm_json_with_root(Arc::clone(&package_json_parent), content)
+                .map_err(LpmError::Registry)
+        })
+        .transpose()?;
+    let env_schema_snapshot = lpm_config
+        .as_ref()
+        .and_then(|config| config.env_schema_resolution.clone());
+    let lpm_json_override = lpm_config
+        .as_ref()
+        .filter(|config| {
+            config
+                .env_schema_source
+                .as_ref()
+                .is_some_and(|source| source.requires_resolution())
+        })
+        .and_then(|config| config.env_schema.as_ref())
+        .map(|schema| {
+            let content = lpm_json_content
+                .as_deref()
+                .ok_or_else(|| LpmError::Registry("env.source_context".into()))?;
+            let mut root: std::collections::BTreeMap<String, Box<serde_json::value::RawValue>> =
+                serde_json::from_str(lpm_common::strip_utf8_bom_str(content))
+                    .map_err(|_| LpmError::Registry("env.invalid_definition".into()))?;
+            let effective = lpm_env_source::schema_json(schema)
+                .map_err(|error| LpmError::Registry(error.to_string()))?;
+            root.insert(
+                "envSchema".into(),
+                serde_json::from_slice(&effective)
+                    .map_err(|_| LpmError::Registry("env.invalid_definition".into()))?,
+            );
+            lpm_env_source::bounded_json(&root, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize)
+                .map_err(|error| LpmError::Registry(error.to_string()))
+        })
         .transpose()?;
     let publish_config = lpm_config.and_then(|c| c.publish);
     Ok(PublishManifest {
@@ -266,6 +301,8 @@ pub(crate) fn read_publish_manifest_from_source(
         package_json_content: content,
         package_json_override: None,
         lpm_json_content,
+        lpm_json_override,
+        env_schema_snapshot,
         pkg_json,
         name,
         version,
@@ -467,6 +504,8 @@ fn prepare_publish_project_from_manifest_with_hook(
         package_json_content,
         package_json_override,
         lpm_json_content,
+        lpm_json_override,
+        env_schema_snapshot,
         mut pkg_json,
         name,
         version,
@@ -520,10 +559,13 @@ fn prepare_publish_project_from_manifest_with_hook(
             include_if_missing: true,
         });
     }
-    if let Some(content) = lpm_json_content.as_ref() {
+    if let Some(content) = lpm_json_override
+        .as_deref()
+        .or(lpm_json_content.as_deref().map(str::as_bytes))
+    {
         content_overrides.push(publish_common::PublishContentOverride {
             path: "lpm.json",
-            content: content.as_bytes(),
+            content,
             include_if_missing: true,
         });
     }
@@ -550,6 +592,11 @@ fn prepare_publish_project_from_manifest_with_hook(
         lpm_json_content.as_deref().map(str::as_bytes),
         &mut compare_scratch,
     )?;
+    if let Some(snapshot) = &env_schema_snapshot {
+        snapshot
+            .verify_dependencies()
+            .map_err(|error| LpmError::Registry(error.to_string()))?;
+    }
     let prepared_tarball = publish_common::prepare_tarball_from_source_root(
         &pkg_json,
         publish_common::TarballOptions {
@@ -563,6 +610,11 @@ fn prepare_publish_project_from_manifest_with_hook(
         &package_json_parent,
         &project_root,
     )?;
+    if let Some(snapshot) = &env_schema_snapshot {
+        snapshot
+            .verify_dependencies()
+            .map_err(|error| LpmError::Registry(error.to_string()))?;
+    }
     let tarball_data = std::sync::Arc::new(prepared_tarball.data);
     let tarball_hashes = std::sync::Arc::new(prepared_tarball.hashes);
     let tarball_size = tarball_data.len();
@@ -1184,6 +1236,73 @@ mod tests {
         )
         .unwrap();
         std::fs::write(project.join("index.js"), "module.exports = {};").unwrap();
+    }
+
+    #[test]
+    fn publish_flattens_filtered_schema_imports_without_changing_author_files_or_numbers() {
+        use std::io::Read as _;
+        let project = tempfile::tempdir().unwrap();
+        write_publish_fixture(project.path(), &["index.js", "lpm.json"]);
+        let original = r#"{"custom":{"number":1e400},"envSchema":{"extends":["base.json"],"overrides":{"VALUE":{"format":"integer","default":"5"}}}}"#;
+        std::fs::write(project.path().join("lpm.json"), original).unwrap();
+        let fragment = r#"{"vars":{"VALUE":{"format":"integer","default":"4"}}}"#;
+        std::fs::write(project.path().join("base.json"), fragment).unwrap();
+        let prepared = prepare_publish_project(project.path(), false).unwrap();
+        let decoder = flate2::read::GzDecoder::new(prepared.tarball_data.as_slice());
+        let mut archive = tar::Archive::new(decoder);
+        let mut packaged = None;
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            assert_ne!(entry.path().unwrap(), Path::new("package/base.json"));
+            if entry.path().unwrap() == Path::new("package/lpm.json") {
+                let mut content = String::new();
+                entry.read_to_string(&mut content).unwrap();
+                packaged = Some(content);
+            }
+        }
+        let packaged = packaged.unwrap();
+        let fields: std::collections::BTreeMap<String, Box<serde_json::value::RawValue>> =
+            serde_json::from_str(&packaged).unwrap();
+        assert_eq!(fields["custom"].get(), r#"{"number":1e400}"#);
+        let schema: lpm_env::EnvSchema = serde_json::from_str(fields["envSchema"].get()).unwrap();
+        assert_eq!(schema.vars["VALUE"].default.as_deref(), Some("5"));
+        assert!(!fields["envSchema"].get().contains("extends"));
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("lpm.json")).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("base.json")).unwrap(),
+            fragment
+        );
+    }
+
+    #[test]
+    fn publish_rejects_schema_fragments_replaced_after_resolution() {
+        let project = tempfile::tempdir().unwrap();
+        write_publish_fixture(project.path(), &["index.js", "lpm.json"]);
+        std::fs::write(
+            project.path().join("lpm.json"),
+            r#"{"envSchema":{"extends":["base.json"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(project.path().join("base.json"), r#"{"vars":{"VALUE":{}}}"#).unwrap();
+        let manifest = read_publish_manifest(project.path()).unwrap();
+        let error =
+            prepare_publish_project_from_manifest_with_hook(manifest, None, None, false, || {
+                std::fs::write(
+                    project.path().join("base.json"),
+                    r#"{"vars":{"REPLACED":{}}}"#,
+                )
+                .unwrap();
+            })
+            .err()
+            .expect("a changed fragment must invalidate the archive")
+            .to_string();
+        assert!(
+            error.contains("env.source_changed") && error.contains("base.json"),
+            "{error}"
+        );
     }
 
     #[test]

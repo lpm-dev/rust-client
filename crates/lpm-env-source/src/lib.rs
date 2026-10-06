@@ -1,0 +1,379 @@
+//! Project-contained schema composition with immutable dependency snapshots.
+
+mod graph;
+mod read;
+
+use lpm_env::{EnvSchema, EnvSchemaDefinition, ValidationErrorKind};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
+
+pub const RESOLVER_VERSION: &str = "lpm-env-source-v1";
+pub const MAX_SCHEMA_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_NODES: usize = 64;
+pub const MAX_EDGES: usize = 256;
+pub const MAX_DEPTH: usize = 16;
+pub const MAX_MERGE_VISITS: usize = 65_536;
+
+/// Diagnostics contain static codes and source locations, never value literals.
+#[derive(Debug, Clone, Serialize)]
+pub struct SchemaDiagnostic {
+    pub code: &'static str,
+    pub phase: &'static str,
+    pub source: String,
+    pub pointer: String,
+    pub key: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceError {
+    pub diagnostic: Box<SchemaDiagnostic>,
+    pub requested_paths: Vec<String>,
+}
+
+impl std::fmt::Display for SourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} at {}{}",
+            self.diagnostic.code,
+            DiagnosticText(&self.diagnostic.source),
+            DiagnosticText(&self.diagnostic.pointer)
+        )
+    }
+}
+
+struct DiagnosticText<'a>(&'a str);
+impl std::fmt::Display for DiagnosticText<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for c in self.0.chars() {
+            if c.is_control()
+                || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            {
+                write!(f, "{}", c.escape_unicode())?;
+            } else {
+                write!(f, "{c}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for SourceError {}
+
+impl SourceError {
+    pub fn new(code: &'static str, phase: &'static str, source: &str, pointer: &str) -> Self {
+        Self {
+            diagnostic: Box::new(SchemaDiagnostic {
+                code,
+                phase,
+                source: source.into(),
+                pointer: if source == "lpm.json"
+                    && !pointer.is_empty()
+                    && !pointer.starts_with("/envSchema")
+                {
+                    format!("/envSchema{pointer}")
+                } else {
+                    pointer.into()
+                },
+                key: None,
+            }),
+            requested_paths: Vec::new(),
+        }
+    }
+}
+
+/// The immutable origin of one effective declaration.
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceLocation {
+    pub source: String,
+    pub pointer: String,
+}
+
+/// A dependency identity records the exact bytes consumed by the parser.
+#[derive(Debug, Clone, Serialize)]
+pub struct SchemaDependency {
+    pub path: String,
+    pub digest: [u8; 32],
+    pub bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct ResolutionStats {
+    pub nodes: usize,
+    pub edges: usize,
+    pub source_bytes: usize,
+    pub merge_visits: usize,
+}
+
+/// Effective declarations and provenance belong to the same retained root capability.
+#[derive(Debug)]
+pub struct SchemaSnapshot {
+    pub origins: BTreeMap<String, SourceLocation>,
+    pub group_origins: BTreeMap<String, SourceLocation>,
+    pub dependencies: Vec<SchemaDependency>,
+    pub fingerprint: [u8; 32],
+    pub root_digest: [u8; 32],
+    pub stats: ResolutionStats,
+    root: Arc<cap_std::fs::Dir>,
+    root_identity: same_file::Handle,
+    named_root: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct ResolvedSchema {
+    pub schema: EnvSchema,
+    pub snapshot: Arc<SchemaSnapshot>,
+}
+
+impl std::ops::Deref for ResolvedSchema {
+    type Target = SchemaSnapshot;
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+impl SchemaSnapshot {
+    pub fn matches_root_content(&self, bytes: &[u8]) -> bool {
+        digest(bytes) == self.root_digest
+    }
+    /// Reopen every dependency from the retained directory to detect atomic replacements.
+    pub fn verify_dependencies(&self) -> Result<(), SourceError> {
+        if let Some(path) = &self.named_root {
+            let directory = cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())
+                .map_err(|_| {
+                    SourceError::new("env.source_changed", "freshness", "lpm.json", "/envSchema")
+                })?;
+            let identity =
+                same_file::Handle::from_file(directory.into_std_file()).map_err(|_| {
+                    SourceError::new("env.source_changed", "freshness", "lpm.json", "/envSchema")
+                })?;
+            if identity != self.root_identity {
+                return Err(SourceError::new(
+                    "env.source_changed",
+                    "freshness",
+                    "lpm.json",
+                    "/envSchema",
+                ));
+            }
+        }
+        let mut scratch = [0u8; 16 * 1024];
+        for dependency in &self.dependencies {
+            let unchanged =
+                read::verify_fragment(&self.root, dependency, &mut scratch).map_err(|_| {
+                    SourceError::new("env.source_changed", "freshness", &dependency.path, "")
+                })?;
+            if !unchanged {
+                return Err(SourceError::new(
+                    "env.source_changed",
+                    "freshness",
+                    &dependency.path,
+                    "",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn resolve_schema(
+    project_dir: &Path,
+    root_content: &[u8],
+    definition: EnvSchemaDefinition,
+) -> Result<ResolvedSchema, SourceError> {
+    resolve_schema_input(
+        project_dir,
+        root_content,
+        std::borrow::Cow::Owned(definition),
+    )
+}
+
+/// Bound an authored definition before copying it into the effective graph.
+pub fn resolve_schema_borrowed(
+    project_dir: &Path,
+    root_content: &[u8],
+    definition: &EnvSchemaDefinition,
+) -> Result<ResolvedSchema, SourceError> {
+    resolve_schema_input(
+        project_dir,
+        root_content,
+        std::borrow::Cow::Borrowed(definition),
+    )
+}
+
+fn resolve_schema_input(
+    project_dir: &Path,
+    root_content: &[u8],
+    definition: std::borrow::Cow<'_, EnvSchemaDefinition>,
+) -> Result<ResolvedSchema, SourceError> {
+    let named_root = std::path::absolute(project_dir).map_err(|_| {
+        SourceError::new(
+            "env.project_unavailable",
+            "resolve",
+            "lpm.json",
+            "/envSchema",
+        )
+    })?;
+    let root = cap_std::fs::Dir::open_ambient_dir(&named_root, cap_std::ambient_authority())
+        .map_err(|_| {
+            SourceError::new(
+                "env.project_unavailable",
+                "resolve",
+                "lpm.json",
+                "/envSchema",
+            )
+        })?;
+    graph::resolve(Arc::new(root), root_content, definition, Some(named_root))
+}
+
+/// Resolve through the caller's existing root capability.
+pub fn resolve_schema_in(
+    root: Arc<cap_std::fs::Dir>,
+    root_content: &[u8],
+    definition: EnvSchemaDefinition,
+) -> Result<ResolvedSchema, SourceError> {
+    if root_content.len() > 16 * 1024 * 1024 {
+        return Err(SourceError::new(
+            "env.source_budget",
+            "resolve",
+            "lpm.json",
+            "/envSchema",
+        ));
+    }
+    graph::resolve(
+        root,
+        root_content,
+        std::borrow::Cow::Owned(definition),
+        None,
+    )
+}
+
+/// Borrowed root definitions receive the same budget checks before copying.
+pub fn resolve_schema_in_borrowed(
+    root: Arc<cap_std::fs::Dir>,
+    root_content: &[u8],
+    definition: &EnvSchemaDefinition,
+) -> Result<ResolvedSchema, SourceError> {
+    graph::resolve(
+        root,
+        root_content,
+        std::borrow::Cow::Borrowed(definition),
+        None,
+    )
+}
+
+pub(crate) fn digest(content: &[u8]) -> [u8; 32] {
+    Sha256::digest(content).into()
+}
+
+pub fn declaration_code(kind: &ValidationErrorKind) -> &'static str {
+    match kind {
+        ValidationErrorKind::InvalidVariableName => "env.invalid_name",
+        ValidationErrorKind::InvalidPattern { .. } => "env.invalid_pattern",
+        ValidationErrorKind::InvalidRule { .. } => "env.invalid_rule",
+        ValidationErrorKind::Empty => "env.empty",
+        ValidationErrorKind::InvalidValue => "env.invalid_value",
+        ValidationErrorKind::Missing => "env.required",
+        ValidationErrorKind::InvalidFormat { .. } => "env.invalid_format",
+        ValidationErrorKind::PatternMismatch { .. } => "env.pattern_mismatch",
+        ValidationErrorKind::NotInEnum { .. } => "env.enum_mismatch",
+        ValidationErrorKind::ConstraintViolation { .. } => "env.constraint",
+        ValidationErrorKind::GroupViolation { .. } => "env.group",
+    }
+}
+
+/// Enforce output size while writing, before an unbounded allocation can occur.
+pub fn bounded_json<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, SourceError> {
+    struct Output {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+    impl std::io::Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+                return Err(std::io::Error::other("bounded JSON output exceeded"));
+            }
+            let needed = self.bytes.len() + bytes.len();
+            if needed > self.bytes.capacity() {
+                let capacity = needed
+                    .max(self.bytes.capacity().saturating_mul(2))
+                    .min(self.limit);
+                self.bytes.reserve_exact(capacity - self.bytes.len());
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut output = Output {
+        bytes: Vec::with_capacity(limit.min(4096)),
+        limit,
+    };
+    serde_json::to_writer(&mut output, value).map_err(|_| {
+        SourceError::new("env.output_budget", "serialize", "lpm.json", "/envSchema")
+    })?;
+    Ok(output.bytes)
+}
+
+#[cfg(test)]
+mod tests;
+
+/// Count bounded serialized bytes without retaining a throwaway output buffer.
+pub fn json_size<T: Serialize>(value: &T, limit: usize) -> Result<usize, SourceError> {
+    struct Counter {
+        length: usize,
+        limit: usize,
+    }
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.limit.saturating_sub(self.length) {
+                return Err(std::io::Error::other("bounded JSON output exceeded"));
+            }
+            self.length += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter { length: 0, limit };
+    serde_json::to_writer(&mut counter, value).map_err(|_| {
+        SourceError::new("env.output_budget", "serialize", "lpm.json", "/envSchema")
+    })?;
+    Ok(counter.length)
+}
+
+/// Stable map ordering for generated artifacts and flattened package manifests.
+pub fn schema_json(schema: &EnvSchema) -> Result<Vec<u8>, SourceError> {
+    bounded_json(&ordered_schema(schema), MAX_SCHEMA_BYTES)
+}
+
+/// Borrow schema payloads while ordering declarations for deterministic serialization.
+pub fn ordered_schema(schema: &EnvSchema) -> impl Serialize + '_ {
+    #[derive(Serialize)]
+    struct OrderedSchema<'a> {
+        vars: BTreeMap<&'a str, &'a lpm_env::EnvVarRule>,
+        #[serde(rename = "clientPrefixes", skip_serializing_if = "Vec::is_empty")]
+        client_prefixes: &'a Vec<String>,
+        #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+        groups: BTreeMap<&'a str, &'a lpm_env::VarGroup>,
+    }
+    OrderedSchema {
+        vars: schema
+            .vars
+            .iter()
+            .map(|(key, value)| (key.as_str(), value))
+            .collect(),
+        client_prefixes: &schema.client_prefixes,
+        groups: schema
+            .groups
+            .iter()
+            .map(|(key, value)| (key.as_str(), value))
+            .collect(),
+    }
+}

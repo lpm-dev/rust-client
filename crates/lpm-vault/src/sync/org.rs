@@ -722,6 +722,10 @@ async fn post_org_update(
         schema: request.metadata.and_then(|value| value.schema),
     };
 
+    if let Some(metadata) = request.metadata {
+        metadata.verify_sources()?;
+    }
+
     let result = match send_authenticated_sync_request(
         client
             .post(&url)
@@ -2024,6 +2028,7 @@ mod tests {
             let metadata = PushMetadata {
                 name: Some("acme-api"),
                 schema: Some(&schema),
+                before_write: None,
             };
 
             let result = push_org_with_keys(

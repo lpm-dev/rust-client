@@ -20,6 +20,7 @@
 //! ```
 
 mod constraints;
+mod definition;
 mod example;
 mod inheritance;
 mod object;
@@ -39,3 +40,5 @@ pub use schema::{
 };
 pub use scopes::{EnvStage, EvalContext, ScopeSelector, ScopedDefault};
 pub use validate::{EnvValidator, ValidationError, ValidationErrorKind, validate, validate_schema};
+
+pub use definition::{EnvSchemaDefinition, env_schema_preset};

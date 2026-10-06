@@ -5523,10 +5523,14 @@ struct TaskWatcher {
 
 impl TaskWatcher {
     fn start(project: &TempProject, task: &str, flags: &[&str]) -> Self {
+        Self::start_command(project, &["run", task, "--watch"], flags)
+    }
+
+    fn start_command(project: &TempProject, args: &[&str], flags: &[&str]) -> Self {
         project.write_file(".lpm/watch.log", "");
         let diagnostics = project.path().join(".lpm/watch.log");
         let mut command = lpm_spawnable(project);
-        command.args(["run", task, "--watch"]).args(flags);
+        command.args(args).args(flags);
         command.stdout(std::process::Stdio::null());
         command.stderr(std::fs::File::create(&diagnostics).unwrap());
         Self {
@@ -6136,4 +6140,113 @@ fn task_cache_invalidates_when_a_node_launcher_selects_a_different_helper() {
         assert_eq!(project.read_file("dist/out"), helper);
     }
     assert_eq!(project.read_file("executions"), "run\nrun\n");
+}
+
+#[test]
+#[test]
+fn imported_schema_changes_invalidate_cache_with_empty_cache_env() {
+    let project = TempProject::empty(r#"{"name":"import-cache"}"#);
+    project.write_file("lpm.json", r#"{"tasks":{"build":{"command":"node record.cjs","cache":true,"cacheEnv":[],"inputs":["src/**"],"outputs":["dist/**"]}},"envSchema":{"extends":["schemas/base.json"]}}"#);
+    project.write_file("record.cjs", "const fs=require('node:fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/value',process.env.IMPORTED_VALUE);fs.appendFileSync('.lpm/executions','run\\n');");
+    project.write_file("src/input", "fixture");
+    project.write_file(".lpm/executions", "");
+    project.write_file(
+        "schemas/base.json",
+        r#"{"vars":{"IMPORTED_VALUE":{"default":"first"}}}"#,
+    );
+    for _ in 0..2 {
+        let output = lpm(&project).args(["run", "build"]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(project.path().join(".lpm/executions")).unwrap(),
+        "run\n"
+    );
+    project.write_file(
+        "schemas/base.json",
+        r#"{"vars":{"IMPORTED_VALUE":{"default":"second"}}}"#,
+    );
+    let output = lpm(&project).args(["run", "build"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("dist/value")).unwrap(),
+        "second"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join(".lpm/executions")).unwrap(),
+        "run\nrun\n"
+    );
+}
+
+#[test]
+fn watch_repairs_missing_literal_imports_and_reloads_after_directory_replacement() {
+    let project = TempProject::empty(r#"{"name":"import-watch"}"#);
+    project.write_file("lpm.json", r#"{"tasks":{"build":{"command":"node record.cjs","inputs":["src/**"],"outputs":["schemas/**"]}},"envSchema":{"extends":["schemas/literal[1].json"]}}"#);
+    project.write_file(
+        "record.cjs",
+        "require('node:fs').writeFileSync('.lpm/value',process.env.IMPORTED_VALUE);",
+    );
+    project.write_file("src/input", "fixture");
+    project.write_file_and_sync(
+        "schemas/literal[1].json",
+        r#"{"vars":{"IMPORTED_VALUE":{"default":"first"}}}"#,
+    );
+    let mut watcher = TaskWatcher::start(&project, "build", &["--no-cache"]);
+    let value = || std::fs::read_to_string(project.path().join(".lpm/value")).unwrap_or_default();
+    watcher.wait_until(|| value() == "first");
+    std::fs::rename(
+        project.path().join("schemas"),
+        project.path().join("previous"),
+    )
+    .unwrap();
+    let diagnostics = watcher.diagnostics.clone();
+    watcher.wait_until(|| {
+        std::fs::read_to_string(&diagnostics)
+            .unwrap_or_default()
+            .contains("env.import_unreadable")
+    });
+    project.write_file_and_sync(
+        "schemas/literal[1].json",
+        r#"{"vars":{"IMPORTED_VALUE":{"default":"second"}}}"#,
+    );
+    watcher.wait_until(|| value() == "second");
+    project.write_file_and_sync(
+        "schemas/literal[1].json",
+        r#"{"vars":{"IMPORTED_VALUE":{"default":"third"}}}"#,
+    );
+    watcher.wait_until(|| value() == "third");
+}
+
+#[test]
+fn direct_file_watch_reloads_imported_schema_outside_script_inputs() {
+    let project = TempProject::empty(r#"{"name":"file-import-watch"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"envSchema":{"extends":["schemas/base.json"]}}"#,
+    );
+    project.write_file(
+        "record.cjs",
+        "require('node:fs').writeFileSync('.lpm/value',process.env.IMPORTED_VALUE);",
+    );
+    project.write_file_and_sync(
+        "schemas/base.json",
+        r#"{"vars":{"IMPORTED_VALUE":{"default":"first"}}}"#,
+    );
+    let mut watcher = TaskWatcher::start_command(&project, &["record.cjs", "--watch"], &[]);
+    let value = || std::fs::read_to_string(project.path().join(".lpm/value")).unwrap_or_default();
+    watcher.wait_until(|| value() == "first");
+    project.write_file_and_sync(
+        "schemas/base.json",
+        r#"{"vars":{"IMPORTED_VALUE":{"default":"second"}}}"#,
+    );
+    watcher.wait_until(|| value() == "second");
+
 }

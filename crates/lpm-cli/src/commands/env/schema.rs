@@ -1,5 +1,45 @@
 use super::prelude::*;
 
+pub(super) fn schema_definition(
+    project_dir: &std::path::Path,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    match lpm_runner::lpm_json::resolve_schema_definition(project_dir) {
+        Ok(resolved) => {
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "command":"env.schema", "success":true,
+                        "context":{"kind":"definition"}, "variables":resolved.schema.len(),
+                        "origins":resolved.origins, "groupOrigins":resolved.group_origins,
+                        "dependencies":resolved.dependencies.iter().map(|dependency| &dependency.path).collect::<Vec<_>>(),
+                        "fingerprint":hex::encode(resolved.fingerprint), "diagnostics":[],
+                    })
+                );
+            } else {
+                install_ui::done_line(crate::install_ui::terminal_line!(
+                    "envSchema is valid ({} variables, {} imported files)",
+                    resolved.schema.len(),
+                    resolved.dependencies.len()
+                ));
+            }
+            Ok(())
+        }
+        Err(error) => {
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::json!({"command":"env.schema", "success":false, "context":{"kind":"definition"}, "diagnostics":[error.diagnostic]})
+                );
+                Err(LpmError::ExitCode(1))
+            } else {
+                Err(LpmError::EnvValidation(error.to_string()))
+            }
+        }
+    }
+}
+
 pub(super) fn vars_example(
     project_dir: &std::path::Path,
     env_input: Option<&str>,

@@ -98,7 +98,14 @@ pub struct LpmJsonConfig {
     /// Defines required vars, formats, patterns, defaults, and secrets.
     /// e.g., `{"envSchema": {"vars": {"DATABASE_URL": {"required": true, "format": "url"}}}}`
     #[serde(default, rename = "envSchema")]
+    pub env_schema_source: Option<lpm_env::EnvSchemaDefinition>,
+    /// Validated effective rules. Authored imports remain in env_schema_source.
+    #[serde(skip)]
+    #[schemars(skip)]
     pub env_schema: Option<EnvSchema>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub env_schema_resolution: Option<std::sync::Arc<lpm_env_source::SchemaSnapshot>>,
 
     /// Named environment definitions with inheritance.
     /// e.g., `{"environments": {"staging": {"extends": "base", "file": ".env.staging"}}}`
@@ -818,11 +825,96 @@ pub fn read_lpm_json(project_dir: &Path) -> Result<Option<LpmJsonConfig>, String
         Err(error) => return Err(format!("failed to read lpm.json: {error}")),
     };
 
-    parse_lpm_json(&content).map(Some)
+    parse_lpm_json_in(project_dir, &content).map(Some)
+}
+
+/// Watch repair paths even when a newly imported fragment is missing or invalid.
+pub fn schema_watch_paths(project_dir: &Path) -> Vec<String> {
+    #[derive(serde::Deserialize)]
+    struct Projection {
+        #[serde(rename = "envSchema")]
+        schema: Option<lpm_env::EnvSchemaDefinition>,
+    }
+    let Ok(content) =
+        read_text_file_capped(&project_dir.join("lpm.json"), CONFIG_FILE_SIZE_CAP_BYTES)
+    else {
+        return Vec::new();
+    };
+    let Ok(Projection {
+        schema: Some(definition),
+    }) = serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
+    else {
+        return Vec::new();
+    };
+    match lpm_env_source::resolve_schema(project_dir, content.as_bytes(), definition) {
+        Ok(resolved) => resolved
+            .dependencies
+            .iter()
+            .map(|dependency| dependency.path.clone())
+            .collect(),
+        Err(error) => error.requested_paths,
+    }
 }
 
 /// Parse and validate an `lpm.json` document that was read by the caller.
 pub fn parse_lpm_json(content: &str) -> Result<LpmJsonConfig, String> {
+    parse_lpm_json_inner(content, None, None)
+}
+
+/// Resolve authored imports relative to this project using the caller's immutable bytes.
+pub fn parse_lpm_json_in(project_dir: &Path, content: &str) -> Result<LpmJsonConfig, String> {
+    parse_lpm_json_inner(content, Some(project_dir), None)
+}
+
+/// Check only declarations and source freshness, without loading environment values.
+pub fn resolve_schema_definition(
+    project_dir: &Path,
+) -> Result<lpm_env_source::ResolvedSchema, lpm_env_source::SourceError> {
+    use lpm_env_source::SourceError;
+    #[derive(Deserialize)]
+    struct Projection {
+        #[serde(rename = "envSchema")]
+        schema: Option<lpm_env::EnvSchemaDefinition>,
+    }
+    let path = project_dir.join("lpm.json");
+    let content = read_text_file_capped(&path, CONFIG_FILE_SIZE_CAP_BYTES)
+        .map_err(|_| SourceError::new("env.root_unreadable", "read", "lpm.json", "/envSchema"))?;
+    let projection: Projection = serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
+        .map_err(|_| {
+            SourceError::new("env.invalid_definition", "parse", "lpm.json", "/envSchema")
+        })?;
+    let definition = projection.schema.ok_or_else(|| {
+        SourceError::new("env.schema_missing", "definition", "lpm.json", "/envSchema")
+    })?;
+    let resolved = lpm_env_source::resolve_schema(project_dir, content.as_bytes(), definition)?;
+    let current = read_text_file_capped(&path, CONFIG_FILE_SIZE_CAP_BYTES).map_err(|_| {
+        SourceError::new("env.source_changed", "freshness", "lpm.json", "/envSchema")
+    })?;
+    if !resolved.matches_root_content(current.as_bytes()) {
+        return Err(SourceError::new(
+            "env.source_changed",
+            "freshness",
+            "lpm.json",
+            "/envSchema",
+        ));
+    }
+    resolved.verify_dependencies()?;
+    Ok(resolved)
+}
+
+/// Resolve through a root already opened by the caller's transaction.
+pub fn parse_lpm_json_with_root(
+    root: std::sync::Arc<cap_std::fs::Dir>,
+    content: &str,
+) -> Result<LpmJsonConfig, String> {
+    parse_lpm_json_inner(content, None, Some(root))
+}
+
+fn parse_lpm_json_inner(
+    content: &str,
+    project_dir: Option<&Path>,
+    root: Option<std::sync::Arc<cap_std::fs::Dir>>,
+) -> Result<LpmJsonConfig, String> {
     let mut deserializer =
         serde_json::Deserializer::from_str(lpm_common::strip_utf8_bom_str(content));
     let mut config: LpmJsonConfig = serde_path_to_error::deserialize(&mut deserializer)
@@ -843,7 +935,33 @@ pub fn parse_lpm_json(content: &str) -> Result<LpmJsonConfig, String> {
         .end()
         .map_err(|error| format!("failed to parse lpm.json: {error}"))?;
 
-    if let Some(schema) = &config.env_schema {
+    if let Some(definition) = &config.env_schema_source {
+        if project_dir.is_some() || root.is_some() {
+            let resolved = match root {
+                Some(root) => {
+                    lpm_env_source::resolve_schema_in_borrowed(root, content.as_bytes(), definition)
+                }
+                None => lpm_env_source::resolve_schema_borrowed(
+                    project_dir.ok_or("env.source_context")?,
+                    content.as_bytes(),
+                    definition,
+                ),
+            }
+            .map_err(|error| error.to_string())?;
+            config.env_schema = Some(resolved.schema);
+            config.env_schema_resolution = Some(resolved.snapshot);
+        } else {
+            if definition.requires_resolution() {
+                return Err(
+                    "env.source_context: composed envSchema requires a project directory".into(),
+                );
+            }
+            config.env_schema = Some(definition.local_schema());
+        }
+    }
+    if config.env_schema_resolution.is_none()
+        && let Some(schema) = &config.env_schema
+    {
         let errors = lpm_env::validate_schema(schema);
         if !errors.is_empty() {
             return Err(errors
@@ -1124,7 +1242,7 @@ mod tests {
             );
         }
         assert_eq!(
-            schema["$defs"]["EnvSchema"]["properties"]["vars"]["propertyNames"]["pattern"],
+            schema["$defs"]["EnvSchemaDefinition"]["properties"]["vars"]["propertyNames"]["pattern"],
             "^[A-Za-z_][A-Za-z0-9_]{0,255}$"
         );
     }

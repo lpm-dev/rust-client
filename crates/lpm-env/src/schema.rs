@@ -308,7 +308,7 @@ pub enum VarGroupMode {
     AtLeastOne,
 }
 
-fn deserialize_unique_groups<'de, D: Deserializer<'de>>(
+pub(crate) fn deserialize_unique_groups<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<HashMap<String, VarGroup>, D::Error> {
     struct Groups;
@@ -418,7 +418,7 @@ pub enum EmptyPolicy {
     Reject,
 }
 
-fn deserialize_client_prefixes<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+pub(crate) fn deserialize_client_prefixes<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -447,7 +447,9 @@ where
     deserializer.deserialize_seq(Prefixes)
 }
 
-fn deserialize_unique_vars<'de, D>(deserializer: D) -> Result<HashMap<String, EnvVarRule>, D::Error>
+pub(crate) fn deserialize_unique_vars<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, EnvVarRule>, D::Error>
 where
     D: Deserializer<'de>,
 {

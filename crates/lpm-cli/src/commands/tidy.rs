@@ -1006,7 +1006,7 @@ fn read_tidy_lpm_json(
         Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    lpm_runner::lpm_json::parse_lpm_json(lpm_common::strip_utf8_bom_str(&content))
+    lpm_runner::lpm_json::parse_lpm_json_in(project_dir, lpm_common::strip_utf8_bom_str(&content))
         .map(Some)
         .map_err(LpmError::Script)
 }

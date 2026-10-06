@@ -90,6 +90,7 @@ impl From<LpmError> for GitHubMutationFailure {
 }
 
 pub(super) struct GitHubActionsClient {
+    pub(super) source_check: Option<super::PlatformSourceCheck>,
     http: reqwest::Client,
     api_url: String,
     authorization: HeaderValue,
@@ -117,6 +118,7 @@ impl GitHubActionsClient {
                 LpmError::Network(format!("failed to build GitHub Actions client: {error}"))
             })?;
         Ok(Self {
+            source_check: None,
             http,
             api_url: github_api_url()?,
             authorization,
@@ -631,6 +633,12 @@ impl GitHubActionsClient {
         operation: &str,
         request: reqwest::RequestBuilder,
     ) -> Result<(), GitHubMutationFailure> {
+        super::check_platform_sources(&self.source_check).map_err(|error| {
+            GitHubMutationFailure {
+                error,
+                ambiguous: false,
+            }
+        })?;
         let response = request
             .send()
             .await

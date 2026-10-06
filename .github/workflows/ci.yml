@@ -66,6 +66,9 @@ jobs:
       - name: Test macOS Keychain search-list helper
         run: bash scripts/ci/test-macos-keychain-search-list.sh
 
+      - name: Test immutable env engine exporter
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
       - name: Install Linux keyring build deps
         run: bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev
 

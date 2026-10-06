@@ -1,0 +1,20 @@
+---
+source: tests/workflows/tests/env_local.rs
+expression: value
+---
+{
+  "command": "env.schema",
+  "success": false,
+  "context": {
+    "kind": "definition"
+  },
+  "diagnostics": [
+    {
+      "code": "env.invalid_pattern",
+      "phase": "definition",
+      "source": "base.json",
+      "pointer": "/vars/VALUE",
+      "key": "VALUE"
+    }
+  ]
+}
