@@ -1811,6 +1811,20 @@ fn resolve_env_name(
     Ok(Some(resolved.canonical))
 }
 
+fn resolve_platform_environment(
+    config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+    explicit: Option<&str>,
+    linked: Option<&str>,
+) -> Result<lpm_env::ResolvedEnv, LpmError> {
+    match (explicit, linked) {
+        (Some(input), _) => lpm_runner::dotenv::resolve_project_environment(Some(input), config),
+        (None, Some(canonical)) => {
+            lpm_runner::dotenv::resolve_stored_project_environment(canonical, config)
+        }
+        (None, None) => lpm_runner::dotenv::resolve_project_environment(None, config),
+    }
+}
+
 fn parse_targets(value: Option<&str>) -> Result<Option<Vec<String>>, LpmError> {
     let Some(value) = value else {
         return Ok(None);
@@ -2147,12 +2161,19 @@ pub(super) async fn vars_platform_push(
     let connection_id = connection.id.clone();
     let client = PlatformClient::from_connection(&connection)?;
     let display_name = client.display_name();
-    let requested_env = parse_flag(args, "--env").or(client.linked_env());
-    let resolved_env = resolve_env_name(project_dir, requested_env)?;
-    let local = std::sync::Arc::new(lpm_runner::dotenv::load_project_env(
-        project_dir,
-        resolved_env.as_deref(),
-    )?);
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    let resolved_env = resolve_platform_environment(
+        config.as_ref(),
+        parse_flag(args, "--env"),
+        client.linked_env(),
+    )?;
+    let local = std::sync::Arc::new(
+        lpm_runner::dotenv::load_project_env_for_resolved_with_config(
+            project_dir,
+            &resolved_env,
+            config.as_ref(),
+        )?,
+    );
     let local = client.prepare_local(project_dir, local)?;
 
     if !json_output {
@@ -2287,7 +2308,7 @@ pub(super) async fn vars_platform_push(
         }
     }
 
-    let env_name = resolved_env.as_deref().unwrap_or("default");
+    let env_name = resolved_env.canonical.as_str();
     let result = match client.apply(&diff, &local, &remote, clean).await {
         Ok(result) => result,
         Err(error) => {
@@ -2437,6 +2458,7 @@ pub(super) async fn vars_platform_status(
         Ready(Box<ReadyWork>),
     }
 
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
     let mut prepared = Vec::with_capacity(connections.len());
     let mut local_cache = HashMap::new();
     for connection in connections {
@@ -2456,9 +2478,15 @@ pub(super) async fn vars_platform_status(
             }
         };
         let env_name = client.linked_env().unwrap_or("default").to_owned();
-        let loaded_local = match cached_status_environment(&mut local_cache, &env_name, |mode| {
-            lpm_runner::dotenv::load_project_env(project_dir, mode)
-                .map_err(|error| error.to_string())
+        let loaded_local = match cached_status_environment(&mut local_cache, &env_name, |_| {
+            let resolved = resolve_platform_environment(config.as_ref(), None, client.linked_env())
+                .map_err(|error| error.to_string())?;
+            lpm_runner::dotenv::load_project_env_for_resolved_with_config(
+                project_dir,
+                &resolved,
+                config.as_ref(),
+            )
+            .map_err(|error| error.to_string())
         }) {
             Ok(local) => local,
             Err(error) => {
@@ -2658,9 +2686,13 @@ pub(super) async fn vars_platform_pull(
     let connection_id = connection.id.clone();
     let client = PlatformClient::from_connection(&connection)?;
     let display_name = client.display_name();
-    let requested_env = parse_flag(args, "--env").or(client.linked_env());
-    let resolved_env = resolve_env_name(project_dir, requested_env)?;
-    let env_name = resolved_env.as_deref().unwrap_or("default");
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    let resolved_env = resolve_platform_environment(
+        config.as_ref(),
+        parse_flag(args, "--env"),
+        client.linked_env(),
+    )?;
+    let env_name = resolved_env.canonical.as_str();
     if !json_output {
         output::info(&format!(
             "pulling env values directly from {display_name}..."
