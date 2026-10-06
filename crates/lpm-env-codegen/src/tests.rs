@@ -346,6 +346,18 @@ fn generated_urls_reject_repaired_schemes_and_normalized_file_drives() {
 }
 
 #[test]
+fn generated_url_authorities_match_native_uri_character_rules() {
+    let schema = schema(json!({"vars":{"VALUE":{"format":"url"}}}));
+    let mut inputs = Vec::with_capacity(95 * 3);
+    for scheme in ["https", "custom", "file"] {
+        for byte in 32u8..=126 {
+            inputs.push(json!({"VALUE":format!("{scheme}://exa{}mple.com/path",char::from(byte))}));
+        }
+    }
+    assert_parity(&schema, &inputs, EvalContext::default());
+}
+
+#[test]
 fn framework_server_reads_include_static_public_values_and_private_runtime_values() {
     for (adapter, prefix, expression) in [
         (Adapter::Nextjs, "NEXT_PUBLIC_", "process.env."),
