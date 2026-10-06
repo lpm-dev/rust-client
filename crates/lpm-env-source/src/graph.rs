@@ -355,6 +355,9 @@ impl Graph {
                 origin.map_or("lpm.json", |o| o.source.as_str()),
                 origin.map_or("/envSchema", |o| o.pointer.as_str()),
             );
+            if let lpm_env::ValidationErrorKind::InvalidRule { message } = error.kind {
+                failure.diagnostic.message = Some(message);
+            }
             if lpm_env::is_valid_env_var_name(&error.key) && error.key.len() <= 256 {
                 failure.diagnostic.key = Some(error.key);
             }
@@ -462,12 +465,14 @@ fn apply<T>(
     override_keys.sort_unstable();
     for key in override_keys {
         if !target.contains_key(key) {
-            return Err(SourceError::new(
+            let mut error = SourceError::new(
                 "env.override_missing",
                 "resolve",
                 source,
                 &pointer(source, override_field, key),
-            ));
+            );
+            error.diagnostic.key = Some(key.clone());
+            return Err(error);
         }
         if local.contains_key(key) {
             return Err(conflict_error(
@@ -503,12 +508,14 @@ fn apply<T>(
     }
     for (key, value) in overrides {
         if !target.contains_key(&key) {
-            return Err(SourceError::new(
+            let mut error = SourceError::new(
                 "env.override_missing",
                 "resolve",
                 source,
                 &pointer(source, override_field, &key),
-            ));
+            );
+            error.diagnostic.key = Some(key.clone());
+            return Err(error);
         }
         // An override is a replacement, never a partial merge of security policy.
         conflicts.remove(&key);
