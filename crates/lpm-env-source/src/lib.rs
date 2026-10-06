@@ -134,6 +134,8 @@ pub struct ResolutionStats {
 pub struct SchemaSnapshot {
     pub origins: BTreeMap<String, SourceLocation>,
     pub group_origins: BTreeMap<String, SourceLocation>,
+    /// Original declaration locations for variables replaced by overrides.
+    pub declaring_origins: BTreeMap<String, SourceLocation>,
     pub dependencies: Vec<SchemaDependency>,
     pub fingerprint: [u8; 32],
     pub root_digest: [u8; 32],

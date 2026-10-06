@@ -118,6 +118,8 @@ pub unsafe extern "C" fn lpm_env_resolve(
                     origins: &'a std::collections::BTreeMap<String, lpm_env_source::SourceLocation>,
                     group_origins:
                         &'a std::collections::BTreeMap<String, lpm_env_source::SourceLocation>,
+                    declaring_origins:
+                        &'a std::collections::BTreeMap<String, lpm_env_source::SourceLocation>,
                     dependencies: &'a [lpm_env_source::SchemaDependency],
                     fingerprint: String,
                 }
@@ -127,6 +129,7 @@ pub unsafe extern "C" fn lpm_env_resolve(
                     effective,
                     origins: &resolved.origins,
                     group_origins: &resolved.group_origins,
+                    declaring_origins: &resolved.declaring_origins,
                     dependencies: &resolved.dependencies,
                     fingerprint: hex::encode(resolved.fingerprint),
                 };
@@ -137,6 +140,7 @@ pub unsafe extern "C" fn lpm_env_resolve(
                         };
                         snapshot.origins.clear();
                         snapshot.group_origins.clear();
+                        snapshot.declaring_origins.clear();
                         result(0, bytes, Some(resolved.snapshot))
                     }
                     Err(_) => failure(4, "env.output_budget"),
@@ -278,10 +282,41 @@ mod tests {
             let retained = &*result.snapshot.cast::<Arc<SchemaSnapshot>>();
             assert!(retained.origins.is_empty());
             assert!(retained.group_origins.is_empty());
+            assert!(retained.declaring_origins.is_empty());
             lpm_env_clear_output(&mut result);
             lpm_env_release(result);
         }
     }
+    #[test]
+    fn overrides_preserve_declaring_origins_across_resolved_import_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        for (file, rule) in [("base.json", "{}"), ("other.json", r#"{"required":true}"#)] {
+            std::fs::write(
+                dir.path().join(file),
+                format!(r#"{{"vars":{{"INHERITED":{rule}}}}}"#),
+            )
+            .unwrap();
+        }
+        let input = br#"{"extends":["base.json","other.json"],"vars":{"LOCAL":{}},"overrides":{"INHERITED":{}}}"#;
+        let result = resolve(input, dir.path().to_str().unwrap());
+        assert_eq!(result.status, 0);
+        let actual = output(&result);
+        // SAFETY: This is the sole release of the returned result.
+        unsafe {
+            lpm_env_release(result);
+        }
+        assert_eq!(actual["origins"]["INHERITED"]["source"], "lpm.json");
+        assert_eq!(
+            actual["declaringOrigins"]["INHERITED"]["source"],
+            "base.json"
+        );
+        assert_eq!(
+            actual["declaringOrigins"]["INHERITED"]["pointer"],
+            "/vars/INHERITED"
+        );
+        assert!(actual["declaringOrigins"].get("LOCAL").is_none());
+    }
+
     #[test]
     fn native_abi_rejects_invalid_semantics_and_never_echoes_literals() {
         let dir = tempfile::tempdir().unwrap();

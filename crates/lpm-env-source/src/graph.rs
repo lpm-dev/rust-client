@@ -12,6 +12,7 @@ use std::sync::Arc;
 struct Declaration<T> {
     value: Arc<T>,
     origin: Arc<SourceLocation>,
+    declaring_origin: Arc<SourceLocation>,
 }
 
 impl<T: serde::Serialize> serde::Serialize for Declaration<T> {
@@ -25,6 +26,7 @@ impl<T> Clone for Declaration<T> {
         Self {
             value: Arc::clone(&self.value),
             origin: Arc::clone(&self.origin),
+            declaring_origin: Arc::clone(&self.declaring_origin),
         }
     }
 }
@@ -308,6 +310,14 @@ impl Graph {
             .iter()
             .map(|(key, declaration)| (key.clone(), (*declaration.origin).clone()))
             .collect();
+        let declaring_origins: BTreeMap<_, _> = node
+            .vars
+            .iter()
+            .filter(|(_, declaration)| {
+                !Arc::ptr_eq(&declaration.origin, &declaration.declaring_origin)
+            })
+            .map(|(key, declaration)| (key.clone(), (*declaration.declaring_origin).clone()))
+            .collect();
         let group_origins: BTreeMap<_, _> = node
             .groups
             .iter()
@@ -380,6 +390,7 @@ impl Graph {
             snapshot: Arc::new(SchemaSnapshot {
                 origins,
                 group_origins,
+                declaring_origins,
                 dependencies,
                 fingerprint: hash.finalize().into(),
                 root_digest,
@@ -544,12 +555,13 @@ fn apply<T>(
             key,
             Declaration {
                 value: Arc::new(value),
+                declaring_origin: Arc::clone(&origin),
                 origin,
             },
         );
     }
     for (key, value) in overrides {
-        if !target.contains_key(&key) {
+        let Some(existing) = target.get_mut(&key) else {
             let mut error = SourceError::new(
                 "env.override_missing",
                 "resolve",
@@ -558,20 +570,15 @@ fn apply<T>(
             );
             error.diagnostic.key = Some(key.clone());
             return Err(error);
-        }
+        };
         // An override is a replacement, never a partial merge of security policy.
         conflicts.remove(&key);
         let origin = Arc::new(SourceLocation {
             source: source.into(),
             pointer: pointer(source, override_field, &key),
         });
-        target.insert(
-            key,
-            Declaration {
-                value: Arc::new(value),
-                origin,
-            },
-        );
+        existing.value = Arc::new(value);
+        existing.origin = origin;
     }
     if let Some((key, origins)) = conflicts.first_key_value() {
         return Err(conflict_error(key, &origins[0], &origins[1]));
@@ -610,14 +617,16 @@ mod tests {
         let mut source = HashMap::with_capacity(4096);
         for index in 0..4096 {
             let key = format!("A{index:04}{}", "x".repeat(251));
+            let origin = Arc::new(SourceLocation {
+                source: "leaf.json".into(),
+                pointer: "/vars".into(),
+            });
             source.insert(
                 key,
                 Declaration {
                     value: Arc::new(EnvVarRule::default()),
-                    origin: Arc::new(SourceLocation {
-                        source: "leaf.json".into(),
-                        pointer: "/vars".into(),
-                    }),
+                    declaring_origin: Arc::clone(&origin),
+                    origin,
                 },
             );
         }

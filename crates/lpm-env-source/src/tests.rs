@@ -725,3 +725,22 @@ fn composed_public_prefix_errors_explain_client_visibility() {
     let error = resolve(&dir, serde_json::json!({"extends":["base.json"]})).unwrap_err();
     assert!(error.to_string().contains("client: true"), "{error}");
 }
+
+#[test]
+fn nested_overrides_retain_the_original_variable_declaration() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("base.json"), r#"{"vars":{"VALUE":{}}}"#).unwrap();
+    fs::write(
+        dir.path().join("middle.json"),
+        r#"{"extends":["base.json"],"overrides":{"VALUE":{"required":true}}}"#,
+    )
+    .unwrap();
+    let result = resolve(
+        &dir,
+        serde_json::json!({"extends":["middle.json"],"overrides":{"VALUE":{}}}),
+    )
+    .unwrap();
+    assert_eq!(result.origins["VALUE"].source, "lpm.json");
+    assert_eq!(result.declaring_origins["VALUE"].source, "base.json");
+    assert_eq!(result.declaring_origins["VALUE"].pointer, "/vars/VALUE");
+}
