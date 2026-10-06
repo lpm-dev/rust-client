@@ -463,4 +463,15 @@ mod tests {
             assert!(!line.starts_with("INJECTED="), "{line}");
         }
     }
+    #[test]
+    fn scoped_default_comments_cannot_inject_assignments_with_carriage_returns() {
+        let schema: EnvSchema = serde_json::from_str(r#"{"vars":{"VALUE":{"defaultsIn":[{"when":{"stage":["build"]},"value":"ok\rINJECTED=scoped"}]}}}"#).unwrap();
+        let output = generate(&schema);
+        assert!(
+            output
+                .replace('\r', "\n")
+                .lines()
+                .all(|line| !line.starts_with("INJECTED="))
+        );
+    }
 }

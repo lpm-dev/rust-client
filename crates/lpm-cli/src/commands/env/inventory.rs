@@ -386,7 +386,14 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
             if let Some(stored) = effective_vars {
                 lpm_runner::dotenv::merge_stored_project_env(&mut values, stored)?;
             }
-            let errors = validator.validate(&mut values);
+            let errors = lpm_runner::dotenv::evaluate_project_env(
+                &mut values,
+                Some(validator),
+                lpm_env::EvalContext {
+                    environment: &env.canonical,
+                    ..Default::default()
+                },
+            )?;
             let mut failed_variables = std::collections::HashSet::new();
             let mut failed_groups = std::collections::HashSet::new();
             for error in &errors {

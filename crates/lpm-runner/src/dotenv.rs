@@ -141,6 +141,45 @@ pub fn load_project_env_with_config_and_context(
     Ok(vars)
 }
 
+/// Load a previously resolved identity without interpreting its canonical name as an alias.
+pub fn load_project_env_for_resolved_with_config(
+    project_dir: &Path,
+    resolved: &lpm_env::ResolvedEnv,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<HashMap<String, String>, LpmError> {
+    let mut vars = load_project_env_unvalidated_for_resolved(project_dir, resolved, config)?;
+    let validator = config
+        .and_then(|config| config.env_schema.as_ref())
+        .map(lpm_env::EnvValidator::new);
+    validate_project_env_with_plan(
+        &mut vars,
+        validator.as_ref(),
+        lpm_env::EvalContext {
+            environment: &resolved.canonical,
+            ..Default::default()
+        },
+    )?;
+    Ok(vars)
+}
+
+/// Recover a stored canonical identity from configured inventory without alias resolution.
+pub fn resolve_stored_project_environment(
+    canonical: &str,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<lpm_env::ResolvedEnv, LpmError> {
+    lpm_env::resolver::validate_env_name(canonical).map_err(LpmError::EnvValidation)?;
+    let empty = HashMap::new();
+    let inventory = lpm_env::resolver::list_all_from_vault_names(
+        config.map_or(&empty, |config| &config.env),
+        config.and_then(|config| config.environments.as_ref()),
+        std::iter::empty(),
+    );
+    Ok(inventory
+        .into_iter()
+        .find(|environment| environment.canonical == canonical)
+        .unwrap_or_else(|| lpm_env::resolver::resolve(canonical, &empty, None)))
+}
+
 /// Check the trusted child PATH together with the final explicit overrides.
 pub(crate) fn validate_child_env(
     vars: &mut HashMap<String, String>,
@@ -179,6 +218,13 @@ pub fn merge_configured_service_env(
     config: Option<&lpm_json::LpmJsonConfig>,
     service: Option<&str>,
 ) -> Result<(), LpmError> {
+    if let (Some(name), Some(config)) = (service, config) {
+        if !config.services.is_empty() && !config.services.contains_key(name) {
+            return Err(LpmError::EnvValidation(format!(
+                "unknown service '{name}'; select a configured service"
+            )));
+        }
+    }
     if let Some(service) =
         service.and_then(|name| config.and_then(|config| config.services.get(name)))
     {
