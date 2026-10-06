@@ -466,7 +466,10 @@ pub(super) fn vars_validate(
     }
 }
 
-fn valid_variable_count(schema: &lpm_env::EnvSchema, errors: &[lpm_env::ValidationError]) -> usize {
+pub(super) fn valid_variable_count(
+    schema: &lpm_env::EnvSchema,
+    errors: &[lpm_env::ValidationError],
+) -> usize {
     let failed: std::collections::HashSet<&str> = errors
         .iter()
         .filter_map(|error| {
