@@ -6889,9 +6889,18 @@ async fn env_share_rejects_a_changed_manifest_principal_before_the_remote_write(
         .mount(mock.server())
         .await;
 
+    let acceptance = org_rotation_recipient_acceptance(&mock, &fingerprint);
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", &registry_url)
-        .args(["--json", "env", "share", "--org", ORG_ROTATION_SLUG])
+        .args([
+            "--json",
+            "env",
+            "share",
+            "--org",
+            ORG_ROTATION_SLUG,
+            "--accept-recipient-keys",
+            &acceptance,
+        ])
         .output()
         .expect("run organization share while its manifest binding changes");
 

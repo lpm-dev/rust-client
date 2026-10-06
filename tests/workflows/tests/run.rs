@@ -246,7 +246,11 @@ fn watch_exits_without_hooks_when_linked_env_retrieval_is_denied() {
             "invalid-encrypted-fixture",
         )
         .unwrap();
-        let mut watcher = TaskWatcher::start(&project, task, &["--no-bail"]);
+        let mut watcher = if task == "entry.js" {
+            TaskWatcher::start_command(&project, &[task, "--watch"], &[])
+        } else {
+            TaskWatcher::start(&project, task, &["--no-bail"])
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let status = loop {
             if let Some(status) = watcher.child.try_wait().unwrap() {
@@ -311,6 +315,36 @@ fn watch_rejects_upstream_dependencies_before_starting_tasks() {
             .unwrap()
             .is_some_and(|status| !status.success())
     );
+}
+
+#[test]
+fn watch_rejects_invalid_tasks_even_when_an_import_is_missing() {
+    for task in [
+        serde_json::json!({"command":"node build.js", "dependsOn":["^build"]}),
+        serde_json::json!({"command":"node build.js", "inputs":["["]}),
+    ] {
+        let project = TempProject::empty(r#"{"name":"watch-invalid-with-import"}"#);
+        project.write_file(
+            "lpm.json",
+            &serde_json::json!({"envSchema":{"extends":["missing.json"]},"tasks":{"build":task}})
+                .to_string(),
+        );
+        project.write_file("build.js", "require('fs').writeFileSync('ran','yes');");
+        let mut watcher = TaskWatcher::start(&project, "build", &[]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while watcher.child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            watcher
+                .child
+                .try_wait()
+                .unwrap()
+                .is_some_and(|status| !status.success()),
+            "invalid tasks were admitted to repair watch"
+        );
+        assert!(!project.file_exists("ran"));
+    }
 }
 
 #[cfg(unix)]
@@ -458,7 +492,8 @@ fn run_rejects_an_invalid_env_schema_regex_before_starting_the_script() {
 
     assert!(!output.status.success(), "invalid regex must fail");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("invalid regex"),
+        String::from_utf8_lossy(&output.stderr)
+            .contains("env.invalid_pattern at lpm.json/envSchema/vars/TOKEN"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );

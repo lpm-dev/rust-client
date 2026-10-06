@@ -818,14 +818,53 @@ static UNKNOWN_FIELD_SCHEMA: LazyLock<serde_json::Value> =
 /// Returns `None` if the file doesn't exist (not an error).
 /// Returns `Err` if the file exists but is malformed.
 pub fn read_lpm_json(project_dir: &Path) -> Result<Option<LpmJsonConfig>, String> {
+    read_lpm_json_detailed(project_dir).map_err(|error| error.to_string())
+}
+
+/// Distinguish env source failures from invalid project configuration.
+#[derive(Debug)]
+pub enum ConfigReadError {
+    Configuration(String),
+    Schema {
+        error: lpm_env_source::SourceError,
+        config: Box<LpmJsonConfig>,
+    },
+}
+
+impl std::fmt::Display for ConfigReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Configuration(message) => formatter.write_str(message),
+            Self::Schema { error, .. } => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ConfigReadError {}
+
+impl From<String> for ConfigReadError {
+    fn from(message: String) -> Self {
+        Self::Configuration(message)
+    }
+}
+
+impl From<&str> for ConfigReadError {
+    fn from(message: &str) -> Self {
+        Self::Configuration(message.to_owned())
+    }
+}
+
+/// Read one configuration snapshot while retaining typed env source errors.
+pub fn read_lpm_json_detailed(
+    project_dir: &Path,
+) -> Result<Option<LpmJsonConfig>, ConfigReadError> {
     let path = project_dir.join("lpm.json");
     let content = match read_text_file_capped(&path, CONFIG_FILE_SIZE_CAP_BYTES) {
         Ok(content) => content,
         Err(BoundedReadError::NotFound { .. }) => return Ok(None),
-        Err(error) => return Err(format!("failed to read lpm.json: {error}")),
+        Err(error) => return Err(format!("failed to read lpm.json: {error}").into()),
     };
-
-    parse_lpm_json_in(project_dir, &content).map(Some)
+    parse_lpm_json_inner(&content, Some(project_dir), None).map(Some)
 }
 
 /// Watch repair paths even when a newly imported fragment is missing or invalid.
@@ -858,11 +897,19 @@ pub fn schema_watch_paths(project_dir: &Path) -> Vec<String> {
 
 /// Parse and validate an `lpm.json` document that was read by the caller.
 pub fn parse_lpm_json(content: &str) -> Result<LpmJsonConfig, String> {
-    parse_lpm_json_inner(content, None, None)
+    parse_lpm_json_inner(content, None, None).map_err(|error| error.to_string())
 }
 
 /// Resolve authored imports relative to this project using the caller's immutable bytes.
 pub fn parse_lpm_json_in(project_dir: &Path, content: &str) -> Result<LpmJsonConfig, String> {
+    parse_lpm_json_in_detailed(project_dir, content).map_err(|error| error.to_string())
+}
+
+/// Parse one captured document while retaining source diagnostics and project settings.
+pub fn parse_lpm_json_in_detailed(
+    project_dir: &Path,
+    content: &str,
+) -> Result<LpmJsonConfig, ConfigReadError> {
     parse_lpm_json_inner(content, Some(project_dir), None)
 }
 
@@ -907,14 +954,14 @@ pub fn parse_lpm_json_with_root(
     root: std::sync::Arc<cap_std::fs::Dir>,
     content: &str,
 ) -> Result<LpmJsonConfig, String> {
-    parse_lpm_json_inner(content, None, Some(root))
+    parse_lpm_json_inner(content, None, Some(root)).map_err(|error| error.to_string())
 }
 
 fn parse_lpm_json_inner(
     content: &str,
     project_dir: Option<&Path>,
     root: Option<std::sync::Arc<cap_std::fs::Dir>>,
-) -> Result<LpmJsonConfig, String> {
+) -> Result<LpmJsonConfig, ConfigReadError> {
     let mut deserializer =
         serde_json::Deserializer::from_str(lpm_common::strip_utf8_bom_str(content));
     let mut config: LpmJsonConfig = serde_path_to_error::deserialize(&mut deserializer)
@@ -935,9 +982,25 @@ fn parse_lpm_json_inner(
         .end()
         .map_err(|error| format!("failed to parse lpm.json: {error}"))?;
 
+    validate_task_cache_globs(&config)?;
+
+    if let Some(vault_id) = config.vault.as_deref()
+        && !lpm_vault::vault_id::is_safe_vault_id(vault_id)
+    {
+        return Err(format!(
+            "invalid lpm.json data: vault id {vault_id:?} contains path-traversal or non-portable characters"
+        ).into());
+    }
+
+    validated_cert_extra_permitted_dns(&config)?;
+
+    validate_dev_services(&config.services)?;
+
+    validate_and_normalize_local_domain_hosts(&mut config)?;
+
     if let Some(definition) = &config.env_schema_source {
         if project_dir.is_some() || root.is_some() {
-            let resolved = match root {
+            let resolution = match root {
                 Some(root) => {
                     lpm_env_source::resolve_schema_in_borrowed(root, content.as_bytes(), definition)
                 }
@@ -946,8 +1009,16 @@ fn parse_lpm_json_inner(
                     content.as_bytes(),
                     definition,
                 ),
-            }
-            .map_err(|error| error.to_string())?;
+            };
+            let resolved = match resolution {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    return Err(ConfigReadError::Schema {
+                        error,
+                        config: Box::new(config),
+                    });
+                }
+            };
             config.env_schema = Some(resolved.schema);
             config.env_schema_resolution = Some(resolved.snapshot);
         } else {
@@ -968,26 +1039,11 @@ fn parse_lpm_json_inner(
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
-                .join("\n"));
+                .join("\n")
+                .into());
         }
     }
-    validate_task_cache_globs(&config)?;
-
-    if let Some(vault_id) = config.vault.as_deref()
-        && !lpm_vault::vault_id::is_safe_vault_id(vault_id)
-    {
-        return Err(format!(
-            "invalid lpm.json data: vault id {vault_id:?} contains path-traversal or non-portable characters"
-        ));
-    }
-
-    validated_cert_extra_permitted_dns(&config)?;
-
-    validate_dev_services(&config.services)?;
     validate_schema_service_selectors(&config)?;
-
-    validate_and_normalize_local_domain_hosts(&mut config)?;
-
     Ok(config)
 }
 

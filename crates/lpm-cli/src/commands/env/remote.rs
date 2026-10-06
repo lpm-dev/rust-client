@@ -180,11 +180,14 @@ pub(super) async fn env_share(
     }
     let member_access = std::sync::Arc::new(member_access);
 
-    let schema_snapshot = manifest.sources;
+    let schema_snapshot = manifest
+        .sources
+        .ok_or_else(|| LpmError::Script("env.source_changed at lpm.json/envSchema".into()))?;
+    let vault_manifest = std::sync::Arc::new(manifest.vault);
     let config = manifest.config;
     let secrets_json = std::sync::Arc::new(super::sync_payload::build_sync_payload(all_envs)?);
 
-    let project_name = manifest.vault.project_name(project_dir);
+    let project_name = vault_manifest.project_name(project_dir);
     let schema_value = std::sync::Arc::new(super::sync_payload::build_push_schema_value(
         config.as_ref(),
     ));
@@ -207,6 +210,7 @@ pub(super) async fn env_share(
             let project_name = project_name.clone();
             let schema_value = std::sync::Arc::clone(&schema_value);
             let schema_snapshot = schema_snapshot.clone();
+            let current_manifest = std::sync::Arc::clone(&vault_manifest);
             let vault_id = vault_id.clone();
             let secrets_json = std::sync::Arc::clone(&secrets_json);
             let recipient_set_acceptance = recipient_set_acceptance.clone();
@@ -214,13 +218,6 @@ pub(super) async fn env_share(
             let access = std::sync::Arc::clone(&member_access);
             let expected_principal_id = expected_principal_id.clone();
             async move {
-                let current_manifest = super::sync_payload::fresh_org_mutation_manifest(
-                    &project_dir,
-                    &vault_id,
-                    org_slug,
-                    &registry_url,
-                    expected_principal_id.as_deref(),
-                )?;
                 let checkpoint_version = current_manifest.org_sync_version_for_principal(
                     org_slug,
                     lpm_vault::vault_id::SyncPrincipal {
@@ -257,7 +254,7 @@ pub(super) async fn env_share(
                 } else {
                     checkpoint_version
                 };
-                let before_write = || super::sync_payload::verify_schema_snapshot(&project_dir, schema_snapshot.as_deref());
+                let before_write = || super::sync_payload::verify_org_mutation_snapshot(&project_dir, &vault_id, org_slug, &registry_url, expected_principal_id.as_deref(), &schema_snapshot);
                 let push_metadata = lpm_vault::sync::PushMetadata {
                     name: Some(&project_name),
                     schema: schema_value.as_ref().as_ref(),
