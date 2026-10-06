@@ -866,10 +866,43 @@ pub fn parse_lpm_json(content: &str) -> Result<LpmJsonConfig, String> {
     validated_cert_extra_permitted_dns(&config)?;
 
     validate_dev_services(&config.services)?;
+    validate_schema_service_selectors(&config)?;
 
     validate_and_normalize_local_domain_hosts(&mut config)?;
 
     Ok(config)
+}
+
+pub(crate) fn validate_schema_service_selectors(config: &LpmJsonConfig) -> Result<(), String> {
+    if config.services.is_empty() {
+        return Ok(());
+    }
+    let Some(schema) = &config.env_schema else {
+        return Ok(());
+    };
+    for (key, rule) in &schema.vars {
+        let selectors = rule
+            .required_in
+            .iter()
+            .enumerate()
+            .map(|(index, selector)| ("requiredIn", index, selector))
+            .chain(
+                rule.defaults_in
+                    .iter()
+                    .enumerate()
+                    .map(|(index, default)| ("defaultsIn", index, &default.when)),
+            );
+        for (field, index, selector) in selectors {
+            for service in selector.service.iter().flatten() {
+                if !config.services.contains_key(service) {
+                    return Err(format!(
+                        "envSchema.vars.{key}.{field}[{index}].service names unconfigured service {service:?}. Select a name from services"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_dev_services(services: &HashMap<String, ServiceConfig>) -> Result<(), String> {

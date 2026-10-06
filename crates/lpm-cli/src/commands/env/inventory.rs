@@ -23,17 +23,14 @@ fn validate_configured_environment_names(
     env_map: &HashMap<String, String>,
     environments: Option<&lpm_env::EnvironmentsConfig>,
 ) -> Result<(), LpmError> {
-    for file_path in env_map.values() {
-        if file_path == ".env" {
-            continue;
-        }
-        let canonical = lpm_env::resolver::extract_mode_from_env_path(file_path).ok_or_else(|| {
-            LpmError::Script(format!(
-                "invalid environment file mapping {file_path:?}: expected `.env` or `.env.<name>`"
+    for alias in env_map.keys() {
+        let canonical = lpm_env::resolver::resolve_canonical_name(alias, env_map, environments);
+        lpm_env::resolver::validate_env_name(canonical).map_err(|_| {
+            LpmError::EnvValidation(lpm_env::resolver::invalid_identity_message(
+                canonical,
+                Some(alias),
             ))
         })?;
-        lpm_env::resolver::validate_env_name(canonical)
-            .map_err(|error| LpmError::Script(format!("invalid environment name: {error}")))?;
     }
     if let Some(environments) = environments {
         for canonical in environments.envs.keys() {
@@ -380,13 +377,34 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
         let schema_status = if let (Some(schema), Some(validator)) = (schema, &validator) {
             let mode = (!env.implicit_default).then_some(env.storage_key.as_str());
             let evaluation = (|| -> Result<usize, LpmError> {
-                lpm_env::resolver::validate_env_name(&env.canonical).map_err(LpmError::EnvValidation)?;
-                let mut values = lpm_runner::dotenv::load_project_env_files_with_config(project_dir, mode, env.file_path.as_deref(), config.as_ref())?;
-                if let Some(stored) = effective_vars { lpm_runner::dotenv::merge_stored_project_env(&mut values, stored)?; }
-                let errors = lpm_runner::dotenv::evaluate_project_env(&mut values, Some(validator), lpm_env::EvalContext { environment: &env.canonical, ..Default::default() })?;
+                lpm_env::resolver::validate_env_name(&env.canonical)
+                    .map_err(LpmError::EnvValidation)?;
+                let mut values = lpm_runner::dotenv::load_project_env_files_with_config(
+                    project_dir,
+                    mode,
+                    env.file_path.as_deref(),
+                    config.as_ref(),
+                )?;
+                if let Some(stored) = effective_vars {
+                    lpm_runner::dotenv::merge_stored_project_env(&mut values, stored)?;
+                }
+                let errors = lpm_runner::dotenv::evaluate_project_env(
+                    &mut values,
+                    Some(validator),
+                    lpm_env::EvalContext {
+                        environment: &env.canonical,
+                        ..Default::default()
+                    },
+                )?;
                 Ok(super::schema::valid_variable_count(schema, &errors))
             })();
-            let valid = match evaluation { Ok(valid) => valid, Err(error) => { schema_error = Some(error.to_string()); 0 } };
+            let valid = match evaluation {
+                Ok(valid) => valid,
+                Err(error) => {
+                    schema_error = Some(error.to_string());
+                    0
+                }
+            };
             Some((valid, schema.len()))
         } else {
             None
