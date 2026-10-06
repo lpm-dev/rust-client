@@ -667,10 +667,10 @@ fn exec_rejects_invalid_schema_variable_name_before_spawn() {
         .expect("failed to run lpm exec");
 
     assert!(!output.status.success(), "invalid schema key must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("invalid environment variable name"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        stderr.contains("env.invalid_name at lpm.json/envSchema/vars"),
+        "{stderr}"
     );
     assert!(
         !project.path().join("spawned.txt").exists(),
