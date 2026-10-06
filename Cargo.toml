@@ -28,6 +28,10 @@ members = [
     "crates/lpm-inspect",
     "crates/lpm-migrate",
     "crates/lpm-env",
+    "crates/lpm-env-codegen",
+    "crates/lpm-env-source",
+    "crates/lpm-env-ffi",
+    "crates/lpm-env-wasm",
     "crates/lpm-global",
     "crates/lpm-audit-corpus",
     "crates/lpm-triage-advisor",
@@ -75,6 +79,8 @@ lpm-dashboard = { path = "crates/lpm-dashboard" }
 lpm-inspect = { path = "crates/lpm-inspect" }
 lpm-migrate = { path = "crates/lpm-migrate" }
 lpm-env = { path = "crates/lpm-env" }
+lpm-env-codegen = { path = "crates/lpm-env-codegen" }
+lpm-env-source = { path = "crates/lpm-env-source" }
 lpm-global = { path = "crates/lpm-global" }
 
 # Async runtime

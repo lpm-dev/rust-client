@@ -305,6 +305,18 @@ impl Respond for ManifestReplacingResponse {
     }
 }
 
+struct SchemaReplacingResponse {
+    fragment: std::path::PathBuf,
+    response: ResponseTemplate,
+}
+
+impl Respond for SchemaReplacingResponse {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        std::fs::write(&self.fragment, r#"{"vars":{"BUILD_MODE":{"ci":"secret"}}}"#).unwrap();
+        self.response.clone()
+    }
+}
+
 struct CredentialsReplacingResponse {
     home: std::path::PathBuf,
     registry_url: String,
@@ -6877,9 +6889,18 @@ async fn env_share_rejects_a_changed_manifest_principal_before_the_remote_write(
         .mount(mock.server())
         .await;
 
+    let acceptance = org_rotation_recipient_acceptance(&mock, &fingerprint);
     let output = lpm(&project)
         .env("LPM_REGISTRY_URL", &registry_url)
-        .args(["--json", "env", "share", "--org", ORG_ROTATION_SLUG])
+        .args([
+            "--json",
+            "env",
+            "share",
+            "--org",
+            ORG_ROTATION_SLUG,
+            "--accept-recipient-keys",
+            &acceptance,
+        ])
         .output()
         .expect("run organization share while its manifest binding changes");
 
@@ -6956,6 +6977,77 @@ async fn env_share_refuses_a_changed_authenticated_caller_key_without_uploading(
             .filter(|request| request.method.as_str() == "POST")
             .count(),
         0,
+    );
+}
+
+#[tokio::test]
+async fn env_share_rejects_imported_schema_changes_before_upload() {
+    let project = TempProject::empty(r#"{"name":"org-share-schema","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    let auth_token = "org-share-schema-token";
+    let vault_id = "vault-org-share-schema";
+    let (_, public_key_b64, fingerprint) =
+        prepare_org_share_project(&project, &mock, auth_token, vault_id);
+    let manifest_path = project.path().join("lpm.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["envSchema"] = serde_json::json!({"extends":["base.json"]});
+    project.write_file("lpm.json", &manifest.to_string());
+    project.write_file("base.json", r#"{"vars":{"VALUE":{"default":"first"}}}"#);
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/api/orgs/{ORG_ROTATION_SLUG}/members/public-keys"
+        )))
+        .respond_with(ManifestReplacingResponse {
+            manifest_path: project.path().join("base.json"),
+            replacement: r#"{"vars":{"VALUE":{"default":"second"}}}"#.into(),
+            response: signed_member_inventory_response(
+                ORG_ROTATION_SLUG,
+                &public_key_b64,
+                &fingerprint,
+            ),
+        })
+        .mount(mock.server())
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!(
+            "/api/orgs/{ORG_ROTATION_SLUG}/vaults/{vault_id}"
+        )))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(mock.server())
+        .await;
+    let acceptance = org_rotation_recipient_acceptance(&mock, &fingerprint);
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", &registry_url)
+        .args([
+            "--json",
+            "env",
+            "share",
+            "--org",
+            ORG_ROTATION_SLUG,
+            "--accept-recipient-keys",
+            &acceptance,
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = parse_clean_json_stdout(&output);
+    assert_eq!(
+        mock.server()
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.method.as_str() == "POST")
+            .count(),
+        0
+    );
+    assert!(
+        error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("env.source_changed")),
+        "{error}"
     );
 }
 
@@ -7310,7 +7402,7 @@ async fn failed_platform_connect_keeps_the_manifest_byte_identical() {
 }
 
 #[tokio::test]
-async fn env_coolify_platform_connect_and_status_use_direct_platform_api() {
+async fn env_coolify_operations_preserve_the_selected_canonical_environment() {
     let project = TempProject::empty(r#"{"name":"coolify-platform","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
     let bearer_token = "coolify-platform-session-token";
@@ -7345,6 +7437,22 @@ async fn env_coolify_platform_connect_and_status_use_direct_platform_api() {
         String::from_utf8_lossy(&seeded.stdout),
         String::from_utf8_lossy(&seeded.stderr),
     );
+
+    lpm(&project)
+        .args([
+            "env",
+            "set",
+            "--env=staging",
+            "APPLICATION_SECRET=wrong-environment",
+        ])
+        .assert()
+        .success();
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("lpm.json")).unwrap();
+    manifest["env"] = serde_json::json!({"release":".env.production", "production":".env.staging"});
+    manifest["envSchema"] =
+        serde_json::json!({"vars":{"APPLICATION_SECRET":{"enum":["local-value"]}}});
+    project.write_file("lpm.json", &manifest.to_string());
 
     mock.with_platform_connect_application_success(
         bearer_token,
@@ -7440,7 +7548,7 @@ async fn env_coolify_platform_connect_and_status_use_direct_platform_api() {
             "--token",
             platform_token,
             "--linked-env",
-            "production",
+            "release",
             "--label",
             "production",
         ])
@@ -7482,7 +7590,15 @@ async fn env_coolify_platform_connect_and_status_use_direct_platform_api() {
     let push = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
         .env("ACCEPTANCE_RUN_ID", "workflow-platform-coolify")
-        .args(["--json", "env", "push", "--to", "coolify", "--yes"])
+        .args([
+            "--json",
+            "env",
+            "push",
+            "--to",
+            "coolify",
+            "--env=release",
+            "--yes",
+        ])
         .output()
         .expect("failed to run lpm env push --to coolify --json");
     assert!(
@@ -7516,6 +7632,16 @@ async fn env_coolify_platform_connect_and_status_use_direct_platform_api() {
     assert_eq!(pull_json["platform"], "coolify");
     assert_eq!(pull_json["keys"], serde_json::json!(["APPLICATION_SECRET"]));
     insta::assert_json_snapshot!("env_coolify_pull_json_envelope", pull_json);
+    let requests = mock.server().received_requests().await.unwrap();
+    let audits: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path().ends_with("/audit"))
+        .collect();
+    assert!(!audits.is_empty());
+    for request in audits {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["env"], "production");
+    }
 }
 
 #[tokio::test]
@@ -7951,7 +8077,7 @@ async fn env_github_actions_platform_reports_names_only_and_audits_failed_pushes
                 "vault":"{vault_id}",
                 "envSchema":{{
                     "vars":{{
-                        "PUBLIC_ORIGIN":{{"client":true}},
+                        "PUBLIC_ORIGIN":{{"client":true,"ci":"variable"}},
                         "API_TOKEN":{{"secret":true}}
                     }}
                 }}
@@ -8167,7 +8293,7 @@ async fn env_github_actions_platform_snapshots_successful_push_and_clean() {
                 "vault":"{vault_id}",
                 "envSchema":{{
                     "vars":{{
-                        "PUBLIC_ORIGIN":{{"client":true}},
+                        "PUBLIC_ORIGIN":{{"client":true,"ci":"variable"}},
                         "API_TOKEN":{{"secret":true}}
                     }}
                 }},
@@ -8360,6 +8486,208 @@ async fn env_github_actions_platform_snapshots_successful_push_and_clean() {
     assert_eq!(clean_json["updated"], 1);
     assert_eq!(clean_json["removed"], 2);
     insta::assert_json_snapshot!("env_github_actions_clean_json_envelope", clean_json);
+}
+
+#[tokio::test]
+async fn github_ci_policy_migrates_both_namespaces_without_clean() {
+    let project = TempProject::empty(r#"{"name":"github-actions-migration","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let bearer = "migration-session";
+    let token = "migration-platform";
+    let vault = "vault-migration-123";
+    let repository = "lpm-dev/example";
+    let repository_id = "123456789";
+    let environment = "production";
+    let registry = mock.url();
+    project.write_file("lpm.json", &format!(r#"{{"vault":"{vault}","envSchema":{{"vars":{{"PUBLIC_ORIGIN":{{"client":true}},"BUILD_MODE":{{"ci":"variable"}}}}}},"vaultSync":{{"personalPlatformBindings":{{"{registry}":{{"registryUrl":"{registry}","principalId":"account-1"}}}}}}}}"#));
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry,
+            access_token: Some(bearer),
+            refresh_token: Some("migration-refresh"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    let seeded = lpm(&project)
+        .args([
+            "env",
+            "set",
+            "--env",
+            environment,
+            "PUBLIC_ORIGIN=https://public.example.test",
+            "BUILD_MODE=release",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        seeded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+    mock.with_platform_credentials_success_calls(bearer,vault,serde_json::json!({"connections":[{"id":"connection-migration","platform":"github-actions","token":token,"connectionConfig":{"repository":repository,"repositoryId":repository_id,"environment":environment,"linkedEnv":environment},"label":"production","lastPushAt":null}]}),1).await;
+    mock.with_github_actions_repository(token, repository, 123_456_789, 3)
+        .await;
+    mock.with_github_actions_environment_list_sequences(
+        token,
+        repository_id,
+        environment,
+        vec![
+            serde_json::json!([{"name":"PUBLIC_ORIGIN","value":"https://old.example.test"}]),
+            serde_json::json!([{"name":"BUILD_MODE","value":"release"}]),
+        ],
+        vec![
+            serde_json::json!([{"name":"BUILD_MODE"}]),
+            serde_json::json!([{"name":"PUBLIC_ORIGIN"}]),
+        ],
+    )
+    .await;
+    mock.with_github_actions_public_key(token, repository_id, environment)
+        .await;
+    mock.with_github_actions_variable_create_success(
+        token,
+        repository_id,
+        environment,
+        "BUILD_MODE",
+        "release",
+    )
+    .await;
+    mock.with_github_actions_secret_upsert_success(
+        token,
+        repository_id,
+        environment,
+        "PUBLIC_ORIGIN",
+        1,
+    )
+    .await;
+    mock.with_github_actions_variable_delete_success(
+        token,
+        repository_id,
+        environment,
+        "PUBLIC_ORIGIN",
+    )
+    .await;
+    mock.with_github_actions_secret_delete_success(token, repository_id, environment, "BUILD_MODE")
+        .await;
+    mock.with_platform_audit_success(
+        bearer,
+        vault,
+        "github-actions",
+        "push",
+        &[("added", 2), ("updated", 0), ("removed", 2)],
+    )
+    .await;
+    let pushed = lpm(&project)
+        .env("LPM_REGISTRY_URL", &registry)
+        .env("ACCEPTANCE_RUN_ID", "workflow-platform-migration")
+        .env("LPM_ACCEPTANCE_GITHUB_API_BASE_URL", &registry)
+        .args(["--json", "env", "push", "--to", "github-actions", "--yes"])
+        .output()
+        .unwrap();
+    assert!(
+        pushed.status.success(),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&pushed.stdout),
+        String::from_utf8_lossy(&pushed.stderr)
+    );
+    let result = parse_clean_json_stdout(&pushed);
+    assert_eq!(result["added"], 2);
+    assert_eq!(result["removed"], 2);
+    let requests = mock.server().received_requests().await.unwrap();
+    let encrypted = requests
+        .iter()
+        .find(|request| {
+            request.method == "PUT" && request.url.path().ends_with("/secrets/PUBLIC_ORIGIN")
+        })
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&encrypted.body).unwrap();
+    assert_ne!(body["encrypted_value"], "https://public.example.test");
+    assert!(!String::from_utf8_lossy(&encrypted.body).contains("https://public.example.test"));
+}
+
+#[tokio::test]
+async fn github_push_rejects_imported_storage_policy_changes_after_remote_listing() {
+    let project = TempProject::empty(r#"{"name":"github-schema-freshness","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry = mock.url();
+    let bearer = "schema-session";
+    let token = "schema-platform";
+    let vault = "vault-github-schema";
+    project.write_file("lpm.json", &serde_json::json!({"vault":vault,"envSchema":{"extends":["base.json"]},"vaultSync":{"personalPlatformBindings":{(registry.clone()):{"registryUrl":registry,"principalId":"account-1"}}}}).to_string());
+    project.write_file("base.json", r#"{"vars":{"BUILD_MODE":{"ci":"variable"}}}"#);
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &registry,
+            access_token: Some(bearer),
+            refresh_token: Some("schema-refresh"),
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    let seeded = lpm(&project)
+        .args(["env", "set", "--env", "production", "BUILD_MODE=release"])
+        .output()
+        .unwrap();
+    assert!(
+        seeded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seeded.stderr)
+    );
+    mock.with_platform_credentials_success_calls(bearer,vault,serde_json::json!({"connections":[{"id":"schema-connection","platform":"github-actions","token":token,"connectionConfig":{"repository":"lpm-dev/example","repositoryId":"123","environment":"production","linkedEnv":"production"},"label":"production","lastPushAt":null}]}),1).await;
+    Mock::given(method("GET"))
+        .and(path("/repos/lpm-dev/example"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"id":123,"full_name":"lpm-dev/example"})),
+        )
+        .mount(mock.server())
+        .await;
+    let variables_path = "/repositories/123/environments/production/variables";
+    Mock::given(method("GET"))
+        .and(path(variables_path))
+        .respond_with(SchemaReplacingResponse {
+            fragment: project.path().join("base.json"),
+            response: ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"total_count":0,"variables":[]})),
+        })
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repositories/123/environments/production/secrets"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"total_count":0,"secrets":[]})),
+        )
+        .mount(mock.server())
+        .await;
+    mock.with_platform_audit_success(
+        bearer,
+        vault,
+        "github-actions",
+        "push_failed",
+        &[("added", 0), ("updated", 0), ("removed", 0)],
+    )
+    .await;
+    let output = lpm(&project)
+        .env("LPM_REGISTRY_URL", &registry)
+        .env("LPM_ACCEPTANCE_GITHUB_API_BASE_URL", &registry)
+        .env("ACCEPTANCE_RUN_ID", "schema-freshness")
+        .args(["--json", "env", "push", "--to", "github-actions", "--yes"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = parse_clean_json_stdout(&output);
+    assert!(error.to_string().contains("env.source_changed"), "{error}");
+    assert!(
+        !mock
+            .server()
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| request.url.path().starts_with("/repositories/")
+                && matches!(request.method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE"))
+    );
 }
 
 #[tokio::test]
@@ -8910,4 +9238,246 @@ async fn assert_org_share_environments(all_empty: bool) {
     let envelope = parse_json_output(&output.stdout);
     assert_eq!(envelope["success"], true);
     assert_eq!(envelope["version"], 1);
+}
+
+#[tokio::test]
+async fn platform_status_distinguishes_redirected_and_stored_default_selections() {
+    for reversed in [false, true] {
+        let project = TempProject::empty(r#"{"name":"platform-default-selection"}"#);
+        let mock = MockRegistry::start().await;
+        let token = "default-selection-session";
+        let vault = "vault-default-selection";
+        project.write_file("lpm.json", &serde_json::json!({"vault":vault,"env":{"default":".env.production"},"vaultSync":{"personalPlatformBindings":{mock.url():{"registryUrl":mock.url(),"principalId":"account-1"}}}}).to_string());
+        project.write_file(".env", "VALUE=implicit\n");
+        project.write_file(".env.default", "VALUE=named\n");
+        project.write_file(".env.production", "VALUE=production\n");
+        seed_sessions(
+            project.home(),
+            &[SessionSeed {
+                registry_url: &mock.url(),
+                access_token: Some(token),
+                refresh_token: Some("default-refresh"),
+                session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+            }],
+        );
+        let mut connections = vec![
+            serde_json::json!({"id":"unlinked","platform":"vercel","token":"platform-token","connectionConfig":{"projectId":"production-project"}}),
+            serde_json::json!({"id":"linked","platform":"coolify","token":"platform-token","connectionConfig":{"url":mock.url(),"applicationId":"default-project","preview":false,"linkedEnv":"default"}}),
+        ];
+        if reversed {
+            connections.reverse();
+        }
+        mock.with_platform_credentials_success(
+            token,
+            vault,
+            serde_json::json!({"connections":connections}),
+        )
+        .await;
+        mock.with_vercel_env_list("platform-token", "production-project", serde_json::json!([{"id":"production-value","key":"VALUE","value":"production","type":"plain","target":["production"]}]), 1).await;
+        mock.with_coolify_env_list("platform-token", "default-project", serde_json::json!([{"id":1,"uuid":"default-value","key":"VALUE","value":"named","real_value":"named","is_preview":false,"is_literal":false,"is_multiline":false,"is_shown_once":false,"is_shared":false}]),1).await;
+        let output = lpm(&project)
+            .env("LPM_REGISTRY_URL", mock.url())
+            .env("ACCEPTANCE_RUN_ID", "default-selection")
+            .env("LPM_ACCEPTANCE_COOLIFY_ALLOW_LOOPBACK", "1")
+            .env("LPM_ACCEPTANCE_VERCEL_API_BASE_URL", mock.url())
+            .args(["--json", "env", "status"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout {} stderr {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result = parse_clean_json_stdout(&output);
+        let rows = result["platforms"].as_array().unwrap();
+        assert_eq!(rows[usize::from(reversed)]["env"], "production");
+        assert_eq!(rows[usize::from(!reversed)]["env"], "default");
+        for row in rows {
+            assert_eq!(row["status"], "synced", "{row}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn cloud_mutations_reject_oversized_metadata_before_authentication() {
+    let project = TempProject::empty(r#"{"name":"metadata-limit"}"#);
+    let mock = MockRegistry::start().await;
+    lpm(&project)
+        .args(["env", "set", "TOKEN=value"])
+        .assert()
+        .success();
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("lpm.json")).unwrap();
+    manifest["envSchema"] =
+        serde_json::json!({"vars":{"TOKEN":{"description":"x".repeat(300*1024)}}});
+    project.write_file("lpm.json", &manifest.to_string());
+    for args in [
+        vec!["--json", "env", "push", "--yes"],
+        vec!["--json", "env", "share", "--org=team"],
+    ] {
+        let output = lpm(&project)
+            .env("LPM_REGISTRY_URL", mock.url())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let result = parse_clean_json_stdout(&output);
+        assert!(
+            result["error"].as_str().unwrap().contains("256 KiB"),
+            "{result}"
+        );
+    }
+    assert!(mock.server().received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn env_push_reports_metadata_warnings_without_changing_success() {
+    for json in [false, true] {
+        let project = TempProject::empty(r#"{"name":"metadata-warning"}"#);
+        let mock = MockRegistry::start().await;
+        let vault_id = "metadata-warning-personal";
+        write_personal_bound_manifest(&project, &mock.url(), vault_id);
+        seed_sessions(
+            project.home(),
+            &[SessionSeed {
+                registry_url: &mock.url(),
+                access_token: Some("warning-token"),
+                refresh_token: Some("warning-refresh"),
+                session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+            }],
+        );
+        let output = lpm(&project)
+            .args(["env", "set", "TOKEN=dummy"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        mount_personal_ci_project(&project, &mock, vault_id, "warning-token").await;
+        Mock::given(method("POST")).and(path(format!("/api/vaults/{vault_id}/sync")))
+            .and(header("x-lpm-env-metadata-warnings", "1"))
+            .respond_with(signed_sync_response(serde_json::json!({"version":2,"status":"synced","warnings":[{"code":"env_metadata_dropped","message":"Encrypted values synced. Invalid metadata was not stored.","hint":"Upgrade the client and push again."}]}), "warning-token", vault_id, TestSyncScope::Personal)).expect(1).mount(mock.server()).await;
+        let mut command = lpm(&project);
+        command.env("LPM_REGISTRY_URL", mock.url());
+        if json {
+            command.arg("--json");
+        }
+        let output = command.args(["env", "push", "--yes"]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if json {
+            let value = parse_clean_json_stdout(&output);
+            assert_eq!(value["status"], "synced");
+            assert_eq!(value["warnings"][0]["code"], "env_metadata_dropped");
+            insta::with_settings!({ sort_maps => true }, {
+            insta::assert_json_snapshot!(value, @r###"
+            {
+              "status": "synced",
+              "success": true,
+              "version": 2,
+              "warnings": [
+                {
+                  "code": "env_metadata_dropped",
+                  "hint": "Upgrade the client and push again.",
+                  "message": "Encrypted values synced. Invalid metadata was not stored."
+                }
+              ]
+            }
+            "###);
+            });
+        } else {
+            let display = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(display.contains("env synced"));
+            assert!(display.contains("Invalid metadata was not stored."));
+            assert!(display.contains("Upgrade the client and push again."));
+        }
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(project.path().join("lpm.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest["vaultSync"]["authorityCheckpoints"]["personal"][mock.url()]["account-1"]["version"],
+            2
+        );
+    }
+}
+
+#[tokio::test]
+async fn env_share_reports_metadata_warnings_without_changing_success() {
+    for json in [false, true] {
+        let project = TempProject::empty(r#"{"name":"metadata-warning"}"#);
+        let mock = MockRegistry::start().await;
+        let vault_id = "metadata-warning-org";
+        let (_, public_key, fingerprint) =
+            prepare_org_share_project(&project, &mock, "warning-token", vault_id);
+        mount_org_member_keys(
+            &mock,
+            "warning-token",
+            ORG_ROTATION_SLUG,
+            &public_key,
+            &fingerprint,
+        )
+        .await;
+        Mock::given(method("POST")).and(path(format!("/api/orgs/{ORG_ROTATION_SLUG}/vaults/{vault_id}")))
+            .and(header("x-lpm-env-metadata-warnings", "1"))
+            .respond_with(signed_sync_response(serde_json::json!({"version":1,"contentKeyVersion":1,"status":"shared","warnings":[{"code":"env_metadata_dropped","message":"Encrypted values synced. Invalid metadata was not stored.","hint":"Upgrade the client and push again."}]}), "warning-token", vault_id, TestSyncScope::Organization(ORG_ROTATION_SLUG.to_owned()))).expect(1).mount(mock.server()).await;
+        let acceptance = org_rotation_recipient_acceptance(&mock, &fingerprint);
+        let mut command = lpm(&project);
+        command.env("LPM_REGISTRY_URL", mock.url());
+        if json {
+            command.arg("--json");
+        }
+        let output = command
+            .args([
+                "env",
+                "share",
+                "--org",
+                ORG_ROTATION_SLUG,
+                "--accept-recipient-keys",
+                &acceptance,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if json {
+            let value = parse_clean_json_stdout(&output);
+            assert_eq!(value["status"], "shared");
+            assert_eq!(value["warnings"][0]["code"], "env_metadata_dropped");
+            insta::with_settings!({ sort_maps => true }, {
+            insta::assert_json_snapshot!(value, @r###"
+            {
+              "org": "acme",
+              "status": "shared",
+              "success": true,
+              "version": 1,
+              "warnings": [
+                {
+                  "code": "env_metadata_dropped",
+                  "hint": "Upgrade the client and push again.",
+                  "message": "Encrypted values synced. Invalid metadata was not stored."
+                }
+              ]
+            }
+            "###);
+            });
+        } else {
+            let display = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(display.contains("env shared"));
+            assert!(display.contains("Invalid metadata was not stored."));
+            assert!(display.contains("Upgrade the client and push again."));
+        }
+    }
 }

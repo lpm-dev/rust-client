@@ -139,6 +139,9 @@ pub(super) async fn env_share(
     let recreate_missing = args.contains(&"--force");
 
     let manifest = super::sync_payload::CloudManifestSnapshot::read(project_dir)?;
+    let schema_value = std::sync::Arc::new(super::sync_payload::checked_push_schema_value(
+        manifest.config.as_ref(),
+    )?);
     let vault_id = manifest
         .vault
         .vault_id()
@@ -180,14 +183,13 @@ pub(super) async fn env_share(
     }
     let member_access = std::sync::Arc::new(member_access);
 
-    let config = manifest.config;
+    let schema_snapshot = manifest
+        .sources
+        .ok_or_else(|| LpmError::Script("env.source_changed at lpm.json".into()))?;
+    let vault_manifest = std::sync::Arc::new(manifest.vault);
     let secrets_json = std::sync::Arc::new(super::sync_payload::build_sync_payload(all_envs)?);
 
-    let project_name = manifest.vault.project_name(project_dir);
-    let schema_value = std::sync::Arc::new(super::sync_payload::build_push_schema_value(
-        config.as_ref(),
-    ));
-    drop(config);
+    let project_name = vault_manifest.project_name(project_dir);
     let project_dir = project_dir.to_path_buf();
 
     if !json_output {
@@ -204,6 +206,8 @@ pub(super) async fn env_share(
         |registry_url, auth_token| {
             let project_name = project_name.clone();
             let schema_value = std::sync::Arc::clone(&schema_value);
+            let schema_snapshot = schema_snapshot.clone();
+            let current_manifest = std::sync::Arc::clone(&vault_manifest);
             let vault_id = vault_id.clone();
             let secrets_json = std::sync::Arc::clone(&secrets_json);
             let recipient_set_acceptance = recipient_set_acceptance.clone();
@@ -211,13 +215,6 @@ pub(super) async fn env_share(
             let access = std::sync::Arc::clone(&member_access);
             let expected_principal_id = expected_principal_id.clone();
             async move {
-                let current_manifest = super::sync_payload::fresh_org_mutation_manifest(
-                    &project_dir,
-                    &vault_id,
-                    org_slug,
-                    &registry_url,
-                    expected_principal_id.as_deref(),
-                )?;
                 let checkpoint_version = current_manifest.org_sync_version_for_principal(
                     org_slug,
                     lpm_vault::vault_id::SyncPrincipal {
@@ -254,9 +251,11 @@ pub(super) async fn env_share(
                 } else {
                     checkpoint_version
                 };
+                let before_write = || super::sync_payload::verify_org_mutation_snapshot(&project_dir, &vault_id, org_slug, &registry_url, expected_principal_id.as_deref(), &schema_snapshot);
                 let push_metadata = lpm_vault::sync::PushMetadata {
                     name: Some(&project_name),
                     schema: schema_value.as_ref().as_ref(),
+                    before_write: Some(&before_write),
                 };
                 let result = lpm_vault::sync::push_org_with_access(
                     &registry_url,
@@ -292,18 +291,25 @@ pub(super) async fn env_share(
     }
 
     if json_output {
-        super::response::print_json_value(&serde_json::json!({
+        let mut response = serde_json::json!({
             "success": true,
             "status": result.status,
             "org": org_slug,
             "version": result.version,
-        }));
+        });
+        if !result.warnings.is_empty() {
+            response["warnings"] = serde_json::json!(result.warnings);
+        }
+        super::response::print_json_value(&response);
     } else {
         output::success_line(install_ui::terminal_line!(
-            "vault shared with org {} (version {})",
+            "env shared with org {} (version {})",
             install_ui::bold(org_slug),
             install_ui::bold(&result.version.unwrap_or(0).to_string()),
         ));
+        for warning in &result.warnings {
+            output::warn(&format!("{} {}", warning.message, warning.hint));
+        }
     }
     Ok(())
 }

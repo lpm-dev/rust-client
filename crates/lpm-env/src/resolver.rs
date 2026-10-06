@@ -38,6 +38,9 @@ pub struct ResolvedEnv {
 
     /// Whether this env is marked sensitive (requires extra auth in dashboard).
     pub sensitive: bool,
+
+    /// True for the implicit default cascade, without an explicit named selection.
+    pub implicit_default: bool,
 }
 
 /// Where an environment entry was discovered from.
@@ -131,6 +134,7 @@ pub fn resolve(
                 .and_then(|d| d.file().map(String::from)),
             source: EnvSource::Config,
             sensitive: is_sensitive_by_name(input),
+            implicit_default: false,
         };
     }
 
@@ -146,13 +150,16 @@ pub fn resolve(
             file_path: Some(file_path.clone()),
             source: EnvSource::Config,
             sensitive: is_sensitive_by_name(&mode),
+            implicit_default: false,
         };
     }
 
     // 3. Check if input is an extracted mode that an alias maps to
-    for (alias, file_path) in env_map {
-        if let Some(mode) = extract_mode_from_env_path(file_path)
-            && mode == input
+    if let Some((alias, file_path)) = env_map
+        .iter()
+        .filter(|(_, path)| extract_mode_from_env_path(path) == Some(input))
+        .min_by_key(|(alias, _)| alias.as_str())
+    {
         {
             return ResolvedEnv {
                 canonical: input.to_string(),
@@ -161,6 +168,7 @@ pub fn resolve(
                 file_path: Some(file_path.clone()),
                 source: EnvSource::Config,
                 sensitive: is_sensitive_by_name(input),
+                implicit_default: false,
             };
         }
     }
@@ -173,6 +181,7 @@ pub fn resolve(
         file_path: None,
         source: EnvSource::Vault,
         sensitive: is_sensitive_by_name(input),
+        implicit_default: false,
     }
 }
 
@@ -185,8 +194,21 @@ pub fn resolve_checked(
     environments: Option<&EnvironmentsConfig>,
 ) -> Result<ResolvedEnv, String> {
     let resolved = resolve(input, env_map, environments);
-    validate_env_name(&resolved.canonical)?;
+    validate_env_name(&resolved.canonical)
+        .map_err(|_| invalid_identity_message(&resolved.canonical, resolved.alias.as_deref()))?;
     Ok(resolved)
+}
+
+/// Explain an invalid resolved identity and the custom-path alias remedy.
+pub fn invalid_identity_message(canonical: &str, alias: Option<&str>) -> String {
+    let identity = alias.map_or_else(
+        || format!("environment {canonical:?}"),
+        |alias| format!("environment alias {alias:?} resolves to {canonical:?}"),
+    );
+    let reason = validate_env_name(canonical).err().unwrap_or_default();
+    format!(
+        "{identity}: {reason}. use a portable alias with ASCII letters, numbers, hyphens, underscores, or dots. For a task name with punctuation, select the environment through tasks.<name>.env"
+    )
 }
 
 /// Resolve from a script name (e.g., `lpm run dev` → script\_name=`"dev"`).
@@ -252,13 +274,19 @@ fn list_all_from_vault_names_inner<'a>(
         file_path: Some(".env".to_string()),
         source: EnvSource::Config,
         sensitive: false,
+        implicit_default: true,
     });
 
     let mut sorted_env: Vec<_> = env_map.iter().collect();
     sorted_env.sort_by_key(|(alias, _)| alias.as_str());
     let mut aliases_by_mode = HashMap::with_capacity(sorted_env.len());
     for (alias, file_path) in &sorted_env {
-        if let Some(mode) = extract_mode_from_env_path(file_path) {
+        let mode = if environments.is_some_and(|values| values.envs.contains_key(alias.as_str())) {
+            alias.as_str()
+        } else {
+            extract_mode_from_env_path(file_path).unwrap_or(alias)
+        };
+        {
             aliases_by_mode
                 .entry(mode)
                 .or_insert((alias.as_str(), file_path.as_str()));
@@ -276,6 +304,7 @@ fn list_all_from_vault_names_inner<'a>(
                 file_path: definition.file().map(str::to_owned),
                 source: EnvSource::Config,
                 sensitive: is_sensitive_by_name(canonical),
+                implicit_default: false,
             };
         }
         let alias = aliases_by_mode.get(canonical);
@@ -286,13 +315,22 @@ fn list_all_from_vault_names_inner<'a>(
             file_path: alias.map(|(_, value)| (*value).to_owned()),
             source: EnvSource::Config,
             sensitive: is_sensitive_by_name(canonical),
+            implicit_default: false,
         }
     };
 
-    for (_, file_path) in &sorted_env {
-        if let Some(mode) = extract_mode_from_env_path(file_path)
-            && !canonical_indexes.contains_key(mode)
-        {
+    if environments.is_some_and(|values| values.envs.contains_key("default"))
+        || aliases_by_mode.contains_key("default")
+    {
+        result[0] = configured_entry("default");
+    }
+    for (alias, file_path) in &sorted_env {
+        let mode = if environments.is_some_and(|values| values.envs.contains_key(alias.as_str())) {
+            alias.as_str()
+        } else {
+            extract_mode_from_env_path(file_path).unwrap_or(alias)
+        };
+        if !canonical_indexes.contains_key(mode) {
             canonical_indexes.insert(mode.to_owned(), result.len());
             result.push(configured_entry(mode));
         }
@@ -329,6 +367,7 @@ fn list_all_from_vault_names_inner<'a>(
                 file_path: None,
                 source: EnvSource::Vault,
                 sensitive: is_sensitive_by_name(vault_key),
+                implicit_default: false,
             });
         }
     }
@@ -337,12 +376,12 @@ fn list_all_from_vault_names_inner<'a>(
 }
 
 fn find_alias_for_mode(env_map: &HashMap<String, String>, mode: &str) -> Option<String> {
-    for (alias, file_path) in env_map {
-        if extract_mode_from_env_path(file_path) == Some(mode) {
-            return Some(alias.clone());
-        }
-    }
-    None
+    env_map
+        .iter()
+        .filter(|(_, path)| extract_mode_from_env_path(path) == Some(mode))
+        .map(|(alias, _)| alias)
+        .min()
+        .cloned()
 }
 
 fn is_sensitive_by_name(name: &str) -> bool {
@@ -476,6 +515,21 @@ mod tests {
         let r = resolve_checked("dev", &env_map, None);
         assert!(r.is_ok());
         assert_eq!(r.unwrap().canonical, "development");
+    }
+
+    #[test]
+    fn resolve_checked_preserves_the_exact_identity_validation_reason() {
+        for name in [
+            "x".repeat(65),
+            "a..b".into(),
+            "__index__".into(),
+            "".into(),
+            "test:unit".into(),
+        ] {
+            let reason = validate_env_name(&name).unwrap_err();
+            let error = resolve_checked(&name, &HashMap::new(), None).unwrap_err();
+            assert!(error.contains(&reason), "{error} omitted {reason}");
+        }
     }
 
     #[test]

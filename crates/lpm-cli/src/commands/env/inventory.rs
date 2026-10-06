@@ -19,29 +19,71 @@ struct InitActionResult {
     outcome: Option<InitActionOutcome>,
 }
 
-fn validate_configured_environment_names(
+#[derive(serde::Serialize)]
+struct SkippedInitEnvironment {
+    environment: String,
+    alias: Option<String>,
+    error: String,
+}
+
+struct InitConfiguration {
+    env_map: HashMap<String, String>,
+    environments: Option<lpm_env::EnvironmentsConfig>,
+    skipped: Vec<SkippedInitEnvironment>,
+}
+
+fn admitted_init_configuration(
     env_map: &HashMap<String, String>,
     environments: Option<&lpm_env::EnvironmentsConfig>,
-) -> Result<(), LpmError> {
-    for file_path in env_map.values() {
-        if file_path == ".env" {
-            continue;
+) -> InitConfiguration {
+    let mut admitted = InitConfiguration {
+        env_map: HashMap::with_capacity(env_map.len()),
+        environments: environments.map(|values| lpm_env::EnvironmentsConfig {
+            envs: HashMap::with_capacity(values.envs.len()),
+        }),
+        skipped: Vec::new(),
+    };
+    let mut aliases: Vec<_> = env_map.iter().collect();
+    aliases.sort_unstable_by_key(|(alias, _)| *alias);
+    for (alias, file) in aliases {
+        let canonical = lpm_env::resolver::resolve_canonical_name(alias, env_map, environments);
+        if let Err(reason) = lpm_env::resolver::validate_env_name(canonical) {
+            admitted.skipped.push(SkippedInitEnvironment {
+                environment: canonical.to_owned(),
+                alias: Some(alias.clone()),
+                error: format!("environment alias \"{alias}\" resolves to \"{canonical}\": {reason}. Use a portable alias; select it through tasks.<name>.env"),
+            });
+        } else {
+            admitted.env_map.insert(alias.clone(), file.clone());
         }
-        let canonical = lpm_env::resolver::extract_mode_from_env_path(file_path).ok_or_else(|| {
-            LpmError::Script(format!(
-                "invalid environment file mapping {file_path:?}: expected `.env` or `.env.<name>`"
-            ))
-        })?;
-        lpm_env::resolver::validate_env_name(canonical)
-            .map_err(|error| LpmError::Script(format!("invalid environment name: {error}")))?;
     }
     if let Some(environments) = environments {
-        for canonical in environments.envs.keys() {
-            lpm_env::resolver::validate_env_name(canonical)
-                .map_err(|error| LpmError::Script(format!("invalid environment name: {error}")))?;
+        let mut names: Vec<_> = environments.envs.iter().collect();
+        names.sort_unstable_by_key(|(name, _)| *name);
+        for (name, definition) in names {
+            let error =
+                lpm_env::resolver::validate_env_name(name)
+                    .err()
+                    .map(|reason| format!("environment {name:?}: {reason}"))
+                    .or_else(|| {
+                        definition.extends().and_then(|parent| {
+                            lpm_env::resolver::validate_env_name(parent).err().map(|reason| {
+                            format!("environment {name:?} has invalid parent {parent:?}: {reason}")
+                        })
+                        })
+                    });
+            if let Some(error) = error {
+                admitted.skipped.push(SkippedInitEnvironment {
+                    environment: name.clone(),
+                    alias: None,
+                    error: format!("{error}. Use a portable environment name"),
+                });
+            } else if let Some(values) = admitted.environments.as_mut() {
+                values.envs.insert(name.clone(), definition.clone());
+            }
         }
     }
-    Ok(())
+    admitted
 }
 
 fn perform_init_actions(
@@ -106,7 +148,14 @@ pub(super) fn vars_init(
     let empty_env_map = HashMap::new();
     let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
     let environments = config.as_ref().and_then(|c| c.environments.as_ref());
-    validate_configured_environment_names(env_map, environments)?;
+    let admitted = admitted_init_configuration(env_map, environments);
+    let env_map = &admitted.env_map;
+    let environments = admitted.environments.as_ref();
+    if !json_output {
+        for skipped in &admitted.skipped {
+            output::warn(&format!("Skipped {}", skipped.error));
+        }
+    }
     let snapshot = lpm_vault::capture_environment_initialization_snapshot(vault_id.as_deref())
         .map_err(LpmError::Script)?;
 
@@ -240,6 +289,7 @@ pub(super) fn vars_init(
                 "success": true,
                 "environments": json_actions.unwrap_or_default(),
                 "actions": results,
+                "skipped": admitted.skipped,
             })
         );
         return Ok(());
@@ -361,11 +411,13 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
         canonical: String,
         var_count: usize,
         schema_status: Option<(usize, usize)>, // (valid, total)
+        schema_error: Option<String>,
         alias: Option<String>,
         source: lpm_env::EnvSource,
     }
 
-    let mut rows: Vec<EnvRow> = Vec::new();
+    let validator = schema.map(lpm_env::EnvValidator::new);
+    let mut rows: Vec<EnvRow> = Vec::with_capacity(all_envs.len());
     for env in &all_envs {
         // Replicate the actual loader fallback behavior from dotenv.rs:79-88:
         // If the env-specific vault is completely empty, fall back to default.
@@ -374,21 +426,52 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
         let effective_vars = effective_schema_vars(&env.canonical, &vault_envs);
         let var_count = env_specific.map_or(0, |v| v.len());
 
-        let schema_status = schema.map(|s| {
-            let total = s.vars.iter().filter(|(_, r)| r.required).count();
-            let valid = s
-                .vars
-                .iter()
-                .filter(|(_, r)| r.required)
-                .filter(|(k, _)| effective_vars.is_some_and(|vars| vars.contains_key(k.as_str())))
-                .count();
-            (valid, total)
-        });
+        let mut schema_error = None;
+        let schema_status = if let (Some(schema), Some(validator)) = (schema, &validator) {
+            let mode = (!env.implicit_default).then_some(env.storage_key.as_str());
+            let evaluation = (|| -> Result<usize, LpmError> {
+                lpm_env::resolver::validate_env_name(&env.canonical).map_err(|_| {
+                    LpmError::EnvValidation(lpm_env::resolver::invalid_identity_message(
+                        &env.canonical,
+                        env.alias.as_deref(),
+                    ))
+                })?;
+                let mut values = lpm_runner::dotenv::load_project_env_files_with_config(
+                    project_dir,
+                    mode,
+                    env.file_path.as_deref(),
+                    config.as_ref(),
+                )?;
+                if let Some(stored) = effective_vars {
+                    lpm_runner::dotenv::merge_stored_project_env(&mut values, stored)?;
+                }
+                let errors = lpm_runner::dotenv::evaluate_project_env(
+                    &mut values,
+                    Some(validator),
+                    lpm_env::EvalContext {
+                        environment: &env.canonical,
+                        ..Default::default()
+                    },
+                )?;
+                Ok(super::schema::valid_variable_count(schema, &errors))
+            })();
+            let valid = match evaluation {
+                Ok(valid) => valid,
+                Err(error) => {
+                    schema_error = Some(error.to_string());
+                    0
+                }
+            };
+            Some((valid, schema.len()))
+        } else {
+            None
+        };
 
         rows.push(EnvRow {
             canonical: env.canonical.clone(),
             var_count,
             schema_status,
+            schema_error,
             alias: env.alias.clone(),
             source: env.source.clone(),
         });
@@ -407,6 +490,9 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
                 if let Some((valid, total)) = r.schema_status {
                     obj["schemaValid"] = serde_json::json!(valid);
                     obj["schemaTotal"] = serde_json::json!(total);
+                }
+                if let Some(error) = &r.schema_error {
+                    obj["schemaError"] = serde_json::json!(error);
                 }
                 obj
             })
@@ -440,21 +526,25 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
     );
 
     for row in &rows {
-        let schema_suffix = match row.schema_status {
-            Some((valid, total)) if total > 0 => {
-                if valid == total {
-                    install_ui::terminal_line!(
-                        " {}",
-                        install_ui::status_ok(&format!("{valid}/{total} ok")),
-                    )
-                } else {
-                    install_ui::terminal_line!(
-                        " {}",
-                        install_ui::red(&format!("{valid}/{total} !!")),
-                    )
+        let schema_suffix = if let Some(error) = &row.schema_error {
+            install_ui::terminal_line!(" {}", install_ui::red(&error.replace(['\n', '\r'], " ")))
+        } else {
+            match row.schema_status {
+                Some((valid, total)) if total > 0 => {
+                    if valid == total {
+                        install_ui::terminal_line!(
+                            " {}",
+                            install_ui::status_ok(&format!("{valid}/{total} ok")),
+                        )
+                    } else {
+                        install_ui::terminal_line!(
+                            " {}",
+                            install_ui::red(&format!("{valid}/{total} !!")),
+                        )
+                    }
                 }
+                _ => install_ui::TerminalLine::new(""),
             }
-            _ => install_ui::TerminalLine::new(""),
         };
 
         let row_synced = sync_summary.synced && row.var_count > 0;

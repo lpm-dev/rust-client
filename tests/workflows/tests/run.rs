@@ -84,8 +84,8 @@ fn run_stops_before_lifecycle_hooks_when_linked_env_secrets_cannot_be_read() {
         );
         if flags.is_empty() || flags.contains(&"--no-env-check") {
             assert!(
-                stderr.contains("skips schema checks only"),
-                "env access failure must explain the schema-only flag: {stderr}"
+                stderr.contains("skips value checks and defaults"),
+                "env access failure must explain the value-validation bypass: {stderr}"
             );
         }
         for phase in ["pre", "main", "post", "second"] {
@@ -246,7 +246,11 @@ fn watch_exits_without_hooks_when_linked_env_retrieval_is_denied() {
             "invalid-encrypted-fixture",
         )
         .unwrap();
-        let mut watcher = TaskWatcher::start(&project, task, &["--no-bail"]);
+        let mut watcher = if task == "entry.js" {
+            TaskWatcher::start_command(&project, &[task, "--watch"], &[])
+        } else {
+            TaskWatcher::start(&project, task, &["--no-bail"])
+        };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let status = loop {
             if let Some(status) = watcher.child.try_wait().unwrap() {
@@ -311,6 +315,36 @@ fn watch_rejects_upstream_dependencies_before_starting_tasks() {
             .unwrap()
             .is_some_and(|status| !status.success())
     );
+}
+
+#[test]
+fn watch_rejects_invalid_tasks_even_when_an_import_is_missing() {
+    for task in [
+        serde_json::json!({"command":"node build.js", "dependsOn":["^build"]}),
+        serde_json::json!({"command":"node build.js", "inputs":["["]}),
+    ] {
+        let project = TempProject::empty(r#"{"name":"watch-invalid-with-import"}"#);
+        project.write_file(
+            "lpm.json",
+            &serde_json::json!({"envSchema":{"extends":["missing.json"]},"tasks":{"build":task}})
+                .to_string(),
+        );
+        project.write_file("build.js", "require('fs').writeFileSync('ran','yes');");
+        let mut watcher = TaskWatcher::start(&project, "build", &[]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while watcher.child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            watcher
+                .child
+                .try_wait()
+                .unwrap()
+                .is_some_and(|status| !status.success()),
+            "invalid tasks were admitted to repair watch"
+        );
+        assert!(!project.file_exists("ran"));
+    }
 }
 
 #[cfg(unix)]
@@ -458,7 +492,8 @@ fn run_rejects_an_invalid_env_schema_regex_before_starting_the_script() {
 
     assert!(!output.status.success(), "invalid regex must fail");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("invalid regex"),
+        String::from_utf8_lossy(&output.stderr)
+            .contains("env.invalid_pattern at lpm.json/envSchema/vars/TOKEN"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -5523,10 +5558,14 @@ struct TaskWatcher {
 
 impl TaskWatcher {
     fn start(project: &TempProject, task: &str, flags: &[&str]) -> Self {
+        Self::start_command(project, &["run", task, "--watch"], flags)
+    }
+
+    fn start_command(project: &TempProject, args: &[&str], flags: &[&str]) -> Self {
         project.write_file(".lpm/watch.log", "");
         let diagnostics = project.path().join(".lpm/watch.log");
         let mut command = lpm_spawnable(project);
-        command.args(["run", task, "--watch"]).args(flags);
+        command.args(args).args(flags);
         command.stdout(std::process::Stdio::null());
         command.stderr(std::fs::File::create(&diagnostics).unwrap());
         Self {
@@ -6045,4 +6084,326 @@ fn scripts_inherit_a_raised_open_file_limit_when_lpm_starts_with_256() {
         })
         .unwrap_or_else(|| panic!("no limit printed: {stdout}"));
     assert!(seen > 256, "the script saw a soft limit of {seen}");
+}
+
+#[test]
+fn watch_reloads_canonical_scoped_defaults_after_schema_changes() {
+    let project =
+        TempProject::empty(r#"{"name":"watch-scoped-env","scripts":{"build":"node record.cjs"}}"#);
+    project.write_file("record.cjs","require('node:fs').writeFileSync('.lpm/value',process.env.WATCH_SCOPED_VALUE || 'missing');");
+    let config = |value: &str| {
+        serde_json::json!({"env":{"release":".env.production"},"tasks":{"build":{"env":"release","inputs":["src/**"]}},"envSchema":{"vars":{"WATCH_SCOPED_VALUE":{"requiredIn":[{"environment":["production"],"stage":["build"]}],"defaultsIn":[{"when":{"environment":["production"],"stage":["build"]},"value":value}]}}}}).to_string()
+    };
+    project.write_file_and_sync("lpm.json", &config("first"));
+    project.write_file("src/input", "fixture");
+    let mut watcher = TaskWatcher::start(&project, "build", &["--no-cache"]);
+    let value = || std::fs::read_to_string(project.path().join(".lpm/value")).unwrap_or_default();
+    watcher.wait_until(|| value() == "first");
+    project.write_file_and_sync("lpm.json", &config("second"));
+    watcher.wait_until(|| value() == "second");
+}
+
+#[cfg(unix)]
+#[test]
+fn task_cache_ignores_unselected_path_tails_with_unchanged_executables() {
+    for (selected, declared) in [(false, false), (false, true), (true, false)] {
+        let project =
+            TempProject::empty(r#"{"name":"cache-path-tail","scripts":{"build":"node build.js"}}"#);
+        project.write_file("lpm.json", &serde_json::json!({"tasks":{"build":{"cache":true,"cacheEnv":if selected {vec!["PATH"]} else {vec![]},"inputs":["build.js"],"outputs":["dist/**"]}},"envSchema":if declared {serde_json::json!({"vars":{"PATH":{}}})} else {serde_json::json!(null)}}).to_string());
+        project.write_file("build.js", "const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/out','ok');fs.appendFileSync('executions','run\\n');");
+        let original = std::env::var("PATH").unwrap();
+        for tail in ["empty-a", "empty-b"] {
+            let path = format!("{original}:{}", project.path().join(tail).display());
+            lpm(&project)
+                .env("PATH", path)
+                .args(["run", "build"])
+                .assert()
+                .success();
+        }
+        assert_eq!(
+            project.read_file("executions"),
+            if selected { "run\nrun\n" } else { "run\n" }
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn task_cache_invalidates_when_a_node_launcher_selects_a_different_helper() {
+    use std::os::unix::fs::PermissionsExt;
+    let project =
+        TempProject::empty(r#"{"name":"launcher-cache","scripts":{"build":"node build.js"}}"#);
+    project.write_file("lpm.json", r#"{"tasks":{"build":{"cache":true,"cacheEnv":[],"inputs":["build.js"],"outputs":["dist/**"]}}}"#);
+    project.write_file("build.js", "const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/out',process.env.HELPER_MARKER);fs.appendFileSync('executions','run\\n');");
+    project.write_file(
+        "node_modules/.bin/node",
+        "#!/bin/sh\nexec helper-node \"$@\"\n",
+    );
+    let real_node = std::process::Command::new("node")
+        .args(["-p", "process.execPath"])
+        .output()
+        .unwrap();
+    let real_node = String::from_utf8(real_node.stdout).unwrap();
+    for helper in ["a", "b"] {
+        project.write_file(
+            &format!("{helper}/helper-node"),
+            &format!(
+                "#!/bin/sh\nexport HELPER_MARKER={helper}\nexec '{}' \"$@\"\n",
+                real_node.trim()
+            ),
+        );
+        for path in [
+            "node_modules/.bin/node".to_owned(),
+            format!("{helper}/helper-node"),
+        ] {
+            std::fs::set_permissions(
+                project.path().join(path),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            project.path().join(helper).display(),
+            std::env::var("PATH").unwrap()
+        );
+        lpm(&project)
+            .env("PATH", path)
+            .args(["run", "build"])
+            .assert()
+            .success();
+        assert_eq!(project.read_file("dist/out"), helper);
+    }
+    assert_eq!(project.read_file("executions"), "run\nrun\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn task_cache_invalidates_when_a_bun_launcher_selects_a_different_helper() {
+    use std::os::unix::fs::PermissionsExt;
+    let project =
+        TempProject::empty(r#"{"name":"launcher-cache","scripts":{"build":"bun build.js"}}"#);
+    project.write_file("lpm.json", r#"{"tasks":{"build":{"cache":true,"cacheEnv":[],"inputs":["build.js"],"outputs":["dist/**"]}}}"#);
+    project.write_file("build.js", "const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/out',process.env.HELPER_MARKER);fs.appendFileSync('executions','run\\n');");
+    project.write_file(
+        "node_modules/.bin/bun",
+        "#!/bin/sh\nexec helper-bun \"$@\"\n",
+    );
+    let real_node = std::process::Command::new("node")
+        .args(["-p", "process.execPath"])
+        .output()
+        .unwrap();
+    let real_node = String::from_utf8(real_node.stdout).unwrap();
+    for helper in ["a", "b"] {
+        project.write_file(
+            &format!("{helper}/helper-bun"),
+            &format!(
+                "#!/bin/sh\nexport HELPER_MARKER={helper}\nexec '{}' \"$@\"\n",
+                real_node.trim()
+            ),
+        );
+        for path in [
+            "node_modules/.bin/bun".to_owned(),
+            format!("{helper}/helper-bun"),
+        ] {
+            std::fs::set_permissions(
+                project.path().join(path),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        let path = format!(
+            "{}:{}",
+            project.path().join(helper).display(),
+            std::env::var("PATH").unwrap()
+        );
+        lpm(&project)
+            .env("PATH", path)
+            .args(["run", "build"])
+            .assert()
+            .success();
+        assert_eq!(project.read_file("dist/out"), helper);
+    }
+    assert_eq!(project.read_file("executions"), "run\nrun\n");
+}
+
+#[test]
+fn imported_schema_changes_invalidate_cache_with_empty_cache_env() {
+    let project = TempProject::empty(r#"{"name":"import-cache"}"#);
+    project.write_file("lpm.json", r#"{"tasks":{"build":{"command":"node record.cjs","cache":true,"cacheEnv":[],"inputs":["src/**"],"outputs":["dist/**"]}},"envSchema":{"extends":["schemas/base.json"]}}"#);
+    project.write_file("record.cjs", "const fs=require('node:fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/value',process.env.IMPORTED_VALUE);fs.appendFileSync('.lpm/executions','run\\n');");
+    project.write_file("src/input", "fixture");
+    project.write_file(".lpm/executions", "");
+    project.write_file(
+        "schemas/base.json",
+        r#"{"vars":{"IMPORTED_VALUE":{"default":"first"}}}"#,
+    );
+    for _ in 0..2 {
+        let output = lpm(&project).args(["run", "build"]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(project.path().join(".lpm/executions")).unwrap(),
+        "run\n"
+    );
+    project.write_file(
+        "schemas/base.json",
+        r#"{"vars":{"IMPORTED_VALUE":{"default":"second"}}}"#,
+    );
+    let output = lpm(&project).args(["run", "build"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("dist/value")).unwrap(),
+        "second"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join(".lpm/executions")).unwrap(),
+        "run\nrun\n"
+    );
+}
+
+#[test]
+fn watch_repairs_missing_literal_imports_and_reloads_after_directory_replacement() {
+    for direct in [false, true] {
+        let project = TempProject::empty(r#"{"name":"import-watch"}"#);
+        project.write_file("lpm.json", r#"{"tasks":{"build":{"command":"node record.cjs","inputs":["src/**"],"outputs":["schemas/**"]}},"envSchema":{"extends":["schemas/literal[1].json"]}}"#);
+        project.write_file(
+            "record.cjs",
+            "require('node:fs').writeFileSync('.lpm/value',process.env.IMPORTED_VALUE);",
+        );
+        project.write_file("src/input", "fixture");
+        project.write_file_and_sync(
+            "schemas/literal[1].json",
+            r#"{"vars":{"IMPORTED_VALUE":{"default":"first"}}}"#,
+        );
+        let mut watcher = if direct {
+            TaskWatcher::start_command(&project, &["record.cjs", "--watch"], &[])
+        } else {
+            TaskWatcher::start(&project, "build", &["--no-cache"])
+        };
+        let value =
+            || std::fs::read_to_string(project.path().join(".lpm/value")).unwrap_or_default();
+        watcher.wait_until(|| value() == "first");
+        std::fs::rename(
+            project.path().join("schemas"),
+            project.path().join("previous"),
+        )
+        .unwrap();
+        let diagnostics = watcher.diagnostics.clone();
+        watcher.wait_until(|| {
+            std::fs::read_to_string(&diagnostics)
+                .unwrap_or_default()
+                .contains("env.import_unreadable")
+        });
+        project.write_file_and_sync(
+            "schemas/literal[1].json",
+            r#"{"vars":{"IMPORTED_VALUE":{"default":"second"}}}"#,
+        );
+        watcher.wait_until(|| value() == "second");
+        project.write_file_and_sync(
+            "schemas/literal[1].json",
+            r#"{"vars":{"IMPORTED_VALUE":{"default":"third"}}}"#,
+        );
+        watcher.wait_until(|| value() == "third");
+    }
+}
+
+#[test]
+fn direct_file_watch_reloads_imported_schema_outside_script_inputs() {
+    let project = TempProject::empty(r#"{"name":"file-import-watch"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"envSchema":{"extends":["schemas/base.json"]}}"#,
+    );
+    project.write_file(
+        "record.cjs",
+        "require('node:fs').writeFileSync('.lpm/value',process.env.IMPORTED_VALUE);",
+    );
+    project.write_file_and_sync(
+        "schemas/base.json",
+        r#"{"vars":{"IMPORTED_VALUE":{"default":"first"}}}"#,
+    );
+    let mut watcher = TaskWatcher::start_command(&project, &["record.cjs", "--watch"], &[]);
+    let value = || std::fs::read_to_string(project.path().join(".lpm/value")).unwrap_or_default();
+    watcher.wait_until(|| value() == "first");
+    project.write_file_and_sync(
+        "schemas/base.json",
+        r#"{"vars":{"IMPORTED_VALUE":{"default":"second"}}}"#,
+    );
+    watcher.wait_until(|| value() == "second");
+}
+
+#[test]
+fn direct_file_watch_recovers_after_entrypoint_directory_recreation() {
+    let project = TempProject::empty(r#"{"name":"entrypoint-repair"}"#);
+    project.write_file("lpm.json", "{}");
+    project.write_file_and_sync(
+        "src/entry.cjs",
+        "require('node:fs').writeFileSync('.lpm/value','first');",
+    );
+    let mut watcher = TaskWatcher::start_command(&project, &["src/entry.cjs", "--watch"], &[]);
+    let value = || std::fs::read_to_string(project.path().join(".lpm/value")).unwrap_or_default();
+    watcher.wait_until(|| value() == "first");
+    std::fs::rename(project.path().join("src"), project.path().join("old-src")).unwrap();
+    let diagnostics = watcher.diagnostics.clone();
+    watcher.wait_until(|| {
+        std::fs::read_to_string(&diagnostics)
+            .unwrap_or_default()
+            .contains("MODULE_NOT_FOUND")
+    });
+    project.write_file_and_sync(
+        "src/entry.cjs",
+        "require('node:fs').writeFileSync('.lpm/value','second');",
+    );
+    watcher.wait_until(|| value() == "second");
+    project.write_file_and_sync(
+        "src/entry.cjs",
+        "require('node:fs').writeFileSync('.lpm/value','third');",
+    );
+    watcher.wait_until(|| value() == "third");
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_file_watch_recovers_when_an_external_symlink_target_directory_returns() {
+    let project = TempProject::empty(r#"{"name":"external-entrypoint-repair"}"#);
+    let outside = TempProject::empty(r#"{"name":"external-entrypoint"}"#);
+    project.write_file("lpm.json", "{}");
+    outside.write_file_and_sync(
+        "src/entry.cjs",
+        "require('node:fs').writeFileSync('.lpm/value','first');",
+    );
+    std::os::unix::fs::symlink(
+        outside.path().join("src/entry.cjs"),
+        project.path().join("entry.cjs"),
+    )
+    .unwrap();
+    let mut watcher = TaskWatcher::start_command(&project, &["entry.cjs", "--watch"], &[]);
+    let value = || std::fs::read_to_string(project.path().join(".lpm/value")).unwrap_or_default();
+    watcher.wait_until(|| value() == "first");
+    std::fs::rename(outside.path().join("src"), outside.path().join("old-src")).unwrap();
+    let diagnostics = watcher.diagnostics.clone();
+    watcher.wait_until(|| {
+        std::fs::read_to_string(&diagnostics)
+            .unwrap_or_default()
+            .contains("MODULE_NOT_FOUND")
+    });
+    outside.write_file_and_sync(
+        "src/entry.cjs",
+        "require('node:fs').writeFileSync('.lpm/value','second');",
+    );
+    watcher.wait_until(|| value() == "second");
+    outside.write_file_and_sync(
+        "src/entry.cjs",
+        "require('node:fs').writeFileSync('.lpm/value','third');",
+    );
+    watcher.wait_until(|| value() == "third");
 }

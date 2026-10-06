@@ -48,6 +48,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
 
       - name: Cache cargo
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
@@ -65,6 +66,9 @@ jobs:
       - name: Test macOS Keychain search-list helper
         run: bash scripts/ci/test-macos-keychain-search-list.sh
 
+      - name: Test immutable env engine exporter
+        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+
       - name: Install Linux keyring build deps
         run: bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev
 
@@ -79,6 +83,9 @@ jobs:
       # lints in build_state.rs that this stricter invocation surfaces).
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Build portable env validator
+        run: cargo build --locked --release -p lpm-env-wasm --target wasm32-unknown-unknown
 
       - name: Check formatting
         run: cargo fmt --check
@@ -150,6 +157,9 @@ jobs:
 
       - name: Runtime readiness bench helper tests
         run: node bench/scripts/run-runtime-readiness.mjs --self-test
+
+      - name: Portable env decoder regression
+        run: python3 -m unittest discover -s scripts/tests -p test_export_env_validator.py
 
       - name: npm wrapper tests
         run: npm --prefix npm/cli test
@@ -288,6 +298,9 @@ jobs:
 
       - name: Build workspace
         run: cargo build --workspace --locked
+
+      - name: Generated environment TypeScript and ESM consumers
+        run: npx --yes --package typescript@5.9.3 -- node scripts/check-env-codegen-types.mjs target/debug/lpm-rs
 
       - name: Local package archive installs
         run: cargo nextest run --locked -p lpm-workflows --test install_local_tarball --no-fail-fast --status-level slow --final-status-level fail
@@ -606,6 +619,12 @@ jobs:
         run: |
           cargo test --locked -p lpm-workflows --test run_runtime workspace_resolves_windows_current_directory_node_before_path
           cargo test --locked -p lpm-workflows --test run_runtime workspace_does_not_reuse_shared_node_shim_version_across_member_cwds
+
+      - name: Windows scoped environment workflows
+        run: |
+          cargo test --locked -p lpm-workflows --test env_local sparse_and_bulk_inherited_lookup_match_windows_canonical_names
+          cargo test --locked -p lpm-workflows --test env_local scoped_direct_files_and_local_bins_use_the_canonical_environment_and_final_values
+          cargo test --locked -p lpm-workflows --test tools detected_test_runners_validate_test_scopes_for_single_and_workspace_packages
 
       - name: Windows dev environment workflow tests
         run: cargo test --locked -p lpm-workflows --test dev dev_schema_

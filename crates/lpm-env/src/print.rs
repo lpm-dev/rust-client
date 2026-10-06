@@ -119,33 +119,33 @@ pub(crate) fn format_dotenv(vars: &[(&str, &str)]) -> String {
     let mut output = String::with_capacity(output_capacity(vars, 4));
     for (key, value) in vars {
         start_line(&mut output);
-        output.push_str(key);
-        output.push('=');
-        let needs_quote = value.contains(' ')
-            || value.contains('\t')
-            || value.contains('"')
-            || value.contains('\'')
-            || value.contains('#')
-            || value.contains('\n')
-            || value.contains('\r');
-        if needs_quote {
-            output.push('"');
-            for character in value.chars() {
-                match character {
-                    '\\' => output.push_str("\\\\"),
-                    '"' => output.push_str("\\\""),
-                    '\n' => output.push_str("\\n"),
-                    '\r' => output.push_str("\\r"),
-                    '\t' => output.push_str("\\t"),
-                    other => output.push(other),
-                }
-            }
-            output.push('"');
-        } else {
-            output.push_str(value);
-        }
+        append_dotenv_entry(&mut output, key, value);
     }
     output
+}
+
+pub(crate) fn append_dotenv_entry(output: &mut String, key: &str, value: &str) {
+    output.push_str(key);
+    output.push('=');
+    let needs_quote = value
+        .chars()
+        .any(|character| character.is_whitespace() || matches!(character, '"' | '\'' | '#'));
+    if needs_quote {
+        output.push('"');
+        for character in value.chars() {
+            match character {
+                '\\' => output.push_str("\\\\"),
+                '"' => output.push_str("\\\""),
+                '\n' => output.push_str("\\n"),
+                '\r' => output.push_str("\\r"),
+                '\t' => output.push_str("\\t"),
+                other => output.push(other),
+            }
+        }
+        output.push('"');
+    } else {
+        output.push_str(value);
+    }
 }
 
 struct BorrowedSortedMap<'a>(&'a [(&'a str, &'a str)]);

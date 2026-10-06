@@ -8,6 +8,13 @@
 //! 5. Runs the script via shell
 //! 6. Checks for and runs post-hooks
 
+mod environment;
+use environment::print_env_context;
+pub(crate) use environment::resolve_and_load_env_with_schema_validation;
+pub use environment::{
+    load_script_child_env_with_config, load_script_env, load_script_env_with_config,
+};
+
 use crate::bin_path;
 use crate::bin_path::ManagedRuntimeHint;
 use crate::dotenv;
@@ -15,8 +22,7 @@ use crate::hooks;
 use crate::lpm_json;
 use crate::npm_context::NpmScriptContext;
 use crate::shell::{self, ShellCommand};
-use lpm_common::color::Painted;
-use lpm_common::{LpmError, sanitize_terminal_inline};
+use lpm_common::LpmError;
 use lpm_workspace::read_package_json;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -49,7 +55,7 @@ pub fn hidden_script_direct_invocation_allowed() -> bool {
 }
 
 fn mark_script_child_env(env_vars: &mut HashMap<String, String>) {
-    env_vars.insert(LPM_SCRIPT_CHILD_ENV.to_string(), "1".to_string());
+    dotenv::insert_project_env(env_vars, LPM_SCRIPT_CHILD_ENV.to_string(), "1".to_string());
 }
 
 /// Escape a runtime argument so the platform shell treats it as data.
@@ -271,28 +277,88 @@ pub fn run_script_with_envs(
     extra_envs: &[(String, String)],
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<(), LpmError> {
+    let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    run_script_with_envs_and_config(
+        project_dir,
+        script_name,
+        extra_args,
+        env_mode,
+        extra_envs,
+        bin_hint,
+        config.as_ref(),
+    )
+}
+
+pub fn run_script_with_envs_and_config(
+    project_dir: &Path,
+    script_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    extra_envs: &[(String, String)],
+    bin_hint: &ManagedRuntimeHint,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<(), LpmError> {
+    let validate_schema = !should_skip_env_validation();
+    let validator = config
+        .filter(|_| validate_schema)
+        .and_then(|config| config.env_schema.as_ref())
+        .map(lpm_env::EnvValidator::new);
     let ResolvedScript {
         command: script_cmd,
         scripts,
         context,
-    } = resolve_script_command(project_dir, script_name)?;
+    } = resolve_script_command_with_config(
+        project_dir,
+        script_name,
+        config,
+        ScriptPreference::PackageScript,
+    )?;
 
     // Build PATH with .bin dirs prepended
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
 
     // Load .env files + merge extra env vars (from HTTPS/tunnel/network setup)
-    let loaded = resolve_and_load_env(project_dir, script_name, env_mode)?;
+    let loaded = resolve_and_load_env_with_schema_validation(
+        project_dir,
+        script_name,
+        env_mode,
+        config,
+        false,
+    )?;
+    let eval_context = lpm_env::EvalContext {
+        environment: loaded.env_name.as_deref().unwrap_or("default"),
+        stage: lpm_env::EnvStage::for_script(script_name),
+        service: None,
+    };
     print_env_context(&loaded);
     let mut env_vars = loaded.vars;
     for (key, value) in extra_envs {
         dotenv::insert_project_env(&mut env_vars, key.clone(), value.clone());
     }
     mark_script_child_env(&mut env_vars);
+    context.apply(&mut env_vars, script_name, &script_cmd);
+    let pre_command = hooks::find_pre_hook(&scripts, script_name);
+    if pre_command.is_some() {
+        dotenv::validate_child_env(
+            &mut env_vars,
+            validator.as_ref(),
+            eval_context,
+            &path,
+            validate_schema,
+        )?;
+    }
 
     // Run pre-hook if it exists
-    if let Some(pre_cmd) = hooks::find_pre_hook(&scripts, script_name) {
+    if let Some(pre_cmd) = pre_command {
         let pre_name = hooks::pre_hook_name(script_name);
         context.apply(&mut env_vars, &pre_name, pre_cmd);
+        dotenv::validate_child_env(
+            &mut env_vars,
+            validator.as_ref(),
+            eval_context,
+            &path,
+            validate_schema,
+        )?;
         tracing::debug!("running pre-hook: {pre_name}");
 
         let status = shell::spawn_shell(&ShellCommand {
@@ -313,6 +379,13 @@ pub fn run_script_with_envs(
     }
 
     context.apply(&mut env_vars, script_name, &script_cmd);
+    dotenv::validate_child_env(
+        &mut env_vars,
+        validator.as_ref(),
+        eval_context,
+        &path,
+        validate_schema,
+    )?;
     let full_cmd = assemble_shell_command(&script_cmd, extra_args, project_dir, &path)?;
 
     // Run the main script
@@ -331,6 +404,13 @@ pub fn run_script_with_envs(
     if let Some(post_cmd) = hooks::find_post_hook(&scripts, script_name) {
         let post_name = hooks::post_hook_name(script_name);
         context.apply(&mut env_vars, &post_name, post_cmd);
+        dotenv::validate_child_env(
+            &mut env_vars,
+            validator.as_ref(),
+            eval_context,
+            &path,
+            validate_schema,
+        )?;
         tracing::debug!("running post-hook: {post_name}");
 
         let status = shell::spawn_shell(&ShellCommand {
@@ -405,17 +485,42 @@ pub fn run_dev_script_with_envs_and_config(
     let loaded =
         resolve_and_load_env_with_schema_validation(project_dir, "dev", env_mode, config, false)?;
     print_env_context(&loaded);
+    let validate_schema = !should_skip_env_validation();
+    let validator = config
+        .filter(|_| validate_schema)
+        .and_then(|config| config.env_schema.as_ref())
+        .map(lpm_env::EnvValidator::new);
+    let eval_context = lpm_env::EvalContext {
+        environment: loaded.env_name.as_deref().unwrap_or("default"),
+        stage: lpm_env::EnvStage::Development,
+        service: None,
+    };
     let mut env_vars = loaded.vars;
     for (key, value) in extra_envs {
         dotenv::insert_project_env(&mut env_vars, key.clone(), value.clone());
     }
-    if !should_skip_env_validation() {
-        dotenv::validate_project_env(&mut env_vars, config)?;
-    }
     mark_script_child_env(&mut env_vars);
+    context.apply(&mut env_vars, "dev", &script_cmd);
+    let pre_command = hooks::find_pre_hook(&scripts, "dev");
+    if pre_command.is_some() {
+        dotenv::validate_child_env(
+            &mut env_vars,
+            validator.as_ref(),
+            eval_context,
+            &path,
+            validate_schema,
+        )?;
+    }
 
-    if let Some(pre_cmd) = hooks::find_pre_hook(&scripts, "dev") {
+    if let Some(pre_cmd) = pre_command {
         context.apply(&mut env_vars, "predev", pre_cmd);
+        dotenv::validate_child_env(
+            &mut env_vars,
+            validator.as_ref(),
+            eval_context,
+            &path,
+            validate_schema,
+        )?;
         let status = shell::spawn_shell_cancellable(
             &ShellCommand {
                 command: pre_cmd,
@@ -439,6 +544,13 @@ pub fn run_dev_script_with_envs_and_config(
     }
 
     context.apply(&mut env_vars, "dev", &script_cmd);
+    dotenv::validate_child_env(
+        &mut env_vars,
+        validator.as_ref(),
+        eval_context,
+        &path,
+        validate_schema,
+    )?;
     let full_cmd = assemble_shell_command(&script_cmd, extra_args, project_dir, &path)?;
     let status = shell::spawn_shell_with_endpoint(
         &ShellCommand {
@@ -464,6 +576,13 @@ pub fn run_dev_script_with_envs_and_config(
 
     if let Some(post_cmd) = hooks::find_post_hook(&scripts, "dev") {
         context.apply(&mut env_vars, "postdev", post_cmd);
+        dotenv::validate_child_env(
+            &mut env_vars,
+            validator.as_ref(),
+            eval_context,
+            &path,
+            validate_schema,
+        )?;
         let status = shell::spawn_shell_cancellable(
             &ShellCommand {
                 command: post_cmd,
@@ -643,22 +762,73 @@ fn run_script_with_output_at_path(
     extra_args: &[String],
     env_mode: Option<&str>,
     path: &str,
+    spawn: impl FnMut(&ShellCommand<'_>) -> Result<shell::CapturedOutput, LpmError>,
+) -> Result<ScriptOutput, LpmError> {
+    let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    run_script_with_output_at_path_and_config(
+        project_dir,
+        script_name,
+        extra_args,
+        env_mode,
+        path,
+        config.as_ref(),
+        spawn,
+    )
+}
+
+fn run_script_with_output_at_path_and_config(
+    project_dir: &Path,
+    script_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    path: &str,
+    config: Option<&lpm_json::LpmJsonConfig>,
     mut spawn: impl FnMut(&ShellCommand<'_>) -> Result<shell::CapturedOutput, LpmError>,
 ) -> Result<ScriptOutput, LpmError> {
+    let validate_schema = !should_skip_env_validation();
+    let validator = config
+        .filter(|_| validate_schema)
+        .and_then(|config| config.env_schema.as_ref())
+        .map(lpm_env::EnvValidator::new);
     let ResolvedScript {
         command,
         scripts,
         context,
-    } = resolve_script_command(project_dir, script_name)?;
-    let mut environment = resolve_and_load_env(project_dir, script_name, env_mode)?.vars;
+    } = resolve_script_command_with_config(
+        project_dir,
+        script_name,
+        config,
+        ScriptPreference::PackageScript,
+    )?;
+    let loaded = resolve_and_load_env_with_schema_validation(
+        project_dir,
+        script_name,
+        env_mode,
+        config,
+        false,
+    )?;
+    let eval_context = lpm_env::EvalContext {
+        environment: loaded.env_name.as_deref().unwrap_or("default"),
+        stage: lpm_env::EnvStage::for_script(script_name),
+        service: None,
+    };
+    let mut environment = loaded.vars;
     mark_script_child_env(&mut environment);
+    let pre_command = hooks::find_pre_hook(&scripts, script_name);
+    if pre_command.is_some() {
+        context.apply(&mut environment, script_name, &command);
+        dotenv::validate_child_env(
+            &mut environment,
+            validator.as_ref(),
+            eval_context,
+            path,
+            validate_schema,
+        )?;
+    }
     let pre_name = hooks::pre_hook_name(script_name);
     let post_name = hooks::post_hook_name(script_name);
     let phases = [
-        (
-            pre_name.as_str(),
-            hooks::find_pre_hook(&scripts, script_name),
-        ),
+        (pre_name.as_str(), pre_command),
         (script_name, Some(command.as_str())),
         (
             post_name.as_str(),
@@ -674,6 +844,13 @@ fn run_script_with_output_at_path(
             continue;
         };
         context.apply(&mut environment, phase, declared_command);
+        dotenv::validate_child_env(
+            &mut environment,
+            validator.as_ref(),
+            eval_context,
+            path,
+            validate_schema,
+        )?;
         let full_command;
         let command = if phase == script_name {
             full_command = assemble_shell_command(declared_command, extra_args, project_dir, path)?;
@@ -779,8 +956,52 @@ fn run_command_buffered_named(
     extra_envs: &[(String, String)],
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
+    let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    run_command_buffered_named_with_config(
+        project_dir,
+        task_name,
+        command,
+        extra_args,
+        env_mode,
+        extra_envs,
+        bin_hint,
+        config.as_ref(),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "runner inputs include a caller-owned configuration snapshot"
+)]
+fn run_command_buffered_named_with_config(
+    project_dir: &Path,
+    task_name: &str,
+    command: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    extra_envs: &[(String, String)],
+    bin_hint: &ManagedRuntimeHint,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<ScriptOutput, LpmError> {
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
-    let mut env_vars = resolve_and_load_env(project_dir, task_name, env_mode)?.vars;
+    let validate_schema = !should_skip_env_validation();
+    let validator = config
+        .filter(|_| validate_schema)
+        .and_then(|config| config.env_schema.as_ref())
+        .map(lpm_env::EnvValidator::new);
+    let loaded = resolve_and_load_env_with_schema_validation(
+        project_dir,
+        task_name,
+        env_mode,
+        config,
+        false,
+    )?;
+    let eval_context = lpm_env::EvalContext {
+        environment: loaded.env_name.as_deref().unwrap_or("default"),
+        stage: lpm_env::EnvStage::for_script(task_name),
+        service: None,
+    };
+    let mut env_vars = loaded.vars;
     for (key, value) in extra_envs {
         dotenv::insert_project_env(&mut env_vars, key.clone(), value.clone());
     }
@@ -792,6 +1013,13 @@ fn run_command_buffered_named(
         );
     }
     mark_script_child_env(&mut env_vars);
+    dotenv::validate_child_env(
+        &mut env_vars,
+        validator.as_ref(),
+        eval_context,
+        &path,
+        validate_schema,
+    )?;
 
     let full_cmd = assemble_shell_command(command, extra_args, project_dir, &path)?;
 
@@ -898,8 +1126,54 @@ fn run_command_prefixed_named(
     color: &str,
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<ScriptOutput, LpmError> {
+    let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    run_command_prefixed_named_with_config(
+        project_dir,
+        task_name,
+        command,
+        extra_args,
+        env_mode,
+        prefix,
+        color,
+        bin_hint,
+        config.as_ref(),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "runner inputs include a caller-owned configuration snapshot"
+)]
+fn run_command_prefixed_named_with_config(
+    project_dir: &Path,
+    task_name: &str,
+    command: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    prefix: &str,
+    color: &str,
+    bin_hint: &ManagedRuntimeHint,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<ScriptOutput, LpmError> {
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
-    let mut env_vars = resolve_and_load_env(project_dir, task_name, env_mode)?.vars;
+    let validate_schema = !should_skip_env_validation();
+    let validator = config
+        .filter(|_| validate_schema)
+        .and_then(|config| config.env_schema.as_ref())
+        .map(lpm_env::EnvValidator::new);
+    let loaded = resolve_and_load_env_with_schema_validation(
+        project_dir,
+        task_name,
+        env_mode,
+        config,
+        false,
+    )?;
+    let eval_context = lpm_env::EvalContext {
+        environment: loaded.env_name.as_deref().unwrap_or("default"),
+        stage: lpm_env::EnvStage::for_script(task_name),
+        service: None,
+    };
+    let mut env_vars = loaded.vars;
     if !task_name.is_empty() {
         NpmScriptContext::load(project_dir, &std::env::current_dir()?)?.apply(
             &mut env_vars,
@@ -908,6 +1182,13 @@ fn run_command_prefixed_named(
         );
     }
     mark_script_child_env(&mut env_vars);
+    dotenv::validate_child_env(
+        &mut env_vars,
+        validator.as_ref(),
+        eval_context,
+        &path,
+        validate_schema,
+    )?;
 
     let full_cmd = assemble_shell_command(command, extra_args, project_dir, &path)?;
 
@@ -1008,8 +1289,52 @@ fn run_command_named_with_envs(
     extra_envs: &[(String, String)],
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<(), LpmError> {
+    let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    run_command_named_with_envs_and_config(
+        project_dir,
+        task_name,
+        command,
+        extra_args,
+        env_mode,
+        extra_envs,
+        bin_hint,
+        config.as_ref(),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "runner inputs include a caller-owned configuration snapshot"
+)]
+fn run_command_named_with_envs_and_config(
+    project_dir: &Path,
+    task_name: &str,
+    command: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    extra_envs: &[(String, String)],
+    bin_hint: &ManagedRuntimeHint,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<(), LpmError> {
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
-    let mut env_vars = resolve_and_load_env(project_dir, task_name, env_mode)?.vars;
+    let validate_schema = !should_skip_env_validation();
+    let validator = config
+        .filter(|_| validate_schema)
+        .and_then(|config| config.env_schema.as_ref())
+        .map(lpm_env::EnvValidator::new);
+    let loaded = resolve_and_load_env_with_schema_validation(
+        project_dir,
+        task_name,
+        env_mode,
+        config,
+        false,
+    )?;
+    let eval_context = lpm_env::EvalContext {
+        environment: loaded.env_name.as_deref().unwrap_or("default"),
+        stage: lpm_env::EnvStage::for_script(task_name),
+        service: None,
+    };
+    let mut env_vars = loaded.vars;
     for (key, value) in extra_envs {
         dotenv::insert_project_env(&mut env_vars, key.clone(), value.clone());
     }
@@ -1021,6 +1346,13 @@ fn run_command_named_with_envs(
         );
     }
     mark_script_child_env(&mut env_vars);
+    dotenv::validate_child_env(
+        &mut env_vars,
+        validator.as_ref(),
+        eval_context,
+        &path,
+        validate_schema,
+    )?;
 
     let full_cmd = assemble_shell_command(command, extra_args, project_dir, &path)?;
 
@@ -1060,6 +1392,8 @@ pub fn build_local_bin_command(
         env_mode,
         no_env_check,
         path,
+        lpm_env::EnvStage::Runtime,
+        None,
     )
 }
 
@@ -1074,6 +1408,56 @@ pub fn build_local_bin_command_bounded(
     no_env_check: bool,
     bin_hint: &ManagedRuntimeHint,
 ) -> Result<Command, LpmError> {
+    build_local_bin_command_bounded_with_stage(
+        project_dir,
+        boundary,
+        command_name,
+        extra_args,
+        env_mode,
+        no_env_check,
+        bin_hint,
+        lpm_env::EnvStage::Runtime,
+    )
+}
+
+/// Build a bounded local binary command with the caller's execution stage.
+#[expect(clippy::too_many_arguments)]
+pub fn build_local_bin_command_bounded_with_stage(
+    project_dir: &Path,
+    boundary: &Path,
+    command_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    no_env_check: bool,
+    bin_hint: &ManagedRuntimeHint,
+    stage: lpm_env::EnvStage,
+) -> Result<Command, LpmError> {
+    build_local_bin_command_bounded_for_script(
+        project_dir,
+        boundary,
+        command_name,
+        extra_args,
+        env_mode,
+        no_env_check,
+        bin_hint,
+        stage,
+        None,
+    )
+}
+
+/// Build a bounded local runner with the environment selected by its script name.
+#[expect(clippy::too_many_arguments)]
+pub fn build_local_bin_command_bounded_for_script(
+    project_dir: &Path,
+    boundary: &Path,
+    command_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    no_env_check: bool,
+    bin_hint: &ManagedRuntimeHint,
+    stage: lpm_env::EnvStage,
+    script_name: Option<&str>,
+) -> Result<Command, LpmError> {
     let bin_dirs = bin_path::find_bin_dirs_bounded(project_dir, boundary)?;
     let bin_path = resolve_local_bin_path_from_dirs(command_name, &bin_dirs)?;
     let path = bin_path::build_path_from_bin_dirs(project_dir, &bin_dirs, bin_hint)?;
@@ -1084,9 +1468,12 @@ pub fn build_local_bin_command_bounded(
         env_mode,
         no_env_check,
         path,
+        stage,
+        script_name,
     )
 }
 
+#[expect(clippy::too_many_arguments)]
 fn build_configured_local_bin_command(
     project_dir: &Path,
     bin_path: PathBuf,
@@ -1094,9 +1481,55 @@ fn build_configured_local_bin_command(
     env_mode: Option<&str>,
     no_env_check: bool,
     path: String,
+    stage: lpm_env::EnvStage,
+    script_name: Option<&str>,
 ) -> Result<Command, LpmError> {
-    let env_vars =
-        dotenv::load_project_env_with_schema_validation(project_dir, env_mode, !no_env_check)?;
+    let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    let explicit_mode = env_mode.or_else(|| {
+        config
+            .as_ref()?
+            .tasks
+            .get(script_name?)
+            .and_then(|task| task.env.as_deref())
+    });
+    let resolved = if explicit_mode.is_some() {
+        dotenv::resolve_project_environment(explicit_mode, config.as_ref())?
+    } else if let Some(resolved) = config.as_ref().and_then(|config| {
+        lpm_env::resolver::resolve_from_script(
+            script_name?,
+            &config.env,
+            config.environments.as_ref(),
+        )
+    }) {
+        lpm_env::resolver::validate_env_name(&resolved.canonical).map_err(|_| {
+            LpmError::EnvValidation(lpm_env::resolver::invalid_identity_message(
+                &resolved.canonical,
+                resolved.alias.as_deref(),
+            ))
+        })?;
+        resolved
+    } else {
+        dotenv::resolve_project_environment(None, config.as_ref())?
+    };
+
+    let mut env_vars =
+        dotenv::load_project_env_unvalidated_for_resolved(project_dir, &resolved, config.as_ref())?;
+    let validator = config
+        .as_ref()
+        .filter(|_| !no_env_check)
+        .and_then(|config| config.env_schema.as_ref())
+        .map(lpm_env::EnvValidator::new);
+    dotenv::validate_child_env(
+        &mut env_vars,
+        validator.as_ref(),
+        lpm_env::EvalContext {
+            environment: &resolved.canonical,
+            stage,
+            service: None,
+        },
+        &path,
+        !no_env_check,
+    )?;
 
     let mut command = Command::new(&bin_path);
     shell::strip_inherited_env_hooks(&mut command);
@@ -1324,8 +1757,52 @@ fn run_command_captured_named(
     bin_hint: &ManagedRuntimeHint,
     reserve_stdout: bool,
 ) -> Result<ScriptOutput, LpmError> {
+    let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    run_command_captured_named_with_config(
+        project_dir,
+        task_name,
+        command,
+        extra_args,
+        env_mode,
+        bin_hint,
+        reserve_stdout,
+        config.as_ref(),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "runner inputs include a caller-owned configuration snapshot"
+)]
+fn run_command_captured_named_with_config(
+    project_dir: &Path,
+    task_name: &str,
+    command: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    bin_hint: &ManagedRuntimeHint,
+    reserve_stdout: bool,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<ScriptOutput, LpmError> {
     let path = bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
-    let mut env_vars = resolve_and_load_env(project_dir, task_name, env_mode)?.vars;
+    let validate_schema = !should_skip_env_validation();
+    let validator = config
+        .filter(|_| validate_schema)
+        .and_then(|config| config.env_schema.as_ref())
+        .map(lpm_env::EnvValidator::new);
+    let loaded = resolve_and_load_env_with_schema_validation(
+        project_dir,
+        task_name,
+        env_mode,
+        config,
+        false,
+    )?;
+    let eval_context = lpm_env::EvalContext {
+        environment: loaded.env_name.as_deref().unwrap_or("default"),
+        stage: lpm_env::EnvStage::for_script(task_name),
+        service: None,
+    };
+    let mut env_vars = loaded.vars;
     if !task_name.is_empty() {
         NpmScriptContext::load(project_dir, &std::env::current_dir()?)?.apply(
             &mut env_vars,
@@ -1334,6 +1811,13 @@ fn run_command_captured_named(
         );
     }
     mark_script_child_env(&mut env_vars);
+    dotenv::validate_child_env(
+        &mut env_vars,
+        validator.as_ref(),
+        eval_context,
+        &path,
+        validate_schema,
+    )?;
 
     let full_cmd = assemble_shell_command(command, extra_args, project_dir, &path)?;
 
@@ -1355,194 +1839,6 @@ fn run_command_captured_named(
         stdout: captured.stdout,
         stderr: captured.stderr,
     })
-}
-
-/// Print a one-line environment context before script execution.
-///
-/// Example output:
-///   Env: development (via lpm.json "dev") · 5 vault secrets
-fn print_env_context(loaded: &LoadedEnv) {
-    let env_label = sanitize_terminal_inline(loaded.env_name.as_deref().unwrap_or("default"));
-
-    let via = match (loaded.source, &loaded.alias) {
-        ("--env flag", _) => format!("via {}", "--env".dimmed()),
-        ("lpm.json task", _) => "via lpm.json task".to_string(),
-        ("lpm.json", Some(alias)) => {
-            format!(
-                "via lpm.json \"{}\"",
-                sanitize_terminal_inline(alias).dimmed()
-            )
-        }
-        _ => String::new(),
-    };
-
-    let vault_str = if loaded.vault_count > 0 {
-        format!(
-            "{} vault secret{}",
-            loaded.vault_count,
-            if loaded.vault_count == 1 { "" } else { "s" }
-        )
-    } else {
-        String::new()
-    };
-
-    // Build parts and join with " · "
-    let mut parts = Vec::new();
-    if !via.is_empty() {
-        parts.push(via);
-    }
-    if !vault_str.is_empty() {
-        parts.push(vault_str);
-    }
-
-    if parts.is_empty() {
-        eprintln!("  {} {}", "Env:".dimmed(), env_label.bold());
-    } else {
-        eprintln!(
-            "  {} {} ({})",
-            "Env:".dimmed(),
-            env_label.bold(),
-            parts.join(" · ").dimmed()
-        );
-    }
-}
-
-/// Result of environment resolution + loading, including display metadata.
-struct LoadedEnv {
-    /// The loaded environment variables to inject into the child process.
-    vars: HashMap<String, String>,
-    /// The canonical environment name (e.g., "development", "production").
-    /// `None` if no env was resolved (just .env + .env.local).
-    env_name: Option<String>,
-    /// The alias that resolved to this env (e.g., "dev" → "development").
-    alias: Option<String>,
-    /// How the env was determined.
-    source: &'static str,
-    /// Number of vault secrets loaded for this env.
-    vault_count: usize,
-}
-
-/// Resolve the env mode and load environment variables.
-///
-/// Loading order (later sources override earlier):
-/// 1. `.env` → `.env.local` → `.env.{mode}` → `.env.{mode}.local`
-/// 2. **LPM Vault** (Keychain-backed secrets) — highest priority
-///
-/// Priority for determining the mode:
-/// 1. Explicit `--env=staging` flag (highest priority)
-/// 2. `lpm.json` `env` mapping for this script name
-/// 3. No mode (load just `.env` and `.env.local`)
-fn resolve_and_load_env(
-    project_dir: &Path,
-    script_name: &str,
-    explicit_mode: Option<&str>,
-) -> Result<LoadedEnv, LpmError> {
-    let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::EnvValidation)?;
-    resolve_and_load_env_with_config(project_dir, script_name, explicit_mode, config.as_ref())
-}
-
-fn resolve_and_load_env_with_config(
-    project_dir: &Path,
-    script_name: &str,
-    explicit_mode: Option<&str>,
-    config: Option<&lpm_json::LpmJsonConfig>,
-) -> Result<LoadedEnv, LpmError> {
-    resolve_and_load_env_with_schema_validation(
-        project_dir,
-        script_name,
-        explicit_mode,
-        config,
-        !should_skip_env_validation(),
-    )
-}
-
-fn resolve_and_load_env_with_schema_validation(
-    project_dir: &Path,
-    script_name: &str,
-    explicit_mode: Option<&str>,
-    config: Option<&lpm_json::LpmJsonConfig>,
-    validate_schema: bool,
-) -> Result<LoadedEnv, LpmError> {
-    // Determine the canonical env name via the resolver.
-    // Priority: 1. explicit --env flag  2. lpm.json script mapping  3. None
-    let (resolved, source) = if let Some(m) = explicit_mode {
-        let resolved = match config {
-            Some(c) => lpm_env::resolver::resolve(m, &c.env, c.environments.as_ref()),
-            None => lpm_env::resolver::resolve(m, &Default::default(), None),
-        };
-        (Some(resolved), "--env flag")
-    } else if let Some(task_mode) = config
-        .and_then(|config| config.tasks.get(script_name))
-        .and_then(|task| task.env.as_deref())
-    {
-        let config = config.expect("task mode requires lpm.json");
-        let resolved =
-            lpm_env::resolver::resolve(task_mode, &config.env, config.environments.as_ref());
-        (Some(resolved), "lpm.json task")
-    } else {
-        match config.and_then(|c| {
-            lpm_env::resolver::resolve_from_script(script_name, &c.env, c.environments.as_ref())
-        }) {
-            Some(resolved) => (Some(resolved), "lpm.json"),
-            None => (None, "default"),
-        }
-    };
-    let env_name = resolved.as_ref().map(|env| env.canonical.as_str());
-    let file_path = resolved.as_ref().and_then(|env| env.file_path.as_deref());
-    let loaded = dotenv::load_project_env_details_with_config_and_schema_validation(
-        project_dir,
-        env_name,
-        file_path,
-        config,
-        validate_schema,
-    )?;
-
-    Ok(LoadedEnv {
-        vars: loaded.vars,
-        env_name: env_name.map(str::to_string),
-        alias: resolved.and_then(|env| env.alias),
-        source,
-        vault_count: loaded.vault_count,
-    })
-}
-
-/// Load the exact environment that a named script or task receives.
-///
-/// This applies the same precedence as script execution: an explicit mode,
-/// then `tasks.<name>.env`, then the `lpm.json` script mapping, then the
-/// default environment.
-pub fn load_script_env(
-    project_dir: &Path,
-    script_name: &str,
-    explicit_mode: Option<&str>,
-) -> Result<HashMap<String, String>, LpmError> {
-    Ok(resolve_and_load_env(project_dir, script_name, explicit_mode)?.vars)
-}
-
-/// Load a script environment using a configuration that the caller already parsed.
-pub fn load_script_env_with_config(
-    project_dir: &Path,
-    script_name: &str,
-    explicit_mode: Option<&str>,
-    config: Option<&lpm_json::LpmJsonConfig>,
-) -> Result<HashMap<String, String>, LpmError> {
-    Ok(resolve_and_load_env_with_config(project_dir, script_name, explicit_mode, config)?.vars)
-}
-
-pub(crate) fn load_script_env_without_schema(
-    project_dir: &Path,
-    script_name: &str,
-    explicit_mode: Option<&str>,
-    config: Option<&lpm_json::LpmJsonConfig>,
-) -> Result<HashMap<String, String>, LpmError> {
-    Ok(resolve_and_load_env_with_schema_validation(
-        project_dir,
-        script_name,
-        explicit_mode,
-        config,
-        false,
-    )?
-    .vars)
 }
 
 /// Resolve a development command, preferring an explicit lpm.json task command.
@@ -1582,19 +1878,6 @@ struct ResolvedScript {
 enum ScriptPreference {
     PackageScript,
     TaskCommand,
-}
-
-fn resolve_script_command(
-    project_dir: &Path,
-    script_name: &str,
-) -> Result<ResolvedScript, LpmError> {
-    let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
-    resolve_script_command_with_config(
-        project_dir,
-        script_name,
-        config.as_ref(),
-        ScriptPreference::PackageScript,
-    )
 }
 
 fn resolve_script_command_with_config(
@@ -1752,6 +2035,174 @@ fn script_not_found_error(script_name: &str, scripts: &HashMap<String, String>) 
         "script '{script_name}' not found. Available: {}",
         available.join(", ")
     ))
+}
+
+/// Execute a package script using the configuration snapshot retained by the caller.
+pub fn run_script_with_config(
+    project_dir: &Path,
+    name: &str,
+    args: &[String],
+    mode: Option<&str>,
+    hint: &ManagedRuntimeHint,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<(), LpmError> {
+    run_script_with_envs_and_config(project_dir, name, args, mode, &[], hint, config)
+}
+
+fn run_script_output_with_config(
+    project_dir: &Path,
+    name: &str,
+    args: &[String],
+    mode: Option<&str>,
+    hint: &ManagedRuntimeHint,
+    config: Option<&lpm_json::LpmJsonConfig>,
+    spawn: impl FnMut(&ShellCommand<'_>) -> Result<shell::CapturedOutput, LpmError>,
+) -> Result<ScriptOutput, LpmError> {
+    let path = bin_path::build_path_with_bins_pre_resolved(project_dir, hint)?;
+    run_script_with_output_at_path_and_config(project_dir, name, args, mode, &path, config, spawn)
+}
+
+pub fn run_script_captured_with_config(
+    project_dir: &Path,
+    name: &str,
+    args: &[String],
+    mode: Option<&str>,
+    hint: &ManagedRuntimeHint,
+    reserve_stdout: bool,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<ScriptOutput, LpmError> {
+    run_script_output_with_config(project_dir, name, args, mode, hint, config, |command| {
+        shell::spawn_shell_tee_with_reserved_stdout(command, reserve_stdout)
+    })
+    .map_err(without_echoed_output)
+}
+pub fn run_script_buffered_with_config(
+    project_dir: &Path,
+    name: &str,
+    args: &[String],
+    mode: Option<&str>,
+    hint: &ManagedRuntimeHint,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<ScriptOutput, LpmError> {
+    run_script_output_with_config(
+        project_dir,
+        name,
+        args,
+        mode,
+        hint,
+        config,
+        shell::spawn_shell_capture,
+    )
+}
+#[expect(
+    clippy::too_many_arguments,
+    reason = "streaming execution accepts output labels and a configuration snapshot"
+)]
+pub fn run_script_prefixed_with_config(
+    project_dir: &Path,
+    name: &str,
+    args: &[String],
+    mode: Option<&str>,
+    prefix: &str,
+    color: &str,
+    hint: &ManagedRuntimeHint,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<ScriptOutput, LpmError> {
+    run_script_output_with_config(project_dir, name, args, mode, hint, config, |command| {
+        shell::spawn_shell_prefixed(command, prefix, color)
+    })
+}
+pub fn run_task_command_with_config(
+    project_dir: &Path,
+    name: &str,
+    command: &str,
+    args: &[String],
+    mode: Option<&str>,
+    hint: &ManagedRuntimeHint,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<(), LpmError> {
+    run_command_named_with_envs_and_config(
+        project_dir,
+        name,
+        command,
+        args,
+        mode,
+        &[],
+        hint,
+        config,
+    )
+}
+pub fn run_task_command_buffered_with_config(
+    project_dir: &Path,
+    name: &str,
+    command: &str,
+    args: &[String],
+    mode: Option<&str>,
+    hint: &ManagedRuntimeHint,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<ScriptOutput, LpmError> {
+    run_command_buffered_named_with_config(
+        project_dir,
+        name,
+        command,
+        args,
+        mode,
+        &[],
+        hint,
+        config,
+    )
+}
+#[expect(
+    clippy::too_many_arguments,
+    reason = "captured execution accepts output policy and a configuration snapshot"
+)]
+pub fn run_task_command_captured_with_config(
+    project_dir: &Path,
+    name: &str,
+    command: &str,
+    args: &[String],
+    mode: Option<&str>,
+    hint: &ManagedRuntimeHint,
+    reserve_stdout: bool,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<ScriptOutput, LpmError> {
+    run_command_captured_named_with_config(
+        project_dir,
+        name,
+        command,
+        args,
+        mode,
+        hint,
+        reserve_stdout,
+        config,
+    )
+}
+#[expect(
+    clippy::too_many_arguments,
+    reason = "streaming execution accepts output labels and a configuration snapshot"
+)]
+pub fn run_task_command_prefixed_with_config(
+    project_dir: &Path,
+    name: &str,
+    command: &str,
+    args: &[String],
+    mode: Option<&str>,
+    prefix: &str,
+    color: &str,
+    hint: &ManagedRuntimeHint,
+    config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<ScriptOutput, LpmError> {
+    run_command_prefixed_named_with_config(
+        project_dir,
+        name,
+        command,
+        args,
+        mode,
+        prefix,
+        color,
+        hint,
+        config,
+    )
 }
 
 #[cfg(test)]
@@ -2107,30 +2558,6 @@ mod tests {
 
         let result = run_script(dir.path(), "check-env", &[], Some("staging"), &Unknown);
         assert!(result.is_ok(), "--env=staging should load .env.staging");
-    }
-
-    #[test]
-    fn script_env_mapping_loads_the_exact_configured_file_path() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join("config")).unwrap();
-        fs::write(
-            dir.path().join("config/dev.env"),
-            "LPM_EXACT_ENV_MAPPING_TEST=from-configured-path\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.path().join(".env.dev"),
-            "LPM_EXACT_ENV_MAPPING_TEST=from-derived-path\n",
-        )
-        .unwrap();
-        let config = lpm_json::parse_lpm_json(r#"{"env":{"dev":"config/dev.env"}}"#).unwrap();
-
-        let loaded = load_script_env_with_config(dir.path(), "dev", None, Some(&config)).unwrap();
-
-        assert_eq!(
-            loaded.get("LPM_EXACT_ENV_MAPPING_TEST").map(String::as_str),
-            Some("from-configured-path")
-        );
     }
 
     #[test]

@@ -3407,6 +3407,8 @@ dependencies = [
  "lpm-common",
  "lpm-dashboard",
  "lpm-env",
+ "lpm-env-codegen",
+ "lpm-env-source",
  "lpm-extractor",
  "lpm-global",
  "lpm-http",
@@ -3548,6 +3550,59 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tracing",
+ "url",
+]
+
+[[package]]
+name = "lpm-env-codegen"
+version = "0.79.0"
+dependencies = [
+ "icu_properties",
+ "lpm-env",
+ "lpm-env-source",
+ "regex-automata",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "lpm-env-ffi"
+version = "0.79.0"
+dependencies = [
+ "hex",
+ "lpm-env",
+ "lpm-env-source",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "lpm-env-source"
+version = "0.79.0"
+dependencies = [
+ "cap-fs-ext",
+ "cap-std",
+ "lpm-env",
+ "same-file",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "lpm-env-wasm"
+version = "0.79.0"
+dependencies = [
+ "lpm-env",
+ "serde_json",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3838,6 +3893,7 @@ dependencies = [
 name = "lpm-runner"
 version = "0.79.0"
 dependencies = [
+ "cap-std",
  "dirs",
  "fd-lock",
  "hex",
@@ -3845,6 +3901,7 @@ dependencies = [
  "lpm-cert",
  "lpm-common",
  "lpm-env",
+ "lpm-env-source",
  "lpm-runtime",
  "lpm-vault",
  "lpm-workspace",
@@ -3861,6 +3918,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "sha2",
  "signal-hook",
  "tempfile",

@@ -135,7 +135,10 @@ pub fn validate_env_file_path(env_name: &str, file: &str) -> Result<(), String> 
         ));
     }
     let p = std::path::Path::new(file);
-    if p.is_absolute() {
+    if p.has_root()
+        || p.components()
+            .any(|component| matches!(component, std::path::Component::Prefix(_)))
+    {
         return Err(format!(
             "environment '{env_name}' file path '{file}' is absolute; must be relative to the project root"
         ));

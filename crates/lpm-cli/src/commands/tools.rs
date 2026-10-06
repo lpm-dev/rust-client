@@ -51,6 +51,13 @@ impl RunnerTool {
         }
     }
 
+    fn env_stage(self) -> lpm_env::EnvStage {
+        match self {
+            Self::Test => lpm_env::EnvStage::Test,
+            Self::Bench => lpm_env::EnvStage::Runtime,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Test => "test",
@@ -300,6 +307,7 @@ async fn run_single_runner(
                     stdio,
                     &runtime_hint,
                     &worker_signals,
+                    tool.env_stage(),
                 )
             })
             .await
@@ -443,6 +451,7 @@ async fn prepare_runner_runtime(
     Ok(hint)
 }
 
+#[expect(clippy::too_many_arguments)]
 fn execute_runner(
     project_dir: &Path,
     boundary: &Path,
@@ -451,6 +460,7 @@ fn execute_runner(
     stdio: StdioMode,
     runtime_hint: &lpm_runner::bin_path::ManagedRuntimeHint,
     signals: &lpm_runner::execution::ExecutionSignals,
+    stage: lpm_env::EnvStage,
 ) -> ToolOutcome {
     let result = signals.check().and_then(|()| match &runner.invocation {
         RunnerInvocation::LocalBin { name, base_args } => execute_local_runner(
@@ -462,6 +472,7 @@ fn execute_runner(
             stdio,
             runtime_hint,
             signals,
+            stage,
         ),
         RunnerInvocation::PackageScript(script) => execute_package_script(
             project_dir,
@@ -486,10 +497,11 @@ fn execute_local_runner(
     stdio: StdioMode,
     runtime_hint: &lpm_runner::bin_path::ManagedRuntimeHint,
     signals: &lpm_runner::execution::ExecutionSignals,
+    stage: lpm_env::EnvStage,
 ) -> Result<ToolOutcome, LpmError> {
     let args = local_runner_args(name, base_args, forwarded_args);
 
-    let mut command = lpm_runner::script::build_local_bin_command_bounded(
+    let mut command = lpm_runner::script::build_local_bin_command_bounded_for_script(
         project_dir,
         boundary,
         name,
@@ -497,6 +509,12 @@ fn execute_local_runner(
         None,
         false,
         runtime_hint,
+        stage,
+        Some(if stage == lpm_env::EnvStage::Test {
+            "test"
+        } else {
+            "bench"
+        }),
     )?;
     let mut outcome = ToolOutcome::default();
     match stdio {
@@ -879,6 +897,7 @@ pub async fn tool_workspace(
                 Ok(lpm_runner::bin_path::ManagedRuntimeHint::Absent)
             };
             tasks.push(RunnerTask {
+                stage: runner_tool.env_stage(),
                 boundary: Arc::clone(&boundary),
                 runner,
                 runtime_hint,
@@ -993,6 +1012,7 @@ fn synthesize_prewarm_failure_members(
 
 #[derive(Clone)]
 struct RunnerTask {
+    stage: lpm_env::EnvStage,
     boundary: Arc<PathBuf>,
     runner: Result<DetectedRunner, String>,
     runtime_hint: Result<lpm_runner::bin_path::ManagedRuntimeHint, String>,
@@ -1172,6 +1192,7 @@ async fn run_runner_member(
             stdio,
             &runtime_hint,
             &task.signals,
+            task.stage,
         ),
         (Err(error), _) | (_, Err(error)) => ToolOutcome {
             error: Some(error),

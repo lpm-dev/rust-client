@@ -3,11 +3,43 @@ use super::prelude::*;
 pub(super) struct CloudManifestSnapshot {
     pub config: Option<lpm_runner::lpm_json::LpmJsonConfig>,
     pub vault: lpm_vault::vault_id::VaultManifestSnapshot,
+    pub sources: Option<std::sync::Arc<lpm_env_source::SchemaSnapshot>>,
 }
 
 impl CloudManifestSnapshot {
     pub fn read(project_dir: &std::path::Path) -> Result<Self, LpmError> {
-        let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+        let content = match lpm_common::read_text_file_capped(
+            &project_dir.join("lpm.json"),
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
+            Ok(content) => Some(content),
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
+            Err(error) => {
+                return Err(LpmError::Script(format!(
+                    "failed to read lpm.json: {error}"
+                )));
+            }
+        };
+        let config = content
+            .as_deref()
+            .map(|content| lpm_runner::lpm_json::parse_lpm_json_in(project_dir, content))
+            .transpose()
+            .map_err(LpmError::Script)?;
+        let sources = match (&content, &config) {
+            (Some(content), Some(config)) => Some(match &config.env_schema_resolution {
+                Some(snapshot) => std::sync::Arc::clone(snapshot),
+                None => {
+                    lpm_env_source::resolve_schema(
+                        project_dir,
+                        content.as_bytes(),
+                        lpm_env::EnvSchemaDefinition::default(),
+                    )
+                    .map_err(|error| LpmError::Script(error.to_string()))?
+                    .snapshot
+                }
+            }),
+            _ => None,
+        };
         let vault = match config.as_ref() {
             Some(config) => {
                 let vault_sync = config
@@ -28,8 +60,89 @@ impl CloudManifestSnapshot {
             }
             None => lpm_vault::vault_id::VaultManifestSnapshot::default(),
         };
-        Ok(Self { config, vault })
+        Ok(Self {
+            config,
+            vault,
+            sources,
+        })
     }
+}
+
+pub(super) fn verify_schema_snapshot(
+    project_dir: &std::path::Path,
+    snapshot: Option<&lpm_env_source::SchemaSnapshot>,
+) -> Result<(), String> {
+    let Some(snapshot) = snapshot else {
+        return Ok(());
+    };
+    let content = lpm_common::read_text_file_capped(
+        &project_dir.join("lpm.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .map_err(|_| "env.source_changed at lpm.json".to_string())?;
+    verify_schema_snapshot_content(snapshot, &content)
+}
+
+fn verify_schema_snapshot_content(
+    snapshot: &lpm_env_source::SchemaSnapshot,
+    content: &str,
+) -> Result<(), String> {
+    if !snapshot.matches_root_content(content.as_bytes()) {
+        return Err("env.source_changed at lpm.json".into());
+    }
+    snapshot
+        .verify_dependencies()
+        .map_err(|error| error.to_string())
+}
+
+pub(super) fn verify_personal_mutation_snapshot(
+    project_dir: &std::path::Path,
+    expected_vault_id: &str,
+    registry_url: &str,
+    expected_principal_id: Option<&str>,
+    sources: &lpm_env_source::SchemaSnapshot,
+) -> Result<(), String> {
+    let content = read_mutation_manifest_content(project_dir)?;
+    let manifest = lpm_vault::vault_id::VaultManifestSnapshot::parse(
+        lpm_common::strip_utf8_bom_str(&content),
+    )?;
+    verify_personal_mutation_manifest(
+        &manifest,
+        expected_vault_id,
+        registry_url,
+        expected_principal_id,
+    )?;
+    verify_schema_snapshot_content(sources, &content)
+}
+
+pub(super) fn verify_org_mutation_snapshot(
+    project_dir: &std::path::Path,
+    expected_vault_id: &str,
+    org_slug: &str,
+    registry_url: &str,
+    expected_principal_id: Option<&str>,
+    sources: &lpm_env_source::SchemaSnapshot,
+) -> Result<(), String> {
+    let content = read_mutation_manifest_content(project_dir)?;
+    let manifest = lpm_vault::vault_id::VaultManifestSnapshot::parse(
+        lpm_common::strip_utf8_bom_str(&content),
+    )?;
+    verify_org_mutation_manifest(
+        &manifest,
+        expected_vault_id,
+        org_slug,
+        registry_url,
+        expected_principal_id,
+    )?;
+    verify_schema_snapshot_content(sources, &content)
+}
+
+fn read_mutation_manifest_content(project_dir: &std::path::Path) -> Result<String, String> {
+    lpm_common::read_text_file_capped(
+        &project_dir.join("lpm.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .map_err(|error| format!("failed to read lpm.json: {error}"))
 }
 
 pub(super) fn fresh_personal_mutation_manifest(
@@ -39,12 +152,27 @@ pub(super) fn fresh_personal_mutation_manifest(
     expected_principal_id: Option<&str>,
 ) -> Result<lpm_vault::vault_id::VaultManifestSnapshot, String> {
     let manifest = lpm_vault::vault_id::VaultManifestSnapshot::read(project_dir)?;
-    verify_fresh_vault_id(&manifest, expected_vault_id)?;
+    verify_personal_mutation_manifest(
+        &manifest,
+        expected_vault_id,
+        registry_url,
+        expected_principal_id,
+    )?;
+    Ok(manifest)
+}
+
+fn verify_personal_mutation_manifest(
+    manifest: &lpm_vault::vault_id::VaultManifestSnapshot,
+    expected_vault_id: &str,
+    registry_url: &str,
+    expected_principal_id: Option<&str>,
+) -> Result<(), String> {
+    verify_fresh_vault_id(manifest, expected_vault_id)?;
     let current_principal = manifest.personal_expected_principal_for_registry(registry_url)?;
     if current_principal.as_deref() != expected_principal_id {
         return Err("the personal env manifest principal changed before the cloud write".into());
     }
-    Ok(manifest)
+    Ok(())
 }
 
 pub(super) fn fresh_org_mutation_manifest(
@@ -55,14 +183,31 @@ pub(super) fn fresh_org_mutation_manifest(
     expected_principal_id: Option<&str>,
 ) -> Result<lpm_vault::vault_id::VaultManifestSnapshot, String> {
     let manifest = lpm_vault::vault_id::VaultManifestSnapshot::read(project_dir)?;
-    verify_fresh_vault_id(&manifest, expected_vault_id)?;
+    verify_org_mutation_manifest(
+        &manifest,
+        expected_vault_id,
+        org_slug,
+        registry_url,
+        expected_principal_id,
+    )?;
+    Ok(manifest)
+}
+
+fn verify_org_mutation_manifest(
+    manifest: &lpm_vault::vault_id::VaultManifestSnapshot,
+    expected_vault_id: &str,
+    org_slug: &str,
+    registry_url: &str,
+    expected_principal_id: Option<&str>,
+) -> Result<(), String> {
+    verify_fresh_vault_id(manifest, expected_vault_id)?;
     let current_principal = manifest.org_sync_principal_for_registry(org_slug, registry_url)?;
     if current_principal.as_deref() != expected_principal_id {
         return Err(
             "the organization env manifest principal changed before the cloud write".into(),
         );
     }
-    Ok(manifest)
+    Ok(())
 }
 
 fn verify_fresh_vault_id(
@@ -137,6 +282,39 @@ pub(super) fn read_lpm_json_for_push(
 /// vaults — the calling layer decides whether to send it. Returns `None`
 /// when the project has no `lpm.json`. Read, parse, and semantic-validation
 /// failures are rejected by [`CloudManifestSnapshot::read`].
+const MAX_METADATA_BYTES: usize = 256 * 1024;
+
+pub(super) fn checked_push_schema_value(
+    config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+) -> Result<Option<serde_json::Value>, LpmError> {
+    let value = build_push_schema_value(config);
+    if let Some(value) = &value {
+        validate_metadata_size(value)?;
+    }
+    Ok(value)
+}
+
+fn validate_metadata_size(value: &serde_json::Value) -> Result<(), LpmError> {
+    struct Budget(usize);
+    impl std::io::Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_sub(bytes.len())
+                .ok_or_else(|| std::io::Error::other("metadata limit"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Budget(MAX_METADATA_BYTES), value).map_err(|_| {
+        LpmError::Script(
+            "env.metadata_too_large: Env metadata exceeds the cloud limit of 256 KiB".into(),
+        )
+    })
+}
+
 pub(super) fn build_push_schema_value(
     config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
 ) -> Option<serde_json::Value> {
@@ -148,7 +326,51 @@ pub(super) fn build_push_schema_value(
     if let Some(env_schema) = &c.env_schema
         && let Ok(v) = serde_json::to_value(&env_schema.vars)
     {
+        let mut v = v;
+        if let Some(vars) = v.as_object_mut() {
+            for (key, value) in vars {
+                if let Some(rule) = value.as_object_mut() {
+                    if env_schema.is_secret(key) {
+                        rule.remove("default");
+                        rule.remove("enum");
+                        rule.remove("defaultsIn");
+                    }
+                    if env_schema
+                        .vars
+                        .get(key)
+                        .and_then(|rule| rule.required_when.as_ref())
+                        .is_some_and(|condition| {
+                            matches!(condition, lpm_env::RequiredWhen::Equals(_))
+                                && env_schema
+                                    .vars
+                                    .get(condition.variable())
+                                    .is_none_or(|source| source.secret)
+                        })
+                    {
+                        rule.remove("requiredWhen");
+                    }
+                    rule.retain(|field, value| {
+                        !(value.is_null()
+                            || matches!(value, serde_json::Value::Bool(false))
+                            || field == "empty" && value == "missing")
+                    });
+                }
+            }
+        }
         obj.insert("envSchema".into(), v);
+        let mut policy = serde_json::Map::new();
+        if !env_schema.client_prefixes.is_empty() {
+            policy.insert(
+                "clientPrefixes".into(),
+                serde_json::json!(env_schema.client_prefixes),
+            );
+        }
+        if !env_schema.groups.is_empty() {
+            policy.insert("groups".into(), serde_json::json!(env_schema.groups));
+        }
+        if !policy.is_empty() {
+            obj.insert("envSchemaConfig".into(), serde_json::Value::Object(policy));
+        }
     }
 
     // envConfig: alias → canonical mapping from lpm.json "env" field
@@ -157,7 +379,17 @@ pub(super) fn build_push_schema_value(
             .env
             .iter()
             .filter_map(|(alias, file_path)| {
-                let mode = lpm_env::resolver::extract_mode_from_env_path(file_path)?;
+                let mode = lpm_env::resolver::resolve_canonical_name(
+                    alias,
+                    &c.env,
+                    c.environments.as_ref(),
+                );
+                if lpm_env::resolver::validate_env_name(alias).is_err()
+                    || lpm_env::resolver::validate_env_name(mode).is_err()
+                    || file_path.chars().any(char::is_control)
+                {
+                    return None;
+                }
                 Some((
                     alias.clone(),
                     serde_json::json!({
@@ -171,10 +403,30 @@ pub(super) fn build_push_schema_value(
     }
 
     // environments: inheritance config (extends, file, sensitive)
-    if let Some(envs) = &c.environments
-        && let Ok(v) = serde_json::to_value(envs)
-    {
-        obj.insert("environments".into(), v);
+    if let Some(envs) = &c.environments {
+        let definitions: serde_json::Map<_, _> = envs
+            .envs
+            .iter()
+            .filter_map(|(name, definition)| {
+                if lpm_env::resolver::validate_env_name(name).is_err()
+                    || definition
+                        .extends()
+                        .is_some_and(|parent| lpm_env::resolver::validate_env_name(parent).is_err())
+                    || definition
+                        .file()
+                        .is_some_and(|file| file.chars().any(char::is_control))
+                {
+                    return None;
+                }
+                serde_json::to_value(definition)
+                    .ok()
+                    .map(|value| (name.clone(), value))
+            })
+            .collect();
+        obj.insert(
+            "environments".into(),
+            serde_json::Value::Object(definitions),
+        );
     }
 
     Some(serde_json::Value::Object(obj))
@@ -225,6 +477,120 @@ pub(super) fn persist_org_sync_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_omits_control_characters_in_alias_and_environment_file_paths() {
+        let config: lpm_runner::lpm_json::LpmJsonConfig = serde_json::from_str(r#"{"env":{"bad":"config/bad\n.env","good":"config/good.env"},"environments":{"bad":"config/bad\u007f.env","structured":{"file":"bad\u0085.env"},"good":"config/good.env"}}"#).unwrap();
+        let metadata = build_push_schema_value(Some(&config)).unwrap();
+        assert!(metadata["envConfig"].get("bad").is_none());
+        assert!(metadata["environments"].get("bad").is_none());
+        assert!(metadata["environments"].get("structured").is_none());
+        assert_eq!(metadata["environments"]["good"], "config/good.env");
+        assert_eq!(metadata["envConfig"]["good"]["file"], "config/good.env");
+    }
+
+    #[test]
+    fn metadata_omits_invalid_alias_and_canonical_names() {
+        let config: lpm_runner::lpm_json::LpmJsonConfig = serde_json::from_str(r#"{"env":{"test:unit":"config/unit.env","":".env.","bad":".env.test:unit","unit":"config/unit.env"}}"#).unwrap();
+        let metadata = build_push_schema_value(Some(&config)).unwrap();
+        assert!(metadata["envConfig"].get("test:unit").is_none());
+        assert!(metadata["envConfig"].get("").is_none());
+        assert!(metadata["envConfig"].get("bad").is_none());
+        assert_eq!(metadata["envConfig"]["unit"]["canonical"], "unit");
+    }
+
+    #[test]
+    fn metadata_omits_invalid_environment_definitions_and_parents() {
+        let config: lpm_runner::lpm_json::LpmJsonConfig = serde_json::from_str(r#"{"environments":{"test:unit":".env.test","unit":{"file":"config/unit.env"},"bad":{"extends":"test:unit"},"base":".env"}}"#).unwrap();
+        let metadata = build_push_schema_value(Some(&config)).unwrap();
+        assert!(metadata["environments"].get("test:unit").is_none());
+        assert!(metadata["environments"].get("bad").is_none());
+        assert_eq!(metadata["environments"]["unit"]["file"], "config/unit.env");
+        assert_eq!(metadata["environments"]["base"], ".env");
+    }
+
+    #[test]
+    fn metadata_budget_counts_the_complete_encoded_payload() {
+        for text in ["x", "é", "\\", "\n"] {
+            let base = serde_json::json!({"envConfig":{"alias":"custom"},"value":""});
+            let overhead = base.to_string().len();
+            let width = serde_json::to_string(text).unwrap().len() - 2;
+            let count = (MAX_METADATA_BYTES - overhead) / width;
+            validate_metadata_size(
+                &serde_json::json!({"envConfig":{"alias":"custom"},"value":text.repeat(count)}),
+            )
+            .unwrap();
+            assert!(validate_metadata_size(&serde_json::json!({"envConfig":{"alias":"custom"},"value":text.repeat(count+1)})).is_err());
+        }
+    }
+
+    #[test]
+    fn mutation_rejects_root_changes_without_authored_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"captured-env"}"#).unwrap();
+        let captured = CloudManifestSnapshot::read(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"vault":"captured-env","name":"changed"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            verify_personal_mutation_snapshot(
+                dir.path(),
+                "captured-env",
+                "https://lpm.dev",
+                None,
+                captured.sources.as_deref().unwrap()
+            )
+            .unwrap_err(),
+            "env.source_changed at lpm.json"
+        );
+        assert_eq!(
+            verify_org_mutation_snapshot(
+                dir.path(),
+                "captured-env",
+                "acme",
+                "https://lpm.dev",
+                None,
+                captured.sources.as_deref().unwrap()
+            )
+            .unwrap_err(),
+            "env.source_changed at lpm.json"
+        );
+    }
+
+    #[test]
+    fn personal_mutation_accepts_an_unchanged_bom_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "\u{feff}{\"vault\":\"bom-env\"}";
+        std::fs::write(dir.path().join("lpm.json"), content).unwrap();
+        let captured = CloudManifestSnapshot::read(dir.path()).unwrap();
+        verify_personal_mutation_snapshot(
+            dir.path(),
+            "bom-env",
+            "https://lpm.dev",
+            None,
+            captured.sources.as_deref().unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn org_mutation_accepts_an_unchanged_bom_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "\u{feff}{\"vault\":\"bom-env\"}";
+        std::fs::write(dir.path().join("lpm.json"), content).unwrap();
+        let captured = CloudManifestSnapshot::read(dir.path()).unwrap();
+        verify_org_mutation_snapshot(
+            dir.path(),
+            "bom-env",
+            "acme",
+            "https://lpm.dev",
+            None,
+            captured.sources.as_deref().unwrap(),
+        )
+        .unwrap();
+    }
 
     // ── env push schema metadata helpers ────────────────────────────
 
@@ -416,7 +782,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        cfg.env_schema = Some(lpm_env::EnvSchema { vars });
+        cfg.env_schema = Some(lpm_env::EnvSchema {
+            vars,
+            ..Default::default()
+        });
 
         let value =
             build_push_schema_value(Some(&cfg)).expect("config with envSchema emits a value");
@@ -427,6 +796,49 @@ mod tests {
             env_schema.get("DATABASE_URL").is_some(),
             "var entries must be flat, not wrapped in EnvSchema"
         );
+    }
+
+    #[test]
+    fn sync_projection_never_contains_secret_default_or_enum_literals() {
+        let cfg = lpm_runner::lpm_json::LpmJsonConfig {
+            env_schema: Some(serde_json::from_value(serde_json::json!({"vars":{"TOKEN":{"secret":true,"default":"private-default","enum":["private-enum"]}}})).unwrap()),
+            ..Default::default()
+        };
+        let value = build_push_schema_value(Some(&cfg)).unwrap();
+        let text = value.to_string();
+        assert!(!text.contains("private-default"));
+        assert!(!text.contains("private-enum"));
+        assert_eq!(value["envSchema"]["TOKEN"]["secret"], true);
+    }
+
+    #[test]
+    fn sync_projection_preserves_root_exposure_policy_and_ci_storage() {
+        let config = lpm_runner::lpm_json::LpmJsonConfig {
+            env_schema: Some(serde_json::from_value(serde_json::json!({"clientPrefixes":["APP_"],"vars":{"APP_API":{"client":true,"ci":"secret"},"BUILD_MODE":{"ci":"variable"}}})).unwrap()),
+            ..Default::default()
+        };
+        let wire = build_push_schema_value(Some(&config)).unwrap();
+        assert_eq!(
+            wire["envSchemaConfig"]["clientPrefixes"],
+            serde_json::json!(["APP_"])
+        );
+        assert_eq!(wire["envSchema"]["BUILD_MODE"]["ci"], "variable");
+        assert_eq!(wire["envSchema"]["APP_API"]["ci"], "secret");
+    }
+
+    #[test]
+    fn maximum_variable_count_fits_the_sync_metadata_byte_limit() {
+        let cfg = lpm_runner::lpm_json::LpmJsonConfig {
+            env_schema: Some(lpm_env::EnvSchema {
+                vars: (0..4096)
+                    .map(|index| (format!("VALUE_{index}"), Default::default()))
+                    .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let text = build_push_schema_value(Some(&cfg)).unwrap().to_string();
+        assert!(text.len() <= 256 * 1024, "{} bytes", text.len());
     }
 
     #[test]
@@ -450,6 +862,26 @@ mod tests {
         assert_eq!(
             dev.get("file"),
             Some(&serde_json::json!(".env.development"))
+        );
+    }
+
+    #[test]
+    fn sync_projection_preserves_groups_exact_bounds_and_presence_predicates_without_prefixes() {
+        let config = lpm_runner::lpm_json::LpmJsonConfig { env_schema: Some(serde_json::from_value(serde_json::json!({"vars":{"N":{"format":"integer","min":"9007199254740993","max":"9223372036854775807","requiredWhen":{"variable":"MODE","present":false}},"MODE":{}},"groups":{"g":{"mode":"exactlyOne","vars":["N","MODE"]}}})).unwrap()), ..Default::default() };
+        let wire = build_push_schema_value(Some(&config)).unwrap();
+        assert_eq!(wire["envSchema"]["N"]["min"], "9007199254740993");
+        assert_eq!(wire["envSchema"]["N"]["requiredWhen"]["present"], false);
+        assert_eq!(wire["envSchemaConfig"]["groups"]["g"]["mode"], "exactlyOne");
+    }
+
+    #[test]
+    fn sync_projection_suppresses_equality_literals_referencing_secret_sources() {
+        let config = lpm_runner::lpm_json::LpmJsonConfig { env_schema: Some(serde_json::from_value(serde_json::json!({"vars":{"SOURCE":{"secret":true},"TARGET":{"requiredWhen":{"variable":"SOURCE","equals":"private-condition"}},"PRESENT":{"requiredWhen":{"variable":"SOURCE","present":true}}}})).unwrap()), ..Default::default() };
+        let wire = build_push_schema_value(Some(&config)).unwrap();
+        assert!(!wire.to_string().contains("private-condition"));
+        assert_eq!(
+            wire["envSchema"]["PRESENT"]["requiredWhen"]["present"],
+            true
         );
     }
 

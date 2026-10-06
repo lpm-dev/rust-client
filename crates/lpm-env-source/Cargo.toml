@@ -1,0 +1,24 @@
+[package]
+name = "lpm-env-source"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Bounded project-contained env schema composition and source snapshots"
+
+[dependencies]
+lpm-env.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_path_to_error = "0.1"
+sha2.workspace = true
+cap-std = "4.0.2"
+cap-fs-ext.workspace = true
+same-file = "1.0.6"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

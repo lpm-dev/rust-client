@@ -722,6 +722,10 @@ async fn post_org_update(
         schema: request.metadata.and_then(|value| value.schema),
     };
 
+    if let Some(metadata) = request.metadata {
+        metadata.verify_sources()?;
+    }
+
     let result = match send_authenticated_sync_request(
         client
             .post(&url)
@@ -737,6 +741,7 @@ async fn post_org_update(
         SyncHttpResponse::Success(result) => result,
         SyncHttpResponse::Error { status, response } => {
             let result = PushResponse {
+                warnings: response.warnings,
                 local_key_checkpoint_failed: false,
                 version: response.version,
                 principal_id: response.principal_id,
@@ -764,6 +769,7 @@ async fn post_org_update(
     }
 
     Ok(PushResponse {
+        warnings: result.warnings,
         local_key_checkpoint_failed: false,
         version: result.version,
         principal_id: result.principal_id,
@@ -2024,6 +2030,7 @@ mod tests {
             let metadata = PushMetadata {
                 name: Some("acme-api"),
                 schema: Some(&schema),
+                before_write: None,
             };
 
             let result = push_org_with_keys(

@@ -151,15 +151,18 @@ impl Respond for SignedSyncResponse {
                 }
             }
         }
-        let body = serde_json::to_string(&serde_json::json!({
+        let mut envelope = serde_json::json!({
             "envelopeVersion": 3,
             "operation": operation,
             "outcome": if operation == "vault.write" { "committed" } else { "current" },
             "requestNonce": request_nonce,
             "binding": binding,
             "data": data,
-        }))
-        .expect("signed sync response must serialize");
+        });
+        if let Some(warnings) = object.get("warnings") {
+            envelope["warnings"] = warnings.clone();
+        }
+        let body = serde_json::to_string(&envelope).expect("signed sync response must serialize");
         let (key_id, signature) =
             lpm_vault::signature::sign_response_for_test(200, body.as_bytes());
         ResponseTemplate::new(200)
@@ -2449,6 +2452,28 @@ impl MockRegistry {
                 "key": base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
             })))
             .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
+    pub async fn with_github_actions_variable_create_success(
+        &self,
+        token: &str,
+        repository_id: &str,
+        environment: &str,
+        name: &str,
+        value: &str,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/repositories/{repository_id}/environments/{environment}/variables"
+            )))
+            .and(header("authorization", format!("Bearer {token}")))
+            .and(body_string_contains(format!("\"name\":\"{name}\"")))
+            .and(body_string_contains(format!("\"value\":\"{value}\"")))
+            .respond_with(ResponseTemplate::new(201))
+            .expect(1)
             .mount(&self.server)
             .await;
         self

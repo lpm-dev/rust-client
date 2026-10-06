@@ -62,6 +62,7 @@ jobs:
           cargo nextest run --locked
           -p lpm-cert -p lpm-common -p lpm-extractor -p lpm-linker
           -p lpm-store -p lpm-global -p lpm-sandbox
+          -p lpm-env -p lpm-env-source -p lpm-env-ffi
           -E 'not (test(extract_accepts_exact_max_file_count) |
           test(extract_rejects_more_than_max_file_count))'
           --no-fail-fast --status-level slow --final-status-level fail

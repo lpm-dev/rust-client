@@ -12,11 +12,14 @@ tempfile = "3"
 lpm-cert = { workspace = true }
 lpm-common = { workspace = true }
 lpm-env = { workspace = true }
+lpm-env-source.workspace = true
+cap-std = "4.0.2"
 lpm-workspace = { path = "../lpm-workspace" }
 lpm-runtime = { path = "../lpm-runtime" }
 lpm-vault = { path = "../lpm-vault" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_path_to_error = "0.1"
 schemars = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }

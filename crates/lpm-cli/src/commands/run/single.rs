@@ -11,6 +11,79 @@ use std::io::{IsTerminal, Write as _};
 use std::path::Path;
 use std::sync::Arc;
 
+#[derive(Default)]
+struct FileWatchConfig {
+    captured: Option<Result<Option<lpm_runner::lpm_json::LpmJsonConfig>, String>>,
+    paths: Vec<String>,
+    root_digest: Option<[u8; 32]>,
+}
+
+impl FileWatchConfig {
+    fn paths(&mut self, project_dir: &Path) -> Vec<String> {
+        use sha2::{Digest, Sha256};
+        let root = match lpm_common::read_text_file_capped(
+            &project_dir.join("lpm.json"),
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
+            Ok(content) => Ok(Some(content)),
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => Ok(None),
+            Err(error) => Err(format!("failed to read lpm.json: {error}")),
+        };
+        let digest = root
+            .as_ref()
+            .ok()
+            .and_then(|content| content.as_ref())
+            .map(|content| Sha256::digest(content.as_bytes()).into());
+        let reusable = root.is_ok()
+            && digest == self.root_digest
+            && self.captured.as_ref().is_some_and(|config| match config {
+                Ok(config) => config
+                    .as_ref()
+                    .and_then(|config| config.env_schema_resolution.as_ref())
+                    .is_none_or(|snapshot| snapshot.verify_dependencies().is_ok()),
+                Err(_) => false,
+            });
+        if !reusable {
+            let config = root
+                .map_err(|message| (message, Vec::new()))
+                .and_then(|content| {
+                    content
+                        .map(|content| {
+                            lpm_runner::lpm_json::parse_lpm_json_in_detailed(project_dir, &content)
+                        })
+                        .transpose()
+                        .map_err(|error| {
+                            let paths = match &error {
+                                lpm_runner::lpm_json::ConfigReadError::Schema { error, .. } => {
+                                    error.requested_paths.clone()
+                                }
+                                _ => Vec::new(),
+                            };
+                            (error.to_string(), paths)
+                        })
+                });
+            self.paths = match &config {
+                Ok(config) => config
+                    .as_ref()
+                    .and_then(|config| config.env_schema_resolution.as_ref())
+                    .map(|snapshot| {
+                        snapshot
+                            .dependencies
+                            .iter()
+                            .map(|dependency| dependency.path.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                Err((_, paths)) => paths.clone(),
+            };
+            let config = config.map_err(|(message, _)| message);
+            self.root_digest = digest;
+            self.captured = Some(config);
+        }
+        self.paths.clone()
+    }
+}
+
 fn script_command_for_display(
     project_dir: &Path,
     script_name: &str,
@@ -157,13 +230,14 @@ pub(crate) async fn run_with_reserved_stdout(
 
     if caching_enabled || reserve_stdout {
         // Run with tee capture (output streams to terminal + captured for cache)
-        let output = lpm_runner::script::run_script_captured_with_reserved_stdout(
+        let output = lpm_runner::script::run_script_captured_with_config(
             project_dir,
             script_name,
             extra_args,
             env_mode,
             bin_hint,
             reserve_stdout,
+            lpm_config.as_ref(),
         )?;
         let duration_ms = start.elapsed().as_millis() as u64;
         if let Some(context) = cache_context.as_ref() {
@@ -184,7 +258,14 @@ pub(crate) async fn run_with_reserved_stdout(
         }
     } else {
         // Run normally (inherited stdio, no capture)
-        lpm_runner::script::run_script(project_dir, script_name, extra_args, env_mode, bin_hint)?;
+        lpm_runner::script::run_script_with_config(
+            project_dir,
+            script_name,
+            extra_args,
+            env_mode,
+            bin_hint,
+            lpm_config.as_ref(),
+        )?;
     }
 
     env_access.check()?;
@@ -210,8 +291,26 @@ pub fn run_watch(
     stream: bool,
 ) -> Result<(), LpmError> {
     let script = script_name.to_string();
-    let plan = super::prepare_single_package_task_plan(project_dir, std::slice::from_ref(&script))?;
-    let filter = lpm_task::watch::WatchFilterHandle::new(task_watch_filter(project_dir, &plan)?);
+    let filter = match lpm_runner::lpm_json::read_lpm_json_detailed(project_dir) {
+        Ok(config) => {
+            let plan = super::prepare_single_package_task_plan_with_config(
+                project_dir,
+                std::slice::from_ref(&script),
+                config,
+            )?;
+            task_watch_filter(project_dir, &plan)?
+        }
+        Err(lpm_runner::lpm_json::ConfigReadError::Schema { error, config }) => {
+            let plan = super::prepare_single_package_task_plan_with_config(
+                project_dir,
+                std::slice::from_ref(&script),
+                Some(*config),
+            )?;
+            task_watch_filter(project_dir, &plan)?.with_config_dependencies(&error.requested_paths)
+        }
+        Err(error) => return Err(LpmError::Script(error.to_string())),
+    };
+    let filter = lpm_task::watch::WatchFilterHandle::new(filter);
     let cycle_filter = filter.clone();
     install_ui::phase_untrusted(&format!(
         "Watching {} (Ctrl+C to stop)",
@@ -231,8 +330,21 @@ pub fn run_watch(
                 let _ = stderr.flush();
             }
             let result = cycle_env_access.run(|| {
-                let plan =
-                    super::prepare_single_package_task_plan(&dir, std::slice::from_ref(&script))?;
+                let config = match lpm_runner::lpm_json::read_lpm_json_detailed(&dir) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        if let lpm_runner::lpm_json::ConfigReadError::Schema { error, .. } = &error
+                        {
+                            cycle_filter.replace_config_dependencies(&error.requested_paths);
+                        }
+                        return Err(LpmError::Script(error.to_string()));
+                    }
+                };
+                let plan = super::prepare_single_package_task_plan_with_config(
+                    &dir,
+                    std::slice::from_ref(&script),
+                    config,
+                )?;
                 cycle_filter.replace(task_watch_filter(&dir, &plan)?);
                 super::execute_single_package_task_plan(
                     &dir,
@@ -304,7 +416,21 @@ fn task_watch_filter(
         &inputs,
         &outputs.into_iter().collect::<Vec<_>>(),
     )
-    .map(lpm_task::watch::WatchFilter::with_config_files)
+    .map(|filter| {
+        let paths: Vec<_> = plan
+            .config
+            .as_ref()
+            .and_then(|config| config.env_schema_resolution.as_ref())
+            .map(|snapshot| {
+                snapshot
+                    .dependencies
+                    .iter()
+                    .map(|dependency| dependency.path.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        filter.with_config_files().with_config_dependencies(&paths)
+    })
     .map_err(LpmError::Script)
 }
 
@@ -398,8 +524,18 @@ pub async fn run_file_watch(
     let env_access = lpm_runner::env_access::EnvAccessScope::default();
     let cycle_env_access = env_access.clone();
 
-    lpm_task::watch::watch_file_and_run(
+    let watch_dir = project_dir.to_path_buf();
+    let cycle_config = Arc::new(std::sync::Mutex::new(FileWatchConfig::default()));
+    let capture_config = Arc::clone(&cycle_config);
+    lpm_task::watch::watch_file_and_run_with_config(
         &watched_file,
+        project_dir,
+        Box::new(move || {
+            let mut cycle = capture_config
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            cycle.paths(&watch_dir)
+        }),
         Box::new(move || {
             let mut stderr = std::io::stderr();
             if stderr.is_terminal() {
@@ -415,9 +551,19 @@ pub async fn run_file_watch(
             let start = std::time::Instant::now();
 
             match cycle_env_access.run(|| {
-                lpm_runner::exec::execute_exec_plan_with_signals(
+                let config = cycle_config
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .captured
+                    .take()
+                    .ok_or_else(|| {
+                        LpmError::Script("missing file watch configuration snapshot".into())
+                    })?
+                    .map_err(LpmError::Script)?;
+                lpm_runner::exec::execute_exec_plan_with_config_and_signals(
                     &dir,
                     &plan_for_watch,
+                    config.as_ref(),
                     &run_signals,
                 )
             }) {
@@ -459,5 +605,118 @@ fn exec_options(
         plain_node,
         runtime_cache_root: None,
         recorded_node_versions: crate::engine_check::recorded_node_versions(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn file_watch_initial_execution_reloads_sources_changed_during_registration() {
+        for scenario in ["root", "fragment", "missing-import", "missing-root"] {
+            let project = tempfile::tempdir().expect("project");
+            let root = project.path().join("lpm.json");
+            let fragment = project.path().join("base.json");
+            if scenario != "missing-root" {
+                let content = if scenario == "root" {
+                    r#"{"envSchema":{"vars":{}}}"#
+                } else {
+                    r#"{"envSchema":{"extends":["base.json"]}}"#
+                };
+                std::fs::write(&root, content).expect("root");
+            }
+            if scenario == "fragment" {
+                std::fs::write(&fragment, r#"{"vars":{"VALUE":{"default":"before"}}}"#)
+                    .expect("fragment");
+            }
+            let entry = project.path().join("entry.cjs");
+            std::fs::write(&entry, "").expect("entry");
+            let captured = Arc::new(std::sync::Mutex::new(FileWatchConfig::default()));
+            let capture = Arc::clone(&captured);
+            let dir = project.path().to_path_buf();
+            let stop = Arc::new(AtomicBool::new(false));
+            let finished = Arc::clone(&stop);
+            let mut first = true;
+            lpm_task::watch::watch_file_and_run_with_config(
+                &entry,
+                project.path(),
+                Box::new(move || {
+                    let paths = capture.lock().expect("capture").paths(&dir);
+                    if first {
+                        first = false;
+                        if scenario == "root" || scenario == "missing-root" {
+                            std::fs::write(
+                                &root,
+                                r#"{"envSchema":{"vars":{"VALUE":{"default":"after!"}}}}"#,
+                            )
+                            .expect("replace root");
+                        } else {
+                            std::fs::write(&fragment, r#"{"vars":{"VALUE":{"default":"after!"}}}"#)
+                                .expect("replace fragment");
+                        }
+                    }
+                    paths
+                }),
+                Box::new(move || {
+                    let config = captured
+                        .lock()
+                        .expect("capture")
+                        .captured
+                        .take()
+                        .expect("captured")
+                        .expect("repaired config")
+                        .expect("root config");
+                    let schema = config.env_schema.expect("schema");
+                    assert_eq!(
+                        schema.vars["VALUE"].default.as_deref(),
+                        Some("after!"),
+                        "{scenario}"
+                    );
+                    finished.store(true, Ordering::SeqCst);
+                }),
+                || stop.load(Ordering::SeqCst),
+            )
+            .expect("watch registration");
+        }
+    }
+
+    #[test]
+    fn file_watch_unchanged_initial_capture_reuses_the_resolved_graph() {
+        let project = tempfile::tempdir().expect("project");
+        std::fs::write(
+            project.path().join("lpm.json"),
+            r#"{"envSchema":{"vars":{}}}"#,
+        )
+        .expect("root");
+        let mut cycle = FileWatchConfig::default();
+        cycle.paths(project.path());
+        let snapshot = Arc::clone(
+            cycle
+                .captured
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .env_schema_resolution
+                .as_ref()
+                .unwrap(),
+        );
+        cycle.paths(project.path());
+        let current = cycle
+            .captured
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .env_schema_resolution
+            .as_ref()
+            .unwrap();
+        assert!(Arc::ptr_eq(&snapshot, current));
     }
 }

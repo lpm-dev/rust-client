@@ -3,6 +3,7 @@
 mod arguments;
 pub(crate) mod auth;
 mod ci;
+mod generate;
 mod github;
 mod inventory;
 mod local;
@@ -47,7 +48,7 @@ pub async fn run(
     if args.is_empty() {
         return local::env_list(None, false, project_dir, json_output);
     }
-    if let Some(action) = arguments::parse(&args)? {
+    if let Some(action) = arguments::parse(&args, json_output)? {
         use arguments::LocalAction;
         return match action {
             LocalAction::Set {
@@ -101,24 +102,46 @@ pub async fn run(
             ),
             LocalAction::Print {
                 environment,
+                scope,
                 format,
                 schema_only,
+                client_only,
                 ci,
             } => schema::vars_print(
                 environment.env.as_deref(),
                 format,
                 schema_only,
+                client_only,
                 ci,
+                &scope,
                 project_dir,
                 json_output,
             ),
             LocalAction::Example { environment } => {
                 schema::vars_example(project_dir, environment.env.as_deref(), json_output)
             }
-            LocalAction::Check => schema::vars_check(project_dir, json_output),
+            LocalAction::Check { environment, scope } => {
+                schema::vars_check(project_dir, environment.env.as_deref(), &scope, json_output)
+            }
             LocalAction::Validate { strict } => {
                 schema::vars_validate(project_dir, strict, json_output)
             }
+            LocalAction::Schema => schema::schema_definition(project_dir, json_output),
+            LocalAction::Generate {
+                environment,
+                scope,
+                out_dir,
+                adapter,
+                check,
+            } => generate::run(
+                project_dir,
+                environment.env.as_deref(),
+                &scope,
+                &out_dir,
+                adapter,
+                check,
+                json_output,
+            ),
             LocalAction::Init { force } => inventory::vars_init(project_dir, force, json_output),
             LocalAction::Ls => inventory::vars_ls(project_dir, json_output),
             LocalAction::Log => remote::env_log(client, project_dir, json_output).await,
@@ -154,7 +177,7 @@ pub async fn run(
         }
         "pair" => pairing::env_pair(client, &args[1..], json_output).await,
         unknown => Err(LpmError::Script(format!(
-            "unknown env action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, example, print, check, connect, status, log, share, rotate-key, rotate-sharing-key, pair, unpair, init, ls, copy"
+            "unknown env action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, schema, generate, example, print, check, connect, status, log, share, rotate-key, rotate-sharing-key, pair, unpair, init, ls, copy"
         ))),
     }
 }

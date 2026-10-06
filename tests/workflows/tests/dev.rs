@@ -457,7 +457,8 @@ fn dev_rejects_an_invalid_env_schema_default_before_starting_the_service() {
 
     assert!(!output.status.success(), "invalid default must fail");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("invalid format"),
+        String::from_utf8_lossy(&output.stderr)
+            .contains("env.invalid_format at lpm.json/envSchema/vars/APPLICATION_PORT"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -2533,4 +2534,97 @@ fn dev_rejects_zero_readiness_timeout_before_starting_a_service() {
         "{output:?}"
     );
     assert!(!project.file_exists("spawned.txt"));
+}
+
+#[test]
+fn dev_validates_generated_ports_and_peer_addresses_in_each_service_scope() {
+    let occupied = (43_000..45_000)
+        .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+        .unwrap();
+    let requested = occupied.local_addr().unwrap().port();
+    let project = service_env_project(serde_json::json!({
+        "envSchema": {"vars": {
+            "PORT": {"format":"port","requiredIn":[{"stage":["development"],"service":["api"]}]},
+            "API_PORT": {"format":"port","requiredIn":[{"stage":["development"],"service":["worker"]}]},
+            "API_URL": {"format":"url","protocols":["http"],"requiredIn":[{"service":["worker"]}]}
+        }},
+        "services": {
+            "api": {"command":"node api.js", "port":requested, "readyTimeout":5},
+            "worker": {"command":"node worker.js", "dependsOn":["api"]}
+        }
+    }));
+    project.write_file(
+        "api.js",
+        r#"
+const http=require('http');const fs=require('fs');
+const server=http.createServer((req,res)=>res.end('ok'));
+server.listen(Number(process.env.PORT),'127.0.0.1',()=>{
+fs.writeFileSync('api-port.txt',process.env.PORT);
+setTimeout(()=>server.close(),1500);
+});
+"#,
+    );
+    project.write_file("worker.js", r#"
+require('fs').writeFileSync('peer-env.json',JSON.stringify({apiPort:process.env.API_PORT,apiUrl:process.env.API_URL,port:process.env.PORT,selfUrl:process.env.WORKER_URL}));
+setTimeout(()=>{},500);
+"#);
+    let output = lpm(&project)
+        .env_remove("PORT")
+        .env_remove("API_PORT")
+        .env_remove("API_URL")
+        .env_remove("WORKER_URL")
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let assigned = project.read_file("api-port.txt");
+    assert_ne!(assigned, requested.to_string());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&project.read_file("peer-env.json")).unwrap(),
+        serde_json::json!({"apiPort":assigned,"apiUrl":format!("http://localhost:{assigned}")})
+    );
+}
+
+#[test]
+fn service_recovery_revalidates_the_final_path_before_restarting() {
+    let project = service_env_project(
+        serde_json::json!({"services":{"worker":{"command":"node worker.cjs","restart":true,"readyTimeout":1}}}),
+    );
+    project.write_file("worker.cjs",r#"
+const fs=require('node:fs');
+if (!fs.existsSync('armed')) {fs.writeFileSync('initial-path',process.env.PATH);setTimeout(()=>process.exit(0),1200)}
+else if (!fs.existsSync('started')) {fs.writeFileSync('started','yes');fs.mkdirSync('node_modules/.bin',{recursive:true});setTimeout(()=>process.exit(1),1200)}
+else {fs.writeFileSync('second-child','ran');setTimeout(()=>process.exit(0),1200)}
+"#);
+    lpm(&project)
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .assert()
+        .success();
+    let path = project.read_file("initial-path");
+    assert!(
+        !path.contains(
+            &project
+                .path()
+                .join("node_modules/.bin")
+                .to_string_lossy()
+                .to_string()
+        )
+    );
+    project.write_file("armed", "yes");
+    project.write_file("lpm.json",&serde_json::json!({"services":{"worker":{"command":"node worker.cjs","restart":true,"readyTimeout":1}},"envSchema":{"vars":{"PATH":{"enum":[path],"requiredIn":[{"stage":["development"],"service":["worker"]}]}}}}).to_string());
+    let output = lpm(&project)
+        .args(["dev", "--no-install", "--no-open", "--no-dashboard"])
+        .output()
+        .unwrap();
+    assert!(
+        !project.file_exists("second-child"),
+        "recovery spawned with an unvalidated PATH: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("PATH"));
 }

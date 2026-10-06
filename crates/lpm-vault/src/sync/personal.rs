@@ -9,6 +9,15 @@ use super::http::{
 use crate::crypto;
 use crate::crypto::personal::{self as personal_crypto, PersonalKeyContext, PersonalKeyEnvelope};
 
+/// A metadata warning returned by an authenticated value-sync write.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyncWarning {
+    pub code: String,
+    pub message: String,
+    pub hint: String,
+}
+
 /// Response from push endpoint.
 ///
 /// Carries both success-path fields (`version`, `status`) and the structured
@@ -25,6 +34,8 @@ use crate::crypto::personal::{self as personal_crypto, PersonalKeyContext, Perso
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PushResponse {
+    #[serde(default)]
+    pub warnings: Vec<SyncWarning>,
     #[serde(skip)]
     pub local_key_checkpoint_failed: bool,
     pub version: Option<i32>,
@@ -198,6 +209,17 @@ pub struct PushMetadata<'a> {
     pub name: Option<&'a str>,
     /// Env schema from `lpm.json` `envSchema` field (as a JSON value).
     pub schema: Option<&'a serde_json::Value>,
+    /// Recheck captured local sources immediately before each remote mutation.
+    pub before_write: Option<&'a (dyn Fn() -> Result<(), String> + Send + Sync)>,
+}
+
+impl PushMetadata<'_> {
+    pub(super) fn verify_sources(&self) -> Result<(), SyncError> {
+        if let Some(check) = self.before_write {
+            check()?;
+        }
+        Ok(())
+    }
 }
 
 /// Revision, principal, and request metadata for a personal vault push.
@@ -505,6 +527,9 @@ pub async fn push_raw_with_project_rotation(
             schema: options.metadata.and_then(|value| value.schema),
         };
 
+        if let Some(metadata) = options.metadata {
+            metadata.verify_sources()?;
+        }
         match send_authenticated_sync_request(
             client
                 .post(&url)
@@ -537,6 +562,7 @@ pub async fn push_raw_with_project_rotation(
                 )
                 .is_err();
                 return Ok(PushResponse {
+                    warnings: result.warnings,
                     local_key_checkpoint_failed,
                     version: result.version,
                     principal_id: result.principal_id,
@@ -550,6 +576,7 @@ pub async fn push_raw_with_project_rotation(
             }
             SyncHttpResponse::Error { status, response } => {
                 let result = PushResponse {
+                    warnings: response.warnings,
                     local_key_checkpoint_failed: false,
                     version: response.version,
                     principal_id: response.principal_id,
@@ -2242,7 +2269,7 @@ mod tests {
     #[test]
     fn format_push_error_appends_hint_when_present() {
         let response = PushResponse {
-            local_key_checkpoint_failed: false,
+            warnings: Vec::new(),            local_key_checkpoint_failed: false,
             version: None,
             principal_id: None,
             content_key_version: None,
@@ -2266,6 +2293,7 @@ mod tests {
     #[test]
     fn format_push_error_falls_back_to_error_only_when_hint_absent() {
         let response = PushResponse {
+            warnings: Vec::new(),
             local_key_checkpoint_failed: false,
             version: None,
             principal_id: None,
@@ -2284,6 +2312,7 @@ mod tests {
     #[test]
     fn format_push_error_falls_back_to_status_when_error_field_missing() {
         let response = PushResponse {
+            warnings: Vec::new(),
             local_key_checkpoint_failed: false,
             version: None,
             principal_id: None,

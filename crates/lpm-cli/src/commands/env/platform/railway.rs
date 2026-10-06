@@ -6,8 +6,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    PLATFORM_TIMEOUT, PlatformDiff, PlatformPushResult, PlatformVariable, VariableScope,
-    read_platform_response,
+    PLATFORM_TIMEOUT, PlatformApplyError, PlatformDiff, PlatformPushResult, PlatformVariable,
+    VariableScope, read_platform_response,
 };
 
 pub(super) const RAILWAY_API_URL: &str = "https://backboard.railway.com/graphql/v2";
@@ -78,6 +78,7 @@ struct UpsertData {
 }
 
 pub(super) struct RailwayClient {
+    pub(super) source_check: Option<super::PlatformSourceCheck>,
     http: reqwest::Client,
     api_url: String,
     token: HeaderValue,
@@ -97,6 +98,7 @@ impl RailwayClient {
                 LpmError::Network(format!("failed to build Railway client: {error}"))
             })?;
         Ok(Self {
+            source_check: None,
             http,
             api_url: railway_api_url()?,
             token,
@@ -138,6 +140,20 @@ impl RailwayClient {
     }
 
     pub(super) async fn apply(
+        &self,
+        diff: &PlatformDiff,
+        local: &HashMap<String, String>,
+        remote: &HashMap<String, PlatformVariable>,
+        clean: bool,
+    ) -> Result<PlatformPushResult, PlatformApplyError> {
+        super::check_platform_sources(&self.source_check)
+            .map_err(|error| PlatformApplyError::tracked(error, PlatformPushResult::default()))?;
+        self.apply_attempted(diff, local, remote, clean)
+            .await
+            .map_err(PlatformApplyError::untracked)
+    }
+
+    async fn apply_attempted(
         &self,
         diff: &PlatformDiff,
         local: &HashMap<String, String>,
@@ -616,6 +632,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_rejected_railway_push_retains_zero_counts_for_failure_audit() {
+        let server = MockServer::start().await;
+        let _env = crate::test_env::ScopedEnv::set([
+            (
+                "ACCEPTANCE_RUN_ID",
+                std::ffi::OsString::from("railway-unsent-audit"),
+            ),
+            (
+                "LPM_ACCEPTANCE_RAILWAY_API_URL",
+                std::ffi::OsString::from(format!("{}/graphql/v2", server.uri())),
+            ),
+        ]);
+        let mut client = RailwayClient::new("railway-token".into(), config(false)).expect("client");
+        client.source_check = Some(std::sync::Arc::new(|| {
+            Err(LpmError::Script("env.source_changed".into()))
+        }));
+        let client = super::super::PlatformClient::Railway(client);
+        let error = client
+            .apply(
+                &PlatformDiff {
+                    added: vec!["KEY".into()],
+                    ..PlatformDiff::default()
+                },
+                &super::super::PlatformLocalValues::Exact(
+                    HashMap::from([("KEY".into(), "local".into())]).into(),
+                ),
+                &super::super::PlatformState::default(),
+                false,
+            )
+            .await
+            .expect_err("source rejection");
+        let super::super::PlatformApplyError::Tracked { error, applied } = error else {
+            panic!("known unsent writes require zero-count failure audit")
+        };
+        assert!(error.to_string().contains("env.source_changed"));
+        assert_eq!((applied.added, applied.updated, applied.removed), (0, 0, 0));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn source_changes_after_upsert_do_not_block_authoritative_verification() {
+        let server = MockServer::start().await;
+        let _env = crate::test_env::ScopedEnv::set([
+            (
+                "ACCEPTANCE_RUN_ID",
+                std::ffi::OsString::from("railway-source-change"),
+            ),
+            (
+                "LPM_ACCEPTANCE_RAILWAY_API_URL",
+                std::ffi::OsString::from(format!("{}/graphql/v2", server.uri())),
+            ),
+        ]);
+        Mock::given(method("POST")).and(body_json(serde_json::json!({
+            "query": VARIABLE_COLLECTION_UPSERT_MUTATION,
+            "variables":{"input":{"projectId":"project-123","environmentId":"environment-123","serviceId":"service-123","variables":{"KEY":"local"},"replace":false}}
+        }))).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":{"variableCollectionUpsert":true}}))).mount(&server).await;
+        Mock::given(method("POST")).and(body_json(serde_json::json!({
+            "query": VARIABLES_QUERY,
+            "variables":{"projectId":"project-123","environmentId":"environment-123","serviceId":"service-123","unrendered":true}
+        }))).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data":{"variables":{"KEY":"local"}}}))).mount(&server).await;
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = std::sync::Arc::clone(&calls);
+        let mut client = RailwayClient::new("railway-token".into(), config(false)).expect("client");
+        client.source_check = Some(std::sync::Arc::new(move || {
+            if observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                Err(LpmError::Script("env.source_changed".into()))
+            }
+        }));
+        let result = client
+            .apply(
+                &PlatformDiff {
+                    added: vec!["KEY".into()],
+                    ..PlatformDiff::default()
+                },
+                &HashMap::from([("KEY".into(), "local".into())]),
+                &HashMap::new(),
+                false,
+            )
+            .await
+            .expect("authoritative verification still runs");
+        assert_eq!(result.added, 1);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(server.received_requests().await.expect("requests").len(), 2);
+    }
+
+    #[tokio::test]
     async fn bulk_upsert_is_verified_by_an_authoritative_reread() {
         let server = MockServer::start().await;
         let _env = crate::test_env::ScopedEnv::set([
@@ -841,6 +951,11 @@ mod tests {
             .await
             .expect_err("partial mutation must not report success");
 
-        assert!(error.to_string().contains("verification failed"));
+        assert!(
+            error
+                .into_error()
+                .to_string()
+                .contains("verification failed")
+        );
     }
 }

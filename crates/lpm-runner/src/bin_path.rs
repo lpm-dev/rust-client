@@ -266,13 +266,15 @@ impl ManagedRuntimeHint {
         path: &std::ffi::OsStr,
         identities: &mut Vec<(String, String)>,
     ) {
-        for runtime in [
+        for (runtime, fingerprint) in [
             lpm_runtime::detect::RuntimeKind::Node,
             lpm_runtime::detect::RuntimeKind::Bun,
-        ] {
-            if let Some(fingerprint) =
-                lpm_runtime::effective::probe_runtime_fingerprint_on_path(cwd, path, runtime)
-            {
+        ]
+        .into_iter()
+        .zip(lpm_runtime::effective::probe_script_runtime_fingerprints(
+            cwd, path,
+        )) {
+            if let Some(fingerprint) = fingerprint {
                 identities.push((format!("{}-executable", runtime.as_str()), fingerprint));
             }
         }

@@ -2,7 +2,7 @@
 //!
 //! Takes `(schema, env_map)` → `Vec<ValidationError>`. No side effects.
 
-use crate::schema::{EnvSchema, EnvVarRule, VarFormat};
+use crate::schema::{EmptyPolicy, EnvSchema, EnvVarRule, VarFormat};
 use regex_automata::{
     Input, MatchKind, PatternID, PatternSet, meta::Regex, nfa::thompson::WhichCaptures,
 };
@@ -37,6 +37,17 @@ pub struct ValidationError {
 pub enum ValidationErrorKind {
     /// The schema key is not a portable environment variable name.
     InvalidVariableName,
+    /// The declaration cannot be safely evaluated.
+    InvalidRule { message: &'static str },
+    /// A resolved environment identity cannot be used for loading or storage.
+    InvalidEnvironmentName {
+        canonical: String,
+        alias: Option<String>,
+    },
+    /// An empty value is explicitly forbidden.
+    Empty,
+    /// A value contains a NUL byte and cannot become a process environment value.
+    InvalidValue,
     /// The configured regular expression cannot be compiled safely.
     InvalidPattern { pattern: String, message: String },
     /// Required variable is not set (or is empty).
@@ -47,12 +58,47 @@ pub enum ValidationErrorKind {
     PatternMismatch { pattern: String, got: String },
     /// Value is not in the allowed enum list.
     NotInEnum { allowed: Vec<String>, got: String },
+    /// A numeric, length, or URL-protocol restriction failed.
+    ConstraintViolation { constraint: &'static str },
+    /// A relationship failed; the error is associated with each affected variable.
+    GroupViolation {
+        group: String,
+        mode: crate::VarGroupMode,
+    },
 }
 
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let key = TerminalSafe(&self.key);
         match &self.kind {
+            ValidationErrorKind::InvalidEnvironmentName { canonical, alias } => write!(
+                f,
+                "{}",
+                TerminalSafe(&crate::resolver::invalid_identity_message(
+                    canonical,
+                    alias.as_deref()
+                ))
+            )?,
+            ValidationErrorKind::ConstraintViolation { constraint } => {
+                write!(f, "{key}: violates {constraint} constraint")?
+            }
+            ValidationErrorKind::GroupViolation { group, mode } => write!(
+                f,
+                "{key}: group {} requires {}",
+                TerminalSafe(group),
+                match mode {
+                    crate::VarGroupMode::AllOrNone => "all values or no values to be non-empty",
+                    crate::VarGroupMode::ExactlyOne => "exactly one non-empty value",
+                    crate::VarGroupMode::AtLeastOne => "at least one non-empty value",
+                }
+            )?,
+            ValidationErrorKind::InvalidRule { message } => {
+                write!(f, "{key}: invalid envSchema rule: {message}")?
+            }
+            ValidationErrorKind::Empty => write!(f, "{key}: empty values are not allowed")?,
+            ValidationErrorKind::InvalidValue => {
+                write!(f, "{key}: values cannot contain NUL bytes")?
+            }
             ValidationErrorKind::InvalidVariableName => {
                 write!(
                     f,
@@ -79,7 +125,7 @@ impl std::fmt::Display for ValidationError {
                 let display_value = display_value(got, self.is_secret);
                 write!(
                     f,
-                    "{}: invalid format, expected {expected:?}, got \"{}\"",
+                    "{}: invalid format, expected {expected}, got \"{}\"",
                     key,
                     TerminalSafe(display_value)
                 )?;
@@ -193,14 +239,34 @@ impl InvalidPatternReason {
 
 /// A reusable validator that deduplicates and compiles configured regexes in batches.
 pub struct EnvValidator<'a> {
+    schema: &'a EnvSchema,
+    groups: Vec<(&'a str, &'a crate::VarGroup)>,
     rules: Vec<CompiledRule<'a>>,
     patterns: Vec<CompiledPattern>,
     pattern_batches: Vec<Regex>,
+    definition_errors: Vec<ValidationError>,
 }
 
 impl<'a> EnvValidator<'a> {
     /// Compile a deterministic validation plan for an environment schema.
     pub fn new(schema: &'a EnvSchema) -> Self {
+        if !crate::scopes::budgets_valid(schema) {
+            return Self {
+                schema,
+                groups: Vec::new(),
+                rules: Vec::new(),
+                patterns: Vec::new(),
+                pattern_batches: Vec::new(),
+                definition_errors: vec![ValidationError {
+                    key: "envSchema".into(),
+                    kind: ValidationErrorKind::InvalidRule {
+                        message: "scope definitions exceed 4096 selectors or 16384 dimension values",
+                    },
+                    description: None,
+                    is_secret: false,
+                }],
+            };
+        }
         let mut keys = Vec::with_capacity(schema.vars.len());
         keys.extend(schema.vars.keys().map(String::as_str));
         keys.sort_unstable();
@@ -260,15 +326,228 @@ impl<'a> EnvValidator<'a> {
             .map(|pattern| pattern.expect("every pattern is compiled or rejected"))
             .collect();
 
-        Self {
+        let mut validator = Self {
+            schema,
+            groups: crate::constraints::ordered_groups(schema),
             rules,
             patterns,
             pattern_batches,
+            definition_errors: Vec::new(),
+        };
+        validator.definition_errors = validator.check_definitions();
+        validator
+    }
+
+    /// The immutable schema used to compile this plan.
+    pub fn schema(&self) -> &'a EnvSchema {
+        self.schema
+    }
+
+    /// Return declaration errors independently of supplied values.
+    pub fn schema_errors(&self) -> &[ValidationError] {
+        &self.definition_errors
+    }
+
+    fn check_definitions(&self) -> Vec<ValidationError> {
+        let mut errors = crate::constraints::definition_errors(self.schema);
+        let mut prefixes =
+            std::collections::HashSet::with_capacity(self.schema.client_prefixes.len().min(32));
+        let prefixes_invalid = self.schema.client_prefixes.len() > 32
+            || self.schema.client_prefixes.iter().any(|prefix| {
+                !is_valid_env_var_name(prefix) || !prefix.ends_with('_') || !prefixes.insert(prefix)
+            });
+        if prefixes_invalid {
+            errors.push(validation_error(
+                "envSchema",
+                &EnvVarRule::default(),
+                ValidationErrorKind::InvalidRule {
+                    message: "clientPrefixes must contain at most 32 unique portable prefixes ending in '_'",
+                },
+            ));
         }
+        let mut matches = PatternSet::new(MAX_PATTERN_BATCH_SIZE);
+        for compiled in &self.rules {
+            let key = compiled.key;
+            let rule = compiled.rule;
+            if let Some(message) = crate::scopes::rule_error(rule) {
+                errors.push(validation_error(
+                    key,
+                    rule,
+                    ValidationErrorKind::InvalidRule { message },
+                ));
+                continue;
+            }
+            if !is_valid_env_var_name(key) {
+                errors.push(validation_error(
+                    key,
+                    rule,
+                    ValidationErrorKind::InvalidVariableName,
+                ));
+                continue;
+            }
+            if rule
+                .description
+                .iter()
+                .chain(rule.pattern.iter())
+                .chain(rule.default.iter())
+                .chain(rule.defaults_in.iter().map(|default| &default.value))
+                .chain(rule.enum_values.iter().flatten())
+                .any(|value| {
+                    value.chars().any(|character| {
+                        matches!(character as u32, 0..=8 | 11..=12 | 14..=31 | 127..=159)
+                    })
+                })
+            {
+                errors.push(validation_error(
+                    key,
+                    rule,
+                    ValidationErrorKind::InvalidRule {
+                        message: "schema text cannot contain unsafe control characters",
+                    },
+                ));
+                continue;
+            }
+            let pattern = match compiled.pattern_index.map(|index| &self.patterns[index]) {
+                Some(CompiledPattern::Valid(location)) => Some(*location),
+                Some(CompiledPattern::Invalid(reason)) => {
+                    errors.push(validation_error(
+                        key,
+                        rule,
+                        ValidationErrorKind::InvalidPattern {
+                            pattern: rule.pattern.clone().unwrap_or_default(),
+                            message: reason.message(),
+                        },
+                    ));
+                    continue;
+                }
+                None => None,
+            };
+            let exposure_error = if rule.secret && rule.client {
+                Some("secret rules cannot be client-visible")
+            } else if rule.secret && rule.ci == Some(crate::CiStorage::Variable) {
+                Some("secret rules cannot use readable CI variable storage")
+            } else if (EnvSchema::has_framework_client_prefix(key)
+                || !prefixes_invalid && self.schema.has_client_prefix(key))
+                != rule.client
+            {
+                Some(if rule.client {
+                    "client-visible keys must use a framework or declared client prefix; rename the key or add its prefix to clientPrefixes"
+                } else {
+                    "public-prefix keys require client: true; remove secret: true or rename the key to keep it private"
+                })
+            } else {
+                None
+            };
+            if let Some(message) = exposure_error {
+                errors.push(validation_error(
+                    key,
+                    rule,
+                    ValidationErrorKind::InvalidRule { message },
+                ));
+                continue;
+            }
+            if rule.secret && (rule.default.is_some() || rule.enum_values.is_some()) {
+                errors.push(validation_error(
+                    key,
+                    rule,
+                    ValidationErrorKind::InvalidRule {
+                        message: "secret rules cannot contain literal defaults or enum values",
+                    },
+                ));
+                continue;
+            }
+            if rule.enum_values.as_ref().is_some_and(Vec::is_empty) {
+                errors.push(validation_error(
+                    key,
+                    rule,
+                    ValidationErrorKind::InvalidRule {
+                        message: "enum must contain at least one value",
+                    },
+                ));
+                continue;
+            }
+            for (default, scoped) in rule.default.iter().map(|value| (value, false)).chain(
+                rule.defaults_in
+                    .iter()
+                    .map(|default| (&default.value, true)),
+            ) {
+                if default.is_empty() && rule.empty == EmptyPolicy::Reject {
+                    errors.push(ValidationError {
+                        key: key.into(),
+                        kind: ValidationErrorKind::Empty,
+                        description: None,
+                        is_secret: rule.secret,
+                    });
+                } else if default.is_empty() && rule.required {
+                    errors.push(ValidationError {
+                        key: key.into(),
+                        kind: ValidationErrorKind::Missing,
+                        description: None,
+                        is_secret: rule.secret,
+                    });
+                } else {
+                    validate_value(
+                        key,
+                        default,
+                        rule,
+                        || {
+                            pattern.map(|location| {
+                                self.matches_pattern(default, location, &mut matches)
+                            })
+                        },
+                        scoped,
+                        &mut errors,
+                    );
+                }
+            }
+        }
+        errors
     }
 
     /// Validate values and inject only defaults that satisfy their complete rule.
     pub fn validate(&self, env_vars: &mut HashMap<String, String>) -> Vec<ValidationError> {
+        self.validate_with_context(env_vars, crate::EvalContext::default())
+    }
+
+    /// Validate the same plan for a resolved environment, command stage, and service.
+    pub fn validate_with_context(
+        &self,
+        env_vars: &mut HashMap<String, String>,
+        context: crate::EvalContext<'_>,
+    ) -> Vec<ValidationError> {
+        self.validate_with_default_policy(env_vars, context, |_| true)
+    }
+
+    /// Validate values while restricting which absent keys can receive defaults.
+    pub fn validate_with_default_policy(
+        &self,
+        env_vars: &mut HashMap<String, String>,
+        context: crate::EvalContext<'_>,
+        allow_default: impl Fn(&str) -> bool,
+    ) -> Vec<ValidationError> {
+        if !self.definition_errors.is_empty() {
+            return self.definition_errors.clone();
+        }
+        if !context.is_valid() {
+            return vec![validation_error(
+                "envSchema",
+                &EnvVarRule::default(),
+                ValidationErrorKind::InvalidRule {
+                    message: "evaluation context requires valid environment and service names",
+                },
+            )];
+        }
+        for compiled in &self.rules {
+            let missing = env_vars.get(compiled.key).is_none_or(|value| {
+                value.is_empty() && compiled.rule.empty == EmptyPolicy::Missing
+            });
+            if missing
+                && allow_default(compiled.key)
+                && let Some(default) = crate::scopes::default_for_context(compiled.rule, context)
+            {
+                env_vars.insert(compiled.key.to_string(), default.to_string());
+            }
+        }
         let mut errors = Vec::new();
         let mut matched_patterns = PatternSet::new(MAX_PATTERN_BATCH_SIZE);
 
@@ -301,31 +580,48 @@ impl<'a> EnvValidator<'a> {
                 None => None,
             };
 
-            let is_missing_or_empty = env_vars.get(key).is_none_or(String::is_empty);
+            let value_is_empty = env_vars.get(key).is_some_and(String::is_empty);
+            if value_is_empty && rule.empty == EmptyPolicy::Reject {
+                errors.push(validation_error(key, rule, ValidationErrorKind::Empty));
+                continue;
+            }
+            let is_missing_or_empty = !env_vars.contains_key(key)
+                || (value_is_empty && rule.empty == EmptyPolicy::Missing);
+            let required = rule.required
+                || rule
+                    .required_in
+                    .iter()
+                    .any(|selector| selector.matches(context))
+                || rule
+                    .required_when
+                    .as_ref()
+                    .is_some_and(|condition| condition.matches(env_vars));
             if is_missing_or_empty {
-                if let Some(default) = &rule.default {
-                    if rule.required && default.is_empty() {
-                        errors.push(validation_error(key, rule, ValidationErrorKind::Missing));
-                        continue;
-                    }
-                    let error_count = errors.len();
-                    let pattern_matches = pattern.map(|location| {
-                        self.matches_pattern(default, location, &mut matched_patterns)
-                    });
-                    validate_value(key, default, rule, pattern_matches, &mut errors);
-                    if errors.len() == error_count {
-                        env_vars.insert(key.to_string(), default.clone());
-                    }
-                } else if rule.required {
+                if required {
                     errors.push(validation_error(key, rule, ValidationErrorKind::Missing));
                 }
             } else if let Some(value) = env_vars.get(key) {
-                let pattern_matches = pattern
-                    .map(|location| self.matches_pattern(value, location, &mut matched_patterns));
-                validate_value(key, value, rule, pattern_matches, &mut errors);
+                if value.is_empty() && required {
+                    errors.push(validation_error(key, rule, ValidationErrorKind::Missing));
+                    continue;
+                }
+                validate_value(
+                    key,
+                    value,
+                    rule,
+                    || {
+                        pattern.map(|location| {
+                            self.matches_pattern(value, location, &mut matched_patterns)
+                        })
+                    },
+                    false,
+                    &mut errors,
+                );
             }
         }
 
+        crate::constraints::validate_groups(self.schema, &self.groups, env_vars, &mut errors);
+        errors.sort_by(|a, b| a.key.cmp(&b.key));
         errors
     }
 
@@ -357,39 +653,80 @@ pub fn validate(
     EnvValidator::new(schema).validate(env_vars)
 }
 
+/// Validate declarations and all defaults without requiring environment values.
+pub fn validate_schema(schema: &EnvSchema) -> Vec<ValidationError> {
+    EnvValidator::new(schema).definition_errors
+}
+
 /// Validate a single value against its rule.
 fn validate_value(
     key: &str,
     value: &str,
     rule: &EnvVarRule,
-    pattern_matches: Option<bool>,
+    pattern_matches: impl FnOnce() -> Option<bool>,
+    declaration: bool,
     errors: &mut Vec<ValidationError>,
 ) {
-    // Format validation
+    let error = |kind| ValidationError {
+        key: key.to_string(),
+        kind: if declaration {
+            ValidationErrorKind::InvalidRule {
+                message: match kind {
+                    ValidationErrorKind::InvalidFormat { .. } => {
+                        "scoped default does not satisfy its format"
+                    }
+                    ValidationErrorKind::NotInEnum { .. } => {
+                        "scoped default does not satisfy its enum"
+                    }
+                    ValidationErrorKind::PatternMismatch { .. } => {
+                        "scoped default does not satisfy its pattern"
+                    }
+                    ValidationErrorKind::ConstraintViolation { .. } => {
+                        "scoped default does not satisfy its scalar constraints"
+                    }
+                    _ => "scoped default is not a process environment value",
+                },
+            }
+        } else {
+            kind
+        },
+        description: if declaration {
+            None
+        } else {
+            rule.description.clone()
+        },
+        is_secret: rule.secret,
+    };
+    if value.as_bytes().contains(&0) {
+        errors.push(error(ValidationErrorKind::InvalidValue));
+        return;
+    }
     if let Some(format) = &rule.format
         && !validate_format(value, format)
     {
-        errors.push(validation_error(
-            key,
-            rule,
-            ValidationErrorKind::InvalidFormat {
-                expected: format.clone(),
-                got: retained_value(value, rule.secret),
-            },
-        ));
+        errors.push(error(ValidationErrorKind::InvalidFormat {
+            expected: format.clone(),
+            got: retained_value(value, rule.secret || declaration),
+        }));
         // Don't check further rules if format is wrong
         return;
     }
 
-    if pattern_matches == Some(false) {
-        errors.push(validation_error(
-            key,
-            rule,
-            ValidationErrorKind::PatternMismatch {
-                pattern: rule.pattern.clone().unwrap_or_default(),
-                got: retained_value(value, rule.secret),
+    if let Some(constraint) = crate::constraints::value_violation(value, rule) {
+        errors.push(error(ValidationErrorKind::ConstraintViolation {
+            constraint,
+        }));
+        return;
+    }
+    if pattern_matches() == Some(false) {
+        errors.push(error(ValidationErrorKind::PatternMismatch {
+            pattern: if declaration {
+                String::new()
+            } else {
+                rule.pattern.clone().unwrap_or_default()
             },
-        ));
+            got: retained_value(value, rule.secret || declaration),
+        }));
         return;
     }
 
@@ -397,22 +734,22 @@ fn validate_value(
     if let Some(allowed) = &rule.enum_values
         && !allowed.iter().any(|a| a == value)
     {
-        errors.push(validation_error(
-            key,
-            rule,
-            ValidationErrorKind::NotInEnum {
-                allowed: if rule.secret {
-                    Vec::new()
-                } else {
-                    allowed.clone()
-                },
-                got: retained_value(value, rule.secret),
+        errors.push(error(ValidationErrorKind::NotInEnum {
+            allowed: if rule.secret || declaration {
+                Vec::new()
+            } else {
+                allowed.clone()
             },
-        ));
+            got: retained_value(value, rule.secret || declaration),
+        }));
     }
 }
 
-fn validation_error(key: &str, rule: &EnvVarRule, kind: ValidationErrorKind) -> ValidationError {
+pub(crate) fn validation_error(
+    key: &str,
+    rule: &EnvVarRule,
+    kind: ValidationErrorKind,
+) -> ValidationError {
     ValidationError {
         key: key.to_string(),
         kind,
@@ -521,34 +858,91 @@ fn validate_format(value: &str, format: &VarFormat) -> bool {
     }
 }
 
-/// URL: must start with a scheme (http://, https://, postgres://, etc.) and have a host.
-///
-/// This is a heuristic check, not a strict RFC 3986 parser. It catches the
-/// common mistakes (missing scheme, empty host) without rejecting exotic but
-/// technically valid URIs. Acceptable trade-off for dev tooling.
+/// A URL must have a valid authority and contain no raw whitespace or control characters.
 fn validate_url(value: &str) -> bool {
-    // Must have scheme://host at minimum
-    let Some((scheme, rest)) = value.split_once("://") else {
-        return false;
-    };
-    // Scheme must be non-empty and alphabetic (with optional + - .)
-    if scheme.is_empty() || !scheme.starts_with(|c: char| c.is_ascii_alphabetic()) {
+    if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return false;
     }
-    // Must have non-empty host portion
-    let host = rest.split('/').next().unwrap_or("");
-    let host = host.split('?').next().unwrap_or(host);
-    let host = host.split('#').next().unwrap_or(host);
-    // Strip userinfo (user:pass@host)
-    let host = host.rsplit('@').next().unwrap_or(host);
-    // Strip port
-    let host_only = if host.starts_with('[') {
-        // IPv6: [::1]:8080
-        host.split(']').next().unwrap_or(host)
-    } else {
-        host.split(':').next().unwrap_or(host)
+    let Some((scheme, tail)) = value.split_once("://") else {
+        return false;
     };
-    !host_only.is_empty()
+    let authority_end = tail.find(['/', '?', '#']).unwrap_or(tail.len());
+    let authority = &tail[..authority_end];
+    let hosts = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, hosts)| hosts);
+    if hosts.is_empty() || hosts.contains(['\\', '^', '{', '}', '|', '"', '<', '>', '`']) {
+        return false;
+    }
+    let special = ["http", "https", "ftp", "file", "ws", "wss"]
+        .iter()
+        .any(|special| scheme.eq_ignore_ascii_case(special));
+    let candidate;
+    let value = if hosts.contains(',') {
+        if special || !hosts.split(',').all(valid_database_endpoint) {
+            return false;
+        }
+        let first = hosts.split(',').next().unwrap_or_default();
+        let prefix_end = value.len() - tail.len() + authority.len() - hosts.len();
+        let mut normalized =
+            String::with_capacity(prefix_end + first.len() + tail.len() - authority_end);
+        normalized.push_str(&value[..prefix_end]);
+        normalized.push_str(first);
+        normalized.push_str(&tail[authority_end..]);
+        candidate = normalized;
+        candidate.as_str()
+    } else {
+        value
+    };
+    parsed_url_is_valid(value, authority.contains('@'))
+}
+
+fn parsed_url_is_valid(value: &str, has_credentials: bool) -> bool {
+    let invalid = std::cell::Cell::new(false);
+    let on_violation = |violation| {
+        if violation != url::SyntaxViolation::EmbeddedCredentials
+            && violation != url::SyntaxViolation::NonUrlCodePoint
+            && !(has_credentials && violation == url::SyntaxViolation::UnencodedAtSign)
+        {
+            invalid.set(true);
+        }
+    };
+    url::Url::options()
+        .syntax_violation_callback(Some(&on_violation))
+        .parse(value)
+        .is_ok_and(|url| url.host().is_some())
+        && !invalid.get()
+}
+
+fn valid_database_endpoint(endpoint: &str) -> bool {
+    let (host, port) = if endpoint.starts_with('[') {
+        let Some(end) = endpoint.find(']') else {
+            return false;
+        };
+        if endpoint[1..end].parse::<Ipv6Addr>().is_err() {
+            return false;
+        }
+        let suffix = &endpoint[end + 1..];
+        if suffix.is_empty() {
+            return true;
+        }
+        let Some(port) = suffix.strip_prefix(':') else {
+            return false;
+        };
+        (&endpoint[..=end], Some(port))
+    } else {
+        match endpoint.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (endpoint, None),
+        }
+    };
+    !host.is_empty()
+        && url::Host::parse(host).is_ok()
+        && port.is_none_or(|port| {
+            !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit())
+                && port.parse::<u16>().is_ok()
+        })
 }
 
 /// Port: must be a number between 1 and 65535.
@@ -556,23 +950,32 @@ fn validate_port(value: &str) -> bool {
     value.parse::<u16>().is_ok_and(|p| p > 0)
 }
 
-/// Email: must contain exactly one `@` with non-empty local and domain parts.
+/// Email accepts an ASCII dot-atom local part and a dotted DNS hostname.
 fn validate_email(value: &str) -> bool {
-    let parts: Vec<&str> = value.splitn(3, '@').collect();
-    if parts.len() != 2 {
+    if value.len() > 254 || !value.is_ascii() {
         return false;
     }
-    let local = parts[0];
-    let domain = parts[1];
-    !local.is_empty() && !domain.is_empty() && domain.contains('.')
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && local.len() <= 64
+        && !local.starts_with('.')
+        && !local.ends_with('.')
+        && !local.contains("..")
+        && local
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b".!#$%&'*+-/=?^_`{|}~".contains(&byte))
+        && domain.contains('.')
+        && validate_hostname(domain)
 }
 
 /// Boolean: must be one of the standard boolean string representations.
 fn validate_boolean(value: &str) -> bool {
-    matches!(
-        value.to_lowercase().as_str(),
-        "true" | "false" | "1" | "0" | "yes" | "no"
-    )
+    matches!(value, "1" | "0")
+        || ["true", "false", "yes", "no"]
+            .iter()
+            .any(|token| value.eq_ignore_ascii_case(token))
 }
 
 /// Integer: must parse as i64.
@@ -630,7 +1033,10 @@ mod tests {
                 )
             })
             .collect();
-        EnvSchema { vars }
+        EnvSchema {
+            vars,
+            ..Default::default()
+        }
     }
 
     // ── Missing / Required ──
@@ -800,6 +1206,96 @@ mod tests {
     fn invalid_urls() {
         for url in ["", "not-a-url", "://missing-scheme", "http://"] {
             assert!(!validate_url(url), "should be invalid: {url}");
+        }
+    }
+
+    #[test]
+    fn urls_accept_compatible_path_and_query_punctuation() {
+        for scheme in ["http", "https", "ws", "wss", "ftp"] {
+            for punctuation in ['|', '^', '{', '}', '"', '<', '>', '`'] {
+                for suffix in [
+                    format!("/{punctuation}value"),
+                    format!("/?q={punctuation}value"),
+                ] {
+                    let value = format!("{scheme}://example.com{suffix}");
+                    assert!(validate_url(&value), "compatible URL rejected: {value}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn urls_accept_raw_at_signs_in_passwords() {
+        for value in [
+            "postgres://user:p@ss@host/db",
+            "postgres://user:p@@ss@h1:5432,h2:5432/db",
+            "https://user:p@ss@host/path",
+            "ftp://user:p@ss@host/path",
+        ] {
+            assert!(
+                validate_url(value),
+                "credential-bearing URL rejected: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn format_errors_use_public_format_names_and_redact_secrets() {
+        for (format, label) in [
+            (VarFormat::Url, "url"),
+            (VarFormat::Port, "port"),
+            (VarFormat::Email, "email"),
+            (VarFormat::Boolean, "boolean"),
+            (VarFormat::Integer, "integer"),
+            (VarFormat::Hostname, "hostname"),
+            (VarFormat::Ip, "ip"),
+        ] {
+            let error = ValidationError {
+                key: "VALUE".into(),
+                kind: ValidationErrorKind::InvalidFormat {
+                    expected: format,
+                    got: "private-value".into(),
+                },
+                description: None,
+                is_secret: true,
+            };
+            assert_eq!(
+                error.to_string(),
+                format!("VALUE: invalid format, expected {label}, got \"[REDACTED]\"")
+            );
+        }
+    }
+
+    #[test]
+    fn database_urls_accept_replica_sets_and_unescaped_credentials() {
+        for value in [
+            "mongodb://h1:27017,h2:27017/db",
+            "postgresql://user:p^ss{word}|@h1:5432,h2:5432/db",
+            "postgres://user:p^ss{word}|@host:5432/db",
+            "postgres://host:5432/path^{value}|",
+            "mongodb://[::1]:27017,[::2]:27017/db",
+        ] {
+            assert!(validate_url(value), "database URL rejected: {value}");
+        }
+    }
+
+    #[test]
+    fn database_replica_sets_reject_invalid_endpoints() {
+        for value in [
+            "mongodb://h1:27017,,h2:27017/db",
+            "mongodb://h1:27017,h2:invalid/db",
+            "mongodb://h1:27017,h2:65536/db",
+            "mongodb://h1:27017,:27017/db",
+            "mongodb://h1:27017,[invalid]:27017/db",
+            "https://h1:443,h2:443/path",
+            "https://h|ost/path",
+            "https://h^st/path",
+            "https://h{st/path",
+            "https://h\"st/path",
+            "https://example.com/%zz",
+            "https://example.com/a\\b",
+        ] {
+            assert!(!validate_url(value), "invalid URL accepted: {value}");
         }
     }
 
@@ -1142,7 +1638,10 @@ mod tests {
             let mut env = (0..count)
                 .map(|index| (format!("PATTERN_{index:02}"), format!("value_{index}")))
                 .collect();
-            let schema = EnvSchema { vars };
+            let schema = EnvSchema {
+                vars,
+                ..Default::default()
+            };
 
             let errors = EnvValidator::new(&schema).validate(&mut env);
 
@@ -1226,6 +1725,7 @@ mod tests {
                 "BAD\u{1b}[31m\n\u{202e}KEY".to_string(),
                 EnvVarRule::default(),
             )]),
+            ..Default::default()
         };
 
         let message = validate(&schema, &mut HashMap::new())[0].to_string();
@@ -1239,6 +1739,7 @@ mod tests {
         let key = "A".repeat(257);
         let schema = EnvSchema {
             vars: HashMap::from([(key, EnvVarRule::default())]),
+            ..Default::default()
         };
 
         let errors = validate(&schema, &mut HashMap::new());
@@ -1307,6 +1808,7 @@ mod tests {
                     ..EnvVarRule::default()
                 },
             )]),
+            ..Default::default()
         };
 
         let message = validate(&schema, &mut HashMap::new())[0].to_string();
@@ -1324,6 +1826,7 @@ mod tests {
                     ..EnvVarRule::default()
                 },
             )]),
+            ..Default::default()
         };
         let mut env = HashMap::from([("MODE".into(), "other".into())]);
 
@@ -1343,6 +1846,7 @@ mod tests {
                     ..EnvVarRule::default()
                 },
             )]),
+            ..Default::default()
         };
 
         let message = validate(&schema, &mut HashMap::new())[0].to_string();
@@ -1461,7 +1965,7 @@ mod tests {
     #[test]
     fn full_schema_integration() {
         let schema = schema_from_json(
-            r#"{"vars": {
+            r#"{"clientPrefixes":["APP_"],"vars": {
                 "DATABASE_URL": {"required": true, "format": "url", "secret": true, "description": "PostgreSQL connection string"},
                 "PORT": {"default": "3000", "format": "port"},
                 "STRIPE_SECRET_KEY": {"required": true, "secret": true, "pattern": "^sk_(test|live)_.*$"},
@@ -1500,5 +2004,257 @@ mod tests {
         let errors = validate(&schema, &mut env);
         let msg = errors[0].to_string();
         assert!(msg.contains("Database URL"));
+    }
+    #[test]
+    fn schema_literals_reject_unsafe_metadata_controls() {
+        for field in ["description", "pattern", "default"] {
+            let schema = schema_from_json(&format!(
+                r#"{{"vars":{{"VALUE":{{"{field}":"private\u001b[31m"}}}}}}"#
+            ));
+            assert!(!validate_schema(&schema).is_empty(), "{field}");
+        }
+    }
+
+    #[test]
+    fn oversized_programmatic_prefix_policy_skips_custom_matching() {
+        let schema = EnvSchema {
+            client_prefixes: vec!["".into(); 100_000],
+            groups: HashMap::new(),
+            vars: (0..4096)
+                .map(|index| (format!("KEY_{index}"), EnvVarRule::default()))
+                .collect(),
+        };
+        let errors = validate_schema(&schema);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].key, "envSchema");
+    }
+
+    #[test]
+    fn create_react_app_public_prefix_is_case_insensitive() {
+        for name in ["react_app_token", "React_App_Token", "REACT_APP_TOKEN"] {
+            let schema = schema_from_json(&format!(r#"{{"vars":{{"{name}":{{"secret":true}}}}}}"#));
+            assert!(!validate_schema(&schema).is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn public_prefix_errors_explain_client_visibility_remedy() {
+        let schema = schema_from_json(r#"{"vars":{"VITE_ENDPOINT":{}}}"#);
+        assert!(
+            validate_schema(&schema)[0]
+                .to_string()
+                .contains("client: true")
+        );
+    }
+
+    #[test]
+    fn secret_client_and_public_prefix_server_rules_are_rejected() {
+        for json in [
+            r#"{"vars":{"PUBLIC_TOKEN":{"secret":true,"client":true}}}"#,
+            r#"{"vars":{"NEXT_PUBLIC_TOKEN":{"secret":true}}}"#,
+            r#"{"vars":{"VITE_ENDPOINT":{}}}"#,
+            r#"{"vars":{"EXPO_PUBLIC_TOKEN":{"secret":true}}}"#,
+            r#"{"vars":{"GATSBY_TOKEN":{"secret":true}}}"#,
+            r#"{"vars":{"NUXT_PUBLIC_TOKEN":{"secret":true}}}"#,
+        ] {
+            assert!(
+                !validate_schema(&schema_from_json(json)).is_empty(),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_prefix_policy_does_not_hide_invalid_variable_rules() {
+        let schema = schema_from_json(
+            r#"{"clientPrefixes":[""],"vars":{"PUBLIC_TOKEN":{"client":true,"secret":true},"PORT":{"format":"port","default":"99999"}}}"#,
+        );
+        let errors = validate_schema(&schema);
+        assert_eq!(errors.len(), 3);
+        assert!(errors.iter().any(|error| error.key == "envSchema"));
+        assert!(errors.iter().any(|error| error.key == "PUBLIC_TOKEN"));
+        assert!(errors.iter().any(|error| error.key == "PORT"));
+    }
+
+    #[test]
+    fn client_prefix_and_ci_storage_policies_are_independent() {
+        for json in [
+            r#"{"vars":{"BUILD_MODE":{"ci":"variable"},"PUBLIC_API":{"client":true}}}"#,
+            r#"{"clientPrefixes":["APP_"],"vars":{"APP_API":{"client":true,"ci":"secret"}}}"#,
+        ] {
+            assert!(validate_schema(&schema_from_json(json)).is_empty());
+        }
+        for json in [
+            r#"{"vars":{"TOKEN":{"secret":true,"ci":"variable"}}}"#,
+            r#"{"vars":{"API":{"client":true}}}"#,
+            r#"{"clientPrefixes":[""],"vars":{}}"#,
+            r#"{"clientPrefixes":["APP_","APP_"],"vars":{}}"#,
+        ] {
+            assert!(!validate_schema(&schema_from_json(json)).is_empty());
+        }
+    }
+
+    #[test]
+    fn malformed_urls_fail_format_validation() {
+        let schema = schema_from_json(r#"{"vars":{"APP_URL":{"format":"url"}}}"#);
+        for value in [
+            "http://[",
+            "ht!tp://example.com",
+            "https://example.com:abc",
+            "https://host name",
+        ] {
+            let mut values = HashMap::from([("APP_URL".into(), value.into())]);
+            assert!(
+                !validate(&schema, &mut values).is_empty(),
+                "accepted {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_email_fails_format_validation() {
+        let schema = schema_from_json(r#"{"vars":{"EMAIL":{"format":"email"}}}"#);
+        let mut values = HashMap::from([("EMAIL".into(), "a b@x..com".into())]);
+        assert!(!validate(&schema, &mut values).is_empty());
+    }
+
+    #[test]
+    fn invalid_defaults_fail_even_when_explicit_values_are_valid() {
+        let schema = schema_from_json(r#"{"vars":{"PORT":{"format":"port","default":"70000"}}}"#);
+        let mut values = HashMap::from([("PORT".into(), "3000".into())]);
+        assert!(!validate(&schema, &mut values).is_empty());
+        assert_eq!(values["PORT"], "3000");
+    }
+
+    #[test]
+    fn secret_defaults_are_rejected_without_retaining_the_default() {
+        let schema =
+            schema_from_json(r#"{"vars":{"TOKEN":{"secret":true,"default":"private-fixture"}}}"#);
+        let errors = validate(&schema, &mut HashMap::new());
+        assert!(!errors.is_empty());
+        assert!(!format!("{errors:?}").contains("private-fixture"));
+    }
+
+    #[test]
+    fn secret_allowlists_are_rejected_without_retaining_the_literals() {
+        let schema =
+            schema_from_json(r#"{"vars":{"TOKEN":{"secret":true,"enum":["private-fixture"]}}}"#);
+        let errors = validate(&schema, &mut HashMap::new());
+        assert!(!errors.is_empty());
+        assert!(!format!("{errors:?}").contains("private-fixture"));
+    }
+
+    #[test]
+    fn reject_empty_policy_rejects_optional_empty_values() {
+        let schema = schema_from_json(r#"{"vars":{"VALUE":{"empty":"reject"}}}"#);
+        let mut values = HashMap::from([("VALUE".into(), String::new())]);
+        assert!(!validate(&schema, &mut values).is_empty());
+    }
+
+    #[test]
+    fn nul_defaults_and_values_are_rejected_before_process_construction() {
+        let schema = schema_from_json(r#"{"vars":{"VALUE":{"default":"a\u0000b"}}}"#);
+        assert!(!validate(&schema, &mut HashMap::new()).is_empty());
+        let schema = schema_from_json(r#"{"vars":{"VALUE":{}}}"#);
+        let mut values = HashMap::from([("VALUE".into(), "a\0b".into())]);
+        assert!(!validate(&schema, &mut values).is_empty());
+    }
+    #[test]
+    fn urls_that_require_parser_repairs_are_rejected() {
+        for value in [
+            "https:///example.com",
+            "https:/example.com?next=://foo",
+            r"https://example.com\oops",
+            "https://example.com/%ZZ",
+        ] {
+            assert!(!validate_url(value), "{value}");
+        }
+    }
+
+    #[test]
+    fn optional_rejected_empty_default_reports_an_empty_error() {
+        let schema = schema_from_json(r#"{"vars":{"OPTIONAL":{"default":"","empty":"reject"}}}"#);
+        assert_eq!(validate_schema(&schema)[0].kind, ValidationErrorKind::Empty);
+    }
+
+    #[test]
+    fn empty_allow_policy_validates_empty_values_without_using_defaults() {
+        for default in [None, Some("fallback")] {
+            let mut rule = EnvVarRule {
+                empty: EmptyPolicy::Allow,
+                default: default.map(str::to_string),
+                ..Default::default()
+            };
+            let mut schema = EnvSchema {
+                vars: HashMap::from([("VALUE".into(), rule.clone())]),
+                ..Default::default()
+            };
+            let mut values = HashMap::from([("VALUE".into(), "".into())]);
+            assert!(validate(&schema, &mut values).is_empty());
+            assert_eq!(values["VALUE"], "");
+            rule.format = Some(VarFormat::Integer);
+            rule.default = default.map(|_| "3".into());
+            schema.vars.insert("VALUE".into(), rule.clone());
+            assert!(matches!(
+                validate(&schema, &mut values)[0].kind,
+                ValidationErrorKind::InvalidFormat { .. }
+            ));
+            rule.format = None;
+            rule.required = true;
+            schema.vars.insert("VALUE".into(), rule);
+            assert_eq!(
+                validate(&schema, &mut values)[0].kind,
+                ValidationErrorKind::Missing
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod scope_diagnostic_budget_tests {
+    use super::*;
+    #[test]
+    fn global_scope_budget_rejects_before_compiling_rules_or_patterns() {
+        let mut vars = serde_json::Map::new();
+        for index in 0..129 {
+            let selectors: Vec<_> = (0..32)
+                .map(|value| serde_json::json!({"environment":[format!("e{value}")]}))
+                .collect();
+            vars.insert(
+                format!("V{index}"),
+                serde_json::json!({"pattern":"[a-z]+","requiredIn":selectors}),
+            );
+        }
+        let schema: EnvSchema = serde_json::from_value(serde_json::json!({"vars":vars})).unwrap();
+        let plan = EnvValidator::new(&schema);
+        assert!(!plan.schema_errors().is_empty());
+        assert!(
+            plan.rules.is_empty() && plan.pattern_batches.is_empty(),
+            "over-budget definitions continued expensive setup"
+        );
+    }
+    #[test]
+    fn invalid_scoped_defaults_do_not_multiply_description_or_allowlist_memory() {
+        let defaults:Vec<_>=(0..32).map(|value|serde_json::json!({"when":{"environment":[format!("e{value}")]},"value":"invalid"})).collect();
+        let schema:EnvSchema=serde_json::from_value(serde_json::json!({"vars":{"VALUE":{"description":"x".repeat(1024*1024),"enum":["y".repeat(1024*1024)],"defaultsIn":defaults}}})).unwrap();
+        let plan = EnvValidator::new(&schema);
+        assert!(!plan.schema_errors().is_empty());
+        let retained: usize = plan
+            .schema_errors()
+            .iter()
+            .map(|error| {
+                error.description.as_ref().map_or(0, String::len)
+                    + match &error.kind {
+                        ValidationErrorKind::NotInEnum { allowed, .. } => {
+                            allowed.iter().map(String::len).sum()
+                        }
+                        _ => 0,
+                    }
+            })
+            .sum();
+        assert!(
+            retained < 1024 * 1024,
+            "definition diagnostics retained {retained} repeated bytes"
+        );
     }
 }

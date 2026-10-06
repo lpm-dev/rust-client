@@ -239,10 +239,37 @@ pub fn execute_exec_plan_with_signals(
     plan: &ExecPlan,
     signals: &crate::execution::ExecutionSignals,
 ) -> Result<(), LpmError> {
-    let env_vars = dotenv::load_project_env_with_schema_validation(
+    let config = crate::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    execute_exec_plan_with_config_and_signals(project_dir, plan, config.as_ref(), signals)
+}
+
+/// Execute against the same configuration snapshot used to select watch dependencies.
+pub fn execute_exec_plan_with_config_and_signals(
+    project_dir: &Path,
+    plan: &ExecPlan,
+    config: Option<&crate::lpm_json::LpmJsonConfig>,
+    signals: &crate::execution::ExecutionSignals,
+) -> Result<(), LpmError> {
+    let resolved = dotenv::resolve_project_environment(plan.env_mode.as_deref(), config)?;
+    let mut env_vars = dotenv::load_project_env_unvalidated_with_config(
         project_dir,
         plan.env_mode.as_deref(),
+        config,
+    )?;
+    let validator = config
+        .filter(|_| !plan.no_env_check)
+        .and_then(|config| config.env_schema.as_ref())
+        .map(lpm_env::EnvValidator::new);
+    dotenv::validate_child_env_with_overrides(
+        &mut env_vars,
+        validator.as_ref(),
+        lpm_env::EvalContext {
+            environment: &resolved.canonical,
+            ..Default::default()
+        },
+        &plan.command.path,
         !plan.no_env_check,
+        &plan.command.env_overrides,
     )?;
 
     let mut command = Command::new(&plan.command.program);
@@ -256,9 +283,6 @@ pub fn execute_exec_plan_with_signals(
     shell::strip_inherited_env_hooks(&mut command);
     if !env_vars.is_empty() {
         command.envs(&env_vars);
-    }
-    for (key, value) in &plan.command.env_overrides {
-        command.env(key, value);
     }
     command.env("PATH", &plan.command.path);
 

@@ -517,3 +517,66 @@ fn service_schema_and_parser_accept_valid_service_bounds() {
     assert!(validator.is_valid(&document));
     assert!(lpm_runner::lpm_json::parse_lpm_json(&document.to_string()).is_ok());
 }
+
+#[test]
+fn env_schema_editor_rejects_secret_literal_defaults_and_enums() {
+    let validator = lpm_json_validator();
+    for literal in [
+        serde_json::json!({"default":"private"}),
+        serde_json::json!({"enum":["private"]}),
+    ] {
+        let mut rule = literal;
+        rule["secret"] = serde_json::json!(true);
+        assert!(!validator.is_valid(&serde_json::json!({"envSchema":{"vars":{"TOKEN":rule}}})));
+    }
+}
+
+#[test]
+fn prefix_schema_and_runtime_agree_on_prefix_shape_and_uniqueness() {
+    let validator = lpm_json_validator();
+    for (prefixes, valid) in [
+        (serde_json::json!(["_"]), true),
+        (serde_json::json!(["APP_"]), true),
+        (serde_json::json!(["APP_", "APP_"]), false),
+        (serde_json::json!([""]), false),
+        (serde_json::json!(["APP"]), false),
+        (serde_json::json!(["BAD-PREFIX_"]), false),
+        (serde_json::json!(["1BAD_"]), false),
+    ] {
+        let document = serde_json::json!({"envSchema":{"clientPrefixes":prefixes,"vars":{}}});
+        assert_eq!(validator.is_valid(&document), valid, "{document}");
+        let parsed = lpm_runner::lpm_json::parse_lpm_json(&document.to_string());
+        assert_eq!(parsed.is_ok(), valid, "{document}");
+    }
+}
+
+#[test]
+fn editor_schema_accepts_scope_shapes_and_rejects_unsafe_selectors() {
+    let validator = lpm_json_validator();
+    for rule in [
+        serde_json::json!({"requiredIn":[{"environment":["production"],"stage":["build"],"service":["api"]}]}),
+        serde_json::json!({"defaultsIn":[{"when":{"stage":["test"]},"value":"line\nvalue"}]}),
+        serde_json::json!({"secret":true,"defaultsIn":[]}),
+    ] {
+        assert!(
+            validator.is_valid(&serde_json::json!({"envSchema":{"vars":{"VALUE":rule}}})),
+            "editor rejected {rule}"
+        );
+    }
+    for rule in [
+        serde_json::json!({"requiredIn":[{}]}),
+        serde_json::json!({"requiredIn":[{"stage":null}]}),
+        serde_json::json!({"requiredIn":[{"stage":[]}]}),
+        serde_json::json!({"requiredIn":[{"stage":["deploy"]}]}),
+        serde_json::json!({"requiredIn":[{"environment":["../production"]}]}),
+        serde_json::json!({"requiredIn":[{"service":["__index__"]}]}),
+        serde_json::json!({"requiredIn":[{"service":["api","api"]}]}),
+        serde_json::json!({"defaultsIn":[{"when":{"stage":["test"]},"value":"unsafe\u{0000}"}]}),
+        serde_json::json!({"secret":true,"defaultsIn":[{"when":{"stage":["test"]},"value":"private"}]}),
+    ] {
+        assert!(
+            !validator.is_valid(&serde_json::json!({"envSchema":{"vars":{"VALUE":rule}}})),
+            "editor accepted {rule}"
+        );
+    }
+}

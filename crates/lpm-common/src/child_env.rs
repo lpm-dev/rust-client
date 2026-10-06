@@ -156,3 +156,22 @@ mod tests {
         assert!(!inherited_env_is_stripped("PATH"));
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn inherited_secret_suffix_filter_matches_windows_process_names() {
+        for alias in ["app_secret", "APP_ſECRET"] {
+            let mut command = Command::new("unused");
+            command.env("APP_SECRET", "first").env(alias, "last");
+            if command.get_envs().count() == 1 {
+                assert!(
+                    inherited_env_is_stripped(alias),
+                    "Windows secret alias survived"
+                );
+            }
+        }
+    }
+}

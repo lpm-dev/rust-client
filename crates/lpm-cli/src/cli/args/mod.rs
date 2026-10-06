@@ -376,7 +376,7 @@ pub(crate) enum Commands {
     /// Manage project environment variables and secrets.
     ///
     /// Local-file management (`lpm env init`, `ls`, `set`, `get`, `delete`,
-    /// `import`, `export`, `print`, `copy`, `check`) plus cloud sync
+    /// `import`, `export`, `print`, `copy`, `check`, `schema`, `generate`) plus cloud sync
     /// (`pull`, `push`, `share`, `pair`, `diff`, `validate`), platform
     /// integrations (`push --to <platform>`, `pull --from <platform>`,
     /// `connect`, `status`), and OIDC policies (`oidc allow`, `oidc list`,

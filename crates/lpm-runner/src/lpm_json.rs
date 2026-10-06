@@ -98,7 +98,14 @@ pub struct LpmJsonConfig {
     /// Defines required vars, formats, patterns, defaults, and secrets.
     /// e.g., `{"envSchema": {"vars": {"DATABASE_URL": {"required": true, "format": "url"}}}}`
     #[serde(default, rename = "envSchema")]
+    pub env_schema_source: Option<lpm_env::EnvSchemaDefinition>,
+    /// Validated effective rules. Authored imports remain in env_schema_source.
+    #[serde(skip)]
+    #[schemars(skip)]
     pub env_schema: Option<EnvSchema>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub env_schema_resolution: Option<std::sync::Arc<lpm_env_source::SchemaSnapshot>>,
 
     /// Named environment definitions with inheritance.
     /// e.g., `{"environments": {"staging": {"extends": "base", "file": ".env.staging"}}}`
@@ -811,30 +818,141 @@ static UNKNOWN_FIELD_SCHEMA: LazyLock<serde_json::Value> =
 /// Returns `None` if the file doesn't exist (not an error).
 /// Returns `Err` if the file exists but is malformed.
 pub fn read_lpm_json(project_dir: &Path) -> Result<Option<LpmJsonConfig>, String> {
+    read_lpm_json_detailed(project_dir).map_err(|error| error.to_string())
+}
+
+/// Distinguish env source failures from invalid project configuration.
+#[derive(Debug)]
+pub enum ConfigReadError {
+    Configuration(String),
+    Schema {
+        error: lpm_env_source::SourceError,
+        config: Box<LpmJsonConfig>,
+    },
+}
+
+impl std::fmt::Display for ConfigReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Configuration(message) => formatter.write_str(message),
+            Self::Schema { error, .. } => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ConfigReadError {}
+
+impl From<String> for ConfigReadError {
+    fn from(message: String) -> Self {
+        Self::Configuration(message)
+    }
+}
+
+impl From<&str> for ConfigReadError {
+    fn from(message: &str) -> Self {
+        Self::Configuration(message.to_owned())
+    }
+}
+
+/// Read one configuration snapshot while retaining typed env source errors.
+pub fn read_lpm_json_detailed(
+    project_dir: &Path,
+) -> Result<Option<LpmJsonConfig>, ConfigReadError> {
     let path = project_dir.join("lpm.json");
     let content = match read_text_file_capped(&path, CONFIG_FILE_SIZE_CAP_BYTES) {
         Ok(content) => content,
         Err(BoundedReadError::NotFound { .. }) => return Ok(None),
-        Err(error) => return Err(format!("failed to read lpm.json: {error}")),
+        Err(error) => return Err(format!("failed to read lpm.json: {error}").into()),
     };
-
-    parse_lpm_json(&content).map(Some)
+    parse_lpm_json_inner(&content, Some(project_dir), None).map(Some)
 }
 
 /// Parse and validate an `lpm.json` document that was read by the caller.
 pub fn parse_lpm_json(content: &str) -> Result<LpmJsonConfig, String> {
-    let mut config: LpmJsonConfig = serde_json::from_str(lpm_common::strip_utf8_bom_str(content))
-        .map_err(|error| match error.classify() {
-        serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
-            format!("failed to parse lpm.json: {error}")
-        }
-        serde_json::error::Category::Data => {
-            format!("invalid lpm.json data: {error}")
-        }
-        serde_json::error::Category::Io => {
-            format!("failed to read lpm.json: {error}")
-        }
+    parse_lpm_json_inner(content, None, None).map_err(|error| error.to_string())
+}
+
+/// Resolve authored imports relative to this project using the caller's immutable bytes.
+pub fn parse_lpm_json_in(project_dir: &Path, content: &str) -> Result<LpmJsonConfig, String> {
+    parse_lpm_json_in_detailed(project_dir, content).map_err(|error| error.to_string())
+}
+
+/// Parse one captured document while retaining source diagnostics and project settings.
+pub fn parse_lpm_json_in_detailed(
+    project_dir: &Path,
+    content: &str,
+) -> Result<LpmJsonConfig, ConfigReadError> {
+    parse_lpm_json_inner(content, Some(project_dir), None)
+}
+
+/// Check only declarations and source freshness, without loading environment values.
+pub fn resolve_schema_definition(
+    project_dir: &Path,
+) -> Result<lpm_env_source::ResolvedSchema, lpm_env_source::SourceError> {
+    use lpm_env_source::SourceError;
+    #[derive(Deserialize)]
+    struct Projection {
+        #[serde(rename = "envSchema")]
+        schema: Option<lpm_env::EnvSchemaDefinition>,
+    }
+    let path = project_dir.join("lpm.json");
+    let content = read_text_file_capped(&path, CONFIG_FILE_SIZE_CAP_BYTES)
+        .map_err(|_| SourceError::new("env.root_unreadable", "read", "lpm.json", "/envSchema"))?;
+    let projection: Projection = serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
+        .map_err(|_| {
+            SourceError::new("env.invalid_definition", "parse", "lpm.json", "/envSchema")
+        })?;
+    let definition = projection.schema.ok_or_else(|| {
+        SourceError::new("env.schema_missing", "definition", "lpm.json", "/envSchema")
     })?;
+    let resolved = lpm_env_source::resolve_schema(project_dir, content.as_bytes(), definition)?;
+    let current = read_text_file_capped(&path, CONFIG_FILE_SIZE_CAP_BYTES).map_err(|_| {
+        SourceError::new("env.source_changed", "freshness", "lpm.json", "/envSchema")
+    })?;
+    if !resolved.matches_root_content(current.as_bytes()) {
+        return Err(SourceError::new(
+            "env.source_changed",
+            "freshness",
+            "lpm.json",
+            "/envSchema",
+        ));
+    }
+    resolved.verify_dependencies()?;
+    Ok(resolved)
+}
+
+/// Resolve through a root already opened by the caller's transaction.
+pub fn parse_lpm_json_with_root(
+    root: std::sync::Arc<cap_std::fs::Dir>,
+    content: &str,
+) -> Result<LpmJsonConfig, String> {
+    parse_lpm_json_inner(content, None, Some(root)).map_err(|error| error.to_string())
+}
+
+fn parse_lpm_json_inner(
+    content: &str,
+    project_dir: Option<&Path>,
+    root: Option<std::sync::Arc<cap_std::fs::Dir>>,
+) -> Result<LpmJsonConfig, ConfigReadError> {
+    let mut deserializer =
+        serde_json::Deserializer::from_str(lpm_common::strip_utf8_bom_str(content));
+    let mut config: LpmJsonConfig = serde_path_to_error::deserialize(&mut deserializer)
+        .map_err(|failure| {
+            let path = failure.path().to_string();
+            let error = failure.inner();
+            if path == "envSchema" || path.starts_with("envSchema.") {
+                let safe_path: String = path.chars().flat_map(char::escape_default).collect();
+                return format!("invalid lpm.json data at {safe_path} (line {}, column {}): check envSchema field names and value types", error.line(), error.column());
+            }
+            match error.classify() {
+                serde_json::error::Category::Syntax | serde_json::error::Category::Eof => format!("failed to parse lpm.json: {error}"),
+                serde_json::error::Category::Data => format!("invalid lpm.json data: {error}"),
+                serde_json::error::Category::Io => format!("failed to read lpm.json: {error}"),
+            }
+        })?;
+    deserializer
+        .end()
+        .map_err(|error| format!("failed to parse lpm.json: {error}"))?;
 
     validate_task_cache_globs(&config)?;
 
@@ -843,7 +961,7 @@ pub fn parse_lpm_json(content: &str) -> Result<LpmJsonConfig, String> {
     {
         return Err(format!(
             "invalid lpm.json data: vault id {vault_id:?} contains path-traversal or non-portable characters"
-        ));
+        ).into());
     }
 
     validated_cert_extra_permitted_dns(&config)?;
@@ -852,7 +970,85 @@ pub fn parse_lpm_json(content: &str) -> Result<LpmJsonConfig, String> {
 
     validate_and_normalize_local_domain_hosts(&mut config)?;
 
+    if let Some(definition) = &config.env_schema_source {
+        if project_dir.is_some() || root.is_some() {
+            let resolution = match root {
+                Some(root) => {
+                    lpm_env_source::resolve_schema_in_borrowed(root, content.as_bytes(), definition)
+                }
+                None => lpm_env_source::resolve_schema_borrowed(
+                    project_dir.ok_or("env.source_context")?,
+                    content.as_bytes(),
+                    definition,
+                ),
+            };
+            let resolved = match resolution {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    return Err(ConfigReadError::Schema {
+                        error,
+                        config: Box::new(config),
+                    });
+                }
+            };
+            config.env_schema = Some(resolved.schema);
+            config.env_schema_resolution = Some(resolved.snapshot);
+        } else {
+            if definition.requires_resolution() {
+                return Err(
+                    "env.source_context: composed envSchema requires a project directory".into(),
+                );
+            }
+            config.env_schema = Some(definition.local_schema());
+        }
+    }
+    if config.env_schema_resolution.is_none()
+        && let Some(schema) = &config.env_schema
+    {
+        let errors = lpm_env::validate_schema(schema);
+        if !errors.is_empty() {
+            return Err(errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .into());
+        }
+    }
+    validate_schema_service_selectors(&config)?;
     Ok(config)
+}
+
+pub(crate) fn validate_schema_service_selectors(config: &LpmJsonConfig) -> Result<(), String> {
+    if config.services.is_empty() {
+        return Ok(());
+    }
+    let Some(schema) = &config.env_schema else {
+        return Ok(());
+    };
+    for (key, rule) in &schema.vars {
+        let selectors = rule
+            .required_in
+            .iter()
+            .enumerate()
+            .map(|(index, selector)| ("requiredIn", index, selector))
+            .chain(
+                rule.defaults_in
+                    .iter()
+                    .enumerate()
+                    .map(|(index, default)| ("defaultsIn", index, &default.when)),
+            );
+        for (field, index, selector) in selectors {
+            for service in selector.service.iter().flatten() {
+                if !config.services.contains_key(service) {
+                    return Err(format!(
+                        "envSchema.vars.{key}.{field}[{index}].service names unconfigured service {service:?}. Select a name from services"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_dev_services(services: &HashMap<String, ServiceConfig>) -> Result<(), String> {
@@ -1107,7 +1303,7 @@ mod tests {
             );
         }
         assert_eq!(
-            schema["$defs"]["EnvSchema"]["properties"]["vars"]["propertyNames"]["pattern"],
+            schema["$defs"]["EnvSchemaDefinition"]["properties"]["vars"]["propertyNames"]["pattern"],
             "^[A-Za-z_][A-Za-z0-9_]{0,255}$"
         );
     }
@@ -1966,5 +2162,20 @@ mod tests {
             config.tunnel.as_ref().and_then(|t| t.domain.as_deref()),
             Some("acme.lpm.llc")
         );
+    }
+    #[test]
+    fn malformed_secret_schema_literals_never_appear_in_parse_errors() {
+        for rule in [
+            r#"{"secret":true,"default":918273645}"#,
+            r#"{"enum":[918273645],"secret":true}"#,
+            r#"{"secret":true,"format":"private-fixture-value"}"#,
+            r#"{"empty":"private-fixture-value","secret":true}"#,
+        ] {
+            let input = format!(r#"{{"envSchema":{{"vars":{{"TOKEN":{rule}}}}}}}"#);
+            let error = parse_lpm_json(&input).unwrap_err();
+            assert!(!error.contains("918273645"), "{error}");
+            assert!(!error.contains("private-fixture-value"), "{error}");
+            assert!(error.contains("envSchema"));
+        }
     }
 }

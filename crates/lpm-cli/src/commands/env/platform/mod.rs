@@ -426,6 +426,30 @@ impl PlatformPushResult {
 }
 
 #[derive(Debug)]
+struct PlatformMutationFailure {
+    error: LpmError,
+    attempted: bool,
+}
+
+impl PlatformMutationFailure {
+    fn not_sent(error: LpmError) -> Self {
+        Self {
+            error,
+            attempted: false,
+        }
+    }
+}
+
+impl From<LpmError> for PlatformMutationFailure {
+    fn from(error: LpmError) -> Self {
+        Self {
+            error,
+            attempted: true,
+        }
+    }
+}
+
+#[derive(Debug)]
 enum PlatformApplyError {
     Untracked(Box<LpmError>),
     Tracked {
@@ -502,6 +526,7 @@ impl From<Result<MutationKind, LpmError>> for MutationOutcome {
 }
 
 struct VercelClient {
+    source_check: Option<PlatformSourceCheck>,
     http: reqwest::Client,
     api_url: String,
     token: String,
@@ -517,6 +542,7 @@ impl VercelClient {
                 LpmError::Network(format!("failed to build Vercel client: {error}"))
             })?;
         Ok(Self {
+            source_check: None,
             http,
             api_url: vercel_api_url()?,
             token,
@@ -756,7 +782,14 @@ impl VercelClient {
         let kind = mutation.kind();
         match self.send_mutation(&mutation).await {
             Ok(()) => MutationOutcome::Applied(kind),
-            Err(error) => match self.mutation_is_applied(&mutation).await {
+            Err(failure) if !failure.attempted => MutationOutcome::Failed {
+                error: failure.error,
+                committed: None,
+            },
+            Err(PlatformMutationFailure { error, .. }) => match self
+                .mutation_is_applied(&mutation)
+                .await
+            {
                 Ok(true) => MutationOutcome::Applied(kind),
                 Ok(false) => MutationOutcome::Failed {
                     error,
@@ -772,7 +805,10 @@ impl VercelClient {
         }
     }
 
-    async fn send_mutation(&self, mutation: &VercelMutation) -> Result<(), LpmError> {
+    async fn send_mutation(
+        &self,
+        mutation: &VercelMutation,
+    ) -> Result<(), PlatformMutationFailure> {
         let (operation, request) = match mutation {
             VercelMutation::Add {
                 key,
@@ -803,6 +839,7 @@ impl VercelClient {
             ),
         };
 
+        check_platform_sources(&self.source_check).map_err(PlatformMutationFailure::not_sent)?;
         let response = request.send().await.map_err(|error| {
             LpmError::Network(format!(
                 "Vercel {operation} failed: {}",
@@ -811,7 +848,7 @@ impl VercelClient {
         })?;
         let (status, body) = read_platform_response(response).await?;
         if !status.is_success() {
-            return Err(vercel_api_error(operation, status, &body));
+            return Err(vercel_api_error(operation, status, &body).into());
         }
         Ok(())
     }
@@ -972,45 +1009,6 @@ impl PlatformClient {
         }
     }
 
-    fn partition_local(
-        &self,
-        project_dir: &std::path::Path,
-        local: &HashMap<String, String>,
-    ) -> Result<LocalPlatformValues, LpmError> {
-        match self {
-            Self::Fly(_) => Ok(fly::partition_local_values(local)),
-            Self::GitHubActions(_) => {
-                let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(|error| {
-                    LpmError::Script(format!(
-                        "failed to read lpm.json for GitHub Actions value classification: {error}"
-                    ))
-                })?;
-                github_actions::partition_local_values(
-                    local,
-                    config
-                        .as_ref()
-                        .and_then(|configuration| configuration.env_schema.as_ref()),
-                )
-            }
-            _ => Err(LpmError::Script(
-                "exact-readable platforms do not partition local values".into(),
-            )),
-        }
-    }
-
-    fn prepare_local(
-        &self,
-        project_dir: &std::path::Path,
-        local: std::sync::Arc<HashMap<String, String>>,
-    ) -> Result<PlatformLocalValues, LpmError> {
-        match self {
-            Self::Fly(_) | Self::GitHubActions(_) => self
-                .partition_local(project_dir, &local)
-                .map(PlatformLocalValues::Partitioned),
-            _ => Ok(PlatformLocalValues::Exact(local)),
-        }
-    }
-
     fn secret_verification(&self) -> &'static str {
         match self {
             Self::Fly(_) | Self::GitHubActions(_) => "names_only",
@@ -1048,15 +1046,51 @@ impl PlatformClient {
             (Self::GitHubActions(client), PlatformLocalValues::Partitioned(local)) => {
                 client.apply(diff, local, remote, clean).await
             }
-            (Self::Railway(client), _) => client
-                .apply(diff, local.readable(), &remote.readable, clean)
-                .await
-                .map_err(PlatformApplyError::untracked),
+            (Self::Railway(client), _) => {
+                client
+                    .apply(diff, local.readable(), &remote.readable, clean)
+                    .await
+            }
             _ => Err(PlatformApplyError::untracked(LpmError::Script(
                 "platform local-value classification is inconsistent".into(),
             ))),
         }
     }
+
+    fn prepare_local(
+        &self,
+        local: std::sync::Arc<HashMap<String, String>>,
+        schema: Option<&lpm_env::EnvSchema>,
+    ) -> Result<PlatformLocalValues, LpmError> {
+        match self {
+            Self::Fly(_) => Ok(PlatformLocalValues::Partitioned(
+                fly::partition_local_values(&local),
+            )),
+            Self::GitHubActions(_) => github_actions::partition_local_values(&local, schema)
+                .map(PlatformLocalValues::Partitioned),
+            _ => Ok(PlatformLocalValues::Exact(local)),
+        }
+    }
+
+    fn set_source_check(&mut self, check: PlatformSourceCheck) {
+        let slot = match self {
+            Self::Vercel(client) => &mut client.source_check,
+            Self::Coolify(client) => &mut client.source_check,
+            Self::Fly(client) => &mut client.source_check,
+            Self::GitHubActions(client) => &mut client.source_check,
+            Self::Railway(client) => &mut client.source_check,
+        };
+        *slot = Some(check);
+    }
+}
+
+type PlatformSourceCheck = std::sync::Arc<dyn Fn() -> Result<(), LpmError> + Send + Sync>;
+
+fn check_platform_sources(check: &Option<PlatformSourceCheck>) -> Result<(), LpmError> {
+    if let Some(check) = check {
+        check()?;
+    }
+    Ok(())
 }
 
 fn vercel_api_url() -> Result<String, LpmError> {
@@ -1743,6 +1777,14 @@ fn expected_platform_principal(
     org_slug: Option<&str>,
 ) -> Result<Option<String>, LpmError> {
     let manifest = super::sync_payload::CloudManifestSnapshot::read(project_dir)?;
+    expected_platform_principal_from_manifest(&manifest, registry_url, org_slug)
+}
+
+fn expected_platform_principal_from_manifest(
+    manifest: &super::sync_payload::CloudManifestSnapshot,
+    registry_url: &str,
+    org_slug: Option<&str>,
+) -> Result<Option<String>, LpmError> {
     let principal = if let Some(slug) = org_slug {
         manifest
             .vault
@@ -1797,18 +1839,37 @@ fn resolve_env_name(
     project_dir: &std::path::Path,
     input: Option<&str>,
 ) -> Result<Option<String>, LpmError> {
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    resolve_env_name_with_config(input, config.as_ref())
+}
+
+fn resolve_env_name_with_config(
+    input: Option<&str>,
+    config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+) -> Result<Option<String>, LpmError> {
     let Some(input) = input else {
         return Ok(None);
     };
-    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
     let empty = HashMap::new();
-    let env_map = config.as_ref().map_or(&empty, |value| &value.env);
-    let environments = config
-        .as_ref()
-        .and_then(|value| value.environments.as_ref());
+    let env_map = config.map_or(&empty, |value| &value.env);
+    let environments = config.and_then(|value| value.environments.as_ref());
     let resolved = lpm_env::resolver::resolve_checked(input, env_map, environments)
         .map_err(|error| LpmError::Script(format!("invalid environment name: {error}")))?;
     Ok(Some(resolved.canonical))
+}
+
+fn resolve_platform_environment(
+    config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+    explicit: Option<&str>,
+    linked: Option<&str>,
+) -> Result<lpm_env::ResolvedEnv, LpmError> {
+    match (explicit, linked) {
+        (Some(input), _) => lpm_runner::dotenv::resolve_project_environment(Some(input), config),
+        (None, Some(canonical)) => {
+            lpm_runner::dotenv::resolve_stored_project_environment(canonical, config)
+        }
+        (None, None) => lpm_runner::dotenv::resolve_project_environment(None, config),
+    }
 }
 
 fn parse_targets(value: Option<&str>) -> Result<Option<Vec<String>>, LpmError> {
@@ -2124,14 +2185,20 @@ pub(super) async fn vars_platform_push(
     }
     let clean = args.contains(&"--clean");
     let yes = args.iter().any(|arg| matches!(*arg, "--yes" | "-y"));
-    let vault_id = lpm_vault::vault_id::read_vault_id(project_dir).ok_or_else(|| {
-        LpmError::Script("no env project configured. Run `lpm env set` first".into())
-    })?;
-    let expected_principal_id = Some(required_platform_principal(
-        project_dir,
+    let manifest = super::sync_payload::CloudManifestSnapshot::read(project_dir)?;
+    let vault_id = manifest
+        .vault
+        .vault_id()
+        .map_err(LpmError::Script)?
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            LpmError::Script("no env project configured. Run `lpm env set` first".into())
+        })?;
+    let expected_principal_id = Some(expected_platform_principal_from_manifest(
+        &manifest,
         registry_client.base_url(),
         org_slug,
-    )?);
+    )?.ok_or_else(|| LpmError::Script("this checkout has no authenticated personal platform binding; reconnect the platform before using stored credentials".into()))?);
     let mut credentials = fetch_connections_with_recovery(
         registry_client,
         &vault_id,
@@ -2145,15 +2212,35 @@ pub(super) async fn vars_platform_push(
         .pop()
         .ok_or_else(|| LpmError::Script(format!("No {platform} connection found")))?;
     let connection_id = connection.id.clone();
-    let client = PlatformClient::from_connection(&connection)?;
+    let mut client = PlatformClient::from_connection(&connection)?;
     let display_name = client.display_name();
-    let requested_env = parse_flag(args, "--env").or(client.linked_env());
-    let resolved_env = resolve_env_name(project_dir, requested_env)?;
-    let local = std::sync::Arc::new(lpm_runner::dotenv::load_project_env(
-        project_dir,
-        resolved_env.as_deref(),
-    )?);
-    let local = client.prepare_local(project_dir, local)?;
+    let snapshot = manifest.sources;
+    let config = manifest.config;
+    super::sync_payload::verify_schema_snapshot(project_dir, snapshot.as_deref())
+        .map_err(LpmError::Script)?;
+    let resolved_env = resolve_platform_environment(
+        config.as_ref(),
+        parse_flag(args, "--env"),
+        client.linked_env(),
+    )?;
+    let local = std::sync::Arc::new(
+        lpm_runner::dotenv::load_project_env_for_resolved_with_config(
+            project_dir,
+            &resolved_env,
+            config.as_ref(),
+        )?,
+    );
+    let local = client.prepare_local(
+        local,
+        config
+            .as_ref()
+            .and_then(|config| config.env_schema.as_ref()),
+    )?;
+    let source_dir = project_dir.to_path_buf();
+    client.set_source_check(std::sync::Arc::new(move || {
+        super::sync_payload::verify_schema_snapshot(&source_dir, snapshot.as_deref())
+            .map_err(LpmError::Script)
+    }));
 
     if !json_output {
         output::info(&format!(
@@ -2287,7 +2374,7 @@ pub(super) async fn vars_platform_push(
         }
     }
 
-    let env_name = resolved_env.as_deref().unwrap_or("default");
+    let env_name = resolved_env.canonical.as_str();
     let result = match client.apply(&diff, &local, &remote, clean).await {
         Ok(result) => result,
         Err(error) => {
@@ -2357,15 +2444,14 @@ pub(super) async fn vars_platform_push(
 fn cached_status_environment<E>(
     cache: &mut StatusEnvironmentCache<E>,
     env_name: &str,
-    load: impl FnOnce(Option<&str>) -> Result<HashMap<String, String>, E>,
+    load: impl FnOnce() -> Result<HashMap<String, String>, E>,
 ) -> Result<SharedEnvironment, E>
 where
     E: Clone,
 {
-    let mode = (env_name != "default").then_some(env_name);
     cache
         .entry(env_name.to_owned())
-        .or_insert_with(|| load(mode).map(std::sync::Arc::new))
+        .or_insert_with(|| load().map(std::sync::Arc::new))
         .clone()
 }
 
@@ -2439,6 +2525,7 @@ pub(super) async fn vars_platform_status(
 
     let mut prepared = Vec::with_capacity(connections.len());
     let mut local_cache = HashMap::new();
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir);
     for connection in connections {
         let label = connection.label.clone();
         let last_push_at = connection.last_push_at.clone();
@@ -2455,10 +2542,28 @@ pub(super) async fn vars_platform_status(
                 continue;
             }
         };
-        let env_name = client.linked_env().unwrap_or("default").to_owned();
-        let loaded_local = match cached_status_environment(&mut local_cache, &env_name, |mode| {
-            lpm_runner::dotenv::load_project_env(project_dir, mode)
+        let resolved = match config.as_ref().map_err(Clone::clone).and_then(|config| {
+            resolve_platform_environment(config.as_ref(), None, client.linked_env())
                 .map_err(|error| error.to_string())
+        }) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                prepared.push(Work::Immediate(serde_json::json!({"platform":connection.platform,"label":label,"status":"error","error":error.to_string(),"lastPushAt":last_push_at})));
+                continue;
+            }
+        };
+        let env_name = resolved.canonical.clone();
+        let cache_key = format!(
+            "{}:{:?}:{:?}",
+            env_name, resolved.implicit_default, resolved.file_path
+        );
+        let loaded_local = match cached_status_environment(&mut local_cache, &cache_key, || {
+            lpm_runner::dotenv::load_project_env_for_resolved_with_config(
+                project_dir,
+                &resolved,
+                config.as_ref().ok().and_then(Option::as_ref),
+            )
+            .map_err(|error| error.to_string())
         }) {
             Ok(local) => local,
             Err(error) => {
@@ -2473,7 +2578,14 @@ pub(super) async fn vars_platform_status(
                 continue;
             }
         };
-        let local = match client.prepare_local(project_dir, loaded_local) {
+        let local = match client.prepare_local(
+            loaded_local,
+            config
+                .as_ref()
+                .ok()
+                .and_then(|config| config.as_ref())
+                .and_then(|config| config.env_schema.as_ref()),
+        ) {
             Ok(local) => local,
             Err(error) => {
                 prepared.push(Work::Immediate(serde_json::json!({
@@ -2658,9 +2770,13 @@ pub(super) async fn vars_platform_pull(
     let connection_id = connection.id.clone();
     let client = PlatformClient::from_connection(&connection)?;
     let display_name = client.display_name();
-    let requested_env = parse_flag(args, "--env").or(client.linked_env());
-    let resolved_env = resolve_env_name(project_dir, requested_env)?;
-    let env_name = resolved_env.as_deref().unwrap_or("default");
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    let resolved_env = resolve_platform_environment(
+        config.as_ref(),
+        parse_flag(args, "--env"),
+        client.linked_env(),
+    )?;
+    let env_name = resolved_env.canonical.as_str();
     if !json_output {
         output::info(&format!(
             "pulling env values directly from {display_name}..."
@@ -3226,6 +3342,7 @@ mod tests {
 
     fn vercel_client(targets: &[&str]) -> VercelClient {
         VercelClient {
+            source_check: None,
             http: reqwest::Client::new(),
             api_url: VERCEL_API_URL.into(),
             token: "test-token".into(),
@@ -3240,6 +3357,7 @@ mod tests {
 
     fn vercel_client_at(api_url: String) -> VercelClient {
         VercelClient {
+            source_check: None,
             http: reqwest::Client::new(),
             api_url,
             token: "test-token".into(),
@@ -3262,7 +3380,7 @@ mod tests {
         let mut load_count = 0;
 
         for _ in 0..3 {
-            let values = cached_status_environment(&mut cache, "production", |_| {
+            let values = cached_status_environment(&mut cache, "production", || {
                 load_count += 1;
                 Ok::<_, String>(HashMap::from([("TOKEN".into(), "value".into())]))
             })
@@ -3279,7 +3397,7 @@ mod tests {
         let mut load_count = 0;
 
         for _ in 0..3 {
-            let error = cached_status_environment(&mut cache, "production", |_| {
+            let error = cached_status_environment(&mut cache, "production", || {
                 load_count += 1;
                 Err::<HashMap<String, String>, _>("decryption failed".to_string())
             })
@@ -3296,7 +3414,7 @@ mod tests {
         let client = platform_client(&["production"]);
 
         let values = client
-            .prepare_local(std::path::Path::new("."), loaded.clone())
+            .prepare_local(loaded.clone(), None)
             .expect("Vercel values should be usable");
 
         let PlatformLocalValues::Exact(readable) = values else {
@@ -3311,7 +3429,7 @@ mod tests {
         let client = platform_client(&["production"]);
 
         let values = client
-            .prepare_local(std::path::Path::new("."), loaded.clone())
+            .prepare_local(loaded.clone(), None)
             .expect("Vercel values should be usable");
 
         let PlatformLocalValues::Exact(readable) = values else {
@@ -3462,6 +3580,39 @@ mod tests {
             .expect_err("a production sync must not mutate a preview value");
 
         assert!(error.to_string().contains("configured deployment targets"));
+    }
+
+    #[tokio::test]
+    async fn vercel_source_rejection_cannot_reconcile_an_unsent_add_as_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"envs":[{"id":"new-id", "key":"KEY", "value":"desired", "target":["production"]}]})))
+            .mount(&server).await;
+        let mut client = vercel_client_at(server.uri());
+        client.source_check = Some(std::sync::Arc::new(|| {
+            Err(LpmError::Script("env.source_changed".into()))
+        }));
+        let outcome = client
+            .apply_one(VercelMutation::Add {
+                key: "KEY".into(),
+                value: "desired".into(),
+                targets: vec!["production".into()],
+            })
+            .await;
+        assert!(matches!(
+            outcome,
+            MutationOutcome::Failed {
+                committed: None,
+                ..
+            }
+        ));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

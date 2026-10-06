@@ -48,6 +48,9 @@ pub(super) async fn vars_push(
     let force = args.contains(&"--force");
     let yes = args.iter().any(|a| *a == "--yes" || *a == "-y");
     let manifest = super::sync_payload::CloudManifestSnapshot::read(project_dir)?;
+    let schema_value = std::sync::Arc::new(super::sync_payload::checked_push_schema_value(
+        manifest.config.as_ref(),
+    )?);
     let vault_id = manifest
         .vault
         .vault_id()
@@ -65,11 +68,13 @@ pub(super) async fn vars_push(
         ));
     }
 
-    let config = manifest.config;
+    let schema_snapshot = manifest
+        .sources
+        .ok_or_else(|| LpmError::Script("env.source_changed at lpm.json".into()))?;
+    let vault_manifest = std::sync::Arc::new(manifest.vault);
 
-    let project_name = manifest.vault.project_name(project_dir);
-    let expected_principal_id = manifest
-        .vault
+    let project_name = vault_manifest.project_name(project_dir);
+    let expected_principal_id = vault_manifest
         .personal_expected_principal_for_registry(client.base_url())
         .map_err(LpmError::Script)?;
 
@@ -98,28 +103,19 @@ pub(super) async fn vars_push(
 
     let secrets_json = std::sync::Arc::new(super::sync_payload::build_sync_payload(all_envs)?);
 
-    let schema_value = std::sync::Arc::new(super::sync_payload::build_push_schema_value(
-        config.as_ref(),
-    ));
-    drop(config);
-
     let project_dir = project_dir.to_path_buf();
     let (result, registry_url) = super::auth::execute_sync_with_bearer(
         client,
         |registry_url, auth_token| {
             let project_name = project_name.clone();
             let schema_value = std::sync::Arc::clone(&schema_value);
+            let schema_snapshot = schema_snapshot.clone();
+            let current_manifest = std::sync::Arc::clone(&vault_manifest);
             let vault_id = vault_id.clone();
             let secrets_json = std::sync::Arc::clone(&secrets_json);
             let project_dir = project_dir.clone();
             let expected_principal_id = expected_principal_id.clone();
             async move {
-                let current_manifest = super::sync_payload::fresh_personal_mutation_manifest(
-                    &project_dir,
-                    &vault_id,
-                    &registry_url,
-                    expected_principal_id.as_deref(),
-                )?;
                 let sync_principal_id = current_manifest
                     .personal_sync_principal_for_registry(&registry_url)?;
                 let expected_version = if let Some(sync_principal_id) = sync_principal_id.as_deref() {
@@ -140,9 +136,11 @@ pub(super) async fn vars_push(
                 } else {
                     None
                 };
+                let before_write = || super::sync_payload::verify_personal_mutation_snapshot(&project_dir, &vault_id, &registry_url, expected_principal_id.as_deref(), &schema_snapshot);
                 let push_metadata = lpm_vault::sync::PushMetadata {
                     name: Some(&project_name),
                     schema: schema_value.as_ref().as_ref(),
+                    before_write: Some(&before_write),
                 };
                 let result = lpm_vault::sync::push_raw_with_options(
                     &registry_url,
@@ -195,8 +193,15 @@ pub(super) async fn vars_push(
             "status": result.status,
             "version": result.version,
         });
-        if !warnings.is_empty() {
-            response["warnings"] = serde_json::json!(warnings);
+        let server_warnings = result
+            .warnings
+            .iter()
+            .map(|warning| serde_json::json!(warning));
+        let all_warnings: Vec<_> = server_warnings
+            .chain(warnings.iter().map(|warning| serde_json::json!(warning)))
+            .collect();
+        if !all_warnings.is_empty() {
+            response["warnings"] = serde_json::json!(all_warnings);
         }
         super::response::print_json_value(&response);
     } else {
@@ -204,6 +209,9 @@ pub(super) async fn vars_push(
             "env synced (version {})",
             install_ui::bold(&version.to_string())
         ));
+        for warning in &result.warnings {
+            output::warn(&format!("{} {}", warning.message, warning.hint));
+        }
         for warning in warnings {
             output::warn(warning);
         }

@@ -252,7 +252,7 @@ pub(super) fn load_lpm_json(project_dir: &Path) -> DiagnosticLpmJson {
     }
 
     // Use the actual semantic parser so Doctor agrees with command execution.
-    let config = match lpm_runner::lpm_json::parse_lpm_json(&content) {
+    let config = match lpm_runner::lpm_json::parse_lpm_json_in(project_dir, &content) {
         Ok(config) => Some(config),
         Err(error) => {
             warnings.push(format!("schema error: {error}"));

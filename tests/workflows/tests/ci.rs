@@ -14,7 +14,7 @@ fn ci_env_github_actions_masks_secret_values_and_emits_github_env_commands() {
   "envSchema": {
     "vars": {
       "API_KEY": { "required": true, "secret": true },
-      "PUBLIC_URL": { "required": true }
+      "PUBLIC_URL": { "required": true, "client": true }
     }
   }
 }"#,
