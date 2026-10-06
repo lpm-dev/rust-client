@@ -64,8 +64,8 @@ def export_locked(root, target_dir, output):
             'PATH', 'HOME', 'TMPDIR', 'CARGO_HOME', 'RUSTUP_HOME', 'DEVELOPER_DIR', 'SDKROOT',
         }}
         cargo_home = Path(env.get('CARGO_HOME', str(Path.home() / '.cargo'))).resolve()
-        flags = '--remap-path-prefix=' + str(frozen) + '=/lpm-rust-client --remap-path-prefix=' + str(cargo_home) + '=/lpm-cargo'
-        env.update(CARGO_TARGET_DIR=str(target_dir), CARGO_INCREMENTAL='0', ZERO_AR_DATE='1', RUSTFLAGS=flags)
+        flags = ['--remap-path-prefix=' + str(frozen) + '=/lpm-rust-client', '--remap-path-prefix=' + str(cargo_home) + '=/lpm-cargo']
+        env.update(CARGO_TARGET_DIR=str(target_dir), CARGO_INCREMENTAL='0', ZERO_AR_DATE='1', CARGO_ENCODED_RUSTFLAGS='\x1f'.join(flags))
         for target in targets:
             if shutil.disk_usage(target_dir).free < 10 * 1024**3:
                 raise RuntimeError('At least 10 GiB free is required on the Cargo target volume')
@@ -74,9 +74,9 @@ def export_locked(root, target_dir, output):
         staging.mkdir()
         library = Path(publication) / 'libLPMEnv.a'
         artifact = staging / 'LPMEnv.xcframework'
-        subprocess.run(['lipo', '-create', *[str(target_dir / target / 'release/liblpm_env_ffi.a') for target in targets], '-output', str(library)], check=True)
-        subprocess.run(['xcrun', 'strip', '-S', str(library)], check=True)
-        subprocess.run(['xcodebuild', '-create-xcframework', '-library', str(library), '-headers', str(frozen / 'crates/lpm-env-ffi/include'), '-output', str(artifact)], check=True)
+        subprocess.run(['lipo', '-create', *[str(target_dir / target / 'release/liblpm_env_ffi.a') for target in targets], '-output', str(library)], env=env, check=True)
+        subprocess.run(['xcrun', 'strip', '-S', str(library)], env=env, check=True)
+        subprocess.run(['xcodebuild', '-create-xcframework', '-library', str(library), '-headers', str(frozen / 'crates/lpm-env-ffi/include'), '-output', str(artifact)], env=env, check=True)
         files = {str(path.relative_to(staging)): file_hash(path) for path in artifact.rglob('*') if path.is_file()}
         provenance = dict(abiVersion=1, toolchain='1.94.0', targets=targets, repository='https://github.com/lpm-dev/rust-client', revision=revision, sources=sources, artifacts=files)
         (staging / 'provenance.json').write_text(json.dumps(provenance, indent=2, sort_keys=True) + '\n')
