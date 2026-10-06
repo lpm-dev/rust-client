@@ -3707,6 +3707,66 @@ fn detected_test_runners_validate_test_scopes_for_single_and_workspace_packages(
 }
 
 #[test]
+fn detected_test_runners_share_named_and_extracted_environment_resolution() {
+    for workspace in [false, true] {
+        for config in [
+            r#"{"environments":{"test":"config/tests.env"}}"#,
+            r#"{"env":{"ci":".env.test"}}"#,
+        ] {
+            let project =
+                TempProject::empty(r#"{"name":"test-selection","workspaces":["packages/*"]}"#);
+            let directory = if workspace { "packages/member/" } else { "" };
+            project.write_file(&format!("{directory}package.json"), r#"{"name":"member","scripts":{"test":"node read.cjs"},"devDependencies":{"vitest":"4.1.9"}}"#);
+            project.write_file(&format!("{directory}lpm.json"), config);
+            project.write_file(
+                &format!("{directory}config/tests.env"),
+                "MAPPED_TEST_VALUE=selected\n",
+            );
+            project.write_file(
+                &format!("{directory}.env.test"),
+                "MAPPED_TEST_VALUE=selected\n",
+            );
+            project.write_file(&format!("{directory}read.cjs"), "require('node:fs').writeFileSync('test-marker',process.env.MAPPED_TEST_VALUE || 'missing')");
+            #[cfg(unix)]
+            write_unix_executable(
+                &project
+                    .path()
+                    .join(format!("{directory}node_modules/.bin/vitest")),
+                "#!/bin/sh\nexec node read.cjs\n",
+            );
+            #[cfg(windows)]
+            project.write_file(
+                &format!("{directory}node_modules/.bin/vitest.cmd"),
+                "@echo off\r\nnode read.cjs\r\n",
+            );
+            for detected in [false, true] {
+                let mut command = lpm(&project);
+                command.env_remove("MAPPED_TEST_VALUE");
+                if detected {
+                    command.arg("test");
+                } else {
+                    command.args(["run", "test"]);
+                }
+                if workspace {
+                    command.arg("--all");
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert_eq!(
+                    project.read_file(&format!("{directory}test-marker")),
+                    "selected",
+                    "workspace={workspace}, detected={detected}, config={config}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn detected_test_runner_loads_the_test_environment_mapping() {
     let project =
         TempProject::empty(r#"{"name":"mapped-test","devDependencies":{"vitest":"4.1.9"}}"#);

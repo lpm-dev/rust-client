@@ -224,10 +224,27 @@ pub(super) fn build_push_schema_value(
     }
 
     // environments: inheritance config (extends, file, sensitive)
-    if let Some(envs) = &c.environments
-        && let Ok(v) = serde_json::to_value(envs)
-    {
-        obj.insert("environments".into(), v);
+    if let Some(envs) = &c.environments {
+        let definitions: serde_json::Map<_, _> = envs
+            .envs
+            .iter()
+            .filter_map(|(name, definition)| {
+                if lpm_env::resolver::validate_env_name(name).is_err()
+                    || definition
+                        .extends()
+                        .is_some_and(|parent| lpm_env::resolver::validate_env_name(parent).is_err())
+                {
+                    return None;
+                }
+                serde_json::to_value(definition)
+                    .ok()
+                    .map(|value| (name.clone(), value))
+            })
+            .collect();
+        obj.insert(
+            "environments".into(),
+            serde_json::Value::Object(definitions),
+        );
     }
 
     Some(serde_json::Value::Object(obj))
@@ -287,6 +304,16 @@ mod tests {
         assert!(metadata["envConfig"].get("").is_none());
         assert!(metadata["envConfig"].get("bad").is_none());
         assert_eq!(metadata["envConfig"]["unit"]["canonical"], "unit");
+    }
+
+    #[test]
+    fn metadata_omits_invalid_environment_definitions_and_parents() {
+        let config: lpm_runner::lpm_json::LpmJsonConfig = serde_json::from_str(r#"{"environments":{"test:unit":".env.test","unit":{"file":"config/unit.env"},"bad":{"extends":"test:unit"},"base":".env"}}"#).unwrap();
+        let metadata = build_push_schema_value(Some(&config)).unwrap();
+        assert!(metadata["environments"].get("test:unit").is_none());
+        assert!(metadata["environments"].get("bad").is_none());
+        assert_eq!(metadata["environments"]["unit"]["file"], "config/unit.env");
+        assert_eq!(metadata["environments"]["base"], ".env");
     }
 
     // ── env push schema metadata helpers ────────────────────────────

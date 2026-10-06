@@ -205,8 +205,9 @@ pub fn invalid_identity_message(canonical: &str, alias: Option<&str>) -> String 
         || format!("environment {canonical:?}"),
         |alias| format!("environment alias {alias:?} resolves to {canonical:?}"),
     );
+    let reason = validate_env_name(canonical).err().unwrap_or_default();
     format!(
-        "{identity}: use a portable alias with ASCII letters, numbers, hyphens, underscores, or dots. For a task name with punctuation, select the environment through tasks.<name>.env"
+        "{identity}: {reason}. use a portable alias with ASCII letters, numbers, hyphens, underscores, or dots. For a task name with punctuation, select the environment through tasks.<name>.env"
     )
 }
 
@@ -514,6 +515,21 @@ mod tests {
         let r = resolve_checked("dev", &env_map, None);
         assert!(r.is_ok());
         assert_eq!(r.unwrap().canonical, "development");
+    }
+
+    #[test]
+    fn resolve_checked_preserves_the_exact_identity_validation_reason() {
+        for name in [
+            "x".repeat(65),
+            "a..b".into(),
+            "__index__".into(),
+            "".into(),
+            "test:unit".into(),
+        ] {
+            let reason = validate_env_name(&name).unwrap_err();
+            let error = resolve_checked(&name, &HashMap::new(), None).unwrap_err();
+            assert!(error.contains(&reason), "{error} omitted {reason}");
+        }
     }
 
     #[test]
