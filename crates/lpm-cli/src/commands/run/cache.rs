@@ -333,9 +333,6 @@ fn build_task_context(
                     || cache_env
                         .as_ref()
                         .is_none_or(|names| names.contains(std::ffi::OsStr::new("PATH")))
-                    || config_ref
-                        .and_then(|config| config.env_schema.as_ref())
-                        .is_some_and(|schema| schema.vars.contains_key("PATH"))
             })
             .map(|(key, value)| (key.into(), value.into())),
     );
