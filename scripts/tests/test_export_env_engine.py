@@ -39,16 +39,25 @@ class EngineExportTests(unittest.TestCase):
                 if args[0] == 'cargo':
                     if failure == 'canonical':
                         self.assertEqual(kwargs['cwd'], kwargs['cwd'].resolve())
+                    if failure == 'remap-spaces':
+                        self.assertEqual(kwargs['env']['CARGO_ENCODED_RUSTFLAGS'].split('\x1f'), [
+                            '--remap-path-prefix=' + str(kwargs['cwd']) + '=/lpm-rust-client',
+                            '--remap-path-prefix=' + str(cargo_home.resolve()) + '=/lpm-cargo',
+                        ])
                     builds.append(kwargs['cwd'])
                     self.assertNotEqual(kwargs['cwd'], root)
                     self.assertEqual((kwargs['cwd'] / 'crates/lpm-env/src/lib.rs').read_text(), 'original')
                     if failure == 'mutation' and len(builds) == 1:
                         (root / 'crates/lpm-env/src/lib.rs').write_text('changed')
                 if args[0] == 'lipo':
-                    if failure in {'packaging', 'canonical'}:
+                    if failure in {'packaging', 'canonical', 'remap-spaces'}:
                         raise subprocess.CalledProcessError(1, args)
                     Path(args[-1]).write_bytes(b'library')
+                if failure == 'environment' and args[0] in {'lipo', 'xcrun', 'xcodebuild'}:
+                    self.assertEqual(kwargs['env']['ZERO_AR_DATE'], '1')
                 if args[0] == 'xcodebuild':
+                    if failure == 'environment':
+                        raise subprocess.CalledProcessError(1, args)
                     artifact = Path(args[-1])
                     artifact.mkdir()
                     (artifact / 'library').write_bytes(b'new bundle')
@@ -62,6 +71,7 @@ class EngineExportTests(unittest.TestCase):
             real.mkdir()
             alias = Path(temporary) / 'frozen-alias'
             alias.symlink_to(real, target_is_directory=True)
+            cargo_home = Path(temporary) / 'cargo home with spaces'
 
             @contextlib.contextmanager
             def temporary_directory(**options):
@@ -72,7 +82,7 @@ class EngineExportTests(unittest.TestCase):
                     with original_temporary_directory(**options) as name:
                         yield name
 
-            with patch.object(exporter.tempfile, 'TemporaryDirectory', side_effect=temporary_directory), patch.object(exporter.subprocess, 'run', side_effect=command), patch.object(exporter.subprocess, 'check_output', side_effect=read):
+            with patch.dict(exporter.os.environ, {'CARGO_HOME': str(cargo_home)}), patch.object(exporter.tempfile, 'TemporaryDirectory', side_effect=temporary_directory), patch.object(exporter.subprocess, 'run', side_effect=command), patch.object(exporter.subprocess, 'check_output', side_effect=read):
                 with self.assertRaises((RuntimeError, subprocess.CalledProcessError)):
                     exporter.export(root, Path(temporary) / 'target', output)
             self.assertEqual((output / 'LPMEnv.xcframework/old').read_bytes(), b'old bundle')
@@ -86,6 +96,12 @@ class EngineExportTests(unittest.TestCase):
 
     def test_frozen_source_remapping_uses_the_canonical_directory(self):
         self.scenario('canonical')
+
+    def test_packaging_receives_the_deterministic_build_environment(self):
+        self.scenario('environment')
+
+    def test_remapping_keeps_paths_with_spaces_in_single_compiler_arguments(self):
+        self.scenario('remap-spaces')
 
 
 if __name__ == '__main__':
