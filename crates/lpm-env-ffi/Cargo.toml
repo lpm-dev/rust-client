@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Versioned static C ABI for authoritative native env schema validation"
 
 [lib]
-crate-type = ["staticlib", "rlib"]
+crate-type = ["staticlib"]
 
 [dependencies]
 lpm-env.workspace = true

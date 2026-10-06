@@ -576,6 +576,10 @@ fn retire_file_watch(watcher: &mut impl Watcher, root: &Path) -> Result<(), Stri
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "The cross-platform interface supports unavailable directory identities."
+)]
 fn watched_directory_identity(_: &Path, metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt as _;
     Some((metadata.dev(), metadata.ino()))
