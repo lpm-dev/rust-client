@@ -129,37 +129,12 @@ pub(crate) fn load_project_env_details_with_config_and_schema_validation(
         }
     });
 
-    // Load .env files — use inheritance chain if `environments` is configured
-    let mut loaded = if let Some(env_name) = env_name
-        && let Some(config) = lpm_config
-        && let Some(envs_config) = &config.environments
-    {
-        match lpm_env::resolve_chain(envs_config, env_name) {
-            Ok(chain) => {
-                tracing::debug!("resolved env chain for '{env_name}': {}", chain.join(" → "));
-                load_env_from_chain(project_dir, &chain)?
-            }
-            Err(_) if !envs_config.envs.contains_key(env_name) => {
-                // An undeclared environment must preserve an explicit file mapping.
-                tracing::debug!(
-                    "env '{env_name}' not in environments config, using file mapping or standard loading"
-                );
-                match configured_file_path {
-                    Some(path) => load_env_from_configured_path(project_dir, path)?,
-                    None => load_env_files(project_dir, Some(env_name))?,
-                }
-            }
-            Err(e) => {
-                // Cycle or other structural error — hard fail
-                return Err(LpmError::EnvValidation(e));
-            }
-        }
-    } else if let Some(file_path) = configured_file_path {
-        load_env_from_configured_path(project_dir, file_path)?
-    } else {
-        // Standard loading (no environments config or no env name)
-        load_env_files(project_dir, env_name)?
-    };
+    let mut loaded = load_project_env_files_with_config(
+        project_dir,
+        env_name,
+        configured_file_path,
+        lpm_config,
+    )?;
 
     if !loaded.is_empty() {
         tracing::debug!(
@@ -195,6 +170,58 @@ pub(crate) fn load_project_env_details_with_config_and_schema_validation(
         vars: loaded,
         vault_count,
     })
+}
+
+/// Load only project files using an already resolved environment and configuration.
+pub fn load_project_env_files_with_config(
+    project_dir: &Path,
+    env_name: Option<&str>,
+    configured_file_path: Option<&str>,
+    lpm_config: Option<&lpm_json::LpmJsonConfig>,
+) -> Result<HashMap<String, String>, LpmError> {
+    // Load .env files — use inheritance chain if `environments` is configured
+    let loaded = if let Some(env_name) = env_name
+        && let Some(config) = lpm_config
+        && let Some(envs_config) = &config.environments
+    {
+        match lpm_env::resolve_chain(envs_config, env_name) {
+            Ok(chain) => {
+                tracing::debug!("resolved env chain for '{env_name}': {}", chain.join(" → "));
+                load_env_from_chain(project_dir, &chain)?
+            }
+            Err(_) if !envs_config.envs.contains_key(env_name) => {
+                // An undeclared environment must preserve an explicit file mapping.
+                tracing::debug!(
+                    "env '{env_name}' not in environments config, using file mapping or standard loading"
+                );
+                match configured_file_path {
+                    Some(path) => load_env_from_configured_path(project_dir, path)?,
+                    None => load_env_files(project_dir, Some(env_name))?,
+                }
+            }
+            Err(e) => {
+                // Cycle or other structural error — hard fail
+                return Err(LpmError::EnvValidation(e));
+            }
+        }
+    } else if let Some(file_path) = configured_file_path {
+        load_env_from_configured_path(project_dir, file_path)?
+    } else {
+        // Standard loading (no environments config or no env name)
+        load_env_files(project_dir, env_name)?
+    };
+
+    Ok(loaded)
+}
+
+/// Merge stored values using the runner's process-safety and casing policy.
+pub fn merge_stored_project_env(
+    target: &mut HashMap<String, String>,
+    values: &HashMap<String, String>,
+) -> Result<(), LpmError> {
+    merge_project_env(target, values)?;
+    remove_dangerous_env_vars(target, "project env");
+    Ok(())
 }
 
 pub(crate) fn validate_project_env(
