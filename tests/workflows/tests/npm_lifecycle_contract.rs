@@ -1016,7 +1016,9 @@ fn parallel_streamed_setup_failures_report_the_diagnostic_without_starting_scrip
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("invalid regex"), "{stderr}");
-    assert!(stderr.contains("TOKEN"), "{stderr}");
+    assert!(
+        stderr.contains("env.invalid_pattern at lpm.json/envSchema/vars/TOKEN"),
+        "{stderr}"
+    );
     assert!(!project.file_exists("spawned.txt"));
 }
