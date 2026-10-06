@@ -218,12 +218,12 @@ pub fn merge_configured_service_env(
     config: Option<&lpm_json::LpmJsonConfig>,
     service: Option<&str>,
 ) -> Result<(), LpmError> {
-    if let (Some(name), Some(config)) = (service, config) {
-        if !config.services.is_empty() && !config.services.contains_key(name) {
-            return Err(LpmError::EnvValidation(format!(
-                "unknown service '{name}'; select a configured service"
-            )));
-        }
+    if let (Some(name), Some(config)) = (service, config)
+        && !config.services.is_empty() && !config.services.contains_key(name)
+    {
+        return Err(LpmError::EnvValidation(format!(
+            "unknown service '{name}'; select a configured service"
+        )));
     }
     if let Some(service) =
         service.and_then(|name| config.and_then(|config| config.services.get(name)))
