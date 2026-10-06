@@ -46,7 +46,7 @@ def export_locked(root, target_dir, output):
     paths = subprocess.check_output(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], cwd=root).split(b'\0')
     targets = ['aarch64-apple-darwin', 'x86_64-apple-darwin']
     with tempfile.TemporaryDirectory(prefix='lpm-env-source-') as temporary, tempfile.TemporaryDirectory(prefix='.lpm-env-export-', dir=output.parent) as publication:
-        frozen = Path(temporary)
+        frozen = Path(temporary).resolve()
         for raw in paths:
             if not raw:
                 continue
@@ -63,7 +63,7 @@ def export_locked(root, target_dir, output):
         env = {key: value for key, value in os.environ.items() if key in {
             'PATH', 'HOME', 'TMPDIR', 'CARGO_HOME', 'RUSTUP_HOME', 'DEVELOPER_DIR', 'SDKROOT',
         }}
-        cargo_home = Path(env.get('CARGO_HOME', str(Path.home() / '.cargo')))
+        cargo_home = Path(env.get('CARGO_HOME', str(Path.home() / '.cargo'))).resolve()
         flags = '--remap-path-prefix=' + str(frozen) + '=/lpm-rust-client --remap-path-prefix=' + str(cargo_home) + '=/lpm-cargo'
         env.update(CARGO_TARGET_DIR=str(target_dir), CARGO_INCREMENTAL='0', ZERO_AR_DATE='1', RUSTFLAGS=flags)
         for target in targets:

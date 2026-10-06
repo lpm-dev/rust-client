@@ -37,13 +37,15 @@ class EngineExportTests(unittest.TestCase):
 
             def command(args, **kwargs):
                 if args[0] == 'cargo':
+                    if failure == 'canonical':
+                        self.assertEqual(kwargs['cwd'], kwargs['cwd'].resolve())
                     builds.append(kwargs['cwd'])
                     self.assertNotEqual(kwargs['cwd'], root)
                     self.assertEqual((kwargs['cwd'] / 'crates/lpm-env/src/lib.rs').read_text(), 'original')
                     if failure == 'mutation' and len(builds) == 1:
                         (root / 'crates/lpm-env/src/lib.rs').write_text('changed')
                 if args[0] == 'lipo':
-                    if failure == 'packaging':
+                    if failure in {'packaging', 'canonical'}:
                         raise subprocess.CalledProcessError(1, args)
                     Path(args[-1]).write_bytes(b'library')
                 if args[0] == 'xcodebuild':
@@ -54,7 +56,23 @@ class EngineExportTests(unittest.TestCase):
             def read(args, **kwargs):
                 return paths if args[1] == 'ls-files' else 'a' * 40 + '\n'
 
-            with patch.object(exporter.subprocess, 'run', side_effect=command), patch.object(exporter.subprocess, 'check_output', side_effect=read):
+            import contextlib
+            original_temporary_directory = tempfile.TemporaryDirectory
+            real = Path(temporary) / 'frozen-real'
+            real.mkdir()
+            alias = Path(temporary) / 'frozen-alias'
+            alias.symlink_to(real, target_is_directory=True)
+
+            @contextlib.contextmanager
+            def temporary_directory(**options):
+                if failure == 'canonical' and options.get('prefix') == 'lpm-env-source-':
+                    with original_temporary_directory(dir=real, **options) as name:
+                        yield str(alias / Path(name).name)
+                else:
+                    with original_temporary_directory(**options) as name:
+                        yield name
+
+            with patch.object(exporter.tempfile, 'TemporaryDirectory', side_effect=temporary_directory), patch.object(exporter.subprocess, 'run', side_effect=command), patch.object(exporter.subprocess, 'check_output', side_effect=read):
                 with self.assertRaises((RuntimeError, subprocess.CalledProcessError)):
                     exporter.export(root, Path(temporary) / 'target', output)
             self.assertEqual((output / 'LPMEnv.xcframework/old').read_bytes(), b'old bundle')
@@ -65,6 +83,9 @@ class EngineExportTests(unittest.TestCase):
 
     def test_packaging_failure_preserves_existing_bundle_and_provenance(self):
         self.scenario('packaging')
+
+    def test_frozen_source_remapping_uses_the_canonical_directory(self):
+        self.scenario('canonical')
 
 
 if __name__ == '__main__':
