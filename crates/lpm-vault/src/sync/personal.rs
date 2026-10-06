@@ -198,6 +198,17 @@ pub struct PushMetadata<'a> {
     pub name: Option<&'a str>,
     /// Env schema from `lpm.json` `envSchema` field (as a JSON value).
     pub schema: Option<&'a serde_json::Value>,
+    /// Recheck captured local sources immediately before each remote mutation.
+    pub before_write: Option<&'a (dyn Fn() -> Result<(), String> + Send + Sync)>,
+}
+
+impl PushMetadata<'_> {
+    pub(super) fn verify_sources(&self) -> Result<(), SyncError> {
+        if let Some(check) = self.before_write {
+            check()?;
+        }
+        Ok(())
+    }
 }
 
 /// Revision, principal, and request metadata for a personal vault push.
@@ -505,6 +516,9 @@ pub async fn push_raw_with_project_rotation(
             schema: options.metadata.and_then(|value| value.schema),
         };
 
+        if let Some(metadata) = options.metadata {
+            metadata.verify_sources()?;
+        }
         match send_authenticated_sync_request(
             client
                 .post(&url)

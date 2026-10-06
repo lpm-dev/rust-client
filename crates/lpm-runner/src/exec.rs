@@ -240,14 +240,23 @@ pub fn execute_exec_plan_with_signals(
     signals: &crate::execution::ExecutionSignals,
 ) -> Result<(), LpmError> {
     let config = crate::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
-    let resolved = dotenv::resolve_project_environment(plan.env_mode.as_deref(), config.as_ref())?;
+    execute_exec_plan_with_config_and_signals(project_dir, plan, config.as_ref(), signals)
+}
+
+/// Execute against the same configuration snapshot used to select watch dependencies.
+pub fn execute_exec_plan_with_config_and_signals(
+    project_dir: &Path,
+    plan: &ExecPlan,
+    config: Option<&crate::lpm_json::LpmJsonConfig>,
+    signals: &crate::execution::ExecutionSignals,
+) -> Result<(), LpmError> {
+    let resolved = dotenv::resolve_project_environment(plan.env_mode.as_deref(), config)?;
     let mut env_vars = dotenv::load_project_env_unvalidated_with_config(
         project_dir,
         plan.env_mode.as_deref(),
-        config.as_ref(),
+        config,
     )?;
     let validator = config
-        .as_ref()
         .filter(|_| !plan.no_env_check)
         .and_then(|config| config.env_schema.as_ref())
         .map(lpm_env::EnvValidator::new);

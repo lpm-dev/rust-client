@@ -247,6 +247,11 @@ pub(crate) fn load_project_env_details_with_config_and_schema_validation(
     lpm_config: Option<&lpm_json::LpmJsonConfig>,
     validate_schema: bool,
 ) -> Result<LoadedProjectEnv, LpmError> {
+    if let Some(snapshot) = lpm_config.and_then(|config| config.env_schema_resolution.as_ref()) {
+        snapshot
+            .verify_dependencies()
+            .map_err(|error| LpmError::EnvValidation(error.to_string()))?;
+    }
     if let Some(env_name) = env_name {
         lpm_env::resolver::validate_env_name(env_name).map_err(LpmError::EnvValidation)?;
     }
