@@ -182,6 +182,28 @@ fn format_print_env(
     Ok(lpm_env::format_env(&env_vars, format, &secret_keys))
 }
 
+fn check_environments(
+    env_input: Option<&str>,
+    config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+    load_inventory: impl FnOnce() -> Result<HashMap<String, HashMap<String, String>>, LpmError>,
+) -> Result<Vec<lpm_env::ResolvedEnv>, LpmError> {
+    let empty_env_map = std::collections::HashMap::new();
+    let all_envs = if let Some(env_input) = env_input {
+        vec![lpm_runner::dotenv::resolve_project_environment(
+            Some(env_input),
+            config,
+        )?]
+    } else {
+        let vault_envs = load_inventory()?;
+        lpm_env::resolver::list_all(
+            config.map_or(&empty_env_map, |c| &c.env),
+            config.and_then(|c| c.environments.as_ref()),
+            &vault_envs,
+        )
+    };
+    Ok(all_envs)
+}
+
 pub(super) fn vars_check(
     project_dir: &std::path::Path,
     env_input: Option<&str>,
@@ -203,25 +225,24 @@ pub(super) fn vars_check(
     // Discover all environments via the canonical resolver.
     // This produces a consistent, deduplicated list from config + vault,
     // with legacy vault keys surfaced separately (never collapsed).
-    let vault_envs = lpm_vault::try_get_all_environments(project_dir).map_err(LpmError::Script)?;
-    let empty_env_map = std::collections::HashMap::new();
-    let all_envs = if let Some(env_input) = env_input {
-        vec![lpm_runner::dotenv::resolve_project_environment(
-            Some(env_input),
-            lpm_config.as_ref(),
-        )?]
-    } else {
-        lpm_env::resolver::list_all(
-            lpm_config.as_ref().map_or(&empty_env_map, |c| &c.env),
-            lpm_config.as_ref().and_then(|c| c.environments.as_ref()),
-            &vault_envs,
-        )
-    };
+    let all_envs = check_environments(env_input, lpm_config.as_ref(), || {
+        lpm_vault::try_get_all_environments(project_dir).map_err(LpmError::Script)
+    })?;
     let mut results: Vec<(String, usize, Vec<lpm_env::ValidationError>)> =
         Vec::with_capacity(all_envs.len());
     let mut all_valid = true;
     let validator = lpm_env::EnvValidator::new(schema);
     for environment in &all_envs {
+        if lpm_env::resolver::validate_env_name(&environment.canonical).is_err() {
+            all_valid = false;
+            results.push((environment.canonical.clone(), schema.len(), vec![lpm_env::ValidationError {
+                key: "env.name".into(),
+                kind: lpm_env::ValidationErrorKind::InvalidRule { message: "invalid canonical environment name; custom paths require a portable alias, or a task with an explicit env selection" },
+                description: None,
+                is_secret: false,
+            }]));
+            continue;
+        }
         let mut env_vars = lpm_runner::dotenv::load_project_env_unvalidated_for_resolved(
             project_dir,
             environment,
@@ -497,6 +518,7 @@ pub(super) fn valid_variable_count(
     schema: &lpm_env::EnvSchema,
     errors: &[lpm_env::ValidationError],
 ) -> usize {
+    if errors.iter().any(|error| error.key == "env.name") { return 0; }
     let failed: std::collections::HashSet<&str> = errors
         .iter()
         .filter_map(|error| {
@@ -512,6 +534,18 @@ pub(super) fn valid_variable_count(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_checks_do_not_decode_the_environment_inventory() {
+        let called = std::cell::Cell::new(false);
+        let selected = check_environments(Some("production"), None, || {
+            called.set(true);
+            Ok(HashMap::new())
+        })
+        .unwrap();
+        assert_eq!(selected[0].canonical, "production");
+        assert!(!called.get());
+    }
 
     #[test]
     fn client_print_uses_one_manifest_snapshot_for_defaults_and_filtering() {
