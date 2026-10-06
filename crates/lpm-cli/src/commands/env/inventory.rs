@@ -365,7 +365,8 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
         source: lpm_env::EnvSource,
     }
 
-    let mut rows: Vec<EnvRow> = Vec::new();
+    let validator = schema.map(lpm_env::EnvValidator::new);
+    let mut rows: Vec<EnvRow> = Vec::with_capacity(all_envs.len());
     for env in &all_envs {
         // Replicate the actual loader fallback behavior from dotenv.rs:79-88:
         // If the env-specific vault is completely empty, fall back to default.
@@ -374,16 +375,35 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
         let effective_vars = effective_schema_vars(&env.canonical, &vault_envs);
         let var_count = env_specific.map_or(0, |v| v.len());
 
-        let schema_status = schema.map(|s| {
-            let total = s.vars.iter().filter(|(_, r)| r.required).count();
-            let valid = s
-                .vars
-                .iter()
-                .filter(|(_, r)| r.required)
-                .filter(|(k, _)| effective_vars.is_some_and(|vars| vars.contains_key(k.as_str())))
-                .count();
-            (valid, total)
-        });
+        let schema_status = if let (Some(schema), Some(validator)) = (schema, &validator) {
+            let mode = (env.canonical != "default").then_some(env.canonical.as_str());
+            let mut values = lpm_runner::dotenv::load_project_env_files_with_config(
+                project_dir,
+                mode,
+                env.file_path.as_deref(),
+                config.as_ref(),
+            )?;
+            if let Some(stored) = effective_vars {
+                lpm_runner::dotenv::merge_stored_project_env(&mut values, stored)?;
+            }
+            let errors = validator.validate(&mut values);
+            let mut failed_variables = std::collections::HashSet::new();
+            let mut failed_groups = std::collections::HashSet::new();
+            for error in &errors {
+                if let lpm_env::ValidationErrorKind::GroupViolation { group, .. } = &error.kind {
+                    failed_groups.insert(group.as_str());
+                } else if schema.vars.contains_key(&error.key) {
+                    failed_variables.insert(error.key.as_str());
+                }
+            }
+            let total = schema.len() + schema.groups.len();
+            Some((
+                total.saturating_sub(failed_variables.len() + failed_groups.len()),
+                total,
+            ))
+        } else {
+            None
+        };
 
         rows.push(EnvRow {
             canonical: env.canonical.clone(),

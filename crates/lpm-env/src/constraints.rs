@@ -35,7 +35,7 @@ pub(crate) fn definition_errors(schema: &EnvSchema) -> Vec<ValidationError> {
     }
     for (name, group) in &schema.groups {
         let mut members = HashSet::with_capacity(group.vars.len());
-        let message = if !crate::is_valid_env_var_name(name) {
+        let message = if name.len() > 256 || !crate::is_valid_env_var_name(name) {
             Some("group names must be portable environment variable names")
         } else if group.vars.is_empty() {
             Some("groups must contain at least one declared variable")
@@ -222,6 +222,30 @@ mod tests {
             .iter()
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn group_names_are_limited_to_256_bytes() {
+        for length in [256, 257] {
+            let name = "G".repeat(length);
+            let schema = schema(&format!(
+                r#"{{"vars":{{"A":{{}}}},"groups":{{"{name}":{{"mode":"atLeastOne","vars":["A"]}}}}}}"#
+            ));
+            assert_eq!(validate_schema(&schema).is_empty(), length == 256);
+        }
+    }
+
+    #[test]
+    fn group_diagnostics_explain_the_required_relationship() {
+        let schema = schema(
+            r#"{"vars":{"A":{},"B":{}},"groups":{"auth":{"mode":"exactlyOne","vars":["A","B"]}}}"#,
+        );
+        let errors = validate(&schema, &mut values(&[]));
+        assert!(
+            errors[0]
+                .to_string()
+                .contains("exactly one non-empty value")
+        );
     }
 
     #[test]

@@ -388,4 +388,12 @@ mod tests {
         assert!(output.contains("Group g: at least one of N, URL"));
         assert!(!output.contains("private-condition"));
     }
+    #[test]
+    fn conditional_and_enum_comments_cannot_inject_assignments_with_carriage_returns() {
+        let schema: EnvSchema = serde_json::from_str(r#"{"vars":{"MODE":{"enum":["on\rINJECTED=enum"]},"TOKEN":{"requiredWhen":{"variable":"MODE","equals":"on\rINJECTED=condition"}}}}"#).unwrap();
+        let output = generate(&schema);
+        for line in output.replace('\r', "\n").lines() {
+            assert!(!line.starts_with("INJECTED="), "{line}");
+        }
+    }
 }
