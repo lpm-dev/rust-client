@@ -12,12 +12,13 @@ use std::fmt::Write as _;
 
 pub const GENERATOR_VERSION: &str = "lpm-env-codegen-v1";
 pub const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
-pub const OWNED_FILES: [&str; 6] = [
+pub const OWNED_FILES: [&str; 7] = [
     "server.js",
     "server.d.ts",
     "client.js",
     "client.d.ts",
     "package.json",
+    ".gitattributes",
     ".lpm-env-generated.json",
 ];
 
@@ -88,6 +89,61 @@ struct Rule<'a> {
     pattern: Option<usize>,
 }
 
+struct IdentityRules<'a>(&'a BTreeMap<&'a str, &'a EnvVarRule>);
+
+impl Serialize for IdentityRules<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (key, rule) in self.0 {
+            map.serialize_entry(
+                key,
+                &IdentityRule {
+                    required: rule.required,
+                    format: &rule.format,
+                    pattern: &rule.pattern,
+                    enum_values: &rule.enum_values,
+                    default: &rule.default,
+                    secret: rule.secret,
+                    client: rule.client,
+                    min: rule.min,
+                    max: rule.max,
+                    min_length: rule.min_length,
+                    max_length: rule.max_length,
+                    protocols: &rule.protocols,
+                    required_when: &rule.required_when,
+                    required_in: &rule.required_in,
+                    defaults_in: &rule.defaults_in,
+                    empty: rule.empty,
+                },
+            )?;
+        }
+        map.end()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentityRule<'a> {
+    required: bool,
+    format: &'a Option<VarFormat>,
+    pattern: &'a Option<String>,
+    #[serde(rename = "enum")]
+    enum_values: &'a Option<Vec<String>>,
+    default: &'a Option<String>,
+    secret: bool,
+    client: bool,
+    min: Option<i64>,
+    max: Option<i64>,
+    min_length: Option<u32>,
+    max_length: Option<u32>,
+    protocols: &'a Option<Vec<String>>,
+    required_when: &'a Option<RequiredWhen>,
+    required_in: &'a [lpm_env::ScopeSelector],
+    defaults_in: &'a [lpm_env::ScopedDefault],
+    empty: EmptyPolicy,
+}
+
 #[derive(Serialize)]
 struct Canonical<'a> {
     version: &'static str,
@@ -95,7 +151,7 @@ struct Canonical<'a> {
     environment: &'a str,
     stage: lpm_env::EnvStage,
     service: Option<&'a str>,
-    vars: &'a BTreeMap<&'a str, &'a EnvVarRule>,
+    vars: IdentityRules<'a>,
     groups: &'a BTreeMap<&'a String, &'a lpm_env::VarGroup>,
     client_prefixes: &'a [String],
 }
@@ -132,15 +188,15 @@ pub fn generate(schema: &EnvSchema, options: Options<'_>) -> Result<Generated, G
         environment: options.context.environment,
         stage: options.context.stage,
         service: options.context.service,
-        vars: &vars,
+        vars: IdentityRules(&vars),
         groups: &groups,
         client_prefixes: &schema.client_prefixes,
     };
-    lpm_env_source::json_size(&canonical, MAX_OUTPUT_BYTES).map_err(|_| GenerateError::Budget)?;
+    lpm_env_source::json_size(schema, MAX_OUTPUT_BYTES).map_err(|_| GenerateError::Budget)?;
     if !lpm_env::validate_schema(schema).is_empty() {
         return Err(GenerateError::Schema);
     }
-    let identity = checksum(&json(&canonical)?);
+    let identity = identity_checksum(&canonical)?;
     let mut files = BTreeMap::new();
     let mut total = 0usize;
     for client in [false, true] {
@@ -149,26 +205,25 @@ pub fn generate(schema: &EnvSchema, options: Options<'_>) -> Result<Generated, G
             .filter(|(_, rule)| !client || rule.client)
             .map(|(&key, &rule)| (key, rule))
             .collect::<BTreeMap<_, _>>();
-        let module = module(&selected, &groups, options, client)?;
-        let declarations = declarations(&selected, options.context)?;
-        for (name, bytes) in [
-            (if client { "client.js" } else { "server.js" }, module),
-            (
-                if client { "client.d.ts" } else { "server.d.ts" },
-                declarations,
-            ),
-        ] {
-            total = total
-                .checked_add(bytes.len())
-                .ok_or(GenerateError::Budget)?;
-            if total > MAX_OUTPUT_BYTES {
-                return Err(GenerateError::Budget);
-            }
-            files.insert(name, bytes);
-        }
+        let module = module(
+            &selected,
+            &groups,
+            options,
+            client,
+            MAX_OUTPUT_BYTES - total,
+        )?;
+        total += module.len();
+        files.insert(if client { "client.js" } else { "server.js" }, module);
+        let declarations = declarations(&selected, options.context, MAX_OUTPUT_BYTES - total)?;
+        total += declarations.len();
+        files.insert(
+            if client { "client.d.ts" } else { "server.d.ts" },
+            declarations,
+        );
     }
     files.insert("package.json", br#"{"private":true,"type":"module","exports":{"./server":{"types":"./server.d.ts","default":"./server.js"},"./client":{"types":"./client.d.ts","default":"./client.js"}}}
 "#.to_vec());
+    files.insert(".gitattributes", b"* -text\n".to_vec());
     let manifest = serde_json::json!({
         "generator": GENERATOR_VERSION, "identity": identity,
         "files": files.iter().map(|(&name, bytes)| (name, checksum(bytes))).collect::<BTreeMap<_, _>>(),
@@ -193,6 +248,36 @@ pub fn checksum(bytes: &[u8]) -> String {
     result
 }
 
+fn identity_checksum(value: &impl Serialize) -> Result<String, GenerateError> {
+    struct HashWriter {
+        hash: Sha256,
+        written: usize,
+    }
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > MAX_OUTPUT_BYTES.saturating_sub(self.written) {
+                return Err(std::io::Error::other("env output limit"));
+            }
+            self.hash.update(bytes);
+            self.written += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = HashWriter {
+        hash: Sha256::new(),
+        written: 0,
+    };
+    serde_json::to_writer(&mut writer, value).map_err(|_| GenerateError::Budget)?;
+    let mut result = String::with_capacity(64);
+    for byte in writer.hash.finalize() {
+        let _ = write!(result, "{byte:02x}");
+    }
+    Ok(result)
+}
+
 fn json(value: &impl Serialize) -> Result<Vec<u8>, GenerateError> {
     lpm_env_source::bounded_json(value, MAX_OUTPUT_BYTES).map_err(|_| GenerateError::Budget)
 }
@@ -210,7 +295,11 @@ fn module(
     groups: &BTreeMap<&String, &lpm_env::VarGroup>,
     options: Options<'_>,
     client: bool,
+    limit: usize,
 ) -> Result<Vec<u8>, GenerateError> {
+    if limit < include_bytes!("formats.js").len() + include_bytes!("runtime.js").len() {
+        return Err(GenerateError::Budget);
+    }
     let patterns = vars
         .values()
         .filter_map(|rule| rule.pattern.as_deref())
@@ -257,7 +346,7 @@ fn module(
     } else {
         Vec::new()
     };
-    let mut result = Vec::with_capacity(32_768);
+    let mut result = Output::new(32_768, limit);
     definition(&mut result, "rules", &rules)?;
     definition(&mut result, "groups", &groups)?;
     definition(&mut result, "programs", &programs)?;
@@ -268,9 +357,8 @@ fn module(
         &mut result,
         b"\nexport function getEnv() { let input; try { input = ",
     )?;
-    let mut source = String::new();
     if matches!(options.adapter, Adapter::Nextjs | Adapter::Vite) {
-        source.push_str("Object.fromEntries([");
+        append(&mut result, b"Object.fromEntries([")?;
         let prefix = if options.adapter == Adapter::Nextjs {
             "NEXT_PUBLIC_"
         } else {
@@ -280,67 +368,101 @@ fn module(
             if rule.client && !key.starts_with(prefix) {
                 return Err(GenerateError::AdapterPrefix);
             }
-            let encoded = serde_json::to_string(key).map_err(|_| GenerateError::Budget)?;
-            let accessor = if options.adapter == Adapter::Nextjs {
-                "process.env."
-            } else if rule.client {
-                "import.meta.env."
+            append(&mut result, b"[")?;
+            serde_json::to_writer(&mut result, key).map_err(|_| GenerateError::Budget)?;
+            if !rule.client {
+                append(&mut result, b",privateValue(")?;
+                serde_json::to_writer(&mut result, key).map_err(|_| GenerateError::Budget)?;
+                append(&mut result, b")],")?;
             } else {
-                "globalThis.process?.env?."
-            };
-            write!(source, "[{encoded},{accessor}{key}],").map_err(|_| GenerateError::Budget)?;
+                append(
+                    &mut result,
+                    if options.adapter == Adapter::Nextjs {
+                        b",process.env."
+                    } else {
+                        b",import.meta.env."
+                    },
+                )?;
+                append(&mut result, key.as_bytes())?;
+                append(&mut result, b"],")?;
+            }
         }
-        source.push_str("])");
+        append(&mut result, b"])")?;
     } else if client && options.adapter == Adapter::Default {
-        source.push_str("Object.create(null)");
+        append(&mut result, b"Object.create(null)")?;
     } else {
-        source.push_str("globalThis.process?.env ?? Object.create(null)");
+        append(
+            &mut result,
+            b"globalThis.process?.env ?? Object.create(null)",
+        )?;
     }
-    append(&mut result, source.as_bytes())?;
     append(&mut result, b"; } catch { throw new EnvError([{key:'envSchema',code:'env.invalid_value'}]); } return createEnv(input); }\n")?;
-    Ok(result)
+    Ok(result.bytes)
 }
 
-fn append(output: &mut Vec<u8>, bytes: &[u8]) -> Result<(), GenerateError> {
-    if bytes.len() > MAX_OUTPUT_BYTES.saturating_sub(output.len()) {
+struct Output {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+impl Output {
+    fn new(capacity: usize, limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(capacity.min(limit)),
+            limit,
+        }
+    }
+}
+impl std::io::Write for Output {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        append(self, bytes).map_err(|_| std::io::Error::other("env output limit"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn append(output: &mut Output, bytes: &[u8]) -> Result<(), GenerateError> {
+    if bytes.len() > output.limit.saturating_sub(output.bytes.len()) {
         return Err(GenerateError::Budget);
     }
-    output.extend_from_slice(bytes);
+    let required = output.bytes.len() + bytes.len();
+    if required > output.bytes.capacity() {
+        let capacity = output
+            .bytes
+            .capacity()
+            .saturating_mul(2)
+            .max(required)
+            .min(output.limit);
+        output
+            .bytes
+            .try_reserve_exact(capacity - output.bytes.len())
+            .map_err(|_| GenerateError::Budget)?;
+    }
+    output.bytes.extend_from_slice(bytes);
     Ok(())
 }
-
 fn definition(
-    output: &mut Vec<u8>,
+    output: &mut Output,
     name: &str,
     value: &impl Serialize,
 ) -> Result<(), GenerateError> {
-    struct Bounded<'a>(&'a mut Vec<u8>);
-    impl std::io::Write for Bounded<'_> {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            append(self.0, bytes).map_err(|_| std::io::Error::other("env output limit"))?;
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
     append(output, b"const ")?;
     append(output, name.as_bytes())?;
     append(output, b" = ")?;
-    serde_json::to_writer(Bounded(output), value).map_err(|_| GenerateError::Budget)?;
+    serde_json::to_writer(&mut *output, value).map_err(|_| GenerateError::Budget)?;
     append(output, b";\n")
 }
 
 fn declarations(
     vars: &BTreeMap<&str, &EnvVarRule>,
     context: EvalContext<'_>,
+    limit: usize,
 ) -> Result<Vec<u8>, GenerateError> {
-    let mut output = Vec::with_capacity(vars.len().saturating_mul(64).min(MAX_OUTPUT_BYTES));
+    let mut output = Output::new(vars.len().saturating_mul(64), limit);
     append(&mut output, b"export type Env = Readonly<{\n")?;
     for (&key, &rule) in vars {
-        let name = json(&key)?;
         append(&mut output, b"  ")?;
-        append(&mut output, &name)?;
+        serde_json::to_writer(&mut output, key).map_err(|_| GenerateError::Budget)?;
         append(&mut output, b": ")?;
         let kind = match rule.format {
             Some(VarFormat::Integer) => "bigint",
@@ -355,7 +477,7 @@ fn declarations(
                 if i > 0 {
                     append(&mut output, b" | ")?;
                 }
-                append(&mut output, &json(value)?)?;
+                serde_json::to_writer(&mut output, value).map_err(|_| GenerateError::Budget)?;
             }
         } else {
             append(&mut output, kind.as_bytes())?;
@@ -370,5 +492,5 @@ fn declarations(
         append(&mut output, b";\n")?;
     }
     append(&mut output, b"}>;\nexport type EnvIssue = Readonly<{key:string;code:string;constraint?:string}>;\nexport declare class EnvError extends Error { constructor(issues: readonly EnvIssue[]); readonly issues: readonly EnvIssue[]; }\nexport declare function createEnv(input: Readonly<Record<string, string | undefined>>): Env;\nexport declare function getEnv(): Env;\n")?;
-    Ok(output)
+    Ok(output.bytes)
 }

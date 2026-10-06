@@ -20,6 +20,7 @@ expression: response
     "client.js",
     "client.d.ts",
     "package.json",
+    ".gitattributes",
     ".lpm-env-generated.json"
   ]
 }

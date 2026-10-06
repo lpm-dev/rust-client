@@ -699,3 +699,261 @@ catch(error){if(error.issues?.[0]?.code!=='env.resource_limit')throw error;}
 "#,
     );
 }
+
+#[test]
+fn generated_urls_match_native_database_credentials_and_endpoint_rules() {
+    let schema = schema(json!({"vars":{"VALUE":{"format":"url"}}}));
+    let cases = [
+        "mongodb://h1:27017,h2:27017/db",
+        "mongodb://h1,h2:1:2/db",
+        "mongodb://h1,h2:123:456/db",
+        "mongodb://h1,h2:65535:3/db",
+        "postgresql://[::1]:5432,h2:5432/db",
+        "postgres://user:p^a{|s@host/db",
+        "https://user:p^a{|s@host/db",
+        "custom://host/a^b",
+        "custom://host/a#b#c",
+        "custom://exa{mple.com/path",
+        "custom://host/a%ZZ",
+        "custom://host%ZZ/path",
+        "mongodb://h1:,h2/db",
+        "mongodb://h1,h2:/db",
+        "mongodb://h1,,h2/db",
+        "mongodb://h1,h2:65536/db",
+        "mongodb://h1,[::1]:65535/db",
+        "mongodb://h1,[::1]:/db",
+        "mongodb://h1,[::z]:1/db",
+        "mongodb://h1:0,h2:65535/db",
+        "https://user:p^s@host/a^b",
+        "https://user:p^s@host/a%ZZ",
+    ];
+    assert_parity(
+        &schema,
+        &cases.iter().map(|v| json!({"VALUE":v})).collect::<Vec<_>>(),
+        EvalContext::default(),
+    );
+}
+
+#[test]
+fn description_and_ci_edits_preserve_every_generated_byte() {
+    let mut schema = schema(json!({"vars":{"VALUE":{"default":"value"}}}));
+    let before = generate(&schema, options()).unwrap();
+    schema.vars.get_mut("VALUE").unwrap().description = Some("Documentation only".into());
+    let described = generate(&schema, options()).unwrap();
+    assert_eq!(before.files, described.files);
+    schema.vars.get_mut("VALUE").unwrap().ci = serde_json::from_str("\"variable\"").unwrap();
+    let classified = generate(&schema, options()).unwrap();
+    assert_eq!(before.files, classified.files);
+    schema.vars.get_mut("VALUE").unwrap().default = Some("changed".into());
+    assert_ne!(
+        before.identity,
+        generate(&schema, options()).unwrap().identity
+    );
+}
+
+#[test]
+fn generated_modules_validate_inputs_and_conditions_without_object_has_own() {
+    let schema = schema(json!({"vars":{
+        "VITE_CONTROL":{"client":true},
+        "VITE_A":{"client":true,"requiredWhen":{"variable":"VITE_CONTROL","present":true}},
+        "VITE_B":{"client":true,"requiredWhen":{"variable":"VITE_CONTROL","equals":"yes"}}
+    }}));
+    let generated = generate(&schema, options()).unwrap();
+    for role in ["server", "client"] {
+        node(
+            &generated,
+            role,
+            &[],
+            r#"
+const original=Object.hasOwn; Object.hasOwn=undefined;
+try {
+ const valid=createEnv({VITE_CONTROL:'yes',VITE_A:'a',VITE_B:'b'});
+ if(valid.VITE_B!=='b')throw new Error('ES2020 input');
+ try {createEnv({VITE_CONTROL:'yes'});throw new Error('expected required error');}
+ catch(error){if(!(error instanceof EnvError)||error.issues.length!==2)throw error;}
+} finally {Object.hasOwn=original;}
+"#,
+        );
+    }
+}
+
+#[test]
+fn framework_private_reads_ignore_prototypes_and_refuse_accessors_without_calling_them() {
+    let schema =
+        schema(json!({"vars":{"__proto__":{},"constructor":{},"toString":{"default":"fallback"}}}));
+    for adapter in [Adapter::Nextjs, Adapter::Vite] {
+        let generated = generate(
+            &schema,
+            Options {
+                adapter,
+                ..options()
+            },
+        )
+        .unwrap();
+        node(
+            &generated,
+            "server",
+            &[],
+            r#"
+const original=globalThis.process;
+try {
+ globalThis.process={env:Object.create({constructor:'inherited',__proto__:'inherited',toString:'inherited'})};
+ let result=getEnv(); if(result.constructor!==undefined||result.__proto__!==undefined||result.toString!=='fallback')throw new Error('inherited values');
+ globalThis.process.env=JSON.parse('{"constructor":"own","__proto__":"own","toString":"own"}');
+ result=getEnv(); if(result.constructor!=='own'||result.__proto__!=='own'||result.toString!=='own')throw new Error('own values');
+ let calls=0; Object.defineProperty(globalThis.process.env,'toString',{get(){calls++;throw new Error('private-marker')}});
+ try {getEnv();throw new Error('expected accessor rejection');}catch(error){if(!(error instanceof EnvError)||calls!==0||JSON.stringify(error).includes('private-marker'))throw error;}
+} finally {globalThis.process=original;}
+"#,
+        );
+    }
+}
+
+#[test]
+fn oversized_output_literals_cannot_allocate_beyond_the_complete_output_budget() {
+    let large = schema(json!({"vars":{"VALUE":{"enum":["a".repeat(5*1024*1024)]}}}));
+    MAX_ALLOCATION.with(|v| v.set(0));
+    PROBE_ENABLED.with(|v| v.set(true));
+    let result = generate(&large, options());
+    PROBE_ENABLED.with(|v| v.set(false));
+    assert!(matches!(result, Err(GenerateError::Budget)));
+    assert!(
+        MAX_ALLOCATION.with(Cell::get) <= MAX_OUTPUT_BYTES,
+        "largest allocation {}",
+        MAX_ALLOCATION.with(Cell::get)
+    );
+}
+
+#[test]
+fn oversized_metadata_is_budgeted_before_invalid_declaration_diagnostics() {
+    let mut schema = schema(json!({"vars":{"VALUE":{"client":true,"secret":true}}}));
+    schema.vars.get_mut("VALUE").unwrap().description = Some("a".repeat(MAX_OUTPUT_BYTES + 1));
+    MAX_ALLOCATION.with(|v| v.set(0));
+    PROBE_ENABLED.with(|v| v.set(true));
+    let result = generate(&schema, options());
+    PROBE_ENABLED.with(|v| v.set(false));
+    assert!(matches!(result, Err(GenerateError::Budget)));
+    assert!(MAX_ALLOCATION.with(Cell::get) < 1024 * 1024);
+}
+
+#[test]
+fn identity_hash_streams_the_same_canonical_bytes_without_a_serialized_buffer() {
+    let value = json!({"bounds":[i64::MIN,i64::MAX],"escaped":"line\nquote\"é","literal":"a".repeat(5*1024*1024)});
+    let expected = checksum(&json(&value).unwrap());
+    MAX_ALLOCATION.with(|v| v.set(0));
+    PROBE_ENABLED.with(|v| v.set(true));
+    let actual = identity_checksum(&value).unwrap();
+    PROBE_ENABLED.with(|v| v.set(false));
+    assert_eq!(actual, expected);
+    assert!(MAX_ALLOCATION.with(Cell::get) < 1024);
+    assert!(matches!(
+        identity_checksum(&"a".repeat(MAX_OUTPUT_BYTES)),
+        Err(GenerateError::Budget)
+    ));
+}
+
+#[test]
+fn output_just_within_the_total_budget_preserves_every_large_enum_literal() {
+    let literal = "a".repeat(MAX_OUTPUT_BYTES / 2 - 32768);
+    let value = schema(json!({"vars":{"VALUE":{"enum":[literal]}}}));
+    let generated = generate(&value, options()).unwrap();
+    let total = generated.files.values().map(Vec::len).sum::<usize>();
+    assert!(total <= MAX_OUTPUT_BYTES);
+    assert!(
+        total > MAX_OUTPUT_BYTES - 65536,
+        "near-limit fixture uses {total} bytes"
+    );
+    for name in ["server.js", "server.d.ts"] {
+        assert!(
+            std::str::from_utf8(&generated.files[name])
+                .unwrap()
+                .contains(&literal)
+        );
+    }
+}
+
+#[test]
+fn impossible_module_budgets_reject_before_compiling_patterns() {
+    let value = schema(json!({"vars":{"VITE_VALUE":{"client":true,"pattern":"^a{1000}$"}}}));
+    let vars = value
+        .vars
+        .iter()
+        .map(|(key, rule)| (key.as_str(), rule))
+        .collect::<BTreeMap<_, _>>();
+    let groups = value.groups.iter().collect::<BTreeMap<_, _>>();
+    MAX_ALLOCATION.with(|v| v.set(0));
+    PROBE_ENABLED.with(|v| v.set(true));
+    let result = module(&vars, &groups, options(), true, 0);
+    PROBE_ENABLED.with(|v| v.set(false));
+    assert!(matches!(result, Err(GenerateError::Budget)));
+    assert!(
+        MAX_ALLOCATION.with(Cell::get) < 1024,
+        "impossible output budget allocated {} bytes",
+        MAX_ALLOCATION.with(Cell::get)
+    );
+}
+
+#[test]
+fn framework_adapter_source_cannot_allocate_beyond_its_module_budget() {
+    let mut value = EnvSchema::default();
+    for index in 0..4096 {
+        value.vars.insert(
+            format!("K{}{:05}", "x".repeat(250), index),
+            EnvVarRule::default(),
+        );
+    }
+    let vars = value
+        .vars
+        .iter()
+        .map(|(key, rule)| (key.as_str(), rule))
+        .collect::<BTreeMap<_, _>>();
+    let groups = value.groups.iter().collect::<BTreeMap<_, _>>();
+    let full = module(
+        &vars,
+        &groups,
+        Options {
+            adapter: Adapter::Nextjs,
+            ..options()
+        },
+        false,
+        MAX_OUTPUT_BYTES,
+    )
+    .unwrap();
+    let source_start = std::str::from_utf8(&full)
+        .unwrap()
+        .find("export function getEnv")
+        .unwrap();
+    for key in [
+        vars.first_key_value().unwrap().0,
+        vars.last_key_value().unwrap().0,
+    ] {
+        let encoded = serde_json::to_string(key).unwrap();
+        assert!(
+            std::str::from_utf8(&full)
+                .unwrap()
+                .contains(&format!("[{encoded},privateValue({encoded})],"))
+        );
+    }
+    let limit = source_start + 1024;
+    for adapter in [Adapter::Nextjs, Adapter::Vite] {
+        MAX_ALLOCATION.with(|v| v.set(0));
+        PROBE_ENABLED.with(|v| v.set(true));
+        let result = module(
+            &vars,
+            &groups,
+            Options {
+                adapter,
+                ..options()
+            },
+            false,
+            limit,
+        );
+        PROBE_ENABLED.with(|v| v.set(false));
+        assert!(matches!(result, Err(GenerateError::Budget)));
+        assert!(
+            MAX_ALLOCATION.with(Cell::get) <= limit,
+            "adapter {adapter:?} allocated {}",
+            MAX_ALLOCATION.with(Cell::get)
+        );
+    }
+}

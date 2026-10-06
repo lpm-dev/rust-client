@@ -41,7 +41,10 @@ pub(super) fn run(
                 );
                 Err(LpmError::ExitCode(1))
             } else {
-                Err(LpmError::EnvValidation(error.to_string()))
+                Err(LpmError::EnvGeneration {
+                    reason: error.to_string(),
+                    help: error.recovery_hint(),
+                })
             }
         }
     }
@@ -62,6 +65,32 @@ impl Error {
         match self {
             Self::Recovery { .. } => "env.generate_recovery_required".into(),
             _ => self.to_string(),
+        }
+    }
+    fn recovery_hint(&self) -> &'static str {
+        match self {
+            Self::Recovery { .. } => {
+                "Recover the retained transaction reported above before retrying."
+            }
+            Self::Code("env.schema_missing") => "Add envSchema to lpm.json, then retry.",
+            Self::Code("env.generate_stale") => {
+                "Run `lpm env generate` to update the generated files."
+            }
+            Self::Code("env.generate_unowned_directory") => {
+                "Choose an empty output directory, or move the existing directory aside before retrying."
+            }
+            Self::Code("env.generate_path") => {
+                "Choose a relative output directory inside the project. Do not use parent-directory paths."
+            }
+            Self::Generate(lpm_env_codegen::GenerateError::AdapterPrefix) => {
+                "Use the adapter's public prefix, or choose a different adapter."
+            }
+            Self::Generate(
+                lpm_env_codegen::GenerateError::Pattern | lpm_env_codegen::GenerateError::Budget,
+            ) => "Reduce the schema or pattern size, then retry.",
+            _ => {
+                "Resolve the reported schema, configuration, or filesystem error, then retry `lpm env generate`."
+            }
         }
     }
     fn recovery_directory(&self) -> Option<&Path> {
@@ -113,30 +142,37 @@ fn generate(
     adapter: lpm_env_codegen::Adapter,
     check: bool,
 ) -> Result<(String, String), Error> {
-    let root = read_root(project)?;
-    let config = lpm_runner::lpm_json::parse_lpm_json_in_detailed(project, &root)
-        .map_err(|_| Error::Code("env.generate_configuration"))?;
-    let schema = config
-        .env_schema
-        .as_ref()
-        .ok_or(Error::Code("env.schema_missing"))?;
-    let snapshot = config
-        .env_schema_resolution
-        .as_ref()
-        .ok_or(Error::Code("env.schema_missing"))?;
-    let selected = lpm_runner::dotenv::resolve_project_environment(environment, Some(&config))
-        .map_err(|_| Error::Code("env.generate_invalid_context"))?;
-    let artifacts = lpm_env_codegen::generate(
-        schema,
-        lpm_env_codegen::Options {
-            adapter,
-            context: lpm_env::EvalContext {
-                environment: &selected.canonical,
-                stage: scope.stage.unwrap_or_default(),
-                service: scope.service.as_deref(),
+    let (snapshot, canonical, artifacts) = {
+        let config = {
+            let root = read_root(project)?;
+            lpm_runner::lpm_json::parse_lpm_json_in_detailed(project, &root)
+                .map_err(|_| Error::Code("env.generate_configuration"))?
+        };
+        let schema = config
+            .env_schema
+            .as_ref()
+            .ok_or(Error::Code("env.schema_missing"))?;
+        let snapshot = std::sync::Arc::clone(
+            config
+                .env_schema_resolution
+                .as_ref()
+                .ok_or(Error::Code("env.schema_missing"))?,
+        );
+        let selected = lpm_runner::dotenv::resolve_project_environment(environment, Some(&config))
+            .map_err(|_| Error::Code("env.generate_invalid_context"))?;
+        let artifacts = lpm_env_codegen::generate(
+            schema,
+            lpm_env_codegen::Options {
+                adapter,
+                context: lpm_env::EvalContext {
+                    environment: &selected.canonical,
+                    stage: scope.stage.unwrap_or_default(),
+                    service: scope.service.as_deref(),
+                },
             },
-        },
-    )?;
+        )?;
+        (snapshot, selected.canonical, artifacts)
+    };
     let fresh = || {
         let root = read_root(project).map_err(|_| Error::Code("env.source_changed"))?;
         if !snapshot.matches_root_content(root.as_bytes()) {
@@ -147,5 +183,5 @@ fn generate(
             .map_err(|_| Error::Code("env.source_changed"))
     };
     publication::write(project, output, &artifacts, check, fresh)?;
-    Ok((artifacts.identity, selected.canonical))
+    Ok((artifacts.identity, canonical))
 }

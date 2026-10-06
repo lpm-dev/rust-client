@@ -25,6 +25,9 @@ impl Destination {
     fn open(project: &Path, output: &Path) -> Result<Self, Error> {
         let mut parts = Vec::new();
         for component in output.components() {
+            if component == Component::CurDir {
+                continue;
+            }
             let Component::Normal(part) = component else {
                 return Err(Error::Code("env.generate_path"));
             };
@@ -200,8 +203,8 @@ fn inventory(directory: &Dir) -> Result<(), Error> {
     };
     if manifest.generator != lpm_env_codegen::GENERATOR_VERSION
         || !hash(&manifest.identity)
-        || manifest.files.len() != 5
-        || OWNED_FILES[..5]
+        || manifest.files.len() != OWNED_FILES.len() - 1
+        || OWNED_FILES[..OWNED_FILES.len() - 1]
             .iter()
             .any(|name| !manifest.files.get(*name).is_some_and(|value| hash(value)))
     {

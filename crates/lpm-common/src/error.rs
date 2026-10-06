@@ -612,6 +612,10 @@ pub enum LpmError {
     )]
     EnvValidation(String),
 
+    #[error("environment generation failed:\n{reason}")]
+    #[diagnostic(code(lpm::env_generation), help("{help}"))]
+    EnvGeneration { reason: String, help: &'static str },
+
     #[error("{engine} version {actual} does not satisfy required {required} (from {from})")]
     #[diagnostic(
         code(lpm::engine_mismatch),
@@ -796,6 +800,7 @@ impl LpmError {
                 "catalog_entry_invalid_recursive_definition"
             }
             LpmError::EnvValidation(_) => "env_validation",
+            LpmError::EnvGeneration { .. } => "env_generation",
             LpmError::EngineMismatch { .. } | LpmError::RunEngineMismatch { .. } => {
                 "engine_mismatch"
             }

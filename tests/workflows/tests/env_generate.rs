@@ -213,3 +213,94 @@ fn env_generate_rejects_a_fifo_root_without_waiting_for_a_writer() {
     }
     assert!(!project.path().join("env.generated").exists());
 }
+
+#[test]
+fn env_generate_accepts_a_leading_current_directory_component() {
+    let project = project();
+    for flags in [
+        vec!["env", "generate", "--out-dir", "./env.generated"],
+        vec!["env", "generate", "--out-dir", "./env.generated", "--check"],
+    ] {
+        let output = lpm(&project).args(flags).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    for path in ["./", "./../outside", "./nested/../outside"] {
+        assert!(
+            !lpm(&project)
+                .args(["env", "generate", "--out-dir", path])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+    }
+}
+
+#[test]
+fn env_generate_errors_explain_generation_recovery_without_unsupported_skip_flags() {
+    let project = TempProject::empty(r#"{"name":"missing-schema"}"#);
+    project.write_file("lpm.json", "{}");
+    let output = lpm(&project).args(["env", "generate"]).output().unwrap();
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(error.contains("Environment generation failed"), "{error}");
+    assert!(!error.contains("--no-env-check"), "{error}");
+    assert!(error.contains("envSchema"), "{error}");
+}
+
+#[test]
+fn env_generate_remains_owned_after_a_git_autocrlf_checkout() {
+    let project = project();
+    assert!(
+        lpm(&project)
+            .args(["env", "generate"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let before = std::fs::read(project.path().join("env.generated/server.js")).unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .current_dir(project.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "core.autocrlf", "true"]);
+    git(&["add", "env.generated"]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "commit",
+        "-qm",
+        "generated fixture",
+    ]);
+    std::fs::remove_dir_all(project.path().join("env.generated")).unwrap();
+    git(&["checkout", "--", "env.generated"]);
+    assert_eq!(
+        std::fs::read(project.path().join("env.generated/server.js")).unwrap(),
+        before
+    );
+    let output = lpm(&project)
+        .args(["env", "generate", "--check"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

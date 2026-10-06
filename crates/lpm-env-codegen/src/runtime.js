@@ -1,3 +1,10 @@
+function hasOwn(value, key) { return Object.prototype.hasOwnProperty.call(value, key); }
+function privateValue(key) {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis.process?.env ?? Object.create(null), key);
+  if (descriptor === undefined) return undefined;
+  if (!hasOwn(descriptor, 'value')) throw new EnvError([{key,code:'env.invalid_value'}]);
+  return descriptor.value;
+}
 const MAX_VALUE_BYTES = 1048576, MAX_INPUT_BYTES = 4194304, MAX_WORK = 10000000;
 
 export class EnvError extends Error {
@@ -157,7 +164,7 @@ export function createEnv(input) {
     try { descriptor = Object.getOwnPropertyDescriptor(input, rule.key); }
     catch { invalid.add(rule.key); issue(rule.key,'env.invalid_value'); continue; }
     if (descriptor !== undefined) {
-      if (!Object.hasOwn(descriptor, 'value') || descriptor.value !== undefined && typeof descriptor.value !== 'string') {
+      if (!hasOwn(descriptor, 'value') || descriptor.value !== undefined && typeof descriptor.value !== 'string') {
         invalid.add(rule.key); issue(rule.key,'env.invalid_value'); continue;
       }
       if (descriptor.value !== undefined) raw[rule.key] = descriptor.value;
@@ -182,10 +189,10 @@ export function createEnv(input) {
     output[key] = undefined;
     if (invalid.has(key)) continue;
     const condition = rule.condition;
-    if (!rule.required && condition !== null && Object.hasOwn(condition,'equals')) {
+    if (!rule.required && condition !== null && hasOwn(condition,'equals')) {
       spend(work, 1 + Math.min(condition.equals.length, raw[condition.variable]?.length ?? 0));
     }
-    const required = rule.required || condition !== null && (Object.hasOwn(condition,'equals') ? raw[condition.variable] === condition.equals : (raw[condition.variable] !== undefined && raw[condition.variable] !== '') === condition.present);
+    const required = rule.required || condition !== null && (hasOwn(condition,'equals') ? raw[condition.variable] === condition.equals : (raw[condition.variable] !== undefined && raw[condition.variable] !== '') === condition.present);
     if (value === '' && rule.empty === 'reject') { issue(key,'env.empty'); continue; }
     if (value === undefined || value === '' && (required || rule.empty === 'missing')) {
       if (required) issue(key,'env.required');

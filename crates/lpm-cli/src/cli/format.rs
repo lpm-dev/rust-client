@@ -924,6 +924,9 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         lpm_common::LpmError::EnvValidation(reason) => {
             diagnostic_lines("Environment validation failed", Some(reason), error)
         }
+        lpm_common::LpmError::EnvGeneration { reason, .. } => {
+            diagnostic_lines("Environment generation failed", Some(reason), error)
+        }
         lpm_common::LpmError::EngineMismatch {
             engine,
             required,

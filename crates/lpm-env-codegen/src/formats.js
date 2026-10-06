@@ -106,40 +106,59 @@ function urlPoint(c) {
   if (c < 128) return c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || "!$&'()*+,-./:;=?@_~".includes(String.fromCharCode(c));
   return c >= 160 && !(c >= 64976 && c <= 65007 || (c & 65535) >= 65534 || c >= 917504 && c <= 921599);
 }
-function urlRegion(value, start, end, work) {
+function urlRegion(value, start, end, work, allowNonUrl = false) {
   for (let i = start; i < end; i++) {
     spend(work);
     const c = value.codePointAt(i);
     if (c === 37) {
       if (i + 2 >= end || !hex(value.charCodeAt(i + 1)) || !hex(value.charCodeAt(i + 2))) return false;
-    } else if (!urlPoint(c)) return false;
+    } else if (!allowNonUrl && !urlPoint(c)) return false;
     if (c > 65535) i++;
   }
   return true;
 }
-function url(value, work) {
-  const schemeEnd = value.indexOf(':');
-  if (schemeEnd < 1 || value.slice(schemeEnd,schemeEnd + 3) !== '://') return false;
-  for (let i = 0; i < value.length; i++) {
-    spend(work);
-    const c = value.codePointAt(i);
-    if (whitespace(c)) return false;
-    if (c > 65535) i++;
+function validDatabaseEndpoint(endpoint, work) {
+  let host, port;
+  if (endpoint.startsWith('[')) {
+    const close = endpoint.indexOf(']');
+    if (close < 0 || !endpoint.slice(1, close).includes(':') || !ip(endpoint.slice(1, close))) return false;
+    host = endpoint.slice(0, close + 1);
+    const suffix = endpoint.slice(close + 1);
+    if (suffix === '') return true;
+    if (suffix[0] !== ':') return false;
+    port = suffix.slice(1);
+  } else {
+    const colon = endpoint.lastIndexOf(':');
+    host = colon < 0 ? endpoint : endpoint.slice(0, colon);
+    port = colon < 0 ? undefined : endpoint.slice(colon + 1);
   }
+  if (host === '' || !host.startsWith('[') && host.includes(':')) return false;
+  if (port !== undefined) {
+    if (port === '') return false;
+    let number = 0;
+    for (let i = 0; i < port.length; i++) {
+      spend(work);
+      const digit = port.charCodeAt(i) - 48;
+      if (digit < 0 || digit > 9) return false;
+      number = number * 10 + digit;
+      if (number > 65535) return false;
+    }
+  }
+  try { return new URL('http://' + host).hostname.length > 0; }
+  catch { return false; }
+}
+function parsedUrl(value, allowNonUrl, work) {
+  const schemeEnd = value.indexOf(':'), start = schemeEnd + 3;
   const scheme = value.slice(0, schemeEnd).toLowerCase();
-  const special = ['http', 'https', 'ftp', 'ws', 'wss', 'file'].includes(scheme);
-  const start = schemeEnd + 3;
+  const special = ['http','https','ftp','ws','wss','file'].includes(scheme);
+  if (special && value.includes('\\')) return false;
   let end = start;
-  while (end < value.length && !'/?#'.includes(value[end]) && !(special && value[end] === '\\')) end++;
-  if (end === start || special && value.includes('\\')) return false;
-  const authority = value.slice(start, end);
-  const at = authority.lastIndexOf('@');
-  if (at >= 0 && (authority.indexOf('@') !== at || !urlRegion(authority, 0, at, work))) return false;
-  if (!urlRegion(value, end, value.length, work)) {
-    // A single # is a structural fragment delimiter; additional raw # is invalid.
-    const hash = value.indexOf('#', end);
-    if (hash < 0 || !urlRegion(value, end, hash, work) || !urlRegion(value, hash + 1, value.length, work)) return false;
-  }
+  while (end < value.length && !'/?#'.includes(value[end])) end++;
+  const authority = value.slice(start,end), at = authority.lastIndexOf('@');
+  if (at >= 0 && (authority.indexOf('@') !== at || !urlRegion(authority,0,at,work,allowNonUrl))) return false;
+  const hash = value.indexOf('#',end);
+  if (!urlRegion(value,end,hash < 0 ? value.length : hash,work,allowNonUrl) ||
+      hash >= 0 && !urlRegion(value,hash + 1,value.length,work,allowNonUrl)) return false;
   if (scheme === 'file') {
     if (authority.toLowerCase() === 'localhost' || at >= 0) return false;
     const path = value.slice(end);
@@ -153,6 +172,39 @@ function url(value, work) {
     }
     return parsed.hostname.length > 0;
   } catch { return false; }
+}
+function url(value, work) {
+  const schemeEnd = value.indexOf(':');
+  if (schemeEnd < 1 || value.slice(schemeEnd,schemeEnd + 3) !== '://') return false;
+  for (let i = 0; i < value.length; i++) {
+    spend(work);
+    const c = value.codePointAt(i);
+    if (whitespace(c)) return false;
+    if (c > 65535) i++;
+  }
+  const scheme = value.slice(0,schemeEnd).toLowerCase();
+  const special = ['http','https','ftp','ws','wss','file'].includes(scheme);
+  const start = schemeEnd + 3;
+  let end = start;
+  while (end < value.length && !'/?#'.includes(value[end])) end++;
+  const authority = value.slice(start,end), at = authority.lastIndexOf('@');
+  const hosts = authority.slice(at + 1);
+  if (hosts === '' || [...'\\^{}|'].some(c=>hosts.includes(c))) return false;
+  const allowNonUrl = special ? at >= 0 && parsedUrl(value.slice(0,start) + hosts + value.slice(end),false,work) : true;
+  let candidate = value;
+  if (hosts.includes(',')) {
+    if (special) return false;
+    let previous = 0;
+    for (let i = 0; i <= hosts.length; i++) {
+      spend(work);
+      if (i === hosts.length || hosts[i] === ',') {
+        if (!validDatabaseEndpoint(hosts.slice(previous,i),work)) return false;
+        previous = i + 1;
+      }
+    }
+    candidate = value.slice(0,start + at + 1) + hosts.slice(0,hosts.indexOf(',')) + value.slice(end);
+  }
+  return parsedUrl(candidate,allowNonUrl,work);
 }
 
 function converted(value, format, work) {
