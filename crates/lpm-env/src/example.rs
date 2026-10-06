@@ -88,7 +88,7 @@ pub fn generate(schema: &EnvSchema) -> String {
             comment.push_str("default: ");
             comment.push_str(default);
         }
-        for line in comment.lines() {
+        for line in comment.lines().flat_map(|line| line.split('\r')) {
             output.push_str("# ");
             output.push_str(line);
             output.push('\n');
@@ -254,5 +254,22 @@ mod tests {
             generate(&schema),
             "#  · required\nA=\n\n# first\n# second · default: line1\n# line2\nB=\"line1\\nline2\"\n"
         );
+    }
+
+    #[test]
+    fn carriage_returns_cannot_turn_example_comments_into_assignments() {
+        for field in ["description", "default", "pattern"] {
+            let schema: EnvSchema = serde_json::from_value(serde_json::json!({
+                "vars": {"TOKEN": {field: "safe\rINJECTED=value"}}
+            }))
+            .unwrap();
+            let normalized = generate(&schema).replace('\r', "\n");
+            assert!(
+                normalized
+                    .lines()
+                    .all(|line| !line.starts_with("INJECTED=")),
+                "uncommented assignment from {field}: {normalized}"
+            );
+        }
     }
 }

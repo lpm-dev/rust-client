@@ -527,7 +527,7 @@ pub(crate) struct DevArgs {
     #[arg(long)]
     pub(crate) no_https: bool,
 
-    /// Skip environment variable schema validation.
+    /// Skip environment value checks and schema defaults. Declarations must remain valid.
     #[arg(long)]
     pub(crate) no_env_check: bool,
 

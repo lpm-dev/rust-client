@@ -88,7 +88,7 @@ pub(crate) struct RunArgs {
     #[arg(long)]
     pub(crate) no_cache: bool,
 
-    /// Skip environment variable schema validation.
+    /// Skip environment value checks and schema defaults. Declarations must remain valid.
     #[arg(long)]
     pub(crate) no_env_check: bool,
 
@@ -107,7 +107,7 @@ pub(crate) struct ExecArgs {
     #[arg(long)]
     pub(crate) env: Option<String>,
 
-    /// Skip environment variable schema validation.
+    /// Skip environment value checks and schema defaults. Declarations must remain valid.
     #[arg(long)]
     pub(crate) no_env_check: bool,
 
@@ -128,7 +128,7 @@ pub(crate) struct RunFileArgs {
     /// File to execute (e.g., src/seed.ts, scripts/migrate.js).
     pub(crate) file: String,
 
-    /// Skip environment variable schema validation.
+    /// Skip environment value checks and schema defaults. Declarations must remain valid.
     #[arg(long)]
     pub(crate) no_env_check: bool,
 
