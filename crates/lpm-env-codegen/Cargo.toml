@@ -1,0 +1,24 @@
+[package]
+name = "lpm-env-codegen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic JavaScript and TypeScript environment validation modules"
+
+[dependencies]
+lpm-env.workspace = true
+lpm-env-source.workspace = true
+regex-automata.workspace = true
+regex-syntax = "=0.8.10"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

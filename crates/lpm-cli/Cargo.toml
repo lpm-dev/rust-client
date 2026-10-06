@@ -16,6 +16,7 @@ lpm-common = { workspace = true }
 lpm-auth = { workspace = true }
 lpm-http = { workspace = true }
 lpm-env = { workspace = true }
+lpm-env-codegen.workspace = true
 lpm-env-source.workspace = true
 lpm-global = { workspace = true }
 lpm-semver = { workspace = true }

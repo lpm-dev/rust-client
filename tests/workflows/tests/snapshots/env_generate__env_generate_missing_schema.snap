@@ -1,0 +1,16 @@
+---
+source: tests/workflows/tests/env_generate.rs
+assertion_line: 143
+expression: response
+---
+{
+  "command": "env.generate",
+  "success": false,
+  "check": true,
+  "diagnostics": [
+    {
+      "code": "env.schema_missing",
+      "recoveryDirectory": null
+    }
+  ]
+}

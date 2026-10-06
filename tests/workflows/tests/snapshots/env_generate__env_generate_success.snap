@@ -1,0 +1,25 @@
+---
+source: tests/workflows/tests/env_generate.rs
+assertion_line: 27
+expression: response
+---
+{
+  "command": "env.generate",
+  "success": true,
+  "check": false,
+  "directory": "env.generated",
+  "identity": "[identity]",
+  "context": {
+    "environment": "production",
+    "stage": "build",
+    "service": null
+  },
+  "files": [
+    "server.js",
+    "server.d.ts",
+    "client.js",
+    "client.d.ts",
+    "package.json",
+    ".lpm-env-generated.json"
+  ]
+}

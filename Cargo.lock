@@ -3407,6 +3407,7 @@ dependencies = [
  "lpm-common",
  "lpm-dashboard",
  "lpm-env",
+ "lpm-env-codegen",
  "lpm-env-source",
  "lpm-extractor",
  "lpm-global",
@@ -3550,6 +3551,21 @@ dependencies = [
  "tempfile",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "lpm-env-codegen"
+version = "0.79.0"
+dependencies = [
+ "lpm-env",
+ "lpm-env-source",
+ "regex-automata",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
