@@ -957,3 +957,34 @@ fn framework_adapter_source_cannot_allocate_beyond_its_module_budget() {
         );
     }
 }
+
+#[test]
+fn generated_urls_accept_raw_path_punctuation_and_database_password_at_signs() {
+    let schema = schema(json!({"vars":{"VALUE":{"format":"url"}}}));
+    let inputs = [
+        "https://fonts.googleapis.com/css?family=Roboto|Open+Sans",
+        "https://host/a^b",
+        "https://host/{x}?q=\"<>`",
+        "ws://host/a|b",
+        "ftp://host/a{x}",
+        "postgres://user:p@ss@host/db",
+    ]
+    .map(|value| json!({"VALUE":value}));
+    assert_parity(&schema, &inputs, EvalContext::default());
+}
+
+#[test]
+fn generated_file_urls_only_reject_complete_drive_segments() {
+    let schema = schema(json!({"vars":{"VALUE":{"format":"url"}}}));
+    let inputs = [
+        "file://host/c:1",
+        "file://host/c:x/y",
+        "file://host/c:",
+        "file://host/c:/x",
+        "file://host/%2e/c:1",
+        "file://host/x/%2e%2e/c:x/y",
+        "file://host/%2e/c:/x",
+    ]
+    .map(|value| json!({"VALUE":value}));
+    assert_parity(&schema, &inputs, EvalContext::default());
+}

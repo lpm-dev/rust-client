@@ -37,7 +37,7 @@ pub(super) fn run(
             if json_output {
                 println!(
                     "{}",
-                    serde_json::json!({"command":"env.generate","success":false,"check":check,"diagnostics":[{"code":error.code(),"recoveryDirectory":error.recovery_directory()}]})
+                    serde_json::json!({"command":"env.generate","success":false,"check":check,"diagnostics":[error.diagnostic()]})
                 );
                 Err(LpmError::ExitCode(1))
             } else {
@@ -54,6 +54,14 @@ pub(super) fn run(
 enum Error {
     #[error("{0}")]
     Code(&'static str),
+    #[error("env.generate_configuration: {0}")]
+    Configuration(String),
+    #[error(transparent)]
+    Schema(lpm_env_source::SourceError),
+    #[error("env.generate_invalid_context: {0}")]
+    Context(String),
+    #[error("env.generate_unowned_directory: {issue} {entry:?}")]
+    Ownership { entry: String, issue: &'static str },
     #[error(transparent)]
     Generate(#[from] lpm_env_codegen::GenerateError),
     #[error("env.generate_recovery_required: retained transaction at {directory:?}")]
@@ -64,8 +72,26 @@ impl Error {
     fn code(&self) -> String {
         match self {
             Self::Recovery { .. } => "env.generate_recovery_required".into(),
+            Self::Configuration(_) => "env.generate_configuration".into(),
+            Self::Schema(error) => error.diagnostic.code.into(),
+            Self::Context(_) => "env.generate_invalid_context".into(),
+            Self::Ownership { .. } => "env.generate_unowned_directory".into(),
             _ => self.to_string(),
         }
+    }
+    fn diagnostic(&self) -> serde_json::Value {
+        let mut diagnostic = match self {
+            Self::Schema(error) => serde_json::json!(error.diagnostic),
+            Self::Configuration(message) | Self::Context(message) => {
+                serde_json::json!({"code":self.code(), "source":"lpm.json", "message":message})
+            }
+            Self::Ownership { entry, issue } => {
+                serde_json::json!({"code":self.code(), "entry":entry, "message":issue})
+            }
+            _ => serde_json::json!({"code":self.code()}),
+        };
+        diagnostic["recoveryDirectory"] = serde_json::json!(self.recovery_directory());
+        diagnostic
     }
     fn recovery_hint(&self) -> &'static str {
         match self {
@@ -74,13 +100,20 @@ impl Error {
             }
             Self::Code("env.schema_missing") => "Add envSchema to lpm.json, then retry.",
             Self::Code("env.generate_stale") => {
-                "Run `lpm env generate` to update the generated files."
+                "Rerun the same command without --check to update the generated files."
+            }
+            Self::Ownership {
+                issue: "extra entry",
+                ..
+            } => "Remove extra files from the output directory, then rerun the same command.",
+            Self::Ownership { .. } => {
+                "Restore modified files from version control, or move the generated directory aside before retrying."
             }
             Self::Code("env.generate_unowned_directory") => {
                 "Choose an empty output directory, or move the existing directory aside before retrying."
             }
             Self::Code("env.generate_path") => {
-                "Choose a relative output directory inside the project. Do not use parent-directory paths."
+                "Choose a relative output directory inside the project with portable names. Avoid reserved Windows names, trailing dots or spaces, and : < > \" | ? * or backslashes."
             }
             Self::Generate(lpm_env_codegen::GenerateError::AdapterPrefix) => {
                 "Use the adapter's public prefix, or choose a different adapter."
@@ -145,8 +178,16 @@ fn generate(
     let (snapshot, canonical, artifacts) = {
         let config = {
             let root = read_root(project)?;
-            lpm_runner::lpm_json::parse_lpm_json_in_detailed(project, &root)
-                .map_err(|_| Error::Code("env.generate_configuration"))?
+            lpm_runner::lpm_json::parse_lpm_json_in_detailed(project, &root).map_err(|error| {
+                match error {
+                    lpm_runner::lpm_json::ConfigReadError::Configuration(message) => {
+                        Error::Configuration(message)
+                    }
+                    lpm_runner::lpm_json::ConfigReadError::Schema { error, .. } => {
+                        Error::Schema(error)
+                    }
+                }
+            })?
         };
         let schema = config
             .env_schema
@@ -158,8 +199,16 @@ fn generate(
                 .as_ref()
                 .ok_or(Error::Code("env.schema_missing"))?,
         );
+        if let Some(service) = &scope.service
+            && !config.services.is_empty()
+            && !config.services.contains_key(service)
+        {
+            return Err(Error::Context(format!(
+                "unknown service {service:?}; select a configured service"
+            )));
+        }
         let selected = lpm_runner::dotenv::resolve_project_environment(environment, Some(&config))
-            .map_err(|_| Error::Code("env.generate_invalid_context"))?;
+            .map_err(|error| Error::Context(error.to_string()))?;
         let artifacts = lpm_env_codegen::generate(
             schema,
             lpm_env_codegen::Options {

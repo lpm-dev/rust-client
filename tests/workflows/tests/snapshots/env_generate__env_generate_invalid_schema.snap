@@ -1,0 +1,19 @@
+---
+source: tests/workflows/tests/env_generate.rs
+expression: response
+---
+{
+  "command": "env.generate",
+  "success": false,
+  "check": false,
+  "diagnostics": [
+    {
+      "code": "env.invalid_pattern",
+      "phase": "definition",
+      "source": "base.json",
+      "pointer": "/vars/VALUE",
+      "key": "VALUE",
+      "recoveryDirectory": null
+    }
+  ]
+}

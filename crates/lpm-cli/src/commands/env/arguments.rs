@@ -27,7 +27,7 @@ fn service_name(value: &str) -> Result<String, String> {
 }
 
 #[derive(Parser)]
-#[command(name = "lpm env", disable_help_flag = true)]
+#[command(name = "lpm env")]
 struct LocalCommand {
     #[command(subcommand)]
     action: LocalAction,
@@ -169,7 +169,11 @@ pub(super) fn parse(args: &[&str]) -> Result<Option<LocalAction>, LpmError> {
     }
     LocalCommand::try_parse_from(std::iter::once("lpm env").chain(args.iter().copied()))
         .map(|command| Some(command.action))
-        .map_err(|error| LpmError::Script(error.to_string()))
+        .map_err(|error| {
+            let status = if error.use_stderr() { 2 } else { 0 };
+            let _ = error.print();
+            LpmError::ExitCode(status)
+        })
 }
 
 fn adapter(value: &str) -> Result<lpm_env_codegen::Adapter, String> {

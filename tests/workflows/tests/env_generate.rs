@@ -304,3 +304,184 @@ fn env_generate_remains_owned_after_a_git_autocrlf_checkout() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn env_generate_reports_schema_source_and_pointer_in_json_and_human_output() {
+    let project = project();
+    project.write_file("lpm.json", r#"{"envSchema":{"extends":["base.json"]}}"#);
+    project.write_file("base.json", r#"{"vars":{"VALUE":{"pattern":"["}}}"#);
+    for json in [false, true] {
+        let mut command = lpm(&project);
+        command.args(["env", "generate"]);
+        if json {
+            command.arg("--json");
+        }
+        let output = command.output().unwrap();
+        assert!(!output.status.success());
+        if json {
+            let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(response["diagnostics"][0]["code"], "env.invalid_pattern");
+            assert_eq!(response["diagnostics"][0]["source"], "base.json");
+            assert_eq!(response["diagnostics"][0]["pointer"], "/vars/VALUE");
+            insta::assert_json_snapshot!("env_generate_invalid_schema", response);
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("env.invalid_pattern") && stderr.contains("base.json/vars/VALUE"),
+                "{stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn env_generate_names_unowned_extra_and_modified_files_without_overwriting_them() {
+    for (entry, extra) in [(".DS_Store", true), ("server.js", false)] {
+        let project = project();
+        lpm(&project).args(["env", "generate"]).assert().success();
+        project.write_file(&format!("env.generated/{entry}"), "user-owned");
+        for check in [false, true] {
+            let mut command = lpm(&project);
+            command.args(["env", "generate"]);
+            if check {
+                command.arg("--check");
+            }
+            let output = command.output().unwrap();
+            assert!(!output.status.success());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(entry), "{stderr}");
+            assert!(
+                stderr.contains(if extra {
+                    "Remove extra files"
+                } else {
+                    "Restore modified files"
+                }),
+                "{stderr}"
+            );
+            assert_eq!(
+                project.read_file(&format!("env.generated/{entry}")),
+                "user-owned"
+            );
+        }
+    }
+}
+
+#[test]
+fn env_generate_stale_hint_retains_the_original_invocation() {
+    let project = project();
+    lpm(&project)
+        .args([
+            "env",
+            "generate",
+            "--adapter",
+            "vite",
+            "--env",
+            "release",
+            "--out-dir",
+            "typed.env",
+        ])
+        .assert()
+        .success();
+    let config = project.read_file("lpm.json").replace("3000", "3001");
+    project.write_file("lpm.json", &config);
+    let output = lpm(&project)
+        .args([
+            "env",
+            "generate",
+            "--adapter",
+            "vite",
+            "--env",
+            "release",
+            "--out-dir",
+            "typed.env",
+            "--check",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("same command without --check"), "{stderr}");
+}
+
+#[test]
+fn env_generate_path_errors_explain_portable_names() {
+    let project = project();
+    for path in ["con.json", "bad:name", "name.", "name "] {
+        let output = lpm(&project)
+            .args(["env", "generate", "--out-dir", path])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("portable") && stderr.contains("reserved"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn env_generate_rejects_unconfigured_services_and_allows_abstract_contexts() {
+    for configured in [false, true] {
+        let project = project();
+        let mut config: serde_json::Value =
+            serde_json::from_str(&project.read_file("lpm.json")).unwrap();
+        if configured {
+            config["services"] = serde_json::json!({"api":{"command":"node api.js"}});
+        }
+        project.write_file("lpm.json", &config.to_string());
+        let output = lpm(&project)
+            .args(["env", "generate", "--service", "apii", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.success(),
+            !configured,
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(project.path().join("env.generated").exists(), !configured);
+    }
+}
+
+#[test]
+fn env_help_lists_generation_and_action_help_exits_successfully() {
+    let project = project();
+    let output = lpm(&project).args(["env", "--help"]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("generate") && stdout.contains("schema"),
+        "{stdout}"
+    );
+    for action in ["generate", "schema", "check", "print"] {
+        let output = lpm(&project)
+            .args(["env", action, "--help"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Usage:"));
+    }
+}
+
+#[test]
+fn env_generate_flag_errors_do_not_suggest_package_scripts() {
+    let project = project();
+    for args in [["--adapter", "typo"], ["--stage", "typo"]] {
+        let output = lpm(&project)
+            .args(["env", "generate"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("Script error") && !stderr.contains("package.json scripts"),
+            "{stderr}"
+        );
+    }
+}

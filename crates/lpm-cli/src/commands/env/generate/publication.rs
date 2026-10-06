@@ -143,7 +143,7 @@ fn read(directory: &Dir, name: &str) -> Result<Vec<u8>, Error> {
     let file = code(directory.open_with(name, &options))?;
     let metadata = code(file.metadata())?;
     if !metadata.is_file() || is_reparse(&metadata) || metadata.len() > MAX_OUTPUT_BYTES as u64 {
-        return Err(Error::Code("env.generate_unowned_directory"));
+        return Err(ownership(OsStr::new(name), "unsafe generated file"));
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     code(
@@ -151,7 +151,7 @@ fn read(directory: &Dir, name: &str) -> Result<Vec<u8>, Error> {
             .read_to_end(&mut bytes),
     )?;
     if bytes.len() > MAX_OUTPUT_BYTES {
-        return Err(Error::Code("env.generate_unowned_directory"));
+        return Err(ownership(OsStr::new(name), "unsafe generated file"));
     }
     Ok(bytes)
 }
@@ -174,6 +174,17 @@ struct Manifest {
     files: BTreeMap<String, String>,
 }
 
+fn ownership(entry: &OsStr, issue: &'static str) -> Error {
+    Error::Ownership {
+        entry: entry
+            .to_string_lossy()
+            .chars()
+            .flat_map(char::escape_default)
+            .collect(),
+        issue,
+    }
+}
+
 fn inventory(directory: &Dir) -> Result<(), Error> {
     let mut count = 0;
     for entry in code(directory.entries())? {
@@ -182,19 +193,29 @@ fn inventory(directory: &Dir) -> Result<(), Error> {
             .iter()
             .any(|name| entry.file_name() == OsStr::new(name))
         {
-            return Err(Error::Code("env.generate_unowned_directory"));
+            return Err(ownership(&entry.file_name(), "extra entry"));
         }
         let metadata = code(directory.symlink_metadata(entry.file_name()))?;
         if !metadata.is_file() || is_reparse(&metadata) {
-            return Err(Error::Code("env.generate_unowned_directory"));
+            return Err(ownership(&entry.file_name(), "unsafe entry"));
         }
         count += 1;
     }
     if count != OWNED_FILES.len() {
-        return Err(Error::Code("env.generate_unowned_directory"));
+        let missing = OWNED_FILES
+            .iter()
+            .find(|name| directory.symlink_metadata(**name).is_err())
+            .copied()
+            .unwrap_or(".lpm-env-generated.json");
+        return Err(ownership(OsStr::new(missing), "missing generated file"));
     }
     let manifest: Manifest = serde_json::from_slice(&read(directory, ".lpm-env-generated.json")?)
-        .map_err(|_| Error::Code("env.generate_unowned_directory"))?;
+        .map_err(|_| {
+        ownership(
+            OsStr::new(".lpm-env-generated.json"),
+            "invalid ownership manifest",
+        )
+    })?;
     let hash = |value: &str| {
         value.len() == 64
             && value
@@ -208,11 +229,14 @@ fn inventory(directory: &Dir) -> Result<(), Error> {
             .iter()
             .any(|name| !manifest.files.get(*name).is_some_and(|value| hash(value)))
     {
-        return Err(Error::Code("env.generate_unowned_directory"));
+        return Err(ownership(
+            OsStr::new(".lpm-env-generated.json"),
+            "invalid ownership manifest",
+        ));
     }
     for (name, digest) in manifest.files {
         if lpm_env_codegen::checksum(&read(directory, &name)?) != digest {
-            return Err(Error::Code("env.generate_unowned_directory"));
+            return Err(ownership(OsStr::new(&name), "modified generated file"));
         }
     }
     Ok(())

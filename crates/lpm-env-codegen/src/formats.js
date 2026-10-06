@@ -102,17 +102,13 @@ function hex(c) { return c >= 48 && c <= 57 || c >= 65 && c <= 70 || c >= 97 && 
 function whitespace(c) {
   return c <= 32 || c >= 127 && c <= 160 || c === 5760 || c >= 8192 && c <= 8202 || c === 8232 || c === 8233 || c === 8239 || c === 8287 || c === 12288;
 }
-function urlPoint(c) {
-  if (c < 128) return c >= 48 && c <= 57 || c >= 65 && c <= 90 || c >= 97 && c <= 122 || "!$&'()*+,-./:;=?@_~".includes(String.fromCharCode(c));
-  return c >= 160 && !(c >= 64976 && c <= 65007 || (c & 65535) >= 65534 || c >= 917504 && c <= 921599);
-}
-function urlRegion(value, start, end, work, allowNonUrl = false) {
+function urlRegion(value, start, end, work) {
   for (let i = start; i < end; i++) {
     spend(work);
     const c = value.codePointAt(i);
     if (c === 37) {
       if (i + 2 >= end || !hex(value.charCodeAt(i + 1)) || !hex(value.charCodeAt(i + 2))) return false;
-    } else if (!allowNonUrl && !urlPoint(c)) return false;
+    }
     if (c > 65535) i++;
   }
   return true;
@@ -147,7 +143,12 @@ function validDatabaseEndpoint(endpoint, work) {
   try { return new URL('http://' + host).hostname.length > 0; }
   catch { return false; }
 }
-function parsedUrl(value, allowNonUrl, work) {
+function fileDriveSegment(path) {
+  const c = path.charCodeAt(1);
+  return path[0] === '/' && (c >= 65 && c <= 90 || c >= 97 && c <= 122) &&
+    (path[2] === ':' || path[2] === '|') && (path.length === 3 || '/?#'.includes(path[3]));
+}
+function parsedUrl(value, work) {
   const schemeEnd = value.indexOf(':'), start = schemeEnd + 3;
   const scheme = value.slice(0, schemeEnd).toLowerCase();
   const special = ['http','https','ftp','ws','wss','file'].includes(scheme);
@@ -155,21 +156,18 @@ function parsedUrl(value, allowNonUrl, work) {
   let end = start;
   while (end < value.length && !'/?#'.includes(value[end])) end++;
   const authority = value.slice(start,end), at = authority.lastIndexOf('@');
-  if (at >= 0 && (authority.indexOf('@') !== at || !urlRegion(authority,0,at,work,allowNonUrl))) return false;
+  if (at >= 0 && !urlRegion(authority,0,at,work)) return false;
   const hash = value.indexOf('#',end);
-  if (!urlRegion(value,end,hash < 0 ? value.length : hash,work,allowNonUrl) ||
-      hash >= 0 && !urlRegion(value,hash + 1,value.length,work,allowNonUrl)) return false;
+  if (!urlRegion(value,end,hash < 0 ? value.length : hash,work) ||
+      hash >= 0 && !urlRegion(value,hash + 1,value.length,work)) return false;
   if (scheme === 'file') {
     if (authority.toLowerCase() === 'localhost' || at >= 0) return false;
     const path = value.slice(end);
-    if (path.length >= 3 && path[0] === '/' && /[A-Za-z]/.test(path[1]) && (path[2] === ':' || path[2] === '|')) return false;
+    if (fileDriveSegment(path)) return false;
   }
   try {
     const parsed = new URL(value);
-    if (scheme === 'file' && parsed.pathname.length >= 3 && parsed.pathname[0] === '/') {
-      const c = parsed.pathname.charCodeAt(1);
-      if ((c >= 65 && c <= 90 || c >= 97 && c <= 122) && parsed.pathname[2] === ':') return false;
-    }
+    if (scheme === 'file' && fileDriveSegment(parsed.pathname)) return false;
     return parsed.hostname.length > 0;
   } catch { return false; }
 }
@@ -189,8 +187,7 @@ function url(value, work) {
   while (end < value.length && !'/?#'.includes(value[end])) end++;
   const authority = value.slice(start,end), at = authority.lastIndexOf('@');
   const hosts = authority.slice(at + 1);
-  if (hosts === '' || [...'\\^{}|'].some(c=>hosts.includes(c))) return false;
-  const allowNonUrl = special ? at >= 0 && parsedUrl(value.slice(0,start) + hosts + value.slice(end),false,work) : true;
+  if (hosts === '' || [...'\\^{}|\"<>`'].some(c=>hosts.includes(c))) return false;
   let candidate = value;
   if (hosts.includes(',')) {
     if (special) return false;
@@ -204,7 +201,7 @@ function url(value, work) {
     }
     candidate = value.slice(0,start + at + 1) + hosts.slice(0,hosts.indexOf(',')) + value.slice(end);
   }
-  return parsedUrl(candidate,allowNonUrl,work);
+  return parsedUrl(candidate,work);
 }
 
 function converted(value, format, work) {
