@@ -65,12 +65,14 @@ pub(super) async fn vars_push(
         ));
     }
 
-    let schema_snapshot = manifest.sources;
+    let schema_snapshot = manifest
+        .sources
+        .ok_or_else(|| LpmError::Script("env.source_changed at lpm.json/envSchema".into()))?;
+    let vault_manifest = std::sync::Arc::new(manifest.vault);
     let config = manifest.config;
 
-    let project_name = manifest.vault.project_name(project_dir);
-    let expected_principal_id = manifest
-        .vault
+    let project_name = vault_manifest.project_name(project_dir);
+    let expected_principal_id = vault_manifest
         .personal_expected_principal_for_registry(client.base_url())
         .map_err(LpmError::Script)?;
 
@@ -112,17 +114,12 @@ pub(super) async fn vars_push(
             let project_name = project_name.clone();
             let schema_value = std::sync::Arc::clone(&schema_value);
             let schema_snapshot = schema_snapshot.clone();
+            let current_manifest = std::sync::Arc::clone(&vault_manifest);
             let vault_id = vault_id.clone();
             let secrets_json = std::sync::Arc::clone(&secrets_json);
             let project_dir = project_dir.clone();
             let expected_principal_id = expected_principal_id.clone();
             async move {
-                let current_manifest = super::sync_payload::fresh_personal_mutation_manifest(
-                    &project_dir,
-                    &vault_id,
-                    &registry_url,
-                    expected_principal_id.as_deref(),
-                )?;
                 let sync_principal_id = current_manifest
                     .personal_sync_principal_for_registry(&registry_url)?;
                 let expected_version = if let Some(sync_principal_id) = sync_principal_id.as_deref() {
@@ -143,7 +140,7 @@ pub(super) async fn vars_push(
                 } else {
                     None
                 };
-                let before_write = || super::sync_payload::verify_schema_snapshot(&project_dir, schema_snapshot.as_deref());
+                let before_write = || super::sync_payload::verify_personal_mutation_snapshot(&project_dir, &vault_id, &registry_url, expected_principal_id.as_deref(), &schema_snapshot);
                 let push_metadata = lpm_vault::sync::PushMetadata {
                     name: Some(&project_name),
                     schema: schema_value.as_ref().as_ref(),

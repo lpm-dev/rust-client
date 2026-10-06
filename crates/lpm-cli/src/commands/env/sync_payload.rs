@@ -80,12 +80,69 @@ pub(super) fn verify_schema_snapshot(
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     )
     .map_err(|_| "env.source_changed at lpm.json/envSchema".to_string())?;
+    verify_schema_snapshot_content(snapshot, &content)
+}
+
+fn verify_schema_snapshot_content(
+    snapshot: &lpm_env_source::SchemaSnapshot,
+    content: &str,
+) -> Result<(), String> {
     if !snapshot.matches_root_content(content.as_bytes()) {
         return Err("env.source_changed at lpm.json/envSchema".into());
     }
     snapshot
         .verify_dependencies()
         .map_err(|error| error.to_string())
+}
+
+pub(super) fn verify_personal_mutation_snapshot(
+    project_dir: &std::path::Path,
+    expected_vault_id: &str,
+    registry_url: &str,
+    expected_principal_id: Option<&str>,
+    sources: &lpm_env_source::SchemaSnapshot,
+) -> Result<(), String> {
+    let content = read_mutation_manifest_content(project_dir)?;
+    let manifest = lpm_vault::vault_id::VaultManifestSnapshot::parse(
+        lpm_common::strip_utf8_bom_str(&content),
+    )?;
+    verify_personal_mutation_manifest(
+        &manifest,
+        expected_vault_id,
+        registry_url,
+        expected_principal_id,
+    )?;
+    verify_schema_snapshot_content(sources, &content)
+}
+
+pub(super) fn verify_org_mutation_snapshot(
+    project_dir: &std::path::Path,
+    expected_vault_id: &str,
+    org_slug: &str,
+    registry_url: &str,
+    expected_principal_id: Option<&str>,
+    sources: &lpm_env_source::SchemaSnapshot,
+) -> Result<(), String> {
+    let content = read_mutation_manifest_content(project_dir)?;
+    let manifest = lpm_vault::vault_id::VaultManifestSnapshot::parse(
+        lpm_common::strip_utf8_bom_str(&content),
+    )?;
+    verify_org_mutation_manifest(
+        &manifest,
+        expected_vault_id,
+        org_slug,
+        registry_url,
+        expected_principal_id,
+    )?;
+    verify_schema_snapshot_content(sources, &content)
+}
+
+fn read_mutation_manifest_content(project_dir: &std::path::Path) -> Result<String, String> {
+    lpm_common::read_text_file_capped(
+        &project_dir.join("lpm.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .map_err(|error| format!("failed to read lpm.json: {error}"))
 }
 
 pub(super) fn fresh_personal_mutation_manifest(
@@ -95,12 +152,27 @@ pub(super) fn fresh_personal_mutation_manifest(
     expected_principal_id: Option<&str>,
 ) -> Result<lpm_vault::vault_id::VaultManifestSnapshot, String> {
     let manifest = lpm_vault::vault_id::VaultManifestSnapshot::read(project_dir)?;
-    verify_fresh_vault_id(&manifest, expected_vault_id)?;
+    verify_personal_mutation_manifest(
+        &manifest,
+        expected_vault_id,
+        registry_url,
+        expected_principal_id,
+    )?;
+    Ok(manifest)
+}
+
+fn verify_personal_mutation_manifest(
+    manifest: &lpm_vault::vault_id::VaultManifestSnapshot,
+    expected_vault_id: &str,
+    registry_url: &str,
+    expected_principal_id: Option<&str>,
+) -> Result<(), String> {
+    verify_fresh_vault_id(manifest, expected_vault_id)?;
     let current_principal = manifest.personal_expected_principal_for_registry(registry_url)?;
     if current_principal.as_deref() != expected_principal_id {
         return Err("the personal env manifest principal changed before the cloud write".into());
     }
-    Ok(manifest)
+    Ok(())
 }
 
 pub(super) fn fresh_org_mutation_manifest(
@@ -111,14 +183,31 @@ pub(super) fn fresh_org_mutation_manifest(
     expected_principal_id: Option<&str>,
 ) -> Result<lpm_vault::vault_id::VaultManifestSnapshot, String> {
     let manifest = lpm_vault::vault_id::VaultManifestSnapshot::read(project_dir)?;
-    verify_fresh_vault_id(&manifest, expected_vault_id)?;
+    verify_org_mutation_manifest(
+        &manifest,
+        expected_vault_id,
+        org_slug,
+        registry_url,
+        expected_principal_id,
+    )?;
+    Ok(manifest)
+}
+
+fn verify_org_mutation_manifest(
+    manifest: &lpm_vault::vault_id::VaultManifestSnapshot,
+    expected_vault_id: &str,
+    org_slug: &str,
+    registry_url: &str,
+    expected_principal_id: Option<&str>,
+) -> Result<(), String> {
+    verify_fresh_vault_id(manifest, expected_vault_id)?;
     let current_principal = manifest.org_sync_principal_for_registry(org_slug, registry_url)?;
     if current_principal.as_deref() != expected_principal_id {
         return Err(
             "the organization env manifest principal changed before the cloud write".into(),
         );
     }
-    Ok(manifest)
+    Ok(())
 }
 
 fn verify_fresh_vault_id(
@@ -370,6 +459,74 @@ mod tests {
         assert!(metadata["environments"].get("bad").is_none());
         assert_eq!(metadata["environments"]["unit"]["file"], "config/unit.env");
         assert_eq!(metadata["environments"]["base"], ".env");
+    }
+
+    #[test]
+    fn mutation_rejects_root_changes_without_authored_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"captured-env"}"#).unwrap();
+        let captured = CloudManifestSnapshot::read(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"vault":"captured-env","name":"changed"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            verify_personal_mutation_snapshot(
+                dir.path(),
+                "captured-env",
+                "https://lpm.dev",
+                None,
+                captured.sources.as_deref().unwrap()
+            )
+            .unwrap_err(),
+            "env.source_changed at lpm.json/envSchema"
+        );
+        assert_eq!(
+            verify_org_mutation_snapshot(
+                dir.path(),
+                "captured-env",
+                "acme",
+                "https://lpm.dev",
+                None,
+                captured.sources.as_deref().unwrap()
+            )
+            .unwrap_err(),
+            "env.source_changed at lpm.json/envSchema"
+        );
+    }
+
+    #[test]
+    fn personal_mutation_accepts_an_unchanged_bom_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "\u{feff}{\"vault\":\"bom-env\"}";
+        std::fs::write(dir.path().join("lpm.json"), content).unwrap();
+        let captured = CloudManifestSnapshot::read(dir.path()).unwrap();
+        verify_personal_mutation_snapshot(
+            dir.path(),
+            "bom-env",
+            "https://lpm.dev",
+            None,
+            captured.sources.as_deref().unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn org_mutation_accepts_an_unchanged_bom_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "\u{feff}{\"vault\":\"bom-env\"}";
+        std::fs::write(dir.path().join("lpm.json"), content).unwrap();
+        let captured = CloudManifestSnapshot::read(dir.path()).unwrap();
+        verify_org_mutation_snapshot(
+            dir.path(),
+            "bom-env",
+            "acme",
+            "https://lpm.dev",
+            None,
+            captured.sources.as_deref().unwrap(),
+        )
+        .unwrap();
     }
 
     // ── env push schema metadata helpers ────────────────────────────
