@@ -364,7 +364,11 @@ impl<'a> EnvValidator<'a> {
                 || !prefixes_invalid && self.schema.has_client_prefix(key))
                 != rule.client
             {
-                Some("client visibility must match a framework or declared client prefix")
+                Some(if rule.client {
+                    "client-visible keys must use a framework or declared client prefix; rename the key or add its prefix to clientPrefixes"
+                } else {
+                    "public-prefix keys require client: true; remove secret: true or rename the key to keep it private"
+                })
             } else {
                 None
             };
@@ -1875,6 +1879,16 @@ mod tests {
             let schema = schema_from_json(&format!(r#"{{"vars":{{"{name}":{{"secret":true}}}}}}"#));
             assert!(!validate_schema(&schema).is_empty(), "{name}");
         }
+    }
+
+    #[test]
+    fn public_prefix_errors_explain_client_visibility_remedy() {
+        let schema = schema_from_json(r#"{"vars":{"VITE_ENDPOINT":{}}}"#);
+        assert!(
+            validate_schema(&schema)[0]
+                .to_string()
+                .contains("client: true")
+        );
     }
 
     #[test]
