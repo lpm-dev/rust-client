@@ -361,6 +361,7 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
         canonical: String,
         var_count: usize,
         schema_status: Option<(usize, usize)>, // (valid, total)
+        schema_error: Option<String>,
         alias: Option<String>,
         source: lpm_env::EnvSource,
     }
@@ -375,32 +376,30 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
         let effective_vars = effective_schema_vars(&env.canonical, &vault_envs);
         let var_count = env_specific.map_or(0, |v| v.len());
 
+        let mut schema_error = None;
         let schema_status = if let (Some(schema), Some(validator)) = (schema, &validator) {
             let mode = (env.canonical != "default").then_some(env.canonical.as_str());
-            let mut values = lpm_runner::dotenv::load_project_env_files_with_config(
-                project_dir,
-                mode,
-                env.file_path.as_deref(),
-                config.as_ref(),
-            )?;
-            if let Some(stored) = effective_vars {
-                lpm_runner::dotenv::merge_stored_project_env(&mut values, stored)?;
-            }
-            let errors = validator.validate(&mut values);
-            let mut failed_variables = std::collections::HashSet::new();
-            let mut failed_groups = std::collections::HashSet::new();
-            for error in &errors {
-                if let lpm_env::ValidationErrorKind::GroupViolation { group, .. } = &error.kind {
-                    failed_groups.insert(group.as_str());
-                } else if schema.vars.contains_key(&error.key) {
-                    failed_variables.insert(error.key.as_str());
+            let evaluation = (|| -> Result<usize, LpmError> {
+                let mut values = lpm_runner::dotenv::load_project_env_files_with_config(
+                    project_dir,
+                    mode,
+                    env.file_path.as_deref(),
+                    config.as_ref(),
+                )?;
+                if let Some(stored) = effective_vars {
+                    lpm_runner::dotenv::merge_stored_project_env(&mut values, stored)?;
                 }
-            }
-            let total = schema.len() + schema.groups.len();
-            Some((
-                total.saturating_sub(failed_variables.len() + failed_groups.len()),
-                total,
-            ))
+                let errors = validator.validate(&mut values);
+                Ok(super::schema::valid_variable_count(schema, &errors))
+            })();
+            let valid = match evaluation {
+                Ok(valid) => valid,
+                Err(error) => {
+                    schema_error = Some(error.to_string());
+                    0
+                }
+            };
+            Some((valid, schema.len()))
         } else {
             None
         };
@@ -409,6 +408,7 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
             canonical: env.canonical.clone(),
             var_count,
             schema_status,
+            schema_error,
             alias: env.alias.clone(),
             source: env.source.clone(),
         });
@@ -427,6 +427,9 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
                 if let Some((valid, total)) = r.schema_status {
                     obj["schemaValid"] = serde_json::json!(valid);
                     obj["schemaTotal"] = serde_json::json!(total);
+                }
+                if let Some(error) = &r.schema_error {
+                    obj["schemaError"] = serde_json::json!(error);
                 }
                 obj
             })
@@ -460,21 +463,25 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
     );
 
     for row in &rows {
-        let schema_suffix = match row.schema_status {
-            Some((valid, total)) if total > 0 => {
-                if valid == total {
-                    install_ui::terminal_line!(
-                        " {}",
-                        install_ui::status_ok(&format!("{valid}/{total} ok")),
-                    )
-                } else {
-                    install_ui::terminal_line!(
-                        " {}",
-                        install_ui::red(&format!("{valid}/{total} !!")),
-                    )
+        let schema_suffix = if let Some(error) = &row.schema_error {
+            install_ui::terminal_line!(" {}", install_ui::red(error))
+        } else {
+            match row.schema_status {
+                Some((valid, total)) if total > 0 => {
+                    if valid == total {
+                        install_ui::terminal_line!(
+                            " {}",
+                            install_ui::status_ok(&format!("{valid}/{total} ok")),
+                        )
+                    } else {
+                        install_ui::terminal_line!(
+                            " {}",
+                            install_ui::red(&format!("{valid}/{total} !!")),
+                        )
+                    }
                 }
+                _ => install_ui::TerminalLine::new(""),
             }
-            _ => install_ui::TerminalLine::new(""),
         };
 
         let row_synced = sync_summary.synced && row.var_count > 0;
