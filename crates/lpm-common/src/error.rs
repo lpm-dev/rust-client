@@ -607,7 +607,7 @@ pub enum LpmError {
     #[diagnostic(
         code(lpm::env_validation),
         help(
-            "Resolve the reported error and retry. --no-env-check skips schema checks only. Env access checks still apply."
+            "Resolve the reported error and retry. --no-env-check skips value checks and defaults; declarations and identities must remain valid. Env access checks still apply."
         )
     )]
     EnvValidation(String),
@@ -907,6 +907,20 @@ mod tests {
         let err = LpmError::ExitCode(1);
         let code = err.code().unwrap();
         assert_eq!(code.to_string(), "lpm::exit_code");
+    }
+
+    #[test]
+    fn environment_validation_help_describes_value_bypass_and_required_admission() {
+        let help = LpmError::EnvValidation("invalid declaration".into())
+            .help()
+            .unwrap()
+            .to_string();
+        assert!(help.contains("skips value checks and defaults"), "{help}");
+        assert!(
+            help.contains("declarations and identities must remain valid"),
+            "{help}"
+        );
+        assert!(help.contains("access checks"), "{help}");
     }
 
     #[test]
