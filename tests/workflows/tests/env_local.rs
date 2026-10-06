@@ -2547,7 +2547,9 @@ fn env_check_reports_invalid_custom_path_alias_without_aborting_other_environmen
     );
     assert!(rows.iter().any(|row| {
         row["environment"] == "test:unit"
-            && ["test:unit", "portable alias", "tasks.<name>.env"].iter().all(|text| row["errors"][0]["error"].as_str().unwrap().contains(text))
+            && ["test:unit", "portable alias", "tasks.<name>.env"]
+                .iter()
+                .all(|text| row["errors"][0]["error"].as_str().unwrap().contains(text))
     }));
 }
 
