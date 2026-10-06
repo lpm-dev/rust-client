@@ -292,18 +292,25 @@ pub(super) async fn env_share(
     }
 
     if json_output {
-        super::response::print_json_value(&serde_json::json!({
+        let mut response = serde_json::json!({
             "success": true,
             "status": result.status,
             "org": org_slug,
             "version": result.version,
-        }));
+        });
+        if !result.warnings.is_empty() {
+            response["warnings"] = serde_json::json!(result.warnings);
+        }
+        super::response::print_json_value(&response);
     } else {
         output::success_line(install_ui::terminal_line!(
-            "vault shared with org {} (version {})",
+            "env shared with org {} (version {})",
             install_ui::bold(org_slug),
             install_ui::bold(&result.version.unwrap_or(0).to_string()),
         ));
+        for warning in &result.warnings {
+            output::warn(&format!("{} {}", warning.message, warning.hint));
+        }
     }
     Ok(())
 }

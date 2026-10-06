@@ -8911,3 +8911,154 @@ async fn assert_org_share_environments(all_empty: bool) {
     assert_eq!(envelope["success"], true);
     assert_eq!(envelope["version"], 1);
 }
+
+#[tokio::test]
+async fn env_push_reports_metadata_warnings_without_changing_success() {
+    for json in [false, true] {
+        let project = TempProject::empty(r#"{"name":"metadata-warning"}"#);
+        let mock = MockRegistry::start().await;
+        let vault_id = "metadata-warning-personal";
+        write_personal_bound_manifest(&project, &mock.url(), vault_id);
+        seed_sessions(
+            project.home(),
+            &[SessionSeed {
+                registry_url: &mock.url(),
+                access_token: Some("warning-token"),
+                refresh_token: Some("warning-refresh"),
+                session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+            }],
+        );
+        let output = lpm(&project)
+            .args(["env", "set", "TOKEN=dummy"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        mount_personal_ci_project(&project, &mock, vault_id, "warning-token").await;
+        Mock::given(method("POST")).and(path(format!("/api/vaults/{vault_id}/sync")))
+            .and(header("x-lpm-env-metadata-warnings", "1"))
+            .respond_with(signed_sync_response(serde_json::json!({"version":2,"status":"synced","warnings":[{"code":"env_metadata_dropped","message":"Encrypted values synced. Invalid metadata was not stored.","hint":"Upgrade the client and push again."}]}), "warning-token", vault_id, TestSyncScope::Personal)).expect(1).mount(mock.server()).await;
+        let mut command = lpm(&project);
+        command.env("LPM_REGISTRY_URL", mock.url());
+        if json {
+            command.arg("--json");
+        }
+        let output = command.args(["env", "push", "--yes"]).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if json {
+            let value = parse_clean_json_stdout(&output);
+            assert_eq!(value["status"], "synced");
+            assert_eq!(value["warnings"][0]["code"], "env_metadata_dropped");
+            insta::with_settings!({ sort_maps => true }, {
+            insta::assert_json_snapshot!(value, @r###"
+            {
+              "status": "synced",
+              "success": true,
+              "version": 2,
+              "warnings": [
+                {
+                  "code": "env_metadata_dropped",
+                  "hint": "Upgrade the client and push again.",
+                  "message": "Encrypted values synced. Invalid metadata was not stored."
+                }
+              ]
+            }
+            "###);
+            });
+        } else {
+            let display = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(display.contains("env synced"));
+            assert!(display.contains("Invalid metadata was not stored."));
+            assert!(display.contains("Upgrade the client and push again."));
+        }
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(project.path().join("lpm.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest["vaultSync"]["authorityCheckpoints"]["personal"][mock.url()]["account-1"]["version"],
+            2
+        );
+    }
+}
+
+#[tokio::test]
+async fn env_share_reports_metadata_warnings_without_changing_success() {
+    for json in [false, true] {
+        let project = TempProject::empty(r#"{"name":"metadata-warning"}"#);
+        let mock = MockRegistry::start().await;
+        let vault_id = "metadata-warning-org";
+        let (_, public_key, fingerprint) =
+            prepare_org_share_project(&project, &mock, "warning-token", vault_id);
+        mount_org_member_keys(
+            &mock,
+            "warning-token",
+            ORG_ROTATION_SLUG,
+            &public_key,
+            &fingerprint,
+        )
+        .await;
+        Mock::given(method("POST")).and(path(format!("/api/orgs/{ORG_ROTATION_SLUG}/vaults/{vault_id}")))
+            .and(header("x-lpm-env-metadata-warnings", "1"))
+            .respond_with(signed_sync_response(serde_json::json!({"version":1,"contentKeyVersion":1,"status":"shared","warnings":[{"code":"env_metadata_dropped","message":"Encrypted values synced. Invalid metadata was not stored.","hint":"Upgrade the client and push again."}]}), "warning-token", vault_id, TestSyncScope::Organization(ORG_ROTATION_SLUG.to_owned()))).expect(1).mount(mock.server()).await;
+        let acceptance = org_rotation_recipient_acceptance(&mock, &fingerprint);
+        let mut command = lpm(&project);
+        command.env("LPM_REGISTRY_URL", mock.url());
+        if json {
+            command.arg("--json");
+        }
+        let output = command
+            .args([
+                "env",
+                "share",
+                "--org",
+                ORG_ROTATION_SLUG,
+                "--accept-recipient-keys",
+                &acceptance,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if json {
+            let value = parse_clean_json_stdout(&output);
+            assert_eq!(value["status"], "shared");
+            assert_eq!(value["warnings"][0]["code"], "env_metadata_dropped");
+            insta::with_settings!({ sort_maps => true }, {
+            insta::assert_json_snapshot!(value, @r###"
+            {
+              "org": "acme",
+              "status": "shared",
+              "success": true,
+              "version": 1,
+              "warnings": [
+                {
+                  "code": "env_metadata_dropped",
+                  "hint": "Upgrade the client and push again.",
+                  "message": "Encrypted values synced. Invalid metadata was not stored."
+                }
+              ]
+            }
+            "###);
+            });
+        } else {
+            let display = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(display.contains("env shared"));
+            assert!(display.contains("Invalid metadata was not stored."));
+            assert!(display.contains("Upgrade the client and push again."));
+        }
+    }
+}

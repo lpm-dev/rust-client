@@ -198,6 +198,13 @@ pub(super) async fn send_authenticated_sync_request(
     policy: SyncEnvelopePolicy,
 ) -> Result<SyncHttpResponse, SyncError> {
     let request_nonce = generate_request_nonce()?;
+    let request = if matches!(policy, SyncEnvelopePolicy::Write) {
+        request
+            .header("X-LPM-Env-Metadata-Warnings", "1")
+            .header("X-LPM-Client-Version", env!("CARGO_PKG_VERSION"))
+    } else {
+        request
+    };
     let response = request
         .header(REQUEST_NONCE_HEADER, &request_nonce)
         .send()

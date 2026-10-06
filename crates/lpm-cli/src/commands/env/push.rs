@@ -195,8 +195,15 @@ pub(super) async fn vars_push(
             "status": result.status,
             "version": result.version,
         });
-        if !warnings.is_empty() {
-            response["warnings"] = serde_json::json!(warnings);
+        let server_warnings = result
+            .warnings
+            .iter()
+            .map(|warning| serde_json::json!(warning));
+        let all_warnings: Vec<_> = server_warnings
+            .chain(warnings.iter().map(|warning| serde_json::json!(warning)))
+            .collect();
+        if !all_warnings.is_empty() {
+            response["warnings"] = serde_json::json!(all_warnings);
         }
         super::response::print_json_value(&response);
     } else {
@@ -204,6 +211,9 @@ pub(super) async fn vars_push(
             "env synced (version {})",
             install_ui::bold(&version.to_string())
         ));
+        for warning in &result.warnings {
+            output::warn(&format!("{} {}", warning.message, warning.hint));
+        }
         for warning in warnings {
             output::warn(warning);
         }

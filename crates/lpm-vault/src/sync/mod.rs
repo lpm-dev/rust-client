@@ -177,11 +177,11 @@ pub use pairing::{
 };
 pub use personal::{
     ListVaultsResponse, PersonalPushOptions, PullResponse, PulledPersonalVault, PushMetadata,
-    PushResponse, RemoteVault, RemoteVaultRevision, list_remote, personal_version_preflight, pull,
-    pull_bound_to_principal, pull_env, pull_env_bound_to_principal, pull_raw, pull_raw_bound,
-    pull_raw_bound_to_principal, pull_raw_for_rotation, pull_raw_for_rotation_bound,
-    pull_raw_for_rotation_bound_to_principal, push, push_raw, push_raw_with_options,
-    push_raw_with_project_rotation,
+    PushResponse, RemoteVault, RemoteVaultRevision, SyncWarning, list_remote,
+    personal_version_preflight, pull, pull_bound_to_principal, pull_env,
+    pull_env_bound_to_principal, pull_raw, pull_raw_bound, pull_raw_bound_to_principal,
+    pull_raw_for_rotation, pull_raw_for_rotation_bound, pull_raw_for_rotation_bound_to_principal,
+    push, push_raw, push_raw_with_options, push_raw_with_project_rotation,
 };
 pub use public_key::{
     LocalPublicKeyState, MemberPublicKey, MyPublicKeyState, OrgMemberKeyAccess, PendingPublicKey,

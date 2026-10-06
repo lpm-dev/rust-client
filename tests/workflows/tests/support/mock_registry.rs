@@ -151,15 +151,18 @@ impl Respond for SignedSyncResponse {
                 }
             }
         }
-        let body = serde_json::to_string(&serde_json::json!({
+        let mut envelope = serde_json::json!({
             "envelopeVersion": 3,
             "operation": operation,
             "outcome": if operation == "vault.write" { "committed" } else { "current" },
             "requestNonce": request_nonce,
             "binding": binding,
             "data": data,
-        }))
-        .expect("signed sync response must serialize");
+        });
+        if let Some(warnings) = object.get("warnings") {
+            envelope["warnings"] = warnings.clone();
+        }
+        let body = serde_json::to_string(&envelope).expect("signed sync response must serialize");
         let (key_id, signature) =
             lpm_vault::signature::sign_response_for_test(200, body.as_bytes());
         ResponseTemplate::new(200)

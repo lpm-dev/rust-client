@@ -1,3 +1,4 @@
+use super::personal::SyncWarning;
 use super::public_key::ValidatedSharingKey;
 use crate::crypto;
 use crate::crypto::personal::PersonalKeyEnvelope;
@@ -38,6 +39,7 @@ impl SyncEnvelopePolicy {
 
 #[derive(Debug)]
 pub(super) struct AuthenticatedSyncResponse {
+    pub(super) warnings: Vec<SyncWarning>,
     pub(super) outcome: String,
     pub(super) personal_keys: Option<PersonalKeyEnvelope>,
     pub(super) encrypted_blob: Option<String>,
@@ -60,6 +62,7 @@ impl AuthenticatedSyncResponse {
     fn new(outcome: String, binding: ValidatedVaultBinding) -> Self {
         Self {
             outcome,
+            warnings: Vec::new(),
             personal_keys: None,
             encrypted_blob: None,
             wrapped_key: None,
@@ -82,6 +85,8 @@ impl AuthenticatedSyncResponse {
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WireEnvelope {
+    #[serde(default)]
+    warnings: Vec<SyncWarning>,
     envelope_version: i32,
     operation: String,
     outcome: String,
@@ -658,6 +663,23 @@ fn parse_wire_envelope(
     if envelope.request_nonce != expected_request_nonce {
         return Err("authenticated response envelope does not match the request nonce".into());
     }
+    if !envelope.warnings.is_empty() {
+        if envelope.operation != "vault.write"
+            || envelope.outcome != "committed"
+            || envelope.warnings.len() > 1
+        {
+            return Err("metadata warnings require a committed write".into());
+        }
+        for warning in &envelope.warnings {
+            if warning.code != "env_metadata_dropped"
+                || [&warning.message, &warning.hint].iter().any(|text| {
+                    text.is_empty() || text.len() > 1024 || text.chars().any(char::is_control)
+                })
+            {
+                return Err("invalid authenticated metadata warning".into());
+            }
+        }
+    }
     validate_request_nonce(&envelope.request_nonce)?;
     Ok(envelope)
 }
@@ -727,6 +749,7 @@ pub(super) fn parse_vault_response(
         &envelope.outcome,
     )?;
     let mut response = AuthenticatedSyncResponse::new(envelope.outcome.clone(), binding);
+    response.warnings = envelope.warnings;
 
     match (policy, envelope.outcome.as_str()) {
         (SyncEnvelopePolicy::Pull, "current") => {
@@ -1217,6 +1240,69 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     const NONCE: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    #[test]
+    fn authenticated_writes_preserve_safe_metadata_warnings() {
+        let mut body: serde_json::Value = serde_json::from_slice(&personal_pull_body()).unwrap();
+        body["operation"] = "vault.write".into();
+        body["outcome"] = "committed".into();
+        body["data"] = serde_json::json!({"revision":42,"cryptoVersion":3,"action":"synced"});
+        body["warnings"] = serde_json::json!([{"code":"env_metadata_dropped","message":"Encrypted values synced. Invalid metadata was not stored.","hint":"Upgrade the client and push again."}]);
+        let response = parse_vault_response(
+            &serde_json::to_vec(&body).unwrap(),
+            200,
+            "vault-123",
+            SyncScope::Personal,
+            NONCE,
+            SyncEnvelopePolicy::Write,
+        );
+        assert_eq!(response.unwrap().warnings[0].code, "env_metadata_dropped");
+    }
+
+    #[test]
+    fn authenticated_writes_reject_unsafe_metadata_warning_extensions() {
+        let mut body: serde_json::Value = serde_json::from_slice(&personal_pull_body()).unwrap();
+        body["operation"] = "vault.write".into();
+        body["outcome"] = "committed".into();
+        body["data"] = serde_json::json!({"revision":42,"cryptoVersion":3,"action":"synced"});
+        for warnings in [
+            serde_json::Value::Null,
+            serde_json::json!([{"code":"other","message":"Values synced.","hint":"Upgrade."}]),
+            serde_json::json!([{"code":"env_metadata_dropped","message":"\u{1b}unsafe","hint":"Upgrade."}]),
+            serde_json::json!([{"code":"env_metadata_dropped","message":"x".repeat(1025),"hint":"Upgrade."}]),
+            serde_json::json!([{"code":"env_metadata_dropped","message":"","hint":"Upgrade."}]),
+            serde_json::json!([{"code":"env_metadata_dropped","message":"Values synced.","hint":"Upgrade.","unknown":true}]),
+            serde_json::json!([{"code":"env_metadata_dropped","message":"Values synced.","hint":"Upgrade."},{"code":"env_metadata_dropped","message":"Values synced.","hint":"Upgrade."}]),
+        ] {
+            body["warnings"] = warnings;
+            assert!(
+                parse_vault_response(
+                    &serde_json::to_vec(&body).unwrap(),
+                    200,
+                    "vault-123",
+                    SyncScope::Personal,
+                    NONCE,
+                    SyncEnvelopePolicy::Write
+                )
+                .is_err()
+            );
+        }
+        body["operation"] = "vault.inspect".into();
+        body["outcome"] = "current".into();
+        body["data"] = serde_json::json!({"revision":42,"cryptoVersion":3});
+        body["warnings"] = serde_json::json!([{"code":"env_metadata_dropped","message":"Values synced.","hint":"Upgrade."}]);
+        assert!(
+            parse_vault_response(
+                &serde_json::to_vec(&body).unwrap(),
+                200,
+                "vault-123",
+                SyncScope::Personal,
+                NONCE,
+                SyncEnvelopePolicy::Inspect
+            )
+            .is_err()
+        );
+    }
 
     fn personal_pull_body() -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
