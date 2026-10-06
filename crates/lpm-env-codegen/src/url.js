@@ -95,7 +95,7 @@ function validJoiners(scalars, work) {
 function boundedPlatformHost(host, idna, work) {
   // Reserve quadratic IDNA work before the platform parser can allocate or encode a label.
   spend(work,host.length);
-  if (!idna || host.startsWith('[')) return true;
+  if (!idna || host.startsWith('[') || !/[^\x00-\x7f%]/u.test(host) && !/xn--/iu.test(host)) return true;
   let decoded;
   try { decoded = decodeURIComponent(host); } catch { return false; }
   const colon = decoded.lastIndexOf(':');
