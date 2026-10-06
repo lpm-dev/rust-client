@@ -670,3 +670,30 @@ fn local_conflicts_report_authored_root_and_import_pointers() {
         }));
     }
 }
+
+#[test]
+fn missing_variable_and_group_overrides_identify_the_requested_key() {
+    let dir = tempfile::tempdir().unwrap();
+    for field in ["overrides", "groupOverrides"] {
+        let input = if field == "overrides" {
+            serde_json::json!({"overrides":{"MISSING":{}}})
+        } else {
+            serde_json::json!({"groupOverrides":{"MISSING":{"mode":"allOrNone","vars":["A","B"]}}})
+        };
+        let error = resolve(&dir, input).unwrap_err();
+        assert_eq!(error.diagnostic.code, "env.override_missing");
+        assert_eq!(error.diagnostic.key.as_deref(), Some("MISSING"));
+    }
+}
+
+#[test]
+fn composed_public_prefix_errors_explain_client_visibility() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("base.json"),
+        r#"{"vars":{"VITE_API_URL":{}}}"#,
+    )
+    .unwrap();
+    let error = resolve(&dir, serde_json::json!({"extends":["base.json"]})).unwrap_err();
+    assert!(error.to_string().contains("client: true"), "{error}");
+}
