@@ -678,13 +678,23 @@ fn validate_url(value: &str) -> bool {
     if hosts.is_empty() || hosts.contains(['\\', '^', '{', '}', '|']) {
         return false;
     }
+    let special = ["http", "https", "ftp", "file", "ws", "wss"]
+        .iter()
+        .any(|special| scheme.eq_ignore_ascii_case(special));
+    let allow_non_url_code_points = if special && authority.contains('@') {
+        let mut without_credentials =
+            String::with_capacity(scheme.len() + 3 + hosts.len() + tail.len() - authority_end);
+        without_credentials.push_str(scheme);
+        without_credentials.push_str("://");
+        without_credentials.push_str(hosts);
+        without_credentials.push_str(&tail[authority_end..]);
+        parsed_url_is_valid(&without_credentials, false)
+    } else {
+        !special
+    };
     let candidate;
     let value = if hosts.contains(',') {
-        if ["http", "https", "ftp", "file", "ws", "wss"]
-            .iter()
-            .any(|special| scheme.eq_ignore_ascii_case(special))
-            || !hosts.split(',').all(valid_database_endpoint)
-        {
+        if special || !hosts.split(',').all(valid_database_endpoint) {
             return false;
         }
         let first = hosts.split(',').next().unwrap_or_default();
@@ -699,12 +709,15 @@ fn validate_url(value: &str) -> bool {
     } else {
         value
     };
+    parsed_url_is_valid(value, allow_non_url_code_points)
+}
+
+fn parsed_url_is_valid(value: &str, allow_non_url_code_points: bool) -> bool {
     let invalid = std::cell::Cell::new(false);
     let on_violation = |violation| {
-        if !matches!(
-            violation,
-            url::SyntaxViolation::EmbeddedCredentials | url::SyntaxViolation::NonUrlCodePoint
-        ) {
+        if violation != url::SyntaxViolation::EmbeddedCredentials
+            && !(allow_non_url_code_points && violation == url::SyntaxViolation::NonUrlCodePoint)
+        {
             invalid.set(true);
         }
     };
@@ -1029,6 +1042,8 @@ mod tests {
             "mongodb://h1:27017,:27017/db",
             "mongodb://h1:27017,[invalid]:27017/db",
             "https://h1:443,h2:443/path",
+            "https://example.com/{raw}",
+            "https://example.com/<raw>",
         ] {
             assert!(!validate_url(value), "invalid URL accepted: {value}");
         }
