@@ -67,6 +67,38 @@ fn env_generate_requires_valid_ownership_before_recommending_extra_file_removal(
 }
 
 #[test]
+fn env_generate_verifies_owned_files_before_recommending_extra_file_removal() {
+    for copied_manifest in [true, false] {
+        let project = project();
+        lpm(&project).args(["env", "generate"]).assert().success();
+        let directory = if copied_manifest {
+            let manifest = project.read_file("env.generated/.lpm-env-generated.json");
+            project.write_file("source/.lpm-env-generated.json", &manifest);
+            "source"
+        } else {
+            project.write_file("env.generated/server.js", "user source");
+            "env.generated"
+        };
+        project.write_file(&format!("{directory}/source.rs"), "user source");
+        for check in [false, true] {
+            let mut command = lpm(&project);
+            command.args(["env", "generate", "--out-dir", directory]);
+            if check {
+                command.arg("--check");
+            }
+            let output = command.output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success());
+            assert!(!stderr.contains("Remove extra files"), "{stderr}");
+            assert_eq!(
+                project.read_file(&format!("{directory}/source.rs")),
+                "user source"
+            );
+        }
+    }
+}
+
+#[test]
 fn env_generate_ownership_json_preserves_unicode_filenames() {
     let project = project();
     lpm(&project).args(["env", "generate"]).assert().success();

@@ -184,6 +184,17 @@ fn inventory(directory: &Dir) -> Result<(), Error> {
             "invalid ownership manifest",
         ));
     }
+    for (name, digest) in manifest.files {
+        let metadata = directory
+            .symlink_metadata(&name)
+            .map_err(|_| ownership(OsStr::new(&name), "missing generated file"))?;
+        if !metadata.is_file() || is_reparse(&metadata) {
+            return Err(ownership(OsStr::new(&name), "unsafe entry"));
+        }
+        if lpm_env_codegen::checksum(&read(directory, &name)?) != digest {
+            return Err(ownership(OsStr::new(&name), "modified generated file"));
+        }
+    }
     let mut count = 0;
     for entry in code(directory.entries())? {
         let entry = code(entry)?;
@@ -206,11 +217,6 @@ fn inventory(directory: &Dir) -> Result<(), Error> {
             .copied()
             .unwrap_or(".lpm-env-generated.json");
         return Err(ownership(OsStr::new(missing), "missing generated file"));
-    }
-    for (name, digest) in manifest.files {
-        if lpm_env_codegen::checksum(&read(directory, &name)?) != digest {
-            return Err(ownership(OsStr::new(&name), "modified generated file"));
-        }
     }
     Ok(())
 }
