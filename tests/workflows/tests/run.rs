@@ -84,8 +84,8 @@ fn run_stops_before_lifecycle_hooks_when_linked_env_secrets_cannot_be_read() {
         );
         if flags.is_empty() || flags.contains(&"--no-env-check") {
             assert!(
-                stderr.contains("skips schema checks only"),
-                "env access failure must explain the schema-only flag: {stderr}"
+                stderr.contains("skips value checks and defaults"),
+                "env access failure must explain the value-validation bypass: {stderr}"
             );
         }
         for phase in ["pre", "main", "post", "second"] {
