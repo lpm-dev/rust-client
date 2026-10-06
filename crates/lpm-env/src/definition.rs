@@ -9,9 +9,11 @@ use std::collections::HashMap;
 #[serde(deny_unknown_fields, remote = "Self")]
 #[schemars(deny_unknown_fields)]
 pub struct EnvSchemaDefinition {
+    /// Variable declarations authored in this document.
     #[serde(default, deserialize_with = "crate::schema::deserialize_unique_vars")]
     #[schemars(extend("propertyNames" = {"pattern":"^[A-Za-z_][A-Za-z0-9_]{0,255}$"}, "maxProperties" = 4096))]
     pub vars: HashMap<String, EnvVarRule>,
+    /// Additional public prefixes. Matching variables must declare client: true.
     #[serde(
         default,
         rename = "clientPrefixes",
@@ -21,6 +23,7 @@ pub struct EnvSchemaDefinition {
     #[schemars(length(max = 32))]
     #[schemars(extend("uniqueItems" = true, "items" = {"type":"string","pattern":"^(?:_|[A-Za-z_][A-Za-z0-9_]{0,254}_)$"}))]
     pub client_prefixes: Vec<String>,
+    /// Relations between declared variables, checked against their effective values.
     #[serde(
         default,
         deserialize_with = "crate::schema::deserialize_unique_groups",
@@ -28,7 +31,7 @@ pub struct EnvSchemaDefinition {
     )]
     #[schemars(extend("propertyNames" = {"pattern":"^[A-Za-z_][A-Za-z0-9_]{0,255}$"}, "maxProperties" = 128))]
     pub groups: HashMap<String, VarGroup>,
-    /// Relative fragments or versioned built-in presets: preset:node, preset:nextjs, preset:vite.
+    /// Relative fragments or offline built-in presets: preset:node, preset:nextjs, preset:vite.
     #[serde(
         default,
         deserialize_with = "deserialize_extends",
@@ -37,6 +40,7 @@ pub struct EnvSchemaDefinition {
     #[schemars(length(max = 32))]
     #[schemars(extend("uniqueItems" = true, "items" = {"type":"string","minLength":1,"maxLength":512}))]
     pub extends: Vec<String>,
+    /// Complete replacement rules for variables inherited from imports.
     #[serde(
         default,
         deserialize_with = "crate::schema::deserialize_unique_vars",
@@ -44,6 +48,7 @@ pub struct EnvSchemaDefinition {
     )]
     #[schemars(extend("propertyNames" = {"pattern":"^[A-Za-z_][A-Za-z0-9_]{0,255}$"}, "maxProperties" = 4096))]
     pub overrides: HashMap<String, EnvVarRule>,
+    /// Complete replacement groups for relations inherited from imports.
     #[serde(
         default,
         rename = "groupOverrides",
@@ -176,5 +181,28 @@ mod tests {
                 && r.defaults_in.is_empty()));
         }
         assert!(env_schema_preset("unknown").is_none());
+    }
+}
+
+#[cfg(test)]
+mod documentation_tests {
+    #[test]
+    fn authored_definition_fields_have_public_schema_descriptions() {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(super::EnvSchemaDefinition)).unwrap();
+        for field in [
+            "vars",
+            "clientPrefixes",
+            "groups",
+            "extends",
+            "overrides",
+            "groupOverrides",
+        ] {
+            let text = schema["properties"][field]["description"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(!text.is_empty(), "{field} lacks a description");
+            assert!(!text.contains("versioned"));
+        }
     }
 }

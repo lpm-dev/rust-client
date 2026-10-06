@@ -6228,7 +6228,6 @@ fn task_cache_invalidates_when_a_bun_launcher_selects_a_different_helper() {
 }
 
 #[test]
-#[test]
 fn imported_schema_changes_invalidate_cache_with_empty_cache_env() {
     let project = TempProject::empty(r#"{"name":"import-cache"}"#);
     project.write_file("lpm.json", r#"{"tasks":{"build":{"command":"node record.cjs","cache":true,"cacheEnv":[],"inputs":["src/**"],"outputs":["dist/**"]}},"envSchema":{"extends":["schemas/base.json"]}}"#);
@@ -6273,41 +6272,48 @@ fn imported_schema_changes_invalidate_cache_with_empty_cache_env() {
 
 #[test]
 fn watch_repairs_missing_literal_imports_and_reloads_after_directory_replacement() {
-    let project = TempProject::empty(r#"{"name":"import-watch"}"#);
-    project.write_file("lpm.json", r#"{"tasks":{"build":{"command":"node record.cjs","inputs":["src/**"],"outputs":["schemas/**"]}},"envSchema":{"extends":["schemas/literal[1].json"]}}"#);
-    project.write_file(
-        "record.cjs",
-        "require('node:fs').writeFileSync('.lpm/value',process.env.IMPORTED_VALUE);",
-    );
-    project.write_file("src/input", "fixture");
-    project.write_file_and_sync(
-        "schemas/literal[1].json",
-        r#"{"vars":{"IMPORTED_VALUE":{"default":"first"}}}"#,
-    );
-    let mut watcher = TaskWatcher::start(&project, "build", &["--no-cache"]);
-    let value = || std::fs::read_to_string(project.path().join(".lpm/value")).unwrap_or_default();
-    watcher.wait_until(|| value() == "first");
-    std::fs::rename(
-        project.path().join("schemas"),
-        project.path().join("previous"),
-    )
-    .unwrap();
-    let diagnostics = watcher.diagnostics.clone();
-    watcher.wait_until(|| {
-        std::fs::read_to_string(&diagnostics)
-            .unwrap_or_default()
-            .contains("env.import_unreadable")
-    });
-    project.write_file_and_sync(
-        "schemas/literal[1].json",
-        r#"{"vars":{"IMPORTED_VALUE":{"default":"second"}}}"#,
-    );
-    watcher.wait_until(|| value() == "second");
-    project.write_file_and_sync(
-        "schemas/literal[1].json",
-        r#"{"vars":{"IMPORTED_VALUE":{"default":"third"}}}"#,
-    );
-    watcher.wait_until(|| value() == "third");
+    for direct in [false, true] {
+        let project = TempProject::empty(r#"{"name":"import-watch"}"#);
+        project.write_file("lpm.json", r#"{"tasks":{"build":{"command":"node record.cjs","inputs":["src/**"],"outputs":["schemas/**"]}},"envSchema":{"extends":["schemas/literal[1].json"]}}"#);
+        project.write_file(
+            "record.cjs",
+            "require('node:fs').writeFileSync('.lpm/value',process.env.IMPORTED_VALUE);",
+        );
+        project.write_file("src/input", "fixture");
+        project.write_file_and_sync(
+            "schemas/literal[1].json",
+            r#"{"vars":{"IMPORTED_VALUE":{"default":"first"}}}"#,
+        );
+        let mut watcher = if direct {
+            TaskWatcher::start_command(&project, &["record.cjs", "--watch"], &[])
+        } else {
+            TaskWatcher::start(&project, "build", &["--no-cache"])
+        };
+        let value =
+            || std::fs::read_to_string(project.path().join(".lpm/value")).unwrap_or_default();
+        watcher.wait_until(|| value() == "first");
+        std::fs::rename(
+            project.path().join("schemas"),
+            project.path().join("previous"),
+        )
+        .unwrap();
+        let diagnostics = watcher.diagnostics.clone();
+        watcher.wait_until(|| {
+            std::fs::read_to_string(&diagnostics)
+                .unwrap_or_default()
+                .contains("env.import_unreadable")
+        });
+        project.write_file_and_sync(
+            "schemas/literal[1].json",
+            r#"{"vars":{"IMPORTED_VALUE":{"default":"second"}}}"#,
+        );
+        watcher.wait_until(|| value() == "second");
+        project.write_file_and_sync(
+            "schemas/literal[1].json",
+            r#"{"vars":{"IMPORTED_VALUE":{"default":"third"}}}"#,
+        );
+        watcher.wait_until(|| value() == "third");
+    }
 }
 
 #[test]
@@ -6333,5 +6339,71 @@ fn direct_file_watch_reloads_imported_schema_outside_script_inputs() {
         r#"{"vars":{"IMPORTED_VALUE":{"default":"second"}}}"#,
     );
     watcher.wait_until(|| value() == "second");
+}
 
+#[test]
+fn direct_file_watch_recovers_after_entrypoint_directory_recreation() {
+    let project = TempProject::empty(r#"{"name":"entrypoint-repair"}"#);
+    project.write_file("lpm.json", "{}");
+    project.write_file_and_sync(
+        "src/entry.cjs",
+        "require('node:fs').writeFileSync('.lpm/value','first');",
+    );
+    let mut watcher = TaskWatcher::start_command(&project, &["src/entry.cjs", "--watch"], &[]);
+    let value = || std::fs::read_to_string(project.path().join(".lpm/value")).unwrap_or_default();
+    watcher.wait_until(|| value() == "first");
+    std::fs::rename(project.path().join("src"), project.path().join("old-src")).unwrap();
+    let diagnostics = watcher.diagnostics.clone();
+    watcher.wait_until(|| {
+        std::fs::read_to_string(&diagnostics)
+            .unwrap_or_default()
+            .contains("MODULE_NOT_FOUND")
+    });
+    project.write_file_and_sync(
+        "src/entry.cjs",
+        "require('node:fs').writeFileSync('.lpm/value','second');",
+    );
+    watcher.wait_until(|| value() == "second");
+    project.write_file_and_sync(
+        "src/entry.cjs",
+        "require('node:fs').writeFileSync('.lpm/value','third');",
+    );
+    watcher.wait_until(|| value() == "third");
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_file_watch_recovers_when_an_external_symlink_target_directory_returns() {
+    let project = TempProject::empty(r#"{"name":"external-entrypoint-repair"}"#);
+    let outside = TempProject::empty(r#"{"name":"external-entrypoint"}"#);
+    project.write_file("lpm.json", "{}");
+    outside.write_file_and_sync(
+        "src/entry.cjs",
+        "require('node:fs').writeFileSync('.lpm/value','first');",
+    );
+    std::os::unix::fs::symlink(
+        outside.path().join("src/entry.cjs"),
+        project.path().join("entry.cjs"),
+    )
+    .unwrap();
+    let mut watcher = TaskWatcher::start_command(&project, &["entry.cjs", "--watch"], &[]);
+    let value = || std::fs::read_to_string(project.path().join(".lpm/value")).unwrap_or_default();
+    watcher.wait_until(|| value() == "first");
+    std::fs::rename(outside.path().join("src"), outside.path().join("old-src")).unwrap();
+    let diagnostics = watcher.diagnostics.clone();
+    watcher.wait_until(|| {
+        std::fs::read_to_string(&diagnostics)
+            .unwrap_or_default()
+            .contains("MODULE_NOT_FOUND")
+    });
+    outside.write_file_and_sync(
+        "src/entry.cjs",
+        "require('node:fs').writeFileSync('.lpm/value','second');",
+    );
+    watcher.wait_until(|| value() == "second");
+    outside.write_file_and_sync(
+        "src/entry.cjs",
+        "require('node:fs').writeFileSync('.lpm/value','third');",
+    );
+    watcher.wait_until(|| value() == "third");
 }

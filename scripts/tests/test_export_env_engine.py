@@ -20,6 +20,31 @@ class EngineExportTests(unittest.TestCase):
             with patch.object(Path, 'read_bytes', side_effect=AssertionError('whole file read')):
                 self.assertEqual(exporter.file_hash(path), hashlib.sha256(data).hexdigest())
 
+    def test_revision_admission_rejects_dirty_engine_inputs_and_allows_unrelated_edits(self):
+        for state in ('modified', 'staged', 'untracked', 'unrelated'):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / 'source'
+                root.mkdir()
+                files = ['Cargo.toml', 'Cargo.lock', 'scripts/export-env-engine.py', 'crates/lpm-env/src/lib.rs']
+                for name in files:
+                    path = root / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text('original')
+                subprocess.run(['git', 'init', '-q', str(root)], check=True)
+                subprocess.run(['git', '-C', str(root), 'add', '.'], check=True)
+                subprocess.run(['git', '-C', str(root), '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture'], check=True)
+                changed = root / ('notes.txt' if state == 'unrelated' else 'crates/lpm-env/src/new.rs' if state == 'untracked' else files[-1])
+                changed.write_text('changed')
+                if state == 'staged': subprocess.run(['git', '-C', str(root), 'add', '.'], check=True)
+                real_run = subprocess.run
+                def reject_build(args, **kwargs):
+                    if args[0] == 'git': return real_run(args, **kwargs)
+                    if state == 'unrelated': raise RuntimeError('fixture build reached')
+                    raise AssertionError('dirty export attempted a build')
+                with patch.object(exporter.subprocess, 'run', side_effect=reject_build):
+                    with self.assertRaisesRegex(RuntimeError, 'fixture build reached' if state == 'unrelated' else 'recorded revision'):
+                        exporter.export(root, Path(temporary) / 'target', Path(temporary) / 'output')
+
     def scenario(self, failure):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / 'source'
@@ -57,6 +82,8 @@ class EngineExportTests(unittest.TestCase):
                     self.assertEqual(kwargs['env']['ZERO_AR_DATE'], '1')
                 if failure == 'pinned-strip' and (args[0] == 'xcrun' or args[0].endswith('llvm-objcopy')):
                     self.assertEqual(args[0], '/pinned/rust-1.94/lib/rustlib/aarch64-apple-darwin/bin/llvm-objcopy')
+                    self.assertIn('--remove-section=__LLVM,__bitcode', args)
+                    self.assertIn('--remove-section=__LLVM,__cmdline', args)
                     self.assertIn('--enable-deterministic-archives', args)
                 if args[0] == 'xcodebuild':
                     if failure in {'environment','pinned-strip'}:
@@ -66,6 +93,7 @@ class EngineExportTests(unittest.TestCase):
                     (artifact / 'library').write_bytes(b'new bundle')
 
             def read(args, **kwargs):
+                if args[:2] == ['git', 'show']: return b'original'
                 if args[0] == 'rustc':
                     return '/pinned/rust-1.94\n' if '--print' in args else 'host: aarch64-apple-darwin\n'
                 return paths if args[1] == 'ls-files' else 'a' * 40 + '\n'
@@ -112,8 +140,6 @@ class EngineExportTests(unittest.TestCase):
         self.scenario('pinned-strip')
 
 
-if __name__ == '__main__':
-    unittest.main()
 
 class ConcurrentEngineExportTests(unittest.TestCase):
     def test_shared_target_exports_keep_both_slices_from_their_own_sources(self):
@@ -128,7 +154,7 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 marker = (root / 'crates/lpm-env/src/lib.rs').read_text()
 paths = b'\0'.join(str(path.relative_to(root)).encode() for path in root.rglob('*') if path.is_file()) + b'\0'
-module.subprocess.check_output = lambda args, **kwargs: ('/pinned/rust-1.94\n' if '--print' in args else 'host: aarch64-apple-darwin\n') if args[0] == 'rustc' else paths if args[1] == 'ls-files' else 'a' * 40 + '\n'
+module.subprocess.check_output = lambda args, **kwargs: ('/pinned/rust-1.94\n' if '--print' in args else 'host: aarch64-apple-darwin\n') if args[0] == 'rustc' else marker.encode() if args[1] == 'show' else paths if args[1] == 'ls-files' else 'a' * 40 + '\n'
 def command(args, **kwargs):
     if args[0] == 'cargo':
         library = pathlib.Path(kwargs['env']['CARGO_TARGET_DIR']) / args[-1] / 'release/liblpm_env_ffi.a'
@@ -170,3 +196,7 @@ module.export(root, target, output)
                 self.assertEqual(process.returncode, 0, (stdout, stderr))
             self.assertEqual((parent/'out-A/LPMEnv.xcframework/library').read_bytes(), b'AA')
             self.assertEqual((parent/'out-B/LPMEnv.xcframework/library').read_bytes(), b'BB')
+
+
+if __name__ == '__main__':
+    unittest.main()

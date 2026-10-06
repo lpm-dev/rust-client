@@ -2218,12 +2218,18 @@ pub(super) async fn vars_platform_push(
     let config = manifest.config;
     super::sync_payload::verify_schema_snapshot(project_dir, snapshot.as_deref())
         .map_err(LpmError::Script)?;
-    let resolved_env = resolve_platform_environment(config.as_ref(), parse_flag(args, "--env"), client.linked_env())?;
-    let local = std::sync::Arc::new(lpm_runner::dotenv::load_project_env_for_resolved_with_config(
-        project_dir,
-        &resolved_env,
+    let resolved_env = resolve_platform_environment(
         config.as_ref(),
-    )?);
+        parse_flag(args, "--env"),
+        client.linked_env(),
+    )?;
+    let local = std::sync::Arc::new(
+        lpm_runner::dotenv::load_project_env_for_resolved_with_config(
+            project_dir,
+            &resolved_env,
+            config.as_ref(),
+        )?,
+    );
     let local = client.prepare_local(
         local,
         config
@@ -2536,7 +2542,10 @@ pub(super) async fn vars_platform_status(
                 continue;
             }
         };
-        let resolved = match config.as_ref().map_err(Clone::clone).and_then(|config| resolve_platform_environment(config.as_ref(), None, client.linked_env()).map_err(|error| error.to_string())) {
+        let resolved = match config.as_ref().map_err(Clone::clone).and_then(|config| {
+            resolve_platform_environment(config.as_ref(), None, client.linked_env())
+                .map_err(|error| error.to_string())
+        }) {
             Ok(resolved) => resolved,
             Err(error) => {
                 prepared.push(Work::Immediate(serde_json::json!({"platform":connection.platform,"label":label,"status":"error","error":error.to_string(),"lastPushAt":last_push_at})));
@@ -2549,7 +2558,6 @@ pub(super) async fn vars_platform_status(
             env_name, resolved.implicit_default, resolved.file_path
         );
         let loaded_local = match cached_status_environment(&mut local_cache, &cache_key, || {
-
             lpm_runner::dotenv::load_project_env_for_resolved_with_config(
                 project_dir,
                 &resolved,

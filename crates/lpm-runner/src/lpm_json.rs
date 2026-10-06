@@ -867,34 +867,6 @@ pub fn read_lpm_json_detailed(
     parse_lpm_json_inner(&content, Some(project_dir), None).map(Some)
 }
 
-/// Watch repair paths even when a newly imported fragment is missing or invalid.
-pub fn schema_watch_paths(project_dir: &Path) -> Vec<String> {
-    #[derive(serde::Deserialize)]
-    struct Projection {
-        #[serde(rename = "envSchema")]
-        schema: Option<lpm_env::EnvSchemaDefinition>,
-    }
-    let Ok(content) =
-        read_text_file_capped(&project_dir.join("lpm.json"), CONFIG_FILE_SIZE_CAP_BYTES)
-    else {
-        return Vec::new();
-    };
-    let Ok(Projection {
-        schema: Some(definition),
-    }) = serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
-    else {
-        return Vec::new();
-    };
-    match lpm_env_source::resolve_schema(project_dir, content.as_bytes(), definition) {
-        Ok(resolved) => resolved
-            .dependencies
-            .iter()
-            .map(|dependency| dependency.path.clone())
-            .collect(),
-        Err(error) => error.requested_paths,
-    }
-}
-
 /// Parse and validate an `lpm.json` document that was read by the caller.
 pub fn parse_lpm_json(content: &str) -> Result<LpmJsonConfig, String> {
     parse_lpm_json_inner(content, None, None).map_err(|error| error.to_string())

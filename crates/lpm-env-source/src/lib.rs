@@ -26,6 +26,8 @@ pub struct SchemaDiagnostic {
     pub source: String,
     pub pointer: String,
     pub key: Option<String>,
+    #[serde(rename = "relatedSources", skip_serializing_if = "Vec::is_empty")]
+    pub related_sources: Vec<SourceLocation>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,7 +44,18 @@ impl std::fmt::Display for SourceError {
             self.diagnostic.code,
             DiagnosticText(&self.diagnostic.source),
             DiagnosticText(&self.diagnostic.pointer)
-        )
+        )?;
+        if let [first, second] = self.diagnostic.related_sources.as_slice() {
+            write!(
+                f,
+                " (conflicting declarations: {}{} and {}{})",
+                DiagnosticText(&first.source),
+                DiagnosticText(&first.pointer),
+                DiagnosticText(&second.source),
+                DiagnosticText(&second.pointer)
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -80,6 +93,7 @@ impl SourceError {
                     pointer.into()
                 },
                 key: None,
+                related_sources: Vec::new(),
             }),
             requested_paths: Vec::new(),
         }
@@ -144,19 +158,15 @@ impl SchemaSnapshot {
     pub fn verify_dependencies(&self) -> Result<(), SourceError> {
         if let Some(path) = &self.named_root {
             let directory = cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())
-                .map_err(|_| {
-                    SourceError::new("env.source_changed", "freshness", "lpm.json", "/envSchema")
-                })?;
-            let identity =
-                same_file::Handle::from_file(directory.into_std_file()).map_err(|_| {
-                    SourceError::new("env.source_changed", "freshness", "lpm.json", "/envSchema")
-                })?;
+                .map_err(|_| SourceError::new("env.source_changed", "freshness", "lpm.json", ""))?;
+            let identity = same_file::Handle::from_file(directory.into_std_file())
+                .map_err(|_| SourceError::new("env.source_changed", "freshness", "lpm.json", ""))?;
             if identity != self.root_identity {
                 return Err(SourceError::new(
                     "env.source_changed",
                     "freshness",
                     "lpm.json",
-                    "/envSchema",
+                    "",
                 ));
             }
         }
@@ -247,28 +257,6 @@ fn open_project_directory(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
         return Err(std::io::Error::other("project root must be a directory"));
     }
     Ok(cap_std::fs::Dir::from_std_file(file))
-}
-
-/// Resolve through the caller's existing root capability.
-pub fn resolve_schema_in(
-    root: Arc<cap_std::fs::Dir>,
-    root_content: &[u8],
-    definition: EnvSchemaDefinition,
-) -> Result<ResolvedSchema, SourceError> {
-    if root_content.len() > 16 * 1024 * 1024 {
-        return Err(SourceError::new(
-            "env.source_budget",
-            "resolve",
-            "lpm.json",
-            "/envSchema",
-        ));
-    }
-    graph::resolve(
-        root,
-        root_content,
-        std::borrow::Cow::Owned(definition),
-        None,
-    )
 }
 
 /// Borrowed root definitions receive the same budget checks before copying.

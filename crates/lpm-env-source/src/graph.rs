@@ -198,8 +198,8 @@ impl Graph {
             ));
         }
         let mut node = Node::default();
-        let mut var_conflicts = HashSet::new();
-        let mut group_conflicts = HashSet::new();
+        let mut var_conflicts = BTreeMap::new();
+        let mut group_conflicts = BTreeMap::new();
         for import in definition.extends {
             if self.stats.edges == MAX_EDGES {
                 return Err(SourceError::new(
@@ -421,12 +421,17 @@ fn check_counts(node: &Node, source: &str) -> Result<(), SourceError> {
 fn merge<T>(
     target: &mut HashMap<String, Declaration<T>>,
     source: &HashMap<String, Declaration<T>>,
-    conflicts: &mut HashSet<String>,
+    conflicts: &mut BTreeMap<String, [Arc<SourceLocation>; 2]>,
 ) {
     for (key, declaration) in source {
         if let Some(existing) = target.get(key) {
             if !Arc::ptr_eq(&existing.origin, &declaration.origin) {
-                conflicts.insert(key.clone());
+                conflicts.entry(key.clone()).or_insert_with(|| {
+                    [
+                        Arc::clone(&existing.origin),
+                        Arc::clone(&declaration.origin),
+                    ]
+                });
             }
         } else {
             target.insert(key.clone(), declaration.clone());
@@ -438,7 +443,7 @@ fn apply<T>(
     target: &mut HashMap<String, Declaration<T>>,
     local: HashMap<String, T>,
     overrides: HashMap<String, T>,
-    conflicts: &mut HashSet<String>,
+    conflicts: &mut BTreeMap<String, [Arc<SourceLocation>; 2]>,
     source: &str,
     field: &str,
     override_field: &str,
@@ -465,22 +470,29 @@ fn apply<T>(
             ));
         }
         if local.contains_key(key) {
-            return Err(SourceError::new(
-                "env.declaration_conflict",
-                "resolve",
-                source,
-                &pointer(source, override_field, key),
+            return Err(conflict_error(
+                key,
+                &SourceLocation {
+                    source: source.into(),
+                    pointer: pointer(source, field, key),
+                },
+                &SourceLocation {
+                    source: source.into(),
+                    pointer: pointer(source, override_field, key),
+                },
             ));
         }
     }
     for (key, value) in local {
-        if target.contains_key(&key) || overrides.contains_key(&key) {
-            conflicts.insert(key.clone());
-        }
         let origin = Arc::new(SourceLocation {
             source: source.into(),
             pointer: pointer(source, field, &key),
         });
+        if let Some(existing) = target.get(&key) {
+            conflicts
+                .entry(key.clone())
+                .or_insert_with(|| [Arc::clone(&existing.origin), Arc::clone(&origin)]);
+        }
         target.insert(
             key,
             Declaration {
@@ -512,15 +524,22 @@ fn apply<T>(
             },
         );
     }
-    if let Some(key) = conflicts.iter().min() {
-        return Err(SourceError::new(
-            "env.declaration_conflict",
-            "resolve",
-            source,
-            &pointer(source, field, key),
-        ));
+    if let Some((key, origins)) = conflicts.first_key_value() {
+        return Err(conflict_error(key, &origins[0], &origins[1]));
     }
     Ok(())
+}
+
+fn conflict_error(key: &str, first: &SourceLocation, second: &SourceLocation) -> SourceError {
+    let mut error = SourceError::new(
+        "env.declaration_conflict",
+        "resolve",
+        &second.source,
+        &second.pointer,
+    );
+    error.diagnostic.key = Some(key.into());
+    error.diagnostic.related_sources = vec![first.clone(), second.clone()];
+    error
 }
 
 fn pointer(source: &str, field: &str, key: &str) -> String {
@@ -554,7 +573,7 @@ mod tests {
             );
         }
         let mut target = source.clone();
-        let mut conflicts = HashSet::new();
+        let mut conflicts = BTreeMap::new();
         let (_, allocated, maximum) =
             crate::tests::allocation_probe(|| merge(&mut target, &source, &mut conflicts));
         assert_eq!(allocated, 0);
