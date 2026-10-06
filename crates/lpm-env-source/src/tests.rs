@@ -59,6 +59,34 @@ fn resolve(
 }
 
 #[test]
+fn fragment_type_errors_preserve_the_field_pointer_without_value_literals() {
+    for (fragment, pointer) in [
+        (
+            serde_json::json!({"vars":{"KEY":{"required":"private-fixture-value"}}}),
+            "/vars/KEY/required",
+        ),
+        (serde_json::json!({"vars":{"KEY":12}}), "/vars/KEY"),
+        (
+            serde_json::json!({"clientPrefixes":[12]}),
+            "/clientPrefixes/0",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("base.json"), fragment.to_string()).unwrap();
+        let error = resolve(&dir, serde_json::json!({"extends":["base.json"]})).unwrap_err();
+        assert_eq!(error.diagnostic.code, "env.invalid_definition");
+        assert_eq!(error.diagnostic.source, "base.json");
+        assert_eq!(error.diagnostic.pointer, pointer);
+        assert!(error.diagnostic.message.unwrap().contains("value type"));
+        assert!(
+            !serde_json::to_string(&error.diagnostic)
+                .unwrap()
+                .contains("private-fixture-value")
+        );
+    }
+}
+
+#[test]
 fn diamond_imports_share_one_declaration_origin_and_read_each_file_once() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(

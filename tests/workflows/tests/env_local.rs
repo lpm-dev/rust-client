@@ -2760,6 +2760,32 @@ fn env_schema_json_reports_import_provenance_without_reading_values() {
 }
 
 #[test]
+fn env_schema_fragment_type_errors_report_safe_field_locations() {
+    let project = TempProject::empty(r#"{"name":"fragment-types"}"#);
+    project.write_file("lpm.json", r#"{"envSchema":{"extends":["base.json"]}}"#);
+    project.write_file(
+        "base.json",
+        r#"{"vars":{"VALUE":{"required":"private-fixture-value"}}}"#,
+    );
+    let output = lpm(&project)
+        .args(["env", "schema", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let value = parse_json_stdout(&output, "fragment type diagnostic");
+    assert_eq!(value["diagnostics"][0]["code"], "env.invalid_definition");
+    assert_eq!(value["diagnostics"][0]["source"], "base.json");
+    assert_eq!(value["diagnostics"][0]["pointer"], "/vars/VALUE/required");
+    assert!(
+        value["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("value type")
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("private-fixture-value"));
+}
+
+#[test]
 fn env_schema_json_reports_static_codes_and_source_pointers_without_literals() {
     let project = TempProject::empty(r#"{"name":"schema-invalid"}"#);
     project.write_file("lpm.json", r#"{"envSchema":{"extends":["base.json"]}}"#);

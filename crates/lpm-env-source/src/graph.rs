@@ -180,8 +180,7 @@ impl Graph {
                         bytes: file.content.len(),
                     },
                 );
-                serde_json::from_slice::<EnvSchemaDefinition>(strip_bom(&file.content))
-                    .map_err(|_| SourceError::new("env.invalid_definition", "parse", source, ""))?
+                decode_definition(strip_bom(&file.content), source)?
             }
         };
         let mut prefix_names = HashSet::with_capacity(definition.client_prefixes.len());
@@ -398,6 +397,49 @@ impl Graph {
             }),
         })
     }
+}
+
+fn decode_definition(bytes: &[u8], source: &str) -> Result<EnvSchemaDefinition, SourceError> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let definition = serde_path_to_error::deserialize(&mut deserializer).map_err(|failure| {
+        let mut pointer = String::with_capacity(64);
+        for segment in failure.path().iter() {
+            pointer.push('/');
+            match segment {
+                serde_path_to_error::Segment::Map { key }
+                | serde_path_to_error::Segment::Enum { variant: key } => {
+                    for c in key.chars() {
+                        match c {
+                            '~' => pointer.push_str("~0"),
+                            '/' => pointer.push_str("~1"),
+                            _ => pointer.push(c),
+                        }
+                    }
+                }
+                serde_path_to_error::Segment::Seq { index } => {
+                    use std::fmt::Write;
+                    let _ = write!(pointer, "{index}");
+                }
+                serde_path_to_error::Segment::Unknown => {
+                    pointer.pop();
+                }
+            }
+        }
+        let mut error = SourceError::new("env.invalid_definition", "parse", source, &pointer);
+        error.diagnostic.message = Some(match failure.inner().classify() {
+            serde_json::error::Category::Data => {
+                "Invalid schema definition. Check the field name and value type at this location."
+            }
+            _ => "Invalid JSON syntax. Correct this schema document.",
+        });
+        error
+    })?;
+    deserializer.end().map_err(|_| {
+        let mut error = SourceError::new("env.invalid_definition", "parse", source, "");
+        error.diagnostic.message = Some("Invalid JSON syntax. Correct this schema document.");
+        error
+    })?;
+    Ok(definition)
 }
 
 fn strip_bom(bytes: &[u8]) -> &[u8] {
