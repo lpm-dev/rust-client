@@ -22,6 +22,7 @@ pub struct WatchFilter {
     all_inputs: bool,
     config_files: bool,
     literal_files: Vec<PathBuf>,
+    config_dependencies: HashSet<PathBuf>,
 }
 
 impl WatchFilter {
@@ -61,6 +62,7 @@ impl WatchFilter {
             all_inputs: inputs.is_empty(),
             config_files: false,
             literal_files: Vec::new(),
+            config_dependencies: HashSet::new(),
         })
     }
 
@@ -104,6 +106,13 @@ impl WatchFilter {
         self
     }
 
+    /// These literal dependencies are observed before task input/output exclusions.
+    pub fn with_config_dependencies(mut self, paths: &[String]) -> Self {
+        self.config_dependencies
+            .extend(paths.iter().map(|path| self.root.join(path)));
+        self
+    }
+
     fn matches(&self, event: &notify::Event) -> bool {
         event.need_rescan()
             || (is_relevant_event(&event.kind)
@@ -111,6 +120,14 @@ impl WatchFilter {
     }
 
     fn matches_path(&self, path: &Path) -> bool {
+        if self.config_dependencies.contains(path)
+            || self
+                .config_dependencies
+                .iter()
+                .any(|dependency| dependency.starts_with(path))
+        {
+            return true;
+        }
         if !self.literal_files.is_empty() {
             return self.literal_files.iter().any(|file| file == path);
         }
@@ -216,6 +233,15 @@ fn compile_watch_glob(pattern: &str) -> Result<Glob, String> {
 pub struct WatchFilterHandle(Arc<RwLock<WatchFilter>>);
 
 impl WatchFilterHandle {
+    pub fn replace_config_dependencies(&self, paths: &[String]) {
+        let mut filter = self.0.write().unwrap_or_else(|error| error.into_inner());
+        let root = filter.root.clone();
+        filter.config_dependencies.clear();
+        filter
+            .config_dependencies
+            .extend(paths.iter().map(|path| root.join(path)));
+    }
+
     /// Create a shared filter.
     pub fn new(filter: WatchFilter) -> Self {
         Self(Arc::new(RwLock::new(filter)))
@@ -367,6 +393,40 @@ pub fn watch_and_run_until(
 /// Watch a literal entrypoint and refresh its symlink targets before each run.
 pub fn watch_file_and_run(
     file: &Path,
+    on_change: OnChange,
+    should_stop: impl Fn() -> bool,
+) -> Result<(), String> {
+    watch_file_and_run_inner(file, None, on_change, should_stop)
+}
+
+/// Watch a literal entrypoint plus the changing schema dependency closure.
+pub fn watch_file_and_run_with_config(
+    file: &Path,
+    project_root: &Path,
+    config_paths: Box<dyn FnMut() -> Vec<String> + Send>,
+    on_change: OnChange,
+    should_stop: impl Fn() -> bool,
+) -> Result<(), String> {
+    let root = std::fs::canonicalize(project_root).map_err(|error| error.to_string())?;
+    watch_file_and_run_inner(file, Some((root, config_paths)), on_change, should_stop)
+}
+
+type FileConfigWatch = Option<(PathBuf, Box<dyn FnMut() -> Vec<String> + Send>)>;
+
+fn file_config_dependencies(config: &mut FileConfigWatch) -> Vec<PathBuf> {
+    match config {
+        Some((root, paths)) => ["lpm.json".into(), "package.json".into()]
+            .into_iter()
+            .chain(paths())
+            .map(|path: String| root.join(path))
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+fn watch_file_and_run_inner(
+    file: &Path,
+    mut config: FileConfigWatch,
     mut on_change: OnChange,
     should_stop: impl Fn() -> bool,
 ) -> Result<(), String> {
@@ -380,11 +440,32 @@ pub fn watch_file_and_run(
         notify::recommended_watcher(move |event| notifications.submit(event))
             .map_err(|error| format!("failed to create file watcher: {error}"))?;
     let mut roots = HashSet::new();
-    refresh_file_watch(&file, &mut watcher, &mut roots, &filter)?;
+    let dependencies = file_config_dependencies(&mut config);
+    refresh_file_watch(
+        &file,
+        &mut watcher,
+        &mut roots,
+        &filter,
+        &dependencies,
+        config.as_ref().map(|(root, _)| root.as_path()),
+    )?;
+    if let Some((root, _)) = &config {
+        watcher
+            .watch(root, RecursiveMode::Recursive)
+            .map_err(|error| error.to_string())?;
+    }
     run_watch_loop(
         receiver,
         Box::new(move || {
-            if let Err(error) = refresh_file_watch(&file, &mut watcher, &mut roots, &filter) {
+            let dependencies = file_config_dependencies(&mut config);
+            if let Err(error) = refresh_file_watch(
+                &file,
+                &mut watcher,
+                &mut roots,
+                &filter,
+                &dependencies,
+                config.as_ref().map(|(root, _)| root.as_path()),
+            ) {
                 errors
                     .0
                     .lock()
@@ -402,15 +483,21 @@ pub fn watch_file_and_run(
 
 fn refresh_file_watch(
     file: &Path,
-    watcher: &mut RecommendedWatcher,
+    watcher: &mut impl Watcher,
     roots: &mut HashSet<PathBuf>,
     filter: &WatchFilterHandle,
+    dependencies: &[PathBuf],
+    recursive_root: Option<&Path>,
 ) -> Result<(), String> {
-    let next_filter = WatchFilter::for_file(file)?;
+    let mut next_filter = WatchFilter::for_file(file)?;
+    next_filter
+        .config_dependencies
+        .extend(dependencies.iter().cloned());
     let next_roots: HashSet<_> = next_filter
         .literal_files
         .iter()
         .filter_map(|path| path.parent().map(Path::to_path_buf))
+        .filter(|path| recursive_root.is_none_or(|root| !path.starts_with(root)))
         .collect();
     for root in next_roots.difference(roots) {
         watcher
@@ -501,7 +588,98 @@ pub fn matches_input_globs(path: &Path, project_dir: &Path, globs: &[String]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_definition_repair_paths_replace_obsolete_dependencies() {
+        let directory = tempfile::tempdir().unwrap();
+        let handle = WatchFilterHandle::new(
+            WatchFilter::new(directory.path(), &[], &[])
+                .unwrap()
+                .with_config_files(),
+        );
+        for index in 0..128 {
+            handle.replace_config_dependencies(&[format!("missing-{index}.json")]);
+        }
+        let filter = handle.0.read().unwrap();
+        assert_eq!(filter.config_dependencies.len(), 1);
+        assert!(
+            filter
+                .config_dependencies
+                .contains(&filter.root.join("missing-127.json"))
+        );
+    }
     use std::path::PathBuf;
+
+    #[derive(Default)]
+    struct RecordedWatches(Vec<(PathBuf, bool)>);
+    impl Watcher for RecordedWatches {
+        fn new<F: notify::EventHandler>(_: F, _: notify::Config) -> notify::Result<Self> {
+            Ok(Self::default())
+        }
+        fn watch(&mut self, path: &Path, _: RecursiveMode) -> notify::Result<()> {
+            self.0.push((path.to_path_buf(), true));
+            Ok(())
+        }
+        fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
+            self.0.push((path.to_path_buf(), false));
+            Ok(())
+        }
+        fn kind() -> notify::WatcherKind {
+            notify::WatcherKind::NullWatcher
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn literal_symlink_refresh_preserves_permanent_recursive_watch_ownership() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("first.cjs"), "").unwrap();
+        std::fs::write(outside.path().join("second.cjs"), "").unwrap();
+        let entry = root.join("src/entry.cjs");
+        std::os::unix::fs::symlink(root.join("first.cjs"), &entry).unwrap();
+        let filter = WatchFilterHandle::new(WatchFilter::for_file(&entry).unwrap());
+        let mut watcher = RecordedWatches::default();
+        let mut roots = HashSet::new();
+        refresh_file_watch(&entry, &mut watcher, &mut roots, &filter, &[], Some(&root)).unwrap();
+        std::fs::remove_file(&entry).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("second.cjs"), &entry).unwrap();
+        refresh_file_watch(&entry, &mut watcher, &mut roots, &filter, &[], Some(&root)).unwrap();
+        assert!(
+            watcher.0.iter().all(|(path, _)| !path.starts_with(&root)),
+            "{:?}",
+            watcher.0
+        );
+        assert!(watcher.0.iter().any(|(_, added)| *added));
+    }
+
+    #[test]
+    fn mandatory_dependency_ancestors_trigger_reloads_outside_inputs_and_outputs() {
+        let root = Path::new("/project");
+        let filter = WatchFilter::new(root, &["src/**".into()], &["config/**".into()])
+            .unwrap()
+            .with_config_dependencies(&["config/nested/schema[base].json".into()]);
+        for kind in [
+            EventKind::Remove(notify::event::RemoveKind::Folder),
+            EventKind::Create(notify::event::CreateKind::Folder),
+            EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Any,
+            )),
+        ] {
+            assert!(
+                filter.matches(&notify::Event::new(kind).add_path(root.join("config"))),
+                "{kind:?}"
+            );
+        }
+        assert!(
+            !filter.matches(
+                &notify::Event::new(EventKind::Modify(notify::event::ModifyKind::Any))
+                    .add_path(root.join("config/unrelated.txt"))
+            )
+        );
+    }
 
     fn matches_watch_event(event: &notify::Event, root: &Path, inputs: &[String]) -> bool {
         WatchFilter::new(root, inputs, &[]).unwrap().matches(event)

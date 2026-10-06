@@ -99,10 +99,13 @@ pub(super) enum LocalAction {
         #[command(flatten)]
         scope: Scope,
     },
+    /// Check stored key names against .env.example.
     Validate {
         #[arg(long)]
         strict: bool,
     },
+    /// Check declarations and imports without reading environment values.
+    Schema,
     Init {
         #[arg(long)]
         force: bool,
@@ -137,6 +140,7 @@ pub(super) fn parse(args: &[&str]) -> Result<Option<LocalAction>, LpmError> {
                 | "example"
                 | "check"
                 | "validate"
+                | "schema"
                 | "init"
                 | "ls"
                 | "copy"

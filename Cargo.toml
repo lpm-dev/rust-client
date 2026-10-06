@@ -28,6 +28,8 @@ members = [
     "crates/lpm-inspect",
     "crates/lpm-migrate",
     "crates/lpm-env",
+    "crates/lpm-env-source",
+    "crates/lpm-env-ffi",
     "crates/lpm-env-wasm",
     "crates/lpm-global",
     "crates/lpm-audit-corpus",
@@ -76,6 +78,7 @@ lpm-dashboard = { path = "crates/lpm-dashboard" }
 lpm-inspect = { path = "crates/lpm-inspect" }
 lpm-migrate = { path = "crates/lpm-migrate" }
 lpm-env = { path = "crates/lpm-env" }
+lpm-env-source = { path = "crates/lpm-env-source" }
 lpm-global = { path = "crates/lpm-global" }
 
 # Async runtime

@@ -2690,3 +2690,91 @@ fn env_ls_and_check_agree_on_default_inheritance_and_invalid_aliases() {
         );
     }
 }
+
+#[test]
+fn env_schema_json_reports_import_provenance_without_reading_values() {
+    let project = TempProject::empty(r#"{"name":"schema-definition"}"#);
+    project.write_file("lpm.json", r#"{"envSchema":{"extends":["preset:node","base.json"],"vars":{"LOCAL":{"required":true}}}}"#);
+    project.write_file(
+        "base.json",
+        r#"{"vars":{"TOKEN":{"secret":true,"required":true}}}"#,
+    );
+    let output = lpm(&project)
+        .args(["--json", "env", "schema"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value = parse_json_stdout(&output, "env schema");
+    assert_eq!(value["origins"]["TOKEN"]["source"], "base.json");
+    assert_eq!(
+        value["origins"]["LOCAL"]["pointer"],
+        "/envSchema/vars/LOCAL"
+    );
+    assert_eq!(value["dependencies"], serde_json::json!(["base.json"]));
+    insta::assert_json_snapshot!("env_schema_definition_json", value, {".fingerprint" => "[fingerprint]"});
+}
+
+#[test]
+fn env_schema_json_reports_static_codes_and_source_pointers_without_literals() {
+    let project = TempProject::empty(r#"{"name":"schema-invalid"}"#);
+    project.write_file("lpm.json", r#"{"envSchema":{"extends":["base.json"]}}"#);
+    project.write_file(
+        "base.json",
+        r#"{"vars":{"VALUE":{"pattern":"[PRIVATE_PATTERN"}}}"#,
+    );
+    let output = lpm(&project)
+        .args(["--json", "env", "schema"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("PRIVATE_PATTERN"));
+    let value = parse_json_stdout(&output, "env schema invalid");
+    assert_eq!(value["diagnostics"][0]["code"], "env.invalid_pattern");
+    assert_eq!(value["diagnostics"][0]["source"], "base.json");
+    assert_eq!(value["diagnostics"][0]["pointer"], "/vars/VALUE");
+    insta::assert_json_snapshot!("env_schema_definition_invalid_json", value);
+}
+
+#[test]
+fn imported_rules_drive_examples_runtime_checks_and_definition_errors() {
+    let project = TempProject::empty(r#"{"name":"schema-import-flow"}"#);
+    project.write_file("lpm.json", r#"{"envSchema":{"extends":["base.json"]}}"#);
+    project.write_file(
+        "base.json",
+        r#"{"vars":{"VALUE":{"format":"integer","default":"4"}}}"#,
+    );
+    let example = lpm(&project)
+        .args(["env", "example", "--json"])
+        .output()
+        .unwrap();
+    assert!(example.status.success());
+    assert!(
+        parse_json_stdout(&example, "env example")["content"]
+            .as_str()
+            .unwrap()
+            .contains("VALUE=4")
+    );
+    let check = lpm(&project)
+        .args(["env", "check", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    project.write_file(
+        "base.json",
+        r#"{"vars":{"VALUE":{"format":"integer","default":"invalid"}}}"#,
+    );
+    let example = lpm(&project)
+        .args(["env", "example", "--json"])
+        .output()
+        .unwrap();
+    assert!(!example.status.success());
+
+}

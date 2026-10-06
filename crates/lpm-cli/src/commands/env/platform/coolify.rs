@@ -1,7 +1,7 @@
 use super::{
     MutationKind, MutationOutcome, PLATFORM_MUTATION_CONCURRENCY, PLATFORM_TIMEOUT,
-    PlatformApplyError, PlatformDiff, PlatformPushResult, PlatformVariable, VariableScope,
-    read_platform_response,
+    PlatformApplyError, PlatformDiff, PlatformMutationFailure, PlatformPushResult,
+    PlatformVariable, VariableScope, read_platform_response,
 };
 use futures::StreamExt;
 use lpm_common::LpmError;
@@ -134,6 +134,7 @@ enum CoolifyMutation {
 }
 
 pub(super) struct CoolifyClient {
+    pub(super) source_check: Option<super::PlatformSourceCheck>,
     http: reqwest::Client,
     token: String,
     config: CoolifyConnectionConfig,
@@ -153,6 +154,7 @@ impl CoolifyClient {
                 LpmError::Network(format!("failed to build Coolify client: {error}"))
             })?;
         Ok(Self {
+            source_check: None,
             http,
             token,
             config,
@@ -402,17 +404,22 @@ impl CoolifyClient {
                     }));
                 match self.send_mutation("update", request).await {
                     Ok(_) => MutationOutcome::Applied(MutationKind::Updated),
-                    Err(error) => match self.read_owned_value(&id, &key, self.config.preview).await
-                    {
-                        Ok(Some(observed)) if observed == value => {
-                            MutationOutcome::Applied(MutationKind::Updated)
-                        }
-                        Ok(_) => MutationOutcome::Failed {
-                            error,
-                            committed: None,
-                        },
-                        Err(_) => MutationOutcome::Unknown(error),
+                    Err(failure) if !failure.attempted => MutationOutcome::Failed {
+                        error: failure.error,
+                        committed: None,
                     },
+                    Err(PlatformMutationFailure { error, .. }) => {
+                        match self.read_owned_value(&id, &key, self.config.preview).await {
+                            Ok(Some(observed)) if observed == value => {
+                                MutationOutcome::Applied(MutationKind::Updated)
+                            }
+                            Ok(_) => MutationOutcome::Failed {
+                                error,
+                                committed: None,
+                            },
+                            Err(_) => MutationOutcome::Unknown(error),
+                        }
+                    }
                 }
             }
             CoolifyMutation::Remove { id } => match self.delete_variable(&id).await {
@@ -592,8 +599,14 @@ impl CoolifyClient {
             }
         }
 
-        if let Err(update_error) = self.update_value(key, value, is_preview).await {
-            match self.read_owned_value(&target_id, key, is_preview).await {
+        if let Err(failure) = self.update_value(key, value, is_preview).await {
+            let observed = if failure.attempted {
+                self.read_owned_value(&target_id, key, is_preview).await
+            } else {
+                Ok(None)
+            };
+            let update_error = failure.error;
+            match observed {
                 Ok(Some(observed)) if observed == value => {}
                 observed => {
                     let mut owned_ids = vec![target_id.clone()];
@@ -624,7 +637,7 @@ impl CoolifyClient {
         let Some(guard_id) = guard_id else {
             return Ok(());
         };
-        match self.delete_variable(&guard_id).await {
+        match self.delete_owned_variable(&guard_id).await {
             DeleteVariableOutcome::Removed => {}
             guard_outcome => {
                 let cleanup_error = delete_failure_error(
@@ -666,7 +679,14 @@ impl CoolifyClient {
             .await
         {
             Ok(result) => result,
-            Err(error) => {
+            Err(failure) if !failure.attempted => {
+                return Err(OwnedCreateFailure {
+                    error: failure.error,
+                    owned_ids: Vec::new(),
+                    committed: CoolifyCommitState::NotCommitted,
+                });
+            }
+            Err(PlatformMutationFailure { error, .. }) => {
                 return self
                     .recover_ambiguous_owned_create(key, value, is_preview, error)
                     .await;
@@ -771,7 +791,7 @@ impl CoolifyClient {
         value: &str,
         is_preview: bool,
         allow_existing: bool,
-    ) -> Result<PostVariableResult, LpmError> {
+    ) -> Result<PostVariableResult, PlatformMutationFailure> {
         let request = self
             .http
             .post(self.collection_url())
@@ -785,6 +805,8 @@ impl CoolifyClient {
                 "is_multiline": false,
                 "is_shown_once": false,
             }));
+        super::check_platform_sources(&self.source_check)
+            .map_err(PlatformMutationFailure::not_sent)?;
         let response = request.send().await.map_err(|error| {
             LpmError::Network(format!(
                 "Coolify create failed: {}",
@@ -796,7 +818,7 @@ impl CoolifyClient {
             return Ok(PostVariableResult::Existing);
         }
         if !status.is_success() {
-            return Err(coolify_api_error("create", status, &body));
+            return Err(coolify_api_error("create", status, &body).into());
         }
         let id = serde_json::from_slice::<CoolifyCreateResponse>(&body)
             .ok()
@@ -891,7 +913,12 @@ impl CoolifyClient {
             .any(|variable| variable.uuid == id))
     }
 
-    async fn update_value(&self, key: &str, value: &str, is_preview: bool) -> Result<(), LpmError> {
+    async fn update_value(
+        &self,
+        key: &str,
+        value: &str,
+        is_preview: bool,
+    ) -> Result<(), PlatformMutationFailure> {
         let request = self
             .http
             .patch(self.collection_url())
@@ -912,19 +939,27 @@ impl CoolifyClient {
     async fn cleanup_owned_ids(&self, ids: Vec<String>) -> Vec<OwnedCleanupOutcome> {
         let mut results = Vec::with_capacity(ids.len());
         for id in ids {
-            let outcome = self.delete_variable(&id).await;
+            let outcome = self.delete_owned_variable(&id).await;
             results.push(OwnedCleanupOutcome { id, outcome });
         }
         results
     }
 
     async fn delete_variable(&self, id: &str) -> DeleteVariableOutcome {
+        if let Err(error) = super::check_platform_sources(&self.source_check) {
+            return DeleteVariableOutcome::Present(error);
+        }
+        self.delete_owned_variable(id).await
+    }
+
+    // Only operation-owned UUIDs can bypass source checks for compensation.
+    async fn delete_owned_variable(&self, id: &str) -> DeleteVariableOutcome {
         let request = self
             .http
             .delete(self.item_url(id))
             .bearer_auth(&self.token)
             .header(reqwest::header::ACCEPT, "application/json");
-        let delete_error = match self.send_mutation("delete", request).await {
+        let delete_error = match self.send_request("delete", request).await {
             Ok(_) => return DeleteVariableOutcome::Removed,
             Err(error) => error,
         };
@@ -944,6 +979,18 @@ impl CoolifyClient {
     }
 
     async fn send_mutation(
+        &self,
+        operation: &str,
+        request: reqwest::RequestBuilder,
+    ) -> Result<Vec<u8>, PlatformMutationFailure> {
+        super::check_platform_sources(&self.source_check)
+            .map_err(PlatformMutationFailure::not_sent)?;
+        self.send_request(operation, request)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn send_request(
         &self,
         operation: &str,
         request: reqwest::RequestBuilder,
@@ -1816,6 +1863,128 @@ mod tests {
         let outcome = client.delete_variable("removed-uuid").await;
 
         assert!(matches!(outcome, DeleteVariableOutcome::Removed));
+    }
+
+    #[tokio::test]
+    async fn source_change_after_owned_create_still_cleans_both_sentinels() {
+        let _env = crate::test_env::ScopedEnv::set([(
+            "ACCEPTANCE_RUN_ID",
+            "coolify-source-cleanup".into(),
+        )]);
+        let server = MockServer::start().await;
+        let current = Arc::new(AtomicBool::new(true));
+        Mock::given(method("POST"))
+            .and(body_string_contains("\"is_preview\":true"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"uuid":"preview-guard-uuid"})),
+            )
+            .mount(&server)
+            .await;
+        let changed = Arc::clone(&current);
+        Mock::given(method("POST"))
+            .and(body_string_contains("\"is_preview\":false"))
+            .respond_with(move |_: &Request| {
+                changed.store(false, Ordering::SeqCst);
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({"uuid":"production-uuid"}))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"uuid":"production-uuid", "key":"NEW_SECRET", "value":"sentinel", "is_preview":false},
+                {"uuid":"preview-guard-uuid", "key":"NEW_SECRET", "value":"sentinel", "is_preview":true}
+            ]))).mount(&server).await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut client =
+            CoolifyClient::new("coolify-token".into(), config(server.uri())).expect("client");
+        client.source_check = Some(Arc::new(move || {
+            if current.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(LpmError::Script("env.source_changed".into()))
+            }
+        }));
+        let failure = client
+            .create_with_preview_isolation("NEW_SECRET", "production-value")
+            .await
+            .expect_err("source change blocks requested value");
+        assert!(failure.error.to_string().contains("env.source_changed"));
+        let requests = server.received_requests().await.expect("requests");
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.method.as_str() == "PATCH")
+        );
+        let mut deletes = requests
+            .iter()
+            .filter(|request| request.method.as_str() == "DELETE")
+            .map(|request| request.url.path().to_owned())
+            .collect::<Vec<_>>();
+        deletes.sort_unstable();
+        assert_eq!(
+            deletes,
+            [
+                "/api/v1/applications/application-123/envs/preview-guard-uuid",
+                "/api/v1/applications/application-123/envs/production-uuid"
+            ]
+        );
+        assert!(matches!(
+            failure.committed,
+            CoolifyCommitState::NotCommitted
+        ));
+    }
+
+    #[tokio::test]
+    async fn source_rejection_cannot_reconcile_an_unsent_update_or_delete_as_success() {
+        let _env =
+            crate::test_env::ScopedEnv::set([("ACCEPTANCE_RUN_ID", "coolify-unsent".into())]);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {"uuid":"updated-id", "key":"KEY", "value":"desired", "is_preview":false}
+            ])))
+            .mount(&server)
+            .await;
+        let mut client =
+            CoolifyClient::new("coolify-token".into(), config(server.uri())).expect("client");
+        client.source_check = Some(Arc::new(|| {
+            Err(LpmError::Script("env.source_changed".into()))
+        }));
+        let outcome = client
+            .apply_one(CoolifyMutation::Update {
+                id: "updated-id".into(),
+                key: "KEY".into(),
+                value: "desired".into(),
+                metadata: CoolifyVariableMetadata {
+                    is_literal: false,
+                    is_multiline: false,
+                    is_shown_once: false,
+                },
+            })
+            .await;
+        assert!(matches!(
+            outcome,
+            MutationOutcome::Failed {
+                committed: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            client.delete_variable("absent-id").await,
+            DeleteVariableOutcome::Present(_)
+        ));
+        assert!(
+            server
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
