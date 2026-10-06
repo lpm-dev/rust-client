@@ -55,14 +55,19 @@ class EngineExportTests(unittest.TestCase):
                     Path(args[-1]).write_bytes(b'library')
                 if failure == 'environment' and args[0] in {'lipo', 'xcrun', 'xcodebuild'}:
                     self.assertEqual(kwargs['env']['ZERO_AR_DATE'], '1')
+                if failure == 'pinned-strip' and (args[0] == 'xcrun' or args[0].endswith('llvm-objcopy')):
+                    self.assertEqual(args[0], '/pinned/rust-1.94/lib/rustlib/aarch64-apple-darwin/bin/llvm-objcopy')
+                    self.assertIn('--enable-deterministic-archives', args)
                 if args[0] == 'xcodebuild':
-                    if failure == 'environment':
+                    if failure in {'environment','pinned-strip'}:
                         raise subprocess.CalledProcessError(1, args)
                     artifact = Path(args[-1])
                     artifact.mkdir()
                     (artifact / 'library').write_bytes(b'new bundle')
 
             def read(args, **kwargs):
+                if args[0] == 'rustc':
+                    return '/pinned/rust-1.94\n' if '--print' in args else 'host: aarch64-apple-darwin\n'
                 return paths if args[1] == 'ls-files' else 'a' * 40 + '\n'
 
             import contextlib
@@ -103,6 +108,9 @@ class EngineExportTests(unittest.TestCase):
     def test_remapping_keeps_paths_with_spaces_in_single_compiler_arguments(self):
         self.scenario('remap-spaces')
 
+    def test_archive_stripping_uses_the_pinned_rust_llvm_tools(self):
+        self.scenario('pinned-strip')
+
 
 if __name__ == '__main__':
     unittest.main()
@@ -120,7 +128,7 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 marker = (root / 'crates/lpm-env/src/lib.rs').read_text()
 paths = b'\0'.join(str(path.relative_to(root)).encode() for path in root.rglob('*') if path.is_file()) + b'\0'
-module.subprocess.check_output = lambda args, **kwargs: paths if args[1] == 'ls-files' else 'a' * 40 + '\n'
+module.subprocess.check_output = lambda args, **kwargs: ('/pinned/rust-1.94\n' if '--print' in args else 'host: aarch64-apple-darwin\n') if args[0] == 'rustc' else paths if args[1] == 'ls-files' else 'a' * 40 + '\n'
 def command(args, **kwargs):
     if args[0] == 'cargo':
         library = pathlib.Path(kwargs['env']['CARGO_TARGET_DIR']) / args[-1] / 'release/liblpm_env_ffi.a'
