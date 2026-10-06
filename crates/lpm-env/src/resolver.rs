@@ -194,8 +194,20 @@ pub fn resolve_checked(
     environments: Option<&EnvironmentsConfig>,
 ) -> Result<ResolvedEnv, String> {
     let resolved = resolve(input, env_map, environments);
-    validate_env_name(&resolved.canonical)?;
+    validate_env_name(&resolved.canonical)
+        .map_err(|_| invalid_identity_message(&resolved.canonical, resolved.alias.as_deref()))?;
     Ok(resolved)
+}
+
+/// Explain an invalid resolved identity and the custom-path alias remedy.
+pub fn invalid_identity_message(canonical: &str, alias: Option<&str>) -> String {
+    let identity = alias.map_or_else(
+        || format!("environment {canonical:?}"),
+        |alias| format!("environment alias {alias:?} resolves to {canonical:?}"),
+    );
+    format!(
+        "{identity}: use a portable alias with ASCII letters, numbers, hyphens, underscores, or dots. For a task name with punctuation, select the environment through tasks.<name>.env"
+    )
 }
 
 /// Resolve from a script name (e.g., `lpm run dev` → script\_name=`"dev"`).

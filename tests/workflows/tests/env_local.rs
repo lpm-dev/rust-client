@@ -13,6 +13,73 @@ mod support;
 use support::{TempProject, lpm};
 
 #[test]
+fn env_init_imports_custom_path_environment_mappings() {
+    let project = TempProject::empty(r#"{"name":"custom-env-init"}"#);
+    project.write_file("lpm.json", r#"{"env":{"unit":"config/unit.env"}}"#);
+    project.write_file("config/unit.env", "CUSTOM_PATH_VALUE=fixture\n");
+    lpm(&project)
+        .args(["env", "init", "--json"])
+        .assert()
+        .success();
+    let output = lpm(&project)
+        .args(["env", "get", "CUSTOM_PATH_VALUE", "--env=unit", "--reveal"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("fixture"));
+}
+
+#[test]
+fn invalid_custom_path_alias_errors_name_the_alias_and_remedy() {
+    let project = TempProject::empty(r#"{"name":"invalid-env-alias"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"env":{"test:unit":"config/unit.env"},"envSchema":{"vars":{"VALUE":{}}}}"#,
+    );
+    for args in [
+        vec!["env", "check", "--json"],
+        vec!["env", "init", "--json"],
+        vec!["env", "print", "--env=test:unit"],
+    ] {
+        let output = lpm(&project).args(args).output().unwrap();
+        assert!(!output.status.success());
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(text.contains("test:unit"), "{text}");
+        assert!(text.contains("portable alias"), "{text}");
+        assert!(!text.contains("invalid envSchema rule"), "{text}");
+    }
+}
+
+#[test]
+fn configured_services_reject_unknown_schema_selectors() {
+    for field in ["requiredIn", "defaultsIn"] {
+        let project = TempProject::empty(r#"{"name":"service-selectors"}"#);
+        let selector = serde_json::json!({"service":["apii"]});
+        let rule = if field == "requiredIn" {
+            serde_json::json!({field:[selector]})
+        } else {
+            serde_json::json!({field:[{"when":selector,"value":"fixture"}]})
+        };
+        project.write_file("lpm.json", &serde_json::json!({"services":{"api":{"command":"echo api"}},"envSchema":{"vars":{"VALUE":rule}}}).to_string());
+        let output = lpm(&project)
+            .args(["env", "check", "--service=api", "--json"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "unconfigured {field} accepted");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(text.contains("apii") && text.contains(field), "{text}");
+    }
+}
+
+#[test]
 fn env_assignment_errors_do_not_print_secret_values() {
     let project = TempProject::empty(r#"{"name":"env-private-errors"}"#);
     for assignment in ["BAD-NAME=private-fixture-value", "private-fixture-value"] {

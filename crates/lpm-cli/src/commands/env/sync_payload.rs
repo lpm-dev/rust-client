@@ -200,19 +200,24 @@ pub(super) fn build_push_schema_value(
         let env_config: serde_json::Map<_, _> = c
             .env
             .iter()
-            .map(|(alias, file_path)| {
+            .filter_map(|(alias, file_path)| {
                 let mode = lpm_env::resolver::resolve_canonical_name(
                     alias,
                     &c.env,
                     c.environments.as_ref(),
                 );
-                (
+                if lpm_env::resolver::validate_env_name(alias).is_err()
+                    || lpm_env::resolver::validate_env_name(mode).is_err()
+                {
+                    return None;
+                }
+                Some((
                     alias.clone(),
                     serde_json::json!({
                         "canonical": mode,
                         "file": file_path,
                     }),
-                )
+                ))
             })
             .collect();
         obj.insert("envConfig".into(), serde_json::Value::Object(env_config));
@@ -273,6 +278,16 @@ pub(super) fn persist_org_sync_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_omits_invalid_alias_and_canonical_names() {
+        let config: lpm_runner::lpm_json::LpmJsonConfig = serde_json::from_str(r#"{"env":{"test:unit":"config/unit.env","":".env.","bad":".env.test:unit","unit":"config/unit.env"}}"#).unwrap();
+        let metadata = build_push_schema_value(Some(&config)).unwrap();
+        assert!(metadata["envConfig"].get("test:unit").is_none());
+        assert!(metadata["envConfig"].get("").is_none());
+        assert!(metadata["envConfig"].get("bad").is_none());
+        assert_eq!(metadata["envConfig"]["unit"]["canonical"], "unit");
+    }
 
     // ── env push schema metadata helpers ────────────────────────────
 

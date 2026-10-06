@@ -1393,6 +1393,7 @@ pub fn build_local_bin_command(
         no_env_check,
         path,
         lpm_env::EnvStage::Runtime,
+        None,
     )
 }
 
@@ -1431,6 +1432,32 @@ pub fn build_local_bin_command_bounded_with_stage(
     bin_hint: &ManagedRuntimeHint,
     stage: lpm_env::EnvStage,
 ) -> Result<Command, LpmError> {
+    build_local_bin_command_bounded_for_script(
+        project_dir,
+        boundary,
+        command_name,
+        extra_args,
+        env_mode,
+        no_env_check,
+        bin_hint,
+        stage,
+        None,
+    )
+}
+
+/// Build a bounded local runner with the environment selected by its script name.
+#[expect(clippy::too_many_arguments)]
+pub fn build_local_bin_command_bounded_for_script(
+    project_dir: &Path,
+    boundary: &Path,
+    command_name: &str,
+    extra_args: &[String],
+    env_mode: Option<&str>,
+    no_env_check: bool,
+    bin_hint: &ManagedRuntimeHint,
+    stage: lpm_env::EnvStage,
+    script_name: Option<&str>,
+) -> Result<Command, LpmError> {
     let bin_dirs = bin_path::find_bin_dirs_bounded(project_dir, boundary)?;
     let bin_path = resolve_local_bin_path_from_dirs(command_name, &bin_dirs)?;
     let path = bin_path::build_path_from_bin_dirs(project_dir, &bin_dirs, bin_hint)?;
@@ -1442,9 +1469,11 @@ pub fn build_local_bin_command_bounded_with_stage(
         no_env_check,
         path,
         stage,
+        script_name,
     )
 }
 
+#[expect(clippy::too_many_arguments)]
 fn build_configured_local_bin_command(
     project_dir: &Path,
     bin_path: PathBuf,
@@ -1453,11 +1482,21 @@ fn build_configured_local_bin_command(
     no_env_check: bool,
     path: String,
     stage: lpm_env::EnvStage,
+    script_name: Option<&str>,
 ) -> Result<Command, LpmError> {
     let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    let env_mode = env_mode.or_else(|| {
+        let name = script_name?;
+        let config = config.as_ref()?;
+        config
+            .tasks
+            .get(name)
+            .and_then(|task| task.env.as_deref())
+            .or_else(|| config.env.contains_key(name).then_some(name))
+    });
     let resolved = dotenv::resolve_project_environment(env_mode, config.as_ref())?;
     let mut env_vars =
-        dotenv::load_project_env_unvalidated_with_config(project_dir, env_mode, config.as_ref())?;
+        dotenv::load_project_env_unvalidated_for_resolved(project_dir, &resolved, config.as_ref())?;
     let validator = config
         .as_ref()
         .filter(|_| !no_env_check)

@@ -146,8 +146,12 @@ pub(crate) fn resolve_and_load_env_with_schema_validation(
         }
     };
     if let Some(resolved) = &resolved {
-        lpm_env::resolver::validate_env_name(&resolved.canonical)
-            .map_err(LpmError::EnvValidation)?;
+        lpm_env::resolver::validate_env_name(&resolved.canonical).map_err(|_| {
+            LpmError::EnvValidation(lpm_env::resolver::invalid_identity_message(
+                &resolved.canonical,
+                resolved.alias.as_deref(),
+            ))
+        })?;
     }
     let env_name = resolved.as_ref().map(|env| env.canonical.as_str());
     let load_mode = resolved.as_ref().and_then(dotenv::resolved_load_mode);

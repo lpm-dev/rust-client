@@ -501,7 +501,7 @@ fn execute_local_runner(
 ) -> Result<ToolOutcome, LpmError> {
     let args = local_runner_args(name, base_args, forwarded_args);
 
-    let mut command = lpm_runner::script::build_local_bin_command_bounded_with_stage(
+    let mut command = lpm_runner::script::build_local_bin_command_bounded_for_script(
         project_dir,
         boundary,
         name,
@@ -510,6 +510,11 @@ fn execute_local_runner(
         false,
         runtime_hint,
         stage,
+        Some(if stage == lpm_env::EnvStage::Test {
+            "test"
+        } else {
+            "bench"
+        }),
     )?;
     let mut outcome = ToolOutcome::default();
     match stdio {

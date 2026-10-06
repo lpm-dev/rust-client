@@ -39,6 +39,11 @@ pub enum ValidationErrorKind {
     InvalidVariableName,
     /// The declaration cannot be safely evaluated.
     InvalidRule { message: &'static str },
+    /// A resolved environment identity cannot be used for loading or storage.
+    InvalidEnvironmentName {
+        canonical: String,
+        alias: Option<String>,
+    },
     /// An empty value is explicitly forbidden.
     Empty,
     /// A value contains a NUL byte and cannot become a process environment value.
@@ -66,6 +71,14 @@ impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let key = TerminalSafe(&self.key);
         match &self.kind {
+            ValidationErrorKind::InvalidEnvironmentName { canonical, alias } => write!(
+                f,
+                "{}",
+                TerminalSafe(&crate::resolver::invalid_identity_message(
+                    canonical,
+                    alias.as_deref()
+                ))
+            )?,
             ValidationErrorKind::ConstraintViolation { constraint } => {
                 write!(f, "{key}: violates {constraint} constraint")?
             }
