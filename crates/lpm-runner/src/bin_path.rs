@@ -270,9 +270,15 @@ impl ManagedRuntimeHint {
             lpm_runtime::detect::RuntimeKind::Node,
             lpm_runtime::detect::RuntimeKind::Bun,
         ] {
-            if let Some(fingerprint) =
-                lpm_runtime::effective::probe_runtime_fingerprint_on_path(cwd, path, runtime)
-            {
+            let fingerprint = match runtime {
+                lpm_runtime::detect::RuntimeKind::Node => {
+                    lpm_runtime::effective::probe_node_fingerprint_on_path(cwd, path)
+                }
+                lpm_runtime::detect::RuntimeKind::Bun => {
+                    lpm_runtime::effective::probe_runtime_fingerprint_on_path(cwd, path, runtime)
+                }
+            };
+            if let Some(fingerprint) = fingerprint {
                 identities.push((format!("{}-executable", runtime.as_str()), fingerprint));
             }
         }

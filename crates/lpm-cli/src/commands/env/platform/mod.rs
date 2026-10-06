@@ -2378,15 +2378,14 @@ pub(super) async fn vars_platform_push(
 fn cached_status_environment<E>(
     cache: &mut StatusEnvironmentCache<E>,
     env_name: &str,
-    load: impl FnOnce(Option<&str>) -> Result<HashMap<String, String>, E>,
+    load: impl FnOnce() -> Result<HashMap<String, String>, E>,
 ) -> Result<SharedEnvironment, E>
 where
     E: Clone,
 {
-    let mode = (env_name != "default").then_some(env_name);
     cache
         .entry(env_name.to_owned())
-        .or_insert_with(|| load(mode).map(std::sync::Arc::new))
+        .or_insert_with(|| load().map(std::sync::Arc::new))
         .clone()
 }
 
@@ -2477,10 +2476,23 @@ pub(super) async fn vars_platform_status(
                 continue;
             }
         };
-        let env_name = client.linked_env().unwrap_or("default").to_owned();
-        let loaded_local = match cached_status_environment(&mut local_cache, &env_name, |_| {
-            let resolved = resolve_platform_environment(config.as_ref(), None, client.linked_env())
-                .map_err(|error| error.to_string())?;
+        let resolved = match resolve_platform_environment(
+            config.as_ref(),
+            None,
+            client.linked_env(),
+        ) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                prepared.push(Work::Immediate(serde_json::json!({"platform":connection.platform,"label":label,"status":"error","error":error.to_string(),"lastPushAt":last_push_at})));
+                continue;
+            }
+        };
+        let env_name = resolved.canonical.clone();
+        let cache_key = format!(
+            "{}:{:?}:{:?}",
+            env_name, resolved.implicit_default, resolved.file_path
+        );
+        let loaded_local = match cached_status_environment(&mut local_cache, &cache_key, || {
             lpm_runner::dotenv::load_project_env_for_resolved_with_config(
                 project_dir,
                 &resolved,
@@ -3294,7 +3306,7 @@ mod tests {
         let mut load_count = 0;
 
         for _ in 0..3 {
-            let values = cached_status_environment(&mut cache, "production", |_| {
+            let values = cached_status_environment(&mut cache, "production", || {
                 load_count += 1;
                 Ok::<_, String>(HashMap::from([("TOKEN".into(), "value".into())]))
             })
@@ -3311,7 +3323,7 @@ mod tests {
         let mut load_count = 0;
 
         for _ in 0..3 {
-            let error = cached_status_environment(&mut cache, "production", |_| {
+            let error = cached_status_environment(&mut cache, "production", || {
                 load_count += 1;
                 Err::<HashMap<String, String>, _>("decryption failed".to_string())
             })

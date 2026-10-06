@@ -2519,3 +2519,39 @@ fn env_ls_uses_the_inventory_environment_for_scoped_rules() {
     let result = parse_json_stdout(&output, "scoped inventory");
     assert_eq!(result["environments"][1]["schemaValid"], 0);
 }
+
+#[test]
+fn env_ls_and_check_agree_on_default_inheritance_and_invalid_aliases() {
+    let project = TempProject::empty(r#"{"name":"inventory-parity"}"#);
+    project.write_file("config/base.env", "VALUE=base\n");
+    for child in [false, true] {
+        project.write_file("config/child.env", "OTHER=child\n");
+        project.write_file("lpm.json", &serde_json::json!({"environments":{"base":"config/base.env","default":if child {serde_json::json!({"extends":"base","file":"config/child.env"})} else {serde_json::json!({"extends":"base"})}},"env":{"test:unit":"config/unit.env"},"envSchema":{"vars":{"VALUE":{"required":true}}}}).to_string());
+        let checked = lpm(&project)
+            .args(["env", "check", "--env=default", "--json"])
+            .output()
+            .unwrap();
+        assert!(
+            checked.status.success(),
+            "{}",
+            String::from_utf8_lossy(&checked.stdout)
+        );
+        let listed = lpm(&project)
+            .args(["env", "ls", "--json"])
+            .output()
+            .unwrap();
+        assert!(listed.status.success());
+        let result = parse_json_stdout(&listed, "inventory parity");
+        let rows = result["environments"].as_array().unwrap();
+        assert_eq!(
+            rows.iter().find(|r| r["environment"] == "default").unwrap()["schemaValid"],
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|r| r["environment"] == "test:unit")
+                .unwrap()["schemaValid"],
+            0
+        );
+    }
+}

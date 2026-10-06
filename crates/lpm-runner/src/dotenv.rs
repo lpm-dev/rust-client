@@ -176,7 +176,7 @@ pub fn resolve_stored_project_environment(
     );
     Ok(inventory
         .into_iter()
-        .find(|environment| environment.canonical == canonical)
+        .find(|environment| environment.canonical == canonical && !environment.implicit_default)
         .unwrap_or_else(|| lpm_env::resolver::resolve(canonical, &empty, None)))
 }
 
@@ -913,6 +913,14 @@ fn merge_env_file(target: &mut HashMap<String, String>, path: &Path) -> Result<(
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn stored_explicit_default_retains_named_file_selection() {
+        let resolved = resolve_stored_project_environment("default", None).unwrap();
+        assert!(!resolved.implicit_default);
+        assert_eq!(resolved_load_mode(&resolved), Some("default"));
+        assert_eq!(resolved.file_path, None);
+    }
 
     #[cfg(windows)]
     #[test]

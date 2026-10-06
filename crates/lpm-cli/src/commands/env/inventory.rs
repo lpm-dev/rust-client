@@ -378,27 +378,15 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
 
         let mut schema_error = None;
         let schema_status = if let (Some(schema), Some(validator)) = (schema, &validator) {
-            let mode = (env.canonical != "default").then_some(env.canonical.as_str());
+            let mode = (!env.implicit_default).then_some(env.storage_key.as_str());
             let evaluation = (|| -> Result<usize, LpmError> {
-                let mut values = lpm_runner::dotenv::load_project_env_files_with_config(
-                    project_dir,
-                    mode,
-                    env.file_path.as_deref(),
-                    config.as_ref(),
-                )?;
-                if let Some(stored) = effective_vars {
-                    lpm_runner::dotenv::merge_stored_project_env(&mut values, stored)?;
-                }
+                lpm_env::resolver::validate_env_name(&env.canonical).map_err(LpmError::EnvValidation)?;
+                let mut values = lpm_runner::dotenv::load_project_env_files_with_config(project_dir, mode, env.file_path.as_deref(), config.as_ref())?;
+                if let Some(stored) = effective_vars { lpm_runner::dotenv::merge_stored_project_env(&mut values, stored)?; }
                 let errors = lpm_runner::dotenv::evaluate_project_env(&mut values, Some(validator), lpm_env::EvalContext { environment: &env.canonical, ..Default::default() })?;
                 Ok(super::schema::valid_variable_count(schema, &errors))
             })();
-            let valid = match evaluation {
-                Ok(valid) => valid,
-                Err(error) => {
-                    schema_error = Some(error.to_string());
-                    0
-                }
-            };
+            let valid = match evaluation { Ok(valid) => valid, Err(error) => { schema_error = Some(error.to_string()); 0 } };
             Some((valid, schema.len()))
         } else {
             None
