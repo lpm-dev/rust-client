@@ -75,7 +75,11 @@ def export_locked(root, target_dir, output):
         library = Path(publication) / 'libLPMEnv.a'
         artifact = staging / 'LPMEnv.xcframework'
         subprocess.run(['lipo', '-create', *[str(target_dir / target / 'release/liblpm_env_ffi.a') for target in targets], '-output', str(library)], env=env, check=True)
-        subprocess.run(['xcrun', 'strip', '-S', str(library)], env=env, check=True)
+        sysroot = subprocess.check_output(['rustc', '+1.94.0', '--print', 'sysroot'], env=env, text=True).strip()
+        version = subprocess.check_output(['rustc', '+1.94.0', '-vV'], env=env, text=True)
+        host = next(line.removeprefix('host: ') for line in version.splitlines() if line.startswith('host: '))
+        objcopy = Path(sysroot) / 'lib/rustlib' / host / 'bin/llvm-objcopy'
+        subprocess.run([str(objcopy), '--strip-debug', '--enable-deterministic-archives', str(library)], env=env, check=True)
         subprocess.run(['xcodebuild', '-create-xcframework', '-library', str(library), '-headers', str(frozen / 'crates/lpm-env-ffi/include'), '-output', str(artifact)], env=env, check=True)
         files = {str(path.relative_to(staging)): file_hash(path) for path in artifact.rglob('*') if path.is_file()}
         provenance = dict(abiVersion=1, toolchain='1.94.0', targets=targets, repository='https://github.com/lpm-dev/rust-client', revision=revision, sources=sources, artifacts=files)

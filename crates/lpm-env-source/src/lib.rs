@@ -217,7 +217,7 @@ fn resolve_schema_input(
             "/envSchema",
         )
     })?;
-    let root = cap_std::fs::Dir::open_ambient_dir(&named_root, cap_std::ambient_authority())
+    let root = open_project_directory(&named_root)
         .map_err(|_| {
             SourceError::new(
                 "env.project_unavailable",
@@ -227,6 +227,21 @@ fn resolve_schema_input(
             )
         })?;
     graph::resolve(Arc::new(root), root_content, definition, Some(named_root))
+}
+
+#[cfg(not(windows))]
+fn open_project_directory(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    cap_std::fs::Dir::open_ambient_dir(path,cap_std::ambient_authority())
+}
+
+#[cfg(windows)]
+fn open_project_directory(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_SHARE_READ_WRITE_DELETE: u32 = 7;
+    let file=std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ_WRITE_DELETE).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path)?;
+    if !file.metadata()?.is_dir() { return Err(std::io::Error::other("project root must be a directory")); }
+    Ok(cap_std::fs::Dir::from_std_file(file))
 }
 
 /// Resolve through the caller's existing root capability.
