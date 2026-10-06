@@ -139,6 +139,9 @@ pub(super) async fn env_share(
     let recreate_missing = args.contains(&"--force");
 
     let manifest = super::sync_payload::CloudManifestSnapshot::read(project_dir)?;
+    let schema_value = std::sync::Arc::new(super::sync_payload::checked_push_schema_value(
+        manifest.config.as_ref(),
+    )?);
     let vault_id = manifest
         .vault
         .vault_id()
@@ -182,17 +185,11 @@ pub(super) async fn env_share(
 
     let schema_snapshot = manifest
         .sources
-        .ok_or_else(|| LpmError::Script("env.source_changed at lpm.json/envSchema".into()))?;
+        .ok_or_else(|| LpmError::Script("env.source_changed at lpm.json".into()))?;
     let vault_manifest = std::sync::Arc::new(manifest.vault);
-    let config = manifest.config;
     let secrets_json = std::sync::Arc::new(super::sync_payload::build_sync_payload(all_envs)?);
 
     let project_name = vault_manifest.project_name(project_dir);
-    let schema_value = std::sync::Arc::new(super::sync_payload::build_push_schema_value(
-        config.as_ref(),
-    ));
-
-    drop(config);
     let project_dir = project_dir.to_path_buf();
 
     if !json_output {

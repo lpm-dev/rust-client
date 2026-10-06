@@ -2817,5 +2817,4 @@ fn imported_rules_drive_examples_runtime_checks_and_definition_errors() {
         .output()
         .unwrap();
     assert!(!example.status.success());
-
 }

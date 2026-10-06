@@ -79,7 +79,7 @@ pub(super) fn verify_schema_snapshot(
         &project_dir.join("lpm.json"),
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     )
-    .map_err(|_| "env.source_changed at lpm.json/envSchema".to_string())?;
+    .map_err(|_| "env.source_changed at lpm.json".to_string())?;
     verify_schema_snapshot_content(snapshot, &content)
 }
 
@@ -88,7 +88,7 @@ fn verify_schema_snapshot_content(
     content: &str,
 ) -> Result<(), String> {
     if !snapshot.matches_root_content(content.as_bytes()) {
-        return Err("env.source_changed at lpm.json/envSchema".into());
+        return Err("env.source_changed at lpm.json".into());
     }
     snapshot
         .verify_dependencies()
@@ -282,6 +282,39 @@ pub(super) fn read_lpm_json_for_push(
 /// vaults — the calling layer decides whether to send it. Returns `None`
 /// when the project has no `lpm.json`. Read, parse, and semantic-validation
 /// failures are rejected by [`CloudManifestSnapshot::read`].
+const MAX_METADATA_BYTES: usize = 256 * 1024;
+
+pub(super) fn checked_push_schema_value(
+    config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
+) -> Result<Option<serde_json::Value>, LpmError> {
+    let value = build_push_schema_value(config);
+    if let Some(value) = &value {
+        validate_metadata_size(value)?;
+    }
+    Ok(value)
+}
+
+fn validate_metadata_size(value: &serde_json::Value) -> Result<(), LpmError> {
+    struct Budget(usize);
+    impl std::io::Write for Budget {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_sub(bytes.len())
+                .ok_or_else(|| std::io::Error::other("metadata limit"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Budget(MAX_METADATA_BYTES), value).map_err(|_| {
+        LpmError::Script(
+            "env.metadata_too_large: Env metadata exceeds the cloud limit of 256 KiB".into(),
+        )
+    })
+}
+
 pub(super) fn build_push_schema_value(
     config: Option<&lpm_runner::lpm_json::LpmJsonConfig>,
 ) -> Option<serde_json::Value> {
@@ -477,6 +510,21 @@ mod tests {
     }
 
     #[test]
+    fn metadata_budget_counts_the_complete_encoded_payload() {
+        for text in ["x", "é", "\\", "\n"] {
+            let base = serde_json::json!({"envConfig":{"alias":"custom"},"value":""});
+            let overhead = base.to_string().len();
+            let width = serde_json::to_string(text).unwrap().len() - 2;
+            let count = (MAX_METADATA_BYTES - overhead) / width;
+            validate_metadata_size(
+                &serde_json::json!({"envConfig":{"alias":"custom"},"value":text.repeat(count)}),
+            )
+            .unwrap();
+            assert!(validate_metadata_size(&serde_json::json!({"envConfig":{"alias":"custom"},"value":text.repeat(count+1)})).is_err());
+        }
+    }
+
+    #[test]
     fn mutation_rejects_root_changes_without_authored_schema() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"captured-env"}"#).unwrap();
@@ -495,7 +543,7 @@ mod tests {
                 captured.sources.as_deref().unwrap()
             )
             .unwrap_err(),
-            "env.source_changed at lpm.json/envSchema"
+            "env.source_changed at lpm.json"
         );
         assert_eq!(
             verify_org_mutation_snapshot(
@@ -507,7 +555,7 @@ mod tests {
                 captured.sources.as_deref().unwrap()
             )
             .unwrap_err(),
-            "env.source_changed at lpm.json/envSchema"
+            "env.source_changed at lpm.json"
         );
     }
 
