@@ -10,10 +10,12 @@
 //! version managers read. A native shim that passes the binary checks still
 //! changes its fingerprint when those inputs select a different version.
 
+use crate::detect::RuntimeKind;
 use sha2::{Digest, Sha256};
 use std::ffi::{OsStr, OsString};
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 const FINGERPRINT_DOMAIN: &[u8] = b"lpm-node-runtime-fingerprint-v2\0script-path";
 /// Node binaries are tens of megabytes; version-manager shims are far smaller.
@@ -57,42 +59,97 @@ fn identity_with_environment(
     managed_node_root: Option<&Path>,
     environment: &SelectorEnvironment,
 ) -> Option<ScriptNodeIdentity> {
-    let canonical_executable = executable.canonicalize().ok()?;
-    let metadata = canonical_executable.metadata().ok()?;
-    if !metadata.is_file() {
-        return None;
-    }
-    let node_binary = is_node_binary(&canonical_executable, &metadata);
+    IdentityContext::new(cwd, path, environment).identify(
+        executable,
+        managed_node_root,
+        RuntimeKind::Node,
+    )
+}
 
-    let mut hasher = FieldHasher::new(FINGERPRINT_DOMAIN);
-    hash_symlink_chain(&mut hasher, executable);
-    hasher.os(canonical_executable.as_os_str());
-    crate::effective::update_with_file_metadata(&mut hasher.0, &metadata);
-    if managed_node_root.is_some_and(|root| canonical_executable.starts_with(root)) {
-        // Each managed runtime is installed under its own version, so no
-        // project input can change the version it reports.
-        hasher.bytes(b"managed");
-    } else {
-        if !node_binary {
-            // A launcher can resolve helpers through the script PATH and read
-            // files relative to the working directory.
-            hasher.bytes(b"launcher");
-            hasher.os(cwd.canonicalize().ok()?.as_os_str());
-            hasher.os(path);
-        }
-        hash_version_selectors(&mut hasher, cwd, environment);
-    }
-
-    Some(ScriptNodeIdentity {
-        canonical_executable,
-        fingerprint: hasher.finish(),
-        node_binary,
+pub(crate) fn script_runtime_fingerprints(
+    executables: &[Option<PathBuf>; 2],
+    cwd: &Path,
+    path: &OsStr,
+    roots: [Option<&Path>; 2],
+) -> [Option<String>; 2] {
+    let environment = SelectorEnvironment::from_process();
+    let context = IdentityContext::new(cwd, path, &environment);
+    std::array::from_fn(|index| {
+        let runtime = [RuntimeKind::Node, RuntimeKind::Bun][index];
+        context
+            .identify(executables[index].as_deref()?, roots[index], runtime)
+            .map(|identity| identity.fingerprint)
     })
 }
 
-fn is_node_binary(canonical: &Path, metadata: &Metadata) -> bool {
+struct IdentityContext<'a> {
+    cwd: &'a Path,
+    path: &'a OsStr,
+    environment: &'a SelectorEnvironment,
+    selectors: OnceLock<String>,
+}
+
+impl<'a> IdentityContext<'a> {
+    fn new(cwd: &'a Path, path: &'a OsStr, environment: &'a SelectorEnvironment) -> Self {
+        Self {
+            cwd,
+            path,
+            environment,
+            selectors: OnceLock::new(),
+        }
+    }
+
+    fn identify(
+        &self,
+        executable: &Path,
+        managed_node_root: Option<&Path>,
+        runtime: RuntimeKind,
+    ) -> Option<ScriptNodeIdentity> {
+        let canonical_executable = executable.canonicalize().ok()?;
+        let metadata = canonical_executable.metadata().ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        let node_binary = is_runtime_binary(&canonical_executable, &metadata, runtime);
+
+        let mut hasher = FieldHasher::new(FINGERPRINT_DOMAIN);
+        hasher.bytes(runtime.as_str().as_bytes());
+        hash_symlink_chain(&mut hasher, executable);
+        hasher.os(canonical_executable.as_os_str());
+        crate::effective::update_with_file_metadata(&mut hasher.0, &metadata);
+        if managed_node_root.is_some_and(|root| canonical_executable.starts_with(root)) {
+            // Each managed runtime is installed under its own version, so no
+            // project input can change the version it reports.
+            hasher.bytes(b"managed");
+        } else {
+            if !node_binary {
+                // A launcher can resolve helpers through the script PATH and read
+                // files relative to the working directory.
+                hasher.bytes(b"launcher");
+                hasher.os(self.cwd.canonicalize().ok()?.as_os_str());
+                hasher.os(self.path);
+            }
+            let selectors = self.selectors.get_or_init(|| {
+                let mut selectors = FieldHasher::new(b"runtime-version-selectors");
+                hash_version_selectors(&mut selectors, self.cwd, self.environment);
+                selectors.finish()
+            });
+            hasher.bytes(selectors.as_bytes());
+        }
+
+        Some(ScriptNodeIdentity {
+            canonical_executable,
+            fingerprint: hasher.finish(),
+            node_binary,
+        })
+    }
+}
+
+fn is_runtime_binary(canonical: &Path, metadata: &Metadata, runtime: RuntimeKind) -> bool {
     #[cfg(debug_assertions)]
-    if let Some(test_binary) = std::env::var_os("LPM_TEST_NODE_BINARY") {
+    if runtime == RuntimeKind::Node
+        && let Some(test_binary) = std::env::var_os("LPM_TEST_NODE_BINARY")
+    {
         return Path::new(&test_binary)
             .canonicalize()
             .is_ok_and(|test_binary| test_binary == canonical);
@@ -101,11 +158,14 @@ fn is_node_binary(canonical: &Path, metadata: &Metadata) -> bool {
     let named_node = canonical.file_name().is_some_and(|name| {
         #[cfg(windows)]
         {
-            name.eq_ignore_ascii_case("node.exe")
+            name.eq_ignore_ascii_case(match runtime {
+                RuntimeKind::Node => "node.exe",
+                RuntimeKind::Bun => "bun.exe",
+            })
         }
         #[cfg(not(windows))]
         {
-            name == "node"
+            name == runtime.binary_name()
         }
     });
     if !named_node || metadata.len() < MIN_NODE_BINARY_BYTES {
@@ -310,6 +370,7 @@ fn is_project_selector(name: &OsStr, tool_versions: &OsStr) -> bool {
                 name,
                 ".nvmrc"
                     | ".node-version"
+                    | ".bun-version"
                     | ".prototools"
                     | "package.json"
                     | ".config"

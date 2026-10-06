@@ -423,8 +423,37 @@ pub fn probe_runtime_fingerprint_on_path(
     path: &OsStr,
     runtime: detect::RuntimeKind,
 ) -> Option<String> {
-    let executable = runtime_executable_in_path(cwd, path, runtime)?;
-    executable_fingerprint(runtime.as_str().as_bytes(), &executable)
+    let index = usize::from(runtime == detect::RuntimeKind::Bun);
+    let mut executables = [None, None];
+    executables[index] = runtime_executable_in_path(cwd, path, runtime);
+    let root = managed_runtime_root(runtime);
+    let mut roots = [None, None];
+    roots[index] = root.as_deref();
+    crate::node_identity::script_runtime_fingerprints(&executables, cwd, path, roots)[index].take()
+}
+
+/// Fingerprint Node and Bun while reading their shared version selectors once.
+pub fn probe_script_runtime_fingerprints(cwd: &Path, path: &OsStr) -> [Option<String>; 2] {
+    let executables = [
+        node_executable_in_path(cwd, path),
+        runtime_executable_in_path(cwd, path, detect::RuntimeKind::Bun),
+    ];
+    let node_root = managed_runtime_root(detect::RuntimeKind::Node);
+    let bun_root = managed_runtime_root(detect::RuntimeKind::Bun);
+    crate::node_identity::script_runtime_fingerprints(
+        &executables,
+        cwd,
+        path,
+        [node_root.as_deref(), bun_root.as_deref()],
+    )
+}
+
+fn managed_runtime_root(runtime: detect::RuntimeKind) -> Option<PathBuf> {
+    crate::node::runtimes_dir()
+        .ok()?
+        .join(runtime.as_str())
+        .canonicalize()
+        .ok()
 }
 
 /// Fingerprint the Node executable LPM would select without executing it.
@@ -769,6 +798,26 @@ fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn bun_fingerprints_cover_launcher_paths_and_version_selectors() {
+        let project = tempfile::tempdir().unwrap();
+        let executable = project.path().join("bun");
+        write_test_executable(&executable, b"#!/bin/sh\nexec helper-bun \"$@\"\n");
+        let first = std::env::join_paths([project.path(), Path::new("/a")]).unwrap();
+        let second = std::env::join_paths([project.path(), Path::new("/b")]).unwrap();
+        let probe = |path: &OsStr| {
+            probe_runtime_fingerprint_on_path(project.path(), path, detect::RuntimeKind::Bun)
+                .unwrap()
+        };
+        assert_ne!(probe(&first), probe(&second));
+        for name in [".tool-versions", ".bun-version", ".prototools", "mise.toml"] {
+            let before = probe(&first);
+            fs::write(project.path().join(name), "bun 1.3.1").unwrap();
+            assert_ne!(before, probe(&first), "{name}");
+        }
+    }
 
     fn test_node_path(dir: &Path) -> PathBuf {
         #[cfg(windows)]

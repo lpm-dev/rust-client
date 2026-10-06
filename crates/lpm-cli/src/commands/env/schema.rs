@@ -235,12 +235,19 @@ pub(super) fn vars_check(
     for environment in &all_envs {
         if lpm_env::resolver::validate_env_name(&environment.canonical).is_err() {
             all_valid = false;
-            results.push((environment.canonical.clone(), schema.len(), vec![lpm_env::ValidationError {
-                key: "env.name".into(),
-                kind: lpm_env::ValidationErrorKind::InvalidRule { message: "invalid canonical environment name; custom paths require a portable alias, or a task with an explicit env selection" },
-                description: None,
-                is_secret: false,
-            }]));
+            results.push((
+                environment.canonical.clone(),
+                schema.len(),
+                vec![lpm_env::ValidationError {
+                    key: "env.name".into(),
+                    kind: lpm_env::ValidationErrorKind::InvalidEnvironmentName {
+                        canonical: environment.canonical.clone(),
+                        alias: environment.alias.clone(),
+                    },
+                    description: None,
+                    is_secret: false,
+                }],
+            ));
             continue;
         }
         let mut env_vars = lpm_runner::dotenv::load_project_env_unvalidated_for_resolved(
@@ -518,7 +525,9 @@ pub(super) fn valid_variable_count(
     schema: &lpm_env::EnvSchema,
     errors: &[lpm_env::ValidationError],
 ) -> usize {
-    if errors.iter().any(|error| error.key == "env.name") { return 0; }
+    if errors.iter().any(|error| error.key == "env.name") {
+        return 0;
+    }
     let failed: std::collections::HashSet<&str> = errors
         .iter()
         .filter_map(|error| {

@@ -3705,3 +3705,28 @@ fn detected_test_runners_validate_test_scopes_for_single_and_workspace_packages(
         }
     }
 }
+
+#[test]
+fn detected_test_runner_loads_the_test_environment_mapping() {
+    let project =
+        TempProject::empty(r#"{"name":"mapped-test","devDependencies":{"vitest":"4.1.9"}}"#);
+    project.write_file("lpm.json", r#"{"env":{"test":"config/tests.env"}}"#);
+    project.write_file("config/tests.env", "MAPPED_TEST_VALUE=selected\n");
+    project.write_file("mapped-test.cjs", "require('node:fs').writeFileSync('test-marker',process.env.MAPPED_TEST_VALUE || 'missing')");
+    #[cfg(unix)]
+    write_unix_executable(
+        &project.path().join("node_modules/.bin/vitest"),
+        "#!/bin/sh\nexec node mapped-test.cjs\n",
+    );
+    #[cfg(windows)]
+    project.write_file(
+        "node_modules/.bin/vitest.cmd",
+        "@echo off\r\nnode mapped-test.cjs\r\n",
+    );
+    lpm(&project)
+        .env_remove("MAPPED_TEST_VALUE")
+        .args(["test"])
+        .assert()
+        .success();
+    assert_eq!(project.read_file("test-marker"), "selected");
+}
