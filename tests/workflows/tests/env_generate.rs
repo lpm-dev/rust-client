@@ -9,6 +9,149 @@ fn project() -> TempProject {
 }
 
 #[test]
+fn env_local_argument_errors_use_the_json_usage_envelope() {
+    let project = project();
+    for args in [
+        vec!["env", "check", "--json", "--bogus"],
+        vec!["env", "check", "--stage=nope", "--json"],
+        vec!["env", "generate", "--json", "--adapter=bad"],
+    ] {
+        let output = lpm(&project).args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["error_code"], "usage");
+        assert_eq!(response["success"], false);
+        assert!(output.stderr.is_empty());
+        if response["argument"] == "--bogus" {
+            insta::assert_json_snapshot!("env_local_unknown_argument", response);
+        }
+    }
+    lpm(&project)
+        .args(["env", "generate", "--help", "--json"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn env_generate_requires_valid_ownership_before_recommending_extra_file_removal() {
+    for kind in ["source", "empty", "invalid"] {
+        let project = project();
+        std::fs::create_dir(project.path().join("existing")).unwrap();
+        if kind != "empty" {
+            project.write_file("existing/source.rs", "user source");
+        }
+        if kind == "invalid" {
+            project.write_file("existing/.lpm-env-generated.json", "{}");
+        }
+        for check in [false, true] {
+            let mut command = lpm(&project);
+            command.args(["env", "generate", "--out-dir", "existing"]);
+            if check {
+                command.arg("--check");
+            }
+            let output = command.output().unwrap();
+            assert!(!output.status.success());
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("not a generated directory"),
+                "{kind}: {stderr}"
+            );
+            assert!(stderr.contains("nonexistent output path"), "{stderr}");
+            assert!(!stderr.contains("Remove extra files"), "{stderr}");
+            assert!(!stderr.contains("Restore modified files"), "{stderr}");
+        }
+        if kind != "empty" {
+            assert_eq!(project.read_file("existing/source.rs"), "user source");
+        }
+    }
+}
+
+#[test]
+fn env_generate_ownership_json_preserves_unicode_filenames() {
+    let project = project();
+    lpm(&project).args(["env", "generate"]).assert().success();
+    project.write_file("env.generated/café.txt", "keep");
+    let output = lpm(&project)
+        .args(["env", "generate", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["diagnostics"][0]["entry"], "café.txt");
+    let output = lpm(&project).args(["env", "generate"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("café.txt"), "{stderr}");
+    assert_eq!(project.read_file("env.generated/café.txt"), "keep");
+}
+
+#[test]
+#[cfg(unix)]
+fn env_generate_ownership_filenames_escape_terminal_controls_once() {
+    let project = project();
+    lpm(&project).args(["env", "generate"]).assert().success();
+    let name = "line\n\u{1b}[31m.txt";
+    project.write_file(&format!("env.generated/{name}"), "keep");
+    let output = lpm(&project)
+        .args(["env", "generate", "--json"])
+        .output()
+        .unwrap();
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["diagnostics"][0]["entry"], name);
+    let output = lpm(&project).args(["env", "generate"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(r"line\n\u{1b}[31m.txt"), "{stderr}");
+    assert!(!stderr.contains('\u{1b}'), "{stderr}");
+}
+
+#[test]
+fn env_generate_existing_file_hint_uses_a_nonexistent_output_path() {
+    let project = project();
+    project.write_file("output", "keep");
+    for check in [false, true] {
+        let mut command = lpm(&project);
+        command.args(["env", "generate", "--out-dir", "output"]);
+        if check {
+            command.arg("--check");
+        }
+        let output = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success());
+        assert!(stderr.contains("nonexistent output path"), "{stderr}");
+        assert_eq!(project.read_file("output"), "keep");
+    }
+}
+
+#[test]
+fn env_generate_rejects_portable_reserved_names_and_accepts_lookalikes() {
+    let project = project();
+    for name in [
+        "COM¹",
+        "COM².txt",
+        "com³",
+        "LPT¹",
+        "lpt².txt",
+        "LPT³",
+        "CONIN$",
+        "conout$.txt",
+    ] {
+        let output = lpm(&project)
+            .args(["env", "generate", "--out-dir", name, "--json"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "accepted {name}");
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["diagnostics"][0]["code"], "env.generate_path");
+        assert!(!project.path().join(name).exists());
+    }
+    for name in ["COM10", "COM⁴", "CONINX"] {
+        lpm(&project)
+            .args(["env", "generate", "--out-dir", name])
+            .assert()
+            .success();
+    }
+}
+
+#[test]
 fn env_generate_json_describes_the_canonical_context_and_owned_files() {
     let project = project();
     let output = lpm(&project)

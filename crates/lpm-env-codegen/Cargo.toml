@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Deterministic JavaScript and TypeScript environment validation modules"
 
 [dependencies]
+icu_properties = "=2.2.0"
 lpm-env.workspace = true
 lpm-env-source.workspace = true
 regex-automata.workspace = true

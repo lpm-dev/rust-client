@@ -34,41 +34,12 @@ impl Destination {
             let Some(text) = part.to_str() else {
                 return Err(Error::Code("env.generate_path"));
             };
-            let stem = text
-                .split('.')
-                .next()
-                .unwrap_or_default()
-                .to_ascii_uppercase();
             if text.is_empty()
                 || text.ends_with([' ', '.'])
                 || text
                     .chars()
                     .any(|c| c.is_control() || "\\:<>\"|?*".contains(c))
-                || matches!(
-                    stem.as_str(),
-                    "CON"
-                        | "PRN"
-                        | "AUX"
-                        | "NUL"
-                        | "COM1"
-                        | "COM2"
-                        | "COM3"
-                        | "COM4"
-                        | "COM5"
-                        | "COM6"
-                        | "COM7"
-                        | "COM8"
-                        | "COM9"
-                        | "LPT1"
-                        | "LPT2"
-                        | "LPT3"
-                        | "LPT4"
-                        | "LPT5"
-                        | "LPT6"
-                        | "LPT7"
-                        | "LPT8"
-                        | "LPT9"
-                )
+                || crate::patch_fs::is_windows_reserved_component(text)
             {
                 return Err(Error::Code("env.generate_path"));
             }
@@ -176,16 +147,43 @@ struct Manifest {
 
 fn ownership(entry: &OsStr, issue: &'static str) -> Error {
     Error::Ownership {
-        entry: entry
-            .to_string_lossy()
-            .chars()
-            .flat_map(char::escape_default)
-            .collect(),
+        entry: entry.to_string_lossy().into_owned(),
         issue,
     }
 }
 
 fn inventory(directory: &Dir) -> Result<(), Error> {
+    let manifest: Manifest =
+        serde_json::from_slice(&read(directory, ".lpm-env-generated.json").map_err(|_| {
+            ownership(
+                OsStr::new(".lpm-env-generated.json"),
+                "not a generated directory",
+            )
+        })?)
+        .map_err(|_| {
+            ownership(
+                OsStr::new(".lpm-env-generated.json"),
+                "invalid ownership manifest",
+            )
+        })?;
+    let hash = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    if manifest.generator != lpm_env_codegen::GENERATOR_VERSION
+        || !hash(&manifest.identity)
+        || manifest.files.len() != OWNED_FILES.len() - 1
+        || OWNED_FILES[..OWNED_FILES.len() - 1]
+            .iter()
+            .any(|name| !manifest.files.get(*name).is_some_and(|value| hash(value)))
+    {
+        return Err(ownership(
+            OsStr::new(".lpm-env-generated.json"),
+            "invalid ownership manifest",
+        ));
+    }
     let mut count = 0;
     for entry in code(directory.entries())? {
         let entry = code(entry)?;
@@ -208,31 +206,6 @@ fn inventory(directory: &Dir) -> Result<(), Error> {
             .copied()
             .unwrap_or(".lpm-env-generated.json");
         return Err(ownership(OsStr::new(missing), "missing generated file"));
-    }
-    let manifest: Manifest = serde_json::from_slice(&read(directory, ".lpm-env-generated.json")?)
-        .map_err(|_| {
-        ownership(
-            OsStr::new(".lpm-env-generated.json"),
-            "invalid ownership manifest",
-        )
-    })?;
-    let hash = |value: &str| {
-        value.len() == 64
-            && value
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    };
-    if manifest.generator != lpm_env_codegen::GENERATOR_VERSION
-        || !hash(&manifest.identity)
-        || manifest.files.len() != OWNED_FILES.len() - 1
-        || OWNED_FILES[..OWNED_FILES.len() - 1]
-            .iter()
-            .any(|name| !manifest.files.get(*name).is_some_and(|value| hash(value)))
-    {
-        return Err(ownership(
-            OsStr::new(".lpm-env-generated.json"),
-            "invalid ownership manifest",
-        ));
     }
     for (name, digest) in manifest.files {
         if lpm_env_codegen::checksum(&read(directory, &name)?) != digest {

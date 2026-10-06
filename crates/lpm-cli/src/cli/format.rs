@@ -186,7 +186,7 @@ pub(super) fn exit_with_lpm_error(error: &lpm_common::LpmError, json_output: boo
     }
 }
 
-fn print_json_clap_error(error: &clap::Error, help_hint: Option<&str>) {
+pub(crate) fn print_json_clap_error(error: &clap::Error, help_hint: Option<&str>) {
     let mut object = serde_json::Map::with_capacity(9);
     object.insert(
         "schema_version".to_owned(),

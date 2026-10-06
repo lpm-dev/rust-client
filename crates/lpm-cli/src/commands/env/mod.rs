@@ -48,7 +48,7 @@ pub async fn run(
     if args.is_empty() {
         return local::env_list(None, false, project_dir, json_output);
     }
-    if let Some(action) = arguments::parse(&args)? {
+    if let Some(action) = arguments::parse(&args, json_output)? {
         use arguments::LocalAction;
         return match action {
             LocalAction::Set {

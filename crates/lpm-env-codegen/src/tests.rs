@@ -131,6 +131,87 @@ fn assert_parity(schema: &EnvSchema, inputs: &[Value], context: EvalContext<'_>)
 }
 
 #[test]
+fn generated_urls_allow_backslashes_only_in_queries_and_fragments() {
+    let schema = schema(json!({"vars":{"VALUE":{"format":"url"}}}));
+    let inputs = [
+        r"https://h/?q=\v",
+        r"https://h/#\",
+        r"https://example.com/search?path=C:\Users",
+        r"https://h/\path",
+        r"https://h\other/",
+    ]
+    .map(|value| json!({"VALUE": value}));
+    assert_parity(&schema, &inputs, EvalContext::default());
+}
+
+#[test]
+fn generated_url_domains_match_native_idna_bidi_rules() {
+    let schema = schema(json!({"vars":{"VALUE":{"format":"url"}}}));
+    let inputs = [
+        "https://١.example",
+        "https://a١.example",
+        "https://١٢.example",
+        "https://xn--9hb.example",
+        "https://1.مثال.example",
+        "https://%D9%A1.example",
+        "https://١。example",
+        "https://مثال١.example",
+        "https://۱.example",
+        "https://example.com",
+        "postgres://١.example/db",
+        "postgres://١.example,example.com/db",
+        "postgres://example.com,١.example/db",
+        "postgres://مثال١.example,example.com/db",
+        "https://مثال1١.example",
+        "https://abc.مثال.example",
+        "https://مثال١.example.",
+        "https://[::1]/",
+    ]
+    .map(|value| json!({"VALUE": value}));
+    assert_parity(&schema, &inputs, EvalContext::default());
+}
+
+#[test]
+fn generated_url_bidi_checks_cover_ltr_rtl_and_combining_label_boundaries() {
+    let schema = schema(json!({"vars":{"VALUE":{"format":"url"}}}));
+    let mut inputs = Vec::with_capacity(400);
+    for first in ["a", "1", "-", "مثال", "١", "۱", "אבג", "\u{301}", "α", "一"] {
+        for last in ["a", "1", "-", "مثال", "١", "۱", "אבג", "\u{301}", "α", "一"] {
+            for suffix in [".example", ".مثال", ".1", ".مثال."] {
+                inputs.push(json!({"VALUE":format!("https://{first}{last}{suffix}/")}));
+            }
+        }
+    }
+    assert_parity(&schema, &inputs, EvalContext::default());
+}
+
+#[test]
+fn generated_url_bidi_work_limit_is_not_swallowed_as_an_invalid_format() {
+    let mut generated = generate(
+        &schema(json!({"vars":{"VALUE":{"format":"url"}}})),
+        options(),
+    )
+    .unwrap();
+    generated
+        .files
+        .get_mut("server.js")
+        .unwrap()
+        .extend_from_slice(b"\nexport function probeUrl(value,left){return url(value,{left});}\n");
+    node(
+        &generated,
+        "server",
+        &[],
+        r#"
+const {probeUrl}=await import('./server.js');
+for(const value of ['https://xn--9hb.example','postgres://xn--9hb.example,example.com/db']){
+  try{probeUrl(value,value.length);throw new Error('expected budget failure');}
+  catch(error){if(error.issues?.[0]?.code!=='env.resource_limit')throw error;}
+}
+"#,
+    );
+}
+
+#[test]
 fn generated_formats_match_rust_on_lexical_edge_cases() {
     let cases: &[(&str, &[&str])] = &[
         (

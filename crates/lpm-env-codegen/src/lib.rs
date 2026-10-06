@@ -351,6 +351,15 @@ fn module(
     definition(&mut result, "groups", &groups)?;
     definition(&mut result, "programs", &programs)?;
     definition(&mut result, "wordRanges", &word)?;
+    let bidi = if vars
+        .values()
+        .any(|rule| rule.format == Some(lpm_env::VarFormat::Url))
+    {
+        bidi_ranges()
+    } else {
+        Vec::new()
+    };
+    definition(&mut result, "bidiRanges", &bidi)?;
     append(&mut result, include_bytes!("formats.js"))?;
     append(&mut result, include_bytes!("runtime.js"))?;
     append(
@@ -403,6 +412,27 @@ fn module(
 struct Output {
     bytes: Vec<u8>,
     limit: usize,
+}
+
+fn bidi_ranges() -> Vec<(u32, u32, u8)> {
+    use icu_properties::{CodePointMapData, props::BidiClass};
+    CodePointMapData::<BidiClass>::new()
+        .iter_ranges_mapped(|class| match class {
+            BidiClass::LeftToRight => 1,
+            BidiClass::RightToLeft | BidiClass::ArabicLetter => 2,
+            BidiClass::ArabicNumber => 4,
+            BidiClass::EuropeanNumber => 8,
+            BidiClass::NonspacingMark => 16,
+            BidiClass::EuropeanSeparator
+            | BidiClass::CommonSeparator
+            | BidiClass::EuropeanTerminator
+            | BidiClass::OtherNeutral
+            | BidiClass::BoundaryNeutral => 32,
+            _ => 0,
+        })
+        .filter(|range| range.value != 1)
+        .map(|range| (*range.range.start(), *range.range.end(), range.value))
+        .collect()
 }
 impl Output {
     fn new(capacity: usize, limit: usize) -> Self {

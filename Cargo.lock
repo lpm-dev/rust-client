@@ -3557,6 +3557,7 @@ dependencies = [
 name = "lpm-env-codegen"
 version = "0.79.0"
 dependencies = [
+ "icu_properties",
  "lpm-env",
  "lpm-env-source",
  "regex-automata",

@@ -8,3 +8,4 @@ pub(crate) use args::{
     BundleFormat, BundlePlatform, CheckEngine, Cli, Commands, InitPackageTargetCli,
 };
 pub(crate) use dispatch::run;
+pub(crate) use format::print_json_clap_error;

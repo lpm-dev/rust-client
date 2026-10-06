@@ -1,0 +1,14 @@
+---
+source: tests/workflows/tests/env_generate.rs
+expression: response
+---
+{
+  "schema_version": 1,
+  "success": false,
+  "error_code": "usage",
+  "kind": "unknown_argument",
+  "error": "unexpected argument '--bogus' found",
+  "argument": "--bogus",
+  "usage": "lpm env check [OPTIONS]",
+  "hint": "Run `lpm env check --help` for command usage."
+}

@@ -106,11 +106,15 @@ impl Error {
                 issue: "extra entry",
                 ..
             } => "Remove extra files from the output directory, then rerun the same command.",
+            Self::Ownership {
+                issue: "invalid ownership manifest" | "not a generated directory",
+                ..
+            }
+            | Self::Code("env.generate_unowned_directory") => {
+                "This is not a generated directory. Choose a nonexistent output path, or move the existing directory aside before retrying."
+            }
             Self::Ownership { .. } => {
                 "Restore modified files from version control, or move the generated directory aside before retrying."
-            }
-            Self::Code("env.generate_unowned_directory") => {
-                "Choose an empty output directory, or move the existing directory aside before retrying."
             }
             Self::Code("env.generate_path") => {
                 "Choose a relative output directory inside the project with portable names. Avoid reserved Windows names, trailing dots or spaces, and : < > \" | ? * or backslashes."

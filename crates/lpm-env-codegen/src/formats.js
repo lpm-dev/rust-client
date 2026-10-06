@@ -140,8 +140,100 @@ function validDatabaseEndpoint(endpoint, work) {
       if (number > 65535) return false;
     }
   }
-  try { return new URL('http://' + host).hostname.length > 0; }
+  let parsed;
+  try { parsed = new URL('http://' + host); }
   catch { return false; }
+  return parsed.hostname.length > 0 && validBidiDomain(parsed.hostname,work);
+}
+const BIDI_LTR = 1, BIDI_RTL = 2, BIDI_AN = 4, BIDI_EN = 8, BIDI_NSM = 16, BIDI_NEUTRAL = 32;
+function bidiClass(c, work) {
+  let low = 0, high = bidiRanges.length - 1;
+  while (low <= high) {
+    spend(work);
+    const mid = (low + high) >>> 1, range = bidiRanges[mid];
+    if (c < range[0]) high = mid - 1;
+    else if (c > range[1]) low = mid + 1;
+    else return range[2];
+  }
+  return BIDI_LTR;
+}
+function punycodeLabel(label, work) {
+  if (!label.startsWith('xn--')) return Array.from(label,c=>c.codePointAt(0));
+  const input = label.slice(4), output = [], delimiter = input.lastIndexOf('-');
+  let position = 0, n = 128, i = 0, bias = 72;
+  if (delimiter >= 0) {
+    for (; position < delimiter; position++) {
+      spend(work);
+      const c = input.charCodeAt(position);
+      if (c > 127) return null;
+      output.push(c);
+    }
+    position++;
+  }
+  while (position < input.length) {
+    const previous = i;
+    let weight = 1;
+    for (let k = 36; ; k += 36) {
+      spend(work);
+      if (position >= input.length) return null;
+      const c = input.charCodeAt(position++);
+      const digit = c >= 97 && c <= 122 ? c - 97 : c >= 48 && c <= 57 ? c - 22 : 36;
+      if (digit >= 36) return null;
+      i += digit * weight;
+      if (!Number.isSafeInteger(i)) return null;
+      const threshold = k <= bias ? 1 : k >= bias + 26 ? 26 : k - bias;
+      if (digit < threshold) break;
+      weight *= 36 - threshold;
+      if (!Number.isSafeInteger(weight)) return null;
+    }
+    const count = output.length + 1;
+    let delta = Math.floor((i - previous) / (previous === 0 ? 700 : 2));
+    delta += Math.floor(delta / count);
+    let k = 0;
+    while (delta > 455) { spend(work); delta = Math.floor(delta / 35); k += 36; }
+    bias = k + Math.floor(36 * delta / (delta + 38));
+    n += Math.floor(i / count);
+    if (n > 1114111 || n >= 55296 && n <= 57343) return null;
+    i %= count;
+    // Charge insertion shifts before allocating or moving decoded scalars.
+    spend(work,output.length - i + 1);
+    output.splice(i,0,n);
+    i++;
+  }
+  return output;
+}
+function validBidiDomain(host, work) {
+  if (host.startsWith('[') || !host.includes('xn--')) return true;
+  const labels = [], parts = host.split('.');
+  let triggered = false;
+  for (const part of parts) {
+    spend(work,part.length + 1);
+    const scalars = punycodeLabel(part,work);
+    if (scalars === null) return false;
+    const classes = scalars.map(c=>bidiClass(c,work));
+    for (const c of classes) { spend(work); if (c & (BIDI_RTL | BIDI_AN)) triggered = true; }
+    labels.push(classes);
+  }
+  if (!triggered) return true;
+  for (const classes of labels) {
+    if (classes.length === 0) continue;
+    const first = classes[0];
+    if (!(first & (BIDI_LTR | BIDI_RTL))) return false;
+    const ltr = first === BIDI_LTR;
+    const allowed = (ltr ? BIDI_LTR : BIDI_RTL | BIDI_AN) | BIDI_EN | BIDI_NSM | BIDI_NEUTRAL;
+    const lastAllowed = (ltr ? BIDI_LTR : BIDI_RTL | BIDI_AN) | BIDI_EN;
+    let last = classes.length - 1, numerals = 0;
+    while (last > 0 && classes[last] === BIDI_NSM) { spend(work); last--; }
+    if (!(classes[last] & lastAllowed)) return false;
+    for (let j = 1; j <= last; j++) {
+      spend(work);
+      const c = classes[j];
+      if (!(c & allowed)) return false;
+      numerals |= c & (BIDI_AN | BIDI_EN);
+    }
+    if (!ltr && numerals === (BIDI_AN | BIDI_EN)) return false;
+  }
+  return true;
 }
 function fileDriveSegment(path) {
   const c = path.charCodeAt(1);
@@ -152,7 +244,7 @@ function parsedUrl(value, work) {
   const schemeEnd = value.indexOf(':'), start = schemeEnd + 3;
   const scheme = value.slice(0, schemeEnd).toLowerCase();
   const special = ['http','https','ftp','ws','wss','file'].includes(scheme);
-  if (special && value.includes('\\')) return false;
+  if (special && value.split(/[?#]/,1)[0].includes('\\')) return false;
   let end = start;
   while (end < value.length && !'/?#'.includes(value[end])) end++;
   const authority = value.slice(start,end), at = authority.lastIndexOf('@');
@@ -165,11 +257,11 @@ function parsedUrl(value, work) {
     const path = value.slice(end);
     if (fileDriveSegment(path)) return false;
   }
-  try {
-    const parsed = new URL(value);
-    if (scheme === 'file' && fileDriveSegment(parsed.pathname)) return false;
-    return parsed.hostname.length > 0;
-  } catch { return false; }
+  let parsed;
+  try { parsed = new URL(value); }
+  catch { return false; }
+  if (scheme === 'file' && fileDriveSegment(parsed.pathname)) return false;
+  return parsed.hostname.length > 0 && (!special || validBidiDomain(parsed.hostname,work));
 }
 function url(value, work) {
   const schemeEnd = value.indexOf(':');

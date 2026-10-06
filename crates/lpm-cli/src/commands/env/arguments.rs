@@ -140,7 +140,7 @@ pub(super) enum LocalAction {
     },
 }
 
-pub(super) fn parse(args: &[&str]) -> Result<Option<LocalAction>, LpmError> {
+pub(super) fn parse(args: &[&str], json_output: bool) -> Result<Option<LocalAction>, LpmError> {
     if !matches!(
         args.first().copied(),
         Some(
@@ -171,7 +171,11 @@ pub(super) fn parse(args: &[&str]) -> Result<Option<LocalAction>, LpmError> {
         .map(|command| Some(command.action))
         .map_err(|error| {
             let status = if error.use_stderr() { 2 } else { 0 };
-            let _ = error.print();
+            if json_output && error.use_stderr() {
+                crate::cli::print_json_clap_error(&error, None);
+            } else {
+                let _ = error.print();
+            }
             LpmError::ExitCode(status)
         })
 }
