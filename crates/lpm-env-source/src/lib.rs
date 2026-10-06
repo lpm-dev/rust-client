@@ -26,6 +26,8 @@ pub struct SchemaDiagnostic {
     pub source: String,
     pub pointer: String,
     pub key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<&'static str>,
     #[serde(rename = "relatedSources", skip_serializing_if = "Vec::is_empty")]
     pub related_sources: Vec<SourceLocation>,
 }
@@ -54,6 +56,9 @@ impl std::fmt::Display for SourceError {
                 DiagnosticText(&second.source),
                 DiagnosticText(&second.pointer)
             )?;
+        }
+        if let Some(message) = self.diagnostic.message {
+            write!(f, ": {message}")?;
         }
         Ok(())
     }
@@ -93,6 +98,7 @@ impl SourceError {
                     pointer.into()
                 },
                 key: None,
+                message: None,
                 related_sources: Vec::new(),
             }),
             requested_paths: Vec::new(),
@@ -282,6 +288,7 @@ pub fn declaration_code(kind: &ValidationErrorKind) -> &'static str {
         ValidationErrorKind::InvalidVariableName => "env.invalid_name",
         ValidationErrorKind::InvalidPattern { .. } => "env.invalid_pattern",
         ValidationErrorKind::InvalidRule { .. } => "env.invalid_rule",
+        ValidationErrorKind::InvalidEnvironmentName { .. } => "env.invalid_environment",
         ValidationErrorKind::Empty => "env.empty",
         ValidationErrorKind::InvalidValue => "env.invalid_value",
         ValidationErrorKind::Missing => "env.required",
