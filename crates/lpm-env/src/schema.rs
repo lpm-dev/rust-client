@@ -201,9 +201,16 @@ impl EnvSchema {
     pub(crate) fn has_framework_client_prefix(name: &str) -> bool {
         name.get(..10)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("REACT_APP_"))
-            || ["NEXT_PUBLIC_", "VITE_", "PUBLIC_"]
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
+            || [
+                "NEXT_PUBLIC_",
+                "VITE_",
+                "PUBLIC_",
+                "EXPO_PUBLIC_",
+                "GATSBY_",
+                "NUXT_PUBLIC_",
+            ]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
     }
 
     /// Returns true if the schema has no variable definitions.

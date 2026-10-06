@@ -1832,6 +1832,9 @@ mod tests {
             r#"{"vars":{"PUBLIC_TOKEN":{"secret":true,"client":true}}}"#,
             r#"{"vars":{"NEXT_PUBLIC_TOKEN":{"secret":true}}}"#,
             r#"{"vars":{"VITE_ENDPOINT":{}}}"#,
+            r#"{"vars":{"EXPO_PUBLIC_TOKEN":{"secret":true}}}"#,
+            r#"{"vars":{"GATSBY_TOKEN":{"secret":true}}}"#,
+            r#"{"vars":{"NUXT_PUBLIC_TOKEN":{"secret":true}}}"#,
         ] {
             assert!(
                 !validate_schema(&schema_from_json(json)).is_empty(),
