@@ -1421,7 +1421,10 @@ fn env_check_human_output_reports_an_invalid_default_as_invalid() {
     );
 
     assert!(!output.status.success(), "invalid default must fail");
-    assert!(combined.contains("PORT: invalid format"), "{combined}");
+    assert!(
+        combined.contains("env.invalid_format at lpm.json/envSchema/vars/PORT"),
+        "{combined}"
+    );
     assert!(!combined.contains("missing: PORT"), "{combined}");
 }
 

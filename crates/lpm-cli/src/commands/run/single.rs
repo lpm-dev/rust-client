@@ -44,11 +44,24 @@ impl FileWatchConfig {
                 Err(_) => false,
             });
         if !reusable {
-            let config = root.and_then(|content| {
-                content
-                    .map(|content| lpm_runner::lpm_json::parse_lpm_json_in(project_dir, &content))
-                    .transpose()
-            });
+            let config = root
+                .map_err(|message| (message, Vec::new()))
+                .and_then(|content| {
+                    content
+                        .map(|content| {
+                            lpm_runner::lpm_json::parse_lpm_json_in_detailed(project_dir, &content)
+                        })
+                        .transpose()
+                        .map_err(|error| {
+                            let paths = match &error {
+                                lpm_runner::lpm_json::ConfigReadError::Schema { error, .. } => {
+                                    error.requested_paths.clone()
+                                }
+                                _ => Vec::new(),
+                            };
+                            (error.to_string(), paths)
+                        })
+                });
             self.paths = match &config {
                 Ok(config) => config
                     .as_ref()
@@ -61,8 +74,9 @@ impl FileWatchConfig {
                             .collect()
                     })
                     .unwrap_or_default(),
-                Err(_) => lpm_runner::lpm_json::schema_watch_paths(project_dir),
+                Err((_, paths)) => paths.clone(),
             };
+            let config = config.map_err(|(message, _)| message);
             self.root_digest = digest;
             self.captured = Some(config);
         }
@@ -277,14 +291,25 @@ pub fn run_watch(
     stream: bool,
 ) -> Result<(), LpmError> {
     let script = script_name.to_string();
-    let filter =
-        match super::prepare_single_package_task_plan(project_dir, std::slice::from_ref(&script)) {
-            Ok(plan) => task_watch_filter(project_dir, &plan)?,
-            Err(_) => lpm_task::watch::WatchFilter::new(project_dir, &[], &[])
-                .map_err(LpmError::Script)?
-                .with_config_files()
-                .with_config_dependencies(&lpm_runner::lpm_json::schema_watch_paths(project_dir)),
-        };
+    let filter = match lpm_runner::lpm_json::read_lpm_json_detailed(project_dir) {
+        Ok(config) => {
+            let plan = super::prepare_single_package_task_plan_with_config(
+                project_dir,
+                std::slice::from_ref(&script),
+                config,
+            )?;
+            task_watch_filter(project_dir, &plan)?
+        }
+        Err(lpm_runner::lpm_json::ConfigReadError::Schema { error, config }) => {
+            let plan = super::prepare_single_package_task_plan_with_config(
+                project_dir,
+                std::slice::from_ref(&script),
+                Some(*config),
+            )?;
+            task_watch_filter(project_dir, &plan)?.with_config_dependencies(&error.requested_paths)
+        }
+        Err(error) => return Err(LpmError::Script(error.to_string())),
+    };
     let filter = lpm_task::watch::WatchFilterHandle::new(filter);
     let cycle_filter = filter.clone();
     install_ui::phase_untrusted(&format!(
@@ -305,18 +330,21 @@ pub fn run_watch(
                 let _ = stderr.flush();
             }
             let result = cycle_env_access.run(|| {
-                let plan = match super::prepare_single_package_task_plan(
-                    &dir,
-                    std::slice::from_ref(&script),
-                ) {
-                    Ok(plan) => plan,
+                let config = match lpm_runner::lpm_json::read_lpm_json_detailed(&dir) {
+                    Ok(config) => config,
                     Err(error) => {
-                        cycle_filter.replace_config_dependencies(
-                            &lpm_runner::lpm_json::schema_watch_paths(&dir),
-                        );
-                        return Err(error);
+                        if let lpm_runner::lpm_json::ConfigReadError::Schema { error, .. } = &error
+                        {
+                            cycle_filter.replace_config_dependencies(&error.requested_paths);
+                        }
+                        return Err(LpmError::Script(error.to_string()));
                     }
                 };
+                let plan = super::prepare_single_package_task_plan_with_config(
+                    &dir,
+                    std::slice::from_ref(&script),
+                    config,
+                )?;
                 cycle_filter.replace(task_watch_filter(&dir, &plan)?);
                 super::execute_single_package_task_plan(
                     &dir,
