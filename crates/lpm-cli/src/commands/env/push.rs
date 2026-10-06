@@ -48,6 +48,9 @@ pub(super) async fn vars_push(
     let force = args.contains(&"--force");
     let yes = args.iter().any(|a| *a == "--yes" || *a == "-y");
     let manifest = super::sync_payload::CloudManifestSnapshot::read(project_dir)?;
+    let schema_value = std::sync::Arc::new(super::sync_payload::checked_push_schema_value(
+        manifest.config.as_ref(),
+    )?);
     let vault_id = manifest
         .vault
         .vault_id()
@@ -67,9 +70,8 @@ pub(super) async fn vars_push(
 
     let schema_snapshot = manifest
         .sources
-        .ok_or_else(|| LpmError::Script("env.source_changed at lpm.json/envSchema".into()))?;
+        .ok_or_else(|| LpmError::Script("env.source_changed at lpm.json".into()))?;
     let vault_manifest = std::sync::Arc::new(manifest.vault);
-    let config = manifest.config;
 
     let project_name = vault_manifest.project_name(project_dir);
     let expected_principal_id = vault_manifest
@@ -100,12 +102,6 @@ pub(super) async fn vars_push(
     }
 
     let secrets_json = std::sync::Arc::new(super::sync_payload::build_sync_payload(all_envs)?);
-
-    let schema_value = std::sync::Arc::new(super::sync_payload::build_push_schema_value(
-        config.as_ref(),
-    ));
-
-    drop(config);
 
     let project_dir = project_dir.to_path_buf();
     let (result, registry_url) = super::auth::execute_sync_with_bearer(

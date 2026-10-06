@@ -586,3 +586,87 @@ fn effective_rules_reuse_owned_declaration_storage_after_graph_preflight() {
         original
     );
 }
+
+#[test]
+fn conflicting_declarations_report_both_authored_origins_and_the_key() {
+    for field in ["vars", "groups"] {
+        let dir = tempfile::tempdir().unwrap();
+        let value = if field == "vars" {
+            serde_json::json!({})
+        } else {
+            serde_json::json!({"mode":"allOrNone","vars":["A"]})
+        };
+        for source in ["a.json", "b.json"] {
+            fs::write(
+                dir.path().join(source),
+                if field == "vars" {
+                    serde_json::json!({"vars":{"DUP":value}})
+                } else {
+                    serde_json::json!({"groups":{"DUP":value},"vars":{"A":{}}})
+                }
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let root = if field == "vars" {
+            serde_json::json!({"extends":["a.json","b.json"]})
+        } else {
+            serde_json::json!({"extends":["a.json","b.json"],"overrides":{"A":{}}})
+        };
+        let error = resolve(&dir, root).unwrap_err();
+        let diagnostic = serde_json::to_value(&error.diagnostic).unwrap();
+        assert_eq!(diagnostic["key"], "DUP");
+        assert_eq!(diagnostic["source"], "b.json");
+        assert_eq!(diagnostic["pointer"], format!("/{field}/DUP"));
+        assert_eq!(diagnostic["relatedSources"][0]["source"], "a.json");
+        assert_eq!(diagnostic["relatedSources"][1]["source"], "b.json");
+    }
+}
+
+#[test]
+fn root_selection_freshness_errors_point_to_the_manifest_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("selected");
+    fs::create_dir(&path).unwrap();
+    let root = b"{}";
+    let schema = resolve_schema(&path, root, Default::default()).unwrap();
+    fs::rename(&path, dir.path().join("old")).unwrap();
+    fs::create_dir(&path).unwrap();
+    let error = schema.verify_dependencies().unwrap_err();
+    assert_eq!(error.diagnostic.source, "lpm.json");
+    assert_eq!(error.diagnostic.pointer, "");
+}
+
+#[test]
+fn local_conflicts_report_authored_root_and_import_pointers() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("base.json"), r#"{"vars":{"A":{}}}"#).unwrap();
+    for overrides in [false, true] {
+        let root = if overrides {
+            serde_json::json!({"extends":["base.json"],"vars":{"A":{}},"overrides":{"A":{}}})
+        } else {
+            serde_json::json!({"extends":["base.json"],"vars":{"A":{}}})
+        };
+        let error = resolve(&dir, root).unwrap_err();
+        assert_eq!(error.diagnostic.key.as_deref(), Some("A"));
+        let origins = &error.diagnostic.related_sources;
+        assert_eq!(origins.len(), 2);
+        assert_eq!(
+            origins[0].source,
+            if overrides { "lpm.json" } else { "base.json" }
+        );
+        assert_eq!(
+            origins[1].pointer,
+            if overrides {
+                "/envSchema/overrides/A"
+            } else {
+                "/envSchema/vars/A"
+            }
+        );
+        assert!(error.to_string().contains(if overrides {
+            "/envSchema/vars/A"
+        } else {
+            "base.json/vars/A"
+        }));
+    }
+}

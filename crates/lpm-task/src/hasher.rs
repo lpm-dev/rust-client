@@ -648,6 +648,15 @@ fn append_windows_file_identity(bytes: &mut Vec<u8>, identity: Option<WindowsFil
 }
 
 #[cfg(windows)]
+pub(crate) fn path_object_identity(path: &Path) -> Option<(u64, u64)> {
+    let identity = windows_path_identity(path, false)?;
+    Some((
+        u64::from(identity.volume_serial_number),
+        identity.file_index,
+    ))
+}
+
+#[cfg(windows)]
 fn windows_path_identity(path: &Path, follow: bool) -> Option<WindowsFileIdentity> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use windows_sys::Win32::Storage::FileSystem::{

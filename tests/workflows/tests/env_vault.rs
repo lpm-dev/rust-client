@@ -9298,3 +9298,35 @@ async fn platform_status_distinguishes_redirected_and_stored_default_selections(
         }
     }
 }
+
+#[tokio::test]
+async fn cloud_mutations_reject_oversized_metadata_before_authentication() {
+    let project = TempProject::empty(r#"{"name":"metadata-limit"}"#);
+    let mock = MockRegistry::start().await;
+    lpm(&project)
+        .args(["env", "set", "TOKEN=value"])
+        .assert()
+        .success();
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("lpm.json")).unwrap();
+    manifest["envSchema"] =
+        serde_json::json!({"vars":{"TOKEN":{"description":"x".repeat(300*1024)}}});
+    project.write_file("lpm.json", &manifest.to_string());
+    for args in [
+        vec!["--json", "env", "push", "--yes"],
+        vec!["--json", "env", "share", "--org=team"],
+    ] {
+        let output = lpm(&project)
+            .env("LPM_REGISTRY_URL", mock.url())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let result = parse_clean_json_stdout(&output);
+        assert!(
+            result["error"].as_str().unwrap().contains("256 KiB"),
+            "{result}"
+        );
+    }
+    assert!(mock.server().received_requests().await.unwrap().is_empty());
+}

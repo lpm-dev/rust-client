@@ -43,6 +43,14 @@ def export_locked(root, target_dir, output):
     if output.exists() and any(path.name not in {'LPMEnv.xcframework', 'provenance.json'} for path in output.iterdir()):
         raise RuntimeError('Output contains files outside the engine bundle')
     revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
+    recorded_sources = source_hashes(root)
+    for relative, digest in recorded_sources.items():
+        try:
+            committed = subprocess.check_output(['git', 'show', revision + ':' + relative], cwd=root, stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError('Engine inputs do not match the recorded revision: ' + relative) from error
+        if hashlib.sha256(committed).hexdigest() != digest:
+            raise RuntimeError('Engine inputs do not match the recorded revision: ' + relative)
     paths = subprocess.check_output(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], cwd=root).split(b'\0')
     targets = ['aarch64-apple-darwin', 'x86_64-apple-darwin']
     with tempfile.TemporaryDirectory(prefix='lpm-env-source-') as temporary, tempfile.TemporaryDirectory(prefix='.lpm-env-export-', dir=output.parent) as publication:
@@ -79,7 +87,7 @@ def export_locked(root, target_dir, output):
         version = subprocess.check_output(['rustc', '+1.94.0', '-vV'], env=env, text=True)
         host = next(line.removeprefix('host: ') for line in version.splitlines() if line.startswith('host: '))
         objcopy = Path(sysroot) / 'lib/rustlib' / host / 'bin/llvm-objcopy'
-        subprocess.run([str(objcopy), '--strip-debug', '--enable-deterministic-archives', str(library)], env=env, check=True)
+        subprocess.run([str(objcopy), '--strip-debug', '--enable-deterministic-archives', '--remove-section=__LLVM,__bitcode', '--remove-section=__LLVM,__cmdline', str(library)], env=env, check=True)
         subprocess.run(['xcodebuild', '-create-xcframework', '-library', str(library), '-headers', str(frozen / 'crates/lpm-env-ffi/include'), '-output', str(artifact)], env=env, check=True)
         files = {str(path.relative_to(staging)): file_hash(path) for path in artifact.rglob('*') if path.is_file()}
         provenance = dict(abiVersion=1, toolchain='1.94.0', targets=targets, repository='https://github.com/lpm-dev/rust-client', revision=revision, sources=sources, artifacts=files)

@@ -4,7 +4,7 @@ mod reconcile;
 
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::time::{Duration, Instant};
@@ -68,6 +68,11 @@ impl WatchFilter {
 
     fn for_file(file: &Path) -> Result<Self, String> {
         let file = normalize_file_path(file)?;
+        Self::for_normalized_file(&file)
+    }
+
+    fn for_normalized_file(file: &Path) -> Result<Self, String> {
+        let file = file.to_path_buf();
         let root = file.parent().ok_or("watched file has no parent")?;
         let mut filter = Self::new(root, &[], &[])?;
         let mut current = file;
@@ -129,7 +134,7 @@ impl WatchFilter {
             return true;
         }
         if !self.literal_files.is_empty() {
-            return self.literal_files.iter().any(|file| file == path);
+            return self.literal_files.iter().any(|file| file.starts_with(path));
         }
         let Ok(relative) = path.strip_prefix(&self.root) else {
             return false;
@@ -159,9 +164,36 @@ fn normalize_file_path(file: &Path) -> Result<PathBuf, String> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let parent = std::fs::canonicalize(parent).map_err(|error| error.to_string())?;
+    let absolute = std::path::absolute(parent).map_err(|error| error.to_string())?;
+    let mut ancestor = absolute.as_path();
+    let mut parent = loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(mut resolved) => {
+                for component in absolute
+                    .strip_prefix(ancestor)
+                    .map_err(|error| error.to_string())?
+                    .components()
+                {
+                    match component {
+                        Component::Normal(name) => resolved.push(name),
+                        Component::ParentDir => {
+                            resolved.pop();
+                        }
+                        Component::CurDir => {}
+                        _ => return Err("invalid watched file parent".into()),
+                    }
+                }
+                break resolved;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = ancestor.parent().ok_or_else(|| error.to_string())?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    };
     let name = file.file_name().ok_or("watched file has no name")?;
-    Ok(parent.join(name))
+    parent.push(name);
+    Ok(parent)
 }
 
 fn normalize_watch_glob(pattern: &str) -> String {
@@ -439,7 +471,7 @@ fn watch_file_and_run_inner(
     let mut watcher: RecommendedWatcher =
         notify::recommended_watcher(move |event| notifications.submit(event))
             .map_err(|error| format!("failed to create file watcher: {error}"))?;
-    let mut roots = HashSet::new();
+    let mut roots = HashMap::new();
     let dependencies = file_config_dependencies(&mut config);
     refresh_file_watch(
         &file,
@@ -449,11 +481,6 @@ fn watch_file_and_run_inner(
         &dependencies,
         config.as_ref().map(|(root, _)| root.as_path()),
     )?;
-    if let Some((root, _)) = &config {
-        watcher
-            .watch(root, RecursiveMode::Recursive)
-            .map_err(|error| error.to_string())?;
-    }
     run_watch_loop(
         receiver,
         Box::new(move || {
@@ -484,32 +511,84 @@ fn watch_file_and_run_inner(
 fn refresh_file_watch(
     file: &Path,
     watcher: &mut impl Watcher,
-    roots: &mut HashSet<PathBuf>,
+    roots: &mut HashMap<PathBuf, Option<(u64, u64)>>,
     filter: &WatchFilterHandle,
     dependencies: &[PathBuf],
-    recursive_root: Option<&Path>,
+    project_root: Option<&Path>,
 ) -> Result<(), String> {
-    let mut next_filter = WatchFilter::for_file(file)?;
+    let mut next_filter = WatchFilter::for_normalized_file(file)?;
     next_filter
         .config_dependencies
         .extend(dependencies.iter().cloned());
-    let next_roots: HashSet<_> = next_filter
+    let mut next_roots = HashMap::new();
+    for path in next_filter
         .literal_files
         .iter()
-        .filter_map(|path| path.parent().map(Path::to_path_buf))
-        .filter(|path| recursive_root.is_none_or(|root| !path.starts_with(root)))
-        .collect();
-    for root in next_roots.difference(roots) {
-        watcher
-            .watch(root, RecursiveMode::NonRecursive)
-            .map_err(|error| error.to_string())?;
+        .chain(&next_filter.config_dependencies)
+    {
+        let mut parent = path.parent();
+        let mut external_ancestors = 0;
+        while let Some(directory) = parent {
+            if let Ok(metadata) = std::fs::symlink_metadata(directory)
+                && metadata.is_dir()
+            {
+                next_roots.insert(
+                    directory.to_path_buf(),
+                    watched_directory_identity(directory, &metadata),
+                );
+                if project_root == Some(directory) {
+                    break;
+                }
+                if project_root.is_none_or(|root| !directory.starts_with(root)) {
+                    external_ancestors += 1;
+                    if external_ancestors == 2 {
+                        break;
+                    }
+                }
+            }
+            parent = directory.parent();
+        }
+    }
+    for (root, identity) in &next_roots {
+        if identity.is_none() || roots.get(root) != Some(identity) {
+            if roots.contains_key(root) {
+                retire_file_watch(watcher, root)?;
+            }
+            watcher
+                .watch(root, RecursiveMode::NonRecursive)
+                .map_err(|error| error.to_string())?;
+        }
     }
     filter.replace(next_filter);
-    for root in roots.difference(&next_roots) {
-        watcher.unwatch(root).map_err(|error| error.to_string())?;
+    for root in roots.keys().filter(|root| !next_roots.contains_key(*root)) {
+        retire_file_watch(watcher, root)?;
     }
     *roots = next_roots;
     Ok(())
+}
+
+fn retire_file_watch(watcher: &mut impl Watcher, root: &Path) -> Result<(), String> {
+    match watcher.unwatch(root) {
+        Ok(()) => Ok(()),
+        Err(error) if matches!(error.kind, notify::ErrorKind::WatchNotFound) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(unix)]
+fn watched_directory_identity(_: &Path, metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn watched_directory_identity(path: &Path, _: &std::fs::Metadata) -> Option<(u64, u64)> {
+    crate::hasher::path_object_identity(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn watched_directory_identity(_: &Path, _: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 fn run_watch_loop(
@@ -611,17 +690,21 @@ mod tests {
     use std::path::PathBuf;
 
     #[derive(Default)]
-    struct RecordedWatches(Vec<(PathBuf, bool)>);
+    struct RecordedWatches(Vec<(PathBuf, bool)>, Vec<RecursiveMode>, HashSet<PathBuf>);
     impl Watcher for RecordedWatches {
         fn new<F: notify::EventHandler>(_: F, _: notify::Config) -> notify::Result<Self> {
             Ok(Self::default())
         }
-        fn watch(&mut self, path: &Path, _: RecursiveMode) -> notify::Result<()> {
+        fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
             self.0.push((path.to_path_buf(), true));
+            self.1.push(mode);
             Ok(())
         }
         fn unwatch(&mut self, path: &Path) -> notify::Result<()> {
             self.0.push((path.to_path_buf(), false));
+            if self.2.contains(path) {
+                return Err(notify::Error::new(notify::ErrorKind::WatchNotFound));
+            }
             Ok(())
         }
         fn kind() -> notify::WatcherKind {
@@ -629,9 +712,207 @@ mod tests {
         }
     }
 
+    #[test]
+    fn file_config_watches_only_existing_dependency_ancestors_without_recursion() {
+        let project = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::write(root.join("entry.cjs"), "").unwrap();
+        std::fs::create_dir(root.join("schemas")).unwrap();
+        let file = root.join("entry.cjs");
+        let filter = WatchFilterHandle::new(WatchFilter::for_file(&file).unwrap());
+        let mut watcher = RecordedWatches::default();
+        let mut roots = HashMap::new();
+        refresh_file_watch(
+            &file,
+            &mut watcher,
+            &mut roots,
+            &filter,
+            &[
+                root.join("lpm.json"),
+                root.join("schemas/missing/base.json"),
+            ],
+            Some(&root),
+        )
+        .unwrap();
+        assert!(roots.contains_key(&root));
+        assert!(roots.contains_key(&root.join("schemas")));
+        assert!(!roots.contains_key(&root.join("schemas/missing")));
+        assert!(
+            watcher
+                .1
+                .iter()
+                .all(|mode| *mode == RecursiveMode::NonRecursive)
+        );
+    }
+
+    #[test]
+    fn file_watch_rearms_a_replaced_dependency_directory() {
+        let project = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::write(root.join("entry.cjs"), "").unwrap();
+        std::fs::create_dir(root.join("schemas")).unwrap();
+        let file = root.join("entry.cjs");
+        let filter = WatchFilterHandle::new(WatchFilter::for_file(&file).unwrap());
+        let mut watcher = RecordedWatches::default();
+        let mut roots = HashMap::new();
+        let dependencies = [root.join("schemas/base.json")];
+        refresh_file_watch(
+            &file,
+            &mut watcher,
+            &mut roots,
+            &filter,
+            &dependencies,
+            Some(&root),
+        )
+        .unwrap();
+        std::fs::rename(root.join("schemas"), root.join("retained")).unwrap();
+        std::fs::create_dir(root.join("schemas")).unwrap();
+        refresh_file_watch(
+            &file,
+            &mut watcher,
+            &mut roots,
+            &filter,
+            &dependencies,
+            Some(&root),
+        )
+        .unwrap();
+        assert_eq!(
+            watcher
+                .0
+                .iter()
+                .filter(|(path, added)| *added && path == &root.join("schemas"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn file_watch_retires_deleted_dependencies_and_rearms_recreated_directories() {
+        let project = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let file = root.join("entry.cjs");
+        let directory = root.join("schemas");
+        std::fs::write(&file, "").unwrap();
+        std::fs::create_dir(&directory).unwrap();
+        let filter = WatchFilterHandle::new(WatchFilter::for_file(&file).unwrap());
+        let mut watcher = RecordedWatches::default();
+        let mut roots = HashMap::new();
+        let dependencies = [directory.join("base.json")];
+        refresh_file_watch(
+            &file,
+            &mut watcher,
+            &mut roots,
+            &filter,
+            &dependencies,
+            Some(&root),
+        )
+        .unwrap();
+        std::fs::remove_dir(&directory).unwrap();
+        watcher.2.insert(directory.clone());
+        refresh_file_watch(
+            &file,
+            &mut watcher,
+            &mut roots,
+            &filter,
+            &dependencies,
+            Some(&root),
+        )
+        .unwrap();
+        assert!(!roots.contains_key(&directory));
+        assert!(roots.contains_key(&root));
+        std::fs::create_dir(&directory).unwrap();
+        refresh_file_watch(
+            &file,
+            &mut watcher,
+            &mut roots,
+            &filter,
+            &dependencies,
+            Some(&root),
+        )
+        .unwrap();
+        assert_eq!(
+            watcher
+                .0
+                .iter()
+                .filter(|(path, added)| *added && path == &directory)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn file_watch_recovers_after_its_entrypoint_parent_is_temporarily_missing() {
+        let project = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let directory = root.join("src");
+        let file = directory.join("entry.cjs");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&file, "").unwrap();
+        let filter = WatchFilterHandle::new(WatchFilter::for_file(&file).unwrap());
+        let mut watcher = RecordedWatches::default();
+        let mut roots = HashMap::new();
+        refresh_file_watch(&file, &mut watcher, &mut roots, &filter, &[], Some(&root)).unwrap();
+        std::fs::rename(&directory, root.join("old-src")).unwrap();
+        refresh_file_watch(&file, &mut watcher, &mut roots, &filter, &[], Some(&root)).unwrap();
+        assert!(roots.contains_key(&root));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(&file, "").unwrap();
+        refresh_file_watch(&file, &mut watcher, &mut roots, &filter, &[], Some(&root)).unwrap();
+        assert_eq!(
+            watcher
+                .0
+                .iter()
+                .filter(|(path, added)| *added && path == &directory)
+                .count(),
+            2
+        );
+        assert!(filter.0.read().unwrap().matches_path(&file));
+    }
+
+    #[test]
+    fn literal_entrypoint_ancestor_events_trigger_reload_without_matching_siblings() {
+        let project = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        let file = root.join("src/entry.cjs");
+        std::fs::write(&file, "").unwrap();
+        let filter = WatchFilter::for_file(&file).unwrap();
+        assert!(filter.matches_path(&root.join("src")));
+        assert!(!filter.matches_path(&root.join("src/sibling.cjs")));
+    }
+
     #[cfg(unix)]
     #[test]
-    fn literal_symlink_refresh_preserves_permanent_recursive_watch_ownership() {
+    fn file_watch_retains_missing_external_symlink_targets_and_their_repair_ancestors() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let external = std::fs::canonicalize(outside.path()).unwrap();
+        let target = external.join("missing/entry.cjs");
+        let file = root.join("entry.cjs");
+        std::os::unix::fs::symlink(&target, &file).unwrap();
+        let filter = WatchFilterHandle::new(WatchFilter::for_file(&file).unwrap());
+        let mut watcher = RecordedWatches::default();
+        let mut roots = HashMap::new();
+        refresh_file_watch(&file, &mut watcher, &mut roots, &filter, &[], Some(&root)).unwrap();
+        assert!(filter.0.read().unwrap().matches_path(&target));
+        assert!(roots.contains_key(&external));
+        std::fs::create_dir(external.join("missing")).unwrap();
+        std::fs::write(&target, "").unwrap();
+        refresh_file_watch(&file, &mut watcher, &mut roots, &filter, &[], Some(&root)).unwrap();
+        assert!(roots.contains_key(&external.join("missing")));
+        assert!(roots.contains_key(&external));
+        assert!(
+            watcher
+                .1
+                .iter()
+                .all(|mode| *mode == RecursiveMode::NonRecursive)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn literal_symlink_refresh_retains_shared_parent_watches() {
         let project = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(project.path()).unwrap();
@@ -642,13 +923,18 @@ mod tests {
         std::os::unix::fs::symlink(root.join("first.cjs"), &entry).unwrap();
         let filter = WatchFilterHandle::new(WatchFilter::for_file(&entry).unwrap());
         let mut watcher = RecordedWatches::default();
-        let mut roots = HashSet::new();
+        let mut roots = HashMap::new();
         refresh_file_watch(&entry, &mut watcher, &mut roots, &filter, &[], Some(&root)).unwrap();
         std::fs::remove_file(&entry).unwrap();
         std::os::unix::fs::symlink(outside.path().join("second.cjs"), &entry).unwrap();
         refresh_file_watch(&entry, &mut watcher, &mut roots, &filter, &[], Some(&root)).unwrap();
         assert!(
-            watcher.0.iter().all(|(path, _)| !path.starts_with(&root)),
+            watcher
+                .0
+                .iter()
+                .filter(|(path, added)| path == &root && *added)
+                .count()
+                == 1,
             "{:?}",
             watcher.0
         );
