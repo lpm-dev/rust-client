@@ -2459,3 +2459,63 @@ fn sparse_and_bulk_inherited_lookup_match_windows_canonical_names() {
         }
     }
 }
+
+#[test]
+fn env_check_reports_invalid_custom_path_alias_without_aborting_other_environments() {
+    let project = TempProject::empty(r#"{"name":"alias-inventory"}"#);
+    project.write_file("lpm.json", r#"{"env":{"test:unit":"config/unit.env"},"envSchema":{"vars":{"VALUE":{"default":"ok"}}}}"#);
+    let output = lpm(&project)
+        .args(["env", "check", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let result = parse_json_stdout(&output, "invalid alias inventory");
+    let rows = result["environments"]
+        .as_array()
+        .expect("inventory must retain other environments");
+    assert!(
+        rows.iter()
+            .any(|row| row["environment"] == "default"
+                && row["errors"].as_array().unwrap().is_empty())
+    );
+    assert!(rows.iter().any(|row| {
+        row["environment"] == "test:unit"
+            && row["errors"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("canonical")
+    }));
+}
+
+#[test]
+fn selected_services_reject_configured_typos_and_allow_abstract_contexts() {
+    let project = TempProject::empty(r#"{"name":"service-context"}"#);
+    for configured in [true, false] {
+        project.write_file("lpm.json", &serde_json::json!({"envSchema":{"vars":{"VALUE":{}}}, "services":if configured {serde_json::json!({"api":{"command":"echo api"}})} else {serde_json::json!({})}}).to_string());
+        for name in ["api", "apii"] {
+            let output = lpm(&project)
+                .args(["env", "check", "--service", name, "--json"])
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.success(),
+                !configured || name == "api",
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
+}
+
+#[test]
+fn env_ls_uses_the_inventory_environment_for_scoped_rules() {
+    let project = TempProject::empty(r#"{"name":"scoped-status"}"#);
+    project.write_file("lpm.json", r#"{"env":{"release":".env.production"},"envSchema":{"vars":{"VALUE":{"requiredIn":[{"environment":["production"]}]}}}}"#);
+    let output = lpm(&project)
+        .args(["env", "ls", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let result = parse_json_stdout(&output, "scoped inventory");
+    assert_eq!(result["environments"][1]["schemaValid"], 0);
+}

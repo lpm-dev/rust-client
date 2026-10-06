@@ -6063,3 +6063,27 @@ fn watch_reloads_canonical_scoped_defaults_after_schema_changes() {
     project.write_file_and_sync("lpm.json", &config("second"));
     watcher.wait_until(|| value() == "second");
 }
+
+#[cfg(unix)]
+#[test]
+fn task_cache_ignores_unselected_path_tails_with_unchanged_executables() {
+    for selected in [false, true] {
+        let project =
+            TempProject::empty(r#"{"name":"cache-path-tail","scripts":{"build":"node build.js"}}"#);
+        project.write_file("lpm.json", &serde_json::json!({"tasks":{"build":{"cache":true,"cacheEnv":if selected {vec!["PATH"]} else {vec![]},"inputs":["build.js"],"outputs":["dist/**"]}}}).to_string());
+        project.write_file("build.js", "const fs=require('fs');fs.mkdirSync('dist',{recursive:true});fs.writeFileSync('dist/out','ok');fs.appendFileSync('executions','run\\n');");
+        let original = std::env::var("PATH").unwrap();
+        for tail in ["empty-a", "empty-b"] {
+            let path = format!("{original}:{}", project.path().join(tail).display());
+            lpm(&project)
+                .env("PATH", path)
+                .args(["run", "build"])
+                .assert()
+                .success();
+        }
+        assert_eq!(
+            project.read_file("executions"),
+            if selected { "run\nrun\n" } else { "run\n" }
+        );
+    }
+}

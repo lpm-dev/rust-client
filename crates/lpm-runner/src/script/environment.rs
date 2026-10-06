@@ -9,7 +9,7 @@ use std::path::Path;
 /// Print a one-line environment context before script execution.
 ///
 /// Example output:
-///   Env: development (via lpm.json "dev") · 5 vault secrets
+///   Env: development (via lpm.json "dev") · 5 env secrets
 pub(super) fn print_env_context(loaded: &LoadedEnv) {
     let env_label = sanitize_terminal_inline(loaded.env_name.as_deref().unwrap_or("default"));
 
@@ -27,7 +27,7 @@ pub(super) fn print_env_context(loaded: &LoadedEnv) {
 
     let vault_str = if loaded.vault_count > 0 {
         format!(
-            "{} vault secret{}",
+            "{} env secret{}",
             loaded.vault_count,
             if loaded.vault_count == 1 { "" } else { "s" }
         )
@@ -67,7 +67,7 @@ pub(crate) struct LoadedEnv {
     alias: Option<String>,
     /// How the env was determined.
     source: &'static str,
-    /// Number of vault secrets loaded for this env.
+    /// Number of env secrets loaded for this env.
     vault_count: usize,
 }
 

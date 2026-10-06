@@ -7310,7 +7310,7 @@ async fn failed_platform_connect_keeps_the_manifest_byte_identical() {
 }
 
 #[tokio::test]
-async fn env_coolify_platform_connect_and_status_use_direct_platform_api() {
+async fn env_coolify_operations_preserve_the_selected_canonical_environment() {
     let project = TempProject::empty(r#"{"name":"coolify-platform","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
     let bearer_token = "coolify-platform-session-token";
@@ -7345,6 +7345,22 @@ async fn env_coolify_platform_connect_and_status_use_direct_platform_api() {
         String::from_utf8_lossy(&seeded.stdout),
         String::from_utf8_lossy(&seeded.stderr),
     );
+
+    lpm(&project)
+        .args([
+            "env",
+            "set",
+            "--env=staging",
+            "APPLICATION_SECRET=wrong-environment",
+        ])
+        .assert()
+        .success();
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&project.read_file("lpm.json")).unwrap();
+    manifest["env"] = serde_json::json!({"release":".env.production", "production":".env.staging"});
+    manifest["envSchema"] =
+        serde_json::json!({"vars":{"APPLICATION_SECRET":{"enum":["local-value"]}}});
+    project.write_file("lpm.json", &manifest.to_string());
 
     mock.with_platform_connect_application_success(
         bearer_token,
@@ -7440,7 +7456,7 @@ async fn env_coolify_platform_connect_and_status_use_direct_platform_api() {
             "--token",
             platform_token,
             "--linked-env",
-            "production",
+            "release",
             "--label",
             "production",
         ])
@@ -7482,7 +7498,15 @@ async fn env_coolify_platform_connect_and_status_use_direct_platform_api() {
     let push = lpm(&project)
         .env("LPM_REGISTRY_URL", mock.url())
         .env("ACCEPTANCE_RUN_ID", "workflow-platform-coolify")
-        .args(["--json", "env", "push", "--to", "coolify", "--yes"])
+        .args([
+            "--json",
+            "env",
+            "push",
+            "--to",
+            "coolify",
+            "--env=release",
+            "--yes",
+        ])
         .output()
         .expect("failed to run lpm env push --to coolify --json");
     assert!(
@@ -7516,6 +7540,16 @@ async fn env_coolify_platform_connect_and_status_use_direct_platform_api() {
     assert_eq!(pull_json["platform"], "coolify");
     assert_eq!(pull_json["keys"], serde_json::json!(["APPLICATION_SECRET"]));
     insta::assert_json_snapshot!("env_coolify_pull_json_envelope", pull_json);
+    let requests = mock.server().received_requests().await.unwrap();
+    let audits: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path().ends_with("/audit"))
+        .collect();
+    assert!(!audits.is_empty());
+    for request in audits {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["env"], "production");
+    }
 }
 
 #[tokio::test]
