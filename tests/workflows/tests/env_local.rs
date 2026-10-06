@@ -1771,3 +1771,38 @@ fn env_check_counts_distinct_failed_variables_when_groups_overlap() {
     assert!(!text.status.success());
     assert!(String::from_utf8_lossy(&text.stdout).contains("0/2"));
 }
+
+#[test]
+fn env_ls_checks_effective_values_defaults_conditions_and_groups() {
+    let project = TempProject::empty(r#"{"name":"env-status"}"#);
+    project.write_file("lpm.json", r#"{"envSchema":{"vars":{"PORT":{"format":"port","required":true},"MODE":{"default":"on"},"TOKEN":{"requiredWhen":{"variable":"MODE","equals":"on"}},"LEFT":{},"RIGHT":{}},"groups":{"auth":{"mode":"exactlyOne","vars":["LEFT","RIGHT"]}}}}"#);
+    project.write_file(".env", "PORT=invalid\n");
+    let output = lpm(&project)
+        .args(["env", "ls", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = parse_json_stdout(&output, "env ls --json");
+    let row = &result["environments"][0];
+    assert_eq!(row["schemaTotal"], 6);
+    assert_eq!(row["schemaValid"], 3);
+    assert_eq!(row["variables"], 0);
+    project.write_file(".env", "PORT=3000\nTOKEN=present\nLEFT=yes\n");
+    let output = lpm(&project)
+        .args(["env", "ls", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = parse_json_stdout(&output, "env ls --json");
+    assert_eq!(result["environments"][0]["schemaValid"], 6);
+}
