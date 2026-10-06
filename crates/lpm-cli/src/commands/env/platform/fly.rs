@@ -6,8 +6,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    LocalPlatformValues, PLATFORM_TIMEOUT, PlatformApplyError, PlatformDiff, PlatformPushResult,
-    PlatformState, append_platform_error_context, read_platform_response,
+    LocalPlatformValues, PLATFORM_TIMEOUT, PlatformApplyError, PlatformDiff,
+    PlatformMutationFailure, PlatformPushResult, PlatformState, append_platform_error_context,
+    read_platform_response,
 };
 
 pub(super) const FLY_API_URL: &str = "https://api.fly.io/graphql";
@@ -108,6 +109,7 @@ struct FlyRelease {
 }
 
 pub(super) struct FlyClient {
+    pub(super) source_check: Option<super::PlatformSourceCheck>,
     http: reqwest::Client,
     api_url: String,
     authorization: HeaderValue,
@@ -132,6 +134,7 @@ impl FlyClient {
                 LpmError::Network(format!("failed to build Fly.io client: {error}"))
             })?;
         Ok(Self {
+            source_check: None,
             http,
             api_url: fly_api_url()?,
             authorization: authorization_header(&token)?,
@@ -233,7 +236,13 @@ impl FlyClient {
         {
             self.set_secrets(&local.write_only)
                 .await
-                .map_err(PlatformApplyError::untracked)?;
+                .map_err(|failure| {
+                    if failure.attempted {
+                        PlatformApplyError::untracked(failure.error)
+                    } else {
+                        PlatformApplyError::tracked(failure.error, applied)
+                    }
+                })?;
             applied.added = diff.write_only_added.len();
             applied.updated = diff.write_only_present.len();
         }
@@ -256,7 +265,10 @@ impl FlyClient {
             }
             match self.unset_secrets(&diff.write_only_removed).await {
                 Ok(()) => applied.removed = diff.write_only_removed.len(),
-                Err(error) => {
+                Err(failure) if !failure.attempted => {
+                    return Err(PlatformApplyError::tracked(failure.error, applied));
+                }
+                Err(PlatformMutationFailure { error, .. }) => {
                     let after_unset = match self.list().await {
                         Ok(after_unset) => after_unset,
                         Err(reconciliation_error) => {
@@ -327,13 +339,18 @@ impl FlyClient {
         })
     }
 
-    async fn set_secrets(&self, values: &HashMap<String, String>) -> Result<(), LpmError> {
+    async fn set_secrets(
+        &self,
+        values: &HashMap<String, String>,
+    ) -> Result<(), PlatformMutationFailure> {
         let mut values = values.iter().collect::<Vec<_>>();
         values.sort_unstable_by(|left, right| left.0.cmp(right.0));
         let secrets = values
             .into_iter()
             .map(|(key, value)| serde_json::json!({ "key": key, "value": value }))
             .collect::<Vec<_>>();
+        super::check_platform_sources(&self.source_check)
+            .map_err(PlatformMutationFailure::not_sent)?;
         let data: SetSecretsData = self
             .execute(
                 "set secrets",
@@ -350,7 +367,9 @@ impl FlyClient {
         Ok(())
     }
 
-    async fn unset_secrets(&self, keys: &[String]) -> Result<(), LpmError> {
+    async fn unset_secrets(&self, keys: &[String]) -> Result<(), PlatformMutationFailure> {
+        super::check_platform_sources(&self.source_check)
+            .map_err(PlatformMutationFailure::not_sent)?;
         let data: UnsetSecretsData = self
             .execute(
                 "unset secrets",
@@ -1006,7 +1025,7 @@ mod tests {
             .await
             .expect_err("missing release acknowledgement must fail closed");
 
-        assert!(error.to_string().contains("release acknowledgement"));
+        assert!(error.error.to_string().contains("release acknowledgement"));
     }
 
     #[tokio::test]
@@ -1046,6 +1065,68 @@ mod tests {
             panic!("stale comparison must remain untracked");
         };
         assert!(error.to_string().contains("changed after comparison"));
+    }
+
+    #[tokio::test]
+    async fn source_rejected_unset_retains_acknowledged_set_counts() {
+        let server = MockServer::start().await;
+        let _env = acceptance_env(&server, "fly-source-change");
+        let current = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let changed = std::sync::Arc::clone(&current);
+        Mock::given(method("POST"))
+            .and(body_json(
+                serde_json::json!({"query":APP_QUERY,"variables":{"appName":"lpm-example"}}),
+            ))
+            .respond_with(move |_: &wiremock::Request| {
+                let read = reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let secrets = if read == 0 {
+                    serde_json::json!([{"name":"OLD","digest":"old"}])
+                } else {
+                    changed.store(false, std::sync::atomic::Ordering::SeqCst);
+                    serde_json::json!([{"name":"OLD","digest":"old"},{"name":"NEW","digest":"new"}])
+                };
+                ResponseTemplate::new(200)
+                    .set_body_json(app_response("app_123", "org_123", secrets))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST")).and(body_json(serde_json::json!({"query":SET_SECRETS_MUTATION,"variables":{"input":{"appId":"lpm-example","secrets":[{"key":"NEW","value":"secret"}]}}})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(release_response("setSecrets"))).mount(&server).await;
+        let mut client = FlyClient::new("fo1_acceptance-token".into(), config()).expect("client");
+        client.source_check = Some(std::sync::Arc::new(move || {
+            if current.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(LpmError::Script("env.source_changed".into()))
+            }
+        }));
+        let remote = PlatformState {
+            readable: HashMap::new(),
+            write_only: std::collections::HashSet::from(["OLD".into()]),
+        };
+        let local = LocalPlatformValues {
+            readable: HashMap::new(),
+            write_only: HashMap::from([("NEW".into(), "secret".into())]),
+        };
+        let diff = PlatformDiff {
+            write_only_added: vec!["NEW".into()],
+            write_only_removed: vec!["OLD".into()],
+            ..PlatformDiff::default()
+        };
+        let error = client
+            .apply(&diff, &local, &remote, true)
+            .await
+            .expect_err("source change rejects unset");
+        let PlatformApplyError::Tracked { error, applied } = error else {
+            panic!("acknowledged additions remain tracked")
+        };
+        assert!(error.to_string().contains("env.source_changed"));
+        assert_eq!((applied.added, applied.updated, applied.removed), (1, 0, 0));
+        let requests = server.received_requests().await.expect("requests");
+        assert!(!requests.iter().any(|request| {
+            String::from_utf8_lossy(&request.body).contains("mutation unsetSecrets")
+        }));
     }
 
     #[tokio::test]

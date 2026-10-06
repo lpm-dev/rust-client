@@ -110,6 +110,9 @@ impl Reconciler {
         let started = Instant::now();
         self.generation = self.generation.wrapping_add(1);
         let mut changed = false;
+        for file in &filter.config_dependencies {
+            self.inspect(file, &mut changed);
+        }
         if filter.literal_files.is_empty() {
             // Root config files override even an output pattern covering the whole tree.
             if filter.config_files {

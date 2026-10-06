@@ -86,6 +86,7 @@ pub(super) struct CacheContext {
     pub(super) remote_cache: Option<crate::commands::remote_cache::RemoteCacheClient>,
     workspace_validation: Option<lpm_task::hasher::FilesystemValidation>,
     input_validation: lpm_task::hasher::FilesystemValidation,
+    schema_snapshot: Option<Arc<lpm_env_source::SchemaSnapshot>>,
     dependencies: Vec<TaskDependencyIdentity>,
     command_preference: CommandPreference,
 }
@@ -221,18 +222,44 @@ fn build_task_context(
         if !is_task_cached_with_config(script_name, Some(provided_config)) {
             return Ok(None);
         }
-        let current_config =
-            lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
-        if current_config
+        let captured_sources_unchanged = provided_config
+            .env_schema_resolution
             .as_ref()
-            .and_then(|config| config.tasks.get(script_name))
-            != provided_config.tasks.get(script_name)
-        {
-            tracing::warn!(
-                "task configuration changed before '{}' started; disabling its cache",
-                lpm_common::sanitize_terminal_inline(script_name)
-            );
-            return Ok(None);
+            .is_some_and(|snapshot| {
+                lpm_common::read_text_file_capped(
+                    &project_dir.join("lpm.json"),
+                    lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+                )
+                .is_ok_and(|content| {
+                    snapshot.matches_root_content(content.as_bytes())
+                        && snapshot.verify_dependencies().is_ok()
+                })
+            });
+        if !captured_sources_unchanged {
+            let current_config =
+                lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+            if current_config
+                .as_ref()
+                .and_then(|config| config.env_schema_resolution.as_ref())
+                .map(|snapshot| snapshot.fingerprint)
+                != provided_config
+                    .env_schema_resolution
+                    .as_ref()
+                    .map(|snapshot| snapshot.fingerprint)
+            {
+                return Ok(None);
+            }
+            if current_config
+                .as_ref()
+                .and_then(|config| config.tasks.get(script_name))
+                != provided_config.tasks.get(script_name)
+            {
+                tracing::warn!(
+                    "task configuration changed before '{}' started; disabling its cache",
+                    lpm_common::sanitize_terminal_inline(script_name)
+                );
+                return Ok(None);
+            }
         }
     }
 
@@ -338,7 +365,19 @@ fn build_task_context(
     );
 
     let cache_inputs = effective_cache_inputs(&task_config, config_ref);
-    let dependency_pairs = dependency_identity_pairs(dependency_identities);
+    let schema_snapshot = config_ref.and_then(|config| config.env_schema_resolution.clone());
+    if let Some(snapshot) = &schema_snapshot {
+        snapshot
+            .verify_dependencies()
+            .map_err(|error| LpmError::EnvValidation(error.to_string()))?;
+    }
+    let mut dependency_pairs = dependency_identity_pairs(dependency_identities);
+    if let Some(snapshot) = &schema_snapshot {
+        dependency_pairs.push((
+            "lpm-env-schema-closure:v1".into(),
+            hex::encode(snapshot.fingerprint),
+        ));
+    }
     let cache_snapshot = lpm_task::hasher::compute_cache_key_snapshot_with_workspace_contract(
         project_dir,
         workspace_contract.map(|contract| &contract.fingerprint),
@@ -351,6 +390,11 @@ fn build_task_context(
         &package_json,
     )?;
 
+    if let Some(snapshot) = &schema_snapshot {
+        snapshot
+            .verify_dependencies()
+            .map_err(|error| LpmError::EnvValidation(error.to_string()))?;
+    }
     Ok(Some(CacheContext {
         command_preference,
         task_config,
@@ -366,6 +410,7 @@ fn build_task_context(
         },
         workspace_validation: workspace_contract.map(|contract| contract.validation.clone()),
         input_validation: cache_snapshot.validation,
+        schema_snapshot,
         dependencies: dependency_identities.to_vec(),
     }))
 }
@@ -474,6 +519,13 @@ pub(super) fn try_cache_hit_with_context(
 }
 
 fn cache_context_is_unchanged(context: &CacheContext) -> Result<bool, LpmError> {
+    if context
+        .schema_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.verify_dependencies().is_err())
+    {
+        return Ok(false);
+    }
     if let Some(validation) = &context.workspace_validation
         && !validation.is_unchanged()?
     {

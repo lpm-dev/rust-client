@@ -180,6 +180,7 @@ pub(super) async fn env_share(
     }
     let member_access = std::sync::Arc::new(member_access);
 
+    let schema_snapshot = manifest.sources;
     let config = manifest.config;
     let secrets_json = std::sync::Arc::new(super::sync_payload::build_sync_payload(all_envs)?);
 
@@ -187,6 +188,7 @@ pub(super) async fn env_share(
     let schema_value = std::sync::Arc::new(super::sync_payload::build_push_schema_value(
         config.as_ref(),
     ));
+
     drop(config);
     let project_dir = project_dir.to_path_buf();
 
@@ -204,6 +206,7 @@ pub(super) async fn env_share(
         |registry_url, auth_token| {
             let project_name = project_name.clone();
             let schema_value = std::sync::Arc::clone(&schema_value);
+            let schema_snapshot = schema_snapshot.clone();
             let vault_id = vault_id.clone();
             let secrets_json = std::sync::Arc::clone(&secrets_json);
             let recipient_set_acceptance = recipient_set_acceptance.clone();
@@ -254,9 +257,11 @@ pub(super) async fn env_share(
                 } else {
                     checkpoint_version
                 };
+                let before_write = || super::sync_payload::verify_schema_snapshot(&project_dir, schema_snapshot.as_deref());
                 let push_metadata = lpm_vault::sync::PushMetadata {
                     name: Some(&project_name),
                     schema: schema_value.as_ref().as_ref(),
+                    before_write: Some(&before_write),
                 };
                 let result = lpm_vault::sync::push_org_with_access(
                     &registry_url,

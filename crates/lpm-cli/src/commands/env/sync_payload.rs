@@ -3,11 +3,43 @@ use super::prelude::*;
 pub(super) struct CloudManifestSnapshot {
     pub config: Option<lpm_runner::lpm_json::LpmJsonConfig>,
     pub vault: lpm_vault::vault_id::VaultManifestSnapshot,
+    pub sources: Option<std::sync::Arc<lpm_env_source::SchemaSnapshot>>,
 }
 
 impl CloudManifestSnapshot {
     pub fn read(project_dir: &std::path::Path) -> Result<Self, LpmError> {
-        let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+        let content = match lpm_common::read_text_file_capped(
+            &project_dir.join("lpm.json"),
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
+            Ok(content) => Some(content),
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
+            Err(error) => {
+                return Err(LpmError::Script(format!(
+                    "failed to read lpm.json: {error}"
+                )));
+            }
+        };
+        let config = content
+            .as_deref()
+            .map(|content| lpm_runner::lpm_json::parse_lpm_json_in(project_dir, content))
+            .transpose()
+            .map_err(LpmError::Script)?;
+        let sources = match (&content, &config) {
+            (Some(content), Some(config)) => Some(match &config.env_schema_resolution {
+                Some(snapshot) => std::sync::Arc::clone(snapshot),
+                None => {
+                    lpm_env_source::resolve_schema(
+                        project_dir,
+                        content.as_bytes(),
+                        lpm_env::EnvSchemaDefinition::default(),
+                    )
+                    .map_err(|error| LpmError::Script(error.to_string()))?
+                    .snapshot
+                }
+            }),
+            _ => None,
+        };
         let vault = match config.as_ref() {
             Some(config) => {
                 let vault_sync = config
@@ -28,8 +60,32 @@ impl CloudManifestSnapshot {
             }
             None => lpm_vault::vault_id::VaultManifestSnapshot::default(),
         };
-        Ok(Self { config, vault })
+        Ok(Self {
+            config,
+            vault,
+            sources,
+        })
     }
+}
+
+pub(super) fn verify_schema_snapshot(
+    project_dir: &std::path::Path,
+    snapshot: Option<&lpm_env_source::SchemaSnapshot>,
+) -> Result<(), String> {
+    let Some(snapshot) = snapshot else {
+        return Ok(());
+    };
+    let content = lpm_common::read_text_file_capped(
+        &project_dir.join("lpm.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .map_err(|_| "env.source_changed at lpm.json/envSchema".to_string())?;
+    if !snapshot.matches_root_content(content.as_bytes()) {
+        return Err("env.source_changed at lpm.json/envSchema".into());
+    }
+    snapshot
+        .verify_dependencies()
+        .map_err(|error| error.to_string())
 }
 
 pub(super) fn fresh_personal_mutation_manifest(
