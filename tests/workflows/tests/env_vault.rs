@@ -9064,6 +9064,65 @@ async fn assert_org_share_environments(all_empty: bool) {
 }
 
 #[tokio::test]
+async fn platform_status_distinguishes_redirected_and_stored_default_selections() {
+    for reversed in [false, true] {
+        let project = TempProject::empty(r#"{"name":"platform-default-selection"}"#);
+        let mock = MockRegistry::start().await;
+        let token = "default-selection-session";
+        let vault = "vault-default-selection";
+        project.write_file("lpm.json", &serde_json::json!({"vault":vault,"env":{"default":".env.production"},"vaultSync":{"personalPlatformBindings":{mock.url():{"registryUrl":mock.url(),"principalId":"account-1"}}}}).to_string());
+        project.write_file(".env", "VALUE=implicit\n");
+        project.write_file(".env.default", "VALUE=named\n");
+        project.write_file(".env.production", "VALUE=production\n");
+        seed_sessions(
+            project.home(),
+            &[SessionSeed {
+                registry_url: &mock.url(),
+                access_token: Some(token),
+                refresh_token: Some("default-refresh"),
+                session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+            }],
+        );
+        let mut connections = vec![
+            serde_json::json!({"id":"unlinked","platform":"vercel","token":"platform-token","connectionConfig":{"projectId":"production-project"}}),
+            serde_json::json!({"id":"linked","platform":"coolify","token":"platform-token","connectionConfig":{"url":mock.url(),"applicationId":"default-project","preview":false,"linkedEnv":"default"}}),
+        ];
+        if reversed {
+            connections.reverse();
+        }
+        mock.with_platform_credentials_success(
+            token,
+            vault,
+            serde_json::json!({"connections":connections}),
+        )
+        .await;
+        mock.with_vercel_env_list("platform-token", "production-project", serde_json::json!([{"id":"production-value","key":"VALUE","value":"production","type":"plain","target":["production"]}]), 1).await;
+        mock.with_coolify_env_list("platform-token", "default-project", serde_json::json!([{"id":1,"uuid":"default-value","key":"VALUE","value":"named","real_value":"named","is_preview":false,"is_literal":false,"is_multiline":false,"is_shown_once":false,"is_shared":false}]),1).await;
+        let output = lpm(&project)
+            .env("LPM_REGISTRY_URL", mock.url())
+            .env("ACCEPTANCE_RUN_ID", "default-selection")
+            .env("LPM_ACCEPTANCE_COOLIFY_ALLOW_LOOPBACK", "1")
+            .env("LPM_ACCEPTANCE_VERCEL_API_BASE_URL", mock.url())
+            .args(["--json", "env", "status"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "stdout {} stderr {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result = parse_clean_json_stdout(&output);
+        let rows = result["platforms"].as_array().unwrap();
+        assert_eq!(rows[usize::from(reversed)]["env"], "production");
+        assert_eq!(rows[usize::from(!reversed)]["env"], "default");
+        for row in rows {
+            assert_eq!(row["status"], "synced", "{row}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn env_push_reports_metadata_warnings_without_changing_success() {
     for json in [false, true] {
         let project = TempProject::empty(r#"{"name":"metadata-warning"}"#);
