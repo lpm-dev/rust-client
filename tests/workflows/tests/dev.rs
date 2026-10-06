@@ -457,7 +457,8 @@ fn dev_rejects_an_invalid_env_schema_default_before_starting_the_service() {
 
     assert!(!output.status.success(), "invalid default must fail");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("invalid format"),
+        String::from_utf8_lossy(&output.stderr)
+            .contains("env.invalid_format at lpm.json/envSchema/vars/APPLICATION_PORT"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );

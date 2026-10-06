@@ -128,6 +128,15 @@ fn prepare_single_package_task_plan(
     reject_direct_hidden_scripts(scripts)?;
     // Read lpm.json for task dependencies
     let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    prepare_single_package_task_plan_with_config(project_dir, scripts, lpm_config)
+}
+
+fn prepare_single_package_task_plan_with_config(
+    project_dir: &Path,
+    scripts: &[String],
+    lpm_config: Option<lpm_runner::lpm_json::LpmJsonConfig>,
+) -> Result<SinglePackageTaskPlan, LpmError> {
+    reject_direct_hidden_scripts(scripts)?;
     let empty_tasks = HashMap::new();
     let tasks = lpm_config
         .as_ref()
