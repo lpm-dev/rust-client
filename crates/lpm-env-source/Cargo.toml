@@ -11,6 +11,7 @@ description = "Bounded project-contained env schema composition and source snaps
 lpm-env.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_path_to_error = "0.1"
 sha2.workspace = true
 cap-std = "4.0.2"
 cap-fs-ext.workspace = true
