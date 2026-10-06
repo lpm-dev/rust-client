@@ -71,8 +71,13 @@ impl std::fmt::Display for ValidationError {
             }
             ValidationErrorKind::GroupViolation { group, mode } => write!(
                 f,
-                "{key}: group {} must satisfy {mode:?}",
-                TerminalSafe(group)
+                "{key}: group {} requires {}",
+                TerminalSafe(group),
+                match mode {
+                    crate::VarGroupMode::AllOrNone => "all values or no values to be non-empty",
+                    crate::VarGroupMode::ExactlyOne => "exactly one non-empty value",
+                    crate::VarGroupMode::AtLeastOne => "at least one non-empty value",
+                }
             )?,
             ValidationErrorKind::InvalidRule { message } => {
                 write!(f, "{key}: invalid envSchema rule: {message}")?
