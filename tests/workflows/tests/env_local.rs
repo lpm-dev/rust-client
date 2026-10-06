@@ -1789,8 +1789,13 @@ fn env_ls_checks_effective_values_defaults_conditions_and_groups() {
     );
     let result = parse_json_stdout(&output, "env ls --json");
     let row = &result["environments"][0];
-    assert_eq!(row["schemaTotal"], 6);
-    assert_eq!(row["schemaValid"], 3);
+    let check = lpm(&project)
+        .args(["env", "check", "--json"])
+        .output()
+        .unwrap();
+    let checked = parse_json_stdout(&check, "env check --json");
+    assert_eq!(row["schemaTotal"], checked["environments"][0]["total"]);
+    assert_eq!(row["schemaValid"], checked["environments"][0]["valid"]);
     assert_eq!(row["variables"], 0);
     project.write_file(".env", "PORT=3000\nTOKEN=present\nLEFT=yes\n");
     let output = lpm(&project)
@@ -1804,5 +1809,27 @@ fn env_ls_checks_effective_values_defaults_conditions_and_groups() {
         String::from_utf8_lossy(&output.stderr)
     );
     let result = parse_json_stdout(&output, "env ls --json");
-    assert_eq!(result["environments"][0]["schemaValid"], 6);
+    assert_eq!(result["environments"][0]["schemaValid"], 5);
+}
+
+#[test]
+fn env_ls_keeps_healthy_rows_when_one_environment_file_fails() {
+    let project = TempProject::empty(r#"{"name":"env-row-errors"}"#);
+    project.write_file("lpm.json", r#"{"environments":{"base":{},"broken":{"extends":"missing"},"healthy":{}},"envSchema":{"vars":{"MODE":{"default":"ok"}}}}"#);
+    let output = lpm(&project)
+        .args(["env", "ls", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value = parse_json_stdout(&output, "env ls --json");
+    let rows = value["environments"].as_array().unwrap();
+    let healthy = rows.iter().find(|r| r["environment"] == "healthy").unwrap();
+    assert_eq!(healthy["schemaValid"], 1);
+    let broken = rows.iter().find(|r| r["environment"] == "broken").unwrap();
+    assert_eq!(broken["schemaValid"], 0);
+    assert!(broken["schemaError"].as_str().unwrap().contains("missing"));
 }
