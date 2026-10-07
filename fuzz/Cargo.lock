@@ -720,7 +720,7 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "lpm-common"
-version = "0.79.0"
+version = "0.80.0"
 dependencies = [
  "base64",
  "cap-fs-ext",
@@ -747,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-extractor"
-version = "0.79.0"
+version = "0.80.0"
 dependencies = [
  "blake3",
  "cap-fs-ext",
@@ -774,7 +774,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-lockfile"
-version = "0.79.0"
+version = "0.80.0"
 dependencies = [
  "hex",
  "lpm-common",
@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-migrate"
-version = "0.79.0"
+version = "0.80.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -810,7 +810,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-semver"
-version = "0.79.0"
+version = "0.80.0"
 dependencies = [
  "lpm-common",
  "node-semver",
@@ -820,7 +820,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-workspace"
-version = "0.79.0"
+version = "0.80.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
