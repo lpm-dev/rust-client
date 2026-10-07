@@ -2,7 +2,7 @@ use crate::added_sources_state::{
     AddedSourceFile, AddedSourceFileAction, AddedSourceRecord, AddedSourcesState,
 };
 use crate::install_ui;
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 use cap_fs_ext::DirExt as _;
 use cap_std::fs::Dir;
 use lpm_common::LpmError;
