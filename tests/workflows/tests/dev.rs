@@ -897,7 +897,8 @@ const http = require('http');
 const port = Number(process.env.PORT);
 const server = http.createServer((_request, response) => response.end('ok'));
 server.listen(port, '127.0.0.1', () => {
-  fs.writeFileSync('child.pid', String(process.pid));
+  fs.writeFileSync('child.pid.tmp', String(process.pid));
+  fs.renameSync('child.pid.tmp', 'child.pid');
   console.log(`Local: http://localhost:${port}/`);
 });
 process.on('SIGTERM', () => server.close(() => process.exit(0)));

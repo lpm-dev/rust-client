@@ -38,8 +38,10 @@ struct RecordDelayedPreflightStart {
 }
 
 #[derive(Clone)]
-struct RecordSkewedPreflightStart {
-    starts: std::sync::Arc<std::sync::Mutex<Vec<(String, std::time::Instant)>>>,
+struct RecordGatedPreflightStart {
+    starts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    first_response_url: String,
+    refill_started: std::sync::mpsc::SyncSender<()>,
 }
 
 #[derive(Clone)]
@@ -159,7 +161,7 @@ impl Respond for RecordDelayedPreflightStart {
     }
 }
 
-impl Respond for RecordSkewedPreflightStart {
+impl Respond for RecordGatedPreflightStart {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let query: std::collections::HashMap<_, _> =
             request.url.query_pairs().into_owned().collect();
@@ -167,21 +169,26 @@ impl Respond for RecordSkewedPreflightStart {
         let version = query.get("version").cloned().unwrap_or_default();
         self.starts
             .lock()
-            .expect("record skewed metadata request start")
-            .push((name.clone(), std::time::Instant::now()));
-        let delay = if name.ends_with("package-0") {
-            std::time::Duration::from_millis(600)
-        } else {
-            std::time::Duration::from_millis(20)
-        };
-        ResponseTemplate::new(200)
-            .set_delay(delay)
-            .set_body_json(serde_json::json!({
-                "success": true,
-                "name": name,
-                "version": version,
-                "packageExists": false,
-            }))
+            .expect("record preflight start")
+            .push(name.clone());
+        if name.ends_with("package-0") {
+            return ResponseTemplate::new(307)
+                .insert_header("Location", self.first_response_url.as_str());
+        }
+        if name
+            .rsplit('-')
+            .next()
+            .and_then(|index| index.parse::<usize>().ok())
+            .is_some_and(|index| index >= 4)
+        {
+            let _ = self.refill_started.try_send(());
+        }
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "name": name,
+            "version": version,
+            "packageExists": false,
+        }))
     }
 }
 
@@ -1209,12 +1216,56 @@ async fn release_publish_preflight_refills_slots_behind_a_slow_first_request() {
             &format!(r#"{{"name":"@lpm.dev/acme.package-{index}","version":"1.0.0"}}"#),
         );
     }
+    use std::io::{BufRead, Write};
+    let first_response =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind gated preflight response");
+    let first_response_url = format!("http://{}/", first_response.local_addr().unwrap());
+    first_response.set_nonblocking(true).unwrap();
+    let (refill_started, refill_received) = std::sync::mpsc::sync_channel(1);
+    let gated_response = std::thread::spawn(move || {
+        let timeout = std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + timeout;
+        let mut stream = loop {
+            match first_response.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "first preflight never arrived"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept gated preflight: {error}"),
+            }
+        };
+        stream.set_read_timeout(Some(timeout)).unwrap();
+        stream.set_write_timeout(Some(timeout)).unwrap();
+        let mut request = std::io::BufReader::new(&mut stream);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert!(
+                request.read_line(&mut line).unwrap() > 0,
+                "incomplete preflight request"
+            );
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let refilled_before_first_completed = refill_received.recv_timeout(timeout).is_ok();
+        let body = r#"{"success":true,"name":"@lpm.dev/acme.package-0","version":"1.0.0","packageExists":false}"#;
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+            .expect("send gated first preflight response");
+        refilled_before_first_completed
+    });
     let server = MockServer::start().await;
     let starts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     Mock::given(method("GET"))
         .and(path("/api/registry/-/package/publish-preflight"))
-        .respond_with(RecordSkewedPreflightStart {
+        .respond_with(RecordGatedPreflightStart {
             starts: std::sync::Arc::clone(&starts),
+            first_response_url,
+            refill_started,
         })
         .expect(8)
         .mount(&server)
@@ -1230,29 +1281,18 @@ async fn release_publish_preflight_refills_slots_behind_a_slow_first_request() {
             "--json",
         ])
         .output()
-        .expect("run skewed release preflight");
+        .expect("run gated release preflight");
 
-    assert!(output.status.success());
-    let starts = starts.lock().expect("read skewed preflight starts");
-    let first = starts
-        .iter()
-        .find(|(name, _)| name.ends_with("package-0"))
-        .expect("package-0 preflight start")
-        .1;
-    let refill = starts
-        .iter()
-        .filter(|(name, _)| {
-            name.rsplit('-')
-                .next()
-                .and_then(|index| index.parse::<usize>().ok())
-                .is_some_and(|index| index >= 4)
-        })
-        .map(|(_, start)| *start)
-        .min()
-        .expect("a refill preflight start");
+    let refilled_before_first_completed = gated_response.join().expect("join gated preflight");
     assert!(
-        refill.duration_since(first) < std::time::Duration::from_millis(300),
-        "bounded preflight left slots idle behind the slow first request"
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(starts.lock().expect("read preflight starts").len(), 8);
+    assert!(
+        refilled_before_first_completed,
+        "bounded preflight waited for the first request before refilling a completed slot"
     );
 }
 
