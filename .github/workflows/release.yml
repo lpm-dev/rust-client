@@ -475,6 +475,7 @@ jobs:
     timeout-minutes: ${{ matrix.timeout_minutes }}
     env:
       LPM_BUILD_VERSION: ${{ needs.release-metadata.outputs.version }}
+      RUSTFLAGS: "-D warnings"
     strategy:
       matrix:
         include:
@@ -545,6 +546,7 @@ jobs:
             --env CARGO_INCREMENTAL \
             --env HOME=/tmp/lpm-home \
             --env LPM_BUILD_VERSION \
+            --env RUSTFLAGS \
             --env RUSTUP_HOME=/rustup \
             --env RUST_TOOLCHAIN \
             "${{ matrix.build_image }}" \
@@ -1064,6 +1066,7 @@ jobs:
     timeout-minutes: 120
     env:
       LPM_BUILD_VERSION: ${{ needs.release-metadata.outputs.version }}
+      RUSTFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
