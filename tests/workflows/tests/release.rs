@@ -1238,6 +1238,9 @@ async fn release_publish_preflight_refills_slots_behind_a_slow_first_request() {
                 Err(error) => panic!("accept gated preflight: {error}"),
             }
         };
+        stream
+            .set_nonblocking(false)
+            .expect("make gated preflight response blocking");
         stream.set_read_timeout(Some(timeout)).unwrap();
         stream.set_write_timeout(Some(timeout)).unwrap();
         let mut request = std::io::BufReader::new(&mut stream);
