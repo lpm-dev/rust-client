@@ -31,14 +31,14 @@ enum ElevationBackend {
 #[cfg(any(test, unix, windows))]
 fn select_elevation_backend(
     platform: ElevationPlatform,
-    candidate_exists: impl Fn(&Path) -> bool,
+    _candidate_exists: impl Fn(&Path) -> bool,
 ) -> Option<ElevationBackend> {
     match platform {
         #[cfg(any(test, unix))]
         ElevationPlatform::Unix => TRUSTED_SUDO_PATHS
             .iter()
             .copied()
-            .find(|candidate| candidate_exists(Path::new(candidate)))
+            .find(|candidate| _candidate_exists(Path::new(candidate)))
             .map(ElevationBackend::Sudo),
         #[cfg(any(test, windows))]
         ElevationPlatform::Windows => Some(ElevationBackend::WindowsRunAs),
