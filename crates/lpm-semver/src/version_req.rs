@@ -184,17 +184,34 @@ fn split_comparator(input: &str) -> (&'static str, &str) {
 }
 
 fn has_invalid_range_token(input: &str) -> bool {
-    input
-        .split("||")
-        .flat_map(str::split_whitespace)
-        .map(strip_range_operator)
-        .map(|token| split_comparator(token).1)
-        .filter(|operand| !operand.is_empty() && *operand != "-")
-        .any(|operand| {
-            operand
-                .bytes()
-                .all(|byte| !byte.is_ascii_alphanumeric() && byte != b'*')
-        })
+    for disjunct in input.split("||") {
+        let mut previous = "";
+        let mut tokens = disjunct.split_whitespace().peekable();
+        while let Some(token) = tokens.next() {
+            if token == "-"
+                && [previous, tokens.peek().copied().unwrap_or_default()]
+                    .into_iter()
+                    .any(|bound| {
+                        bound
+                            .bytes()
+                            .any(|byte| matches!(byte, b'<' | b'>' | b'=' | b'^' | b'~'))
+                    })
+            {
+                return true;
+            }
+            previous = token;
+            let operand = split_comparator(strip_range_operator(token)).1;
+            if !operand.is_empty()
+                && operand != "-"
+                && operand
+                    .bytes()
+                    .all(|byte| !byte.is_ascii_alphanumeric() && byte != b'*')
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn has_malformed_wildcard_range_operator(input: &str) -> bool {
@@ -750,6 +767,37 @@ mod tests {
         assert!(VersionReq::parse(". ~x\n").is_err());
         assert!(VersionReq::parse("~X0^.00").is_err());
         assert!(VersionReq::parse("~\tx~x\n\n").is_err());
+    }
+
+    #[test]
+    fn hyphen_range_comparators_are_rejected_before_upstream_parsing() {
+        for input in [
+            "1>0.0 - =x",
+            "1 - =x",
+            "=x - 1",
+            ">=1 - 2",
+            "1 - <=2",
+            "1\t-\t~x",
+            "^1 - 2 || 3",
+        ] {
+            assert!(has_invalid_range_token(input), "accepted {input:?}");
+        }
+    }
+
+    #[test]
+    fn hyphen_range_bounds_allow_versions_prereleases_and_wildcards() {
+        for input in [
+            "1 - 2",
+            "1.0 - 2.5",
+            "1.2.3 - 2.0.0",
+            "1.x - 2.x",
+            "v1.2.3 - v2.0.0",
+            "1.2.3-alpha+build - 2.0.0-beta",
+            "1\t-\t2",
+            "1 - 2 || >=3",
+        ] {
+            assert!(!has_invalid_range_token(input), "rejected {input:?}");
+        }
     }
 
     // --- Display ---
