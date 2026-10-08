@@ -613,7 +613,7 @@ fn push_pointer_segment(pointer: &mut String, segment: &str) {
         match c {
             '~' => pointer.push_str("~0"),
             '/' => pointer.push_str("~1"),
-            c if crate::is_display_unsafe(c) => {
+            c if !c.is_ascii() || crate::is_display_unsafe(c) => {
                 let _ = write!(pointer, "{}", c.escape_unicode());
             }
             c => pointer.push(c),

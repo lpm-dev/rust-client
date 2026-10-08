@@ -69,7 +69,7 @@ impl std::fmt::Display for SourceError {
 /// Characters that can hide or reorder the text around them when shown.
 pub(crate) fn is_display_unsafe(c: char) -> bool {
     c.is_control()
-        || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
 /// The diagnostic `key` for a declared name: only a portable variable name,

@@ -372,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_pointers_escape_control_and_direction_characters() {
+    fn diagnostic_pointers_escape_line_and_direction_characters() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("base.json"),
@@ -383,6 +383,10 @@ mod tests {
             (
                 "{\"vars\":{\"PORT\":{\"fmt\u{202e}\\u0007\":\"PRIVATE\"}}}",
                 "/envSchema/vars/PORT/fmt\\u{202e}\\u{7}",
+            ),
+            (
+                "{\"vars\":{\"PORT\":{\"line\u{2028}paragraph\u{2029}\":\"PRIVATE\"}}}",
+                "/envSchema/vars/PORT/line\\u{2028}paragraph\\u{2029}",
             ),
             (r#"{"extends":["base.json"]}"#, "/vars/A/x\\u{202e}\\u{a}"),
         ] {
@@ -395,7 +399,9 @@ mod tests {
             }
             let rendered = diagnostic.to_string();
             assert!(
-                !rendered.contains('\u{202e}') && !rendered.contains('\u{7}'),
+                ['\u{7}', '\u{2028}', '\u{2029}', '\u{202e}']
+                    .into_iter()
+                    .all(|character| !rendered.contains(character)),
                 "{rendered}"
             );
             assert_eq!(diagnostic["pointer"], pointer, "{input}");
