@@ -9,6 +9,7 @@ description = "Secure local secret storage for LPM projects"
 
 [dependencies]
 lpm-common = { workspace = true }
+lpm-env = { workspace = true }
 lpm-http = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

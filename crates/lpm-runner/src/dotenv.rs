@@ -12,36 +12,12 @@
 
 use crate::lpm_json;
 use lpm_common::{BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, LpmError, read_text_file_capped};
+use lpm_env::is_denied_env_var;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 mod names;
 use names::EnvName;
-
-const DENIED_ENV_VARS: &[&str] = &[
-    "LD_PRELOAD",
-    "LD_LIBRARY_PATH",
-    "LD_AUDIT",
-    "DYLD_INSERT_LIBRARIES",
-    "DYLD_LIBRARY_PATH",
-    "DYLD_FRAMEWORK_PATH",
-    "DYLD_FALLBACK_LIBRARY_PATH",
-    "NODE_OPTIONS",
-    "PYTHONPATH",
-    "PYTHONSTARTUP",
-    "GIT_SSH_COMMAND",
-    "BASH_ENV",
-    "ENV",
-    "PERL5OPT",
-    "PERL5LIB",
-    "RUBYOPT",
-    "RUBYLIB",
-    "PATH",
-    "HOME",
-    "USER",
-    "SHELL",
-    "TERM",
-];
 
 /// Load the fully-resolved environment for a project.
 ///
@@ -901,12 +877,6 @@ pub(crate) fn remove_dangerous_env_vars(vars: &mut HashMap<String, String>, sour
             );
         }
     }
-}
-
-fn is_denied_env_var(key: &str) -> bool {
-    DENIED_ENV_VARS
-        .iter()
-        .any(|denied| key.eq_ignore_ascii_case(denied))
 }
 
 /// Merge a single `.env` file into an existing map (overwriting existing keys).
