@@ -768,9 +768,19 @@ mod tests {
     ) {
         let project = tempfile::TempDir::new().unwrap();
         for request_port in [true, false] {
-            let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let port = listener.local_addr().unwrap().port();
+            // A child owns the listener, so listeners that tests running in this
+            // process open can't make the discovered owner ambiguous.
+            let port_path = project.path().join(format!("port-{request_port}"));
+            let connected_path = project.path().join(format!("connected-{request_port}"));
+            let script = "const fs=require('fs');const [portPath,connectedPath]=process.argv.slice(1);const server=require('net').createServer(socket=>{fs.writeFileSync(connectedPath,'connected');socket.destroy()});server.listen(0,'::1',()=>{const tmp=`${portPath}.tmp`;fs.writeFileSync(tmp,String(server.address().port));fs.renameSync(tmp,portPath)})";
+            let mut child = std::process::Command::new("node")
+                .args(["-e", script])
+                .arg(&port_path)
+                .arg(&connected_path)
+                .current_dir(project.path())
+                .spawn()
+                .unwrap();
+            let port = wait_for_published_port(&mut child, &port_path);
             let requested_port = request_port.then_some(port);
             let target = LocalTarget {
                 scheme: LocalScheme::Http,
@@ -788,7 +798,7 @@ mod tests {
             let mut discovery_started = false;
             let endpoint = resolve_spawned_endpoint_until(
                 project.path(),
-                std::process::id(),
+                child.id(),
                 None,
                 requested_port,
                 &candidate_rx,
@@ -796,7 +806,7 @@ mod tests {
                 || {
                     // The cancellation probe schedules stdout during the blocking OS checks.
                     let deliver = if after_reachability {
-                        listener.accept().is_ok()
+                        connected_path.exists()
                     } else {
                         discovery_started
                     };
@@ -806,14 +816,36 @@ mod tests {
                     discovery_started = true;
                     false
                 },
-            )
-            .unwrap()
-            .unwrap();
+            );
+            let _ = child.kill();
+            let _ = child.wait();
 
             assert_eq!(
-                endpoint.target, target,
+                endpoint.unwrap().unwrap().target,
+                target,
                 "requested port: {requested_port:?}"
             );
+        }
+    }
+
+    /// The port a child listener publishes by renaming a file into `path`.
+    fn wait_for_published_port(child: &mut std::process::Child, path: &Path) -> u16 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match std::fs::read_to_string(path) {
+                Ok(port) => return port.parse::<u16>().unwrap(),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("child did not publish its listener port: {error}");
+                }
+            }
         }
     }
 
@@ -876,23 +908,7 @@ mod tests {
             .current_dir(project.path())
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let owned_port = loop {
-            match std::fs::read_to_string(&port_path) {
-                Ok(port) => break port.parse::<u16>().unwrap(),
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::NotFound
-                        && Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("child did not publish its listener port: {error}");
-                }
-            }
-        };
+        let owned_port = wait_for_published_port(&mut child, &port_path);
         let incidental_port = if owned_port == u16::MAX {
             owned_port - 1
         } else {
