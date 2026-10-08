@@ -27,6 +27,15 @@ def source_hashes(root):
     return {str(path.relative_to(root)): file_hash(path) for path in inputs}
 
 
+def header_abi_version(root):
+    header = (root / 'crates/lpm-env-ffi/include/lpm_env.h').read_text()
+    for line in header.splitlines():
+        fields = line.split()
+        if fields[:2] == ['#define', 'LPM_ENV_ABI_VERSION'] and len(fields) == 3 and fields[2].isdigit():
+            return int(fields[2])
+    raise RuntimeError('lpm_env.h does not define LPM_ENV_ABI_VERSION')
+
+
 def export(root, target_dir, output):
     target_dir = target_dir.resolve() / 'env-engine-export'
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -68,6 +77,7 @@ def export_locked(root, target_dir, output):
         sources = source_hashes(frozen)
         if source_hashes(root) != sources:
             raise RuntimeError('Engine sources changed during capture')
+        abi_version = header_abi_version(frozen)
         env = {key: value for key, value in os.environ.items() if key in {
             'PATH', 'HOME', 'TMPDIR', 'CARGO_HOME', 'RUSTUP_HOME', 'DEVELOPER_DIR', 'SDKROOT',
         }}
@@ -90,7 +100,7 @@ def export_locked(root, target_dir, output):
         subprocess.run([str(objcopy), '--strip-debug', '--enable-deterministic-archives', '--remove-section=__LLVM,__bitcode', '--remove-section=__LLVM,__cmdline', str(library)], env=env, check=True)
         subprocess.run(['xcodebuild', '-create-xcframework', '-library', str(library), '-headers', str(frozen / 'crates/lpm-env-ffi/include'), '-output', str(artifact)], env=env, check=True)
         files = {str(path.relative_to(staging)): file_hash(path) for path in artifact.rglob('*') if path.is_file()}
-        provenance = dict(abiVersion=1, toolchain='1.94.0', targets=targets, repository='https://github.com/lpm-dev/rust-client', revision=revision, sources=sources, artifacts=files)
+        provenance = dict(abiVersion=abi_version, toolchain='1.94.0', targets=targets, repository='https://github.com/lpm-dev/rust-client', revision=revision, sources=sources, artifacts=files)
         (staging / 'provenance.json').write_text(json.dumps(provenance, indent=2, sort_keys=True) + '\n')
         if source_hashes(root) != sources or subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip() != revision:
             raise RuntimeError('Engine sources changed during export')

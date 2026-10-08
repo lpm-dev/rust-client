@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -10,7 +11,22 @@ exporter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(exporter)
 
 
+HEADER = '#ifndef LPM_ENV_H\n#define LPM_ENV_H\n#define LPM_ENV_ABI_VERSION 7\n#endif\n'
+
+
 class EngineExportTests(unittest.TestCase):
+    def test_provenance_abi_version_comes_from_the_header(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            header = root / 'crates/lpm-env-ffi/include/lpm_env.h'
+            header.parent.mkdir(parents=True)
+            header.write_text(HEADER)
+            self.assertEqual(exporter.header_abi_version(root), 7)
+            for text in ['#define LPM_ENV_ABI_VERSION\n', '#define LPM_ENV_ABI_VERSION two\n', '#define LPM_ENV_INPUT_LIMIT 2\n']:
+                header.write_text(text)
+                with self.assertRaisesRegex(RuntimeError, 'LPM_ENV_ABI_VERSION'):
+                    exporter.header_abi_version(root)
+
     def test_archive_hashing_streams_without_reading_the_complete_file(self):
         import hashlib
         with tempfile.TemporaryDirectory() as temporary:
@@ -30,6 +46,9 @@ class EngineExportTests(unittest.TestCase):
                     path = root / name
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_text('original')
+                header = root / 'crates/lpm-env-ffi/include/lpm_env.h'
+                header.parent.mkdir(parents=True)
+                header.write_text(HEADER)
                 subprocess.run(['git', 'init', '-q', str(root)], check=True)
                 subprocess.run(['git', '-C', str(root), 'add', '.'], check=True)
                 subprocess.run(['git', '-C', str(root), '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture'], check=True)
@@ -52,7 +71,7 @@ class EngineExportTests(unittest.TestCase):
             for name in ['Cargo.toml', 'Cargo.lock', 'scripts/export-env-engine.py', 'crates/lpm-env/src/lib.rs', 'crates/lpm-env-source/src/lib.rs', 'crates/lpm-env-ffi/include/lpm_env.h']:
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text('original')
+                path.write_text(HEADER if name.endswith('lpm_env.h') else 'original')
             output = Path(temporary) / 'engine'
             (output / 'LPMEnv.xcframework').mkdir(parents=True)
             (output / 'LPMEnv.xcframework/old').write_bytes(b'old bundle')
@@ -154,7 +173,7 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 marker = (root / 'crates/lpm-env/src/lib.rs').read_text()
 paths = b'\0'.join(str(path.relative_to(root)).encode() for path in root.rglob('*') if path.is_file()) + b'\0'
-module.subprocess.check_output = lambda args, **kwargs: ('/pinned/rust-1.94\n' if '--print' in args else 'host: aarch64-apple-darwin\n') if args[0] == 'rustc' else marker.encode() if args[1] == 'show' else paths if args[1] == 'ls-files' else 'a' * 40 + '\n'
+module.subprocess.check_output = lambda args, **kwargs: ('/pinned/rust-1.94\n' if '--print' in args else 'host: aarch64-apple-darwin\n') if args[0] == 'rustc' else (root / args[2].split(':', 1)[1]).read_bytes() if args[1] == 'show' else paths if args[1] == 'ls-files' else 'a' * 40 + '\n'
 def command(args, **kwargs):
     if args[0] == 'cargo':
         library = pathlib.Path(kwargs['env']['CARGO_TARGET_DIR']) / args[-1] / 'release/liblpm_env_ffi.a'
@@ -181,7 +200,7 @@ module.export(root, target, output)
                 for name in ['Cargo.toml', 'Cargo.lock', 'scripts/export-env-engine.py', 'crates/lpm-env/src/lib.rs', 'crates/lpm-env-source/src/lib.rs', 'crates/lpm-env-ffi/include/lpm_env.h']:
                     path = root / name
                     path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_text(marker)
+                    path.write_text(HEADER + marker if name.endswith('lpm_env.h') else marker)
                 sources.append(root)
             signal = parent / 'first-slice-built'
             target = parent / 'shared-target'
@@ -196,6 +215,9 @@ module.export(root, target, output)
                 self.assertEqual(process.returncode, 0, (stdout, stderr))
             self.assertEqual((parent/'out-A/LPMEnv.xcframework/library').read_bytes(), b'AA')
             self.assertEqual((parent/'out-B/LPMEnv.xcframework/library').read_bytes(), b'BB')
+            for name in ['out-A', 'out-B']:
+                provenance = json.loads((parent / name / 'provenance.json').read_text())
+                self.assertEqual(provenance['abiVersion'], 7)
 
 
 if __name__ == '__main__':

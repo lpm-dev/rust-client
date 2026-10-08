@@ -23,6 +23,7 @@ mod constraints;
 mod definition;
 mod example;
 mod inheritance;
+mod names;
 mod object;
 mod print;
 pub mod resolver;
@@ -33,6 +34,7 @@ mod validate;
 
 pub use example::generate as generate_env_example;
 pub use inheritance::{EnvDefinition, EnvironmentsConfig, list_environments, resolve_chain};
+pub use names::{CasingConflict, EnvName, align_declared_casing};
 pub use print::{PrintFormat, format_env, is_valid_env_var_name};
 pub use resolver::{EnvSource, ResolvedEnv, extract_mode_from_env_path};
 pub use schema::{
@@ -40,7 +42,10 @@ pub use schema::{
     RequiredWhen, VarFormat, VarGroup, VarGroupMode,
 };
 pub use scopes::{EnvStage, EvalContext, ScopeSelector, ScopedDefault};
-pub use stored::{DEFAULT_ENVIRONMENT, is_denied_env_var, reads_default_environment};
+pub use stored::{
+    DEFAULT_ENVIRONMENT, StoredValuesCheck, check_stored_values, is_denied_env_var,
+    reads_default_environment,
+};
 pub use validate::{EnvValidator, ValidationError, ValidationErrorKind, validate, validate_schema};
 
 pub use definition::{EnvSchemaDefinition, env_schema_preset};

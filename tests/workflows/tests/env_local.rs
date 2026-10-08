@@ -1485,6 +1485,117 @@ fn env_check_json_exits_nonzero_and_reports_invalid_environment() {
 }
 
 #[test]
+fn stored_value_check_reports_what_env_check_reports_for_vault_values() {
+    let project = TempProject::empty(r#"{"name":"stored-check-parity","version":"1.0.0"}"#);
+    let schema = r#"{"vars":{
+        "PARITY_URL":{"required":true,"format":"url"},
+        "PARITY_PORT":{"format":"port","default":"3000"},
+        "PARITY_WORKERS":{"format":"integer","min":"1","max":"8"},
+        "PARITY_LEVEL":{"enum":["debug","info"],"defaultsIn":[{"when":{"environment":["production"]},"value":"info"}]},
+        "PARITY_TOKEN":{"secret":true,"requiredIn":[{"environment":["production"]}]},
+        "PARITY_CODE":{"pattern":"^[A-Z]{3}$"},
+        "PARITY_PASSWORD":{"secret":true},
+        "PARITY_OAUTH":{"secret":true}
+    },"groups":{"parity_credentials":{"mode":"exactlyOne","vars":["PARITY_PASSWORD","PARITY_OAUTH"]}}}"#;
+    project.write_file("lpm.json", &format!(r#"{{"envSchema":{schema}}}"#));
+    let stored: [(&str, &[(&str, &str)]); 2] = [
+        (
+            "default",
+            &[
+                ("PARITY_URL", "not-a-url"),
+                ("PARITY_WORKERS", "9"),
+                ("PARITY_LEVEL", "trace"),
+                ("PARITY_CODE", "abc"),
+                ("PARITY_PASSWORD", "fixture-password"),
+                ("PARITY_OAUTH", "fixture-oauth"),
+            ],
+        ),
+        (
+            "production",
+            &[
+                ("PARITY_URL", "https://example.com"),
+                ("PARITY_PORT", "80800"),
+                ("PARITY_PASSWORD", "fixture-password"),
+            ],
+        ),
+    ];
+    for (environment, values) in &stored {
+        let mut command = lpm(&project);
+        command.args(["env", "set"]);
+        if *environment != "default" {
+            command.arg(format!("--env={environment}"));
+        }
+        command.args(values.iter().map(|(key, value)| format!("{key}={value}")));
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let output = lpm(&project)
+        .args(["--json", "env", "check"])
+        .output()
+        .expect("failed to run lpm env check --json");
+    let envelope = parse_json_stdout(&output, "env check --json");
+    let reported = envelope["environments"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|environment| {
+            let mut errors = environment["errors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|error| error["error"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            errors.sort();
+            (
+                environment["environment"].as_str().unwrap().to_owned(),
+                errors,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    let definition = lpm_env_source::decode_definition(schema.as_bytes(), "lpm.json").unwrap();
+    let resolved =
+        lpm_env_source::resolve_schema(project.path(), schema.as_bytes(), definition).unwrap();
+    let validator = lpm_env::EnvValidator::new(&resolved.schema);
+    let environments = stored
+        .iter()
+        .map(|(environment, values)| {
+            let values = values
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect();
+            ((*environment).to_owned(), values)
+        })
+        .collect();
+    let checked = stored
+        .iter()
+        .map(|(environment, _)| {
+            let check =
+                lpm_env::check_stored_values(&validator, environment, &environments).unwrap();
+            let mut errors = check
+                .errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            errors.sort();
+            ((*environment).to_owned(), errors)
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    assert_eq!(
+        reported.keys().collect::<Vec<_>>(),
+        ["default", "production"]
+    );
+    assert!(reported.values().all(|errors| !errors.is_empty()));
+    assert_eq!(checked, reported);
+}
+
+#[test]
 fn env_check_json_exits_zero_when_environment_is_valid() {
     let project = TempProject::empty(r#"{"name":"env-check","version":"1.0.0"}"#);
     project.write_file(
