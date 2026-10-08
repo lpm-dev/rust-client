@@ -351,28 +351,6 @@ fn relay_tls_error(error: &tokio_tungstenite::tungstenite::Error) -> Option<&rus
     }
 }
 
-fn relay_pin_mismatch(error: &tokio_tungstenite::tungstenite::Error) -> Option<&RelayPinMismatch> {
-    match relay_tls_error(error)? {
-        rustls::Error::Other(error) => error.0.downcast_ref(),
-        _ => None,
-    }
-}
-
-async fn recover_relay_pin(
-    provider: Option<&TunnelPinProvider>,
-    error: &tokio_tungstenite::tungstenite::Error,
-    approval_already_loaded: bool,
-) -> Result<Option<Vec<String>>, TunnelConnectError> {
-    if !approval_already_loaded
-        && relay_pin_mismatch(error)
-            .is_some_and(|error| error.host == crate::relay::DEFAULT_RELAY_HOST)
-        && let Some(provider) = provider
-    {
-        return provider.approved_pins().await.map(Some);
-    }
-    Ok(None)
-}
-
 fn classify_websocket_connect_error(
     error: tokio_tungstenite::tungstenite::Error,
 ) -> TunnelConnectError {
@@ -1881,12 +1859,12 @@ async fn try_connect_with_token(
         .pin_provider
         .as_ref()
         .filter(|_| canonical && !options.no_pin);
-    let mut approved_pins = if let Some(provider) = provider
-        && read_tofu_pin(crate::relay::DEFAULT_RELAY_HOST)
-            .map_err(|error| TunnelConnectError::permanent(error.to_string()))?
-            .is_none()
-    {
-        Some(provider.approved_pins().await?)
+    let approved_pins = if let Some(provider) = provider {
+        Some(tokio::select! {
+            biased;
+            _ = wait_for_tunnel_shutdown(options.shutdown.as_ref()) => return Ok(()),
+            pins = provider.approved_pins() => pins?,
+        })
     } else {
         None
     };
@@ -1921,29 +1899,16 @@ async fn try_connect_with_token(
         ..Default::default()
     };
 
-    let (ws_stream, _) = loop {
-        let connector = relay_tls_connector(options, approved_pins.clone())
-            .map_err(TunnelConnectError::permanent)?;
-        let result = tokio_tungstenite::connect_async_tls_with_config(
-            request.clone(),
-            Some(ws_config),
-            false,
-            Some(connector),
-        )
-        .await;
-        match result {
-            Ok(connected) => break connected,
-            Err(error) => {
-                if let Some(pins) =
-                    recover_relay_pin(provider, &error, approved_pins.is_some()).await?
-                {
-                    approved_pins = Some(pins);
-                    continue;
-                }
-                return Err(classify_websocket_connect_error(error));
-            }
-        }
-    };
+    let connector =
+        relay_tls_connector(options, approved_pins).map_err(TunnelConnectError::permanent)?;
+    let (ws_stream, _) = tokio_tungstenite::connect_async_tls_with_config(
+        request,
+        Some(ws_config),
+        false,
+        Some(connector),
+    )
+    .await
+    .map_err(classify_websocket_connect_error)?;
 
     let (mut write, mut read) = ws_stream.split();
 
@@ -3449,72 +3414,106 @@ mod tests {
         );
     }
 
-    fn pin_mismatch_error(host: &str) -> tokio_tungstenite::tungstenite::Error {
-        tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            rustls::Error::Other(rustls::OtherError(Arc::new(RelayPinMismatch {
-                host: host.into(),
-            }))),
-        ))
-    }
-
-    #[tokio::test]
-    async fn pin_recovery_fetches_once_and_only_for_the_canonical_relay() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let callback_calls = Arc::clone(&calls);
-        let provider = TunnelPinProvider::new(move || {
-            callback_calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(vec!["a".repeat(64)]) })
-        });
-        let error = pin_mismatch_error(crate::relay::DEFAULT_RELAY_HOST);
-        assert!(
-            recover_relay_pin(Some(&provider), &error, false)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            recover_relay_pin(Some(&provider), &error, true)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            recover_relay_pin(
-                Some(&provider),
-                &pin_mismatch_error("custom.example"),
-                false
-            )
-            .await
+    #[test]
+    fn tunnel_shutdown_cancels_pending_first_use_key_authorization() {
+        let _lock = crate::test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
             .unwrap()
-            .is_none()
-        );
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            classify_websocket_connect_error(error).retry_class,
-            RetryClass::Permanent
-        );
+            .block_on(async {
+                let shutdown = tokio_util::sync::CancellationToken::new();
+                let provider_dropped = tokio_util::sync::CancellationToken::new();
+                let callback_shutdown = shutdown.clone();
+                let callback_dropped = provider_dropped.clone();
+                let mut options = TunnelOptions::new("test-token".into(), 5173);
+                options.shutdown = Some(shutdown);
+                options.pin_provider = Some(TunnelPinProvider::new(move || {
+                    callback_shutdown.cancel();
+                    let guard = callback_dropped.clone().drop_guard();
+                    Box::pin(async move {
+                        let _guard = guard;
+                        std::future::pending().await
+                    })
+                }));
+
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    connect_with_usage(
+                        &options,
+                        |_| panic!("unexpected connection"),
+                        |_| panic!("shutdown must not retry"),
+                        |_, _| {},
+                    ),
+                )
+                .await
+                .expect("shutdown did not cancel key authorization")
+                .expect("shutdown must succeed without an authorization error");
+                assert!(
+                    provider_dropped.is_cancelled(),
+                    "the authorization request remained alive after shutdown"
+                );
+                assert!(
+                    read_tofu_pin(crate::relay::DEFAULT_RELAY_HOST)
+                        .unwrap()
+                        .is_none()
+                );
+            });
     }
 
-    #[tokio::test]
-    async fn pin_recovery_does_not_fetch_for_invalid_certificate_chains() {
-        let provider =
-            TunnelPinProvider::new(|| panic!("invalid TLS must not fetch key authorization"));
-        let error = tokio_tungstenite::tungstenite::Error::Tls(
-            tokio_tungstenite::tungstenite::error::TlsError::Rustls(
-                rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
-            ),
-        );
-        assert!(
-            recover_relay_pin(Some(&provider), &error, false)
+    #[test]
+    fn saved_canonical_pin_requires_current_key_authorization_before_tls() {
+        let _lock = crate::test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let saved = "a".repeat(64);
+                write_tofu_pin(crate::relay::DEFAULT_RELAY_HOST, &saved).unwrap();
+                let shutdown = tokio_util::sync::CancellationToken::new();
+                let callback_shutdown = shutdown.clone();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let callback_calls = Arc::clone(&calls);
+                let provider_dropped = tokio_util::sync::CancellationToken::new();
+                let callback_dropped = provider_dropped.clone();
+                let mut options = TunnelOptions::new("test-token".into(), 5173);
+                options.relay_url = "wss://relay.lpm.fyi:0/connect".into();
+                options.shutdown = Some(shutdown);
+                options.pin_provider = Some(TunnelPinProvider::new(move || {
+                    callback_calls.fetch_add(1, Ordering::SeqCst);
+                    callback_shutdown.cancel();
+                    let guard = callback_dropped.clone().drop_guard();
+                    Box::pin(async move {
+                        let _guard = guard;
+                        std::future::pending().await
+                    })
+                }));
+
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    try_connect(&options, &|_| panic!("unexpected connection"), &|_, _| {}),
+                )
                 .await
-                .unwrap()
-                .is_none()
-        );
+                .expect("the saved pin skipped key authorization")
+                .expect("shutdown during key authorization must stop before TLS");
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert!(provider_dropped.is_cancelled());
+                assert_eq!(
+                    read_tofu_pin(crate::relay::DEFAULT_RELAY_HOST).unwrap(),
+                    Some(saved)
+                );
+            });
     }
 
     #[tokio::test(start_paused = true)]
-    async fn pin_recovery_timeout_stops_without_transient_retries() {
+    async fn key_authorization_timeout_stops_without_transient_retries() {
         let provider = TunnelPinProvider::new(|| Box::pin(std::future::pending()));
         let error = provider.approved_pins().await.unwrap_err();
         assert_eq!(error.retry_class, RetryClass::Permanent);
@@ -4241,6 +4240,25 @@ mod tests {
             &[],
             rustls::pki_types::UnixTime::now(),
         )
+    }
+
+    #[test]
+    fn matching_saved_pin_is_rejected_when_signed_authorization_removes_the_key() {
+        let _lock = crate::test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let (verifier, certificate) = trusted_relay_certificate(Some(vec!["a".repeat(64)]));
+        let saved = spki_sha256_hex(certificate.as_ref()).unwrap();
+        write_tofu_pin(crate::relay::DEFAULT_RELAY_HOST, &saved).unwrap();
+
+        assert!(
+            verify_test_certificate(&verifier, &certificate, crate::relay::DEFAULT_RELAY_HOST)
+                .is_err()
+        );
+        assert_eq!(
+            read_tofu_pin(crate::relay::DEFAULT_RELAY_HOST).unwrap(),
+            Some(saved)
+        );
     }
 
     #[test]
