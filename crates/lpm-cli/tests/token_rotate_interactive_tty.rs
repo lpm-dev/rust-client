@@ -193,7 +193,7 @@ mod tty {
         .expect("write package.json");
 
         let server = wiremock::MockServer::start().await;
-        common::seed_lpm_token(project.path(), &server.uri(), "old-session-token");
+        common::seed_lpm_token(lpm_home.path(), &server.uri(), "old-session-token");
         Mock::given(method("POST"))
             .and(path("/api/registry/-/token/rotate"))
             .respond_with(OtpChallengeResponder)

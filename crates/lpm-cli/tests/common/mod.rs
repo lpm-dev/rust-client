@@ -192,10 +192,9 @@ pub fn parse_json_stdout(stdout: &str) -> serde_json::Value {
     })
 }
 
-/// Seed one encrypted, file-backed LPM credential under an isolated test home.
-pub fn seed_lpm_token(home: &Path, registry_url: &str, token: &str) {
-    let lpm_dir = home.join(".lpm");
-    std::fs::create_dir_all(&lpm_dir).expect("create test auth directory");
+/// Seed one encrypted, file-backed LPM credential under the selected LPM root.
+pub fn seed_lpm_token(lpm_dir: &Path, registry_url: &str, token: &str) {
+    std::fs::create_dir_all(lpm_dir).expect("create test auth directory");
     std::fs::write(
         lpm_dir.join(".key"),
         format!("raw:{}", hex::encode(TEST_AUTH_ENCRYPTION_KEY)),
