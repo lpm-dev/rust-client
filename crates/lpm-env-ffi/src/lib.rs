@@ -12,7 +12,8 @@ const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 /// The most environments one check evaluates.
 const CHECK_ENVIRONMENT_LIMIT: usize = 256;
 /// The most work one check does: each environment costs a unit per
-/// declaration, group, group member, selected stored value, plus one.
+/// declaration, enum member, enum UTF-8 byte, group, group member,
+/// selected stored value (including fallback values), plus one.
 const CHECK_WORK_LIMIT: usize = 1 << 18;
 
 /// C callers own this result until one matching lpm_env_release call.
