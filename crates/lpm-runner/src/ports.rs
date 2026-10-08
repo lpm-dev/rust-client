@@ -4205,28 +4205,9 @@ mod tests {
     use super::*;
 
     #[cfg(target_os = "linux")]
-    struct KillOnDropChild(Option<Child>);
-
-    #[cfg(target_os = "linux")]
-    impl KillOnDropChild {
-        fn new(child: Child) -> Self {
-            Self(Some(child))
-        }
-
-        fn child_mut(&mut self) -> &mut Child {
-            self.0.as_mut().expect("child should be available")
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    impl Drop for KillOnDropChild {
-        fn drop(&mut self) {
-            if let Some(mut child) = self.0.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-    }
+    use crate::test_support::KillOnDropChild;
+    #[cfg(unix)]
+    use crate::test_support::ProcessSpawners;
 
     #[cfg(windows)]
     #[test]
@@ -5890,17 +5871,7 @@ tcp4 0 0 127.0.0.1.60000 127.0.0.1.443 ESTABLISHED 1 2 3 4 node:99 00100\n",
             tmp.path().join("leases"),
         )
         .unwrap();
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let spawners: Vec<_> = (0..4)
-            .map(|_| {
-                let stop = std::sync::Arc::clone(&stop);
-                std::thread::spawn(move || {
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        let _ = std::process::Command::new("true").status();
-                    }
-                })
-            })
-            .collect();
+        let spawners = ProcessSpawners::new();
         let mut held = 0;
         for _ in 0..1000 {
             drop(allocation.try_acquire_lease(3000).unwrap());
@@ -5909,10 +5880,7 @@ tcp4 0 0 127.0.0.1.60000 127.0.0.1.443 ESTABLISHED 1 2 3 4 node:99 00100\n",
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        for spawner in spawners {
-            spawner.join().unwrap();
-        }
+        drop(spawners);
         assert_eq!(held, 0, "released leases stayed held by spawned processes");
     }
 

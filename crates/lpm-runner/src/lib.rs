@@ -42,6 +42,9 @@ pub mod shell;
 pub mod task_graph;
 pub mod ts_transform;
 
+#[cfg(test)]
+mod test_support;
+
 pub type ShutdownStartedCallback =
     Box<dyn FnOnce() -> Result<(), lpm_common::LpmError> + Send + 'static>;
 
