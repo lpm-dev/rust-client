@@ -31,6 +31,7 @@ sha2 = { workspace = true }
 toml = { workspace = true }
 
 [dev-dependencies]
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 

@@ -1602,6 +1602,7 @@ pub async fn run(
             relay_url,
             token: token.to_string(),
             token_provider,
+            pin_provider: Some(crate::relay_trust::pin_provider()),
             local_target: LocalTarget::loopback(LocalScheme::Http, port),
             live_local_target: None,
             domain: tunnel_domain.map(|s| s.to_string()),
