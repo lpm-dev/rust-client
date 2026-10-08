@@ -54,6 +54,7 @@ fn ensure_config_parent(path: &std::path::Path) -> Result<(), LpmError> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
+    #[cfg(unix)]
     let create_parent = !parent.exists();
     std::fs::create_dir_all(parent)?;
     #[cfg(unix)]
@@ -126,11 +127,9 @@ impl ConfigFileSnapshot {
 
     fn restore(&self, path: &std::path::Path) -> Result<(), LpmError> {
         if let Some(content) = self.content.as_ref() {
-            let mut options = lpm_common::AtomicWriteOptions::new();
+            let options = lpm_common::AtomicWriteOptions::new();
             #[cfg(unix)]
-            if let Some(mode) = self.mode {
-                options = options.unix_mode(mode);
-            }
+            let options = self.mode.map_or(options, |mode| options.unix_mode(mode));
             lpm_common::write_file_atomic_with_options(path, content.as_bytes(), options)?;
         } else {
             match std::fs::remove_file(path) {

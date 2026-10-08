@@ -36,6 +36,39 @@ jobs:
   windows-filesystem:
     uses: ./.github/workflows/windows-filesystem-gate.yml
 
+  release-check:
+    name: Release compiler warnings (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-release-check-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install Linux keyring build deps
+        if: runner.os == 'Linux'
+        run: bash scripts/ci/install-apt-packages.sh pkg-config libdbus-1-dev
+
+      - name: Check release binaries without warnings
+        run: cargo check --locked --release -p lpm-cli -p lpm-sandbox --bins
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
