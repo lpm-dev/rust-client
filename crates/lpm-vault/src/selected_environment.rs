@@ -5,6 +5,7 @@ use std::fmt;
 use serde::de::{DeserializeSeed, Deserializer, Error as _, MapAccess, Visitor};
 
 use crate::{EnvironmentMap, SecretMap};
+use lpm_env::{DEFAULT_ENVIRONMENT, reads_default_environment};
 
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17,7 +18,7 @@ pub(crate) fn parse_all(json: &str) -> Result<EnvironmentMap, serde_json::Error>
     let payload = serde_json::from_str::<CompleteVaultPayload>(json)?;
     let mut environments = payload.environments;
     if environments.is_empty() {
-        environments.insert("default".to_owned(), HashMap::new());
+        environments.insert(DEFAULT_ENVIRONMENT.to_owned(), HashMap::new());
     }
     Ok(environments)
 }
@@ -126,25 +127,25 @@ pub(crate) fn parse(
     json: &str,
     selected_environment: &str,
 ) -> Result<SelectedVaultPayload, serde_json::Error> {
-    parse_with_optional_fallback(json, selected_environment, None)
+    parse_with_optional_fallback(json, selected_environment, false)
 }
 
 pub(crate) fn parse_with_default_fallback(
     json: &str,
     selected_environment: &str,
 ) -> Result<SelectedVaultPayload, serde_json::Error> {
-    parse_with_optional_fallback(json, selected_environment, Some("default"))
+    parse_with_optional_fallback(json, selected_environment, true)
 }
 
 fn parse_with_optional_fallback(
     json: &str,
     selected_environment: &str,
-    fallback_environment: Option<&str>,
+    default_fallback: bool,
 ) -> Result<SelectedVaultPayload, serde_json::Error> {
     let mut deserializer = serde_json::Deserializer::from_str(json);
     let payload = SelectedPayloadSeed {
         selected_environment,
-        fallback_environment,
+        default_fallback,
     }
     .deserialize(&mut deserializer)?;
     deserializer.end()?;
@@ -153,7 +154,7 @@ fn parse_with_optional_fallback(
 
 struct SelectedPayloadSeed<'selection> {
     selected_environment: &'selection str,
-    fallback_environment: Option<&'selection str>,
+    default_fallback: bool,
 }
 
 impl<'de> DeserializeSeed<'de> for SelectedPayloadSeed<'_> {
@@ -165,14 +166,14 @@ impl<'de> DeserializeSeed<'de> for SelectedPayloadSeed<'_> {
     {
         deserializer.deserialize_map(SelectedPayloadVisitor {
             selected_environment: self.selected_environment,
-            fallback_environment: self.fallback_environment,
+            default_fallback: self.default_fallback,
         })
     }
 }
 
 struct SelectedPayloadVisitor<'selection> {
     selected_environment: &'selection str,
-    fallback_environment: Option<&'selection str>,
+    default_fallback: bool,
 }
 
 impl<'de> Visitor<'de> for SelectedPayloadVisitor<'_> {
@@ -199,9 +200,9 @@ impl<'de> Visitor<'de> for SelectedPayloadVisitor<'_> {
             saw_environments = true;
             let parsed = map.next_value_seed(SelectedEnvironmentsSeed {
                 selected_environment: self.selected_environment,
-                fallback_environment: self.fallback_environment,
+                default_fallback: self.default_fallback,
             })?;
-            selected = if parsed.is_empty && self.selected_environment == "default" {
+            selected = if parsed.is_empty && self.selected_environment == DEFAULT_ENVIRONMENT {
                 Some(HashMap::new())
             } else {
                 parsed.selected
@@ -222,7 +223,7 @@ struct SelectedEnvironments {
 
 struct SelectedEnvironmentsSeed<'selection> {
     selected_environment: &'selection str,
-    fallback_environment: Option<&'selection str>,
+    default_fallback: bool,
 }
 
 impl<'de> DeserializeSeed<'de> for SelectedEnvironmentsSeed<'_> {
@@ -234,14 +235,14 @@ impl<'de> DeserializeSeed<'de> for SelectedEnvironmentsSeed<'_> {
     {
         deserializer.deserialize_map(SelectedEnvironmentsVisitor {
             selected_environment: self.selected_environment,
-            fallback_environment: self.fallback_environment,
+            default_fallback: self.default_fallback,
         })
     }
 }
 
 struct SelectedEnvironmentsVisitor<'selection> {
     selected_environment: &'selection str,
-    fallback_environment: Option<&'selection str>,
+    default_fallback: bool,
 }
 
 impl<'de> Visitor<'de> for SelectedEnvironmentsVisitor<'_> {
@@ -255,14 +256,14 @@ impl<'de> Visitor<'de> for SelectedEnvironmentsVisitor<'_> {
     where
         A: MapAccess<'de>,
     {
-        visit_selected_environments_map(map, self.selected_environment, self.fallback_environment)
+        visit_selected_environments_map(map, self.selected_environment, self.default_fallback)
     }
 }
 
 fn visit_selected_environments_map<'de, A>(
     mut map: A,
     selected_environment: &str,
-    fallback_environment: Option<&str>,
+    default_fallback: bool,
 ) -> Result<SelectedEnvironments, A::Error>
 where
     A: MapAccess<'de>,
@@ -283,15 +284,17 @@ where
         }
         if environment == selected_environment {
             selected = Some(map.next_value_seed(RetainedSecretMapSeed)?);
-        } else if fallback_environment.is_some_and(|fallback| environment == fallback) {
+        } else if default_fallback && environment == DEFAULT_ENVIRONMENT {
             fallback = Some(map.next_value_seed(RetainedSecretMapSeed)?);
         } else {
             map.next_value_seed(ValidateSecretMapSeed)?;
         }
     }
-    let selected = if fallback_environment.is_some_and(|fallback| fallback != selected_environment)
-        && selected.as_ref().is_none_or(HashMap::is_empty)
-    {
+    let selected = if default_fallback
+        && reads_default_environment(
+            selected_environment,
+            selected.as_ref().is_some_and(|values| !values.is_empty()),
+        ) {
         fallback
     } else {
         selected

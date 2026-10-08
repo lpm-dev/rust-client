@@ -28,6 +28,7 @@ mod print;
 pub mod resolver;
 mod schema;
 mod scopes;
+mod stored;
 mod validate;
 
 pub use example::generate as generate_env_example;
@@ -39,6 +40,7 @@ pub use schema::{
     RequiredWhen, VarFormat, VarGroup, VarGroupMode,
 };
 pub use scopes::{EnvStage, EvalContext, ScopeSelector, ScopedDefault};
+pub use stored::{DEFAULT_ENVIRONMENT, is_denied_env_var, reads_default_environment};
 pub use validate::{EnvValidator, ValidationError, ValidationErrorKind, validate, validate_schema};
 
 pub use definition::{EnvSchemaDefinition, env_schema_preset};

@@ -4137,6 +4137,7 @@ dependencies = [
  "keyring",
  "libc",
  "lpm-common",
+ "lpm-env",
  "lpm-http",
  "objc2-local-authentication",
  "p256",
