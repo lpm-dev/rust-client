@@ -1,7 +1,7 @@
 //! Rules for stored project env values, shared by every reader of them.
 
 use crate::{CasingConflict, EnvValidator, EvalContext, ValidationError, ValidationErrorKind};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// The environment whose stored values an environment without values of its own uses.
 pub const DEFAULT_ENVIRONMENT: &str = "default";
@@ -95,7 +95,13 @@ fn check_stored_values_with_case_policy(
     let mut values = HashMap::with_capacity(stored.map_or(0, HashMap::len));
     let mut ignored = Vec::new();
     let mut errors = Vec::new();
+    let mut stored_names = case_insensitive.then(BTreeSet::new);
     for (key, value) in stored.into_iter().flatten() {
+        if let Some(names) = &mut stored_names
+            && !names.insert(crate::EnvName::new(key))
+        {
+            return Err(CasingConflict::Stored(key.clone()));
+        }
         // The runner rejects a NUL anywhere before it drops denied variables.
         let unusable = value.as_bytes().contains(&0);
         let denied = is_denied_env_var(key);
@@ -156,6 +162,27 @@ fn check_stored_values_with_case_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filtered_values_cannot_hide_casing_collisions() {
+        let schema: crate::EnvSchema = serde_json::from_str(r#"{"vars":{"TOKEN":{}}}"#).unwrap();
+        let validator = EnvValidator::new(&schema);
+        for (upper, lower, value) in [
+            ("NODE_OPTIONS", "node_options", "x"),
+            ("UNDECLARED", "undeclared", "\0"),
+        ] {
+            let stored = environments(&[("default", &[(upper, value), (lower, value)])]);
+            for environment in ["default", "production"] {
+                assert!(matches!(
+                    check_stored_values_with_case_policy(&validator, environment, &stored, true),
+                    Err(CasingConflict::Stored(_))
+                ));
+            }
+            assert!(
+                check_stored_values_with_case_policy(&validator, "default", &stored, false).is_ok()
+            );
+        }
+    }
 
     #[test]
     fn denied_variables_match_without_case_and_ordinary_names_pass() {

@@ -322,10 +322,15 @@ pub unsafe extern "C" fn lpm_env_check(
         if input.environments.len() > CHECK_ENVIRONMENT_LIMIT {
             return failure(4, "env.check_budget");
         }
+        let rule_work = schema.vars.values().fold(schema.vars.len(), |work, rule| {
+            rule.enum_values.as_ref().map_or(work, |allowed| {
+                allowed.iter().fold(work, |work, value| {
+                    work.saturating_add(1).saturating_add(value.len())
+                })
+            })
+        });
         let per_environment = schema.groups.values().fold(
-            schema
-                .vars
-                .len()
+            rule_work
                 .saturating_add(schema.groups.len())
                 .saturating_add(1),
             |work, group| work.saturating_add(group.vars.len()),
@@ -678,6 +683,36 @@ mod tests {
                 "ignored": [],
             })
         );
+    }
+
+    #[test]
+    fn checking_counts_enum_members_for_every_environment() {
+        let allowed: Vec<_> = (0..8_192).map(|index| index.to_string()).collect();
+        let schema =
+            serde_json::to_vec(&serde_json::json!({"vars":{"X":{"enum":allowed}}})).unwrap();
+        let environments: BTreeMap<_, _> = (0..64)
+            .map(|index| (format!("env{index}"), serde_json::json!({"X":"invalid"})))
+            .collect();
+        let input = serde_json::to_vec(&serde_json::json!({"environments":environments})).unwrap();
+        let (status, output) = check(&schema, &input);
+        assert_eq!(status, 4);
+        assert_eq!(output["code"], "env.check_budget");
+    }
+
+    #[test]
+    fn checking_counts_enum_bytes_before_retaining_mismatch_details() {
+        let allowed: Vec<_> = (0..8)
+            .map(|index| format!("{index}{}", "x".repeat(4_096)))
+            .collect();
+        let schema =
+            serde_json::to_vec(&serde_json::json!({"vars":{"X":{"enum":allowed}}})).unwrap();
+        let environments: BTreeMap<_, _> = (0..16)
+            .map(|index| (format!("env{index}"), serde_json::json!({"X":"invalid"})))
+            .collect();
+        let input = serde_json::to_vec(&serde_json::json!({"environments":environments})).unwrap();
+        let (status, output) = check(&schema, &input);
+        assert_eq!(status, 4);
+        assert_eq!(output["code"], "env.check_budget");
     }
 
     #[test]
