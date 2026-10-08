@@ -1,0 +1,49 @@
+name: Publish approved relay keys
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *"
+  push:
+    branches: [main]
+    paths:
+      - security/relay-pins.json
+      - scripts/relay-trust.py
+      - .github/workflows/relay-trust.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: relay-trust
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'lpm-dev/rust-client' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - name: Build the reviewed key list
+        run: python3 scripts/relay-trust.py security/relay-pins.json relay-trust.json
+      - name: Attest the key list
+        id: attest
+        uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661 # v3
+        with:
+          subject-path: relay-trust.json
+      - name: Publish the signed key list
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cp "${{ steps.attest.outputs.bundle-path }}" relay-trust.json.sigstore
+          if ! gh release view relay-trust >/dev/null 2>&1; then
+            gh release create relay-trust --target "$GITHUB_SHA" --prerelease --latest=false \
+              --title "Approved relay keys" --notes "Signed key authorization for tunnel clients."
+          fi
+          gh release upload relay-trust relay-trust.json relay-trust.json.sigstore --clobber

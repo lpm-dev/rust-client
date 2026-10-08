@@ -533,6 +533,7 @@ pub(crate) async fn run_start(
         relay_url: relay_url.map_or_else(lpm_tunnel::resolve_relay_url, str::to_owned),
         token: token.to_string(),
         token_provider,
+        pin_provider: Some(crate::relay_trust::pin_provider()),
         local_target: local_target.clone(),
         live_local_target: None,
         domain: domain.map(|s| s.to_string()),

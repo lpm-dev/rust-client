@@ -149,6 +149,37 @@ impl std::fmt::Debug for TunnelTokenProvider {
     }
 }
 
+/// Signed key list returned by a caller that verifies the canonical relay's authorization.
+pub type TunnelPinFuture = Pin<Box<dyn Future<Output = Result<Vec<String>, LpmError>> + Send>>;
+
+/// Fetches cryptographically authorized keys for `relay.lpm.fyi` only.
+#[derive(Clone)]
+pub struct TunnelPinProvider(Arc<dyn Fn() -> TunnelPinFuture + Send + Sync>);
+
+impl TunnelPinProvider {
+    /// The callback must verify the signature, publisher, host, and validity window.
+    pub fn new(provider: impl Fn() -> TunnelPinFuture + Send + Sync + 'static) -> Self {
+        Self(Arc::new(provider))
+    }
+
+    async fn approved_pins(&self) -> Result<Vec<String>, TunnelConnectError> {
+        tokio::time::timeout(std::time::Duration::from_secs(15), (self.0)())
+            .await
+            .map_err(|_| TunnelConnectError::permanent(
+                "Cannot fetch the approved relay keys. Retry the command when the network is available.",
+            ))?
+            .map_err(|error| TunnelConnectError::permanent(format!(
+                "Cannot verify the approved relay keys: {error}. Retry the command or update LPM CLI.",
+            )))
+    }
+}
+
+impl std::fmt::Debug for TunnelPinProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TunnelPinProvider([verified key source])")
+    }
+}
+
 /// Captured webhook plus reservations for its queued request and response bodies.
 pub struct CapturedWebhookEvent {
     pub webhook: Arc<CapturedWebhook>,
@@ -303,12 +334,56 @@ fn classify_relay_rejection(status: u16, body: &[u8]) -> TunnelConnectError {
     error
 }
 
+#[derive(Debug, Clone, thiserror::Error)]
+#[error(
+    "LPM CLI cannot verify the relay key for {host}. Run lpm self-update, then retry the tunnel. If the error continues, contact the relay operator."
+)]
+struct RelayPinMismatch {
+    host: String,
+}
+
+fn relay_tls_error(error: &tokio_tungstenite::tungstenite::Error) -> Option<&rustls::Error> {
+    use tokio_tungstenite::tungstenite::{Error, error::TlsError};
+    match error {
+        Error::Tls(TlsError::Rustls(error)) => Some(error),
+        Error::Io(error) => error.get_ref()?.downcast_ref(),
+        _ => None,
+    }
+}
+
+fn relay_pin_mismatch(error: &tokio_tungstenite::tungstenite::Error) -> Option<&RelayPinMismatch> {
+    match relay_tls_error(error)? {
+        rustls::Error::Other(error) => error.0.downcast_ref(),
+        _ => None,
+    }
+}
+
+async fn recover_relay_pin(
+    provider: Option<&TunnelPinProvider>,
+    error: &tokio_tungstenite::tungstenite::Error,
+    approval_already_loaded: bool,
+) -> Result<Option<Vec<String>>, TunnelConnectError> {
+    if !approval_already_loaded
+        && relay_pin_mismatch(error)
+            .is_some_and(|error| error.host == crate::relay::DEFAULT_RELAY_HOST)
+        && let Some(provider) = provider
+    {
+        return provider.approved_pins().await.map(Some);
+    }
+    Ok(None)
+}
+
 fn classify_websocket_connect_error(
     error: tokio_tungstenite::tungstenite::Error,
 ) -> TunnelConnectError {
     if let tokio_tungstenite::tungstenite::Error::Http(response) = &error {
         let body = response.body().as_deref().unwrap_or_default();
         return classify_relay_rejection(response.status().as_u16(), body);
+    }
+    if relay_tls_error(&error).is_some()
+        || matches!(error, tokio_tungstenite::tungstenite::Error::Tls(_))
+    {
+        return TunnelConnectError::permanent(format!("failed to connect to relay: {error}"));
     }
     TunnelConnectError::transient(format!("failed to connect to relay: {error}"))
 }
@@ -789,6 +864,8 @@ pub struct TunnelOptions {
     pub token: String,
     /// Dynamic refresh-backed bearer source. Static callers can leave this unset.
     pub token_provider: Option<TunnelTokenProvider>,
+    /// Verified canonical relay key source for first use and key rotation.
+    pub pin_provider: Option<TunnelPinProvider>,
     /// Validated local HTTP endpoint to tunnel.
     pub local_target: lpm_common::LocalTarget,
     /// Live endpoint source for dev services that can restart.
@@ -890,6 +967,7 @@ impl TunnelOptions {
             relay_url: DEFAULT_RELAY_URL.to_string(),
             token,
             token_provider: None,
+            pin_provider: None,
             local_target: lpm_common::LocalTarget::loopback(
                 lpm_common::LocalScheme::Http,
                 local_port,
@@ -1429,21 +1507,7 @@ async fn forward_http_request(
 
 // ── TOFU Certificate Pinning ──────────────────────────────────────
 
-/// Optional embedded SPKI SHA-256 pin for the canonical relay
-/// (`relay.lpm.fyi`). When `Some`, the first connect to the canonical
-/// host MUST match this pin — pure WebPKI-valid-but-unknown TOFU is
-/// rejected.
-///
-/// L3: pure TOFU on first connect lets an attacker who controls the
-/// network on the user's first `lpm dev --tunnel` capture a forged
-/// pin. The embedded pin slot is wired up here so the release pipeline
-/// can flip `None` → `Some("<canonical SPKI sha256 hex>")` to close
-/// the first-connect gap. Default stays at `None` to avoid shipping a
-/// pin that's wrong (or rotated) and would brick every install.
-///
-/// Non-canonical hosts (`LPM_TUNNEL_RELAY` override, regional relays)
-/// continue to use pure TOFU — the embedded pin would be meaningless
-/// for them.
+// Library callers without a signed key provider can pin the canonical key at build time.
 const EMBEDDED_CANONICAL_RELAY_SPKI_PIN_HEX: Option<&str> = None;
 
 /// Read the stored TOFU pin (hex-encoded SHA-256 of SPKI) for `host`.
@@ -1491,35 +1555,20 @@ fn read_tofu_pin(host: &str) -> Result<Option<String>, lpm_common::BoundedReadEr
 /// the first time they reconnect post-upgrade.
 fn write_tofu_pin(host: &str, pin_hex: &str) -> Result<(), String> {
     let path = crate::relay::tofu_pin_path_for_host(host).ok_or("no home directory")?;
-    let parent = path.parent().unwrap();
+    let parent = path
+        .parent()
+        .ok_or("relay pin path has no parent directory")?;
     std::fs::create_dir_all(parent)
         .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
-    #[cfg(unix)]
-    {
-        // Open with O_CREAT|O_TRUNC|O_WRONLY and mode 0o600 so the
-        // file lands owner-only from creation rather than via a
-        // post-write chmod. Closes the race window where another
-        // process could observe the pin file between the umask-based
-        // create and the set_permissions call. The pin itself is not
-        // a secret (it's an SPKI hash), but locking it down at create
-        // time matches the broader credential-metadata posture and
-        // prevents tampering by other local UIDs.
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .map_err(|e| format!("failed to open relay pin for write: {e}"))?;
-        f.write_all(pin_hex.as_bytes())
-            .map_err(|e| format!("failed to write relay pin: {e}"))?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&path, pin_hex).map_err(|e| format!("failed to write relay pin: {e}"))?;
-    }
+    lpm_common::write_file_atomic_with_options(
+        &path,
+        pin_hex,
+        lpm_common::AtomicWriteOptions::new()
+            .unix_mode(0o600)
+            .sync_file(),
+    )
+    .map_err(|error| format!("failed to store relay pin: {error}"))?;
+
     Ok(())
 }
 
@@ -1616,6 +1665,9 @@ fn read_der_length(data: &[u8]) -> Option<(usize, usize)> {
 /// path layouts we support.
 fn server_name_to_string(server_name: &rustls::pki_types::ServerName<'_>) -> String {
     match server_name {
+        rustls::pki_types::ServerName::DnsName(n) if canonical_relay_host(n.as_ref()) => {
+            crate::relay::DEFAULT_RELAY_HOST.to_string()
+        }
         rustls::pki_types::ServerName::DnsName(n) => n.as_ref().to_string(),
         rustls::pki_types::ServerName::IpAddress(ip) => format!("{ip:?}"),
         // rustls's ServerName is `#[non_exhaustive]`; if a future variant
@@ -1626,19 +1678,29 @@ fn server_name_to_string(server_name: &rustls::pki_types::ServerName<'_>) -> Str
     }
 }
 
+fn canonical_relay_host(host: &str) -> bool {
+    host.strip_suffix('.')
+        .unwrap_or(host)
+        .eq_ignore_ascii_case(crate::relay::DEFAULT_RELAY_HOST)
+}
+
 /// TOFU (Trust On First Use) certificate pinning verifier.
 ///
 /// Delegates standard chain validation to the default `WebPkiServerVerifier`, then
 /// checks the end-entity certificate's SPKI hash against a stored pin. On first
-/// connection the pin is saved; on subsequent connections a mismatch is rejected.
+/// connection the pin is saved. A mismatch requires an authorized canonical key.
 #[derive(Debug)]
 struct TofuPinningVerifier {
     default_verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    approved_pins: Option<Vec<String>>,
 }
 
 impl TofuPinningVerifier {
     fn new(default_verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>) -> Self {
-        Self { default_verifier }
+        Self {
+            default_verifier,
+            approved_pins: None,
+        }
     }
 }
 
@@ -1674,65 +1736,31 @@ impl rustls::client::danger::ServerCertVerifier for TofuPinningVerifier {
 
         tracing::debug!("relay certificate SPKI SHA-256 for {host}: {current_pin}");
 
-        match read_tofu_pin(&host).map_err(|error| rustls::Error::General(error.to_string()))? {
-            Some(stored_pin) => {
-                if stored_pin != current_pin {
-                    let pin_path = crate::relay::tofu_pin_path_for_host(&host).map_or_else(
-                        || format!("~/.lpm/relay-pins/{host}"),
-                        |p| p.display().to_string(),
-                    );
-                    tracing::error!(
-                        "CERTIFICATE PIN MISMATCH for {host}: stored={stored_pin}, current={current_pin}. \
-                         The relay's certificate has changed. This could indicate a MITM attack. \
-                         If the relay legitimately rotated certificates, delete {pin_path} and reconnect."
-                    );
-                    return Err(rustls::Error::General(format!(
-                        "certificate pin mismatch for {host} — possible MITM \
-                         (delete {pin_path} to re-pin)"
-                    )));
-                }
-                tracing::debug!("TOFU certificate pin verified for {host}");
-            }
-            None => {
-                // L3: on the canonical relay, if an embedded SPKI pin
-                // is compiled in, the cert MUST match it on first
-                // connect — pure WebPKI-valid TOFU is no longer good
-                // enough. Closes the first-connect MITM window. The
-                // const is None by default; release flips it to
-                // `Some(...)` to enable enforcement.
-                if host == crate::relay::DEFAULT_RELAY_HOST
-                    && let Some(expected) = EMBEDDED_CANONICAL_RELAY_SPKI_PIN_HEX
-                    && expected != current_pin
-                {
-                    tracing::error!(
-                        "FIRST-CONNECT PIN MISMATCH for {host}: embedded={expected}, current={current_pin}. \
-                         The relay's certificate does not match the pin shipped with this binary."
-                    );
-                    return Err(rustls::Error::General(format!(
-                        "first-connect pin mismatch for {host} — possible MITM \
-                         (delete any stored pin and reinstall lpm if the relay legitimately rotated)"
-                    )));
-                }
-
-                // First connection (or post-upgrade migration from the
-                // legacy global pin file) — store the pin under the
-                // per-host layout. Warn-level so operators reviewing CI
-                // logs see when a fresh pin was captured (a pure-TOFU
-                // accept on the canonical relay is the L3 hazard
-                // surface; surfacing it is the minimum step while the
-                // embedded-pin slot is still empty).
-                if let Err(e) = write_tofu_pin(&host, &current_pin) {
-                    tracing::warn!("failed to store TOFU pin for {host}: {e}");
-                } else if host == crate::relay::DEFAULT_RELAY_HOST {
-                    tracing::warn!(
-                        host = %host,
-                        pin = %current_pin,
-                        "captured first-connect TOFU pin for canonical relay — verify the SPKI hash matches the published one before relying on this install"
-                    );
-                } else {
-                    tracing::info!("stored relay certificate pin (TOFU) for {host}: {current_pin}");
-                }
-            }
+        let stored_pin =
+            read_tofu_pin(&host).map_err(|error| rustls::Error::General(error.to_string()))?;
+        let authorized = host == crate::relay::DEFAULT_RELAY_HOST
+            && self
+                .approved_pins
+                .as_ref()
+                .is_some_and(|pins| pins.contains(&current_pin));
+        // A signed list is authoritative when supplied. A CA-valid key alone cannot authorize rotation.
+        let signed_key_required =
+            host == crate::relay::DEFAULT_RELAY_HOST && self.approved_pins.is_some();
+        let pin_is_untrusted = signed_key_required
+            || stored_pin.as_ref().is_some_and(|pin| pin != &current_pin)
+            || (stored_pin.is_none()
+                && host == crate::relay::DEFAULT_RELAY_HOST
+                && EMBEDDED_CANONICAL_RELAY_SPKI_PIN_HEX.is_some_and(|pin| pin != current_pin));
+        if pin_is_untrusted && !authorized {
+            return Err(rustls::Error::Other(rustls::OtherError(Arc::new(
+                RelayPinMismatch { host },
+            ))));
+        }
+        let needs_migration =
+            crate::relay::tofu_pin_path_for_host(&host).is_some_and(|path| !path.exists());
+        if stored_pin.as_ref() != Some(&current_pin) || needs_migration {
+            write_tofu_pin(&host, &current_pin).map_err(rustls::Error::General)?;
+            tracing::debug!(host, "stored verified relay key");
         }
 
         Ok(rustls::client::danger::ServerCertVerified::assertion())
@@ -1787,6 +1815,33 @@ pub fn relay_url_is_loopback(url: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
+fn relay_tls_connector(
+    options: &TunnelOptions,
+    approved_pins: Option<Vec<String>>,
+) -> Result<tokio_tungstenite::Connector, String> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let root_store =
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut config = if !options.no_pin && !relay_url_is_loopback(&options.relay_url) {
+        let default_verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
+            .build()
+            .map_err(|error| error.to_string())?;
+        let mut verifier = TofuPinningVerifier::new(default_verifier);
+        verifier.approved_pins = approved_pins;
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_no_client_auth()
+    } else {
+        rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    };
+    // The relay requires HTTP/1.1 for WebSocket upgrades.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(tokio_tungstenite::Connector::Rustls(Arc::new(config)))
+}
+
 /// Single connection attempt to the relay.
 #[cfg(test)]
 async fn try_connect(
@@ -1815,37 +1870,26 @@ async fn try_connect_with_token(
     }
     tracing::debug!("connecting to relay: {connect_url}");
 
-    // Force HTTP/1.1 — Cloudflare Workers require HTTP/1.1 for WebSocket upgrades.
-    // HTTP/2 (default via ALPN) doesn't support the Upgrade header mechanism.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let root_store =
-        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    let use_pinning = !options.no_pin && !relay_url_is_loopback(&options.relay_url);
-
-    let mut tls_config = if use_pinning {
-        let default_verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
-            .build()
-            .map_err(|e| LpmError::Tunnel(format!("failed to build TLS verifier: {e}")))?;
-
-        let pinning_verifier = Arc::new(TofuPinningVerifier::new(default_verifier));
-
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(pinning_verifier)
-            .with_no_client_auth()
+    let canonical = options
+        .relay_url
+        .parse::<tokio_tungstenite::tungstenite::http::Uri>()
+        .ok()
+        .is_some_and(|uri| {
+            uri.scheme_str() == Some("wss") && uri.host().is_some_and(canonical_relay_host)
+        });
+    let provider = options
+        .pin_provider
+        .as_ref()
+        .filter(|_| canonical && !options.no_pin);
+    let mut approved_pins = if let Some(provider) = provider
+        && read_tofu_pin(crate::relay::DEFAULT_RELAY_HOST)
+            .map_err(|error| TunnelConnectError::permanent(error.to_string()))?
+            .is_none()
+    {
+        Some(provider.approved_pins().await?)
     } else {
-        if options.no_pin {
-            tracing::debug!("certificate pinning disabled (--no-pin)");
-        }
-        rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth()
+        None
     };
-
-    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
-
-    let tls_connector = tokio_tungstenite::Connector::Rustls(Arc::new(tls_config));
 
     // Build WebSocket request with auth token in Authorization header
     // tunnel_auth goes in X-Tunnel-Auth header (not URL) to avoid leaking in proxy/CDN logs
@@ -1877,14 +1921,29 @@ async fn try_connect_with_token(
         ..Default::default()
     };
 
-    let (ws_stream, _) = tokio_tungstenite::connect_async_tls_with_config(
-        request,
-        Some(ws_config),
-        false,
-        Some(tls_connector),
-    )
-    .await
-    .map_err(classify_websocket_connect_error)?;
+    let (ws_stream, _) = loop {
+        let connector = relay_tls_connector(options, approved_pins.clone())
+            .map_err(TunnelConnectError::permanent)?;
+        let result = tokio_tungstenite::connect_async_tls_with_config(
+            request.clone(),
+            Some(ws_config),
+            false,
+            Some(connector),
+        )
+        .await;
+        match result {
+            Ok(connected) => break connected,
+            Err(error) => {
+                if let Some(pins) =
+                    recover_relay_pin(provider, &error, approved_pins.is_some()).await?
+                {
+                    approved_pins = Some(pins);
+                    continue;
+                }
+                return Err(classify_websocket_connect_error(error));
+            }
+        }
+    };
 
     let (mut write, mut read) = ws_stream.split();
 
@@ -3364,6 +3423,104 @@ mod tests {
     }
 
     #[test]
+    fn relay_pin_mismatch_does_not_enter_transient_retries() {
+        let tls_error =
+            rustls::Error::General("certificate pin mismatch for relay.lpm.fyi".to_string());
+        let error = tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            tls_error,
+        ));
+        assert_eq!(
+            classify_websocket_connect_error(error).retry_class,
+            RetryClass::Permanent
+        );
+    }
+
+    #[test]
+    fn relay_invalid_certificate_does_not_enter_transient_retries() {
+        let error = tokio_tungstenite::tungstenite::Error::Tls(
+            tokio_tungstenite::tungstenite::error::TlsError::Rustls(
+                rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName),
+            ),
+        );
+        assert_eq!(
+            classify_websocket_connect_error(error).retry_class,
+            RetryClass::Permanent
+        );
+    }
+
+    fn pin_mismatch_error(host: &str) -> tokio_tungstenite::tungstenite::Error {
+        tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::Other(rustls::OtherError(Arc::new(RelayPinMismatch {
+                host: host.into(),
+            }))),
+        ))
+    }
+
+    #[tokio::test]
+    async fn pin_recovery_fetches_once_and_only_for_the_canonical_relay() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let provider = TunnelPinProvider::new(move || {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(vec!["a".repeat(64)]) })
+        });
+        let error = pin_mismatch_error(crate::relay::DEFAULT_RELAY_HOST);
+        assert!(
+            recover_relay_pin(Some(&provider), &error, false)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            recover_relay_pin(Some(&provider), &error, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            recover_relay_pin(
+                Some(&provider),
+                &pin_mismatch_error("custom.example"),
+                false
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            classify_websocket_connect_error(error).retry_class,
+            RetryClass::Permanent
+        );
+    }
+
+    #[tokio::test]
+    async fn pin_recovery_does_not_fetch_for_invalid_certificate_chains() {
+        let provider =
+            TunnelPinProvider::new(|| panic!("invalid TLS must not fetch key authorization"));
+        let error = tokio_tungstenite::tungstenite::Error::Tls(
+            tokio_tungstenite::tungstenite::error::TlsError::Rustls(
+                rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+            ),
+        );
+        assert!(
+            recover_relay_pin(Some(&provider), &error, false)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pin_recovery_timeout_stops_without_transient_retries() {
+        let provider = TunnelPinProvider::new(|| Box::pin(std::future::pending()));
+        let error = provider.approved_pins().await.unwrap_err();
+        assert_eq!(error.retry_class, RetryClass::Permanent);
+    }
+
+    #[test]
     fn relay_http_status_fallback_does_not_retry_client_errors() {
         assert_eq!(
             classify_relay_rejection(401, br#"{"error":"Unauthorized"}"#).retry_class,
@@ -4033,12 +4190,203 @@ mod tests {
 
     #[test]
     fn pinning_verifier_rejects_wrong_pin() {
-        // Simulate: stored pin differs from current cert's pin.
-        // We test the comparison logic directly since constructing a full
-        // TLS handshake in a unit test is impractical.
-        let stored = "aaaa";
-        let current = "bbbb";
-        assert_ne!(stored, current, "mismatched pins should be detected");
+        let _lock = crate::test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let (verifier, certificate) = trusted_relay_certificate(None);
+        write_tofu_pin(crate::relay::DEFAULT_RELAY_HOST, &"a".repeat(64)).unwrap();
+        assert!(
+            verify_test_certificate(&verifier, &certificate, crate::relay::DEFAULT_RELAY_HOST)
+                .is_err()
+        );
+        assert_eq!(
+            read_tofu_pin(crate::relay::DEFAULT_RELAY_HOST).unwrap(),
+            Some("a".repeat(64))
+        );
+    }
+
+    fn trusted_relay_certificate(
+        pins: Option<Vec<String>>,
+    ) -> (
+        TofuPinningVerifier,
+        rustls::pki_types::CertificateDer<'static>,
+    ) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certified = rcgen::generate_simple_self_signed(vec![
+            crate::relay::DEFAULT_RELAY_HOST.into(),
+            "custom.example".into(),
+        ])
+        .unwrap();
+        let certificate = certified.cert.der().clone();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate.clone()).unwrap();
+        let default = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let mut verifier = TofuPinningVerifier::new(default);
+        verifier.approved_pins = pins;
+        (verifier, certificate)
+    }
+
+    fn verify_test_certificate(
+        verifier: &TofuPinningVerifier,
+        certificate: &rustls::pki_types::CertificateDer<'_>,
+        host: &str,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        use rustls::client::danger::ServerCertVerifier;
+        verifier.verify_server_cert(
+            certificate,
+            &[],
+            &host.try_into().unwrap(),
+            &[],
+            rustls::pki_types::UnixTime::now(),
+        )
+    }
+
+    #[test]
+    fn signed_rotation_replaces_a_saved_pin_atomically_with_private_permissions() {
+        let _lock = crate::test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let (mut verifier, certificate) = trusted_relay_certificate(None);
+        let current = spki_sha256_hex(certificate.as_ref()).unwrap();
+        write_tofu_pin(crate::relay::DEFAULT_RELAY_HOST, &"a".repeat(64)).unwrap();
+        verifier.approved_pins = Some(vec![current.clone()]);
+        verify_test_certificate(&verifier, &certificate, crate::relay::DEFAULT_RELAY_HOST).unwrap();
+        assert_eq!(
+            read_tofu_pin(crate::relay::DEFAULT_RELAY_HOST).unwrap(),
+            Some(current)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path =
+                crate::relay::tofu_pin_path_for_host(crate::relay::DEFAULT_RELAY_HOST).unwrap();
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn signed_first_use_rejects_unknown_keys_without_storing_a_pin() {
+        let _lock = crate::test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let (verifier, certificate) = trusted_relay_certificate(Some(vec!["a".repeat(64)]));
+        assert!(
+            verify_test_certificate(&verifier, &certificate, crate::relay::DEFAULT_RELAY_HOST)
+                .is_err()
+        );
+        assert!(
+            read_tofu_pin(crate::relay::DEFAULT_RELAY_HOST)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn signed_first_use_stores_an_approved_key() {
+        let _lock = crate::test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let (mut verifier, certificate) = trusted_relay_certificate(None);
+        let current = spki_sha256_hex(certificate.as_ref()).unwrap();
+        verifier.approved_pins = Some(vec![current.clone()]);
+        verify_test_certificate(&verifier, &certificate, crate::relay::DEFAULT_RELAY_HOST).unwrap();
+        assert_eq!(
+            read_tofu_pin(crate::relay::DEFAULT_RELAY_HOST).unwrap(),
+            Some(current)
+        );
+    }
+
+    #[test]
+    fn signed_keys_do_not_bypass_hostname_checks() {
+        let (mut verifier, certificate) = trusted_relay_certificate(None);
+        verifier.approved_pins = Some(vec![spki_sha256_hex(certificate.as_ref()).unwrap()]);
+        assert!(matches!(
+            verify_test_certificate(&verifier, &certificate, "wrong.example"),
+            Err(rustls::Error::InvalidCertificate(_))
+        ));
+    }
+
+    #[test]
+    fn signed_keys_do_not_bypass_certificate_chain_checks() {
+        let (mut verifier, certificate) = trusted_relay_certificate(None);
+        verifier.approved_pins = Some(vec![spki_sha256_hex(certificate.as_ref()).unwrap()]);
+        let roots =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        verifier.default_verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        assert!(matches!(
+            verify_test_certificate(&verifier, &certificate, crate::relay::DEFAULT_RELAY_HOST),
+            Err(rustls::Error::InvalidCertificate(_))
+        ));
+    }
+
+    #[test]
+    fn canonical_host_case_and_trailing_dot_require_the_same_signed_keys() {
+        for host in ["relay.lpm.fyi", "RELAY.LPM.FYI", "relay.lpm.fyi."] {
+            assert!(canonical_relay_host(host));
+            let name = rustls::pki_types::ServerName::try_from(host).unwrap();
+            assert_eq!(
+                server_name_to_string(&name),
+                crate::relay::DEFAULT_RELAY_HOST
+            );
+        }
+        assert!(!canonical_relay_host("relay.lpm.fyi.attacker.example"));
+    }
+
+    #[test]
+    fn canonical_approval_cannot_replace_a_custom_relay_pin() {
+        let _lock = crate::test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let (mut verifier, certificate) = trusted_relay_certificate(None);
+        write_tofu_pin("custom.example", &"a".repeat(64)).unwrap();
+        verifier.approved_pins = Some(vec![spki_sha256_hex(certificate.as_ref()).unwrap()]);
+        assert!(verify_test_certificate(&verifier, &certificate, "custom.example").is_err());
+        assert_eq!(
+            read_tofu_pin("custom.example").unwrap(),
+            Some("a".repeat(64))
+        );
+    }
+
+    #[test]
+    fn legacy_pin_rotates_without_deleting_the_legacy_file() {
+        let _lock = crate::test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let path = crate::relay::legacy_tofu_pin_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "a".repeat(64)).unwrap();
+        let (mut verifier, certificate) = trusted_relay_certificate(None);
+        let current = spki_sha256_hex(certificate.as_ref()).unwrap();
+        verifier.approved_pins = Some(vec![current.clone()]);
+        verify_test_certificate(&verifier, &certificate, crate::relay::DEFAULT_RELAY_HOST).unwrap();
+        assert_eq!(
+            read_tofu_pin(crate::relay::DEFAULT_RELAY_HOST).unwrap(),
+            Some(current)
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "a".repeat(64));
+    }
+
+    #[test]
+    fn matching_legacy_pin_migrates_to_the_per_host_file() {
+        let _lock = crate::test_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let _home = HomeGuard::set(home.path());
+        let (verifier, certificate) = trusted_relay_certificate(None);
+        let current = spki_sha256_hex(certificate.as_ref()).unwrap();
+        let legacy = crate::relay::legacy_tofu_pin_path().unwrap();
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, &current).unwrap();
+        verify_test_certificate(&verifier, &certificate, crate::relay::DEFAULT_RELAY_HOST).unwrap();
+        let per_host =
+            crate::relay::tofu_pin_path_for_host(crate::relay::DEFAULT_RELAY_HOST).unwrap();
+        assert_eq!(std::fs::read_to_string(per_host).unwrap(), current);
     }
 
     #[test]
@@ -4049,6 +4397,7 @@ mod tests {
             relay_url: "wss://relay.lpm.fyi/connect".to_string(),
             token: "test-token".to_string(),
             token_provider: None,
+            pin_provider: None,
             local_target: lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, 3000),
             live_local_target: None,
             domain: Some("myapp.lpm.fyi".to_string()),

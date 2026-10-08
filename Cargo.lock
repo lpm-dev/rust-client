@@ -4101,6 +4101,7 @@ dependencies = [
  "lpm-common",
  "lpm-http",
  "rand 0.8.6",
+ "rcgen",
  "reqwest",
  "rustls",
  "serde",

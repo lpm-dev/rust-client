@@ -50,6 +50,7 @@ mod provenance_bundle;
 mod provenance_fetch;
 mod quality;
 mod registry_signatures;
+mod relay_trust;
 mod release_age_config;
 mod release_age_selection;
 mod release_channel;
