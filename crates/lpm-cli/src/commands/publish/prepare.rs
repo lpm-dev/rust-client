@@ -1971,18 +1971,23 @@ mod tests {
         let fixture = swift_fixture_tarball();
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("swift-timeout");
-        write_executable(&executable, "#!/bin/sh\nsleep 2\nprintf '{}'\n");
+        write_executable(&executable, "#!/bin/sh\nsleep 30\nprintf '{}'\n");
         let started = std::time::Instant::now();
 
-        let manifest = dump_swift_manifest_from_publish_artifact_with_command(
+        let error = dump_swift_manifest_from_publish_artifact_with_command(
             &fixture,
             executable.as_os_str(),
             std::time::Duration::from_millis(20),
             128,
-        );
+        )
+        .unwrap_err();
+        let elapsed = started.elapsed();
 
-        assert!(manifest.is_err());
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(error.to_string().contains("timeout after"), "{error}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "timed-out inspector returned after {elapsed:?}"
+        );
     }
 
     #[test]
