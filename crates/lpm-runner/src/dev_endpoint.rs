@@ -85,8 +85,40 @@ pub(crate) fn resolve_spawned_endpoint_until(
     requested_port: Option<u16>,
     candidates: &Receiver<LocalTarget>,
     deadline: Instant,
-    mut should_cancel: impl FnMut() -> bool,
+    should_cancel: impl FnMut() -> bool,
 ) -> Result<Option<DevEndpoint>, String> {
+    resolve_spawned_endpoint_with_probes(
+        project_dir,
+        root_pid,
+        baseline,
+        requested_port,
+        candidates,
+        deadline,
+        DiscoveryProbes {
+            should_cancel,
+            reachable: target_is_reachable,
+        },
+    )
+}
+
+struct DiscoveryProbes<C, R> {
+    should_cancel: C,
+    reachable: R,
+}
+
+fn resolve_spawned_endpoint_with_probes(
+    project_dir: &Path,
+    root_pid: u32,
+    baseline: Option<&ListenerSnapshot>,
+    requested_port: Option<u16>,
+    candidates: &Receiver<LocalTarget>,
+    deadline: Instant,
+    probes: DiscoveryProbes<impl FnMut() -> bool, impl FnMut(&LocalTarget) -> bool>,
+) -> Result<Option<DevEndpoint>, String> {
+    let DiscoveryProbes {
+        mut should_cancel,
+        mut reachable,
+    } = probes;
     let project_dir = project_dir
         .canonicalize()
         .unwrap_or_else(|_| project_dir.to_path_buf());
@@ -154,7 +186,7 @@ pub(crate) fn resolve_spawned_endpoint_until(
             let Some(owner_identity) = listener_remains_owned_after_reachability(
                 listener,
                 target,
-                || target_is_reachable(target),
+                || reachable(target),
                 || {
                     owned_listeners_for_process_tree(
                         &project_dir,
@@ -198,7 +230,7 @@ pub(crate) fn resolve_spawned_endpoint_until(
                     && let Some(owner_identity) = listener_remains_owned_after_reachability(
                         listener,
                         &target,
-                        || target_is_reachable(&target),
+                        || reachable(&target),
                         || {
                             owned_listeners_for_process_tree(
                                 &project_dir,
@@ -235,7 +267,7 @@ pub(crate) fn resolve_spawned_endpoint_until(
                         && let Some(owner_identity) = listener_remains_owned_after_reachability(
                             listener,
                             &target,
-                            || target_is_reachable(&target),
+                            || reachable(&target),
                             || {
                                 owned_listeners_for_process_tree(
                                     &project_dir,
@@ -732,6 +764,18 @@ mod tests {
         assert_endpoint_discovery_preserves_late_url(true, true);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_discovery_preserves_late_urls_when_child_acceptance_is_suspended() {
+        for initially_advertised in [false, true] {
+            assert_endpoint_discovery_preserves_late_url_with_paused_child(
+                true,
+                initially_advertised,
+                true,
+            );
+        }
+    }
+
     #[test]
     fn repeated_advertised_urls_do_not_prevent_endpoint_discovery() {
         let project = tempfile::TempDir::new().unwrap();
@@ -766,11 +810,48 @@ mod tests {
         after_reachability: bool,
         initially_advertised: bool,
     ) {
+        assert_endpoint_discovery_preserves_late_url_with_paused_child(
+            after_reachability,
+            initially_advertised,
+            false,
+        );
+    }
+
+    fn assert_endpoint_discovery_preserves_late_url_with_paused_child(
+        after_reachability: bool,
+        initially_advertised: bool,
+        pause_child: bool,
+    ) {
         let project = tempfile::TempDir::new().unwrap();
         for request_port in [true, false] {
-            let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
-            listener.set_nonblocking(true).unwrap();
-            let port = listener.local_addr().unwrap().port();
+            // A child owns the listener, so listeners that tests running in this
+            // process open can't make the discovered owner ambiguous.
+            let port_path = project.path().join(format!("port-{request_port}"));
+            let script = "const fs=require('fs');const portPath=process.argv[1];const server=require('net').createServer(socket=>socket.destroy());server.listen(0,'::1',()=>{const tmp=`${portPath}.tmp`;fs.writeFileSync(tmp,String(server.address().port));fs.renameSync(tmp,portPath)})";
+            let mut child = crate::test_support::KillOnDropChild::new(
+                std::process::Command::new("node")
+                    .args(["-e", script])
+                    .arg(&port_path)
+                    .current_dir(project.path())
+                    .spawn()
+                    .unwrap(),
+            );
+            let port = wait_for_published_port(child.child_mut(), &port_path);
+            if pause_child {
+                #[cfg(unix)]
+                {
+                    let mut status = 0;
+                    let pid = child.id() as libc::pid_t;
+                    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+                    assert_eq!(
+                        unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
+                        pid
+                    );
+                    assert!(libc::WIFSTOPPED(status));
+                }
+                #[cfg(not(unix))]
+                panic!("suspended child fixture requires Unix");
+            }
             let requested_port = request_port.then_some(port);
             let target = LocalTarget {
                 scheme: LocalScheme::Http,
@@ -784,36 +865,65 @@ mod tests {
                     .send(target.clone().with_base_path("/before/"))
                     .unwrap();
             }
-            let mut pending_target = Some(target.clone());
+            let pending_target = std::cell::RefCell::new(Some(target.clone()));
+            let deliver_target = || {
+                if let Some(target) = pending_target.borrow_mut().take() {
+                    candidate_tx.send(target).unwrap();
+                }
+            };
             let mut discovery_started = false;
-            let endpoint = resolve_spawned_endpoint_until(
+            let endpoint = resolve_spawned_endpoint_with_probes(
                 project.path(),
-                std::process::id(),
+                child.id(),
                 None,
                 requested_port,
                 &candidate_rx,
                 Instant::now() + Duration::from_secs(5),
-                || {
-                    // The cancellation probe schedules stdout during the blocking OS checks.
-                    let deliver = if after_reachability {
-                        listener.accept().is_ok()
-                    } else {
-                        discovery_started
-                    };
-                    if deliver && let Some(target) = pending_target.take() {
-                        candidate_tx.send(target).unwrap();
-                    }
-                    discovery_started = true;
-                    false
+                DiscoveryProbes {
+                    should_cancel: || {
+                        if !after_reachability && discovery_started {
+                            deliver_target();
+                        }
+                        discovery_started = true;
+                        false
+                    },
+                    reachable: |probe: &LocalTarget| {
+                        let reachable = target_is_reachable(probe);
+                        if after_reachability && reachable {
+                            deliver_target();
+                        }
+                        reachable
+                    },
                 },
-            )
-            .unwrap()
-            .unwrap();
+            );
+            drop(child);
 
             assert_eq!(
-                endpoint.target, target,
+                endpoint.unwrap().unwrap().target,
+                target,
                 "requested port: {requested_port:?}"
             );
+        }
+    }
+
+    /// The port a child listener publishes by renaming a file into `path`.
+    fn wait_for_published_port(child: &mut std::process::Child, path: &Path) -> u16 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match std::fs::read_to_string(path) {
+                Ok(port) => return port.parse::<u16>().unwrap(),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("child did not publish its listener port: {error}");
+                }
+            }
         }
     }
 
@@ -876,23 +986,7 @@ mod tests {
             .current_dir(project.path())
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let owned_port = loop {
-            match std::fs::read_to_string(&port_path) {
-                Ok(port) => break port.parse::<u16>().unwrap(),
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::NotFound
-                        && Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("child did not publish its listener port: {error}");
-                }
-            }
-        };
+        let owned_port = wait_for_published_port(&mut child, &port_path);
         let incidental_port = if owned_port == u16::MAX {
             owned_port - 1
         } else {

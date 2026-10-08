@@ -25,7 +25,28 @@ pub(crate) struct PortAllocation {
 }
 
 pub(crate) struct PortLease {
-    _lock: fd_lock::RwLock<std::fs::File>,
+    lock: Option<fd_lock::RwLock<std::fs::File>>,
+}
+
+impl Drop for PortLease {
+    fn drop(&mut self) {
+        let Some(lock) = self.lock.take() else {
+            return;
+        };
+        let file = lock.into_inner();
+        // A process spawned at this instant holds a copy of the descriptor until it
+        // executes its program. Unlocking releases the lease for every copy, where
+        // closing the file alone would leave it held until then.
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: `file` keeps the descriptor open for the duration of the call.
+            unsafe {
+                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+        drop(file);
+    }
 }
 
 impl PortAllocation {
@@ -90,7 +111,7 @@ impl PortAllocation {
             Err(err) => return Err(LpmError::Io(err)),
         };
         if acquired {
-            Ok(Some(PortLease { _lock: lock }))
+            Ok(Some(PortLease { lock: Some(lock) }))
         } else {
             Ok(None)
         }
@@ -1497,10 +1518,12 @@ fn process_tree_snapshot_batch(
         return;
     }
 
+    // The latest deadline: an earlier one would cut the shared query short and
+    // answer callers that are still waiting with incomplete results.
     let query_deadline = requests
         .iter()
         .map(|request| request.deadline)
-        .min()
+        .max()
         .unwrap_or_else(std::time::Instant::now);
     let table = query(query_deadline);
     for request in requests {
@@ -2623,10 +2646,12 @@ fn process_full_listener_batch(
         return;
     }
 
+    // The latest deadline: an earlier one would cut the shared query short and
+    // answer callers that are still waiting with incomplete results.
     let query_deadline = requests
         .iter()
         .map(|request| request.deadline)
-        .min()
+        .max()
         .unwrap_or_else(std::time::Instant::now);
     let rows = query(query_deadline);
     for request in requests {
@@ -2723,10 +2748,12 @@ fn process_pid_listener_batch(
     for request in &requests {
         pids.extend(request.pids.iter().copied());
     }
+    // The latest deadline: an earlier one would cut the shared query short and
+    // answer callers that are still waiting with incomplete results.
     let query_deadline = requests
         .iter()
         .map(|request| request.deadline)
-        .min()
+        .max()
         .unwrap_or_else(std::time::Instant::now);
     let rows = query(&pids, query_deadline);
     for request in requests {
@@ -4178,28 +4205,9 @@ mod tests {
     use super::*;
 
     #[cfg(target_os = "linux")]
-    struct KillOnDropChild(Option<Child>);
-
-    #[cfg(target_os = "linux")]
-    impl KillOnDropChild {
-        fn new(child: Child) -> Self {
-            Self(Some(child))
-        }
-
-        fn child_mut(&mut self) -> &mut Child {
-            self.0.as_mut().expect("child should be available")
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    impl Drop for KillOnDropChild {
-        fn drop(&mut self) {
-            if let Some(mut child) = self.0.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-    }
+    use crate::test_support::KillOnDropChild;
+    #[cfg(unix)]
+    use crate::test_support::ProcessSpawners;
 
     #[cfg(windows)]
     #[test]
@@ -4322,6 +4330,86 @@ mod tests {
                 .collect::<HashSet<_>>(),
             HashSet::from([20, 30])
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_short_deadline_does_not_cut_short_a_batched_listener_query() {
+        let short = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        let long = std::time::Instant::now() + std::time::Duration::from_secs(5);
+
+        let (requests, receiver) = std::sync::mpsc::channel();
+        let (later, _later_rows) = std::sync::mpsc::sync_channel(1);
+        let (first, _first_rows) = std::sync::mpsc::sync_channel(1);
+        requests
+            .send(PidListenerRequest {
+                pids: HashSet::from([20]),
+                deadline: long,
+                response: later,
+            })
+            .unwrap();
+        let mut queried = None;
+        process_pid_listener_batch(
+            PidListenerRequest {
+                pids: HashSet::from([10]),
+                deadline: short,
+                response: first,
+            },
+            &receiver,
+            |_, deadline| {
+                queried = Some(deadline);
+                Vec::new()
+            },
+        );
+        assert_eq!(queried, Some(long));
+
+        let (requests, receiver) = std::sync::mpsc::channel();
+        let (later, _later_rows) = std::sync::mpsc::sync_channel(1);
+        let (first, _first_rows) = std::sync::mpsc::sync_channel(1);
+        requests
+            .send(FullListenerRequest {
+                deadline: long,
+                response: later,
+            })
+            .unwrap();
+        let mut queried = None;
+        process_full_listener_batch(
+            FullListenerRequest {
+                deadline: short,
+                response: first,
+            },
+            &receiver,
+            |deadline| {
+                queried = Some(deadline);
+                Vec::new()
+            },
+        );
+        assert_eq!(queried, Some(long));
+
+        let (requests, receiver) = std::sync::mpsc::channel();
+        let (later, _later_snapshot) = std::sync::mpsc::sync_channel(1);
+        let (first, _first_snapshot) = std::sync::mpsc::sync_channel(1);
+        requests
+            .send(ProcessTreeSnapshotRequest {
+                root_pid: 20,
+                deadline: long,
+                response: later,
+            })
+            .unwrap();
+        let mut queried = None;
+        process_tree_snapshot_batch(
+            ProcessTreeSnapshotRequest {
+                root_pid: 10,
+                deadline: short,
+                response: first,
+            },
+            &receiver,
+            |deadline| {
+                queried = Some(deadline);
+                None
+            },
+        );
+        assert_eq!(queried, Some(long));
     }
 
     #[cfg(unix)]
@@ -5772,6 +5860,28 @@ tcp4 0 0 127.0.0.1.60000 127.0.0.1.443 ESTABLISHED 1 2 3 4 node:99 00100\n",
         assert!(second_allocation.try_acquire_lease(3000).unwrap().is_none());
         drop(first_lease);
         assert!(second_allocation.try_acquire_lease(3000).unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_released_port_lease_is_free_while_other_threads_spawn_processes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let allocation = PortAllocation::acquire_for_root_and_lease_dir(
+            LpmRoot::from_dir(tmp.path().join("home")),
+            tmp.path().join("leases"),
+        )
+        .unwrap();
+        let spawners = ProcessSpawners::new();
+        let mut held = 0;
+        for _ in 0..1000 {
+            drop(allocation.try_acquire_lease(3000).unwrap());
+            if allocation.try_acquire_lease(3000).unwrap().is_none() {
+                held += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        drop(spawners);
+        assert_eq!(held, 0, "released leases stayed held by spawned processes");
     }
 
     #[cfg(unix)]
