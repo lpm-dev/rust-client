@@ -372,6 +372,38 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_pointers_escape_control_and_direction_characters() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("base.json"),
+            "{\"vars\":{\"A\":{\"x\u{202e}\\n\":1}}}",
+        )
+        .unwrap();
+        for (input, pointer) in [
+            (
+                "{\"vars\":{\"PORT\":{\"fmt\u{202e}\\u0007\":\"PRIVATE\"}}}",
+                "/envSchema/vars/PORT/fmt\\u{202e}\\u{7}",
+            ),
+            (r#"{"extends":["base.json"]}"#, "/vars/A/x\\u{202e}\\u{a}"),
+        ] {
+            let result = resolve(input.as_bytes(), dir.path().to_str().unwrap());
+            assert_eq!(result.status, 1, "{input}");
+            let diagnostic = output(&result);
+            // SAFETY: This is the sole release of the returned result.
+            unsafe {
+                lpm_env_release(result);
+            }
+            let rendered = diagnostic.to_string();
+            assert!(
+                !rendered.contains('\u{202e}') && !rendered.contains('\u{7}'),
+                "{rendered}"
+            );
+            assert_eq!(diagnostic["pointer"], pointer, "{input}");
+            assert!(diagnostic["key"].is_null(), "{input}");
+        }
+    }
+
+    #[test]
     fn native_abi_bounds_input_before_dereference_and_checks_utf8() {
         // SAFETY: Invalid pointers are only used with rejected lengths, before dereference.
         let result =
