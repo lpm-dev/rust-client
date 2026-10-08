@@ -12,12 +12,9 @@
 
 use crate::lpm_json;
 use lpm_common::{BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, LpmError, read_text_file_capped};
-use lpm_env::is_denied_env_var;
+use lpm_env::{EnvName, is_denied_env_var};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-
-mod names;
-use names::EnvName;
 
 /// Load the fully-resolved environment for a project.
 ///
@@ -432,38 +429,12 @@ fn evaluate_project_env_with_case_policy(
     validate_process_values(vars)?;
     if let Some(validator) = validator {
         let schema = validator.schema();
-        let mut schema_names = std::collections::BTreeMap::new();
-        if case_insensitive {
-            for key in schema.vars.keys() {
-                if schema_names
-                    .insert(EnvName::new(key), key.as_str())
-                    .is_some()
-                {
-                    return Err(LpmError::EnvValidation(format!(
-                        "ambiguous environment schema variable casing for '{key}'"
-                    )));
-                }
-            }
-            let mut existing_names = std::collections::BTreeMap::new();
-            for key in vars.keys() {
-                if existing_names
-                    .insert(EnvName::new(key), key.clone())
-                    .is_some()
-                {
-                    return Err(LpmError::EnvValidation(format!(
-                        "ambiguous environment variable casing for '{key}'"
-                    )));
-                }
-            }
-            for key in schema.vars.keys() {
-                if let Some(existing) = existing_names.get(&EnvName::new(key))
-                    && existing != key
-                    && let Some(value) = vars.remove(existing)
-                {
-                    vars.insert(key.clone(), value);
-                }
-            }
-        }
+        let schema_names = if case_insensitive {
+            lpm_env::align_declared_casing(vars, schema)
+                .map_err(|conflict| LpmError::EnvValidation(conflict.to_string()))?
+        } else {
+            std::collections::BTreeMap::new()
+        };
         let mut inherited_values = Vec::with_capacity(schema.vars.len().min(32));
         let eligible =
             |key: &str| !vars.contains_key(key) && !crate::shell::inherited_env_is_stripped(key);

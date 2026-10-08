@@ -1575,7 +1575,8 @@ fn stored_value_check_reports_what_env_check_reports_for_vault_values() {
     let checked = stored
         .iter()
         .map(|(environment, _)| {
-            let check = lpm_env::check_stored_values(&validator, environment, &environments);
+            let check =
+                lpm_env::check_stored_values(&validator, environment, &environments).unwrap();
             let mut errors = check
                 .errors
                 .iter()

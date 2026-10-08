@@ -9,6 +9,11 @@ use std::sync::Arc;
 
 const ABI_VERSION: u32 = 1;
 const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
+/// The most environments one check evaluates.
+const CHECK_ENVIRONMENT_LIMIT: usize = 256;
+/// The most work one check does: each environment costs a unit per
+/// declaration and group, plus one, and each stored value costs a unit.
+const CHECK_WORK_LIMIT: usize = 1 << 18;
 
 /// C callers own this result until one matching lpm_env_release call.
 #[repr(C)]
@@ -236,6 +241,39 @@ impl From<lpm_env::ValidationError> for Problem {
     }
 }
 
+/// Each environment's check, evaluated while it is written, so output stops,
+/// and evaluation with it, at the output limit.
+struct Checks<'a, 's> {
+    validator: &'a lpm_env::EnvValidator<'s>,
+    environments: &'a BTreeMap<String, HashMap<String, String>>,
+    /// Set when an environment's names differ only in case on a host that ignores case.
+    conflict: &'a std::cell::Cell<bool>,
+}
+
+impl Serialize for Checks<'_, '_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error, SerializeMap};
+        let mut map = serializer.serialize_map(Some(self.environments.len()))?;
+        for name in self.environments.keys() {
+            let Ok(check) = lpm_env::check_stored_values(self.validator, name, self.environments)
+            else {
+                self.conflict.set(true);
+                return Err(S::Error::custom("ambiguous environment variable casing"));
+            };
+            map.serialize_entry(
+                name,
+                &CheckedEnvironment {
+                    reads_default_environment: check.reads_default_environment,
+                    problems: check.errors.into_iter().map(Problem::from).collect(),
+                    defaults: check.defaults,
+                    ignored: check.ignored,
+                },
+            )?;
+        }
+        map.end()
+    }
+}
+
 /// Check the values stored for each environment against a flat schema, such
 /// as the `effective` schema `lpm_env_resolve` returns, the way the runner
 /// evaluates them at runtime, without project files or the process
@@ -281,36 +319,40 @@ pub unsafe extern "C" fn lpm_env_check(
         }) {
             return failure(2, "env.invalid_input");
         }
+        let per_environment = schema.vars.len() + schema.groups.len() + 1;
+        let stored = input.environments.values().map(HashMap::len).sum::<usize>();
+        if input.environments.len() > CHECK_ENVIRONMENT_LIMIT
+            || input
+                .environments
+                .len()
+                .saturating_mul(per_environment)
+                .saturating_add(stored)
+                > CHECK_WORK_LIMIT
+        {
+            return failure(4, "env.check_budget");
+        }
         let validator = lpm_env::EnvValidator::new(&schema);
         if let Some(error) = validator.schema_errors().first() {
             return failure(1, lpm_env_source::declaration_code(&error.kind));
         }
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
-        struct Output<'a> {
+        struct Output<'a, 's> {
             abi_version: u32,
-            environments: BTreeMap<&'a str, CheckedEnvironment>,
+            environments: Checks<'a, 's>,
         }
-        let environments = input
-            .environments
-            .keys()
-            .map(|name| {
-                let check = lpm_env::check_stored_values(&validator, name, &input.environments);
-                let checked = CheckedEnvironment {
-                    reads_default_environment: check.reads_default_environment,
-                    problems: check.errors.into_iter().map(Problem::from).collect(),
-                    defaults: check.defaults,
-                    ignored: check.ignored,
-                };
-                (name.as_str(), checked)
-            })
-            .collect();
+        let conflict = std::cell::Cell::new(false);
         let output = Output {
             abi_version: ABI_VERSION,
-            environments,
+            environments: Checks {
+                validator: &validator,
+                environments: &input.environments,
+                conflict: &conflict,
+            },
         };
         match lpm_env_source::bounded_json(&output, OUTPUT_LIMIT) {
             Ok(bytes) => result(0, bytes, None),
+            Err(_) if conflict.get() => failure(1, "env.ambiguous_casing"),
             Err(_) => failure(4, "env.output_budget"),
         }
     }))
@@ -617,6 +659,56 @@ mod tests {
                 "ignored": [],
             })
         );
+    }
+
+    #[test]
+    fn checking_refuses_work_beyond_its_budget_before_evaluating_values() {
+        let small = effective(br#"{"vars":{"A":{"default":"x"}}}"#);
+        let many = format!(
+            r#"{{"environments":{{{}}}}}"#,
+            (0..300)
+                .map(|index| format!(r#""env{index}":{{}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let (status, output) = check(&small, many.as_bytes());
+        assert_eq!(status, 4);
+        assert_eq!(output["code"], "env.check_budget");
+
+        let vars = (0..4096)
+            .map(|index| format!(r#""V{index}":{{"default":"x"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let wide = effective(format!(r#"{{"vars":{{{vars}}}}}"#).as_bytes());
+        let environments = format!(
+            r#"{{"environments":{{{}}}}}"#,
+            (0..100)
+                .map(|index| format!(r#""env{index}":{{}}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let (status, output) = check(&wide, environments.as_bytes());
+        assert_eq!(status, 4);
+        assert_eq!(output["code"], "env.check_budget");
+
+        let (status, _) = check(&wide, br#"{"environments":{"default":{},"production":{}}}"#);
+        assert_eq!(status, 0, "a large schema within the budget is checked");
+    }
+
+    #[test]
+    fn checking_stops_at_the_output_limit() {
+        let long = "x".repeat(4096);
+        let vars = (0..400)
+            .map(|index| format!(r#""V{index}":{{"default":"{long}"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let schema = effective(format!(r#"{{"vars":{{{vars}}}}}"#).as_bytes());
+        let (status, output) = check(
+            &schema,
+            br#"{"environments":{"a":{},"b":{},"c":{},"d":{},"e":{},"f":{}}}"#,
+        );
+        assert_eq!(status, 4);
+        assert_eq!(output["code"], "env.output_budget");
     }
 
     #[test]

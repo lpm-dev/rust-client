@@ -1,6 +1,6 @@
 //! Rules for stored project env values, shared by every reader of them.
 
-use crate::{EnvValidator, EvalContext, ValidationError, ValidationErrorKind};
+use crate::{CasingConflict, EnvValidator, EvalContext, ValidationError, ValidationErrorKind};
 use std::collections::{BTreeMap, HashMap};
 
 /// The environment whose stored values an environment without values of its own uses.
@@ -65,12 +65,24 @@ pub struct StoredValuesCheck {
 
 /// Evaluate the values stored for `environment` the way the runner does at
 /// runtime, without project files or the process environment: select the
-/// environment's values, drop denied variables, then apply the schema.
+/// environment's values, reject unusable values, drop denied variables,
+/// give declared keys their declared casing where the host ignores case, then
+/// apply the schema. Fails where the runner fails: on names that differ only
+/// in case on such a host.
 pub fn check_stored_values(
     validator: &EnvValidator<'_>,
     environment: &str,
     environments: &BTreeMap<String, HashMap<String, String>>,
-) -> StoredValuesCheck {
+) -> Result<StoredValuesCheck, CasingConflict> {
+    check_stored_values_with_case_policy(validator, environment, environments, cfg!(windows))
+}
+
+fn check_stored_values_with_case_policy(
+    validator: &EnvValidator<'_>,
+    environment: &str,
+    environments: &BTreeMap<String, HashMap<String, String>>,
+    case_insensitive: bool,
+) -> Result<StoredValuesCheck, CasingConflict> {
     let own = environments.get(environment);
     let reads_default =
         reads_default_environment(environment, own.is_some_and(|values| !values.is_empty()));
@@ -80,24 +92,41 @@ pub fn check_stored_values(
         own
     };
     let schema = validator.schema();
-    let mut values = HashMap::with_capacity(stored.map_or(0, HashMap::len) + schema.vars.len());
+    let mut values = HashMap::with_capacity(stored.map_or(0, HashMap::len));
     let mut ignored = Vec::new();
     let mut errors = Vec::new();
     for (key, value) in stored.into_iter().flatten() {
-        if is_denied_env_var(key) {
-            ignored.push(key.clone());
-        } else if value.as_bytes().contains(&0) && !schema.vars.contains_key(key) {
+        // The runner rejects a NUL anywhere before it drops denied variables.
+        let unusable = value.as_bytes().contains(&0);
+        let denied = is_denied_env_var(key);
+        if unusable && (denied || !schema.vars.contains_key(key)) {
             errors.push(ValidationError {
                 key: key.clone(),
                 kind: ValidationErrorKind::InvalidValue,
                 description: None,
                 is_secret: false,
             });
-        } else {
+        }
+        if denied {
+            ignored.push(key.clone());
+        } else if !unusable || schema.vars.contains_key(key) {
             values.insert(key.clone(), value.clone());
         }
     }
     ignored.sort_unstable();
+    if case_insensitive {
+        crate::align_declared_casing(&mut values, schema)?;
+    }
+    // Declared keys a default can fill, and whether each held an empty value.
+    let unset = schema
+        .vars
+        .keys()
+        .filter_map(|key| match values.get(key) {
+            None => Some((key.as_str(), false)),
+            Some(value) if value.is_empty() => Some((key.as_str(), true)),
+            Some(_) => None,
+        })
+        .collect::<HashMap<_, _>>();
     errors.extend(validator.validate_with_default_policy(
         &mut values,
         EvalContext {
@@ -107,22 +136,21 @@ pub fn check_stored_values(
         |key| !is_denied_env_var(key),
     ));
     errors.sort_by(|a, b| a.key.cmp(&b.key));
-    // Validation changes a declared value only by filling its default.
     let defaults = schema
         .vars
         .keys()
         .filter_map(|key| {
+            let was_empty = *unset.get(key.as_str())?;
             let value = values.get(key)?;
-            let stored = stored.and_then(|stored| stored.get(key));
-            (stored != Some(value)).then(|| (key.clone(), value.clone()))
+            (!was_empty || !value.is_empty()).then(|| (key.clone(), value.clone()))
         })
         .collect();
-    StoredValuesCheck {
+    Ok(StoredValuesCheck {
         reads_default_environment: reads_default,
         errors,
         defaults,
         ignored,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -191,7 +219,7 @@ mod tests {
             ),
         ]);
 
-        let default = check_stored_values(&validator, "default", &stored);
+        let default = check_stored_values(&validator, "default", &stored).unwrap();
         assert!(!default.reads_default_environment);
         assert_eq!(
             codes(&default),
@@ -203,7 +231,7 @@ mod tests {
         );
         assert!(default.ignored.is_empty());
 
-        let production = check_stored_values(&validator, "production", &stored);
+        let production = check_stored_values(&validator, "production", &stored).unwrap();
         assert!(!production.reads_default_environment);
         assert_eq!(codes(&production), [("API_TOKEN", "missing")]);
         assert_eq!(
@@ -224,12 +252,12 @@ mod tests {
             ("staging", &[]),
         ]);
         for environment in ["staging", "preview"] {
-            let check = check_stored_values(&validator, environment, &stored);
+            let check = check_stored_values(&validator, environment, &stored).unwrap();
             assert!(check.reads_default_environment, "{environment}");
             assert!(check.errors.is_empty(), "{environment}: {:?}", check.errors);
         }
         let empty = environments(&[("staging", &[])]);
-        let check = check_stored_values(&validator, "staging", &empty);
+        let check = check_stored_values(&validator, "staging", &empty).unwrap();
         assert!(check.reads_default_environment);
         assert_eq!(codes(&check), [("DATABASE_URL", "missing")]);
     }
@@ -251,7 +279,7 @@ mod tests {
                 ("OTHER", "set"),
             ],
         )]);
-        let check = check_stored_values(&validator, "default", &stored);
+        let check = check_stored_values(&validator, "default", &stored).unwrap();
         assert_eq!(check.ignored, ["NODE_OPTIONS"]);
         assert_eq!(
             codes(&check),
@@ -263,6 +291,42 @@ mod tests {
                 ("UNDECLARED", "value"),
             ]
         );
+    }
+
+    #[test]
+    fn a_denied_variable_with_an_unusable_value_still_fails() {
+        let schema: crate::EnvSchema = serde_json::from_str(r#"{"vars":{"TOKEN":{}}}"#).unwrap();
+        let validator = EnvValidator::new(&schema);
+        let stored = environments(&[("default", &[("NODE_OPTIONS", "a\0b"), ("TOKEN", "ok")])]);
+        let check = check_stored_values(&validator, "default", &stored).unwrap();
+        assert_eq!(codes(&check), [("NODE_OPTIONS", "value")]);
+        assert_eq!(check.ignored, ["NODE_OPTIONS"]);
+    }
+
+    #[test]
+    fn hosts_that_ignore_case_check_a_value_under_its_declared_spelling() {
+        let schema: crate::EnvSchema =
+            serde_json::from_str(r#"{"vars":{"PORT":{"format":"port","default":"3000"}}}"#)
+                .unwrap();
+        let validator = EnvValidator::new(&schema);
+        let stored = environments(&[("default", &[("port", "invalid")])]);
+        let insensitive =
+            check_stored_values_with_case_policy(&validator, "default", &stored, true).unwrap();
+        assert_eq!(codes(&insensitive), [("PORT", "format")]);
+        assert!(insensitive.defaults.is_empty());
+        let sensitive =
+            check_stored_values_with_case_policy(&validator, "default", &stored, false).unwrap();
+        assert!(sensitive.errors.is_empty());
+        assert_eq!(
+            sensitive.defaults,
+            BTreeMap::from([("PORT".to_owned(), "3000".to_owned())])
+        );
+
+        let ambiguous = environments(&[("default", &[("port", "1"), ("PORT", "2")])]);
+        assert!(matches!(
+            check_stored_values_with_case_policy(&validator, "default", &ambiguous, true),
+            Err(CasingConflict::Stored(_))
+        ));
     }
 
     #[test]

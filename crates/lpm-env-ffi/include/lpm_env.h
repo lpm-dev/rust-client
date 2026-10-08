@@ -34,7 +34,10 @@ uint32_t lpm_env_verify(const LPMEnvSnapshot *snapshot);
  * "default"'s values were checked), problems [{key, code, format?, constraint?,
  * group?, mode?}], defaults {KEY: schema default that fills it}, and ignored keys the
  * runner never passes to a process. Output never contains stored values.
- * status: 0=checked, 1=invalid schema, 2=invalid input, 3=panic, 4=output limit. */
+ * At most 256 environments, and environments x (declarations + groups + 1) plus
+ * stored values of at most 262144, are checked; larger inputs fail before evaluation.
+ * status: 0=checked, 1=invalid schema or names differing only in case where the host
+ * ignores case, 2=invalid input, 3=panic, 4=work or output limit. */
 LPMEnvResult lpm_env_check(const uint8_t *schema, size_t schema_length,
                          const uint8_t *input, size_t input_length);
 /* Release only the output buffer after decoding; the snapshot stays live.
