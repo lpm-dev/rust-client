@@ -40,7 +40,10 @@ pub use schema::{
     RequiredWhen, VarFormat, VarGroup, VarGroupMode,
 };
 pub use scopes::{EnvStage, EvalContext, ScopeSelector, ScopedDefault};
-pub use stored::{DEFAULT_ENVIRONMENT, is_denied_env_var, reads_default_environment};
+pub use stored::{
+    DEFAULT_ENVIRONMENT, StoredValuesCheck, check_stored_values, is_denied_env_var,
+    reads_default_environment,
+};
 pub use validate::{EnvValidator, ValidationError, ValidationErrorKind, validate, validate_schema};
 
 pub use definition::{EnvSchemaDefinition, env_schema_preset};

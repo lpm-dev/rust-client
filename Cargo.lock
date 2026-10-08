@@ -4175,6 +4175,8 @@ dependencies = [
  "libc",
  "lpm-cert",
  "lpm-common",
+ "lpm-env",
+ "lpm-env-source",
  "lpm-global",
  "lpm-inspect",
  "lpm-linker",

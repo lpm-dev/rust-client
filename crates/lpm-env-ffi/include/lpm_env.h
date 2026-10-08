@@ -26,6 +26,17 @@ LPMEnvResult lpm_env_resolve(const uint8_t *input, size_t input_length,
                            const uint8_t *folder, size_t folder_length);
 /* 0=unchanged, 1=changed, 2=null snapshot, 3=panic. Retains no new ownership. */
 uint32_t lpm_env_verify(const LPMEnvSnapshot *snapshot);
+/* Check stored values against a flat schema, such as the "effective" schema that
+ * lpm_env_resolve returns, the way the runner evaluates them at runtime, without
+ * project files or the process environment. Both ranges must be valid UTF-8 JSON.
+ * Input: {"environments":{"<name>":{"<KEY>":"<value>"}}}.
+ * Output per environment: readsDefaultEnvironment (it has no values of its own, so
+ * "default"'s values were checked), problems [{key, code, format?, constraint?,
+ * group?, mode?}], defaults {KEY: schema default that fills it}, and ignored keys the
+ * runner never passes to a process. Output never contains stored values.
+ * status: 0=checked, 1=invalid schema, 2=invalid input, 3=panic, 4=output limit. */
+LPMEnvResult lpm_env_check(const uint8_t *schema, size_t schema_length,
+                         const uint8_t *input, size_t input_length);
 /* Release only the output buffer after decoding; the snapshot stays live.
  * Exclusively borrow result. Clears data/length; repeated calls are harmless.
  * A matching lpm_env_release is still required for the result. */
