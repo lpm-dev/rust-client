@@ -414,6 +414,9 @@ pub fn decode_definition(bytes: &[u8], source: &str) -> Result<EnvSchemaDefiniti
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let definition = serde_path_to_error::deserialize(&mut deserializer).map_err(|failure| {
         let mut pointer = String::with_capacity(64);
+        if source == "lpm.json" {
+            pointer.push_str("/envSchema");
+        }
         for segment in failure.path().iter() {
             pointer.push('/');
             match segment {

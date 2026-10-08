@@ -103,7 +103,8 @@ impl SourceError {
                 source: source.into(),
                 pointer: if source == "lpm.json"
                     && !pointer.is_empty()
-                    && !pointer.starts_with("/envSchema")
+                    && pointer != "/envSchema"
+                    && !pointer.starts_with("/envSchema/")
                 {
                     format!("/envSchema{pointer}")
                 } else {

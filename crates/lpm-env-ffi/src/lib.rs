@@ -337,6 +337,19 @@ mod tests {
         }
     }
     #[test]
+    fn root_definition_fields_named_like_the_schema_keep_the_document_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        for field in ["envSchemaTypo", "envSchema"] {
+            let input = format!(r#"{{"{field}":{{}}}}"#);
+            let result = resolve(input.as_bytes(), dir.path().to_str().unwrap());
+            let diagnostic = output(&result);
+            // SAFETY: This is the sole release of the returned result.
+            unsafe { lpm_env_release(result) };
+            assert_eq!(diagnostic["pointer"], format!("/envSchema/{field}"));
+        }
+    }
+
+    #[test]
     fn root_definition_errors_name_the_declaration_and_never_echo_literals() {
         let dir = tempfile::tempdir().unwrap();
         for (input, pointer, message) in [
