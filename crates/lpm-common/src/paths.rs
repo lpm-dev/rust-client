@@ -2009,23 +2009,65 @@ mod tests {
     /// be copied into a child at any instant.
     #[cfg(unix)]
     fn while_spawning_processes(body: impl FnOnce()) {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let stop = std::sync::Arc::new(AtomicBool::new(false));
-        let spawners: Vec<_> = (0..4)
-            .map(|_| {
-                let stop = std::sync::Arc::clone(&stop);
-                std::thread::spawn(move || {
-                    while !stop.load(Ordering::Relaxed) {
+        let _spawners = ProcessSpawners::new();
+        body();
+    }
+
+    #[cfg(unix)]
+    struct ProcessSpawners {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        threads: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(unix)]
+    impl ProcessSpawners {
+        fn new() -> Self {
+            let mut spawners = Self {
+                stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                threads: Vec::with_capacity(4),
+            };
+            for _ in 0..4 {
+                let stop = std::sync::Arc::clone(&spawners.stop);
+                spawners.threads.push(std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                         let _ = std::process::Command::new("true").status();
                     }
-                })
-            })
-            .collect();
-        body();
-        stop.store(true, Ordering::Relaxed);
-        for spawner in spawners {
-            spawner.join().unwrap();
+                }));
+            }
+            spawners
         }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ProcessSpawners {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let mut worker_panicked = false;
+            for thread in self.threads.drain(..) {
+                worker_panicked |= thread.join().is_err();
+            }
+            if !std::thread::panicking() {
+                assert!(!worker_panicked, "process-spawning worker panicked");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_spawners_stop_and_join_when_the_body_panics() {
+        let mut shutdown = None;
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let spawners = ProcessSpawners::new();
+            shutdown = Some(std::sync::Arc::downgrade(&spawners.stop));
+            panic!("injected body panic");
+        }));
+        assert!(panic.is_err());
+        let shutdown = shutdown.unwrap();
+        let stopped = shutdown.upgrade().is_none();
+        if let Some(stop) = shutdown.upgrade() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        assert!(stopped, "process-spawning workers survived the body panic");
     }
 
     #[cfg(unix)]
