@@ -636,25 +636,52 @@ fn format_default_wait_hint() -> String {
     )
 }
 
+/// An acquired advisory lock, owned without its guard so a handle can hold
+/// it without borrowing (the guard is forgotten at acquisition). Dropping it
+/// unlocks, then closes the file. A process spawned at that instant holds a
+/// copy of the descriptor until it executes its program, and closing alone
+/// would leave the lock held through that copy until then.
+struct HeldLock {
+    lock: Option<fd_lock::RwLock<std::fs::File>>,
+}
+
+impl HeldLock {
+    fn new(lock: fd_lock::RwLock<std::fs::File>) -> Self {
+        Self { lock: Some(lock) }
+    }
+}
+
+impl Drop for HeldLock {
+    fn drop(&mut self) {
+        let Some(lock) = self.lock.take() else {
+            return;
+        };
+        let file = lock.into_inner();
+        // Windows children don't inherit the handle, so closing releases it there.
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            // SAFETY: `file` keeps the descriptor open for the duration of the call.
+            unsafe {
+                libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+        drop(file);
+    }
+}
+
 /// RAII handle for a held shared (multi-reader) lock. Drop releases.
-///
-/// We intentionally hold the `fd-lock` `RwLock` rather than its guard
-/// — calling `mem::forget` on the guard skips its `flock(LOCK_UN)`
-/// drop, leaving the OS-level lock held by the underlying file
-/// descriptor. The lock then releases when this handle drops and the
-/// file is closed. This shape lets us return ownership of the held
-/// lock without bumping into self-referential-struct lifetime issues.
 ///
 /// Readers only retain the data lock — the writer-intent gate is
 /// released once they've successfully acquired data-shared, so new
 /// writers can immediately raise their gate and queue.
 pub struct SharedLockHandle {
-    _data: fd_lock::RwLock<std::fs::File>,
+    _data: HeldLock,
 }
 
 /// RAII handle for a single-file shared advisory lock.
 pub struct SingleFileSharedLockHandle {
-    _data: fd_lock::RwLock<std::fs::File>,
+    _data: HeldLock,
 }
 
 /// RAII handle for a held exclusive (single-writer) lock. Holds the
@@ -666,14 +693,14 @@ pub struct SingleFileSharedLockHandle {
 /// successor (if any) from being preempted by readers between
 /// release-of-intent and release-of-queue.
 pub struct ExclusiveLockHandle {
-    _data: fd_lock::RwLock<std::fs::File>,
-    _writer_intent: fd_lock::RwLock<std::fs::File>,
-    _writer_queue: fd_lock::RwLock<std::fs::File>,
+    _data: HeldLock,
+    _writer_intent: HeldLock,
+    _writer_queue: HeldLock,
 }
 
 /// RAII handle for a single-file exclusive advisory lock.
 pub struct SingleFileExclusiveLockHandle {
-    _data: fd_lock::RwLock<std::fs::File>,
+    _data: HeldLock,
 }
 
 fn open_lock_file(lock_path: &Path) -> std::io::Result<std::fs::File> {
@@ -765,7 +792,7 @@ enum LockMode {
 
 /// Try to acquire `rw` once in the requested mode. On success the
 /// guard is `mem::forget`'d so the OS-level lock survives — caller
-/// retains the lock by holding `rw` itself.
+/// retains the lock by wrapping `rw` in a [`HeldLock`].
 fn try_acquire(rw: &mut fd_lock::RwLock<std::fs::File>, mode: LockMode) -> Result<bool, LpmError> {
     let attempt = match mode {
         LockMode::Shared => rw.try_read().map(|g| {
@@ -907,11 +934,16 @@ fn try_acquire_shared_from_source(
     if !try_acquire(&mut intent, LockMode::Shared)? {
         return Ok(None);
     }
+    let intent = HeldLock::new(intent);
     let mut data = fd_lock::RwLock::new(source.open(LockFileComponent::Data)?);
     if !try_acquire(&mut data, LockMode::Shared)? {
         return Ok(None);
     }
-    Ok(Some(SharedLockHandle { _data: data }))
+    let handle = SharedLockHandle {
+        _data: HeldLock::new(data),
+    };
+    drop(intent);
+    Ok(Some(handle))
 }
 
 /// Acquire a shared lock under the writer-preference turnstile.
@@ -969,6 +1001,7 @@ fn acquire_shared_from_source(
         on_first_wait,
         Some(&mut on_first_contention),
     )?;
+    let intent = HeldLock::new(intent_rw);
 
     // acquire data-shared.
     let data_file = source.open(LockFileComponent::Data)?;
@@ -979,10 +1012,13 @@ fn acquire_shared_from_source(
         None,
         Some(&mut on_first_contention),
     )?;
+    let handle = SharedLockHandle {
+        _data: HeldLock::new(data_rw),
+    };
 
     // Drop gate so new writers can raise it immediately.
-    drop(intent_rw);
-    Ok(SharedLockHandle { _data: data_rw })
+    drop(intent);
+    Ok(handle)
 }
 
 /// Acquire an exclusive lock under the writer-preference turnstile.
@@ -1018,6 +1054,7 @@ fn acquire_exclusive_from_source(
         Some(Box::new(on_first_wait)),
         Some(&mut on_first_contention),
     )?;
+    let queue = HeldLock::new(queue_rw);
 
     // gate exclusive. Blocks new readers from passing the
     // gate. Existing in-body readers don't hold the gate so they
@@ -1030,6 +1067,7 @@ fn acquire_exclusive_from_source(
         None,
         Some(&mut on_first_contention),
     )?;
+    let intent = HeldLock::new(intent_rw);
 
     // data exclusive. Wait for in-body readers to release.
     let data_file = source.open(LockFileComponent::Data)?;
@@ -1042,9 +1080,9 @@ fn acquire_exclusive_from_source(
     )?;
 
     Ok(ExclusiveLockHandle {
-        _data: data_rw,
-        _writer_intent: intent_rw,
-        _writer_queue: queue_rw,
+        _data: HeldLock::new(data_rw),
+        _writer_intent: intent,
+        _writer_queue: queue,
     })
 }
 
@@ -1238,7 +1276,9 @@ pub fn acquire_single_file_shared_lock_from_file(
         Some(Box::new(default_wait_hint)),
         None,
     )?;
-    Ok(SingleFileSharedLockHandle { _data: data })
+    Ok(SingleFileSharedLockHandle {
+        _data: HeldLock::new(data),
+    })
 }
 
 /// Acquire an exclusive advisory lock that retains one file descriptor.
@@ -1261,7 +1301,9 @@ pub fn acquire_single_file_exclusive_lock_from_file(
         Some(Box::new(default_wait_hint)),
         None,
     )?;
-    Ok(SingleFileExclusiveLockHandle { _data: data })
+    Ok(SingleFileExclusiveLockHandle {
+        _data: HeldLock::new(data),
+    })
 }
 
 pub fn try_acquire_single_file_exclusive_lock_from_file(
@@ -1269,7 +1311,9 @@ pub fn try_acquire_single_file_exclusive_lock_from_file(
 ) -> Result<Option<SingleFileExclusiveLockHandle>, LpmError> {
     let mut data = fd_lock::RwLock::new(file);
     if try_acquire(&mut data, LockMode::Exclusive)? {
-        Ok(Some(SingleFileExclusiveLockHandle { _data: data }))
+        Ok(Some(SingleFileExclusiveLockHandle {
+            _data: HeldLock::new(data),
+        }))
     } else {
         Ok(None)
     }
@@ -1311,6 +1355,7 @@ fn try_acquire_exclusive_from_source(
         }
         return Ok(None);
     }
+    let queue = HeldLock::new(queue_rw);
 
     let intent_file = source.open(LockFileComponent::WriterIntent)?;
     let mut intent_rw = fd_lock::RwLock::new(intent_file);
@@ -1320,6 +1365,7 @@ fn try_acquire_exclusive_from_source(
         }
         return Ok(None);
     }
+    let intent = HeldLock::new(intent_rw);
 
     let data_file = source.open(LockFileComponent::Data)?;
     let mut data_rw = fd_lock::RwLock::new(data_file);
@@ -1331,9 +1377,9 @@ fn try_acquire_exclusive_from_source(
     }
 
     Ok(Some(ExclusiveLockHandle {
-        _data: data_rw,
-        _writer_intent: intent_rw,
-        _writer_queue: queue_rw,
+        _data: HeldLock::new(data_rw),
+        _writer_intent: intent,
+        _writer_queue: queue,
     }))
 }
 
@@ -1957,6 +2003,109 @@ mod tests {
         assert!(err.is_err());
         // Lock must be released even after a body error; a second call succeeds.
         with_exclusive_lock(&lock_path, || Ok::<_, LpmError>(())).unwrap();
+    }
+
+    /// Runs `body` while threads keep spawning processes, so a descriptor can
+    /// be copied into a child at any instant.
+    #[cfg(unix)]
+    fn while_spawning_processes(body: impl FnOnce()) {
+        let _spawners = ProcessSpawners::new();
+        body();
+    }
+
+    #[cfg(unix)]
+    struct ProcessSpawners {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        threads: Vec<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(unix)]
+    impl ProcessSpawners {
+        fn new() -> Self {
+            let mut spawners = Self {
+                stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                threads: Vec::with_capacity(4),
+            };
+            for _ in 0..4 {
+                let stop = std::sync::Arc::clone(&spawners.stop);
+                spawners.threads.push(std::thread::spawn(move || {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true").status();
+                    }
+                }));
+            }
+            spawners
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ProcessSpawners {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            let mut worker_panicked = false;
+            for thread in self.threads.drain(..) {
+                worker_panicked |= thread.join().is_err();
+            }
+            if !std::thread::panicking() {
+                assert!(!worker_panicked, "process-spawning worker panicked");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_spawners_stop_and_join_when_the_body_panics() {
+        let mut shutdown = None;
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let spawners = ProcessSpawners::new();
+            shutdown = Some(std::sync::Arc::downgrade(&spawners.stop));
+            panic!("injected body panic");
+        }));
+        assert!(panic.is_err());
+        let shutdown = shutdown.unwrap();
+        let stopped = shutdown.upgrade().is_none();
+        if let Some(stop) = shutdown.upgrade() {
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        assert!(stopped, "process-spawning workers survived the body panic");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn released_locks_are_free_while_other_threads_spawn_processes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.lock");
+        let single = dir.path().join("single.lock");
+        let mut held = Vec::new();
+        let mut released = |kind: &'static str, free: bool| {
+            if !free {
+                held.push(kind);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        };
+        let exclusive_is_free = || try_acquire_exclusive_lock(&path).unwrap().is_some();
+        let single_is_free = || {
+            try_acquire_single_file_exclusive_lock_from_file(open_lock_file(&single).unwrap())
+                .unwrap()
+                .is_some()
+        };
+        while_spawning_processes(|| {
+            for _ in 0..500 {
+                drop(try_acquire_exclusive_lock(&path).unwrap());
+                released("exclusive", exclusive_is_free());
+                with_shared_lock(&path, || Ok(())).unwrap();
+                released("shared", exclusive_is_free());
+                drop(acquire_single_file_exclusive_lock(&single).unwrap());
+                released("single-file exclusive", single_is_free());
+                drop(acquire_single_file_shared_lock(&single).unwrap());
+                released("single-file shared", single_is_free());
+            }
+        });
+        let mut counts = std::collections::BTreeMap::new();
+        for kind in held {
+            *counts.entry(kind).or_insert(0) += 1;
+        }
+        assert!(counts.is_empty(), "released locks stayed held: {counts:?}");
     }
 
     #[test]
