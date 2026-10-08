@@ -3,6 +3,8 @@
 mod graph;
 mod read;
 
+pub use graph::decode_definition;
+
 use lpm_env::{EnvSchema, EnvSchemaDefinition, ValidationErrorKind};
 use serde::Serialize;
 use sha2::{Digest, Sha256};

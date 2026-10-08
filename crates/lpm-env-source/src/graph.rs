@@ -410,7 +410,9 @@ impl Graph {
     }
 }
 
-fn decode_definition(bytes: &[u8], source: &str) -> Result<EnvSchemaDefinition, SourceError> {
+/// Decode one schema document, locating a failure by its source and JSON
+/// pointer. The diagnostic never contains literals from the document.
+pub fn decode_definition(bytes: &[u8], source: &str) -> Result<EnvSchemaDefinition, SourceError> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let definition = serde_path_to_error::deserialize(&mut deserializer).map_err(|failure| {
         let mut pointer = String::with_capacity(64);
