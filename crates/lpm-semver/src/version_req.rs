@@ -113,6 +113,10 @@ enum WildcardPart {
 
 fn normalize_wildcard_comparator(input: &str) -> Option<String> {
     let (operator, operand) = split_comparator(input);
+    normalize_wildcard_comparator_operand(operator, operand)
+}
+
+fn normalize_wildcard_comparator_operand(operator: &str, operand: &str) -> Option<String> {
     let partial = parse_wildcard_partial(operand)?;
     if !partial.has_wildcard_or_missing() {
         return None;
@@ -141,60 +145,167 @@ fn normalize_wildcard_comparator(input: &str) -> Option<String> {
 }
 
 fn normalize_wildcard_hyphen(input: &str) -> Option<String> {
-    let (left, right) = input.split_once(" - ")?;
-    if right.contains(" - ") {
+    let (left, right) = split_hyphen_bounds(input)?;
+    normalize_hyphen_bounds(left, right)
+}
+
+#[derive(Clone, Copy)]
+struct HyphenBound<'a> {
+    operand: &'a str,
+    equality: bool,
+}
+
+fn split_hyphen_bounds(input: &str) -> Option<(HyphenBound<'_>, HyphenBound<'_>)> {
+    let mut tokens = input.split_whitespace();
+    let left = take_hyphen_bound(&mut tokens)?;
+    if tokens.next()? != "-" {
         return None;
     }
-
-    let left = parse_wildcard_partial(left)?;
-    let right = parse_wildcard_partial(right)?;
-    if !left.has_wildcard_or_missing() && !right.has_wildcard_or_missing() {
+    let right = take_hyphen_bound(&mut tokens)?;
+    if tokens.next().is_some() {
         return None;
     }
+    Some((left, right))
+}
 
-    let mut comparators = Vec::with_capacity(2);
-    if !matches!(left.major, WildcardPart::Wildcard) {
-        let lower = left.lower_bound();
-        comparators.push(format!(">={}.{}.{}", lower.0, lower.1, lower.2));
-    }
-    if !matches!(right.major, WildcardPart::Wildcard) {
-        if let Some(upper) = right.exact_bound() {
-            comparators.push(format!("<={}.{}.{}", upper.0, upper.1, upper.2));
-        } else {
-            let upper = right.upper_exclusive_bound()?;
-            comparators.push(format!("<{}.{}.{}-0", upper.0, upper.1, upper.2));
+fn take_hyphen_bound<'a>(tokens: &mut std::str::SplitWhitespace<'a>) -> Option<HyphenBound<'a>> {
+    let token = tokens.next()?;
+    let operand = if token == "=" { tokens.next()? } else { token };
+    let version_then_equality = operand.strip_prefix("v=");
+    Some(HyphenBound {
+        operand: version_then_equality.unwrap_or_else(|| operand.trim_start_matches('=')),
+        equality: token.starts_with('=') || version_then_equality.is_some(),
+    })
+}
+
+fn normalize_hyphen_bounds(left: HyphenBound<'_>, right: HyphenBound<'_>) -> Option<String> {
+    let left = normalize_hyphen_bound(left, true)?;
+    let right = normalize_hyphen_bound(right, false)?;
+    if !left.is_empty() && !right.is_empty() {
+        let (_, lower) = split_comparator(&left);
+        let (operator, upper) = split_comparator(&right);
+        let lower = node_semver::Version::parse(lower).ok()?;
+        let upper = node_semver::Version::parse(upper).ok()?;
+        if lower > upper || (lower == upper && operator == "<") {
+            return Some("<0.0.0-0".to_string());
         }
     }
-
-    if comparators.is_empty() {
-        Some("*".to_string())
-    } else {
-        Some(comparators.join(" "))
+    match (left.is_empty(), right.is_empty()) {
+        (true, true) => Some("*".to_string()),
+        (false, true) => Some(left),
+        (true, false) => Some(right),
+        (false, false) => Some(format!("{left} {right}")),
     }
+}
+
+fn normalize_hyphen_bound(bound: HyphenBound<'_>, is_lower: bool) -> Option<String> {
+    let input = bound.operand;
+    if let Some(partial) = parse_wildcard_partial(input) {
+        if bound.equality && !partial.has_wildcard_or_missing() {
+            return None;
+        }
+        if matches!(partial.major, WildcardPart::Wildcard) {
+            return Some(String::new());
+        }
+        if is_lower {
+            let lower = partial.lower_bound();
+            return Some(format!(">={}.{}.{}", lower.0, lower.1, lower.2));
+        }
+        if let Some(upper) = partial.exact_bound() {
+            return Some(format!("<={}.{}.{}", upper.0, upper.1, upper.2));
+        }
+        let upper = partial.upper_exclusive_bound()?;
+        return Some(format!("<{}.{}.{}-0", upper.0, upper.1, upper.2));
+    }
+    let version = node_semver::Version::parse(input).ok()?;
+    if bound.equality && (is_lower || !version.is_prerelease()) {
+        return None;
+    }
+    Some(format!("{}{version}", if is_lower { ">=" } else { "<=" }))
 }
 
 fn split_comparator(input: &str) -> (&'static str, &str) {
     let trimmed = input.trim();
     for operator in ["<=", ">=", "<", ">", "="] {
         if let Some(rest) = trimmed.strip_prefix(operator) {
-            return (operator, rest.trim_start());
+            return (operator, rest.trim_start().trim_start_matches('='));
         }
     }
     ("", trimmed)
 }
 
 fn has_invalid_range_token(input: &str) -> bool {
-    input
-        .split("||")
-        .flat_map(str::split_whitespace)
-        .map(strip_range_operator)
-        .map(|token| split_comparator(token).1)
-        .filter(|operand| !operand.is_empty() && *operand != "-")
-        .any(|operand| {
-            operand
-                .bytes()
-                .all(|byte| !byte.is_ascii_alphanumeric() && byte != b'*')
-        })
+    for disjunct in input.split("||") {
+        if disjunct.split_whitespace().any(|token| token == "-") {
+            if normalize_wildcard_hyphen(disjunct).is_none() {
+                return true;
+            }
+            continue;
+        }
+        let mut previous = None;
+        let mut tokens = disjunct.split_whitespace().peekable();
+        while let Some(token) = tokens.next() {
+            if is_operator_only_token(token) && tokens.peek().is_none() {
+                return true;
+            }
+            if previous == Some("~>") && token == "=" {
+                return true;
+            }
+            if previous
+                .is_some_and(|token: &str| is_range_operator_token(token.trim_end_matches('=')))
+                && is_comparison_operator(token)
+                && token != "="
+            {
+                return true;
+            }
+            if previous.is_some_and(is_comparison_operator) && is_comparison_operator(token) {
+                return true;
+            }
+            if previous.is_some_and(is_comparison_operator)
+                && token.starts_with("==")
+                && node_semver::Version::parse(token.trim_start_matches('=')).is_ok()
+            {
+                return true;
+            }
+            if previous.is_some_and(|token: &str| {
+                is_comparison_operator(token)
+                    || is_range_operator_token(token.trim_end_matches('='))
+            }) && token.starts_with(['<', '>', '^', '~'])
+            {
+                return true;
+            }
+            let operand = split_comparator(strip_range_operator(token)).1;
+            let normalized_operand = strip_loose_version_equality(operand);
+            if !operand.is_empty()
+                && operand != "-"
+                && ((parse_wildcard_partial(normalized_operand).is_none()
+                    && node_semver::Version::parse(normalized_operand).is_err())
+                    || is_malformed_wildcard_operand(operand)
+                    || normalized_operand
+                        .bytes()
+                        .any(|byte| matches!(byte, b'<' | b'>' | b'=' | b'^' | b'~'))
+                    || normalized_operand
+                        .bytes()
+                        .all(|byte| !byte.is_ascii_alphanumeric() && byte != b'*'))
+            {
+                return true;
+            }
+            previous = Some(token);
+        }
+    }
+    false
+}
+
+fn is_operator_only_token(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|byte| matches!(byte, b'<' | b'>' | b'=' | b'^' | b'~'))
+}
+
+fn is_comparison_operator(token: &str) -> bool {
+    matches!(token, "<" | ">" | "<=" | ">=")
+        || (!token.is_empty() && token.bytes().all(|byte| byte == b'='))
 }
 
 fn has_malformed_wildcard_range_operator(input: &str) -> bool {
@@ -243,31 +354,72 @@ fn normalize_wildcard_range_operators(input: &str) -> Option<String> {
 }
 
 fn normalize_wildcard_operator_disjunct(disjunct: &str, changed: &mut bool) -> String {
+    if let Some(range) = normalize_wildcard_hyphen(disjunct) {
+        *changed = true;
+        return range;
+    }
     let mut local_changed = false;
     let mut normalized = Vec::new();
     let mut tokens = disjunct.split_whitespace().peekable();
     while let Some(token) = tokens.next() {
-        if is_range_operator_token(token)
-            && tokens
-                .peek()
-                .is_some_and(|operand| is_valid_wildcard_operand(operand))
+        let range_operator = token.trim_end_matches('=');
+        if is_range_operator_token(range_operator) {
+            let mut operand = tokens.peek().copied().unwrap_or_default();
+            if operand == "=" {
+                tokens.next();
+                operand = tokens.peek().copied().unwrap_or_default();
+            }
+            if !operand.is_empty() {
+                tokens.next();
+                local_changed = true;
+                let operand = operand.trim_start_matches('=');
+                normalized.push(if is_valid_wildcard_operand(operand) {
+                    "*".to_string()
+                } else {
+                    format!("{range_operator}{operand}")
+                });
+                continue;
+            }
+        }
+        let (operator, operand) = split_comparator(token);
+        let candidate_operand = if operand.is_empty() {
+            tokens.peek().copied().unwrap_or_default()
+        } else {
+            operand
+        }
+        .trim_start_matches('=');
+        if !operator.is_empty()
+            && let Some(range) = normalize_wildcard_comparator_operand(operator, candidate_operand)
         {
-            tokens.next();
+            if operand.is_empty() {
+                tokens.next();
+            }
             local_changed = true;
-            normalized.push("*".to_string());
+            normalized.push(range);
             continue;
         }
-        if range_operator_operand(token).is_some_and(is_valid_wildcard_operand) {
-            local_changed = true;
-            normalized.push("*".to_string());
-            continue;
+        if let Some(operand) = range_operator_operand(token) {
+            if is_valid_wildcard_operand(operand) {
+                local_changed = true;
+                normalized.push("*".to_string());
+                continue;
+            }
+            if token.contains('=') {
+                local_changed = true;
+                let operator = if token.starts_with('^') { "^" } else { "~" };
+                normalized.push(format!("{operator}{operand}"));
+                continue;
+            }
         }
         normalized.push(token.to_string());
+    }
+    if normalized.iter().any(|token| token == "<0.0.0-0") {
+        *changed = true;
+        return "<0.0.0-0".to_string();
     }
     if !local_changed {
         return disjunct.to_string();
     }
-
     *changed = true;
     normalized.retain(|token| token != "*");
     if normalized.is_empty() {
@@ -286,6 +438,7 @@ fn range_operator_operand(token: &str) -> Option<&str> {
         .strip_prefix("~>")
         .or_else(|| token.strip_prefix('^'))
         .or_else(|| token.strip_prefix('~'))
+        .map(|operand| strip_loose_version_equality(operand.trim_start_matches('=')))
 }
 
 fn has_malformed_wildcard_comparator(input: &str) -> bool {
@@ -333,6 +486,8 @@ fn is_valid_wildcard_operand(input: &str) -> bool {
 }
 
 fn starts_like_wildcard(input: &str) -> bool {
+    let input = strip_loose_version_equality(input);
+    let input = input.strip_prefix('v').unwrap_or(input);
     matches!(input.as_bytes().first(), Some(b'*' | b'x' | b'X'))
 }
 
@@ -402,6 +557,7 @@ fn parse_wildcard_partial(input: &str) -> Option<WildcardPartial> {
         return None;
     }
 
+    let token = strip_loose_version_equality(token);
     let token = token.strip_prefix('v').unwrap_or(token);
     let mut parts = token.split('.');
     let major = parse_wildcard_part(parts.next()?)?;
@@ -425,6 +581,10 @@ fn parse_wildcard_partial(input: &str) -> Option<WildcardPartial> {
         minor,
         patch,
     })
+}
+
+fn strip_loose_version_equality(input: &str) -> &str {
+    input.strip_prefix("v=").unwrap_or(input)
 }
 
 fn wildcard_hierarchy_is_valid(
@@ -750,6 +910,280 @@ mod tests {
         assert!(VersionReq::parse(". ~x\n").is_err());
         assert!(VersionReq::parse("~X0^.00").is_err());
         assert!(VersionReq::parse("~\tx~x\n\n").is_err());
+    }
+
+    #[test]
+    fn embedded_range_operators_are_rejected_before_upstream_parsing() {
+        for input in ["1>0.0 - =x", ">10.0>- =x", "1= x", "1.2>3", "1.0.0-alpha^1"] {
+            assert!(has_invalid_range_token(input), "accepted {input:?}");
+        }
+    }
+
+    #[test]
+    fn repeated_comparison_operators_are_rejected_before_upstream_parsing() {
+        for input in ["= = x", "= = *1.0-", "x- 9-x- 9- = = *1.0- = 1", "= === X"] {
+            assert!(has_invalid_range_token(input), "accepted {input:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_wildcard_operands_are_rejected_after_separated_equality() {
+        for input in [">1 N 2 = =*2.", "^= = *1.0", "= =x-"] {
+            assert!(has_invalid_range_token(input), "accepted {input:?}");
+        }
+    }
+
+    #[test]
+    fn non_version_comparator_operands_are_rejected_before_upstream_parsing() {
+        for input in ["=v * -2", "=v", ">N", "1 N 2"] {
+            assert!(has_invalid_range_token(input), "accepted {input:?}");
+        }
+    }
+
+    #[test]
+    fn separated_range_operators_reject_other_range_operators() {
+        for input in ["~ > X", "~\t\t>\t\t\t X", "^ < x", "~ ^x", "~ === X"] {
+            assert!(has_invalid_range_token(input), "accepted {input:?}");
+        }
+    }
+
+    #[test]
+    fn range_operators_without_operands_are_rejected() {
+        for input in ["1 >=", "1 =", "1 ^", "1 ^=", "1 ~=", ">= || 1", "^= || 1"] {
+            assert!(VersionReq::parse(input).is_err(), "accepted {input:?}");
+        }
+    }
+
+    #[test]
+    fn separated_comparators_reject_repeated_equality_on_exact_versions() {
+        for input in [
+            ">= ==1.2.3",
+            "= ==1.2.3",
+            "1 >= ==1.2.3",
+            "1 = ==1.2.3",
+            ">= ==1.2.3-alpha",
+        ] {
+            assert!(VersionReq::parse(input).is_err(), "accepted {input:?}");
+        }
+        assert!(VersionReq::parse(">= ==1").is_ok());
+    }
+
+    #[test]
+    fn tilde_greater_equality_spacing_matches_npm() {
+        for input in ["~> = 1.2.3", "~> = x", "~> = x || 1"] {
+            assert!(VersionReq::parse(input).is_err(), "accepted {input:?}");
+        }
+        for input in ["~> =1.2.3", "~> =x", "^ = 1.2.3", "~ = 1.2.3"] {
+            assert!(VersionReq::parse(input).is_ok(), "rejected {input:?}");
+        }
+    }
+
+    #[test]
+    fn version_prefixed_wildcard_operators_match_stable_versions() {
+        for input in ["~vx", "^vx", "~ vx", "^ vx", "1 ~vx"] {
+            let range = r(input);
+            assert!(range.matches(&v("1.0.0")), "{input}");
+            if input != "1 ~vx" {
+                assert!(range.matches(&v("9.0.0")), "{input}");
+            }
+        }
+    }
+
+    #[test]
+    fn version_then_equality_prefix_matches_npm_partial_ranges() {
+        for input in ["v=1", "^v=1", "~v=1", "v=x", "^v=x"] {
+            let range = r(input);
+            assert!(range.matches(&v("1.0.0")), "{input}");
+        }
+        let exact_caret = r("^v=1.2.3");
+        assert!(exact_caret.matches(&v("1.2.3")));
+        assert!(!exact_caret.matches(&v("2.0.0")));
+    }
+
+    #[test]
+    fn equality_prefixes_preserve_npm_range_operator_meaning() {
+        for input in ["^=x", "^ = x", "~=x", "~ = x", "==x", "= =x", ">= =x"] {
+            let range = r(input);
+            assert!(range.matches(&v("0.0.0")), "{input}");
+            assert!(range.matches(&v("9.0.0")), "{input}");
+        }
+        for input in ["^=1.2", "^ = 1.2", "^ =1.2"] {
+            let range = r(input);
+            assert!(range.matches(&v("1.9.0")), "{input}");
+            assert!(!range.matches(&v("2.0.0")), "{input}");
+        }
+        for input in ["==1", "= =1", "1 - ==2"] {
+            let range = r(input);
+            assert!(range.matches(&v("1.0.0")), "{input}");
+            assert!(!range.matches(&v("3.0.0")), "{input}");
+        }
+    }
+
+    #[test]
+    fn reversed_hyphen_bounds_match_no_version() {
+        for input in ["1 - 0.x", "2 - 1", "2.0.0 - 1.0.0", "1.x - 0.x"] {
+            let range = r(input);
+            for version in ["0.0.0", "0.9.9", "1.0.0", "1.9.9", "2.0.0", "9.0.0"] {
+                assert!(!range.matches(&v(version)), "{input} matched {version}");
+            }
+        }
+        let disjunction = r("2 - 1 || 3");
+        assert!(!disjunction.matches(&v("2.0.0")));
+        assert!(disjunction.matches(&v("3.0.0")));
+    }
+
+    #[test]
+    fn hyphen_ranges_reject_additional_conjuncts() {
+        for input in [
+            "^ = 1 - 2",
+            "> = 1 - 2",
+            "1 - =x 3",
+            ">=1 1 - 2",
+            "1 - 2 <=3",
+        ] {
+            assert!(VersionReq::parse(input).is_err(), "accepted {input}");
+        }
+    }
+
+    #[test]
+    fn full_stable_hyphen_bounds_reject_equality_prefixes() {
+        for input in [
+            "=1.2.3 - 2",
+            "1 - =2.0.0",
+            "=1.2.3+build - 2",
+            "1 - =2.0.0+build",
+            "v=1.2.3 - 2",
+            "v=1.0.0-alpha - 2",
+            "1 - v=2.0.0",
+        ] {
+            assert!(VersionReq::parse(input).is_err(), "accepted {input}");
+        }
+    }
+
+    #[test]
+    fn hyphen_range_bounds_allow_versions_prereleases_and_wildcards() {
+        for input in [
+            "1 - 2",
+            "1.0 - 2.5",
+            "1.2.3 - 2.0.0",
+            "1.x - 2.x",
+            "v1.2.3 - v2.0.0",
+            "1.2.3-alpha+build - 2.0.0-beta",
+            "1\t-\t2",
+            "1 - 2 || >=3",
+            "1 - =x",
+            "=x - 1",
+        ] {
+            assert!(!has_invalid_range_token(input), "rejected {input:?}");
+        }
+    }
+
+    #[test]
+    fn wildcard_comparator_conjunctions_preserve_numeric_bounds() {
+        for input in ["1 =x", "1 = x", "1 =X", "1 =*", "1 >=x"] {
+            let range = r(input);
+            assert!(range.matches(&v("1.0.0")), "rejected lower bound: {input}");
+            assert!(range.matches(&v("1.9.9")), "rejected major range: {input}");
+            assert!(!range.matches(&v("2.0.0")), "lost upper bound: {input}");
+        }
+    }
+
+    #[test]
+    fn hyphen_range_equality_prefixes_follow_npm_bounds() {
+        for input in ["1 - =x", "1\t-\t=x", "1 - =x || 3", "v=1 - 2"] {
+            let range = r(input);
+            assert!(!range.matches(&v("0.9.9")), "lost lower bound: {input}");
+            assert!(range.matches(&v("1.0.0")), "rejected lower bound: {input}");
+            if !input.ends_with(" - 2") {
+                assert!(
+                    range.matches(&v("9.0.0")),
+                    "lost wildcard upper bound: {input}"
+                );
+            }
+        }
+        let version_prefixed_upper = r("1 - v=2");
+        assert!(version_prefixed_upper.matches(&v("2.9.9")));
+        assert!(!version_prefixed_upper.matches(&v("3.0.0")));
+        let range = r("=x - 1");
+        assert!(range.matches(&v("0.0.0")));
+        assert!(range.matches(&v("1.9.9")));
+        assert!(!range.matches(&v("2.0.0")));
+    }
+
+    #[test]
+    fn wildcard_comparator_disjunctions_preserve_empty_and_any_ranges() {
+        let any = r("^1 || =x");
+        assert!(any.matches(&v("0.0.0")));
+        assert!(any.matches(&v("9.0.0")));
+        assert!(!any.matches(&v("1.0.0-alpha")));
+
+        let empty = r(">=1 <x");
+        assert!(!empty.matches(&v("0.0.0")));
+        assert!(!empty.matches(&v("1.0.0")));
+        assert!(!empty.matches(&v("9.0.0")));
+    }
+
+    #[test]
+    fn empty_wildcard_comparators_absorb_only_their_conjunction() {
+        for input in [">=1 <x", ">=1 < x", ">x >=1", "> x >=1"] {
+            let range = r(input);
+            for version in ["0.0.0", "1.0.0", "3.0.0"] {
+                assert!(!range.matches(&v(version)), "{input} matched {version}");
+            }
+        }
+        for input in [">=1 <x || 3", "3 || > x >=1"] {
+            let range = r(input);
+            assert!(!range.matches(&v("1.0.0")), "{input}");
+            assert!(range.matches(&v("3.0.0")), "{input}");
+        }
+    }
+
+    #[test]
+    fn hyphen_bounds_reject_operators_other_than_equality() {
+        for input in [
+            ">=1 - 2",
+            "1 - <=2",
+            "1 - ~x",
+            "^1 - 2 || 3",
+            ">=x - 1",
+            "1 - <=x",
+        ] {
+            assert!(VersionReq::parse(input).is_err(), "accepted {input}");
+        }
+    }
+
+    #[test]
+    fn spaced_equality_hyphen_bounds_preserve_disjunctions() {
+        for input in ["1 - = x || 0", "0 || 1 - = x"] {
+            let range = r(input);
+            for version in ["0.0.0", "1.0.0", "9.0.0"] {
+                assert!(range.matches(&v(version)), "{input} rejected {version}");
+            }
+        }
+        let range = r("1 - = 2 || 4");
+        assert!(range.matches(&v("2.9.9")));
+        assert!(range.matches(&v("4.0.0")));
+        assert!(!range.matches(&v("3.0.0")));
+    }
+
+    #[test]
+    fn equality_hyphen_bounds_preserve_prereleases_and_metadata() {
+        for input in [
+            "1 - =2.0.0-beta",
+            "1 - = 2.0.0-beta || 4",
+            "1 - v=2.0.0-beta",
+        ] {
+            let range = r(input);
+            assert!(range.matches(&v("2.0.0-alpha")), "{input}");
+            assert!(range.matches(&v("2.0.0-beta")), "{input}");
+            assert!(!range.matches(&v("2.0.0")), "{input}");
+        }
+        for input in ["1.0.0-alpha - =x", "1.0.0-alpha+build - = x || 3"] {
+            let range = r(input);
+            assert!(range.matches(&v("1.0.0-alpha")), "{input}");
+            assert!(range.matches(&v("1.0.0")), "{input}");
+            assert!(range.matches(&v("9.0.0")), "{input}");
+        }
     }
 
     // --- Display ---
