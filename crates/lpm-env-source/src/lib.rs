@@ -3,6 +3,8 @@
 mod graph;
 mod read;
 
+pub use graph::decode_definition;
+
 use lpm_env::{EnvSchema, EnvSchemaDefinition, ValidationErrorKind};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -64,13 +66,23 @@ impl std::fmt::Display for SourceError {
     }
 }
 
+/// Characters that can hide or reorder the text around them when shown.
+pub(crate) fn is_display_unsafe(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// The diagnostic `key` for a declared name: only a portable variable name,
+/// which is plain ASCII and safe to show.
+pub(crate) fn diagnostic_key(key: &str) -> Option<String> {
+    (lpm_env::is_valid_env_var_name(key) && key.len() <= 256).then(|| key.to_owned())
+}
+
 struct DiagnosticText<'a>(&'a str);
 impl std::fmt::Display for DiagnosticText<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for c in self.0.chars() {
-            if c.is_control()
-                || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-            {
+            if is_display_unsafe(c) {
                 write!(f, "{}", c.escape_unicode())?;
             } else {
                 write!(f, "{c}")?;
@@ -91,7 +103,8 @@ impl SourceError {
                 source: source.into(),
                 pointer: if source == "lpm.json"
                     && !pointer.is_empty()
-                    && !pointer.starts_with("/envSchema")
+                    && pointer != "/envSchema"
+                    && !pointer.starts_with("/envSchema/")
                 {
                     format!("/envSchema{pointer}")
                 } else {

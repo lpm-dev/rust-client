@@ -367,9 +367,7 @@ impl Graph {
             if let lpm_env::ValidationErrorKind::InvalidRule { message } = error.kind {
                 failure.diagnostic.message = Some(message);
             }
-            if lpm_env::is_valid_env_var_name(&error.key) && error.key.len() <= 256 {
-                failure.diagnostic.key = Some(error.key);
-            }
+            failure.diagnostic.key = crate::diagnostic_key(&error.key);
             return Err(failure);
         }
         let dependencies: Vec<_> = self.dependencies.values().cloned().collect();
@@ -410,22 +408,21 @@ impl Graph {
     }
 }
 
-fn decode_definition(bytes: &[u8], source: &str) -> Result<EnvSchemaDefinition, SourceError> {
+/// Decode one schema document, locating a failure by its source and JSON
+/// pointer. The diagnostic never contains literals from the document.
+pub fn decode_definition(bytes: &[u8], source: &str) -> Result<EnvSchemaDefinition, SourceError> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let definition = serde_path_to_error::deserialize(&mut deserializer).map_err(|failure| {
         let mut pointer = String::with_capacity(64);
+        if source == "lpm.json" {
+            pointer.push_str("/envSchema");
+        }
         for segment in failure.path().iter() {
             pointer.push('/');
             match segment {
                 serde_path_to_error::Segment::Map { key }
                 | serde_path_to_error::Segment::Enum { variant: key } => {
-                    for c in key.chars() {
-                        match c {
-                            '~' => pointer.push_str("~0"),
-                            '/' => pointer.push_str("~1"),
-                            _ => pointer.push(c),
-                        }
-                    }
+                    push_pointer_segment(&mut pointer, key);
                 }
                 serde_path_to_error::Segment::Seq { index } => {
                     use std::fmt::Write;
@@ -524,7 +521,7 @@ fn apply<T>(
                 source,
                 &pointer(source, override_field, key),
             );
-            error.diagnostic.key = Some(key.clone());
+            error.diagnostic.key = crate::diagnostic_key(key);
             return Err(error);
         }
         if local.contains_key(key) {
@@ -568,7 +565,7 @@ fn apply<T>(
                 source,
                 &pointer(source, override_field, &key),
             );
-            error.diagnostic.key = Some(key.clone());
+            error.diagnostic.key = crate::diagnostic_key(&key);
             return Err(error);
         };
         // An override is a replacement, never a partial merge of security policy.
@@ -593,20 +590,38 @@ fn conflict_error(key: &str, first: &SourceLocation, second: &SourceLocation) ->
         &second.source,
         &second.pointer,
     );
-    error.diagnostic.key = Some(key.into());
+    error.diagnostic.key = crate::diagnostic_key(key);
     error.diagnostic.related_sources = vec![first.clone(), second.clone()];
     error
 }
 
 fn pointer(source: &str, field: &str, key: &str) -> String {
-    format!(
-        "{}{field}/{key}",
-        if source == "lpm.json" {
-            "/envSchema/"
-        } else {
-            "/"
+    let mut pointer = String::with_capacity(16 + field.len() + key.len());
+    pointer.push_str(if source == "lpm.json" {
+        "/envSchema/"
+    } else {
+        "/"
+    });
+    pointer.push_str(field);
+    pointer.push('/');
+    push_pointer_segment(&mut pointer, key);
+    pointer
+}
+
+/// Appends an authored key as a JSON pointer segment that is safe to show:
+/// characters that could hide or reorder the surrounding text are escaped.
+fn push_pointer_segment(pointer: &mut String, segment: &str) {
+    use std::fmt::Write;
+    for c in segment.chars() {
+        match c {
+            '~' => pointer.push_str("~0"),
+            '/' => pointer.push_str("~1"),
+            c if !c.is_ascii() || crate::is_display_unsafe(c) => {
+                let _ = write!(pointer, "{}", c.escape_unicode());
+            }
+            c => pointer.push(c),
         }
-    )
+    }
 }
 
 #[cfg(test)]

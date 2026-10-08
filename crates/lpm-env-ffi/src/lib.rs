@@ -39,6 +39,13 @@ fn failure(status: u32, code: &'static str) -> LPMEnvResult {
     )
 }
 
+fn diagnostic(error: &lpm_env_source::SourceError) -> LPMEnvResult {
+    match lpm_env_source::bounded_json(&error.diagnostic, 4096) {
+        Ok(bytes) => result(1, bytes, None),
+        Err(_) => failure(4, "env.output_budget"),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn lpm_env_abi_version() -> u32 {
     ABI_VERSION
@@ -96,17 +103,15 @@ pub unsafe extern "C" fn lpm_env_resolve(
         let input = unsafe { std::slice::from_raw_parts(input, input_length) };
         // SAFETY: The C caller supplies valid ranges; lengths were bounded above.
         let folder = unsafe { std::slice::from_raw_parts(folder, folder_length) };
-        let (Ok(input_text), Ok(folder)) =
-            (std::str::from_utf8(input), std::str::from_utf8(folder))
-        else {
+        let (Ok(_), Ok(folder)) = (std::str::from_utf8(input), std::str::from_utf8(folder)) else {
             return failure(2, "env.invalid_utf8");
         };
         if folder.contains('\0') {
             return failure(2, "env.invalid_input");
         }
-        let definition = match serde_json::from_str::<lpm_env::EnvSchemaDefinition>(input_text) {
+        let definition = match lpm_env_source::decode_definition(input, "lpm.json") {
             Ok(definition) => definition,
-            Err(_) => return failure(1, "env.invalid_definition"),
+            Err(error) => return diagnostic(&error),
         };
         match lpm_env_source::resolve_schema(std::path::Path::new(folder), input, definition) {
             Ok(mut resolved) => {
@@ -146,10 +151,7 @@ pub unsafe extern "C" fn lpm_env_resolve(
                     Err(_) => failure(4, "env.output_budget"),
                 }
             }
-            Err(error) => match lpm_env_source::bounded_json(&error.diagnostic, 4096) {
-                Ok(bytes) => result(1, bytes, None),
-                Err(_) => failure(4, "env.output_budget"),
-            },
+            Err(error) => diagnostic(&error),
         }
     }))
     .unwrap_or_else(|_| failure(3, "env.engine_panic"))
@@ -334,6 +336,92 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn root_definition_fields_named_like_the_schema_keep_the_document_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        for field in ["envSchemaTypo", "envSchema"] {
+            let input = format!(r#"{{"{field}":{{}}}}"#);
+            let result = resolve(input.as_bytes(), dir.path().to_str().unwrap());
+            let diagnostic = output(&result);
+            // SAFETY: This is the sole release of the returned result.
+            unsafe { lpm_env_release(result) };
+            assert_eq!(diagnostic["pointer"], format!("/envSchema/{field}"));
+        }
+    }
+
+    #[test]
+    fn root_definition_errors_name_the_declaration_and_never_echo_literals() {
+        let dir = tempfile::tempdir().unwrap();
+        for (input, pointer, message) in [
+            (
+                r#"{"vars":{"PORT":{"rnage":"PRIVATE"}}}"#,
+                "/envSchema/vars/PORT/rnage",
+                "Invalid schema definition. Check the field name and value type at this location.",
+            ),
+            (
+                r#"{"vars":{"PORT":{"required":"PRIVATE"}}}"#,
+                "/envSchema/vars/PORT/required",
+                "Invalid schema definition. Check the field name and value type at this location.",
+            ),
+            (
+                r#"{"varz":{}}"#,
+                "/envSchema/varz",
+                "Invalid schema definition. Check the field name and value type at this location.",
+            ),
+        ] {
+            let result = resolve(input.as_bytes(), dir.path().to_str().unwrap());
+            assert_eq!(result.status, 1, "{input}");
+            let diagnostic = output(&result);
+            // SAFETY: This is the sole release of the returned result.
+            unsafe {
+                lpm_env_release(result);
+            }
+            assert_eq!(diagnostic["code"], "env.invalid_definition", "{input}");
+            assert_eq!(diagnostic["source"], "lpm.json", "{input}");
+            assert_eq!(diagnostic["pointer"], pointer, "{input}");
+            assert_eq!(diagnostic["message"], message, "{input}");
+            assert!(!diagnostic.to_string().contains("PRIVATE"), "{input}");
+        }
+    }
+
+    #[test]
+    fn diagnostic_pointers_escape_line_and_direction_characters() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("base.json"),
+            "{\"vars\":{\"A\":{\"x\u{202e}\\n\":1}}}",
+        )
+        .unwrap();
+        for (input, pointer) in [
+            (
+                "{\"vars\":{\"PORT\":{\"fmt\u{202e}\\u0007\":\"PRIVATE\"}}}",
+                "/envSchema/vars/PORT/fmt\\u{202e}\\u{7}",
+            ),
+            (
+                "{\"vars\":{\"PORT\":{\"line\u{2028}paragraph\u{2029}\":\"PRIVATE\"}}}",
+                "/envSchema/vars/PORT/line\\u{2028}paragraph\\u{2029}",
+            ),
+            (r#"{"extends":["base.json"]}"#, "/vars/A/x\\u{202e}\\u{a}"),
+        ] {
+            let result = resolve(input.as_bytes(), dir.path().to_str().unwrap());
+            assert_eq!(result.status, 1, "{input}");
+            let diagnostic = output(&result);
+            // SAFETY: This is the sole release of the returned result.
+            unsafe {
+                lpm_env_release(result);
+            }
+            let rendered = diagnostic.to_string();
+            assert!(
+                ['\u{7}', '\u{2028}', '\u{2029}', '\u{202e}']
+                    .into_iter()
+                    .all(|character| !rendered.contains(character)),
+                "{rendered}"
+            );
+            assert_eq!(diagnostic["pointer"], pointer, "{input}");
+            assert!(diagnostic["key"].is_null(), "{input}");
+        }
+    }
+
     #[test]
     fn native_abi_bounds_input_before_dereference_and_checks_utf8() {
         // SAFETY: Invalid pointers are only used with rejected lengths, before dereference.

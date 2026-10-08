@@ -474,9 +474,11 @@ fn bounded_json_capacity_never_exceeds_its_output_budget() {
 }
 
 #[test]
-fn human_diagnostics_escape_bidi_controls_without_changing_repair_paths() {
+fn human_diagnostics_escape_line_and_bidi_controls_without_changing_repair_paths() {
     let dir = tempfile::tempdir().unwrap();
-    for control in ['\u{061c}', '\u{200e}', '\u{200f}', '\u{202e}', '\u{2066}'] {
+    for control in [
+        '\u{061c}', '\u{200e}', '\u{200f}', '\u{2028}', '\u{2029}', '\u{202e}', '\u{2066}',
+    ] {
         let path = format!("safe{control}json");
         let error = resolve(&dir, serde_json::json!({"extends":[path]})).unwrap_err();
         assert!(!error.to_string().contains(control), "{control:?}");
