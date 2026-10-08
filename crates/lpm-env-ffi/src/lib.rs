@@ -12,7 +12,7 @@ const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 /// The most environments one check evaluates.
 const CHECK_ENVIRONMENT_LIMIT: usize = 256;
 /// The most work one check does: each environment costs a unit per
-/// declaration and group, plus one, and each stored value costs a unit.
+/// declaration, group, group member, selected stored value, plus one.
 const CHECK_WORK_LIMIT: usize = 1 << 18;
 
 /// C callers own this result until one matching lpm_env_release call.
@@ -319,16 +319,35 @@ pub unsafe extern "C" fn lpm_env_check(
         }) {
             return failure(2, "env.invalid_input");
         }
-        let per_environment = schema.vars.len() + schema.groups.len() + 1;
-        let stored = input.environments.values().map(HashMap::len).sum::<usize>();
-        if input.environments.len() > CHECK_ENVIRONMENT_LIMIT
-            || input
-                .environments
+        if input.environments.len() > CHECK_ENVIRONMENT_LIMIT {
+            return failure(4, "env.check_budget");
+        }
+        let per_environment = schema.groups.values().fold(
+            schema
+                .vars
                 .len()
-                .saturating_mul(per_environment)
-                .saturating_add(stored)
-                > CHECK_WORK_LIMIT
-        {
+                .saturating_add(schema.groups.len())
+                .saturating_add(1),
+            |work, group| work.saturating_add(group.vars.len()),
+        );
+        let default_values = input
+            .environments
+            .get(lpm_env::DEFAULT_ENVIRONMENT)
+            .map_or(0, HashMap::len);
+        let work = input
+            .environments
+            .iter()
+            .fold(0usize, |work, (name, values)| {
+                let selected_values =
+                    if lpm_env::reads_default_environment(name, !values.is_empty()) {
+                        default_values
+                    } else {
+                        values.len()
+                    };
+                work.saturating_add(per_environment)
+                    .saturating_add(selected_values)
+            });
+        if work > CHECK_WORK_LIMIT {
             return failure(4, "env.check_budget");
         }
         let validator = lpm_env::EnvValidator::new(&schema);
@@ -693,6 +712,55 @@ mod tests {
 
         let (status, _) = check(&wide, br#"{"environments":{"default":{},"production":{}}}"#);
         assert_eq!(status, 0, "a large schema within the budget is checked");
+    }
+
+    #[test]
+    fn checking_counts_default_values_for_every_environment_that_reads_them() {
+        let schema = effective(br#"{"vars":{"A":{}}}"#);
+        let default_values = (0..1024)
+            .map(|index| format!(r#""V{index}":"x""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let empty_environments = (0..255)
+            .map(|index| format!(r#""env{index}":{{}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let input = format!(
+            r#"{{"environments":{{"default":{{{default_values}}},{empty_environments}}}}}"#
+        );
+
+        let (status, output) = check(&schema, input.as_bytes());
+
+        assert_eq!(status, 4);
+        assert_eq!(output["code"], "env.check_budget");
+    }
+
+    #[test]
+    fn checking_counts_each_group_member_for_every_environment() {
+        let vars = (0..32)
+            .map(|index| format!(r#""V{index}":{{}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let members = (0..32)
+            .map(|index| format!(r#""V{index}""#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let groups = (0..128)
+            .map(|index| format!(r#""G{index}":{{"mode":"allOrNone","vars":[{members}]}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let schema =
+            effective(format!(r#"{{"vars":{{{vars}}},"groups":{{{groups}}}}}"#).as_bytes());
+        let environments = (0..64)
+            .map(|index| format!(r#""env{index}":{{}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let input = format!(r#"{{"environments":{{{environments}}}}}"#);
+
+        let (status, output) = check(&schema, input.as_bytes());
+
+        assert_eq!(status, 4);
+        assert_eq!(output["code"], "env.check_budget");
     }
 
     #[test]
