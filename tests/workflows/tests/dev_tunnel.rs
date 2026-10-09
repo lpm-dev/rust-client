@@ -763,9 +763,9 @@ async fn multi_service_dev_stops_when_the_tunnel_fails_after_readiness() {
                         "subdomain": "multi-ready.lpm.test",
                         "tunnel_url": "https://multi-ready.lpm.test",
                         "session_id": "session-multi-ready",
-                        "plan": "free",
+                        "plan": "pro",
                         "base_domain": "lpm.test",
-                        "domain_kind": "random"
+                        "domain_kind": "account"
                     })
                     .to_string(),
                 ))
@@ -1134,9 +1134,9 @@ async fn tunnel_start_under_json_emits_pretty_success_contract_on_stdout() {
                         "subdomain": "review-test.lpm.test",
                         "tunnel_url": "https://review-test.lpm.test",
                         "session_id": "session-review-test",
-                        "plan": "free",
+                        "plan": "pro",
                         "base_domain": "lpm.test",
-                        "domain_kind": "random"
+                        "domain_kind": "account"
                     })
                     .to_string(),
                 ))
@@ -1182,11 +1182,9 @@ async fn tunnel_start_under_json_emits_pretty_success_contract_on_stdout() {
       "local_port": 5173,
       "local_url": "http://127.0.0.1:5173/",
       "session_id": "session-review-test",
-      "plan": "free",
+      "plan": "pro",
       "base_domain": "lpm.test",
-      "domain_kind": "random",
-      "session_expires_at": null,
-      "session_max_ms": null,
+      "domain_kind": "account",
       "limits": null,
       "usage": null,
       "tunnel_auth": null,
@@ -1210,7 +1208,7 @@ async fn tunnel_json_reports_a_retry_before_a_successful_reconnection() {
             let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
             websocket.send(Message::Text(serde_json::json!({
                 "type":"hello", "subdomain":"retry.lpm.test", "tunnel_url":"https://retry.lpm.test",
-                "session_id":"session-retry", "plan":"free", "base_domain":"lpm.test", "domain_kind":"random"
+                "session_id":"session-retry", "plan":"pro", "base_domain":"lpm.test", "domain_kind":"account"
             }).to_string())).await.unwrap();
             websocket.close(None).await.unwrap();
         }).await.expect("retry relay timed out");
@@ -1280,9 +1278,9 @@ async fn tunnel_start_warns_that_capture_history_persists_sensitive_request_data
                         "subdomain": "capture-warning.lpm.test",
                         "tunnel_url": "https://capture-warning.lpm.test",
                         "session_id": "session-capture-warning",
-                        "plan": "free",
+                        "plan": "pro",
                         "base_domain": "lpm.test",
-                        "domain_kind": "random"
+                        "domain_kind": "account"
                     })
                     .to_string(),
                 ))

@@ -926,10 +926,12 @@ fn show_tunnel_notice(message: &str) {
     dev_ui::warn(message);
     if message.contains("not claimed") {
         dev_ui::hint_line("Run: lpm tunnel claim <domain>");
-    } else if message.contains("Pro plan") || message.contains("plan_required") {
-        dev_ui::hint_line("Upgrade at: https://lpm.dev/pricing");
+    } else if message.contains("plan_required") {
+        dev_ui::hint_line(
+            "Upgrade at https://lpm.dev/pricing, or connect with --domain and your organization's domain",
+        );
     } else if message.contains("concurrent") {
-        dev_ui::hint_line("Close other tunnels first, or upgrade your plan");
+        dev_ui::hint_line("Close another tunnel first");
     }
 }
 
@@ -974,11 +976,6 @@ fn render_tunnel_connection(publication: &TunnelReadyPublication) {
             publication.local_target_url,
         ),
     );
-    if let Some(expiry) =
-        crate::commands::tunnel::tunnel_session_expiry_summary(&publication.session)
-    {
-        dev_ui::hint_line(&format!("Tunnel expires {expiry}"));
-    }
     if let Some(limits) =
         crate::commands::tunnel::tunnel_limit_summary(publication.session.limits.as_ref())
     {
@@ -4895,8 +4892,6 @@ mod tests {
                 plan: None,
                 base_domain: None,
                 domain_kind: None,
-                session_expires_at: None,
-                session_max_ms: None,
                 limits: None,
             },
             local_target_url: new_target.url(),
@@ -4989,8 +4984,6 @@ mod tests {
                 plan: None,
                 base_domain: None,
                 domain_kind: None,
-                session_expires_at: None,
-                session_max_ms: None,
                 limits: None,
             },
             local_target_url: new_target.url(),

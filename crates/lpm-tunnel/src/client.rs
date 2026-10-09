@@ -72,10 +72,6 @@ enum RelayHandshakeMessage {
         #[serde(default)]
         domain_kind: Option<String>,
         #[serde(default)]
-        session_expires_at: Option<u64>,
-        #[serde(default)]
-        session_max_ms: Option<u64>,
-        #[serde(default)]
         limits: Option<Box<TunnelLimitMetadata>>,
         #[serde(default)]
         usage: Option<Box<TunnelUsageMetadata>>,
@@ -280,10 +276,11 @@ fn relay_code_retry_class(code: &str) -> Option<RetryClass> {
     match code {
         "auth_failed" => Some(RetryClass::AuthRejected),
         "plan_required"
+        | "domain_required"
         | "domain_not_owned"
         | "concurrent_limit"
         | "billing_inactive"
-        | "session_expired"
+        | "account_not_found"
         | "monthly_allowance_exhausted" => Some(RetryClass::Permanent),
         "auth_unavailable"
         | "domain_unavailable"
@@ -848,8 +845,9 @@ pub struct TunnelOptions {
     pub local_target: lpm_common::LocalTarget,
     /// Live endpoint source for dev services that can restart.
     pub live_local_target: Option<Arc<RwLock<lpm_common::LocalTarget>>>,
-    /// Full tunnel domain (e.g., "acme-api.lpm.llc"). Pro/Org only.
-    /// If None, relay assigns a random domain on lpm.fyi (free tier).
+    /// Full tunnel domain (e.g., "acme-api.lpm.llc"). If None, the relay uses
+    /// the Pro account's `<username>.lpm.fyi`. Organization tunnels need one of
+    /// the organization's claimed domains.
     /// If bare name without dot, ".lpm.fyi" is appended for backward compat.
     pub domain: Option<String>,
     /// Auth token for protecting the tunnel URL. When set, the relay
@@ -1932,8 +1930,6 @@ async fn try_connect_with_token(
                     plan,
                     base_domain,
                     domain_kind,
-                    session_expires_at,
-                    session_max_ms,
                     limits,
                     usage,
                     protocol,
@@ -1977,8 +1973,6 @@ async fn try_connect_with_token(
                             plan,
                             base_domain,
                             domain_kind,
-                            session_expires_at,
-                            session_max_ms,
                             limits: limits.map(|value| *value),
                         },
                         usage.map(|value| *value),
@@ -3364,13 +3358,15 @@ mod tests {
     fn relay_quota_errors_have_stable_retry_classification() {
         for code in [
             "plan_required",
+            "domain_required",
             "domain_not_owned",
             "concurrent_limit",
             "billing_inactive",
+            "account_not_found",
             "monthly_allowance_exhausted",
         ] {
             let body = format!(r#"{{"error":"denied","code":"{code}"}}"#);
-            let error = classify_relay_rejection(429, body.as_bytes());
+            let error = classify_relay_rejection(503, body.as_bytes());
             assert_eq!(error.retry_class, RetryClass::Permanent, "code={code}");
         }
 
@@ -3541,10 +3537,15 @@ mod tests {
 
     #[test]
     fn active_relay_errors_preserve_their_retry_classification() {
-        assert_eq!(
-            classify_relay_message_error("upgrade required", Some("plan_required")).retry_class,
-            RetryClass::Permanent
-        );
+        // The relay closes a tunnel with these codes when the account's access
+        // ends; reconnecting can't succeed until the plan changes.
+        for code in ["plan_required", "billing_inactive", "account_not_found"] {
+            assert_eq!(
+                classify_relay_message_error("access ended", Some(code)).retry_class,
+                RetryClass::Permanent,
+                "code={code}"
+            );
+        }
         assert_eq!(
             classify_relay_message_error("session expired", Some("auth_failed")).retry_class,
             RetryClass::AuthRejected

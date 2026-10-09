@@ -330,8 +330,9 @@ pub struct CertBlock {
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct TunnelConfig {
-    /// Full tunnel domain (e.g., "acme-api.lpm.llc").
-    /// Pro/Org only — free users get ephemeral random domains.
+    /// Full tunnel domain (e.g., "acme-api.lpm.llc"). Without it, a Pro account
+    /// uses `<username>.lpm.fyi`; organization tunnels need one of the
+    /// organization's claimed domains.
     #[serde(default)]
     pub domain: Option<String>,
 }
