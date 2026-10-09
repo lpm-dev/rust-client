@@ -1,7 +1,8 @@
 use crate::{
     MAX_DEPTH, MAX_EDGES, MAX_MERGE_VISITS, MAX_NODES, MAX_SCHEMA_BYTES, MAX_SOURCE_BYTES,
-    RESOLVER_VERSION, ResolutionStats, ResolvedSchema, SchemaDependency, SchemaSnapshot,
-    SourceError, SourceLocation, declaration_code, digest, json_size, read,
+    RESOLVER_VERSION, ReplacedGroups, ReplacedRules, ResolutionStats, ResolvedSchema,
+    SchemaDependency, SchemaSnapshot, SourceError, SourceLocation, declaration_code, digest,
+    json_size, read,
 };
 use lpm_env::{EnvSchema, EnvSchemaDefinition, EnvVarRule, VarGroup, env_schema_preset};
 use sha2::{Digest, Sha256};
@@ -14,6 +15,18 @@ struct Declaration<T> {
     origin: Arc<SourceLocation>,
     declaring_origin: Arc<SourceLocation>,
 }
+
+/// Imports that declare the same key: the first two locations, which an
+/// unsettled conflict reports, and, while lpm.json's own imports merge,
+/// each declaration after the first once, which an override that settles
+/// the conflict replaces.
+struct Conflict<T> {
+    origins: [Arc<SourceLocation>; 2],
+    others: Vec<Inherited<T>>,
+}
+
+/// An inherited declaration, where it comes from and what it says.
+type Inherited<T> = (Arc<SourceLocation>, Arc<T>);
 
 impl<T: serde::Serialize> serde::Serialize for Declaration<T> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -36,7 +49,8 @@ struct Node {
     height: usize,
     vars: HashMap<String, Declaration<EnvVarRule>>,
     groups: HashMap<String, Declaration<VarGroup>>,
-    prefixes: BTreeSet<String>,
+    /// Each prefix with the first schema, in resolution order, that lists it.
+    prefixes: BTreeMap<String, Arc<SourceLocation>>,
 }
 
 struct Graph {
@@ -50,6 +64,9 @@ struct Graph {
     stats: ResolutionStats,
     root_identity: Option<same_file::Handle>,
     named_root: Option<std::path::PathBuf>,
+    /// The inherited declarations each of lpm.json's overrides replaces.
+    root_replaced: BTreeMap<String, Vec<Inherited<EnvVarRule>>>,
+    root_replaced_groups: BTreeMap<String, Vec<Inherited<VarGroup>>>,
 }
 
 pub(crate) fn resolve(
@@ -90,6 +107,8 @@ pub(crate) fn resolve(
         root,
         root_identity: Some(root_identity),
         named_root,
+        root_replaced: BTreeMap::new(),
+        root_replaced_groups: BTreeMap::new(),
         memo: HashMap::with_capacity(MAX_NODES),
         active: HashSet::with_capacity(MAX_DEPTH),
         identities: HashMap::with_capacity(MAX_NODES),
@@ -201,6 +220,10 @@ impl Graph {
         let mut node = Node::default();
         let mut var_conflicts = BTreeMap::new();
         let mut group_conflicts = BTreeMap::new();
+        // Only lpm.json's own overrides report what they replace.
+        let records_replaced = depth == 0;
+        let mut replaced = BTreeMap::new();
+        let mut replaced_groups = BTreeMap::new();
         for import in definition.extends {
             if self.stats.edges == MAX_EDGES {
                 return Err(SourceError::new(
@@ -223,9 +246,23 @@ impl Graph {
                 inherited.vars.len() + inherited.groups.len() + inherited.prefixes.len(),
                 source,
             )?;
-            merge(&mut node.vars, &inherited.vars, &mut var_conflicts);
-            merge(&mut node.groups, &inherited.groups, &mut group_conflicts);
-            node.prefixes.extend(inherited.prefixes.iter().cloned());
+            merge(
+                &mut node.vars,
+                &inherited.vars,
+                &mut var_conflicts,
+                records_replaced,
+            );
+            merge(
+                &mut node.groups,
+                &inherited.groups,
+                &mut group_conflicts,
+                records_replaced,
+            );
+            for (prefix, origin) in &inherited.prefixes {
+                node.prefixes
+                    .entry(prefix.clone())
+                    .or_insert_with(|| Arc::clone(origin));
+            }
             check_counts(&node, source)?;
         }
         self.visit_cost(
@@ -241,6 +278,7 @@ impl Graph {
             definition.vars,
             definition.overrides,
             &mut var_conflicts,
+            records_replaced.then_some(&mut replaced),
             source,
             "vars",
             "overrides",
@@ -250,11 +288,23 @@ impl Graph {
             definition.groups,
             definition.group_overrides,
             &mut group_conflicts,
+            records_replaced.then_some(&mut replaced_groups),
             source,
             "groups",
             "groupOverrides",
         )?;
-        node.prefixes.extend(definition.client_prefixes);
+        if records_replaced {
+            self.root_replaced = replaced;
+            self.root_replaced_groups = replaced_groups;
+        }
+        for (index, prefix) in definition.client_prefixes.into_iter().enumerate() {
+            node.prefixes.entry(prefix).or_insert_with(|| {
+                Arc::new(SourceLocation {
+                    source: source.into(),
+                    pointer: pointer(source, "clientPrefixes", &index.to_string()),
+                })
+            });
+        }
         check_counts(&node, source)?;
         if node
             .groups
@@ -294,8 +344,12 @@ impl Graph {
             vars: &'a HashMap<String, Declaration<EnvVarRule>>,
             #[serde(skip_serializing_if = "HashMap::is_empty")]
             groups: &'a HashMap<String, Declaration<VarGroup>>,
-            #[serde(rename = "clientPrefixes", skip_serializing_if = "BTreeSet::is_empty")]
-            prefixes: &'a BTreeSet<String>,
+            #[serde(
+                rename = "clientPrefixes",
+                skip_serializing_if = "BTreeMap::is_empty",
+                serialize_with = "serialize_keys"
+            )]
+            prefixes: &'a BTreeMap<String, Arc<SourceLocation>>,
         }
         json_size(
             &SharedSchema {
@@ -323,6 +377,44 @@ impl Graph {
             .iter()
             .map(|(key, declaration)| (key.clone(), (*declaration.origin).clone()))
             .collect();
+        let group_declaring_origins: BTreeMap<_, _> = node
+            .groups
+            .iter()
+            .filter(|(_, declaration)| {
+                !Arc::ptr_eq(&declaration.origin, &declaration.declaring_origin)
+            })
+            .map(|(key, declaration)| (key.clone(), (*declaration.declaring_origin).clone()))
+            .collect();
+        let client_prefix_origins: BTreeMap<_, _> = node
+            .prefixes
+            .iter()
+            .map(|(prefix, origin)| (prefix.clone(), (**origin).clone()))
+            .collect();
+        let replaced_vars: BTreeMap<_, _> = std::mem::take(&mut self.root_replaced)
+            .into_iter()
+            .filter_map(|(key, rules)| {
+                let replaced = ReplacedRules {
+                    count: rules.len(),
+                    origin: (*rules.first()?.0).clone(),
+                    client: rules.iter().all(|(_, rule)| rule.client),
+                    secret: rules
+                        .iter()
+                        .find(|(_, rule)| rule.secret)
+                        .map(|(origin, _)| (**origin).clone()),
+                };
+                Some((key, replaced))
+            })
+            .collect();
+        let replaced_groups: BTreeMap<_, _> = std::mem::take(&mut self.root_replaced_groups)
+            .into_iter()
+            .filter_map(|(name, groups)| {
+                let replaced = ReplacedGroups {
+                    count: groups.len(),
+                    origin: (*groups.first()?.0).clone(),
+                };
+                Some((name, replaced))
+            })
+            .collect();
         self.memo.clear();
         let node = Arc::try_unwrap(node).map_err(|_| {
             SourceError::new("env.engine_internal", "resolve", "lpm.json", "/envSchema")
@@ -348,7 +440,7 @@ impl Graph {
                     )
                 })
                 .collect(),
-            client_prefixes: node.prefixes.into_iter().collect(),
+            client_prefixes: node.prefixes.into_keys().collect(),
         };
 
         if let Some(error) = lpm_env::validate_schema(&schema).into_iter().next() {
@@ -389,6 +481,10 @@ impl Graph {
                 origins,
                 group_origins,
                 declaring_origins,
+                group_declaring_origins,
+                client_prefix_origins,
+                replaced_vars,
+                replaced_groups,
                 dependencies,
                 fingerprint: hash.finalize().into(),
                 root_digest,
@@ -459,6 +555,13 @@ fn hash_record(hash: &mut Sha256, bytes: &[u8]) {
     hash.update(bytes);
 }
 
+fn serialize_keys<S: serde::Serializer, V>(
+    map: &&BTreeMap<String, V>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(map.keys())
+}
+
 fn check_counts(node: &Node, source: &str) -> Result<(), SourceError> {
     if node.vars.len() > 4096 || node.groups.len() > 128 || node.prefixes.len() > 32 {
         return Err(SourceError::new(
@@ -471,20 +574,36 @@ fn check_counts(node: &Node, source: &str) -> Result<(), SourceError> {
     Ok(())
 }
 
+/// Merges `source`'s declarations into `target`, noting each key two
+/// imports declare differently. With `records_others`, a conflict also keeps
+/// every later declaration, once per origin, for the override that settles it.
 fn merge<T>(
     target: &mut HashMap<String, Declaration<T>>,
     source: &HashMap<String, Declaration<T>>,
-    conflicts: &mut BTreeMap<String, [Arc<SourceLocation>; 2]>,
+    conflicts: &mut BTreeMap<String, Conflict<T>>,
+    records_others: bool,
 ) {
     for (key, declaration) in source {
         if let Some(existing) = target.get(key) {
             if !Arc::ptr_eq(&existing.origin, &declaration.origin) {
-                conflicts.entry(key.clone()).or_insert_with(|| {
-                    [
+                let conflict = conflicts.entry(key.clone()).or_insert_with(|| Conflict {
+                    origins: [
                         Arc::clone(&existing.origin),
                         Arc::clone(&declaration.origin),
-                    ]
+                    ],
+                    others: Vec::new(),
                 });
+                if records_others
+                    && !conflict
+                        .others
+                        .iter()
+                        .any(|(origin, _)| Arc::ptr_eq(origin, &declaration.origin))
+                {
+                    conflict.others.push((
+                        Arc::clone(&declaration.origin),
+                        Arc::clone(&declaration.value),
+                    ));
+                }
             }
         } else {
             target.insert(key.clone(), declaration.clone());
@@ -492,11 +611,15 @@ fn merge<T>(
     }
 }
 
+/// Applies a schema's own declarations and overrides over what it inherits.
+/// With `replaced`, each override records the inherited declarations it replaces.
+#[allow(clippy::too_many_arguments)]
 fn apply<T>(
     target: &mut HashMap<String, Declaration<T>>,
     local: HashMap<String, T>,
     overrides: HashMap<String, T>,
-    conflicts: &mut BTreeMap<String, [Arc<SourceLocation>; 2]>,
+    conflicts: &mut BTreeMap<String, Conflict<T>>,
+    mut replaced: Option<&mut BTreeMap<String, Vec<Inherited<T>>>>,
     source: &str,
     field: &str,
     override_field: &str,
@@ -544,9 +667,10 @@ fn apply<T>(
             pointer: pointer(source, field, &key),
         });
         if let Some(existing) = target.get(&key) {
-            conflicts
-                .entry(key.clone())
-                .or_insert_with(|| [Arc::clone(&existing.origin), Arc::clone(&origin)]);
+            conflicts.entry(key.clone()).or_insert_with(|| Conflict {
+                origins: [Arc::clone(&existing.origin), Arc::clone(&origin)],
+                others: Vec::new(),
+            });
         }
         target.insert(
             key,
@@ -569,16 +693,25 @@ fn apply<T>(
             return Err(error);
         };
         // An override is a replacement, never a partial merge of security policy.
-        conflicts.remove(&key);
+        let settled = conflicts.remove(&key);
         let origin = Arc::new(SourceLocation {
             source: source.into(),
             pointer: pointer(source, override_field, &key),
         });
+        if let Some(replaced) = replaced.as_deref_mut() {
+            let mut inherited = vec![(Arc::clone(&existing.origin), Arc::clone(&existing.value))];
+            inherited.extend(settled.into_iter().flat_map(|conflict| conflict.others));
+            replaced.insert(key.clone(), inherited);
+        }
         existing.value = Arc::new(value);
         existing.origin = origin;
     }
-    if let Some((key, origins)) = conflicts.first_key_value() {
-        return Err(conflict_error(key, &origins[0], &origins[1]));
+    if let Some((key, conflict)) = conflicts.first_key_value() {
+        return Err(conflict_error(
+            key,
+            &conflict.origins[0],
+            &conflict.origins[1],
+        ));
     }
     Ok(())
 }
@@ -648,7 +781,7 @@ mod tests {
         let mut target = source.clone();
         let mut conflicts = BTreeMap::new();
         let (_, allocated, maximum) =
-            crate::tests::allocation_probe(|| merge(&mut target, &source, &mut conflicts));
+            crate::tests::allocation_probe(|| merge(&mut target, &source, &mut conflicts, true));
         assert_eq!(allocated, 0);
         assert_eq!(maximum, 0);
         assert_eq!(target.len(), 4096);

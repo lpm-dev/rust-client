@@ -132,6 +132,14 @@ pub unsafe extern "C" fn lpm_env_resolve(
                         &'a std::collections::BTreeMap<String, lpm_env_source::SourceLocation>,
                     declaring_origins:
                         &'a std::collections::BTreeMap<String, lpm_env_source::SourceLocation>,
+                    group_declaring_origins:
+                        &'a std::collections::BTreeMap<String, lpm_env_source::SourceLocation>,
+                    client_prefix_origins:
+                        &'a std::collections::BTreeMap<String, lpm_env_source::SourceLocation>,
+                    replaced_vars:
+                        &'a std::collections::BTreeMap<String, lpm_env_source::ReplacedRules>,
+                    replaced_groups:
+                        &'a std::collections::BTreeMap<String, lpm_env_source::ReplacedGroups>,
                     dependencies: &'a [lpm_env_source::SchemaDependency],
                     fingerprint: String,
                 }
@@ -142,6 +150,10 @@ pub unsafe extern "C" fn lpm_env_resolve(
                     origins: &resolved.origins,
                     group_origins: &resolved.group_origins,
                     declaring_origins: &resolved.declaring_origins,
+                    group_declaring_origins: &resolved.group_declaring_origins,
+                    client_prefix_origins: &resolved.client_prefix_origins,
+                    replaced_vars: &resolved.replaced_vars,
+                    replaced_groups: &resolved.replaced_groups,
                     dependencies: &resolved.dependencies,
                     fingerprint: hex::encode(resolved.fingerprint),
                 };
@@ -153,6 +165,10 @@ pub unsafe extern "C" fn lpm_env_resolve(
                         snapshot.origins.clear();
                         snapshot.group_origins.clear();
                         snapshot.declaring_origins.clear();
+                        snapshot.group_declaring_origins.clear();
+                        snapshot.client_prefix_origins.clear();
+                        snapshot.replaced_vars.clear();
+                        snapshot.replaced_groups.clear();
                         result(0, bytes, Some(resolved.snapshot))
                     }
                     Err(_) => failure(4, "env.output_budget"),
@@ -493,6 +509,10 @@ mod tests {
             assert!(retained.origins.is_empty());
             assert!(retained.group_origins.is_empty());
             assert!(retained.declaring_origins.is_empty());
+            assert!(retained.group_declaring_origins.is_empty());
+            assert!(retained.client_prefix_origins.is_empty());
+            assert!(retained.replaced_vars.is_empty());
+            assert!(retained.replaced_groups.is_empty());
             lpm_env_clear_output(&mut result);
             lpm_env_release(result);
         }
@@ -525,6 +545,99 @@ mod tests {
             "/vars/INHERITED"
         );
         assert!(actual["declaringOrigins"].get("LOCAL").is_none());
+    }
+
+    #[test]
+    fn overrides_report_the_rules_they_replace_and_where_groups_and_prefixes_come_from() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("base.json"),
+            r#"{"vars":{"SHARED_TOKEN":{"secret":true},"SHARED_REGION":{"client":true},"MIDDLE":{}},"groups":{"pair":{"mode":"allOrNone","vars":["SHARED_TOKEN","MIDDLE"]},"solo":{"mode":"atLeastOne","vars":["MIDDLE"]}},"clientPrefixes":["SHARED_","BASE_"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("middle.json"),
+            r#"{"extends":["base.json"],"overrides":{"MIDDLE":{"required":true}}}"#,
+        )
+        .unwrap();
+        let input = br#"{"extends":["middle.json"],"clientPrefixes":["OWN_","SHARED_"],"vars":{"LOCAL":{}},"overrides":{"SHARED_TOKEN":{"client":true}},"groupOverrides":{"pair":{"mode":"exactlyOne","vars":["SHARED_TOKEN","MIDDLE"]}}}"#;
+        let result = resolve(input, dir.path().to_str().unwrap());
+        assert_eq!(result.status, 0, "{}", output(&result));
+        let actual = output(&result);
+        // SAFETY: This is the sole release of the returned result.
+        unsafe {
+            lpm_env_release(result);
+        }
+        assert_eq!(
+            actual["replacedVars"],
+            serde_json::json!({"SHARED_TOKEN": {
+                "count": 1,
+                "origin": {"source": "base.json", "pointer": "/vars/SHARED_TOKEN"},
+                "client": false,
+                "secret": {"source": "base.json", "pointer": "/vars/SHARED_TOKEN"},
+            }}),
+            "Only lpm.json's own overrides report what they replace"
+        );
+        assert_eq!(
+            actual["replacedGroups"],
+            serde_json::json!({"pair": {"count": 1, "origin": {"source": "base.json", "pointer": "/groups/pair"}}})
+        );
+        assert_eq!(actual["effective"]["vars"]["SHARED_TOKEN"]["client"], true);
+        assert_eq!(actual["groupOrigins"]["pair"]["source"], "lpm.json");
+        assert_eq!(
+            actual["groupDeclaringOrigins"],
+            serde_json::json!({"pair": {"source": "base.json", "pointer": "/groups/pair"}})
+        );
+        assert_eq!(
+            actual["clientPrefixOrigins"],
+            serde_json::json!({
+                "BASE_": {"source": "base.json", "pointer": "/clientPrefixes/1"},
+                "OWN_": {"source": "lpm.json", "pointer": "/envSchema/clientPrefixes/0"},
+                "SHARED_": {"source": "base.json", "pointer": "/clientPrefixes/0"},
+            }),
+            "A prefix lpm.json shares with an import names the import"
+        );
+        assert_eq!(
+            actual["effective"]["clientPrefixes"],
+            serde_json::json!(["BASE_", "OWN_", "SHARED_"])
+        );
+    }
+
+    #[test]
+    fn replaced_rules_are_summarized_without_their_values_and_stay_small() {
+        let dir = tempfile::tempdir().unwrap();
+        let description = "d".repeat(1024 * 1024);
+        std::fs::write(
+            dir.path().join("d.json"),
+            format!(
+                r#"{{"vars":{{"KEY":{{"secret":true,"default":"PRIVATE_LITERAL","enum":["PRIVATE_LITERAL"],"description":"{description}"}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let paths: Vec<String> = (0..8).map(|index| format!("p{index}.json")).collect();
+        for path in &paths {
+            std::fs::write(dir.path().join(path), r#"{"extends":["d.json"]}"#).unwrap();
+        }
+        let input = serde_json::json!({"extends": paths, "overrides": {"KEY": {}}}).to_string();
+        let result = resolve(input.as_bytes(), dir.path().to_str().unwrap());
+        assert_eq!(result.status, 0, "{}", output(&result));
+        let actual = output(&result);
+        // SAFETY: This is the sole release of the returned result.
+        unsafe {
+            lpm_env_release(result);
+        }
+        let text = actual.to_string();
+        assert!(
+            !text.contains("PRIVATE_LITERAL"),
+            "An overridden rule's values never leave the engine"
+        );
+        assert!(
+            text.len() < 64 * 1024,
+            "The summary doesn't grow with the rule or the paths: {} bytes",
+            text.len()
+        );
+        assert_eq!(actual["replacedVars"]["KEY"]["count"], 1);
+        assert_eq!(actual["replacedVars"]["KEY"]["secret"]["source"], "d.json");
     }
 
     #[test]
