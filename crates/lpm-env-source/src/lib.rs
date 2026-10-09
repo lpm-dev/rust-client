@@ -142,6 +142,33 @@ pub struct ResolutionStats {
     pub merge_visits: usize,
 }
 
+/// The inherited rules one of lpm.json's variable overrides replaces, in
+/// summary: never their values, which no validation has checked once
+/// they're overridden.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplacedRules {
+    /// How many: more than one when the override settles a conflict between
+    /// imports, each import counted once however many paths reach it.
+    pub count: usize,
+    /// Where the first one comes from: what lpm.json's imports resolve, an
+    /// import's own override when one overrides the original declaration.
+    pub origin: SourceLocation,
+    /// Whether every one marks the variable client-visible.
+    pub client: bool,
+    /// Where the first one that marks the variable secret comes from; none when none does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret: Option<SourceLocation>,
+}
+
+/// The inherited groups one of lpm.json's group overrides replaces, in summary.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplacedGroups {
+    /// How many: more than one when the override settles a conflict between imports.
+    pub count: usize,
+    /// Where the first one comes from, as for `ReplacedRules`.
+    pub origin: SourceLocation,
+}
+
 /// Effective declarations and provenance belong to the same retained root capability.
 #[derive(Debug)]
 pub struct SchemaSnapshot {
@@ -149,6 +176,15 @@ pub struct SchemaSnapshot {
     pub group_origins: BTreeMap<String, SourceLocation>,
     /// Original declaration locations for variables replaced by overrides.
     pub declaring_origins: BTreeMap<String, SourceLocation>,
+    /// Original declaration locations for groups replaced by overrides.
+    pub group_declaring_origins: BTreeMap<String, SourceLocation>,
+    /// Where each client prefix is listed: the first schema in resolution
+    /// order that lists it, so a prefix lpm.json shares with an import names the import.
+    pub client_prefix_origins: BTreeMap<String, SourceLocation>,
+    /// What each of lpm.json's variable overrides replaces.
+    pub replaced_vars: BTreeMap<String, ReplacedRules>,
+    /// What each of lpm.json's group overrides replaces.
+    pub replaced_groups: BTreeMap<String, ReplacedGroups>,
     pub dependencies: Vec<SchemaDependency>,
     pub fingerprint: [u8; 32],
     pub root_digest: [u8; 32],

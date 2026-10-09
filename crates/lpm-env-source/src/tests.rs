@@ -143,6 +143,112 @@ fn complete_overrides_resolve_conflicts_without_retaining_inherited_security_pol
 }
 
 #[test]
+fn an_override_that_settles_a_conflict_replaces_every_import_s_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, rule) in [
+        ("one.json", r#"{"default":"public","client":true}"#),
+        ("two.json", r#"{"secret":true}"#),
+        ("three.json", r#"{"required":true}"#),
+    ] {
+        fs::write(
+            dir.path().join(name),
+            format!(r#"{{"vars":{{"VALUE":{rule}}},"clientPrefixes":["SHARED_"]}}"#),
+        )
+        .unwrap();
+    }
+    let result = resolve(
+        &dir,
+        serde_json::json!({
+            "extends":["one.json","two.json","three.json"],
+            "overrides":{"VALUE":{}},
+            "clientPrefixes":["SHARED_","OWN_"],
+        }),
+    )
+    .unwrap();
+    let replaced = &result.replaced_vars["VALUE"];
+    assert_eq!(
+        replaced.count, 3,
+        "The override replaces each import's rule"
+    );
+    assert_eq!(
+        replaced.origin.source, "one.json",
+        "The first in resolution order"
+    );
+    assert!(!replaced.client, "Not every replaced rule marks it public");
+    let secret = replaced.secret.as_ref().unwrap();
+    assert_eq!(
+        (secret.source.as_str(), secret.pointer.as_str()),
+        ("two.json", "/vars/VALUE")
+    );
+    assert_eq!(result.declaring_origins["VALUE"].source, "one.json");
+    assert_eq!(result.client_prefix_origins["SHARED_"].source, "one.json");
+    assert_eq!(
+        result.client_prefix_origins["OWN_"].pointer,
+        "/envSchema/clientPrefixes/1"
+    );
+}
+
+#[test]
+fn an_import_reached_by_several_paths_is_replaced_once() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("b.json"), r#"{"vars":{"K":{}}}"#).unwrap();
+    fs::write(
+        dir.path().join("e.json"),
+        r#"{"vars":{"K":{"secret":true}}}"#,
+    )
+    .unwrap();
+    for name in ["c.json", "d.json"] {
+        fs::write(dir.path().join(name), r#"{"extends":["e.json"]}"#).unwrap();
+    }
+    let result = resolve(
+        &dir,
+        serde_json::json!({"extends":["b.json","c.json","d.json"],"overrides":{"K":{}}}),
+    )
+    .unwrap();
+    let replaced = &result.replaced_vars["K"];
+    assert_eq!(
+        replaced.count, 2,
+        "b.json and e.json, however many paths reach e.json"
+    );
+    assert_eq!(replaced.secret.as_ref().unwrap().source, "e.json");
+}
+
+#[test]
+fn an_override_replaces_what_its_imports_resolve_not_what_they_override() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("d.json"),
+        r#"{"vars":{"K":{"secret":true}}}"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("m.json"),
+        r#"{"extends":["d.json"],"overrides":{"K":{"required":true}}}"#,
+    )
+    .unwrap();
+    let result = resolve(
+        &dir,
+        serde_json::json!({"extends":["m.json"],"overrides":{"K":{}}}),
+    )
+    .unwrap();
+    let replaced = &result.replaced_vars["K"];
+    assert_eq!(replaced.count, 1);
+    assert_eq!(
+        (
+            replaced.origin.source.as_str(),
+            replaced.origin.pointer.as_str()
+        ),
+        ("m.json", "/overrides/K"),
+        "lpm.json's override replaces m.json's"
+    );
+    assert!(
+        replaced.secret.is_none(),
+        "m.json's override is the rule replaced, and it isn't secret"
+    );
+    assert_eq!(result.declaring_origins["K"].source, "d.json");
+}
+
+#[test]
 fn overrides_require_an_inherited_declaration_and_cannot_duplicate_local_rules() {
     let dir = tempfile::tempdir().unwrap();
     for input in [
