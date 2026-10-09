@@ -92,7 +92,7 @@ pub enum ServerMessage {
         /// Wire format uses "subdomain" for backward compat with relay Worker.
         #[serde(rename = "subdomain")]
         domain: String,
-        /// Full tunnel URL (e.g., `https://abc123.t.lpm.dev`).
+        /// Full tunnel URL (e.g., `https://acme.lpm.fyi`).
         tunnel_url: String,
         /// Session ID for reconnection.
         session_id: String,

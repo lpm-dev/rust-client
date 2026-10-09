@@ -922,16 +922,34 @@ fn publish_primary_endpoint(
     Ok(())
 }
 
+fn tunnel_notice_hint(message: &str) -> Option<&'static str> {
+    if message.contains("not claimed") {
+        Some("Run: lpm tunnel claim <domain>")
+    } else if message.contains("concurrent") {
+        Some("Close another tunnel first")
+    } else {
+        None
+    }
+}
+
 fn show_tunnel_notice(message: &str) {
     dev_ui::warn(message);
-    if message.contains("not claimed") {
-        dev_ui::hint_line("Run: lpm tunnel claim <domain>");
-    } else if message.contains("plan_required") {
-        dev_ui::hint_line(
-            "Upgrade at https://lpm.dev/pricing, or connect with --domain and your organization's domain",
-        );
-    } else if message.contains("concurrent") {
-        dev_ui::hint_line("Close another tunnel first");
+    if let Some(hint) = tunnel_notice_hint(message) {
+        dev_ui::hint_line(hint);
+    }
+}
+
+fn tunnel_failure_hint(error: &LpmError) -> Option<String> {
+    match error {
+        LpmError::TunnelAccess { help, .. } => Some(help.clone()),
+        _ => tunnel_notice_hint(&error.to_string()).map(str::to_owned),
+    }
+}
+
+fn show_tunnel_failure(error: &LpmError) {
+    dev_ui::warn(&format!("Tunnel failed: {error}"));
+    if let Some(hint) = tunnel_failure_hint(error) {
+        dev_ui::hint_line(&hint);
     }
 }
 
@@ -1744,7 +1762,7 @@ pub async fn run(
                 {
                     let _ = sender.send(Err::<TunnelReadyPublication, String>(error.to_string()));
                 }
-                show_tunnel_notice(&format!("Tunnel failed: {error}"));
+                show_tunnel_failure(error);
                 if let Some(controller) = tunnel_failure_controller.as_ref() {
                     controller.send(lpm_runner::orchestrator::OrchestratorCommand::StopAll);
                 }
@@ -2429,7 +2447,7 @@ pub async fn run(
                     )
                     .await;
                     if let Err(error) = &result {
-                        show_tunnel_notice(&format!("Tunnel failed: {error}"));
+                        show_tunnel_failure(error);
                     }
                     result
                 }));
@@ -4333,6 +4351,25 @@ async fn serve_ca_cert(listener: tokio::net::TcpListener, ca_cert_data: Arc<[u8]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tunnel_failure_hints_explain_account_refusals_by_their_code() {
+        let refused = LpmError::tunnel_access("plan_required", "Tunnels need a Pro plan");
+        let hint = tunnel_failure_hint(&refused).unwrap();
+        assert!(hint.contains("lpm dev --domain <domain>"), "{hint}");
+        assert!(hint.contains("https://lpm.dev/pricing"), "{hint}");
+        assert_eq!(
+            tunnel_failure_hint(&LpmError::Tunnel(
+                "relay rejected connection: Domain is not claimed by you (domain_not_owned)".into()
+            ))
+            .as_deref(),
+            Some("Run: lpm tunnel claim <domain>")
+        );
+        assert_eq!(
+            tunnel_failure_hint(&LpmError::Tunnel("connection reset".into())),
+            None
+        );
+    }
     use crate::install_state::compute_install_hash;
     use std::collections::HashMap;
     use std::fs;
