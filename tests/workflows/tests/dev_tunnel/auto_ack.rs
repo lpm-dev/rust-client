@@ -1,5 +1,4 @@
 use super::*;
-use futures_util::StreamExt;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_ack_is_on_disk_before_provider_receives_success() {
@@ -18,18 +17,27 @@ async fn auto_ack_is_on_disk_before_provider_receives_success() {
             let (socket, _) = relay.accept().await.unwrap();
             let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
             websocket.send(Message::Text(serde_json::json!({
-                "type":"hello", "subdomain":"capture.lpm.test", "tunnel_url":"https://capture.lpm.test",
-                "session_id":"durable-session", "plan":"free", "base_domain":"lpm.test", "domain_kind":"random"
+                "type":"hello", "protocol":4, "transport_seq":1, "transport_ack_nonce":"00000000-0000-4000-8000-000000000001", "subdomain":"capture.lpm.test", "tunnel_url":"https://capture.lpm.test",
+                "session_id":"durable-session", "plan":"pro", "base_domain":"lpm.test", "domain_kind":"random"
             }).to_string())).await.unwrap();
+            await_fixture_ready(&mut websocket).await;
             websocket.send(Message::Text(serde_json::json!({
-                "type":"http_request", "id":"durable-auto-ack", "method":"POST", "url":"/webhook",
+                "type":"http_request", "transport_seq":2, "transport_ack_nonce":"00000000-0000-4000-8000-000000000002", "id":"durable-auto-ack", "method":"POST", "url":"/webhook",
                 "headers":{"content-type":"application/json"}, "body":"e30="
             }).to_string())).await.unwrap();
+            let mut request_acked = false;
             loop {
                 let message = websocket.next().await.unwrap().unwrap();
                 let Message::Text(text) = message else { continue };
                 let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if response["type"] == "transport_ack" {
+                    assert_eq!(response["transport_seq"], 2);
+                    assert_eq!(response["transport_ack_nonce"], "00000000-0000-4000-8000-000000000002");
+                    request_acked = true;
+                    continue;
+                }
                 if response["id"] != "durable-auto-ack" { continue }
+                assert!(request_acked, "request receipt precedes the provider response");
                 assert_eq!(response["status"], 200);
                 // Read through a new connection before shutdown can flush queued captures.
                 let db = lpm_inspect::db::InspectorDb::open(&project_path).unwrap();

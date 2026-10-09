@@ -4095,6 +4095,7 @@ name = "lpm-tunnel"
 version = "0.80.0"
 dependencies = [
  "base64",
+ "bytes",
  "chrono",
  "futures-util",
  "hex",

@@ -398,6 +398,9 @@ fn tunnel_ready_json(
     auto_ack: bool,
 ) -> serde_json::Value {
     serde_json::json!({
+        "schema_version": 2,
+        "event": "ready",
+        "protocol": 4,
         "success": true,
         "tunnel_url": session.tunnel_url,
         "domain": session.domain,
@@ -648,7 +651,7 @@ pub(crate) async fn run_start(
         |msg| {
             if json_output {
                 let event = serde_json::json!({
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "success": false,
                     "event": "retry",
                     "error_code": "tunnel_retry",
@@ -664,11 +667,13 @@ pub(crate) async fn run_start(
             *usage_for_notices
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(usage.clone());
-            if !initial
-                && !json_output
-                && let Some(summary) = tunnel_usage_summary(Some(usage))
-            {
-                install_ui::warn_untrusted(&format!("Tunnel usage: {summary}"));
+            if !initial {
+                if json_output {
+                    let event = serde_json::json!({ "schema_version": 2, "success": true, "event": "usage_notice", "quota_version": usage.quota_version, "usage": usage });
+                    println!("{event:#}");
+                } else if let Some(summary) = tunnel_usage_summary(Some(usage)) {
+                    install_ui::warn_untrusted(&format!("Tunnel usage: {summary}"));
+                }
             }
         },
     );
@@ -1393,11 +1398,39 @@ pub(crate) fn tunnel_usage_summary(
             usage.overage_requests.unwrap_or_default()
         ));
     }
-    summary.push_str(if usage.overage_enabled.unwrap_or(false) {
-        " · overage on"
+    if let (Some(used), Some(included)) = (usage.busy_object_ms, usage.included_busy_object_ms) {
+        summary.push_str(&format!(
+            " · {:.1} / {:.1} busy h",
+            used as f64 / 3_600_000.0,
+            included as f64 / 3_600_000.0
+        ));
+    }
+    if let (Some(used), Some(included)) = (usage.relay_messages, usage.included_relay_messages) {
+        summary.push_str(&format!(" · {used} / {included} relay messages"));
+    }
+    if let (Some(used), Some(included)) = (usage.transfer_bytes, usage.included_transfer_bytes) {
+        summary.push_str(&format!(
+            " · {:.1} / {:.1} GiB",
+            used as f64 / 1024_f64.powi(3),
+            included as f64 / 1024_f64.powi(3)
+        ));
+    }
+    if let (Some(used), Some(included)) = (
+        usage.connection_attempts,
+        usage.included_connection_attempts,
+    ) {
+        summary.push_str(&format!(" · {used} / {included} connections"));
+    }
+    if usage.overage_enabled.unwrap_or(false) && usage.authorized_bundles.unwrap_or_default() > 0 {
+        summary.push_str(&format!(
+            " · {} / {} bundles (${:.2} cap)",
+            usage.billable_bundles.unwrap_or_default(),
+            usage.authorized_bundles.unwrap_or_default(),
+            usage.overage_spend_cap_cents.unwrap_or_default() as f64 / 100.0
+        ));
     } else {
-        " · hard stop"
-    });
+        summary.push_str(" · hard stop");
+    }
     Some(summary)
 }
 
@@ -2136,6 +2169,9 @@ mod tests {
         assert_eq!(output["local_url"], "http://[::1]:5173/app/");
         insta::assert_json_snapshot!(output, @r###"
         {
+          "schema_version": 2,
+          "event": "ready",
+          "protocol": 4,
           "success": true,
           "tunnel_url": "https://orange-moon.lpm.fyi",
           "domain": "orange-moon.lpm.fyi",
@@ -2282,6 +2318,8 @@ mod tests {
     #[test]
     fn tunnel_limit_summary_includes_account_and_relay_caps() {
         let limits = lpm_tunnel::TunnelLimitMetadata {
+            quota_version: Some(2),
+            public_websockets_available: Some(false),
             max_concurrent: Some(1),
             request_rate_limit_per_minute: Some(4_000),
             per_ip_rate_limit_per_minute: Some(600),
@@ -2299,6 +2337,8 @@ mod tests {
     #[test]
     fn tunnel_limit_summary_displays_unlimited_request_rate() {
         let limits = lpm_tunnel::TunnelLimitMetadata {
+            quota_version: Some(2),
+            public_websockets_available: Some(false),
             max_concurrent: Some(3),
             request_rate_limit_per_minute: Some(20_000),
             per_ip_rate_limit_per_minute: Some(600),
@@ -2324,7 +2364,34 @@ mod tests {
         };
         assert_eq!(
             tunnel_usage_summary(Some(&usage)).as_deref(),
-            Some("100250 / 100000 requests · 250 overage · overage on")
+            Some("100250 / 100000 requests · 250 overage · hard stop")
+        );
+    }
+
+    #[test]
+    fn tunnel_usage_summary_shows_all_resources_connections_and_authorized_spend() {
+        let usage = lpm_tunnel::TunnelUsageMetadata {
+            accepted_requests: Some(25_000),
+            included_requests: Some(50_000),
+            busy_object_ms: Some(90_000_000),
+            included_busy_object_ms: Some(180_000_000),
+            relay_messages: Some(500_000),
+            included_relay_messages: Some(1_000_000),
+            transfer_bytes: Some(5 * 1024 * 1024 * 1024),
+            included_transfer_bytes: Some(10 * 1024 * 1024 * 1024),
+            connection_attempts: Some(10),
+            included_connection_attempts: Some(1_000),
+            overage_enabled: Some(true),
+            authorized_bundles: Some(2),
+            billable_bundles: Some(1),
+            overage_spend_cap_cents: Some(1_200),
+            ..Default::default()
+        };
+        assert_eq!(
+            tunnel_usage_summary(Some(&usage)).as_deref(),
+            Some(
+                "25000 / 50000 requests · 25.0 / 50.0 busy h · 500000 / 1000000 relay messages · 5.0 / 10.0 GiB · 10 / 1000 connections · 1 / 2 bundles ($12.00 cap)"
+            )
         );
     }
 

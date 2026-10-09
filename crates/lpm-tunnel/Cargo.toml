@@ -23,6 +23,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
 base64 = { workspace = true }
+bytes = "1"
 urlencoding = "2"
 chrono = { workspace = true }
 hex = { workspace = true }
