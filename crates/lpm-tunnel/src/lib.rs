@@ -4,7 +4,7 @@
 //! (e.g., `https://acme-api.lpm.llc`) and proxies HTTP requests to the endpoint.
 //!
 //! Supports multiple base domains (lpm.fyi, lpm.llc).
-//! Free users get ephemeral random domains on lpm.fyi.
+//! Public tunnels require Pro or Org.
 //! Pro/Org users can claim persistent domains on any available base domain.
 
 pub mod client;
@@ -52,6 +52,12 @@ pub(crate) fn validate_forward_target(
 /// Plan and relay limits advertised by the tunnel service.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TunnelLimitMetadata {
+    /// Resource contract version.
+    #[serde(default)]
+    pub quota_version: Option<u64>,
+    /// Whether the relay accepts public WebSocket upgrades.
+    #[serde(default)]
+    pub public_websockets_available: Option<bool>,
     /// Maximum simultaneously open tunnels for the account.
     #[serde(default)]
     pub max_concurrent: Option<u64>,
@@ -75,6 +81,45 @@ pub struct TunnelLimitMetadata {
 /// Account-wide request usage advertised by the tunnel service.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TunnelUsageMetadata {
+    /// Resource contract version.
+    #[serde(default)]
+    pub quota_version: Option<u64>,
+    /// Aggregate busy Durable Object time consumed in milliseconds.
+    #[serde(default)]
+    pub busy_object_ms: Option<u64>,
+    /// Included busy time in milliseconds.
+    #[serde(default)]
+    pub included_busy_object_ms: Option<u64>,
+    /// Inbound relay messages consumed.
+    #[serde(default)]
+    pub relay_messages: Option<u64>,
+    /// Included inbound relay messages.
+    #[serde(default)]
+    pub included_relay_messages: Option<u64>,
+    /// Bidirectional relay transfer consumed in bytes.
+    #[serde(default)]
+    pub transfer_bytes: Option<u64>,
+    /// Included bidirectional relay transfer in bytes.
+    #[serde(default)]
+    pub included_transfer_bytes: Option<u64>,
+    /// New connection attempts consumed in the paid period.
+    #[serde(default)]
+    pub connection_attempts: Option<u64>,
+    /// Connection attempts included across paid seats, independent of bundles.
+    #[serde(default)]
+    pub included_connection_attempts: Option<u64>,
+    /// Owner-approved monthly overage spending cap in cents.
+    #[serde(default)]
+    pub overage_spend_cap_cents: Option<u64>,
+    /// Overage bundles authorized by the spending cap.
+    #[serde(default)]
+    pub authorized_bundles: Option<u64>,
+    /// Overage bundles consumed by the largest resource excess.
+    #[serde(default)]
+    pub billable_bundles: Option<u64>,
+    /// Price per resource bundle in cents.
+    #[serde(default)]
+    pub bundle_price_cents: Option<u64>,
     /// Requests admitted during the current usage period.
     #[serde(default)]
     pub accepted_requests: Option<u64>,
@@ -84,7 +129,7 @@ pub struct TunnelUsageMetadata {
     /// Requests above the included allowance.
     #[serde(default)]
     pub overage_requests: Option<u64>,
-    /// Whether requests continue into proportional overage.
+    /// Whether the owner enabled capped resource bundles.
     #[serde(default)]
     pub overage_enabled: Option<bool>,
     /// Whether the allowance is currently a hard stop.

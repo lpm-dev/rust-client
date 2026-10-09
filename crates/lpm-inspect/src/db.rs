@@ -977,13 +977,8 @@ fn insert_request_row(
     let headers_json = serde_json::to_string(&webhook.request_headers).unwrap_or_default();
     let resp_headers_json = serde_json::to_string(&webhook.response_headers).unwrap_or_default();
 
-    // Extract text for FTS indexing (only index UTF-8 content)
-    let req_body_text = std::str::from_utf8(&webhook.request_body)
-        .unwrap_or("")
-        .to_string();
-    let res_body_text = std::str::from_utf8(&webhook.response_body)
-        .unwrap_or("")
-        .to_string();
+    let req_body_text = std::str::from_utf8(&webhook.request_body).unwrap_or("");
+    let res_body_text = std::str::from_utf8(&webhook.response_body).unwrap_or("");
 
     // Before INSERT OR REPLACE: if this ID already exists, delete its FTS entry.
     // INSERT OR REPLACE deletes the old row (and its rowid) then inserts a new one

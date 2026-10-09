@@ -45,10 +45,10 @@ pub enum ClientMessage {
     },
     /// One demand-limited response chunk, at most 64 KiB decoded.
     #[serde(rename = "http_response_chunk")]
-    HttpResponseChunk { id: String, body: String },
+    HttpResponseChunk { id: String, body: String, seq: u64 },
     /// End of a streamed response; failed means the body is incomplete.
     #[serde(rename = "http_response_end")]
-    HttpResponseEnd { id: String, failed: bool },
+    HttpResponseEnd { id: String, failed: bool, seq: u64 },
 
     /// WebSocket frame from local server back to the remote client.
     #[serde(rename = "ws_frame")]
@@ -133,7 +133,7 @@ pub enum ServerMessage {
 
     /// The visitor is ready for one response chunk.
     #[serde(rename = "http_response_pull")]
-    HttpResponsePull { id: String },
+    HttpResponsePull { id: String, seq: u64 },
     /// The visitor stopped reading the response.
     #[serde(rename = "http_cancel")]
     HttpCancel { id: String },
@@ -292,6 +292,8 @@ mod tests {
                 assert_eq!(
                     limits,
                     Some(crate::TunnelLimitMetadata {
+                        quota_version: None,
+                        public_websockets_available: None,
                         max_concurrent: Some(1),
                         request_rate_limit_per_minute: Some(4_000),
                         per_ip_rate_limit_per_minute: Some(600),

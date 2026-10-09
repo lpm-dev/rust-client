@@ -115,7 +115,7 @@ pub async fn forward_request(
     request: &ServerMessage,
 ) -> Result<ClientMessage, LpmError> {
     Ok(
-        forward_request_inner(http_client, local_target, request, None, None)
+        forward_request_inner(http_client, local_target, request, None, None, None)
             .await?
             .message,
     )
@@ -131,6 +131,7 @@ pub(crate) async fn forward_request_with_memory_budget(
     memory_unit_bytes: usize,
     memory_multiplier: usize,
     stream: Option<crate::http_stream::StreamOutput>,
+    decoded_body: Option<bytes::Bytes>,
 ) -> Result<ForwardedResponse, LpmError> {
     forward_request_inner(
         http_client,
@@ -143,6 +144,7 @@ pub(crate) async fn forward_request_with_memory_budget(
             memory_multiplier,
         )),
         stream,
+        decoded_body,
     )
     .await
 }
@@ -153,6 +155,7 @@ async fn forward_request_inner(
     request: &ServerMessage,
     memory_budget: Option<(Arc<tokio::sync::Semaphore>, usize, usize, usize)>,
     stream: Option<crate::http_stream::StreamOutput>,
+    decoded_body: Option<bytes::Bytes>,
 ) -> Result<ForwardedResponse, LpmError> {
     crate::validate_forward_target(local_target)?;
     let (id, method, url, headers, body) = match request {
@@ -192,7 +195,9 @@ async fn forward_request_inner(
     builder = builder.header("host", local_target.authority());
 
     // Decode and attach body
-    if !body.is_empty() {
+    if let Some(bytes) = decoded_body {
+        builder = builder.body(bytes);
+    } else if !body.is_empty() {
         let body_bytes =
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, body)
                 .map_err(|e| LpmError::Tunnel(format!("failed to decode request body: {e}")))?;
@@ -239,8 +244,22 @@ async fn forward_request_inner(
             .next()
             .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
     });
-    if is_event_stream && let Some(output) = stream {
-        let capture = output.forward(id, status, &resp_headers, response).await?;
+    if let Some(output) = stream {
+        let body_deadline = if is_event_stream {
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30 * 60)
+        } else {
+            deadline
+        };
+        let capture = output
+            .forward(
+                id,
+                status,
+                &resp_headers,
+                method.eq_ignore_ascii_case("HEAD") || matches!(status, 204 | 205 | 304),
+                response,
+                body_deadline,
+            )
+            .await?;
         return Ok(ForwardedResponse {
             message: ClientMessage::HttpResponse {
                 id: id.clone(),
@@ -254,6 +273,7 @@ async fn forward_request_inner(
             stream_end: Some(ClientMessage::HttpResponseEnd {
                 id: id.clone(),
                 failed: capture.failed,
+                seq: capture.next_sequence,
             }),
             capture_incomplete: capture.incomplete,
             memory_permit: None,
@@ -591,6 +611,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_timeout_preserves_capture_and_emits_a_failed_stream_end() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nfirst")
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let (messages, mut output) = tokio::sync::mpsc::channel(1);
+        let (credits, credit_rx) = tokio::sync::mpsc::channel(1);
+        let forward = tokio::spawn(async move {
+            let request = ServerMessage::HttpRequest {
+                id: "ordinary".into(),
+                method: "GET".into(),
+                url: "/file".into(),
+                headers: HashMap::new(),
+                body: String::new(),
+            };
+            forward_request_inner(
+                &reqwest::Client::builder().no_proxy().build().unwrap(),
+                &lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, address.port()),
+                &request,
+                None,
+                Some(crate::http_stream::StreamOutput {
+                    messages,
+                    credits: credit_rx,
+                    cancel: tokio_util::sync::CancellationToken::new(),
+                }),
+                None,
+            )
+            .await
+        });
+        assert!(matches!(
+            output.recv().await,
+            Some(crate::client::HttpRelayFrame::Stream(
+                ClientMessage::HttpResponseStart { .. }
+            ))
+        ));
+        credits.send(1).await.unwrap();
+        assert!(matches!(
+            output.recv().await,
+            Some(crate::client::HttpRelayFrame::Stream(
+                ClientMessage::HttpResponseChunk { seq: 1, .. }
+            ))
+        ));
+        credits.send(2).await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        let response = forward.await.unwrap();
+        server.abort();
+        let response = response
+            .expect("stream timeout must return a failed terminal, not discard streaming state");
+        assert!(matches!(
+            response.stream_end,
+            Some(ClientMessage::HttpResponseEnd {
+                failed: true,
+                seq: 2,
+                ..
+            })
+        ));
+        assert!(response.capture_incomplete);
+        assert!(
+            matches!(response.message, ClientMessage::HttpResponse { body, .. } if body == "Zmlyc3Q=")
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_response_headers_arrive_before_the_body_is_complete() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 1000000\r\n\r\nfirst").await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let (messages, mut output) = tokio::sync::mpsc::channel(1);
+        let (_credits, credit_rx) = tokio::sync::mpsc::channel(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let forward_cancel = cancel.clone();
+        let forward = tokio::spawn(async move {
+            let request = ServerMessage::HttpRequest {
+                id: "ordinary".into(),
+                method: "GET".into(),
+                url: "/file".into(),
+                headers: HashMap::new(),
+                body: String::new(),
+            };
+            forward_request_inner(
+                &reqwest::Client::builder().no_proxy().build().unwrap(),
+                &lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, address.port()),
+                &request,
+                None,
+                Some(crate::http_stream::StreamOutput {
+                    messages,
+                    credits: credit_rx,
+                    cancel: forward_cancel,
+                }),
+                None,
+            )
+            .await
+        });
+        let first =
+            tokio::time::timeout(std::time::Duration::from_millis(100), output.recv()).await;
+        cancel.cancel();
+        forward.abort();
+        server.abort();
+        assert!(matches!(
+            first,
+            Ok(Some(crate::client::HttpRelayFrame::Stream(
+                ClientMessage::HttpResponseStart { status: 200, .. }
+            )))
+        ));
+    }
+
+    #[tokio::test]
     async fn event_stream_reconnect_preserves_last_event_id() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -681,12 +825,17 @@ mod tests {
                     credits: credit_rx,
                     cancel: tokio_util::sync::CancellationToken::new(),
                 }),
+                None,
             )
             .await
             .unwrap()
         });
         let mut received = 0;
+        let mut sequence = 1;
         while let Some(message) = output.recv().await {
+            let crate::client::HttpRelayFrame::Stream(message) = message else {
+                panic!("unexpected completed response")
+            };
             match message {
                 ClientMessage::HttpResponseStart { status: 200, .. } => {}
                 ClientMessage::HttpResponseChunk { body, .. } => {
@@ -698,7 +847,8 @@ mod tests {
                 }
                 _ => panic!("unexpected stream message"),
             }
-            credits.send(()).await.unwrap();
+            credits.send(sequence).await.unwrap();
+            sequence += 1;
         }
         let response = forward.await.unwrap();
         server.await.unwrap();
@@ -864,7 +1014,7 @@ mod tests {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             forward_request_with_memory_budget(
-                &client, &target, &request, budget, permits, unit_bytes, 4, None,
+                &client, &target, &request, budget, permits, unit_bytes, 4, None, None,
             ),
         )
         .await;
@@ -945,6 +1095,7 @@ mod tests {
                 64,
                 1024 * 1024,
                 4,
+                None,
                 None,
             )
             .await

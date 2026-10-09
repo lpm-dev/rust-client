@@ -15,7 +15,7 @@
 
 mod support;
 
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read, Write as _};
@@ -29,6 +29,28 @@ use tokio_tungstenite::tungstenite::Message;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::any};
 
 const MAX_CAPTURED_STREAM_BYTES: usize = 256 * 1024;
+
+async fn await_fixture_ready(
+    socket: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+) {
+    let ack = socket.next().await.unwrap().unwrap();
+    let Message::Text(ack) = ack else {
+        panic!("expected hello receipt")
+    };
+    let ack: serde_json::Value = serde_json::from_str(&ack).unwrap();
+    assert_eq!(ack["type"], "transport_ack");
+    assert_eq!(ack["transport_seq"], 1);
+    assert_eq!(
+        ack["transport_ack_nonce"],
+        "00000000-0000-4000-8000-000000000001"
+    );
+    let ready = socket.next().await.unwrap().unwrap();
+    let Message::Text(ready) = ready else {
+        panic!("expected readiness")
+    };
+    let ready: serde_json::Value = serde_json::from_str(&ready).unwrap();
+    assert_eq!(ready["type"], "client_ready");
+}
 
 fn captured_webhook(
     id: &str,
@@ -694,6 +716,8 @@ async fn dev_tunnel_stops_a_long_running_server_when_the_relay_fails() {
                 .send(Message::Text(
                     serde_json::json!({
                         "type": "error",
+                        "transport_seq": 1,
+                        "transport_ack_nonce": "00000000-0000-4000-8000-000000000001",
                         "message": "the account plan does not permit this tunnel",
                         "code": "plan_required"
                     })
@@ -760,10 +784,13 @@ async fn multi_service_dev_stops_when_the_tunnel_fails_after_readiness() {
                 .send(Message::Text(
                     serde_json::json!({
                         "type": "hello",
+                        "protocol": 4,
+                        "transport_seq": 1,
+                        "transport_ack_nonce": "00000000-0000-4000-8000-000000000001",
                         "subdomain": "multi-ready.lpm.test",
                         "tunnel_url": "https://multi-ready.lpm.test",
                         "session_id": "session-multi-ready",
-                        "plan": "free",
+                        "plan": "pro",
                         "base_domain": "lpm.test",
                         "domain_kind": "random"
                     })
@@ -771,11 +798,14 @@ async fn multi_service_dev_stops_when_the_tunnel_fails_after_readiness() {
                 ))
                 .await
                 .unwrap();
+            await_fixture_ready(&mut websocket).await;
             tokio::time::sleep(Duration::from_millis(300)).await;
             websocket
                 .send(Message::Text(
                     serde_json::json!({
                         "type": "error",
+                        "transport_seq": 2,
+                        "transport_ack_nonce": "00000000-0000-4000-8000-000000000002",
                         "message": "relay failed after all services became ready",
                         "code": "plan_required"
                     })
@@ -1131,10 +1161,13 @@ async fn tunnel_start_under_json_emits_pretty_success_contract_on_stdout() {
                 .send(Message::Text(
                     serde_json::json!({
                         "type": "hello",
+                        "protocol": 4,
+                        "transport_seq": 1,
+                        "transport_ack_nonce": "00000000-0000-4000-8000-000000000001",
                         "subdomain": "review-test.lpm.test",
                         "tunnel_url": "https://review-test.lpm.test",
                         "session_id": "session-review-test",
-                        "plan": "free",
+                        "plan": "pro",
                         "base_domain": "lpm.test",
                         "domain_kind": "random"
                     })
@@ -1142,6 +1175,7 @@ async fn tunnel_start_under_json_emits_pretty_success_contract_on_stdout() {
                 ))
                 .await
                 .unwrap();
+            await_fixture_ready(&mut websocket).await;
             websocket.close(None).await.unwrap();
         })
         .await
@@ -1170,19 +1204,22 @@ async fn tunnel_start_under_json_emits_pretty_success_contract_on_stdout() {
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
-        stdout.starts_with("{\n  \"success\""),
+        stdout.starts_with("{\n  \"schema_version\""),
         "tunnel JSON must use the pretty JSON formatter, got:\n{stdout}"
     );
     let contract: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     insta::assert_json_snapshot!(contract, @r#"
     {
+      "schema_version": 2,
+      "event": "ready",
+      "protocol": 4,
       "success": true,
       "tunnel_url": "https://review-test.lpm.test",
       "domain": "review-test.lpm.test",
       "local_port": 5173,
       "local_url": "http://127.0.0.1:5173/",
       "session_id": "session-review-test",
-      "plan": "free",
+      "plan": "pro",
       "base_domain": "lpm.test",
       "domain_kind": "random",
       "session_expires_at": null,
@@ -1194,6 +1231,82 @@ async fn tunnel_start_under_json_emits_pretty_success_contract_on_stdout() {
       "auto_ack": false
     }
     "#);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_json_ready_and_usage_notices_preserve_resource_limits_and_spending_cap() {
+    let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_url = format!("ws://{}/connect", relay.local_addr().unwrap());
+    let relay_task = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let (socket, _) = relay.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let mut usage = serde_json::json!({
+                "quota_version":2, "accepted_requests":40000, "included_requests":50000,
+                "busy_object_ms":36000000, "included_busy_object_ms":180000000,
+                "relay_messages":100000, "included_relay_messages":1000000,
+                "transfer_bytes":1073741824u64, "included_transfer_bytes":10737418240u64,
+                "connection_attempts":10, "included_connection_attempts":1000,
+                "overage_spend_cap_cents":600, "authorized_bundles":2, "billable_bundles":0,
+                "bundle_price_cents":300, "estimated_overage_cents":0, "overage_requests":0,
+                "overage_enabled":true, "hard_limit":false,
+                "period_start":"2026-10-01T00:00:00Z", "period_end":"2026-11-01T00:00:00Z"
+            });
+            websocket.send(Message::Text(serde_json::json!({
+                "type":"hello", "protocol":4, "transport_seq":1,
+                "transport_ack_nonce":"00000000-0000-4000-8000-000000000001",
+                "subdomain":"resources.lpm.test", "tunnel_url":"https://resources.lpm.test",
+                "session_id":"resource-session", "plan":"pro", "base_domain":"lpm.test", "domain_kind":"random",
+                "limits": { "quota_version":2, "public_websockets_available":false, "max_concurrent":3,
+                    "request_rate_limit_per_minute":1000, "per_ip_rate_limit_per_minute":600,
+                    "max_request_body_bytes":10485760, "max_custom_domains":3, "tunnel_auth_available":true },
+                "usage":usage
+            }).to_string())).await.unwrap();
+            await_fixture_ready(&mut websocket).await;
+            usage["accepted_requests"] = serde_json::json!(50001);
+            usage["overage_requests"] = serde_json::json!(1);
+            usage["billable_bundles"] = serde_json::json!(1);
+            usage["estimated_overage_cents"] = serde_json::json!(300);
+            websocket.send(Message::Text(serde_json::json!({ "type":"usage_notice", "transport_seq":2,
+                "transport_ack_nonce":"00000000-0000-4000-8000-000000000002", "usage":usage }).to_string())).await.unwrap();
+            let Message::Text(ack) = websocket.next().await.unwrap().unwrap() else { panic!("missing notice receipt") };
+            let ack: serde_json::Value = serde_json::from_str(&ack).unwrap();
+            assert_eq!(ack["transport_seq"], 2);
+            assert_eq!(ack["transport_ack_nonce"], "00000000-0000-4000-8000-000000000002");
+            websocket.close(None).await.unwrap();
+        }).await.expect("resource contract relay timed out");
+    });
+    let output_task = tokio::task::spawn_blocking(move || {
+        let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+        let mut command = lpm_spawnable(&project);
+        command.env("LPM_TUNNEL_RELAY", relay_url).args([
+            "--token",
+            "workflow-token",
+            "--json",
+            "tunnel",
+            "5173",
+            "--no-inspect",
+        ]);
+        command_output_with_deadline(command, Duration::from_secs(12))
+    });
+    let output = finish_bounded_tunnel_workflow(output_task, relay_task).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events: Vec<serde_json::Value> = serde_json::Deserializer::from_slice(&output.stdout)
+        .into_iter()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["schema_version"], 2);
+    assert_eq!(events[0]["event"], "ready");
+    assert_eq!(events[0]["limits"]["public_websockets_available"], false);
+    assert_eq!(events[1]["event"], "usage_notice");
+    assert_eq!(events[1]["usage"]["billable_bundles"], 1);
+    assert_eq!(events[1]["usage"]["overage_spend_cap_cents"], 600);
+    insta::assert_json_snapshot!("tunnel_resource_events", events);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1209,9 +1322,10 @@ async fn tunnel_json_reports_a_retry_before_a_successful_reconnection() {
             let (socket, _) = relay.accept().await.unwrap();
             let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
             websocket.send(Message::Text(serde_json::json!({
-                "type":"hello", "subdomain":"retry.lpm.test", "tunnel_url":"https://retry.lpm.test",
-                "session_id":"session-retry", "plan":"free", "base_domain":"lpm.test", "domain_kind":"random"
+                "type":"hello", "protocol":4, "transport_seq":1, "transport_ack_nonce":"00000000-0000-4000-8000-000000000001", "subdomain":"retry.lpm.test", "tunnel_url":"https://retry.lpm.test",
+                "session_id":"session-retry", "plan":"pro", "base_domain":"lpm.test", "domain_kind":"random"
             }).to_string())).await.unwrap();
+            await_fixture_ready(&mut websocket).await;
             websocket.close(None).await.unwrap();
         }).await.expect("retry relay timed out");
     });
@@ -1255,7 +1369,7 @@ async fn tunnel_json_reports_a_retry_before_a_successful_reconnection() {
     assert_eq!(events[1]["success"], true);
     insta::assert_json_snapshot!(events[0], {".error" => "[retry delay and relay rejection]"}, @r#"
     {
-      "schema_version": 1,
+      "schema_version": 2,
       "success": false,
       "event": "retry",
       "error_code": "tunnel_retry",
@@ -1277,10 +1391,13 @@ async fn tunnel_start_warns_that_capture_history_persists_sensitive_request_data
                 .send(Message::Text(
                     serde_json::json!({
                         "type": "hello",
+                        "protocol": 4,
+                        "transport_seq": 1,
+                        "transport_ack_nonce": "00000000-0000-4000-8000-000000000001",
                         "subdomain": "capture-warning.lpm.test",
                         "tunnel_url": "https://capture-warning.lpm.test",
                         "session_id": "session-capture-warning",
-                        "plan": "free",
+                        "plan": "pro",
                         "base_domain": "lpm.test",
                         "domain_kind": "random"
                     })
@@ -1288,6 +1405,7 @@ async fn tunnel_start_warns_that_capture_history_persists_sensitive_request_data
                 ))
                 .await
                 .unwrap();
+            await_fixture_ready(&mut websocket).await;
             websocket.close(None).await.unwrap();
         })
         .await

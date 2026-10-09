@@ -15,14 +15,14 @@ use lpm_common::LpmError;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
-/// Maximum WebSocket message size from relay (50 MB).
-pub(crate) const MAX_WS_MESSAGE_SIZE: usize = 50 * 1024 * 1024;
+/// Maximum WebSocket message size from relay (16 MiB).
+pub(crate) const MAX_WS_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Maximum WebSocket frame size from relay (16 MB).
 pub(crate) const MAX_WS_FRAME_SIZE: usize = 16 * 1024 * 1024;
@@ -38,11 +38,11 @@ const PONG_TIMEOUT_SECS: u64 = 90;
 /// Maximum time to wait for in-flight tasks during graceful shutdown.
 const SHUTDOWN_TIMEOUT_SECS: u64 = 5;
 
-const MAX_CONCURRENT_HTTP_FORWARDS: usize = 4;
+const MAX_CONCURRENT_HTTP_FORWARDS: usize = 3;
 const HTTP_RESPONSE_MEMORY_PERMITS: usize = 64;
 const HTTP_RESPONSE_MEMORY_UNIT_BYTES: usize = 1024 * 1024;
 const HTTP_RESPONSE_ESTIMATED_OVERHEAD_MULTIPLIER: usize = 4;
-const HTTP_REQUEST_MEMORY_PERMITS: usize = 256;
+const HTTP_REQUEST_MEMORY_PERMITS: usize = 64;
 const HTTP_REQUEST_ESTIMATED_OVERHEAD_MULTIPLIER: usize = 4;
 const WEBSOCKET_MEMORY_PERMITS: usize = 128;
 const MAX_CONCURRENT_WEBSOCKETS: usize = 64;
@@ -51,7 +51,7 @@ const WEBSOCKET_LOCAL_ENQUEUE_TIMEOUT_MILLIS: u64 = 100;
 const WEBSOCKET_SEND_TIMEOUT_SECS: u64 = 5;
 const WEBSOCKET_CAPTURE_HEADER_BYTES: usize = 64 * 1024;
 const WEBSOCKET_WRITE_BUFFER_BYTES: usize = 128 * 1024;
-const WEBSOCKET_MAX_WRITE_BUFFER_BYTES: usize = 72 * 1024 * 1024;
+const WEBSOCKET_MAX_WRITE_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 const MAX_WEBSOCKET_CONNECTION_ID_BYTES: usize = 256;
 const MAX_WEBSOCKET_LOCAL_URL_BYTES: usize = 8 * 1024;
 const MAX_WEBSOCKET_CLOSE_REASON_BYTES: usize = 123;
@@ -92,6 +92,15 @@ enum RelayHandshakeMessage {
 #[derive(serde::Serialize)]
 #[serde(tag = "type")]
 enum ClientExtensionMessage {
+    #[serde(rename = "transport_ack")]
+    TransportAck {
+        transport_seq: u64,
+        transport_ack_nonce: String,
+    },
+    #[serde(rename = "client_ready")]
+    ClientReady,
+    #[serde(rename = "http_cancelled")]
+    HttpCancelled { id: String },
     #[serde(rename = "ws_ready")]
     WebSocketReady { id: String },
     #[serde(rename = "ws_reject")]
@@ -107,7 +116,7 @@ enum RetryClass {
 
 #[derive(Debug)]
 struct TunnelConnectError {
-    error: LpmError,
+    error: Box<LpmError>,
     retry_class: RetryClass,
     capacity_limited: bool,
 }
@@ -203,21 +212,151 @@ impl CapturedWebhookEvent {
 }
 
 struct ActiveHttpForward {
-    credits: tokio::sync::mpsc::Sender<()>,
+    credits: tokio::sync::mpsc::Sender<u64>,
     cancel: tokio_util::sync::CancellationToken,
+    next_credit: u64,
 }
 
-struct CompletedHttpForward {
+pub(crate) struct CompletedHttpForward {
     id: String,
     json: String,
     permit: tokio::sync::OwnedSemaphorePermit,
     memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    request_memory_permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+}
+
+pub(crate) enum HttpRelayFrame {
+    Stream(ClientMessage),
+    Completed(CompletedHttpForward),
+}
+
+#[derive(serde::Deserialize)]
+struct RelayReceipt<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: &'a str,
+    transport_seq: u64,
+    #[serde(borrow)]
+    transport_ack_nonce: &'a str,
+}
+
+#[derive(serde::Deserialize)]
+struct BorrowedRelayRequest<'a> {
+    #[serde(borrow)]
+    id: &'a str,
+    #[serde(borrow)]
+    method: &'a str,
+    #[serde(borrow)]
+    url: &'a str,
+    #[serde(borrow)]
+    headers: &'a serde_json::value::RawValue,
+    #[serde(borrow)]
+    body: &'a str,
+}
+
+fn validate_relay_request(text: &str) -> Result<(), TunnelConnectError> {
+    let request: BorrowedRelayRequest<'_> = serde_json::from_str(text)
+        .map_err(|_| TunnelConnectError::permanent("Invalid relay request"))?;
+    const MAXIMUM_BODY_BYTES: usize = 10 * 1024 * 1024;
+    let padding = request
+        .body
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'=')
+        .take(3)
+        .count();
+    let decoded_bytes = request
+        .body
+        .len()
+        .div_ceil(4)
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_sub(padding));
+    if request.id.len() > 256
+        || request.method.len() > 32
+        || request.url.len() > 8192
+        || request.headers.get().len() > 32 * 1024
+        || request.body.len() > MAXIMUM_BODY_BYTES.div_ceil(3) * 4
+        || padding > 2
+        || decoded_bytes.is_none_or(|bytes| bytes > MAXIMUM_BODY_BYTES)
+    {
+        return Err(TunnelConnectError::permanent(
+            "Relay request metadata or body exceeds the limit",
+        ));
+    }
+    struct HeaderLimit;
+    impl<'de> serde::de::Visitor<'de> for HeaderLimit {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("at most 128 headers")
+        }
+        fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
+            let mut count = 0;
+            while map
+                .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                .is_some()
+            {
+                count += 1;
+                if count > 128 {
+                    return Err(serde::de::Error::custom("too many headers"));
+                }
+            }
+            Ok(())
+        }
+    }
+    let mut headers = serde_json::Deserializer::from_str(request.headers.get());
+    serde::de::Deserializer::deserialize_map(&mut headers, HeaderLimit)
+        .map_err(|_| TunnelConnectError::permanent("Relay request headers exceed the limit"))?;
+    Ok(())
+}
+
+fn relay_receipt(text: &str, previous: u64) -> Result<RelayReceipt<'_>, TunnelConnectError> {
+    let receipt: RelayReceipt<'_> = serde_json::from_str(text)
+        .map_err(|_| TunnelConnectError::permanent("Invalid relay transport receipt"))?;
+    let nonce = receipt.transport_ack_nonce.as_bytes();
+    if previous.checked_add(1) != Some(receipt.transport_seq)
+        || nonce.len() != 36
+        || !nonce.iter().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+    {
+        return Err(TunnelConnectError::permanent(
+            "Invalid relay transport receipt",
+        ));
+    }
+    Ok(receipt)
+}
+
+fn encode_relay_acknowledgment(receipt: &RelayReceipt<'_>) -> Result<String, TunnelConnectError> {
+    serde_json::to_string(&ClientExtensionMessage::TransportAck {
+        transport_seq: receipt.transport_seq,
+        transport_ack_nonce: receipt.transport_ack_nonce.to_owned(),
+    })
+    .map_err(|_| TunnelConnectError::permanent("Cannot encode relay receipt"))
+}
+
+async fn acknowledge_relay<S>(
+    write: &mut S,
+    receipt: &RelayReceipt<'_>,
+) -> Result<(), TunnelConnectError>
+where
+    S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    send_to_relay(
+        write,
+        Message::Text(encode_relay_acknowledgment(receipt)?),
+        "acknowledge relay delivery",
+    )
+    .await
 }
 
 impl TunnelConnectError {
     fn permanent(message: impl Into<String>) -> Self {
         Self {
-            error: LpmError::Tunnel(message.into()),
+            error: Box::new(LpmError::Tunnel(message.into())),
             retry_class: RetryClass::Permanent,
             capacity_limited: false,
         }
@@ -225,7 +364,7 @@ impl TunnelConnectError {
 
     fn transient(message: impl Into<String>) -> Self {
         Self {
-            error: LpmError::Tunnel(message.into()),
+            error: Box::new(LpmError::Tunnel(message.into())),
             retry_class: RetryClass::Transient,
             capacity_limited: false,
         }
@@ -233,7 +372,7 @@ impl TunnelConnectError {
 
     fn auth_rejected(message: impl Into<String>) -> Self {
         Self {
-            error: LpmError::Tunnel(message.into()),
+            error: Box::new(LpmError::Tunnel(message.into())),
             retry_class: RetryClass::AuthRejected,
             capacity_limited: false,
         }
@@ -246,7 +385,7 @@ impl TunnelConnectError {
             RetryClass::Transient
         };
         Self {
-            error,
+            error: Box::new(error),
             retry_class,
             capacity_limited: false,
         }
@@ -262,7 +401,7 @@ impl std::fmt::Display for TunnelConnectError {
 impl From<LpmError> for TunnelConnectError {
     fn from(error: LpmError) -> Self {
         Self {
-            error,
+            error: Box::new(error),
             retry_class: RetryClass::Transient,
             capacity_limited: false,
         }
@@ -284,6 +423,9 @@ fn relay_code_retry_class(code: &str) -> Option<RetryClass> {
         | "concurrent_limit"
         | "billing_inactive"
         | "session_expired"
+        | "unsupported_protocol"
+        | "tunnels_paid_required"
+        | "monthly_connections_exhausted"
         | "monthly_allowance_exhausted" => Some(RetryClass::Permanent),
         "auth_unavailable"
         | "domain_unavailable"
@@ -643,25 +785,28 @@ fn activate_local_websocket(
                 break;
             };
             let is_close = matches!(&command, LocalWebSocketCommand::Close { .. });
-            let message = match command {
+            let (message, memory_permit) = match command {
                 LocalWebSocketCommand::Frame {
                     data,
                     is_binary,
                     _memory_permit,
                 } => match local_websocket_message(data, is_binary) {
-                    Ok(message) => message,
+                    Ok(message) => (message, Some(_memory_permit)),
                     Err(error) => {
                         reason = error;
                         break;
                     }
                 },
-                LocalWebSocketCommand::Close { code, reason } => Message::Close(
-                    code.map(CloseCode::from)
-                        .filter(|code| code.is_allowed())
-                        .map(|code| CloseFrame {
-                            code,
-                            reason: reason.unwrap_or_default().into(),
-                        }),
+                LocalWebSocketCommand::Close { code, reason } => (
+                    Message::Close(
+                        code.map(CloseCode::from)
+                            .filter(|code| code.is_allowed())
+                            .map(|code| CloseFrame {
+                                code,
+                                reason: reason.unwrap_or_default().into(),
+                            }),
+                    ),
+                    None,
                 ),
             };
             let send = async {
@@ -676,6 +821,7 @@ fn activate_local_websocket(
                     send,
                 ) => result,
             };
+            drop(memory_permit);
             match result {
                 Ok(Ok(())) if is_close => {
                     reason = "relay closed the WebSocket".to_string();
@@ -1042,11 +1188,15 @@ pub async fn connect_with_usage_fallible(
         {
             return Ok(());
         }
-        let connection_start = std::time::Instant::now();
+        let connected_at = Mutex::new(None);
         let attempt_token = retry_token.take();
         let mark_authenticated = |session: &TunnelSession| {
             auth_refresh_attempted.store(false, std::sync::atomic::Ordering::Relaxed);
             on_connected(session)?;
+            *connected_at
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                Some(tokio::time::Instant::now());
             connected_once.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         };
@@ -1064,20 +1214,31 @@ pub async fn connect_with_usage_fallible(
                 return Ok(());
             }
             Err(mut e) => {
+                let connected_duration = connected_at
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .map(|start| start.elapsed());
                 if e.retry_class == RetryClass::AuthRejected {
                     let Some(provider) = options.token_provider.as_ref() else {
-                        return Err(e.error);
+                        return Err(*e.error);
                     };
                     if auth_refresh_attempted.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        return Err(e.error);
+                        return Err(*e.error);
                     }
-                    match provider.refresh_after_rejection().await {
+                    let refreshed = tokio::select! {
+                        biased;
+                        _ = wait_for_tunnel_shutdown(options.shutdown.as_ref()) => return Ok(()),
+                        result = tokio::time::timeout(std::time::Duration::from_secs(20), provider.refresh_after_rejection()) => result
+                            .map_err(|_| TunnelConnectError::transient("Tunnel credential refresh timed out"))
+                            .and_then(|token| token.map_err(TunnelConnectError::from_token_provider)),
+                    };
+                    match refreshed {
                         Ok(token) => {
                             retry_token = Some(token);
                             continue;
                         }
                         Err(error) => {
-                            e = TunnelConnectError::from_token_provider(error);
+                            e = error;
                             if e.retry_class == RetryClass::Transient {
                                 auth_refresh_attempted
                                     .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1088,12 +1249,12 @@ pub async fn connect_with_usage_fallible(
                 let recovering_capacity =
                     e.capacity_limited && connected_once.load(std::sync::atomic::Ordering::Relaxed);
                 if e.retry_class == RetryClass::Permanent && !recovering_capacity {
-                    return Err(e.error);
+                    return Err(*e.error);
                 }
                 // Reset retry counter if the connection was healthy (lasted > 60s).
                 // This prevents a long-running tunnel from accumulating retries
                 // across unrelated transient failures.
-                if connection_start.elapsed().as_secs() >= HEALTHY_CONNECTION_SECS {
+                if healthy_tunnel_attempt(connected_duration) {
                     retry_count = 0;
                 }
 
@@ -1117,6 +1278,10 @@ pub async fn connect_with_usage_fallible(
             }
         }
     }
+}
+
+fn healthy_tunnel_attempt(established_duration: Option<std::time::Duration>) -> bool {
+    established_duration.is_some_and(|duration| duration.as_secs() >= HEALTHY_CONNECTION_SECS)
 }
 
 async fn wait_for_tunnel_shutdown(shutdown: Option<&tokio_util::sync::CancellationToken>) {
@@ -1349,11 +1514,21 @@ fn bounded_websocket_upgrade_headers(
     Ok(headers)
 }
 
+fn take_request_body(message: &mut ServerMessage) -> Result<bytes::Bytes, LpmError> {
+    let ServerMessage::HttpRequest { body, .. } = message else {
+        return Err(LpmError::Tunnel("expected HttpRequest message".into()));
+    };
+    let encoded = std::mem::take(body);
+    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+        .map(bytes::Bytes::from)
+        .map_err(|error| LpmError::Tunnel(format!("failed to decode request body: {error}")))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn forward_http_request(
     http_client: reqwest::Client,
     local_target: lpm_common::LocalTarget,
-    server_msg: ServerMessage,
+    mut server_msg: ServerMessage,
     auto_ack: bool,
     webhook_tx: Option<tokio::sync::mpsc::Sender<CapturedWebhookEvent>>,
     memory_budget: Arc<tokio::sync::Semaphore>,
@@ -1363,6 +1538,8 @@ async fn forward_http_request(
     ClientMessage,
     Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 ) {
+    let decoded_body = take_request_body(&mut server_msg);
+    let capture_body = decoded_body.as_ref().cloned().unwrap_or_default();
     let forward_start = std::time::Instant::now();
     let mut was_auto_acked = false;
     let memory_multiplier = if webhook_tx.is_some() {
@@ -1372,18 +1549,24 @@ async fn forward_http_request(
     };
     let mut stream_end = None;
     let mut capture_incomplete = false;
-    let (mut response, memory_permit) = match proxy::forward_request_with_memory_budget(
-        &http_client,
-        &local_target,
-        &server_msg,
-        memory_budget,
-        HTTP_RESPONSE_MEMORY_PERMITS,
-        HTTP_RESPONSE_MEMORY_UNIT_BYTES,
-        memory_multiplier,
-        stream,
-    )
-    .await
-    {
+    let forwarded = match decoded_body {
+        Ok(body) => {
+            proxy::forward_request_with_memory_budget(
+                &http_client,
+                &local_target,
+                &server_msg,
+                memory_budget,
+                HTTP_RESPONSE_MEMORY_PERMITS,
+                HTTP_RESPONSE_MEMORY_UNIT_BYTES,
+                memory_multiplier,
+                stream,
+                Some(body),
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
+    let (mut response, memory_permit) = match forwarded {
         Ok(response) => {
             stream_end = response.stream_end;
             capture_incomplete = response.capture_incomplete;
@@ -1411,11 +1594,10 @@ async fn forward_http_request(
             ref method,
             ref url,
             ref headers,
-            ref body,
+            ..
         } = server_msg
     {
-        let request_body = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, body)
-            .unwrap_or_default();
+        let request_body = Vec::from(capture_body);
         let (response_status, response_headers, response_body) = extract_response_data(&response);
         let mut captured = CapturedWebhook {
             id: id.clone(),
@@ -1460,7 +1642,7 @@ async fn forward_http_request(
             webhook: Arc::new(captured),
             persistence: receipt_tx,
             _response_memory_permit: memory_permit.clone(),
-            _request_memory_permit: request_memory_permit,
+            _request_memory_permit: request_memory_permit.clone(),
         };
         let queued = tx.try_send(event).is_ok();
         if let Some(receipt_rx) = receipt_rx {
@@ -1839,7 +2021,7 @@ async fn try_connect_with_token(
     let connection_target = options.current_local_target();
     // Build connect URL — non-sensitive params only (token goes in Authorization header)
     let mut connect_url = format!(
-        "{}?port={}&protocol=3",
+        "{}?port={}&protocol=4",
         options.relay_url, connection_target.port
     );
     if let Some(domain) = options.resolved_domain() {
@@ -1874,12 +2056,13 @@ async fn try_connect_with_token(
     // Use IntoClientRequest so tungstenite generates the required upgrade headers.
     let dynamic_token = if token_override.is_none() {
         match options.token_provider.as_ref() {
-            Some(provider) => Some(
-                provider
-                    .current()
-                    .await
+            Some(provider) => Some(tokio::select! {
+                biased;
+                _ = wait_for_tunnel_shutdown(options.shutdown.as_ref()) => return Ok(()),
+                result = tokio::time::timeout(std::time::Duration::from_secs(20), provider.current()) => result
+                    .map_err(|_| TunnelConnectError::transient("Tunnel credential resolution timed out"))?
                     .map_err(TunnelConnectError::from_token_provider)?,
-            ),
+            }),
             None => None,
         }
     } else {
@@ -1901,26 +2084,36 @@ async fn try_connect_with_token(
 
     let connector =
         relay_tls_connector(options, approved_pins).map_err(TunnelConnectError::permanent)?;
-    let (ws_stream, _) = tokio_tungstenite::connect_async_tls_with_config(
+    let handshake = tokio_tungstenite::connect_async_tls_with_config(
         request,
         Some(ws_config),
         false,
         Some(connector),
-    )
-    .await
-    .map_err(classify_websocket_connect_error)?;
+    );
+    let (ws_stream, _) = tokio::select! {
+        _ = wait_for_tunnel_shutdown(options.shutdown.as_ref()) => return Ok(()),
+        result = tokio::time::timeout(std::time::Duration::from_secs(15), handshake) => result.map_err(|_| TunnelConnectError::transient("Tunnel connection timed out"))?.map_err(classify_websocket_connect_error)?,
+    };
 
     let (mut write, mut read) = ws_stream.split();
 
     // Wait for ServerHello (Worker sends it after validating token)
-    let server_hello = read
-        .next()
-        .await
+    let server_hello = tokio::select! {
+        _ = wait_for_tunnel_shutdown(options.shutdown.as_ref()) => return Ok(()),
+        message = tokio::time::timeout(std::time::Duration::from_secs(15), read.next()) => message.map_err(|_| TunnelConnectError::transient("Tunnel hello timed out"))?,
+    }
         .ok_or_else(|| LpmError::Tunnel("relay closed connection before hello".into()))?
         .map_err(|e| LpmError::Tunnel(format!("failed to read server hello: {e}")))?;
 
+    let mut relay_sequence = 0;
     let (session, initial_usage, relay_protocol) = match server_hello {
         Message::Text(text) => {
+            if text.len() > 64 * 1024 {
+                return Err(TunnelConnectError::permanent(
+                    "Tunnel hello exceeds the metadata limit",
+                ));
+            }
+            let receipt = relay_receipt(&text, relay_sequence)?;
             let msg: RelayHandshakeMessage = serde_json::from_str(&text)
                 .map_err(|e| LpmError::Tunnel(format!("invalid server message: {e}")))?;
 
@@ -1938,6 +2131,13 @@ async fn try_connect_with_token(
                     usage,
                     protocol,
                 } => {
+                    if protocol != 4 {
+                        return Err(TunnelConnectError::permanent(
+                            "Relay protocol 4 is required; update the relay or LPM CLI",
+                        ));
+                    }
+                    acknowledge_relay(&mut write, &receipt).await?;
+                    relay_sequence = receipt.transport_seq;
                     // domain field from relay may be just the subdomain or full domain
                     // tunnel_url is always the full URL
                     let domain = if raw_domain.contains('.') {
@@ -2012,24 +2212,12 @@ async fn try_connect_with_token(
     if let Some(ref usage) = initial_usage {
         on_usage(usage, true);
     }
+
     on_connected(&session).map_err(|error| TunnelConnectError {
-        error,
+        error: Box::new(error),
         retry_class: RetryClass::Permanent,
         capacity_limited: false,
     })?;
-    if let Some(admission) = options.forwarding_admission.as_ref() {
-        tokio::select! {
-            result = admission.wait() => {
-                result.map_err(|error| TunnelConnectError {
-                    error,
-                    retry_class: RetryClass::Permanent,
-                    capacity_limited: false,
-                })?;
-            }
-            _ = wait_for_tunnel_shutdown(options.shutdown.as_ref()) => return Ok(()),
-        }
-    }
-
     // Create HTTP client for local proxying. `Policy::none()` disables
     // redirect-following entirely — the local dev server should never
     // 30x our tunnel forwarder anywhere meaningful, and an attacker-
@@ -2043,6 +2231,10 @@ async fn try_connect_with_token(
     let http_client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
+        .no_gzip()
+        .no_brotli()
+        .no_zstd()
+        .no_deflate()
         .build()
         .map_err(|e| LpmError::Tunnel(format!("failed to create HTTP client: {e}")))?;
 
@@ -2063,8 +2255,6 @@ async fn try_connect_with_token(
     let http_forward_slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HTTP_FORWARDS));
     let http_request_memory = Arc::new(tokio::sync::Semaphore::new(HTTP_REQUEST_MEMORY_PERMITS));
     let http_response_memory = Arc::new(tokio::sync::Semaphore::new(HTTP_RESPONSE_MEMORY_PERMITS));
-    let (http_response_tx, mut http_response_rx) =
-        tokio::sync::mpsc::channel::<CompletedHttpForward>(MAX_CONCURRENT_HTTP_FORWARDS);
 
     // Track spawned task handles for graceful shutdown.
     let mut task_handles = tokio::task::JoinSet::new();
@@ -2083,7 +2273,26 @@ async fn try_connect_with_token(
     let mut credential_renewal: Option<TunnelTokenFuture> = None;
     let mut http_forwards: HashMap<String, ActiveHttpForward> = HashMap::new();
     let (stream_tx, mut stream_rx) =
-        tokio::sync::mpsc::channel::<ClientMessage>(MAX_CONCURRENT_HTTP_FORWARDS);
+        tokio::sync::mpsc::channel::<HttpRelayFrame>(MAX_CONCURRENT_HTTP_FORWARDS);
+
+    let mut admission_wait = options.forwarding_admission.as_ref().map(|admission| {
+        Box::pin(tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            admission.wait(),
+        ))
+    });
+    let mut client_ready = admission_wait.is_none();
+    if client_ready {
+        send_to_relay(
+            &mut write,
+            Message::Text(
+                serde_json::to_string(&ClientExtensionMessage::ClientReady)
+                    .map_err(|_| TunnelConnectError::permanent("Cannot encode client readiness"))?,
+            ),
+            "publish tunnel readiness",
+        )
+        .await?;
+    }
 
     // Message loop
     let mut connection_result = Err(TunnelConnectError::transient(
@@ -2091,6 +2300,12 @@ async fn try_connect_with_token(
     ));
     loop {
         tokio::select! {
+            admitted = async { match admission_wait.as_mut() { Some(wait) => wait.await, None => std::future::pending().await } } => {
+                admitted.map_err(|_| TunnelConnectError::permanent("Tunnel startup admission timed out"))?.map_err(|error| TunnelConnectError { error: Box::new(error), retry_class: RetryClass::Permanent, capacity_limited: false })?;
+                admission_wait = None;
+                client_ready = true;
+                send_to_relay(&mut write, Message::Text(serde_json::to_string(&ClientExtensionMessage::ClientReady).map_err(|_| TunnelConnectError::permanent("Cannot encode client readiness"))?), "publish tunnel readiness").await?;
+            },
             _ = wait_for_tunnel_shutdown(options.shutdown.as_ref()) => {
                 connection_result = Ok(());
                 break;
@@ -2099,6 +2314,25 @@ async fn try_connect_with_token(
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        let wire_len = text.len();
+                        let receipt = relay_receipt(&text, relay_sequence)?;
+                        let inbound_memory = if receipt.kind == "http_request" {
+                            validate_relay_request(&text)?;
+                            let permits = request_memory_permits(text.len()).ok_or_else(|| TunnelConnectError::permanent("Relay request exceeds the memory budget"))?;
+                            let permit = if client_ready { Arc::clone(&http_request_memory).try_acquire_many_owned(permits).ok() } else { None };
+                            let Some(permit) = permit else {
+                                let request: BorrowedRelayRequest<'_> = serde_json::from_str(&text).map_err(|_| TunnelConnectError::permanent("Invalid relay request"))?;
+                                acknowledge_relay(&mut write, &receipt).await?;
+                                relay_sequence = receipt.transport_seq;
+                                let json = serde_json::to_string(&proxy::service_unavailable_response(request.id)).map_err(|_| TunnelConnectError::transient("Cannot encode busy response"))?;
+                                send_to_relay(&mut write, Message::Text(json), "reject busy local request").await?;
+                                continue;
+                            };
+                            Some(Arc::new(permit))
+                        } else {
+                            if text.len() > 512 * 1024 { return Err(TunnelConnectError::permanent("Relay control frame exceeds the limit")); }
+                            None
+                        };
                         let server_msg: ServerMessage = match serde_json::from_str(&text) {
                             Ok(m) => m,
                             Err(e) => {
@@ -2106,6 +2340,11 @@ async fn try_connect_with_token(
                                 continue;
                             }
                         };
+                        let acknowledgment = encode_relay_acknowledgment(&receipt)?;
+                        let transport_seq = receipt.transport_seq;
+                        drop(text);
+                        send_to_relay(&mut write, Message::Text(acknowledgment), "acknowledge relay delivery").await?;
+                        relay_sequence = transport_seq;
 
                         match server_msg {
                             ServerMessage::HttpRequest { ref id, ref url, .. } => {
@@ -2131,24 +2370,10 @@ async fn try_connect_with_token(
                                     continue;
                                 }
 
-                                let request_permits = request_memory_permits(text.len());
-                                let request_permits = match request_permits {
-                                    Some(permits) => permits,
-                                    None => {
-                                        let response = proxy::service_unavailable_response(id);
-                                        if let Ok(json) = serde_json::to_string(&response)
-                                            && send_to_relay(&mut write, Message::Text(json), "send message to relay").await.is_err()
-                                        {
-                                            break;
-                                        }
-                                        continue;
-                                    }
-                                };
-                                let request_memory_permit = match Arc::clone(&http_request_memory)
-                                    .try_acquire_many_owned(request_permits)
+                                let request_memory_permit = match inbound_memory
                                 {
-                                    Ok(permit) => Arc::new(permit),
-                                    Err(_) => {
+                                    Some(permit) => permit,
+                                    None => {
                                         let response = proxy::service_unavailable_response(id);
                                         if let Ok(json) = serde_json::to_string(&response)
                                             && send_to_relay(&mut write, Message::Text(json), "send message to relay").await.is_err()
@@ -2189,7 +2414,7 @@ async fn try_connect_with_token(
                                 let local_target = options.current_local_target();
                                 let auto_ack = options.auto_ack;
                                 let webhook_tx = options.webhook_tx.clone();
-                                let http_response_tx = http_response_tx.clone();
+                                let http_response_tx = stream_tx.clone();
                                 let http_response_memory = Arc::clone(&http_response_memory);
                                 let request_id = id.clone();
                                 let cancel = tokio_util::sync::CancellationToken::new();
@@ -2197,7 +2422,7 @@ async fn try_connect_with_token(
                                 let stream = (relay_protocol >= 3).then(|| crate::http_stream::StreamOutput {
                                     messages: stream_tx.clone(), credits: credit_rx, cancel: cancel.clone(),
                                 });
-                                http_forwards.insert(request_id.clone(), ActiveHttpForward { credits, cancel: cancel.clone() });
+                                http_forwards.insert(request_id.clone(), ActiveHttpForward { credits, cancel: cancel.clone(), next_credit: 1 });
                                 task_handles.spawn(async move {
                                     let forward = forward_http_request(
                                         http_client,
@@ -2206,12 +2431,13 @@ async fn try_connect_with_token(
                                         auto_ack,
                                         webhook_tx.clone(),
                                         http_response_memory,
-                                        Some(request_memory_permit),
+                                        Some(Arc::clone(&request_memory_permit)),
                                         stream,
                                     );
                                     let (response, memory_permit) = tokio::select! {
+                                        biased;
                                         result = forward => result,
-                                        _ = cancel.cancelled() => (ClientMessage::HttpResponseEnd { id: request_id.clone(), failed: true }, None),
+                                        _ = cancel.cancelled() => (ClientMessage::HttpResponseEnd { id: request_id.clone(), failed: true, seq: 0 }, None),
                                     };
                                     let json = match serde_json::to_string(&response) {
                                         Ok(json) => json,
@@ -2223,22 +2449,36 @@ async fn try_connect_with_token(
                                         }
                                     };
                                     let _ = http_response_tx
-                                        .send(CompletedHttpForward {
+                                        .send(HttpRelayFrame::Completed(CompletedHttpForward {
                                             id: request_id,
                                             json,
                                             permit,
                                             memory_permit,
-                                        })
+                                            request_memory_permit,
+                                        }))
                                         .await;
                                 });
                             }
-                            ServerMessage::HttpResponsePull { id } => {
-                                if let Some(forward) = http_forwards.get(&id) { let _ = forward.credits.try_send(()); }
+                            ServerMessage::HttpResponsePull { id, seq } => {
+                                if let Some(forward) = http_forwards.get_mut(&id) {
+                                    if seq != forward.next_credit || forward.credits.try_send(seq).is_err() { forward.cancel.cancel(); }
+                                    else { forward.next_credit += 1; }
+                                }
                             }
                             ServerMessage::HttpCancel { id } => {
                                 if let Some(forward) = http_forwards.get(&id) { forward.cancel.cancel(); }
+                                else {
+                                    let json = serde_json::to_string(&ClientExtensionMessage::HttpCancelled { id }).map_err(|_| TunnelConnectError::transient("Cannot encode cancellation receipt"))?;
+                                    send_to_relay(&mut write, Message::Text(json), "confirm completed cancellation").await?;
+                                }
                             }
                             ServerMessage::WebSocketUpgrade { id, url, headers } => {
+                                if relay_protocol == 4 {
+                                    let message = ClientExtensionMessage::WebSocketReject { id, error: "Public WebSockets are unavailable".into() };
+                                    let json = serde_json::to_string(&message).map_err(|_| TunnelConnectError::transient("Cannot encode WebSocket rejection"))?;
+                                    send_to_relay(&mut write, Message::Text(json), "reject unavailable public WebSocket").await?;
+                                    continue;
+                                }
                                 if let Some(error) = websocket_upgrade_metadata_error(&id, &url) {
                                     tracing::warn!(
                                         "rejected WebSocket upgrade with unsafe URL: {:?}",
@@ -2379,7 +2619,7 @@ async fn try_connect_with_token(
                                 // Forward frame from relay → local WebSocket
                                 if let Some(connection) = ws_connections.get(&id) {
                                     let Some(permits) =
-                                        inbound_websocket_memory_permits(text.len(), data.len())
+                                        inbound_websocket_memory_permits(wire_len, data.len())
                                     else {
                                         tracing::warn!(
                                             "closing WebSocket {id} after an oversized relay frame"
@@ -2720,24 +2960,36 @@ async fn try_connect_with_token(
             }
 
             Some(message) = stream_rx.recv() => {
-                let id = match &message {
-                    ClientMessage::HttpResponseStart { id, .. } | ClientMessage::HttpResponseChunk { id, .. } => id,
-                    _ => continue,
-                };
-                if http_forwards.get(id).is_none_or(|forward| forward.cancel.is_cancelled()) { continue; }
-                if let Ok(json) = serde_json::to_string(&message)
-                    && send_to_relay(&mut write, Message::Text(json), "send response stream").await.is_err() { break; }
-            }
-            Some(response) = http_response_rx.recv() => {
-                let CompletedHttpForward { id, json, permit, memory_permit } = response;
+                match message {
+                HttpRelayFrame::Stream(message) => {
+                    let id = match &message {
+                        ClientMessage::HttpResponseStart { id, .. } | ClientMessage::HttpResponseChunk { id, .. } => id,
+                        _ => continue,
+                    };
+                    if http_forwards.get(id).is_none_or(|forward| forward.cancel.is_cancelled()) { continue; }
+                    if let Ok(json) = serde_json::to_string(&message)
+                        && send_to_relay(&mut write, Message::Text(json), "send response stream").await.is_err() { break; }
+                }
+                HttpRelayFrame::Completed(response) => {
+                let CompletedHttpForward { id, json, permit, memory_permit, request_memory_permit } = response;
                 let active = http_forwards.remove(&id);
-                if active.is_some_and(|forward| forward.cancel.is_cancelled()) { continue; }
+                if active.is_some_and(|forward| forward.cancel.is_cancelled()) {
+                    drop(permit);
+                    drop(memory_permit);
+                    drop(request_memory_permit);
+                    let json = serde_json::to_string(&ClientExtensionMessage::HttpCancelled { id }).map_err(|_| TunnelConnectError::transient("Cannot encode cancellation receipt"))?;
+                    send_to_relay(&mut write, Message::Text(json), "confirm local cancellation").await?;
+                    continue;
+                }
                 if let Err(error) = send_to_relay(&mut write, Message::Text(json), "send message to relay").await {
                     tracing::warn!("failed to send HTTP response to relay: {error}");
                     break;
                 }
                 drop(permit);
                 drop(memory_permit);
+                drop(request_memory_permit);
+                }
+                }
             }
 
             Some(result) = task_handles.join_next(), if !task_handles.is_empty() => {
@@ -2800,6 +3052,14 @@ async fn try_connect_with_token(
 
     connection_result
 }
+
+#[cfg(test)]
+#[path = "client/mock_relay.rs"]
+mod mock_relay;
+
+#[cfg(test)]
+#[path = "client/protocol_tests.rs"]
+mod protocol_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2923,99 +3183,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn event_stream_delivers_before_eof_and_cancels_local_request() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let local = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = local.local_addr().unwrap().port();
-        let local_task = tokio::spawn(async move {
-            let (mut socket, _) = local.accept().await.unwrap();
-            let mut request = [0; 4096];
-            assert!(socket.read(&mut request).await.unwrap() > 0);
-            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n9\r\ndata: 1\n\n\r\n").await.unwrap();
-            socket.read(&mut request).await.unwrap()
-        });
-        let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = relay.local_addr().unwrap();
-        let mut options = TunnelOptions::new("test-token".into(), port);
-        options.relay_url = format!("ws://{address}/connect");
-        options.no_pin = true;
-        let client =
-            tokio::spawn(async move { try_connect(&options, &|_| Ok(()), &|_, _| {}).await });
-        let (socket, _) = relay.accept().await.unwrap();
-        let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
-        for message in [
-            serde_json::json!({"type":"hello","subdomain":"stream.localhost","tunnel_url":"http://stream.localhost","session_id":"stream","protocol":3}),
-            serde_json::json!({"type":"http_request","id":"sse","method":"GET","url":"/events","headers":{},"body":""}),
-        ] {
-            ws.send(Message::Text(message.to_string())).await.unwrap();
-        }
-        let start = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await;
-        if start.is_err() {
-            client.abort();
-            local_task.abort();
-        }
-        let Message::Text(start) = start
-            .expect("SSE headers must arrive before EOF")
-            .unwrap()
-            .unwrap()
-        else {
-            panic!("missing headers")
-        };
-        let start: serde_json::Value = serde_json::from_str(&start).unwrap();
-        assert_eq!(start["type"], "http_response_start");
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), ws.next())
-                .await
-                .is_err(),
-            "body must wait for visitor demand"
-        );
-        ws.send(Message::Text(
-            serde_json::json!({"type":"http_response_pull","id":"sse"}).to_string(),
-        ))
-        .await
-        .unwrap();
-        let Message::Text(chunk) =
-            tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap()
-        else {
-            panic!("missing chunk")
-        };
-        let chunk: serde_json::Value = serde_json::from_str(&chunk).unwrap();
-        assert_eq!(chunk["type"], "http_response_chunk");
-        assert_eq!(
-            base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                chunk["body"].as_str().unwrap()
-            )
-            .unwrap(),
-            b"data: 1\n\n"
-        );
-        ws.send(Message::Text(
-            serde_json::json!({"type":"http_cancel","id":"sse"}).to_string(),
-        ))
-        .await
-        .unwrap();
-        assert_eq!(
-            tokio::time::timeout(std::time::Duration::from_secs(2), local_task)
-                .await
-                .expect("visitor cancellation must close local request")
-                .unwrap(),
-            0
-        );
-        ws.close(None).await.unwrap();
-        client.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
     async fn credential_refresh_renews_the_existing_relay_connection() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let relay = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let mut websocket = mock_relay::accept(socket).await.unwrap();
             for value in [
                 serde_json::json!({
                     "type": "hello", "subdomain": "renew.localhost", "tunnel_url": "http://renew.localhost", "session_id": "original-session",
@@ -3059,7 +3232,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let relay = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let mut websocket = mock_relay::accept(socket).await.unwrap();
             websocket.send(Message::Text(serde_json::json!({
                 "type": "hello", "subdomain": "recovery.localhost", "tunnel_url": "http://recovery.localhost", "session_id": "recovery",
             }).to_string())).await.unwrap();
@@ -3093,7 +3266,7 @@ mod tests {
         let (ping_tx, mut ping_rx) = tokio::sync::mpsc::unbounded_channel();
         let relay = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
-            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let mut websocket = mock_relay::accept(socket).await.unwrap();
             websocket.send(Message::Text(serde_json::json!({
                 "type": "hello", "subdomain": "heartbeat.localhost", "tunnel_url": "http://heartbeat.localhost", "session_id": "heartbeat",
             }).to_string())).await.unwrap();
@@ -3156,6 +3329,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_admission_wait_acknowledges_relay_controls_before_readiness() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (controller, admission) = forwarding_admission_barrier();
+        let relay = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            for (seq, value) in [
+                (
+                    1,
+                    serde_json::json!({ "type": "hello", "protocol": 4, "subdomain": "test.localhost", "tunnel_url": "http://test.localhost", "session_id": "session" }),
+                ),
+                (2, serde_json::json!({ "type": "pong" })),
+            ] {
+                let mut value = value;
+                value["transport_seq"] = serde_json::json!(seq);
+                value["transport_ack_nonce"] =
+                    serde_json::json!(format!("00000000-0000-4000-8000-{seq:012x}"));
+                ws.send(Message::Text(value.to_string())).await.unwrap();
+                let response =
+                    tokio::time::timeout(std::time::Duration::from_millis(200), ws.next()).await;
+                let Message::Text(text) = response.unwrap().unwrap().unwrap() else {
+                    panic!("missing transport acknowledgement");
+                };
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+                    serde_json::json!({
+                        "type": "transport_ack", "transport_seq": seq,
+                        "transport_ack_nonce": value["transport_ack_nonce"],
+                    })
+                );
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), ws.next())
+                    .await
+                    .is_err(),
+                "readiness must wait for admission"
+            );
+            controller.open();
+            let Message::Text(text) = ws.next().await.unwrap().unwrap() else {
+                panic!("missing readiness")
+            };
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&text).unwrap()["type"],
+                "client_ready"
+            );
+        });
+        let mut options = TunnelOptions::new("test-token".into(), 3000);
+        options.relay_url = format!("ws://{address}/connect");
+        options.no_pin = true;
+        options.forwarding_admission = Some(admission);
+        let client =
+            tokio::spawn(async move { try_connect(&options, &|_| Ok(()), &|_, _| {}).await });
+        let result = relay.await;
+        client.abort();
+        result.unwrap();
+    }
+
+    #[tokio::test]
     async fn rejected_runtime_publication_never_forwards_a_queued_relay_request() {
         let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let local_address = local_listener.local_addr().unwrap();
@@ -3164,7 +3396,7 @@ mod tests {
         let (request_sent_tx, request_sent_rx) = tokio::sync::oneshot::channel();
         let relay = tokio::spawn(async move {
             let (socket, _) = relay_listener.accept().await.unwrap();
-            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let mut websocket = mock_relay::accept(socket).await.unwrap();
             websocket
                 .send(Message::Text(
                     serde_json::json!({
@@ -3305,7 +3537,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let relay = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut socket = mock_relay::accept(stream).await.unwrap();
             let hello = serde_json::json!({
                 "type": "hello", "subdomain": "recovery.localhost",
                 "tunnel_url": "http://recovery.localhost", "session_id": "before-disconnect",
@@ -3329,7 +3561,7 @@ mod tests {
             stream.write_all(format!("HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
             drop(stream);
             let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut socket = mock_relay::accept(stream).await.unwrap();
             socket.send(Message::Text(hello)).await.unwrap();
             socket.close(None).await.unwrap();
         });
@@ -3368,6 +3600,7 @@ mod tests {
             "concurrent_limit",
             "billing_inactive",
             "monthly_allowance_exhausted",
+            "monthly_connections_exhausted",
         ] {
             let body = format!(r#"{{"error":"denied","code":"{code}"}}"#);
             let error = classify_relay_rejection(429, body.as_bytes());
@@ -3577,7 +3810,7 @@ mod tests {
 
             let (second_socket, _) = relay_listener.accept().await.unwrap();
             let callback_tokens = Arc::clone(&relay_tokens);
-            let mut websocket = tokio_tungstenite::accept_hdr_async(
+            let mut websocket = mock_relay::accept_with_headers(
                 second_socket,
                 move |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
                       response: tokio_tungstenite::tungstenite::handshake::server::Response| {
@@ -3700,7 +3933,7 @@ mod tests {
 
             let (socket, _) = relay_listener.accept().await.unwrap();
             let callback_tokens = Arc::clone(&relay_tokens);
-            let mut websocket = tokio_tungstenite::accept_hdr_async(
+            let mut websocket = mock_relay::accept_with_headers(
                 socket,
                 move |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
                       response: tokio_tungstenite::tungstenite::handshake::server::Response| {
@@ -4007,13 +4240,13 @@ mod tests {
     #[test]
     fn ws_config_constants_are_reasonable() {
         // Verify WebSocket message size limits are set and sane.
-        assert_eq!(MAX_WS_MESSAGE_SIZE, 50 * 1024 * 1024);
+        assert_eq!(MAX_WS_MESSAGE_SIZE, 16 * 1024 * 1024);
         assert_eq!(MAX_WS_FRAME_SIZE, 16 * 1024 * 1024);
     }
 
     #[test]
-    fn websocket_write_buffer_accepts_the_largest_http_response_message() {
-        let maximum_encoded_body = (50 * 1024 * 1024_usize).div_ceil(3) * 4;
+    fn websocket_write_buffer_accepts_a_bounded_stream_response_chunk() {
+        let maximum_encoded_body = (64 * 1024_usize).div_ceil(3) * 4;
 
         assert!(WEBSOCKET_MAX_WRITE_BUFFER_BYTES >= maximum_encoded_body + 1024 * 1024);
     }
@@ -4603,7 +4836,7 @@ mod tests {
         let relay_address = relay_listener.local_addr().unwrap();
         let relay = tokio::spawn(async move {
             let (socket, _) = relay_listener.accept().await.unwrap();
-            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let mut websocket = mock_relay::accept(socket).await.unwrap();
             websocket
                 .send(Message::Text(
                     serde_json::json!({
@@ -4698,7 +4931,7 @@ mod tests {
         let relay_active = Arc::clone(&active_requests);
         let relay = tokio::spawn(async move {
             let (socket, _) = relay_listener.accept().await.unwrap();
-            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let mut websocket = mock_relay::accept(socket).await.unwrap();
             websocket
                 .send(Message::Text(
                     serde_json::json!({
@@ -4792,6 +5025,215 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capture_backlog_rejects_one_request_and_keeps_controls_and_recovery_live() {
+        let local = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = local.local_addr().unwrap().port();
+        drop(local);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (webhook_tx, mut captures) = tokio::sync::mpsc::channel(4);
+        let mut options = TunnelOptions::new("test-token".into(), port);
+        options.relay_url = format!("ws://{address}/connect");
+        options.no_pin = true;
+        options.webhook_tx = Some(webhook_tx);
+        options.token_provider = Some(TunnelTokenProvider::new(
+            || Box::pin(async { Ok("test-token".into()) }),
+            || Box::pin(async { Ok("renewed-token".into()) }),
+        ));
+        let client =
+            tokio::spawn(async move { try_connect(&options, &|_| Ok(()), &|_, _| {}).await });
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut ws = mock_relay::accept(socket).await.unwrap();
+        ws.send(Message::Text(serde_json::json!({ "type":"hello", "subdomain":"test.localhost", "tunnel_url":"http://test.localhost", "session_id":"session" }).to_string())).await.unwrap();
+        let body = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            vec![0; 5 * 1024 * 1024],
+        );
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for (id, status) in [("capture-one", 502), ("capture-two", 502), ("rejected", 503)] {
+                ws.send(Message::Text(serde_json::json!({ "type":"http_request", "id":id, "method":"POST", "url":"/webhook", "headers":{}, "body":body }).to_string())).await.unwrap();
+                let Message::Text(response) = ws.next().await.unwrap().unwrap() else { panic!("missing HTTP response") };
+                let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+                assert_eq!(response["id"], id);
+                assert_eq!(response["status"], status);
+            }
+            ws.send(Message::Text(serde_json::json!({ "type":"credential_refresh" }).to_string())).await.unwrap();
+            let Message::Text(renewal) = ws.next().await.unwrap().unwrap() else { panic!("missing credential control") };
+            let renewal: serde_json::Value = serde_json::from_str(&renewal).unwrap();
+            assert_eq!(renewal["token"], "renewed-token");
+            drop(captures.recv().await.unwrap());
+            drop(captures.recv().await.unwrap());
+            assert!(captures.try_recv().is_err(), "rejected requests do not allocate a capture");
+            ws.send(Message::Text(serde_json::json!({ "type":"http_request", "id":"recovered", "method":"POST", "url":"/webhook", "headers":{}, "body":body }).to_string())).await.unwrap();
+            let Message::Text(response) = ws.next().await.unwrap().unwrap() else { panic!("missing recovered response") };
+            let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(response["id"], "recovered");
+            assert_eq!(response["status"], 502);
+        }).await;
+        client.abort();
+        result.expect("capture saturation must not terminate the relay connection");
+    }
+
+    #[tokio::test]
+    async fn already_completed_request_acknowledges_crossing_cancellation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = mock_relay::accept(socket).await.unwrap();
+            ws.send(Message::Text(serde_json::json!({ "type": "hello", "subdomain": "test.localhost", "tunnel_url": "http://test.localhost", "session_id": "session" }).to_string())).await.unwrap();
+            ws.send(Message::Text(
+                serde_json::json!({ "type": "http_cancel", "id": "already-completed" }).to_string(),
+            ))
+            .await
+            .unwrap();
+            let response =
+                tokio::time::timeout(std::time::Duration::from_millis(100), ws.next()).await;
+            assert!(
+                matches!(response, Ok(Some(Ok(Message::Text(text)))) if serde_json::from_str::<serde_json::Value>(&text).unwrap()["type"] == "http_cancelled")
+            );
+        });
+        let mut options = TunnelOptions::new("test-token".into(), 3000);
+        options.relay_url = format!("ws://{address}/connect");
+        options.no_pin = true;
+        let client =
+            tokio::spawn(async move { try_connect(&options, &|_| Ok(()), &|_, _| {}).await });
+        let result = relay.await;
+        client.abort();
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn too_many_relay_headers_are_rejected_before_owned_parsing() {
+        let headers: HashMap<String, String> = (0..129)
+            .map(|i| (format!("x-{i}"), "value".into()))
+            .collect();
+        let request = serde_json::json!({ "id": "bounded", "method": "GET", "url": "/", "headers": headers, "body": "" });
+        assert!(validate_relay_request(&request.to_string()).is_err());
+    }
+
+    #[tokio::test]
+    async fn bodyless_responses_keep_complete_captures_when_relay_cancellation_crosses_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (method, status) in [("HEAD", 200), ("GET", 204), ("GET", 205), ("GET", 304)] {
+            let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = origin.local_addr().unwrap().port();
+            let local = tokio::spawn(async move {
+                let (mut socket, _) = origin.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status} OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (webhook_tx, mut captures) = tokio::sync::mpsc::channel(1);
+            let mut options = TunnelOptions::new("test-token".into(), port);
+            options.relay_url = format!("ws://{address}/connect");
+            options.no_pin = true;
+            options.webhook_tx = Some(webhook_tx);
+            let client =
+                tokio::spawn(async move { try_connect(&options, &|_| Ok(()), &|_, _| {}).await });
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let receipt = |mut value: serde_json::Value, seq| {
+                value["transport_seq"] = serde_json::json!(seq);
+                value["transport_ack_nonce"] =
+                    serde_json::json!(format!("00000000-0000-4000-8000-{seq:012}"));
+                Message::Text(value.to_string())
+            };
+            ws.send(receipt(serde_json::json!({ "type": "hello", "protocol": 4, "subdomain": "test.localhost", "tunnel_url": "http://test.localhost", "session_id": "session" }), 1)).await.unwrap();
+            ws.send(receipt(serde_json::json!({ "type": "http_request", "id": "bodyless", "method": method, "url": "/", "headers": {}, "body": "" }), 2)).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if value["type"] == "http_response_start" {
+                        assert_eq!(value["status"], status);
+                        return;
+                    }
+                }
+                panic!("missing response headers");
+            })
+            .await
+            .unwrap();
+            ws.send(receipt(
+                serde_json::json!({ "type": "http_cancel", "id": "bodyless" }),
+                3,
+            ))
+            .await
+            .unwrap();
+            let captured =
+                tokio::time::timeout(std::time::Duration::from_millis(250), captures.recv()).await;
+            client.abort();
+            local.await.unwrap();
+            let event = captured
+                .expect("bodyless response must capture without body demand")
+                .expect("capture channel closed");
+            assert_eq!(event.webhook.response_status, status);
+            assert!(event.webhook.response_body.is_empty());
+            assert!(!event.webhook.response_body_incomplete);
+        }
+    }
+
+    #[test]
+    fn relay_body_limit_counts_decoded_bytes_at_the_base64_padding_boundary() {
+        use base64::Engine;
+        const MAXIMUM: usize = 10 * 1024 * 1024;
+        for excess in 0..=2 {
+            let body = base64::engine::general_purpose::STANDARD.encode(vec![0; MAXIMUM + excess]);
+            let request = serde_json::json!({ "id": "boundary", "method": "POST", "url": "/", "headers": {}, "body": body });
+            assert_eq!(
+                validate_relay_request(&request.to_string()).is_ok(),
+                excess == 0,
+                "decoded size: {}",
+                MAXIMUM + excess
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn persistence_receipt_keeps_request_memory_until_forwarding_returns() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::new(Arc::clone(&budget).acquire_owned().await.unwrap());
+        let (webhook_tx, mut webhook_rx) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(forward_http_request(
+            reqwest::Client::builder().no_proxy().build().unwrap(),
+            lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, address.port()),
+            ServerMessage::HttpRequest {
+                id: "persisted".into(),
+                method: "POST".into(),
+                url: "/".into(),
+                headers: HashMap::new(),
+                body: String::new(),
+            },
+            true,
+            Some(webhook_tx),
+            Arc::new(tokio::sync::Semaphore::new(64)),
+            Some(permit),
+            None,
+        ));
+        let event = webhook_rx.recv().await.unwrap();
+        event.complete_persistence(Ok(()));
+        assert_eq!(
+            budget.available_permits(),
+            0,
+            "request is still retained by the forwarding future"
+        );
+        task.await.unwrap();
+        assert_eq!(budget.available_permits(), 1);
+    }
+
+    #[tokio::test]
     async fn queued_capture_keeps_response_memory_reserved_until_received() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -4852,7 +5294,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_large_requests_cannot_reserve_more_than_the_byte_budget() {
-        let encoded_len = (20 * 1024 * 1024_usize).div_ceil(3) * 4;
+        let encoded_len = (10 * 1024 * 1024_usize).div_ceil(3) * 4;
         let permits = request_memory_permits(encoded_len).unwrap();
         let budget = Arc::new(tokio::sync::Semaphore::new(HTTP_REQUEST_MEMORY_PERMITS));
         let mut reservations = Vec::new();
@@ -5027,10 +5469,81 @@ mod tests {
 
     #[test]
     fn inbound_websocket_admission_accounts_for_wire_and_decoded_buffers() {
-        let wire_bytes = MAX_WS_MESSAGE_SIZE - 1;
+        let wire_bytes = 50 * 1024 * 1024 - 1;
         let base64_bytes = wire_bytes - 128;
 
         assert!(inbound_websocket_memory_permits(wire_bytes, base64_bytes).is_none());
+    }
+
+    #[tokio::test]
+    async fn local_websocket_writer_retains_memory_until_stalled_send_stops() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_send_buffer_size(1024).unwrap();
+        let (stream, accepted) = tokio::join!(
+            socket.connect(listener.local_addr().unwrap()),
+            listener.accept()
+        );
+        let stream = stream.unwrap();
+        let (peer, _) = accepted.unwrap();
+        let websocket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+            tokio_tungstenite::MaybeTlsStream::Plain(stream),
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let (local_write, local_read) = websocket.split();
+        let (relay_tx, _relay_rx) = tokio::sync::mpsc::channel(4);
+        let (closed_tx, _closed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let memory = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut tasks = tokio::task::JoinSet::new();
+        let connection = activate_local_websocket(
+            &mut tasks,
+            LocalWebSocketActivation {
+                id: "stalled".into(),
+                generation: 1,
+                local_write,
+                local_read,
+                slot: Arc::new(tokio::sync::Semaphore::new(1))
+                    .acquire_owned()
+                    .await
+                    .unwrap(),
+                relay_tx,
+                relay_memory: Arc::new(tokio::sync::Semaphore::new(WEBSOCKET_MEMORY_PERMITS)),
+                ws_tx: None,
+                closed_tx,
+            },
+        );
+        connection
+            .commands
+            .send(LocalWebSocketCommand::Frame {
+                data: vec![0; 8 * 1024 * 1024],
+                is_binary: true,
+                _memory_permit: Arc::clone(&memory).acquire_owned().await.unwrap(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while connection.commands.capacity() != connection.commands.max_capacity() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer consumed the command");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let retained = memory.available_permits();
+        connection.cancel.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await
+        .expect("cancellation stops both halves");
+        drop(peer);
+        assert_eq!(
+            retained, 0,
+            "in-flight native output must retain its memory reservation"
+        );
+        assert_eq!(memory.available_permits(), 1);
     }
 
     #[tokio::test]
@@ -5039,7 +5552,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut websocket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut websocket = mock_relay::accept(stream).await.unwrap();
             websocket
                 .send(Message::Close(Some(CloseFrame {
                     code: CloseCode::Normal,
@@ -5103,7 +5616,7 @@ mod tests {
         let expected = code.filter(|code| *code != 1005);
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut socket = mock_relay::accept(stream).await.unwrap();
             if server_initiates {
                 socket
                     .send(Message::Close(expected.map(|code| CloseFrame {
