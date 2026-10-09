@@ -763,9 +763,9 @@ async fn multi_service_dev_stops_when_the_tunnel_fails_after_readiness() {
                         "subdomain": "multi-ready.lpm.test",
                         "tunnel_url": "https://multi-ready.lpm.test",
                         "session_id": "session-multi-ready",
-                        "plan": "free",
+                        "plan": "pro",
                         "base_domain": "lpm.test",
-                        "domain_kind": "random"
+                        "domain_kind": "account"
                     })
                     .to_string(),
                 ))
@@ -1134,9 +1134,9 @@ async fn tunnel_start_under_json_emits_pretty_success_contract_on_stdout() {
                         "subdomain": "review-test.lpm.test",
                         "tunnel_url": "https://review-test.lpm.test",
                         "session_id": "session-review-test",
-                        "plan": "free",
+                        "plan": "pro",
                         "base_domain": "lpm.test",
-                        "domain_kind": "random"
+                        "domain_kind": "account"
                     })
                     .to_string(),
                 ))
@@ -1182,11 +1182,9 @@ async fn tunnel_start_under_json_emits_pretty_success_contract_on_stdout() {
       "local_port": 5173,
       "local_url": "http://127.0.0.1:5173/",
       "session_id": "session-review-test",
-      "plan": "free",
+      "plan": "pro",
       "base_domain": "lpm.test",
-      "domain_kind": "random",
-      "session_expires_at": null,
-      "session_max_ms": null,
+      "domain_kind": "account",
       "limits": null,
       "usage": null,
       "tunnel_auth": null,
@@ -1194,6 +1192,98 @@ async fn tunnel_start_under_json_emits_pretty_success_contract_on_stdout() {
       "auto_ack": false
     }
     "#);
+}
+
+/// A relay that refuses the first connect with `plan_required` and reports
+/// whether the CLI tried again.
+fn plan_required_relay() -> (String, tokio::task::JoinHandle<bool>) {
+    let relay = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    relay.set_nonblocking(true).unwrap();
+    let relay = tokio::net::TcpListener::from_std(relay).unwrap();
+    let relay_url = format!("ws://{}/connect", relay.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = tokio::time::timeout(Duration::from_secs(12), relay.accept())
+            .await
+            .expect("no connect reached the relay")
+            .unwrap();
+        let body = r#"{"error":"Tunnels need a Pro plan. Upgrade at https://lpm.dev/pricing","code":"plan_required"}"#;
+        tokio::io::AsyncWriteExt::write_all(&mut socket, format!("HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        drop(socket);
+        tokio::time::timeout(Duration::from_secs(4), relay.accept())
+            .await
+            .is_ok()
+    });
+    (relay_url, task)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_without_a_paid_plan_explains_it_and_stops() {
+    let (relay_url, relay_task) = plan_required_relay();
+    let output = tokio::task::spawn_blocking(move || {
+        let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+        let mut command = lpm_spawnable(&project);
+        command.env("LPM_TUNNEL_RELAY", relay_url).args([
+            "--token",
+            "workflow-token",
+            "tunnel",
+            "5173",
+            "--no-inspect",
+        ]);
+        command_output_with_deadline(command, Duration::from_secs(15))
+    })
+    .await
+    .unwrap();
+    assert!(
+        !relay_task.await.unwrap(),
+        "the CLI connected again after plan_required"
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("plan_required"), "{stderr}");
+    assert!(stderr.contains("lpm tunnel <port> <domain>"), "{stderr}");
+    assert!(
+        !stderr.contains("Check your network connection"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_json_reports_a_plan_refusal_with_its_relay_code() {
+    let (relay_url, relay_task) = plan_required_relay();
+    let output = tokio::task::spawn_blocking(move || {
+        let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+        let mut command = lpm_spawnable(&project);
+        command.env("LPM_TUNNEL_RELAY", relay_url).args([
+            "--token",
+            "workflow-token",
+            "--json",
+            "tunnel",
+            "5173",
+            "--no-inspect",
+        ]);
+        command_output_with_deadline(command, Duration::from_secs(15))
+    })
+    .await
+    .unwrap();
+    assert!(
+        !relay_task.await.unwrap(),
+        "the CLI connected again after plan_required"
+    );
+    assert!(!output.status.success());
+    let events: Vec<serde_json::Value> = serde_json::Deserializer::from_slice(&output.stdout)
+        .into_iter()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let failure = events.last().expect("no JSON output");
+    assert_eq!(failure["error_code"], "tunnel_access", "{failure}");
+    assert_eq!(failure["error"]["relay_code"], "plan_required", "{failure}");
+    assert!(
+        failure["error"]["help"]
+            .as_str()
+            .unwrap()
+            .contains("https://lpm.dev/pricing"),
+        "{failure}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1210,7 +1300,7 @@ async fn tunnel_json_reports_a_retry_before_a_successful_reconnection() {
             let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
             websocket.send(Message::Text(serde_json::json!({
                 "type":"hello", "subdomain":"retry.lpm.test", "tunnel_url":"https://retry.lpm.test",
-                "session_id":"session-retry", "plan":"free", "base_domain":"lpm.test", "domain_kind":"random"
+                "session_id":"session-retry", "plan":"pro", "base_domain":"lpm.test", "domain_kind":"account"
             }).to_string())).await.unwrap();
             websocket.close(None).await.unwrap();
         }).await.expect("retry relay timed out");
@@ -1280,9 +1370,9 @@ async fn tunnel_start_warns_that_capture_history_persists_sensitive_request_data
                         "subdomain": "capture-warning.lpm.test",
                         "tunnel_url": "https://capture-warning.lpm.test",
                         "session_id": "session-capture-warning",
-                        "plan": "free",
+                        "plan": "pro",
                         "base_domain": "lpm.test",
-                        "domain_kind": "random"
+                        "domain_kind": "account"
                     })
                     .to_string(),
                 ))

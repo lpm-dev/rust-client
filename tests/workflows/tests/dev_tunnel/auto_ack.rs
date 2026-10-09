@@ -19,7 +19,7 @@ async fn auto_ack_is_on_disk_before_provider_receives_success() {
             let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
             websocket.send(Message::Text(serde_json::json!({
                 "type":"hello", "subdomain":"capture.lpm.test", "tunnel_url":"https://capture.lpm.test",
-                "session_id":"durable-session", "plan":"free", "base_domain":"lpm.test", "domain_kind":"random"
+                "session_id":"durable-session", "plan":"pro", "base_domain":"lpm.test", "domain_kind":"account"
             }).to_string())).await.unwrap();
             websocket.send(Message::Text(serde_json::json!({
                 "type":"http_request", "id":"durable-auto-ack", "method":"POST", "url":"/webhook",

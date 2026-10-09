@@ -514,6 +514,16 @@ pub enum LpmError {
     )]
     Tunnel(String),
 
+    /// The relay refused a tunnel because the account can't run one, such
+    /// as a plan without tunnels. Retrying doesn't help until the account changes.
+    #[error("tunnel unavailable: {message} ({code})")]
+    #[diagnostic(code(lpm::tunnel_access), help("{help}"))]
+    TunnelAccess {
+        code: String,
+        message: String,
+        help: String,
+    },
+
     #[error("store error: {0}")]
     #[diagnostic(
         code(lpm::store),
@@ -739,7 +749,38 @@ pub enum LpmError {
     },
 }
 
+/// Relay codes that mean the account can't run a tunnel.
+pub const TUNNEL_ACCESS_CODES: [&str; 4] = [
+    "plan_required",
+    "domain_required",
+    "billing_inactive",
+    "account_not_found",
+];
+
 impl LpmError {
+    /// The error for a relay refusal with one of [`TUNNEL_ACCESS_CODES`].
+    pub fn tunnel_access(code: &str, message: impl Into<String>) -> Self {
+        let help = match code {
+            "plan_required" => {
+                "Tunnels need a Pro plan, or one of your organization's claimed domains. Upgrade at https://lpm.dev/pricing, or name the organization's domain: `lpm tunnel <port> <domain>` or `lpm dev --domain <domain>`."
+            }
+            "domain_required" => {
+                "Your tunnel URL comes from your lpm.dev username. Set one at https://lpm.dev/dashboard/settings, or name a domain you claimed: `lpm tunnel <port> <domain>` or `lpm dev --domain <domain>`."
+            }
+            "billing_inactive" => {
+                "The organization's billing is inactive. An owner can update its payment method in the organization's billing settings on lpm.dev."
+            }
+            _ => {
+                "The tunnel's account is no longer available. Run `lpm login`, then start the tunnel again."
+            }
+        };
+        LpmError::TunnelAccess {
+            code: code.to_owned(),
+            message: message.into(),
+            help: help.to_owned(),
+        }
+    }
+
     /// Machine-readable error code for structured JSON output.
     ///
     /// Used by the CLI's `--json` flag to provide parseable error responses
@@ -787,6 +828,7 @@ impl LpmError {
             LpmError::ScriptPhase { .. } => "script",
             LpmError::Cert(_) => "cert",
             LpmError::Tunnel(_) => "tunnel",
+            LpmError::TunnelAccess { .. } => "tunnel_access",
             LpmError::Store(_) => "store",
             LpmError::ProjectLayout(_) => "project_layout",
             LpmError::ExitCode(_) => "exit_code",
@@ -1024,6 +1066,7 @@ mod tests {
             },
             LpmError::Cert("x".into()),
             LpmError::Tunnel("x".into()),
+            LpmError::tunnel_access("plan_required", "x"),
             LpmError::Store("x".into()),
             LpmError::ProjectLayout("x".into()),
             LpmError::ExitCode(1),

@@ -72,10 +72,6 @@ enum RelayHandshakeMessage {
         #[serde(default)]
         domain_kind: Option<String>,
         #[serde(default)]
-        session_expires_at: Option<u64>,
-        #[serde(default)]
-        session_max_ms: Option<u64>,
-        #[serde(default)]
         limits: Option<Box<TunnelLimitMetadata>>,
         #[serde(default)]
         usage: Option<Box<TunnelUsageMetadata>>,
@@ -279,12 +275,9 @@ struct RelayRejectionBody {
 fn relay_code_retry_class(code: &str) -> Option<RetryClass> {
     match code {
         "auth_failed" => Some(RetryClass::AuthRejected),
-        "plan_required"
-        | "domain_not_owned"
-        | "concurrent_limit"
-        | "billing_inactive"
-        | "session_expired"
-        | "monthly_allowance_exhausted" => Some(RetryClass::Permanent),
+        "domain_not_owned" | "concurrent_limit" | "monthly_allowance_exhausted" => {
+            Some(RetryClass::Permanent)
+        }
         "auth_unavailable"
         | "domain_unavailable"
         | "quota_unavailable"
@@ -295,13 +288,34 @@ fn relay_code_retry_class(code: &str) -> Option<RetryClass> {
     }
 }
 
-fn classify_relay_message_error(message: &str, code: Option<&str>) -> TunnelConnectError {
-    let message = format!("relay error: {message}");
-    match code.and_then(relay_code_retry_class) {
-        Some(RetryClass::Permanent) => TunnelConnectError::permanent(message),
-        Some(RetryClass::AuthRejected) => TunnelConnectError::auth_rejected(message),
-        Some(RetryClass::Transient) | None => TunnelConnectError::transient(message),
+/// The error for a relay refusal or error frame. A refusal because the
+/// account can't run a tunnel keeps its code, so commands can explain it.
+fn relay_error(
+    context: &str,
+    message: &str,
+    code: Option<&str>,
+    fallback: RetryClass,
+) -> TunnelConnectError {
+    if let Some(code) = code.filter(|code| lpm_common::error::TUNNEL_ACCESS_CODES.contains(code)) {
+        return TunnelConnectError {
+            error: LpmError::tunnel_access(code, message),
+            retry_class: RetryClass::Permanent,
+            capacity_limited: false,
+        };
     }
+    let detail = format!(
+        "{context}: {message}{}",
+        code.map(|value| format!(" ({value})")).unwrap_or_default()
+    );
+    match code.and_then(relay_code_retry_class).unwrap_or(fallback) {
+        RetryClass::Permanent => TunnelConnectError::permanent(detail),
+        RetryClass::Transient => TunnelConnectError::transient(detail),
+        RetryClass::AuthRejected => TunnelConnectError::auth_rejected(detail),
+    }
+}
+
+fn classify_relay_message_error(message: &str, code: Option<&str>) -> TunnelConnectError {
+    relay_error("relay error", message, code, RetryClass::Transient)
 }
 
 fn classify_relay_rejection(status: u16, body: &[u8]) -> TunnelConnectError {
@@ -311,25 +325,14 @@ fn classify_relay_rejection(status: u16, body: &[u8]) -> TunnelConnectError {
         .as_ref()
         .and_then(|value| value.error.as_deref().or(value.message.as_deref()))
         .unwrap_or("relay rejected connection");
-    let message = format!(
-        "relay rejected connection: {detail}{}",
-        code.map(|value| format!(" ({value})")).unwrap_or_default()
-    );
-
-    let retry_class = code.and_then(relay_code_retry_class).unwrap_or({
-        if status == 401 {
-            RetryClass::AuthRejected
-        } else if status >= 500 {
-            RetryClass::Transient
-        } else {
-            RetryClass::Permanent
-        }
-    });
-    let mut error = match retry_class {
-        RetryClass::Permanent => TunnelConnectError::permanent(message),
-        RetryClass::Transient => TunnelConnectError::transient(message),
-        RetryClass::AuthRejected => TunnelConnectError::auth_rejected(message),
+    let fallback = if status == 401 {
+        RetryClass::AuthRejected
+    } else if status >= 500 {
+        RetryClass::Transient
+    } else {
+        RetryClass::Permanent
     };
+    let mut error = relay_error("relay rejected connection", detail, code, fallback);
     error.capacity_limited = code == Some("concurrent_limit");
     error
 }
@@ -848,8 +851,9 @@ pub struct TunnelOptions {
     pub local_target: lpm_common::LocalTarget,
     /// Live endpoint source for dev services that can restart.
     pub live_local_target: Option<Arc<RwLock<lpm_common::LocalTarget>>>,
-    /// Full tunnel domain (e.g., "acme-api.lpm.llc"). Pro/Org only.
-    /// If None, relay assigns a random domain on lpm.fyi (free tier).
+    /// Full tunnel domain (e.g., "acme-api.lpm.llc"). If None, the relay uses
+    /// the Pro account's `<username>.lpm.fyi`. Organization tunnels need one of
+    /// the organization's claimed domains.
     /// If bare name without dot, ".lpm.fyi" is appended for backward compat.
     pub domain: Option<String>,
     /// Auth token for protecting the tunnel URL. When set, the relay
@@ -1932,8 +1936,6 @@ async fn try_connect_with_token(
                     plan,
                     base_domain,
                     domain_kind,
-                    session_expires_at,
-                    session_max_ms,
                     limits,
                     usage,
                     protocol,
@@ -1950,10 +1952,9 @@ async fn try_connect_with_token(
                             .unwrap_or(&raw_domain)
                             .to_string()
                     };
-                    // Verify the assigned domain matches what was requested.
-                    // A mismatch could indicate a relay bug or MITM — warn but
-                    // don't hard-fail since the server may have valid reasons
-                    // to reassign (e.g., domain taken, plan downgrade).
+                    // The relay never reassigns a requested domain, so a
+                    // mismatch means a relay bug. Warn rather than fail: the
+                    // relay may normalize the requested name's case.
                     if let Some(requested) = options.resolved_domain()
                         && domain != requested
                     {
@@ -1977,8 +1978,6 @@ async fn try_connect_with_token(
                             plan,
                             base_domain,
                             domain_kind,
-                            session_expires_at,
-                            session_max_ms,
                             limits: limits.map(|value| *value),
                         },
                         usage.map(|value| *value),
@@ -1986,19 +1985,12 @@ async fn try_connect_with_token(
                     )
                 }
                 RelayHandshakeMessage::Error { message, code } => {
-                    let retry_class = code
-                        .as_deref()
-                        .and_then(relay_code_retry_class)
-                        .unwrap_or(RetryClass::Permanent);
-                    let detail = format!(
-                        "relay rejected connection: {message}{}",
-                        code.map(|value| format!(" ({value})")).unwrap_or_default()
-                    );
-                    return Err(match retry_class {
-                        RetryClass::Permanent => TunnelConnectError::permanent(detail),
-                        RetryClass::Transient => TunnelConnectError::transient(detail),
-                        RetryClass::AuthRejected => TunnelConnectError::auth_rejected(detail),
-                    });
+                    return Err(relay_error(
+                        "relay rejected connection",
+                        &message,
+                        code.as_deref(),
+                        RetryClass::Permanent,
+                    ));
                 }
             }
         }
@@ -3361,16 +3353,120 @@ mod tests {
     }
 
     #[test]
+    fn relay_refusals_for_the_account_keep_their_code_and_explain_it() {
+        for (code, advice) in [
+            ("plan_required", "https://lpm.dev/pricing"),
+            ("domain_required", "https://lpm.dev/dashboard/settings"),
+            ("billing_inactive", "billing settings"),
+            ("account_not_found", "lpm login"),
+        ] {
+            let rejection = classify_relay_rejection(
+                403,
+                format!(r#"{{"error":"denied","code":"{code}"}}"#).as_bytes(),
+            );
+            let LpmError::TunnelAccess {
+                code: kept,
+                message,
+                help,
+            } = &rejection.error
+            else {
+                panic!("{code}: {}", rejection.error);
+            };
+            assert_eq!(kept, code);
+            assert_eq!(message, "denied");
+            assert!(help.contains(advice), "{code}: {help}");
+            assert!(!help.contains("network"), "{code}: {help}");
+            assert!(rejection.error.to_string().contains(&format!("({code})")));
+        }
+    }
+
+    async fn assert_access_ended_frame_stops(code: &'static str) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "hello",
+                        "subdomain": "acme.localhost",
+                        "tunnel_url": "http://acme.localhost",
+                        "session_id": "s1",
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "error",
+                        "code": code,
+                        "message": "Tunnel access ended",
+                    })
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            let _ = socket
+                .close(Some(CloseFrame {
+                    code:
+                        tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
+                    reason: "Tunnel access ended".into(),
+                }))
+                .await;
+            // A reconnect would arrive within the first backoff of about two seconds.
+            tokio::time::timeout(std::time::Duration::from_secs(4), listener.accept())
+                .await
+                .is_ok()
+        });
+        let mut options = TunnelOptions::new("test-token".into(), 5173);
+        options.relay_url = format!("ws://{address}/connect");
+        options.no_pin = true;
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            connect(
+                &options,
+                |_| {},
+                |message| panic!("{code}: retried after access ended: {message}"),
+            ),
+        )
+        .await
+        .expect("an access-ended tunnel did not stop")
+        .unwrap_err();
+        assert!(
+            matches!(&error, LpmError::TunnelAccess { code: kept, .. } if kept == code),
+            "{code}: {error}"
+        );
+        assert!(
+            !relay.await.unwrap(),
+            "{code}: reconnected after access ended"
+        );
+    }
+
+    #[tokio::test]
+    async fn access_ended_frame_stops_without_reconnecting() {
+        tokio::join!(
+            assert_access_ended_frame_stops("plan_required"),
+            assert_access_ended_frame_stops("billing_inactive"),
+            assert_access_ended_frame_stops("account_not_found"),
+        );
+    }
+
+    #[test]
     fn relay_quota_errors_have_stable_retry_classification() {
         for code in [
             "plan_required",
+            "domain_required",
             "domain_not_owned",
             "concurrent_limit",
             "billing_inactive",
+            "account_not_found",
             "monthly_allowance_exhausted",
         ] {
             let body = format!(r#"{{"error":"denied","code":"{code}"}}"#);
-            let error = classify_relay_rejection(429, body.as_bytes());
+            let error = classify_relay_rejection(503, body.as_bytes());
             assert_eq!(error.retry_class, RetryClass::Permanent, "code={code}");
         }
 
@@ -3541,10 +3637,17 @@ mod tests {
 
     #[test]
     fn active_relay_errors_preserve_their_retry_classification() {
-        assert_eq!(
-            classify_relay_message_error("upgrade required", Some("plan_required")).retry_class,
-            RetryClass::Permanent
-        );
+        // The relay closes a tunnel with these codes when the account's access
+        // ends; reconnecting can't succeed until the plan changes.
+        for code in ["plan_required", "billing_inactive", "account_not_found"] {
+            let error = classify_relay_message_error("access ended", Some(code));
+            assert_eq!(error.retry_class, RetryClass::Permanent, "code={code}");
+            assert!(
+                matches!(&error.error, LpmError::TunnelAccess { code: kept, .. } if kept == code),
+                "code={code}: {}",
+                error.error
+            );
+        }
         assert_eq!(
             classify_relay_message_error("session expired", Some("auth_failed")).retry_class,
             RetryClass::AuthRejected
