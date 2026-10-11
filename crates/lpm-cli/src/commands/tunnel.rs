@@ -772,18 +772,12 @@ pub(crate) async fn warn_capture_persistence(project_dir: &Path, show_human_warn
         return;
     };
     if !files.tracked.is_empty() {
-        let names = files
-            .tracked
-            .iter()
-            .map(|name| shell_quote(name))
-            .collect::<Vec<_>>()
-            .join(" ");
         capture_warning(
             &format!(
                 "git tracks {}, so captures there can be committed and stay in its \
-                 history; run `git rm --cached -- {names}`, commit, and rotate any \
-                 credentials they held",
-                listed(&files.tracked)
+                 history; run `{}`, commit, and rotate any credentials they held",
+                listed(&files.tracked),
+                untrack_command(&files.tracked)
             ),
             show_human_warning,
         );
@@ -820,6 +814,8 @@ struct CaptureGitFiles {
     unignored: Vec<String>,
 }
 
+const CAPTURES_PATHSPEC: &str = ":(glob,icase).lpm/inspector.db*";
+
 const CAPTURE_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How git treats the capture files in `project_dir`, matching their names
@@ -836,7 +832,7 @@ async fn capture_git_state(project_dir: &Path) -> Option<CaptureGitFiles> {
             "--others",
             "--exclude-standard",
             "--",
-            ":(glob,icase).lpm/inspector.db*",
+            CAPTURES_PATHSPEC,
         ],
     ));
     command
@@ -886,6 +882,21 @@ fn listed(names: &[String]) -> String {
         listed.push_str(&format!(" and {} more", names.len() - LISTED_FILES));
     }
     listed
+}
+
+/// The command that stops git tracking `tracked`: their names, or the
+/// capture pathspec when there are more than the warning lists.
+fn untrack_command(tracked: &[String]) -> String {
+    let paths = if tracked.len() > LISTED_FILES {
+        shell_quote(CAPTURES_PATHSPEC)
+    } else {
+        tracked
+            .iter()
+            .map(|name| shell_quote(name))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    format!("git rm --cached -- {paths}")
 }
 
 /// A POSIX shell word for `value`.
@@ -2145,6 +2156,25 @@ mod tests {
             listed(&many),
             "'.lpm/inspector.db0', '.lpm/inspector.db1', '.lpm/inspector.db2', \
              '.lpm/inspector.db3', '.lpm/inspector.db4' and 2 more"
+        );
+    }
+
+    #[test]
+    fn untracks_listed_names_or_every_capture_file_past_the_list() {
+        let names = |count: usize| -> Vec<String> {
+            (0..count)
+                .map(|index| format!(".lpm/inspector.db{index}"))
+                .collect()
+        };
+
+        assert_eq!(
+            untrack_command(&names(5)),
+            "git rm --cached -- '.lpm/inspector.db0' '.lpm/inspector.db1' \
+             '.lpm/inspector.db2' '.lpm/inspector.db3' '.lpm/inspector.db4'"
+        );
+        assert_eq!(
+            untrack_command(&names(6)),
+            "git rm --cached -- ':(glob,icase).lpm/inspector.db*'"
         );
     }
 
