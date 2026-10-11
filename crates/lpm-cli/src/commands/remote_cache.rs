@@ -80,6 +80,8 @@ struct RequestLimits {
     upload_limit_warned: AtomicBool,
     lookups_busy_noted: AtomicBool,
     uploads_busy_noted: AtomicBool,
+    uploads_refused: AtomicBool,
+    lookups_refused: AtomicBool,
 }
 
 impl RequestLimits {
@@ -139,6 +141,31 @@ impl RequestLimits {
         let resume = Instant::now() + wait;
         extend(self.until(request), resume);
         extend(self.limited_until(request), resume);
+    }
+
+    /// Stops uploads for the rest of the run once the cache server refuses
+    /// one: the token can't write there, and every later upload would be
+    /// refused too, each counting against the server's limit for refused
+    /// requests.
+    fn refuse_uploads(&self) {
+        self.uploads_refused.store(true, Ordering::Relaxed);
+    }
+
+    fn uploads_refused(&self) -> bool {
+        self.uploads_refused.load(Ordering::Relaxed)
+    }
+
+    /// Stops lookups and uploads for the rest of the run once the cache
+    /// server refuses a lookup: the token can't read that cache, or the
+    /// cache is paused or disabled, so every later request would be refused
+    /// too.
+    fn refuse_lookups(&self) {
+        self.lookups_refused.store(true, Ordering::Relaxed);
+        self.refuse_uploads();
+    }
+
+    fn lookups_refused(&self) -> bool {
+        self.lookups_refused.load(Ordering::Relaxed)
     }
 
     /// True the first time the run reaches this kind of limit.
@@ -229,6 +256,9 @@ pub fn try_restore(
     output_globs: &[String],
     validate: impl FnOnce() -> Result<bool, lpm_common::LpmError>,
 ) -> Option<lpm_task::cache::CacheHit> {
+    if client.limits.lookups_refused() {
+        return None;
+    }
     if client.limits.lookups_paused() {
         client.skipping_while_busy(LimitedRequest::Lookup);
         return None;
@@ -255,7 +285,7 @@ pub fn try_store(
     env_vars: &HashMap<String, String>,
     inherited_env: &HashMap<std::ffi::OsString, std::ffi::OsString>,
 ) {
-    if client.read_only {
+    if client.read_only || client.limits.uploads_refused() {
         return;
     }
     // A lookup's pause skips uploads too, so its notice alone wouldn't say so.
@@ -574,6 +604,13 @@ impl RemoteCacheClient {
         match response.status() {
             StatusCode::OK => {}
             StatusCode::NOT_FOUND => return Ok(None),
+            StatusCode::FORBIDDEN => {
+                self.limits.refuse_lookups();
+                return Err(format!(
+                    "{}; skipping the remote cache for this run",
+                    remote_cache_http_error(response, "lookup").await
+                ));
+            }
             _ => return Err(remote_cache_http_error(response, "lookup").await),
         }
 
@@ -786,6 +823,13 @@ impl RemoteCacheClient {
             // the next lookup as well as this one would.
             if response.status().is_success() || response.status() == StatusCode::CONFLICT {
                 return Ok(());
+            }
+            if response.status() == StatusCode::FORBIDDEN {
+                self.limits.refuse_uploads();
+                return Err(format!(
+                    "{}; skipping remote cache uploads for this run",
+                    remote_cache_http_error(response, "upload").await
+                ));
             }
             if response.status() != StatusCode::TOO_MANY_REQUESTS {
                 return Err(remote_cache_http_error(response, "upload").await);
@@ -2063,6 +2107,86 @@ mod tests {
             .set_body_json(serde_json::json!({
                 "error": "Remote cache limit reached: 8 uploads at once",
             }))
+    }
+
+    #[tokio::test]
+    async fn an_upload_the_token_may_not_make_stops_uploads_for_the_run() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "error": "Token does not have remote cache write permissions",
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (client, uploaded) = upload_to(&server).await;
+
+        let error = uploaded.unwrap_err();
+        assert!(
+            error.ends_with("; skipping remote cache uploads for this run"),
+            "{error}"
+        );
+        assert!(client.limits.uploads_refused());
+        assert!(!client.limits.uploads_paused());
+        let client = client.clone();
+        tokio::task::spawn_blocking(move || store_with(&client))
+            .await
+            .unwrap();
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn a_lookup_the_token_may_not_make_stops_the_cache_for_the_run() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "error": "Token does not have remote cache read permissions",
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client(&format!("{}/v8", server.uri()), MIB);
+        let project = tempfile::tempdir().unwrap();
+
+        let error = client
+            .restore_async(&"a".repeat(64), project.path(), &[], || Ok(true))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.ends_with("; skipping the remote cache for this run"),
+            "{error}"
+        );
+        assert!(client.limits.lookups_refused() && client.limits.uploads_refused());
+        let client = client.clone();
+        tokio::task::spawn_blocking(move || {
+            let project = tempfile::tempdir().unwrap();
+            let restored = try_restore(&client, &"b".repeat(64), project.path(), &[], || Ok(true));
+            assert!(restored.is_none());
+            store_with(&client);
+        })
+        .await
+        .unwrap();
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn an_upload_refused_for_another_reason_leaves_uploads_on() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let (client, uploaded) = upload_to(&server).await;
+
+        assert!(uploaded.is_err());
+        assert!(!client.limits.uploads_refused());
     }
 
     #[tokio::test]
