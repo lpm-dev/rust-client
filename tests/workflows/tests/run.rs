@@ -3473,6 +3473,107 @@ fn successful_build_stderr(output: &std::process::Output) -> String {
     stderr
 }
 
+fn parallel_remote_cache_project(server: &MockServer) -> TempProject {
+    let project = TempProject::empty(
+        r#"{
+        "name": "remote-cache-parallel",
+        "version": "1.0.0",
+        "scripts": {
+            "one": "node -e \"const fs=require('fs'); fs.mkdirSync('one',{recursive:true}); fs.writeFileSync('one/a.txt','1')\"",
+            "two": "node -e \"const fs=require('fs'); fs.mkdirSync('two',{recursive:true}); fs.writeFileSync('two/a.txt','2')\""
+        }
+    }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+            "remoteCache": {{ "enabled": true, "url": "{}/v8" }},
+            "tasks": {{
+                "one": {{ "cache": true, "outputs": ["one/**"] }},
+                "two": {{ "cache": true, "outputs": ["two/**"] }}
+            }}
+        }}"#,
+            server.uri(),
+        ),
+    );
+    project
+}
+
+fn run_parallel_with_remote_token(project: &TempProject) -> std::process::Output {
+    lpm(project)
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
+        .args(["run", "one", "two", "--parallel"])
+        .output()
+        .expect("failed to run lpm run one two --parallel")
+}
+
+fn refused(error: &str) -> ResponseTemplate {
+    ResponseTemplate::new(403)
+        .set_body_json(serde_json::json!({ "error": error }))
+        .set_delay(std::time::Duration::from_millis(400))
+}
+
+#[tokio::test]
+async fn run_remote_cache_says_once_that_it_stops_uploads_refused_at_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(refused(
+            "Token does not have remote cache write permissions",
+        ))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let project = parallel_remote_cache_project(&server);
+
+    let stderr = successful_build_stderr(&run_parallel_with_remote_token(&project));
+
+    assert_eq!(
+        stderr
+            .matches("skipping remote cache uploads for this run")
+            .count(),
+        1,
+        "two uploads refused at once must say so once:\n{stderr}",
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn run_remote_cache_says_once_that_it_stops_lookups_refused_at_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(refused("Token does not have remote cache read permissions"))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "urls": [] })))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let project = parallel_remote_cache_project(&server);
+
+    let stderr = successful_build_stderr(&run_parallel_with_remote_token(&project));
+
+    assert_eq!(
+        stderr
+            .matches("skipping the remote cache for this run")
+            .count(),
+        1,
+        "two lookups refused at once must say so once:\n{stderr}",
+    );
+    server.verify().await;
+}
+
 #[tokio::test]
 async fn run_remote_cache_skips_lookups_and_uploads_while_a_lookup_limit_lasts() {
     let server = MockServer::start().await;
