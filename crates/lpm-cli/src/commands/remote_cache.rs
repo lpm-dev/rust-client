@@ -28,6 +28,9 @@ const MAX_REMOTE_STATUS_BYTES: u64 = 64 * 1024;
 const DEFAULT_LIMIT_PAUSE: Duration = Duration::from_secs(60);
 /// The longest pause a 429 can ask for: a day, the Registry's longest window.
 const MAX_LIMIT_PAUSE: Duration = Duration::from_secs(24 * 60 * 60);
+/// The longest wait an upload refused with 429 sits out before going once
+/// more; a longer one is a spent limit.
+const MAX_UPLOAD_RETRY_WAIT: Duration = Duration::from_secs(5);
 const REMOTE_CACHE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Each upload read moves to the blocking pool, so the stream's 4 KiB default
 /// made a 64 MiB upload about ten times slower than 64 KiB reads.
@@ -500,7 +503,8 @@ impl RemoteCacheClient {
             StatusCode::OK => {}
             StatusCode::NOT_FOUND => return Ok(None),
             StatusCode::TOO_MANY_REQUESTS => {
-                self.limit_reached(LimitedRequest::Lookup, response).await;
+                let limit = read_limit_reached(response).await;
+                self.limit_reached(LimitedRequest::Lookup, limit);
                 return Ok(None);
             }
             _ => return Err(remote_cache_http_error(response, "lookup").await),
@@ -600,7 +604,6 @@ impl RemoteCacheClient {
         stderr: &str,
         duration_ms: u64,
     ) -> Result<(), String> {
-        let client = http_client()?;
         let mut artifact = tempfile::NamedTempFile::new()
             .map_err(|e| format!("failed to create remote cache artifact temp file: {e}"))?;
         let artifact_path = artifact.path().to_path_buf();
@@ -622,92 +625,118 @@ impl RemoteCacheClient {
             .metadata()
             .map_err(|e| format!("failed to stat remote cache artifact: {e}"))?
             .len();
+        self.check_upload_size(artifact_len)?;
+        self.upload_artifact(key, artifact.as_file(), artifact_len, duration_ms)
+            .await
+    }
+
+    fn check_upload_size(&self, artifact_len: u64) -> Result<(), String> {
         if artifact_len > self.max_artifact_bytes {
             return Err(format!(
                 "remote cache artifact exceeds the {} upload limit; skipping upload",
-                format_bytes(self.max_artifact_bytes),
+                format_cap(self.max_artifact_bytes),
             ));
         }
+        Ok(())
+    }
 
+    /// Uploads the artifact in `artifact`, going once more after a 429 with a
+    /// short wait, and pausing uploads after one that asks for longer.
+    async fn upload_artifact(
+        &self,
+        key: &str,
+        artifact: &File,
+        artifact_len: u64,
+        duration_ms: u64,
+    ) -> Result<(), String> {
+        let client = http_client()?;
         let hash_file = artifact
-            .as_file()
             .try_clone()
             .map_err(|e| format!("failed to retain remote cache artifact for hashing: {e}"))?;
         let digests = hash_artifact(hash_file, self.signature_key.as_deref())?;
         let url = self.artifact_url(key)?;
-        let response = self
-            .send_authenticated(
-                "remote cache upload was not authorized; continuing without it",
-                async |bearer: String| {
-                    let mut body_file = artifact.as_file().try_clone().map_err(|error| {
-                        RemoteCacheRequestError::Message(format!(
-                            "failed to retain remote cache artifact for upload: {error}"
-                        ))
-                    })?;
-                    body_file.rewind().map_err(|error| {
-                        RemoteCacheRequestError::Message(format!(
-                            "failed to rewind remote cache artifact for upload: {error}"
-                        ))
-                    })?;
-                    let mut request = client
-                        .put(url.clone())
-                        .bearer_auth(bearer)
-                        .header(CONTENT_LENGTH, artifact_len.to_string())
-                        .header(ARTIFACT_DURATION_HEADER, duration_ms.to_string())
-                        .header(ARTIFACT_SHA_HEADER, digests.sha256_hex.as_str())
-                        .header(
-                            ARTIFACT_CLIENT_CI_HEADER,
-                            if is_ci_environment() { "1" } else { "0" },
-                        )
-                        .header(
-                            ARTIFACT_CLIENT_INTERACTIVE_HEADER,
-                            if std::io::stdout().is_terminal() {
-                                "1"
-                            } else {
-                                "0"
-                            },
-                        )
-                        .body(Body::wrap_stream(
-                            tokio_util::io::ReaderStream::with_capacity(
-                                tokio::fs::File::from_std(body_file),
-                                UPLOAD_READ_BYTES,
-                            ),
-                        ));
+        let mut retried = false;
+        loop {
+            let response = self
+                .send_authenticated(
+                    "remote cache upload was not authorized; continuing without it",
+                    async |bearer: String| {
+                        let mut body_file = artifact.try_clone().map_err(|error| {
+                            RemoteCacheRequestError::Message(format!(
+                                "failed to retain remote cache artifact for upload: {error}"
+                            ))
+                        })?;
+                        body_file.rewind().map_err(|error| {
+                            RemoteCacheRequestError::Message(format!(
+                                "failed to rewind remote cache artifact for upload: {error}"
+                            ))
+                        })?;
+                        let mut request = client
+                            .put(url.clone())
+                            .bearer_auth(bearer)
+                            .header(CONTENT_LENGTH, artifact_len.to_string())
+                            .header(ARTIFACT_DURATION_HEADER, duration_ms.to_string())
+                            .header(ARTIFACT_SHA_HEADER, digests.sha256_hex.as_str())
+                            .header(
+                                ARTIFACT_CLIENT_CI_HEADER,
+                                if is_ci_environment() { "1" } else { "0" },
+                            )
+                            .header(
+                                ARTIFACT_CLIENT_INTERACTIVE_HEADER,
+                                if std::io::stdout().is_terminal() {
+                                    "1"
+                                } else {
+                                    "0"
+                                },
+                            )
+                            .body(Body::wrap_stream(
+                                tokio_util::io::ReaderStream::with_capacity(
+                                    tokio::fs::File::from_std(body_file),
+                                    UPLOAD_READ_BYTES,
+                                ),
+                            ));
 
-                    if let Some(tag) = digests.hmac_tag.as_deref() {
-                        request = request.header(ARTIFACT_TAG_HEADER, tag);
-                    }
+                        if let Some(tag) = digests.hmac_tag.as_deref() {
+                            request = request.header(ARTIFACT_TAG_HEADER, tag);
+                        }
 
-                    let response = request.send().await.map_err(|error| {
-                        RemoteCacheRequestError::Message(format!(
-                            "remote cache upload failed: {}",
-                            lpm_http::display_error(&error)
-                        ))
-                    })?;
-                    if response.status() == StatusCode::UNAUTHORIZED {
-                        Err(RemoteCacheRequestError::Unauthorized)
-                    } else {
-                        Ok(response)
-                    }
-                },
-            )
-            .await?;
+                        let response = request.send().await.map_err(|error| {
+                            RemoteCacheRequestError::Message(format!(
+                                "remote cache upload failed: {}",
+                                lpm_http::display_error(&error)
+                            ))
+                        })?;
+                        if response.status() == StatusCode::UNAUTHORIZED {
+                            Err(RemoteCacheRequestError::Unauthorized)
+                        } else {
+                            Ok(response)
+                        }
+                    },
+                )
+                .await?;
 
-        if response.status().is_success() {
+            if response.status().is_success() {
+                return Ok(());
+            }
+            if response.status() != StatusCode::TOO_MANY_REQUESTS {
+                return Err(remote_cache_http_error(response, "upload").await);
+            }
+            let limit = read_limit_reached(response).await;
+            // A wait this short is the server's room for uploads at once, not a
+            // spent limit: the upload goes again rather than being dropped.
+            if !retried && limit.wait <= MAX_UPLOAD_RETRY_WAIT {
+                retried = true;
+                tokio::time::sleep(limit.wait).await;
+                continue;
+            }
+            self.limit_reached(LimitedRequest::Upload, limit);
             return Ok(());
         }
-        if response.status() == StatusCode::TOO_MANY_REQUESTS {
-            self.limit_reached(LimitedRequest::Upload, response).await;
-            return Ok(());
-        }
-
-        Err(remote_cache_http_error(response, "upload").await)
     }
 
     /// Pauses the refused kind of request for as long as the cache server
     /// asks, and warns the first time the run reaches that limit.
-    async fn limit_reached(&self, request: LimitedRequest, response: reqwest::Response) {
-        let limit = read_limit_reached(response).await;
+    fn limit_reached(&self, request: LimitedRequest, limit: LimitReached) {
         self.limits.pause(request, limit.wait);
         if !self.limits.first_warning(request) {
             return;
@@ -1185,10 +1214,15 @@ fn env_flag(name: &str) -> Option<bool> {
     }
 }
 
+/// An artifact size cap, a whole number of MiB, as the Registry states it.
+fn format_cap(bytes: u64) -> String {
+    format!("{} MiB", bytes / (1024 * 1024))
+}
+
 fn oversized_download(max_artifact_bytes: u64) -> String {
     format!(
         "remote cache artifact exceeds the {} limit; treating it as a miss",
-        format_bytes(max_artifact_bytes),
+        format_cap(max_artifact_bytes),
     )
 }
 
@@ -1823,6 +1857,145 @@ mod tests {
             &shared,
             &RequestLimits::for_cache("https://other.example/v8", Some("team-a"))
         ));
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn test_client(base_url: &str, max_artifact_bytes: u64) -> RemoteCacheClient {
+        RemoteCacheClient {
+            base_url: base_url.to_owned(),
+            auth: RemoteCacheAuth::Static("remote-token".into()),
+            team: None,
+            signature_key: None,
+            read_only: false,
+            env_policy: lpm_runner::lpm_json::RemoteCacheEnvConfig::default(),
+            max_artifact_bytes,
+            limits: Arc::new(RequestLimits::default()),
+        }
+    }
+
+    #[test]
+    fn uploads_only_artifacts_within_the_cache_servers_cap() {
+        let client = test_client("http://127.0.0.1:9/v8", MIB);
+
+        assert_eq!(client.check_upload_size(MIB), Ok(()));
+        assert_eq!(
+            client.check_upload_size(MIB + 1),
+            Err("remote cache artifact exceeds the 1 MiB upload limit; skipping upload".into())
+        );
+    }
+
+    /// A cache server that streams `bytes` of every artifact in chunks, with
+    /// no Content-Length, so only the streaming check can stop a large one.
+    fn chunked_artifact_server(bytes: u64) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && matches!(stream.read(&mut byte), Ok(1)) {
+                    head.push(byte[0]);
+                }
+                let chunk = vec![0u8; 64 * 1024];
+                let mut sent = 0;
+                let mut send = |data: &[u8]| stream.write_all(data).is_ok();
+                if !send(
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                ) {
+                    continue;
+                }
+                while sent < bytes
+                    && send(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    && send(&chunk)
+                    && send(b"\r\n")
+                {
+                    sent += chunk.len() as u64;
+                }
+                send(b"0\r\n\r\n");
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn treats_a_streamed_artifact_past_the_cache_servers_cap_as_a_miss() {
+        let url = chunked_artifact_server(2 * MIB);
+        let client = test_client(&format!("{url}/v8"), MIB);
+        let project = tempfile::tempdir().unwrap();
+
+        let restored = client
+            .restore_async(&"a".repeat(64), project.path(), &[], || Ok(true))
+            .await;
+
+        match restored {
+            Err(error) => assert_eq!(
+                error,
+                "remote cache artifact exceeds the 1 MiB limit; treating it as a miss"
+            ),
+            Ok(_) => panic!("an artifact past the cap was restored"),
+        }
+    }
+
+    async fn upload_to(server: &wiremock::MockServer) -> (RemoteCacheClient, Result<(), String>) {
+        let client = test_client(&format!("{}/v8", server.uri()), MIB);
+        let mut artifact = tempfile::tempfile().unwrap();
+        artifact.write_all(b"artifact").unwrap();
+        let uploaded = client
+            .upload_artifact(&"a".repeat(64), &artifact, 8, 10)
+            .await;
+        (client, uploaded)
+    }
+
+    fn upload_refused(retry_after: &str) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(429)
+            .insert_header("retry-after", retry_after)
+            .set_body_json(serde_json::json!({
+                "error": "Remote cache limit reached: 8 uploads at once",
+            }))
+    }
+
+    #[tokio::test]
+    async fn an_upload_refused_for_a_moment_goes_once_more_and_pauses_nothing() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(upload_refused("1"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "urls": [] })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (client, uploaded) = upload_to(&server).await;
+
+        assert_eq!(uploaded, Ok(()));
+        assert!(!client.limits.uploads_paused());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn uploads_pause_once_a_retry_is_refused_too_or_the_wait_is_a_spent_limit() {
+        for (retry_after, attempts) in [("1", 2), ("60", 1)] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("PUT"))
+                .respond_with(upload_refused(retry_after))
+                .expect(attempts)
+                .mount(&server)
+                .await;
+
+            let (client, uploaded) = upload_to(&server).await;
+
+            assert_eq!(uploaded, Ok(()));
+            assert!(client.limits.uploads_paused(), "Retry-After {retry_after}");
+            server.verify().await;
+        }
     }
 
     #[test]

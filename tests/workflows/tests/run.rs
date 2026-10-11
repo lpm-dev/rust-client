@@ -3677,7 +3677,7 @@ fn run_remote_cache_skips_artifacts_over_100_mib_from_the_registry() {
     let stderr = run_read_only_build(&project, Some(&url));
 
     assert!(
-        stderr.contains("remote cache artifact exceeds the 100.0 MB limit; treating it as a miss"),
+        stderr.contains("remote cache artifact exceeds the 100 MiB limit; treating it as a miss"),
         "{stderr}"
     );
 }
@@ -3694,7 +3694,7 @@ fn run_remote_cache_reads_artifacts_up_to_500_mib_from_another_cache_server() {
     let over = oversized_artifact_server(600 * MIB);
     let stderr = run_read_only_build(&remote_cache_project_at(&over), None);
     assert!(
-        stderr.contains("remote cache artifact exceeds the 500.0 MB limit; treating it as a miss"),
+        stderr.contains("remote cache artifact exceeds the 500 MiB limit; treating it as a miss"),
         "{stderr}"
     );
 }
