@@ -1615,7 +1615,7 @@ fn tunnel_inspect_reports_an_actionable_corrupt_database_error() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(rendered.contains(".lpm/inspector.db"));
-    assert!(rendered.contains("Repair or move"));
+    assert!(rendered.contains("Move or repair"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

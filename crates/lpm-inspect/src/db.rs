@@ -1534,13 +1534,57 @@ mod tests {
         assert!(!outside.path().join("inspector.db").exists());
 
         for name in ["inspector.db", "inspector.db-wal"] {
+            use std::os::unix::fs::PermissionsExt;
+
             let project = tempfile::tempdir().unwrap();
             std::fs::create_dir(project.path().join(".lpm")).unwrap();
             let target = outside.path().join(format!("{name}-target"));
+            std::fs::write(&target, "outside\n").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
             std::os::unix::fs::symlink(&target, project.path().join(".lpm").join(name)).unwrap();
 
             assert!(InspectorDb::open(project.path()).is_err(), "{name}");
-            assert!(!target.exists(), "{name}");
+            assert_eq!(
+                std::fs::read_to_string(&target).unwrap(),
+                "outside\n",
+                "{name}"
+            );
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o644, "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preparing_makes_leftover_capture_files_owner_only_before_sqlite_opens_them() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = tempfile::tempdir().unwrap();
+        let lpm_dir = project.path().join(".lpm");
+        std::fs::create_dir(&lpm_dir).unwrap();
+        for name in [
+            "inspector.db-wal",
+            "inspector.db-shm",
+            "inspector.db-journal",
+        ] {
+            let path = lpm_dir.join(name);
+            std::fs::write(&path, b"").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        prepare_capture_files(&lpm_dir, &lpm_dir.join("inspector.db")).unwrap();
+
+        for name in [
+            "inspector.db",
+            "inspector.db-wal",
+            "inspector.db-shm",
+            "inspector.db-journal",
+        ] {
+            let mode = std::fs::metadata(lpm_dir.join(name))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{name}");
         }
     }
 
