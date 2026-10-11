@@ -3531,7 +3531,7 @@ async fn run_remote_cache_skips_uploads_while_an_upload_limit_lasts() {
 }
 
 #[tokio::test]
-async fn run_remote_cache_resumes_once_a_limit_has_passed() {
+async fn run_remote_cache_looks_up_again_after_a_refusal_of_a_second_and_goes_on() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
@@ -3540,10 +3540,12 @@ async fn run_remote_cache_resumes_once_a_limit_has_passed() {
         .expect(1)
         .mount(&server)
         .await;
+    // The refused lookup, looked up again after its second, and the second
+    // task's.
     Mock::given(method("GET"))
         .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
         .respond_with(ResponseTemplate::new(404))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
     Mock::given(method("PUT"))
@@ -3552,8 +3554,6 @@ async fn run_remote_cache_resumes_once_a_limit_has_passed() {
         .expect(2)
         .mount(&server)
         .await;
-    // The first task outlasts the one-second pause, so its upload and the
-    // second task's lookup and upload all go ahead.
     let project = two_task_remote_cache_project(&server, 1_500);
 
     successful_build_stderr(&run_build_with_remote_token(&project));

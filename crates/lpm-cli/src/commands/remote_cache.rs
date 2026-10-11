@@ -30,7 +30,7 @@ const DEFAULT_LIMIT_PAUSE: Duration = Duration::from_secs(60);
 const MAX_LIMIT_PAUSE: Duration = Duration::from_secs(24 * 60 * 60);
 /// The longest wait an upload refused with 429 sits out before going once
 /// more; a longer one is a spent limit.
-const MAX_UPLOAD_RETRY_WAIT: Duration = Duration::from_secs(5);
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(5);
 const REMOTE_CACHE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Each upload read moves to the blocking pool, so the stream's 4 KiB default
 /// made a 64 MiB upload about ten times slower than 64 KiB reads.
@@ -110,6 +110,27 @@ impl RequestLimits {
     /// artifact up would likely upload one the cache already holds.
     fn uploads_paused(&self) -> bool {
         self.paused(LimitedRequest::Upload) || self.paused(LimitedRequest::Lookup)
+    }
+
+    fn remaining(&self, request: LimitedRequest) -> Duration {
+        self.until(request)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .map_or(Duration::ZERO, |until| {
+                until.saturating_duration_since(Instant::now())
+            })
+    }
+
+    /// Whether this kind of request waits out a spent limit, rather than the
+    /// cache server's room for requests at once.
+    fn paused_by_a_limit(&self, request: LimitedRequest) -> bool {
+        let remaining = match request {
+            LimitedRequest::Lookup => self.remaining(LimitedRequest::Lookup),
+            LimitedRequest::Upload => self
+                .remaining(LimitedRequest::Upload)
+                .max(self.remaining(LimitedRequest::Lookup)),
+        };
+        remaining > MAX_RETRY_WAIT
     }
 
     fn pause(&self, request: LimitedRequest, wait: Duration) {
@@ -487,38 +508,54 @@ impl RemoteCacheClient {
     ) -> Result<Option<lpm_task::cache::CacheHit>, String> {
         let client = http_client()?;
         let url = self.artifact_url(key)?;
-        let mut response = self
-            .send_authenticated(
-                "remote cache authorization failed; continuing without it",
-                async |bearer: String| {
-                    let response = client
-                        .get(url.clone())
-                        .bearer_auth(bearer)
-                        .send()
-                        .await
-                        .map_err(|error| {
-                            RemoteCacheRequestError::Message(format!(
-                                "remote cache lookup failed: {}",
-                                lpm_http::display_error(&error)
-                            ))
-                        })?;
-                    if response.status() == StatusCode::UNAUTHORIZED {
-                        Err(RemoteCacheRequestError::Unauthorized)
-                    } else {
-                        Ok(response)
-                    }
-                },
-            )
-            .await?;
+        let mut retried = false;
+        let mut response = loop {
+            let response = self
+                .send_authenticated(
+                    "remote cache authorization failed; continuing without it",
+                    async |bearer: String| {
+                        let response = client
+                            .get(url.clone())
+                            .bearer_auth(bearer)
+                            .send()
+                            .await
+                            .map_err(|error| {
+                                RemoteCacheRequestError::Message(format!(
+                                    "remote cache lookup failed: {}",
+                                    lpm_http::display_error(&error)
+                                ))
+                            })?;
+                        if response.status() == StatusCode::UNAUTHORIZED {
+                            Err(RemoteCacheRequestError::Unauthorized)
+                        } else {
+                            Ok(response)
+                        }
+                    },
+                )
+                .await?;
+            if response.status() != StatusCode::TOO_MANY_REQUESTS {
+                break response;
+            }
+            let limit = read_limit_reached(response).await;
+            // A wait this short is the server's room for requests at once, not
+            // a spent limit: a hit is worth looking up again after it, unless
+            // lookups were paused meanwhile.
+            if !retried && limit.wait <= MAX_RETRY_WAIT {
+                retried = true;
+                tokio::time::sleep(limit.wait + retry_jitter(key, limit.wait)).await;
+                if self.limits.lookups_paused() {
+                    self.skipping_while_busy(LimitedRequest::Lookup);
+                    return Ok(None);
+                }
+                continue;
+            }
+            self.limit_reached(LimitedRequest::Lookup, limit);
+            return Ok(None);
+        };
 
         match response.status() {
             StatusCode::OK => {}
             StatusCode::NOT_FOUND => return Ok(None),
-            StatusCode::TOO_MANY_REQUESTS => {
-                let limit = read_limit_reached(response).await;
-                self.limit_reached(LimitedRequest::Lookup, limit);
-                return Ok(None);
-            }
             _ => return Err(remote_cache_http_error(response, "lookup").await),
         }
 
@@ -739,11 +776,11 @@ impl RemoteCacheClient {
             // A wait this short is the server's room for uploads at once, not a
             // spent limit: the upload goes again rather than being dropped,
             // unless uploads were paused meanwhile.
-            if !retried && limit.wait <= MAX_UPLOAD_RETRY_WAIT {
+            if !retried && limit.wait <= MAX_RETRY_WAIT {
                 retried = true;
                 tokio::time::sleep(limit.wait + retry_jitter(key, limit.wait)).await;
                 if self.limits.uploads_paused() {
-                    self.skipping_while_busy(LimitedRequest::Upload, &limit.message);
+                    self.skipping_while_busy(LimitedRequest::Upload);
                     return Ok(());
                 }
                 continue;
@@ -760,8 +797,8 @@ impl RemoteCacheClient {
         // A pause of a few seconds is the server's room for requests at once,
         // not a spent limit: it gets its own notice, leaving the warning for a
         // longer limit later.
-        if limit.wait <= MAX_UPLOAD_RETRY_WAIT {
-            self.skipping_while_busy(request, &limit.message);
+        if limit.wait <= MAX_RETRY_WAIT {
+            self.skipping_while_busy(request);
             return;
         }
         if !self.limits.first_warning(request) {
@@ -780,18 +817,13 @@ impl RemoteCacheClient {
     }
 
     /// Notes, once a run for each kind, that requests are being skipped
-    /// while the cache server is busy for a moment.
-    fn skipping_while_busy(&self, request: LimitedRequest, message: &str) {
-        if !self.limits.first_busy_notice(request) {
+    /// while the cache server is busy for a moment. A request paused by a
+    /// spent limit has that limit's warning instead.
+    fn skipping_while_busy(&self, request: LimitedRequest) {
+        if self.limits.paused_by_a_limit(request) || !self.limits.first_busy_notice(request) {
             return;
         }
-        let skipped = match request {
-            LimitedRequest::Lookup => "lookups",
-            LimitedRequest::Upload => "uploads",
-        };
-        install_ui::warn_untrusted(&format!(
-            "{message}; skipping some remote cache {skipped} while it's busy"
-        ));
+        install_ui::skipped(busy_notice(request));
     }
 
     fn artifact_url(&self, key: &str) -> Result<reqwest::Url, String> {
@@ -1252,6 +1284,13 @@ fn env_flag(name: &str) -> Option<bool> {
         "1" | "true" | "yes" | "on" => Some(true),
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
+    }
+}
+
+fn busy_notice(request: LimitedRequest) -> &'static str {
+    match request {
+        LimitedRequest::Lookup => "remote cache is busy; skipping some lookups for a moment",
+        LimitedRequest::Upload => "remote cache is busy; skipping some uploads for a moment",
     }
 }
 
@@ -2107,9 +2146,116 @@ mod tests {
             pause.await.unwrap();
             assert_eq!(uploaded, Ok(()));
             server.verify().await;
-            // The dropped upload was noted as skipped while the cache was busy.
-            assert!(!client.limits.first_busy_notice(LimitedRequest::Upload));
+            // A minute's pause is a spent limit, whose warning covers the
+            // dropped upload, so the busy notice stays unspent.
+            assert!(client.limits.first_busy_notice(LimitedRequest::Upload));
         }
+    }
+
+    #[test]
+    fn the_busy_notice_names_what_it_skips_in_lpm_s_own_words() {
+        assert_eq!(
+            busy_notice(LimitedRequest::Lookup),
+            "remote cache is busy; skipping some lookups for a moment"
+        );
+        assert_eq!(
+            busy_notice(LimitedRequest::Upload),
+            "remote cache is busy; skipping some uploads for a moment"
+        );
+    }
+
+    #[test]
+    fn a_short_refusal_during_a_spent_limit_leaves_the_busy_notice_unspent() {
+        let client = test_client("http://127.0.0.1:9/v8", MIB);
+        client
+            .limits
+            .pause(LimitedRequest::Lookup, Duration::from_secs(60));
+
+        client.limit_reached(
+            LimitedRequest::Upload,
+            LimitReached {
+                message: "Remote cache limit reached: 8 uploads at once".into(),
+                wait: Duration::from_secs(1),
+            },
+        );
+
+        assert!(client.limits.first_busy_notice(LimitedRequest::Upload));
+    }
+
+    fn lookup_refused(retry_after: &str) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(429)
+            .insert_header("retry-after", retry_after)
+            .set_body_json(serde_json::json!({
+                "error": "Remote cache limit reached: 32 uploads and downloads at once",
+            }))
+    }
+
+    async fn look_up_at(client: &RemoteCacheClient) {
+        let project = tempfile::tempdir().unwrap();
+        let restored = client
+            .restore_async(&"a".repeat(64), project.path(), &[], || Ok(true))
+            .await;
+        assert!(matches!(restored, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn a_lookup_refused_for_a_moment_goes_once_more_and_pauses_nothing() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(lookup_refused("1"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client(&format!("{}/v8", server.uri()), MIB);
+
+        look_up_at(&client).await;
+
+        assert!(!client.limits.lookups_paused());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn a_lookup_pauses_lookups_once_its_retry_is_refused_too() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(lookup_refused("1"))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = test_client(&format!("{}/v8", server.uri()), MIB);
+
+        look_up_at(&client).await;
+
+        assert!(client.limits.lookups_paused());
+        assert!(!client.limits.first_busy_notice(LimitedRequest::Lookup));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn a_lookup_doesnt_go_again_once_lookups_were_paused_while_it_waited() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(lookup_refused("1"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client(&format!("{}/v8", server.uri()), MIB);
+        let limits = client.limits.clone();
+        let pause = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            limits.pause(LimitedRequest::Lookup, Duration::from_secs(60));
+        });
+
+        look_up_at(&client).await;
+
+        pause.await.unwrap();
+        server.verify().await;
     }
 
     #[tokio::test]
