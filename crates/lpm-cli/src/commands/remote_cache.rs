@@ -146,9 +146,9 @@ impl RequestLimits {
     /// Stops uploads for the rest of the run once the cache server refuses
     /// one: the token can't write there, and every later upload would be
     /// refused too, each counting against the server's limit for refused
-    /// requests.
-    fn refuse_uploads(&self) {
-        self.uploads_refused.store(true, Ordering::Relaxed);
+    /// requests. True when this call stopped them, so the run says so once.
+    fn refuse_uploads(&self) -> bool {
+        !self.uploads_refused.swap(true, Ordering::Relaxed)
     }
 
     fn uploads_refused(&self) -> bool {
@@ -156,12 +156,12 @@ impl RequestLimits {
     }
 
     /// Stops lookups and uploads for the rest of the run once the cache
-    /// server refuses a lookup: the token can't read that cache, or the
-    /// cache is paused or disabled, so every later request would be refused
-    /// too.
-    fn refuse_lookups(&self) {
-        self.lookups_refused.store(true, Ordering::Relaxed);
-        self.refuse_uploads();
+    /// server refuses a lookup, or bills nothing more: the token can't read
+    /// that cache, or the cache is paused or disabled, so every later
+    /// request would be refused too. True when this call stopped lookups.
+    fn refuse_lookups(&self) -> bool {
+        self.uploads_refused.store(true, Ordering::Relaxed);
+        !self.lookups_refused.swap(true, Ordering::Relaxed)
     }
 
     fn lookups_refused(&self) -> bool {
@@ -591,6 +591,9 @@ impl RemoteCacheClient {
             if !retried && limit.wait <= MAX_RETRY_WAIT {
                 retried = true;
                 tokio::time::sleep(limit.wait + retry_jitter(key, limit.wait)).await;
+                if self.limits.lookups_refused() {
+                    return Ok(None);
+                }
                 if self.limits.lookups_paused() {
                     self.skipping_while_busy(LimitedRequest::Lookup);
                     return Ok(None);
@@ -604,12 +607,15 @@ impl RemoteCacheClient {
         match response.status() {
             StatusCode::OK => {}
             StatusCode::NOT_FOUND => return Ok(None),
-            StatusCode::FORBIDDEN => {
-                self.limits.refuse_lookups();
-                return Err(format!(
-                    "{}; skipping the remote cache for this run",
-                    remote_cache_http_error(response, "lookup").await
-                ));
+            StatusCode::FORBIDDEN | StatusCode::PAYMENT_REQUIRED => {
+                let refusal = read_refusal(response, "lookup").await;
+                if self.limits.refuse_lookups() {
+                    install_ui::warn_untrusted(&format!(
+                        "{}; skipping the remote cache for this run",
+                        refusal.detail
+                    ));
+                }
+                return Ok(None);
             }
             _ => return Err(remote_cache_http_error(response, "lookup").await),
         }
@@ -824,12 +830,26 @@ impl RemoteCacheClient {
             if response.status().is_success() || response.status() == StatusCode::CONFLICT {
                 return Ok(());
             }
-            if response.status() == StatusCode::FORBIDDEN {
-                self.limits.refuse_uploads();
-                return Err(format!(
-                    "{}; skipping remote cache uploads for this run",
-                    remote_cache_http_error(response, "upload").await
-                ));
+            let status = response.status();
+            if matches!(status, StatusCode::FORBIDDEN | StatusCode::PAYMENT_REQUIRED) {
+                let refusal = read_refusal(response, "upload").await;
+                // A cache too full for this upload may still take a later or
+                // smaller one.
+                if refusal.code.as_deref() == Some(QUOTA_EXCEEDED_CODE) {
+                    return Err(format!("{}; continuing without it", refusal.detail));
+                }
+                let (stopped, skipped) = if status == StatusCode::PAYMENT_REQUIRED {
+                    (self.limits.refuse_lookups(), "the remote cache")
+                } else {
+                    (self.limits.refuse_uploads(), "remote cache uploads")
+                };
+                if stopped {
+                    install_ui::warn_untrusted(&format!(
+                        "{}; skipping {skipped} for this run",
+                        refusal.detail
+                    ));
+                }
+                return Ok(());
             }
             if response.status() != StatusCode::TOO_MANY_REQUESTS {
                 return Err(remote_cache_http_error(response, "upload").await);
@@ -841,6 +861,9 @@ impl RemoteCacheClient {
             if !retried && limit.wait <= MAX_RETRY_WAIT {
                 retried = true;
                 tokio::time::sleep(limit.wait + retry_jitter(key, limit.wait)).await;
+                if self.limits.uploads_refused() {
+                    return Ok(());
+                }
                 if self.limits.uploads_paused() {
                     self.skipping_while_busy(LimitedRequest::Upload);
                     return Ok(());
@@ -1214,6 +1237,27 @@ async fn remote_cache_http_error(response: reqwest::Response, operation: &str) -
             format_wait(limit.wait)
         );
     }
+    let refusal = read_refusal(response, operation).await;
+    if operation == "status" {
+        refusal.detail
+    } else {
+        format!("{}; continuing without it", refusal.detail)
+    }
+}
+
+/// The code the cache server gives an upload it couldn't make room for,
+/// whose evictions stay: a later or smaller upload may still fit.
+const QUOTA_EXCEEDED_CODE: &str = "REMOTE_CACHE_QUOTA_EXCEEDED";
+
+/// A refused remote cache request: what to tell the user, and the server's
+/// code for it, if any.
+struct Refusal {
+    detail: String,
+    code: Option<String>,
+}
+
+async fn read_refusal(response: reqwest::Response, operation: &str) -> Refusal {
+    let status = response.status();
     let body = if matches!(status, StatusCode::FORBIDDEN | StatusCode::PAYMENT_REQUIRED) {
         read_remote_status_body(response).await.ok()
     } else {
@@ -1243,10 +1287,9 @@ async fn remote_cache_http_error(response: reqwest::Response, operation: &str) -
     } else {
         format!("remote cache {operation} returned HTTP {}", status.as_u16())
     };
-    if operation == "status" {
-        detail
-    } else {
-        format!("{detail}; continuing without it")
+    Refusal {
+        detail,
+        code: code.map(ToOwned::to_owned),
     }
 }
 
@@ -2124,12 +2167,9 @@ mod tests {
 
         let (client, uploaded) = upload_to(&server).await;
 
-        let error = uploaded.unwrap_err();
-        assert!(
-            error.ends_with("; skipping remote cache uploads for this run"),
-            "{error}"
-        );
+        assert_eq!(uploaded, Ok(()));
         assert!(client.limits.uploads_refused());
+        assert!(!client.limits.lookups_refused());
         assert!(!client.limits.uploads_paused());
         let client = client.clone();
         tokio::task::spawn_blocking(move || store_with(&client))
@@ -2153,15 +2193,11 @@ mod tests {
         let client = test_client(&format!("{}/v8", server.uri()), MIB);
         let project = tempfile::tempdir().unwrap();
 
-        let error = client
+        let restored = client
             .restore_async(&"a".repeat(64), project.path(), &[], || Ok(true))
-            .await
-            .unwrap_err();
+            .await;
 
-        assert!(
-            error.ends_with("; skipping the remote cache for this run"),
-            "{error}"
-        );
+        assert!(matches!(restored, Ok(None)));
         assert!(client.limits.lookups_refused() && client.limits.uploads_refused());
         let client = client.clone();
         tokio::task::spawn_blocking(move || {
@@ -2173,6 +2209,186 @@ mod tests {
         .await
         .unwrap();
         server.verify().await;
+    }
+
+    fn billing_lapsed() -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(402).set_body_json(serde_json::json!({
+            "error": "Organization billing requires attention.",
+            "code": "ORG_BILLING_LAPSED",
+            "status": "paused",
+        }))
+    }
+
+    #[tokio::test]
+    async fn an_upload_the_token_may_not_make_leaves_lookups_on() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_json(
+                serde_json::json!({ "error": "Token does not have remote cache write permissions" }),
+            ))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (client, _) = upload_to(&server).await;
+        let project = tempfile::tempdir().unwrap();
+
+        let restored = client
+            .restore_async(&"b".repeat(64), project.path(), &[], || Ok(true))
+            .await;
+
+        assert!(matches!(restored, Ok(None)));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn a_lapsed_bill_on_a_lookup_stops_the_cache_for_the_run() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(billing_lapsed())
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client(&format!("{}/v8", server.uri()), MIB);
+        let project = tempfile::tempdir().unwrap();
+
+        let restored = client
+            .restore_async(&"a".repeat(64), project.path(), &[], || Ok(true))
+            .await;
+
+        assert!(matches!(restored, Ok(None)));
+        assert!(client.limits.lookups_refused() && client.limits.uploads_refused());
+        let client = client.clone();
+        tokio::task::spawn_blocking(move || {
+            let project = tempfile::tempdir().unwrap();
+            assert!(
+                try_restore(&client, &"b".repeat(64), project.path(), &[], || Ok(true)).is_none()
+            );
+            store_with(&client);
+        })
+        .await
+        .unwrap();
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn a_lapsed_bill_on_an_upload_stops_the_cache_for_the_run() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(billing_lapsed())
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (client, uploaded) = upload_to(&server).await;
+
+        assert_eq!(uploaded, Ok(()));
+        assert!(client.limits.lookups_refused() && client.limits.uploads_refused());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn an_upload_the_cache_has_no_room_for_leaves_uploads_on() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "error": "Remote cache quota exceeded",
+                    "status": "over_limit",
+                    "code": "REMOTE_CACHE_QUOTA_EXCEEDED",
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (client, uploaded) = upload_to(&server).await;
+
+        assert_eq!(
+            uploaded,
+            Err("remote cache quota was exceeded; free cache space or enable overage; continuing without it".to_string())
+        );
+        assert!(!client.limits.uploads_refused());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn an_upload_of_an_account_over_its_limit_stops_uploads_for_the_run() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(wiremock::ResponseTemplate::new(403).set_body_json(
+                serde_json::json!({ "error": "Remote cache is not enabled", "status": "over_limit" }),
+            ))
+            .mount(&server)
+            .await;
+
+        let (client, uploaded) = upload_to(&server).await;
+
+        assert_eq!(uploaded, Ok(()));
+        assert!(client.limits.uploads_refused());
+    }
+
+    #[tokio::test]
+    async fn an_upload_waiting_to_go_again_is_dropped_once_the_run_stops_uploads() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(upload_refused("1"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client(&format!("{}/v8", server.uri()), MIB);
+        let limits = client.limits.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            limits.refuse_uploads();
+        });
+        let mut artifact = tempfile::tempfile().unwrap();
+        artifact.write_all(b"artifact").unwrap();
+
+        let uploaded = client
+            .upload_artifact(&"a".repeat(64), &artifact, 8, 10)
+            .await;
+
+        assert_eq!(uploaded, Ok(()));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn a_lookup_waiting_to_go_again_is_dropped_once_the_run_stops_lookups() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(upload_refused("1"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client(&format!("{}/v8", server.uri()), MIB);
+        let limits = client.limits.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            limits.refuse_lookups();
+        });
+        let project = tempfile::tempdir().unwrap();
+
+        let restored = client
+            .restore_async(&"a".repeat(64), project.path(), &[], || Ok(true))
+            .await;
+
+        assert!(matches!(restored, Ok(None)));
+        server.verify().await;
+    }
+
+    #[test]
+    fn says_once_that_the_run_stops_each_kind_of_request() {
+        let limits = RequestLimits::default();
+
+        assert!(limits.refuse_uploads());
+        assert!(!limits.refuse_uploads());
+        assert!(limits.refuse_lookups());
+        assert!(!limits.refuse_lookups());
+        assert!(!limits.refuse_uploads());
     }
 
     #[tokio::test]
