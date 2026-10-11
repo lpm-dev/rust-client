@@ -3425,6 +3425,111 @@ async fn run_remote_cache_upload_rebuilds_the_body_after_reactive_session_refres
     registry.server().verify().await;
 }
 
+/// Two cached tasks, the second depending on the first, so one run makes two
+/// remote-cache lookups and two uploads.
+fn two_task_remote_cache_project(server: &MockServer) -> TempProject {
+    let project = TempProject::empty(
+        r#"{
+        "name": "remote-cache-limits",
+        "version": "1.0.0",
+        "scripts": {
+            "assets": "node -e \"const fs=require('fs'); fs.mkdirSync('assets',{recursive:true}); fs.writeFileSync('assets/a.txt','a')\"",
+            "build": "node -e \"const fs=require('fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt','built')\""
+        }
+    }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+            "remoteCache": {{ "enabled": true, "url": "{}/v8" }},
+            "tasks": {{
+                "assets": {{ "cache": true, "outputs": ["assets/**"] }},
+                "build": {{ "cache": true, "outputs": ["dist/**"], "dependsOn": ["assets"] }}
+            }}
+        }}"#,
+            server.uri(),
+        ),
+    );
+    project
+}
+
+fn limit_reached(limit: &str) -> ResponseTemplate {
+    ResponseTemplate::new(429)
+        .insert_header("retry-after", "42")
+        .set_body_json(serde_json::json!({
+            "error": format!("Remote cache limit reached: {limit}"),
+            "retryAfter": 42,
+        }))
+}
+
+#[tokio::test]
+async fn run_remote_cache_skips_lookups_for_the_rest_of_the_run_after_a_limit() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(limit_reached("1,500 cache hits a minute"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "urls": [] })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let project = two_task_remote_cache_project(&server);
+
+    let output = run_build_with_remote_token(&project);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "a limit must not fail the build:\n{stderr}"
+    );
+    assert_eq!(project.read_file("dist/value.txt"), "built");
+    assert!(
+        stderr.contains(
+            "Remote cache limit reached: 1,500 cache hits a minute; skipping remote cache lookups for the rest of this run"
+        ),
+        "the warning should name the limit:\n{stderr}",
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn run_remote_cache_skips_uploads_for_the_rest_of_the_run_after_a_limit() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(limit_reached("300 uploads a minute"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let project = two_task_remote_cache_project(&server);
+
+    let output = run_build_with_remote_token(&project);
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "a limit must not fail the build:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "Remote cache limit reached: 300 uploads a minute; skipping remote cache uploads for the rest of this run"
+        ),
+        "the warning should name the limit:\n{stderr}",
+    );
+    server.verify().await;
+}
+
 #[tokio::test]
 async fn run_remote_cache_outage_does_not_fail_successful_local_build() {
     let server = MockServer::start().await;

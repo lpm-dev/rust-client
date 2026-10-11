@@ -18,7 +18,8 @@ use std::time::Duration;
 
 type HmacSha256 = Hmac<Sha256>;
 
-const MAX_REMOTE_ARTIFACT_BYTES: u64 = 500 * 1024 * 1024;
+/// The largest artifact the LPM.dev Registry stores.
+const MAX_REMOTE_ARTIFACT_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_REMOTE_STATUS_BYTES: u64 = 64 * 1024;
 const REMOTE_CACHE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Each upload read moves to the blocking pool, so the stream's 4 KiB default
@@ -31,6 +32,11 @@ const ARTIFACT_CLIENT_CI_HEADER: &str = "x-artifact-client-ci";
 const ARTIFACT_CLIENT_INTERACTIVE_HEADER: &str = "x-artifact-client-interactive";
 
 static REMOTE_CACHE_WARNING_SHOWN: AtomicBool = AtomicBool::new(false);
+/// Set once the Registry refuses a lookup, or an upload, for the account's
+/// request limits: the rest of the run skips that kind of request rather
+/// than send more the limit would refuse.
+static REMOTE_CACHE_LOOKUPS_LIMITED: AtomicBool = AtomicBool::new(false);
+static REMOTE_CACHE_UPLOADS_LIMITED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 pub struct RemoteCacheClient {
@@ -89,6 +95,9 @@ pub fn try_restore(
     output_globs: &[String],
     validate: impl FnOnce() -> Result<bool, lpm_common::LpmError>,
 ) -> Option<lpm_task::cache::CacheHit> {
+    if REMOTE_CACHE_LOOKUPS_LIMITED.load(Ordering::Relaxed) {
+        return None;
+    }
     match client.restore(key, project_dir, output_globs, validate) {
         Ok(hit) => hit,
         Err(reason) => {
@@ -111,7 +120,7 @@ pub fn try_store(
     env_vars: &HashMap<String, String>,
     inherited_env: &HashMap<std::ffi::OsString, std::ffi::OsString>,
 ) {
-    if client.read_only {
+    if client.read_only || REMOTE_CACHE_UPLOADS_LIMITED.load(Ordering::Relaxed) {
         return;
     }
 
@@ -404,7 +413,12 @@ impl RemoteCacheClient {
         match response.status() {
             StatusCode::OK => {}
             StatusCode::NOT_FOUND => return Ok(None),
-            _ => return Err(remote_cache_http_error(response, "lookup").await),
+            status => {
+                if status == StatusCode::TOO_MANY_REQUESTS {
+                    REMOTE_CACHE_LOOKUPS_LIMITED.store(true, Ordering::Relaxed);
+                }
+                return Err(remote_cache_http_error(response, "lookup").await);
+            }
         }
 
         if let Some(length) = response.content_length()
@@ -594,6 +608,9 @@ impl RemoteCacheClient {
 
         if response.status().is_success() {
             return Ok(());
+        }
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            REMOTE_CACHE_UPLOADS_LIMITED.store(true, Ordering::Relaxed);
         }
 
         Err(remote_cache_http_error(response, "upload").await)
@@ -854,11 +871,22 @@ fn status_body_too_large() -> String {
 
 async fn remote_cache_http_error(response: reqwest::Response, operation: &str) -> String {
     let status = response.status();
-    let body = if matches!(status, StatusCode::FORBIDDEN | StatusCode::PAYMENT_REQUIRED) {
+    let body = if matches!(
+        status,
+        StatusCode::FORBIDDEN | StatusCode::PAYMENT_REQUIRED | StatusCode::TOO_MANY_REQUESTS
+    ) {
         read_remote_status_body(response).await.ok()
     } else {
         None
     };
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        let limit = body
+            .as_ref()
+            .and_then(|body| body.get("error"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("remote cache limit reached");
+        return format!("{limit}; skipping remote cache {operation}s for the rest of this run");
+    }
     let code = body
         .as_ref()
         .and_then(|body| body.get("code"))
