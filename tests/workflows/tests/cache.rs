@@ -530,7 +530,7 @@ async fn cache_status_human_renders_tables_and_slim_completion() {
         "cache status must render local and remote sections, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("1.0 KB / 2.0 KB  █████░░░░░"),
+        stdout.contains("1.0 KiB / 2.0 KiB  █████░░░░░"),
         "cache status must render remote usage with a quota bar, got:\n{stdout}"
     );
 

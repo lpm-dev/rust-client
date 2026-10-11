@@ -772,7 +772,7 @@ fn publish_result_display() {
 fn dry_run_files_value_uses_slim_value_roles() {
     assert_eq!(
         console::strip_ansi_codes(&format_dry_run_files_value(3, 2048)).into_owned(),
-        "3 files (2.0 KB)"
+        "3 files (2.0 KiB)"
     );
 }
 

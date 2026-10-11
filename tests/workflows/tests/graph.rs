@@ -349,16 +349,16 @@ fn graph_html_writes_human_readable_size() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // The size suffix must read as KB or MB — never "0 KB" via integer
-    // division. The fixture renders well over 1 KB of HTML, so KB is the
+    // The size suffix must read as KiB or MiB — never "0 KiB" via integer
+    // division. The fixture renders well over 1 KiB of HTML, so KiB is the
     // expected unit.
     assert!(
-        combined.contains(" KB)") || combined.contains(" MB)"),
+        combined.contains(" KiB)") || combined.contains(" MiB)"),
         "size in success message should use a human-readable unit: {combined}"
     );
     assert!(
-        !combined.contains("(0 KB)"),
-        "size must never collapse to 0 KB via integer truncation: {combined}"
+        !combined.contains("(0 KiB)"),
+        "size must never collapse to 0 KiB via integer truncation: {combined}"
     );
 }
 

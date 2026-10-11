@@ -309,22 +309,34 @@ pub fn is_loopback_host(host: &str) -> bool {
     false
 }
 
-/// Format bytes into a human-readable string (e.g., "1.2 KB", "3.4 MB").
+/// Format bytes into a human-readable string in binary units, as they're
+/// counted (e.g., "1.2 KiB", "3.4 MiB"). Switches unit at each 1024, so a
+/// 900-byte file never reads as "0.9 KiB" or "0 KiB".
 pub fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
     } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
     } else if bytes < 1024 * 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
     } else {
-        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_bytes_labels_binary_units() {
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
+        assert_eq!(format_bytes(1_048_576), "1.0 MiB");
+        assert_eq!(format_bytes(2_621_440), "2.5 MiB");
+        assert_eq!(format_bytes(5 * 1024 * 1024 * 1024), "5.0 GiB");
+    }
 
     // ── read_capped_state_file ────────────────────────────────────────
 

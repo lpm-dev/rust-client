@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 /// Maximum size for captured workspace stdout/stderr before truncation.
 /// Mirrors the `MAX_CAPTURED_OUTPUT` constant in `commands::run` so chatty
 /// failing members don't unbound the JSON envelope.
-const MAX_CAPTURED_OUTPUT: usize = 10 * 1024 * 1024; // 10 MB
+const MAX_CAPTURED_OUTPUT: usize = 10 * 1024 * 1024; // 10 MiB
 
 /// Truncate captured output if it exceeds `MAX_CAPTURED_OUTPUT`, cutting at
 /// the last newline boundary to avoid splitting a line.

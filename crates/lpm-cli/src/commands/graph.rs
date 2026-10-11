@@ -250,7 +250,7 @@ pub async fn run(
             install_ui::done_line(crate::install_ui::terminal_line!(
                 "Generated {} ({})",
                 out_path.display().to_string(),
-                format_byte_size(html_size),
+                lpm_common::format_bytes(html_size),
             ));
 
             // Open in browser unless suppressed (headless / CI).
@@ -529,21 +529,6 @@ fn prune_unreachable(graph: &mut DepGraph) {
 
     graph.nodes.retain(|k, _| reachable.contains(k));
     graph_render::recompute_stats(graph);
-}
-
-/// Format a byte count as a short human-readable string. Uses 1024-based
-/// units to match `du -h` / file managers; switches unit at the natural
-/// boundary so a 900-byte HTML never reads as "0 KB".
-fn format_byte_size(bytes: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * 1024;
-    if bytes >= MIB {
-        format!("{:.1} MB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.1} KB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 #[cfg(test)]
