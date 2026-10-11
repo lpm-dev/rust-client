@@ -241,8 +241,11 @@ pub fn read_text_file_capped(path: &Path, limit: u64) -> Result<String, BoundedR
     read_text_file_capped_with_metadata(path, limit).map(|(content, _)| content)
 }
 
-/// Read bounded UTF-8 text without following a linked leaf or blocking on a special file.
-pub fn read_text_file_capped_nofollow(path: &Path, limit: u64) -> Result<String, BoundedReadError> {
+/// Open a file for reading without following a linked leaf or blocking on a
+/// special file: the handle is the entry at `path` itself, so checks made on
+/// it hold for what the handle reads or changes, even if the path is
+/// replaced concurrently.
+pub fn open_nofollow(path: &Path) -> io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -258,7 +261,12 @@ pub fn read_text_file_capped_nofollow(path: &Path, limit: u64) -> Result<String,
 
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    let file = options.open(path).map_err(|source| {
+    options.open(path)
+}
+
+/// Read bounded UTF-8 text without following a linked leaf or blocking on a special file.
+pub fn read_text_file_capped_nofollow(path: &Path, limit: u64) -> Result<String, BoundedReadError> {
+    let file = open_nofollow(path).map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
             BoundedReadError::NotFound {
                 path: path.to_path_buf(),

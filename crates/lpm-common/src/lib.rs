@@ -39,9 +39,9 @@ pub use atomic_write::{
 pub use bounded_read::permissions_are_owner_only;
 pub use bounded_read::{
     BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, NPMRC_FILE_SIZE_CAP_BYTES,
-    TLS_MATERIAL_AGGREGATE_CAP_BYTES, TLS_MATERIAL_FILE_SIZE_CAP_BYTES, read_file_capped,
-    read_file_capped_from_open_file, read_regular_file_capped_with_metadata, read_stream_capped,
-    read_text_file_capped, read_text_file_capped_from_open_file,
+    TLS_MATERIAL_AGGREGATE_CAP_BYTES, TLS_MATERIAL_FILE_SIZE_CAP_BYTES, open_nofollow,
+    read_file_capped, read_file_capped_from_open_file, read_regular_file_capped_with_metadata,
+    read_stream_capped, read_text_file_capped, read_text_file_capped_from_open_file,
     read_text_file_capped_from_open_file_with_known_size, read_text_file_capped_nofollow,
     read_text_file_capped_with_metadata, read_text_regular_file_capped_with_metadata,
 };

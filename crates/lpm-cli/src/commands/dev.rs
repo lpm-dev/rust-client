@@ -1539,12 +1539,7 @@ pub async fn run(
         // It runs alongside the dashboard's webhook tab (which is
         // text-only) so the user can pick whichever fits the moment.
         // Quiet by default — we never auto-open a browser tab here.
-        let inspector_db = lpm_inspect::db::InspectorDb::open(project_dir).map_err(|error| {
-            LpmError::Tunnel(format!(
-                "failed to open this project's .lpm/inspector.db: {error}. \
-                 Move or repair it and retry"
-            ))
-        })?;
+        let inspector_db = crate::commands::tunnel::open_inspector_db(project_dir)?;
         let inspector_state = lpm_inspect::state::InspectorState::with_db_pending(inspector_db);
         multi_inspector_state = Some(inspector_state.clone());
         if !no_inspect {

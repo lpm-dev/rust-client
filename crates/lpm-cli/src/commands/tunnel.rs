@@ -760,11 +760,7 @@ pub(crate) async fn warn_capture_persistence(project_dir: &Path, show_human_warn
             "tunnel webhook capture persists full request/response bodies and headers \
              (incl. Authorization, Cookie, *-Signature) in .lpm/inspector.db (owner-only \
              on Unix; project ACLs on Windows){}",
-            if kept_out {
-                "; .lpm/.gitignore keeps it out of git"
-            } else {
-                ""
-            }
+            if kept_out { "; git ignores it" } else { "" }
         ),
         show_human_warning,
     );
@@ -783,10 +779,18 @@ pub(crate) async fn warn_capture_persistence(project_dir: &Path, show_human_warn
         );
     }
     if !files.unignored.is_empty() {
+        // Git doesn't read a linked ignore file, so the rule can't go there.
+        let linked_ignore_file = std::fs::symlink_metadata(project_dir.join(".lpm/.gitignore"))
+            .is_ok_and(|metadata| metadata.file_type().is_symlink());
         capture_warning(
             &format!(
-                "git doesn't ignore {}; add `inspector.db*` to .lpm/.gitignore",
-                listed(&files.unignored)
+                "git doesn't ignore {}; {}",
+                listed(&files.unignored),
+                if linked_ignore_file {
+                    "replace the linked .lpm/.gitignore with a file that holds `inspector.db*`"
+                } else {
+                    "add `inspector.db*` to .lpm/.gitignore"
+                }
             ),
             show_human_warning,
         );
@@ -822,7 +826,7 @@ const CAPTURE_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// without regard to case, as a case-insensitive disk does; None when it
 /// isn't a repository, git can't be run, or it doesn't answer in time.
 async fn capture_git_state(project_dir: &Path) -> Option<CaptureGitFiles> {
-    let mut command = tokio::process::Command::from(crate::commands::npmrc::hardened_git_command(
+    let command = tokio::process::Command::from(crate::commands::npmrc::hardened_git_command(
         project_dir,
         &[
             "ls-files",
@@ -835,11 +839,21 @@ async fn capture_git_state(project_dir: &Path) -> Option<CaptureGitFiles> {
             CAPTURES_PATHSPEC,
         ],
     ));
+    capture_git_output(command, CAPTURE_GIT_TIMEOUT).await
+}
+
+/// Runs the capture check's git command, giving up after `timeout` and
+/// killing it, so a slow repository delays the tunnel's start by that much
+/// at most.
+async fn capture_git_output(
+    mut command: tokio::process::Command,
+    timeout: std::time::Duration,
+) -> Option<CaptureGitFiles> {
     command
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let output = tokio::time::timeout(CAPTURE_GIT_TIMEOUT, command.output())
+    let output = tokio::time::timeout(timeout, command.output())
         .await
         .ok()?
         .ok()?;
@@ -858,10 +872,14 @@ fn parse_capture_git_files(stdout: &[u8]) -> CaptureGitFiles {
             continue;
         };
         let name = String::from_utf8_lossy(name).into_owned();
-        if tag == b'?' {
-            files.unignored.push(name);
+        // A conflicted file is listed once for each stage, one after another.
+        let list = if tag == b'?' {
+            &mut files.unignored
         } else {
-            files.tracked.push(name);
+            &mut files.tracked
+        };
+        if list.last() != Some(&name) {
+            list.push(name);
         }
     }
     files
@@ -888,19 +906,29 @@ fn listed(names: &[String]) -> String {
 /// capture pathspec when there are more than the warning lists.
 fn untrack_command(tracked: &[String]) -> String {
     let paths = if tracked.len() > LISTED_FILES {
-        shell_quote(CAPTURES_PATHSPEC)
+        shell_word(CAPTURES_PATHSPEC)
     } else {
         tracked
             .iter()
-            .map(|name| shell_quote(name))
+            .map(|name| shell_word(name))
             .collect::<Vec<_>>()
             .join(" ")
     };
     format!("git rm --cached -- {paths}")
 }
 
-/// A POSIX shell word for `value`.
-fn shell_quote(value: &str) -> String {
+/// `value` as one word for a shell: bare when it holds only characters no
+/// shell treats specially, in double quotes when nothing in it expands
+/// inside them, which POSIX shells, PowerShell and cmd.exe all read alike,
+/// and otherwise single-quoted for a POSIX shell.
+fn shell_word(value: &str) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '/' | '_' | '-');
+    if !value.is_empty() && value.chars().all(plain) {
+        return value.to_string();
+    }
+    if !value.contains(['"', '$', '`', '\\', '!', '%']) {
+        return format!("\"{value}\"");
+    }
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
@@ -1411,17 +1439,23 @@ async fn run_log(project_dir: &Path, args: &[String], json_output: bool) -> Resu
 
 // ── Helper functions ────────────────────────────────────────────────
 
-fn open_inspector_db(project_dir: &Path) -> Result<lpm_inspect::db::InspectorDb, LpmError> {
+/// Opens the project's capture database. Its failures are local, so they're
+/// reported as such, not as a tunnel's.
+pub(crate) fn open_inspector_db(
+    project_dir: &Path,
+) -> Result<lpm_inspect::db::InspectorDb, LpmError> {
     lpm_inspect::db::InspectorDb::open(project_dir).map_err(|error| {
-        LpmError::Tunnel(format!(
+        LpmError::Io(std::io::Error::other(format!(
             "failed to open this project's .lpm/inspector.db: {error}. \
              Move or repair it and retry"
-        ))
+        )))
     })
 }
 
 fn inspector_query_error(error: impl Display) -> LpmError {
-    LpmError::Tunnel(format!("failed to read .lpm/inspector.db: {error}"))
+    LpmError::Io(std::io::Error::other(format!(
+        "failed to read .lpm/inspector.db: {error}"
+    )))
 }
 
 async fn read_capture_entries(
@@ -2036,6 +2070,14 @@ mod tests {
     fn capture_project(files: &[&str]) -> tempfile::TempDir {
         let project = tempfile::tempdir().unwrap();
         git(project.path(), &["init", "--quiet"]);
+        // The check runs git with the user's own configuration, so a global
+        // ignore file mustn't hide the files these tests make.
+        let no_excludes = project.path().join(".git/no-excludes");
+        std::fs::write(&no_excludes, b"").unwrap();
+        git(
+            project.path(),
+            &["config", "core.excludesFile", no_excludes.to_str().unwrap()],
+        );
         for name in files {
             let path = project.path().join(name);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2169,19 +2211,45 @@ mod tests {
 
         assert_eq!(
             untrack_command(&names(5)),
-            "git rm --cached -- '.lpm/inspector.db0' '.lpm/inspector.db1' \
-             '.lpm/inspector.db2' '.lpm/inspector.db3' '.lpm/inspector.db4'"
+            "git rm --cached -- .lpm/inspector.db0 .lpm/inspector.db1 \
+             .lpm/inspector.db2 .lpm/inspector.db3 .lpm/inspector.db4"
         );
         assert_eq!(
             untrack_command(&names(6)),
-            "git rm --cached -- ':(glob,icase).lpm/inspector.db*'"
+            "git rm --cached -- \":(glob,icase).lpm/inspector.db*\""
         );
     }
 
     #[test]
-    fn quotes_names_for_a_posix_shell() {
-        assert_eq!(shell_quote(".lpm/inspector.db"), "'.lpm/inspector.db'");
-        assert_eq!(shell_quote(".lpm/it's.db"), "'.lpm/it'\\''s.db'");
+    fn writes_names_as_words_every_shell_reads_alike() {
+        assert_eq!(shell_word(".lpm/inspector.db-wal"), ".lpm/inspector.db-wal");
+        assert_eq!(shell_word(".lpm/inspector db"), "\".lpm/inspector db\"");
+        assert_eq!(shell_word(".lpm/it's.db"), "\".lpm/it's.db\"");
+        assert_eq!(shell_word(".lpm/$HOME.db"), "'.lpm/$HOME.db'");
+        assert_eq!(shell_word(".lpm/it's $x"), "'.lpm/it'\\''s $x'");
+    }
+
+    #[test]
+    fn lists_a_conflicted_capture_file_once() {
+        let files = parse_capture_git_files(
+            b"M .lpm/inspector.db\0M .lpm/inspector.db\0M .lpm/inspector.db\0? .lpm/inspector.db-wal\0",
+        );
+
+        assert_eq!(files.tracked, names(&[".lpm/inspector.db"]));
+        assert_eq!(files.unignored, names(&[".lpm/inspector.db-wal"]));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gives_up_on_a_slow_repository_and_stops_its_git() {
+        let started = std::time::Instant::now();
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("5");
+
+        let state = capture_git_output(command, std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(state, None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

@@ -1360,22 +1360,45 @@ async fn tunnel_start_names_capture_files_git_tracks_and_how_to_stop_it() {
 
     assert!(
         stderr.contains("git tracks '.lpm/inspector.db'")
-            && stderr.contains("git rm --cached -- '.lpm/inspector.db'")
+            && stderr.contains("git rm --cached -- .lpm/inspector.db")
             && stderr.contains("rotate any credentials"),
         "tunnel startup must name tracked capture files:\n{stderr}"
     );
     assert!(
-        !stderr.contains("keeps it out of git"),
-        "a tracked capture isn't kept out of git:\n{stderr}"
+        !stderr.contains("git ignores it"),
+        "a tracked capture isn't ignored by git:\n{stderr}"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tunnel_start_says_captures_are_kept_out_of_git_once_git_ignores_them() {
+async fn tunnel_start_says_git_ignores_captures_once_it_does() {
     let stderr = tunnel_start_stderr(|project| git(project, &["init", "--quiet"])).await;
 
     assert!(
-        stderr.contains(".lpm/.gitignore keeps it out of git") && !stderr.contains("git tracks"),
+        stderr.contains("; git ignores it") && !stderr.contains("git tracks"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_start_says_to_replace_a_linked_lpm_gitignore_git_doesnt_read() {
+    let outside = tempfile::tempdir().unwrap();
+    let rules = outside.path().join("rules");
+    std::fs::write(&rules, "inspector.db*\n").unwrap();
+    let stderr = tunnel_start_stderr(move |project| {
+        git(project, &["init", "--quiet"]);
+        std::fs::create_dir(project.join(".lpm")).unwrap();
+        std::os::unix::fs::symlink(&rules, project.join(".lpm/.gitignore")).unwrap();
+    })
+    .await;
+
+    assert!(
+        stderr.contains("git doesn't ignore")
+            && stderr.contains(
+                "replace the linked .lpm/.gitignore with a file that holds `inspector.db*`"
+            )
+            && !stderr.contains("git ignores it"),
         "{stderr}"
     );
 }
@@ -1616,6 +1639,10 @@ fn tunnel_inspect_reports_an_actionable_corrupt_database_error() {
     );
     assert!(rendered.contains(".lpm/inspector.db"));
     assert!(rendered.contains("Move or repair"));
+    assert!(
+        !rendered.contains("network connection"),
+        "a local database error isn't a network one:\n{rendered}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
