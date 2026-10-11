@@ -7,20 +7,27 @@ use reqwest::StatusCode;
 use reqwest::header::CONTENT_LENGTH;
 use reqwest::{Body, Client};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::future::Future;
 use std::io::{IsTerminal, Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant, SystemTime};
 
 type HmacSha256 = Hmac<Sha256>;
 
 /// The largest artifact the LPM.dev Registry stores.
-const MAX_REMOTE_ARTIFACT_BYTES: u64 = 100 * 1024 * 1024;
+const REGISTRY_MAX_ARTIFACT_BYTES: u64 = 100 * 1024 * 1024;
+/// The largest artifact uploaded to, or restored from, any other cache server.
+const MAX_REMOTE_ARTIFACT_BYTES: u64 = 500 * 1024 * 1024;
 const MAX_REMOTE_STATUS_BYTES: u64 = 64 * 1024;
+/// How long a 429 pauses requests when it gives no `Retry-After`: a minute,
+/// the Registry's shortest window.
+const DEFAULT_LIMIT_PAUSE: Duration = Duration::from_secs(60);
+/// The longest pause a 429 can ask for: a day, the Registry's longest window.
+const MAX_LIMIT_PAUSE: Duration = Duration::from_secs(24 * 60 * 60);
 const REMOTE_CACHE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Each upload read moves to the blocking pool, so the stream's 4 KiB default
 /// made a 64 MiB upload about ten times slower than 64 KiB reads.
@@ -32,11 +39,11 @@ const ARTIFACT_CLIENT_CI_HEADER: &str = "x-artifact-client-ci";
 const ARTIFACT_CLIENT_INTERACTIVE_HEADER: &str = "x-artifact-client-interactive";
 
 static REMOTE_CACHE_WARNING_SHOWN: AtomicBool = AtomicBool::new(false);
-/// Set once the Registry refuses a lookup, or an upload, for the account's
-/// request limits: the rest of the run skips that kind of request rather
-/// than send more the limit would refuse.
-static REMOTE_CACHE_LOOKUPS_LIMITED: AtomicBool = AtomicBool::new(false);
-static REMOTE_CACHE_UPLOADS_LIMITED: AtomicBool = AtomicBool::new(false);
+/// A cache server's base URL and the team its requests name.
+type CacheTeam = (String, Option<String>);
+/// Each cache server and team's request limits, shared by every task's client
+/// in the run.
+static REQUEST_LIMITS: Mutex<BTreeMap<CacheTeam, Arc<RequestLimits>>> = Mutex::new(BTreeMap::new());
 
 #[derive(Clone)]
 pub struct RemoteCacheClient {
@@ -46,6 +53,85 @@ pub struct RemoteCacheClient {
     signature_key: Option<String>,
     read_only: bool,
     env_policy: lpm_runner::lpm_json::RemoteCacheEnvConfig,
+    max_artifact_bytes: u64,
+    limits: Arc<RequestLimits>,
+}
+
+#[derive(Clone, Copy)]
+enum LimitedRequest {
+    Lookup,
+    Upload,
+}
+
+/// Until when a cache server refuses one team's lookups, and its uploads,
+/// after answering one with 429, and whether the run has said so yet.
+#[derive(Default)]
+struct RequestLimits {
+    lookups_until: Mutex<Option<Instant>>,
+    uploads_until: Mutex<Option<Instant>>,
+    lookup_limit_warned: AtomicBool,
+    upload_limit_warned: AtomicBool,
+}
+
+impl RequestLimits {
+    fn for_cache(base_url: &str, team: Option<&str>) -> Arc<Self> {
+        REQUEST_LIMITS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry((base_url.to_owned(), team.map(ToOwned::to_owned)))
+            .or_default()
+            .clone()
+    }
+
+    fn until(&self, request: LimitedRequest) -> &Mutex<Option<Instant>> {
+        match request {
+            LimitedRequest::Lookup => &self.lookups_until,
+            LimitedRequest::Upload => &self.uploads_until,
+        }
+    }
+
+    fn paused(&self, request: LimitedRequest) -> bool {
+        self.until(request)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    fn lookups_paused(&self) -> bool {
+        self.paused(LimitedRequest::Lookup)
+    }
+
+    /// Uploads also wait out a lookup limit: a task that couldn't look its
+    /// artifact up would likely upload one the cache already holds.
+    fn uploads_paused(&self) -> bool {
+        self.paused(LimitedRequest::Upload) || self.paused(LimitedRequest::Lookup)
+    }
+
+    fn pause(&self, request: LimitedRequest, wait: Duration) {
+        let resume = Instant::now() + wait;
+        let mut until = self
+            .until(request)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if until.is_none_or(|until| until < resume) {
+            *until = Some(resume);
+        }
+    }
+
+    /// True the first time the run reaches this kind of limit.
+    fn first_warning(&self, request: LimitedRequest) -> bool {
+        let warned = match request {
+            LimitedRequest::Lookup => &self.lookup_limit_warned,
+            LimitedRequest::Upload => &self.upload_limit_warned,
+        };
+        !warned.swap(true, Ordering::Relaxed)
+    }
+}
+
+/// A 429's message, and how long to wait before the next request of its kind.
+struct LimitReached {
+    message: String,
+    wait: Duration,
 }
 
 #[derive(Clone)]
@@ -95,7 +181,7 @@ pub fn try_restore(
     output_globs: &[String],
     validate: impl FnOnce() -> Result<bool, lpm_common::LpmError>,
 ) -> Option<lpm_task::cache::CacheHit> {
-    if REMOTE_CACHE_LOOKUPS_LIMITED.load(Ordering::Relaxed) {
+    if client.limits.lookups_paused() {
         return None;
     }
     match client.restore(key, project_dir, output_globs, validate) {
@@ -120,7 +206,7 @@ pub fn try_store(
     env_vars: &HashMap<String, String>,
     inherited_env: &HashMap<std::ffi::OsString, std::ffi::OsString>,
 ) {
-    if client.read_only || REMOTE_CACHE_UPLOADS_LIMITED.load(Ordering::Relaxed) {
+    if client.read_only || client.limits.uploads_paused() {
         return;
     }
 
@@ -413,21 +499,17 @@ impl RemoteCacheClient {
         match response.status() {
             StatusCode::OK => {}
             StatusCode::NOT_FOUND => return Ok(None),
-            status => {
-                if status == StatusCode::TOO_MANY_REQUESTS {
-                    REMOTE_CACHE_LOOKUPS_LIMITED.store(true, Ordering::Relaxed);
-                }
-                return Err(remote_cache_http_error(response, "lookup").await);
+            StatusCode::TOO_MANY_REQUESTS => {
+                self.limit_reached(LimitedRequest::Lookup, response).await;
+                return Ok(None);
             }
+            _ => return Err(remote_cache_http_error(response, "lookup").await),
         }
 
         if let Some(length) = response.content_length()
-            && length > MAX_REMOTE_ARTIFACT_BYTES
+            && length > self.max_artifact_bytes
         {
-            return Err(format!(
-                "remote cache artifact exceeds the {} limit; treating it as a miss",
-                format_bytes(MAX_REMOTE_ARTIFACT_BYTES),
-            ));
+            return Err(oversized_download(self.max_artifact_bytes));
         }
 
         let tag = response
@@ -442,8 +524,13 @@ impl RemoteCacheClient {
             .map(ToOwned::to_owned);
         let mut temp = tempfile::NamedTempFile::new()
             .map_err(|e| format!("failed to create remote cache temp file: {e}"))?;
-        let digests =
-            copy_response_to_temp(&mut response, &mut temp, self.signature_key.as_deref()).await?;
+        let digests = copy_response_to_temp(
+            &mut response,
+            &mut temp,
+            self.signature_key.as_deref(),
+            self.max_artifact_bytes,
+        )
+        .await?;
 
         // A downloaded artifact is extracted into the project tree only after
         // the advertised content hash passes. When a signing key is configured,
@@ -535,10 +622,10 @@ impl RemoteCacheClient {
             .metadata()
             .map_err(|e| format!("failed to stat remote cache artifact: {e}"))?
             .len();
-        if artifact_len > MAX_REMOTE_ARTIFACT_BYTES {
+        if artifact_len > self.max_artifact_bytes {
             return Err(format!(
                 "remote cache artifact exceeds the {} upload limit; skipping upload",
-                format_bytes(MAX_REMOTE_ARTIFACT_BYTES),
+                format_bytes(self.max_artifact_bytes),
             ));
         }
 
@@ -610,10 +697,31 @@ impl RemoteCacheClient {
             return Ok(());
         }
         if response.status() == StatusCode::TOO_MANY_REQUESTS {
-            REMOTE_CACHE_UPLOADS_LIMITED.store(true, Ordering::Relaxed);
+            self.limit_reached(LimitedRequest::Upload, response).await;
+            return Ok(());
         }
 
         Err(remote_cache_http_error(response, "upload").await)
+    }
+
+    /// Pauses the refused kind of request for as long as the cache server
+    /// asks, and warns the first time the run reaches that limit.
+    async fn limit_reached(&self, request: LimitedRequest, response: reqwest::Response) {
+        let limit = read_limit_reached(response).await;
+        self.limits.pause(request, limit.wait);
+        if !self.limits.first_warning(request) {
+            return;
+        }
+        let skipped = match request {
+            LimitedRequest::Lookup if !self.read_only => "lookups and uploads",
+            LimitedRequest::Lookup => "lookups",
+            LimitedRequest::Upload => "uploads",
+        };
+        install_ui::warn_untrusted(&format!(
+            "{}; skipping remote cache {skipped} for {}",
+            limit.message,
+            format_wait(limit.wait),
+        ));
     }
 
     fn artifact_url(&self, key: &str) -> Result<reqwest::Url, String> {
@@ -697,17 +805,25 @@ fn resolve_client(
         );
     }
 
+    let team = std::env::var("LPM_REMOTE_CACHE_TEAM")
+        .ok()
+        .filter(|team| !team.trim().is_empty())
+        .or_else(|| config.and_then(|cfg| cfg.team.clone()));
+    let limits = RequestLimits::for_cache(&base_url, team.as_deref());
     Ok(Some(RemoteCacheClient {
         base_url,
         auth,
-        team: std::env::var("LPM_REMOTE_CACHE_TEAM")
-            .ok()
-            .filter(|team| !team.trim().is_empty())
-            .or_else(|| config.and_then(|cfg| cfg.team.clone())),
+        team,
         signature_key,
         read_only: env_flag("LPM_REMOTE_CACHE_READ_ONLY").unwrap_or(false)
             || config.is_some_and(|cfg| cfg.read_only),
         env_policy: config.map(|cfg| cfg.env.clone()).unwrap_or_default(),
+        max_artifact_bytes: if cache_matches_registry {
+            REGISTRY_MAX_ARTIFACT_BYTES
+        } else {
+            MAX_REMOTE_ARTIFACT_BYTES
+        },
+        limits,
     }))
 }
 
@@ -869,24 +985,75 @@ fn status_body_too_large() -> String {
     )
 }
 
+/// Reads a 429's message and wait: `Retry-After`, in seconds or as a date,
+/// else the body's `retryAfter` seconds, else a minute; at least a second and
+/// at most a day.
+async fn read_limit_reached(response: reqwest::Response) -> LimitReached {
+    let header_wait = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| parse_retry_after(value, SystemTime::now()));
+    let body = read_remote_status_body(response).await.ok();
+    let message = body
+        .as_ref()
+        .and_then(|body| body.get("error"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("remote cache limit reached")
+        .to_owned();
+    let wait = header_wait
+        .or_else(|| {
+            body.as_ref()
+                .and_then(|body| body.get("retryAfter"))
+                .and_then(serde_json::Value::as_f64)
+                .and_then(|seconds| Duration::try_from_secs_f64(seconds).ok())
+        })
+        .unwrap_or(DEFAULT_LIMIT_PAUSE)
+        .clamp(Duration::from_secs(1), MAX_LIMIT_PAUSE);
+    LimitReached { message, wait }
+}
+
+fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let date = httpdate::parse_http_date(value).ok()?;
+    Some(date.duration_since(now).unwrap_or(Duration::ZERO))
+}
+
+/// A wait in the largest whole unit that fits, rounded up.
+fn format_wait(wait: Duration) -> String {
+    let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+    let (count, unit) = if seconds < 60 {
+        (seconds, "second")
+    } else if seconds < 60 * 60 {
+        (seconds.div_ceil(60), "minute")
+    } else {
+        (seconds.div_ceil(60 * 60), "hour")
+    };
+    if count == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{count} {unit}s")
+    }
+}
+
 async fn remote_cache_http_error(response: reqwest::Response, operation: &str) -> String {
     let status = response.status();
-    let body = if matches!(
-        status,
-        StatusCode::FORBIDDEN | StatusCode::PAYMENT_REQUIRED | StatusCode::TOO_MANY_REQUESTS
-    ) {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        let limit = read_limit_reached(response).await;
+        return format!(
+            "{}; try again in {}",
+            limit.message,
+            format_wait(limit.wait)
+        );
+    }
+    let body = if matches!(status, StatusCode::FORBIDDEN | StatusCode::PAYMENT_REQUIRED) {
         read_remote_status_body(response).await.ok()
     } else {
         None
     };
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        let limit = body
-            .as_ref()
-            .and_then(|body| body.get("error"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("remote cache limit reached");
-        return format!("{limit}; skipping remote cache {operation}s for the rest of this run");
-    }
     let code = body
         .as_ref()
         .and_then(|body| body.get("code"))
@@ -1018,10 +1185,18 @@ fn env_flag(name: &str) -> Option<bool> {
     }
 }
 
+fn oversized_download(max_artifact_bytes: u64) -> String {
+    format!(
+        "remote cache artifact exceeds the {} limit; treating it as a miss",
+        format_bytes(max_artifact_bytes),
+    )
+}
+
 async fn copy_response_to_temp(
     response: &mut reqwest::Response,
     temp: &mut tempfile::NamedTempFile,
     signature_key: Option<&str>,
+    max_artifact_bytes: u64,
 ) -> Result<ArtifactDigests, String> {
     let mut total = 0u64;
     let mut sha = Sha256::new();
@@ -1034,11 +1209,8 @@ async fn copy_response_to_temp(
     {
         let read = buffer.len();
         total = total.saturating_add(read as u64);
-        if total > MAX_REMOTE_ARTIFACT_BYTES {
-            return Err(format!(
-                "remote cache artifact exceeds the {} limit; treating it as a miss",
-                format_bytes(MAX_REMOTE_ARTIFACT_BYTES),
-            ));
+        if total > max_artifact_bytes {
+            return Err(oversized_download(max_artifact_bytes));
         }
 
         sha.update(&buffer[..read]);
@@ -1516,6 +1688,141 @@ mod tests {
         .expect("secret-like inherited env must block upload");
 
         assert!(reason.contains("CI_DEPLOY_PASSWORD"));
+    }
+
+    #[test]
+    fn retry_after_reads_seconds_and_dates() {
+        let now = httpdate::parse_http_date("Sun, 11 Oct 2026 12:00:00 GMT").unwrap();
+
+        assert_eq!(
+            parse_retry_after(" 42 ", now),
+            Some(Duration::from_secs(42))
+        );
+        assert_eq!(
+            parse_retry_after("Sun, 11 Oct 2026 12:01:30 GMT", now),
+            Some(Duration::from_secs(90))
+        );
+        assert_eq!(
+            parse_retry_after("Sun, 11 Oct 2026 11:59:00 GMT", now),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(parse_retry_after("soon", now), None);
+        assert_eq!(parse_retry_after("-5", now), None);
+    }
+
+    #[test]
+    fn waits_read_in_their_largest_unit_rounded_up() {
+        for (seconds, expected) in [
+            (0.5, "1 second"),
+            (1.0, "1 second"),
+            (42.0, "42 seconds"),
+            (60.0, "1 minute"),
+            (61.0, "2 minutes"),
+            (3_600.0, "1 hour"),
+            (86_339.0, "24 hours"),
+        ] {
+            assert_eq!(format_wait(Duration::from_secs_f64(seconds)), expected);
+        }
+    }
+
+    async fn limit_from(response: wiremock::ResponseTemplate) -> LimitReached {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        let response = reqwest::get(server.uri()).await.unwrap();
+        read_limit_reached(response).await
+    }
+
+    #[tokio::test]
+    async fn a_limit_waits_as_long_as_the_server_asks_within_a_second_and_a_day() {
+        let limited = || {
+            wiremock::ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "error": "Remote cache limit reached: 300 uploads a minute",
+                "retryAfter": 30,
+            }))
+        };
+
+        let from_header = limit_from(limited().insert_header("retry-after", "42")).await;
+        assert_eq!(
+            from_header.message,
+            "Remote cache limit reached: 300 uploads a minute"
+        );
+        assert_eq!(from_header.wait, Duration::from_secs(42));
+        assert_eq!(
+            limit_from(limited()).await.wait,
+            Duration::from_secs(30),
+            "without the header, the body's retryAfter"
+        );
+        assert_eq!(
+            limit_from(limited().insert_header("retry-after", "0"))
+                .await
+                .wait,
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            limit_from(limited().insert_header("retry-after", "604800"))
+                .await
+                .wait,
+            MAX_LIMIT_PAUSE
+        );
+
+        let bare = limit_from(wiremock::ResponseTemplate::new(429)).await;
+        assert_eq!(bare.message, "remote cache limit reached");
+        assert_eq!(bare.wait, DEFAULT_LIMIT_PAUSE);
+    }
+
+    #[test]
+    fn a_lookup_limit_pauses_uploads_too_but_an_upload_limit_pauses_only_uploads() {
+        let lookups = RequestLimits::default();
+        lookups.pause(LimitedRequest::Lookup, Duration::from_secs(60));
+        assert!(lookups.lookups_paused() && lookups.uploads_paused());
+
+        let uploads = RequestLimits::default();
+        uploads.pause(LimitedRequest::Upload, Duration::from_secs(60));
+        assert!(!uploads.lookups_paused() && uploads.uploads_paused());
+    }
+
+    #[test]
+    fn a_pause_ends_when_its_wait_does_and_a_shorter_one_never_cuts_it() {
+        let limits = RequestLimits::default();
+        limits.pause(LimitedRequest::Lookup, Duration::ZERO);
+        assert!(!limits.lookups_paused());
+
+        limits.pause(LimitedRequest::Lookup, Duration::from_secs(60));
+        limits.pause(LimitedRequest::Lookup, Duration::ZERO);
+        assert!(limits.lookups_paused());
+    }
+
+    #[test]
+    fn each_kind_of_limit_warns_once() {
+        let limits = RequestLimits::default();
+
+        assert!(limits.first_warning(LimitedRequest::Lookup));
+        assert!(!limits.first_warning(LimitedRequest::Lookup));
+        assert!(limits.first_warning(LimitedRequest::Upload));
+        assert!(!limits.first_warning(LimitedRequest::Upload));
+    }
+
+    #[test]
+    fn clients_share_limits_per_cache_server_and_team() {
+        let url = "https://limits-test.example/v8";
+        let shared = RequestLimits::for_cache(url, Some("team-a"));
+
+        assert!(Arc::ptr_eq(
+            &shared,
+            &RequestLimits::for_cache(url, Some("team-a"))
+        ));
+        assert!(!Arc::ptr_eq(
+            &shared,
+            &RequestLimits::for_cache(url, Some("team-b"))
+        ));
+        assert!(!Arc::ptr_eq(&shared, &RequestLimits::for_cache(url, None)));
+        assert!(!Arc::ptr_eq(
+            &shared,
+            &RequestLimits::for_cache("https://other.example/v8", Some("team-a"))
+        ));
     }
 
     #[test]
