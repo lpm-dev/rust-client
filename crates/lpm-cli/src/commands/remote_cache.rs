@@ -723,10 +723,14 @@ impl RemoteCacheClient {
             }
             let limit = read_limit_reached(response).await;
             // A wait this short is the server's room for uploads at once, not a
-            // spent limit: the upload goes again rather than being dropped.
+            // spent limit: the upload goes again rather than being dropped,
+            // unless uploads were paused meanwhile.
             if !retried && limit.wait <= MAX_UPLOAD_RETRY_WAIT {
                 retried = true;
-                tokio::time::sleep(limit.wait).await;
+                tokio::time::sleep(limit.wait + retry_jitter(key, limit.wait)).await;
+                if self.limits.uploads_paused() {
+                    return Ok(());
+                }
                 continue;
             }
             self.limit_reached(LimitedRequest::Upload, limit);
@@ -738,7 +742,9 @@ impl RemoteCacheClient {
     /// asks, and warns the first time the run reaches that limit.
     fn limit_reached(&self, request: LimitedRequest, limit: LimitReached) {
         self.limits.pause(request, limit.wait);
-        if !self.limits.first_warning(request) {
+        // A pause of a few seconds isn't worth a warning, nor worth using up
+        // the one a longer limit later needs.
+        if limit.wait <= MAX_UPLOAD_RETRY_WAIT || !self.limits.first_warning(request) {
             return;
         }
         let skipped = match request {
@@ -1212,6 +1218,15 @@ fn env_flag(name: &str) -> Option<bool> {
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+/// Up to half the wait again, from the artifact's key, so uploads refused
+/// together don't all go again together.
+fn retry_jitter(key: &str, wait: Duration) -> Duration {
+    let spread = key.bytes().fold(0u64, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(u64::from(byte))
+    });
+    wait.mul_f64((spread % 1000) as f64 / 2000.0)
 }
 
 /// An artifact size cap, a whole number of MiB, as the Registry states it.
@@ -1982,7 +1997,7 @@ mod tests {
 
     #[tokio::test]
     async fn uploads_pause_once_a_retry_is_refused_too_or_the_wait_is_a_spent_limit() {
-        for (retry_after, attempts) in [("1", 2), ("60", 1)] {
+        for (retry_after, attempts) in [("1", 2), ("6", 1), ("60", 1)] {
             let server = wiremock::MockServer::start().await;
             wiremock::Mock::given(wiremock::matchers::method("PUT"))
                 .respond_with(upload_refused(retry_after))
@@ -1996,6 +2011,75 @@ mod tests {
             assert!(client.limits.uploads_paused(), "Retry-After {retry_after}");
             server.verify().await;
         }
+    }
+
+    #[tokio::test]
+    async fn an_upload_refused_for_five_seconds_still_goes_once_more() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(upload_refused("5"))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let (client, uploaded) = upload_to(&server).await;
+
+        assert_eq!(uploaded, Ok(()));
+        assert!(client.limits.uploads_paused());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn an_upload_doesnt_go_again_once_uploads_were_paused_while_it_waited() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(upload_refused("1"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = test_client(&format!("{}/v8", server.uri()), MIB);
+        let mut artifact = tempfile::tempfile().unwrap();
+        artifact.write_all(b"artifact").unwrap();
+        let limits = client.limits.clone();
+        let pause = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            limits.pause(LimitedRequest::Upload, Duration::from_secs(60));
+        });
+
+        let uploaded = client
+            .upload_artifact(&"a".repeat(64), &artifact, 8, 10)
+            .await;
+
+        pause.await.unwrap();
+        assert_eq!(uploaded, Ok(()));
+        server.verify().await;
+    }
+
+    #[test]
+    fn retries_spread_over_up_to_half_the_wait_again() {
+        let wait = Duration::from_secs(1);
+        let spreads: std::collections::BTreeSet<_> = (0..50)
+            .map(|index| retry_jitter(&format!("{index:064x}"), wait))
+            .collect();
+
+        assert!(spreads.iter().all(|spread| *spread <= wait / 2));
+        assert!(spreads.len() > 10, "{spreads:?}");
+    }
+
+    #[test]
+    fn a_pause_of_a_few_seconds_leaves_the_warning_for_a_longer_limit() {
+        let client = test_client("http://127.0.0.1:9/v8", MIB);
+        let limit = |seconds| LimitReached {
+            message: "Remote cache limit reached: 8 uploads at once".into(),
+            wait: Duration::from_secs(seconds),
+        };
+
+        client.limit_reached(LimitedRequest::Upload, limit(1));
+        assert!(client.limits.uploads_paused());
+        assert!(client.limits.first_warning(LimitedRequest::Upload));
+
+        client.limit_reached(LimitedRequest::Lookup, limit(60));
+        assert!(!client.limits.first_warning(LimitedRequest::Lookup));
     }
 
     #[test]
