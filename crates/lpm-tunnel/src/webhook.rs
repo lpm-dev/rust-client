@@ -219,9 +219,9 @@ fn format_size(bytes: usize) -> String {
     if bytes < 1024 {
         format!("{bytes}B")
     } else if bytes < 1024 * 1024 {
-        format!("{:.1}KB", bytes as f64 / 1024.0)
+        format!("{:.1}KiB", bytes as f64 / 1024.0)
     } else {
-        format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
+        format!("{:.1}MiB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
 
@@ -414,7 +414,7 @@ mod tests {
             w.path = "/api/hook".to_string();
             w.request_body = vec![0u8; 2500];
         });
-        assert_eq!(summarize_webhook(&wh), "POST /api/hook (2.4KB)");
+        assert_eq!(summarize_webhook(&wh), "POST /api/hook (2.4KiB)");
     }
 
     // -- CapturedWebhook methods --
@@ -535,12 +535,12 @@ mod tests {
 
     #[test]
     fn format_size_kilobytes() {
-        assert_eq!(format_size(1024), "1.0KB");
-        assert_eq!(format_size(2560), "2.5KB");
+        assert_eq!(format_size(1024), "1.0KiB");
+        assert_eq!(format_size(2560), "2.5KiB");
     }
 
     #[test]
     fn format_size_megabytes() {
-        assert_eq!(format_size(1024 * 1024), "1.0MB");
+        assert_eq!(format_size(1024 * 1024), "1.0MiB");
     }
 }

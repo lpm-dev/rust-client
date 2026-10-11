@@ -20,7 +20,7 @@ fn truncate_output(text: &str) -> String {
         }
         let end = text[..end].rfind('\n').unwrap_or(end);
         format!(
-            "{}...\n\n[output truncated at {}MB]",
+            "{}...\n\n[output truncated at {} MiB]",
             &text[..end],
             MAX_CAPTURED_OUTPUT / (1024 * 1024),
         )
@@ -343,7 +343,7 @@ mod tests {
         let huge = "x".repeat(MAX_CAPTURED_OUTPUT + 2_000);
         let result = truncate_output(&huge);
         assert!(
-            result.ends_with("[output truncated at 10MB]"),
+            result.ends_with("[output truncated at 10 MiB]"),
             "expected truncation marker, got tail: {:?}",
             &result[result.len().saturating_sub(60)..]
         );

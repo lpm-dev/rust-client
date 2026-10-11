@@ -369,7 +369,7 @@ async fn read_download_body(
 fn checked_download_size(size: u64) -> Result<usize, LpmError> {
     let size = usize::try_from(size).map_err(|_| {
         LpmError::Script(format!(
-            "download size {size} bytes exceeds maximum allowed size of {MAX_DOWNLOAD_SIZE} bytes ({}MB)",
+            "download size {size} bytes exceeds maximum allowed size of {MAX_DOWNLOAD_SIZE} bytes ({} MiB)",
             MAX_DOWNLOAD_SIZE / (1024 * 1024)
         ))
     })?;
@@ -763,7 +763,7 @@ const MAX_DOWNLOAD_SIZE: usize = 200 * 1024 * 1024;
 fn validate_download_size(size: usize) -> Result<(), LpmError> {
     if size > MAX_DOWNLOAD_SIZE {
         return Err(LpmError::Network(format!(
-            "download size {size} bytes exceeds maximum allowed size of {MAX_DOWNLOAD_SIZE} bytes ({}MB)",
+            "download size {size} bytes exceeds maximum allowed size of {MAX_DOWNLOAD_SIZE} bytes ({} MiB)",
             MAX_DOWNLOAD_SIZE / (1024 * 1024)
         )));
     }

@@ -36,7 +36,7 @@ pub(super) fn truncate_output(output: String) -> String {
         let truncated = &output[..limit];
         let end = truncated.rfind('\n').unwrap_or(limit);
         format!(
-            "{}...\n\n[output truncated at {}MB]",
+            "{}...\n\n[output truncated at {} MiB]",
             &output[..end],
             MAX_CAPTURED_OUTPUT / (1024 * 1024),
         )

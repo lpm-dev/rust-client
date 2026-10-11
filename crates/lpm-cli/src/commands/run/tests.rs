@@ -155,7 +155,7 @@ fn truncate_output_large_truncated() {
     let large = "x".repeat(11 * 1024 * 1024);
     let result = truncate_output(large);
     assert!(result.len() <= MAX_CAPTURED_OUTPUT + 100); // +100 for the message
-    assert!(result.contains("[output truncated at 10MB]"));
+    assert!(result.contains("[output truncated at 10 MiB]"));
 }
 
 #[test]
@@ -167,7 +167,7 @@ fn truncate_output_cuts_at_newline() {
         s.push_str(&line);
     }
     let result = truncate_output(s);
-    assert!(result.contains("[output truncated at 10MB]"));
+    assert!(result.contains("[output truncated at 10 MiB]"));
     // The truncated content (before "...") should end at a newline boundary
     let before_ellipsis = result.split("...\n").next().unwrap();
     assert!(before_ellipsis.ends_with('\n') || before_ellipsis.ends_with('a'));

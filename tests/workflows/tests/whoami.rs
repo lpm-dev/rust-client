@@ -149,7 +149,8 @@ async fn whoami_human_output_uses_slim_account_summary() {
         "authenticated whoami should warn when auth storage uses the encrypted file fallback, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("usage") && stderr.contains("storage        50.00MB / 500MB  █░░░░░░░░░"),
+        stderr.contains("usage")
+            && stderr.contains("storage        50.00 MiB / 500 MiB  █░░░░░░░░░"),
         "authenticated whoami should show storage usage with a quota bar, got:\n{stderr}"
     );
     assert!(

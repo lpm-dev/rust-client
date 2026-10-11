@@ -154,7 +154,7 @@ fn validate_open_directory(skills_dir: &cap_std::fs::Dir) -> Result<ValidationRe
     }
     if report.total_size_bytes > MAX_TOTAL_SIZE {
         report.errors.push(format!(
-            "total package skills size {} bytes exceeds 100KB limit",
+            "total package skills size {} bytes exceeds 100 KiB limit",
             report.total_size_bytes
         ));
     }
@@ -203,7 +203,7 @@ fn validate_opened_file(
     if size > MAX_SKILL_SIZE {
         report
             .errors
-            .push(format!("{display}: exceeds 15KB limit ({size} bytes)"));
+            .push(format!("{display}: exceeds 15 KiB limit ({size} bytes)"));
         return Ok(());
     }
 
@@ -217,7 +217,7 @@ fn validate_opened_file(
             .saturating_sub(size)
             .saturating_add(bytes.len() as u64);
         report.errors.push(format!(
-            "{display}: exceeds 15KB limit ({} bytes)",
+            "{display}: exceeds 15 KiB limit ({} bytes)",
             bytes.len()
         ));
         return Ok(());
@@ -597,7 +597,7 @@ mod tests {
             report
                 .errors
                 .iter()
-                .any(|error| error.contains("exceeds 100KB limit"))
+                .any(|error| error.contains("exceeds 100 KiB limit"))
         );
         assert!(retained_bytes <= MAX_TOTAL_SIZE, "{retained_bytes}");
     }
