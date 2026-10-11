@@ -535,9 +535,19 @@ pub(super) fn reject_tracked_npmrc(project_dir: &Path) -> Result<(), LpmError> {
     )))
 }
 
+/// A git command for a project that may be untrusted: no `GIT_*` variable
+/// from the environment, no `core.fsmonitor` program, which reading the
+/// index would run, and no repository found as a bare one, which a cloned
+/// project can contain with its own config.
 pub(crate) fn hardened_git_command(project_dir: &Path, args: &[&str]) -> std::process::Command {
     let mut command = std::process::Command::new("git");
     command
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "safe.bareRepository=explicit",
+        ])
         .args(args)
         .current_dir(project_dir)
         .env("LC_ALL", "C");

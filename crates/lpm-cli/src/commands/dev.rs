@@ -1542,7 +1542,7 @@ pub async fn run(
         let inspector_db = lpm_inspect::db::InspectorDb::open(project_dir).map_err(|error| {
             LpmError::Tunnel(format!(
                 "failed to open this project's .lpm/inspector.db: {error}. \
-                 Repair or move the corrupt database and retry"
+                 Move or repair it and retry"
             ))
         })?;
         let inspector_state = lpm_inspect::state::InspectorState::with_db_pending(inspector_db);
@@ -1573,7 +1573,7 @@ pub async fn run(
         let (webhook_tx, mut webhook_rx) =
             tokio::sync::mpsc::channel::<lpm_tunnel::client::CapturedWebhookEvent>(64);
 
-        crate::commands::tunnel::warn_capture_persistence(project_dir, !quiet);
+        crate::commands::tunnel::warn_capture_persistence(project_dir, !quiet).await;
 
         // Dashboard webhook channel: when --dashboard is active, webhooks are
         // forwarded to the dashboard TUI via a std::sync channel.

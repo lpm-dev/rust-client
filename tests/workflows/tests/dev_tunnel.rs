@@ -1265,8 +1265,9 @@ async fn tunnel_json_reports_a_retry_before_a_successful_reconnection() {
     "#);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tunnel_start_warns_that_capture_history_persists_sensitive_request_data() {
+/// Starts `lpm tunnel 5173` against a relay that greets it and closes, in a
+/// project `prepare` sets up, and returns its stderr.
+async fn tunnel_start_stderr(prepare: impl FnOnce(&Path) + Send + 'static) -> String {
     let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay_url = format!("ws://{}/connect", relay.local_addr().unwrap());
     let relay_task = tokio::spawn(async move {
@@ -1296,6 +1297,7 @@ async fn tunnel_start_warns_that_capture_history_persists_sensitive_request_data
 
     let output_task = tokio::task::spawn_blocking(move || {
         let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+        prepare(project.path());
         let mut command = lpm_spawnable(&project);
         command.env("LPM_TUNNEL_RELAY", relay_url).args([
             "--token",
@@ -1313,13 +1315,68 @@ async fn tunnel_start_warns_that_capture_history_persists_sensitive_request_data
         "tunnel command failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn git(directory: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(directory)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {output:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_start_warns_that_capture_history_persists_sensitive_request_data() {
+    let stderr = tunnel_start_stderr(|_| {}).await;
+
+    assert_eq!(
+        stderr
+            .matches("tunnel webhook capture persists full request/response bodies and headers")
+            .count(),
+        1,
+        "human tunnel startup must disclose capture persistence once:\n{stderr}"
+    );
     assert!(
-        stderr.contains("tunnel webhook capture persists full request/response bodies and headers")
-            && stderr.contains(".lpm/inspector.db")
-            && stderr.contains("mode 0600 on Unix")
+        stderr.contains(".lpm/inspector.db")
+            && stderr.contains("owner-only on Unix")
             && stderr.contains("project ACLs on Windows"),
         "human tunnel startup must disclose capture persistence:\n{stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_start_names_capture_files_git_tracks_and_how_to_stop_it() {
+    let stderr = tunnel_start_stderr(|project| {
+        git(project, &["init", "--quiet"]);
+        std::fs::create_dir(project.join(".lpm")).unwrap();
+        std::fs::write(project.join(".lpm/inspector.db"), b"").unwrap();
+        git(project, &["add", ".lpm/inspector.db"]);
+    })
+    .await;
+
+    assert!(
+        stderr.contains("git tracks '.lpm/inspector.db'")
+            && stderr.contains("git rm --cached -- '.lpm/inspector.db'")
+            && stderr.contains("rotate any credentials"),
+        "tunnel startup must name tracked capture files:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("keeps it out of git"),
+        "a tracked capture isn't kept out of git:\n{stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_start_says_captures_are_kept_out_of_git_once_git_ignores_them() {
+    let stderr = tunnel_start_stderr(|project| git(project, &["init", "--quiet"])).await;
+
+    assert!(
+        stderr.contains(".lpm/.gitignore keeps it out of git") && !stderr.contains("git tracks"),
+        "{stderr}"
     );
 }
 

@@ -62,26 +62,21 @@ impl InspectorDb {
     /// write-batching task.
     pub fn open(project_dir: &Path) -> Result<Self, rusqlite::Error> {
         let lpm_dir = project_dir.join(".lpm");
-        std::fs::create_dir_all(&lpm_dir)
+        let db_path = lpm_dir.join("inspector.db");
+        prepare_capture_files(&lpm_dir, &db_path)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         if let Err(error) = ensure_captures_ignored(&lpm_dir) {
-            tracing::warn!(
-                "could not add `{CAPTURES_IGNORE_LINE}` to {}: {error}",
-                lpm_dir.join(".gitignore").display()
-            );
+            tracing::warn!("could not keep tunnel captures out of git: {error}");
         }
 
-        let db_path = lpm_dir.join("inspector.db");
-
         // Write connection (owned by the background flush task)
-        let write_conn = Connection::open(&db_path)?;
-        restrict_database_permissions(&db_path)?;
+        let write_conn = open_capture_connection(&db_path)?;
         init_schema(&write_conn)?;
 
         // Read connection (shared across API handlers).
         // busy_timeout ensures low-frequency mutations (tag updates, session renames)
         // wait gracefully if the write connection holds a lock during batch flushes.
-        let read_conn = Connection::open(&db_path)?;
+        let read_conn = open_capture_connection(&db_path)?;
         read_conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
@@ -763,55 +758,192 @@ impl InspectorDb {
 /// The `.lpm/.gitignore` line that keeps the capture database and its
 /// SQLite sidecars out of git, since captures hold request headers and
 /// bodies.
-pub const CAPTURES_IGNORE_LINE: &str = "inspector.db*";
+const CAPTURES_IGNORE_LINE: &str = "inspector.db*";
 
-const GITIGNORE_SIZE_CAP_BYTES: u64 = 64 * 1024;
+/// The capture database and the sidecar files SQLite keeps beside it.
+fn capture_files(db_path: &Path) -> [std::path::PathBuf; 4] {
+    let named = |suffix: &str| {
+        let mut name = db_path.as_os_str().to_os_string();
+        name.push(suffix);
+        std::path::PathBuf::from(name)
+    };
+    [
+        db_path.to_path_buf(),
+        named("-wal"),
+        named("-shm"),
+        named("-journal"),
+    ]
+}
 
-/// Adds [`CAPTURES_IGNORE_LINE`] to `.lpm/.gitignore` unless it's there.
-/// An ignore file inside `.lpm/` holds wherever the project sits in a
-/// repository, and leaves the project's own `.gitignore` alone. A linked
-/// `.lpm/.gitignore` is left as it is.
+fn linked_or_not(path: &Path, expected: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "{} is a link or not a {expected}; tunnel captures, which hold request \
+             headers and bodies, are kept only in the project's own files",
+            path.display()
+        ),
+    )
+}
+
+/// Makes `.lpm/` and the capture files safe to write: neither `.lpm` nor
+/// any capture file may be a link, which a cloned repository could point
+/// anywhere, such as into a directory it serves; existing capture files are
+/// made owner-only, as a checkout or an older release may have left them
+/// readable; and a new database is created owner-only before SQLite opens
+/// it, so it's never readable by others.
+fn prepare_capture_files(lpm_dir: &Path, db_path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(lpm_dir) {
+        Ok(metadata) if lpm_common::is_symlink_or_junction(&metadata) || !metadata.is_dir() => {
+            return Err(linked_or_not(lpm_dir, "directory"));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(lpm_dir)?;
+        }
+        Err(error) => return Err(error),
+    }
+    for path in capture_files(db_path) {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if lpm_common::is_symlink_or_junction(&metadata) || !metadata.is_file() =>
+            {
+                return Err(linked_or_not(&path, "file"));
+            }
+            Ok(_) => make_owner_only(&path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    create_owner_only(db_path)
+}
+
+#[cfg(unix)]
+fn make_owner_only(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn make_owner_only(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_owner_only(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn create_owner_only(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Opens the capture database without following a link at its path.
+/// SQLite's no-follow open refuses a link anywhere in the path, as macOS's
+/// `/var` and `/tmp` are, so it gets the directory's real path, which leaves
+/// only the database itself to refuse as a link.
+fn open_capture_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
+    let directory = match path.parent() {
+        Some(directory) if !directory.as_os_str().is_empty() => directory,
+        _ => Path::new("."),
+    };
+    let real_path = std::fs::canonicalize(directory)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
+        .join(path.file_name().unwrap_or(path.as_os_str()));
+    Connection::open_with_flags(
+        real_path,
+        rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+}
+
+/// A `.gitignore` line as git reads it: without a trailing carriage return
+/// or trailing spaces that aren't escaped. Leading whitespace stays part of
+/// the pattern, as it does for git.
+fn git_pattern(line: &str) -> &str {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let bytes = line.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1] == b' ' && !(end >= 2 && bytes[end - 2] == b'\\') {
+        end -= 1;
+    }
+    &line[..end]
+}
+
+/// Whether these `.gitignore` lines leave the capture files ignored: the
+/// rule, unanchored or anchored to `.lpm/`, after the last line that could
+/// negate it.
+fn ignores_captures(lines: &str) -> bool {
+    let mut ignored = false;
+    for line in lines.lines() {
+        let pattern = git_pattern(line);
+        if pattern == CAPTURES_IGNORE_LINE
+            || pattern.strip_prefix('/') == Some(CAPTURES_IGNORE_LINE)
+        {
+            ignored = true;
+        } else if pattern.starts_with('!') && pattern.contains("inspector.db") {
+            ignored = false;
+        }
+    }
+    ignored
+}
+
+/// Adds [`CAPTURES_IGNORE_LINE`] to `.lpm/.gitignore` unless the file
+/// already ignores the capture files. An ignore file inside `.lpm/` holds
+/// wherever the project sits in a repository, and leaves the project's own
+/// `.gitignore` alone. A linked or read-only `.lpm/.gitignore` is left as it
+/// is; the CLI's capture warning then says git doesn't ignore the captures.
 fn ensure_captures_ignored(lpm_dir: &Path) -> std::io::Result<()> {
     let path = lpm_dir.join(".gitignore");
-    let existing = match lpm_common::read_text_file_capped_nofollow(&path, GITIGNORE_SIZE_CAP_BYTES)
-    {
+    let existing = match lpm_common::read_text_file_capped_nofollow(
+        &path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
         Ok(text) => text,
         Err(lpm_common::BoundedReadError::NotFound { .. }) => String::new(),
         Err(error) => return Err(std::io::Error::other(error)),
     };
-    if existing
-        .lines()
-        .any(|line| line.trim() == CAPTURES_IGNORE_LINE)
-    {
+    if ignores_captures(&existing) {
         return Ok(());
     }
+    if !existing.is_empty() && std::fs::metadata(&path)?.permissions().readonly() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} is read-only", path.display()),
+        ));
+    }
+    let newline = if existing.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let mut updated = existing;
     if !updated.is_empty() && !updated.ends_with('\n') {
-        updated.push('\n');
+        updated.push_str(newline);
     }
-    updated.push_str("# LPM tunnel captures hold request headers and bodies.\n");
+    updated.push_str("# LPM tunnel captures hold request headers and bodies.");
+    updated.push_str(newline);
     updated.push_str(CAPTURES_IGNORE_LINE);
-    updated.push('\n');
+    updated.push_str(newline);
     lpm_common::write_file_atomic(&path, updated)
 }
 
 // ── Schema initialization ─────────────────────────────────────────────
 
-#[cfg(unix)]
-fn restrict_database_permissions(path: &Path) -> Result<(), rusqlite::Error> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
-}
-
-#[cfg(not(unix))]
-fn restrict_database_permissions(_path: &Path) -> Result<(), rusqlite::Error> {
-    Ok(())
-}
-
 fn open_control_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
-    let connection = Connection::open(path)?;
+    let connection = open_capture_connection(path)?;
     connection.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=FULL;
@@ -1325,19 +1457,113 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn opening_leaves_an_lpm_gitignore_that_already_ignores_captures() {
+    fn opened_with_gitignore(content: &str) -> (tempfile::TempDir, String) {
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir(project.path().join(".lpm")).unwrap();
-        std::fs::write(
-            project.path().join(".lpm/.gitignore"),
-            "  inspector.db*  \n",
-        )
-        .unwrap();
+        std::fs::write(project.path().join(".lpm/.gitignore"), content).unwrap();
+        drop(InspectorDb::open(project.path()).unwrap());
+        let written = lpm_gitignore(project.path());
+        (project, written)
+    }
+
+    #[tokio::test]
+    async fn opening_leaves_an_lpm_gitignore_git_reads_as_ignoring_captures() {
+        for content in [
+            "inspector.db*\n",
+            "inspector.db*  \n",
+            "inspector.db*\r\n",
+            "/inspector.db*\n",
+            "!inspector.db\ninspector.db*\n",
+        ] {
+            let (_project, written) = opened_with_gitignore(content);
+            assert_eq!(written, content, "{content:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn opening_adds_the_rule_where_git_wouldnt_read_one() {
+        for content in [
+            "  inspector.db*\n",
+            "\tinspector.db*\n",
+            "inspector.db*\t\n",
+            "inspector.db*\\ \n",
+            "inspector.db*\n!inspector.db\n",
+        ] {
+            let (_project, written) = opened_with_gitignore(content);
+            assert_eq!(
+                written,
+                format!("{content}{CAPTURES_IGNORED}"),
+                "{content:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn opening_adds_the_rule_with_the_file_s_line_endings() {
+        let (_project, written) = opened_with_gitignore("skills/\r\n");
+
+        assert_eq!(
+            written,
+            "skills/\r\n# LPM tunnel captures hold request headers and bodies.\r\ninspector.db*\r\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opening_leaves_a_read_only_lpm_gitignore_alone() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+        let path = project.path().join(".lpm/.gitignore");
+        std::fs::write(&path, "skills/\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
 
         drop(InspectorDb::open(project.path()).unwrap());
 
-        assert_eq!(lpm_gitignore(project.path()), "  inspector.db*  \n");
+        assert_eq!(lpm_gitignore(project.path()), "skills/\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opening_refuses_a_linked_lpm_directory_or_capture_file() {
+        let outside = tempfile::tempdir().unwrap();
+        let linked_dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), linked_dir.path().join(".lpm")).unwrap();
+        assert!(InspectorDb::open(linked_dir.path()).is_err());
+        assert!(!outside.path().join("inspector.db").exists());
+
+        for name in ["inspector.db", "inspector.db-wal"] {
+            let project = tempfile::tempdir().unwrap();
+            std::fs::create_dir(project.path().join(".lpm")).unwrap();
+            let target = outside.path().join(format!("{name}-target"));
+            std::os::unix::fs::symlink(&target, project.path().join(".lpm").join(name)).unwrap();
+
+            assert!(InspectorDb::open(project.path()).is_err(), "{name}");
+            assert!(!target.exists(), "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opening_keeps_capture_files_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+        let wal = project.path().join(".lpm/inspector.db-wal");
+        std::fs::write(&wal, b"").unwrap();
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        drop(InspectorDb::open(project.path()).unwrap());
+
+        for name in ["inspector.db", "inspector.db-wal"] {
+            let mode = std::fs::metadata(project.path().join(".lpm").join(name))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "{name}");
+        }
     }
 
     #[cfg(unix)]
