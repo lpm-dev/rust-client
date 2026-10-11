@@ -230,6 +230,7 @@ pub fn try_restore(
     validate: impl FnOnce() -> Result<bool, lpm_common::LpmError>,
 ) -> Option<lpm_task::cache::CacheHit> {
     if client.limits.lookups_paused() {
+        client.skipping_while_busy(LimitedRequest::Lookup);
         return None;
     }
     match client.restore(key, project_dir, output_globs, validate) {
@@ -254,7 +255,12 @@ pub fn try_store(
     env_vars: &HashMap<String, String>,
     inherited_env: &HashMap<std::ffi::OsString, std::ffi::OsString>,
 ) {
-    if client.read_only || client.limits.uploads_paused() {
+    if client.read_only {
+        return;
+    }
+    // A lookup's pause skips uploads too, so its notice alone wouldn't say so.
+    if client.limits.uploads_paused() {
+        client.skipping_while_busy(LimitedRequest::Upload);
         return;
     }
 
@@ -2164,6 +2170,84 @@ mod tests {
             // A minute's pause is a spent limit, whose warning covers the
             // dropped upload, so the busy notice stays unspent.
             assert!(client.limits.first_busy_notice(LimitedRequest::Upload));
+        }
+    }
+
+    fn store_with(client: &RemoteCacheClient) {
+        let project = tempfile::tempdir().unwrap();
+        try_store(
+            client,
+            "abc123",
+            project.path(),
+            "build",
+            &[],
+            "",
+            "",
+            1,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+    }
+
+    #[test]
+    fn an_upload_skipped_while_a_lookup_waits_on_a_busy_server_gets_the_busy_notice() {
+        let client = test_client("http://127.0.0.1:9/v8", MIB);
+        client
+            .limits
+            .pause(LimitedRequest::Lookup, Duration::from_secs(3));
+
+        store_with(&client);
+
+        assert!(!client.limits.first_busy_notice(LimitedRequest::Upload));
+    }
+
+    #[test]
+    fn an_upload_skipped_for_a_spent_lookup_limit_has_that_limit_s_warning_instead() {
+        let client = test_client("http://127.0.0.1:9/v8", MIB);
+        client
+            .limits
+            .spend(LimitedRequest::Lookup, Duration::from_secs(60));
+
+        store_with(&client);
+
+        assert!(client.limits.first_busy_notice(LimitedRequest::Upload));
+    }
+
+    #[test]
+    fn a_read_only_client_skips_uploads_without_a_notice() {
+        let mut client = test_client("http://127.0.0.1:9/v8", MIB);
+        client.read_only = true;
+        client
+            .limits
+            .pause(LimitedRequest::Upload, Duration::from_secs(3));
+
+        store_with(&client);
+
+        assert!(client.limits.first_busy_notice(LimitedRequest::Upload));
+    }
+
+    #[test]
+    fn a_lookup_skipped_while_the_server_is_busy_gets_the_busy_notice() {
+        let client = test_client("http://127.0.0.1:9/v8", MIB);
+        client
+            .limits
+            .pause(LimitedRequest::Lookup, Duration::from_secs(3));
+        let project = tempfile::tempdir().unwrap();
+
+        let hit = try_restore(&client, "abc123", project.path(), &[], || Ok(true));
+
+        assert!(hit.is_none());
+        assert!(!client.limits.first_busy_notice(LimitedRequest::Lookup));
+    }
+
+    #[test]
+    fn a_key_s_retry_jitter_holds_for_the_whole_run() {
+        let wait = Duration::from_secs(2);
+        for index in 0..32 {
+            let key = format!("{index:064x}");
+            let jitter = retry_jitter(&key, wait);
+            assert_eq!(retry_jitter(&key, wait), jitter);
+            assert!(jitter < wait / 2, "{jitter:?}");
         }
     }
 
