@@ -1573,7 +1573,7 @@ pub async fn run(
         let (webhook_tx, mut webhook_rx) =
             tokio::sync::mpsc::channel::<lpm_tunnel::client::CapturedWebhookEvent>(64);
 
-        crate::commands::tunnel::warn_capture_persistence(!quiet);
+        crate::commands::tunnel::warn_capture_persistence(project_dir, !quiet);
 
         // Dashboard webhook channel: when --dashboard is active, webhooks are
         // forwarded to the dashboard TUI via a std::sync channel.

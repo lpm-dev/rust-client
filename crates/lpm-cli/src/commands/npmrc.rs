@@ -535,7 +535,7 @@ pub(super) fn reject_tracked_npmrc(project_dir: &Path) -> Result<(), LpmError> {
     )))
 }
 
-fn hardened_git_command(project_dir: &Path, args: &[&str]) -> std::process::Command {
+pub(crate) fn hardened_git_command(project_dir: &Path, args: &[&str]) -> std::process::Command {
     let mut command = std::process::Command::new("git");
     command
         .args(args)

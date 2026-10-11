@@ -476,7 +476,7 @@ pub(crate) async fn run_start(
     let inspector_db = open_inspector_db(project_dir)?;
     let inspector_state =
         lpm_inspect::state::InspectorState::with_db_for_target(local_target.clone(), inspector_db);
-    warn_capture_persistence(show_capture_warning);
+    warn_capture_persistence(project_dir, show_capture_warning);
     let inspector_handle = if no_inspect {
         None
     } else {
@@ -747,22 +747,64 @@ pub(crate) async fn run_start(
     }
 }
 
-pub(crate) fn warn_capture_persistence(show_human_warning: bool) {
-    tracing::warn!(
-        target: "lpm_cli::tunnel",
+/// Warns that captures persist, and that git tracks them where it does: an
+/// ignore rule doesn't stop a tracked file from being committed.
+pub(crate) fn warn_capture_persistence(project_dir: &Path, show_human_warning: bool) {
+    capture_warning(
         "tunnel webhook capture persists full request/response bodies and headers \
-         (incl. Authorization, Cookie, *-Signature) in .lpm/inspector.db — the \
-         database uses mode 0600 on Unix and inherits project ACLs on Windows; \
-         it survives commits / backups / IDE indexing. \
-         Add `.lpm/inspector.db*` to .gitignore if you haven't already."
+         (incl. Authorization, Cookie, *-Signature) in .lpm/inspector.db (mode 0600 \
+         on Unix; project ACLs on Windows); .lpm/.gitignore keeps it out of git",
+        show_human_warning,
     );
-    if show_human_warning {
-        install_ui::warn(
-            "tunnel webhook capture persists full request/response bodies and headers \
-             in .lpm/inspector.db (mode 0600 on Unix; project ACLs on Windows). \
-             Add `.lpm/inspector.db*` to .gitignore.",
+    let tracked = tracked_capture_files(project_dir);
+    if !tracked.is_empty() {
+        capture_warning(
+            &format!(
+                "git tracks {}, so captures can still be committed; run \
+                 `git rm --cached .lpm/inspector.db*` and commit",
+                tracked.join(", ")
+            ),
+            show_human_warning,
         );
     }
+}
+
+/// The human warning, or the same text on the log when it isn't shown, so
+/// it isn't printed twice.
+fn capture_warning(message: &str, show_human_warning: bool) {
+    if show_human_warning {
+        install_ui::warn_untrusted(message);
+    } else {
+        tracing::warn!(
+            target: "lpm_cli::tunnel",
+            "{}",
+            lpm_common::sanitize_terminal_inline(message)
+        );
+    }
+}
+
+/// The capture files git tracks in `project_dir`. None when it isn't a
+/// repository or git can't be run.
+fn tracked_capture_files(project_dir: &Path) -> Vec<String> {
+    let output = crate::commands::npmrc::hardened_git_command(
+        project_dir,
+        &["ls-files", "-z", "--", ".lpm/inspector.db*"],
+    )
+    .stdin(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+        .map(|name| String::from_utf8_lossy(name).into_owned())
+        .collect()
 }
 
 fn compose_tunnel_control_and_connect(
@@ -1882,6 +1924,48 @@ fn is_valid_tunnel_domain(domain: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(directory: &Path, args: &[&str]) {
+        let output = crate::commands::npmrc::hardened_git_command(directory, args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+    }
+
+    #[test]
+    fn names_the_capture_files_git_tracks() {
+        let project = tempfile::tempdir().unwrap();
+        git(project.path(), &["init", "--quiet"]);
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+        for name in ["inspector.db", "inspector.db-wal", "added-sources.json"] {
+            std::fs::write(project.path().join(".lpm").join(name), b"x").unwrap();
+        }
+        git(
+            project.path(),
+            &[
+                "add",
+                ".lpm/inspector.db",
+                ".lpm/inspector.db-wal",
+                ".lpm/added-sources.json",
+            ],
+        );
+
+        assert_eq!(
+            tracked_capture_files(project.path()),
+            [".lpm/inspector.db", ".lpm/inspector.db-wal"]
+        );
+    }
+
+    #[test]
+    fn names_no_capture_files_outside_a_repository_or_when_untracked() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+        std::fs::write(project.path().join(".lpm/inspector.db"), b"x").unwrap();
+
+        assert!(tracked_capture_files(project.path()).is_empty());
+        git(project.path(), &["init", "--quiet"]);
+        assert!(tracked_capture_files(project.path()).is_empty());
+    }
 
     #[test]
     fn non_interactive_tunnel_auth_output_never_contains_the_secret() {

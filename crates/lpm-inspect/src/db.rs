@@ -64,6 +64,12 @@ impl InspectorDb {
         let lpm_dir = project_dir.join(".lpm");
         std::fs::create_dir_all(&lpm_dir)
             .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        if let Err(error) = ensure_captures_ignored(&lpm_dir) {
+            tracing::warn!(
+                "could not add `{CAPTURES_IGNORE_LINE}` to {}: {error}",
+                lpm_dir.join(".gitignore").display()
+            );
+        }
 
         let db_path = lpm_dir.join("inspector.db");
 
@@ -754,6 +760,41 @@ impl InspectorDb {
     }
 }
 
+/// The `.lpm/.gitignore` line that keeps the capture database and its
+/// SQLite sidecars out of git, since captures hold request headers and
+/// bodies.
+pub const CAPTURES_IGNORE_LINE: &str = "inspector.db*";
+
+const GITIGNORE_SIZE_CAP_BYTES: u64 = 64 * 1024;
+
+/// Adds [`CAPTURES_IGNORE_LINE`] to `.lpm/.gitignore` unless it's there.
+/// An ignore file inside `.lpm/` holds wherever the project sits in a
+/// repository, and leaves the project's own `.gitignore` alone. A linked
+/// `.lpm/.gitignore` is left as it is.
+fn ensure_captures_ignored(lpm_dir: &Path) -> std::io::Result<()> {
+    let path = lpm_dir.join(".gitignore");
+    let existing = match lpm_common::read_text_file_capped_nofollow(&path, GITIGNORE_SIZE_CAP_BYTES)
+    {
+        Ok(text) => text,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => String::new(),
+        Err(error) => return Err(std::io::Error::other(error)),
+    };
+    if existing
+        .lines()
+        .any(|line| line.trim() == CAPTURES_IGNORE_LINE)
+    {
+        return Ok(());
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str("# LPM tunnel captures hold request headers and bodies.\n");
+    updated.push_str(CAPTURES_IGNORE_LINE);
+    updated.push('\n');
+    lpm_common::write_file_atomic(&path, updated)
+}
+
 // ── Schema initialization ─────────────────────────────────────────────
 
 #[cfg(unix)]
@@ -1252,6 +1293,74 @@ mod tests {
     use super::*;
     use lpm_tunnel::webhook::WebhookProvider;
     use std::collections::HashMap;
+
+    const CAPTURES_IGNORED: &str =
+        "# LPM tunnel captures hold request headers and bodies.\ninspector.db*\n";
+
+    fn lpm_gitignore(project: &Path) -> String {
+        std::fs::read_to_string(project.join(".lpm/.gitignore")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn opening_keeps_captures_out_of_git_once() {
+        let project = tempfile::tempdir().unwrap();
+
+        drop(InspectorDb::open(project.path()).unwrap());
+        drop(InspectorDb::open(project.path()).unwrap());
+
+        assert_eq!(lpm_gitignore(project.path()), CAPTURES_IGNORED);
+    }
+
+    #[tokio::test]
+    async fn opening_adds_the_capture_rule_to_an_lpm_gitignore_of_the_project() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+        std::fs::write(project.path().join(".lpm/.gitignore"), "skills/").unwrap();
+
+        drop(InspectorDb::open(project.path()).unwrap());
+
+        assert_eq!(
+            lpm_gitignore(project.path()),
+            format!("skills/\n{CAPTURES_IGNORED}")
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_leaves_an_lpm_gitignore_that_already_ignores_captures() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+        std::fs::write(
+            project.path().join(".lpm/.gitignore"),
+            "  inspector.db*  \n",
+        )
+        .unwrap();
+
+        drop(InspectorDb::open(project.path()).unwrap());
+
+        assert_eq!(lpm_gitignore(project.path()), "  inspector.db*  \n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn opening_leaves_a_linked_lpm_gitignore_and_its_target_alone() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("profile");
+        std::fs::write(&target, "export PATH\n").unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+        let link = project.path().join(".lpm/.gitignore");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        drop(InspectorDb::open(project.path()).unwrap());
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "export PATH\n");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
 
     #[test]
     fn capture_schema_upgrade_serializes_concurrent_openers() {

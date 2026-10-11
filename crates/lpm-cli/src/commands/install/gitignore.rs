@@ -107,11 +107,9 @@ pub(super) fn maintain_project_linker_layout(project_dir: &Path, json_output: bo
 /// — ensure `.gitignore` contains an entry for
 /// `.lpm/wrappers/`.
 ///
-/// Mirrors [`ensure_skills_gitignore`] (and its siblings in
-/// `lpm-vault::ensure_lpm_dir_gitignore` and
-/// `commands::npmrc::ensure_lpm_dir_gitignore`) — runtime "ensure
-/// once" pattern, idempotent, OpenOptions-append to minimize the
-/// read-then-write TOCTOU window.
+/// Mirrors [`ensure_skills_gitignore`] — runtime "ensure once" pattern,
+/// idempotent, OpenOptions-append to minimize the read-then-write TOCTOU
+/// window.
 ///
 /// Why runtime instead of template emission: existing projects also
 /// need the entry, and the repo has a precedent for runtime
