@@ -3478,7 +3478,7 @@ async fn run_remote_cache_skips_lookups_and_uploads_while_a_lookup_limit_lasts()
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
-        .respond_with(limit_reached("1,500 cache hits a minute", 42))
+        .respond_with(limit_reached("2,000 cache hits a minute", 42))
         .expect(1)
         .mount(&server)
         .await;
@@ -3495,7 +3495,7 @@ async fn run_remote_cache_skips_lookups_and_uploads_while_a_lookup_limit_lasts()
     assert_eq!(project.read_file("dist/value.txt"), "built");
     assert!(
         stderr.contains(
-            "Remote cache limit reached: 1,500 cache hits a minute; skipping remote cache lookups and uploads for 42 seconds"
+            "Remote cache limit reached: 2,000 cache hits a minute; skipping remote cache lookups and uploads for 42 seconds"
         ),
         "the warning should name the limit and the pause:\n{stderr}",
     );
@@ -3535,7 +3535,7 @@ async fn run_remote_cache_looks_up_again_after_a_refusal_of_a_second_and_goes_on
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
-        .respond_with(limit_reached("1,500 cache hits a minute", 1))
+        .respond_with(limit_reached("2,000 cache hits a minute", 1))
         .up_to_n_times(1)
         .expect(1)
         .mount(&server)
@@ -3554,7 +3554,7 @@ async fn run_remote_cache_looks_up_again_after_a_refusal_of_a_second_and_goes_on
         .expect(2)
         .mount(&server)
         .await;
-    let project = two_task_remote_cache_project(&server, 1_500);
+    let project = two_task_remote_cache_project(&server, 0);
 
     successful_build_stderr(&run_build_with_remote_token(&project));
 

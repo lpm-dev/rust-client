@@ -10,10 +10,11 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::future::Future;
+use std::hash::{BuildHasher, RandomState};
 use std::io::{IsTerminal, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -67,11 +68,14 @@ enum LimitedRequest {
 }
 
 /// Until when a cache server refuses one team's lookups, and its uploads,
-/// after answering one with 429, and whether the run has said so yet.
+/// after answering one with 429, until when of that for a spent limit, and
+/// whether the run has said so yet.
 #[derive(Default)]
 struct RequestLimits {
     lookups_until: Mutex<Option<Instant>>,
     uploads_until: Mutex<Option<Instant>>,
+    lookups_limited_until: Mutex<Option<Instant>>,
+    uploads_limited_until: Mutex<Option<Instant>>,
     lookup_limit_warned: AtomicBool,
     upload_limit_warned: AtomicBool,
     lookups_busy_noted: AtomicBool,
@@ -95,11 +99,15 @@ impl RequestLimits {
         }
     }
 
+    fn limited_until(&self, request: LimitedRequest) -> &Mutex<Option<Instant>> {
+        match request {
+            LimitedRequest::Lookup => &self.lookups_limited_until,
+            LimitedRequest::Upload => &self.uploads_limited_until,
+        }
+    }
+
     fn paused(&self, request: LimitedRequest) -> bool {
-        self.until(request)
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_some_and(|until| Instant::now() < until)
+        running(self.until(request))
     }
 
     fn lookups_paused(&self) -> bool {
@@ -112,36 +120,25 @@ impl RequestLimits {
         self.paused(LimitedRequest::Upload) || self.paused(LimitedRequest::Lookup)
     }
 
-    fn remaining(&self, request: LimitedRequest) -> Duration {
-        self.until(request)
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .map_or(Duration::ZERO, |until| {
-                until.saturating_duration_since(Instant::now())
-            })
-    }
-
     /// Whether this kind of request waits out a spent limit, rather than the
     /// cache server's room for requests at once.
     fn paused_by_a_limit(&self, request: LimitedRequest) -> bool {
-        let remaining = match request {
-            LimitedRequest::Lookup => self.remaining(LimitedRequest::Lookup),
-            LimitedRequest::Upload => self
-                .remaining(LimitedRequest::Upload)
-                .max(self.remaining(LimitedRequest::Lookup)),
-        };
-        remaining > MAX_RETRY_WAIT
+        running(self.limited_until(request))
+            || (matches!(request, LimitedRequest::Upload)
+                && running(self.limited_until(LimitedRequest::Lookup)))
     }
 
+    /// Pauses this kind of request while the cache server has no room for it.
     fn pause(&self, request: LimitedRequest, wait: Duration) {
+        extend(self.until(request), Instant::now() + wait);
+    }
+
+    /// Pauses this kind of request for a spent limit, whose warning covers
+    /// the requests it skips.
+    fn spend(&self, request: LimitedRequest, wait: Duration) {
         let resume = Instant::now() + wait;
-        let mut until = self
-            .until(request)
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if until.is_none_or(|until| until < resume) {
-            *until = Some(resume);
-        }
+        extend(self.until(request), resume);
+        extend(self.limited_until(request), resume);
     }
 
     /// True the first time the run reaches this kind of limit.
@@ -161,6 +158,21 @@ impl RequestLimits {
             LimitedRequest::Upload => &self.uploads_busy_noted,
         };
         !noted.swap(true, Ordering::Relaxed)
+    }
+}
+
+fn running(until: &Mutex<Option<Instant>>) -> bool {
+    until
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_some_and(|until| Instant::now() < until)
+}
+
+/// Moves `until` to `resume`, unless it's already later.
+fn extend(until: &Mutex<Option<Instant>>, resume: Instant) {
+    let mut until = until.lock().unwrap_or_else(PoisonError::into_inner);
+    if until.is_none_or(|until| until < resume) {
+        *until = Some(resume);
     }
 }
 
@@ -793,14 +805,15 @@ impl RemoteCacheClient {
     /// Pauses the refused kind of request for as long as the cache server
     /// asks, and warns the first time the run reaches that limit.
     fn limit_reached(&self, request: LimitedRequest, limit: LimitReached) {
-        self.limits.pause(request, limit.wait);
         // A pause of a few seconds is the server's room for requests at once,
         // not a spent limit: it gets its own notice, leaving the warning for a
         // longer limit later.
         if limit.wait <= MAX_RETRY_WAIT {
+            self.limits.pause(request, limit.wait);
             self.skipping_while_busy(request);
             return;
         }
+        self.limits.spend(request, limit.wait);
         if !self.limits.first_warning(request) {
             return;
         }
@@ -1294,12 +1307,14 @@ fn busy_notice(request: LimitedRequest) -> &'static str {
     }
 }
 
-/// Up to half the wait again, from the artifact's key, so uploads refused
+/// Seeded afresh each run, so CI jobs refused together on the same key
+/// don't all go again together either.
+static RETRY_JITTER_SEED: LazyLock<RandomState> = LazyLock::new(RandomState::new);
+
+/// Up to half the wait again, from the artifact's key, so requests refused
 /// together don't all go again together.
 fn retry_jitter(key: &str, wait: Duration) -> Duration {
-    let spread = key.bytes().fold(0u64, |hash, byte| {
-        hash.wrapping_mul(31).wrapping_add(u64::from(byte))
-    });
+    let spread = RETRY_JITTER_SEED.hash_one(key);
     wait.mul_f64((spread % 1000) as f64 / 2000.0)
 }
 
@@ -2136,7 +2151,7 @@ mod tests {
             let limits = client.limits.clone();
             let pause = tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(300)).await;
-                limits.pause(paused, Duration::from_secs(60));
+                limits.spend(paused, Duration::from_secs(60));
             });
 
             let uploaded = client
@@ -2169,7 +2184,7 @@ mod tests {
         let client = test_client("http://127.0.0.1:9/v8", MIB);
         client
             .limits
-            .pause(LimitedRequest::Lookup, Duration::from_secs(60));
+            .spend(LimitedRequest::Lookup, Duration::from_secs(60));
 
         client.limit_reached(
             LimitedRequest::Upload,
@@ -2213,9 +2228,15 @@ mod tests {
             .mount(&server)
             .await;
         let client = test_client(&format!("{}/v8", server.uri()), MIB);
+        let limits = client.limits.clone();
+        let during = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            limits.lookups_paused() || limits.uploads_paused()
+        });
 
         look_up_at(&client).await;
 
+        assert!(!during.await.unwrap(), "nothing pauses while it waits");
         assert!(!client.limits.lookups_paused());
         server.verify().await;
     }
@@ -2239,23 +2260,100 @@ mod tests {
 
     #[tokio::test]
     async fn a_lookup_doesnt_go_again_once_lookups_were_paused_while_it_waited() {
+        // A spent limit's warning covers the skipped lookup; a busy server's
+        // pause gets the busy notice.
+        for (spent, noted) in [(true, false), (false, true)] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .respond_with(lookup_refused("1"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = test_client(&format!("{}/v8", server.uri()), MIB);
+            let limits = client.limits.clone();
+            let pause = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                if spent {
+                    limits.spend(LimitedRequest::Lookup, Duration::from_secs(60));
+                } else {
+                    limits.pause(LimitedRequest::Lookup, Duration::from_secs(3));
+                }
+            });
+
+            look_up_at(&client).await;
+
+            pause.await.unwrap();
+            server.verify().await;
+            assert_eq!(
+                !client.limits.first_busy_notice(LimitedRequest::Lookup),
+                noted,
+                "spent limit: {spent}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_lookup_refused_for_five_seconds_still_goes_once_more() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .respond_with(lookup_refused("1"))
-            .expect(1)
+            .respond_with(lookup_refused("5"))
+            .expect(2)
             .mount(&server)
             .await;
         let client = test_client(&format!("{}/v8", server.uri()), MIB);
-        let limits = client.limits.clone();
-        let pause = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            limits.pause(LimitedRequest::Lookup, Duration::from_secs(60));
-        });
 
         look_up_at(&client).await;
 
-        pause.await.unwrap();
+        assert!(client.limits.lookups_paused());
+        assert!(!client.limits.paused_by_a_limit(LimitedRequest::Lookup));
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn a_lookup_goes_again_after_the_wait_and_its_share_of_the_spread() {
+        let wait = Duration::from_secs(1);
+        let key = (0u32..)
+            .map(|index| format!("{index:064x}"))
+            .find(|key| retry_jitter(key, wait) >= Duration::from_millis(300))
+            .unwrap();
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(lookup_refused("1"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let client = test_client(&format!("{}/v8", server.uri()), MIB);
+        let project = tempfile::tempdir().unwrap();
+
+        let started = Instant::now();
+        let restored = client
+            .restore_async(&key, project.path(), &[], || Ok(true))
+            .await;
+
+        assert!(matches!(restored, Ok(None)));
+        assert!(started.elapsed() >= wait + retry_jitter(&key, wait));
+    }
+
+    #[test]
+    fn a_spent_limit_is_told_from_a_busy_server_however_little_of_it_is_left() {
+        let limits = RequestLimits::default();
+        limits.spend(LimitedRequest::Lookup, Duration::from_millis(5_500));
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(limits.paused_by_a_limit(LimitedRequest::Lookup));
+        assert!(limits.paused_by_a_limit(LimitedRequest::Upload));
+
+        let busy = RequestLimits::default();
+        busy.pause(LimitedRequest::Lookup, Duration::from_secs(60));
+        assert!(busy.lookups_paused());
+        assert!(!busy.paused_by_a_limit(LimitedRequest::Lookup));
+
+        let uploads = RequestLimits::default();
+        uploads.spend(LimitedRequest::Upload, Duration::from_secs(60));
+        assert!(!uploads.paused_by_a_limit(LimitedRequest::Lookup));
     }
 
     #[tokio::test]
@@ -2312,11 +2410,13 @@ mod tests {
 
             client.limit_reached(request, limit(5));
             assert!(client.limits.paused(request));
+            assert!(!client.limits.paused_by_a_limit(request));
             assert!(!client.limits.first_busy_notice(request));
             assert!(client.limits.first_warning(request));
 
             let client = test_client("http://127.0.0.1:9/v8", MIB);
             client.limit_reached(request, limit(6));
+            assert!(client.limits.paused_by_a_limit(request));
             assert!(!client.limits.first_warning(request));
             assert!(client.limits.first_busy_notice(request));
         }
