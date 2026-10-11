@@ -74,6 +74,8 @@ struct RequestLimits {
     uploads_until: Mutex<Option<Instant>>,
     lookup_limit_warned: AtomicBool,
     upload_limit_warned: AtomicBool,
+    lookups_busy_noted: AtomicBool,
+    uploads_busy_noted: AtomicBool,
 }
 
 impl RequestLimits {
@@ -128,6 +130,16 @@ impl RequestLimits {
             LimitedRequest::Upload => &self.upload_limit_warned,
         };
         !warned.swap(true, Ordering::Relaxed)
+    }
+
+    /// True the first time the run skips this kind of request because the
+    /// cache server was busy for a moment.
+    fn first_busy_notice(&self, request: LimitedRequest) -> bool {
+        let noted = match request {
+            LimitedRequest::Lookup => &self.lookups_busy_noted,
+            LimitedRequest::Upload => &self.uploads_busy_noted,
+        };
+        !noted.swap(true, Ordering::Relaxed)
     }
 }
 
@@ -715,7 +727,9 @@ impl RemoteCacheClient {
                 )
                 .await?;
 
-            if response.status().is_success() {
+            // A conflict is another upload storing this artifact, which serves
+            // the next lookup as well as this one would.
+            if response.status().is_success() || response.status() == StatusCode::CONFLICT {
                 return Ok(());
             }
             if response.status() != StatusCode::TOO_MANY_REQUESTS {
@@ -729,6 +743,7 @@ impl RemoteCacheClient {
                 retried = true;
                 tokio::time::sleep(limit.wait + retry_jitter(key, limit.wait)).await;
                 if self.limits.uploads_paused() {
+                    self.skipping_while_busy(LimitedRequest::Upload, &limit.message);
                     return Ok(());
                 }
                 continue;
@@ -742,9 +757,14 @@ impl RemoteCacheClient {
     /// asks, and warns the first time the run reaches that limit.
     fn limit_reached(&self, request: LimitedRequest, limit: LimitReached) {
         self.limits.pause(request, limit.wait);
-        // A pause of a few seconds isn't worth a warning, nor worth using up
-        // the one a longer limit later needs.
-        if limit.wait <= MAX_UPLOAD_RETRY_WAIT || !self.limits.first_warning(request) {
+        // A pause of a few seconds is the server's room for requests at once,
+        // not a spent limit: it gets its own notice, leaving the warning for a
+        // longer limit later.
+        if limit.wait <= MAX_UPLOAD_RETRY_WAIT {
+            self.skipping_while_busy(request, &limit.message);
+            return;
+        }
+        if !self.limits.first_warning(request) {
             return;
         }
         let skipped = match request {
@@ -756,6 +776,21 @@ impl RemoteCacheClient {
             "{}; skipping remote cache {skipped} for {}",
             limit.message,
             format_wait(limit.wait),
+        ));
+    }
+
+    /// Notes, once a run for each kind, that requests are being skipped
+    /// while the cache server is busy for a moment.
+    fn skipping_while_busy(&self, request: LimitedRequest, message: &str) {
+        if !self.limits.first_busy_notice(request) {
+            return;
+        }
+        let skipped = match request {
+            LimitedRequest::Lookup => "lookups",
+            LimitedRequest::Upload => "uploads",
+        };
+        install_ui::warn_untrusted(&format!(
+            "{message}; skipping some remote cache {skipped} while it's busy"
         ));
     }
 
@@ -1996,6 +2031,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_upload_another_is_storing_is_left_to_it_quietly() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(wiremock::ResponseTemplate::new(409).set_body_json(
+                serde_json::json!({ "error": "Remote cache artifact upload already in progress" }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (client, uploaded) = upload_to(&server).await;
+
+        assert_eq!(uploaded, Ok(()));
+        assert!(!client.limits.uploads_paused());
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn uploads_pause_once_a_retry_is_refused_too_or_the_wait_is_a_spent_limit() {
         for (retry_after, attempts) in [("1", 2), ("6", 1), ("60", 1)] {
             let server = wiremock::MockServer::start().await;
@@ -2030,29 +2083,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_upload_doesnt_go_again_once_uploads_were_paused_while_it_waited() {
+    async fn an_upload_doesnt_go_again_once_uploads_or_lookups_were_paused_while_it_waited() {
+        for paused in [LimitedRequest::Upload, LimitedRequest::Lookup] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("PUT"))
+                .respond_with(upload_refused("1"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = test_client(&format!("{}/v8", server.uri()), MIB);
+            let mut artifact = tempfile::tempfile().unwrap();
+            artifact.write_all(b"artifact").unwrap();
+            let limits = client.limits.clone();
+            let pause = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                limits.pause(paused, Duration::from_secs(60));
+            });
+
+            let uploaded = client
+                .upload_artifact(&"a".repeat(64), &artifact, 8, 10)
+                .await;
+
+            pause.await.unwrap();
+            assert_eq!(uploaded, Ok(()));
+            server.verify().await;
+            // The dropped upload was noted as skipped while the cache was busy.
+            assert!(!client.limits.first_busy_notice(LimitedRequest::Upload));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_upload_goes_again_after_the_wait_and_its_share_of_the_spread() {
+        let wait = Duration::from_secs(1);
+        let key = (0u32..)
+            .map(|index| format!("{index:064x}"))
+            .find(|key| retry_jitter(key, wait) >= Duration::from_millis(300))
+            .unwrap();
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("PUT"))
             .respond_with(upload_refused("1"))
-            .expect(1)
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("PUT"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "urls": [] })),
+            )
             .mount(&server)
             .await;
         let client = test_client(&format!("{}/v8", server.uri()), MIB);
         let mut artifact = tempfile::tempfile().unwrap();
         artifact.write_all(b"artifact").unwrap();
-        let limits = client.limits.clone();
-        let pause = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            limits.pause(LimitedRequest::Upload, Duration::from_secs(60));
-        });
 
-        let uploaded = client
-            .upload_artifact(&"a".repeat(64), &artifact, 8, 10)
-            .await;
+        let started = Instant::now();
+        let uploaded = client.upload_artifact(&key, &artifact, 8, 10).await;
 
-        pause.await.unwrap();
         assert_eq!(uploaded, Ok(()));
-        server.verify().await;
+        assert!(started.elapsed() >= wait + retry_jitter(&key, wait));
     }
 
     #[test]
@@ -2067,19 +2155,25 @@ mod tests {
     }
 
     #[test]
-    fn a_pause_of_a_few_seconds_leaves_the_warning_for_a_longer_limit() {
-        let client = test_client("http://127.0.0.1:9/v8", MIB);
+    fn a_pause_of_up_to_five_seconds_gets_its_own_notice_and_leaves_the_warning_for_a_longer_limit()
+    {
         let limit = |seconds| LimitReached {
             message: "Remote cache limit reached: 8 uploads at once".into(),
             wait: Duration::from_secs(seconds),
         };
+        for request in [LimitedRequest::Upload, LimitedRequest::Lookup] {
+            let client = test_client("http://127.0.0.1:9/v8", MIB);
 
-        client.limit_reached(LimitedRequest::Upload, limit(1));
-        assert!(client.limits.uploads_paused());
-        assert!(client.limits.first_warning(LimitedRequest::Upload));
+            client.limit_reached(request, limit(5));
+            assert!(client.limits.paused(request));
+            assert!(!client.limits.first_busy_notice(request));
+            assert!(client.limits.first_warning(request));
 
-        client.limit_reached(LimitedRequest::Lookup, limit(60));
-        assert!(!client.limits.first_warning(LimitedRequest::Lookup));
+            let client = test_client("http://127.0.0.1:9/v8", MIB);
+            client.limit_reached(request, limit(6));
+            assert!(!client.limits.first_warning(request));
+            assert!(client.limits.first_busy_notice(request));
+        }
     }
 
     #[test]
