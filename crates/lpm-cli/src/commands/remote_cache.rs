@@ -258,8 +258,7 @@ pub fn print_cache_status_human(status: &CacheStatus) {
             );
         }
         if let (Some(usage), Some(limit)) = (status.remote.usage_bytes, status.remote.limit_bytes) {
-            let usage_display = format_bytes(usage);
-            let limit_display = format_bytes(limit);
+            let (usage_display, limit_display) = lpm_common::format_quota(usage, limit);
             let usage_bar = install_ui::usage_bar(usage, limit, 10);
             let usage_line = if usage_bar.is_empty() {
                 crate::install_ui::terminal_line!(

@@ -2887,7 +2887,7 @@ fn skills_validate_rejects_skill_exceeding_size_limit() {
         String::from_utf8_lossy(&output.stderr),
     );
     assert!(
-        combined.contains("15 KiB") || combined.contains("exceed") || combined.contains("limit"),
+        combined.contains("exceeds 15 KiB limit ("),
         "validate output must surface the per-skill size-limit warning, got:\n{combined}",
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2940,7 +2940,7 @@ fn skills_validate_json_reports_success_false_and_exits_non_zero_on_error() {
         .as_str()
         .expect("each error entry must be a string");
     assert!(
-        error_text.contains("15 KiB") || error_text.contains("limit"),
+        error_text.contains("exceeds 15 KiB limit ("),
         "error text must name the violated limit, got {error_text:?}",
     );
 }

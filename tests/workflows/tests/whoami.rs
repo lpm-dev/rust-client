@@ -149,7 +149,8 @@ async fn whoami_human_output_uses_slim_account_summary() {
         "authenticated whoami should warn when auth storage uses the encrypted file fallback, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("usage") && stderr.contains("storage        512.1 MiB / 5 GiB  ██░░░░░░░░"),
+        stderr.contains("usage")
+            && stderr.contains("storage        512.09 MiB / 5 GiB  ██░░░░░░░░"),
         "authenticated whoami should show storage usage with a quota bar, got:\n{stderr}"
     );
     assert!(
@@ -202,6 +203,108 @@ async fn whoami_human_output_uses_slim_account_summary() {
         colored_stderr.contains("\u{1b}[1;33;48;5;236m admin \u{1b}[0m"),
         "color-forced whoami should render admin with a badge background, got:\n{colored_stderr:?}"
     );
+}
+
+/// Human `lpm whoami` stderr for an account the registry describes as
+/// `account`.
+async fn whoami_stderr(account: serde_json::Value) -> String {
+    let project = TempProject::empty(r#"{"name":"whoami","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .and(header("authorization", "Bearer access-primary"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(account))
+        .mount(mock.server())
+        .await;
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("access-primary"),
+            refresh_token: None,
+            session_access_expires_at: None,
+        }],
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .arg("whoami")
+        .output()
+        .expect("failed to run lpm whoami");
+    assert!(
+        output.status.success(),
+        "whoami must exit 0, stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+#[tokio::test]
+async fn whoami_tells_a_pro_account_past_its_storage_that_it_is_billed_not_restricted() {
+    let stderr = whoami_stderr(serde_json::json!({
+        "username": "testuser",
+        "plan_tier": "pro",
+        "usage": { "storage_bytes": 5 * GIB + 51 * 1024 * 1024, "private_packages": 3 },
+        "limits": { "storageBytes": 5 * GIB, "privatePackages": 100 },
+    }))
+    .await;
+
+    assert!(
+        stderr.contains("storage        5.05 GiB / 5 GiB")
+            && stderr.contains(
+                "overage        storage past 5 GiB is billed per GiB a month, rounded up"
+            ),
+        "a Pro account past its storage should read as past it and billed, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("OVER LIMIT")
+            && !stderr.contains("restricted")
+            && !stderr.contains("Upgrade"),
+        "a Pro account's billed storage must not read as restricted, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn whoami_tells_a_free_account_past_its_storage_that_publishing_is_restricted() {
+    let stderr = whoami_stderr(serde_json::json!({
+        "username": "testuser",
+        "plan_tier": "free",
+        "usage": { "storage_bytes": 100 * 1024 * 1024 + 1, "private_packages": 1 },
+        "limits": { "storageBytes": 100 * 1024 * 1024, "privatePackages": 2 },
+    }))
+    .await;
+
+    assert!(
+        stderr.contains("Storage: 100.01 MiB / 100 MiB")
+            && stderr.contains("(OVER LIMIT)")
+            && stderr.contains("Write access (publishing, inviting members) is restricted."),
+        "a free account past its storage should read as over its limit and restricted, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn whoami_shows_storage_alone_without_a_storage_limit() {
+    let with_other_limits = whoami_stderr(serde_json::json!({
+        "username": "testuser",
+        "plan_tier": "pro",
+        "usage": { "storage_bytes": 3 * GIB + GIB / 2, "private_packages": 3 },
+        "limits": { "privatePackages": 100 },
+    }))
+    .await;
+    let without_limits = whoami_stderr(serde_json::json!({
+        "username": "testuser",
+        "plan_tier": "pro",
+        "usage": { "storage_bytes": 3 * GIB + GIB / 2, "private_packages": 3 },
+    }))
+    .await;
+
+    for stderr in [with_other_limits, without_limits] {
+        assert!(
+            stderr.contains("storage        3.5 GiB") && !stderr.contains("3.5 GiB /"),
+            "storage without a limit should read as its size alone, got:\n{stderr}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -527,6 +527,15 @@ async fn download_human_output_uses_slim_progress_and_completion() {
         stderr.contains("output:") && stderr.contains("files extracted:"),
         "download must report extraction details on stderr, got:\n{stderr}"
     );
+    let size_row = format!(
+        "{:<16} {}",
+        "size:",
+        lpm_common::format_bytes(tarball.len() as u64)
+    );
+    assert!(
+        stderr.contains(&size_row),
+        "download must state the tarball's size in binary units, {size_row:?}, got:\n{stderr}"
+    );
     assert!(
         stderr.contains("✓ Done · tarball extracted in "),
         "download must report slim timed completion, got:\n{stderr}"

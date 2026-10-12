@@ -101,22 +101,35 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         whoami_ui::blank_line();
         whoami_ui::section("usage");
         let storage = lpm_common::format_bytes(usage.storage_bytes);
+        // Pro storage past its allowance is billed, not refused; only the
+        // free plan's limit stops publishing.
+        let storage_billed = user
+            .plan_tier
+            .as_deref()
+            .is_some_and(|tier| tier.eq_ignore_ascii_case("pro"));
 
         if let Some(limits) = &user.limits {
             // Storage
             if let Some(limit_bytes) = limits.storage_bytes {
+                let (used, limit) = lpm_common::format_quota(usage.storage_bytes, limit_bytes);
                 let storage_msg = with_usage_bar(
-                    format!("{storage} / {}", lpm_common::format_bytes(limit_bytes)),
+                    format!("{used} / {limit}"),
                     usage.storage_bytes,
                     limit_bytes,
                 );
-                if usage.storage_bytes > limit_bytes {
+                if usage.storage_bytes <= limit_bytes {
+                    whoami_ui::detail("storage", storage_msg);
+                } else if storage_billed {
+                    whoami_ui::detail("storage", storage_msg);
+                    whoami_ui::detail(
+                        "overage",
+                        format!("storage past {limit} is billed per GiB a month, rounded up"),
+                    );
+                } else {
                     whoami_ui::warn_line(crate::install_ui::terminal_line!(
                         "Storage: {} (OVER LIMIT)",
                         storage_msg
                     ));
-                } else {
-                    whoami_ui::detail("storage", storage_msg);
                 }
             } else {
                 whoami_ui::detail("storage", storage);
@@ -149,9 +162,10 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
             }
 
             // Over-limit warning
-            let over_storage = limits
-                .storage_bytes
-                .is_some_and(|l| usage.storage_bytes > l);
+            let over_storage = !storage_billed
+                && limits
+                    .storage_bytes
+                    .is_some_and(|l| usage.storage_bytes > l);
             let over_packages = limits
                 .private_packages
                 .is_some_and(|l| l > 0 && l != u32::MAX && usage.private_packages > l);

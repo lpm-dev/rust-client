@@ -356,9 +356,11 @@ fn graph_html_writes_human_readable_size() {
         combined.contains(" KiB)") || combined.contains(" MiB)"),
         "size in success message should use a human-readable unit: {combined}"
     );
+    let written = project.read_file(".lpm/graph.html").len() as u64;
+    let stated = format!("({})", lpm_common::format_bytes(written));
     assert!(
-        !combined.contains("(0 KiB)"),
-        "size must never collapse to 0 KiB via integer truncation: {combined}"
+        combined.contains(&stated),
+        "the success message must state the written file's size, {stated}: {combined}"
     );
 }
 
