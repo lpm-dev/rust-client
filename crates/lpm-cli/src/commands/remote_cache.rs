@@ -42,8 +42,8 @@ const ARTIFACT_DURATION_HEADER: &str = "x-artifact-duration";
 const ARTIFACT_CLIENT_CI_HEADER: &str = "x-artifact-client-ci";
 const ARTIFACT_CLIENT_INTERACTIVE_HEADER: &str = "x-artifact-client-interactive";
 /// Asks the LPM.dev Registry to answer a cache hit with a redirect to the
-/// artifact in storage, its headers on the redirect, rather than streaming
-/// it. Other cache servers ignore it.
+/// cache's download host, the artifact's headers on the redirect, rather
+/// than streaming it. Other cache servers ignore it.
 const DOWNLOAD_REDIRECT_HEADER: &str = "x-lpm-download-redirect";
 
 static REMOTE_CACHE_WARNING_SHOWN: AtomicBool = AtomicBool::new(false);
