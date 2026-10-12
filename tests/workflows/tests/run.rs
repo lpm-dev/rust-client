@@ -783,6 +783,109 @@ async fn mount_stateful_remote_cache(server: &MockServer, state: RemoteCacheStat
         .await;
 }
 
+/// Answers a lookup that asks for a redirect as the LPM.dev Registry does:
+/// 302 to the artifact's storage path, with its headers on the redirect.
+struct RedirectingGetResponder {
+    state: RemoteCacheState,
+}
+
+impl Respond for RedirectingGetResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let asked = request
+            .headers
+            .get("x-lpm-download-redirect")
+            .is_some_and(|value| value == "1");
+        let stored = self
+            .state
+            .artifact
+            .lock()
+            .expect("remote cache artifact mutex poisoned")
+            .is_some();
+        if !asked || !stored {
+            return RemoteCacheGetResponder {
+                state: self.state.clone(),
+            }
+            .respond(request);
+        }
+        let hash = request.url.path().rsplit('/').next().unwrap_or_default();
+        let mut response =
+            ResponseTemplate::new(302).insert_header("Location", format!("/storage/{hash}"));
+        if let Some(tag) = self
+            .state
+            .tag
+            .lock()
+            .expect("remote cache tag mutex poisoned")
+            .clone()
+        {
+            response = response.insert_header("x-artifact-tag", tag);
+        }
+        if let Some(sha) = self
+            .state
+            .sha
+            .lock()
+            .expect("remote cache sha mutex poisoned")
+            .clone()
+        {
+            response = response.insert_header("x-artifact-sha", sha);
+        }
+        response
+    }
+}
+
+/// Serves stored artifacts from storage, refusing a request that carries a
+/// token, which a redirect must not pass on.
+struct StorageGetResponder {
+    state: RemoteCacheState,
+    present: bool,
+}
+
+impl Respond for StorageGetResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        if request.headers.contains_key("authorization") {
+            return ResponseTemplate::new(400).set_body_string("token sent to storage");
+        }
+        let artifact = self
+            .state
+            .artifact
+            .lock()
+            .expect("remote cache artifact mutex poisoned")
+            .clone();
+        match artifact {
+            Some(artifact) if self.present => ResponseTemplate::new(200)
+                .insert_header("Content-Length", artifact.len().to_string())
+                .set_body_bytes(artifact),
+            _ => ResponseTemplate::new(404).set_body_string("<Error>NoSuchKey</Error>"),
+        }
+    }
+}
+
+async fn mount_redirecting_remote_cache(
+    server: &MockServer,
+    state: RemoteCacheState,
+    present: bool,
+) {
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(RedirectingGetResponder {
+            state: state.clone(),
+        })
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/storage/[a-fA-F0-9]+$"))
+        .respond_with(StorageGetResponder {
+            state: state.clone(),
+            present,
+        })
+        .mount(server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(RemoteCachePutResponder { state })
+        .mount(server)
+        .await;
+}
+
 fn remote_cache_project(server: &MockServer, extra_remote_config: &str) -> TempProject {
     let project = TempProject::empty(
         r#"{
@@ -3096,6 +3199,79 @@ async fn run_remote_cache_miss_uploads_and_later_restores_outputs() {
     assert!(
         combined.contains("remote-build-output") && combined.contains("cache"),
         "remote hit should replay cached output and mention cache, got:\n{combined}",
+    );
+}
+
+#[tokio::test]
+async fn run_remote_cache_restores_from_the_storage_a_lookup_is_redirected_to_without_the_token() {
+    let server = MockServer::start().await;
+    let state = RemoteCacheState::default();
+    mount_redirecting_remote_cache(&server, state.clone(), true).await;
+    let project = remote_cache_project(&server, "");
+
+    let first = run_build_with_remote_token(&project);
+    assert!(first.status.success());
+    assert!(
+        state
+            .artifact
+            .lock()
+            .expect("remote cache artifact mutex poisoned")
+            .is_some(),
+        "the first run should upload its artifact:\nstderr: {}",
+        String::from_utf8_lossy(&first.stderr),
+    );
+    remove_local_task_cache(&project);
+    remove_project_file(&project, "dist");
+    remove_project_file(&project, "executed-marker");
+
+    let second = run_build_with_remote_token(&project);
+
+    assert!(
+        second.status.success(),
+        "redirected hit run should succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+    assert_eq!(project.read_file("dist/value.txt"), "remote-hit");
+    assert!(
+        !project.file_exists("executed-marker"),
+        "a redirected hit must restore outputs without re-running the script:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+    let storage_reads = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path().starts_with("/storage/"))
+        .count();
+    assert_eq!(storage_reads, 1);
+}
+
+#[tokio::test]
+async fn run_remote_cache_treats_a_redirect_to_a_missing_artifact_as_a_miss() {
+    let server = MockServer::start().await;
+    let state = RemoteCacheState::default();
+    mount_redirecting_remote_cache(&server, state.clone(), false).await;
+    let project = remote_cache_project(&server, "");
+
+    assert!(run_build_with_remote_token(&project).status.success());
+    remove_local_task_cache(&project);
+    remove_project_file(&project, "dist");
+    remove_project_file(&project, "executed-marker");
+
+    let second = run_build_with_remote_token(&project);
+
+    assert!(second.status.success());
+    assert!(
+        project.file_exists("executed-marker"),
+        "a redirect to a missing artifact must rebuild",
+    );
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        !stderr.contains("remote cache download"),
+        "a missing artifact is a plain miss, not a failed download:\n{stderr}",
     );
 }
 

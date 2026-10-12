@@ -4,7 +4,7 @@ use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
 use lpm_common::{LpmError, LpmRoot, format_bytes};
 use reqwest::StatusCode;
-use reqwest::header::CONTENT_LENGTH;
+use reqwest::header::{CONTENT_LENGTH, LOCATION};
 use reqwest::{Body, Client};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
@@ -41,6 +41,10 @@ const ARTIFACT_SHA_HEADER: &str = "x-artifact-sha";
 const ARTIFACT_DURATION_HEADER: &str = "x-artifact-duration";
 const ARTIFACT_CLIENT_CI_HEADER: &str = "x-artifact-client-ci";
 const ARTIFACT_CLIENT_INTERACTIVE_HEADER: &str = "x-artifact-client-interactive";
+/// Asks the LPM.dev Registry to answer a cache hit with a redirect to the
+/// artifact in storage, its headers on the redirect, rather than streaming
+/// it. Other cache servers ignore it.
+const DOWNLOAD_REDIRECT_HEADER: &str = "x-lpm-download-redirect";
 
 static REMOTE_CACHE_WARNING_SHOWN: AtomicBool = AtomicBool::new(false);
 /// A cache server's base URL and the team its requests name.
@@ -554,10 +558,10 @@ impl RemoteCacheClient {
         output_globs: &[String],
         validate: impl FnOnce() -> Result<bool, lpm_common::LpmError>,
     ) -> Result<Option<lpm_task::cache::CacheHit>, String> {
-        let client = http_client()?;
+        let client = lookup_client()?;
         let url = self.artifact_url(key)?;
         let mut retried = false;
-        let mut response = loop {
+        let response = loop {
             let response = self
                 .send_authenticated(
                     "remote cache authorization failed; continuing without it",
@@ -565,6 +569,7 @@ impl RemoteCacheClient {
                         let response = client
                             .get(url.clone())
                             .bearer_auth(bearer)
+                            .header(DOWNLOAD_REDIRECT_HEADER, "1")
                             .send()
                             .await
                             .map_err(|error| {
@@ -604,8 +609,16 @@ impl RemoteCacheClient {
             return Ok(None);
         };
 
-        match response.status() {
-            StatusCode::OK => {}
+        let tag = artifact_header(&response, ARTIFACT_TAG_HEADER);
+        let advertised_sha = artifact_header(&response, ARTIFACT_SHA_HEADER);
+        let mut response = match response.status() {
+            StatusCode::OK => response,
+            status if status.is_redirection() => {
+                match fetch_redirected_artifact(&url, &response).await? {
+                    Some(artifact) => artifact,
+                    None => return Ok(None),
+                }
+            }
             StatusCode::NOT_FOUND => return Ok(None),
             StatusCode::FORBIDDEN | StatusCode::PAYMENT_REQUIRED => {
                 let refusal = read_refusal(response, "lookup").await;
@@ -618,7 +631,7 @@ impl RemoteCacheClient {
                 return Ok(None);
             }
             _ => return Err(remote_cache_http_error(response, "lookup").await),
-        }
+        };
 
         if let Some(length) = response.content_length()
             && length > self.max_artifact_bytes
@@ -626,16 +639,6 @@ impl RemoteCacheClient {
             return Err(oversized_download(self.max_artifact_bytes));
         }
 
-        let tag = response
-            .headers()
-            .get(ARTIFACT_TAG_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .map(ToOwned::to_owned);
-        let advertised_sha = response
-            .headers()
-            .get(ARTIFACT_SHA_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .map(ToOwned::to_owned);
         let mut temp = tempfile::NamedTempFile::new()
             .map_err(|e| format!("failed to create remote cache temp file: {e}"))?;
         let digests = copy_response_to_temp(
@@ -1291,6 +1294,70 @@ async fn read_refusal(response: reqwest::Response, operation: &str) -> Refusal {
         detail,
         code: code.map(ToOwned::to_owned),
     }
+}
+
+/// The value of an artifact header, if it's text.
+fn artifact_header(response: &reqwest::Response, name: &str) -> Option<String> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+}
+
+/// Fetches an artifact a lookup was redirected to, without the token: the
+/// location is a short-lived storage URL the redirect's own headers vouch
+/// for, and a redirect from HTTPS may not lead to plain HTTP. Returns None
+/// for an artifact storage no longer holds, a miss.
+async fn fetch_redirected_artifact(
+    lookup_url: &reqwest::Url,
+    redirect: &reqwest::Response,
+) -> Result<Option<reqwest::Response>, String> {
+    let target = redirect_target(
+        lookup_url,
+        redirect
+            .headers()
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok()),
+    )?;
+    let response = http_client()?.get(target).send().await.map_err(|error| {
+        format!(
+            "remote cache download failed: {}",
+            lpm_http::display_error(&error)
+        )
+    })?;
+    match response.status() {
+        StatusCode::OK => Ok(Some(response)),
+        StatusCode::NOT_FOUND => Ok(None),
+        _ => Err(remote_cache_http_error(response, "download").await),
+    }
+}
+
+/// Where a lookup's redirect leads: its location, resolved against the
+/// lookup's URL, which may not leave HTTPS.
+fn redirect_target(
+    lookup_url: &reqwest::Url,
+    location: Option<&str>,
+) -> Result<reqwest::Url, String> {
+    let location =
+        location.ok_or("remote cache redirect has no location; treating it as a miss")?;
+    let target = lookup_url
+        .join(location)
+        .map_err(|e| format!("remote cache redirect has an invalid location: {e}"))?;
+    if lookup_url.scheme() == "https" && target.scheme() != "https" {
+        return Err("remote cache redirect leaves HTTPS; treating it as a miss".into());
+    }
+    Ok(target)
+}
+
+/// The client for lookups, which leaves redirects to
+/// `fetch_redirected_artifact`, so the token never follows one.
+fn lookup_client() -> Result<Client, String> {
+    lpm_http::client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(REMOTE_CACHE_TIMEOUT)
+        .build()
+        .map_err(|e| format!("failed to initialize remote cache HTTP client: {e}"))
 }
 
 fn http_client() -> Result<Client, String> {
@@ -2242,6 +2309,36 @@ mod tests {
 
         assert!(matches!(restored, Ok(None)));
         server.verify().await;
+    }
+
+    #[test]
+    fn a_redirect_resolves_against_the_lookup_and_may_not_leave_https() {
+        let lookup = reqwest::Url::parse("https://lpm.dev/v8/artifacts/abc?slug=acme").unwrap();
+
+        assert_eq!(
+            redirect_target(&lookup, Some("/storage/abc"))
+                .unwrap()
+                .as_str(),
+            "https://lpm.dev/storage/abc"
+        );
+        assert_eq!(
+            redirect_target(&lookup, Some("https://storage.example/abc?sig=1"))
+                .unwrap()
+                .as_str(),
+            "https://storage.example/abc?sig=1"
+        );
+        assert!(
+            redirect_target(&lookup, Some("http://storage.example/abc"))
+                .unwrap_err()
+                .contains("leaves HTTPS")
+        );
+        assert!(
+            redirect_target(&lookup, None)
+                .unwrap_err()
+                .contains("no location")
+        );
+        let plain = reqwest::Url::parse("http://127.0.0.1:3000/v8/artifacts/abc").unwrap();
+        assert!(redirect_target(&plain, Some("http://127.0.0.1:3000/storage/abc")).is_ok());
     }
 
     #[tokio::test]
