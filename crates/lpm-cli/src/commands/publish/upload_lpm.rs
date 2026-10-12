@@ -86,32 +86,19 @@ pub(super) async fn publish_to_lpm(
         None
     };
 
-    let tarball_key = format!(
-        "{}-{}.tgz",
-        name.replace('/', "-").replace('@', ""),
-        version
-    );
-    let swift_metadata = swift_manifest.as_ref().map(extract_swift_metadata);
-    let version_object = version_data.as_object().ok_or_else(|| {
-        LpmError::Registry("prepared publish version metadata must be a JSON object".into())
-    })?;
-    let pack_metadata = LpmPackMetadata::new(tarball_files, package_json_size_override);
-    let lpm_version = LpmVersionPayload {
-        base: version_object,
-        quality_result: quality_result.as_ref(),
-        pack_metadata: &pack_metadata,
-        lpm_config: lpm_config.as_ref(),
-        detected_ecosystem,
-        swift_metadata: swift_metadata.as_ref(),
-    };
-    let prefix = build_lpm_publish_payload_prefix(LpmPublishPayload {
+    let prefix = LpmPublishBody {
         name,
         version,
         readme: readme.as_deref(),
+        version_data,
+        tarball_files,
+        package_json_size_override,
+        quality_result: quality_result.as_ref(),
+        lpm_config: lpm_config.as_ref(),
         detected_ecosystem,
-        lpm_version: &lpm_version,
-        tarball_key: &tarball_key,
-    })?;
+        swift_manifest: swift_manifest.as_ref(),
+    }
+    .prefix()?;
     let payload = publish_common::prepare_base64_json_publish_body(prefix, tarball_data)?;
     let published_integrity = version_data
         .get("dist")
@@ -132,6 +119,59 @@ pub(super) async fn publish_to_lpm(
             tarball_data.len(),
         )
         .await
+}
+
+/// What an lpm.dev publish request carries, but its tarball.
+pub(super) struct LpmPublishBody<'a> {
+    pub(super) name: &'a str,
+    pub(super) version: &'a str,
+    pub(super) readme: Option<&'a str>,
+    pub(super) version_data: &'a serde_json::Value,
+    pub(super) tarball_files: &'a [TarballFile],
+    pub(super) package_json_size_override: Option<u64>,
+    pub(super) quality_result: Option<&'a quality::QualityResult>,
+    pub(super) lpm_config: Option<&'a serde_json::Value>,
+    pub(super) detected_ecosystem: &'a str,
+    pub(super) swift_manifest: Option<&'a serde_json::Value>,
+}
+
+impl LpmPublishBody<'_> {
+    /// The request's JSON up to the tarball's base64.
+    fn prefix(&self) -> Result<Vec<u8>, LpmError> {
+        let tarball_key = format!(
+            "{}-{}.tgz",
+            self.name.replace('/', "-").replace('@', ""),
+            self.version
+        );
+        let swift_metadata = self.swift_manifest.map(extract_swift_metadata);
+        let version_object = self.version_data.as_object().ok_or_else(|| {
+            LpmError::Registry("prepared publish version metadata must be a JSON object".into())
+        })?;
+        let pack_metadata =
+            LpmPackMetadata::new(self.tarball_files, self.package_json_size_override);
+        let lpm_version = LpmVersionPayload {
+            base: version_object,
+            quality_result: self.quality_result,
+            pack_metadata: &pack_metadata,
+            lpm_config: self.lpm_config,
+            detected_ecosystem: self.detected_ecosystem,
+            swift_metadata: swift_metadata.as_ref(),
+        };
+        build_lpm_publish_payload_prefix(LpmPublishPayload {
+            name: self.name,
+            version: self.version,
+            readme: self.readme,
+            detected_ecosystem: self.detected_ecosystem,
+            lpm_version: &lpm_version,
+            tarball_key: &tarball_key,
+        })
+    }
+
+    /// The length of the request that carries a tarball of `tarball_len`
+    /// bytes, as `publish_to_lpm` sends it.
+    pub(super) fn len_with(&self, tarball_len: usize) -> Result<u64, LpmError> {
+        publish_common::base64_json_publish_body_len(self.prefix()?.len(), tarball_len)
+    }
 }
 
 struct LpmPackMetadata<'a> {

@@ -10,7 +10,8 @@ use super::output::{
 use super::prepare::read_publish_manifest;
 use super::prepare::{
     PublishSource, prepare_publish_project_from_manifest, read_publish_manifest_from_source,
-    validate_lpm_registry_tarball_size, validate_publish_tarball_size,
+    validate_lpm_registry_body_size, validate_lpm_registry_tarball_size,
+    validate_publish_tarball_size,
 };
 use super::provenance::{
     ProvenanceRequest, load_provenance_request_file, materialize_provenance_request,
@@ -24,7 +25,7 @@ use super::types::{
     LpmPublicationStatus, NpmTargetArtifact, NpmTargetArtifactInput, PublicationWaitResult,
     PublishProject, PublishQualityGateInput, PublishResult, PublishTarget, ResolvedProvenance,
 };
-use super::upload_lpm::publish_to_lpm;
+use super::upload_lpm::{LpmPublishBody, publish_to_lpm};
 use super::version_data::{build_publish_version_data, integrity_to_sha512_hex};
 use super::wait::{DEFAULT_PUBLICATION_WAIT_TIMEOUT, wait_for_lpm_publication_with_oidc};
 use crate::commands::skills::author;
@@ -1160,14 +1161,14 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
         &tarball_data,
         !allow_secrets,
     )?;
-    if targets.contains(&PublishTarget::Lpm) {
-        let lpm_name = target_names
-            .get("lpm")
-            .map_or(name.as_str(), String::as_str);
-        let lpm_tarball_size = rewritten_tarballs
-            .get(lpm_name)
-            .map_or(tarball_data.len(), |tarball| tarball.len());
-        validate_lpm_registry_tarball_size(lpm_tarball_size)?;
+    if targets_lpm {
+        check_lpm_target_tarball(
+            &target_names,
+            &name,
+            &tarball_data,
+            &tarball_hashes,
+            &rewritten_tarballs,
+        )?;
     }
     let version_data = build_publish_version_data(
         &pkg_json,
@@ -1238,6 +1239,23 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
     } else {
         None
     };
+    if targets_lpm {
+        check_lpm_target_body(LpmTargetBodyCheck {
+            target_names: &target_names,
+            name: &name,
+            version: &version,
+            readme: readme.as_deref(),
+            version_data: &version_data,
+            tarball_data: &tarball_data,
+            tarball_hashes: &tarball_hashes,
+            rewritten_tarballs: &rewritten_tarballs,
+            tarball_files: &tarball_files,
+            quality_result: quality_result.as_ref(),
+            lpm_config: lpm_config.as_ref(),
+            detected_ecosystem: &detected_ecosystem,
+            swift_manifest: swift_manifest.as_ref(),
+        })?;
+    }
 
     let local_skills_digest =
         has_skills.then(|| author::compute_validated_digest(&validated_skills));
@@ -1617,14 +1635,8 @@ async fn execute_prepared_inner(
 
                     // Recompute dist hashes from the final rewritten tarball so metadata
                     // matches the actual uploaded artifact (not the pre-rewrite original).
-                    let mut lpm_version_data = version_data.clone();
-                    lpm_version_data["name"] = serde_json::json!(lpm_name);
-                    lpm_version_data["_id"] =
-                        serde_json::json!(format!("{lpm_name}@{version}"));
-                    lpm_version_data["dist"] = serde_json::json!({
-                        "shasum": lpm_tarball.hashes.shasum,
-                        "integrity": lpm_tarball.hashes.integrity,
-                    });
+                    let mut lpm_version_data =
+                        lpm_target_version_data(&version_data, lpm_name, &version, lpm_tarball.hashes);
 
                     // Generate per-target provenance from the final rewritten tarball
                     if let Some(ref provenance) = provenance_context {
@@ -2248,12 +2260,113 @@ struct TargetTarball<'a> {
 }
 
 impl TargetTarball<'_> {
+    fn len(&self) -> usize {
+        match self.data {
+            TargetTarballData::Base(data) => data.len(),
+            TargetTarballData::Rewritten(tarball) => tarball.len(),
+        }
+    }
+
     fn read_data(&self) -> Result<std::sync::Arc<Vec<u8>>, LpmError> {
         match self.data {
             TargetTarballData::Base(data) => Ok(std::sync::Arc::clone(data)),
             TargetTarballData::Rewritten(tarball) => tarball.read_data().map(std::sync::Arc::new),
         }
     }
+}
+
+/// lpm.dev's name for the package: its target's, or package.json's.
+fn lpm_target_name<'a>(target_names: &'a HashMap<String, String>, name: &'a str) -> &'a str {
+    target_names.get("lpm").map_or(name, String::as_str)
+}
+
+/// The version metadata lpm.dev receives, named as its target and carrying
+/// the hashes of the tarball it's sent.
+fn lpm_target_version_data(
+    version_data: &serde_json::Value,
+    lpm_name: &str,
+    version: &str,
+    hashes: &publish_common::TarballHashes,
+) -> serde_json::Value {
+    let mut lpm_version_data = version_data.clone();
+    lpm_version_data["name"] = serde_json::json!(lpm_name);
+    lpm_version_data["_id"] = serde_json::json!(format!("{lpm_name}@{version}"));
+    lpm_version_data["dist"] = serde_json::json!({
+        "shasum": hashes.shasum,
+        "integrity": hashes.integrity,
+    });
+    lpm_version_data
+}
+
+/// Refuses, before any target publishes, a tarball lpm.dev would refuse for
+/// its size: the one it's sent, renamed for it where its name differs from
+/// package.json's.
+fn check_lpm_target_tarball(
+    target_names: &HashMap<String, String>,
+    name: &str,
+    tarball_data: &std::sync::Arc<Vec<u8>>,
+    tarball_hashes: &std::sync::Arc<publish_common::TarballHashes>,
+    rewritten_tarballs: &HashMap<String, publish_common::RewrittenTarball>,
+) -> Result<(), LpmError> {
+    let lpm_tarball = target_tarball(
+        lpm_target_name(target_names, name),
+        name,
+        tarball_data,
+        tarball_hashes,
+        rewritten_tarballs,
+    )?;
+    validate_lpm_registry_tarball_size(lpm_tarball.len())
+}
+
+struct LpmTargetBodyCheck<'a> {
+    target_names: &'a HashMap<String, String>,
+    name: &'a str,
+    version: &'a str,
+    readme: Option<&'a str>,
+    version_data: &'a serde_json::Value,
+    tarball_data: &'a std::sync::Arc<Vec<u8>>,
+    tarball_hashes: &'a std::sync::Arc<publish_common::TarballHashes>,
+    rewritten_tarballs: &'a HashMap<String, publish_common::RewrittenTarball>,
+    tarball_files: &'a [publish_common::TarballFile],
+    quality_result: Option<&'a crate::quality::QualityResult>,
+    lpm_config: Option<&'a serde_json::Value>,
+    detected_ecosystem: &'a str,
+    swift_manifest: Option<&'a serde_json::Value>,
+}
+
+/// Refuses, before any target publishes, a publish request lpm.dev would
+/// refuse for its size: the request `publish_to_lpm` sends, but for the
+/// provenance bundle a `--provenance` publish adds as it goes, a few
+/// kilobytes.
+fn check_lpm_target_body(input: LpmTargetBodyCheck<'_>) -> Result<(), LpmError> {
+    let lpm_name = lpm_target_name(input.target_names, input.name);
+    let lpm_tarball = target_tarball(
+        lpm_name,
+        input.name,
+        input.tarball_data,
+        input.tarball_hashes,
+        input.rewritten_tarballs,
+    )?;
+    let version_data = lpm_target_version_data(
+        input.version_data,
+        lpm_name,
+        input.version,
+        lpm_tarball.hashes,
+    );
+    let body_len = LpmPublishBody {
+        name: lpm_name,
+        version: input.version,
+        readme: input.readme,
+        version_data: &version_data,
+        tarball_files: input.tarball_files,
+        package_json_size_override: lpm_tarball.package_json_size,
+        quality_result: input.quality_result,
+        lpm_config: input.lpm_config,
+        detected_ecosystem: input.detected_ecosystem,
+        swift_manifest: input.swift_manifest,
+    }
+    .len_with(lpm_tarball.len())?;
+    validate_lpm_registry_body_size(body_len)
 }
 
 fn target_tarball<'a>(
@@ -2375,6 +2488,132 @@ fn resolve_npm_compatible_publish_endpoint(
             .and_then(|config| config.tag.as_deref())
             .is_some(),
     }))
+}
+
+#[cfg(test)]
+mod lpm_target_limit_tests {
+    use super::{
+        LpmTargetBodyCheck, check_lpm_target_body, check_lpm_target_tarball, publish_common,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    const MIB: usize = 1024 * 1024;
+
+    fn hashes() -> Arc<publish_common::TarballHashes> {
+        Arc::new(publish_common::TarballHashes {
+            shasum: "0".repeat(40),
+            integrity: "sha512-AAAA".into(),
+        })
+    }
+
+    fn renamed_to(lpm_name: &str) -> HashMap<String, String> {
+        HashMap::from([("lpm".to_owned(), lpm_name.to_owned())])
+    }
+
+    #[test]
+    fn measures_the_tarball_lpm_dev_is_sent() {
+        let limit = publish_common::MAX_LPM_REGISTRY_TARBALL_BYTES as usize;
+        let past = Arc::new(vec![0_u8; limit + 1]);
+        let within = Arc::new(vec![0_u8; limit]);
+        let no_copies = HashMap::new();
+
+        let error = check_lpm_target_tarball(&HashMap::new(), "pkg", &past, &hashes(), &no_copies)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("tarball too large for the LPM registry"),
+            "{error}"
+        );
+        check_lpm_target_tarball(&HashMap::new(), "pkg", &within, &hashes(), &no_copies).unwrap();
+
+        // Renamed for lpm.dev, it's sent the copy, whatever the packed one's size.
+        let copies = HashMap::from([(
+            "@lpm.dev/acme.pkg".to_owned(),
+            publish_common::RewrittenTarball::spool_base(&[0_u8; 16], hashes()).unwrap(),
+        )]);
+        check_lpm_target_tarball(
+            &renamed_to("@lpm.dev/acme.pkg"),
+            "pkg",
+            &past,
+            &hashes(),
+            &copies,
+        )
+        .unwrap();
+    }
+
+    fn body_check<'a>(
+        tarball_data: &'a Arc<Vec<u8>>,
+        tarball_hashes: &'a Arc<publish_common::TarballHashes>,
+        tarball_files: &'a [publish_common::TarballFile],
+        version_data: &'a serde_json::Value,
+        no_copies: &'a HashMap<String, publish_common::RewrittenTarball>,
+        target_names: &'a HashMap<String, String>,
+    ) -> LpmTargetBodyCheck<'a> {
+        LpmTargetBodyCheck {
+            target_names,
+            name: "pkg",
+            version: "1.0.0",
+            readme: None,
+            version_data,
+            tarball_data,
+            tarball_hashes,
+            rewritten_tarballs: no_copies,
+            tarball_files,
+            quality_result: None,
+            lpm_config: None,
+            detected_ecosystem: "js",
+            swift_manifest: None,
+        }
+    }
+
+    #[test]
+    fn refuses_a_request_its_file_list_takes_past_the_body_limit_though_its_tarball_is_within_its_own()
+     {
+        // 133.33 MiB of base64 for a tarball at its 100 MiB limit.
+        let tarball = Arc::new(vec![0_u8; 100 * MIB]);
+        let version_data = serde_json::json!({ "name": "pkg", "version": "1.0.0" });
+        let few: Vec<_> = (0..10)
+            .map(|index| publish_common::TarballFile {
+                path: format!("package/{index}.js"),
+                size: 1,
+            })
+            .collect();
+        let many: Vec<_> = (0..100_000)
+            .map(|index| publish_common::TarballFile {
+                path: format!("package/{}/{index}.js", "d".repeat(180)),
+                size: 1,
+            })
+            .collect();
+        let (hashes, no_copies, names) = (hashes(), HashMap::new(), HashMap::new());
+
+        check_lpm_target_body(body_check(
+            &tarball,
+            &hashes,
+            &few,
+            &version_data,
+            &no_copies,
+            &names,
+        ))
+        .unwrap();
+        let error = check_lpm_target_body(body_check(
+            &tarball,
+            &hashes,
+            &many,
+            &version_data,
+            &no_copies,
+            &names,
+        ))
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("publish request too large for the LPM registry"),
+            "{error}"
+        );
+    }
 }
 
 #[cfg(test)]

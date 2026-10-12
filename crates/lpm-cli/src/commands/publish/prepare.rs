@@ -689,6 +689,19 @@ pub(crate) fn validate_lpm_registry_tarball_size(tarball_size: usize) -> Result<
     )
 }
 
+/// Refuses a publish request the LPM registry would refuse for its size.
+pub(crate) fn validate_lpm_registry_body_size(body_size: u64) -> Result<(), LpmError> {
+    let max = publish_common::MAX_LPM_REGISTRY_BODY_BYTES;
+    if body_size > max {
+        return Err(LpmError::Registry(format!(
+            "publish request too large for the LPM registry: {} (max {}), the tarball in base64 with the package's metadata; publish fewer or smaller files",
+            lpm_common::format_bytes_past(body_size),
+            lpm_common::format_bytes(max)
+        )));
+    }
+    Ok(())
+}
+
 fn tarball_within(tarball_size: usize, max: u64, target: &str) -> Result<(), LpmError> {
     let size = tarball_size as u64;
     if size > max {

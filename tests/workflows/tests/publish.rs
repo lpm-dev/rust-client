@@ -250,6 +250,46 @@ fn publish_dry_run_validates_package() {
     );
 }
 
+#[test]
+fn publish_refuses_a_tarball_past_lpm_dev_s_limit_before_any_target_publishes() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "@lpm.dev/testuser.too-big",
+        "version": "1.0.0",
+        "main": "index.js",
+        "license": "MIT"
+    }"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+    // Incompressible, so the gzipped tarball stays past lpm.dev's 100 MiB.
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    let blob: Vec<u8> = (0..(101 * 1024 * 1024 / 8))
+        .flat_map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()
+        })
+        .collect();
+    std::fs::write(project.path().join("blob.bin"), blob).unwrap();
+
+    let output = lpm(&project)
+        .args(["publish", "--dry-run", "--yes", "--json"])
+        .output()
+        .expect("failed to run lpm publish --dry-run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("publish --json must print JSON: {error}\n{stdout}"));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("tarball too large for the LPM registry")),
+        "{stdout}"
+    );
+}
+
 #[tokio::test]
 async fn publish_dry_run_with_authored_skills_leaves_project_files_unchanged() {
     let mock = MockRegistry::start().await;

@@ -290,7 +290,7 @@ async fn whoami_tells_a_free_account_past_its_storage_that_publishing_is_restric
 }
 
 #[tokio::test]
-async fn whoami_tells_an_account_in_a_payment_grace_past_its_storage_that_overage_waits_for_the_payment()
+async fn whoami_tells_an_account_whose_billing_isnt_active_that_publishing_past_its_storage_waits_for_it()
  {
     let stderr = whoami_stderr(serde_json::json!({
         "username": "testuser",
@@ -303,11 +303,13 @@ async fn whoami_tells_an_account_in_a_payment_grace_past_its_storage_that_overag
 
     assert!(
         stderr.contains("Storage: 5.01 GiB / 5 GiB")
-            && stderr.contains(
-                "Storage overage is paused until the outstanding payment succeeds; publishing past 5 GiB is refused meanwhile."
-            )
-            && stderr.contains("Update your payment method"),
-        "an account in a payment grace should read as paused until it pays, got:\n{stderr}"
+            && stderr.contains("Publishing past 5 GiB is refused until billing is active again.")
+            && stderr.contains("Manage billing"),
+        "an account whose billing isn't active should read as refused until it is, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("payment") && !stderr.contains("overage is paused"),
+        "a subscription that ended in its grace owes no payment, got:\n{stderr}"
     );
     assert!(
         !stderr.contains("is billed per GiB") && !stderr.contains("Upgrade your plan"),
@@ -327,14 +329,61 @@ async fn whoami_claims_nothing_of_storage_past_its_limit_when_the_registry_doesn
 
     assert!(
         stderr.contains("storage        5.01 GiB / 5 GiB")
-            && stderr.contains("overage        past the included 5 GiB"),
+            && stderr.contains("limit          past the 5 GiB limit"),
         "storage past its limit should read as past it, got:\n{stderr}"
     );
     assert!(
         !stderr.contains("billed")
+            && !stderr.contains("overage")
+            && !stderr.contains("included")
             && !stderr.contains("OVER LIMIT")
             && !stderr.contains("restricted"),
         "without the Registry's word, whoami should claim neither billing nor a refusal, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn whoami_tells_a_free_account_past_its_storage_that_publishing_is_restricted_when_the_registry_doesnt_say()
+ {
+    let stderr = whoami_stderr(serde_json::json!({
+        "username": "testuser",
+        "plan_tier": "free",
+        "usage": { "storage_bytes": 100 * 1024 * 1024 + 1, "private_packages": 1 },
+        "limits": { "storageBytes": 100 * 1024 * 1024, "privatePackages": 2 },
+    }))
+    .await;
+
+    assert!(
+        stderr.contains("Storage: 100.01 MiB / 100 MiB")
+            && stderr.contains("(OVER LIMIT)")
+            && stderr.contains("Publishing is restricted."),
+        "every Registry refuses the free plan's storage past its limit, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn whoami_tells_a_pro_account_without_a_subscription_that_storage_past_its_limit_needs_one() {
+    let stderr = whoami_stderr(serde_json::json!({
+        "username": "testuser",
+        "plan_tier": "pro",
+        "usage": { "storage_bytes": 5 * GIB + 1, "private_packages": 3 },
+        "limits": { "storageBytes": 5 * GIB, "privatePackages": 100 },
+        "storage_overage": "blocked",
+    }))
+    .await;
+
+    assert!(
+        stderr.contains("Storage: 5.01 GiB / 5 GiB")
+            && stderr.contains("(OVER LIMIT)")
+            && stderr.contains(
+                "Storage past 5 GiB is billed only with a Pro subscription, so publishing past it is refused."
+            )
+            && stderr.contains("Subscribe"),
+        "a Pro account without a subscription should be told to subscribe, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("Upgrade your plan"),
+        "an account already on Pro has nothing to upgrade, got:\n{stderr}"
     );
 }
 

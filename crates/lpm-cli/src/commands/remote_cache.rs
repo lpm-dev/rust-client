@@ -188,7 +188,7 @@ pub fn cache_status_json(status: &CacheStatus) -> serde_json::Value {
             let (usage, limit) = lpm_common::format_quota(usage, limit);
             (Some(usage), Some(limit))
         }
-        (usage, limit) => (usage.map(format_bytes), limit.map(format_bytes)),
+        (usage, limit) => (usage.map(lpm_common::format_usage), limit.map(format_bytes)),
     };
     serde_json::json!({
         "success": true,
@@ -285,6 +285,16 @@ pub fn print_cache_status_human(status: &CacheStatus) {
                 )
             };
             println!("{usage_line}");
+        } else if let (Some(usage), None) = (status.remote.usage_bytes, status.remote.limit_bytes) {
+            // A plan whose cache is unlimited reports no limit.
+            println!(
+                "{}",
+                crate::install_ui::terminal_line!(
+                    "  {} {} / Unlimited",
+                    cache_status_label("usage"),
+                    lpm_common::format_usage(usage)
+                )
+            );
         }
     }
     println!();

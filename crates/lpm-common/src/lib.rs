@@ -345,6 +345,12 @@ pub fn format_quota(used: u64, limit: u64) -> (String, String) {
     )
 }
 
+/// Formats a usage with no limit to show it against, as `format_quota`
+/// shows usage: to two decimals, in GiB at most with thousands grouped.
+pub fn format_usage(used: u64) -> String {
+    format_scaled(used, 2, GIB_UNIT, Rounding::Nearest, true)
+}
+
 const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
 const GIB_UNIT: usize = 3;
 
@@ -471,6 +477,15 @@ mod tests {
             "512.10 MiB / 5 GiB"
         );
         assert_eq!(quota(0, 5 * GIB), "0 B / 5 GiB");
+    }
+
+    #[test]
+    fn format_usage_reads_usage_as_quotas_do_without_a_limit() {
+        let gib = 1024_u64.pow(3);
+        assert_eq!(format_usage(1253 * gib + gib / 2), "1,253.50 GiB");
+        assert_eq!(format_usage(1023), "1,023 B");
+        assert_eq!(format_usage(2048), "2 KiB");
+        assert_eq!(format_usage(2049), "2.00 KiB");
     }
 
     #[test]

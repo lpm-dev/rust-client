@@ -103,9 +103,18 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         whoami_ui::section("usage");
         let storage = lpm_common::format_bytes(usage.storage_bytes);
         // What publishing does past the limit, as the Registry's publish
-        // gate decides it. An older Registry doesn't say, and nothing is
-        // claimed then.
-        let storage_overage = user.storage_overage.as_deref();
+        // gate decides it. A Registry that doesn't say still refuses the
+        // free plan's storage past its limit; nothing is claimed of others.
+        let storage_overage = user.storage_overage.as_deref().or_else(|| {
+            user.plan_tier
+                .as_deref()
+                .is_some_and(|tier| tier.eq_ignore_ascii_case("free"))
+                .then_some("blocked")
+        });
+        let on_pro = user
+            .plan_tier
+            .as_deref()
+            .is_some_and(|tier| tier.eq_ignore_ascii_case("pro"));
         let mut over_storage = None;
 
         if let Some(limits) = &user.limits {
@@ -139,7 +148,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                         }
                         _ => {
                             whoami_ui::detail("storage", storage_msg);
-                            whoami_ui::detail("overage", format!("past the included {limit}"));
+                            whoami_ui::detail("limit", format!("past the {limit} limit"));
                         }
                     }
                 }
@@ -174,19 +183,31 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
             }
 
             // Over-limit warning
-            let storage_refused = over_storage.is_some() && storage_overage == Some("blocked");
             let over_packages = limits
                 .private_packages
                 .is_some_and(|l| l > 0 && l != u32::MAX && usage.private_packages > l);
+            // A Pro plan without a subscription has nothing to bill
+            // storage on; subscribing fixes it, not upgrading.
+            let unbilled_pro = on_pro && storage_overage == Some("blocked");
+            let storage_refused =
+                over_storage.is_some() && storage_overage == Some("blocked") && !unbilled_pro;
 
-            if let (Some(limit), Some("paused")) = (&over_storage, storage_overage) {
-                whoami_ui::warn_line(crate::install_ui::terminal_line!(
-                    "Storage overage is paused until the outstanding payment succeeds; publishing past {} is refused meanwhile.",
-                    limit.as_str()
-                ));
-                whoami_ui::warn(
-                    "Update your payment method: https://lpm.dev/dashboard/settings/billing",
-                );
+            match (&over_storage, storage_overage) {
+                (Some(limit), Some("paused")) => {
+                    whoami_ui::warn_line(crate::install_ui::terminal_line!(
+                        "Publishing past {} is refused until billing is active again.",
+                        limit.as_str()
+                    ));
+                    whoami_ui::warn("Manage billing: https://lpm.dev/dashboard/settings/billing");
+                }
+                (Some(limit), Some("blocked")) if unbilled_pro => {
+                    whoami_ui::warn_line(crate::install_ui::terminal_line!(
+                        "Storage past {} is billed only with a Pro subscription, so publishing past it is refused.",
+                        limit.as_str()
+                    ));
+                    whoami_ui::warn("Subscribe: https://lpm.dev/dashboard/settings/billing");
+                }
+                _ => {}
             }
             if storage_refused || over_packages {
                 whoami_ui::warn("Your account is over its plan limits.");
