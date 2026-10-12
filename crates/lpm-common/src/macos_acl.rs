@@ -1,6 +1,7 @@
-//! Extended access control lists on macOS. Their entries grant access the
-//! file mode doesn't show: an `everyone allow read` entry, inherited from a
-//! directory, makes a 0600 file readable by any user.
+//! Access on macOS that the file mode doesn't show. Extended access control
+//! list entries grant it: an `everyone allow read` entry, inherited from a
+//! directory, makes a 0600 file readable by any user. So does a volume that
+//! ignores ownership, on which every user owns every file.
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::io;
@@ -16,6 +17,21 @@ unsafe extern "C" {
     fn acl_get_link_np(path: *const c_char, acl_type: c_int) -> *mut c_void;
     fn acl_init(entry_count: c_int) -> *mut c_void;
     fn acl_set_fd_np(file_descriptor: c_int, acl: *mut c_void, acl_type: c_int) -> c_int;
+}
+
+/// Whether the volume holding the open file or directory ignores ownership,
+/// as one mounted `noowners` does, which external drives are by default:
+/// every user is then the owner of its files, whatever their mode.
+pub fn ignores_ownership(handle: impl AsFd) -> io::Result<bool> {
+    let mut volume = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: fstatfs fills `volume` from a descriptor that stays open while
+    // `handle` is borrowed.
+    if unsafe { libc::fstatfs(handle.as_fd().as_raw_fd(), volume.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstatfs succeeded, so it filled `volume`.
+    let flags = unsafe { volume.assume_init() }.f_flags;
+    Ok(flags & libc::MNT_IGNORE_OWNERSHIP as u32 != 0)
 }
 
 /// Whether the open file or directory has extended ACL entries.
@@ -95,6 +111,14 @@ pub fn clear_extended_acl(handle: impl AsFd) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_volume_that_keeps_ownership_reads_as_such() {
+        let directory = tempfile::tempdir().unwrap();
+        let handle = std::fs::File::open(directory.path()).unwrap();
+
+        assert!(!ignores_ownership(&handle).unwrap());
+    }
 
     fn add_entry(path: &std::path::Path, entry: &str) {
         let status = std::process::Command::new("/bin/chmod")

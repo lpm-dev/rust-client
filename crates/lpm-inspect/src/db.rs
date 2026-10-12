@@ -82,14 +82,17 @@ impl InspectorDb {
     ) -> Result<Self, OpenError> {
         let lpm_dir = project_dir.join(".lpm");
         let db_path = lpm_dir.join("inspector.db");
-        prepare_lpm_dir(&lpm_dir, owner, access)?;
+        let ownership_ignored = prepare_lpm_dir(&lpm_dir, owner, access)?;
         let _opening = lock_capture_files(&db_path, owner)?;
         remove_replacement_copy(&db_path)?;
         if let Err(error) = ensure_captures_ignored(&lpm_dir, owner) {
             tracing::warn!("could not keep tunnel captures out of git: {error}");
         }
-        let mut open_to_others = prepare_capture_files(&db_path, owner, access)?;
-        if open_to_others && access == Access::Capture {
+        // On a volume that ignores ownership, every user owns the files, so
+        // they're open to others whatever their mode, and a copy is too.
+        let mut open_to_others =
+            prepare_capture_files(&db_path, owner, access)? || ownership_ignored;
+        if open_to_others && access == Access::Capture && !ownership_ignored {
             open_to_others = !replace_with_owner_only_copy(&db_path, owner)?;
         }
         open_to_others |= !create_wal_sidecars(&db_path, owner)?;
@@ -1017,8 +1020,9 @@ fn hard_linked(path: &Path) -> std::io::Error {
 /// into a directory it serves, is refused; the metadata of a link, read
 /// without following it, is never a directory's. Reparse points other than
 /// links, such as a synced folder's placeholders on Windows, read as the
-/// directories they stand for. See [`restrict_lpm_dir`] for Unix.
-fn prepare_lpm_dir(lpm_dir: &Path, owner: CaptureOwner, access: Access) -> std::io::Result<()> {
+/// directories they stand for. See [`restrict_lpm_dir`] for Unix, and for
+/// whether `.lpm`'s volume ignores ownership, which this returns.
+fn prepare_lpm_dir(lpm_dir: &Path, owner: CaptureOwner, access: Access) -> std::io::Result<bool> {
     let created = match std::fs::symlink_metadata(lpm_dir) {
         Ok(metadata) if !metadata.is_dir() => return Err(linked_or_not(lpm_dir, "directory")),
         Ok(_) => false,
@@ -1035,14 +1039,15 @@ fn prepare_lpm_dir(lpm_dir: &Path, owner: CaptureOwner, access: Access) -> std::
 /// by no one else, and on macOS clears its extended ACL, whose entries can
 /// grant what its mode doesn't and pass to the files created in it, so no
 /// other user can swap the capture files' names between the checks below
-/// and SQLite's opens, or read the files created there.
+/// and SQLite's opens, or read the files created there. Says whether its
+/// volume ignores ownership, as only macOS reports.
 #[cfg(unix)]
 fn restrict_lpm_dir(
     lpm_dir: &Path,
     owner: CaptureOwner,
     access: Access,
     created: bool,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let directory =
@@ -1054,11 +1059,18 @@ fn restrict_lpm_dir(
     if !owner.owns(&metadata) {
         return Err(another_users(lpm_dir));
     }
+    #[cfg(target_os = "macos")]
+    let ownership_ignored = lpm_common::macos_acl::ignores_ownership(&directory)
+        .map_err(|error| with_path(lpm_dir, error))?;
+    #[cfg(not(target_os = "macos"))]
+    let ownership_ignored = false;
+    #[cfg(test)]
+    let ownership_ignored = ownership_ignored || tests::OWNERSHIP_IGNORED.get();
     if created {
         owner.give(&directory, lpm_dir)?;
     }
     if access == Access::Review {
-        return Ok(());
+        return Ok(ownership_ignored);
     }
     let mode = metadata.mode() & 0o7777;
     if mode & 0o022 != 0 {
@@ -1071,7 +1083,7 @@ fn restrict_lpm_dir(
         lpm_common::macos_acl::clear_extended_acl(&directory)
             .map_err(|error| with_path(lpm_dir, error))?;
     }
-    Ok(())
+    Ok(ownership_ignored)
 }
 
 #[cfg(not(unix))]
@@ -1080,8 +1092,8 @@ fn restrict_lpm_dir(
     _owner: CaptureOwner,
     _access: Access,
     _created: bool,
-) -> std::io::Result<()> {
-    Ok(())
+) -> std::io::Result<bool> {
+    Ok(false)
 }
 
 /// Holds other LPM processes off the capture files while this one checks,
@@ -1354,9 +1366,19 @@ fn create_owner_only(_path: &Path, _owner: CaptureOwner) -> std::io::Result<bool
 fn replace_with_owner_only_copy(db_path: &Path, owner: CaptureOwner) -> Result<bool, OpenError> {
     let copy_path = capture_file(db_path, "-copy");
     let owner_only = create_owner_only(&copy_path, owner);
+    #[cfg(test)]
+    let owner_only = tests::COPY_CREATE_ERROR
+        .get()
+        .map_or(owner_only, |kind| Err(kind.into()));
     if !matches!(owner_only, Ok(true)) {
         let removed = remove_replacement_copy(db_path);
-        owner_only?;
+        if let Err(error) = owner_only {
+            return Err(if error.kind() == std::io::ErrorKind::StorageFull {
+                no_room_to_copy(db_path)
+            } else {
+                error.into()
+            });
+        }
         removed?;
         return Ok(false);
     }
@@ -1560,15 +1582,17 @@ type SchemaObject = (String, String, String, Option<String>);
 /// `ALTER TABLE` splices in reads the same however it's spaced. Whitespace
 /// and word characters are SQLite's own: only ASCII space, tab, newline,
 /// form feed and carriage return separate tokens, and any other character
-/// past ASCII belongs to a word, so text whose tokens differ for SQLite
-/// can't read the same here.
+/// past ASCII belongs to a word. Quoted text, a string or a quoted name, is
+/// kept as written, since its spaces are part of it. So text whose tokens
+/// differ for SQLite can't read the same here.
 fn canonical_sql(sql: &str) -> String {
     let is_word = |character: char| {
         character.is_ascii_alphanumeric() || matches!(character, '_' | '$') || !character.is_ascii()
     };
     let mut canonical = String::with_capacity(sql.len());
     let mut spaced = false;
-    for character in sql.chars() {
+    let mut characters = sql.chars();
+    while let Some(character) = characters.next() {
         if matches!(character, ' ' | '\t' | '\n' | '\x0c' | '\r') {
             spaced = true;
             continue;
@@ -1578,6 +1602,19 @@ fn canonical_sql(sql: &str) -> String {
         }
         spaced = false;
         canonical.push(character);
+        let close = match character {
+            '\'' | '"' | '`' => character,
+            '[' => ']',
+            _ => continue,
+        };
+        // A doubled quote, which stands for one, ends a span where the next
+        // begins, so its text is kept all the same.
+        for quoted in characters.by_ref() {
+            canonical.push(quoted);
+            if quoted == close {
+                break;
+            }
+        }
     }
     canonical
 }
@@ -2253,6 +2290,10 @@ mod tests {
         /// [`OPEN_LOCK_TIMEOUT`], for a test of the wait itself.
         pub(super) static OPEN_LOCK_WAIT: std::cell::Cell<Option<std::time::Duration>> =
             const { std::cell::Cell::new(None) };
+        /// The failure this thread's replacement copies are created with, as
+        /// a disk with no blocks left fails them.
+        pub(super) static COPY_CREATE_ERROR: std::cell::Cell<Option<std::io::ErrorKind>> =
+            const { std::cell::Cell::new(None) };
     }
 
     #[cfg(unix)]
@@ -2260,6 +2301,9 @@ mod tests {
         /// Makes this thread's new capture files read as a filesystem
         /// without Unix modes shows them: open to anyone.
         pub(super) static MODELESS_FILESYSTEM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Makes this thread's `.lpm` read as on a volume that ignores
+        /// ownership.
+        pub(super) static OWNERSHIP_IGNORED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// The capture owner of a project of this user's.
@@ -2800,7 +2844,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            error.to_string().contains("another process has it open"),
+            error.to_string().contains("another process has it open")
+                && error.to_string().contains("`lpm tunnel inspect --ui`"),
             "{error}"
         );
         assert_eq!(error.kind(), std::io::ErrorKind::ResourceBusy);
@@ -2935,6 +2980,45 @@ mod tests {
         });
         MODELESS_FILESYSTEM.set(false);
 
+        assert!(existing);
+        assert!(new);
+        assert!(kept.is_some());
+        assert_eq!(std::fs::metadata(&db_path).unwrap().ino(), inode);
+        assert!(!project.path().join(".lpm/inspector.db-copy").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_volume_that_ignores_ownership_keeps_its_database_and_says_it_s_open_to_others() {
+        use std::os::unix::fs::MetadataExt;
+
+        let project = project_with_a_capture();
+        let db_path = project.path().join(".lpm/inspector.db");
+        set_mode(&db_path, 0o644);
+        let inode = std::fs::metadata(&db_path).unwrap().ino();
+        let fresh = tempfile::tempdir().unwrap();
+        let owner_only = project_with_a_capture();
+        assert_eq!(mode(&owner_only.path().join(".lpm/inspector.db")), 0o600);
+        OWNERSHIP_IGNORED.set(true);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (reviewed, existing, kept, new) = runtime.block_on(async {
+            let reviewed = InspectorDb::open_for_review(owner_only.path())
+                .unwrap()
+                .open_to_others();
+            let review = InspectorDb::open_for_review(project.path()).unwrap();
+            let db = InspectorDb::open(project.path()).unwrap();
+            let kept = db.get_webhook("kept").await.unwrap();
+            let new = InspectorDb::open(fresh.path()).unwrap().open_to_others();
+            drop(review);
+            (reviewed, db.open_to_others(), kept, new)
+        });
+        OWNERSHIP_IGNORED.set(false);
+
+        assert!(reviewed);
         assert!(existing);
         assert!(new);
         assert!(kept.is_some());
@@ -3353,6 +3437,10 @@ mod tests {
                 "table sessions",
                 lpm_schema.replace("id TEXT PRIMARY KEY,", "id TEXT\u{a0}PRIMARY KEY,"),
             ),
+            (
+                "table sessions",
+                lpm_schema.replacen("datetime('now')", "datetime(' now')", 1),
+            ),
         ];
         for (named, build) in planted {
             for open in [InspectorDb::open, InspectorDb::open_for_review] {
@@ -3416,6 +3504,36 @@ mod tests {
         assert_ne!(canonical_sql("summary TEXT"), canonical_sql("summ aryTEXT"));
     }
 
+    #[test]
+    fn canonical_sql_keeps_quoted_text_as_written() {
+        for (written, respaced) in [
+            ("DEFAULT (datetime('now'))", "DEFAULT (datetime(' now'))"),
+            ("DEFAULT (datetime('now'))", "DEFAULT (datetime('now '))"),
+            ("CREATE TABLE \"a b\" (x)", "CREATE TABLE \"a  b\" (x)"),
+            ("CREATE TABLE `a b` (x)", "CREATE TABLE `a\tb` (x)"),
+            ("CREATE TABLE [a b] (x)", "CREATE TABLE [a\nb] (x)"),
+            ("DEFAULT ('it''s a')", "DEFAULT ('it''s  a')"),
+        ] {
+            assert_ne!(
+                canonical_sql(written),
+                canonical_sql(respaced),
+                "{respaced}"
+            );
+        }
+        assert_eq!(
+            canonical_sql("DEFAULT ( 'it''s  a' ) , b"),
+            "DEFAULT('it''s  a'),b"
+        );
+        assert_eq!(
+            canonical_sql("CHECK (x IN ('a ]',  [b c] ))"),
+            "CHECK(x IN('a ]',[b c]))"
+        );
+        assert_eq!(
+            canonical_sql("CREATE TABLE [a]] b] (x)"),
+            "CREATE TABLE[a]]b](x)"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn copying_onto_a_full_disk_says_how_much_room_the_copy_needs() {
@@ -3443,6 +3561,38 @@ mod tests {
             )),
             "{error}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_disk_too_full_to_create_the_copy_says_how_much_room_it_needs() {
+        for (kind, room) in [
+            (std::io::ErrorKind::StorageFull, true),
+            (std::io::ErrorKind::PermissionDenied, false),
+        ] {
+            let project = project_with_a_database(&format!(
+                "{CAPTURE_SCHEMA} ALTER TABLE requests ADD COLUMN response_body_incomplete \
+                 INTEGER NOT NULL DEFAULT 0;"
+            ));
+            let db_path = project.path().join(".lpm/inspector.db");
+
+            COPY_CREATE_ERROR.set(Some(kind));
+            let opened = InspectorDb::open(project.path()).map(drop);
+            COPY_CREATE_ERROR.set(None);
+
+            let error = opened.unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(
+                error.to_string().contains(&format!(
+                    "needs about {} free on its disk",
+                    lpm_common::format_bytes(std::fs::metadata(&db_path).unwrap().len())
+                )),
+                room,
+                "{error}"
+            );
+            assert_eq!(mode(&db_path), 0o644);
+            assert!(!capture_file(&db_path, "-copy").exists());
+        }
     }
 
     #[test]
@@ -3527,34 +3677,36 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn opening_takes_a_schema_sqlite_finds_corrupt_for_damage() {
-        let project = project_with_a_capture();
-        let db_path = project.path().join(".lpm/inspector.db");
-        let connection = Connection::open(&db_path).unwrap();
-        connection
-            .execute_batch("PRAGMA journal_mode=DELETE;")
-            .unwrap();
-        drop(connection);
-        // The b-tree header of page 1, which holds the schema, past the
-        // 100-byte database header.
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&db_path)
-            .unwrap();
-        use std::io::{Seek as _, Write as _};
-        file.seek(std::io::SeekFrom::Start(100)).unwrap();
-        file.write_all(&[0xff; 8]).unwrap();
-        drop(file);
-        set_mode(&db_path, 0o600);
-
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let error = runtime
-            .block_on(async { InspectorDb::open_for_review(project.path()).map(drop) })
-            .unwrap_err();
+        for open in [InspectorDb::open, InspectorDb::open_for_review] {
+            let project = project_with_a_capture();
+            let db_path = project.path().join(".lpm/inspector.db");
+            let connection = Connection::open(&db_path).unwrap();
+            connection
+                .execute_batch("PRAGMA journal_mode=DELETE;")
+                .unwrap();
+            drop(connection);
+            // The b-tree header of page 1, which holds the schema, past the
+            // 100-byte database header.
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&db_path)
+                .unwrap();
+            use std::io::{Seek as _, Write as _};
+            file.seek(std::io::SeekFrom::Start(100)).unwrap();
+            file.write_all(&[0xff; 8]).unwrap();
+            drop(file);
+            set_mode(&db_path, 0o600);
 
-        assert!(
-            matches!(&error, OpenError::Damaged { detail, .. } if detail.contains("malformed")),
-            "{error:?}"
-        );
+            let error = runtime
+                .block_on(async { open(project.path()).map(drop) })
+                .unwrap_err();
+
+            assert!(
+                matches!(&error, OpenError::Damaged { detail, .. } if detail.contains("malformed")),
+                "{error:?}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -3765,7 +3917,8 @@ mod tests {
         .unwrap()
         .unwrap_err();
 
-        assert!(started.elapsed() >= wait);
+        let waited = started.elapsed();
+        assert!(waited >= wait && waited < wait * 4, "{waited:?}");
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(
             error.to_string().contains("another LPM process held"),

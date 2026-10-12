@@ -762,7 +762,7 @@ fn capture_warnings(
     let access = match store {
         CaptureStore::OwnerOnly => "owner-only on Unix; project ACLs on Windows",
         CaptureStore::OpenToOthers => {
-            "open to other users, as this filesystem doesn't keep Unix file modes"
+            "open to other users, as this filesystem's file modes don't keep them out"
         }
     };
     let mut warnings = vec![format!(
@@ -773,11 +773,19 @@ fn capture_warnings(
     let Some(state) = state else {
         return warnings;
     };
-    if state.incomplete {
+    if let Some(repository) = state.unanswered {
         warnings.push(
-            "git didn't answer in time for every capture file, so check that git ignores \
-             and doesn't track inspector.db*"
-                .to_string(),
+            match repository {
+                CaptureRepository::Project => {
+                    "git couldn't run, or didn't answer in time, for the project's repository, \
+                     so check that it doesn't track .lpm/inspector.db*"
+                }
+                CaptureRepository::Lpm => {
+                    "git couldn't run, or didn't answer in time, in .lpm, so check that git \
+                     ignores and doesn't track .lpm/inspector.db*"
+                }
+            }
+            .to_string(),
         );
     }
     if state.lpm_unasked {
@@ -854,8 +862,9 @@ fn capture_warning(message: &str, show_human_warning: bool) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CaptureStore {
     OwnerOnly,
-    /// On a filesystem that shows every file open to others, which no
-    /// replacement improves.
+    /// On a filesystem whose file modes don't keep other users out, which
+    /// no replacement improves: one without Unix modes, or on macOS one
+    /// that ignores ownership.
     OpenToOthers,
 }
 
@@ -889,16 +898,16 @@ struct CaptureGitState {
     /// Whether git refused to answer for `.lpm`, as for one that looks like a
     /// bare repository.
     lpm_unasked: bool,
-    /// Whether one of the queries couldn't run or didn't answer in time, so
+    /// The repository whose query couldn't run or didn't answer in time, so
     /// what the other found stands but git's ignoring the files isn't
     /// confirmed.
-    incomplete: bool,
+    unanswered: Option<CaptureRepository>,
 }
 
 impl CaptureGitState {
     fn kept_out(&self) -> bool {
         !self.lpm_unasked
-            && !self.incomplete
+            && self.unanswered.is_none()
             && self.project_tracked.is_empty()
             && self.lpm_tracked.is_empty()
             && self.unignored.is_empty()
@@ -989,16 +998,23 @@ where
         }
         Err(CaptureGitFailure::Refused) => false,
         Err(CaptureGitFailure::Unavailable) => {
-            state.incomplete = true;
+            state.unanswered = Some(CaptureRepository::Project);
             false
         }
     };
     let inside_answered = match inside {
         Some(Ok(files)) => {
             // Without a repository of its own, git in `.lpm` lists the
-            // project's tracked files, which the project's query has.
+            // project's tracked files, which the project's query has when
+            // it answers; when it doesn't, they're what's known of them.
             if own_repository {
                 state.lpm_tracked = files.tracked;
+            } else if !project_answered {
+                state.project_tracked = files
+                    .tracked
+                    .into_iter()
+                    .map(|name| format!(".lpm/{name}"))
+                    .collect();
             }
             state.unignored = files.unignored;
             true
@@ -1008,7 +1024,7 @@ where
             false
         }
         Some(Err(CaptureGitFailure::Unavailable)) => {
-            state.incomplete = true;
+            state.unanswered = Some(CaptureRepository::Lpm);
             false
         }
         None => false,
@@ -2578,8 +2594,26 @@ mod tests {
                 lpm_tracked: Vec::new(),
                 unignored: names(&["inspector.db-wal"]),
                 lpm_unasked: false,
-                incomplete: false,
+                unanswered: None,
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_the_project_s_names_for_its_tracked_files_when_both_answer() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+
+        let (state, _) = state_from_answers(
+            project.path(),
+            Ok(files(&[".LPM/inspector.db"], &[])),
+            Ok(files(&["inspector.db"], &[])),
+        )
+        .await;
+
+        assert_eq!(
+            state.unwrap().project_tracked,
+            names(&[".LPM/inspector.db"])
         );
     }
 
@@ -2653,18 +2687,52 @@ mod tests {
             "{warnings:?}"
         );
         assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.starts_with("git didn't answer in time")),
+            warnings.iter().any(|warning| warning
+                .starts_with("git couldn't run, or didn't answer in time, in .lpm")),
             "{warnings:?}"
         );
         let quiet = warnings_for(quiet, false);
         assert!(!quiet[0].contains("git ignores it"), "{quiet:?}");
+        assert!(quiet.iter().any(|warning| warning.starts_with(
+            "git couldn't run, or didn't answer in time, for the project's repository"
+        )));
+    }
+
+    #[tokio::test]
+    async fn reports_what_git_in_lpm_finds_tracked_when_the_project_s_query_doesn_t_answer() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+
+        let (state, _) = state_from_answers(
+            project.path(),
+            Err(CaptureGitFailure::Unavailable),
+            Ok(files(&["inspector.db"], &[])),
+        )
+        .await;
+
+        let state = state.unwrap();
+        assert_eq!(state.project_tracked, names(&[".lpm/inspector.db"]));
+        assert_eq!(state.unanswered, Some(CaptureRepository::Project));
+        let warnings = warnings_for(Some(state), false);
         assert!(
-            quiet
-                .iter()
-                .any(|warning| warning.starts_with("git didn't answer in time"))
+            warnings.iter().any(
+                |warning| warning.starts_with("git tracks '.lpm/inspector.db'")
+                    && warning.contains("`git rm --cached -- .lpm/inspector.db`")
+            ),
+            "{warnings:?}"
         );
+
+        std::fs::create_dir(project.path().join(".lpm/.git")).unwrap();
+        let (own, _) = state_from_answers(
+            project.path(),
+            Err(CaptureGitFailure::Unavailable),
+            Ok(files(&["inspector.db"], &[])),
+        )
+        .await;
+
+        let own = own.unwrap();
+        assert!(own.project_tracked.is_empty(), "{own:?}");
+        assert_eq!(own.lpm_tracked, names(&["inspector.db"]));
     }
 
     fn warnings_for(state: Option<CaptureGitState>, ignore_file_skipped: bool) -> Vec<String> {
@@ -2681,7 +2749,7 @@ mod tests {
             lpm_tracked: names(lpm_tracked),
             unignored: names(unignored),
             lpm_unasked: false,
-            incomplete: false,
+            unanswered: None,
         }
     }
 
@@ -2692,12 +2760,20 @@ mod tests {
             None,
             Some(CaptureGitState {
                 lpm_unasked: true,
-                incomplete: false,
+                unanswered: None,
                 ..state(&[], &[], &[])
             }),
             Some(state(&[".lpm/inspector.db"], &[], &[])),
             Some(state(&[], &["inspector.db"], &[])),
             Some(state(&[], &[], &["inspector.db-wal"])),
+            Some(CaptureGitState {
+                unanswered: Some(CaptureRepository::Project),
+                ..state(&[], &[], &[])
+            }),
+            Some(CaptureGitState {
+                unanswered: Some(CaptureRepository::Lpm),
+                ..state(&[], &[], &[])
+            }),
         ] {
             assert!(
                 !warnings_for(unconfirmed.clone(), false)[0].contains("git ignores it"),
@@ -2711,7 +2787,7 @@ mod tests {
         let warnings = warnings_for(
             Some(CaptureGitState {
                 lpm_unasked: true,
-                incomplete: false,
+                unanswered: None,
                 ..state(&[], &[], &[])
             }),
             false,
@@ -2776,8 +2852,9 @@ mod tests {
         let owner_only = capture_warnings(None, false, CaptureStore::OwnerOnly);
 
         assert!(
-            open[0]
-                .contains("(open to other users, as this filesystem doesn't keep Unix file modes)"),
+            open[0].contains(
+                "(open to other users, as this filesystem's file modes don't keep them out)"
+            ),
             "{open:?}"
         );
         assert!(!open[0].contains("owner-only"), "{open:?}");
