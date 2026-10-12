@@ -614,6 +614,14 @@ impl RemoteCacheClient {
         let mut response = match response.status() {
             StatusCode::OK => response,
             status if status.is_redirection() => {
+                // The redirect carries what verifies the download; without it
+                // storage isn't asked, as the artifact couldn't be restored.
+                if advertised_sha.is_none() {
+                    return Err(MISSING_CONTENT_HASH.into());
+                }
+                if self.signature_key.is_some() && tag.is_none() {
+                    return Err(MISSING_SIGNATURE_TAG.into());
+                }
                 match fetch_redirected_artifact(&url, &response).await? {
                     Some(artifact) => artifact,
                     None => return Ok(None),
@@ -654,18 +662,13 @@ impl RemoteCacheClient {
         // the HMAC must pass too, so a cache host without the key can't forge
         // restoreable bytes.
         let Some(advertised_sha) = &advertised_sha else {
-            return Err(
-                "remote cache artifact is missing a content hash; treating it as a miss".into(),
-            );
+            return Err(MISSING_CONTENT_HASH.into());
         };
         verify_artifact_sha(advertised_sha, &digests.sha256_hex)?;
 
         if let Some(key) = &self.signature_key {
             let Some(tag) = tag else {
-                return Err(
-                    "remote cache artifact is missing a signature tag; treating it as a miss"
-                        .into(),
-                );
+                return Err(MISSING_SIGNATURE_TAG.into());
             };
             verify_artifact_tag(key, &tag, &digests.hmac_tag)?;
         }
@@ -1309,6 +1312,11 @@ fn artifact_header(response: &reqwest::Response, name: &str) -> Option<String> {
 /// location is a short-lived storage URL the redirect's own headers vouch
 /// for, and a redirect from HTTPS may not lead to plain HTTP. Returns None
 /// for an artifact storage no longer holds, a miss.
+const MISSING_CONTENT_HASH: &str =
+    "remote cache artifact is missing a content hash; treating it as a miss";
+const MISSING_SIGNATURE_TAG: &str =
+    "remote cache artifact is missing a signature tag; treating it as a miss";
+
 async fn fetch_redirected_artifact(
     lookup_url: &reqwest::Url,
     redirect: &reqwest::Response,

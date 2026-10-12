@@ -3276,6 +3276,37 @@ async fn run_remote_cache_treats_a_redirect_to_a_missing_artifact_as_a_miss() {
 }
 
 #[tokio::test]
+async fn run_remote_cache_doesnt_fetch_storage_for_a_redirect_without_the_artifacts_hash() {
+    let server = MockServer::start().await;
+    let state = RemoteCacheState::default();
+    mount_redirecting_remote_cache(&server, state.clone(), true).await;
+    let project = remote_cache_project(&server, "");
+
+    assert!(run_build_with_remote_token(&project).status.success());
+    // As for an artifact Turborepo uploaded, which carries no hash.
+    *state.sha.lock().expect("remote cache sha mutex poisoned") = None;
+    remove_local_task_cache(&project);
+    remove_project_file(&project, "dist");
+    remove_project_file(&project, "executed-marker");
+
+    let second = run_build_with_remote_token(&project);
+
+    assert!(second.status.success());
+    assert!(
+        project.file_exists("executed-marker"),
+        "an artifact that can't be verified must rebuild",
+    );
+    let storage_reads = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path().starts_with("/storage/"))
+        .count();
+    assert_eq!(storage_reads, 0);
+}
+
+#[tokio::test]
 async fn run_remote_cache_accepts_http_ipv6_loopback() {
     let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
     let registry =
