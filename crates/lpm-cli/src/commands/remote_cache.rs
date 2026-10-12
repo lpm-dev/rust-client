@@ -1308,15 +1308,16 @@ fn artifact_header(response: &reqwest::Response, name: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-/// Fetches an artifact a lookup was redirected to, without the token: the
-/// location is a short-lived storage URL the redirect's own headers vouch
-/// for, and a redirect from HTTPS may not lead to plain HTTP. Returns None
-/// for an artifact storage no longer holds, a miss.
 const MISSING_CONTENT_HASH: &str =
     "remote cache artifact is missing a content hash; treating it as a miss";
 const MISSING_SIGNATURE_TAG: &str =
     "remote cache artifact is missing a signature tag; treating it as a miss";
 
+/// Fetches an artifact a lookup was redirected to, without the token: the
+/// location is a short-lived URL on the cache's download host, which the
+/// redirect's own headers vouch for, and a redirect from HTTPS may not lead
+/// to plain HTTP. Returns None for an artifact the host no longer serves, a
+/// miss.
 async fn fetch_redirected_artifact(
     lookup_url: &reqwest::Url,
     redirect: &reqwest::Response,

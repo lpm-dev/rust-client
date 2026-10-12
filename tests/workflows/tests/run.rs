@@ -3307,6 +3307,45 @@ async fn run_remote_cache_doesnt_fetch_storage_for_a_redirect_without_the_artifa
 }
 
 #[tokio::test]
+async fn run_remote_cache_doesnt_fetch_storage_for_a_redirect_without_the_tag_a_signing_key_needs()
+{
+    let server = MockServer::start().await;
+    let state = RemoteCacheState::default();
+    mount_redirecting_remote_cache(&server, state.clone(), true).await;
+    let project = remote_cache_project(&server, r#", "signature": true"#);
+    let signed_build = || {
+        lpm(&project)
+            .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+            .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
+            .args(["run", "build"])
+            .output()
+            .expect("failed to run signed remote build")
+    };
+
+    assert!(signed_build().status.success());
+    *state.tag.lock().expect("remote cache tag mutex poisoned") = None;
+    remove_local_task_cache(&project);
+    remove_project_file(&project, "dist");
+    remove_project_file(&project, "executed-marker");
+
+    let second = signed_build();
+
+    assert!(second.status.success());
+    assert!(
+        project.file_exists("executed-marker"),
+        "an artifact without its tag must rebuild",
+    );
+    let storage_reads = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path().starts_with("/storage/"))
+        .count();
+    assert_eq!(storage_reads, 0);
+}
+
+#[tokio::test]
 async fn run_remote_cache_accepts_http_ipv6_loopback() {
     let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
     let registry =
