@@ -43,6 +43,7 @@ pub struct InspectorDb {
     queued_capture_bytes: Arc<AtomicUsize>,
     /// Database file path (for display/diagnostics).
     pub db_path: PathBuf,
+    open_to_others: bool,
 }
 
 /// A write operation to be batched.
@@ -56,37 +57,71 @@ enum DbWrite {
 }
 
 impl InspectorDb {
-    /// Open (or create) the inspector database at `{project_dir}/.lpm/inspector.db`.
-    ///
-    /// Initializes the schema if the database is new. Starts the background
-    /// write-batching task.
-    pub fn open(project_dir: &Path) -> Result<Self, rusqlite::Error> {
+    /// Opens (or creates) `{project_dir}/.lpm/inspector.db` to record
+    /// captures, starting the background write-batching task. The capture
+    /// files are made owner-only first: a database others could open is
+    /// replaced with an owner-only copy (see [`OpenError`] for when it can't
+    /// be yet).
+    pub fn open(project_dir: &Path) -> Result<Self, OpenError> {
+        Self::open_project(project_dir, Access::Capture, CaptureOwner::of(project_dir)?)
+    }
+
+    /// Opens (or creates) `{project_dir}/.lpm/inspector.db` to read and
+    /// manage the captures recorded there, without recording any. Existing
+    /// files keep their access, so this works while another process records
+    /// to the database; [`Self::open_to_others`] says whether others could
+    /// open it.
+    pub fn open_for_review(project_dir: &Path) -> Result<Self, OpenError> {
+        Self::open_project(project_dir, Access::Review, CaptureOwner::of(project_dir)?)
+    }
+
+    fn open_project(
+        project_dir: &Path,
+        access: Access,
+        owner: CaptureOwner,
+    ) -> Result<Self, OpenError> {
         let lpm_dir = project_dir.join(".lpm");
         let db_path = lpm_dir.join("inspector.db");
-        prepare_lpm_dir(&lpm_dir).map_err(sqlite_io_error)?;
-        let _opening = lock_capture_files(&db_path)?;
-        if let Err(error) = ensure_captures_ignored(&lpm_dir) {
+        prepare_lpm_dir(&lpm_dir, owner, access)?;
+        let _opening = lock_capture_files(&db_path, owner)?;
+        remove_replacement_copy(&db_path)?;
+        if let Err(error) = ensure_captures_ignored(&lpm_dir, owner) {
             tracing::warn!("could not keep tunnel captures out of git: {error}");
         }
-        if prepare_capture_files(&db_path).map_err(sqlite_io_error)? {
-            replace_with_owner_only_copy(&db_path)?;
+        let mut open_to_others = prepare_capture_files(&db_path, owner, access)?;
+        if open_to_others && access == Access::Capture {
+            open_to_others = !replace_with_owner_only_copy(&db_path, owner)?;
         }
 
         // Write connection (owned by the background flush task)
-        let write_conn = open_capture_connection(&db_path, "NORMAL")?;
-        refuse_foreign_schema(&write_conn, &db_path)?;
-        init_schema(&write_conn)?;
+        let write_conn = open_capture_connection(&db_path, "NORMAL").map_err(damaged(&db_path))?;
+        refuse_unknown_schema(&write_conn, &db_path)?;
+        init_schema(&write_conn).map_err(damaged(&db_path))?;
 
         // Read connection (shared across API handlers). The busy timeout
         // lets low-frequency mutations (tag updates, session renames) wait
         // while the write connection flushes a batch.
-        let read_conn = open_capture_connection(&db_path, "NORMAL")?;
-        let control_conn = open_control_connection(&db_path)?;
+        let read_conn = open_capture_connection(&db_path, "NORMAL").map_err(damaged(&db_path))?;
+        let control_conn = open_control_connection(&db_path).map_err(damaged(&db_path))?;
 
+        Ok(Self::with_connections(
+            write_conn,
+            read_conn,
+            control_conn,
+            db_path,
+            open_to_others,
+        ))
+    }
+
+    fn with_connections(
+        write_conn: Connection,
+        read_conn: Connection,
+        control_conn: Connection,
+        db_path: PathBuf,
+        open_to_others: bool,
+    ) -> Self {
         let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE_CAPACITY);
         let queued_capture_bytes = Arc::new(AtomicUsize::new(0));
-
-        // Spawn background flush task
         let write_conn = Arc::new(Mutex::new(write_conn));
         tokio::spawn(flush_task(
             write_conn,
@@ -94,20 +129,22 @@ impl InspectorDb {
             Arc::clone(&queued_capture_bytes),
         ));
 
-        Ok(Self {
+        Self {
             read_conn: Arc::new(Mutex::new(read_conn)),
             control_conn: Arc::new(std::sync::Mutex::new(control_conn)),
             write_tx,
             queued_capture_bytes,
             db_path,
-        })
+            open_to_others,
+        }
     }
 
-    /// Open a temporary file-based database (for testing).
+    /// Open a temporary file-based database.
     ///
     /// Each call creates a unique database file so tests don't interfere
     /// with each other when running in parallel.
-    pub fn open_temp() -> Result<Self, rusqlite::Error> {
+    #[cfg(test)]
+    pub(crate) fn open_temp() -> Result<Self, rusqlite::Error> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -123,27 +160,25 @@ impl InspectorDb {
         let write_conn = Connection::open(&tmp)?;
         configure_connection(&write_conn, "NORMAL")?;
         init_schema(&write_conn)?;
-
         let read_conn = Connection::open(&tmp)?;
         configure_connection(&read_conn, "NORMAL")?;
         let control_conn = open_control_connection(&tmp)?;
 
-        let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE_CAPACITY);
-        let queued_capture_bytes = Arc::new(AtomicUsize::new(0));
-        let write_conn = Arc::new(Mutex::new(write_conn));
-        tokio::spawn(flush_task(
+        Ok(Self::with_connections(
             write_conn,
-            write_rx,
-            Arc::clone(&queued_capture_bytes),
-        ));
+            read_conn,
+            control_conn,
+            tmp,
+            false,
+        ))
+    }
 
-        Ok(Self {
-            read_conn: Arc::new(Mutex::new(read_conn)),
-            control_conn: Arc::new(std::sync::Mutex::new(control_conn)),
-            write_tx,
-            queued_capture_bytes,
-            db_path: tmp,
-        })
+    /// Whether other users could open the capture files when this handle
+    /// opened them: a database [`Self::open_for_review`] found so, or one on
+    /// a filesystem that shows its files open to others whatever their mode,
+    /// which [`Self::open`] can't make owner-only.
+    pub fn open_to_others(&self) -> bool {
+        self.open_to_others
     }
 
     /// Insert a captured request (non-blocking — queued for batch write).
@@ -728,7 +763,12 @@ impl InspectorDb {
     /// Remove captured requests and completed sessions from the inspector database.
     ///
     /// Open sessions are retained so another process can continue attaching
-    /// captures without violating the request-to-session foreign key.
+    /// captures without violating the request-to-session foreign key. The
+    /// captures leave no trace in the file: the full-text index, which keeps
+    /// a deleted entry's terms until its segments merge, is rebuilt from its
+    /// emptied content; `secure_delete` zeroes the freed pages; and the WAL,
+    /// which still holds the captures' earlier pages, is checkpointed and
+    /// truncated, unless another connection is reading at that moment.
     pub async fn clear_history(&self) -> Result<(), rusqlite::Error> {
         let conn = self.read_conn.lock().await;
         // Immediate: a deferred transaction that reads before it writes gets
@@ -737,9 +777,14 @@ impl InspectorDb {
         let tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM requests_fts", [])?;
+        tx.execute(
+            "INSERT INTO requests_fts(requests_fts) VALUES ('rebuild')",
+            [],
+        )?;
         tx.execute("DELETE FROM requests", [])?;
         tx.execute("DELETE FROM sessions WHERE ended_at IS NOT NULL", [])?;
-        tx.commit()
+        tx.commit()?;
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
     }
 
     /// Return SQLite's connection-local external-write revision.
@@ -753,6 +798,143 @@ impl InspectorDb {
     }
 }
 
+/// Why the capture database couldn't be opened.
+#[derive(Debug, thiserror::Error)]
+pub enum OpenError {
+    /// `.lpm` or a capture file failed a check or a file operation; the
+    /// message names it, and says what to do. One others could open that
+    /// another process has open, which [`InspectorDb::open`] can't replace
+    /// yet, is [`std::io::ErrorKind::ResourceBusy`].
+    #[error("{0}")]
+    Files(#[from] std::io::Error),
+    /// SQLite can't read the file as a database, or finds it damaged.
+    #[error(
+        "{} is damaged or isn't a capture database ({detail}); move it aside and retry",
+        path.display()
+    )]
+    Damaged { path: PathBuf, detail: String },
+    /// Any other SQLite failure.
+    #[error(transparent)]
+    Database(#[from] rusqlite::Error),
+}
+
+impl OpenError {
+    /// The I/O failure this is, for callers that report it as one.
+    pub fn kind(&self) -> std::io::ErrorKind {
+        match self {
+            Self::Files(error) => error.kind(),
+            Self::Damaged { .. } => std::io::ErrorKind::InvalidData,
+            Self::Database(_) => std::io::ErrorKind::Other,
+        }
+    }
+}
+
+/// Reads SQLite's refusal of a file it can't use as a database as such.
+fn damaged(db_path: &Path) -> impl Fn(rusqlite::Error) -> OpenError + '_ {
+    move |error| match error.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt) => {
+            OpenError::Damaged {
+                path: db_path.to_path_buf(),
+                detail: error.to_string(),
+            }
+        }
+        _ => OpenError::Database(error),
+    }
+}
+
+/// What an open of the capture database may change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Access {
+    /// Records captures: makes `.lpm` and the capture files safe to write
+    /// them to, replacing a database others could open.
+    Capture,
+    /// Reads and manages recorded captures. Changes no existing file's
+    /// access, and so runs while another process records to the database.
+    Review,
+}
+
+/// Whose capture files are. A user's own; under root, as in a container
+/// over a mounted checkout, the project directory's owner's, or root's.
+/// What root creates is given to that owner, so they can open it without
+/// root later; SQLite gives its sidecars to the database's owner itself.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+struct CaptureOwner {
+    uid: u32,
+    /// The group root gives what it creates to.
+    gid: u32,
+    as_root: bool,
+}
+
+#[cfg(unix)]
+impl CaptureOwner {
+    fn of(project_dir: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let uid = lpm_common::current_uid();
+        if uid != 0 {
+            return Ok(Self {
+                uid,
+                gid: 0,
+                as_root: false,
+            });
+        }
+        let project =
+            std::fs::metadata(project_dir).map_err(|error| with_path(project_dir, error))?;
+        Ok(Self {
+            uid: project.uid(),
+            gid: project.gid(),
+            as_root: true,
+        })
+    }
+
+    fn owns(self, metadata: &std::fs::Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt;
+
+        metadata.uid() == self.uid || (self.as_root && metadata.uid() == 0)
+    }
+
+    /// Gives a file or directory this process created to the owner, when
+    /// running as root.
+    fn give(self, handle: &std::fs::File, path: &Path) -> std::io::Result<()> {
+        if !self.as_root {
+            return Ok(());
+        }
+        std::os::unix::fs::fchown(handle, Some(self.uid), Some(self.gid))
+            .map_err(|error| with_path(path, error))
+    }
+
+    /// [`Self::give`] for an entry renamed into place, by its name, which
+    /// no one else can swap in a directory only its owner can write.
+    fn give_at(self, path: &Path) -> std::io::Result<()> {
+        if !self.as_root {
+            return Ok(());
+        }
+        std::os::unix::fs::lchown(path, Some(self.uid), Some(self.gid))
+            .map_err(|error| with_path(path, error))
+    }
+}
+
+/// Access to the capture files on Windows is the project's ACLs.
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Copy)]
+struct CaptureOwner;
+
+#[cfg(not(unix))]
+impl CaptureOwner {
+    fn of(_project_dir: &Path) -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    fn give(self, _handle: &std::fs::File, _path: &Path) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn give_at(self, _path: &Path) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// The `.lpm/.gitignore` line that keeps the capture database and its
 /// SQLite sidecars out of git, since captures hold request headers and
 /// bodies.
@@ -762,6 +944,19 @@ const CAPTURES_IGNORE_LINE: &str = "inspector.db*";
 /// keeps retrying what SQLite refuses at once while another connection is
 /// busy.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long opening waits for another LPM process to finish opening the
+/// capture files, which takes longest when one replaces a large database.
+const OPEN_LOCK_TIMEOUT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_secs(1)
+} else {
+    std::time::Duration::from_secs(10)
+};
+
+/// The longest string, blob or row SQLite builds: a capture's two bodies of
+/// at most 50 MiB each and its headers fit, and a database from elsewhere
+/// can't have SQLite build anything much larger for a capture written to it.
+const LONGEST_VALUE_BYTES: i32 = 128 * 1024 * 1024;
 
 /// The suffixes of the files SQLite keeps beside the capture database.
 const SQLITE_SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
@@ -781,10 +976,6 @@ fn capture_files(db_path: &Path) -> [PathBuf; 4] {
         capture_file(db_path, SQLITE_SIDECARS[1]),
         capture_file(db_path, SQLITE_SIDECARS[2]),
     ]
-}
-
-fn sqlite_io_error(error: std::io::Error) -> rusqlite::Error {
-    rusqlite::Error::ToSqlConversionFailure(Box::new(error))
 }
 
 fn with_path(path: &Path, error: std::io::Error) -> std::io::Error {
@@ -826,35 +1017,37 @@ fn hard_linked(path: &Path) -> std::io::Error {
     )
 }
 
-/// Whether an entry is a link: a symbolic link, or on Windows a junction.
-/// Other reparse points, such as a synced folder's cloud placeholders, are
-/// the project's own files.
-fn is_link(metadata: &std::fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
-}
-
 /// Makes sure `.lpm` is a directory of the project's own, creating it if
-/// needed: a link, which a cloned repository could point anywhere, such as
-/// into a directory it serves, is refused. On Unix it must also be the
-/// user's own, and is made writable by no one else, so no other user can
-/// swap the capture files' names between the checks below and SQLite's
-/// opens.
-fn prepare_lpm_dir(lpm_dir: &Path) -> std::io::Result<()> {
-    match std::fs::symlink_metadata(lpm_dir) {
-        Ok(metadata) if is_link(&metadata) || !metadata.is_dir() => {
-            return Err(linked_or_not(lpm_dir, "directory"));
-        }
-        Ok(_) => {}
+/// needed. A link, which a cloned repository could point anywhere, such as
+/// into a directory it serves, is refused; the metadata of a link, read
+/// without following it, is never a directory's. Reparse points other than
+/// links, such as a synced folder's placeholders on Windows, read as the
+/// directories they stand for. See [`restrict_lpm_dir`] for Unix.
+fn prepare_lpm_dir(lpm_dir: &Path, owner: CaptureOwner, access: Access) -> std::io::Result<()> {
+    let created = match std::fs::symlink_metadata(lpm_dir) {
+        Ok(metadata) if !metadata.is_dir() => return Err(linked_or_not(lpm_dir, "directory")),
+        Ok(_) => false,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             std::fs::create_dir_all(lpm_dir).map_err(|error| with_path(lpm_dir, error))?;
+            true
         }
         Err(error) => return Err(with_path(lpm_dir, error)),
-    }
-    restrict_lpm_dir(lpm_dir)
+    };
+    restrict_lpm_dir(lpm_dir, owner, access, created)
 }
 
+/// `.lpm` must be the capture owner's. A capture writer makes it writable
+/// by no one else, and on macOS clears its extended ACL, whose entries can
+/// grant what its mode doesn't and pass to the files created in it, so no
+/// other user can swap the capture files' names between the checks below
+/// and SQLite's opens, or read the files created there.
 #[cfg(unix)]
-fn restrict_lpm_dir(lpm_dir: &Path) -> std::io::Result<()> {
+fn restrict_lpm_dir(
+    lpm_dir: &Path,
+    owner: CaptureOwner,
+    access: Access,
+    created: bool,
+) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let directory =
@@ -863,8 +1056,14 @@ fn restrict_lpm_dir(lpm_dir: &Path) -> std::io::Result<()> {
     if !metadata.is_dir() {
         return Err(linked_or_not(lpm_dir, "directory"));
     }
-    if metadata.uid() != lpm_common::current_uid() {
+    if !owner.owns(&metadata) {
         return Err(another_users(lpm_dir));
+    }
+    if created {
+        owner.give(&directory, lpm_dir)?;
+    }
+    if access == Access::Review {
+        return Ok(());
     }
     let mode = metadata.mode() & 0o7777;
     if mode & 0o022 != 0 {
@@ -872,47 +1071,82 @@ fn restrict_lpm_dir(lpm_dir: &Path) -> std::io::Result<()> {
             .set_permissions(std::fs::Permissions::from_mode(mode & !0o022))
             .map_err(|error| with_path(lpm_dir, error))?;
     }
+    #[cfg(target_os = "macos")]
+    if lpm_common::macos_acl::has_extended_acl(&directory)? {
+        lpm_common::macos_acl::clear_extended_acl(&directory)
+            .map_err(|error| with_path(lpm_dir, error))?;
+    }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn restrict_lpm_dir(_lpm_dir: &Path) -> std::io::Result<()> {
+fn restrict_lpm_dir(
+    _lpm_dir: &Path,
+    _owner: CaptureOwner,
+    _access: Access,
+    _created: bool,
+) -> std::io::Result<()> {
     Ok(())
 }
 
 /// Holds other LPM processes off the capture files while this one checks,
 /// replaces and opens them. A process that opened the database while it was
-/// being replaced would go on writing to the old file.
+/// being replaced would go on writing to the old file. Releases before the
+/// lock don't take it.
 fn lock_capture_files(
     db_path: &Path,
-) -> Result<lpm_common::SingleFileExclusiveLockHandle, rusqlite::Error> {
+    owner: CaptureOwner,
+) -> std::io::Result<lpm_common::SingleFileExclusiveLockHandle> {
     let lock_path = capture_file(db_path, "-lock");
-    lpm_common::acquire_single_file_exclusive_lock_nofollow(&lock_path).map_err(|error| {
-        sqlite_io_error(std::io::Error::other(format!(
+    let file = lpm_common::open_lock_file_nofollow(&lock_path)
+        .map_err(|error| with_path(&lock_path, error))?;
+    owner.give(&file, &lock_path)?;
+    match lpm_common::acquire_single_file_exclusive_lock_from_file_within(file, OPEN_LOCK_TIMEOUT) {
+        Ok(Some(lock)) => Ok(lock),
+        Ok(None) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "another LPM process held {} for {} s while opening the captures; retry \
+                 once it has started",
+                lock_path.display(),
+                OPEN_LOCK_TIMEOUT.as_secs()
+            ),
+        )),
+        Err(error) => Err(std::io::Error::other(format!(
             "{}: {error}",
             lock_path.display()
-        )))
-    })
+        ))),
+    }
 }
 
-/// Makes the capture files safe to write before SQLite opens them, and says
-/// whether the database must be replaced, as others could open it or a
-/// sidecar. No capture file may be a link, another user's, or have other
-/// hard links. Existing ones are made owner-only, as a checkout or an older
-/// release may have left them readable (see [`restrict_capture_file`]).
-/// Sidecars without a database, which SQLite could read into a new one, are
-/// removed, and a new database is created owner-only, so it's never
-/// readable by others.
-fn prepare_capture_files(db_path: &Path) -> std::io::Result<bool> {
+/// Removes the copy, and its journal, of a replacement that didn't finish,
+/// as they hold captures. Only an open holding the lock makes one, so any
+/// found under it is left over.
+fn remove_replacement_copy(db_path: &Path) -> std::io::Result<()> {
+    let copy_path = capture_file(db_path, "-copy");
+    remove_if_present(&capture_file(&copy_path, "-journal"))?;
+    remove_if_present(&copy_path)
+}
+
+/// Checks the capture files before SQLite opens them, and says whether
+/// others could open them (see [`check_capture_file`]). No capture file may
+/// be a link, another user's (see [`CaptureOwner`]), or have other hard
+/// links. Sidecars without
+/// a database are a removed database's leftovers, which may hold its
+/// captures, and are removed; SQLite would only discard them on its next
+/// write. A missing database is created owner-only.
+fn prepare_capture_files(
+    db_path: &Path,
+    owner: CaptureOwner,
+    access: Access,
+) -> std::io::Result<bool> {
     let mut open_to_others = false;
     let mut database_exists = false;
     for path in capture_files(db_path) {
         match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if is_link(&metadata) || !metadata.is_file() => {
-                return Err(linked_or_not(&path, "file"));
-            }
+            Ok(metadata) if !metadata.is_file() => return Err(linked_or_not(&path, "file")),
             Ok(metadata) => {
-                open_to_others |= restrict_capture_file(&path, &metadata)?;
+                open_to_others |= check_capture_file(&path, &metadata, owner, access)?;
                 database_exists |= path == db_path;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -925,8 +1159,7 @@ fn prepare_capture_files(db_path: &Path) -> std::io::Result<bool> {
     for suffix in SQLITE_SIDECARS {
         remove_if_present(&capture_file(db_path, suffix))?;
     }
-    create_owner_only(db_path)?;
-    Ok(false)
+    Ok(!create_owner_only(db_path, owner)?)
 }
 
 fn remove_if_present(path: &Path) -> std::io::Result<()> {
@@ -936,28 +1169,43 @@ fn remove_if_present(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Checks an existing capture file and says whether others could open it.
-/// One they couldn't is made owner-only. One they could keeps its mode,
-/// made only the owner's to read and write as well, until the database is
-/// replaced, so a replacement that can't run yet runs on a later open.
-/// Modes are changed by name, which no other user can swap in a directory
-/// only its owner can write, rather than through a handle, whose closing
-/// would drop the locks SQLite holds on the file in this process, and which
-/// a file without read permission can't have. A file that's gone needs
-/// nothing: SQLite removes `-wal` and `-shm` when another process closes
-/// its last connection.
+/// Checks an existing capture file and says whether others could open it
+/// to read: its mode lets its group or anyone read it, or on macOS it has
+/// an extended ACL, whose entries can grant what the mode doesn't. A
+/// capture writer makes one others couldn't open owner-only. One they could
+/// keeps its mode, made only the owner's to read and write as well, until
+/// the database is replaced, so a replacement that can't run yet runs on a
+/// later open. Modes are read and changed by name, which no other user can
+/// swap in a directory only its owner can write, rather than through a
+/// handle, whose closing would drop the locks SQLite holds on the file in
+/// this process, and which a file without read permission can't have. A
+/// file that's gone needs nothing: SQLite removes `-wal` and `-shm` when
+/// another process closes its last connection.
 #[cfg(unix)]
-fn restrict_capture_file(path: &Path, metadata: &std::fs::Metadata) -> std::io::Result<bool> {
+fn check_capture_file(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    owner: CaptureOwner,
+    access: Access,
+) -> std::io::Result<bool> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    if metadata.uid() != lpm_common::current_uid() {
+    if !owner.owns(metadata) {
         return Err(another_users(path));
     }
     if metadata.nlink() > 1 {
         return Err(hard_linked(path));
     }
     let mode = metadata.mode() & 0o7777;
-    let open_to_others = mode & 0o077 != 0;
+    #[cfg(target_os = "macos")]
+    let extended_acl =
+        lpm_common::macos_acl::has_extended_acl_at(path).map_err(|error| with_path(path, error))?;
+    #[cfg(not(target_os = "macos"))]
+    let extended_acl = false;
+    let open_to_others = mode & 0o044 != 0 || extended_acl;
+    if access == Access::Review {
+        return Ok(open_to_others);
+    }
     let wanted = if open_to_others { mode | 0o600 } else { 0o600 };
     if mode != wanted {
         match std::fs::set_permissions(path, std::fs::Permissions::from_mode(wanted)) {
@@ -972,7 +1220,12 @@ fn restrict_capture_file(path: &Path, metadata: &std::fs::Metadata) -> std::io::
 /// Refuses an existing capture file with other hard links, read through a
 /// handle that doesn't follow a link. Access to it is the project's ACLs.
 #[cfg(not(unix))]
-fn restrict_capture_file(path: &Path, _metadata: &std::fs::Metadata) -> std::io::Result<bool> {
+fn check_capture_file(
+    path: &Path,
+    _metadata: &std::fs::Metadata,
+    _owner: CaptureOwner,
+    _access: Access,
+) -> std::io::Result<bool> {
     let file = match lpm_common::open_nofollow(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -984,81 +1237,146 @@ fn restrict_capture_file(path: &Path, _metadata: &std::fs::Metadata) -> std::io:
     Ok(false)
 }
 
+/// Creates a capture file only its owner can open, given to the capture
+/// owner, and says whether it reads that way: a filesystem without Unix
+/// modes, such as FAT or a Windows drive mounted in Linux, shows the mode it
+/// likes. On macOS, extended ACL entries it inherited are cleared. A file
+/// that appears at the name meanwhile, made by an LPM release that doesn't
+/// take the lock, is refused until a retry checks it; `O_EXCL` also refuses
+/// a link there.
 #[cfg(unix)]
-fn create_owner_only(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
+fn create_owner_only(path: &Path, owner: CaptureOwner) -> std::io::Result<bool> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-    match std::fs::OpenOptions::new()
+    let file = match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(path)
     {
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(with_path(path, error)),
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "{} appeared while LPM was creating it; retry",
+                    path.display()
+                ),
+            ));
+        }
+        Err(error) => return Err(with_path(path, error)),
+    };
+    owner.give(&file, path)?;
+    #[cfg(target_os = "macos")]
+    if lpm_common::macos_acl::has_extended_acl(&file)? {
+        lpm_common::macos_acl::clear_extended_acl(&file).map_err(|error| with_path(path, error))?;
     }
+    let mode = file.metadata()?.mode();
+    #[cfg(test)]
+    let mode = if tests::MODELESS_FILESYSTEM.get() {
+        mode | 0o777
+    } else {
+        mode
+    };
+    Ok(mode & 0o044 == 0)
 }
 
 #[cfg(not(unix))]
-fn create_owner_only(_path: &Path) -> std::io::Result<()> {
-    Ok(())
+fn create_owner_only(_path: &Path, _owner: CaptureOwner) -> std::io::Result<bool> {
+    Ok(true)
 }
 
-/// Replaces a capture database others could open with an owner-only copy.
-/// Making the file owner-only stops new opens, but not a handle another user
-/// opened while it was readable, which would go on reading every capture
-/// written after; the copy is a new file such a handle doesn't reach. A
-/// database another process has open isn't replaced, since that process
-/// would go on writing to the old file.
-fn replace_with_owner_only_copy(db_path: &Path) -> Result<(), rusqlite::Error> {
-    let in_use = || {
-        sqlite_io_error(std::io::Error::new(
-            std::io::ErrorKind::ResourceBusy,
-            format!(
-                "{} is open to other users, and another process has it open, so it \
-                 can't be replaced with an owner-only copy yet; stop other `lpm tunnel` \
-                 and `lpm dev` runs in this project and retry",
-                db_path.display()
-            ),
-        ))
-    };
-    let database = open_nofollow_connection(db_path)?;
-    // Leaving WAL needs the only connection, so it also proves no other
-    // process has the database open, and folds the WAL into the file.
+/// Replaces a capture database others could open with an owner-only copy,
+/// and says whether it did. Making the file owner-only stops new opens, but
+/// not a handle another user opened while it was readable, which would go
+/// on reading every capture written after; the copy is a new file such a
+/// handle doesn't reach. As one others could open may have come from
+/// anywhere, its schema and integrity are checked first. A database another
+/// process has open isn't replaced, since that process would go on writing
+/// to the old file. Nor is one on a filesystem that shows the copy open to
+/// others too, which the copy wouldn't improve.
+fn replace_with_owner_only_copy(db_path: &Path, owner: CaptureOwner) -> Result<bool, OpenError> {
+    let database = open_nofollow_connection(db_path).map_err(damaged(db_path))?;
+    refuse_unknown_schema(&database, db_path)?;
+    // In WAL, which every LPM connection uses, leaving it needs the only
+    // connection, so it proves no other LPM process has the database open,
+    // and folds the WAL into the file.
     match database.query_row("PRAGMA journal_mode=DELETE", [], |row| {
         row.get::<_, String>(0)
     }) {
         Ok(mode) if mode.eq_ignore_ascii_case("delete") => {}
-        Ok(_) => return Err(in_use()),
-        Err(error) if is_busy(&error) => return Err(in_use()),
-        Err(error) => return Err(error),
+        Ok(_) => return Err(in_use(db_path)),
+        Err(error) if is_busy(&error) => return Err(in_use(db_path)),
+        Err(error) => return Err(damaged(db_path)(error)),
     }
+    refuse_damage(&database, db_path)?;
 
     let copy_path = capture_file(db_path, "-copy");
-    for path in [&copy_path, &capture_file(&copy_path, "-journal")] {
-        remove_if_present(path).map_err(sqlite_io_error)?;
-    }
-    create_owner_only(&copy_path).map_err(sqlite_io_error)?;
-    {
-        let mut copy = open_nofollow_connection(&copy_path)?;
-        let backup = rusqlite::backup::Backup::new(&database, &mut copy)?;
-        let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
-        loop {
-            match backup.step(-1)? {
-                rusqlite::backup::StepResult::Done => break,
-                _ if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                _ => return Err(in_use()),
-            }
-        }
+    let copied = copy_database(&database, &copy_path, owner, db_path);
+    if !matches!(copied, Ok(true)) {
+        drop(database);
+        let removed = remove_replacement_copy(db_path);
+        return match (copied, removed) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error.into()),
+            (Ok(_), Ok(())) => Ok(false),
+        };
     }
     drop(database);
     for suffix in SQLITE_SIDECARS {
-        remove_if_present(&capture_file(db_path, suffix)).map_err(sqlite_io_error)?;
+        remove_if_present(&capture_file(db_path, suffix))?;
     }
-    std::fs::rename(&copy_path, db_path).map_err(|error| sqlite_io_error(with_path(db_path, error)))
+    std::fs::rename(&copy_path, db_path).map_err(|error| with_path(db_path, error))?;
+    Ok(true)
+}
+
+fn in_use(db_path: &Path) -> OpenError {
+    OpenError::Files(std::io::Error::new(
+        std::io::ErrorKind::ResourceBusy,
+        format!(
+            "{} is open to other users, and another process has it open, so it can't \
+             be replaced with an owner-only copy yet; close what has it open, such as \
+             other `lpm tunnel` and `lpm dev` runs in this project, and retry",
+            db_path.display()
+        ),
+    ))
+}
+
+/// Copies the database into a new owner-only file, and says whether it
+/// did: not when the new file doesn't read owner-only. A lock another
+/// connection holds on the database is waited out for the busy timeout,
+/// inside the copy's one step.
+fn copy_database(
+    database: &Connection,
+    copy_path: &Path,
+    owner: CaptureOwner,
+    db_path: &Path,
+) -> Result<bool, OpenError> {
+    if !create_owner_only(copy_path, owner)? {
+        return Ok(false);
+    }
+    let mut copy = open_nofollow_connection(copy_path)?;
+    let backup = rusqlite::backup::Backup::new(database, &mut copy)?;
+    match backup.step(-1).map_err(damaged(db_path))? {
+        rusqlite::backup::StepResult::Done => Ok(true),
+        _ => Err(in_use(db_path)),
+    }
+}
+
+/// Refuses a database SQLite finds damaged, in its pages and records or in
+/// its full-text index, whose damage a crafted file could aim at SQLite's
+/// full-text code: `quick_check` runs the index's own check too.
+fn refuse_damage(connection: &Connection, db_path: &Path) -> Result<(), OpenError> {
+    let pages: String = connection
+        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
+        .map_err(damaged(db_path))?;
+    if pages != "ok" {
+        return Err(OpenError::Damaged {
+            path: db_path.to_path_buf(),
+            detail: lpm_common::sanitize_terminal_inline(&pages).into_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Opens a capture database without following a link at its path, with the
@@ -1081,7 +1399,9 @@ fn connect_nofollow(path: &Path) -> Result<Connection, rusqlite::Error> {
             _ => Path::new("."),
         };
         std::fs::canonicalize(directory)
-            .map_err(|error| sqlite_io_error(with_path(directory, error)))?
+            .map_err(|error| {
+                rusqlite::Error::ToSqlConversionFailure(Box::new(with_path(directory, error)))
+            })?
             .join(path.file_name().unwrap_or(path.as_os_str()))
     };
     Connection::open_with_flags(
@@ -1090,15 +1410,21 @@ fn connect_nofollow(path: &Path) -> Result<Connection, rusqlite::Error> {
     )
 }
 
-/// What every capture connection has: a database from a repository or
-/// another tool can't run schema code with side effects or write SQLite's
-/// internal tables, and a busy database is waited for.
+/// What every capture connection has. A database from a repository or
+/// another tool can't run schema code with side effects, write SQLite's
+/// internal tables, or have SQLite build a value larger than
+/// [`LONGEST_VALUE_BYTES`]; SQLite checks each page's cells as it reads
+/// them; deleted captures are overwritten, not left in free pages; and a
+/// busy database is waited for.
 fn harden_connection(connection: &Connection) -> Result<(), rusqlite::Error> {
     use rusqlite::config::DbConfig;
+    use rusqlite::limits::Limit;
 
     connection.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
     connection.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
-    connection.busy_timeout(BUSY_TIMEOUT)
+    connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, LONGEST_VALUE_BYTES)?;
+    connection.busy_timeout(BUSY_TIMEOUT)?;
+    connection.execute_batch("PRAGMA cell_size_check=ON; PRAGMA secure_delete=ON;")
 }
 
 /// Opens a capture connection in WAL, with `synchronous` as its sync level.
@@ -1141,26 +1467,88 @@ fn is_busy(error: &rusqlite::Error) -> bool {
     )
 }
 
-/// Refuses a database whose schema holds triggers or views, which LPM never
-/// creates: one from a repository or another tool could run them on every
-/// capture written.
-fn refuse_foreign_schema(connection: &Connection, db_path: &Path) -> Result<(), rusqlite::Error> {
-    let foreign: bool = connection.query_row(
-        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type IN ('trigger', 'view'))",
-        [],
-        |row| row.get(0),
-    )?;
-    if foreign {
-        return Err(sqlite_io_error(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "{} holds triggers or views, which LPM never creates; move it aside \
-                 and retry",
-                db_path.display()
-            ),
-        )));
+/// A schema object as SQLite stores it: its type, name, table and SQL, the
+/// SQL in its [`canonical_sql`] form.
+type SchemaObject = (String, String, String, Option<String>);
+
+/// SQL without the whitespace that separates nothing: a run of whitespace
+/// is kept, as one space, only between two word characters, so the text an
+/// `ALTER TABLE` splices in reads the same however it's spaced.
+fn canonical_sql(sql: &str) -> String {
+    let is_word = |character: char| character.is_alphanumeric() || character == '_';
+    let mut canonical = String::with_capacity(sql.len());
+    let mut spaced = false;
+    for character in sql.chars() {
+        if character.is_whitespace() {
+            spaced = true;
+            continue;
+        }
+        if spaced && canonical.ends_with(is_word) && is_word(character) {
+            canonical.push(' ');
+        }
+        spaced = false;
+        canonical.push(character);
     }
-    Ok(())
+    canonical
+}
+
+/// The database's schema objects, but for the query planner's statistics,
+/// which run nothing.
+fn schema_objects(connection: &Connection) -> Result<Vec<SchemaObject>, rusqlite::Error> {
+    let mut statement = connection.prepare(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master
+         WHERE substr(name, 1, 11) <> 'sqlite_stat'",
+    )?;
+    statement
+        .query_map([], |row| {
+            let sql: Option<String> = row.get(3)?;
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                sql.as_deref().map(canonical_sql),
+            ))
+        })?
+        .collect()
+}
+
+/// LPM's own schema objects: those [`CAPTURE_SCHEMA`] creates, which a
+/// database from an earlier release may hold as they are, and those after
+/// [`ensure_capture_schema`] upgrades them, both built by this SQLite in
+/// memory.
+fn lpm_schema() -> Result<std::collections::HashSet<SchemaObject>, rusqlite::Error> {
+    let connection = Connection::open_in_memory()?;
+    connection.execute_batch(CAPTURE_SCHEMA)?;
+    let mut objects: std::collections::HashSet<_> =
+        schema_objects(&connection)?.into_iter().collect();
+    ensure_capture_schema(&connection)?;
+    objects.extend(schema_objects(&connection)?);
+    Ok(objects)
+}
+
+/// Refuses a database holding a schema object LPM never creates. One from
+/// a repository or another tool could otherwise run code of its own on
+/// every capture written: a trigger, or a check, default, generated column
+/// or index expression that's slow by design.
+fn refuse_unknown_schema(connection: &Connection, db_path: &Path) -> Result<(), OpenError> {
+    let known = lpm_schema()?;
+    let unknown: Vec<String> = schema_objects(connection)
+        .map_err(damaged(db_path))?
+        .into_iter()
+        .filter(|object| !known.contains(object))
+        .map(|(kind, name, _, _)| format!("{kind} {}", lpm_common::sanitize_terminal_inline(&name)))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    Err(OpenError::Files(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "{} holds schema LPM never creates ({}); move it aside and retry",
+            db_path.display(),
+            unknown.join(", ")
+        ),
+    )))
 }
 
 /// A `.gitignore` line as git reads it: without one trailing carriage
@@ -1218,8 +1606,8 @@ fn could_name_a_capture_file(pattern: &[u8]) -> bool {
 /// project's, being a link or not a regular file, or that its owner keeps
 /// from being written, being read-only or on Unix another user's, is left
 /// as it is; the CLI's capture warning then says git doesn't ignore the
-/// captures.
-fn ensure_captures_ignored(lpm_dir: &Path) -> std::io::Result<()> {
+/// captures. Under root, the file written is given to the capture owner.
+fn ensure_captures_ignored(lpm_dir: &Path, owner: CaptureOwner) -> std::io::Result<()> {
     let path = lpm_dir.join(".gitignore");
     let (existing, metadata) = match lpm_common::read_file_capped_unlinked(
         &path,
@@ -1233,7 +1621,7 @@ fn ensure_captures_ignored(lpm_dir: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     if let Some(metadata) = &metadata {
-        refuse_kept_from_writing(&path, metadata)?;
+        refuse_kept_from_writing(&path, metadata, owner)?;
     }
     let newline: &[u8] = if existing.windows(2).any(|pair| pair == b"\r\n") {
         b"\r\n"
@@ -1248,15 +1636,21 @@ fn ensure_captures_ignored(lpm_dir: &Path) -> std::io::Result<()> {
     updated.extend_from_slice(newline);
     updated.extend_from_slice(CAPTURES_IGNORE_LINE.as_bytes());
     updated.extend_from_slice(newline);
-    lpm_common::write_file_atomic(&path, updated)
+    lpm_common::write_file_atomic(&path, updated)?;
+    owner.give_at(&path)
 }
 
-fn refuse_kept_from_writing(path: &Path, metadata: &std::fs::Metadata) -> std::io::Result<()> {
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn refuse_kept_from_writing(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    owner: CaptureOwner,
+) -> std::io::Result<()> {
     #[cfg(unix)]
     let read_only = {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::fs::PermissionsExt;
 
-        if metadata.uid() != lpm_common::current_uid() {
+        if !owner.owns(metadata) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!("{} belongs to another user", path.display()),
@@ -1282,8 +1676,13 @@ fn open_control_connection(path: &Path) -> Result<Connection, rusqlite::Error> {
 }
 
 fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS sessions (
+    conn.execute_batch(CAPTURE_SCHEMA)?;
+    ensure_capture_schema(conn)
+}
+
+/// The capture tables and indexes, as every release has created them;
+/// [`ensure_capture_schema`] upgrades them since.
+const CAPTURE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS sessions (
              id TEXT PRIMARY KEY,
              name TEXT,
              domain TEXT,
@@ -1327,10 +1726,7 @@ fn init_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
 
          CREATE VIRTUAL TABLE IF NOT EXISTS requests_fts USING fts5(
              path, summary, request_body, response_body
-         );",
-    )?;
-    ensure_capture_schema(conn)
-}
+         );";
 
 fn ensure_capture_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
@@ -1749,6 +2145,19 @@ mod tests {
     use lpm_tunnel::webhook::WebhookProvider;
     use std::collections::HashMap;
 
+    #[cfg(unix)]
+    thread_local! {
+        /// Makes this thread's new capture files read as a filesystem
+        /// without Unix modes shows them: open to anyone.
+        pub(super) static MODELESS_FILESYSTEM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// The capture owner of a project of this user's.
+    #[cfg(unix)]
+    fn this_user() -> CaptureOwner {
+        CaptureOwner::of(Path::new(".")).unwrap()
+    }
+
     const CAPTURES_IGNORED: &str =
         "# LPM tunnel captures hold request headers and bodies.\ninspector.db*\n";
 
@@ -1958,7 +2367,7 @@ mod tests {
             return;
         };
 
-        let error = refuse_kept_from_writing(&path, &metadata).unwrap_err();
+        let error = refuse_kept_from_writing(&path, &metadata, this_user()).unwrap_err();
 
         assert!(
             error.to_string().contains("belongs to another user"),
@@ -2009,7 +2418,8 @@ mod tests {
             return;
         }
 
-        let error = restrict_lpm_dir(Path::new("/usr")).unwrap_err();
+        let error =
+            restrict_lpm_dir(Path::new("/usr"), this_user(), Access::Review, false).unwrap_err();
 
         assert!(
             error.to_string().contains("belongs to another user"),
@@ -2024,7 +2434,7 @@ mod tests {
             return;
         };
 
-        let error = restrict_capture_file(&path, &metadata).unwrap_err();
+        let error = check_capture_file(&path, &metadata, this_user(), Access::Review).unwrap_err();
 
         assert!(
             error.to_string().contains("belongs to another user"),
@@ -2034,7 +2444,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn restricting_a_capture_file_that_vanished_needs_nothing() {
+    fn checking_a_capture_file_that_vanished_needs_nothing() {
         let project = tempfile::tempdir().unwrap();
         let path = project.path().join("inspector.db-wal");
         std::fs::write(&path, b"").unwrap();
@@ -2042,7 +2452,7 @@ mod tests {
         let metadata = std::fs::symlink_metadata(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
 
-        assert!(!restrict_capture_file(&path, &metadata).unwrap());
+        assert!(!check_capture_file(&path, &metadata, this_user(), Access::Capture).unwrap());
     }
 
     #[cfg(unix)]
@@ -2056,7 +2466,9 @@ mod tests {
         set_mode(&served, 0o644);
         std::fs::hard_link(&served, lpm_dir.join("inspector.db")).unwrap();
 
-        let error = prepare_capture_files(&lpm_dir.join("inspector.db")).unwrap_err();
+        let error =
+            prepare_capture_files(&lpm_dir.join("inspector.db"), this_user(), Access::Capture)
+                .unwrap_err();
 
         assert!(error.to_string().contains("other hard links"), "{error}");
         assert_eq!(mode(&served), 0o644);
@@ -2098,15 +2510,18 @@ mod tests {
         for (name, leftover_mode) in [
             ("inspector.db", 0o000),
             ("inspector.db-wal", 0o400),
-            ("inspector.db-shm", 0o700),
-            ("inspector.db-journal", 0o600),
+            ("inspector.db-shm", 0o733),
+            ("inspector.db-journal", 0o611),
         ] {
             let path = lpm_dir.join(name);
             std::fs::write(&path, b"").unwrap();
             set_mode(&path, leftover_mode);
         }
 
-        assert!(!prepare_capture_files(&lpm_dir.join("inspector.db")).unwrap());
+        assert!(
+            !prepare_capture_files(&lpm_dir.join("inspector.db"), this_user(), Access::Capture)
+                .unwrap()
+        );
 
         for name in [
             "inspector.db",
@@ -2130,9 +2545,32 @@ mod tests {
             set_mode(&path, leftover_mode);
         }
 
-        assert!(prepare_capture_files(&lpm_dir.join("inspector.db")).unwrap());
+        assert!(
+            prepare_capture_files(&lpm_dir.join("inspector.db"), this_user(), Access::Capture)
+                .unwrap()
+        );
 
         assert_eq!(mode(&lpm_dir.join("inspector.db-wal")), 0o604);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preparing_reads_a_capture_file_its_group_could_read_as_open_to_others() {
+        let project = tempfile::tempdir().unwrap();
+        let lpm_dir = project.path().join(".lpm");
+        std::fs::create_dir(&lpm_dir).unwrap();
+        for (name, leftover_mode) in [("inspector.db", 0o600), ("inspector.db-shm", 0o440)] {
+            let path = lpm_dir.join(name);
+            std::fs::write(&path, b"").unwrap();
+            set_mode(&path, leftover_mode);
+        }
+
+        assert!(
+            prepare_capture_files(&lpm_dir.join("inspector.db"), this_user(), Access::Capture)
+                .unwrap()
+        );
+
+        assert_eq!(mode(&lpm_dir.join("inspector.db-shm")), 0o640);
     }
 
     #[cfg(unix)]
@@ -2151,7 +2589,10 @@ mod tests {
             set_mode(&path, 0o644);
         }
 
-        assert!(!prepare_capture_files(&lpm_dir.join("inspector.db")).unwrap());
+        assert!(
+            !prepare_capture_files(&lpm_dir.join("inspector.db"), this_user(), Access::Capture)
+                .unwrap()
+        );
 
         for name in [
             "inspector.db-wal",
@@ -2231,7 +2672,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn opening_waits_to_replace_a_database_another_process_has_open() {
+    fn opening_waits_to_replace_a_database_another_connection_has_open() {
         let project = project_with_a_capture();
         let db_path = project.path().join(".lpm/inspector.db");
         set_mode(&db_path, 0o644);
@@ -2252,6 +2693,8 @@ mod tests {
             error.to_string().contains("another process has it open"),
             "{error}"
         );
+        assert_eq!(error.kind(), std::io::ErrorKind::ResourceBusy);
+        assert!(!error.to_string().contains("Move or repair"), "{error}");
         // Leaving WAL tells at once; the copy's own wait is the busy timeout.
         assert!(started.elapsed() < std::time::Duration::from_secs(4));
         assert_eq!(mode(&db_path), 0o644);
@@ -2260,26 +2703,542 @@ mod tests {
         assert_eq!(mode(&db_path), 0o600);
     }
 
-    #[tokio::test]
-    async fn opening_refuses_a_database_with_triggers_or_views() {
-        for statement in [
-            "CREATE TRIGGER copy_requests AFTER INSERT ON requests BEGIN SELECT 1; END;",
-            "CREATE VIEW recent AS SELECT * FROM requests;",
-        ] {
-            let project = tempfile::tempdir().unwrap();
-            std::fs::create_dir(project.path().join(".lpm")).unwrap();
-            let db_path = project.path().join(".lpm/inspector.db");
-            Connection::open(&db_path)
-                .unwrap()
-                .execute_batch(&format!("CREATE TABLE requests (id TEXT); {statement}"))
+    /// Holds the lock openers take while they check, replace and open the
+    /// capture files.
+    fn hold_capture_lock(project: &Path) -> lpm_common::SingleFileExclusiveLockHandle {
+        let file =
+            lpm_common::open_lock_file_nofollow(&project.join(".lpm/inspector.db-lock")).unwrap();
+        lpm_common::acquire_single_file_exclusive_lock_from_file_within(
+            file,
+            std::time::Duration::ZERO,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    /// Opens a project's capture database, as `open` would, on a thread of
+    /// its own with a runtime of its own, and drops it.
+    fn open_on_a_thread(
+        project: &Path,
+        open: fn(&Path) -> Result<InspectorDb, OpenError>,
+    ) -> std::thread::JoinHandle<Result<(), OpenError>> {
+        let project = project.to_path_buf();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
                 .unwrap();
-            #[cfg(unix)]
-            set_mode(&db_path, 0o600);
+            runtime.block_on(async { open(&project).map(drop) })
+        })
+    }
 
-            let error = InspectorDb::open(project.path()).map(drop).unwrap_err();
+    #[cfg(unix)]
+    #[test]
+    fn reviewing_leaves_a_database_others_could_open_as_it_is_and_says_so() {
+        use std::os::unix::fs::MetadataExt;
 
-            assert!(error.to_string().contains("triggers or views"), "{error}");
+        let project = project_with_a_capture();
+        let lpm_dir = project.path().join(".lpm");
+        let db_path = lpm_dir.join("inspector.db");
+        set_mode(&db_path, 0o644);
+        set_mode(&lpm_dir, 0o775);
+        let inode = std::fs::metadata(&db_path).unwrap().ino();
+        // A process recording to it, which a writer's open would refuse to
+        // replace it under.
+        let recording = Connection::open(&db_path).unwrap();
+        recording
+            .query_row("SELECT count(*) FROM requests", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+
+        let reviewing = tokio::runtime::Runtime::new().unwrap();
+        let (open_to_others, kept) = reviewing.block_on(async {
+            let db = InspectorDb::open_for_review(project.path()).unwrap();
+            (db.open_to_others(), db.get_webhook("kept").await.unwrap())
+        });
+        // Shutting the runtime down closes the review's connections, as the
+        // end of its process would.
+        drop(reviewing);
+
+        assert!(open_to_others);
+        assert!(kept.is_some());
+        assert_eq!(mode(&db_path), 0o644);
+        assert_eq!(mode(&lpm_dir), 0o775);
+        assert_eq!(std::fs::metadata(&db_path).unwrap().ino(), inode);
+        drop(recording);
+        let open_to_others = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { InspectorDb::open(project.path()).unwrap().open_to_others() });
+        assert!(!open_to_others);
+        assert_eq!(mode(&db_path), 0o600);
+        assert_eq!(mode(&lpm_dir), 0o755);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reviewing_a_new_project_creates_an_owner_only_database() {
+        let project = tempfile::tempdir().unwrap();
+
+        let db = InspectorDb::open_for_review(project.path()).unwrap();
+
+        assert!(!db.open_to_others());
+        assert_eq!(mode(&project.path().join(".lpm/inspector.db")), 0o600);
+        assert_eq!(lpm_gitignore(project.path()), CAPTURES_IGNORED);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reviewing_leaves_capture_files_others_couldnt_open_as_they_are() {
+        let project = tempfile::tempdir().unwrap();
+        drop(InspectorDb::open(project.path()).unwrap());
+        let db_path = project.path().join(".lpm/inspector.db");
+        set_mode(&db_path, 0o620);
+
+        let db = InspectorDb::open_for_review(project.path()).unwrap();
+
+        assert!(!db.open_to_others());
+        assert_eq!(mode(&db_path), 0o620);
+    }
+
+    #[tokio::test]
+    async fn every_open_removes_a_replacement_copy_left_over() {
+        for open in [InspectorDb::open, InspectorDb::open_for_review] {
+            let project = tempfile::tempdir().unwrap();
+            let lpm_dir = project.path().join(".lpm");
+            std::fs::create_dir(&lpm_dir).unwrap();
+            std::fs::write(lpm_dir.join("inspector.db-copy"), b"captures").unwrap();
+            std::fs::write(lpm_dir.join("inspector.db-copy-journal"), b"captures").unwrap();
+
+            drop(open(project.path()).unwrap());
+
+            assert!(!lpm_dir.join("inspector.db-copy").exists());
+            assert!(!lpm_dir.join("inspector.db-copy-journal").exists());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_filesystem_without_modes_keeps_its_database_and_says_it_s_open_to_others() {
+        use std::os::unix::fs::MetadataExt;
+
+        let project = project_with_a_capture();
+        let db_path = project.path().join(".lpm/inspector.db");
+        set_mode(&db_path, 0o644);
+        let inode = std::fs::metadata(&db_path).unwrap().ino();
+        let fresh = tempfile::tempdir().unwrap();
+        MODELESS_FILESYSTEM.set(true);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (existing, kept, new) = runtime.block_on(async {
+            let db = InspectorDb::open(project.path()).unwrap();
+            let kept = db.get_webhook("kept").await.unwrap();
+            let new = InspectorDb::open(fresh.path()).unwrap().open_to_others();
+            (db.open_to_others(), kept, new)
+        });
+        MODELESS_FILESYSTEM.set(false);
+
+        assert!(existing);
+        assert!(new);
+        assert!(kept.is_some());
+        assert_eq!(std::fs::metadata(&db_path).unwrap().ino(), inode);
+        assert!(!project.path().join(".lpm/inspector.db-copy").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_accepts_the_project_owner_s_files_and_its_own() {
+        let as_root = CaptureOwner {
+            uid: 501,
+            gid: 20,
+            as_root: true,
+        };
+        let as_user = CaptureOwner {
+            uid: 501,
+            gid: 0,
+            as_root: false,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let mine = std::fs::symlink_metadata(directory.path()).unwrap();
+        let roots = std::fs::symlink_metadata("/").unwrap();
+        let me = CaptureOwner {
+            uid: lpm_common::current_uid(),
+            ..as_root
+        };
+
+        assert!(as_root.owns(&roots));
+        assert!(!as_user.owns(&roots));
+        assert!(me.owns(&mine));
+        assert!(
+            !CaptureOwner {
+                uid: lpm_common::current_uid() + 1,
+                ..as_user
+            }
+            .owns(&mine)
+        );
+    }
+
+    /// A group this user is in besides the one its files get, or None.
+    #[cfg(unix)]
+    fn another_group_of_mine(file: &Path) -> Option<u32> {
+        use std::os::unix::fs::MetadataExt;
+
+        let primary = std::fs::metadata(file).unwrap().gid();
+        let groups = std::process::Command::new("id").arg("-G").output().ok()?;
+        String::from_utf8_lossy(&groups.stdout)
+            .split_whitespace()
+            .filter_map(|group| group.parse().ok())
+            .find(|group| *group != primary)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_gives_what_it_creates_to_the_project_s_owner() {
+        use std::os::unix::fs::MetadataExt;
+
+        let project = project_with_a_capture();
+        let Some(group) = another_group_of_mine(project.path()) else {
+            return;
+        };
+        let lpm_dir = project.path().join(".lpm");
+        set_mode(&lpm_dir.join("inspector.db"), 0o644);
+        std::fs::remove_file(lpm_dir.join("inspector.db-lock")).unwrap();
+        std::fs::remove_file(lpm_dir.join(".gitignore")).unwrap();
+        let fresh = tempfile::tempdir().unwrap();
+        // Root's opens give what they create to the project's owner; this
+        // user, chowning to itself, can stand in for root by giving files a
+        // group of its own instead.
+        let owner = CaptureOwner {
+            uid: lpm_common::current_uid(),
+            gid: group,
+            as_root: true,
+        };
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            drop(InspectorDb::open_project(project.path(), Access::Capture, owner).unwrap());
+            drop(InspectorDb::open_project(fresh.path(), Access::Review, owner).unwrap());
+        });
+
+        for path in [
+            lpm_dir.join("inspector.db"),
+            lpm_dir.join("inspector.db-lock"),
+            lpm_dir.join(".gitignore"),
+            fresh.path().join(".lpm"),
+            fresh.path().join(".lpm/inspector.db"),
+            fresh.path().join(".lpm/inspector.db-lock"),
+            fresh.path().join(".lpm/.gitignore"),
+        ] {
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().gid(),
+                group,
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn add_acl_entry(path: &Path, entry: &str) {
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", entry])
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn has_acl(path: &Path) -> bool {
+        lpm_common::macos_acl::has_extended_acl_at(path).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_capture_file_with_an_extended_acl_is_open_to_others() {
+        use std::os::unix::fs::MetadataExt;
+
+        let project = project_with_a_capture();
+        let db_path = project.path().join(".lpm/inspector.db");
+        add_acl_entry(&db_path, "group:everyone allow read");
+        let inode = std::fs::metadata(&db_path).unwrap().ino();
+
+        let reviewing = tokio::runtime::Runtime::new().unwrap();
+        let reviewed = reviewing.block_on(async {
+            InspectorDb::open_for_review(project.path())
+                .unwrap()
+                .open_to_others()
+        });
+        drop(reviewing);
+        assert!(reviewed);
+        assert!(has_acl(&db_path));
+
+        let (open_to_others, kept) = tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let db = InspectorDb::open(project.path()).unwrap();
+            (db.open_to_others(), db.get_webhook("kept").await.unwrap())
+        });
+
+        assert!(!open_to_others);
+        assert!(kept.is_some());
+        assert!(!has_acl(&db_path));
+        assert_ne!(std::fs::metadata(&db_path).unwrap().ino(), inode);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn an_extended_acl_lpm_passes_on_reaches_no_capture_file() {
+        const INHERITED: &str = "group:everyone allow read,write,file_inherit,directory_inherit";
+
+        let reviewed = tempfile::tempdir().unwrap();
+        let reviewed_lpm = reviewed.path().join(".lpm");
+        std::fs::create_dir(&reviewed_lpm).unwrap();
+        add_acl_entry(&reviewed_lpm, INHERITED);
+        let db = InspectorDb::open_for_review(reviewed.path()).unwrap();
+        assert!(!db.open_to_others());
+        assert!(has_acl(&reviewed_lpm));
+        assert!(!has_acl(&reviewed_lpm.join("inspector.db")));
+
+        let captured = tempfile::tempdir().unwrap();
+        let captured_lpm = captured.path().join(".lpm");
+        std::fs::create_dir(&captured_lpm).unwrap();
+        add_acl_entry(&captured_lpm, INHERITED);
+        let db = InspectorDb::open(captured.path()).unwrap();
+        db.insert_durable_request(Arc::new(make_webhook("kept", 200)), None)
+            .await
+            .unwrap();
+        assert!(!db.open_to_others());
+        assert!(!has_acl(&captured_lpm));
+        for name in ["inspector.db", "inspector.db-wal", "inspector.db-shm"] {
+            assert!(!has_acl(&captured_lpm.join(name)), "{name}");
+        }
+    }
+
+    /// A project whose capture database others could open, built by
+    /// `build` on a connection that may write SQLite's own tables.
+    fn project_with_a_database(build: &str) -> tempfile::TempDir {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+        let db_path = project.path().join(".lpm/inspector.db");
+        Connection::open(&db_path)
+            .unwrap()
+            .execute_batch(build)
+            .unwrap();
+        #[cfg(unix)]
+        set_mode(&db_path, 0o644);
+        project
+    }
+
+    #[tokio::test]
+    async fn opening_refuses_a_database_with_schema_lpm_never_creates() {
+        let lpm_schema = format!(
+            "{CAPTURE_SCHEMA} ALTER TABLE requests ADD COLUMN response_body_incomplete \
+             INTEGER NOT NULL DEFAULT 0;"
+        );
+        let planted = [
+            (
+                "trigger copy_requests",
+                format!(
+                    "{lpm_schema} CREATE TRIGGER copy_requests AFTER INSERT ON requests \
+                     BEGIN SELECT 1; END;"
+                ),
+            ),
+            (
+                "view recent",
+                format!("{lpm_schema} CREATE VIEW recent AS SELECT * FROM requests;"),
+            ),
+            (
+                "table requests",
+                lpm_schema.replace(
+                    "tags TEXT,",
+                    "tags TEXT CHECK (length(hex(zeroblob(1000))) > 0),",
+                ),
+            ),
+            (
+                "table requests",
+                lpm_schema.replace(
+                    "tags TEXT,",
+                    "tags TEXT, slow TEXT GENERATED ALWAYS AS (hex(zeroblob(1000))) VIRTUAL,",
+                ),
+            ),
+            (
+                "table sessions",
+                lpm_schema.replace("name TEXT,", "name TEXT DEFAULT (hex(zeroblob(1000))),"),
+            ),
+            (
+                "index slow_requests",
+                format!(
+                    "{lpm_schema} CREATE INDEX slow_requests ON requests(length(request_body));"
+                ),
+            ),
+            (
+                "index slow_index",
+                format!(
+                    "{lpm_schema} CREATE INDEX slow_index ON requests_fts_data(length(block));"
+                ),
+            ),
+            (
+                "table extra",
+                format!("{lpm_schema} CREATE TABLE extra (x);"),
+            ),
+        ];
+        for (named, build) in planted {
+            for open in [InspectorDb::open, InspectorDb::open_for_review] {
+                let project = project_with_a_database(&build);
+
+                let error = open(project.path()).map(drop).unwrap_err();
+
+                assert!(
+                    error.to_string().contains("holds schema LPM never creates")
+                        && error.to_string().contains(named),
+                    "{named}: {error}"
+                );
+                #[cfg(unix)]
+                assert_eq!(
+                    mode(&project.path().join(".lpm/inspector.db")),
+                    0o644,
+                    "{named}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn opening_upgrades_a_database_an_earlier_release_created() {
+        let earlier = CAPTURE_SCHEMA
+            .replace(
+                "CREATE TABLE IF NOT EXISTS pending_sessions (
+             session_id TEXT PRIMARY KEY,
+             FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+         );",
+                "",
+            )
+            .replace("\n             ", "\n\t");
+        assert_ne!(earlier, CAPTURE_SCHEMA);
+        // With the query planner's statistics, which a tool may have added.
+        let project = project_with_a_database(&format!(
+            "{earlier} INSERT INTO requests (id, timestamp, method, path) \
+             VALUES ('kept', '2026-04-06T12:00:00Z', 'POST', '/'); ANALYZE;"
+        ));
+
+        let db = InspectorDb::open(project.path()).unwrap();
+
+        assert_eq!(db.count().await.unwrap(), 1);
+        let connection = Connection::open(project.path().join(".lpm/inspector.db")).unwrap();
+        let tables: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'pending_sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 1);
+    }
+
+    #[test]
+    fn canonical_sql_keeps_only_the_spaces_between_words() {
+        assert_eq!(
+            canonical_sql("CREATE TABLE t (\n\t a  TEXT ,b\tINT )"),
+            "CREATE TABLE t(a TEXT,b INT)"
+        );
+        assert_ne!(canonical_sql("summary TEXT"), canonical_sql("summ aryTEXT"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copying_waits_out_a_lock_another_connection_holds_on_the_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("inspector.db");
+        let database = Connection::open(&db_path).unwrap();
+        database
+            .execute_batch("CREATE TABLE kept (x); INSERT INTO kept VALUES (1);")
+            .unwrap();
+        let holder = Connection::open(&db_path).unwrap();
+        holder
+            .execute_batch("BEGIN EXCLUSIVE; INSERT INTO kept VALUES (2);")
+            .unwrap();
+        let released = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            holder.execute_batch("COMMIT").unwrap();
+        });
+
+        let copied = copy_database(
+            &database,
+            &capture_file(&db_path, "-copy"),
+            this_user(),
+            &db_path,
+        )
+        .unwrap();
+        released.join().unwrap();
+
+        assert!(copied);
+        let rows: i64 = Connection::open(capture_file(&db_path, "-copy"))
+            .unwrap()
+            .query_row("SELECT count(*) FROM kept", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_refuses_a_database_with_a_damaged_full_text_index() {
+        let project = project_with_a_capture();
+        let db_path = project.path().join(".lpm/inspector.db");
+        let damaging = Connection::open(&db_path).unwrap();
+        damaging
+            .execute_batch("UPDATE requests_fts_data SET block = zeroblob(64) WHERE id > 10;")
+            .unwrap();
+        drop(damaging);
+        set_mode(&db_path, 0o644);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let error = runtime
+            .block_on(async { InspectorDb::open(project.path()).map(drop) })
+            .unwrap_err();
+
+        assert!(matches!(error, OpenError::Damaged { .. }), "{error}");
+        assert!(error.to_string().contains("move it aside"), "{error}");
+        assert_eq!(mode(&db_path), 0o644);
+        assert!(!project.path().join(".lpm/inspector.db-copy").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_refuses_a_database_with_damaged_pages() {
+        let project = project_with_a_capture();
+        let db_path = project.path().join(".lpm/inspector.db");
+        let connection = Connection::open(&db_path).unwrap();
+        let (page_size, pages): (u64, u64) = connection
+            .query_row(
+                "SELECT * FROM pragma_page_size, pragma_page_count",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(connection);
+        assert!(pages > 3);
+        // The header of page 2, the `sessions` table's root.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&db_path)
+            .unwrap();
+        use std::io::{Seek as _, Write as _};
+        file.seek(std::io::SeekFrom::Start(page_size)).unwrap();
+        file.write_all(&[0xff; 8]).unwrap();
+        drop(file);
+        set_mode(&db_path, 0o644);
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let error = runtime
+            .block_on(async { InspectorDb::open(project.path()).map(drop) })
+            .unwrap_err();
+
+        assert!(matches!(error, OpenError::Damaged { .. }), "{error}");
     }
 
     #[cfg(unix)]
@@ -2312,6 +3271,50 @@ mod tests {
             connection
                 .db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE)
                 .unwrap()
+        );
+        for pragma in ["cell_size_check", "secure_delete"] {
+            let on: i64 = connection
+                .query_row(&format!("PRAGMA {pragma}"), [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(on, 1, "{pragma}");
+        }
+        assert_eq!(
+            connection
+                .limit(rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH)
+                .unwrap(),
+            LONGEST_VALUE_BYTES
+        );
+        assert!(
+            connection
+                .query_row(
+                    "SELECT length(zeroblob(?1))",
+                    [LONGEST_VALUE_BYTES + 1],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_largest_capture_fits_the_longest_value() {
+        let connection = Connection::open_in_memory().unwrap();
+        harden_connection(&connection).unwrap();
+        init_schema(&connection).unwrap();
+        let body = vec![b'x'; 50 * 1024 * 1024];
+        let mut webhook = make_webhook("largest", 200);
+        webhook.request_body.clone_from(&body);
+        webhook.response_body = body;
+
+        insert_request_row(&connection, &webhook, None).unwrap();
+    }
+
+    #[test]
+    fn bundled_sqlite_has_the_full_text_fix() {
+        // 3.50.3 fixed CVE-2025-7709, a read past a damaged FTS5 index.
+        assert!(
+            rusqlite::version_number() >= 3_050_003,
+            "{}",
+            rusqlite::version()
         );
     }
 
@@ -2354,7 +3357,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn opening_a_new_database_from_several_processes_at_once_succeeds() {
+    async fn opening_a_new_database_from_several_openers_at_once_succeeds() {
         for _ in 0..10 {
             let project = tempfile::tempdir().unwrap();
             let openers: Vec<_> = (0..8)
@@ -2370,17 +3373,14 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn opening_waits_for_another_lpm_process_opening_the_captures() {
+    async fn opening_waits_while_another_opener_holds_the_capture_lock() {
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir(project.path().join(".lpm")).unwrap();
-        let lock = lpm_common::acquire_single_file_exclusive_lock_nofollow(
-            project.path().join(".lpm/inspector.db-lock"),
-        )
-        .unwrap();
+        let lock = hold_capture_lock(project.path());
         let path = project.path().to_path_buf();
         let opener = tokio::task::spawn_blocking(move || {
             InspectorDb::open(&path).map(drop)?;
-            Ok::<_, rusqlite::Error>(std::time::Instant::now())
+            Ok::<_, OpenError>(std::time::Instant::now())
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -2391,8 +3391,97 @@ mod tests {
         assert!(opened >= released, "opened before the lock was released");
     }
 
+    #[test]
+    fn opening_gives_up_once_another_opener_holds_the_lock_too_long() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+        let lock = hold_capture_lock(project.path());
+        let started = std::time::Instant::now();
+
+        let error = open_on_a_thread(project.path(), InspectorDb::open)
+            .join()
+            .unwrap()
+            .unwrap_err();
+
+        assert!(started.elapsed() >= OPEN_LOCK_TIMEOUT);
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            error.to_string().contains("another LPM process held"),
+            "{error}"
+        );
+        assert!(!project.path().join(".lpm/inspector.db").exists());
+        drop(lock);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn openers_racing_to_replace_a_database_others_could_open_all_succeed() {
+        for round in 0..30 {
+            let project = project_with_a_capture();
+            let db_path = project.path().join(".lpm/inspector.db");
+            set_mode(&db_path, 0o644);
+            let start = Arc::new(std::sync::Barrier::new(4));
+            let openers: Vec<_> = (0..4)
+                .map(|_| {
+                    let start = Arc::clone(&start);
+                    let project = project.path().to_path_buf();
+                    std::thread::spawn(move || {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap();
+                        start.wait();
+                        runtime.block_on(async {
+                            // Each keeps its database open while the others
+                            // open theirs, as concurrent runs would.
+                            let db = InspectorDb::open(&project)?;
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                            Ok::<_, OpenError>(db.open_to_others())
+                        })
+                    })
+                })
+                .collect();
+            for opener in openers {
+                assert!(!opener.join().unwrap().unwrap(), "round {round}");
+            }
+            assert_eq!(mode(&db_path), 0o600, "round {round}");
+        }
+    }
+
+    #[tokio::test]
+    async fn clearing_history_leaves_no_capture_on_disk_while_another_handle_stays_open() {
+        const SECRET: &[u8] = b"zqxcapturedsecretzqx";
+
+        let project = tempfile::tempdir().unwrap();
+        let recording = InspectorDb::open(project.path()).unwrap();
+        let mut webhook = make_webhook("secret", 200);
+        webhook.request_body = SECRET.to_vec();
+        webhook.summary = String::from_utf8(SECRET.to_vec()).unwrap();
+        webhook.request_headers.insert(
+            "authorization".into(),
+            String::from_utf8(SECRET.to_vec()).unwrap(),
+        );
+        recording
+            .insert_durable_request(Arc::new(webhook), None)
+            .await
+            .unwrap();
+        let clearing = InspectorDb::open_for_review(project.path()).unwrap();
+
+        clearing.clear_history().await.unwrap();
+
+        for name in ["inspector.db", "inspector.db-wal"] {
+            let path = project.path().join(".lpm").join(name);
+            let bytes = std::fs::read(&path).unwrap_or_default();
+            assert!(
+                !bytes.windows(SECRET.len()).any(|window| window == SECRET),
+                "{name} still holds the capture"
+            );
+        }
+        assert_eq!(recording.count().await.unwrap(), 0);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn clearing_history_from_two_processes_at_once_succeeds() {
+    async fn clearing_history_from_two_handles_at_once_succeeds() {
         let project = tempfile::tempdir().unwrap();
         let first = InspectorDb::open(project.path()).unwrap();
         let second = InspectorDb::open(project.path()).unwrap();
@@ -2659,6 +3748,7 @@ mod tests {
             write_tx,
             queued_capture_bytes: Arc::clone(&queued_capture_bytes),
             db_path,
+            open_to_others: false,
         };
 
         db.start_session("saturated-session".to_string(), None, 3000)
@@ -3108,12 +4198,18 @@ mod tests {
         std::fs::create_dir_all(&lpm_dir).unwrap();
         std::fs::write(lpm_dir.join("inspector.db"), b"not a sqlite database").unwrap();
 
-        let error = match InspectorDb::open(project.path()) {
-            Ok(_) => panic!("corrupt database must not open"),
-            Err(error) => error,
-        };
+        for open in [InspectorDb::open, InspectorDb::open_for_review] {
+            let error = match open(project.path()) {
+                Ok(_) => panic!("corrupt database must not open"),
+                Err(error) => error,
+            };
 
-        assert!(error.to_string().contains("database"));
+            assert!(matches!(error, OpenError::Damaged { .. }), "{error}");
+            assert!(
+                error.to_string().contains("move it aside and retry"),
+                "{error}"
+            );
+        }
     }
 }
 

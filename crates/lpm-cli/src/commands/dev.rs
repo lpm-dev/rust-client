@@ -749,9 +749,33 @@ fn rollback_inspector_session_after(
     };
     match publication.rollback() {
         Ok(()) => error,
-        Err(rollback_error) => LpmError::Tunnel(format!(
-            "{error}; restoring the inspector session also failed: {rollback_error}"
+        Err(rollback_error) => error_also(
+            error,
+            &format!("restoring the inspector session also failed: {rollback_error}"),
+        ),
+    }
+}
+
+/// An error's message, without the prefix its kind adds.
+fn error_detail(error: &LpmError) -> String {
+    match error {
+        LpmError::Io(error) => error.to_string(),
+        LpmError::Tunnel(message) => message.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// `first` with `also` added to its message. A disk error stays one when a
+/// tunnel cleanup fails after it, and a tunnel error stays a tunnel's; any
+/// other is reported as the tunnel's, as it was raised running one.
+fn error_also(first: LpmError, also: &str) -> LpmError {
+    match first {
+        LpmError::Io(error) => LpmError::Io(std::io::Error::new(
+            error.kind(),
+            format!("{error}; {also}"),
         )),
+        LpmError::Tunnel(message) => LpmError::Tunnel(format!("{message}; {also}")),
+        other => LpmError::Tunnel(format!("{other}; {also}")),
     }
 }
 
@@ -1539,6 +1563,7 @@ pub async fn run(
         // text-only) so the user can pick whichever fits the moment.
         // Quiet by default — we never auto-open a browser tab here.
         let inspector_db = crate::commands::tunnel::open_inspector_db(project_dir)?;
+        let capture_store = crate::commands::tunnel::CaptureStore::of(&inspector_db);
         let inspector_state = lpm_inspect::state::InspectorState::with_db_pending(inspector_db);
         multi_inspector_state = Some(inspector_state.clone());
         if !no_inspect {
@@ -1567,7 +1592,7 @@ pub async fn run(
         let (webhook_tx, mut webhook_rx) =
             tokio::sync::mpsc::channel::<lpm_tunnel::client::CapturedWebhookEvent>(64);
 
-        crate::commands::tunnel::warn_capture_persistence(project_dir, !quiet).await;
+        crate::commands::tunnel::warn_capture_persistence(project_dir, capture_store, !quiet).await;
 
         // Dashboard webhook channel: when --dashboard is active, webhooks are
         // forwarded to the dashboard TUI via a std::sync channel.
@@ -3245,15 +3270,8 @@ async fn finalize_multi_service_tunnel_after(
         None => Ok(()),
     };
     let persistence_result = if let Some(state) = inspector_state {
-        let end_result = state.end_session().await.map_err(|error| {
-            crate::commands::tunnel::inspector_write_error("persist inspector session end", error)
-        });
-        let flush_result = state.flush().await.map_err(|error| {
-            crate::commands::tunnel::inspector_write_error(
-                "commit captures to .lpm/inspector.db",
-                error,
-            )
-        });
+        let (end_result, flush_result) =
+            crate::commands::tunnel::finish_capture_session(&state).await;
         combine_tunnel_cleanup_results(end_result, flush_result)
     } else {
         Ok(())
@@ -3275,7 +3293,7 @@ fn combine_tunnel_cleanup_results(
     match (first, second) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(first), Err(second)) => Err(LpmError::Tunnel(format!("{first}; {second}"))),
+        (Err(first), Err(second)) => Err(error_also(first, &error_detail(&second))),
     }
 }
 
@@ -3289,9 +3307,13 @@ fn compose_tunnel_runtime_and_cleanup(
         (Err(primary), Ok(())) => Err(primary),
         (Err(primary), Err(cleanup_error)) => {
             dev_ui::warn(&format!("tunnel capture cleanup failed: {cleanup_error}"));
-            Err(LpmError::Tunnel(format!(
-                "{primary}; tunnel capture cleanup also failed: {cleanup_error}"
-            )))
+            Err(error_also(
+                primary,
+                &format!(
+                    "tunnel capture cleanup also failed: {}",
+                    error_detail(&cleanup_error)
+                ),
+            ))
         }
     }
 }
@@ -4821,6 +4843,140 @@ mod tests {
         assert!(error.contains("runtime failed"), "{error}");
         assert!(error.contains("capture task failed"), "{error}");
         assert!(error.contains("inspector session end failed"), "{error}");
+    }
+
+    /// An inspector whose capture database lost its tables after it was
+    /// opened, so its every write fails as the disk's would.
+    fn inspector_whose_writes_fail(
+        project: &Path,
+    ) -> (
+        lpm_inspect::state::InspectorState,
+        lpm_inspect::state::PublishedInspectorSession,
+    ) {
+        let db = lpm_inspect::db::InspectorDb::open(project).unwrap();
+        let state = lpm_inspect::state::InspectorState::with_db(3000, db);
+        state
+            .start_session_immediate("running".to_string(), None, 3000, None)
+            .unwrap();
+        let publication = state
+            .start_session_reversible(
+                "published".to_string(),
+                None,
+                3000,
+                None,
+                "https://example.lpm.fyi".to_string(),
+            )
+            .unwrap();
+        rusqlite::Connection::open(project.join(".lpm/inspector.db"))
+            .unwrap()
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF; DROP TABLE requests_fts; DROP TABLE requests; \
+                 DROP TABLE pending_sessions; DROP TABLE sessions;",
+            )
+            .unwrap();
+        (state, publication)
+    }
+
+    fn ready_publication() -> TunnelReadyPublication {
+        TunnelReadyPublication {
+            session: lpm_tunnel::TunnelSession {
+                tunnel_url: "https://example.lpm.fyi".to_string(),
+                domain: "example.lpm.fyi".to_string(),
+                session_id: "session".to_string(),
+                local_port: 3000,
+                plan: None,
+                base_domain: None,
+                domain_kind: None,
+                session_expires_at: None,
+                session_max_ms: None,
+                limits: None,
+            },
+            local_target_url: "http://127.0.0.1:3000".to_string(),
+            tunnel_auth: None,
+            usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_store_failures_stay_disk_errors_through_dev_s_tunnel_lifecycle() {
+        let project = TempDir::new().unwrap();
+        let (state, publication) = inspector_whose_writes_fail(project.path());
+
+        let started = prepare_tunnel_connection(&state, &ready_publication())
+            .map(drop)
+            .unwrap_err();
+        let rolled_back = rollback_inspector_session_after(
+            LpmError::Io(std::io::Error::other("disk full")),
+            Some(publication),
+        );
+        state
+            .push(lpm_tunnel::webhook::CapturedWebhook {
+                id: "queued".to_string(),
+                timestamp: "2026-08-14T12:00:00Z".to_string(),
+                method: "POST".to_string(),
+                path: "/hook".to_string(),
+                request_headers: HashMap::new(),
+                request_body: b"request".to_vec(),
+                response_status: 202,
+                response_headers: HashMap::new(),
+                response_body: b"accepted".to_vec(),
+                duration_ms: 1,
+                provider: None,
+                summary: "queued capture".to_string(),
+                signature_diagnostic: None,
+                auto_acked: false,
+                response_body_incomplete: false,
+            })
+            .await;
+        let finished = finalize_multi_service_tunnel_after(Ok(()), None, Some(state), None)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&started, LpmError::Io(error) if error.to_string().contains("persist inspector session start")),
+            "{started:?}"
+        );
+        assert!(
+            matches!(&rolled_back, LpmError::Io(error) if error.to_string().contains("disk full")
+                && error.to_string().contains("restoring the inspector session also failed")),
+            "{rolled_back:?}"
+        );
+        assert!(
+            matches!(&finished, LpmError::Io(error) if error.to_string().contains("persist inspector session end")
+                && error.to_string().contains("commit captures")),
+            "{finished:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleanup_failure_after_another_keeps_the_first_one_s_kind() {
+        let io = || {
+            LpmError::Io(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                "disk full",
+            ))
+        };
+        let tunnel = || LpmError::Tunnel("relay closed".to_string());
+
+        let disk_first = combine_tunnel_cleanup_results(Err(io()), Err(tunnel())).unwrap_err();
+        let tunnel_first = combine_tunnel_cleanup_results(Err(tunnel()), Err(io())).unwrap_err();
+        let primary_disk =
+            compose_tunnel_runtime_and_cleanup(Err(io()), Err(tunnel())).unwrap_err();
+
+        assert!(
+            matches!(&disk_first, LpmError::Io(error) if error.kind() == std::io::ErrorKind::StorageFull
+                && error.to_string() == "disk full; relay closed"),
+            "{disk_first:?}"
+        );
+        assert!(
+            matches!(&tunnel_first, LpmError::Tunnel(message) if message == "relay closed; disk full"),
+            "{tunnel_first:?}"
+        );
+        assert!(
+            matches!(&primary_disk, LpmError::Io(error)
+                if error.to_string() == "disk full; tunnel capture cleanup also failed: relay closed"),
+            "{primary_disk:?}"
+        );
     }
 
     #[test]

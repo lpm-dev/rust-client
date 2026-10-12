@@ -718,7 +718,11 @@ fn open_lock_file(lock_path: &Path) -> std::io::Result<std::fs::File> {
     options.open(lock_path)
 }
 
-fn open_lock_file_nofollow(lock_path: &Path) -> std::io::Result<std::fs::File> {
+/// Opens the lock file at `lock_path`, created owner-only, without following
+/// a link there, for a lock in a directory whose entries a repository can
+/// supply, such as a project's `.lpm`. Anything but a regular file is
+/// refused.
+pub fn open_lock_file_nofollow(lock_path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.create(true).read(true).write(true).truncate(false);
     #[cfg(unix)]
@@ -1319,16 +1323,6 @@ pub fn acquire_single_file_exclusive_lock(
     acquire_single_file_exclusive_lock_from_file(file)
 }
 
-/// Acquire a single-file exclusive advisory lock whose file is opened without
-/// following a link at `lock_path`, for a lock in a directory whose entries a
-/// repository can supply, such as a project's `.lpm`.
-pub fn acquire_single_file_exclusive_lock_nofollow(
-    lock_path: impl AsRef<Path>,
-) -> Result<SingleFileExclusiveLockHandle, LpmError> {
-    let file = open_lock_file_nofollow(lock_path.as_ref())?;
-    acquire_single_file_exclusive_lock_from_file(file)
-}
-
 pub fn acquire_single_file_exclusive_lock_from_file(
     file: std::fs::File,
 ) -> Result<SingleFileExclusiveLockHandle, LpmError> {
@@ -1342,6 +1336,34 @@ pub fn acquire_single_file_exclusive_lock_from_file(
     Ok(SingleFileExclusiveLockHandle {
         _data: HeldLock::new(data),
     })
+}
+
+/// Acquires an exclusive advisory lock on `file`, waiting at most `timeout`
+/// for another holder to release it, with the usual hint once the wait is
+/// noticeable. `None` when the lock was still held at the deadline.
+pub fn acquire_single_file_exclusive_lock_from_file_within(
+    file: std::fs::File,
+    timeout: std::time::Duration,
+) -> Result<Option<SingleFileExclusiveLockHandle>, LpmError> {
+    let mut data = fd_lock::RwLock::new(file);
+    let start = std::time::Instant::now();
+    let mut hinted = false;
+    loop {
+        if try_acquire(&mut data, LockMode::Exclusive)? {
+            return Ok(Some(SingleFileExclusiveLockHandle {
+                _data: HeldLock::new(data),
+            }));
+        }
+        let waited = start.elapsed();
+        let Some(left) = timeout.checked_sub(waited).filter(|left| !left.is_zero()) else {
+            return Ok(None);
+        };
+        if !hinted && waited >= LOCK_WAIT_HINT_AFTER {
+            hinted = true;
+            default_wait_hint();
+        }
+        std::thread::sleep(LOCK_POLL_INTERVAL.min(left));
+    }
 }
 
 pub fn try_acquire_single_file_exclusive_lock_from_file(
@@ -2261,11 +2283,21 @@ mod tests {
         );
     }
 
+    fn lock_nofollow_within(
+        lock_path: &Path,
+        timeout: std::time::Duration,
+    ) -> Result<Option<SingleFileExclusiveLockHandle>, LpmError> {
+        let file = open_lock_file_nofollow(lock_path)?;
+        acquire_single_file_exclusive_lock_from_file_within(file, timeout)
+    }
+
     #[test]
     fn nofollow_single_file_lock_shares_the_lock_domain_of_its_path() {
         let tmp = TempDir::new().unwrap();
         let lock_path = tmp.path().join("inspector.db-lock");
-        let held = acquire_single_file_exclusive_lock_nofollow(&lock_path).unwrap();
+        let held = lock_nofollow_within(&lock_path, std::time::Duration::ZERO)
+            .unwrap()
+            .unwrap();
 
         assert!(
             try_acquire_single_file_exclusive_lock_from_file(open_lock_file(&lock_path).unwrap())
@@ -2288,8 +2320,38 @@ mod tests {
         let lock_path = tmp.path().join("inspector.db-lock");
         std::os::unix::fs::symlink(&target, &lock_path).unwrap();
 
-        assert!(acquire_single_file_exclusive_lock_nofollow(&lock_path).is_err());
+        assert!(open_lock_file_nofollow(&lock_path).is_err());
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn a_lock_wait_with_a_deadline_gives_up_at_it_and_takes_a_released_lock() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("inspector.db-lock");
+        let held = lock_nofollow_within(&lock_path, std::time::Duration::ZERO)
+            .unwrap()
+            .unwrap();
+
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(250);
+        assert!(lock_nofollow_within(&lock_path, timeout).unwrap().is_none());
+        let waited = start.elapsed();
+        assert!(waited >= timeout, "{waited:?}");
+        assert!(
+            waited < timeout + std::time::Duration::from_secs(2),
+            "{waited:?}"
+        );
+
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            drop(held);
+        });
+        assert!(
+            lock_nofollow_within(&lock_path, std::time::Duration::from_secs(5))
+                .unwrap()
+                .is_some()
+        );
+        release.join().unwrap();
     }
 
     /// Shared lock blocks an exclusive acquire until released.

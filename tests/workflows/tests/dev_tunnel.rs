@@ -1360,7 +1360,8 @@ async fn tunnel_start_names_capture_files_git_tracks_and_how_to_stop_it() {
 
     assert!(
         stderr.contains("git tracks '.lpm/inspector.db'")
-            && stderr.contains("git -C .lpm rm --cached -- inspector.db")
+            && stderr.contains("run `git rm --cached -- .lpm/inspector.db`")
+            && !stderr.contains("git -C .lpm")
             && stderr.contains("rotate any credentials"),
         "tunnel startup must name tracked capture files:\n{stderr}"
     );
@@ -1503,7 +1504,7 @@ fn tunnel_inspect_reports_a_capture_database_it_cant_open_as_a_disk_error_under_
     assert!(
         envelope["error"]
             .as_str()
-            .is_some_and(|message| message.contains("Move or repair it")),
+            .is_some_and(|message| message.contains("move it aside and retry")),
         "{envelope}"
     );
 }
@@ -1547,6 +1548,55 @@ fn tunnel_inspect_without_auth_reads_project_inspector_database_under_json() {
     assert_eq!(rows.len(), 1, "expected one seeded webhook row");
     assert_eq!(rows[0]["provider"], serde_json::json!("Stripe"));
     assert_eq!(rows[0]["status"], serde_json::json!(402));
+}
+
+#[cfg(unix)]
+#[test]
+fn reading_captures_others_could_open_works_while_another_process_records_and_warns() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+    let db_path = project.path().join(".lpm/inspector.db");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let recording = runtime.block_on(async {
+        let state = lpm_inspect::state::InspectorState::with_db(
+            3000,
+            lpm_inspect::db::InspectorDb::open(project.path()).unwrap(),
+        );
+        state
+            .push(captured_webhook("wh-kept", "2026-05-22T10:05:00Z", 200))
+            .await;
+        state.flush().await.unwrap();
+        state
+    });
+    // As an earlier release or a checkout left it.
+    std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let human = lpm(&project).args(["tunnel", "log"]).output().unwrap();
+    let json = lpm(&project)
+        .args(["--json", "tunnel", "log"])
+        .output()
+        .unwrap();
+
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&human.stdout),
+        String::from_utf8_lossy(&human.stderr)
+    );
+    assert!(human.status.success(), "{rendered}");
+    assert!(rendered.contains("is open to other users"), "{rendered}");
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(rows.as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    drop(recording);
 }
 
 #[test]
@@ -1694,7 +1744,7 @@ fn tunnel_inspect_reports_an_actionable_corrupt_database_error() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(rendered.contains(".lpm/inspector.db"));
-    assert!(rendered.contains("Move or repair"));
+    assert!(rendered.contains("move it aside and retry"));
     assert!(
         !rendered.contains("network connection"),
         "a local database error isn't a network one:\n{rendered}"

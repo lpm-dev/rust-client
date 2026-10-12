@@ -16,6 +16,8 @@ pub mod integrity;
 pub mod known_projects;
 pub mod local_target;
 pub mod lpm_json;
+#[cfg(target_os = "macos")]
+pub mod macos_acl;
 pub mod npmrc;
 pub mod package_instance;
 pub mod package_name;
@@ -72,9 +74,10 @@ pub use paths::{
     ExclusiveLockHandle, FsKind, GLOBAL_INSTALL_PATH_BUDGET, INSTALL_READY_MARKER, LpmRoot,
     ProjectLockDirectory, ProjectLockKind, SharedLockHandle, SingleFileExclusiveLockHandle,
     SingleFileSharedLockHandle, acquire_exclusive_lock, acquire_single_file_exclusive_lock,
-    acquire_single_file_exclusive_lock_from_file, acquire_single_file_exclusive_lock_nofollow,
-    acquire_single_file_shared_lock, acquire_single_file_shared_lock_from_file, as_extended_path,
-    check_install_path_budget, is_local_fs, parent_install_lock_environment, project_install_lock,
+    acquire_single_file_exclusive_lock_from_file,
+    acquire_single_file_exclusive_lock_from_file_within, acquire_single_file_shared_lock,
+    acquire_single_file_shared_lock_from_file, as_extended_path, check_install_path_budget,
+    is_local_fs, open_lock_file_nofollow, parent_install_lock_environment, project_install_lock,
     project_publish_lock, try_acquire_capability_exclusive_lock, try_acquire_exclusive_lock,
     try_acquire_single_file_exclusive_lock_from_file, try_with_exclusive_lock,
     with_capability_exclusive_lock, with_exclusive_lock, with_exclusive_lock_async,
