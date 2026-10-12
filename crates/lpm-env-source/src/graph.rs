@@ -383,24 +383,24 @@ impl Graph {
             .filter(|(_, declaration)| {
                 !Arc::ptr_eq(&declaration.origin, &declaration.declaring_origin)
             })
-            .map(|(key, declaration)| (key.clone(), (*declaration.declaring_origin).clone()))
+            .map(|(key, declaration)| (key.clone(), Arc::clone(&declaration.declaring_origin)))
             .collect();
         let client_prefix_origins: BTreeMap<_, _> = node
             .prefixes
             .iter()
-            .map(|(prefix, origin)| (prefix.clone(), (**origin).clone()))
+            .map(|(prefix, origin)| (prefix.clone(), Arc::clone(origin)))
             .collect();
         let replaced_vars: BTreeMap<_, _> = std::mem::take(&mut self.root_replaced)
             .into_iter()
             .filter_map(|(key, rules)| {
                 let replaced = ReplacedRules {
                     count: rules.len(),
-                    origin: (*rules.first()?.0).clone(),
+                    origin: Arc::clone(&rules.first()?.0),
                     client: rules.iter().all(|(_, rule)| rule.client),
                     secret: rules
                         .iter()
                         .find(|(_, rule)| rule.secret)
-                        .map(|(origin, _)| (**origin).clone()),
+                        .map(|(origin, _)| Arc::clone(origin)),
                 };
                 Some((key, replaced))
             })
@@ -410,7 +410,7 @@ impl Graph {
             .filter_map(|(name, groups)| {
                 let replaced = ReplacedGroups {
                     count: groups.len(),
-                    origin: (*groups.first()?.0).clone(),
+                    origin: Arc::clone(&groups.first()?.0),
                 };
                 Some((name, replaced))
             })
