@@ -386,6 +386,10 @@ pub(crate) const MAX_UNCOMPRESSED_TARBALL_BYTES: u64 = 500 * 1024 * 1024;
 
 pub(crate) const MAX_COMPRESSED_TARBALL_BYTES: u64 = 500 * 1024 * 1024;
 
+/// The LPM registry's limit for a compressed tarball, below the local one,
+/// checked before any target publishes so a larger one fails up front.
+pub(crate) const MAX_LPM_REGISTRY_TARBALL_BYTES: u64 = 100 * 1024 * 1024;
+
 pub(crate) const MAX_PUBLISH_ARCHIVE_ENTRIES: usize = 100_000;
 
 pub(crate) const MAX_PUBLISH_ARCHIVE_PATH_DEPTH: usize = 256;

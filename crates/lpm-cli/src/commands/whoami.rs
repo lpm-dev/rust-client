@@ -47,6 +47,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                 "storage_bytes": l.storage_bytes,
                 "private_packages": l.private_packages,
             })),
+            "storage_overage": user.storage_overage,
             "orgs": user.organizations.iter().map(|o| serde_json::json!({
                 "slug": o.slug,
                 "name": o.name,
@@ -101,12 +102,11 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         whoami_ui::blank_line();
         whoami_ui::section("usage");
         let storage = lpm_common::format_bytes(usage.storage_bytes);
-        // Pro storage past its allowance is billed, not refused; only the
-        // free plan's limit stops publishing.
-        let storage_billed = user
-            .plan_tier
-            .as_deref()
-            .is_some_and(|tier| tier.eq_ignore_ascii_case("pro"));
+        // What publishing does past the limit, as the Registry's publish
+        // gate decides it. An older Registry doesn't say, and nothing is
+        // claimed then.
+        let storage_overage = user.storage_overage.as_deref();
+        let mut over_storage = None;
 
         if let Some(limits) = &user.limits {
             // Storage
@@ -119,17 +119,29 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                 );
                 if usage.storage_bytes <= limit_bytes {
                     whoami_ui::detail("storage", storage_msg);
-                } else if storage_billed {
-                    whoami_ui::detail("storage", storage_msg);
-                    whoami_ui::detail(
-                        "overage",
-                        format!("storage past {limit} is billed per GiB a month, rounded up"),
-                    );
                 } else {
-                    whoami_ui::warn_line(crate::install_ui::terminal_line!(
-                        "Storage: {} (OVER LIMIT)",
-                        storage_msg
-                    ));
+                    over_storage = Some(limit.clone());
+                    match storage_overage {
+                        Some("billed") => {
+                            whoami_ui::detail("storage", storage_msg);
+                            whoami_ui::detail(
+                                "overage",
+                                format!(
+                                    "storage past {limit} is billed per GiB a month, rounded up"
+                                ),
+                            );
+                        }
+                        Some("paused" | "blocked") => {
+                            whoami_ui::warn_line(crate::install_ui::terminal_line!(
+                                "Storage: {} (OVER LIMIT)",
+                                storage_msg
+                            ));
+                        }
+                        _ => {
+                            whoami_ui::detail("storage", storage_msg);
+                            whoami_ui::detail("overage", format!("past the included {limit}"));
+                        }
+                    }
                 }
             } else {
                 whoami_ui::detail("storage", storage);
@@ -162,17 +174,23 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
             }
 
             // Over-limit warning
-            let over_storage = !storage_billed
-                && limits
-                    .storage_bytes
-                    .is_some_and(|l| usage.storage_bytes > l);
+            let storage_refused = over_storage.is_some() && storage_overage == Some("blocked");
             let over_packages = limits
                 .private_packages
                 .is_some_and(|l| l > 0 && l != u32::MAX && usage.private_packages > l);
 
-            if over_storage || over_packages {
+            if let (Some(limit), Some("paused")) = (&over_storage, storage_overage) {
+                whoami_ui::warn_line(crate::install_ui::terminal_line!(
+                    "Storage overage is paused until the outstanding payment succeeds; publishing past {} is refused meanwhile.",
+                    limit.as_str()
+                ));
+                whoami_ui::warn(
+                    "Update your payment method: https://lpm.dev/dashboard/settings/billing",
+                );
+            }
+            if storage_refused || over_packages {
                 whoami_ui::warn("Your account is over its plan limits.");
-                whoami_ui::warn("Write access (publishing, inviting members) is restricted.");
+                whoami_ui::warn("Publishing is restricted.");
                 whoami_ui::warn("Upgrade your plan: https://lpm.dev/dashboard/settings/billing");
             }
         } else {

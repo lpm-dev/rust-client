@@ -10,7 +10,7 @@ use super::output::{
 use super::prepare::read_publish_manifest;
 use super::prepare::{
     PublishSource, prepare_publish_project_from_manifest, read_publish_manifest_from_source,
-    validate_publish_tarball_size,
+    validate_lpm_registry_tarball_size, validate_publish_tarball_size,
 };
 use super::provenance::{
     ProvenanceRequest, load_provenance_request_file, materialize_provenance_request,
@@ -1160,6 +1160,15 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
         &tarball_data,
         !allow_secrets,
     )?;
+    if targets.contains(&PublishTarget::Lpm) {
+        let lpm_name = target_names
+            .get("lpm")
+            .map_or(name.as_str(), String::as_str);
+        let lpm_tarball_size = rewritten_tarballs
+            .get(lpm_name)
+            .map_or(tarball_data.len(), |tarball| tarball.len());
+        validate_lpm_registry_tarball_size(lpm_tarball_size)?;
+    }
     let version_data = build_publish_version_data(
         &pkg_json,
         &name,

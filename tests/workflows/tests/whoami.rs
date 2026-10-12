@@ -247,6 +247,7 @@ async fn whoami_tells_a_pro_account_past_its_storage_that_it_is_billed_not_restr
         "plan_tier": "pro",
         "usage": { "storage_bytes": 5 * GIB + 51 * 1024 * 1024, "private_packages": 3 },
         "limits": { "storageBytes": 5 * GIB, "privatePackages": 100 },
+        "storage_overage": "billed",
     }))
     .await;
 
@@ -272,14 +273,89 @@ async fn whoami_tells_a_free_account_past_its_storage_that_publishing_is_restric
         "plan_tier": "free",
         "usage": { "storage_bytes": 100 * 1024 * 1024 + 1, "private_packages": 1 },
         "limits": { "storageBytes": 100 * 1024 * 1024, "privatePackages": 2 },
+        "storage_overage": "blocked",
     }))
     .await;
 
     assert!(
         stderr.contains("Storage: 100.01 MiB / 100 MiB")
             && stderr.contains("(OVER LIMIT)")
-            && stderr.contains("Write access (publishing, inviting members) is restricted."),
+            && stderr.contains("Publishing is restricted."),
         "a free account past its storage should read as over its limit and restricted, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("inviting members"),
+        "a personal account invites no members, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn whoami_tells_an_account_in_a_payment_grace_past_its_storage_that_overage_waits_for_the_payment()
+ {
+    let stderr = whoami_stderr(serde_json::json!({
+        "username": "testuser",
+        "plan_tier": "pro",
+        "usage": { "storage_bytes": 5 * GIB + 1, "private_packages": 3 },
+        "limits": { "storageBytes": 5 * GIB, "privatePackages": 100 },
+        "storage_overage": "paused",
+    }))
+    .await;
+
+    assert!(
+        stderr.contains("Storage: 5.01 GiB / 5 GiB")
+            && stderr.contains(
+                "Storage overage is paused until the outstanding payment succeeds; publishing past 5 GiB is refused meanwhile."
+            )
+            && stderr.contains("Update your payment method"),
+        "an account in a payment grace should read as paused until it pays, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("is billed per GiB") && !stderr.contains("Upgrade your plan"),
+        "a paused overage is neither billed nor an upgrade's to fix, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn whoami_claims_nothing_of_storage_past_its_limit_when_the_registry_doesnt_say() {
+    let stderr = whoami_stderr(serde_json::json!({
+        "username": "testuser",
+        "plan_tier": "pro",
+        "usage": { "storage_bytes": 5 * GIB + 1, "private_packages": 3 },
+        "limits": { "storageBytes": 5 * GIB, "privatePackages": 100 },
+    }))
+    .await;
+
+    assert!(
+        stderr.contains("storage        5.01 GiB / 5 GiB")
+            && stderr.contains("overage        past the included 5 GiB"),
+        "storage past its limit should read as past it, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("billed")
+            && !stderr.contains("OVER LIMIT")
+            && !stderr.contains("restricted"),
+        "without the Registry's word, whoami should claim neither billing nor a refusal, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
+async fn whoami_reads_storage_at_its_limit_as_within_it() {
+    let stderr = whoami_stderr(serde_json::json!({
+        "username": "testuser",
+        "plan_tier": "free",
+        "usage": { "storage_bytes": 100 * 1024 * 1024, "private_packages": 1 },
+        "limits": { "storageBytes": 100 * 1024 * 1024, "privatePackages": 2 },
+        "storage_overage": "blocked",
+    }))
+    .await;
+
+    assert!(
+        stderr.contains("storage        100 MiB / 100 MiB"),
+        "storage at its limit should read as within it, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("OVER LIMIT") && !stderr.contains("restricted"),
+        "storage at its limit isn't past it, got:\n{stderr}"
     );
 }
 
@@ -317,7 +393,8 @@ async fn whoami_json_reports_file_backed_auth_storage_backend() {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "username": "test@example.com",
             "profile_username": "testuser",
-            "email": "test@example.com"
+            "email": "test@example.com",
+            "storage_overage": "paused"
         })))
         .mount(mock.server())
         .await;
@@ -350,6 +427,7 @@ async fn whoami_json_reports_file_backed_auth_storage_backend() {
         serde_json::json!("encrypted_file_fallback")
     );
     assert_eq!(json["storage_degraded"], serde_json::json!(true));
+    assert_eq!(json["storage_overage"], serde_json::json!("paused"));
     assert_eq!(
         json["registries"][0]["storage_backend"],
         serde_json::json!("encrypted_file_fallback")

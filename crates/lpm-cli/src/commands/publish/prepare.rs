@@ -677,10 +677,25 @@ fn publish_project_changed_error(package_json_path: &Path) -> LpmError {
 }
 
 pub(crate) fn validate_publish_tarball_size(tarball_size: usize) -> Result<(), LpmError> {
-    if tarball_size > MAX_PUBLISH_TARBALL_BYTES {
+    tarball_within(tarball_size, MAX_PUBLISH_TARBALL_BYTES as u64, "")
+}
+
+/// Refuses a tarball the LPM registry would refuse for its size.
+pub(crate) fn validate_lpm_registry_tarball_size(tarball_size: usize) -> Result<(), LpmError> {
+    tarball_within(
+        tarball_size,
+        publish_common::MAX_LPM_REGISTRY_TARBALL_BYTES,
+        " for the LPM registry",
+    )
+}
+
+fn tarball_within(tarball_size: usize, max: u64, target: &str) -> Result<(), LpmError> {
+    let size = tarball_size as u64;
+    if size > max {
         return Err(LpmError::Registry(format!(
-            "tarball too large: {} (max 500 MiB)",
-            lpm_common::format_bytes(tarball_size as u64)
+            "tarball too large{target}: {} (max {})",
+            lpm_common::format_bytes_past(size),
+            lpm_common::format_bytes(max)
         )));
     }
     Ok(())

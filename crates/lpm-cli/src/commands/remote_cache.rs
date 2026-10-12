@@ -182,6 +182,14 @@ fn local_task_cache_size(path: &Path) -> Result<u64, LpmError> {
 }
 
 pub fn cache_status_json(status: &CacheStatus) -> serde_json::Value {
+    // As the human line shows them: usage on its side of the limit.
+    let (usage, limit) = match (status.remote.usage_bytes, status.remote.limit_bytes) {
+        (Some(usage), Some(limit)) => {
+            let (usage, limit) = lpm_common::format_quota(usage, limit);
+            (Some(usage), Some(limit))
+        }
+        (usage, limit) => (usage.map(format_bytes), limit.map(format_bytes)),
+    };
     serde_json::json!({
         "success": true,
         "local": {
@@ -195,9 +203,9 @@ pub fn cache_status_json(status: &CacheStatus) -> serde_json::Value {
             "team": status.remote.team,
             "status": status.remote.status,
             "usage_bytes": status.remote.usage_bytes,
-            "usage": status.remote.usage_bytes.map(format_bytes),
+            "usage": usage,
             "limit_bytes": status.remote.limit_bytes,
-            "limit": status.remote.limit_bytes.map(format_bytes),
+            "limit": limit,
             "error": status.remote.error,
         },
     })

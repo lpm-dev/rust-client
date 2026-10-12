@@ -84,7 +84,7 @@ async fn cache_status_json_reports_local_usage_and_remote_status() {
         .and(path("/v8/artifacts/status"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "status": "enabled",
-            "usageBytes": 1024,
+            "usageBytes": 2049,
             "limitBytes": 2048
         })))
         .mount(&server)
@@ -126,8 +126,11 @@ async fn cache_status_json_reports_local_usage_and_remote_status() {
     assert!(envelope["local"]["bytes"].as_u64().unwrap_or(0) >= 11);
     assert_eq!(envelope["remote"]["enabled"], serde_json::json!(true));
     assert_eq!(envelope["remote"]["status"], serde_json::json!("enabled"));
-    assert_eq!(envelope["remote"]["usage_bytes"], serde_json::json!(1024));
+    assert_eq!(envelope["remote"]["usage_bytes"], serde_json::json!(2049));
     assert_eq!(envelope["remote"]["limit_bytes"], serde_json::json!(2048));
+    // A byte past the limit reads as past it, as the human line shows it.
+    assert_eq!(envelope["remote"]["usage"], serde_json::json!("2.01 KiB"));
+    assert_eq!(envelope["remote"]["limit"], serde_json::json!("2 KiB"));
 }
 
 #[tokio::test]

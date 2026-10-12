@@ -993,6 +993,12 @@ pub struct WhoamiResponse {
 
     #[serde(default)]
     pub limits: Option<WhoamiLimits>,
+
+    /// What publishing does with storage past the plan's limit: `billed`,
+    /// `paused` while billing isn't active, or `blocked`. A Registry that
+    /// predates it sends none.
+    #[serde(default, rename = "storage_overage")]
+    pub storage_overage: Option<String>,
 }
 
 /// GET /api/registry/-/package/publish-preflight

@@ -320,6 +320,13 @@ pub fn format_bytes(bytes: u64) -> String {
     format_scaled(bytes, 1, UNITS.len() - 1, Rounding::Nearest, false)
 }
 
+/// Formats a size past a limit it's shown against: to two decimals, rounded
+/// up, so a size a byte past its limit never reads as within it ("500.01
+/// MiB" against 500 MiB), as the LPM.dev Registry states such sizes.
+pub fn format_bytes_past(bytes: u64) -> String {
+    format_scaled(bytes, 2, UNITS.len() - 1, Rounding::Up, false)
+}
+
 /// Formats a usage and the limit it's shown against as the LPM.dev
 /// Registry's billing page does: to two decimals, in GiB at most with
 /// thousands grouped, as limits and prices are stated per GiB. The usage
@@ -359,7 +366,12 @@ fn format_scaled(
     grouped: bool,
 ) -> String {
     if bytes < 1024 {
-        return format!("{bytes} B");
+        let shown = if grouped {
+            group_thousands(u128::from(bytes))
+        } else {
+            bytes.to_string()
+        };
+        return format!("{shown} B");
     }
     let places = 10_u128.pow(decimals);
     let shown = |scale: u128| {
@@ -473,6 +485,12 @@ mod tests {
             "1,253.50 GiB"
         );
         assert_eq!(format_quota(u64::MAX, u64::MAX).0, "17,179,869,184.00 GiB");
+        assert_eq!(format_bytes_past(500 * 1024 * 1024 + 1), "500.01 MiB");
+        assert_eq!(format_bytes_past(500 * 1024 * 1024), "500 MiB");
+        assert_eq!(format_bytes_past(5 * GIB + 1), "5.01 GiB");
+        // As the Registry groups bytes too ("1,000 B").
+        assert_eq!(format_quota(1000, 2048), ("1,000 B".into(), "2 KiB".into()));
+        assert_eq!(format_bytes(1000), "1000 B");
     }
 
     // ── read_capped_state_file ────────────────────────────────────────
