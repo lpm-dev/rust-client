@@ -1592,6 +1592,8 @@ fn reading_captures_others_could_open_works_while_another_process_records_and_wa
     );
     let rows: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     assert_eq!(rows.as_array().map(Vec::len), Some(1));
+    let json_log = String::from_utf8_lossy(&json.stderr);
+    assert!(json_log.contains("is open to other users"), "{json_log}");
     assert_eq!(
         std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777,
         0o644

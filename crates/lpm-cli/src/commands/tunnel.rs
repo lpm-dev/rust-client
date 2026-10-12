@@ -773,6 +773,13 @@ fn capture_warnings(
     let Some(state) = state else {
         return warnings;
     };
+    if state.incomplete {
+        warnings.push(
+            "git didn't answer in time for every capture file, so check that git ignores \
+             and doesn't track inspector.db*"
+                .to_string(),
+        );
+    }
     if state.lpm_unasked {
         warnings.push(
             "git couldn't be asked about .lpm, so check that git ignores and doesn't \
@@ -882,11 +889,16 @@ struct CaptureGitState {
     /// Whether git refused to answer for `.lpm`, as for one that looks like a
     /// bare repository.
     lpm_unasked: bool,
+    /// Whether one of the queries couldn't run or didn't answer in time, so
+    /// what the other found stands but git's ignoring the files isn't
+    /// confirmed.
+    incomplete: bool,
 }
 
 impl CaptureGitState {
     fn kept_out(&self) -> bool {
         !self.lpm_unasked
+            && !self.incomplete
             && self.project_tracked.is_empty()
             && self.lpm_tracked.is_empty()
             && self.unignored.is_empty()
@@ -930,8 +942,9 @@ struct CaptureGitQuery {
 /// whatever the case of their directory; and git in `.lpm`, for those
 /// neither tracked nor ignored there, and for those a repository of `.lpm`'s
 /// own tracks, such as a submodule, whose files the project's index doesn't
-/// list. None when neither is a repository, git can't be run, or it doesn't
-/// answer in time.
+/// list. What one query confirms stands when the other doesn't answer in
+/// time. None when neither answers: neither is a repository, git can't be
+/// run, or it doesn't answer in time.
 async fn capture_git_state(project_dir: &Path) -> Option<CaptureGitState> {
     capture_git_state_by(project_dir, |query| {
         capture_git_output(capture_git_command(&query), CAPTURE_GIT_TIMEOUT)
@@ -975,7 +988,10 @@ where
             true
         }
         Err(CaptureGitFailure::Refused) => false,
-        Err(CaptureGitFailure::Unavailable) => return None,
+        Err(CaptureGitFailure::Unavailable) => {
+            state.incomplete = true;
+            false
+        }
     };
     let inside_answered = match inside {
         Some(Ok(files)) => {
@@ -991,7 +1007,10 @@ where
             state.lpm_unasked = true;
             false
         }
-        Some(Err(CaptureGitFailure::Unavailable)) => return None,
+        Some(Err(CaptureGitFailure::Unavailable)) => {
+            state.incomplete = true;
+            false
+        }
         None => false,
     };
     (project_answered || inside_answered).then_some(state)
@@ -2559,6 +2578,7 @@ mod tests {
                 lpm_tracked: Vec::new(),
                 unignored: names(&["inspector.db-wal"]),
                 lpm_unasked: false,
+                incomplete: false,
             })
         );
     }
@@ -2579,17 +2599,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn says_nothing_of_git_when_either_query_doesn_t_answer_in_time() {
+    async fn says_nothing_of_git_when_neither_query_answers() {
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir(project.path().join(".lpm")).unwrap();
 
         for (project_answer, inside_answer) in [
             (
                 Err(CaptureGitFailure::Unavailable),
-                Ok(CaptureGitFiles::default()),
+                Err(CaptureGitFailure::Unavailable),
             ),
             (
-                Ok(CaptureGitFiles::default()),
+                Err(CaptureGitFailure::Refused),
                 Err(CaptureGitFailure::Unavailable),
             ),
             (
@@ -2601,6 +2621,50 @@ mod tests {
                 state_from_answers(project.path(), project_answer, inside_answer).await;
             assert_eq!(state, None);
         }
+    }
+
+    #[tokio::test]
+    async fn keeps_what_one_query_confirms_when_the_other_doesn_t_answer_in_time() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+
+        let (tracked, _) = state_from_answers(
+            project.path(),
+            Ok(files(&[".lpm/inspector.db"], &[])),
+            Err(CaptureGitFailure::Unavailable),
+        )
+        .await;
+        let (quiet, _) = state_from_answers(
+            project.path(),
+            Err(CaptureGitFailure::Unavailable),
+            Ok(CaptureGitFiles::default()),
+        )
+        .await;
+
+        let tracked = tracked.unwrap();
+        assert_eq!(tracked.project_tracked, names(&[".lpm/inspector.db"]));
+        let warnings = warnings_for(Some(tracked), false);
+        assert!(warnings[0].ends_with(")"), "{warnings:?}");
+        assert!(
+            warnings.iter().any(
+                |warning| warning.starts_with("git tracks '.lpm/inspector.db'")
+                    && warning.contains("git rm --cached")
+            ),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.starts_with("git didn't answer in time")),
+            "{warnings:?}"
+        );
+        let quiet = warnings_for(quiet, false);
+        assert!(!quiet[0].contains("git ignores it"), "{quiet:?}");
+        assert!(
+            quiet
+                .iter()
+                .any(|warning| warning.starts_with("git didn't answer in time"))
+        );
     }
 
     fn warnings_for(state: Option<CaptureGitState>, ignore_file_skipped: bool) -> Vec<String> {
@@ -2617,6 +2681,7 @@ mod tests {
             lpm_tracked: names(lpm_tracked),
             unignored: names(unignored),
             lpm_unasked: false,
+            incomplete: false,
         }
     }
 
@@ -2627,6 +2692,7 @@ mod tests {
             None,
             Some(CaptureGitState {
                 lpm_unasked: true,
+                incomplete: false,
                 ..state(&[], &[], &[])
             }),
             Some(state(&[".lpm/inspector.db"], &[], &[])),
@@ -2645,6 +2711,7 @@ mod tests {
         let warnings = warnings_for(
             Some(CaptureGitState {
                 lpm_unasked: true,
+                incomplete: false,
                 ..state(&[], &[], &[])
             }),
             false,

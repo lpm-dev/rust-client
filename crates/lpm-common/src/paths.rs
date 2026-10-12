@@ -2324,6 +2324,22 @@ mod tests {
         assert!(!target.exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn nofollow_single_file_lock_refuses_a_path_that_is_not_a_regular_file() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("inspector.db-lock");
+        let name = std::ffi::CString::new(lock_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+
+        let error = open_lock_file_nofollow(&lock_path).unwrap_err();
+
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+    }
+
     #[test]
     fn a_lock_wait_with_a_deadline_gives_up_at_it_and_takes_a_released_lock() {
         let tmp = TempDir::new().unwrap();
