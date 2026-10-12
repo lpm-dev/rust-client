@@ -1146,7 +1146,10 @@ pub(crate) fn mutate_vault_env<T>(
 
 fn warn_if_large(size: usize) {
     if size > MAX_VAULT_SIZE_WARNING {
-        tracing::warn!("vault data is {size} bytes (approaching ~100KB Keychain limit)");
+        tracing::warn!(
+            "env data is {} (approaching the Keychain's ~100 KiB limit)",
+            lpm_common::format_bytes(size as u64)
+        );
     }
 }
 

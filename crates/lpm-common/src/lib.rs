@@ -310,17 +310,31 @@ pub fn is_loopback_host(host: &str) -> bool {
 }
 
 /// Format bytes into a human-readable string in binary units, as they're
-/// counted (e.g., "1.2 KiB", "3.4 MiB"). Switches unit at each 1024, so a
-/// 900-byte file never reads as "0.9 KiB" or "0 KiB".
+/// counted (e.g., "1.2 KiB", "3.4 MiB", "5 GiB"), as the LPM.dev Registry
+/// labels them. Switches unit at each 1024, so a 900-byte file never reads
+/// as "0.9 KiB", and a value whose tenth would read 1024.0 takes the next
+/// unit. A whole number only for an exact size, so 5 GiB and a few bytes
+/// reads "5.0 GiB".
 pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
     if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KiB", bytes as f64 / 1024.0)
-    } else if bytes < 1024 * 1024 * 1024 {
-        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+        return format!("{bytes} B");
+    }
+    let tenths = |scale: u64| format!("{:.1}", bytes as f64 / scale as f64);
+    let mut unit = 0;
+    let mut scale = 1024_u64;
+    while unit + 1 < UNITS.len()
+        && tenths(scale)
+            .parse::<f64>()
+            .is_ok_and(|shown| shown >= 1024.0)
+    {
+        unit += 1;
+        scale *= 1024;
+    }
+    if bytes.is_multiple_of(scale) {
+        format!("{} {}", bytes / scale, UNITS[unit])
     } else {
-        format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        format!("{} {}", tenths(scale), UNITS[unit])
     }
 }
 
@@ -331,11 +345,19 @@ mod tests {
     #[test]
     fn format_bytes_labels_binary_units() {
         assert_eq!(format_bytes(500), "500 B");
-        assert_eq!(format_bytes(1024), "1.0 KiB");
+        assert_eq!(format_bytes(1024), "1 KiB");
         assert_eq!(format_bytes(1536), "1.5 KiB");
-        assert_eq!(format_bytes(1_048_576), "1.0 MiB");
+        assert_eq!(format_bytes(1_048_576), "1 MiB");
         assert_eq!(format_bytes(2_621_440), "2.5 MiB");
-        assert_eq!(format_bytes(5 * 1024 * 1024 * 1024), "5.0 GiB");
+        assert_eq!(format_bytes(5 * 1024 * 1024 * 1024), "5 GiB");
+        assert_eq!(format_bytes(5 * 1024 * 1024 * 1024 + 100), "5.0 GiB");
+        assert_eq!(format_bytes(1025 * 1024_u64.pow(3)), "1.0 TiB");
+        assert_eq!(format_bytes(2 * 1024_u64.pow(4)), "2 TiB");
+        assert_eq!(format_bytes(3 * 1024_u64.pow(5)), "3 PiB");
+        assert_eq!(format_bytes(u64::MAX), "16384.0 PiB");
+        // Whose tenth would read 1024.0 takes the next unit.
+        assert_eq!(format_bytes(1_048_525), "1.0 MiB");
+        assert_eq!(format_bytes(1_048_524), "1023.9 KiB");
     }
 
     // ── read_capped_state_file ────────────────────────────────────────

@@ -100,14 +100,13 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
     if let Some(usage) = &user.usage {
         whoami_ui::blank_line();
         whoami_ui::section("usage");
-        let storage_mb = usage.storage_bytes as f64 / (1024.0 * 1024.0);
+        let storage = lpm_common::format_bytes(usage.storage_bytes);
 
         if let Some(limits) = &user.limits {
             // Storage
             if let Some(limit_bytes) = limits.storage_bytes {
-                let limit_mb = limit_bytes as f64 / (1024.0 * 1024.0);
                 let storage_msg = with_usage_bar(
-                    format!("{:.2} MiB / {:.0} MiB", storage_mb, limit_mb),
+                    format!("{storage} / {}", lpm_common::format_bytes(limit_bytes)),
                     usage.storage_bytes,
                     limit_bytes,
                 );
@@ -120,7 +119,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                     whoami_ui::detail("storage", storage_msg);
                 }
             } else {
-                whoami_ui::detail("storage", format!("{:.2} MiB", storage_mb));
+                whoami_ui::detail("storage", storage);
             }
 
             // Package count
@@ -163,7 +162,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                 whoami_ui::warn("Upgrade your plan: https://lpm.dev/dashboard/settings/billing");
             }
         } else {
-            whoami_ui::detail("storage", format!("{:.2} MiB", storage_mb));
+            whoami_ui::detail("storage", storage);
             whoami_ui::detail("private pkgs", format!("{}", usage.private_packages));
         }
     }

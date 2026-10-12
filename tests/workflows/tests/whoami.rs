@@ -74,11 +74,11 @@ async fn whoami_human_output_uses_slim_account_summary() {
             "mfa_enabled": false,
             "has_pool_access": true,
             "usage": {
-                "storage_bytes": 1024 * 1024 * 50,
+                "storage_bytes": 1024 * 1024 * 512 + 1024 * 100,
                 "private_packages": 3
             },
             "limits": {
-                "storageBytes": 1024 * 1024 * 500,
+                "storageBytes": 1024_u64 * 1024 * 1024 * 5,
                 "privatePackages": 100
             },
             "organizations": [
@@ -149,8 +149,7 @@ async fn whoami_human_output_uses_slim_account_summary() {
         "authenticated whoami should warn when auth storage uses the encrypted file fallback, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("usage")
-            && stderr.contains("storage        50.00 MiB / 500 MiB  █░░░░░░░░░"),
+        stderr.contains("usage") && stderr.contains("storage        512.1 MiB / 5 GiB  ██░░░░░░░░"),
         "authenticated whoami should show storage usage with a quota bar, got:\n{stderr}"
     );
     assert!(

@@ -244,7 +244,7 @@ pub(super) fn selected_schedule_state(
 }
 
 /// Emit the workspace JSON envelope. Stdout/stderr surface ONLY for failed
-/// members and are truncated at the 10MB ceiling.
+/// members and are truncated at the 10 MiB ceiling.
 pub(super) fn emit_envelope(
     results: &[MemberResult],
     total: usize,

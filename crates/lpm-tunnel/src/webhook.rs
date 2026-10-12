@@ -210,19 +210,8 @@ fn extract_json_type(body: &[u8]) -> Option<String> {
 
 /// Generic summary: `METHOD /path (size)`.
 fn format_generic(webhook: &CapturedWebhook) -> String {
-    let size = format_size(webhook.body_size());
+    let size = lpm_common::format_bytes(webhook.body_size() as u64);
     format!("{} {} ({size})", webhook.method, webhook.path)
-}
-
-/// Format byte size into a human-readable string.
-fn format_size(bytes: usize) -> String {
-    if bytes < 1024 {
-        format!("{bytes}B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1}KiB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.1}MiB", bytes as f64 / (1024.0 * 1024.0))
-    }
 }
 
 /// Serde helper for base64-encoding `Vec<u8>` fields.
@@ -414,7 +403,7 @@ mod tests {
             w.path = "/api/hook".to_string();
             w.request_body = vec![0u8; 2500];
         });
-        assert_eq!(summarize_webhook(&wh), "POST /api/hook (2.4KiB)");
+        assert_eq!(summarize_webhook(&wh), "POST /api/hook (2.4 KiB)");
     }
 
     // -- CapturedWebhook methods --
@@ -522,25 +511,5 @@ mod tests {
         assert_eq!(WebhookProvider::Stripe.to_string(), "Stripe");
         assert_eq!(WebhookProvider::GitHub.to_string(), "GitHub");
         assert_eq!(WebhookProvider::SendGrid.to_string(), "SendGrid");
-    }
-
-    // -- format_size --
-
-    #[test]
-    fn format_size_bytes() {
-        assert_eq!(format_size(0), "0B");
-        assert_eq!(format_size(512), "512B");
-        assert_eq!(format_size(1023), "1023B");
-    }
-
-    #[test]
-    fn format_size_kilobytes() {
-        assert_eq!(format_size(1024), "1.0KiB");
-        assert_eq!(format_size(2560), "2.5KiB");
-    }
-
-    #[test]
-    fn format_size_megabytes() {
-        assert_eq!(format_size(1024 * 1024), "1.0MiB");
     }
 }

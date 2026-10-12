@@ -2292,7 +2292,7 @@ mod tests {
 
         assert_eq!(
             tunnel_limit_summary(Some(&limits)).as_deref(),
-            Some("1 tunnel · 4000/min · 10.0 MiB body · 0 custom domains · 600/min/IP")
+            Some("1 tunnel · 4000/min · 10 MiB body · 0 custom domains · 600/min/IP")
         );
     }
 
@@ -2309,7 +2309,7 @@ mod tests {
 
         assert_eq!(
             tunnel_limit_summary(Some(&limits)).as_deref(),
-            Some("3 tunnels · 20000/min · 100.0 MiB body · 3 custom domains · 600/min/IP")
+            Some("3 tunnels · 20000/min · 100 MiB body · 3 custom domains · 600/min/IP")
         );
     }
 
