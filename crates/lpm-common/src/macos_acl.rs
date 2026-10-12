@@ -120,6 +120,66 @@ mod tests {
         assert!(!ignores_ownership(&handle).unwrap());
     }
 
+    struct AttachedImage(std::path::PathBuf);
+
+    impl Drop for AttachedImage {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("/usr/bin/hdiutil")
+                .args(["detach", "-force", "-quiet"])
+                .arg(&self.0)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+
+    fn hdiutil(arguments: &[&std::ffi::OsStr]) {
+        let output = std::process::Command::new("/usr/bin/hdiutil")
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "hdiutil {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn a_volume_mounted_without_owners_reads_as_ignoring_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("volume.dmg");
+        let mount_point = directory.path().join("mounted");
+        std::fs::create_dir(&mount_point).unwrap();
+        hdiutil(&[
+            "create".as_ref(),
+            "-quiet".as_ref(),
+            "-size".as_ref(),
+            "2m".as_ref(),
+            "-fs".as_ref(),
+            "HFS+".as_ref(),
+            "-volname".as_ref(),
+            "lpm-noowners".as_ref(),
+            image.as_os_str(),
+        ]);
+        hdiutil(&[
+            "attach".as_ref(),
+            "-quiet".as_ref(),
+            "-nobrowse".as_ref(),
+            "-noautoopen".as_ref(),
+            "-owners".as_ref(),
+            "off".as_ref(),
+            "-mountpoint".as_ref(),
+            mount_point.as_os_str(),
+            image.as_os_str(),
+        ]);
+        let attached = AttachedImage(mount_point);
+
+        let handle = std::fs::File::open(&attached.0).unwrap();
+
+        assert!(ignores_ownership(&handle).unwrap());
+    }
+
     fn add_entry(path: &std::path::Path, entry: &str) {
         let status = std::process::Command::new("/bin/chmod")
             .args(["+a", entry])

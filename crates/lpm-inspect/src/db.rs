@@ -44,6 +44,7 @@ pub struct InspectorDb {
     /// Database file path (for display/diagnostics).
     pub db_path: PathBuf,
     open_to_others: bool,
+    ownership_ignored: bool,
 }
 
 /// A write operation to be batched.
@@ -114,6 +115,7 @@ impl InspectorDb {
             control_conn,
             db_path,
             open_to_others,
+            ownership_ignored,
         ))
     }
 
@@ -123,6 +125,7 @@ impl InspectorDb {
         control_conn: Connection,
         db_path: PathBuf,
         open_to_others: bool,
+        ownership_ignored: bool,
     ) -> Self {
         let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE_CAPACITY);
         let queued_capture_bytes = Arc::new(AtomicUsize::new(0));
@@ -140,6 +143,7 @@ impl InspectorDb {
             queued_capture_bytes,
             db_path,
             open_to_others,
+            ownership_ignored,
         }
     }
 
@@ -174,15 +178,24 @@ impl InspectorDb {
             control_conn,
             tmp,
             false,
+            false,
         ))
     }
 
     /// Whether other users could open the capture files when this handle
-    /// opened them: a database [`Self::open_for_review`] found so, or one on
-    /// a filesystem that shows its files open to others whatever their mode,
-    /// which [`Self::open`] can't make owner-only.
+    /// opened them: a database [`Self::open_for_review`] found so, or one
+    /// whose file modes don't keep others out, which [`Self::open`] can't
+    /// make owner-only: on a filesystem without Unix modes, or a volume that
+    /// ignores ownership ([`Self::ownership_ignored`]).
     pub fn open_to_others(&self) -> bool {
         self.open_to_others
+    }
+
+    /// Whether the capture files' volume ignores ownership, as one mounted
+    /// `noowners` on macOS does: every user owns its files, so they're open
+    /// to others whatever their mode, and no open can change that.
+    pub fn ownership_ignored(&self) -> bool {
+        self.ownership_ignored
     }
 
     /// Insert a captured request (non-blocking — queued for batch write).
@@ -1401,7 +1414,8 @@ fn replace_with_owner_only_copy(db_path: &Path, owner: CaptureOwner) -> Result<b
 /// Checks a database others could open, and copies it into the owner-only
 /// file made for the copy.
 fn copy_checked_database(db_path: &Path, copy_path: &Path) -> Result<(), OpenError> {
-    let database = open_nofollow_connection(db_path).map_err(damaged(db_path))?;
+    ensure_room_to_copy(db_path)?;
+    let database = open_nofollow_connection(db_path).map_err(checking(db_path))?;
     refuse_unknown_schema(&database, db_path)?;
     // In WAL, which every LPM connection uses, leaving it needs the only
     // connection, so it proves no other LPM process has the database open,
@@ -1412,10 +1426,52 @@ fn copy_checked_database(db_path: &Path, copy_path: &Path) -> Result<(), OpenErr
         Ok(mode) if mode.eq_ignore_ascii_case("delete") => {}
         Ok(_) => return Err(in_use(db_path)),
         Err(error) if is_busy(&error) => return Err(in_use(db_path)),
-        Err(error) => return Err(damaged(db_path)(error)),
+        Err(error) => return Err(checking(db_path)(error)),
     }
     refuse_damage(&database, db_path)?;
     copy_database(&database, copy_path, db_path)
+}
+
+/// Reads a full disk while the database is checked as the copy's want of
+/// room, and any other failure as [`damaged`] does.
+fn checking(db_path: &Path) -> impl Fn(rusqlite::Error) -> OpenError + '_ {
+    move |error| {
+        if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) {
+            no_room_to_copy(db_path)
+        } else {
+            damaged(db_path)(error)
+        }
+    }
+}
+
+/// The room SQLite's shared-memory file takes as the check opens the
+/// database.
+const SHARED_MEMORY_ROOM: u64 = 64 * 1024;
+
+/// The free space replacing a database takes: the copy, which holds the
+/// database with its WAL folded in; the database's own growth, as leaving
+/// WAL folds the WAL into it; and SQLite's shared-memory file.
+fn room_to_copy(db_path: &Path) -> Option<u64> {
+    let database = std::fs::metadata(db_path).ok()?.len();
+    let wal = std::fs::metadata(capture_file(db_path, "-wal")).map_or(0, |wal| wal.len());
+    Some(
+        database
+            .saturating_add(wal.saturating_mul(2))
+            .saturating_add(SHARED_MEMORY_ROOM),
+    )
+}
+
+/// Refuses a replacement its disk can't hold before the database is
+/// opened, as SQLite's own failure on a full disk can come as a bare I/O
+/// error and leave its files behind.
+fn ensure_room_to_copy(db_path: &Path) -> Result<(), OpenError> {
+    let available = lpm_common::filesystem_available_bytes(db_path);
+    #[cfg(test)]
+    let available = tests::AVAILABLE_BYTES.get().or(available);
+    match (available, room_to_copy(db_path)) {
+        (Some(available), Some(needed)) if available < needed => Err(no_room_to_copy(db_path)),
+        _ => Ok(()),
+    }
 }
 
 fn in_use(db_path: &Path) -> OpenError {
@@ -1455,9 +1511,9 @@ fn copy_database(database: &Connection, copy_path: &Path, db_path: &Path) -> Res
 }
 
 fn no_room_to_copy(db_path: &Path) -> OpenError {
-    let needed = std::fs::metadata(db_path).map_or_else(
-        |_| "as much as it takes".to_owned(),
-        |metadata| format!("about {}", lpm_common::format_bytes(metadata.len())),
+    let needed = room_to_copy(db_path).map_or_else(
+        || "as much as it takes".to_owned(),
+        |bytes| format!("about {}", lpm_common::format_bytes(bytes)),
     );
     OpenError::Files(std::io::Error::new(
         std::io::ErrorKind::StorageFull,
@@ -1577,44 +1633,54 @@ fn is_busy(error: &rusqlite::Error) -> bool {
 /// SQL in its [`canonical_sql`] form.
 type SchemaObject = (String, String, String, Option<String>);
 
-/// SQL without the whitespace that separates nothing: a run of whitespace
-/// is kept, as one space, only between two word characters, so the text an
-/// `ALTER TABLE` splices in reads the same however it's spaced. Whitespace
-/// and word characters are SQLite's own: only ASCII space, tab, newline,
-/// form feed and carriage return separate tokens, and any other character
-/// past ASCII belongs to a word. Quoted text, a string or a quoted name, is
-/// kept as written, since its spaces are part of it. So text whose tokens
-/// differ for SQLite can't read the same here.
+/// SQL as SQLite tokenizes it, for comparing schema text. Whitespace next
+/// to a parenthesis or a comma, which are tokens of their own, is dropped,
+/// so the text an `ALTER TABLE` splices in reads the same however it's
+/// spaced; any other run of whitespace reads as one space, as it may part
+/// two tokens that would otherwise read as one (`< =` and `<=`). Quoted
+/// text, a string or a quoted name, and comments are kept as written, a
+/// line comment with the newline that ends it. Whitespace is SQLite's own:
+/// ASCII space, tab, newline, form feed and carriage return. So text whose
+/// tokens differ for SQLite can't read the same here.
 fn canonical_sql(sql: &str) -> String {
-    let is_word = |character: char| {
-        character.is_ascii_alphanumeric() || matches!(character, '_' | '$') || !character.is_ascii()
-    };
+    let separates = |character: char| matches!(character, '(' | ')' | ',');
     let mut canonical = String::with_capacity(sql.len());
     let mut spaced = false;
-    let mut characters = sql.chars();
+    let mut characters = sql.chars().peekable();
     while let Some(character) = characters.next() {
         if matches!(character, ' ' | '\t' | '\n' | '\x0c' | '\r') {
             spaced = true;
             continue;
         }
-        if spaced && canonical.ends_with(is_word) && is_word(character) {
+        if spaced
+            && !canonical.is_empty()
+            && !canonical.ends_with(separates)
+            && !separates(character)
+        {
             canonical.push(' ');
         }
         spaced = false;
         canonical.push(character);
-        let close = match character {
-            '\'' | '"' | '`' => character,
-            '[' => ']',
+        let end = match (character, characters.peek()) {
+            ('\'' | '"' | '`', _) => character.to_string(),
+            ('[', _) => "]".to_owned(),
+            ('-', Some('-')) => "\n".to_owned(),
+            ('/', Some('*')) => {
+                canonical.push('*');
+                characters.next();
+                "*/".to_owned()
+            }
             _ => continue,
         };
-        // A doubled quote, which stands for one, ends a span where the next
-        // begins, so its text is kept all the same.
-        for quoted in characters.by_ref() {
-            canonical.push(quoted);
-            if quoted == close {
+        // The span's own text, so `/*/` doesn't read as a closed comment.
+        let mut span = String::new();
+        for kept in characters.by_ref() {
+            span.push(kept);
+            if span.ends_with(end.as_str()) {
                 break;
             }
         }
+        canonical.push_str(&span);
     }
     canonical
 }
@@ -2289,6 +2355,9 @@ mod tests {
         /// How long this thread's opens wait for the lock, in place of
         /// [`OPEN_LOCK_TIMEOUT`], for a test of the wait itself.
         pub(super) static OPEN_LOCK_WAIT: std::cell::Cell<Option<std::time::Duration>> =
+            const { std::cell::Cell::new(None) };
+        /// The free space this thread's replacements find on their disk.
+        pub(super) static AVAILABLE_BYTES: std::cell::Cell<Option<u64>> =
             const { std::cell::Cell::new(None) };
         /// The failure this thread's replacement copies are created with, as
         /// a disk with no blocks left fails them.
@@ -2972,15 +3041,16 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let (existing, kept, new) = runtime.block_on(async {
+        let (existing, ownership_ignored, kept, new) = runtime.block_on(async {
             let db = InspectorDb::open(project.path()).unwrap();
             let kept = db.get_webhook("kept").await.unwrap();
             let new = InspectorDb::open(fresh.path()).unwrap().open_to_others();
-            (db.open_to_others(), kept, new)
+            (db.open_to_others(), db.ownership_ignored(), kept, new)
         });
         MODELESS_FILESYSTEM.set(false);
 
         assert!(existing);
+        assert!(!ownership_ignored);
         assert!(new);
         assert!(kept.is_some());
         assert_eq!(std::fs::metadata(&db_path).unwrap().ino(), inode);
@@ -3006,24 +3076,183 @@ mod tests {
             .build()
             .unwrap();
         let (reviewed, existing, kept, new) = runtime.block_on(async {
-            let reviewed = InspectorDb::open_for_review(owner_only.path())
-                .unwrap()
-                .open_to_others();
+            let reviewed = InspectorDb::open_for_review(owner_only.path()).unwrap();
             let review = InspectorDb::open_for_review(project.path()).unwrap();
             let db = InspectorDb::open(project.path()).unwrap();
             let kept = db.get_webhook("kept").await.unwrap();
-            let new = InspectorDb::open(fresh.path()).unwrap().open_to_others();
+            let new = InspectorDb::open(fresh.path()).unwrap();
             drop(review);
-            (reviewed, db.open_to_others(), kept, new)
+            let state = |db: &InspectorDb| (db.open_to_others(), db.ownership_ignored());
+            (state(&reviewed), state(&db), kept, state(&new))
         });
         OWNERSHIP_IGNORED.set(false);
 
-        assert!(reviewed);
-        assert!(existing);
-        assert!(new);
+        assert_eq!(reviewed, (true, true));
+        assert_eq!(existing, (true, true));
+        assert_eq!(new, (true, true));
         assert!(kept.is_some());
         assert_eq!(std::fs::metadata(&db_path).unwrap().ino(), inode);
         assert!(!project.path().join(".lpm/inspector.db-copy").exists());
+    }
+
+    /// A disk image attached for a test, detached when dropped.
+    #[cfg(target_os = "macos")]
+    struct AttachedImage(std::path::PathBuf);
+
+    #[cfg(target_os = "macos")]
+    impl Drop for AttachedImage {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("/usr/bin/hdiutil")
+                .args(["detach", "-force", "-quiet"])
+                .arg(&self.0)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+
+    /// Attaches a new HFS+ image of `size` in `directory`, keeping or
+    /// ignoring ownership on it.
+    #[cfg(target_os = "macos")]
+    fn attach_image(directory: &Path, size: &str, owners: bool) -> AttachedImage {
+        let hdiutil = |arguments: &[&std::ffi::OsStr]| {
+            let output = std::process::Command::new("/usr/bin/hdiutil")
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "hdiutil {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        let image = directory.join("volume.dmg");
+        let mount_point = directory.join("mounted");
+        std::fs::create_dir(&mount_point).unwrap();
+        hdiutil(&[
+            "create".as_ref(),
+            "-quiet".as_ref(),
+            "-size".as_ref(),
+            size.as_ref(),
+            "-fs".as_ref(),
+            "HFS+".as_ref(),
+            "-volname".as_ref(),
+            "lpm-inspect-test".as_ref(),
+            image.as_os_str(),
+        ]);
+        hdiutil(&[
+            "attach".as_ref(),
+            "-quiet".as_ref(),
+            "-nobrowse".as_ref(),
+            "-noautoopen".as_ref(),
+            "-owners".as_ref(),
+            if owners { "on" } else { "off" }.as_ref(),
+            "-mountpoint".as_ref(),
+            mount_point.as_os_str(),
+            image.as_os_str(),
+        ]);
+        AttachedImage(mount_point)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_project_on_a_volume_mounted_without_owners_keeps_captures_and_says_they_re_open_to_others()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let attached = attach_image(directory.path(), "8m", false);
+        let project = attached.0.join("project");
+        std::fs::create_dir(&project).unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (created, reopened, kept) = runtime.block_on(async {
+            let db = InspectorDb::open(&project).unwrap();
+            db.insert_durable_request(Arc::new(make_webhook("kept", 200)), None)
+                .await
+                .unwrap();
+            let created = (db.open_to_others(), db.ownership_ignored());
+            drop(db);
+            let db = InspectorDb::open(&project).unwrap();
+            let kept = db.get_webhook("kept").await.unwrap();
+            (created, (db.open_to_others(), db.ownership_ignored()), kept)
+        });
+        drop(runtime);
+
+        assert_eq!(created, (true, true));
+        assert_eq!(reopened, (true, true));
+        assert!(kept.is_some());
+        assert!(!project.join(".lpm/inspector.db-copy").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_disk_that_fills_while_the_database_is_checked_says_how_much_room_the_copy_needs() {
+        let directory = tempfile::tempdir().unwrap();
+        let attached = attach_image(directory.path(), "4m", true);
+        let project = attached.0.join("project");
+        std::fs::create_dir(&project).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let db = InspectorDb::open(&project).unwrap();
+            db.insert_durable_request(Arc::new(make_webhook("kept", 200)), None)
+                .await
+                .unwrap();
+        });
+        drop(runtime);
+        let db_path = project.join(".lpm/inspector.db");
+        // A WAL that leaving WAL has to fold into the database, which the
+        // disk then has no room for.
+        let writer = Connection::open(&db_path).unwrap();
+        writer
+            .set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                true,
+            )
+            .unwrap();
+        writer.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        writer
+            .execute(
+                "INSERT INTO requests (id, timestamp, method, path, request_body) \
+                 VALUES ('bulk', '2026-04-06T12:00:00Z', 'POST', '/', zeroblob(600000))",
+                [],
+            )
+            .unwrap();
+        drop(writer);
+        set_mode(&db_path, 0o644);
+        let filler = attached.0.join("filler");
+        let free = lpm_common::filesystem_available_bytes(&attached.0).unwrap();
+        std::fs::write(
+            &filler,
+            vec![0; usize::try_from(free - 200 * 1024).unwrap()],
+        )
+        .unwrap();
+
+        AVAILABLE_BYTES.set(Some(u64::MAX));
+        let full = InspectorDb::open(&project).map(drop);
+        AVAILABLE_BYTES.set(None);
+
+        let error = full.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull, "{error}");
+        assert!(error.to_string().contains("free on its disk"), "{error}");
+        assert_eq!(mode(&db_path), 0o644);
+        assert!(!capture_file(&db_path, "-copy").exists());
+
+        std::fs::remove_file(&filler).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let kept = runtime.block_on(async {
+            let db = InspectorDb::open(&project).unwrap();
+            db.get_webhook("kept").await.unwrap()
+        });
+        assert!(kept.is_some());
+        assert_eq!(mode(&db_path), 0o600);
     }
 
     #[cfg(unix)]
@@ -3496,12 +3725,16 @@ mod tests {
     }
 
     #[test]
-    fn canonical_sql_keeps_only_the_spaces_between_words() {
+    fn canonical_sql_drops_the_spaces_around_parentheses_and_commas() {
         assert_eq!(
             canonical_sql("CREATE TABLE t (\n\t a  TEXT ,b\tINT )"),
             "CREATE TABLE t(a TEXT,b INT)"
         );
         assert_ne!(canonical_sql("summary TEXT"), canonical_sql("summ aryTEXT"));
+        assert_eq!(
+            canonical_sql("\n  CREATE TABLE t (x)\n"),
+            "CREATE TABLE t(x)"
+        );
     }
 
     #[test]
@@ -3530,7 +3763,41 @@ mod tests {
         );
         assert_eq!(
             canonical_sql("CREATE TABLE [a]] b] (x)"),
-            "CREATE TABLE[a]]b](x)"
+            "CREATE TABLE [a]] b](x)"
+        );
+    }
+
+    #[test]
+    fn canonical_sql_keeps_apart_what_sqlite_reads_apart() {
+        for (written, respaced) in [
+            // One string against two.
+            ("c 'a''b'", "c 'a' 'b'"),
+            // Subtraction of a negative against a comment.
+            ("DEFAULT (1 - -1)", "DEFAULT (1 --1\n)"),
+            ("x <= 1", "x < = 1"),
+            // A string against a blob literal.
+            ("x '00'", "x'00'"),
+            // A comment through the end against one ended by a newline.
+            ("DEFAULT (1 --1)", "DEFAULT (1 --1\n)"),
+            ("a /* x */ b", "a b"),
+        ] {
+            assert_ne!(
+                canonical_sql(written),
+                canonical_sql(respaced),
+                "{written:?} against {respaced:?}"
+            );
+        }
+        assert_eq!(
+            canonical_sql("a /*/  b */  c -- d\n  e"),
+            "a /*/  b */ c -- d\n e"
+        );
+        assert_eq!(
+            canonical_sql("a /* ' */  b -- '\n  c"),
+            "a /* ' */ b -- '\n c"
+        );
+        assert_eq!(
+            canonical_sql("CREATE TABLE t (\n\t a  TEXT ,b\tINT )"),
+            canonical_sql("CREATE TABLE t(a TEXT, b INT)")
         );
     }
 
@@ -3557,10 +3824,61 @@ mod tests {
         assert!(
             error.to_string().contains(&format!(
                 "needs about {} free on its disk",
-                lpm_common::format_bytes(std::fs::metadata(&db_path).unwrap().len())
+                lpm_common::format_bytes(room_to_copy(&db_path).unwrap())
             )),
             "{error}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_disk_without_room_for_the_replacement_says_so_before_anything_is_opened() {
+        let project = project_with_a_database(&format!(
+            "{CAPTURE_SCHEMA} ALTER TABLE requests ADD COLUMN response_body_incomplete \
+             INTEGER NOT NULL DEFAULT 0;"
+        ));
+        let db_path = project.path().join(".lpm/inspector.db");
+        let needed = room_to_copy(&db_path).unwrap();
+
+        AVAILABLE_BYTES.set(Some(needed - 1));
+        let short = InspectorDb::open(project.path()).map(drop);
+        AVAILABLE_BYTES.set(None);
+
+        let error = short.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+        assert!(
+            error.to_string().contains(&format!(
+                "needs about {} free on its disk",
+                lpm_common::format_bytes(needed)
+            )),
+            "{error}"
+        );
+        assert_eq!(mode(&db_path), 0o644);
+        assert!(!capture_file(&db_path, "-copy").exists());
+        assert!(!capture_file(&db_path, "-shm").exists());
+
+        AVAILABLE_BYTES.set(Some(needed));
+        let enough = InspectorDb::open(project.path()).map(drop);
+        AVAILABLE_BYTES.set(None);
+
+        enough.unwrap();
+        assert_eq!(mode(&db_path), 0o600);
+    }
+
+    #[test]
+    fn the_room_a_replacement_needs_counts_the_wal_twice() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("inspector.db");
+        std::fs::write(&db_path, vec![0; 10_000]).unwrap();
+        assert_eq!(room_to_copy(&db_path), Some(10_000 + SHARED_MEMORY_ROOM));
+
+        std::fs::write(capture_file(&db_path, "-wal"), vec![0; 3_000]).unwrap();
+        assert_eq!(
+            room_to_copy(&db_path),
+            Some(10_000 + 6_000 + SHARED_MEMORY_ROOM)
+        );
+        std::fs::remove_file(&db_path).unwrap();
+        assert_eq!(room_to_copy(&db_path), None);
     }
 
     #[cfg(unix)]
@@ -3585,7 +3903,7 @@ mod tests {
             assert_eq!(
                 error.to_string().contains(&format!(
                     "needs about {} free on its disk",
-                    lpm_common::format_bytes(std::fs::metadata(&db_path).unwrap().len())
+                    lpm_common::format_bytes(room_to_copy(&db_path).unwrap())
                 )),
                 room,
                 "{error}"
@@ -4264,6 +4582,7 @@ mod tests {
             queued_capture_bytes: Arc::clone(&queued_capture_bytes),
             db_path,
             open_to_others: false,
+            ownership_ignored: false,
         };
 
         db.start_session("saturated-session".to_string(), None, 3000)

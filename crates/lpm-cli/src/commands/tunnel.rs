@@ -773,16 +773,16 @@ fn capture_warnings(
     let Some(state) = state else {
         return warnings;
     };
-    if let Some(repository) = state.unanswered {
+    for repository in &state.unanswered {
         warnings.push(
             match repository {
                 CaptureRepository::Project => {
-                    "git couldn't run, or didn't answer in time, for the project's repository, \
-                     so check that it doesn't track .lpm/inspector.db*"
+                    "git didn't answer for the project's repository (it couldn't run, refused, \
+                     or took over 2 s), so check that it doesn't track .lpm/inspector.db*"
                 }
                 CaptureRepository::Lpm => {
-                    "git couldn't run, or didn't answer in time, in .lpm, so check that git \
-                     ignores and doesn't track .lpm/inspector.db*"
+                    "git didn't answer in .lpm (it couldn't run or took over 2 s), so check \
+                     that git ignores and doesn't track .lpm/inspector.db*"
                 }
             }
             .to_string(),
@@ -803,12 +803,25 @@ fn capture_warnings(
             .chain(state.lpm_tracked.iter().map(|name| format!(".lpm/{name}")))
             .collect();
         let commands: Vec<String> = [
-            (&state.project_tracked, CaptureRepository::Project),
-            (&state.lpm_tracked, CaptureRepository::Lpm),
+            (
+                &state.project_tracked,
+                CaptureRepository::Project,
+                state.project_spelling_unknown,
+            ),
+            (&state.lpm_tracked, CaptureRepository::Lpm, false),
         ]
         .into_iter()
-        .filter(|(names, _)| !names.is_empty())
-        .map(|(names, repository)| format!("`{}`", untrack_command(names, repository)))
+        .filter(|(names, _, _)| !names.is_empty())
+        .map(|(names, repository, spelling_unknown)| {
+            format!(
+                "`{}`",
+                if spelling_unknown {
+                    untrack_every_capture(repository)
+                } else {
+                    untrack_command(names, repository)
+                }
+            )
+        })
         .collect();
         warnings.push(format!(
             "git tracks {}, so captures there can be committed and stay in its history; \
@@ -891,6 +904,10 @@ struct CaptureGitFiles {
 struct CaptureGitState {
     /// Those the project's repository tracks, by name in the project.
     project_tracked: Vec<String>,
+    /// Whether `project_tracked` is spelled as git in `.lpm` lists it, when
+    /// the project's query didn't answer: the index may spell the directory
+    /// otherwise, as an upstream `.LPM/` on a case-insensitive disk.
+    project_spelling_unknown: bool,
     /// Those a repository of `.lpm`'s own tracks, by name in `.lpm`.
     lpm_tracked: Vec<String>,
     /// Those git neither tracks nor ignores, by name in `.lpm`.
@@ -898,16 +915,16 @@ struct CaptureGitState {
     /// Whether git refused to answer for `.lpm`, as for one that looks like a
     /// bare repository.
     lpm_unasked: bool,
-    /// The repository whose query couldn't run or didn't answer in time, so
-    /// what the other found stands but git's ignoring the files isn't
-    /// confirmed.
-    unanswered: Option<CaptureRepository>,
+    /// The repositories whose query couldn't run, was refused in a
+    /// repository, or didn't answer in time, so what the other found stands
+    /// but git's ignoring the files isn't confirmed.
+    unanswered: Vec<CaptureRepository>,
 }
 
 impl CaptureGitState {
     fn kept_out(&self) -> bool {
         !self.lpm_unasked
-            && self.unanswered.is_none()
+            && self.unanswered.is_empty()
             && self.project_tracked.is_empty()
             && self.lpm_tracked.is_empty()
             && self.unignored.is_empty()
@@ -968,7 +985,10 @@ where
 {
     let lpm_dir = project_dir.join(".lpm");
     let lpm_exists = lpm_dir.is_dir();
-    let own_repository = std::fs::symlink_metadata(lpm_dir.join(".git")).is_ok();
+    let own_repository = marks_a_repository(&lpm_dir.join(".git"));
+    let in_repository = project_dir
+        .ancestors()
+        .any(|directory| marks_a_repository(&directory.join(".git")));
     let project = ask(CaptureGitQuery {
         directory: project_dir.to_path_buf(),
         pathspec: PROJECT_CAPTURES_PATHSPEC,
@@ -996,11 +1016,14 @@ where
             state.project_tracked = files.tracked;
             true
         }
-        Err(CaptureGitFailure::Refused) => false,
-        Err(CaptureGitFailure::Unavailable) => {
-            state.unanswered = Some(CaptureRepository::Project);
+        // In a repository, a query that fails is no answer, git refusing
+        // included, as for one another user owns, run as root; outside one,
+        // there's nothing to ask.
+        Err(_) if in_repository => {
+            state.unanswered.push(CaptureRepository::Project);
             false
         }
+        Err(_) => false,
     };
     let inside_answered = match inside {
         Some(Ok(files)) => {
@@ -1015,6 +1038,7 @@ where
                     .into_iter()
                     .map(|name| format!(".lpm/{name}"))
                     .collect();
+                state.project_spelling_unknown = !state.project_tracked.is_empty();
             }
             state.unignored = files.unignored;
             true
@@ -1024,12 +1048,28 @@ where
             false
         }
         Some(Err(CaptureGitFailure::Unavailable)) => {
-            state.unanswered = Some(CaptureRepository::Lpm);
+            state.unanswered.push(CaptureRepository::Lpm);
             false
         }
         None => false,
     };
-    (project_answered || inside_answered).then_some(state)
+    (project_answered || inside_answered || in_repository || own_repository).then_some(state)
+}
+
+/// Whether a `.git` entry makes its directory a repository's: a directory,
+/// or a file pointing at one (`gitdir: …`). An empty or other file doesn't,
+/// as git doesn't take it for one.
+fn marks_a_repository(git: &Path) -> bool {
+    match std::fs::symlink_metadata(git) {
+        Ok(metadata) if metadata.is_dir() => true,
+        Ok(metadata) if metadata.is_file() => {
+            let mut start = [0_u8; 7];
+            lpm_common::open_nofollow(git)
+                .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut start))
+                .is_ok_and(|()| &start == b"gitdir:")
+        }
+        _ => false,
+    }
 }
 
 fn capture_git_command(query: &CaptureGitQuery) -> tokio::process::Command {
@@ -1122,15 +1162,27 @@ fn listed(names: &[String]) -> String {
 /// otherwise the repository's capture pathspec, which every shell reads
 /// alike in double quotes.
 fn untrack_command(tracked: &[String], repository: CaptureRepository) -> String {
-    let named = tracked.len() <= LISTED_FILES && tracked.iter().all(|name| is_plain(name));
-    let (command, pathspec) = match repository {
-        CaptureRepository::Project => ("git rm --cached --", PROJECT_CAPTURES_PATHSPEC),
-        CaptureRepository::Lpm => ("git -C .lpm rm --cached --", CAPTURES_PATHSPEC),
-    };
-    if named {
-        format!("{command} {}", tracked.join(" "))
+    if tracked.len() <= LISTED_FILES && tracked.iter().all(|name| is_plain(name)) {
+        format!("{} {}", untrack_prefix(repository), tracked.join(" "))
     } else {
-        format!("{command} \"{pathspec}\"")
+        untrack_every_capture(repository)
+    }
+}
+
+/// The command that stops `repository` tracking every capture file, by the
+/// capture pathspec, matched without regard to case.
+fn untrack_every_capture(repository: CaptureRepository) -> String {
+    let pathspec = match repository {
+        CaptureRepository::Project => PROJECT_CAPTURES_PATHSPEC,
+        CaptureRepository::Lpm => CAPTURES_PATHSPEC,
+    };
+    format!("{} \"{pathspec}\"", untrack_prefix(repository))
+}
+
+fn untrack_prefix(repository: CaptureRepository) -> &'static str {
+    match repository {
+        CaptureRepository::Project => "git rm --cached --",
+        CaptureRepository::Lpm => "git -C .lpm rm --cached --",
     }
 }
 
@@ -1657,15 +1709,31 @@ fn open_inspector_db_for_review(
 ) -> Result<lpm_inspect::db::InspectorDb, LpmError> {
     let db =
         lpm_inspect::db::InspectorDb::open_for_review(project_dir).map_err(inspector_open_error)?;
-    if db.open_to_others() {
-        capture_warning(CAPTURES_OPEN_TO_OTHERS, show_human_warning);
+    if let Some(warning) = review_warning(db.open_to_others(), db.ownership_ignored()) {
+        capture_warning(warning, show_human_warning);
     }
     Ok(db)
 }
 
+/// What a review tells of a capture database other users could open, and
+/// whether a capture writer's run can change it.
+fn review_warning(open_to_others: bool, ownership_ignored: bool) -> Option<&'static str> {
+    if !open_to_others {
+        None
+    } else if ownership_ignored {
+        Some(CAPTURES_ON_A_SHARED_VOLUME)
+    } else {
+        Some(CAPTURES_OPEN_TO_OTHERS)
+    }
+}
+
 const CAPTURES_OPEN_TO_OTHERS: &str = ".lpm/inspector.db is open to other users, so they may \
      read its captures; an `lpm tunnel` or `lpm dev --tunnel` run in this project makes it \
-     owner-only where the filesystem keeps Unix file modes";
+     owner-only where file modes keep other users out";
+
+const CAPTURES_ON_A_SHARED_VOLUME: &str = ".lpm/inspector.db is open to other users, so they \
+     may read its captures: its volume ignores ownership, so every user owns its files whatever \
+     their mode; keep the project on a volume that keeps ownership";
 
 /// The capture database's open failures are local, so they're reported as
 /// such, not as a tunnel's; each says what to do.
@@ -2591,10 +2659,11 @@ mod tests {
             state,
             Some(CaptureGitState {
                 project_tracked: names(&[".lpm/inspector.db"]),
+                project_spelling_unknown: false,
                 lpm_tracked: Vec::new(),
                 unignored: names(&["inspector.db-wal"]),
                 lpm_unasked: false,
-                unanswered: None,
+                unanswered: Vec::new(),
             })
         );
     }
@@ -2633,7 +2702,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn says_nothing_of_git_when_neither_query_answers() {
+    async fn says_nothing_of_git_outside_a_repository_when_neither_query_answers() {
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir(project.path().join(".lpm")).unwrap();
 
@@ -2655,11 +2724,138 @@ mod tests {
                 state_from_answers(project.path(), project_answer, inside_answer).await;
             assert_eq!(state, None);
         }
+
+        // Git in `.lpm` answered, so only the project's query went unanswered,
+        // and outside a repository there was nothing for it to find.
+        let (answered, _) = state_from_answers(
+            project.path(),
+            Err(CaptureGitFailure::Unavailable),
+            Ok(CaptureGitFiles::default()),
+        )
+        .await;
+        let answered = answered.unwrap();
+        assert!(answered.unanswered.is_empty(), "{answered:?}");
+        assert!(answered.kept_out());
+    }
+
+    #[tokio::test]
+    async fn names_lpm_s_own_repository_when_git_there_doesn_t_answer() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".lpm/.git")).unwrap();
+
+        let (state, _) = state_from_answers(
+            project.path(),
+            Err(CaptureGitFailure::Refused),
+            Err(CaptureGitFailure::Unavailable),
+        )
+        .await;
+
+        let state = state.unwrap();
+        assert_eq!(state.unanswered, vec![CaptureRepository::Lpm]);
+        let warnings = warnings_for(Some(state), false);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.starts_with("git didn't answer in .lpm")),
+            "{warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn names_each_query_a_repository_leaves_unanswered_even_when_neither_answers() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".git")).unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+
+        // As for a repository another user owns, run as root.
+        let (refused, _) = state_from_answers(
+            project.path(),
+            Err(CaptureGitFailure::Refused),
+            Err(CaptureGitFailure::Refused),
+        )
+        .await;
+        let refused = refused.unwrap();
+        assert_eq!(refused.unanswered, vec![CaptureRepository::Project]);
+        assert!(refused.lpm_unasked);
+        let warnings = warnings_for(Some(refused), false);
+        assert!(
+            warnings.iter().any(|warning| warning
+                .starts_with("git didn't answer for the project's repository (it couldn't run, refused, or took over 2 s)")),
+            "{warnings:?}"
+        );
+
+        let (slow, _) = state_from_answers(
+            project.path(),
+            Err(CaptureGitFailure::Unavailable),
+            Err(CaptureGitFailure::Unavailable),
+        )
+        .await;
+        let slow = slow.unwrap();
+        assert_eq!(
+            slow.unanswered,
+            vec![CaptureRepository::Project, CaptureRepository::Lpm]
+        );
+        assert!(!slow.kept_out());
+        let warnings = warnings_for(Some(slow), false);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.starts_with("git didn't answer in .lpm")),
+            "{warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn takes_a_project_inside_a_repository_s_subdirectory_as_in_that_repository() {
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repository.path().join(".git")).unwrap();
+        let project = repository.path().join("packages/app");
+        std::fs::create_dir_all(project.join(".lpm")).unwrap();
+
+        let (state, _) = state_from_answers(
+            &project,
+            Err(CaptureGitFailure::Refused),
+            Err(CaptureGitFailure::Refused),
+        )
+        .await;
+
+        assert_eq!(state.unwrap().unanswered, vec![CaptureRepository::Project]);
+    }
+
+    #[tokio::test]
+    async fn takes_lpm_s_git_entry_for_a_repository_only_as_git_does() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+        let git = project.path().join(".lpm/.git");
+
+        for (contents, own) in [
+            ("", false),
+            ("not a pointer\n", false),
+            ("gitdir: ../../elsewhere/.git\n", true),
+        ] {
+            std::fs::write(&git, contents).unwrap();
+            let (state, _) = state_from_answers(
+                project.path(),
+                Err(CaptureGitFailure::Unavailable),
+                Ok(files(&["inspector.db"], &[])),
+            )
+            .await;
+            let state = state.unwrap();
+            assert_eq!(
+                (
+                    state.lpm_tracked.is_empty(),
+                    state.project_tracked.is_empty()
+                ),
+                (!own, own),
+                "{contents:?}: {state:?}"
+            );
+        }
     }
 
     #[tokio::test]
     async fn keeps_what_one_query_confirms_when_the_other_doesn_t_answer_in_time() {
         let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".git")).unwrap();
         std::fs::create_dir(project.path().join(".lpm")).unwrap();
 
         let (tracked, _) = state_from_answers(
@@ -2687,20 +2883,24 @@ mod tests {
             "{warnings:?}"
         );
         assert!(
-            warnings.iter().any(|warning| warning
-                .starts_with("git couldn't run, or didn't answer in time, in .lpm")),
+            warnings
+                .iter()
+                .any(|warning| warning.starts_with("git didn't answer in .lpm")),
             "{warnings:?}"
         );
         let quiet = warnings_for(quiet, false);
         assert!(!quiet[0].contains("git ignores it"), "{quiet:?}");
-        assert!(quiet.iter().any(|warning| warning.starts_with(
-            "git couldn't run, or didn't answer in time, for the project's repository"
-        )));
+        assert!(
+            quiet.iter().any(
+                |warning| warning.starts_with("git didn't answer for the project's repository")
+            )
+        );
     }
 
     #[tokio::test]
     async fn reports_what_git_in_lpm_finds_tracked_when_the_project_s_query_doesn_t_answer() {
         let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".git")).unwrap();
         std::fs::create_dir(project.path().join(".lpm")).unwrap();
 
         let (state, _) = state_from_answers(
@@ -2712,12 +2912,16 @@ mod tests {
 
         let state = state.unwrap();
         assert_eq!(state.project_tracked, names(&[".lpm/inspector.db"]));
-        assert_eq!(state.unanswered, Some(CaptureRepository::Project));
+        assert_eq!(state.unanswered, vec![CaptureRepository::Project]);
+        assert!(state.project_spelling_unknown);
         let warnings = warnings_for(Some(state), false);
+        // Git in `.lpm` may spell the directory otherwise than the index, so
+        // the command matches every capture file without regard to case.
+        let command = format!("`git rm --cached -- \"{PROJECT_CAPTURES_PATHSPEC}\"`");
         assert!(
             warnings.iter().any(
                 |warning| warning.starts_with("git tracks '.lpm/inspector.db'")
-                    && warning.contains("`git rm --cached -- .lpm/inspector.db`")
+                    && warning.contains(&command)
             ),
             "{warnings:?}"
         );
@@ -2735,6 +2939,23 @@ mod tests {
         assert_eq!(own.lpm_tracked, names(&["inspector.db"]));
     }
 
+    #[test]
+    fn a_review_says_whether_a_tunnel_run_can_make_the_database_owner_only() {
+        assert_eq!(review_warning(false, false), None);
+        assert_eq!(review_warning(false, true), None);
+        assert!(
+            review_warning(true, false)
+                .unwrap()
+                .ends_with("makes it owner-only where file modes keep other users out")
+        );
+        let shared = review_warning(true, true).unwrap();
+        assert!(
+            shared.contains("its volume ignores ownership")
+                && !shared.contains("makes it owner-only"),
+            "{shared}"
+        );
+    }
+
     fn warnings_for(state: Option<CaptureGitState>, ignore_file_skipped: bool) -> Vec<String> {
         capture_warnings(state.as_ref(), ignore_file_skipped, CaptureStore::OwnerOnly)
     }
@@ -2746,10 +2967,11 @@ mod tests {
     ) -> CaptureGitState {
         CaptureGitState {
             project_tracked: names(project_tracked),
+            project_spelling_unknown: false,
             lpm_tracked: names(lpm_tracked),
             unignored: names(unignored),
             lpm_unasked: false,
-            unanswered: None,
+            unanswered: Vec::new(),
         }
     }
 
@@ -2760,18 +2982,18 @@ mod tests {
             None,
             Some(CaptureGitState {
                 lpm_unasked: true,
-                unanswered: None,
+                unanswered: Vec::new(),
                 ..state(&[], &[], &[])
             }),
             Some(state(&[".lpm/inspector.db"], &[], &[])),
             Some(state(&[], &["inspector.db"], &[])),
             Some(state(&[], &[], &["inspector.db-wal"])),
             Some(CaptureGitState {
-                unanswered: Some(CaptureRepository::Project),
+                unanswered: vec![CaptureRepository::Project],
                 ..state(&[], &[], &[])
             }),
             Some(CaptureGitState {
-                unanswered: Some(CaptureRepository::Lpm),
+                unanswered: vec![CaptureRepository::Lpm],
                 ..state(&[], &[], &[])
             }),
         ] {
@@ -2787,7 +3009,7 @@ mod tests {
         let warnings = warnings_for(
             Some(CaptureGitState {
                 lpm_unasked: true,
-                unanswered: None,
+                unanswered: Vec::new(),
                 ..state(&[], &[], &[])
             }),
             false,

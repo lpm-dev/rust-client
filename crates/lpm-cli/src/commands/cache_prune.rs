@@ -303,7 +303,7 @@ fn run_all_virtual_stores_locked(
 ) -> Result<PruneSummary, LpmError> {
     let free_before = flags
         .apply
-        .then(|| filesystem_available_bytes(v3_store.paths().root()))
+        .then(|| lpm_common::filesystem_available_bytes(v3_store.paths().root()))
         .flatten();
     let stores = [v2_store, v3_store];
     let directories = [
@@ -353,7 +353,7 @@ fn run_all_virtual_stores_locked(
     }
     let mut summary = merge_prune_summaries(v2, v3);
     summary.observed_physical_bytes_freed = free_before.and_then(|before| {
-        filesystem_available_bytes(v3_store.paths().root())?.checked_sub(before)
+        lpm_common::filesystem_available_bytes(v3_store.paths().root())?.checked_sub(before)
     });
     Ok(summary)
 }
@@ -1496,35 +1496,6 @@ fn dir_size(dir: &Path) -> std::io::Result<u64> {
         }
     }
     Ok(total)
-}
-
-#[cfg(unix)]
-fn filesystem_available_bytes(path: &Path) -> Option<u64> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let mut probe = path.to_path_buf();
-    while !probe.try_exists().ok()? {
-        if !probe.pop() {
-            return None;
-        }
-    }
-    let path = CString::new(probe.as_os_str().as_bytes()).ok()?;
-    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: `path` is NUL-terminated and `stats` points to writable,
-    // properly aligned storage that is read only after a successful call.
-    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
-        return None;
-    }
-    // SAFETY: `statvfs` returned success and initialized the output structure.
-    let stats = unsafe { stats.assume_init() };
-    let bytes = u128::from(stats.f_bavail).checked_mul(u128::from(stats.f_frsize))?;
-    u64::try_from(bytes).ok()
-}
-
-#[cfg(not(unix))]
-fn filesystem_available_bytes(_path: &Path) -> Option<u64> {
-    None
 }
 
 /// LRU + crash-recovery orphan detection for the compat-island cache at

@@ -315,6 +315,37 @@ pub fn is_loopback_host(host: &str) -> bool {
     false
 }
 
+/// The bytes free to this user on the filesystem holding `path`, or its
+/// nearest existing ancestor; None where it can't be read.
+#[cfg(unix)]
+pub fn filesystem_available_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut probe = path.to_path_buf();
+    while !probe.try_exists().ok()? {
+        if !probe.pop() {
+            return None;
+        }
+    }
+    let path = CString::new(probe.as_os_str().as_bytes()).ok()?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `stats` points to writable,
+    // properly aligned storage that is read only after a successful call.
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: `statvfs` returned success and initialized the output structure.
+    let stats = unsafe { stats.assume_init() };
+    let bytes = u128::from(stats.f_bavail).checked_mul(u128::from(stats.f_frsize))?;
+    u64::try_from(bytes).ok()
+}
+
+#[cfg(not(unix))]
+pub fn filesystem_available_bytes(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
 /// Format bytes into a human-readable string (e.g., "1.2 KB", "3.4 MB").
 pub fn format_bytes(bytes: u64) -> String {
     if bytes < 1024 {
@@ -331,6 +362,47 @@ pub fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `df`'s figure for the filesystem holding `path`: its size and the
+    /// space free to this user, in bytes.
+    #[cfg(unix)]
+    fn df(path: &std::path::Path) -> (u64, u64) {
+        let output = std::process::Command::new("/bin/df")
+            .arg("-Pk")
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).unwrap();
+        let fields: Vec<u64> = output
+            .lines()
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .skip(1)
+            .take(3)
+            .map(|field| field.parse().unwrap())
+            .collect();
+        (fields[0] * 1024, fields[2] * 1024)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reads_the_space_free_to_this_user_as_df_does() {
+        let directory = tempfile::tempdir().unwrap();
+        let (size, free) = df(directory.path());
+
+        let available = filesystem_available_bytes(directory.path()).unwrap();
+
+        // Other writers move the figure a little between the two reads; the
+        // space reserved for root, which this user can't use, is far more.
+        assert!(
+            available.abs_diff(free) <= size / 200,
+            "{available} against df's {free} of {size}"
+        );
+        let unmade = filesystem_available_bytes(&directory.path().join("not/yet/made")).unwrap();
+        assert!(unmade.abs_diff(available) <= size / 200);
+    }
 
     // ── read_capped_state_file ────────────────────────────────────────
 
