@@ -264,6 +264,114 @@ pub fn open_nofollow(path: &Path) -> io::Result<std::fs::File> {
     options.open(path)
 }
 
+/// The effective user id of this process.
+#[cfg(unix)]
+pub fn current_uid() -> u32 {
+    // SAFETY: geteuid takes no arguments, can't fail, and touches no memory
+    // of the caller's.
+    unsafe { libc::geteuid() }
+}
+
+/// How many names the open file has, as hard links, on Unix and on Windows,
+/// where the standard library doesn't say.
+pub fn link_count(file: &std::fs::File) -> io::Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        Ok(file.metadata()?.nlink())
+    }
+    #[cfg(windows)]
+    {
+        Ok(u64::from(handle_information(file)?.nNumberOfLinks))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Ok(1)
+    }
+}
+
+#[cfg(windows)]
+fn handle_information(
+    file: &std::fs::File,
+) -> io::Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value of its
+    // plain integer fields, and the call only writes into it.
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is the open file's, valid while `file` lives.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(information)
+}
+
+/// Read a bounded regular file unless the entry at `path` is a link: a
+/// symbolic link, or on Windows a junction or another name-surrogate reparse
+/// point. Unlike [`read_text_file_capped_nofollow`], other reparse points,
+/// such as a synced folder's cloud placeholders, are read through, from the
+/// same file the check opened. The metadata is the read file's.
+pub fn read_file_capped_unlinked(
+    path: &Path,
+    limit: u64,
+) -> Result<(Vec<u8>, Metadata), BoundedReadError> {
+    let io_error = |source| BoundedReadError::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    let file = open_nofollow(path).map_err(|source| {
+        if source.kind() == io::ErrorKind::NotFound {
+            BoundedReadError::NotFound {
+                path: path.to_path_buf(),
+            }
+        } else {
+            io_error(source)
+        }
+    })?;
+    let metadata = file.metadata().map_err(io_error)?;
+    if !metadata.is_file() {
+        return Err(io_error(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a link or not a regular file",
+        )));
+    }
+    #[cfg(windows)]
+    let file = if metadata_is_link_or_reparse(&metadata) {
+        open_reparse_point_target(&file, path).map_err(io_error)?
+    } else {
+        file
+    };
+    read_file_capped_from_open_file(file, path, limit)
+}
+
+/// Opens a reparse point that isn't a link through its filter, as a cloud
+/// placeholder must be read, and checks the file opened is the one `checked`
+/// holds, so an entry swapped in between isn't read.
+#[cfg(windows)]
+fn open_reparse_point_target(checked: &std::fs::File, path: &Path) -> io::Result<std::fs::File> {
+    let target = std::fs::File::open(path)?;
+    let identity =
+        |information: windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION| {
+            (
+                information.dwVolumeSerialNumber,
+                information.nFileIndexHigh,
+                information.nFileIndexLow,
+            )
+        };
+    if identity(handle_information(checked)?) != identity(handle_information(&target)?) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the file changed while it was opened",
+        ));
+    }
+    Ok(target)
+}
+
 /// Read bounded UTF-8 text without following a linked leaf or blocking on a special file.
 pub fn read_text_file_capped_nofollow(path: &Path, limit: u64) -> Result<String, BoundedReadError> {
     let file = open_nofollow(path).map_err(|source| {
@@ -574,5 +682,58 @@ mod tests {
             read_file_capped(&large_link, 5),
             Err(BoundedReadError::TooLarge { limit: 5, .. })
         ));
+    }
+
+    #[test]
+    fn unlinked_read_returns_a_regular_file_s_bytes_and_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".gitignore");
+        std::fs::write(&path, b"skills/\n\xff").unwrap();
+
+        let (bytes, metadata) = read_file_capped_unlinked(&path, 32).unwrap();
+
+        assert_eq!(bytes, b"skills/\n\xff");
+        assert_eq!(metadata.len(), 9);
+        assert!(matches!(
+            read_file_capped_unlinked(&dir.path().join("missing"), 32),
+            Err(BoundedReadError::NotFound { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlinked_read_refuses_a_link_and_a_fifo_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"outside").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let fifo = dir.path().join("fifo");
+        let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: the name is a valid NUL-terminated path for the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+
+        for path in [&link, &fifo] {
+            assert!(
+                matches!(
+                    read_file_capped_unlinked(path, 32),
+                    Err(BoundedReadError::Io { .. })
+                ),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn link_count_counts_a_file_s_hard_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(link_count(&File::open(&path).unwrap()).unwrap(), 1);
+
+        std::fs::hard_link(&path, dir.path().join("other-name")).unwrap();
+
+        assert_eq!(link_count(&File::open(&path).unwrap()).unwrap(), 2);
     }
 }

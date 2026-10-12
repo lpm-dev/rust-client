@@ -707,9 +707,10 @@ fn publish_initial_runtime(
         && let Err(finalize_error) = publication.finalize()
     {
         let error = rollback_inspector_session_after(
-            LpmError::Tunnel(format!(
-                "failed to publish the inspector session: {finalize_error}"
-            )),
+            crate::commands::tunnel::inspector_write_error(
+                "publish the inspector session",
+                finalize_error,
+            ),
             published_inspector_session,
         );
         return Err(rollback_published_proxy_after(
@@ -940,7 +941,7 @@ fn publish_tunnel_connection(
     prepare_tunnel_connection(inspector_state, publication)?
         .finalize()
         .map_err(|error| {
-            LpmError::Tunnel(format!("failed to publish the inspector session: {error}"))
+            crate::commands::tunnel::inspector_write_error("publish the inspector session", error)
         })?;
     render_tunnel_connection(publication);
     Ok(())
@@ -959,9 +960,7 @@ fn prepare_tunnel_connection(
             publication.session.tunnel_url.clone(),
         )
         .map_err(|error| {
-            LpmError::Tunnel(format!(
-                "failed to persist inspector session start: {error}"
-            ))
+            crate::commands::tunnel::inspector_write_error("persist inspector session start", error)
         })
 }
 
@@ -3247,12 +3246,13 @@ async fn finalize_multi_service_tunnel_after(
     };
     let persistence_result = if let Some(state) = inspector_state {
         let end_result = state.end_session().await.map_err(|error| {
-            LpmError::Tunnel(format!("failed to persist inspector session end: {error}"))
+            crate::commands::tunnel::inspector_write_error("persist inspector session end", error)
         });
         let flush_result = state.flush().await.map_err(|error| {
-            LpmError::Tunnel(format!(
-                "failed to commit captures to .lpm/inspector.db: {error}"
-            ))
+            crate::commands::tunnel::inspector_write_error(
+                "commit captures to .lpm/inspector.db",
+                error,
+            )
         });
         combine_tunnel_cleanup_results(end_result, flush_result)
     } else {

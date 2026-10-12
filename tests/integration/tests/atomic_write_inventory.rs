@@ -159,6 +159,10 @@ fn reviewed_raw_atomic_writer(key: &str) -> bool {
 
 const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
     (
+        "crates/lpm-inspect/src/db.rs::replace_with_owner_only_copy",
+        "renames SQLite's finished backup, written into an exclusively created owner-only file beside the capture database, over a database others could open, under the capture files' lock",
+    ),
+    (
         "crates/lpm-cli/src/cli/install_timeline.rs::export_with",
         "serializes and flushes an exclusively created same-directory NamedTempFile, then publishes with persist_noclobber without replacing an existing destination",
     ),

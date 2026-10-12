@@ -1360,13 +1360,33 @@ async fn tunnel_start_names_capture_files_git_tracks_and_how_to_stop_it() {
 
     assert!(
         stderr.contains("git tracks '.lpm/inspector.db'")
-            && stderr.contains("git rm --cached -- .lpm/inspector.db")
+            && stderr.contains("git -C .lpm rm --cached -- inspector.db")
             && stderr.contains("rotate any credentials"),
         "tunnel startup must name tracked capture files:\n{stderr}"
     );
     assert!(
         !stderr.contains("git ignores it"),
         "a tracked capture isn't ignored by git:\n{stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_start_asks_a_repository_inside_lpm_about_the_captures_it_tracks() {
+    let stderr = tunnel_start_stderr(|project| {
+        git(project, &["init", "--quiet"]);
+        let lpm_dir = project.join(".lpm");
+        std::fs::create_dir(&lpm_dir).unwrap();
+        git(&lpm_dir, &["init", "--quiet"]);
+        std::fs::write(lpm_dir.join("inspector.db"), b"").unwrap();
+        git(&lpm_dir, &["add", "inspector.db"]);
+    })
+    .await;
+
+    assert!(
+        stderr.contains("git tracks '.lpm/inspector.db'")
+            && stderr.contains("git -C .lpm rm --cached -- inspector.db")
+            && !stderr.contains("git ignores it"),
+        "a repository inside .lpm must answer for the captures it tracks:\n{stderr}"
     );
 }
 
@@ -1396,7 +1416,8 @@ async fn tunnel_start_says_to_replace_a_linked_lpm_gitignore_git_doesnt_read() {
     assert!(
         stderr.contains("git doesn't ignore")
             && stderr.contains(
-                "replace the linked .lpm/.gitignore with a file that holds `inspector.db*`"
+                "replace .lpm/.gitignore, which git doesn't read as a file of the project's, \
+                 with a file that holds `inspector.db*`"
             )
             && !stderr.contains("git ignores it"),
         "{stderr}"
@@ -1450,6 +1471,41 @@ fn tunnel_list_without_auth_under_json_emits_error_envelope_on_stdout() {
     });
     assert_eq!(envelope["success"], serde_json::json!(false));
     assert_eq!(envelope["error_code"], serde_json::json!("tunnel"));
+}
+
+#[test]
+fn tunnel_inspect_reports_a_capture_database_it_cant_open_as_a_disk_error_under_json() {
+    let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+    std::fs::create_dir(project.path().join(".lpm")).unwrap();
+    std::fs::write(project.path().join(".lpm/inspector.db"), b"not a database").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(
+            project.path().join(".lpm/inspector.db"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+
+    let output = lpm(&project)
+        .args(["--json", "tunnel", "inspect"])
+        .output()
+        .expect("failed to run lpm --json tunnel inspect");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("--json tunnel inspect error path must emit JSON: {e}\n---\n{stdout}")
+    });
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(envelope["error_code"], serde_json::json!("io"));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("Move or repair it")),
+        "{envelope}"
+    );
 }
 
 #[test]

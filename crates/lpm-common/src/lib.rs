@@ -36,14 +36,17 @@ pub use atomic_write::{
     write_file_atomic_in_dir_with_options, write_file_atomic_with, write_file_atomic_with_options,
 };
 #[cfg(unix)]
+pub use bounded_read::current_uid;
+#[cfg(unix)]
 pub use bounded_read::permissions_are_owner_only;
 pub use bounded_read::{
     BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, NPMRC_FILE_SIZE_CAP_BYTES,
-    TLS_MATERIAL_AGGREGATE_CAP_BYTES, TLS_MATERIAL_FILE_SIZE_CAP_BYTES, open_nofollow,
-    read_file_capped, read_file_capped_from_open_file, read_regular_file_capped_with_metadata,
-    read_stream_capped, read_text_file_capped, read_text_file_capped_from_open_file,
-    read_text_file_capped_from_open_file_with_known_size, read_text_file_capped_nofollow,
-    read_text_file_capped_with_metadata, read_text_regular_file_capped_with_metadata,
+    TLS_MATERIAL_AGGREGATE_CAP_BYTES, TLS_MATERIAL_FILE_SIZE_CAP_BYTES, link_count, open_nofollow,
+    read_file_capped, read_file_capped_from_open_file, read_file_capped_unlinked,
+    read_regular_file_capped_with_metadata, read_stream_capped, read_text_file_capped,
+    read_text_file_capped_from_open_file, read_text_file_capped_from_open_file_with_known_size,
+    read_text_file_capped_nofollow, read_text_file_capped_with_metadata,
+    read_text_regular_file_capped_with_metadata,
 };
 pub use command_name::{PortableCommandNameError, validate_portable_command_name};
 pub use error::{
@@ -69,10 +72,10 @@ pub use paths::{
     ExclusiveLockHandle, FsKind, GLOBAL_INSTALL_PATH_BUDGET, INSTALL_READY_MARKER, LpmRoot,
     ProjectLockDirectory, ProjectLockKind, SharedLockHandle, SingleFileExclusiveLockHandle,
     SingleFileSharedLockHandle, acquire_exclusive_lock, acquire_single_file_exclusive_lock,
-    acquire_single_file_exclusive_lock_from_file, acquire_single_file_shared_lock,
-    acquire_single_file_shared_lock_from_file, as_extended_path, check_install_path_budget,
-    is_local_fs, parent_install_lock_environment, project_install_lock, project_publish_lock,
-    try_acquire_capability_exclusive_lock, try_acquire_exclusive_lock,
+    acquire_single_file_exclusive_lock_from_file, acquire_single_file_exclusive_lock_nofollow,
+    acquire_single_file_shared_lock, acquire_single_file_shared_lock_from_file, as_extended_path,
+    check_install_path_budget, is_local_fs, parent_install_lock_environment, project_install_lock,
+    project_publish_lock, try_acquire_capability_exclusive_lock, try_acquire_exclusive_lock,
     try_acquire_single_file_exclusive_lock_from_file, try_with_exclusive_lock,
     with_capability_exclusive_lock, with_exclusive_lock, with_exclusive_lock_async,
     with_project_exclusive_lock, with_project_exclusive_lock_async, with_project_shared_lock,

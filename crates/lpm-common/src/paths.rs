@@ -718,6 +718,34 @@ fn open_lock_file(lock_path: &Path) -> std::io::Result<std::fs::File> {
     options.open(lock_path)
 }
 
+fn open_lock_file_nofollow(lock_path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(lock_path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other(format!(
+            "refusing lock path that is a link or not a regular file: {}",
+            lock_path.display()
+        )));
+    }
+    Ok(file)
+}
+
 fn open_capability_lock_file(
     directory: &cap_std::fs::Dir,
     name: &OsStr,
@@ -1288,6 +1316,16 @@ pub fn acquire_single_file_exclusive_lock(
     lock_path: impl AsRef<Path>,
 ) -> Result<SingleFileExclusiveLockHandle, LpmError> {
     let file = open_lock_file(lock_path.as_ref())?;
+    acquire_single_file_exclusive_lock_from_file(file)
+}
+
+/// Acquire a single-file exclusive advisory lock whose file is opened without
+/// following a link at `lock_path`, for a lock in a directory whose entries a
+/// repository can supply, such as a project's `.lpm`.
+pub fn acquire_single_file_exclusive_lock_nofollow(
+    lock_path: impl AsRef<Path>,
+) -> Result<SingleFileExclusiveLockHandle, LpmError> {
+    let file = open_lock_file_nofollow(lock_path.as_ref())?;
     acquire_single_file_exclusive_lock_from_file(file)
 }
 
@@ -2221,6 +2259,37 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn nofollow_single_file_lock_shares_the_lock_domain_of_its_path() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("inspector.db-lock");
+        let held = acquire_single_file_exclusive_lock_nofollow(&lock_path).unwrap();
+
+        assert!(
+            try_acquire_single_file_exclusive_lock_from_file(open_lock_file(&lock_path).unwrap())
+                .unwrap()
+                .is_none()
+        );
+        drop(held);
+        assert!(
+            try_acquire_single_file_exclusive_lock_from_file(open_lock_file(&lock_path).unwrap())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nofollow_single_file_lock_refuses_a_linked_path_and_creates_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("elsewhere");
+        let lock_path = tmp.path().join("inspector.db-lock");
+        std::os::unix::fs::symlink(&target, &lock_path).unwrap();
+
+        assert!(acquire_single_file_exclusive_lock_nofollow(&lock_path).is_err());
+        assert!(!target.exists());
     }
 
     /// Shared lock blocks an exclusive acquire until released.

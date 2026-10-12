@@ -3,7 +3,7 @@ use lpm_common::{LpmError, format_bytes};
 use lpm_registry::RegistryClient;
 use std::fmt::Display;
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -575,11 +575,7 @@ pub(crate) async fn run_start(
             let name = session_name_owned.clone();
             state
                 .start_session_immediate(session_id, domain, local, name)
-                .map_err(|error| {
-                    LpmError::Tunnel(format!(
-                        "failed to persist inspector session start: {error}"
-                    ))
-                })?;
+                .map_err(|error| inspector_write_error("persist inspector session start", error))?;
             tokio::spawn(async move {
                 state.set_tunnel_url(url).await;
             });
@@ -718,14 +714,14 @@ pub(crate) async fn run_start(
     let websocket_result = ws_consumer
         .await
         .map_err(|error| LpmError::Tunnel(format!("WebSocket capture task failed: {error}")));
-    let session_result = inspector_state.end_session().await.map_err(|error| {
-        LpmError::Tunnel(format!("failed to persist inspector session end: {error}"))
-    });
-    let flush_result = inspector_state.flush().await.map_err(|error| {
-        LpmError::Tunnel(format!(
-            "failed to commit captures to .lpm/inspector.db: {error}"
-        ))
-    });
+    let session_result = inspector_state
+        .end_session()
+        .await
+        .map_err(|error| inspector_write_error("persist inspector session end", error));
+    let flush_result = inspector_state
+        .flush()
+        .await
+        .map_err(|error| inspector_write_error("commit captures to .lpm/inspector.db", error));
     let inspector_result = match inspector_handle {
         Some(handle) => handle.shutdown().await,
         None => Ok(()),
@@ -747,54 +743,75 @@ pub(crate) async fn run_start(
     }
 }
 
-/// Warns that captures persist, and says how git treats them: kept out of
-/// git only where git confirms it ignores them; files git tracks, which an
-/// ignore rule can't keep from being committed; and files it neither tracks
-/// nor ignores.
+/// Warns that captures persist, and says how git treats them.
 pub(crate) async fn warn_capture_persistence(project_dir: &Path, show_human_warning: bool) {
     let state = capture_git_state(project_dir).await;
-    let kept_out =
-        matches!(state, Some(ref files) if files.tracked.is_empty() && files.unignored.is_empty());
-    capture_warning(
-        &format!(
-            "tunnel webhook capture persists full request/response bodies and headers \
-             (incl. Authorization, Cookie, *-Signature) in .lpm/inspector.db (owner-only \
-             on Unix; project ACLs on Windows){}",
-            if kept_out { "; git ignores it" } else { "" }
-        ),
-        show_human_warning,
-    );
-    let Some(files) = state else {
-        return;
+    for warning in capture_warnings(
+        state.as_ref(),
+        &git_base(project_dir),
+        ignore_file_git_skips(project_dir),
+    ) {
+        capture_warning(&warning, show_human_warning);
+    }
+}
+
+/// The capture warnings: that captures persist, kept out of git only where
+/// git confirms it ignores them; files git tracks, which an ignore rule
+/// can't keep from being committed; and files it neither tracks nor
+/// ignores.
+fn capture_warnings(
+    state: Option<&CaptureGitState>,
+    base: &GitBase,
+    ignore_file_skipped: bool,
+) -> Vec<String> {
+    let kept_out = state.is_some_and(|state| {
+        state.asked_in_lpm && state.files.tracked.is_empty() && state.files.unignored.is_empty()
+    });
+    let mut warnings = vec![format!(
+        "tunnel webhook capture persists full request/response bodies and headers \
+         (incl. Authorization, Cookie, *-Signature) in .lpm/inspector.db (owner-only \
+         on Unix; project ACLs on Windows){}",
+        if kept_out { "; git ignores it" } else { "" }
+    )];
+    let Some(state) = state else {
+        return warnings;
     };
-    if !files.tracked.is_empty() {
-        capture_warning(
-            &format!(
-                "git tracks {}, so captures there can be committed and stay in its \
-                 history; run `{}`, commit, and rotate any credentials they held",
-                listed(&files.tracked),
-                untrack_command(&files.tracked)
-            ),
-            show_human_warning,
+    if !state.asked_in_lpm {
+        warnings.push(
+            "git couldn't be asked inside .lpm, so if .lpm holds a repository of its own, \
+             check that it doesn't track inspector.db*"
+                .to_string(),
         );
+    }
+    let files = &state.files;
+    if !files.tracked.is_empty() {
+        warnings.push(format!(
+            "git tracks {}, so captures there can be committed and stay in its history; \
+             run `{}`, commit, and rotate any credentials they held",
+            listed(&state.shown(&files.tracked)),
+            untrack_command(&files.tracked, state.asked_in_lpm, base)
+        ));
     }
     if !files.unignored.is_empty() {
-        // Git doesn't read a linked ignore file, so the rule can't go there.
-        let linked_ignore_file = std::fs::symlink_metadata(project_dir.join(".lpm/.gitignore"))
-            .is_ok_and(|metadata| metadata.file_type().is_symlink());
-        capture_warning(
-            &format!(
-                "git doesn't ignore {}; {}",
-                listed(&files.unignored),
-                if linked_ignore_file {
-                    "replace the linked .lpm/.gitignore with a file that holds `inspector.db*`"
-                } else {
-                    "add `inspector.db*` to .lpm/.gitignore"
-                }
-            ),
-            show_human_warning,
-        );
+        warnings.push(format!(
+            "git doesn't ignore {}; {}",
+            listed(&state.shown(&files.unignored)),
+            if ignore_file_skipped {
+                "replace .lpm/.gitignore, which git doesn't read as a file of the \
+                 project's, with a file that holds `inspector.db*`"
+            } else {
+                "add `inspector.db*` to .lpm/.gitignore"
+            }
+        ));
     }
+    warnings
+}
+
+/// Whether git skips `.lpm/.gitignore`: a link, which git doesn't follow,
+/// or an entry that isn't a regular file, such as a directory.
+fn ignore_file_git_skips(project_dir: &Path) -> bool {
+    std::fs::symlink_metadata(project_dir.join(".lpm/.gitignore"))
+        .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
 }
 
 /// The human warning, or the same text on the log when it isn't shown, so
@@ -811,23 +828,96 @@ fn capture_warning(message: &str, show_human_warning: bool) {
     }
 }
 
-/// Capture files git tracks, and those it neither tracks nor ignores.
-#[derive(Debug, Default, PartialEq, Eq)]
+/// Capture files git tracks, and those it neither tracks nor ignores, by
+/// name relative to the directory git was asked in.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct CaptureGitFiles {
     tracked: Vec<String>,
     unignored: Vec<String>,
 }
 
-const CAPTURES_PATHSPEC: &str = ":(glob,icase).lpm/inspector.db*";
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CaptureGitState {
+    files: CaptureGitFiles,
+    /// Whether git answered inside `.lpm`, where a repository of its own,
+    /// such as a submodule, keeps the files from the project's repository.
+    /// Otherwise the project's repository answered.
+    asked_in_lpm: bool,
+}
+
+impl CaptureGitState {
+    /// Names as the project sees them.
+    fn shown(&self, names: &[String]) -> Vec<String> {
+        if self.asked_in_lpm {
+            names.iter().map(|name| format!(".lpm/{name}")).collect()
+        } else {
+            names.to_vec()
+        }
+    }
+}
+
+const CAPTURES_PATHSPEC: &str = ":(glob,icase)inspector.db*";
+
+const PROJECT_CAPTURES_PATHSPEC: &str = ":(glob,icase).lpm/inspector.db*";
 
 const CAPTURE_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Why git didn't say how it treats the capture files.
+#[derive(Debug, PartialEq, Eq)]
+enum CaptureGitFailure {
+    /// Git ran and refused, as outside a repository, or for one it won't use.
+    Refused,
+    /// Git couldn't be run, or didn't answer in time.
+    Unavailable,
+}
+
 /// How git treats the capture files in `project_dir`, matching their names
-/// without regard to case, as a case-insensitive disk does; None when it
+/// without regard to case, as a case-insensitive disk does. Git is asked
+/// inside `.lpm`, and only if it refuses there, in the project. None when it
 /// isn't a repository, git can't be run, or it doesn't answer in time.
-async fn capture_git_state(project_dir: &Path) -> Option<CaptureGitFiles> {
-    let command = tokio::process::Command::from(crate::commands::npmrc::hardened_git_command(
-        project_dir,
+async fn capture_git_state(project_dir: &Path) -> Option<CaptureGitState> {
+    capture_git_state_by(project_dir, |directory, pathspec| {
+        capture_git_output(
+            capture_git_command(&directory, pathspec),
+            CAPTURE_GIT_TIMEOUT,
+        )
+    })
+    .await
+}
+
+async fn capture_git_state_by<Ask, Answer>(project_dir: &Path, ask: Ask) -> Option<CaptureGitState>
+where
+    Ask: Fn(PathBuf, &'static str) -> Answer,
+    Answer: std::future::Future<Output = Result<CaptureGitFiles, CaptureGitFailure>>,
+{
+    let lpm_dir = project_dir.join(".lpm");
+    let in_lpm = if lpm_dir.is_dir() {
+        ask(lpm_dir, CAPTURES_PATHSPEC).await
+    } else {
+        Err(CaptureGitFailure::Refused)
+    };
+    match in_lpm {
+        Ok(files) => Some(CaptureGitState {
+            files,
+            asked_in_lpm: true,
+        }),
+        // A git too slow to answer once would be as slow again.
+        Err(CaptureGitFailure::Unavailable) => None,
+        Err(CaptureGitFailure::Refused) => {
+            ask(project_dir.to_path_buf(), PROJECT_CAPTURES_PATHSPEC)
+                .await
+                .ok()
+                .map(|files| CaptureGitState {
+                    files,
+                    asked_in_lpm: false,
+                })
+        }
+    }
+}
+
+fn capture_git_command(directory: &Path, pathspec: &str) -> tokio::process::Command {
+    tokio::process::Command::from(crate::commands::npmrc::hardened_git_command(
+        directory,
         &[
             "ls-files",
             "-z",
@@ -836,10 +926,9 @@ async fn capture_git_state(project_dir: &Path) -> Option<CaptureGitFiles> {
             "--others",
             "--exclude-standard",
             "--",
-            CAPTURES_PATHSPEC,
+            pathspec,
         ],
-    ));
-    capture_git_output(command, CAPTURE_GIT_TIMEOUT).await
+    ))
 }
 
 /// Runs the capture check's git command, giving up after `timeout` and
@@ -848,19 +937,19 @@ async fn capture_git_state(project_dir: &Path) -> Option<CaptureGitFiles> {
 async fn capture_git_output(
     mut command: tokio::process::Command,
     timeout: std::time::Duration,
-) -> Option<CaptureGitFiles> {
+) -> Result<CaptureGitFiles, CaptureGitFailure> {
     command
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
     let output = tokio::time::timeout(timeout, command.output())
         .await
-        .ok()?
-        .ok()?;
+        .map_err(|_| CaptureGitFailure::Unavailable)?
+        .map_err(|_| CaptureGitFailure::Unavailable)?;
     if !output.status.success() {
-        return None;
+        return Err(CaptureGitFailure::Refused);
     }
-    Some(parse_capture_git_files(&output.stdout))
+    Ok(parse_capture_git_files(&output.stdout))
 }
 
 fn parse_capture_git_files(stdout: &[u8]) -> CaptureGitFiles {
@@ -887,49 +976,90 @@ fn parse_capture_git_files(stdout: &[u8]) -> CaptureGitFiles {
 
 const LISTED_FILES: usize = 5;
 
-/// Names quoted, at most `LISTED_FILES` of them, so text from the
-/// repository reads as names in the warning.
+/// Whether a name holds only characters no shell treats specially and no
+/// terminal reads as anything but text, so it can go into the warning and
+/// its command as it is.
+fn is_plain(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '/' | '_' | '-'))
+}
+
+/// At most `LISTED_FILES` plain names, quoted; other names are only
+/// counted, so text from the repository can't read as part of the warning.
 fn listed(names: &[String]) -> String {
-    let mut listed = names
+    let shown: Vec<String> = names
         .iter()
+        .filter(|name| is_plain(name))
         .take(LISTED_FILES)
         .map(|name| format!("'{name}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    if names.len() > LISTED_FILES {
-        listed.push_str(&format!(" and {} more", names.len() - LISTED_FILES));
+        .collect();
+    let rest = names.len() - shown.len();
+    match (shown.is_empty(), rest) {
+        (true, 1) => "1 capture file".to_string(),
+        (true, count) => format!("{count} capture files"),
+        (false, 0) => shown.join(", "),
+        (false, count) => format!("{} and {count} more", shown.join(", ")),
     }
-    listed
 }
 
-/// The command that stops git tracking `tracked`: their names, or the
-/// capture pathspec when there are more than the warning lists.
-fn untrack_command(tracked: &[String]) -> String {
-    let paths = if tracked.len() > LISTED_FILES {
-        shell_word(CAPTURES_PATHSPEC)
+/// The command that stops git tracking `tracked`, run from the current
+/// directory: their names when the warning lists them all, and otherwise
+/// the capture pathspec, which every shell reads alike in double quotes.
+fn untrack_command(tracked: &[String], asked_in_lpm: bool, base: &GitBase) -> String {
+    let paths = if tracked.len() <= LISTED_FILES && tracked.iter().all(|name| is_plain(name)) {
+        tracked.join(" ")
+    } else if asked_in_lpm {
+        format!("\"{CAPTURES_PATHSPEC}\"")
     } else {
-        tracked
-            .iter()
-            .map(|name| shell_word(name))
-            .collect::<Vec<_>>()
-            .join(" ")
+        format!("\"{PROJECT_CAPTURES_PATHSPEC}\"")
     };
-    format!("git rm --cached -- {paths}")
+    let directory = if asked_in_lpm {
+        Some(base.join(".lpm"))
+    } else {
+        base.project()
+    };
+    match directory {
+        Some(directory) => format!("git -C {directory} rm --cached -- {paths}"),
+        None => format!("git rm --cached -- {paths}"),
+    }
 }
 
-/// `value` as one word for a shell: bare when it holds only characters no
-/// shell treats specially, in double quotes when nothing in it expands
-/// inside them, which POSIX shells, PowerShell and cmd.exe all read alike,
-/// and otherwise single-quoted for a POSIX shell.
-fn shell_word(value: &str) -> String {
-    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '/' | '_' | '-');
-    if !value.is_empty() && value.chars().all(plain) {
-        return value.to_string();
+/// The project directory as the current directory reaches it: `..` once for
+/// each level the current directory is below it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitBase {
+    levels_up: usize,
+}
+
+impl GitBase {
+    /// The project's own directory, or None when it's the current one.
+    fn project(&self) -> Option<String> {
+        (self.levels_up > 0).then(|| vec![".."; self.levels_up].join("/"))
     }
-    if !value.contains(['"', '$', '`', '\\', '!', '%']) {
-        return format!("\"{value}\"");
+
+    fn join(&self, name: &str) -> String {
+        match self.project() {
+            Some(project) => format!("{project}/{name}"),
+            None => name.to_string(),
+        }
     }
-    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// How many levels the current directory is below `project_dir`, or none
+/// when it isn't below it.
+fn git_base(project_dir: &Path) -> GitBase {
+    let levels_up = std::env::current_dir()
+        .ok()
+        .and_then(|current| {
+            current
+                .strip_prefix(project_dir)
+                .ok()
+                .map(|below| below.components().count())
+        })
+        .unwrap_or(0);
+    GitBase { levels_up }
 }
 
 fn compose_tunnel_control_and_connect(
@@ -1450,6 +1580,12 @@ pub(crate) fn open_inspector_db(
              Move or repair it and retry"
         )))
     })
+}
+
+/// A failure writing `.lpm/inspector.db`, which is the disk's, not the
+/// tunnel connection's.
+pub(crate) fn inspector_write_error(what: &str, error: impl Display) -> LpmError {
+    LpmError::Io(std::io::Error::other(format!("failed to {what}: {error}")))
 }
 
 fn inspector_query_error(error: impl Display) -> LpmError {
@@ -2090,6 +2226,8 @@ mod tests {
         names.iter().map(|name| (*name).to_string()).collect()
     }
 
+    const HERE: GitBase = GitBase { levels_up: 0 };
+
     #[tokio::test]
     async fn tells_capture_files_git_tracks_from_those_it_neither_tracks_nor_ignores() {
         let project = capture_project(&[
@@ -2104,15 +2242,13 @@ mod tests {
             &["add", ".lpm/inspector.db", ".lpm/added-sources.json"],
         );
 
-        let files = capture_git_state(project.path()).await.unwrap();
+        let state = capture_git_state(project.path()).await.unwrap();
 
-        assert_eq!(files.tracked, names(&[".lpm/inspector.db"]));
-        let mut unignored = files.unignored;
+        assert!(state.asked_in_lpm);
+        assert_eq!(state.files.tracked, names(&["inspector.db"]));
+        let mut unignored = state.files.unignored;
         unignored.sort();
-        assert_eq!(
-            unignored,
-            names(&[".lpm/inspector.db-shm", ".lpm/inspector.db-wal"])
-        );
+        assert_eq!(unignored, names(&["inspector.db-shm", "inspector.db-wal"]));
     }
 
     #[tokio::test]
@@ -2122,18 +2258,65 @@ mod tests {
 
         assert_eq!(
             capture_git_state(project.path()).await,
-            Some(CaptureGitFiles::default())
+            Some(CaptureGitState {
+                files: CaptureGitFiles::default(),
+                asked_in_lpm: true,
+            })
         );
     }
 
     #[tokio::test]
     async fn names_tracked_capture_files_whatever_their_case() {
-        let project = capture_project(&[".LPM/Inspector.DB"]);
-        git(project.path(), &["add", ".LPM/Inspector.DB"]);
+        let project = capture_project(&[".lpm/Inspector.DB"]);
+        git(project.path(), &["add", ".lpm/Inspector.DB"]);
 
-        let files = capture_git_state(project.path()).await.unwrap();
+        let state = capture_git_state(project.path()).await.unwrap();
 
-        assert_eq!(files.tracked, names(&[".LPM/Inspector.DB"]));
+        assert_eq!(state.files.tracked, names(&["Inspector.DB"]));
+    }
+
+    #[tokio::test]
+    async fn asks_a_repository_inside_lpm_about_the_files_it_keeps() {
+        let project = capture_project(&[".lpm/inspector.db"]);
+        let lpm_dir = project.path().join(".lpm");
+        git(&lpm_dir, &["init", "--quiet"]);
+        git(&lpm_dir, &["add", "inspector.db"]);
+
+        let state = capture_git_state(project.path()).await.unwrap();
+
+        assert!(state.asked_in_lpm);
+        assert_eq!(state.files.tracked, names(&["inspector.db"]));
+        assert_eq!(
+            untrack_command(&state.files.tracked, state.asked_in_lpm, &HERE),
+            "git -C .lpm rm --cached -- inspector.db"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn asks_the_project_when_git_refuses_inside_lpm_and_says_so() {
+        let project = capture_project(&[".lpm/inspector.db"]);
+        git(project.path(), &["add", ".lpm/inspector.db"]);
+        // An `.lpm` that looks like a bare repository, which the check's
+        // git refuses to use.
+        let lpm_dir = project.path().join(".lpm");
+        for directory in ["objects", "refs"] {
+            std::fs::create_dir(lpm_dir.join(directory)).unwrap();
+        }
+        std::fs::write(lpm_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let state = capture_git_state(project.path()).await.unwrap();
+
+        assert!(!state.asked_in_lpm);
+        assert_eq!(state.files.tracked, names(&[".lpm/inspector.db"]));
+        assert_eq!(
+            state.shown(&state.files.tracked),
+            names(&[".lpm/inspector.db"])
+        );
+        assert_eq!(
+            untrack_command(&state.files.tracked, state.asked_in_lpm, &HERE),
+            "git rm --cached -- .lpm/inspector.db"
+        );
     }
 
     #[tokio::test]
@@ -2188,6 +2371,163 @@ mod tests {
         assert!(!marker.exists());
     }
 
+    /// Asks with canned answers, one per call, recording where each was asked.
+    async fn state_from_answers(
+        project_dir: &Path,
+        answers: Vec<Result<CaptureGitFiles, CaptureGitFailure>>,
+    ) -> (Option<CaptureGitState>, Vec<(PathBuf, &'static str)>) {
+        let answers = std::sync::Mutex::new(answers.into_iter());
+        let asked = std::sync::Mutex::new(Vec::new());
+        let state = capture_git_state_by(project_dir, |directory, pathspec| {
+            asked.lock().unwrap().push((directory, pathspec));
+            let answer = answers.lock().unwrap().next().unwrap();
+            async move { answer }
+        })
+        .await;
+        (state, asked.into_inner().unwrap())
+    }
+
+    #[tokio::test]
+    async fn asks_the_project_only_when_git_refuses_inside_lpm() {
+        let project = tempfile::tempdir().unwrap();
+        let lpm_dir = project.path().join(".lpm");
+        std::fs::create_dir(&lpm_dir).unwrap();
+        let tracked = CaptureGitFiles {
+            tracked: names(&[".lpm/inspector.db"]),
+            unignored: Vec::new(),
+        };
+
+        let (state, asked) = state_from_answers(
+            project.path(),
+            vec![Err(CaptureGitFailure::Refused), Ok(tracked)],
+        )
+        .await;
+        assert_eq!(state.unwrap().files.tracked, names(&[".lpm/inspector.db"]));
+        assert_eq!(
+            asked,
+            vec![
+                (lpm_dir.clone(), CAPTURES_PATHSPEC),
+                (project.path().to_path_buf(), PROJECT_CAPTURES_PATHSPEC),
+            ]
+        );
+
+        let (state, asked) =
+            state_from_answers(project.path(), vec![Err(CaptureGitFailure::Unavailable)]).await;
+        assert_eq!(state, None);
+        assert_eq!(asked.len(), 1);
+
+        let (state, asked) =
+            state_from_answers(project.path(), vec![Ok(CaptureGitFiles::default())]).await;
+        assert!(state.unwrap().asked_in_lpm);
+        assert_eq!(asked.len(), 1);
+    }
+
+    fn warnings_for(state: Option<CaptureGitState>, ignore_file_skipped: bool) -> Vec<String> {
+        capture_warnings(state.as_ref(), &HERE, ignore_file_skipped)
+    }
+
+    fn state(asked_in_lpm: bool, tracked: &[&str], unignored: &[&str]) -> CaptureGitState {
+        CaptureGitState {
+            files: CaptureGitFiles {
+                tracked: names(tracked),
+                unignored: names(unignored),
+            },
+            asked_in_lpm,
+        }
+    }
+
+    #[test]
+    fn says_git_ignores_captures_only_when_git_inside_lpm_says_so() {
+        assert!(warnings_for(Some(state(true, &[], &[])), false)[0].ends_with("; git ignores it"));
+        for unconfirmed in [
+            None,
+            Some(state(false, &[], &[])),
+            Some(state(true, &["inspector.db"], &[])),
+            Some(state(true, &[], &["inspector.db-wal"])),
+        ] {
+            assert!(
+                !warnings_for(unconfirmed.clone(), false)[0].contains("git ignores it"),
+                "{unconfirmed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn says_when_git_couldnt_be_asked_inside_lpm() {
+        let warnings = warnings_for(Some(state(false, &[], &[])), false);
+
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[1].starts_with("git couldn't be asked inside .lpm"));
+        assert_eq!(warnings_for(Some(state(true, &[], &[])), false).len(), 1);
+        assert_eq!(warnings_for(None, false).len(), 1);
+    }
+
+    #[test]
+    fn names_tracked_captures_and_the_command_that_stops_tracking_them() {
+        let warnings = warnings_for(Some(state(true, &["inspector.db"], &[])), false);
+
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(
+            warnings[1],
+            "git tracks '.lpm/inspector.db', so captures there can be committed and stay in \
+             its history; run `git -C .lpm rm --cached -- inspector.db`, commit, and rotate \
+             any credentials they held"
+        );
+    }
+
+    #[test]
+    fn advises_on_captures_git_neither_tracks_nor_ignores() {
+        let added = warnings_for(Some(state(true, &[], &["inspector.db-wal"])), false);
+        let replaced = warnings_for(Some(state(true, &[], &["inspector.db-wal"])), true);
+
+        assert_eq!(
+            added[1],
+            "git doesn't ignore '.lpm/inspector.db-wal'; add `inspector.db*` to .lpm/.gitignore"
+        );
+        assert_eq!(
+            replaced[1],
+            "git doesn't ignore '.lpm/inspector.db-wal'; replace .lpm/.gitignore, which git \
+             doesn't read as a file of the project's, with a file that holds `inspector.db*`"
+        );
+    }
+
+    #[test]
+    fn reports_inspector_database_reads_as_disk_errors() {
+        let error = inspector_query_error("database disk image is malformed");
+
+        assert_eq!(error.error_code(), "io");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to read .lpm/inspector.db: database disk image is malformed")
+        );
+    }
+
+    #[test]
+    fn reports_inspector_database_writes_as_disk_errors() {
+        let error = inspector_write_error("commit captures to .lpm/inspector.db", "disk I/O error");
+
+        assert_eq!(error.error_code(), "io");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to commit captures to .lpm/inspector.db: disk I/O error")
+        );
+    }
+
+    #[test]
+    fn shows_names_git_gave_inside_lpm_as_the_project_sees_them() {
+        let state = CaptureGitState {
+            files: CaptureGitFiles::default(),
+            asked_in_lpm: true,
+        };
+
+        assert_eq!(
+            state.shown(&names(&["inspector.db"])),
+            names(&[".lpm/inspector.db"])
+        );
+    }
+
     #[test]
     fn lists_at_most_five_names_quoted() {
         let many: Vec<String> = (0..7)
@@ -2202,54 +2542,153 @@ mod tests {
     }
 
     #[test]
+    fn lists_names_with_other_characters_only_by_count() {
+        assert_eq!(
+            listed(&names(&[
+                ".lpm/inspector.db",
+                ".lpm/inspector.db\u{202e}bd.x",
+                ".lpm/it\u{2019}s.db",
+            ])),
+            "'.lpm/inspector.db' and 2 more"
+        );
+        assert_eq!(listed(&names(&[".lpm/inspector db"])), "1 capture file");
+        assert_eq!(
+            listed(&names(&[".lpm/inspector db", ".lpm/inspector\u{200b}.db"])),
+            "2 capture files"
+        );
+    }
+
+    #[test]
     fn untracks_listed_names_or_every_capture_file_past_the_list() {
         let names = |count: usize| -> Vec<String> {
             (0..count)
-                .map(|index| format!(".lpm/inspector.db{index}"))
+                .map(|index| format!("inspector.db{index}"))
                 .collect()
         };
 
         assert_eq!(
-            untrack_command(&names(5)),
-            "git rm --cached -- .lpm/inspector.db0 .lpm/inspector.db1 \
-             .lpm/inspector.db2 .lpm/inspector.db3 .lpm/inspector.db4"
+            untrack_command(&names(5), true, &HERE),
+            "git -C .lpm rm --cached -- inspector.db0 inspector.db1 \
+             inspector.db2 inspector.db3 inspector.db4"
         );
         assert_eq!(
-            untrack_command(&names(6)),
+            untrack_command(&names(6), true, &HERE),
+            "git -C .lpm rm --cached -- \":(glob,icase)inspector.db*\""
+        );
+        assert_eq!(
+            untrack_command(&names(6), false, &HERE),
             "git rm --cached -- \":(glob,icase).lpm/inspector.db*\""
         );
     }
 
     #[test]
-    fn writes_names_as_words_every_shell_reads_alike() {
-        assert_eq!(shell_word(".lpm/inspector.db-wal"), ".lpm/inspector.db-wal");
-        assert_eq!(shell_word(".lpm/inspector db"), "\".lpm/inspector db\"");
-        assert_eq!(shell_word(".lpm/it's.db"), "\".lpm/it's.db\"");
-        assert_eq!(shell_word(".lpm/$HOME.db"), "'.lpm/$HOME.db'");
-        assert_eq!(shell_word(".lpm/it's $x"), "'.lpm/it'\\''s $x'");
+    fn untracks_every_capture_file_when_a_name_has_other_characters() {
+        for name in [
+            "inspector db",
+            "inspector\u{201d}.db",
+            "inspector\u{2019}.db",
+            "!'$(touch x)'.db",
+            "inspector\".db",
+            "%PATH%.db",
+            "",
+        ] {
+            assert_eq!(
+                untrack_command(&names(&["inspector.db", name]), true, &HERE),
+                "git -C .lpm rm --cached -- \":(glob,icase)inspector.db*\"",
+                "{name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn untracks_from_a_directory_below_the_project() {
+        let below = GitBase { levels_up: 2 };
+
+        assert_eq!(
+            untrack_command(&names(&["inspector.db"]), true, &below),
+            "git -C ../../.lpm rm --cached -- inspector.db"
+        );
+        assert_eq!(
+            untrack_command(&names(&[".lpm/inspector.db"]), false, &below),
+            "git -C ../.. rm --cached -- .lpm/inspector.db"
+        );
+    }
+
+    #[test]
+    fn counts_the_levels_from_the_project_to_the_current_directory() {
+        let current = std::env::current_dir().unwrap();
+
+        assert_eq!(git_base(&current), HERE);
+        assert_eq!(
+            git_base(current.parent().unwrap()),
+            GitBase { levels_up: 1 }
+        );
+        assert_eq!(git_base(Path::new("/nowhere-near")), HERE);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tells_an_lpm_gitignore_git_skips_from_one_it_reads() {
+        let project = tempfile::tempdir().unwrap();
+        let lpm_dir = project.path().join(".lpm");
+        std::fs::create_dir(&lpm_dir).unwrap();
+        assert!(!ignore_file_git_skips(project.path()));
+
+        std::fs::write(lpm_dir.join(".gitignore"), "skills/\n").unwrap();
+        assert!(!ignore_file_git_skips(project.path()));
+
+        std::fs::remove_file(lpm_dir.join(".gitignore")).unwrap();
+        std::fs::create_dir(lpm_dir.join(".gitignore")).unwrap();
+        assert!(ignore_file_git_skips(project.path()));
+
+        std::fs::remove_dir(lpm_dir.join(".gitignore")).unwrap();
+        std::os::unix::fs::symlink(project.path().join("elsewhere"), lpm_dir.join(".gitignore"))
+            .unwrap();
+        assert!(ignore_file_git_skips(project.path()));
     }
 
     #[test]
     fn lists_a_conflicted_capture_file_once() {
         let files = parse_capture_git_files(
-            b"M .lpm/inspector.db\0M .lpm/inspector.db\0M .lpm/inspector.db\0? .lpm/inspector.db-wal\0",
+            b"M inspector.db\0M inspector.db\0M inspector.db\0? inspector.db-wal\0",
         );
 
-        assert_eq!(files.tracked, names(&[".lpm/inspector.db"]));
-        assert_eq!(files.unignored, names(&[".lpm/inspector.db-wal"]));
+        assert_eq!(files.tracked, names(&["inspector.db"]));
+        assert_eq!(files.unignored, names(&["inspector.db-wal"]));
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn gives_up_on_a_slow_repository_and_stops_its_git() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("pid");
         let started = std::time::Instant::now();
-        let mut command = tokio::process::Command::new("sleep");
-        command.arg("5");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("echo $$ > \"$1\"; exec sleep 5")
+            .arg("sh")
+            .arg(&pid_file);
 
-        let state = capture_git_output(command, std::time::Duration::from_millis(100)).await;
+        let state = capture_git_output(command, std::time::Duration::from_millis(300)).await;
 
-        assert_eq!(state, None);
+        assert_eq!(state, Err(CaptureGitFailure::Unavailable));
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let stopped = |pid: &str| {
+            let output = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", pid.trim()])
+                .output()
+                .unwrap();
+            let status = String::from_utf8_lossy(&output.stdout);
+            // Gone, or killed and not yet reaped.
+            status.trim().is_empty() || status.trim_start().starts_with('Z')
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !stopped(&pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(stopped(&pid), "the slow command is still running");
     }
 
     #[test]
