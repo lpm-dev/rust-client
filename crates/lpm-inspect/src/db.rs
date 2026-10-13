@@ -1378,6 +1378,8 @@ fn create_owner_only(_path: &Path, _owner: CaptureOwner) -> std::io::Result<bool
 /// database.
 fn replace_with_owner_only_copy(db_path: &Path, owner: CaptureOwner) -> Result<bool, OpenError> {
     let copy_path = capture_file(db_path, "-copy");
+    // Taken before anything is opened, as leaving WAL grows the database.
+    let needed = room_to_copy(db_path);
     let owner_only = create_owner_only(&copy_path, owner);
     #[cfg(test)]
     let owner_only = tests::COPY_CREATE_ERROR
@@ -1387,7 +1389,7 @@ fn replace_with_owner_only_copy(db_path: &Path, owner: CaptureOwner) -> Result<b
         let removed = remove_replacement_copy(db_path);
         if let Err(error) = owner_only {
             return Err(if error.kind() == std::io::ErrorKind::StorageFull {
-                no_room_to_copy(db_path)
+                no_room_to_copy(db_path, needed)
             } else {
                 error.into()
             });
@@ -1395,7 +1397,7 @@ fn replace_with_owner_only_copy(db_path: &Path, owner: CaptureOwner) -> Result<b
         removed?;
         return Ok(false);
     }
-    if let Err(error) = copy_checked_database(db_path, &copy_path) {
+    if let Err(error) = copy_checked_database(db_path, &copy_path, needed) {
         if let Err(removal) = remove_replacement_copy(db_path) {
             tracing::warn!(
                 "could not remove {}: {removal}",
@@ -1412,33 +1414,23 @@ fn replace_with_owner_only_copy(db_path: &Path, owner: CaptureOwner) -> Result<b
 }
 
 /// Checks a database others could open, and copies it into the owner-only
-/// file made for the copy. The check's connection makes the WAL sidecars
-/// where there are none. Those are its own, as the opening lock keeps other
-/// LPM processes out and a connection already open would have made them, so
-/// a check that fails removes them, leaving the files as it found them.
-fn copy_checked_database(db_path: &Path, copy_path: &Path) -> Result<(), OpenError> {
-    ensure_room_to_copy(db_path)?;
-    let made_by_check: Vec<PathBuf> = ["-wal", "-shm"]
-        .into_iter()
-        .map(|suffix| capture_file(db_path, suffix))
-        .filter(|sidecar| {
-            matches!(sidecar.symlink_metadata(), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-        })
-        .collect();
-    let copied = check_then_copy(db_path, copy_path);
-    if copied.is_err() {
-        for sidecar in &made_by_check {
-            if let Err(error) = remove_if_present(sidecar) {
-                tracing::warn!("could not remove {}: {error}", sidecar.display());
-            }
-        }
+/// file made for the copy. A check that fails leaves the WAL files its
+/// connection made: they hold no captures, SQLite removes them as the last
+/// connection closes, and a connection that attached meanwhile, as an
+/// earlier release or another tool can without the opening lock, may be
+/// using them.
+fn copy_checked_database(
+    db_path: &Path,
+    copy_path: &Path,
+    needed: Option<u64>,
+) -> Result<(), OpenError> {
+    ensure_room_to_copy(db_path, needed)?;
+    #[cfg(test)]
+    if let Some(attach) = tests::BEFORE_CHECK.with_borrow_mut(Option::take) {
+        attach();
     }
-    copied
-}
-
-fn check_then_copy(db_path: &Path, copy_path: &Path) -> Result<(), OpenError> {
-    let database = open_nofollow_connection(db_path).map_err(checking(db_path))?;
-    refuse_unknown_schema(&database, db_path, checking(db_path))?;
+    let database = open_nofollow_connection(db_path).map_err(checking(db_path, needed))?;
+    refuse_unknown_schema(&database, db_path, checking(db_path, needed))?;
     // In WAL, which every LPM connection uses, leaving it needs the only
     // connection, so it proves no other LPM process has the database open,
     // and folds the WAL into the file.
@@ -1448,18 +1440,18 @@ fn check_then_copy(db_path: &Path, copy_path: &Path) -> Result<(), OpenError> {
         Ok(mode) if mode.eq_ignore_ascii_case("delete") => {}
         Ok(_) => return Err(in_use(db_path)),
         Err(error) if is_busy(&error) => return Err(in_use(db_path)),
-        Err(error) => return Err(checking(db_path)(error)),
+        Err(error) => return Err(checking(db_path, needed)(error)),
     }
     refuse_damage(&database, db_path)?;
-    copy_database(&database, copy_path, db_path)
+    copy_database(&database, copy_path, db_path, needed)
 }
 
 /// Reads a full disk while the database is checked as the copy's want of
 /// room, and any other failure as [`damaged`] does.
-fn checking(db_path: &Path) -> impl Fn(rusqlite::Error) -> OpenError + '_ {
+fn checking(db_path: &Path, needed: Option<u64>) -> impl Fn(rusqlite::Error) -> OpenError + '_ {
     move |error| {
         if out_of_room(&error) {
-            no_room_to_copy(db_path)
+            no_room_to_copy(db_path, needed)
         } else {
             damaged(db_path)(error)
         }
@@ -1486,30 +1478,37 @@ fn shared_memory_room(wal: u64) -> u64 {
     (64 * 1024u64).saturating_add(wal / 512)
 }
 
+/// Free space a filesystem reports but won't let a write use: APFS keeps a
+/// few MiB back, about 2.5 MB on a 96 MB volume.
+const UNUSABLE_FREE_ROOM: u64 = 8 * 1024 * 1024;
+
 /// The free space replacing a database takes. Leaving WAL folds the WAL into
 /// the database, which grows by the WAL at most while the shared-memory file
 /// is open; then the WAL and that file are removed, and the copy takes the
 /// grown database's size. So it never takes more than the database and its
-/// WAL, with the shared-memory file on top.
+/// WAL, with the shared-memory file and what a filesystem keeps back on top.
 fn room_to_copy(db_path: &Path) -> Option<u64> {
     let database = std::fs::metadata(db_path).ok()?.len();
     let wal = std::fs::metadata(capture_file(db_path, "-wal")).map_or(0, |wal| wal.len());
     Some(
         database
             .saturating_add(wal)
-            .saturating_add(shared_memory_room(wal)),
+            .saturating_add(shared_memory_room(wal))
+            .saturating_add(UNUSABLE_FREE_ROOM),
     )
 }
 
 /// Refuses a replacement its disk can't hold before the database is
 /// opened, as SQLite's own failure on a full disk can come as a bare I/O
-/// error and leave its files behind.
-fn ensure_room_to_copy(db_path: &Path) -> Result<(), OpenError> {
+/// error.
+fn ensure_room_to_copy(db_path: &Path, needed: Option<u64>) -> Result<(), OpenError> {
     let available = lpm_common::filesystem_available_bytes(db_path);
     #[cfg(test)]
     let available = tests::AVAILABLE_BYTES.get().or(available);
-    match (available, room_to_copy(db_path)) {
-        (Some(available), Some(needed)) if available < needed => Err(no_room_to_copy(db_path)),
+    match (available, needed) {
+        (Some(available), Some(needed)) if available < needed => {
+            Err(no_room_to_copy(db_path, Some(needed)))
+        }
         _ => Ok(()),
     }
 }
@@ -1533,7 +1532,12 @@ fn in_use(db_path: &Path) -> OpenError {
 /// refused rather than taken for the database. The copy takes as much
 /// space as the database, free pages included, so a disk without it is
 /// named as the cause.
-fn copy_database(database: &Connection, copy_path: &Path, db_path: &Path) -> Result<(), OpenError> {
+fn copy_database(
+    database: &Connection,
+    copy_path: &Path,
+    db_path: &Path,
+    needed: Option<u64>,
+) -> Result<(), OpenError> {
     let mut copy = open_nofollow_connection(copy_path)?;
     #[cfg(test)]
     if let Some(pages) = tests::COPY_PAGE_LIMIT.get() {
@@ -1543,13 +1547,15 @@ fn copy_database(database: &Connection, copy_path: &Path, db_path: &Path) -> Res
     match backup.step(-1) {
         Ok(rusqlite::backup::StepResult::Done) => Ok(()),
         Ok(_) => Err(in_use(db_path)),
-        Err(error) if out_of_room(&error) => Err(no_room_to_copy(db_path)),
+        Err(error) if out_of_room(&error) => Err(no_room_to_copy(db_path, needed)),
         Err(error) => Err(damaged(db_path)(error)),
     }
 }
 
-fn no_room_to_copy(db_path: &Path) -> OpenError {
-    let needed = room_to_copy(db_path).map_or_else(
+/// The refusal of a replacement its disk lacks room for, naming the room
+/// taken before the database was opened.
+fn no_room_to_copy(db_path: &Path, needed: Option<u64>) -> OpenError {
+    let needed = needed.map_or_else(
         || "as much as it takes".to_owned(),
         |bytes| format!("about {}", lpm_common::format_bytes(bytes)),
     );
@@ -1679,9 +1685,12 @@ type SchemaObject = (String, String, String, Option<String>);
 /// text, a string or a quoted name, and comments are kept as written, a
 /// line comment with the newline that ends it. Whitespace is SQLite's own:
 /// ASCII space, tab, newline, form feed and carriage return. So schema text
-/// whose tokens differ for SQLite can't read the same here. Only a
-/// parameter's Tcl form takes a parenthesis into its token (`$x(y)` against
-/// `$x (y)`), and SQLite allows no parameter in a schema.
+/// whose tokens differ for SQLite can't read the same here, but for one
+/// case: a parameter's Tcl form, `$x(y)` and its `@`, `:` and `#` kin, takes
+/// a parenthesis into its token, so it reads the same as `$x (y)`. SQLite
+/// creates no schema with a parameter, but a crafted file's schema can hold
+/// one; LPM's schema has none of those characters outside quotes, so such
+/// text never reads as LPM's.
 fn canonical_sql(sql: &str) -> String {
     let separates = |character: char| matches!(character, '(' | ')' | ',');
     let mut canonical = String::with_capacity(sql.len());
@@ -2407,6 +2416,10 @@ mod tests {
         /// a disk with no blocks left fails them.
         pub(super) static COPY_CREATE_ERROR: std::cell::Cell<Option<std::io::ErrorKind>> =
             const { std::cell::Cell::new(None) };
+        /// Runs once as this thread's next replacement starts its check, as
+        /// another process can open the database then.
+        pub(super) static BEFORE_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     #[cfg(unix)]
@@ -3238,7 +3251,8 @@ mod tests {
     #[test]
     fn a_disk_that_fills_while_the_database_is_checked_says_how_much_room_the_copy_needs() {
         let directory = tempfile::tempdir().unwrap();
-        let attached = attach_image(directory.path(), "4m", true);
+        // Past the room a replacement keeps back, for the retry.
+        let attached = attach_image(directory.path(), "16m", true);
         let project = attached.0.join("project");
         std::fs::create_dir(&project).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3272,6 +3286,7 @@ mod tests {
             .unwrap();
         drop(writer);
         set_mode(&db_path, 0o644);
+        let needed = room_to_copy(&db_path).unwrap();
         let filler = attached.0.join("filler");
         let free = lpm_common::filesystem_available_bytes(&attached.0).unwrap();
         std::fs::write(
@@ -3286,7 +3301,9 @@ mod tests {
 
         let error = full.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::StorageFull, "{error}");
-        assert!(error.to_string().contains("free on its disk"), "{error}");
+        // The room taken before the WAL was folded in, which grew the database.
+        let named = format!("needs about {} free", lpm_common::format_bytes(needed));
+        assert!(error.to_string().contains(&named), "{error}");
         assert_eq!(mode(&db_path), 0o644);
         assert!(!capture_file(&db_path, "-copy").exists());
 
@@ -3309,7 +3326,8 @@ mod tests {
         use std::io::Write as _;
 
         let directory = tempfile::tempdir().unwrap();
-        let attached = attach_image(directory.path(), "4m", true);
+        // Past the room a replacement keeps back, for the retry.
+        let attached = attach_image(directory.path(), "16m", true);
         let project = attached.0.join("project");
         std::fs::create_dir(&project).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3341,12 +3359,79 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::StorageFull, "{error}");
         assert!(error.to_string().contains("free on its disk"), "{error}");
         assert_eq!(mode(&db_path), 0o644);
-        for suffix in ["-copy", "-wal", "-shm"] {
-            assert!(
-                !capture_file(&db_path, suffix).exists(),
-                "{suffix} left behind"
-            );
+        assert!(!capture_file(&db_path, "-copy").exists());
+        // What the check's connection left holds no captures.
+        let wal = capture_file(&db_path, "-wal");
+        assert!(!wal.exists() || std::fs::metadata(&wal).unwrap().len() == 0);
+
+        std::fs::remove_file(attached.0.join("filler")).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let kept = runtime.block_on(async {
+            let db = InspectorDb::open(&project).unwrap();
+            db.get_webhook("kept").await.unwrap()
+        });
+        assert!(kept.is_some());
+        assert_eq!(mode(&db_path), 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_connection_that_attaches_during_the_check_keeps_its_wal_files() {
+        let project = project_with_a_capture();
+        let db_path = project.path().join(".lpm/inspector.db");
+        set_mode(&db_path, 0o644);
+        // As an earlier release, which takes no opening lock, or another
+        // tool can, once the room was taken and before the check opens it.
+        let other = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let held = std::rc::Rc::clone(&other);
+        let path = db_path.clone();
+        BEFORE_CHECK.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move || {
+                let connection = Connection::open(&path).unwrap();
+                connection
+                    .query_row("SELECT count(*) FROM requests", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap();
+                *held.borrow_mut() = Some(connection);
+            }));
+        });
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let error = runtime
+            .block_on(async { InspectorDb::open(project.path()).map(drop) })
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::ResourceBusy, "{error}");
+        for suffix in ["-wal", "-shm"] {
+            assert!(capture_file(&db_path, suffix).exists(), "{suffix} removed");
         }
+        let connection = other.borrow_mut().take().unwrap();
+        connection
+            .execute(
+                "INSERT INTO requests (id, timestamp, method, path) \
+                 VALUES ('later', '2026-04-06T12:00:00Z', 'POST', '/')",
+                [],
+            )
+            .unwrap();
+        let reader = Connection::open(&db_path).unwrap();
+        let later: i64 = reader
+            .query_row(
+                "SELECT count(*) FROM requests WHERE id = 'later'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop((connection, reader));
+        assert_eq!(later, 1);
+        let integrity: String = Connection::open(&db_path)
+            .unwrap()
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
     }
 
     #[cfg(unix)]
@@ -3908,7 +3993,7 @@ mod tests {
         assert!(create_owner_only(&copy_path, this_user()).unwrap());
 
         COPY_PAGE_LIMIT.set(Some(1));
-        let copied = copy_database(&database, &copy_path, &db_path);
+        let copied = copy_database(&database, &copy_path, &db_path, room_to_copy(&db_path));
         COPY_PAGE_LIMIT.set(None);
 
         let Err(OpenError::Files(error)) = copied else {
@@ -3964,13 +4049,16 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let db_path = directory.path().join("inspector.db");
         std::fs::write(&db_path, vec![0; 10_000]).unwrap();
-        assert_eq!(room_to_copy(&db_path), Some(10_000 + 64 * 1024));
+        assert_eq!(
+            room_to_copy(&db_path),
+            Some(10_000 + 64 * 1024 + UNUSABLE_FREE_ROOM)
+        );
 
         let wal = std::fs::File::create(capture_file(&db_path, "-wal")).unwrap();
         wal.set_len(512 * 1024 * 1024).unwrap();
         assert_eq!(
             room_to_copy(&db_path),
-            Some(10_000 + 512 * 1024 * 1024 + 64 * 1024 + 1024 * 1024)
+            Some(10_000 + 512 * 1024 * 1024 + 64 * 1024 + 1024 * 1024 + UNUSABLE_FREE_ROOM)
         );
         std::fs::remove_file(&db_path).unwrap();
         assert_eq!(room_to_copy(&db_path), None);
@@ -4026,7 +4114,7 @@ mod tests {
         let copy_path = capture_file(&db_path, "-copy");
         assert!(create_owner_only(&copy_path, this_user()).unwrap());
 
-        let copied = copy_database(&database, &copy_path, &db_path);
+        let copied = copy_database(&database, &copy_path, &db_path, room_to_copy(&db_path));
         holder.execute_batch("COMMIT").unwrap();
 
         assert!(matches!(
@@ -4054,7 +4142,7 @@ mod tests {
 
         let copy_path = capture_file(&db_path, "-copy");
         assert!(create_owner_only(&copy_path, this_user()).unwrap());
-        copy_database(&database, &copy_path, &db_path).unwrap();
+        copy_database(&database, &copy_path, &db_path, room_to_copy(&db_path)).unwrap();
         released.join().unwrap();
 
         let rows: i64 = Connection::open(capture_file(&db_path, "-copy"))

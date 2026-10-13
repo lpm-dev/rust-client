@@ -777,12 +777,15 @@ fn capture_warnings(
         warnings.push(
             match repository {
                 CaptureRepository::Project => {
-                    "git didn't answer for the project's repository (it couldn't run, refused, \
-                     or took over 2 s), so check that it doesn't track .lpm/inspector.db*"
+                    "git didn't answer for the project's repository (it couldn't run, took \
+                     over 2 s, refused, or stopped at a filesystem boundary or a broken .git \
+                     file), so check that it doesn't track .lpm/inspector.db*"
                 }
                 CaptureRepository::Lpm => {
-                    "git didn't answer in .lpm (it couldn't run or took over 2 s), so check \
-                     that git ignores and doesn't track .lpm/inspector.db*"
+                    "git didn't answer in .lpm (it couldn't run, took over 2 s, or stopped \
+                     short of the project's repository, as at a filesystem boundary or a \
+                     broken .git file), so check that git ignores and doesn't track \
+                     .lpm/inspector.db*"
                 }
             }
             .to_string(),
@@ -917,8 +920,8 @@ struct CaptureGitState {
     /// bare repository.
     lpm_unasked: bool,
     /// The repositories whose query couldn't run, was refused in a
-    /// repository, or didn't answer in time, so what the other found stands
-    /// but git's ignoring the files isn't confirmed.
+    /// repository, stopped short of one, or didn't answer in time, so what
+    /// the other found stands but git's ignoring the files isn't confirmed.
     unanswered: Vec<CaptureRepository>,
 }
 
@@ -948,8 +951,13 @@ const CAPTURE_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// Why git didn't say how it treats the capture files.
 #[derive(Debug, PartialEq, Eq)]
 enum CaptureGitFailure {
-    /// Git ran and found no repository it would use there.
+    /// Git ran and found no repository there or in any directory above.
     NoRepository,
+    /// Git ran and stopped looking before it found one: at a filesystem
+    /// boundary, or at a `.git` file that doesn't point at a repository,
+    /// which no git command there gets past. A repository above can still
+    /// hold the directory.
+    Stopped,
     /// Git ran and refused, for a repository it won't use, such as one
     /// another user owns.
     Refused,
@@ -957,25 +965,38 @@ enum CaptureGitFailure {
     Unavailable,
 }
 
-/// What git says, with `LC_ALL=C`, where it finds no repository: none at
-/// all, none before a filesystem boundary, or a `.git` file that doesn't
-/// point at one, which no git command there gets past.
-const NO_REPOSITORY_MESSAGES: [&str; 3] = [
-    "not a git repository",
+/// How git's `fatal: ` line starts, with `LC_ALL=C`, where it found no
+/// repository, and where it stopped looking.
+const NO_REPOSITORY_MESSAGE: &str = "not a git repository (or any of the parent directories)";
+const STOPPED_MESSAGES: [&str; 4] = [
+    "not a git repository (or any parent up to mount",
+    "not a git repository: ",
     "invalid gitfile format",
     "no path in gitfile",
 ];
 
+/// Reads git's failure from the start of its `fatal: ` line, as the rest can
+/// quote a path, and without regard to case, as releases before 2.17 write
+/// "Not a git repository".
 fn capture_git_failure(stderr: &[u8]) -> CaptureGitFailure {
     let message = String::from_utf8_lossy(stderr);
-    if NO_REPOSITORY_MESSAGES
-        .iter()
-        .any(|pattern| message.contains(pattern))
-    {
-        CaptureGitFailure::NoRepository
-    } else {
-        CaptureGitFailure::Refused
+    for line in message.lines() {
+        let Some(reason) = line.strip_prefix("fatal: ") else {
+            continue;
+        };
+        let starts = |start: &str| {
+            reason
+                .get(..start.len())
+                .is_some_and(|text| text.eq_ignore_ascii_case(start))
+        };
+        if starts(NO_REPOSITORY_MESSAGE) {
+            return CaptureGitFailure::NoRepository;
+        }
+        if STOPPED_MESSAGES.into_iter().any(starts) {
+            return CaptureGitFailure::Stopped;
+        }
     }
+    CaptureGitFailure::Refused
 }
 
 /// A git query of the capture files: the directory it runs in, its
@@ -1039,11 +1060,12 @@ where
 
     let mut state = CaptureGitState::default();
     // Whether git found a repository the project is in; only where git
-    // didn't run or answer is that read from the `.git` entries.
+    // didn't run, answer, or get past a filesystem boundary or a broken
+    // `.git` file is that read from the `.git` entries.
     let in_repository = match &project {
         Ok(_) | Err(CaptureGitFailure::Refused) => true,
         Err(CaptureGitFailure::NoRepository) => false,
-        Err(CaptureGitFailure::Unavailable) => project_dir
+        Err(CaptureGitFailure::Stopped | CaptureGitFailure::Unavailable) => project_dir
             .ancestors()
             .any(|directory| marks_a_repository(&directory.join(".git"))),
     };
@@ -1060,6 +1082,10 @@ where
         }
         Err(_) => false,
     };
+    // Only where git couldn't be run in `.lpm` is a repository of its own
+    // read from its `.git` entry; one git ran past isn't a repository.
+    let own_repository = matches!(inside, Some(Err(CaptureGitFailure::Unavailable)))
+        && marks_a_repository(&lpm_dir.join(".git"));
     let inside_answered = match inside {
         Some(Ok(files)) => {
             let (own, project_files): (Vec<String>, Vec<String>) = files
@@ -1085,9 +1111,9 @@ where
             true
         }
         // Git in `.lpm` stopped short of the project's repository, as at a
-        // filesystem boundary, so whether it ignores the files there isn't
-        // known.
-        Some(Err(CaptureGitFailure::NoRepository)) => {
+        // filesystem boundary, or found none there, so whether it ignores
+        // the files there isn't known.
+        Some(Err(CaptureGitFailure::NoRepository | CaptureGitFailure::Stopped)) => {
             if in_repository {
                 state.unanswered.push(CaptureRepository::Lpm);
             }
@@ -1103,7 +1129,6 @@ where
         }
         None => false,
     };
-    let own_repository = lpm_exists && marks_a_repository(&lpm_dir.join(".git"));
     (project_answered || inside_answered || in_repository || own_repository).then_some(state)
 }
 
@@ -2884,7 +2909,7 @@ mod tests {
         let warnings = warnings_for(Some(refused), false);
         assert!(
             warnings.iter().any(|warning| warning
-                .starts_with("git didn't answer for the project's repository (it couldn't run, refused, or took over 2 s)")),
+                .starts_with("git didn't answer for the project's repository (it couldn't run, took over 2 s, refused,")),
             "{warnings:?}"
         );
 
@@ -2964,17 +2989,116 @@ mod tests {
         std::fs::create_dir(project.path().join(".lpm")).unwrap();
 
         // As at a filesystem boundary between the project and `.lpm`.
+        for inside in [CaptureGitFailure::Stopped, CaptureGitFailure::NoRepository] {
+            let (state, _) =
+                state_from_answers(project.path(), Ok(CaptureGitFiles::default()), Err(inside))
+                    .await;
+
+            let state = state.unwrap();
+            assert_eq!(state.unanswered, vec![CaptureRepository::Lpm]);
+            assert!(!state.lpm_unasked);
+            assert!(!state.kept_out());
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_the_git_entries_where_git_stops_short_of_the_project_s_repository() {
+        let repository = tempfile::tempdir().unwrap();
+        repository_entry(repository.path());
+        let project = repository.path().join("app");
+        std::fs::create_dir_all(project.join(".lpm")).unwrap();
+
         let (state, _) = state_from_answers(
-            project.path(),
-            Ok(CaptureGitFiles::default()),
-            Err(CaptureGitFailure::NoRepository),
+            &project,
+            Err(CaptureGitFailure::Stopped),
+            Err(CaptureGitFailure::Stopped),
         )
         .await;
 
-        let state = state.unwrap();
-        assert_eq!(state.unanswered, vec![CaptureRepository::Lpm]);
-        assert!(!state.lpm_unasked);
-        assert!(!state.kept_out());
+        assert_eq!(
+            state.unwrap().unanswered,
+            vec![CaptureRepository::Project, CaptureRepository::Lpm]
+        );
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outside.path().join(".lpm")).unwrap();
+        let (state, _) = state_from_answers(
+            outside.path(),
+            Err(CaptureGitFailure::Stopped),
+            Err(CaptureGitFailure::Stopped),
+        )
+        .await;
+        assert_eq!(state, None);
+    }
+
+    #[tokio::test]
+    async fn asks_for_a_check_where_a_broken_git_file_stops_git_inside_a_repository() {
+        let repository = capture_project(&["app/.lpm/inspector.db"]);
+        git(repository.path(), &["add", "app/.lpm/inspector.db"]);
+        let project = repository.path().join("app");
+        for entry in ["not a pointer\n", "gitdir: \n", "gitdir: ../gone/.git\n"] {
+            std::fs::write(project.join(".git"), entry).unwrap();
+
+            let state = capture_git_state(&project).await.unwrap();
+
+            assert_eq!(
+                state.unanswered,
+                vec![CaptureRepository::Project, CaptureRepository::Lpm],
+                "{entry:?}"
+            );
+            let warnings = warnings_for(Some(state), false);
+            assert!(!warnings[0].contains("git ignores it"), "{entry:?}");
+            assert!(
+                warnings[1].contains("a broken .git file"),
+                "{entry:?}: {warnings:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn says_nothing_of_git_for_a_stale_lpm_git_entry_git_ran_past() {
+        for entry in ["gitdir: ../gone/.git\n", "HEAD only"] {
+            let project = tempfile::tempdir().unwrap();
+            let lpm_git = project.path().join(".lpm/.git");
+            std::fs::create_dir_all(lpm_git.parent().unwrap()).unwrap();
+            std::fs::write(project.path().join(".lpm/inspector.db"), b"x").unwrap();
+            if entry == "HEAD only" {
+                repository_entry(&project.path().join(".lpm"));
+            } else {
+                std::fs::write(&lpm_git, entry).unwrap();
+            }
+            assert!(marks_a_repository(&lpm_git), "{entry:?}");
+
+            let state = capture_git_state(project.path()).await;
+
+            assert_eq!(state, None, "{entry:?}");
+            assert!(
+                !warnings_for(state, false)[0].contains("git ignores it"),
+                "{entry:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_lpm_s_own_git_entry_only_where_git_couldn_t_run_there() {
+        let project = tempfile::tempdir().unwrap();
+        repository_entry(&project.path().join(".lpm"));
+
+        for (inside, unanswered) in [
+            (
+                CaptureGitFailure::Unavailable,
+                Some(vec![CaptureRepository::Lpm]),
+            ),
+            (CaptureGitFailure::Stopped, None),
+            (CaptureGitFailure::NoRepository, None),
+        ] {
+            let (state, _) = state_from_answers(
+                project.path(),
+                Err(CaptureGitFailure::NoRepository),
+                Err(inside),
+            )
+            .await;
+            assert_eq!(state.map(|state| state.unanswered), unanswered);
+        }
     }
 
     /// Makes `directory/.git` as `git init` leaves its `HEAD`.
@@ -3015,24 +3139,53 @@ mod tests {
     }
 
     #[test]
-    fn reads_git_s_failure_as_no_repository_only_where_it_says_so() {
+    fn reads_git_s_failure_from_the_start_of_its_fatal_line() {
         for (stderr, failure) in [
             (
                 "fatal: not a git repository (or any of the parent directories): .git\n",
                 CaptureGitFailure::NoRepository,
             ),
             (
+                "fatal: Not a git repository (or any of the parent directories): .git\n",
+                CaptureGitFailure::NoRepository,
+            ),
+            (
                 "fatal: not a git repository (or any parent up to mount point /mnt)\n\
                  Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n",
-                CaptureGitFailure::NoRepository,
+                CaptureGitFailure::Stopped,
+            ),
+            (
+                "fatal: Not a git repository (or any parent up to mount point /mnt)\n",
+                CaptureGitFailure::Stopped,
             ),
             (
                 "fatal: invalid gitfile format: /work/app/.git\n",
-                CaptureGitFailure::NoRepository,
+                CaptureGitFailure::Stopped,
+            ),
+            (
+                "fatal: Invalid gitfile format: /work/app/.git\n",
+                CaptureGitFailure::Stopped,
             ),
             (
                 "fatal: no path in gitfile: /work/app/.git\n",
-                CaptureGitFailure::NoRepository,
+                CaptureGitFailure::Stopped,
+            ),
+            (
+                "fatal: No path in gitfile: /work/app/.git\n",
+                CaptureGitFailure::Stopped,
+            ),
+            (
+                "fatal: not a git repository: /work/gone/.git\n",
+                CaptureGitFailure::Stopped,
+            ),
+            (
+                "fatal: detected dubious ownership in repository at \
+                 '/work/not a git repository (or any of the parent directories)'\n",
+                CaptureGitFailure::Refused,
+            ),
+            (
+                "warning: not a git repository (or any of the parent directories)\n",
+                CaptureGitFailure::Refused,
             ),
             (
                 "fatal: detected dubious ownership in repository at '/work/app'\n",
