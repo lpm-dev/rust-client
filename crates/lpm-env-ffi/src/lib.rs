@@ -1,7 +1,9 @@
 //! Bounded C ABI for the bundled native schema engine. No process environment access.
 
-use lpm_env_source::SchemaSnapshot;
-use serde::{Deserialize, Serialize};
+use lpm_env_source::{ReplacedGroups, ReplacedRules, SchemaSnapshot, SourceLocation};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Serialize, Serializer};
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -9,6 +11,10 @@ use std::sync::Arc;
 
 const ABI_VERSION: u32 = 1;
 const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
+/// The most a resolution's `Provenance` adds on top of `OUTPUT_LIMIT`. It
+/// grows with the overrides, groups, and prefixes, whose counts and names
+/// the engine bounds, so the largest valid schema stays well under it.
+const PROVENANCE_LIMIT: usize = 2 * 1024 * 1024;
 /// The most environments one check evaluates.
 const CHECK_ENVIRONMENT_LIMIT: usize = 256;
 /// The most work one check does: each environment costs a unit per
@@ -44,6 +50,113 @@ fn failure(status: u32, code: &'static str) -> LPMEnvResult {
         format!("{{\"abiVersion\":{ABI_VERSION},\"code\":\"{code}\"}}").into_bytes(),
         None,
     )
+}
+
+/// Where overridden groups were declared, where client prefixes come from,
+/// and what lpm.json's overrides replace. Each schema it names is listed
+/// once in `sources`, and entries name one by its index, so its size follows
+/// the overrides rather than how long their schemas' paths are.
+struct Provenance<'a> {
+    sources: Vec<&'a str>,
+    indexes: HashMap<&'a str, usize>,
+    snapshot: &'a SchemaSnapshot,
+}
+
+impl<'a> Provenance<'a> {
+    fn new(snapshot: &'a SchemaSnapshot) -> Self {
+        let mut provenance = Self {
+            sources: Vec::new(),
+            indexes: HashMap::new(),
+            snapshot,
+        };
+        let origins = snapshot
+            .group_declaring_origins
+            .values()
+            .chain(snapshot.client_prefix_origins.values())
+            .chain(snapshot.replaced_vars.values().flat_map(|replaced| {
+                std::iter::once(&replaced.origin).chain(replaced.secret.as_ref())
+            }))
+            .chain(
+                snapshot
+                    .replaced_groups
+                    .values()
+                    .map(|replaced| &replaced.origin),
+            );
+        for origin in origins {
+            if let Entry::Vacant(entry) = provenance.indexes.entry(origin.source.as_str()) {
+                entry.insert(provenance.sources.len());
+                provenance.sources.push(&origin.source);
+            }
+        }
+        provenance
+    }
+
+    fn index(&self, origin: &SourceLocation) -> usize {
+        self.indexes[origin.source.as_str()]
+    }
+}
+
+impl Serialize for Provenance<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Replaced {
+            count: usize,
+            origin: usize,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            client: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            secret: Option<usize>,
+        }
+        let snapshot = self.snapshot;
+        let mut fields = serializer.serialize_struct("Provenance", 5)?;
+        fields.serialize_field("sources", &self.sources)?;
+        fields.serialize_field(
+            "groupDeclaringOrigins",
+            &Entries(
+                &snapshot.group_declaring_origins,
+                |origin: &Arc<SourceLocation>| self.index(origin),
+            ),
+        )?;
+        fields.serialize_field(
+            "clientPrefixOrigins",
+            &Entries(
+                &snapshot.client_prefix_origins,
+                |origin: &Arc<SourceLocation>| self.index(origin),
+            ),
+        )?;
+        fields.serialize_field(
+            "replacedVars",
+            &Entries(&snapshot.replaced_vars, |replaced: &ReplacedRules| {
+                Replaced {
+                    count: replaced.count,
+                    origin: self.index(&replaced.origin),
+                    client: Some(replaced.client),
+                    secret: replaced.secret.as_deref().map(|origin| self.index(origin)),
+                }
+            }),
+        )?;
+        fields.serialize_field(
+            "replacedGroups",
+            &Entries(&snapshot.replaced_groups, |replaced: &ReplacedGroups| {
+                Replaced {
+                    count: replaced.count,
+                    origin: self.index(&replaced.origin),
+                    client: None,
+                    secret: None,
+                }
+            }),
+        )?;
+        fields.end()
+    }
+}
+
+/// A map serialized with each value converted on the way out.
+struct Entries<'a, V, F>(&'a BTreeMap<String, V>, F);
+
+impl<V, T: Serialize, F: Fn(&V) -> T> Serialize for Entries<'_, V, F> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter().map(|(key, value)| (key, (self.1)(value))))
+    }
 }
 
 fn diagnostic(error: &lpm_env_source::SourceError) -> LPMEnvResult {
@@ -127,25 +240,32 @@ pub unsafe extern "C" fn lpm_env_resolve(
                 struct Output<'a, E: Serialize> {
                     abi_version: u32,
                     effective: E,
-                    origins: &'a std::collections::BTreeMap<String, lpm_env_source::SourceLocation>,
-                    group_origins:
-                        &'a std::collections::BTreeMap<String, lpm_env_source::SourceLocation>,
-                    declaring_origins:
-                        &'a std::collections::BTreeMap<String, lpm_env_source::SourceLocation>,
+                    origins: &'a BTreeMap<String, SourceLocation>,
+                    group_origins: &'a BTreeMap<String, SourceLocation>,
+                    declaring_origins: &'a BTreeMap<String, SourceLocation>,
+                    #[serde(flatten)]
+                    provenance: &'a Provenance<'a>,
                     dependencies: &'a [lpm_env_source::SchemaDependency],
                     fingerprint: String,
                 }
-                let effective = lpm_env_source::ordered_schema(&resolved.schema);
+                let provenance = Provenance::new(&resolved.snapshot);
+                // The provenance has an allowance of its own, so a schema whose
+                // output fit `OUTPUT_LIMIT` without it still resolves with it.
+                let Ok(provenance_bytes) = lpm_env_source::json_size(&provenance, PROVENANCE_LIMIT)
+                else {
+                    return failure(4, "env.output_budget");
+                };
                 let output = Output {
                     abi_version: ABI_VERSION,
-                    effective,
+                    effective: lpm_env_source::ordered_schema(&resolved.schema),
                     origins: &resolved.origins,
                     group_origins: &resolved.group_origins,
                     declaring_origins: &resolved.declaring_origins,
+                    provenance: &provenance,
                     dependencies: &resolved.dependencies,
                     fingerprint: hex::encode(resolved.fingerprint),
                 };
-                match lpm_env_source::bounded_json(&output, OUTPUT_LIMIT) {
+                match lpm_env_source::bounded_json(&output, OUTPUT_LIMIT + provenance_bytes) {
                     Ok(bytes) => {
                         let Some(snapshot) = Arc::get_mut(&mut resolved.snapshot) else {
                             return failure(3, "env.engine_internal");
@@ -153,6 +273,10 @@ pub unsafe extern "C" fn lpm_env_resolve(
                         snapshot.origins.clear();
                         snapshot.group_origins.clear();
                         snapshot.declaring_origins.clear();
+                        snapshot.group_declaring_origins.clear();
+                        snapshot.client_prefix_origins.clear();
+                        snapshot.replaced_vars.clear();
+                        snapshot.replaced_groups.clear();
                         result(0, bytes, Some(resolved.snapshot))
                     }
                     Err(_) => failure(4, "env.output_budget"),
@@ -493,6 +617,10 @@ mod tests {
             assert!(retained.origins.is_empty());
             assert!(retained.group_origins.is_empty());
             assert!(retained.declaring_origins.is_empty());
+            assert!(retained.group_declaring_origins.is_empty());
+            assert!(retained.client_prefix_origins.is_empty());
+            assert!(retained.replaced_vars.is_empty());
+            assert!(retained.replaced_groups.is_empty());
             lpm_env_clear_output(&mut result);
             lpm_env_release(result);
         }
@@ -525,6 +653,230 @@ mod tests {
             "/vars/INHERITED"
         );
         assert!(actual["declaringOrigins"].get("LOCAL").is_none());
+    }
+
+    #[test]
+    fn overrides_report_the_rules_they_replace_and_where_groups_and_prefixes_come_from() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("base.json"),
+            r#"{"vars":{"SHARED_TOKEN":{"secret":true},"SHARED_REGION":{"client":true},"MIDDLE":{}},"groups":{"pair":{"mode":"allOrNone","vars":["SHARED_TOKEN","MIDDLE"]},"solo":{"mode":"atLeastOne","vars":["MIDDLE"]}},"clientPrefixes":["SHARED_","BASE_"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("middle.json"),
+            r#"{"extends":["base.json"],"overrides":{"MIDDLE":{"required":true}}}"#,
+        )
+        .unwrap();
+        let input = br#"{"extends":["middle.json"],"clientPrefixes":["OWN_","SHARED_"],"vars":{"LOCAL":{}},"overrides":{"SHARED_TOKEN":{"client":true}},"groupOverrides":{"pair":{"mode":"exactlyOne","vars":["SHARED_TOKEN","MIDDLE"]}}}"#;
+        let result = resolve(input, dir.path().to_str().unwrap());
+        assert_eq!(result.status, 0, "{}", output(&result));
+        let actual = output(&result);
+        // SAFETY: This is the sole release of the returned result.
+        unsafe {
+            lpm_env_release(result);
+        }
+        assert_eq!(
+            actual["sources"],
+            serde_json::json!(["base.json", "lpm.json"]),
+            "Each schema the provenance names is listed once"
+        );
+        assert_eq!(
+            actual["replacedVars"],
+            serde_json::json!({"SHARED_TOKEN": {"count": 1, "origin": 0, "client": false, "secret": 0}}),
+            "Only lpm.json's own overrides report what they replace"
+        );
+        assert_eq!(
+            actual["replacedGroups"],
+            serde_json::json!({"pair": {"count": 1, "origin": 0}})
+        );
+        assert_eq!(actual["effective"]["vars"]["SHARED_TOKEN"]["client"], true);
+        assert_eq!(actual["groupOrigins"]["pair"]["source"], "lpm.json");
+        assert_eq!(
+            actual["groupDeclaringOrigins"],
+            serde_json::json!({"pair": 0})
+        );
+        assert_eq!(
+            actual["clientPrefixOrigins"],
+            serde_json::json!({"BASE_": 0, "OWN_": 1, "SHARED_": 0}),
+            "A prefix lpm.json shares with an import names the import"
+        );
+        assert_eq!(
+            actual["effective"]["clientPrefixes"],
+            serde_json::json!(["BASE_", "OWN_", "SHARED_"])
+        );
+    }
+
+    #[test]
+    fn replaced_rules_are_summarized_without_their_values_and_stay_small() {
+        let dir = tempfile::tempdir().unwrap();
+        let description = "d".repeat(1024 * 1024);
+        std::fs::write(
+            dir.path().join("d.json"),
+            format!(
+                r#"{{"vars":{{"KEY":{{"secret":true,"default":"PRIVATE_LITERAL","enum":["PRIVATE_LITERAL"],"description":"{description}"}}}}}}"#
+            ),
+        )
+        .unwrap();
+        let paths: Vec<String> = (0..8).map(|index| format!("p{index}.json")).collect();
+        for path in &paths {
+            std::fs::write(dir.path().join(path), r#"{"extends":["d.json"]}"#).unwrap();
+        }
+        let input = serde_json::json!({"extends": paths, "overrides": {"KEY": {}}}).to_string();
+        let result = resolve(input.as_bytes(), dir.path().to_str().unwrap());
+        assert_eq!(result.status, 0, "{}", output(&result));
+        let actual = output(&result);
+        // SAFETY: This is the sole release of the returned result.
+        unsafe {
+            lpm_env_release(result);
+        }
+        let text = actual.to_string();
+        assert!(
+            !text.contains("PRIVATE_LITERAL"),
+            "An overridden rule's values never leave the engine"
+        );
+        assert!(
+            text.len() < 64 * 1024,
+            "The summary doesn't grow with the rule or the paths: {} bytes",
+            text.len()
+        );
+        assert_eq!(actual["replacedVars"]["KEY"]["count"], 1);
+        assert_eq!(actual["sources"], serde_json::json!(["d.json"]));
+        assert_eq!(actual["replacedVars"]["KEY"]["secret"], 0);
+    }
+
+    /// The resolve output's provenance fields, and the rest of it, as the engine writes them.
+    fn split_provenance(output: &serde_json::Value) -> (Vec<u8>, Vec<u8>) {
+        let mut rest = output.as_object().unwrap().clone();
+        let mut provenance = serde_json::Map::new();
+        for field in [
+            "sources",
+            "groupDeclaringOrigins",
+            "clientPrefixOrigins",
+            "replacedVars",
+            "replacedGroups",
+        ] {
+            provenance.insert(field.into(), rest.shift_remove(field).unwrap());
+        }
+        (
+            serde_json::to_vec(&provenance).unwrap(),
+            serde_json::to_vec(&rest).unwrap(),
+        )
+    }
+
+    fn long_name(prefix: char, index: usize) -> String {
+        format!("{prefix}{index:0>255}")
+    }
+
+    #[test]
+    fn a_schema_whose_output_fit_the_budget_before_provenance_still_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = "f".repeat(250);
+        std::fs::create_dir(dir.path().join(&folder)).unwrap();
+        let import = format!("{folder}/{}.json", "i".repeat(244));
+        let names: Vec<String> = (0..4096).map(|index| long_name('K', index)).collect();
+        let rules = |rule: &str| {
+            names
+                .iter()
+                .map(|name| format!(r#""{name}":{rule}"#))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        std::fs::write(
+            dir.path().join(&import),
+            format!(r#"{{"vars":{{{}}}}}"#, rules(r#"{"secret":true}"#)),
+        )
+        .unwrap();
+        let input = format!(
+            r#"{{"extends":["{import}"],"overrides":{{{}}}}}"#,
+            rules("{}")
+        );
+        assert!(input.len() <= lpm_env_source::MAX_SCHEMA_BYTES);
+        let result = resolve(input.as_bytes(), dir.path().to_str().unwrap());
+        assert_eq!(result.status, 0, "{}", output(&result));
+        let length = result.length;
+        let actual = output(&result);
+        // SAFETY: This is the sole release of the returned result.
+        unsafe {
+            lpm_env_release(result);
+        }
+        let (provenance, rest) = split_provenance(&actual);
+        assert!(
+            rest.len() <= OUTPUT_LIMIT && length > OUTPUT_LIMIT,
+            "The output without provenance fits the budget, and only its allowance fits the rest: {} + {} bytes",
+            rest.len(),
+            provenance.len()
+        );
+        assert_eq!(actual["sources"], serde_json::json!([import]));
+        assert_eq!(actual["replacedVars"].as_object().unwrap().len(), 4096);
+        assert_eq!(
+            actual["replacedVars"][&names[0]],
+            serde_json::json!({"count": 1, "origin": 0, "client": false, "secret": 0})
+        );
+    }
+
+    #[test]
+    fn provenance_of_the_largest_overrides_stays_well_within_its_allowance() {
+        let dir = tempfile::tempdir().unwrap();
+        let import = format!("{}.json", "i".repeat(180));
+        let names: Vec<String> = (0..4096).map(|index| long_name('K', index)).collect();
+        let groups: Vec<String> = (0..128).map(|index| long_name('G', index)).collect();
+        let prefixes: Vec<String> = (0..32).map(|index| format!("P{index:0>254}_")).collect();
+        let group = |index: usize| format!(r#"{{"mode":"allOrNone","vars":["{}"]}}"#, names[index]);
+        let vars = names
+            .iter()
+            .map(|name| format!(r#""{name}":{{"secret":true}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let declared_groups = (0..128)
+            .map(|index| format!(r#""{}":{}"#, groups[index], group(index)))
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::write(
+            dir.path().join(&import),
+            serde_json::to_string(&serde_json::json!({
+                "vars": serde_json::from_str::<serde_json::Value>(&format!("{{{vars}}}")).unwrap(),
+                "groups": serde_json::from_str::<serde_json::Value>(&format!("{{{declared_groups}}}")).unwrap(),
+                "clientPrefixes": prefixes,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let overrides = names
+            .iter()
+            .map(|name| format!(r#""{name}":{{}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let group_overrides = (0..128)
+            .map(|index| format!(r#""{}":{}"#, groups[index], group(4095 - index)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let input = format!(
+            r#"{{"extends":["{import}"],"overrides":{{{overrides}}},"groupOverrides":{{{group_overrides}}}}}"#
+        );
+        let result = resolve(input.as_bytes(), dir.path().to_str().unwrap());
+        assert_eq!(result.status, 0, "{}", output(&result));
+        let actual = output(&result);
+        // SAFETY: This is the sole release of the returned result.
+        unsafe {
+            lpm_env_release(result);
+        }
+        assert_eq!(actual["replacedVars"].as_object().unwrap().len(), 4096);
+        assert_eq!(actual["replacedGroups"].as_object().unwrap().len(), 128);
+        assert_eq!(
+            actual["groupDeclaringOrigins"].as_object().unwrap().len(),
+            128
+        );
+        assert_eq!(actual["clientPrefixOrigins"].as_object().unwrap().len(), 32);
+        let (provenance, _) = split_provenance(&actual);
+        // What this fixture doesn't reach: a second digit in each override's
+        // count and indexes, and every schema listed at full length, escaped.
+        let unreached = 4096 * 3 + (lpm_env_source::MAX_NODES + 1) * (512 * 6 + 3);
+        assert!(
+            provenance.len() + unreached < PROVENANCE_LIMIT,
+            "Every override, group, and prefix the engine accepts, named at full length: {} bytes",
+            provenance.len()
+        );
     }
 
     #[test]
