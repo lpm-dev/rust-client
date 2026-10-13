@@ -189,33 +189,14 @@ pub async fn run(
     }
     let exchange_url = format!("{registry_url}/api/cli/exchange");
     let http_client = exchange_client(std::time::Duration::from_secs(30))?;
-    let resp = http_client
-        .post(&exchange_url)
-        .json(&serde_json::json!({ "code": code, "code_verifier": code_verifier }))
-        .send()
-        .await
-        .map_err(|error| {
-            LpmError::Registry(format!(
-                "exchange request failed: {}",
-                lpm_http::display_error(&error)
-            ))
-        })?;
-
-    let status = resp.status();
-    let body = read_capped_exchange_body(resp).await?;
-    if !status.is_success() {
-        let detail = if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body) {
-            json["error"]
-                .as_str()
-                .unwrap_or("unknown error")
-                .to_string()
-        } else {
-            format!("HTTP {status}")
-        };
-        return Err(LpmError::Registry(format!(
-            "Failed to exchange authorization code: {detail}. It may have expired — please try again."
-        )));
-    }
+    let body = exchange_authorization_code(
+        &http_client,
+        &exchange_url,
+        &code,
+        &code_verifier,
+        EXCHANGE_RETRY_BUDGET,
+    )
+    .await?;
 
     let session = parse_cli_exchange_session(&body)?;
     let token = session.token;
@@ -249,6 +230,78 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// How long `lpm login` keeps asking the Registry to redeem an authorization
+/// code it answered "try again" for, as while it settles a code's state.
+const EXCHANGE_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+/// The longest wait between attempts, whatever `Retry-After` asks.
+const EXCHANGE_RETRY_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Redeems the authorization code for a session, and returns the response
+/// body. The Registry answers 503 while it can't yet tell whether the code
+/// was redeemed, and 429 when the address is rate-limited; both keep the
+/// code, so they're asked again after their `Retry-After` while `budget`
+/// allows. Any other refusal is final, as the code is spent or invalid.
+async fn exchange_authorization_code(
+    client: &reqwest::Client,
+    exchange_url: &str,
+    code: &str,
+    code_verifier: &str,
+    budget: std::time::Duration,
+) -> Result<Vec<u8>, LpmError> {
+    let started = std::time::Instant::now();
+    loop {
+        let response = client
+            .post(exchange_url)
+            .json(&serde_json::json!({ "code": code, "code_verifier": code_verifier }))
+            .send()
+            .await
+            .map_err(|error| {
+                LpmError::Registry(format!(
+                    "exchange request failed: {}",
+                    lpm_http::display_error(&error)
+                ))
+            })?;
+        let status = response.status();
+        let retryable = status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        let wait = exchange_retry_wait(&response);
+        let body = read_capped_exchange_body(response).await?;
+        if status.is_success() {
+            return Ok(body);
+        }
+        if retryable && started.elapsed() + wait <= budget {
+            tokio::time::sleep(wait).await;
+            continue;
+        }
+        let detail = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|json| json["error"].as_str().map(str::to_string))
+            .unwrap_or_else(|| format!("HTTP {}", status.as_u16()));
+        return Err(LpmError::Registry(if retryable {
+            format!("Failed to exchange authorization code: {detail}. Run `lpm login` again.")
+        } else {
+            format!(
+                "Failed to exchange authorization code: {detail}. It may have expired — please try again."
+            )
+        }));
+    }
+}
+
+/// The wait a response's `Retry-After` asks, in whole seconds, or a second
+/// when it names none, at most `EXCHANGE_RETRY_MAX_WAIT`.
+fn exchange_retry_wait(response: &reqwest::Response) -> std::time::Duration {
+    response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs,
+        )
+        .min(EXCHANGE_RETRY_MAX_WAIT)
 }
 
 fn exchange_client(timeout: std::time::Duration) -> Result<reqwest::Client, LpmError> {
@@ -755,6 +808,124 @@ mod tests {
                 "exchange must time out for headers={headers}"
             );
         }
+    }
+
+    async fn exchange_server(responses: Vec<wiremock::ResponseTemplate>) -> wiremock::MockServer {
+        use wiremock::{Mock, MockServer};
+        let server = MockServer::start().await;
+        for (index, response) in responses.into_iter().enumerate() {
+            Mock::given(wiremock::matchers::method("POST"))
+                .respond_with(response)
+                .up_to_n_times(1)
+                .with_priority(u8::try_from(index + 1).unwrap())
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    #[tokio::test]
+    async fn exchange_retries_while_the_registry_settles_the_code_then_succeeds() {
+        use wiremock::ResponseTemplate;
+        let unsettled = || {
+            ResponseTemplate::new(503)
+                .insert_header("retry-after", "0")
+                .set_body_json(serde_json::json!({"error": "The sign-in can't be completed right now; try again"}))
+        };
+        let server = exchange_server(vec![
+            unsettled(),
+            ResponseTemplate::new(429).insert_header("retry-after", "0"),
+            unsettled(),
+            ResponseTemplate::new(200).set_body_json(valid_exchange_session()),
+        ])
+        .await;
+        let client = exchange_client(std::time::Duration::from_secs(5)).unwrap();
+
+        let body = exchange_authorization_code(
+            &client,
+            &server.uri(),
+            "the-code",
+            "the-verifier",
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+
+        assert!(parse_cli_exchange_session(&body).is_ok());
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 4);
+        for request in requests {
+            let sent: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(
+                sent,
+                serde_json::json!({"code": "the-code", "code_verifier": "the-verifier"})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exchange_stops_retrying_at_its_budget_with_the_registry_message() {
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("retry-after", "1")
+                    .set_body_json(serde_json::json!({"error": "The sign-in can't be completed right now; try again"})),
+            )
+            .mount(&server)
+            .await;
+        let client = exchange_client(std::time::Duration::from_secs(5)).unwrap();
+        let started = std::time::Instant::now();
+
+        let error = exchange_authorization_code(
+            &client,
+            &server.uri(),
+            "the-code",
+            "the-verifier",
+            std::time::Duration::from_millis(1500),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        assert!(
+            error
+                .to_string()
+                .contains("The sign-in can't be completed right now"),
+            "{error}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn exchange_does_not_retry_a_refused_code() {
+        use wiremock::ResponseTemplate;
+        let server = exchange_server(vec![
+            ResponseTemplate::new(401)
+                .set_body_json(serde_json::json!({"error": "Invalid or expired exchange code"})),
+            ResponseTemplate::new(200).set_body_json(valid_exchange_session()),
+        ])
+        .await;
+        let client = exchange_client(std::time::Duration::from_secs(5)).unwrap();
+
+        let error = exchange_authorization_code(
+            &client,
+            &server.uri(),
+            "the-code",
+            "the-verifier",
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid or expired exchange code"),
+            "{error}"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[test]
