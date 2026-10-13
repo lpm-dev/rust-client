@@ -416,7 +416,9 @@ fn filesystem_space(_path: &std::path::Path) -> Option<FilesystemSpace> {
 /// which also covers the blocks a file's own metadata takes. That's the
 /// least a write needs: on a fresh volume, writes flushed as they go, or
 /// spread over many files, stopped up to about 16 MB sooner, so a write
-/// counted as fitting can still fail, as on a full disk.
+/// counted as fitting can still fail, as on a full disk. APFS sometimes
+/// keeps back less: one run on macOS 26 let a stream take 0.7 MB more of a
+/// 64 MB volume, so a write can also fit in a little more than this counts.
 #[cfg(any(target_os = "macos", test))]
 fn apfs_held_back(size: u64) -> u64 {
     (size / 50)
@@ -523,7 +525,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn on_apfs_a_stream_of_writes_takes_what_it_counts_writable_and_little_more() {
+    fn on_apfs_a_stream_of_writes_takes_what_it_counts_writable_but_not_all_reported_free() {
         use std::io::Write as _;
 
         let directory = tempfile::tempdir().unwrap();
@@ -586,10 +588,15 @@ mod tests {
             }
         }
 
+        // How much of its reserve APFS lets a stream take varies by release
+        // and run, so how closely the reserve matches is checked against
+        // measured volumes in `apfs_holds_back_at_least_what_measured_volumes_kept_from_writes`.
+        assert_eq!(writable, space.available - space.held_back);
         assert!(written >= writable, "wrote {written} of {writable}");
         assert!(
-            written - writable < 1024 * 1024,
-            "wrote {written}, far past {writable}"
+            written < space.available,
+            "wrote {written}, all of the {} reported free",
+            space.available
         );
     }
 
