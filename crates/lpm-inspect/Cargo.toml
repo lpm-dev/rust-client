@@ -35,5 +35,8 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 reqwest = { workspace = true }
 tempfile = "3"
 
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true

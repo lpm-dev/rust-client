@@ -1007,10 +1007,11 @@ fn capture_git_failure(stderr: &[u8]) -> CaptureGitFailure {
 fn unreadable_git_file(reason: &str, starts: impl Fn(&str) -> bool) -> bool {
     let names_a_git_file = |path: &str| path.ends_with("/.git") || path == ".git";
     if starts("error opening '") {
+        // The path is quoted, then ": " and the system's error; the path
+        // itself can hold a quote.
         return reason["error opening '".len()..]
-            .split('\'')
-            .next()
-            .is_some_and(names_a_git_file);
+            .rsplit_once("': ")
+            .is_some_and(|(path, _)| names_a_git_file(path));
     }
     starts("error reading ") && names_a_git_file(reason["error reading ".len()..].trim_end())
 }
@@ -1177,15 +1178,38 @@ fn marks_a_repository(git: &Path) -> bool {
             let Some(pointer) = contents
                 .strip_prefix(b"gitdir: ")
                 .map(trim_line_breaks)
-                .and_then(|path| std::str::from_utf8(path).ok())
+                .map(until_nul)
                 .filter(|path| !path.is_empty())
             else {
                 return false;
             };
             let directory = git.parent().unwrap_or(Path::new("."));
-            is_git_directory(&directory.join(pointer))
+            is_git_directory(&directory.join(path_from_bytes(pointer)))
         }
         _ => false,
+    }
+}
+
+/// `bytes` up to a NUL, where git, reading them as a C string, stops.
+fn until_nul(bytes: &[u8]) -> &[u8] {
+    bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .map_or(bytes, |end| &bytes[..end])
+}
+
+/// A path from the bytes of a file git reads; on Windows, where a path
+/// isn't bytes, only UTF-8 reads as one.
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
     }
 }
 
@@ -1206,14 +1230,22 @@ fn is_git_directory(directory: &Path) -> bool {
     if !names_a_head(&directory.join("HEAD")) {
         return false;
     }
+    // Git fails on a `commondir` file it can't read, an empty one, or one
+    // naming a path that doesn't resolve.
     let common = match lpm_common::read_regular_file_capped_with_metadata(
         &directory.join("commondir"),
         GITFILE_LIMIT,
     ) {
-        Ok((contents, _)) => match std::str::from_utf8(trim_line_breaks(&contents)) {
-            Ok(path) => directory.join(path),
-            Err(_) => return false,
-        },
+        Ok((contents, _)) => {
+            let path = until_nul(trim_line_breaks(&contents));
+            if path.is_empty() {
+                return false;
+            }
+            match std::fs::canonicalize(directory.join(path_from_bytes(path))) {
+                Ok(common) => common,
+                Err(_) => return false,
+            }
+        }
         Err(lpm_common::BoundedReadError::NotFound { .. }) => directory.to_path_buf(),
         Err(_) => return false,
     };
@@ -3398,6 +3430,16 @@ mod tests {
         }
         assert!(!marks_a_repository(&directory.path().join("gone/.git")));
 
+        // Git reads a pointer as a C string, so it ends at a NUL.
+        let nul_dir = tempfile::tempdir().unwrap();
+        repository_entry(&nul_dir.path().join("elsewhere"));
+        std::fs::write(
+            nul_dir.path().join(".git"),
+            b"gitdir: elsewhere/.git\0junk\n",
+        )
+        .unwrap();
+        assert!(marks_a_repository(&nul_dir.path().join(".git")));
+
         // A pointer with no path is none, even in a git directory, which the
         // empty path would otherwise name.
         let bare = tempfile::tempdir().unwrap();
@@ -3415,6 +3457,9 @@ mod tests {
         let git = directory.path().join(".git");
         repository_entry(directory.path());
         let head = git.join("HEAD");
+        // Git reads the first 255 bytes of it.
+        let within = format!("ref:{}refs/heads/main\n", " ".repeat(240));
+        let past = format!("ref:{}refs/heads/main\n", " ".repeat(260));
         for (contents, repository) in [
             ("ref: refs/heads/main\n", true),
             ("ref:refs/heads/main", true),
@@ -3422,6 +3467,8 @@ mod tests {
             ("ref: \x0b refs/heads/main\n", false),
             ("ref: \x0c refs/heads/main\n", false),
             ("ref: heads/main\n", false),
+            (within.as_str(), true),
+            (past.as_str(), false),
             ("refs/heads/main\n", false),
             ("0123456789abcdef0123456789ABCDEF01234567\n", true),
             ("0123456789abcdef0123456789abcdef01234567", true),
@@ -3488,6 +3535,9 @@ mod tests {
             ("../..\r\n", true),
             ("../../objects\n", false),
             ("../gone\n", false),
+            // Git fails on an empty one.
+            ("\n", false),
+            ("", false),
         ] {
             std::fs::write(worktree_git.join("commondir"), common).unwrap();
             assert_eq!(
@@ -3572,6 +3622,19 @@ mod tests {
                 "fatal: error opening '/work/app/.git/index': Permission denied\n",
                 CaptureGitFailure::Refused,
             ),
+            (
+                "fatal: error opening '/work/it's/app/.git': Permission denied\n",
+                CaptureGitFailure::Stopped,
+            ),
+            (
+                "fatal: error opening '/work/app/x.git': Permission denied\n",
+                CaptureGitFailure::Refused,
+            ),
+            (
+                "fatal: error reading /work/app/x.git\n",
+                CaptureGitFailure::Refused,
+            ),
+            ("fatal: error reading .git\n", CaptureGitFailure::Stopped),
             (
                 "warning: unable to access '/home/user/.config/git/attributes'\n\
                  fatal: not a git repository (or any of the parent directories): .git\n",

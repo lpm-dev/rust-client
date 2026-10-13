@@ -21,6 +21,8 @@ pub mod macos_acl;
 pub mod npmrc;
 pub mod package_instance;
 pub mod package_name;
+#[cfg(unix)]
+pub mod path_trust;
 pub mod paths;
 pub mod peer;
 pub mod platform;

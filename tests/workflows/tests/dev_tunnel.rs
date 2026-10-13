@@ -1506,7 +1506,8 @@ fn tunnel_inspect_reports_a_capture_database_it_cant_open_as_a_disk_error_under_
             .as_str()
             .is_some_and(|message| message.ends_with(
                 "move it aside together with any inspector.db-wal, inspector.db-shm and \
-                 inspector.db-journal beside it, and retry"
+                 inspector.db-journal beside it, under names that still start inspector.db \
+                 so git goes on ignoring them, and retry"
             )),
         "{envelope}"
     );
@@ -1755,7 +1756,8 @@ fn tunnel_inspect_reports_an_actionable_corrupt_database_error() {
     assert!(rendered.contains(".lpm/inspector.db"));
     assert!(rendered.contains(
         "move it aside together with any inspector.db-wal, inspector.db-shm and \
-         inspector.db-journal beside it, and retry"
+         inspector.db-journal beside it, under names that still start inspector.db so git \
+         goes on ignoring them, and retry"
     ));
     assert!(
         !rendered.contains("network connection"),

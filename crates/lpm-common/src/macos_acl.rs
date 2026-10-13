@@ -11,9 +11,20 @@ use std::path::Path;
 
 const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
 
+const ACL_FIRST_ENTRY: c_int = 0;
+const ACL_NEXT_ENTRY: c_int = -1;
+const ACL_EXTENDED_ALLOW: c_int = 1;
+/// What lets someone change a directory's entries, or who may: adding a
+/// file or a subdirectory, deleting a child, and changing its ACL or owner.
+const ENTRY_CHANGING_PERMISSIONS: [c_int; 5] = [1 << 2, 1 << 5, 1 << 6, 1 << 12, 1 << 13];
+
 unsafe extern "C" {
     fn acl_free(value: *mut c_void) -> c_int;
+    fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
     fn acl_get_fd_np(file_descriptor: c_int, acl_type: c_int) -> *mut c_void;
+    fn acl_get_perm_np(permset: *mut c_void, perm: c_int) -> c_int;
+    fn acl_get_permset(entry: *mut c_void, permset: *mut *mut c_void) -> c_int;
+    fn acl_get_tag_type(entry: *mut c_void, tag: *mut c_int) -> c_int;
     fn acl_get_link_np(path: *const c_char, acl_type: c_int) -> *mut c_void;
     fn acl_init(entry_count: c_int) -> *mut c_void;
     fn acl_set_fd_np(file_descriptor: c_int, acl: *mut c_void, acl_type: c_int) -> c_int;
@@ -76,6 +87,64 @@ fn extended_acl_found(get: impl FnOnce() -> *mut c_void) -> io::Result<bool> {
             Err(io::Error::last_os_error())
         }
     }
+}
+
+/// Whether the open directory's extended ACL allows anyone to add, remove
+/// or rename its entries, or to change its ACL or owner. Every allow entry
+/// counts, whoever it names, as the directory's owner needs none.
+pub fn allows_entry_changes(handle: impl AsFd) -> io::Result<bool> {
+    let file_descriptor = handle.as_fd().as_raw_fd();
+    // SAFETY: errno is this thread's own; the ACL is freed once, and the
+    // entries and permission sets read from it are used only before that.
+    unsafe {
+        *libc::__error() = 0;
+        let acl = acl_get_fd_np(file_descriptor, ACL_TYPE_EXTENDED);
+        if acl.is_null() {
+            let error = *libc::__error();
+            return if error == 0 || error == libc::ENOENT {
+                Ok(false)
+            } else {
+                Err(io::Error::from_raw_os_error(error))
+            };
+        }
+        let allows = allow_entry_changes_in(acl);
+        if acl_free(acl) != 0 && allows.is_ok() {
+            return Err(io::Error::last_os_error());
+        }
+        allows
+    }
+}
+
+/// # Safety
+/// `acl` must be a live ACL from `acl_get_fd_np`.
+unsafe fn allow_entry_changes_in(acl: *mut c_void) -> io::Result<bool> {
+    let mut entry = std::ptr::null_mut();
+    let mut entry_id = ACL_FIRST_ENTRY;
+    // SAFETY: as the caller guarantees; each out-pointer is a local.
+    unsafe {
+        while acl_get_entry(acl, entry_id, &mut entry) == 0 {
+            entry_id = ACL_NEXT_ENTRY;
+            let mut tag = 0;
+            if acl_get_tag_type(entry, &mut tag) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if tag != ACL_EXTENDED_ALLOW {
+                continue;
+            }
+            let mut permset = std::ptr::null_mut();
+            if acl_get_permset(entry, &mut permset) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            for permission in ENTRY_CHANGING_PERMISSIONS {
+                match acl_get_perm_np(permset, permission) {
+                    0 => {}
+                    1 => return Ok(true),
+                    _ => return Err(io::Error::last_os_error()),
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Removes every extended ACL entry from the open file or directory, and

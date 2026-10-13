@@ -7,37 +7,39 @@
 use std::io;
 
 /// The calling thread reaching files as another user, until this is
-/// dropped, which gives the thread back the identity it had. A thread it
-/// starts meanwhile keeps the user's for good, as Linux gives a new thread
-/// its creator's.
+/// dropped, which gives the thread back the identity it had, so it can't
+/// leave the thread. A thread it starts meanwhile keeps the user's for
+/// good, as Linux gives a new thread its creator's.
 #[must_use = "the thread acts as the user only while this is held"]
 #[derive(Debug)]
 pub struct ActingAs {
     fsuid: libc::uid_t,
     fsgid: libc::gid_t,
     groups: Vec<libc::gid_t>,
+    thread: std::marker::PhantomData<*const ()>,
 }
 
-/// Has the calling thread reach files as `uid`, with `gid` as its only
-/// group. The kernel takes root's file capabilities from a thread whose
-/// filesystem user isn't root, so its access is the user's. Fails, leaving
-/// the thread as it was, where it may not take the identity: without
-/// `CAP_SETUID` and `CAP_SETGID`, or for an ID its user namespace doesn't
-/// map.
-pub fn act_as(uid: u32, gid: u32) -> io::Result<ActingAs> {
+/// Has the calling thread reach files as `uid`, with `gid` as its group and
+/// `groups` as its supplementary groups. The kernel takes root's file
+/// capabilities from a thread whose filesystem user isn't root, so its
+/// access is the user's. Fails, leaving the thread as it was, where it may
+/// not take the identity: without `CAP_SETUID` and `CAP_SETGID`, or for an
+/// ID its user namespace doesn't map.
+pub fn act_as(uid: u32, gid: u32, groups: &[u32]) -> io::Result<ActingAs> {
     let acting = ActingAs {
         fsuid: filesystem_uid(),
         fsgid: filesystem_gid(),
         groups: thread_groups()?,
+        thread: std::marker::PhantomData,
     };
-    set_thread_groups(&[gid])?;
+    set_thread_groups(groups)?;
     // SAFETY: each changes only the calling thread's credentials, and takes
     // no pointer.
     unsafe {
         libc::setfsgid(gid);
         libc::setfsuid(uid);
     }
-    if filesystem_uid() != uid || filesystem_gid() != gid {
+    if filesystem_uid() != uid || filesystem_gid() != gid || thread_groups()? != groups {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("this process may not reach files as user {uid} and group {gid}"),
@@ -110,6 +112,10 @@ fn set_thread_groups(groups: &[libc::gid_t]) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    // Dropped on another thread, it would give that thread the identity
+    // and leave its own thread the user's.
+    static_assertions::assert_not_impl_any!(ActingAs: Send, Sync);
+
     #[test]
     fn a_thread_that_may_not_act_as_another_user_is_left_as_it_was() {
         if crate::current_uid() == 0 {
@@ -117,7 +123,38 @@ mod tests {
         }
         let before = (filesystem_uid(), filesystem_gid(), thread_groups().unwrap());
 
-        let error = act_as(crate::current_uid() + 1, before.1 + 1).unwrap_err();
+        let error = act_as(crate::current_uid() + 1, before.1 + 1, &[before.1 + 1]).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            (filesystem_uid(), filesystem_gid(), thread_groups().unwrap()),
+            before
+        );
+    }
+
+    /// Whether the calling thread may set user IDs, as root in a container
+    /// started with `--cap-drop SETUID` may not.
+    fn thread_may_set_uid() -> bool {
+        const CAP_SETUID: u32 = 7;
+        let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+        let effective = status
+            .lines()
+            .find_map(|line| line.strip_prefix("CapEff:"))
+            .unwrap();
+        u64::from_str_radix(effective.trim(), 16).unwrap() & (1 << CAP_SETUID) != 0
+    }
+
+    /// Runs only as root without `CAP_SETUID`, as in the container the gate
+    /// starts with `--cap-drop SETUID`: `setfsuid` fails there without
+    /// saying so, while the groups can still change.
+    #[test]
+    fn as_root_without_the_capability_to_set_users_a_thread_is_left_as_it_was() {
+        if crate::current_uid() != 0 || thread_may_set_uid() {
+            return;
+        }
+        let before = (filesystem_uid(), filesystem_gid(), thread_groups().unwrap());
+
+        let error = act_as(65_000, 65_001, &[65_001, 65_002]).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(
@@ -130,7 +167,7 @@ mod tests {
     /// tests in once more; CI's runner isn't root.
     #[test]
     fn as_root_a_thread_reaches_files_as_the_user_and_alone_until_it_lets_go() {
-        if crate::current_uid() != 0 {
+        if crate::current_uid() != 0 || !thread_may_set_uid() {
             return;
         }
         let directory = tempfile::tempdir().unwrap();
@@ -150,9 +187,9 @@ mod tests {
         });
 
         {
-            let _acting = act_as(65_000, 65_000).unwrap();
-            assert_eq!((filesystem_uid(), filesystem_gid()), (65_000, 65_000));
-            assert_eq!(thread_groups().unwrap(), vec![65_000]);
+            let _acting = act_as(65_000, 65_001, &[65_001, 65_002]).unwrap();
+            assert_eq!((filesystem_uid(), filesystem_gid()), (65_000, 65_001));
+            assert_eq!(thread_groups().unwrap(), vec![65_001, 65_002]);
             assert_eq!(
                 std::fs::read(&private).unwrap_err().kind(),
                 io::ErrorKind::PermissionDenied
