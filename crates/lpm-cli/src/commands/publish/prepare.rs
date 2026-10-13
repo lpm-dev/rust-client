@@ -2005,6 +2005,33 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_failed_swift_manifest_inspection_says_how_swift_ended() {
+        let fixture = swift_fixture_tarball();
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("swift-fails");
+        write_executable(
+            &executable,
+            "#!/bin/sh\necho 'error: invalid manifest' >&2\nexit 3\n",
+        );
+
+        let error = dump_swift_manifest_from_publish_artifact_with_command(
+            &fixture,
+            executable.as_os_str(),
+            std::time::Duration::from_secs(10),
+            128,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("exit status: 3: error: invalid manifest"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn swift_manifest_inspection_stops_a_stalled_process_at_the_timeout() {
         let fixture = swift_fixture_tarball();
         let directory = tempfile::tempdir().unwrap();
