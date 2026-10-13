@@ -805,7 +805,13 @@ impl RegistryClient {
             .map_err(|error| LpmError::Network(format!("failed to build request: {error}")))?;
         let provider = super::http::PolicyMetadataClientProvider(self.http.as_ref());
         let response = self
-            .send_request_with_retry_and_client_provider(request, None, None, &provider)
+            .send_request_with_retry_and_client_provider(
+                request,
+                None,
+                None,
+                &provider,
+                super::transport::FailedAnswer::Error,
+            )
             .await?;
         crate::timing::record_metadata_http_version(response.version());
         Ok(response)

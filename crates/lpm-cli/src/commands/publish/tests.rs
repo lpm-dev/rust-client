@@ -848,9 +848,9 @@ fn publish_tarball_size_for_the_lpm_registry_is_its_100_mib_limit() {
 #[test]
 fn publish_request_size_for_the_lpm_registry_is_its_150_mib_limit() {
     let limit = crate::commands::publish_common::MAX_LPM_REGISTRY_BODY_BYTES;
-    assert!(super::prepare::validate_lpm_registry_body_size(limit).is_ok());
+    assert!(super::prepare::validate_lpm_registry_body_size(limit, 0).is_ok());
 
-    let error = super::prepare::validate_lpm_registry_body_size(limit + 1).unwrap_err();
+    let error = super::prepare::validate_lpm_registry_body_size(limit + 1, 0).unwrap_err();
 
     assert!(
         error

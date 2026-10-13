@@ -316,11 +316,35 @@ impl PublishIntent {
                 } else {
                     client
                 };
-                let preflight = client
-                    .publish_preflight(&resolved.name, &self.package_version)
+                let verdict = client
+                    .publish_preflight(&resolved.name, &self.package_version, None)
                     .await?;
                 drop(light_permit);
-                if !preflight.package_exists {
+                let package_exists = match verdict {
+                    PublishPreflightVerdict::Accepted(response) => response.package_exists,
+                    PublishPreflightVerdict::Refused {
+                        code: Some(code), ..
+                    } if code == VERSION_EXISTS_CODE => {
+                        return Ok(PublishTargetPreflight {
+                            target_display: resolved.target.display_name().to_string(),
+                            version_exists: true,
+                        });
+                    }
+                    PublishPreflightVerdict::Refused { status, error, .. } => {
+                        let answer = if status >= 500 || matches!(status, 408 | 429) {
+                            "couldn't check"
+                        } else {
+                            "refuses"
+                        };
+                        return Err(LpmError::Registry(format!(
+                            "LPM.dev {answer} {}@{}: {}",
+                            resolved.name,
+                            self.package_version,
+                            lpm_common::sanitize_terminal_inline(&error)
+                        )));
+                    }
+                };
+                if !package_exists {
                     false
                 } else {
                     let _metadata_permit = acquire_preflight_permits(permits, permit_limit).await?;
@@ -1492,7 +1516,7 @@ async fn execute_prepared_inner(
         if targets_lpm {
             let request = lpm_target_request(lpm_source)?;
             let refusal = match client
-                .publish_preflight_sized(request.name, &version, request.tarball.len() as u64)
+                .publish_preflight(request.name, &version, Some(request.tarball.len() as u64))
                 .await
             {
                 Ok(PublishPreflightVerdict::Accepted(_)) => None,
@@ -1622,7 +1646,7 @@ async fn execute_prepared_inner(
     }
 
     if targets_lpm && targets.len() > 1 {
-        refuse_lpm_target_storage_before_any_publish(client, lpm_source, &version).await?;
+        refuse_before_any_publish_what_lpm_dev_refuses(client, lpm_source, &version).await?;
     }
 
     let provenance_context = match provenance_request {
@@ -2411,30 +2435,38 @@ impl LpmTargetRequest<'_> {
     }
 }
 
-/// The preflight codes of an lpm.dev refusal for storage, which no retry of
-/// the same publish gets past.
-const LPM_STORAGE_REFUSAL_CODES: [&str; 2] = ["STORAGE_LIMIT_EXCEEDED", "STORAGE_OVERAGE_PAUSED"];
+/// The preflight's code for a version lpm.dev already has.
+const VERSION_EXISTS_CODE: &str = "VERSION_EXISTS";
+
+/// Whether an lpm.dev preflight refusal is one no retry of the same publish
+/// gets past: the account's storage or package limit, its billing, a second
+/// factor it requires, the tarball's size, or the token's permission. A
+/// version lpm.dev already has, as after a partial publish, isn't one, nor a
+/// request the Registry can't read, a rate limit or a server error, which
+/// the upload judges.
+fn refusal_stops_every_target(status: u16, code: Option<&str>) -> bool {
+    matches!(status, 402 | 403 | 413) && code != Some(VERSION_EXISTS_CODE)
+}
 
 /// Stops a publish to more than one target before any publishes when
-/// lpm.dev refuses its storage, so the other targets don't publish a version
-/// lpm.dev won't take. Any other answer, as for a version lpm.dev already
-/// has after a partial publish, leaves each target to its own upload, as
-/// does a Registry that can't be asked.
-async fn refuse_lpm_target_storage_before_any_publish(
+/// lpm.dev refuses it for good, so the other targets don't publish a version
+/// lpm.dev won't take. Any other answer leaves each target to its own
+/// upload, as does a Registry that can't be asked.
+async fn refuse_before_any_publish_what_lpm_dev_refuses(
     client: &RegistryClient,
     source: LpmTargetSource<'_>,
     version: &str,
 ) -> Result<(), LpmError> {
     let request = lpm_target_request(source)?;
     let verdict = client
-        .publish_preflight_sized(request.name, version, request.tarball.len() as u64)
+        .publish_preflight(request.name, version, Some(request.tarball.len() as u64))
         .await;
     if let Ok(PublishPreflightVerdict::Refused {
-        code: Some(code),
+        status,
+        code,
         error,
-        ..
     }) = verdict
-        && LPM_STORAGE_REFUSAL_CODES.contains(&code.as_str())
+        && refusal_stops_every_target(status, code.as_deref())
     {
         return Err(LpmError::Registry(format!(
             "LPM.dev refuses {}@{version}, so no target was published: {}",
@@ -2463,11 +2495,7 @@ fn check_lpm_target_body(
     } else {
         0
     };
-    validate_lpm_registry_body_size(
-        lpm_target_request(source)?
-            .len(parts)?
-            .saturating_add(reserve),
-    )
+    validate_lpm_registry_body_size(lpm_target_request(source)?.len(parts)?, reserve)
 }
 
 fn target_tarball<'a>(
@@ -2711,28 +2739,32 @@ mod lpm_target_limit_tests {
         let version_data = serde_json::json!({ "name": "pkg", "version": "1.0.0" });
         let (hashes, no_copies, names) = (hashes(), HashMap::new(), HashMap::new());
         let files = [];
-        let small = Arc::new(vec![0_u8; 3]);
-        let fixed = lpm_target_request(source(&small, &hashes, &version_data, &no_copies, &names))
-            .unwrap()
-            .len(&parts(&files))
-            .unwrap()
-            - 4;
-        // A request half a MiB short of the limit: base64 is 4 bytes for 3.
-        let limit = publish_common::MAX_LPM_REGISTRY_BODY_BYTES;
-        let tarball = Arc::new(vec![0_u8; ((limit - 512 * 1024 - fixed) / 4 * 3) as usize]);
-        let source = source(&tarball, &hashes, &version_data, &no_copies, &names);
-        let length = lpm_target_request(source)
-            .unwrap()
-            .len(&parts(&files))
-            .unwrap();
-        assert!(length <= limit && limit - length < PROVENANCE_BODY_RESERVE_BYTES);
+        let length = |size: usize| {
+            let tarball = Arc::new(vec![0_u8; size]);
+            lpm_target_request(source(&tarball, &hashes, &version_data, &no_copies, &names))
+                .unwrap()
+                .len(&parts(&files))
+                .unwrap()
+        };
+        // Whole groups of 3 bytes, which base64 writes as 4, so the request
+        // grows by exactly 4 bytes a group near the size it's sized for.
+        let room = publish_common::MAX_LPM_REGISTRY_BODY_BYTES - PROVENANCE_BODY_RESERVE_BYTES;
+        let near = (room / 4 * 3) as usize;
+        let groups = (room as i64 - length(near) as i64).div_euclid(4);
+        let fits = (near as i64 + 3 * groups) as usize;
+        assert!(length(fits) <= room && room - length(fits) < 4);
+        let check = |size: usize, provenance: bool| {
+            let tarball = Arc::new(vec![0_u8; size]);
+            let source = source(&tarball, &hashes, &version_data, &no_copies, &names);
+            check_lpm_target_body(source, &parts(&files), provenance)
+        };
 
-        check_lpm_target_body(source, &parts(&files), false).unwrap();
-        let error = check_lpm_target_body(source, &parts(&files), true).unwrap_err();
+        check(fits, true).unwrap();
+        check(fits + 3, false).unwrap();
+        let error = check(fits + 3, true).unwrap_err().to_string();
         assert!(
-            error
-                .to_string()
-                .contains("publish request too large for the LPM registry"),
+            error.contains("publish request too large for the LPM registry")
+                && error.contains("less 1 MiB kept for its provenance bundle"),
             "{error}"
         );
     }

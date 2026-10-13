@@ -101,12 +101,170 @@ async fn publish_preflight_sends_resolved_identity_and_bearer_without_mutation()
     let client = RegistryClient::new()
         .with_base_url(server.uri())
         .with_token("publish-token");
-    let response = client
-        .publish_preflight("@lpm.dev/owner.resolved", "1.2.3")
+    let verdict = client
+        .publish_preflight("@lpm.dev/owner.resolved", "1.2.3", None)
         .await
         .unwrap();
+    let PublishPreflightVerdict::Accepted(response) = verdict else {
+        panic!("expected an accepted preflight, got {verdict:?}");
+    };
     assert!(response.success);
     assert!(response.package_exists);
+}
+
+#[tokio::test]
+async fn publish_preflight_sends_the_size_it_is_given() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .and(query_param("size", "1048576"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "name": "@lpm.dev/owner.resolved",
+            "version": "1.2.3",
+            "packageExists": false
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let verdict = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("publish-token")
+        .publish_preflight("@lpm.dev/owner.resolved", "1.2.3", Some(1024 * 1024))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(verdict, PublishPreflightVerdict::Accepted(_)),
+        "{verdict:?}"
+    );
+}
+
+#[tokio::test]
+async fn publish_preflight_keeps_a_refusal_s_status_code_and_message() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for (status, body, code, error) in [
+        (
+            402,
+            serde_json::json!({ "error": "Billing is past due.", "code": "ORG_BILLING_LAPSED" }),
+            Some("ORG_BILLING_LAPSED"),
+            "Billing is past due.",
+        ),
+        (
+            403,
+            serde_json::json!({ "error": "Token does not have publish permissions" }),
+            None,
+            "Token does not have publish permissions",
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/package/publish-preflight"))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let verdict = RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("publish-token")
+            .publish_preflight("@lpm.dev/owner.resolved", "1.2.3", Some(1))
+            .await
+            .unwrap();
+
+        let PublishPreflightVerdict::Refused {
+            status: refused,
+            code: refused_code,
+            error: message,
+        } = verdict
+        else {
+            panic!("expected a refusal, got {verdict:?}");
+        };
+        assert_eq!(
+            (refused, refused_code.as_deref(), message.as_str()),
+            (status, code, error)
+        );
+    }
+}
+
+#[tokio::test]
+async fn publish_preflight_names_the_status_of_an_answer_that_isnt_json() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(ResponseTemplate::new(413).set_body_string("<html>too large</html>"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let verdict = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("publish-token")
+        .publish_preflight("@lpm.dev/owner.resolved", "1.2.3", Some(1))
+        .await
+        .unwrap();
+
+    let PublishPreflightVerdict::Refused {
+        status,
+        code,
+        error,
+    } = verdict
+    else {
+        panic!("expected a refusal, got {verdict:?}");
+    };
+    assert_eq!(
+        (status, code, error.as_str()),
+        (413, None, "HTTP 413 Payload Too Large")
+    );
+}
+
+#[tokio::test]
+async fn publish_preflight_retries_a_server_error_before_reading_the_answer() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": "Version 1.2.3 already exists. You cannot overwrite versions.",
+            "code": "VERSION_EXISTS",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let verdict = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("publish-token")
+        .publish_preflight("@lpm.dev/owner.resolved", "1.2.3", None)
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(
+            &verdict,
+            PublishPreflightVerdict::Refused { status: 403, code: Some(code), .. }
+                if code == "VERSION_EXISTS"
+        ),
+        "{verdict:?}"
+    );
 }
 
 #[tokio::test]
@@ -190,7 +348,7 @@ async fn publish_preflight_rejects_an_unsuccessful_success_envelope() {
     let error = RegistryClient::new()
         .with_base_url(server.uri())
         .with_token("publish-token")
-        .publish_preflight("@lpm.dev/owner.resolved", "1.2.3")
+        .publish_preflight("@lpm.dev/owner.resolved", "1.2.3", None)
         .await
         .unwrap_err()
         .to_string();
@@ -218,7 +376,7 @@ async fn publish_preflight_rejects_a_mismatched_response_identity() {
     let error = RegistryClient::new()
         .with_base_url(server.uri())
         .with_token("publish-token")
-        .publish_preflight("@lpm.dev/owner.resolved", "1.2.3")
+        .publish_preflight("@lpm.dev/owner.resolved", "1.2.3", None)
         .await
         .unwrap_err()
         .to_string();
@@ -245,7 +403,7 @@ async fn publish_preflight_rejects_a_response_without_package_existence() {
     let error = RegistryClient::new()
         .with_base_url(server.uri())
         .with_token("publish-token")
-        .publish_preflight("@lpm.dev/owner.resolved", "1.2.3")
+        .publish_preflight("@lpm.dev/owner.resolved", "1.2.3", None)
         .await
         .expect_err("a missing packageExists field must fail closed")
         .to_string();

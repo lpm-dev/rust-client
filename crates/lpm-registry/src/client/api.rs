@@ -240,68 +240,45 @@ impl RegistryClient {
             .await
     }
 
-    /// Validate publish authorization and version availability without
-    /// reserving a version or creating Registry state.
+    /// Asks the publish preflight whether the Registry would take
+    /// `name@version`: the token's publish authorization and the version's
+    /// availability, and given the `size` of the tarball it would be sent,
+    /// the size cap and the account's storage. It creates no Registry state.
+    /// A refusal comes back with its status and code; a timeout, a rate
+    /// limit, a server error or a network failure is retried first.
     pub async fn publish_preflight(
         &self,
         name: &str,
         version: &str,
-    ) -> Result<PublishPreflightResponse, LpmError> {
-        let url = format!(
+        size: Option<u64>,
+    ) -> Result<PublishPreflightVerdict, LpmError> {
+        let mut url = format!(
             "{}/api/registry/-/package/publish-preflight?name={}&version={}",
             self.base_url,
             urlencoding::encode(name),
             urlencoding::encode(version)
         );
-        let response: PublishPreflightResponse = self
-            .execute_with_recovery(AuthPosture::AuthRequired, || self.get_json(&url))
-            .await?;
-        if !response.success {
-            return Err(LpmError::Registry(format!(
-                "publish preflight was denied for {name}@{version}"
-            )));
+        if let Some(size) = size {
+            url.push_str(&format!("&size={size}"));
         }
-        if response.name != name || response.version != version {
-            return Err(LpmError::Registry(format!(
-                "publish preflight returned a mismatched package identity (expected {name}@{version}, received {}@{})",
-                response.name, response.version
-            )));
-        }
-        Ok(response)
-    }
-
-    /// Asks the publish preflight about a publish whose tarball is `size`
-    /// bytes, which also checks the account's storage, and keeps a refusal's
-    /// status and code rather than turning it into an error.
-    pub async fn publish_preflight_sized(
-        &self,
-        name: &str,
-        version: &str,
-        size: u64,
-    ) -> Result<PublishPreflightVerdict, LpmError> {
-        let url = format!(
-            "{}/api/registry/-/package/publish-preflight?name={}&version={}&size={size}",
-            self.base_url,
-            urlencoding::encode(name),
-            urlencoding::encode(version)
-        );
-        let (status, body) = self
+        let response = self
             .execute_with_recovery(AuthPosture::AuthRequired, || async {
                 let response = self
-                    .send_once_preserving_status(self.build_get(&url).await?)
+                    .send_with_retry_keeping_status(self.build_get(&url).await?)
                     .await?;
-                let status = response.status();
-                if status == reqwest::StatusCode::UNAUTHORIZED {
+                if response.status() == reqwest::StatusCode::UNAUTHORIZED {
                     return Err(LpmError::AuthRequired);
                 }
-                let body: serde_json::Value =
-                    parse_capped_api_json(response, "publish preflight response").await?;
-                Ok((status, body))
+                Ok(response)
             })
             .await?;
+        let status = response.status();
         if !status.is_success() {
+            let body = super::body::read_capped_error_text(response).await;
+            let json = serde_json::from_str::<serde_json::Value>(&body).ok();
             let text = |field: &str| {
-                body.get(field)
+                json.as_ref()
+                    .and_then(|json| json.get(field))
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned)
             };
@@ -311,14 +288,17 @@ impl RegistryClient {
                 error: text("error").unwrap_or_else(|| format!("HTTP {status}")),
             });
         }
-        let response: PublishPreflightResponse = serde_json::from_value(body).map_err(|error| {
-            LpmError::Registry(format!(
-                "publish preflight response: failed to parse JSON: {error}"
-            ))
-        })?;
-        if !response.success || response.name != name || response.version != version {
+        let response: PublishPreflightResponse =
+            parse_capped_api_json(response, "publish preflight response").await?;
+        if !response.success {
             return Err(LpmError::Registry(format!(
-                "publish preflight returned a mismatched answer for {name}@{version}"
+                "publish preflight was denied for {name}@{version}"
+            )));
+        }
+        if response.name != name || response.version != version {
+            return Err(LpmError::Registry(format!(
+                "publish preflight returned a mismatched package identity (expected {name}@{version}, received {}@{})",
+                response.name, response.version
             )));
         }
         Ok(PublishPreflightVerdict::Accepted(response))

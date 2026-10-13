@@ -281,7 +281,7 @@ async fn whoami_tells_a_free_account_past_its_storage_that_publishing_is_restric
         stderr.contains("Storage: 100.01 MiB / 100 MiB")
             && stderr.contains("(OVER LIMIT)")
             && stderr.contains(
-                "Publishing to your personal scope is refused while its storage is past 100 MiB."
+                "Publishing to your personal scope is refused while its storage is at or past 100 MiB."
             ),
         "a free account past its storage should read as over its limit and refused, got:\n{stderr}"
     );
@@ -292,6 +292,10 @@ async fn whoami_tells_a_free_account_past_its_storage_that_publishing_is_restric
     assert!(
         !stderr.contains("inviting members"),
         "a personal account invites no members, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Hobby") && !stderr.contains("Free") && !stderr.contains("exempt"),
+        "the free plan reads as Hobby, and storage nothing exempts shows no exempt line, got:\n{stderr}"
     );
 }
 
@@ -312,7 +316,9 @@ async fn whoami_reads_a_free_account_s_storage_as_its_limit_counts_it() {
 
     assert!(
         stderr.contains("storage        50 MiB / 100 MiB")
-            && stderr.contains("exempt         100 MiB more, in packages whose sales exempt them"),
+            && stderr.contains(
+                "exempt         100 MiB more, the tarballs of packages whose sales exempt them"
+            ),
         "storage the limit doesn't count should read apart from it, got:\n{stderr}"
     );
     assert!(
@@ -334,7 +340,9 @@ async fn whoami_tells_an_account_past_its_private_packages_that_only_new_ones_ar
 
     assert!(
         stderr.contains("Private Packages: 3 / 2")
-            && stderr.contains("New private packages in your personal scope are refused past 2."),
+            && stderr.contains(
+                "New private packages in your personal scope are refused once it holds 2."
+            ),
         "an account past its private packages should read as refusing new ones, got:\n{stderr}"
     );
     assert!(
@@ -411,7 +419,7 @@ async fn whoami_tells_a_free_account_past_its_storage_that_publishing_is_restric
         stderr.contains("Storage: 100.01 MiB / 100 MiB")
             && stderr.contains("(OVER LIMIT)")
             && stderr.contains(
-                "Publishing to your personal scope is refused while its storage is past 100 MiB."
+                "Publishing to your personal scope is refused while its storage is at or past 100 MiB."
             ),
         "every Registry refuses the free plan's storage past its limit, got:\n{stderr}"
     );
@@ -444,6 +452,31 @@ async fn whoami_tells_a_pro_account_without_a_subscription_that_its_storage_past
 }
 
 #[tokio::test]
+async fn whoami_tells_an_account_at_its_private_packages_that_new_ones_are_refused() {
+    let stderr = whoami_stderr(serde_json::json!({
+        "username": "testuser",
+        "plan_tier": "free",
+        "usage": { "storage_bytes": 1024, "private_packages": 2 },
+        "limits": { "storageBytes": 100 * 1024 * 1024, "privatePackages": 2 },
+        "storage_overage": "blocked",
+    }))
+    .await;
+
+    assert!(
+        stderr.contains("private pkgs   2 / 2")
+            && stderr.contains(
+                "New private packages in your personal scope are refused once it holds 2."
+            )
+            && stderr.contains("Upgrade your plan"),
+        "an account at its private packages should read as refusing new ones, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("OVER LIMIT") && !stderr.contains("over its plan limits"),
+        "an account at its limit isn't over it, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
 async fn whoami_reads_storage_at_its_limit_as_within_it() {
     let stderr = whoami_stderr(serde_json::json!({
         "username": "testuser",
@@ -459,8 +492,17 @@ async fn whoami_reads_storage_at_its_limit_as_within_it() {
         "storage at its limit should read as within it, got:\n{stderr}"
     );
     assert!(
-        !stderr.contains("OVER LIMIT") && !stderr.contains("restricted"),
+        !stderr.contains("OVER LIMIT")
+            && !stderr.contains("restricted")
+            && !stderr.contains("over its plan limits"),
         "storage at its limit isn't past it, got:\n{stderr}"
+    );
+    // But any publish would take it past.
+    assert!(
+        stderr.contains(
+            "Publishing to your personal scope is refused while its storage is at or past 100 MiB."
+        ),
+        "storage at its limit refuses the next publish, got:\n{stderr}"
     );
 }
 
@@ -499,7 +541,12 @@ async fn whoami_json_reports_file_backed_auth_storage_backend() {
             "username": "test@example.com",
             "profile_username": "testuser",
             "email": "test@example.com",
-            "storage_overage": "paused"
+            "storage_overage": "paused",
+            "usage": {
+                "storage_bytes": 150 * 1024 * 1024,
+                "counted_storage_bytes": 50 * 1024 * 1024,
+                "private_packages": 1,
+            },
         })))
         .mount(mock.server())
         .await;
@@ -533,6 +580,10 @@ async fn whoami_json_reports_file_backed_auth_storage_backend() {
     );
     assert_eq!(json["storage_degraded"], serde_json::json!(true));
     assert_eq!(json["storage_overage"], serde_json::json!("paused"));
+    assert_eq!(
+        json["usage"]["counted_storage_bytes"],
+        serde_json::json!(50 * 1024 * 1024)
+    );
     assert_eq!(
         json["registries"][0]["storage_backend"],
         serde_json::json!("encrypted_file_fallback")

@@ -690,11 +690,25 @@ pub(crate) fn validate_lpm_registry_tarball_size(tarball_size: usize) -> Result<
 }
 
 /// Refuses a publish request the LPM registry would refuse for its size.
-pub(crate) fn validate_lpm_registry_body_size(body_size: u64) -> Result<(), LpmError> {
+/// Refuses a publish request of `body_size` bytes that lpm.dev would refuse
+/// for its size, keeping `reserve` bytes of the limit for what the upload
+/// adds after the check, as a provenance bundle.
+pub(crate) fn validate_lpm_registry_body_size(
+    body_size: u64,
+    reserve: u64,
+) -> Result<(), LpmError> {
     let max = publish_common::MAX_LPM_REGISTRY_BODY_BYTES;
-    if body_size > max {
+    if body_size.saturating_add(reserve) > max {
+        let kept = if reserve > 0 {
+            format!(
+                ", less {} kept for its provenance bundle",
+                lpm_common::format_bytes(reserve)
+            )
+        } else {
+            String::new()
+        };
         return Err(LpmError::Registry(format!(
-            "publish request too large for the LPM registry: {} (max {}), the tarball in base64 with the package's metadata; publish fewer or smaller files",
+            "publish request too large for the LPM registry: {} (max {}{kept}), the tarball in base64 with the package's metadata; publish fewer or smaller files",
             lpm_common::format_bytes_past(body_size),
             lpm_common::format_bytes(max)
         )));

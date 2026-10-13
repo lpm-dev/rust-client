@@ -1763,6 +1763,93 @@ async fn release_publish_checks_the_requested_version_when_the_lpm_package_exist
 }
 
 #[tokio::test]
+async fn release_publish_skips_a_version_lpm_dev_says_it_already_has() {
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"version":"0.0.0","workspaces":["packages/*"]}"#,
+    );
+    let name = "@lpm.dev/acme.published";
+    project.write_file(
+        "packages/published/package.json",
+        &format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+    );
+    let server = MockServer::start().await;
+    // As the Registry answers a version it has: a refusal with its code.
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": "Version 1.0.0 already exists. You cannot overwrite versions.",
+            "code": "VERSION_EXISTS",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let output = lpm_with_registry(&project, &server.uri())
+        .args([
+            "release",
+            "publish",
+            "--all",
+            "--lpm",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .expect("run release publish against a version lpm.dev has");
+
+    assert!(
+        output.status.success(),
+        "release publish failed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let result = &parse_json_output(&output.stdout)["results"][0];
+    assert_eq!(result["status"], "skipped", "{result}");
+    assert_eq!(result["reason"], "already_published", "{result}");
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn release_publish_reports_what_lpm_dev_refuses_in_its_preflight() {
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"version":"0.0.0","workspaces":["packages/*"]}"#,
+    );
+    project.write_file(
+        "packages/lapsed/package.json",
+        r#"{"name":"@lpm.dev/acme.lapsed","version":"1.0.0"}"#,
+    );
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(ResponseTemplate::new(402).set_body_json(serde_json::json!({
+            "error": "Organization billing is past due. Package publishing is blocked.",
+            "code": "ORG_BILLING_LAPSED",
+        })))
+        .mount(&server)
+        .await;
+
+    let output = lpm_with_registry(&project, &server.uri())
+        .args([
+            "release",
+            "publish",
+            "--all",
+            "--lpm",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .expect("run release publish against a refused member");
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "LPM.dev refuses @lpm.dev/acme.lapsed@1.0.0: Organization billing is past due."
+        ) && !stdout.contains("{\\\"error"),
+        "{stdout}"
+    );
+}
+
+#[tokio::test]
 async fn release_publish_revalidates_fresh_metadata_before_deciding_version_absence() {
     let project = TempProject::empty(
         r#"{"name":"root","private":true,"version":"0.0.0","workspaces":["packages/*"]}"#,

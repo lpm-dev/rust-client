@@ -41,6 +41,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
             "has_pool_access": user.has_pool_access,
             "usage": user.usage.as_ref().map(|u| serde_json::json!({
                 "storage_bytes": u.storage_bytes,
+                "counted_storage_bytes": u.counted_storage_bytes,
                 "private_packages": u.private_packages,
             })),
             "limits": user.limits.as_ref().map(|l| serde_json::json!({
@@ -115,7 +116,10 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
             .plan_tier
             .as_deref()
             .is_some_and(|tier| tier.eq_ignore_ascii_case("pro"));
-        let mut over_storage = None;
+        // The storage limit's figure where storage is at or past it, so any
+        // publish goes past it, and whether it's past.
+        let mut full_storage = None;
+        let mut over_storage = false;
 
         if let Some(limits) = &user.limits {
             // Storage
@@ -128,10 +132,13 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                     .min(usage.storage_bytes);
                 let (used, limit) = lpm_common::format_quota(counted, limit_bytes);
                 let storage_msg = with_usage_bar(format!("{used} / {limit}"), counted, limit_bytes);
+                if counted >= limit_bytes {
+                    full_storage = Some(limit.clone());
+                }
                 if counted <= limit_bytes {
                     whoami_ui::detail("storage", storage_msg);
                 } else {
-                    over_storage = Some(limit.clone());
+                    over_storage = true;
                     match storage_overage {
                         Some("billed") => {
                             whoami_ui::detail("storage", storage_msg);
@@ -158,7 +165,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                     whoami_ui::detail(
                         "exempt",
                         format!(
-                            "{} more, in packages whose sales exempt them",
+                            "{} more, the tarballs of packages whose sales exempt them",
                             lpm_common::format_bytes(usage.storage_bytes - counted)
                         ),
                     );
@@ -193,17 +200,20 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                 whoami_ui::detail("private pkgs", format!("{}", usage.private_packages));
             }
 
-            // Over-limit warning
-            let over_packages = limits
+            // The Registry refuses a new private package once the scope
+            // holds its limit, and a publish once storage is at its own.
+            let package_limit = limits
                 .private_packages
-                .is_some_and(|l| l > 0 && l != u32::MAX && usage.private_packages > l);
+                .filter(|&limit| limit > 0 && limit != u32::MAX);
+            let packages_full = package_limit.is_some_and(|limit| usage.private_packages >= limit);
+            let over_packages = package_limit.is_some_and(|limit| usage.private_packages > limit);
             // A Pro plan without a subscription, as staff grant one, has
             // nothing to bill storage on, and no subscription to take out.
             let unbilled_pro = on_pro && storage_overage == Some("blocked");
             let storage_refused =
-                over_storage.is_some() && storage_overage == Some("blocked") && !unbilled_pro;
+                full_storage.is_some() && storage_overage == Some("blocked") && !unbilled_pro;
 
-            match (&over_storage, storage_overage) {
+            match (&full_storage, storage_overage) {
                 (Some(limit), Some("paused")) => {
                     whoami_ui::warn_line(crate::install_ui::terminal_line!(
                         "Publishing past {} is refused until billing is active again.",
@@ -219,20 +229,22 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                 }
                 _ => {}
             }
-            if storage_refused || over_packages {
+            if (over_storage && storage_refused) || over_packages {
                 whoami_ui::warn("Your account is over its plan limits.");
-                if let (Some(limit), true) = (&over_storage, storage_refused) {
-                    whoami_ui::warn_line(crate::install_ui::terminal_line!(
-                        "Publishing to your personal scope is refused while its storage is past {}.",
-                        limit.as_str()
-                    ));
-                }
-                if let (Some(limit), true) = (limits.private_packages, over_packages) {
-                    whoami_ui::warn_line(crate::install_ui::terminal_line!(
-                        "New private packages in your personal scope are refused past {}.",
-                        limit
-                    ));
-                }
+            }
+            if let (Some(limit), true) = (&full_storage, storage_refused) {
+                whoami_ui::warn_line(crate::install_ui::terminal_line!(
+                    "Publishing to your personal scope is refused while its storage is at or past {}.",
+                    limit.as_str()
+                ));
+            }
+            if let (Some(limit), true) = (package_limit, packages_full) {
+                whoami_ui::warn_line(crate::install_ui::terminal_line!(
+                    "New private packages in your personal scope are refused once it holds {}.",
+                    limit
+                ));
+            }
+            if storage_refused || packages_full {
                 whoami_ui::warn("Upgrade your plan: https://lpm.dev/dashboard/settings/billing");
             }
         } else {
@@ -328,11 +340,18 @@ fn login_command_for_registry(registry_url: &str) -> String {
     }
 }
 
+/// The plan's name as lpm.dev shows it: the free plan is Hobby.
 fn format_plan_tier(tier: &str) -> String {
-    let mut chars = tier.chars();
-    match chars.next() {
-        Some(first) => first.to_uppercase().chain(chars).collect(),
-        None => String::new(),
+    match tier.to_ascii_lowercase().as_str() {
+        "free" => "Hobby".to_string(),
+        "org" => "Organization".to_string(),
+        _ => {
+            let mut chars = tier.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+                None => String::new(),
+            }
+        }
     }
 }
 

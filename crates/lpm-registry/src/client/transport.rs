@@ -727,6 +727,29 @@ impl RegistryClient {
             client_override,
             auth,
             self.http.as_ref(),
+            FailedAnswer::Error,
+        )
+        .await
+    }
+
+    /// Sends a request as [`send_with_retry`](Self::send_with_retry) does,
+    /// retrying a timeout, a rate limit, a server error or a network
+    /// failure, but hands back any other answer, and the last one retried,
+    /// with its status and body for the caller to read.
+    pub(super) async fn send_with_retry_keeping_status(
+        &self,
+        request_builder: reqwest::RequestBuilder,
+    ) -> Result<reqwest::Response, LpmError> {
+        self.validate_base_url()?;
+        let request = request_builder
+            .build()
+            .map_err(|e| LpmError::Network(format!("failed to build request: {e}")))?;
+        self.send_request_with_retry_and_client_provider(
+            request,
+            None,
+            None,
+            self.http.as_ref(),
+            FailedAnswer::Response,
         )
         .await
     }
@@ -743,6 +766,7 @@ impl RegistryClient {
         client_override: Option<reqwest::Client>,
         auth: Option<&crate::npmrc::RegistryAuth>,
         provider: &P,
+        failed: FailedAnswer,
     ) -> Result<reqwest::Response, LpmError>
     where
         P: lpm_http::ReplayableHttpClientProvider<Error = LpmError> + Sync,
@@ -800,6 +824,14 @@ impl RegistryClient {
                 Ok(response) => {
                     let status = response.status().as_u16();
                     tracing::event!(name: "headers_observed", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64, status = u64::from(status));
+                    let retried = matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+                        && attempt < MAX_RETRIES;
+                    if failed == FailedAnswer::Response
+                        && !matches!(status, 200..=299 | 304)
+                        && !retried
+                    {
+                        return Ok(response);
+                    }
 
                     match status {
                         200..=299 | 304 => return Ok(response),
@@ -906,6 +938,17 @@ async fn read_publish_error_text(response: reqwest::Response, bearer: Option<&st
         Some(secret) => lpm_common::redact_exact_secret(&body, secret).into_owned(),
         None => body,
     }
+}
+
+/// What the retry loop hands back for an answer that isn't a success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FailedAnswer {
+    /// An error: a 401 as `AuthRequired`, a 403 as forbidden, a 404 as not
+    /// found, any other as `Http`.
+    Error,
+    /// The response, with its status and body: one that isn't retried, and
+    /// the last one that was.
+    Response,
 }
 
 /// Parse `Retry-After` header from a 429 response.
