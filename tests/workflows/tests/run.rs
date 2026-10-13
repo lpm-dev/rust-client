@@ -787,6 +787,8 @@ async fn mount_stateful_remote_cache(server: &MockServer, state: RemoteCacheStat
 /// 302 to the artifact's storage path, with its headers on the redirect.
 struct RedirectingGetResponder {
     state: RemoteCacheState,
+    /// Where the redirect leads, in place of this server's storage.
+    location: Option<String>,
 }
 
 impl Respond for RedirectingGetResponder {
@@ -808,8 +810,11 @@ impl Respond for RedirectingGetResponder {
             .respond(request);
         }
         let hash = request.url.path().rsplit('/').next().unwrap_or_default();
-        let mut response =
-            ResponseTemplate::new(302).insert_header("Location", format!("/storage/{hash}"));
+        let location = self
+            .location
+            .clone()
+            .unwrap_or_else(|| format!("/storage/{hash}"));
+        let mut response = ResponseTemplate::new(302).insert_header("Location", location);
         if let Some(tag) = self
             .state
             .tag
@@ -868,6 +873,7 @@ async fn mount_redirecting_remote_cache(
         .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
         .respond_with(RedirectingGetResponder {
             state: state.clone(),
+            location: None,
         })
         .mount(server)
         .await;
@@ -3247,6 +3253,103 @@ async fn run_remote_cache_restores_from_the_storage_a_lookup_is_redirected_to_wi
         .filter(|request| request.url.path().starts_with("/storage/"))
         .count();
     assert_eq!(storage_reads, 1);
+}
+
+#[tokio::test]
+async fn run_remote_cache_leaves_the_signed_url_out_of_a_failed_download_s_warning() {
+    const CREDENTIAL: &str = "signed-download-credential-7f3a";
+    let server = MockServer::start().await;
+    let state = RemoteCacheState::default();
+    // A port nothing listens on, so the download fails to connect.
+    let storage = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let location = format!("http://{storage}/storage/artifact?verify={CREDENTIAL}");
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(RedirectingGetResponder {
+            state: state.clone(),
+            location: Some(location),
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(RemoteCachePutResponder {
+            state: state.clone(),
+        })
+        .mount(&server)
+        .await;
+    let project = remote_cache_project(&server, "");
+
+    assert!(run_build_with_remote_token(&project).status.success());
+    remove_local_task_cache(&project);
+    remove_project_file(&project, "dist");
+    remove_project_file(&project, "executed-marker");
+
+    let second = run_build_with_remote_token(&project);
+
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(second.status.success(), "{output}");
+    assert!(project.file_exists("executed-marker"), "{output}");
+    assert!(
+        output.contains("remote cache download failed"),
+        "the download should have been tried:\n{output}"
+    );
+    assert!(!output.contains(CREDENTIAL), "{output}");
+    assert!(!output.contains("/storage/artifact"), "{output}");
+}
+
+#[tokio::test]
+async fn run_remote_cache_says_a_refused_download_is_the_download_host_s_not_the_token_s() {
+    let server = MockServer::start().await;
+    let state = RemoteCacheState::default();
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(RedirectingGetResponder {
+            state: state.clone(),
+            location: Some("/expired-download".to_owned()),
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/expired-download$"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("<html>Forbidden</html>"))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(RemoteCachePutResponder {
+            state: state.clone(),
+        })
+        .mount(&server)
+        .await;
+    let project = remote_cache_project(&server, "");
+
+    assert!(run_build_with_remote_token(&project).status.success());
+    remove_local_task_cache(&project);
+    remove_project_file(&project, "dist");
+    remove_project_file(&project, "executed-marker");
+
+    let second = run_build_with_remote_token(&project);
+
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(second.status.success(), "{output}");
+    assert!(project.file_exists("executed-marker"), "{output}");
+    assert!(
+        output.contains("remote cache download returned HTTP 403"),
+        "{output}"
+    );
+    assert!(!output.contains("token permissions"), "{output}");
 }
 
 #[tokio::test]

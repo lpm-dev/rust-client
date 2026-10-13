@@ -1317,7 +1317,8 @@ const MISSING_SIGNATURE_TAG: &str =
 /// location is a short-lived URL on the cache's download host, which the
 /// redirect's own headers vouch for, and a redirect from HTTPS may not lead
 /// to plain HTTP. Returns None for an artifact the host no longer serves, a
-/// miss.
+/// miss. The URL carries the download's credential, so its errors leave it
+/// out.
 async fn fetch_redirected_artifact(
     lookup_url: &reqwest::Url,
     redirect: &reqwest::Response,
@@ -1332,13 +1333,18 @@ async fn fetch_redirected_artifact(
     let response = http_client()?.get(target).send().await.map_err(|error| {
         format!(
             "remote cache download failed: {}",
-            lpm_http::display_error(&error)
+            lpm_http::display_error(&error.without_url())
         )
     })?;
+    // The download host's refusals aren't the cache server's: a 403 there
+    // is the URL's, which may have expired, not the token's.
     match response.status() {
         StatusCode::OK => Ok(Some(response)),
         StatusCode::NOT_FOUND => Ok(None),
-        _ => Err(remote_cache_http_error(response, "download").await),
+        status => Err(format!(
+            "remote cache download returned HTTP {}; continuing without it",
+            status.as_u16()
+        )),
     }
 }
 
@@ -1509,11 +1515,12 @@ async fn copy_response_to_temp(
     let mut sha = Sha256::new();
     let mut mac = signature_key.map(new_hmac).transpose()?;
 
-    while let Some(buffer) = response
-        .chunk()
-        .await
-        .map_err(|e| format!("failed to read remote cache artifact: {e}"))?
-    {
+    while let Some(buffer) = response.chunk().await.map_err(|error| {
+        format!(
+            "failed to read remote cache artifact: {}",
+            error.without_url()
+        )
+    })? {
         let read = buffer.len();
         total = total.saturating_add(read as u64);
         if total > max_artifact_bytes {
