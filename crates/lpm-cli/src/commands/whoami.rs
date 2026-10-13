@@ -120,13 +120,15 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         if let Some(limits) = &user.limits {
             // Storage
             if let Some(limit_bytes) = limits.storage_bytes {
-                let (used, limit) = lpm_common::format_quota(usage.storage_bytes, limit_bytes);
-                let storage_msg = with_usage_bar(
-                    format!("{used} / {limit}"),
-                    usage.storage_bytes,
-                    limit_bytes,
-                );
-                if usage.storage_bytes <= limit_bytes {
+                // The free plan's limit leaves out the storage of packages
+                // whose sales exempt them, as publishing does.
+                let counted = usage
+                    .counted_storage_bytes
+                    .unwrap_or(usage.storage_bytes)
+                    .min(usage.storage_bytes);
+                let (used, limit) = lpm_common::format_quota(counted, limit_bytes);
+                let storage_msg = with_usage_bar(format!("{used} / {limit}"), counted, limit_bytes);
+                if counted <= limit_bytes {
                     whoami_ui::detail("storage", storage_msg);
                 } else {
                     over_storage = Some(limit.clone());
@@ -151,6 +153,15 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                             whoami_ui::detail("limit", format!("past the {limit} limit"));
                         }
                     }
+                }
+                if counted < usage.storage_bytes {
+                    whoami_ui::detail(
+                        "exempt",
+                        format!(
+                            "{} more, in packages whose sales exempt them",
+                            lpm_common::format_bytes(usage.storage_bytes - counted)
+                        ),
+                    );
                 }
             } else {
                 whoami_ui::detail("storage", storage);
@@ -186,8 +197,8 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
             let over_packages = limits
                 .private_packages
                 .is_some_and(|l| l > 0 && l != u32::MAX && usage.private_packages > l);
-            // A Pro plan without a subscription has nothing to bill
-            // storage on; subscribing fixes it, not upgrading.
+            // A Pro plan without a subscription, as staff grant one, has
+            // nothing to bill storage on, and no subscription to take out.
             let unbilled_pro = on_pro && storage_overage == Some("blocked");
             let storage_refused =
                 over_storage.is_some() && storage_overage == Some("blocked") && !unbilled_pro;
@@ -202,16 +213,26 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                 }
                 (Some(limit), Some("blocked")) if unbilled_pro => {
                     whoami_ui::warn_line(crate::install_ui::terminal_line!(
-                        "Storage past {} is billed only with a Pro subscription, so publishing past it is refused.",
+                        "Storage past {} isn't billed on this plan, so publishing to your personal scope past it is refused.",
                         limit.as_str()
                     ));
-                    whoami_ui::warn("Subscribe: https://lpm.dev/dashboard/settings/billing");
                 }
                 _ => {}
             }
             if storage_refused || over_packages {
                 whoami_ui::warn("Your account is over its plan limits.");
-                whoami_ui::warn("Publishing is restricted.");
+                if let (Some(limit), true) = (&over_storage, storage_refused) {
+                    whoami_ui::warn_line(crate::install_ui::terminal_line!(
+                        "Publishing to your personal scope is refused while its storage is past {}.",
+                        limit.as_str()
+                    ));
+                }
+                if let (Some(limit), true) = (limits.private_packages, over_packages) {
+                    whoami_ui::warn_line(crate::install_ui::terminal_line!(
+                        "New private packages in your personal scope are refused past {}.",
+                        limit
+                    ));
+                }
                 whoami_ui::warn("Upgrade your plan: https://lpm.dev/dashboard/settings/billing");
             }
         } else {

@@ -361,7 +361,10 @@ jobs:
         run: scripts/ci/with-hermetic-workflow-cli.sh cargo nextest run --locked -p lpm-workflows --test publish -E 'test(publish_npm_generated_provenance_attaches_sigstore_bundle_to_registry_put)' --no-fail-fast --status-level slow --final-status-level fail
 
       - name: LPM registry publish limits workflow
-        run: scripts/ci/with-hermetic-workflow-cli.sh cargo nextest run --locked -p lpm-workflows --test publish -E 'test(publish_refuses_a_tarball_past_lpm_dev_s_limit_before_any_target_publishes)' --no-fail-fast --status-level slow --final-status-level fail
+        run: scripts/ci/with-hermetic-workflow-cli.sh cargo nextest run --locked -p lpm-workflows --test publish -E 'test(publish_refuses_a_tarball_past_lpm_dev_s_limit_before_any_target_publishes) | test(publish_refuses_a_request_past_lpm_dev_s_limit_whose_tarball_is_within_its_own)' --no-fail-fast --status-level slow --final-status-level fail
+
+      - name: Whoami workflow
+        run: scripts/ci/with-hermetic-workflow-cli.sh cargo nextest run --locked -p lpm-workflows --test whoami --no-fail-fast --status-level slow --final-status-level fail
 
       - name: Native Swift publication workflow
         run: |

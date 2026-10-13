@@ -262,16 +262,11 @@ fn publish_refuses_a_tarball_past_lpm_dev_s_limit_before_any_target_publishes() 
     );
     project.write_file("index.js", "module.exports = {}");
     // Incompressible, so the gzipped tarball stays past lpm.dev's 100 MiB.
-    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
-    let blob: Vec<u8> = (0..(101 * 1024 * 1024 / 8))
-        .flat_map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state.to_le_bytes()
-        })
-        .collect();
-    std::fs::write(project.path().join("blob.bin"), blob).unwrap();
+    std::fs::write(
+        project.path().join("blob.bin"),
+        incompressible(101 * 1024 * 1024),
+    )
+    .unwrap();
 
     let output = lpm(&project)
         .args(["publish", "--dry-run", "--yes", "--json"])
@@ -287,6 +282,118 @@ fn publish_refuses_a_tarball_past_lpm_dev_s_limit_before_any_target_publishes() 
             .as_str()
             .is_some_and(|error| error.contains("tarball too large for the LPM registry")),
         "{stdout}"
+    );
+}
+
+/// `bytes` that gzip can't shrink.
+fn incompressible(bytes: usize) -> Vec<u8> {
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    (0..bytes.div_ceil(8))
+        .flat_map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()
+        })
+        .take(bytes)
+        .collect()
+}
+
+#[test]
+fn publish_refuses_a_request_past_lpm_dev_s_limit_whose_tarball_is_within_its_own() {
+    // The tarball stays under 100 MiB. Its base64, package.json's long field
+    // and a README whose control characters JSON writes six bytes each, sent
+    // twice, take the request past 150 MiB.
+    let filler = "x".repeat(15 * 1024 * 1024);
+    let project = TempProject::empty(&format!(
+        r#"{{
+        "name": "@lpm.dev/testuser.too-big-request",
+        "version": "1.0.0",
+        "main": "index.js",
+        "license": "MIT",
+        "filler": "{filler}"
+    }}"#
+    ));
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file("README.md", &"\u{1}".repeat(1024 * 1024));
+    std::fs::write(
+        project.path().join("blob.bin"),
+        incompressible(96 * 1024 * 1024),
+    )
+    .unwrap();
+
+    let output = lpm(&project)
+        .args(["publish", "--dry-run", "--yes", "--json"])
+        .output()
+        .expect("failed to run lpm publish --dry-run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("publish --json must print JSON: {error}\n{stdout}"));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("publish request too large for the LPM registry")),
+        "{stdout}"
+    );
+}
+
+#[tokio::test]
+async fn publish_publishes_no_target_when_lpm_dev_refuses_its_storage() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .and(wiremock::matchers::query_param_contains("size", ""))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": "Storage limit exceeded (100MB). Upgrade to Pro for more storage.",
+            "code": "STORAGE_LIMIT_EXCEEDED",
+        })))
+        .mount(mock.server())
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "@lpm.dev/testuser.storage-refused",
+        "version": "1.0.0",
+        "main": "index.js",
+        "license": "MIT"
+    }"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{"publish":{{"npm":{{"name":"storage-refused","registry":"{}","access":"public"}}}}}}"#,
+            mock.url()
+        ),
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "--json",
+            "publish",
+            "--yes",
+            "--token",
+            "test-token-123",
+            "--lpm",
+            "--npm",
+        ])
+        .output()
+        .expect("run publish");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains(
+            "LPM.dev refuses @lpm.dev/testuser.storage-refused@1.0.0, so no target was published"
+        ) && stdout.contains("Storage limit exceeded"),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

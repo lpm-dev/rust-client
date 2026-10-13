@@ -846,6 +846,21 @@ fn publish_tarball_size_for_the_lpm_registry_is_its_100_mib_limit() {
 }
 
 #[test]
+fn publish_request_size_for_the_lpm_registry_is_its_150_mib_limit() {
+    let limit = crate::commands::publish_common::MAX_LPM_REGISTRY_BODY_BYTES;
+    assert!(super::prepare::validate_lpm_registry_body_size(limit).is_ok());
+
+    let error = super::prepare::validate_lpm_registry_body_size(limit + 1).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("publish request too large for the LPM registry: 150.01 MiB (max 150 MiB)"),
+        "unexpected request limit error: {error}"
+    );
+}
+
+#[test]
 fn lpm_package_url_preserves_the_canonical_dotted_name() {
     assert_eq!(
         lpm_package_url("https://lpm.dev", "@lpm.dev/acme.widget").as_deref(),

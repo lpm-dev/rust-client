@@ -10,19 +10,10 @@ use std::io::Write as _;
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn publish_to_lpm(
     client: &RegistryClient,
-    name: &str,
-    version: &str,
-    readme: &Option<String>,
+    body: LpmPublishBody<'_>,
     tarball_data: &std::sync::Arc<Vec<u8>>,
-    tarball_files: &[TarballFile],
-    package_json_size_override: Option<u64>,
-    version_data: &serde_json::Value,
-    quality_result: &Option<quality::QualityResult>,
-    lpm_config: &Option<serde_json::Value>,
     provided_otp: Option<&str>,
     json_output: bool,
-    detected_ecosystem: &str,
-    swift_manifest: &Option<serde_json::Value>,
     whoami_cache: Option<&tokio::sync::OnceCell<lpm_registry::WhoamiResponse>>,
 ) -> Result<serde_json::Value, LpmError> {
     // Credentials must not travel over plain HTTP for LPM publish.
@@ -86,21 +77,9 @@ pub(super) async fn publish_to_lpm(
         None
     };
 
-    let prefix = LpmPublishBody {
-        name,
-        version,
-        readme: readme.as_deref(),
-        version_data,
-        tarball_files,
-        package_json_size_override,
-        quality_result: quality_result.as_ref(),
-        lpm_config: lpm_config.as_ref(),
-        detected_ecosystem,
-        swift_manifest: swift_manifest.as_ref(),
-    }
-    .prefix()?;
-    let payload = publish_common::prepare_base64_json_publish_body(prefix, tarball_data)?;
-    let published_integrity = version_data
+    let payload = publish_common::prepare_base64_json_publish_body(body.prefix()?, tarball_data)?;
+    let published_integrity = body
+        .version_data
         .get("dist")
         .and_then(|dist| dist.get("integrity"))
         .and_then(serde_json::Value::as_str)
@@ -108,11 +87,11 @@ pub(super) async fn publish_to_lpm(
             LpmError::Registry("prepared publish metadata is missing dist.integrity".into())
         })?;
 
-    let encoded_name = urlencoding::encode(name);
+    let encoded_name = urlencoding::encode(body.name);
     client
         .publish_package(
             &encoded_name,
-            version,
+            body.version,
             published_integrity,
             payload.replayable(),
             otp_code.as_deref(),

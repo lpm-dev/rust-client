@@ -270,6 +270,60 @@ impl RegistryClient {
         Ok(response)
     }
 
+    /// Asks the publish preflight about a publish whose tarball is `size`
+    /// bytes, which also checks the account's storage, and keeps a refusal's
+    /// status and code rather than turning it into an error.
+    pub async fn publish_preflight_sized(
+        &self,
+        name: &str,
+        version: &str,
+        size: u64,
+    ) -> Result<PublishPreflightVerdict, LpmError> {
+        let url = format!(
+            "{}/api/registry/-/package/publish-preflight?name={}&version={}&size={size}",
+            self.base_url,
+            urlencoding::encode(name),
+            urlencoding::encode(version)
+        );
+        let (status, body) = self
+            .execute_with_recovery(AuthPosture::AuthRequired, || async {
+                let response = self
+                    .send_once_preserving_status(self.build_get(&url).await?)
+                    .await?;
+                let status = response.status();
+                if status == reqwest::StatusCode::UNAUTHORIZED {
+                    return Err(LpmError::AuthRequired);
+                }
+                let body: serde_json::Value =
+                    parse_capped_api_json(response, "publish preflight response").await?;
+                Ok((status, body))
+            })
+            .await?;
+        if !status.is_success() {
+            let text = |field: &str| {
+                body.get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            };
+            return Ok(PublishPreflightVerdict::Refused {
+                status: status.as_u16(),
+                code: text("code"),
+                error: text("error").unwrap_or_else(|| format!("HTTP {status}")),
+            });
+        }
+        let response: PublishPreflightResponse = serde_json::from_value(body).map_err(|error| {
+            LpmError::Registry(format!(
+                "publish preflight response: failed to parse JSON: {error}"
+            ))
+        })?;
+        if !response.success || response.name != name || response.version != version {
+            return Err(LpmError::Registry(format!(
+                "publish preflight returned a mismatched answer for {name}@{version}"
+            )));
+        }
+        Ok(PublishPreflightVerdict::Accepted(response))
+    }
+
     /// Read the current publication lifecycle state for an uploaded LPM version.
     pub async fn get_publication_status(
         &self,

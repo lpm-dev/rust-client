@@ -486,6 +486,8 @@ mod tests {
         assert_eq!(format_usage(1023), "1,023 B");
         assert_eq!(format_usage(2048), "2 KiB");
         assert_eq!(format_usage(2049), "2.00 KiB");
+        // To nearest: 1.0059 KiB reads 1.01, not 1.00.
+        assert_eq!(format_usage(1030), "1.01 KiB");
     }
 
     #[test]
