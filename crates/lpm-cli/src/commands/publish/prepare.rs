@@ -1140,12 +1140,9 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
         .map_err(swift_inspection_error)?;
     let status = status.map_err(swift_inspection_error)?;
     if !status.success() {
-        let diagnostic = String::from_utf8_lossy(&stderr)
-            .chars()
-            .take(4096)
-            .collect::<String>();
-        let diagnostic = lpm_common::sanitize_terminal_inline(&diagnostic);
-        return Err(swift_inspection_error(format!("{status}: {diagnostic}")));
+        return Err(swift_inspection_error(
+            crate::swift_manifest::swift_failure_reason(&status, &stderr),
+        ));
     }
     serde_json::from_slice::<serde_json::Value>(&stdout).map_err(swift_inspection_error)
 }
