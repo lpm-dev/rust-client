@@ -1,6 +1,5 @@
 ---
 source: tests/workflows/tests/auth_lifecycle.rs
-assertion_line: 278
 expression: json
 ---
 {
@@ -23,8 +22,11 @@ expression: json
   ],
   "storage_backend": "encrypted_file_fallback",
   "storage_degraded": true,
+  "storage_excess_billed": null,
+  "storage_overage": null,
   "success": true,
   "usage": {
+    "counted_storage_bytes": null,
     "private_packages": 3,
     "storage_bytes": 52428800
   },

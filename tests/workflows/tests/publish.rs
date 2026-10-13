@@ -460,9 +460,57 @@ async fn publish_publishes_no_target_when_lpm_dev_refuses_it_for_good() {
 }
 
 #[tokio::test]
+async fn publish_asks_for_lpm_dev_s_second_factor_before_any_target_publishes() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "username": "test@example.com",
+            "profile_username": "testuser",
+            "mfa_enabled": true,
+        })))
+        .mount(mock.server())
+        .await;
+    mount_preflight(
+        &mock,
+        200,
+        serde_json::json!({
+            "success": true,
+            "name": "@lpm.dev/testuser.guarded",
+            "version": "1.0.0",
+            "packageExists": false,
+        }),
+    )
+    .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(mock.server())
+        .await;
+    let project = lpm_and_npm_project("guarded", &mock.url());
+
+    // `--json` can't ask for the code lpm.dev needs, so no target publishes.
+    let output = publish_to_lpm_and_npm(&project, &mock.url());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    // The publish stops as a whole, before any target's result.
+    let envelope = parse_json_output(&output.stdout);
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("2FA required in JSON mode"))
+            && envelope.get("results").is_none(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
 async fn publish_leaves_each_target_to_its_upload_when_lpm_dev_s_answer_isnt_final() {
-    // A version lpm.dev already has, as after a partial publish, and a
-    // server error that outlasts the retries.
+    // A version lpm.dev already has, as after a partial publish, also from
+    // a Registry that answers it without a code, and a server error that
+    // outlasts the retries.
     for (status, body) in [
         (
             403,
@@ -471,7 +519,19 @@ async fn publish_leaves_each_target_to_its_upload_when_lpm_dev_s_answer_isnt_fin
                 "code": "VERSION_EXISTS",
             }),
         ),
+        (
+            403,
+            serde_json::json!({
+                "error": "Version 1.0.0 already exists. You cannot overwrite versions.",
+            }),
+        ),
         (503, serde_json::json!({ "error": "Service unavailable" })),
+        // A request it can't read, an unknown package, a rate limit, and an
+        // answer that can't be read, which leaves the Registry unasked.
+        (400, serde_json::json!({ "error": "Invalid version" })),
+        (404, serde_json::json!({ "error": "Not found" })),
+        (429, serde_json::json!({ "error": "Too many requests" })),
+        (200, serde_json::json!("not a preflight answer")),
     ] {
         let mock = MockRegistry::start().await;
         mock.with_whoami("testuser", "test@example.com").await;
@@ -586,6 +646,29 @@ async fn publish_dry_run_retries_lpm_dev_s_preflight_and_names_its_status() {
         "{stdout}"
     );
     mock.server().verify().await;
+}
+
+#[tokio::test]
+async fn publish_dry_run_fails_when_lpm_dev_s_preflight_answer_cant_be_read() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not a preflight answer"))
+        .mount(mock.server())
+        .await;
+    let project = lpm_and_npm_project("unreadable", &mock.url());
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "publish", "--dry-run", "--yes", "--lpm"])
+        .output()
+        .expect("run publish dry-run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("LPM.dev publish preflight failed for @lpm.dev/testuser.unreadable@1.0.0"),
+        "{stdout}"
+    );
 }
 
 #[tokio::test]

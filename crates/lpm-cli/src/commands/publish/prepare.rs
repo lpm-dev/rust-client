@@ -689,7 +689,6 @@ pub(crate) fn validate_lpm_registry_tarball_size(tarball_size: usize) -> Result<
     )
 }
 
-/// Refuses a publish request the LPM registry would refuse for its size.
 /// Refuses a publish request of `body_size` bytes that lpm.dev would refuse
 /// for its size, keeping `reserve` bytes of the limit for what the upload
 /// adds after the check, as a provenance bundle.

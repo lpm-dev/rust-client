@@ -25,7 +25,7 @@ use super::types::{
     LpmPublicationStatus, NpmTargetArtifact, NpmTargetArtifactInput, PublicationWaitResult,
     PublishProject, PublishQualityGateInput, PublishResult, PublishTarget, ResolvedProvenance,
 };
-use super::upload_lpm::{LpmPublishBody, publish_to_lpm};
+use super::upload_lpm::{LpmPublishBody, publish_to_lpm, resolve_lpm_otp};
 use super::version_data::{build_publish_version_data, integrity_to_sha512_hex};
 use super::wait::{DEFAULT_PUBLICATION_WAIT_TIMEOUT, wait_for_lpm_publication_with_oidc};
 use crate::commands::skills::author;
@@ -320,31 +320,27 @@ impl PublishIntent {
                     .publish_preflight(&resolved.name, &self.package_version, None)
                     .await?;
                 drop(light_permit);
-                let package_exists = match verdict {
-                    PublishPreflightVerdict::Accepted(response) => response.package_exists,
-                    PublishPreflightVerdict::Refused {
-                        code: Some(code), ..
-                    } if code == VERSION_EXISTS_CODE => {
-                        return Ok(PublishTargetPreflight {
-                            target_display: resolved.target.display_name().to_string(),
-                            version_exists: true,
-                        });
-                    }
-                    PublishPreflightVerdict::Refused { status, error, .. } => {
-                        let answer = if status >= 500 || matches!(status, 408 | 429) {
-                            "couldn't check"
-                        } else {
-                            "refuses"
-                        };
-                        return Err(LpmError::Registry(format!(
-                            "LPM.dev {answer} {}@{}: {}",
-                            resolved.name,
-                            self.package_version,
-                            lpm_common::sanitize_terminal_inline(&error)
-                        )));
-                    }
-                };
-                if !package_exists {
+                if let PublishPreflightVerdict::Refused {
+                    status,
+                    code,
+                    error,
+                    ..
+                } = &verdict
+                    && lpm_dev_has_the_version(
+                        *status,
+                        code.as_deref(),
+                        error,
+                        &self.package_version,
+                    )
+                {
+                    return Ok(PublishTargetPreflight {
+                        target_display: resolved.target.display_name().to_string(),
+                        version_exists: true,
+                    });
+                }
+                // Any other refusal is the error the request's failure is,
+                // as `--json` reports it.
+                if !verdict.into_result()?.package_exists {
                     false
                 } else {
                     let _metadata_permit = acquire_preflight_permits(permits, permit_limit).await?;
@@ -1455,9 +1451,12 @@ async fn execute_prepared_inner(
     } else {
         client
     };
-    let lpm_whoami_cache = release_clients
-        .filter(|_| !using_registry_oidc)
-        .map(|clients| &clients.lpm_whoami);
+    let local_whoami = tokio::sync::OnceCell::new();
+    let lpm_whoami_cache = Some(
+        release_clients
+            .filter(|_| !using_registry_oidc)
+            .map_or(&local_whoami, |clients| &clients.lpm_whoami),
+    );
 
     // Skills staleness check is an LPM network read, so skip it in --check.
     //
@@ -1645,9 +1644,14 @@ async fn execute_prepared_inner(
         }
     }
 
-    if targets_lpm && targets.len() > 1 {
+    // lpm.dev's second factor is settled before any target publishes too,
+    // so one `--json` can't ask for publishes none.
+    let otp = if targets_lpm && targets.len() > 1 {
         refuse_before_any_publish_what_lpm_dev_refuses(client, lpm_source, &version).await?;
-    }
+        resolve_lpm_otp(client, otp.as_deref(), json_output, lpm_whoami_cache).await?
+    } else {
+        otp
+    };
 
     let provenance_context = match provenance_request {
         ProvenanceRequest::File(_) => None,
@@ -2438,14 +2442,30 @@ impl LpmTargetRequest<'_> {
 /// The preflight's code for a version lpm.dev already has.
 const VERSION_EXISTS_CODE: &str = "VERSION_EXISTS";
 
+/// Whether an lpm.dev preflight refusal says lpm.dev already has `version`:
+/// by its code, or, from a Registry that sends none, by the message it
+/// gives that refusal.
+fn lpm_dev_has_the_version(status: u16, code: Option<&str>, error: &str, version: &str) -> bool {
+    match code {
+        Some(code) => code == VERSION_EXISTS_CODE,
+        None => {
+            status == 403
+                && error
+                    .strip_prefix("Version ")
+                    .and_then(|rest| rest.strip_prefix(version))
+                    .is_some_and(|rest| rest.starts_with(" already exists."))
+        }
+    }
+}
+
 /// Whether an lpm.dev preflight refusal is one no retry of the same publish
 /// gets past: the account's storage or package limit, its billing, a second
 /// factor it requires, the tarball's size, or the token's permission. A
 /// version lpm.dev already has, as after a partial publish, isn't one, nor a
 /// request the Registry can't read, a rate limit or a server error, which
 /// the upload judges.
-fn refusal_stops_every_target(status: u16, code: Option<&str>) -> bool {
-    matches!(status, 402 | 403 | 413) && code != Some(VERSION_EXISTS_CODE)
+fn refusal_stops_every_target(status: u16, code: Option<&str>, error: &str, version: &str) -> bool {
+    matches!(status, 402 | 403 | 413) && !lpm_dev_has_the_version(status, code, error, version)
 }
 
 /// Stops a publish to more than one target before any publishes when
@@ -2465,8 +2485,9 @@ async fn refuse_before_any_publish_what_lpm_dev_refuses(
         status,
         code,
         error,
+        ..
     }) = verdict
-        && refusal_stops_every_target(status, code.as_deref())
+        && refusal_stops_every_target(status, code.as_deref(), &error, version)
     {
         return Err(LpmError::Registry(format!(
             "LPM.dev refuses {}@{version}, so no target was published: {}",
@@ -2623,12 +2644,68 @@ fn resolve_npm_compatible_publish_endpoint(
 mod lpm_target_limit_tests {
     use super::{
         LpmPublishParts, LpmTargetSource, PROVENANCE_BODY_RESERVE_BYTES, check_lpm_target_body,
-        check_lpm_target_tarball, lpm_target_request, publish_common,
+        check_lpm_target_tarball, lpm_dev_has_the_version, lpm_target_request, publish_common,
+        refusal_stops_every_target,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
 
     const MIB: usize = 1024 * 1024;
+
+    #[test]
+    fn reads_a_version_lpm_dev_has_from_its_code_or_a_codeless_registry_s_message() {
+        // What a Registry without the code answers.
+        let deployed = "Version 1.0.0 already exists. You cannot overwrite versions.";
+        assert!(lpm_dev_has_the_version(
+            403,
+            Some("VERSION_EXISTS"),
+            "",
+            "1.0.0"
+        ));
+        assert!(lpm_dev_has_the_version(403, None, deployed, "1.0.0"));
+        assert!(!lpm_dev_has_the_version(403, None, deployed, "1.0"));
+        assert!(!lpm_dev_has_the_version(403, None, deployed, "1.0.0-beta"));
+        assert!(!lpm_dev_has_the_version(402, None, deployed, "1.0.0"));
+        assert!(!lpm_dev_has_the_version(
+            403,
+            Some("STORAGE_LIMIT_EXCEEDED"),
+            deployed,
+            "1.0.0"
+        ));
+        assert!(!lpm_dev_has_the_version(
+            403,
+            None,
+            "Insufficient permissions",
+            "1.0.0"
+        ));
+
+        assert!(!refusal_stops_every_target(403, None, deployed, "1.0.0"));
+        assert!(!refusal_stops_every_target(
+            403,
+            Some("VERSION_EXISTS"),
+            "",
+            "1.0.0"
+        ));
+        assert!(refusal_stops_every_target(
+            403,
+            None,
+            "Insufficient permissions",
+            "1.0.0"
+        ));
+        assert!(refusal_stops_every_target(
+            402,
+            Some("ORG_BILLING_LAPSED"),
+            "",
+            "1.0.0"
+        ));
+        assert!(refusal_stops_every_target(413, None, "", "1.0.0"));
+        for status in [400, 404, 408, 429, 500, 503] {
+            assert!(
+                !refusal_stops_every_target(status, None, "", "1.0.0"),
+                "{status}"
+            );
+        }
+    }
 
     fn hashes() -> Arc<publish_common::TarballHashes> {
         Arc::new(publish_common::TarballHashes {

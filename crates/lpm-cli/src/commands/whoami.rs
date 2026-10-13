@@ -49,6 +49,7 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                 "private_packages": l.private_packages,
             })),
             "storage_overage": user.storage_overage,
+            "storage_excess_billed": user.storage_excess_billed,
             "orgs": user.organizations.iter().map(|o| serde_json::json!({
                 "slug": o.slug,
                 "name": o.name,
@@ -142,12 +143,6 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                     match storage_overage {
                         Some("billed") => {
                             whoami_ui::detail("storage", storage_msg);
-                            whoami_ui::detail(
-                                "overage",
-                                format!(
-                                    "storage past {limit} is billed per GiB a month, rounded up"
-                                ),
-                            );
                         }
                         Some("paused" | "blocked") => {
                             whoami_ui::warn_line(crate::install_ui::terminal_line!(
@@ -160,6 +155,14 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                             whoami_ui::detail("limit", format!("past the {limit} limit"));
                         }
                     }
+                }
+                // At the limit too, so the publish that starts the overage
+                // isn't its first notice.
+                if counted >= limit_bytes && storage_overage == Some("billed") {
+                    whoami_ui::detail(
+                        "overage",
+                        format!("storage past {limit} is billed per GiB a month, rounded up"),
+                    );
                 }
                 if counted < usage.storage_bytes {
                     whoami_ui::detail(
@@ -219,6 +222,15 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                         "Publishing past {} is refused until billing is active again.",
                         limit.as_str()
                     ));
+                    match (over_storage, user.storage_excess_billed) {
+                        (true, Some(true)) => whoami_ui::warn(
+                            "Storage already past it is still billed while the payment is retried.",
+                        ),
+                        (true, Some(false)) => {
+                            whoami_ui::warn("Storage already past it isn't billed meanwhile.")
+                        }
+                        _ => {}
+                    }
                     whoami_ui::warn("Manage billing: https://lpm.dev/dashboard/settings/billing");
                 }
                 (Some(limit), Some("blocked")) if unbilled_pro => {
@@ -386,6 +398,15 @@ fn with_usage_bar(message: String, used: u64, limit: u64) -> install_ui::Termina
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[test]
+    fn names_each_plan_as_lpm_dev_does() {
+        assert_eq!(format_plan_tier("free"), "Hobby");
+        assert_eq!(format_plan_tier("FREE"), "Hobby");
+        assert_eq!(format_plan_tier("pro"), "Pro");
+        assert_eq!(format_plan_tier("org"), "Organization");
+        assert_eq!(format_plan_tier(""), "");
+    }
 
     fn scoped_home_dir() -> (tempfile::TempDir, crate::test_env::ScopedEnv) {
         let dir = tempfile::tempdir().unwrap();

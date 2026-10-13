@@ -6,6 +6,58 @@ use lpm_registry::RegistryClient;
 use serde::ser::{SerializeMap as _, SerializeSeq as _};
 use std::io::Write as _;
 
+/// The second factor an lpm.dev publish sends: `provided_otp`, checked, or,
+/// for an account with 2FA on, one asked for, which `--json` can't do. Reads
+/// the account through whoami, which also checks the token.
+pub(super) async fn resolve_lpm_otp(
+    client: &RegistryClient,
+    provided_otp: Option<&str>,
+    json_output: bool,
+    whoami_cache: Option<&tokio::sync::OnceCell<lpm_registry::WhoamiResponse>>,
+) -> Result<Option<String>, LpmError> {
+    let mfa_enabled = if let Some(cache) = whoami_cache {
+        cache
+            .get_or_try_init(|| client.whoami())
+            .await
+            .map_err(|e| LpmError::Registry(format!("authentication failed: {e}")))?
+            .mfa_enabled
+    } else {
+        client
+            .whoami()
+            .await
+            .map_err(|e| LpmError::Registry(format!("authentication failed: {e}")))?
+            .mfa_enabled
+    };
+
+    if let Some(code) = provided_otp {
+        if !is_valid_otp(code) {
+            return Err(LpmError::Registry(
+                "--otp must be exactly six ASCII digits".into(),
+            ));
+        }
+        return Ok(Some(code.to_owned()));
+    }
+    if mfa_enabled != Some(true) {
+        return Ok(None);
+    }
+    if json_output {
+        return Err(LpmError::Registry(
+            "2FA required in JSON mode — pass --otp <code> or use a CI token".into(),
+        ));
+    }
+    let code: String = cliclack::input("Enter 2FA code")
+        .validate(|input: &String| {
+            if is_valid_otp(input) {
+                Ok(())
+            } else {
+                Err("Must be a 6-digit code")
+            }
+        })
+        .interact()
+        .map_err(|e| LpmError::Registry(e.to_string()))?;
+    Ok(Some(code))
+}
+
 /// Publish to the LPM registry (existing behavior).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn publish_to_lpm(
@@ -33,49 +85,7 @@ pub(super) async fn publish_to_lpm(
         ));
     }
 
-    // Verify token has publish scope
-    let mfa_enabled = if let Some(cache) = whoami_cache {
-        cache
-            .get_or_try_init(|| client.whoami())
-            .await
-            .map_err(|e| LpmError::Registry(format!("authentication failed: {e}")))?
-            .mfa_enabled
-    } else {
-        client
-            .whoami()
-            .await
-            .map_err(|e| LpmError::Registry(format!("authentication failed: {e}")))?
-            .mfa_enabled
-    };
-
-    // 2FA check — prompt before uploading
-    let otp_code: Option<String> = if let Some(code) = provided_otp {
-        if !is_valid_otp(code) {
-            return Err(LpmError::Registry(
-                "--otp must be exactly six ASCII digits".into(),
-            ));
-        }
-        Some(code.to_owned())
-    } else if mfa_enabled == Some(true) {
-        if json_output {
-            return Err(LpmError::Registry(
-                "2FA required in JSON mode — pass --otp <code> or use a CI token".into(),
-            ));
-        }
-        let code: String = cliclack::input("Enter 2FA code")
-            .validate(|input: &String| {
-                if is_valid_otp(input) {
-                    Ok(())
-                } else {
-                    Err("Must be a 6-digit code")
-                }
-            })
-            .interact()
-            .map_err(|e| LpmError::Registry(e.to_string()))?;
-        Some(code)
-    } else {
-        None
-    };
+    let otp_code = resolve_lpm_otp(client, provided_otp, json_output, whoami_cache).await?;
 
     let payload = publish_common::prepare_base64_json_publish_body(body.prefix()?, tarball_data)?;
     let published_integrity = body

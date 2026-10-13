@@ -267,6 +267,101 @@ async fn whoami_tells_a_pro_account_past_its_storage_that_it_is_billed_not_restr
 }
 
 #[tokio::test]
+async fn whoami_tells_a_pro_account_at_its_storage_that_the_next_publish_is_billed() {
+    let stderr = whoami_stderr(serde_json::json!({
+        "username": "testuser",
+        "plan_tier": "pro",
+        "usage": { "storage_bytes": 5 * GIB, "private_packages": 3 },
+        "limits": { "storageBytes": 5 * GIB, "privatePackages": 100 },
+        "storage_overage": "billed",
+    }))
+    .await;
+
+    assert!(
+        stderr.contains("storage        5 GiB / 5 GiB")
+            && stderr.contains(
+                "overage        storage past 5 GiB is billed per GiB a month, rounded up"
+            ),
+        "a Pro account at its storage should be told what past it costs, got:\n{stderr}"
+    );
+    let below = whoami_stderr(serde_json::json!({
+        "username": "testuser",
+        "plan_tier": "pro",
+        "usage": { "storage_bytes": 5 * GIB - 1, "private_packages": 3 },
+        "limits": { "storageBytes": 5 * GIB, "privatePackages": 100 },
+        "storage_overage": "billed",
+    }))
+    .await;
+    assert!(!below.contains("overage "), "{below}");
+}
+
+#[tokio::test]
+async fn whoami_says_whether_storage_already_past_the_limit_is_billed_while_billing_isnt_active() {
+    for (billed, said) in [
+        (
+            serde_json::json!(true),
+            Some("Storage already past it is still billed while the payment is retried."),
+        ),
+        (
+            serde_json::json!(false),
+            Some("Storage already past it isn't billed meanwhile."),
+        ),
+        (serde_json::Value::Null, None),
+    ] {
+        let stderr = whoami_stderr(serde_json::json!({
+            "username": "testuser",
+            "plan_tier": "pro",
+            "usage": { "storage_bytes": 5 * GIB + 1, "private_packages": 3 },
+            "limits": { "storageBytes": 5 * GIB, "privatePackages": 100 },
+            "storage_overage": "paused",
+            "storage_excess_billed": billed,
+        }))
+        .await;
+
+        match said {
+            Some(said) => assert!(stderr.contains(said), "{billed}: {stderr}"),
+            None => assert!(!stderr.contains("Storage already past it"), "{stderr}"),
+        }
+    }
+
+    // At the limit, nothing is past it yet, but the next publish is refused.
+    let at = whoami_stderr(serde_json::json!({
+        "username": "testuser",
+        "plan_tier": "pro",
+        "usage": { "storage_bytes": 5 * GIB, "private_packages": 3 },
+        "limits": { "storageBytes": 5 * GIB, "privatePackages": 100 },
+        "storage_overage": "paused",
+        "storage_excess_billed": true,
+    }))
+    .await;
+    assert!(
+        at.contains("Publishing past 5 GiB is refused until billing is active again.")
+            && !at.contains("Storage already past it"),
+        "{at}"
+    );
+}
+
+#[tokio::test]
+async fn whoami_tells_a_pro_account_without_a_subscription_at_its_storage_that_past_it_is_refused()
+{
+    let stderr = whoami_stderr(serde_json::json!({
+        "username": "testuser",
+        "plan_tier": "pro",
+        "usage": { "storage_bytes": 5 * GIB, "private_packages": 3 },
+        "limits": { "storageBytes": 5 * GIB, "privatePackages": 100 },
+        "storage_overage": "blocked",
+    }))
+    .await;
+
+    assert!(
+        stderr.contains(
+            "Storage past 5 GiB isn't billed on this plan, so publishing to your personal scope past it is refused."
+        ) && !stderr.contains("OVER LIMIT"),
+        "{stderr}"
+    );
+}
+
+#[tokio::test]
 async fn whoami_tells_a_free_account_past_its_storage_that_publishing_is_restricted() {
     let stderr = whoami_stderr(serde_json::json!({
         "username": "testuser",
@@ -542,6 +637,7 @@ async fn whoami_json_reports_file_backed_auth_storage_backend() {
             "profile_username": "testuser",
             "email": "test@example.com",
             "storage_overage": "paused",
+            "storage_excess_billed": false,
             "usage": {
                 "storage_bytes": 150 * 1024 * 1024,
                 "counted_storage_bytes": 50 * 1024 * 1024,
@@ -580,6 +676,7 @@ async fn whoami_json_reports_file_backed_auth_storage_backend() {
     );
     assert_eq!(json["storage_degraded"], serde_json::json!(true));
     assert_eq!(json["storage_overage"], serde_json::json!("paused"));
+    assert_eq!(json["storage_excess_billed"], serde_json::json!(false));
     assert_eq!(
         json["usage"]["counted_storage_bytes"],
         serde_json::json!(50 * 1024 * 1024)

@@ -182,6 +182,7 @@ async fn publish_preflight_keeps_a_refusal_s_status_code_and_message() {
             status: refused,
             code: refused_code,
             error: message,
+            ..
         } = verdict
         else {
             panic!("expected a refusal, got {verdict:?}");
@@ -217,14 +218,87 @@ async fn publish_preflight_names_the_status_of_an_answer_that_isnt_json() {
         status,
         code,
         error,
+        body,
+        ..
     } = verdict
     else {
         panic!("expected a refusal, got {verdict:?}");
     };
     assert_eq!(
-        (status, code, error.as_str()),
-        (413, None, "HTTP 413 Payload Too Large")
+        (status, code, error.as_str(), body.as_str()),
+        (
+            413,
+            None,
+            "HTTP 413 Payload Too Large",
+            "<html>too large</html>"
+        )
     );
+}
+
+#[tokio::test]
+async fn a_publish_preflight_refusal_is_the_error_any_request_s_failure_is() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for (status, body) in [
+        (403, "Insufficient permissions"),
+        (404, "no such package"),
+        (429, "slow down"),
+        (409, "ordered-alpha-error"),
+    ] {
+        let server = MockServer::start().await;
+        if status == 429 {
+            // Retried at once three times; the last answer's wait is the
+            // one reported.
+            Mock::given(method("GET"))
+                .and(path("/api/registry/-/package/publish-preflight"))
+                .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+                .up_to_n_times(3)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/package/publish-preflight"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("retry-after", "7")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let verdict = RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("publish-token")
+            .publish_preflight("@lpm.dev/owner.resolved", "1.2.3", None)
+            .await
+            .unwrap();
+
+        let error = verdict.into_result().unwrap_err();
+        match status {
+            403 => assert!(
+                matches!(&error, LpmError::Forbidden(message) if message == body),
+                "{error:?}"
+            ),
+            404 => assert!(
+                matches!(&error, LpmError::NotFound(message) if message == body),
+                "{error:?}"
+            ),
+            429 => assert!(
+                matches!(
+                    error,
+                    LpmError::RateLimited {
+                        retry_after_secs: 7
+                    }
+                ),
+                "{error:?}"
+            ),
+            _ => assert!(
+                matches!(&error, LpmError::Http { status: 409, message } if message == body),
+                "{error:?}"
+            ),
+        }
+    }
 }
 
 #[tokio::test]
@@ -232,39 +306,41 @@ async fn publish_preflight_retries_a_server_error_before_reading_the_answer() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/api/registry/-/package/publish-preflight"))
-        .respond_with(ResponseTemplate::new(503))
-        .up_to_n_times(1)
-        .expect(1)
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/api/registry/-/package/publish-preflight"))
-        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
-            "error": "Version 1.2.3 already exists. You cannot overwrite versions.",
-            "code": "VERSION_EXISTS",
-        })))
-        .expect(1)
-        .mount(&server)
-        .await;
+    for status in [408, 500, 502, 503, 504] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/package/publish-preflight"))
+            .respond_with(ResponseTemplate::new(status))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/package/publish-preflight"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": "Version 1.2.3 already exists. You cannot overwrite versions.",
+                "code": "VERSION_EXISTS",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
 
-    let verdict = RegistryClient::new()
-        .with_base_url(server.uri())
-        .with_token("publish-token")
-        .publish_preflight("@lpm.dev/owner.resolved", "1.2.3", None)
-        .await
-        .unwrap();
+        let verdict = RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("publish-token")
+            .publish_preflight("@lpm.dev/owner.resolved", "1.2.3", None)
+            .await
+            .unwrap();
 
-    assert!(
-        matches!(
-            &verdict,
-            PublishPreflightVerdict::Refused { status: 403, code: Some(code), .. }
-                if code == "VERSION_EXISTS"
-        ),
-        "{verdict:?}"
-    );
+        assert!(
+            matches!(
+                &verdict,
+                PublishPreflightVerdict::Refused { status: 403, code: Some(code), .. }
+                    if code == "VERSION_EXISTS"
+            ),
+            "{status}: {verdict:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -361,27 +437,36 @@ async fn publish_preflight_rejects_a_mismatched_response_identity() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/api/registry/-/package/publish-preflight"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "success": true,
-            "name": "@lpm.dev/owner.other",
-            "version": "9.9.9",
-            "packageExists": false
-        })))
-        .mount(&server)
-        .await;
+    // Another package, or another version of this one.
+    for (name, version) in [
+        ("@lpm.dev/owner.other", "1.2.3"),
+        ("@lpm.dev/owner.resolved", "9.9.9"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/package/publish-preflight"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "name": name,
+                "version": version,
+                "packageExists": false
+            })))
+            .mount(&server)
+            .await;
 
-    let error = RegistryClient::new()
-        .with_base_url(server.uri())
-        .with_token("publish-token")
-        .publish_preflight("@lpm.dev/owner.resolved", "1.2.3", None)
-        .await
-        .unwrap_err()
-        .to_string();
+        let error = RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("publish-token")
+            .publish_preflight("@lpm.dev/owner.resolved", "1.2.3", None)
+            .await
+            .unwrap_err()
+            .to_string();
 
-    assert!(error.contains("mismatched package identity"), "{error}");
+        assert!(
+            error.contains("mismatched package identity"),
+            "{name}@{version}: {error}"
+        );
+    }
 }
 
 #[tokio::test]

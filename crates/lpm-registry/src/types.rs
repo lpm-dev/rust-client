@@ -999,6 +999,12 @@ pub struct WhoamiResponse {
     /// predates it sends none.
     #[serde(default, rename = "storage_overage")]
     pub storage_overage: Option<String>,
+
+    /// Whether storage already past the plan's limit is billed meanwhile,
+    /// as it is while a subscription is past due, and not while it's paused
+    /// or ended. A Registry that predates it sends none.
+    #[serde(default, rename = "storage_excess_billed")]
+    pub storage_excess_billed: Option<bool>,
 }
 
 /// GET /api/registry/-/package/publish-preflight
@@ -1017,11 +1023,15 @@ pub enum PublishPreflightVerdict {
     /// The Registry would take the publish.
     Accepted(PublishPreflightResponse),
     /// The Registry refuses it: its HTTP status, its `code` where it gives
-    /// one, and its message.
+    /// one, its message, or `HTTP <status>` where its body has none, the
+    /// body as sent, which a request's failure reports, and a 429's
+    /// `Retry-After` in seconds.
     Refused {
         status: u16,
         code: Option<String>,
         error: String,
+        body: String,
+        retry_after_secs: u64,
     },
 }
 

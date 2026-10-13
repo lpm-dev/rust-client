@@ -274,6 +274,7 @@ impl RegistryClient {
             .await?;
         let status = response.status();
         if !status.is_success() {
+            let retry_after_secs = super::transport::parse_retry_after(&response);
             let body = super::body::read_capped_error_text(response).await;
             let json = serde_json::from_str::<serde_json::Value>(&body).ok();
             let text = |field: &str| {
@@ -286,6 +287,8 @@ impl RegistryClient {
                 status: status.as_u16(),
                 code: text("code"),
                 error: text("error").unwrap_or_else(|| format!("HTTP {status}")),
+                body,
+                retry_after_secs,
             });
         }
         let response: PublishPreflightResponse =
@@ -760,4 +763,32 @@ fn validate_search_registry_base(base_url: &str) -> Result<(), LpmError> {
         ));
     }
     Ok(())
+}
+
+impl PublishPreflightVerdict {
+    /// The accepted answer, or the refusal as the error any other request's
+    /// failure is (see [`super::transport::failed_answer_error`]), with the
+    /// Registry's message where its body gives one, and the body otherwise.
+    pub fn into_result(self) -> Result<PublishPreflightResponse, LpmError> {
+        match self {
+            Self::Accepted(response) => Ok(response),
+            Self::Refused {
+                status,
+                body,
+                retry_after_secs,
+                ..
+            } => {
+                let message = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|json| json.get("error")?.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| body.clone());
+                Err(super::transport::failed_answer_error(
+                    status,
+                    &body,
+                    message,
+                    retry_after_secs,
+                ))
+            }
+        }
+    }
 }

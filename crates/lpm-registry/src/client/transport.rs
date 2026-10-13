@@ -838,21 +838,16 @@ impl RegistryClient {
 
                         // Non-retryable errors — fail immediately
                         401 => return Err(LpmError::AuthRequired),
-                        403 => {
+                        403 | 404 => {
                             let body = read_request_error_text(response, &request).await;
-                            return Err(forbidden_error_from_body(body));
-                        }
-                        404 => {
-                            let body = read_request_error_text(response, &request).await;
-                            return Err(LpmError::NotFound(body));
+                            return Err(failed_answer_error(status, &body, body.clone(), 0));
                         }
 
                         // Retryable: rate limit
                         429 => {
                             let retry_after = parse_retry_after(&response);
-                            last_error = Some(LpmError::RateLimited {
-                                retry_after_secs: retry_after,
-                            });
+                            last_error =
+                                Some(failed_answer_error(status, "", String::new(), retry_after));
                             if attempt < MAX_RETRIES {
                                 // Honor the test-only backoff override here
                                 // too — see the sibling site in publish-path.
@@ -873,10 +868,7 @@ impl RegistryClient {
                             )
                             .await
                             .unwrap_or_default();
-                            last_error = Some(LpmError::Http {
-                                status,
-                                message: body,
-                            });
+                            last_error = Some(failed_answer_error(status, &body, body.clone(), 0));
                             if attempt < MAX_RETRIES {
                                 let delay = backoff_delay(attempt);
                                 tracing::event!(name: "backoff_start", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64);
@@ -889,10 +881,7 @@ impl RegistryClient {
                         // Other errors — fail immediately
                         _ => {
                             let body = read_request_error_text(response, &request).await;
-                            return Err(LpmError::Http {
-                                status,
-                                message: body,
-                            });
+                            return Err(failed_answer_error(status, &body, body.clone(), 0));
                         }
                     }
                 }
@@ -940,11 +929,31 @@ async fn read_publish_error_text(response: reqwest::Response, bearer: Option<&st
     }
 }
 
+/// The error an answer that isn't a success, nor a 401, is: a 403 as
+/// forbidden, or as the error an LPM Worker's `body` names, a 404 as not
+/// found, a 429 as rate limited for `retry_after_secs`, any other as
+/// `Http`, each with `message`.
+pub(super) fn failed_answer_error(
+    status: u16,
+    body: &str,
+    message: String,
+    retry_after_secs: u64,
+) -> LpmError {
+    match status {
+        403 => {
+            super::body::parse_lpm_worker_error_body(body).unwrap_or(LpmError::Forbidden(message))
+        }
+        404 => LpmError::NotFound(message),
+        429 => LpmError::RateLimited { retry_after_secs },
+        _ => LpmError::Http { status, message },
+    }
+}
+
 /// What the retry loop hands back for an answer that isn't a success.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FailedAnswer {
-    /// An error: a 401 as `AuthRequired`, a 403 as forbidden, a 404 as not
-    /// found, any other as `Http`.
+    /// An error: a 401 as `AuthRequired`, any other as
+    /// [`failed_answer_error`] makes it.
     Error,
     /// The response, with its status and body: one that isn't retried, and
     /// the last one that was.
