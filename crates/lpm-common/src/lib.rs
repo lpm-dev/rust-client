@@ -29,6 +29,9 @@ pub mod project_glob;
 pub mod provenance;
 pub mod symlink;
 pub mod terminal;
+// The 64-bit system call's groups are 32-bit; 32-bit systems have two calls.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+pub mod thread_identity;
 mod utf8_bom;
 
 #[cfg(unix)]
@@ -405,11 +408,13 @@ fn filesystem_space(_path: &std::path::Path) -> Option<FilesystemSpace> {
 }
 
 /// What APFS reports free on a volume of `size` bytes but refuses writes:
-/// a write there fails with about 2% of the volume and 460 KB more still
-/// reported free, and never more than 32 MiB and 80 KiB, as measured on
-/// volumes of 64 MB to 8 GB. Rounded up by about half a MiB, which also
-/// covers the blocks a file's own metadata takes, so a write that would
-/// just fit can be refused, but never one counted as fitting.
+/// a stream of writes to one file stops with about 2% of the volume and
+/// 460 KB more still reported free, and never more than 32 MiB and 80 KiB,
+/// as measured on volumes of 64 MB to 8 GB. Rounded up by about half a MiB,
+/// which also covers the blocks a file's own metadata takes. That's the
+/// least a write needs: on a fresh volume, writes flushed as they go, or
+/// spread over many files, stopped up to about 16 MB sooner, so a write
+/// counted as fitting can still fail, as on a full disk.
 #[cfg(any(target_os = "macos", test))]
 fn apfs_held_back(size: u64) -> u64 {
     (size / 50)
@@ -500,7 +505,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn on_any_filesystem_but_apfs_a_write_can_take_what_it_reports_free() {
+    fn on_any_filesystem_but_apfs_nothing_reported_free_counts_as_kept_back() {
         let directory = tempfile::tempdir().unwrap();
         let space = filesystem_space(directory.path()).unwrap();
         if cfg!(target_os = "macos") && space.held_back > 0 {
@@ -516,7 +521,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn on_apfs_a_write_takes_what_it_counts_writable_and_little_more() {
+    fn on_apfs_a_stream_of_writes_takes_what_it_counts_writable_and_little_more() {
         use std::io::Write as _;
 
         let directory = tempfile::tempdir().unwrap();
