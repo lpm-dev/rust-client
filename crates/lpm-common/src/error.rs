@@ -767,8 +767,10 @@ impl LpmError {
             "domain_required" => {
                 "Your tunnel URL comes from your lpm.dev username. Set one at https://lpm.dev/dashboard/settings, or name a domain you claimed: `lpm tunnel <port> <domain>` or `lpm dev --domain <domain>`."
             }
+            // The code comes back for a lapsed Pro account and for an
+            // organization alike, and the relay doesn't say which.
             "billing_inactive" => {
-                "The organization's billing is inactive. An owner can update its payment method in the organization's billing settings on lpm.dev."
+                "Billing for the tunnel's account is inactive. For your Pro plan, update your payment method at https://lpm.dev/dashboard/settings/billing; for an organization, an owner can update it in the organization's billing settings on lpm.dev."
             }
             _ => {
                 "The tunnel's account is no longer available. Run `lpm login`, then start the tunnel again."
@@ -861,6 +863,22 @@ impl LpmError {
 mod tests {
     use super::*;
     use miette::Diagnostic;
+
+    #[test]
+    fn inactive_billing_points_a_personal_account_and_an_organization_to_their_own_billing() {
+        let LpmError::TunnelAccess { help, .. } = LpmError::tunnel_access(
+            "billing_inactive",
+            "Pro billing is inactive. Update your payment method at https://lpm.dev/dashboard/settings/billing",
+        ) else {
+            panic!("not a tunnel access error");
+        };
+
+        assert!(
+            help.contains("https://lpm.dev/dashboard/settings/billing"),
+            "{help}"
+        );
+        assert!(help.contains("organization's billing settings"), "{help}");
+    }
 
     #[test]
     fn task_error_display() {
