@@ -302,6 +302,51 @@ async fn a_publish_preflight_refusal_is_the_error_any_request_s_failure_is() {
 }
 
 #[tokio::test]
+async fn publish_preflight_redacts_a_refusal_s_reflection_of_its_bearer() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let token = "lpm-preflight-reflection-secret";
+    for (status, body) in [
+        (
+            403,
+            serde_json::json!({ "error": format!("bearer {token} may not publish") }).to_string(),
+        ),
+        (409, format!("submitted bearer was {token}")),
+        // The last of the retried answers.
+        (429, format!("slow down, {token}")),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/package/publish-preflight"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("retry-after", "0")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let verdict = RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token(token)
+            .publish_preflight("@lpm.dev/owner.resolved", "1.2.3", None)
+            .await
+            .unwrap();
+
+        let PublishPreflightVerdict::Refused { error, body, .. } = &verdict else {
+            panic!("expected a refusal, got {verdict:?}");
+        };
+        for text in [error, body] {
+            assert!(!text.contains(token), "{status}: bearer leaked: {text}");
+        }
+        assert!(body.contains("<redacted>"), "{status}: {body}");
+        let error = format!("{:?}", verdict.into_result().unwrap_err());
+        assert!(!error.contains(token), "{status}: bearer leaked: {error}");
+    }
+}
+
+#[tokio::test]
 async fn publish_preflight_retries_a_server_error_before_reading_the_answer() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1082,6 +1127,46 @@ async fn publish_package_replays_the_exact_body_after_gateway_failure() {
                 .and_then(|value| value.to_str().ok()),
             Some("123456")
         );
+    }
+}
+
+#[tokio::test]
+async fn publish_package_redacts_a_registry_reflection_of_its_one_time_code() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let code = "731905";
+    for status in [403, 404, 422] {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/registry/@lpm.dev/test.reflection"))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_string(format!("code {code} was refused")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let payload = replayable_json(&serde_json::json!({
+            "name": "@lpm.dev/test.reflection"
+        }));
+
+        let error = RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("publish-token")
+            .publish_package(
+                "@lpm.dev/test.reflection",
+                "1.0.0",
+                "sha512-test",
+                &payload,
+                Some(code),
+                0,
+            )
+            .await
+            .expect_err("registry rejection must remain an error")
+            .to_string();
+
+        assert!(!error.contains(code), "{status}: code leaked: {error}");
+        assert!(error.contains("<redacted>"), "{status}: {error}");
     }
 }
 

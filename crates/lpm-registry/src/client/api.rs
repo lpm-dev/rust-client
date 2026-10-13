@@ -1,3 +1,4 @@
+use super::transport::{Answered, FailedResponse};
 use super::*;
 
 impl RegistryClient {
@@ -261,36 +262,47 @@ impl RegistryClient {
         if let Some(size) = size {
             url.push_str(&format!("&size={size}"));
         }
-        let response = self
+        let answer = self
             .execute_with_recovery(AuthPosture::AuthRequired, || async {
-                let response = self
+                match self
                     .send_with_retry_keeping_status(self.build_get(&url).await?)
-                    .await?;
-                if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-                    return Err(LpmError::AuthRequired);
+                    .await?
+                {
+                    Answered::Failed(FailedResponse { status: 401, .. }) => {
+                        Err(LpmError::AuthRequired)
+                    }
+                    answer => Ok(answer),
                 }
-                Ok(response)
             })
             .await?;
-        let status = response.status();
-        if !status.is_success() {
-            let retry_after_secs = super::transport::parse_retry_after(&response);
-            let body = super::body::read_capped_error_text(response).await;
-            let json = serde_json::from_str::<serde_json::Value>(&body).ok();
-            let text = |field: &str| {
-                json.as_ref()
-                    .and_then(|json| json.get(field))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            };
-            return Ok(PublishPreflightVerdict::Refused {
-                status: status.as_u16(),
-                code: text("code"),
-                error: text("error").unwrap_or_else(|| format!("HTTP {status}")),
-                body,
+        let response = match answer {
+            Answered::Success(response) => response,
+            Answered::Failed(FailedResponse {
+                status,
                 retry_after_secs,
-            });
-        }
+                body,
+            }) => {
+                let json = serde_json::from_str::<serde_json::Value>(&body).ok();
+                let text = |field: &str| {
+                    json.as_ref()
+                        .and_then(|json| json.get(field))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                };
+                let error = text("error").unwrap_or_else(|| {
+                    let status = reqwest::StatusCode::from_u16(status)
+                        .map_or_else(|_| status.to_string(), |status| status.to_string());
+                    format!("HTTP {status}")
+                });
+                return Ok(PublishPreflightVerdict::Refused {
+                    status,
+                    code: text("code"),
+                    error,
+                    body,
+                    retry_after_secs,
+                });
+            }
+        };
         let response: PublishPreflightResponse =
             parse_capped_api_json(response, "publish preflight response").await?;
         if !response.success {

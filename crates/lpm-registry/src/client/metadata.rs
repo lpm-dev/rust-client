@@ -812,7 +812,8 @@ impl RegistryClient {
                 &provider,
                 super::transport::FailedAnswer::Error,
             )
-            .await?;
+            .await
+            .and_then(super::transport::Answered::into_response)?;
         crate::timing::record_metadata_http_version(response.version());
         Ok(response)
     }

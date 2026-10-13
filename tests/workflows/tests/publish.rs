@@ -700,6 +700,43 @@ async fn publish_dry_run_reports_what_lpm_dev_refuses() {
 }
 
 #[tokio::test]
+async fn publish_redacts_lpm_dev_s_reflection_of_its_bearer_from_a_refusal() {
+    let token = "test-token-123";
+    let mock = MockRegistry::start().await;
+    mount_preflight(
+        &mock,
+        403,
+        serde_json::json!({ "error": format!("Bearer {token} may not publish") }),
+    )
+    .await;
+    let project = lpm_and_npm_project("reflected", &mock.url());
+
+    for json in [true, false] {
+        let mut command = lpm_with_registry(&project, &mock.url());
+        if json {
+            command.arg("--json");
+        }
+        let output = command
+            .env("LPM_RETRY_BACKOFF_MS_OVERRIDE", "0")
+            .args(["publish", "--yes", "--token", token, "--lpm", "--npm"])
+            .output()
+            .expect("run publish");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stdout}");
+        assert!(
+            !stdout.contains(token) && !stderr.contains(token),
+            "bearer leaked (json: {json})\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            format!("{stdout}{stderr}").contains("Bearer <redacted> may not publish"),
+            "json: {json}\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn publish_dry_run_with_authored_skills_leaves_project_files_unchanged() {
     let mock = MockRegistry::start().await;
     let project = authored_skills_project("@lpm.dev/testuser.read-only-dry-run");
