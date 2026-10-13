@@ -1504,7 +1504,10 @@ fn tunnel_inspect_reports_a_capture_database_it_cant_open_as_a_disk_error_under_
     assert!(
         envelope["error"]
             .as_str()
-            .is_some_and(|message| message.contains("move it aside and retry")),
+            .is_some_and(|message| message.ends_with(
+                "move it aside together with any inspector.db-wal, inspector.db-shm and \
+                 inspector.db-journal beside it, and retry"
+            )),
         "{envelope}"
     );
 }
@@ -1750,7 +1753,10 @@ fn tunnel_inspect_reports_an_actionable_corrupt_database_error() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(rendered.contains(".lpm/inspector.db"));
-    assert!(rendered.contains("move it aside and retry"));
+    assert!(rendered.contains(
+        "move it aside together with any inspector.db-wal, inspector.db-shm and \
+         inspector.db-journal beside it, and retry"
+    ));
     assert!(
         !rendered.contains("network connection"),
         "a local database error isn't a network one:\n{rendered}"
