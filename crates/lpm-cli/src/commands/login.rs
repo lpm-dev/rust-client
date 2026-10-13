@@ -292,10 +292,16 @@ async fn exchange_authorization_code(
 /// The wait a response's `Retry-After` asks, in whole seconds, or a second
 /// when it names none, at most `EXCHANGE_RETRY_MAX_WAIT`.
 fn exchange_retry_wait(response: &reqwest::Response) -> std::time::Duration {
-    response
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
+    retry_after_wait(
+        response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+    )
+}
+
+fn retry_after_wait(retry_after: Option<&str>) -> std::time::Duration {
+    retry_after
         .and_then(|value| value.trim().parse::<u64>().ok())
         .map_or(
             std::time::Duration::from_secs(1),
@@ -895,7 +901,25 @@ mod tests {
                 .contains("The sign-in can't be completed right now"),
             "{error}"
         );
+        assert!(
+            error.to_string().contains("Run `lpm login` again."),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("expired"), "{error}");
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn exchange_waits_what_retry_after_asks_within_its_cap() {
+        let second = std::time::Duration::from_secs(1);
+        assert_eq!(retry_after_wait(Some("0")), std::time::Duration::ZERO);
+        assert_eq!(retry_after_wait(Some(" 2 ")), 2 * second);
+        assert_eq!(retry_after_wait(Some("3600")), EXCHANGE_RETRY_MAX_WAIT);
+        assert_eq!(
+            retry_after_wait(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            second
+        );
+        assert_eq!(retry_after_wait(None), second);
     }
 
     #[tokio::test]
