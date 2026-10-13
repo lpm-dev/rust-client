@@ -892,7 +892,8 @@ impl CaptureStore {
 }
 
 /// Capture files a git query listed as tracked, and as neither tracked nor
-/// ignored, by name relative to the directory it was asked in.
+/// ignored, by name relative to the directory it was asked in, or to its
+/// repository's top with `--full-name`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct CaptureGitFiles {
     tracked: Vec<String>,
@@ -947,19 +948,45 @@ const CAPTURE_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// Why git didn't say how it treats the capture files.
 #[derive(Debug, PartialEq, Eq)]
 enum CaptureGitFailure {
-    /// Git ran and refused, as outside a repository, or for one it won't use.
+    /// Git ran and found no repository it would use there.
+    NoRepository,
+    /// Git ran and refused, for a repository it won't use, such as one
+    /// another user owns.
     Refused,
     /// Git couldn't be run, or didn't answer in time.
     Unavailable,
 }
 
+/// What git says, with `LC_ALL=C`, where it finds no repository: none at
+/// all, none before a filesystem boundary, or a `.git` file that doesn't
+/// point at one, which no git command there gets past.
+const NO_REPOSITORY_MESSAGES: [&str; 3] = [
+    "not a git repository",
+    "invalid gitfile format",
+    "no path in gitfile",
+];
+
+fn capture_git_failure(stderr: &[u8]) -> CaptureGitFailure {
+    let message = String::from_utf8_lossy(stderr);
+    if NO_REPOSITORY_MESSAGES
+        .iter()
+        .any(|pattern| message.contains(pattern))
+    {
+        CaptureGitFailure::NoRepository
+    } else {
+        CaptureGitFailure::Refused
+    }
+}
+
 /// A git query of the capture files: the directory it runs in, its
-/// pathspec, and whether it lists files neither tracked nor ignored too.
+/// pathspec, whether it lists files neither tracked nor ignored too, and
+/// whether it names them from their repository's top.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CaptureGitQuery {
     directory: PathBuf,
     pathspec: &'static str,
     unignored: bool,
+    full_name: bool,
 }
 
 /// How git treats the capture files in `project_dir`, matching their names
@@ -968,9 +995,11 @@ struct CaptureGitQuery {
 /// whatever the case of their directory; and git in `.lpm`, for those
 /// neither tracked nor ignored there, and for those a repository of `.lpm`'s
 /// own tracks, such as a submodule, whose files the project's index doesn't
-/// list. What one query confirms stands when the other doesn't answer in
-/// time. None when neither answers: neither is a repository, git can't be
-/// run, or it doesn't answer in time.
+/// list. Git names the files in `.lpm` from their repository's top, so a
+/// name without a directory is one a repository of `.lpm`'s own tracks.
+/// What one query confirms stands when the other doesn't answer in time.
+/// None when neither answers: neither is a repository, git can't be run, or
+/// it doesn't answer in time.
 async fn capture_git_state(project_dir: &Path) -> Option<CaptureGitState> {
     capture_git_state_by(project_dir, |query| {
         capture_git_output(capture_git_command(&query), CAPTURE_GIT_TIMEOUT)
@@ -985,22 +1014,20 @@ where
 {
     let lpm_dir = project_dir.join(".lpm");
     let lpm_exists = lpm_dir.is_dir();
-    let own_repository = marks_a_repository(&lpm_dir.join(".git"));
-    let in_repository = project_dir
-        .ancestors()
-        .any(|directory| marks_a_repository(&directory.join(".git")));
     let project = ask(CaptureGitQuery {
         directory: project_dir.to_path_buf(),
         pathspec: PROJECT_CAPTURES_PATHSPEC,
         unignored: false,
+        full_name: false,
     });
     let inside = async {
         if lpm_exists {
             Some(
                 ask(CaptureGitQuery {
-                    directory: lpm_dir,
+                    directory: lpm_dir.clone(),
                     pathspec: CAPTURES_PATHSPEC,
                     unignored: true,
+                    full_name: true,
                 })
                 .await,
             )
@@ -1011,14 +1038,22 @@ where
     let (project, inside) = tokio::join!(project, inside);
 
     let mut state = CaptureGitState::default();
+    // Whether git found a repository the project is in; only where git
+    // didn't run or answer is that read from the `.git` entries.
+    let in_repository = match &project {
+        Ok(_) | Err(CaptureGitFailure::Refused) => true,
+        Err(CaptureGitFailure::NoRepository) => false,
+        Err(CaptureGitFailure::Unavailable) => project_dir
+            .ancestors()
+            .any(|directory| marks_a_repository(&directory.join(".git"))),
+    };
     let project_answered = match project {
         Ok(files) => {
             state.project_tracked = files.tracked;
             true
         }
         // In a repository, a query that fails is no answer, git refusing
-        // included, as for one another user owns, run as root; outside one,
-        // there's nothing to ask.
+        // included, as for one another user owns, run as root.
         Err(_) if in_repository => {
             state.unanswered.push(CaptureRepository::Project);
             false
@@ -1027,21 +1062,36 @@ where
     };
     let inside_answered = match inside {
         Some(Ok(files)) => {
-            // Without a repository of its own, git in `.lpm` lists the
-            // project's tracked files, which the project's query has when
-            // it answers; when it doesn't, they're what's known of them.
-            if own_repository {
-                state.lpm_tracked = files.tracked;
-            } else if !project_answered {
-                state.project_tracked = files
-                    .tracked
-                    .into_iter()
-                    .map(|name| format!(".lpm/{name}"))
+            let (own, project_files): (Vec<String>, Vec<String>) = files
+                .tracked
+                .into_iter()
+                .partition(|name| !name.contains('/'));
+            state.lpm_tracked = own;
+            // Git in `.lpm` lists what the project's repository tracks
+            // there, which the project's query has when it answers; when it
+            // doesn't, they're what's known of them.
+            if !project_answered {
+                state.project_tracked = project_files
+                    .iter()
+                    .map(|name| format!(".lpm/{}", file_name(name)))
                     .collect();
                 state.project_spelling_unknown = !state.project_tracked.is_empty();
             }
-            state.unignored = files.unignored;
+            state.unignored = files
+                .unignored
+                .iter()
+                .map(|name| file_name(name).to_owned())
+                .collect();
             true
+        }
+        // Git in `.lpm` stopped short of the project's repository, as at a
+        // filesystem boundary, so whether it ignores the files there isn't
+        // known.
+        Some(Err(CaptureGitFailure::NoRepository)) => {
+            if in_repository {
+                state.unanswered.push(CaptureRepository::Lpm);
+            }
+            false
         }
         Some(Err(CaptureGitFailure::Refused)) => {
             state.lpm_unasked = true;
@@ -1053,20 +1103,27 @@ where
         }
         None => false,
     };
+    let own_repository = lpm_exists && marks_a_repository(&lpm_dir.join(".git"));
     (project_answered || inside_answered || in_repository || own_repository).then_some(state)
 }
 
-/// Whether a `.git` entry makes its directory a repository's: a directory,
-/// or a file pointing at one (`gitdir: …`). An empty or other file doesn't,
-/// as git doesn't take it for one.
+/// The part of a name git lists after its last directory.
+fn file_name(name: &str) -> &str {
+    name.rsplit_once('/').map_or(name, |(_, file)| file)
+}
+
+/// Whether a `.git` entry looks like a repository's, for when git itself
+/// can't be asked: a directory, or a link to one, holding `HEAD`, or a file
+/// pointing at one as git writes it (`gitdir: …`). An empty directory or
+/// another file doesn't, as git looks past them.
 fn marks_a_repository(git: &Path) -> bool {
-    match std::fs::symlink_metadata(git) {
-        Ok(metadata) if metadata.is_dir() => true,
+    match std::fs::metadata(git) {
+        Ok(metadata) if metadata.is_dir() => git.join("HEAD").is_file(),
         Ok(metadata) if metadata.is_file() => {
-            let mut start = [0_u8; 7];
+            let mut start = [0_u8; 8];
             lpm_common::open_nofollow(git)
                 .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut start))
-                .is_ok_and(|()| &start == b"gitdir:")
+                .is_ok_and(|()| &start == b"gitdir: ")
         }
         _ => false,
     }
@@ -1076,6 +1133,9 @@ fn capture_git_command(query: &CaptureGitQuery) -> tokio::process::Command {
     let mut args = vec!["ls-files", "-z", "-t", "--cached"];
     if query.unignored {
         args.extend(["--others", "--exclude-standard"]);
+    }
+    if query.full_name {
+        args.push("--full-name");
     }
     args.extend(["--", query.pathspec]);
     tokio::process::Command::from(crate::commands::npmrc::hardened_git_command(
@@ -1093,14 +1153,14 @@ async fn capture_git_output(
 ) -> Result<CaptureGitFiles, CaptureGitFailure> {
     command
         .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     let output = tokio::time::timeout(timeout, command.output())
         .await
         .map_err(|_| CaptureGitFailure::Unavailable)?
         .map_err(|_| CaptureGitFailure::Unavailable)?;
     if !output.status.success() {
-        return Err(CaptureGitFailure::Refused);
+        return Err(capture_git_failure(&output.stderr));
     }
     Ok(parse_capture_git_files(&output.stdout))
 }
@@ -2519,6 +2579,36 @@ mod tests {
         assert!(!state.kept_out());
     }
 
+    #[tokio::test]
+    async fn lists_a_capture_once_when_lpm_holds_an_empty_git_directory() {
+        let project = capture_project(&[".lpm/inspector.db"]);
+        git(project.path(), &["add", ".lpm/inspector.db"]);
+        std::fs::create_dir(project.path().join(".lpm/.git")).unwrap();
+
+        let state = capture_git_state(project.path()).await.unwrap();
+
+        assert_eq!(state.project_tracked, names(&[".lpm/inspector.db"]));
+        assert!(state.lpm_tracked.is_empty(), "{state:?}");
+        assert!(state.unanswered.is_empty(), "{state:?}");
+    }
+
+    #[tokio::test]
+    async fn says_nothing_of_git_entries_git_takes_for_no_repository() {
+        for entry in ["empty directory", "gitdir:../elsewhere/.git\n"] {
+            let project = tempfile::tempdir().unwrap();
+            std::fs::create_dir(project.path().join(".lpm")).unwrap();
+            std::fs::write(project.path().join(".lpm/inspector.db"), b"x").unwrap();
+            let git_entry = project.path().join(".git");
+            if entry == "empty directory" {
+                std::fs::create_dir(&git_entry).unwrap();
+            } else {
+                std::fs::write(&git_entry, entry).unwrap();
+            }
+
+            assert_eq!(capture_git_state(project.path()).await, None, "{entry:?}");
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn says_when_git_refuses_to_answer_for_lpm() {
@@ -2587,7 +2677,11 @@ mod tests {
         .unwrap();
         std::fs::write(web.join(".lpm/inspector.db"), b"x").unwrap();
 
-        assert_eq!(capture_git_state(&web).await, None);
+        // Git without `safe.bareRepository=explicit` would use it, so its
+        // refusal here leaves the files unconfirmed.
+        let state = capture_git_state(&web).await.unwrap();
+        assert_eq!(state.unanswered, vec![CaptureRepository::Project]);
+        assert!(state.lpm_unasked);
         assert!(!marker.exists());
     }
 
@@ -2633,7 +2727,7 @@ mod tests {
         let (state, mut asked) = state_from_answers(
             project.path(),
             Ok(files(&[".lpm/inspector.db"], &[])),
-            Ok(files(&["inspector.db"], &["inspector.db-wal"])),
+            Ok(files(&[".lpm/inspector.db"], &[".lpm/inspector.db-wal"])),
         )
         .await;
 
@@ -2645,16 +2739,18 @@ mod tests {
                     directory: project.path().to_path_buf(),
                     pathspec: PROJECT_CAPTURES_PATHSPEC,
                     unignored: false,
+                    full_name: false,
                 },
                 CaptureGitQuery {
                     directory: lpm_dir,
                     pathspec: CAPTURES_PATHSPEC,
                     unignored: true,
+                    full_name: true,
                 },
             ]
         );
-        // Without a repository of `.lpm`'s own, git there lists the
-        // project's files, which the project's query has.
+        // Git in `.lpm` names the project's files from its top, and the
+        // project's query has them.
         assert_eq!(
             state,
             Some(CaptureGitState {
@@ -2676,7 +2772,7 @@ mod tests {
         let (state, _) = state_from_answers(
             project.path(),
             Ok(files(&[".LPM/inspector.db"], &[])),
-            Ok(files(&["inspector.db"], &[])),
+            Ok(files(&[".LPM/inspector.db"], &[])),
         )
         .await;
 
@@ -2689,16 +2785,20 @@ mod tests {
     #[tokio::test]
     async fn counts_what_a_repository_of_lpm_s_own_tracks() {
         let project = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(project.path().join(".lpm/.git")).unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
 
         let (state, _) = state_from_answers(
             project.path(),
-            Err(CaptureGitFailure::Refused),
-            Ok(files(&["inspector.db"], &[])),
+            Err(CaptureGitFailure::NoRepository),
+            Ok(files(&["inspector.db"], &["inspector.db-wal"])),
         )
         .await;
 
-        assert_eq!(state.unwrap().lpm_tracked, names(&["inspector.db"]));
+        let state = state.unwrap();
+        assert_eq!(state.lpm_tracked, names(&["inspector.db"]));
+        assert!(state.project_tracked.is_empty());
+        assert_eq!(state.unignored, names(&["inspector.db-wal"]));
+        assert!(state.unanswered.is_empty());
     }
 
     #[tokio::test]
@@ -2712,11 +2812,15 @@ mod tests {
                 Err(CaptureGitFailure::Unavailable),
             ),
             (
-                Err(CaptureGitFailure::Refused),
+                Err(CaptureGitFailure::NoRepository),
                 Err(CaptureGitFailure::Unavailable),
             ),
             (
-                Err(CaptureGitFailure::Refused),
+                Err(CaptureGitFailure::NoRepository),
+                Err(CaptureGitFailure::NoRepository),
+            ),
+            (
+                Err(CaptureGitFailure::NoRepository),
                 Err(CaptureGitFailure::Refused),
             ),
         ] {
@@ -2741,11 +2845,11 @@ mod tests {
     #[tokio::test]
     async fn names_lpm_s_own_repository_when_git_there_doesn_t_answer() {
         let project = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(project.path().join(".lpm/.git")).unwrap();
+        repository_entry(&project.path().join(".lpm"));
 
         let (state, _) = state_from_answers(
             project.path(),
-            Err(CaptureGitFailure::Refused),
+            Err(CaptureGitFailure::NoRepository),
             Err(CaptureGitFailure::Unavailable),
         )
         .await;
@@ -2764,7 +2868,7 @@ mod tests {
     #[tokio::test]
     async fn names_each_query_a_repository_leaves_unanswered_even_when_neither_answers() {
         let project = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(project.path().join(".git")).unwrap();
+        repository_entry(project.path());
         std::fs::create_dir(project.path().join(".lpm")).unwrap();
 
         // As for a repository another user owns, run as root.
@@ -2808,13 +2912,14 @@ mod tests {
     #[tokio::test]
     async fn takes_a_project_inside_a_repository_s_subdirectory_as_in_that_repository() {
         let repository = tempfile::tempdir().unwrap();
-        std::fs::create_dir(repository.path().join(".git")).unwrap();
+        repository_entry(repository.path());
         let project = repository.path().join("packages/app");
         std::fs::create_dir_all(project.join(".lpm")).unwrap();
 
+        // Git didn't run, so the `.git` entries are what's known.
         let (state, _) = state_from_answers(
             &project,
-            Err(CaptureGitFailure::Refused),
+            Err(CaptureGitFailure::Unavailable),
             Err(CaptureGitFailure::Refused),
         )
         .await;
@@ -2823,39 +2928,130 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn takes_lpm_s_git_entry_for_a_repository_only_as_git_does() {
+    async fn takes_whose_index_a_capture_is_in_from_the_name_git_gives_it() {
         let project = tempfile::tempdir().unwrap();
-        std::fs::create_dir(project.path().join(".lpm")).unwrap();
-        let git = project.path().join(".lpm/.git");
+        // Git looks past an empty `.git` directory, whatever it holds.
+        std::fs::create_dir_all(project.path().join(".lpm/.git")).unwrap();
 
-        for (contents, own) in [
-            ("", false),
-            ("not a pointer\n", false),
-            ("gitdir: ../../elsewhere/.git\n", true),
+        for (listed, own) in [
+            ("inspector.db", true),
+            (".lpm/inspector.db", false),
+            ("apps/web/.lpm/inspector.db", false),
         ] {
-            std::fs::write(&git, contents).unwrap();
             let (state, _) = state_from_answers(
                 project.path(),
                 Err(CaptureGitFailure::Unavailable),
-                Ok(files(&["inspector.db"], &[])),
+                Ok(files(&[listed], &[])),
             )
             .await;
             let state = state.unwrap();
+            let (lpm_tracked, project_tracked) = if own {
+                (names(&["inspector.db"]), Vec::new())
+            } else {
+                (Vec::new(), names(&[".lpm/inspector.db"]))
+            };
             assert_eq!(
-                (
-                    state.lpm_tracked.is_empty(),
-                    state.project_tracked.is_empty()
-                ),
-                (!own, own),
-                "{contents:?}: {state:?}"
+                (state.lpm_tracked, state.project_tracked),
+                (lpm_tracked, project_tracked),
+                "{listed}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn names_lpm_unanswered_where_git_there_stops_short_of_the_project_s_repository() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+
+        // As at a filesystem boundary between the project and `.lpm`.
+        let (state, _) = state_from_answers(
+            project.path(),
+            Ok(CaptureGitFiles::default()),
+            Err(CaptureGitFailure::NoRepository),
+        )
+        .await;
+
+        let state = state.unwrap();
+        assert_eq!(state.unanswered, vec![CaptureRepository::Lpm]);
+        assert!(!state.lpm_unasked);
+        assert!(!state.kept_out());
+    }
+
+    /// Makes `directory/.git` as `git init` leaves its `HEAD`.
+    fn repository_entry(directory: &Path) {
+        std::fs::create_dir_all(directory.join(".git")).unwrap();
+        std::fs::write(directory.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
+    #[test]
+    fn takes_a_git_entry_for_a_repository_s_only_as_git_would() {
+        let directory = tempfile::tempdir().unwrap();
+        let git = directory.path().join(".git");
+
+        for (contents, repository) in [
+            ("", false),
+            ("not a pointer\n", false),
+            ("gitdir:../elsewhere/.git\n", false),
+            ("gitdir: ../elsewhere/.git\n", true),
+        ] {
+            std::fs::write(&git, contents).unwrap();
+            assert_eq!(marks_a_repository(&git), repository, "{contents:?}");
+        }
+        std::fs::remove_file(&git).unwrap();
+
+        std::fs::create_dir(&git).unwrap();
+        assert!(!marks_a_repository(&git));
+        repository_entry(directory.path());
+        assert!(marks_a_repository(&git));
+
+        #[cfg(unix)]
+        {
+            let linked = directory.path().join("linked");
+            std::fs::create_dir(&linked).unwrap();
+            std::os::unix::fs::symlink(&git, linked.join(".git")).unwrap();
+            assert!(marks_a_repository(&linked.join(".git")));
+        }
+        assert!(!marks_a_repository(&directory.path().join("gone/.git")));
+    }
+
+    #[test]
+    fn reads_git_s_failure_as_no_repository_only_where_it_says_so() {
+        for (stderr, failure) in [
+            (
+                "fatal: not a git repository (or any of the parent directories): .git\n",
+                CaptureGitFailure::NoRepository,
+            ),
+            (
+                "fatal: not a git repository (or any parent up to mount point /mnt)\n\
+                 Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n",
+                CaptureGitFailure::NoRepository,
+            ),
+            (
+                "fatal: invalid gitfile format: /work/app/.git\n",
+                CaptureGitFailure::NoRepository,
+            ),
+            (
+                "fatal: no path in gitfile: /work/app/.git\n",
+                CaptureGitFailure::NoRepository,
+            ),
+            (
+                "fatal: detected dubious ownership in repository at '/work/app'\n",
+                CaptureGitFailure::Refused,
+            ),
+            (
+                "fatal: cannot use bare repository '/work/app' (safe.bareRepository is 'explicit')\n",
+                CaptureGitFailure::Refused,
+            ),
+            ("", CaptureGitFailure::Refused),
+        ] {
+            assert_eq!(capture_git_failure(stderr.as_bytes()), failure, "{stderr}");
         }
     }
 
     #[tokio::test]
     async fn keeps_what_one_query_confirms_when_the_other_doesn_t_answer_in_time() {
         let project = tempfile::tempdir().unwrap();
-        std::fs::create_dir(project.path().join(".git")).unwrap();
+        repository_entry(project.path());
         std::fs::create_dir(project.path().join(".lpm")).unwrap();
 
         let (tracked, _) = state_from_answers(
@@ -2900,13 +3096,13 @@ mod tests {
     #[tokio::test]
     async fn reports_what_git_in_lpm_finds_tracked_when_the_project_s_query_doesn_t_answer() {
         let project = tempfile::tempdir().unwrap();
-        std::fs::create_dir(project.path().join(".git")).unwrap();
+        repository_entry(project.path());
         std::fs::create_dir(project.path().join(".lpm")).unwrap();
 
         let (state, _) = state_from_answers(
             project.path(),
             Err(CaptureGitFailure::Unavailable),
-            Ok(files(&["inspector.db"], &[])),
+            Ok(files(&[".lpm/inspector.db"], &[])),
         )
         .await;
 
@@ -2926,7 +3122,6 @@ mod tests {
             "{warnings:?}"
         );
 
-        std::fs::create_dir(project.path().join(".lpm/.git")).unwrap();
         let (own, _) = state_from_answers(
             project.path(),
             Err(CaptureGitFailure::Unavailable),

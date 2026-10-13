@@ -329,15 +329,33 @@ pub fn filesystem_available_bytes(path: &std::path::Path) -> Option<u64> {
         }
     }
     let path = CString::new(probe.as_os_str().as_bytes()).ok()?;
-    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: `path` is NUL-terminated and `stats` points to writable,
-    // properly aligned storage that is read only after a successful call.
-    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
-        return None;
-    }
-    // SAFETY: `statvfs` returned success and initialized the output structure.
-    let stats = unsafe { stats.assume_init() };
-    let bytes = u128::from(stats.f_bavail).checked_mul(u128::from(stats.f_frsize))?;
+    // macOS's `statvfs` counts blocks in 32 bits, which can't hold the free
+    // blocks of a volume with more than 16 TiB free; its `statfs` counts in
+    // 64 bits.
+    #[cfg(target_os = "macos")]
+    let bytes = {
+        let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: `path` is NUL-terminated and `stats` points to writable,
+        // properly aligned storage that is read only after a successful call.
+        if unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: `statfs` returned success and initialized the output structure.
+        let stats = unsafe { stats.assume_init() };
+        u128::from(stats.f_bavail).checked_mul(u128::from(stats.f_bsize))?
+    };
+    #[cfg(not(target_os = "macos"))]
+    let bytes = {
+        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: `path` is NUL-terminated and `stats` points to writable,
+        // properly aligned storage that is read only after a successful call.
+        if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: `statvfs` returned success and initialized the output structure.
+        let stats = unsafe { stats.assume_init() };
+        u128::from(stats.f_bavail).checked_mul(u128::from(stats.f_frsize))?
+    };
     u64::try_from(bytes).ok()
 }
 

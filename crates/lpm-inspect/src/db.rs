@@ -100,7 +100,7 @@ impl InspectorDb {
 
         // Write connection (owned by the background flush task)
         let write_conn = open_capture_connection(&db_path, "NORMAL").map_err(damaged(&db_path))?;
-        refuse_unknown_schema(&write_conn, &db_path)?;
+        refuse_unknown_schema(&write_conn, &db_path, damaged(&db_path))?;
         init_schema(&write_conn).map_err(damaged(&db_path))?;
 
         // Read connection (shared across API handlers). The busy timeout
@@ -1412,11 +1412,33 @@ fn replace_with_owner_only_copy(db_path: &Path, owner: CaptureOwner) -> Result<b
 }
 
 /// Checks a database others could open, and copies it into the owner-only
-/// file made for the copy.
+/// file made for the copy. The check's connection makes the WAL sidecars
+/// where there are none. Those are its own, as the opening lock keeps other
+/// LPM processes out and a connection already open would have made them, so
+/// a check that fails removes them, leaving the files as it found them.
 fn copy_checked_database(db_path: &Path, copy_path: &Path) -> Result<(), OpenError> {
     ensure_room_to_copy(db_path)?;
+    let made_by_check: Vec<PathBuf> = ["-wal", "-shm"]
+        .into_iter()
+        .map(|suffix| capture_file(db_path, suffix))
+        .filter(|sidecar| {
+            matches!(sidecar.symlink_metadata(), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        })
+        .collect();
+    let copied = check_then_copy(db_path, copy_path);
+    if copied.is_err() {
+        for sidecar in &made_by_check {
+            if let Err(error) = remove_if_present(sidecar) {
+                tracing::warn!("could not remove {}: {error}", sidecar.display());
+            }
+        }
+    }
+    copied
+}
+
+fn check_then_copy(db_path: &Path, copy_path: &Path) -> Result<(), OpenError> {
     let database = open_nofollow_connection(db_path).map_err(checking(db_path))?;
-    refuse_unknown_schema(&database, db_path)?;
+    refuse_unknown_schema(&database, db_path, checking(db_path))?;
     // In WAL, which every LPM connection uses, leaving it needs the only
     // connection, so it proves no other LPM process has the database open,
     // and folds the WAL into the file.
@@ -1436,7 +1458,7 @@ fn copy_checked_database(db_path: &Path, copy_path: &Path) -> Result<(), OpenErr
 /// room, and any other failure as [`damaged`] does.
 fn checking(db_path: &Path) -> impl Fn(rusqlite::Error) -> OpenError + '_ {
     move |error| {
-        if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) {
+        if out_of_room(&error) {
             no_room_to_copy(db_path)
         } else {
             damaged(db_path)(error)
@@ -1444,20 +1466,38 @@ fn checking(db_path: &Path) -> impl Fn(rusqlite::Error) -> OpenError + '_ {
     }
 }
 
-/// The room SQLite's shared-memory file takes as the check opens the
-/// database.
-const SHARED_MEMORY_ROOM: u64 = 64 * 1024;
+/// Whether SQLite failed for want of disk space: a full disk, or a
+/// shared-memory file it couldn't grow, which is how a disk with less free
+/// than the file's next 32 KiB fails an open.
+fn out_of_room(error: &rusqlite::Error) -> bool {
+    match error {
+        rusqlite::Error::SqliteFailure(failure, _) => {
+            failure.code == rusqlite::ErrorCode::DiskFull
+                || failure.extended_code == rusqlite::ffi::SQLITE_IOERR_SHMSIZE
+        }
+        _ => false,
+    }
+}
 
-/// The free space replacing a database takes: the copy, which holds the
-/// database with its WAL folded in; the database's own growth, as leaving
-/// WAL folds the WAL into it; and SQLite's shared-memory file.
+/// The room SQLite's shared-memory file takes while the check reads a
+/// database with `wal` bytes of WAL: 32 KiB for about every 4,096 frames,
+/// about 1/512 of the WAL, and a region more for rounding.
+fn shared_memory_room(wal: u64) -> u64 {
+    (64 * 1024u64).saturating_add(wal / 512)
+}
+
+/// The free space replacing a database takes. Leaving WAL folds the WAL into
+/// the database, which grows by the WAL at most while the shared-memory file
+/// is open; then the WAL and that file are removed, and the copy takes the
+/// grown database's size. So it never takes more than the database and its
+/// WAL, with the shared-memory file on top.
 fn room_to_copy(db_path: &Path) -> Option<u64> {
     let database = std::fs::metadata(db_path).ok()?.len();
     let wal = std::fs::metadata(capture_file(db_path, "-wal")).map_or(0, |wal| wal.len());
     Some(
         database
-            .saturating_add(wal.saturating_mul(2))
-            .saturating_add(SHARED_MEMORY_ROOM),
+            .saturating_add(wal)
+            .saturating_add(shared_memory_room(wal)),
     )
 }
 
@@ -1503,9 +1543,7 @@ fn copy_database(database: &Connection, copy_path: &Path, db_path: &Path) -> Res
     match backup.step(-1) {
         Ok(rusqlite::backup::StepResult::Done) => Ok(()),
         Ok(_) => Err(in_use(db_path)),
-        Err(error) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) => {
-            Err(no_room_to_copy(db_path))
-        }
+        Err(error) if out_of_room(&error) => Err(no_room_to_copy(db_path)),
         Err(error) => Err(damaged(db_path)(error)),
     }
 }
@@ -1640,8 +1678,10 @@ type SchemaObject = (String, String, String, Option<String>);
 /// two tokens that would otherwise read as one (`< =` and `<=`). Quoted
 /// text, a string or a quoted name, and comments are kept as written, a
 /// line comment with the newline that ends it. Whitespace is SQLite's own:
-/// ASCII space, tab, newline, form feed and carriage return. So text whose
-/// tokens differ for SQLite can't read the same here.
+/// ASCII space, tab, newline, form feed and carriage return. So schema text
+/// whose tokens differ for SQLite can't read the same here. Only a
+/// parameter's Tcl form takes a parenthesis into its token (`$x(y)` against
+/// `$x (y)`), and SQLite allows no parameter in a schema.
 fn canonical_sql(sql: &str) -> String {
     let separates = |character: char| matches!(character, '(' | ')' | ',');
     let mut canonical = String::with_capacity(sql.len());
@@ -1723,10 +1763,14 @@ fn lpm_schema() -> Result<std::collections::HashSet<SchemaObject>, rusqlite::Err
 /// a repository or another tool could otherwise run code of its own on
 /// every capture written: a trigger, or a check, default, generated column
 /// or index expression that's slow by design.
-fn refuse_unknown_schema(connection: &Connection, db_path: &Path) -> Result<(), OpenError> {
+fn refuse_unknown_schema(
+    connection: &Connection,
+    db_path: &Path,
+    failed: impl Fn(rusqlite::Error) -> OpenError,
+) -> Result<(), OpenError> {
     let known = lpm_schema()?;
     let unknown: Vec<String> = schema_objects(connection)
-        .map_err(damaged(db_path))?
+        .map_err(failed)?
         .into_iter()
         .filter(|object| !known.contains(object))
         .map(|(kind, name, _, _)| format!("{kind} {}", lpm_common::sanitize_terminal_inline(&name)))
@@ -2922,6 +2966,10 @@ mod tests {
         // Leaving WAL tells at once; the copy's own wait is the busy timeout.
         assert!(started.elapsed() < std::time::Duration::from_secs(4));
         assert_eq!(mode(&db_path), 0o644);
+        // The open connection's WAL files aren't the refused check's to remove.
+        for suffix in ["-wal", "-shm"] {
+            assert!(capture_file(&db_path, suffix).exists(), "{suffix} removed");
+        }
         drop(other);
         runtime.block_on(async { drop(InspectorDb::open(project.path()).unwrap()) });
         assert_eq!(mode(&db_path), 0o600);
@@ -3253,6 +3301,52 @@ mod tests {
         });
         assert!(kept.is_some());
         assert_eq!(mode(&db_path), 0o600);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_disk_too_full_for_the_check_s_shared_memory_says_how_much_room_the_copy_needs() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let attached = attach_image(directory.path(), "4m", true);
+        let project = attached.0.join("project");
+        std::fs::create_dir(&project).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let db = InspectorDb::open(&project).unwrap();
+            db.insert_durable_request(Arc::new(make_webhook("kept", 200)), None)
+                .await
+                .unwrap();
+        });
+        drop(runtime);
+        let db_path = project.join(".lpm/inspector.db");
+        set_mode(&db_path, 0o644);
+        // Room for the copy's empty file, but not for SQLite's first 32 KiB
+        // of shared memory, which the check's first read sizes.
+        let mut filler = std::fs::File::create(attached.0.join("filler")).unwrap();
+        while filler.write_all(&[0; 4096]).is_ok() {}
+        let filled = filler.metadata().unwrap().len();
+        filler.set_len(filled - 8 * 1024).unwrap();
+        drop(filler);
+
+        AVAILABLE_BYTES.set(Some(u64::MAX));
+        let full = InspectorDb::open(&project).map(drop);
+        AVAILABLE_BYTES.set(None);
+
+        let error = full.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull, "{error}");
+        assert!(error.to_string().contains("free on its disk"), "{error}");
+        assert_eq!(mode(&db_path), 0o644);
+        for suffix in ["-copy", "-wal", "-shm"] {
+            assert!(
+                !capture_file(&db_path, suffix).exists(),
+                "{suffix} left behind"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -3866,16 +3960,17 @@ mod tests {
     }
 
     #[test]
-    fn the_room_a_replacement_needs_counts_the_wal_twice() {
+    fn the_room_a_replacement_needs_counts_the_wal_once_with_its_shared_memory() {
         let directory = tempfile::tempdir().unwrap();
         let db_path = directory.path().join("inspector.db");
         std::fs::write(&db_path, vec![0; 10_000]).unwrap();
-        assert_eq!(room_to_copy(&db_path), Some(10_000 + SHARED_MEMORY_ROOM));
+        assert_eq!(room_to_copy(&db_path), Some(10_000 + 64 * 1024));
 
-        std::fs::write(capture_file(&db_path, "-wal"), vec![0; 3_000]).unwrap();
+        let wal = std::fs::File::create(capture_file(&db_path, "-wal")).unwrap();
+        wal.set_len(512 * 1024 * 1024).unwrap();
         assert_eq!(
             room_to_copy(&db_path),
-            Some(10_000 + 6_000 + SHARED_MEMORY_ROOM)
+            Some(10_000 + 512 * 1024 * 1024 + 64 * 1024 + 1024 * 1024)
         );
         std::fs::remove_file(&db_path).unwrap();
         assert_eq!(room_to_copy(&db_path), None);
