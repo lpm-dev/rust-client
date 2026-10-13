@@ -106,13 +106,16 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
         let storage = lpm_common::format_bytes(usage.storage_bytes);
         // What publishing does past the limit, as the Registry's publish
         // gate decides it. A Registry that doesn't say still refuses the
-        // free plan's storage past its limit; nothing is claimed of others.
-        let storage_overage = user.storage_overage.as_deref().or_else(|| {
-            user.plan_tier
+        // free plan's storage past its limit, but without saying how much
+        // of it counts: packages whose sales exempt them don't, so only
+        // that the refusal comes at the limit is claimed. Nothing is claimed
+        // of other plans.
+        let free_plan_unstated = user.storage_overage.is_none()
+            && user
+                .plan_tier
                 .as_deref()
-                .is_some_and(|tier| tier.eq_ignore_ascii_case("free"))
-                .then_some("blocked")
-        });
+                .is_some_and(|tier| tier.eq_ignore_ascii_case("free"));
+        let storage_overage = user.storage_overage.as_deref();
         let on_pro = user
             .plan_tier
             .as_deref()
@@ -126,7 +129,8 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
             // Storage
             if let Some(limit_bytes) = limits.storage_bytes {
                 // The free plan's limit leaves out the storage of packages
-                // whose sales exempt them, as publishing does.
+                // whose sales exempt them, as publishing does; a Registry
+                // that doesn't say how much counts is shown all of it.
                 let counted = usage
                     .counted_storage_bytes
                     .unwrap_or(usage.storage_bytes)
@@ -256,7 +260,14 @@ pub async fn run(client: &RegistryClient, json_output: bool) -> Result<(), LpmEr
                     limit
                 ));
             }
-            if storage_refused || packages_full {
+            let storage_may_be_refused = free_plan_unstated && full_storage.is_some();
+            if let (Some(limit), true) = (&full_storage, storage_may_be_refused) {
+                whoami_ui::warn_line(crate::install_ui::terminal_line!(
+                    "Publishing to your personal scope is refused while its storage is at or past {}, apart from packages whose sales exempt them.",
+                    limit.as_str()
+                ));
+            }
+            if storage_refused || storage_may_be_refused || packages_full {
                 whoami_ui::warn("Upgrade your plan: https://lpm.dev/dashboard/settings/billing");
             }
         } else {

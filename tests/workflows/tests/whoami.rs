@@ -500,8 +500,10 @@ async fn whoami_claims_nothing_of_storage_past_its_limit_when_the_registry_doesn
 }
 
 #[tokio::test]
-async fn whoami_tells_a_free_account_past_its_storage_that_publishing_is_restricted_when_the_registry_doesnt_say()
+async fn whoami_tells_a_free_account_past_its_storage_only_where_publishing_stops_when_the_registry_doesnt_say_what_counts()
  {
+    // Packages whose sales exempt them don't count against the limit, and
+    // this Registry doesn't say how much of the storage is theirs.
     let stderr = whoami_stderr(serde_json::json!({
         "username": "testuser",
         "plan_tier": "free",
@@ -511,12 +513,18 @@ async fn whoami_tells_a_free_account_past_its_storage_that_publishing_is_restric
     .await;
 
     assert!(
-        stderr.contains("Storage: 100.01 MiB / 100 MiB")
-            && stderr.contains("(OVER LIMIT)")
+        stderr.contains("storage        100.01 MiB / 100 MiB")
+            && stderr.contains("limit          past the 100 MiB limit")
             && stderr.contains(
-                "Publishing to your personal scope is refused while its storage is at or past 100 MiB."
+                "Publishing to your personal scope is refused while its storage is at or past 100 MiB, apart from packages whose sales exempt them."
             ),
-        "every Registry refuses the free plan's storage past its limit, got:\n{stderr}"
+        "the refusal should be told with what it leaves out, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("OVER LIMIT")
+            && !stderr.contains("over its plan limits")
+            && !stderr.contains("refused while its storage is at or past 100 MiB.\n"),
+        "without the counted storage, the account isn't said to be refused, got:\n{stderr}"
     );
 }
 

@@ -25,7 +25,7 @@ use super::types::{
     LpmPublicationStatus, NpmTargetArtifact, NpmTargetArtifactInput, PublicationWaitResult,
     PublishProject, PublishQualityGateInput, PublishResult, PublishTarget, ResolvedProvenance,
 };
-use super::upload_lpm::{LpmPublishBody, publish_to_lpm, resolve_lpm_otp};
+use super::upload_lpm::{LpmPublishBody, OtpFailure, publish_to_lpm, resolve_lpm_otp};
 use super::version_data::{build_publish_version_data, integrity_to_sha512_hex};
 use super::wait::{DEFAULT_PUBLICATION_WAIT_TIMEOUT, wait_for_lpm_publication_with_oidc};
 use crate::commands::skills::author;
@@ -1645,10 +1645,22 @@ async fn execute_prepared_inner(
     }
 
     // lpm.dev's second factor is settled before any target publishes too,
-    // so one `--json` can't ask for publishes none.
+    // so one `--json` can't ask for publishes none. A version lpm.dev
+    // already has needs none, and an account that can't be read yet is the
+    // LPM target's to read again.
+    let mut lpm_dev_has_the_version = None;
     let otp = if targets_lpm && targets.len() > 1 {
-        refuse_before_any_publish_what_lpm_dev_refuses(client, lpm_source, &version).await?;
-        resolve_lpm_otp(client, otp.as_deref(), json_output, lpm_whoami_cache).await?
+        lpm_dev_has_the_version =
+            refuse_before_any_publish_what_lpm_dev_refuses(client, lpm_source, &version).await?;
+        if lpm_dev_has_the_version.is_some() {
+            otp
+        } else {
+            match resolve_lpm_otp(client, otp.as_deref(), json_output, lpm_whoami_cache).await {
+                Ok(settled) => settled,
+                Err(OtpFailure::AccountUnread(_)) => otp,
+                Err(OtpFailure::Final(error)) => return Err(error),
+            }
+        }
     } else {
         otp
     };
@@ -1675,6 +1687,9 @@ async fn execute_prepared_inner(
             PublishTarget::Lpm => {
                 // Wrap the entire LPM publish path so any error becomes a PublishResult
                 let lpm_result: Result<serde_json::Value, LpmError> = async {
+                    if let Some(refusal) = &lpm_dev_has_the_version {
+                        return Err(LpmError::Registry(refusal.clone()));
+                    }
                     let mut request = lpm_target_request(LpmTargetSource {
                         target_names: &target_names,
                         name: &name,
@@ -2470,32 +2485,39 @@ fn refusal_stops_every_target(status: u16, code: Option<&str>, error: &str, vers
 
 /// Stops a publish to more than one target before any publishes when
 /// lpm.dev refuses it for good, so the other targets don't publish a version
-/// lpm.dev won't take. Any other answer leaves each target to its own
-/// upload, as does a Registry that can't be asked.
+/// lpm.dev won't take. Returns lpm.dev's refusal of a version it already
+/// has, as after a partial publish, which the other targets still publish.
+/// Any other answer leaves each target to its own upload, as does a
+/// Registry that can't be asked.
 async fn refuse_before_any_publish_what_lpm_dev_refuses(
     client: &RegistryClient,
     source: LpmTargetSource<'_>,
     version: &str,
-) -> Result<(), LpmError> {
+) -> Result<Option<String>, LpmError> {
     let request = lpm_target_request(source)?;
     let verdict = client
         .publish_preflight(request.name, version, Some(request.tarball.len() as u64))
         .await;
-    if let Ok(PublishPreflightVerdict::Refused {
+    let Ok(PublishPreflightVerdict::Refused {
         status,
         code,
         error,
         ..
     }) = verdict
-        && refusal_stops_every_target(status, code.as_deref(), &error, version)
-    {
+    else {
+        return Ok(None);
+    };
+    let error = lpm_common::sanitize_terminal_inline(&error).into_owned();
+    if lpm_dev_has_the_version(status, code.as_deref(), &error, version) {
+        return Ok(Some(error));
+    }
+    if refusal_stops_every_target(status, code.as_deref(), &error, version) {
         return Err(LpmError::Registry(format!(
-            "LPM.dev refuses {}@{version}, so no target was published: {}",
+            "LPM.dev refuses {}@{version}, so no target was published: {error}",
             request.name,
-            lpm_common::sanitize_terminal_inline(&error)
         )));
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Room a `--provenance` publish keeps for its Sigstore bundle, which goes

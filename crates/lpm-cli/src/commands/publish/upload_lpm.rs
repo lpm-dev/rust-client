@@ -6,6 +6,37 @@ use lpm_registry::RegistryClient;
 use serde::ser::{SerializeMap as _, SerializeSeq as _};
 use std::io::Write as _;
 
+/// Why lpm.dev's second factor couldn't be settled.
+pub(super) enum OtpFailure {
+    /// The account couldn't be read, as while the Registry is unavailable,
+    /// which a later try may get past.
+    AccountUnread(LpmError),
+    /// A malformed `--otp`, a token lpm.dev refuses, or a code `--json`
+    /// can't ask for, which no retry gets past.
+    Final(LpmError),
+}
+
+impl From<OtpFailure> for LpmError {
+    fn from(failure: OtpFailure) -> Self {
+        match failure {
+            OtpFailure::AccountUnread(error) | OtpFailure::Final(error) => error,
+        }
+    }
+}
+
+/// Whether whoami's failure is lpm.dev refusing the token, which a retry
+/// with it won't get past.
+fn refuses_the_token(error: &LpmError) -> bool {
+    matches!(
+        error,
+        LpmError::AuthRequired
+            | LpmError::SessionExpired
+            | LpmError::EnvTokenRejected
+            | LpmError::Forbidden(_)
+            | LpmError::UnsupportedAuthSource { .. }
+    )
+}
+
 /// The second factor an lpm.dev publish sends: `provided_otp`, checked, or,
 /// for an account with 2FA on, one asked for, which `--json` can't do. Reads
 /// the account through whoami, which also checks the token.
@@ -14,36 +45,42 @@ pub(super) async fn resolve_lpm_otp(
     provided_otp: Option<&str>,
     json_output: bool,
     whoami_cache: Option<&tokio::sync::OnceCell<lpm_registry::WhoamiResponse>>,
-) -> Result<Option<String>, LpmError> {
-    let mfa_enabled = if let Some(cache) = whoami_cache {
-        cache
+) -> Result<Option<String>, OtpFailure> {
+    if provided_otp.is_some_and(|code| !is_valid_otp(code)) {
+        return Err(OtpFailure::Final(LpmError::Registry(
+            "--otp must be exactly six ASCII digits".into(),
+        )));
+    }
+    let whoami = match whoami_cache {
+        Some(cache) => cache
             .get_or_try_init(|| client.whoami())
             .await
-            .map_err(|e| LpmError::Registry(format!("authentication failed: {e}")))?
-            .mfa_enabled
-    } else {
-        client
-            .whoami()
-            .await
-            .map_err(|e| LpmError::Registry(format!("authentication failed: {e}")))?
-            .mfa_enabled
+            .map(|account| account.mfa_enabled),
+        None => client.whoami().await.map(|account| account.mfa_enabled),
+    };
+    let mfa_enabled = match whoami {
+        Ok(mfa_enabled) => mfa_enabled,
+        Err(error) => {
+            let refused = refuses_the_token(&error);
+            let error = LpmError::Registry(format!("authentication failed: {error}"));
+            return Err(if refused {
+                OtpFailure::Final(error)
+            } else {
+                OtpFailure::AccountUnread(error)
+            });
+        }
     };
 
     if let Some(code) = provided_otp {
-        if !is_valid_otp(code) {
-            return Err(LpmError::Registry(
-                "--otp must be exactly six ASCII digits".into(),
-            ));
-        }
         return Ok(Some(code.to_owned()));
     }
     if mfa_enabled != Some(true) {
         return Ok(None);
     }
     if json_output {
-        return Err(LpmError::Registry(
+        return Err(OtpFailure::Final(LpmError::Registry(
             "2FA required in JSON mode — pass --otp <code> or use a CI token".into(),
-        ));
+        )));
     }
     let code: String = cliclack::input("Enter 2FA code")
         .validate(|input: &String| {
@@ -54,7 +91,7 @@ pub(super) async fn resolve_lpm_otp(
             }
         })
         .interact()
-        .map_err(|e| LpmError::Registry(e.to_string()))?;
+        .map_err(|e| OtpFailure::Final(LpmError::Registry(e.to_string())))?;
     Ok(Some(code))
 }
 

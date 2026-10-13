@@ -361,6 +361,18 @@ fn lpm_and_npm_project(name: &str, registry: &str) -> TempProject {
 }
 
 fn publish_to_lpm_and_npm(project: &TempProject, registry: &str) -> std::process::Output {
+    let login = lpm(project)
+        .args([
+            "--json",
+            "login",
+            "--login-registry",
+            registry,
+            "--token",
+            CUSTOM_REGISTRY_TOKEN,
+        ])
+        .output()
+        .expect("store the npm registry's token");
+    assert!(login.status.success(), "{login:?}");
     lpm_with_registry(project, registry)
         .env("LPM_RETRY_BACKOFF_MS_OVERRIDE", "0")
         .args([
@@ -504,6 +516,146 @@ async fn publish_asks_for_lpm_dev_s_second_factor_before_any_target_publishes() 
         "{stdout}\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// The uploads a publish made: to lpm.dev's publish route, and to the npm
+/// registry's.
+async fn uploads(mock: &MockRegistry) -> (usize, usize) {
+    let requests = mock.server().received_requests().await.unwrap();
+    let puts = requests
+        .iter()
+        .filter(|request| request.method.as_str() == "PUT");
+    let lpm = puts
+        .clone()
+        .filter(|request| request.url.path().starts_with("/api/registry/"))
+        .count();
+    (lpm, puts.count() - lpm)
+}
+
+async fn mount_accepted_preflight(mock: &MockRegistry, name: &str) {
+    mount_preflight(
+        mock,
+        200,
+        serde_json::json!({
+            "success": true,
+            "name": format!("@lpm.dev/testuser.{name}"),
+            "version": "1.0.0",
+            "packageExists": false,
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn publish_publishes_the_other_targets_when_lpm_dev_s_account_can_t_be_read() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+            "error": "Service unavailable",
+        })))
+        .mount(mock.server())
+        .await;
+    mount_accepted_preflight(&mock, "unread").await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+        .mount(mock.server())
+        .await;
+    let project = lpm_and_npm_project("unread", &mock.url());
+
+    let output = publish_to_lpm_and_npm(&project, &mock.url());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope = parse_json_output(&output.stdout);
+    let results = envelope["results"].as_array();
+    assert!(
+        results.is_some_and(|results| results.len() == 2),
+        "each target should report its own result:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(uploads(&mock).await, (0, 1), "{stdout}");
+}
+
+#[tokio::test]
+async fn publish_publishes_no_target_when_lpm_dev_refuses_the_token() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": "Unauthorized",
+        })))
+        .mount(mock.server())
+        .await;
+    mount_accepted_preflight(&mock, "unauthorized").await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+        .mount(mock.server())
+        .await;
+    let project = lpm_and_npm_project("unauthorized", &mock.url());
+
+    let output = publish_to_lpm_and_npm(&project, &mock.url());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    let envelope = parse_json_output(&output.stdout);
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("authentication failed"))
+            && envelope.get("results").is_none(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(uploads(&mock).await, (0, 0), "{stdout}");
+}
+
+#[tokio::test]
+async fn publish_asks_no_second_factor_for_a_version_lpm_dev_already_has() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "username": "test@example.com",
+            "profile_username": "testuser",
+            "mfa_enabled": true,
+        })))
+        .mount(mock.server())
+        .await;
+    mount_preflight(
+        &mock,
+        403,
+        serde_json::json!({
+            "error": "Version 1.0.0 already exists. You cannot overwrite versions.",
+            "code": "VERSION_EXISTS",
+        }),
+    )
+    .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+        .mount(mock.server())
+        .await;
+    let project = lpm_and_npm_project("partial-mfa", &mock.url());
+
+    // As after a partial publish: lpm.dev has the version, npm doesn't.
+    let output = publish_to_lpm_and_npm(&project, &mock.url());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("2FA required"), "{stdout}");
+    let envelope = parse_json_output(&output.stdout);
+    let lpm_error = envelope["results"]
+        .as_array()
+        .and_then(|results| {
+            results
+                .iter()
+                .find(|result| result["registry"] == serde_json::json!("lpm"))
+        })
+        .and_then(|result| result["error"].as_str());
+    assert!(
+        lpm_error.is_some_and(|error| error.contains("already exists")),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(uploads(&mock).await, (0, 1), "{stdout}");
 }
 
 #[tokio::test]

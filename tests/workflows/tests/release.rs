@@ -1860,6 +1860,58 @@ async fn release_publish_reports_what_lpm_dev_refuses_in_its_preflight() {
 }
 
 #[tokio::test]
+async fn release_publish_redacts_lpm_dev_s_reflection_of_its_bearer_from_a_refusal() {
+    let token = "test-token-123";
+    for (status, json_body) in [(402, true), (403, true), (403, false), (500, false)] {
+        let project = TempProject::empty(
+            r#"{"name":"root","private":true,"version":"0.0.0","workspaces":["packages/*"]}"#,
+        );
+        project.write_file(
+            "packages/reflected/package.json",
+            r#"{"name":"@lpm.dev/acme.reflected","version":"1.0.0"}"#,
+        );
+        let server = MockServer::start().await;
+        let reflected = format!("Authorization: Bearer {token} may not publish");
+        let response = if json_body {
+            ResponseTemplate::new(status).set_body_json(serde_json::json!({ "error": reflected }))
+        } else {
+            ResponseTemplate::new(status).set_body_string(reflected)
+        };
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/package/publish-preflight"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        for json in [true, false] {
+            let mut command = lpm_with_registry(&project, &server.uri());
+            command
+                .env("LPM_RETRY_BACKOFF_MS_OVERRIDE", "0")
+                .args(["release", "publish", "--all", "--lpm", "--dry-run"])
+                .args(["--token", token]);
+            if json {
+                command.arg("--json");
+            }
+            let output = command.output().expect("run release publish");
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{status}: {stdout}");
+            assert!(
+                !stdout.contains(token) && !stderr.contains(token),
+                "bearer leaked ({status}, JSON body: {json_body}, --json: {json})\nstdout: {stdout}\nstderr: {stderr}"
+            );
+            if json_body {
+                assert!(
+                    format!("{stdout}{stderr}").contains("Bearer <redacted> may not publish"),
+                    "{status}, --json: {json}\nstdout: {stdout}\nstderr: {stderr}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn release_publish_reports_a_preflight_refusal_as_the_error_its_status_is() {
     for (status, error_code) in [
         (401, "auth_required"),
