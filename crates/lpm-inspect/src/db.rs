@@ -830,8 +830,9 @@ pub enum OpenError {
     Files(#[from] std::io::Error),
     /// SQLite can't read the file as a database, or finds it damaged.
     #[error(
-        "{} is damaged or isn't a capture database ({detail}); move it aside and retry",
-        path.display()
+        "{} is damaged or isn't a capture database ({detail}); move it aside {}, and retry",
+        path.display(),
+        with_its_sidecars(path)
     )]
     Damaged { path: PathBuf, detail: String },
     /// Any other SQLite failure.
@@ -1017,15 +1018,32 @@ fn another_users(path: &Path) -> std::io::Error {
     )
 }
 
-fn hard_linked(path: &Path) -> std::io::Error {
+fn hard_linked(path: &Path, db_path: &Path) -> std::io::Error {
+    let database = if path == db_path {
+        "it".to_owned()
+    } else {
+        db_path.display().to_string()
+    };
     std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
         format!(
             "{} has other hard links, so captures written to it would change those \
-             files too; move it aside and retry",
-            path.display()
+             files too; move {database} aside {}, and retry",
+            path.display(),
+            with_its_sidecars(db_path)
         ),
     )
+}
+
+/// Names the files SQLite keeps beside a capture database, for advice to
+/// move it: they go with it, as an open removes those it finds without a
+/// database, and a WAL not yet folded into the database holds part of it.
+fn with_its_sidecars(db_path: &Path) -> String {
+    let name = db_path
+        .file_name()
+        .unwrap_or(db_path.as_os_str())
+        .to_string_lossy();
+    format!("together with any {name}-wal, {name}-shm and {name}-journal beside it")
 }
 
 /// Makes sure `.lpm` is a directory of the project's own, creating it if
@@ -1167,7 +1185,7 @@ fn prepare_capture_files(
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if !metadata.is_file() => return Err(linked_or_not(&path, "file")),
             Ok(metadata) => {
-                open_to_others |= check_capture_file(&path, &metadata, owner, access)?;
+                open_to_others |= check_capture_file(&path, db_path, &metadata, owner, access)?;
                 database_exists |= path == db_path;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1227,6 +1245,7 @@ fn remove_if_present(path: &Path) -> std::io::Result<()> {
 #[cfg(unix)]
 fn check_capture_file(
     path: &Path,
+    db_path: &Path,
     metadata: &std::fs::Metadata,
     owner: CaptureOwner,
     access: Access,
@@ -1237,7 +1256,7 @@ fn check_capture_file(
         return Err(another_users(path));
     }
     if metadata.nlink() > 1 {
-        return Err(hard_linked(path));
+        return Err(hard_linked(path, db_path));
     }
     let mode = metadata.mode() & 0o7777;
     #[cfg(target_os = "macos")]
@@ -1300,6 +1319,7 @@ fn set_mode_through_handle(
 #[cfg(not(unix))]
 fn check_capture_file(
     path: &Path,
+    db_path: &Path,
     _metadata: &std::fs::Metadata,
     _owner: CaptureOwner,
     _access: Access,
@@ -1310,7 +1330,7 @@ fn check_capture_file(
         Err(error) => return Err(with_path(path, error)),
     };
     if lpm_common::link_count(&file).map_err(|error| with_path(path, error))? > 1 {
-        return Err(hard_linked(path));
+        return Err(hard_linked(path, db_path));
     }
     Ok(false)
 }
@@ -1406,6 +1426,10 @@ fn replace_with_owner_only_copy(db_path: &Path, owner: CaptureOwner) -> Result<b
         }
         return Err(error);
     }
+    #[cfg(test)]
+    if let Some(attach) = tests::AFTER_COPY.with_borrow_mut(Option::take) {
+        attach();
+    }
     for suffix in SQLITE_SIDECARS {
         remove_if_present(&capture_file(db_path, suffix))?;
     }
@@ -1472,29 +1496,65 @@ fn out_of_room(error: &rusqlite::Error) -> bool {
 }
 
 /// The room SQLite's shared-memory file takes while the check reads a
-/// database with `wal` bytes of WAL: 32 KiB for about every 4,096 frames,
-/// about 1/512 of the WAL, and a region more for rounding.
-fn shared_memory_room(wal: u64) -> u64 {
-    (64 * 1024u64).saturating_add(wal / 512)
+/// database with `wal` bytes of WAL in pages of `page_size`: the WAL index
+/// keeps a 32 KiB region for each 4,096 frames, the first region 4,062,
+/// and a region more is counted for rounding.
+fn shared_memory_room(wal: u64, page_size: u64) -> u64 {
+    const REGION: u64 = 32 * 1024;
+    const WAL_HEADER: u64 = 32;
+    const FRAME_HEADER: u64 = 24;
+    let frames = wal.saturating_sub(WAL_HEADER) / (page_size + FRAME_HEADER);
+    let regions = 1 + frames.saturating_sub(4062).div_ceil(4096);
+    (regions + 1) * REGION
 }
 
-/// Free space a filesystem reports but won't let a write use: APFS keeps a
-/// few MiB back, about 2.5 MB on a 96 MB volume.
-const UNUSABLE_FREE_ROOM: u64 = 8 * 1024 * 1024;
+/// The size of the pages the WAL beside `db_path` holds, from its header,
+/// or else of the database's, from its header; where neither reads as one,
+/// SQLite's smallest, 512 bytes, which counts the most frames in a WAL.
+fn page_size(db_path: &Path) -> u64 {
+    let header = |path: &Path, bytes: &mut [u8]| {
+        lpm_common::open_nofollow(path)
+            .and_then(|mut file| std::io::Read::read_exact(&mut file, bytes))
+            .is_ok()
+    };
+    let valid = |size: u64| size.is_power_of_two() && (512..=65_536).contains(&size);
+    let mut wal = [0; 12];
+    if header(&capture_file(db_path, "-wal"), &mut wal)
+        && matches!(
+            u32::from_be_bytes([wal[0], wal[1], wal[2], wal[3]]),
+            0x377f_0682 | 0x377f_0683
+        )
+    {
+        let size = u64::from(u32::from_be_bytes([wal[8], wal[9], wal[10], wal[11]]));
+        if valid(size) {
+            return size;
+        }
+    }
+    let mut database = [0; 18];
+    if header(db_path, &mut database) {
+        let size = match u16::from_be_bytes([database[16], database[17]]) {
+            1 => 65_536,
+            size => u64::from(size),
+        };
+        if valid(size) {
+            return size;
+        }
+    }
+    512
+}
 
 /// The free space replacing a database takes. Leaving WAL folds the WAL into
 /// the database, which grows by the WAL at most while the shared-memory file
 /// is open; then the WAL and that file are removed, and the copy takes the
 /// grown database's size. So it never takes more than the database and its
-/// WAL, with the shared-memory file and what a filesystem keeps back on top.
+/// WAL, with the shared-memory file on top.
 fn room_to_copy(db_path: &Path) -> Option<u64> {
     let database = std::fs::metadata(db_path).ok()?.len();
     let wal = std::fs::metadata(capture_file(db_path, "-wal")).map_or(0, |wal| wal.len());
     Some(
         database
             .saturating_add(wal)
-            .saturating_add(shared_memory_room(wal))
-            .saturating_add(UNUSABLE_FREE_ROOM),
+            .saturating_add(shared_memory_room(wal, page_size(db_path))),
     )
 }
 
@@ -1502,7 +1562,7 @@ fn room_to_copy(db_path: &Path) -> Option<u64> {
 /// opened, as SQLite's own failure on a full disk can come as a bare I/O
 /// error.
 fn ensure_room_to_copy(db_path: &Path, needed: Option<u64>) -> Result<(), OpenError> {
-    let available = lpm_common::filesystem_available_bytes(db_path);
+    let available = lpm_common::filesystem_writable_bytes(db_path);
     #[cfg(test)]
     let available = tests::AVAILABLE_BYTES.get().or(available);
     match (available, needed) {
@@ -1563,8 +1623,9 @@ fn no_room_to_copy(db_path: &Path, needed: Option<u64>) -> OpenError {
         std::io::ErrorKind::StorageFull,
         format!(
             "{} is open to other users, and replacing it with an owner-only copy needs \
-             {needed} free on its disk; free that much, or move the database aside, and retry",
-            db_path.display()
+             {needed} free on its disk; free that much, or move it aside {}, and retry",
+            db_path.display(),
+            with_its_sidecars(db_path)
         ),
     ))
 }
@@ -1790,9 +1851,10 @@ fn refuse_unknown_schema(
     Err(OpenError::Files(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
         format!(
-            "{} holds schema LPM never creates ({}); move it aside and retry",
+            "{} holds schema LPM never creates ({}); move it aside {}, and retry",
             db_path.display(),
-            unknown.join(", ")
+            unknown.join(", "),
+            with_its_sidecars(db_path)
         ),
     )))
 }
@@ -2400,6 +2462,10 @@ mod tests {
     use lpm_tunnel::webhook::WebhookProvider;
     use std::collections::HashMap;
 
+    /// The advice for the capture database LPM can't use.
+    const ADVICE: &str = "move it aside together with any inspector.db-wal, \
+                          inspector.db-shm and inspector.db-journal beside it, and retry";
+
     thread_local! {
         /// The most pages this thread's database copies may hold, as a
         /// full disk would stop them.
@@ -2419,6 +2485,11 @@ mod tests {
         /// Runs once as this thread's next replacement starts its check, as
         /// another process can open the database then.
         pub(super) static BEFORE_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+        /// Runs once after this thread's next replacement has copied the
+        /// database, before the copy takes its name, as a connection
+        /// without the opening lock can leave files beside it then.
+        pub(super) static AFTER_COPY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
             const { std::cell::RefCell::new(None) };
     }
 
@@ -2714,7 +2785,8 @@ mod tests {
             return;
         };
 
-        let error = check_capture_file(&path, &metadata, this_user(), Access::Review).unwrap_err();
+        let error =
+            check_capture_file(&path, &path, &metadata, this_user(), Access::Review).unwrap_err();
 
         assert!(
             error.to_string().contains("belongs to another user"),
@@ -2732,7 +2804,9 @@ mod tests {
         let metadata = std::fs::symlink_metadata(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
 
-        assert!(!check_capture_file(&path, &metadata, this_user(), Access::Capture).unwrap());
+        assert!(
+            !check_capture_file(&path, &path, &metadata, this_user(), Access::Capture).unwrap()
+        );
     }
 
     #[cfg(unix)]
@@ -2744,14 +2818,32 @@ mod tests {
         let served = project.path().join("public.txt");
         std::fs::write(&served, b"").unwrap();
         set_mode(&served, 0o644);
-        std::fs::hard_link(&served, lpm_dir.join("inspector.db")).unwrap();
+        let db_path = lpm_dir.join("inspector.db");
+        std::fs::hard_link(&served, &db_path).unwrap();
 
-        let error =
-            prepare_capture_files(&lpm_dir.join("inspector.db"), this_user(), Access::Capture)
-                .unwrap_err();
+        let error = prepare_capture_files(&db_path, this_user(), Access::Capture).unwrap_err();
 
         assert!(error.to_string().contains("other hard links"), "{error}");
+        assert!(error.to_string().ends_with(ADVICE), "{error}");
         assert_eq!(mode(&served), 0o644);
+
+        // A sidecar with other hard links moves with its database, which an
+        // open would otherwise find without it and remove.
+        std::fs::remove_file(&db_path).unwrap();
+        std::fs::write(&db_path, b"").unwrap();
+        std::fs::hard_link(&served, lpm_dir.join("inspector.db-wal")).unwrap();
+
+        let error = prepare_capture_files(&db_path, this_user(), Access::Capture).unwrap_err();
+
+        assert!(
+            error.to_string().ends_with(&format!(
+                "move {} aside together with any inspector.db-wal, inspector.db-shm and \
+                 inspector.db-journal beside it, and retry",
+                db_path.display()
+            )),
+            "{error}"
+        );
+        assert!(lpm_dir.join("inspector.db-wal").exists());
     }
 
     #[cfg(unix)]
@@ -3251,7 +3343,7 @@ mod tests {
     #[test]
     fn a_disk_that_fills_while_the_database_is_checked_says_how_much_room_the_copy_needs() {
         let directory = tempfile::tempdir().unwrap();
-        // Past the room a replacement keeps back, for the retry.
+        // Room for the retry, which the WAL folded in has grown.
         let attached = attach_image(directory.path(), "16m", true);
         let project = attached.0.join("project");
         std::fs::create_dir(&project).unwrap();
@@ -3304,6 +3396,12 @@ mod tests {
         // The room taken before the WAL was folded in, which grew the database.
         let named = format!("needs about {} free", lpm_common::format_bytes(needed));
         assert!(error.to_string().contains(&named), "{error}");
+        assert!(
+            error
+                .to_string()
+                .ends_with(&format!("free that much, or {ADVICE}")),
+            "{error}"
+        );
         assert_eq!(mode(&db_path), 0o644);
         assert!(!capture_file(&db_path, "-copy").exists());
 
@@ -3326,7 +3424,7 @@ mod tests {
         use std::io::Write as _;
 
         let directory = tempfile::tempdir().unwrap();
-        // Past the room a replacement keeps back, for the retry.
+        // Room for the retry, which the WAL folded in has grown.
         let attached = attach_image(directory.path(), "16m", true);
         let project = attached.0.join("project");
         std::fs::create_dir(&project).unwrap();
@@ -3502,7 +3600,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("inspector.db");
         let elsewhere = directory.path().join("elsewhere");
-        for swap in ["link", "another file"] {
+        // A file written in its place instead could take its inode number,
+        // as ext4 gives a freed one out again, and is one the owner could
+        // change anyway; a name of an existing file never has its number.
+        for swap in ["link", "another name"] {
             std::fs::write(&path, b"captures").unwrap();
             // Others can't open it, so a writer makes it 0600.
             set_mode(&path, 0o700);
@@ -3512,10 +3613,11 @@ mod tests {
             std::fs::remove_file(&path).unwrap();
             match swap {
                 "link" => std::os::unix::fs::symlink(&elsewhere, &path).unwrap(),
-                _ => std::fs::write(&path, b"swapped in").unwrap(),
+                _ => std::fs::hard_link(&elsewhere, &path).unwrap(),
             }
 
-            let checked_now = check_capture_file(&path, &checked, me_as_root, Access::Capture);
+            let checked_now =
+                check_capture_file(&path, &path, &checked, me_as_root, Access::Capture);
 
             assert!(checked_now.is_err(), "{swap}");
             assert_eq!(
@@ -3858,7 +3960,8 @@ mod tests {
 
                 assert!(
                     error.to_string().contains("holds schema LPM never creates")
-                        && error.to_string().contains(named),
+                        && error.to_string().contains(named)
+                        && error.to_string().ends_with(ADVICE),
                     "{named}: {error}"
                 );
                 #[cfg(unix)]
@@ -3992,8 +4095,13 @@ mod tests {
         let copy_path = capture_file(&db_path, "-copy");
         assert!(create_owner_only(&copy_path, this_user()).unwrap());
 
+        // The room taken before the database was opened, which this
+        // database's room now would read as less.
+        let needed = 3 * 1024 * 1024;
+        assert!(room_to_copy(&db_path).unwrap() < needed);
+
         COPY_PAGE_LIMIT.set(Some(1));
-        let copied = copy_database(&database, &copy_path, &db_path, room_to_copy(&db_path));
+        let copied = copy_database(&database, &copy_path, &db_path, Some(needed));
         COPY_PAGE_LIMIT.set(None);
 
         let Err(OpenError::Files(error)) = copied else {
@@ -4001,17 +4109,16 @@ mod tests {
         };
         assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
         assert!(
-            error.to_string().contains(&format!(
-                "needs about {} free on its disk",
-                lpm_common::format_bytes(room_to_copy(&db_path).unwrap())
-            )),
+            error
+                .to_string()
+                .contains("needs about 3.0 MB free on its disk"),
             "{error}"
         );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_disk_without_room_for_the_replacement_says_so_before_anything_is_opened() {
+    async fn a_disk_without_room_for_the_replacement_says_so_before_the_database_is_opened() {
         let project = project_with_a_database(&format!(
             "{CAPTURE_SCHEMA} ALTER TABLE requests ADD COLUMN response_body_incomplete \
              INTEGER NOT NULL DEFAULT 0;"
@@ -4019,9 +4126,11 @@ mod tests {
         let db_path = project.path().join(".lpm/inspector.db");
         let needed = room_to_copy(&db_path).unwrap();
 
+        BEFORE_CHECK.set(Some(Box::new(|| {})));
         AVAILABLE_BYTES.set(Some(needed - 1));
         let short = InspectorDb::open(project.path()).map(drop);
         AVAILABLE_BYTES.set(None);
+        let opened = BEFORE_CHECK.with_borrow_mut(Option::take).is_none();
 
         let error = short.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
@@ -4032,9 +4141,12 @@ mod tests {
             )),
             "{error}"
         );
+        assert!(
+            !opened,
+            "the database was opened before its room was checked"
+        );
         assert_eq!(mode(&db_path), 0o644);
         assert!(!capture_file(&db_path, "-copy").exists());
-        assert!(!capture_file(&db_path, "-shm").exists());
 
         AVAILABLE_BYTES.set(Some(needed));
         let enough = InspectorDb::open(project.path()).map(drop);
@@ -4048,20 +4160,131 @@ mod tests {
     fn the_room_a_replacement_needs_counts_the_wal_once_with_its_shared_memory() {
         let directory = tempfile::tempdir().unwrap();
         let db_path = directory.path().join("inspector.db");
-        std::fs::write(&db_path, vec![0; 10_000]).unwrap();
-        assert_eq!(
-            room_to_copy(&db_path),
-            Some(10_000 + 64 * 1024 + UNUSABLE_FREE_ROOM)
-        );
+        let mut database = vec![0; 10_000];
+        database[16..18].copy_from_slice(&4096u16.to_be_bytes());
+        std::fs::write(&db_path, &database).unwrap();
+        assert_eq!(page_size(&db_path), 4096);
+        assert_eq!(room_to_copy(&db_path), Some(10_000 + 64 * 1024));
+        database[16..18].copy_from_slice(&1u16.to_be_bytes());
+        std::fs::write(&db_path, &database).unwrap();
+        assert_eq!(page_size(&db_path), 65_536);
 
-        let wal = std::fs::File::create(capture_file(&db_path, "-wal")).unwrap();
+        // 130,308 frames of the WAL's 4 KiB pages: 32 regions of the WAL
+        // index, and one more. The WAL's header says what its frames hold.
+        let mut wal = std::fs::File::create(capture_file(&db_path, "-wal")).unwrap();
+        std::io::Write::write_all(&mut wal, &[0x37, 0x7f, 0x06, 0x82, 0, 0x2d, 0xe2, 0x18])
+            .unwrap();
+        std::io::Write::write_all(&mut wal, &4096u32.to_be_bytes()).unwrap();
         wal.set_len(512 * 1024 * 1024).unwrap();
         assert_eq!(
             room_to_copy(&db_path),
-            Some(10_000 + 512 * 1024 * 1024 + 64 * 1024 + 1024 * 1024 + UNUSABLE_FREE_ROOM)
+            Some(10_000 + 512 * 1024 * 1024 + 33 * 32 * 1024)
         );
+
+        // A WAL without a header counts frames of SQLite's smallest pages.
+        wal.set_len(0).unwrap();
+        wal.set_len(512 * 1024 * 1024).unwrap();
+        database[16..18].copy_from_slice(&[0, 0]);
+        std::fs::write(&db_path, &database).unwrap();
+        assert_eq!(page_size(&db_path), 512);
+        assert_eq!(
+            room_to_copy(&db_path),
+            Some(10_000 + 512 * 1024 * 1024 + 246 * 32 * 1024)
+        );
+
         std::fs::remove_file(&db_path).unwrap();
         assert_eq!(room_to_copy(&db_path), None);
+    }
+
+    #[test]
+    fn the_room_check_counts_what_a_write_can_take_rather_than_what_is_reported_free() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("inspector.db");
+        std::fs::write(&db_path, b"").unwrap();
+        let available = lpm_common::filesystem_available_bytes(&db_path).unwrap();
+        let writable = lpm_common::filesystem_writable_bytes(&db_path).unwrap();
+        if writable >= available {
+            return;
+        }
+
+        // Halfway, so other writers moving the free space by less than half
+        // of what's held back don't change the answer.
+        let error =
+            ensure_room_to_copy(&db_path, Some(writable + (available - writable) / 2)).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::StorageFull, "{error}");
+    }
+
+    #[test]
+    fn the_room_for_shared_memory_follows_the_page_size_of_the_wal() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("inspector.db");
+        let writer = Connection::open(&db_path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA page_size = 512; PRAGMA journal_mode = WAL; \
+                 PRAGMA wal_autocheckpoint = 0; CREATE TABLE kept (x); BEGIN;",
+            )
+            .unwrap();
+        for _ in 0..12_000 {
+            writer
+                .execute("INSERT INTO kept VALUES (zeroblob(400))", [])
+                .unwrap();
+        }
+        writer.execute_batch("COMMIT;").unwrap();
+        let wal = std::fs::metadata(capture_file(&db_path, "-wal"))
+            .unwrap()
+            .len();
+        let shared_memory = std::fs::metadata(capture_file(&db_path, "-shm"))
+            .unwrap()
+            .len();
+
+        assert_eq!(page_size(&db_path), 512);
+        // Frames past the first region, which 4 KiB pages would need eight
+        // times the WAL for.
+        assert!(shared_memory > 32 * 1024, "{shared_memory}");
+        assert!(shared_memory_room(wal, 4096) < shared_memory);
+        assert!(shared_memory_room(wal, 512) >= shared_memory);
+        drop(writer);
+        assert_eq!(page_size(&db_path), 512);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_replacement_removes_files_left_beside_the_database_it_replaces() {
+        let project = project_with_a_database(&format!(
+            "{CAPTURE_SCHEMA} ALTER TABLE requests ADD COLUMN response_body_incomplete \
+             INTEGER NOT NULL DEFAULT 0;"
+        ));
+        let db_path = project.path().join(".lpm/inspector.db");
+        let left = [
+            capture_file(&db_path, "-wal"),
+            capture_file(&db_path, "-shm"),
+        ];
+        let leaving = left.clone();
+        AFTER_COPY.set(Some(Box::new(move || {
+            for path in &leaving {
+                std::fs::write(path, b"left by another connection").unwrap();
+                set_mode(path, 0o644);
+            }
+        })));
+
+        let db = InspectorDb::open(project.path());
+        let copied = AFTER_COPY.with_borrow_mut(Option::take).is_none();
+
+        let db = db.unwrap();
+        assert!(copied);
+        assert_eq!(mode(&db_path), 0o600);
+        for path in &left {
+            assert_eq!(mode(path), 0o600, "{}", path.display());
+            assert_ne!(
+                std::fs::read(path).unwrap(),
+                b"left by another connection",
+                "{}",
+                path.display()
+            );
+        }
+        drop(db);
     }
 
     #[cfg(unix)]
@@ -4170,7 +4393,7 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, OpenError::Damaged { .. }), "{error}");
-        assert!(error.to_string().contains("move it aside"), "{error}");
+        assert!(error.to_string().ends_with(ADVICE), "{error}");
         assert_eq!(mode(&db_path), 0o644);
         assert!(!project.path().join(".lpm/inspector.db-copy").exists());
     }
@@ -5222,10 +5445,7 @@ mod tests {
             };
 
             assert!(matches!(error, OpenError::Damaged { .. }), "{error}");
-            assert!(
-                error.to_string().contains("move it aside and retry"),
-                "{error}"
-            );
+            assert!(error.to_string().ends_with(ADVICE), "{error}");
         }
     }
 }

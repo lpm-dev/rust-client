@@ -317,8 +317,27 @@ pub fn is_loopback_host(host: &str) -> bool {
 
 /// The bytes free to this user on the filesystem holding `path`, or its
 /// nearest existing ancestor; None where it can't be read.
-#[cfg(unix)]
 pub fn filesystem_available_bytes(path: &std::path::Path) -> Option<u64> {
+    filesystem_space(path).map(|space| space.available)
+}
+
+/// The bytes a write by this user can take on the filesystem holding
+/// `path`, or its nearest existing ancestor: what it reports free, less
+/// what APFS keeps back from writes (see [`apfs_held_back`]). None where it
+/// can't be read.
+pub fn filesystem_writable_bytes(path: &std::path::Path) -> Option<u64> {
+    filesystem_space(path).map(|space| space.available.saturating_sub(space.held_back))
+}
+
+/// What a filesystem reports free to this user, and how much of that it
+/// keeps back from writes.
+struct FilesystemSpace {
+    available: u64,
+    held_back: u64,
+}
+
+#[cfg(unix)]
+fn filesystem_space(path: &std::path::Path) -> Option<FilesystemSpace> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -333,7 +352,7 @@ pub fn filesystem_available_bytes(path: &std::path::Path) -> Option<u64> {
     // blocks of a volume with more than 16 TiB free; its `statfs` counts in
     // 64 bits.
     #[cfg(target_os = "macos")]
-    let bytes = {
+    let (available, held_back) = {
         let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
         // SAFETY: `path` is NUL-terminated and `stats` points to writable,
         // properly aligned storage that is read only after a successful call.
@@ -342,10 +361,25 @@ pub fn filesystem_available_bytes(path: &std::path::Path) -> Option<u64> {
         }
         // SAFETY: `statfs` returned success and initialized the output structure.
         let stats = unsafe { stats.assume_init() };
-        u128::from(stats.f_bavail).checked_mul(u128::from(stats.f_bsize))?
+        let block = u128::from(stats.f_bsize);
+        let available = u128::from(stats.f_bavail).checked_mul(block)?;
+        let apfs = stats
+            .f_fstypename
+            .iter()
+            .take_while(|&&byte| byte != 0)
+            .map(|&byte| byte as u8)
+            .eq(*b"apfs");
+        let held_back = if apfs {
+            let size = u128::from(stats.f_blocks).checked_mul(block)?;
+            apfs_held_back(u64::try_from(size).unwrap_or(u64::MAX))
+        } else {
+            0
+        };
+        (available, held_back)
     };
+    // `f_bavail` already leaves out what's reserved for root.
     #[cfg(not(target_os = "macos"))]
-    let bytes = {
+    let (available, held_back) = {
         let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
         // SAFETY: `path` is NUL-terminated and `stats` points to writable,
         // properly aligned storage that is read only after a successful call.
@@ -354,14 +388,33 @@ pub fn filesystem_available_bytes(path: &std::path::Path) -> Option<u64> {
         }
         // SAFETY: `statvfs` returned success and initialized the output structure.
         let stats = unsafe { stats.assume_init() };
-        u128::from(stats.f_bavail).checked_mul(u128::from(stats.f_frsize))?
+        (
+            u128::from(stats.f_bavail).checked_mul(u128::from(stats.f_frsize))?,
+            0,
+        )
     };
-    u64::try_from(bytes).ok()
+    Some(FilesystemSpace {
+        available: u64::try_from(available).ok()?,
+        held_back,
+    })
 }
 
 #[cfg(not(unix))]
-pub fn filesystem_available_bytes(_path: &std::path::Path) -> Option<u64> {
+fn filesystem_space(_path: &std::path::Path) -> Option<FilesystemSpace> {
     None
+}
+
+/// What APFS reports free on a volume of `size` bytes but refuses writes:
+/// a write there fails with about 2% of the volume and 460 KB more still
+/// reported free, and never more than 32 MiB and 80 KiB, as measured on
+/// volumes of 64 MB to 8 GB. Rounded up by about half a MiB, which also
+/// covers the blocks a file's own metadata takes, so a write that would
+/// just fit can be refused, but never one counted as fitting.
+#[cfg(any(target_os = "macos", test))]
+fn apfs_held_back(size: u64) -> u64 {
+    (size / 50)
+        .saturating_add(1024 * 1024)
+        .min(33 * 1024 * 1024)
 }
 
 /// Format bytes into a human-readable string (e.g., "1.2 KB", "3.4 MB").
@@ -420,6 +473,117 @@ mod tests {
         );
         let unmade = filesystem_available_bytes(&directory.path().join("not/yet/made")).unwrap();
         assert!(unmade.abs_diff(available) <= size / 200);
+    }
+
+    #[test]
+    fn apfs_holds_back_at_least_what_measured_volumes_kept_from_writes() {
+        // A volume's size, and what it still reported free once a write
+        // failed.
+        for (size, kept) in [
+            (104_816_640, 2_564_096),
+            (314_531_840, 6_758_400),
+            (524_247_040, 10_952_704),
+            (1_073_700_864, 21_946_368),
+            (2_147_442_688, 33_636_352),
+            (4_085_211_136, 33_636_352),
+            (8_380_178_432, 33_636_352),
+        ] {
+            let held_back = apfs_held_back(size);
+            assert!(held_back >= kept, "{size}: {held_back} < {kept}");
+            assert!(
+                held_back - kept < 1024 * 1024,
+                "{size}: {held_back} past {kept}"
+            );
+        }
+        assert_eq!(apfs_held_back(u64::MAX), 33 * 1024 * 1024);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_any_filesystem_but_apfs_a_write_can_take_what_it_reports_free() {
+        let directory = tempfile::tempdir().unwrap();
+        let space = filesystem_space(directory.path()).unwrap();
+        if cfg!(target_os = "macos") && space.held_back > 0 {
+            return;
+        }
+
+        assert_eq!(space.held_back, 0);
+        let writable = filesystem_writable_bytes(directory.path()).unwrap();
+        let available = filesystem_available_bytes(directory.path()).unwrap();
+        let (size, _) = df(directory.path());
+        assert!(writable.abs_diff(available) <= size / 200);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_apfs_a_write_takes_what_it_counts_writable_and_little_more() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("volume.sparseimage");
+        let mount_point = directory.path().join("mounted");
+        std::fs::create_dir(&mount_point).unwrap();
+        let hdiutil = |arguments: &[&std::ffi::OsStr]| {
+            let output = std::process::Command::new("/usr/bin/hdiutil")
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "hdiutil {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        hdiutil(&[
+            "create".as_ref(),
+            "-quiet".as_ref(),
+            "-size".as_ref(),
+            "64m".as_ref(),
+            "-fs".as_ref(),
+            "APFS".as_ref(),
+            "-type".as_ref(),
+            "SPARSE".as_ref(),
+            "-volname".as_ref(),
+            "lpm-common-test".as_ref(),
+            image.as_os_str(),
+        ]);
+        hdiutil(&[
+            "attach".as_ref(),
+            "-quiet".as_ref(),
+            "-nobrowse".as_ref(),
+            "-noautoopen".as_ref(),
+            "-mountpoint".as_ref(),
+            mount_point.as_os_str(),
+            image.as_os_str(),
+        ]);
+        struct Detach<'a>(&'a std::path::Path);
+        impl Drop for Detach<'_> {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("/usr/bin/hdiutil")
+                    .args(["detach", "-force", "-quiet"])
+                    .arg(self.0)
+                    .status();
+            }
+        }
+        let _detach = Detach(&mount_point);
+
+        let space = filesystem_space(&mount_point).unwrap();
+        assert!(space.held_back > 0);
+        let writable = filesystem_writable_bytes(&mount_point).unwrap();
+        let mut filler = std::fs::File::create(mount_point.join("filler")).unwrap();
+        let mut written = 0u64;
+        for chunk in [64 * 1024, 4096] {
+            let block = vec![0; chunk];
+            while filler.write_all(&block).is_ok() {
+                written += chunk as u64;
+            }
+        }
+
+        assert!(written >= writable, "wrote {written} of {writable}");
+        assert!(
+            written - writable < 1024 * 1024,
+            "wrote {written}, far past {writable}"
+        );
     }
 
     // ── read_capped_state_file ────────────────────────────────────────

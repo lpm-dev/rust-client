@@ -968,11 +968,14 @@ enum CaptureGitFailure {
 /// How git's `fatal: ` line starts, with `LC_ALL=C`, where it found no
 /// repository, and where it stopped looking.
 const NO_REPOSITORY_MESSAGE: &str = "not a git repository (or any of the parent directories)";
-const STOPPED_MESSAGES: [&str; 4] = [
+const STOPPED_MESSAGES: [&str; 7] = [
     "not a git repository (or any parent up to mount",
     "not a git repository: ",
     "invalid gitfile format",
     "no path in gitfile",
+    "error opening '",
+    "error reading ",
+    "too large to be a .git file",
 ];
 
 /// Reads git's failure from the start of its `fatal: ` line, as the rest can
@@ -1082,10 +1085,13 @@ where
         }
         Err(_) => false,
     };
-    // Only where git couldn't be run in `.lpm` is a repository of its own
-    // read from its `.git` entry; one git ran past isn't a repository.
-    let own_repository = matches!(inside, Some(Err(CaptureGitFailure::Unavailable)))
-        && marks_a_repository(&lpm_dir.join(".git"));
+    // `.lpm` has a repository of its own where git refused to use one there,
+    // and, where git couldn't be run there, where its `.git` entry says so.
+    let own_repository = match &inside {
+        Some(Err(CaptureGitFailure::Refused)) => true,
+        Some(Err(CaptureGitFailure::Unavailable)) => marks_a_repository(&lpm_dir.join(".git")),
+        _ => false,
+    };
     let inside_answered = match inside {
         Some(Ok(files)) => {
             let (own, project_files): (Vec<String>, Vec<String>) = files
@@ -1114,9 +1120,7 @@ where
         // filesystem boundary, or found none there, so whether it ignores
         // the files there isn't known.
         Some(Err(CaptureGitFailure::NoRepository | CaptureGitFailure::Stopped)) => {
-            if in_repository {
-                state.unanswered.push(CaptureRepository::Lpm);
-            }
+            state.unanswered.push(CaptureRepository::Lpm);
             false
         }
         Some(Err(CaptureGitFailure::Refused)) => {
@@ -1137,18 +1141,46 @@ fn file_name(name: &str) -> &str {
     name.rsplit_once('/').map_or(name, |(_, file)| file)
 }
 
+/// The largest `.git` file git reads; it stops at a larger one.
+const GITFILE_LIMIT: u64 = 1024 * 1024;
+
 /// Whether a `.git` entry looks like a repository's, for when git itself
-/// can't be asked: a directory, or a link to one, holding `HEAD`, or a file
-/// pointing at one as git writes it (`gitdir: …`). An empty directory or
-/// another file doesn't, as git looks past them.
+/// can't be asked, or stopped: a directory, or a link to one, holding
+/// `HEAD`, or a file pointing at one as git reads it: `gitdir: ` and the
+/// rest of the file, but for the line breaks that end it, a path from the
+/// file's directory. An empty directory, another file, or a pointer to no
+/// repository doesn't, as git looks past the first two and stops at the
+/// last, and at a file too large to be a pointer.
 fn marks_a_repository(git: &Path) -> bool {
     match std::fs::metadata(git) {
         Ok(metadata) if metadata.is_dir() => git.join("HEAD").is_file(),
         Ok(metadata) if metadata.is_file() => {
-            let mut start = [0_u8; 8];
-            lpm_common::open_nofollow(git)
-                .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut start))
-                .is_ok_and(|()| &start == b"gitdir: ")
+            let mut contents = Vec::new();
+            let read = lpm_common::open_nofollow(git).and_then(|file| {
+                std::io::Read::read_to_end(
+                    &mut std::io::Read::take(file, GITFILE_LIMIT + 1),
+                    &mut contents,
+                )
+            });
+            if read.is_err() || contents.len() as u64 > GITFILE_LIMIT {
+                return false;
+            }
+            let Some(pointer) = contents
+                .strip_prefix(b"gitdir: ")
+                .map(|rest| {
+                    let end = rest
+                        .iter()
+                        .rposition(|byte| !matches!(byte, b'\n' | b'\r'))
+                        .map_or(0, |last| last + 1);
+                    &rest[..end]
+                })
+                .and_then(|path| std::str::from_utf8(path).ok())
+                .filter(|path| !path.is_empty())
+            else {
+                return false;
+            };
+            let directory = git.parent().unwrap_or(Path::new("."));
+            directory.join(pointer).join("HEAD").is_file()
         }
         _ => false,
     }
@@ -2846,13 +2878,29 @@ mod tests {
             ),
             (
                 Err(CaptureGitFailure::NoRepository),
-                Err(CaptureGitFailure::Refused),
+                Err(CaptureGitFailure::Stopped),
+            ),
+            (
+                Err(CaptureGitFailure::Stopped),
+                Err(CaptureGitFailure::Stopped),
             ),
         ] {
             let (state, _) =
                 state_from_answers(project.path(), project_answer, inside_answer).await;
             assert_eq!(state, None);
         }
+
+        // A repository git refused in `.lpm`, where the project's query found
+        // none, is `.lpm`'s own, so it's asked to be checked.
+        let (refused, _) = state_from_answers(
+            project.path(),
+            Err(CaptureGitFailure::NoRepository),
+            Err(CaptureGitFailure::Refused),
+        )
+        .await;
+        let refused = refused.unwrap();
+        assert!(refused.lpm_unasked, "{refused:?}");
+        assert!(refused.unanswered.is_empty(), "{refused:?}");
 
         // Git in `.lpm` answered, so only the project's query went unanswered,
         // and outside a repository there was nothing for it to find.
@@ -2998,6 +3046,15 @@ mod tests {
             assert_eq!(state.unanswered, vec![CaptureRepository::Lpm]);
             assert!(!state.lpm_unasked);
             assert!(!state.kept_out());
+            let warnings = warnings_for(Some(state), false);
+            assert!(
+                warnings.iter().any(|warning| warning
+                    == "git didn't answer in .lpm (it couldn't run, took over 2 s, or stopped \
+                        short of the project's repository, as at a filesystem boundary or a \
+                        broken .git file), so check that git ignores and doesn't track \
+                        .lpm/inspector.db*"),
+                "{warnings:?}"
+            );
         }
     }
 
@@ -3055,7 +3112,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn says_nothing_of_git_for_a_stale_lpm_git_entry_git_ran_past() {
+    async fn says_nothing_of_git_for_an_lpm_git_entry_git_stops_at_or_looks_past() {
         for entry in ["gitdir: ../gone/.git\n", "HEAD only"] {
             let project = tempfile::tempdir().unwrap();
             let lpm_git = project.path().join(".lpm/.git");
@@ -3066,7 +3123,6 @@ mod tests {
             } else {
                 std::fs::write(&lpm_git, entry).unwrap();
             }
-            assert!(marks_a_repository(&lpm_git), "{entry:?}");
 
             let state = capture_git_state(project.path()).await;
 
@@ -3079,15 +3135,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reads_lpm_s_own_git_entry_only_where_git_couldn_t_run_there() {
+    async fn takes_lpm_for_a_repository_of_its_own_where_git_refused_or_couldn_t_run_there() {
         let project = tempfile::tempdir().unwrap();
         repository_entry(&project.path().join(".lpm"));
 
         for (inside, unanswered) in [
             (
                 CaptureGitFailure::Unavailable,
-                Some(vec![CaptureRepository::Lpm]),
+                Some((vec![CaptureRepository::Lpm], false)),
             ),
+            (CaptureGitFailure::Refused, Some((Vec::new(), true))),
             (CaptureGitFailure::Stopped, None),
             (CaptureGitFailure::NoRepository, None),
         ] {
@@ -3097,8 +3154,69 @@ mod tests {
                 Err(inside),
             )
             .await;
-            assert_eq!(state.map(|state| state.unanswered), unanswered);
+            assert_eq!(
+                state.map(|state| (state.unanswered, state.lpm_unasked)),
+                unanswered
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn asks_for_a_check_of_an_lpm_repository_git_refuses_outside_any_project_repository() {
+        let project = tempfile::tempdir().unwrap();
+        let lpm_dir = project.path().join(".lpm");
+        std::fs::create_dir(&lpm_dir).unwrap();
+        git(&lpm_dir, &["init", "--quiet"]);
+        std::fs::write(lpm_dir.join("inspector.db"), b"x").unwrap();
+        git(&lpm_dir, &["add", "inspector.db"]);
+        // A repository whose format git doesn't know, which it refuses.
+        git(&lpm_dir, &["config", "core.repositoryformatversion", "1"]);
+        git(&lpm_dir, &["config", "extensions.lpmUnknown", "true"]);
+
+        let state = capture_git_state(project.path()).await;
+
+        let warnings = warnings_for(state, false);
+        assert!(!warnings[0].contains("git ignores it"), "{warnings:?}");
+        assert!(
+            warnings.iter().any(|warning| warning
+                == "git couldn't be asked about .lpm, so check that git ignores and doesn't \
+                    track inspector.db*"),
+            "{warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn says_nothing_of_git_for_a_project_whose_own_git_file_points_nowhere_outside_any_repository()
+     {
+        for entry in ["gitdir: ../gone/.git\n", "gitdir: \n", "not a pointer\n"] {
+            let project = tempfile::tempdir().unwrap();
+            std::fs::create_dir(project.path().join(".lpm")).unwrap();
+            std::fs::write(project.path().join(".lpm/inspector.db"), b"x").unwrap();
+            std::fs::write(project.path().join(".git"), entry).unwrap();
+
+            assert_eq!(capture_git_state(project.path()).await, None, "{entry:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn says_nothing_of_git_for_a_project_whose_own_git_file_it_can_t_read_outside_any_repository()
+     {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if lpm_common::current_uid() == 0 {
+            return;
+        }
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".lpm")).unwrap();
+        let git_file = project.path().join(".git");
+        std::fs::write(&git_file, "gitdir: elsewhere\n").unwrap();
+        std::fs::set_permissions(&git_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let state = capture_git_state(project.path()).await;
+
+        std::fs::set_permissions(&git_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(state, None);
     }
 
     /// Makes `directory/.git` as `git init` leaves its `HEAD`.
@@ -3112,15 +3230,39 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let git = directory.path().join(".git");
 
+        repository_entry(&directory.path().join("elsewhere"));
+        let absolute = format!(
+            "gitdir: {}\n",
+            directory.path().join("elsewhere/.git").display()
+        );
         for (contents, repository) in [
             ("", false),
             ("not a pointer\n", false),
-            ("gitdir:../elsewhere/.git\n", false),
-            ("gitdir: ../elsewhere/.git\n", true),
+            ("gitdir:elsewhere/.git\n", false),
+            ("gitdir: \n", false),
+            ("gitdir: gone/.git\n", false),
+            ("gitdir: elsewhere/.git\n", true),
+            ("gitdir: elsewhere/.git\r\n", true),
+            ("gitdir: elsewhere/.git\n\n\r\n", true),
+            (absolute.as_str(), true),
+            // Git reads the whole file as the path: a second line, or a
+            // space at its end, is part of it.
+            ("gitdir: elsewhere/.git\nsecond line\n", false),
+            ("gitdir: elsewhere/.git \n", false),
+            // A directory without `HEAD` isn't a repository.
+            ("gitdir: elsewhere\n", false),
         ] {
             std::fs::write(&git, contents).unwrap();
             assert_eq!(marks_a_repository(&git), repository, "{contents:?}");
         }
+        // Git reads a pointer of up to 1 MiB, and stops at a larger file.
+        let mut padded = b"gitdir: elsewhere/.git".to_vec();
+        padded.resize(1024 * 1024, b'\n');
+        std::fs::write(&git, &padded).unwrap();
+        assert!(marks_a_repository(&git));
+        padded.push(b'\n');
+        std::fs::write(&git, &padded).unwrap();
+        assert!(!marks_a_repository(&git));
         std::fs::remove_file(&git).unwrap();
 
         std::fs::create_dir(&git).unwrap();
@@ -3177,6 +3319,23 @@ mod tests {
             (
                 "fatal: not a git repository: /work/gone/.git\n",
                 CaptureGitFailure::Stopped,
+            ),
+            (
+                "fatal: error opening '/work/app/.git': Permission denied\n",
+                CaptureGitFailure::Stopped,
+            ),
+            (
+                "fatal: too large to be a .git file: '/work/app/.git'\n",
+                CaptureGitFailure::Stopped,
+            ),
+            (
+                "fatal: error reading /work/app/.git\n",
+                CaptureGitFailure::Stopped,
+            ),
+            (
+                "warning: unable to access '/home/user/.config/git/attributes'\n\
+                 fatal: not a git repository (or any of the parent directories): .git\n",
+                CaptureGitFailure::NoRepository,
             ),
             (
                 "fatal: detected dubious ownership in repository at \
