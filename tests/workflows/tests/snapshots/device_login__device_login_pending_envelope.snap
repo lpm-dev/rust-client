@@ -1,0 +1,14 @@
+---
+source: tests/workflows/tests/device_login.rs
+expression: started
+---
+{
+  "success": true,
+  "status": "authorization_pending",
+  "login_id": "[login-id]",
+  "registry": "[registry]",
+  "verification_uri": "[verification-uri]",
+  "request_code": "[request-code]",
+  "expires_at": "[expires-at]",
+  "interval": 3
+}

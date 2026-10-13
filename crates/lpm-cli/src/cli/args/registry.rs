@@ -177,6 +177,14 @@ pub(crate) struct StageArgs {
     )
 )]
 pub(crate) struct LoginArgs {
+    /// Authorize LPM.dev access from a browser on any device. With --json, return a pending request.
+    #[arg(long, conflicts_with_all = ["npm", "github", "gitlab", "login_registry", "token", "save_env_token", "complete"])]
+    pub(crate) device: bool,
+
+    /// Complete or resume an LPM.dev device request on this host. With --json, poll once.
+    #[arg(long, value_name = "LOGIN_ID", conflicts_with_all = ["npm", "github", "gitlab", "login_registry", "token", "save_env_token", "device"])]
+    pub(crate) complete: Option<String>,
+
     /// Log in to npm registry with npm web auth.
     #[arg(long)]
     pub(crate) npm: bool,

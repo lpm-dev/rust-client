@@ -599,8 +599,8 @@ pub(crate) fn clear_rejected_refresh_session_if_current(
 }
 
 pub(crate) fn clear_login_state_unlocked(registry_url: &str) -> Result<(), String> {
-    if let Some(marker) = dirs::home_dir().map(|h| h.join(".lpm").join(".token-check")) {
-        let _ = std::fs::remove_file(marker);
+    if let Ok(directory) = lpm_dir() {
+        let _ = std::fs::remove_file(directory.join(".token-check"));
     }
 
     let access_result = clear_stored_access_token_unlocked(registry_url);
@@ -1149,7 +1149,9 @@ pub fn clear_custom_registry_token(registry_url: &str) -> Result<(), String> {
 
 /// Path to the JSON file tracking custom registry URLs.
 fn custom_registries_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".lpm").join(".custom-registries.json"))
+    lpm_dir()
+        .ok()
+        .map(|directory| directory.join(".custom-registries.json"))
 }
 
 fn custom_registries_lock_path() -> Result<PathBuf, String> {
@@ -1421,7 +1423,9 @@ pub fn list_stored_registries() -> Vec<(String, String)> {
 
 /// Token expiry tracking file path.
 fn token_expiry_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".lpm").join(".token-expiry.json"))
+    lpm_dir()
+        .ok()
+        .map(|directory| directory.join(".token-expiry.json"))
 }
 
 fn token_expiry_lock_path() -> Result<std::path::PathBuf, String> {
@@ -2264,10 +2268,11 @@ fn clear_token_from_keychain(registry_url: &str) -> Result<(), String> {
 
 // ─── Encrypted File ────────────────────────────────────────────────
 
-/// Get the `~/.lpm/` directory path.
+/// Resolve the file-backed auth root, respecting `LPM_HOME`.
 fn lpm_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("could not determine home directory")?;
-    Ok(home.join(".lpm"))
+    lpm_common::paths::LpmRoot::from_env()
+        .map(|root| root.root().to_path_buf())
+        .map_err(|error| error.to_string())
 }
 
 fn credentials_path() -> Result<PathBuf, String> {
@@ -2417,10 +2422,7 @@ fn write_file_auth_key(key_path: &Path, value: &str) -> Result<(), String> {
 
 #[cfg(test)]
 fn get_auth_key_material() -> Result<AuthKeyMaterial, String> {
-    let key_path = dirs::home_dir()
-        .ok_or("no home directory")?
-        .join(".lpm")
-        .join(".key");
+    let key_path = lpm_dir()?.join(".key");
 
     if key_path.exists() {
         let value =
@@ -2447,10 +2449,7 @@ fn get_auth_key_material() -> Result<AuthKeyMaterial, String> {
     const KEY_SERVICE: &str = "dev.lpm.credentials-key";
     const KEY_ACCOUNT: &str = "encryption-key";
 
-    let key_path = dirs::home_dir()
-        .ok_or("no home directory")?
-        .join(".lpm")
-        .join(".key");
+    let key_path = lpm_dir()?.join(".key");
 
     let keyring_probe = if force_file_auth() {
         Ok(None)
@@ -2897,6 +2896,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _env = super::test_env::ScopedEnv::update([
             ("HOME", Some(temp.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(temp.path().join(".lpm").into_os_string())),
             (DISABLE_HOST_CLI_AUTH_ENV, Some("1".into())),
         ]);
 

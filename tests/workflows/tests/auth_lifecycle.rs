@@ -20,6 +20,85 @@ const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
 const GITHUB_REGISTRY_URL: &str = "https://npm.pkg.github.com";
 const GITLAB_REGISTRY_URL: &str = "https://gitlab.com/packages/npm";
 
+#[tokio::test]
+async fn custom_registry_login_and_logout_use_the_selected_lpm_home() {
+    let project = TempProject::empty(r#"{"name":"custom-auth-root","version":"1.0.0"}"#);
+    let registry = MockRegistry::start().await;
+    let profile = tempfile::tempdir().unwrap();
+    let root = profile.path().join(".lpm");
+    for (home, token) in [
+        (project.home(), "default-token"),
+        (profile.path(), "profile-token"),
+    ] {
+        seed_sessions(
+            home,
+            &[SessionSeed {
+                registry_url: &registry.url(),
+                access_token: Some(token),
+                session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+                ..Default::default()
+            }],
+        );
+        seed_custom_registries(home, &[&registry.url()]);
+    }
+    let output = lpm_with_registry(&project, &registry.url())
+        .args([
+            "login",
+            "--login-registry",
+            &registry.url(),
+            "--token",
+            "replacement-token",
+            "--json",
+        ])
+        .env("LPM_HOME", &root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        read_credentials(profile.path())[&registry.url()],
+        "replacement-token"
+    );
+    assert_eq!(
+        read_credentials(project.home())[&registry.url()],
+        "default-token"
+    );
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["logout", "--logout-registry", &registry.url(), "--json"])
+        .env("LPM_HOME", &root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(!credentials_path(profile.path()).exists());
+    assert!(!custom_registries_path(profile.path()).exists());
+    assert!(
+        read_expiry_metadata(profile.path())
+            .get(registry.url())
+            .is_none()
+    );
+    assert_eq!(
+        read_credentials(project.home())[&registry.url()],
+        "default-token"
+    );
+    assert!(
+        read_expiry_metadata(project.home())
+            .get(registry.url())
+            .is_some()
+    );
+    let original_inventory: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(custom_registries_path(project.home())).unwrap())
+            .unwrap();
+    assert_eq!(original_inventory, serde_json::json!([registry.url()]));
+}
+
 fn seed_expiry_metadata(home: &std::path::Path, entries: &[(&str, serde_json::Value)]) {
     let expiries = serde_json::Value::Object(
         entries
@@ -392,7 +471,7 @@ async fn login_starts_browser_flow_when_only_access_credential_is_valid() {
 
     let mut command = lpm_spawnable(&project);
     command
-        .args(["--registry", &mock.url(), "--insecure", "login", "--json"])
+        .args(["--registry", &mock.url(), "--insecure", "login"])
         .env("BROWSER", "false");
     let mut child = command.spawn().expect("failed to spawn lpm login");
     let browser_flow_marker = project.home().join(".lpm/device-id");

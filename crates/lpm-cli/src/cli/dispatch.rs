@@ -1545,6 +1545,8 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
         Commands::Login(args) => {
             let registry_args::LoginArgs {
+                device,
+                complete,
                 npm,
                 github,
                 gitlab,
@@ -1566,7 +1568,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                     .registry
                     .as_deref()
                     .unwrap_or(lpm_common::DEFAULT_REGISTRY_URL);
-                commands::login::run(&client, registry, cli.json).await
+                commands::login::run(&client, registry, cli.json, device, complete.as_deref()).await
             }
         }
         Commands::Logout(args) => {

@@ -1,0 +1,11 @@
+---
+source: tests/workflows/tests/device_login.rs
+expression: completed
+---
+{
+  "success": true,
+  "username": "testuser",
+  "registry": "[registry]",
+  "storage_backend": "encrypted_file_fallback",
+  "storage_degraded": true
+}
