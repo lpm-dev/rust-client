@@ -128,7 +128,7 @@ pub async fn run(
         }
     };
     let firewall_json = firewall_verdict.settle(json_output).await?;
-    let size = downloaded.compressed_size as usize;
+    let size = downloaded.compressed_size;
 
     let integrity_verified = if let Some(sri) = integrity_str.as_ref() {
         if !json_output {
@@ -202,7 +202,7 @@ pub async fn run(
             crate::install_ui::terminal_line!(
                 "    {} {}",
                 install_ui::dim(&format!("{:<16}", "size:")),
-                format_bytes(size)
+                lpm_common::format_bytes(size)
             )
         );
         eprintln!();
@@ -262,14 +262,4 @@ fn short_integrity(integrity: &str) -> String {
         .rev()
         .collect();
     format!("{prefix}…{suffix}")
-}
-
-fn format_bytes(bytes: usize) -> String {
-    if bytes >= 1_048_576 {
-        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
-    } else if bytes >= 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{bytes} B")
-    }
 }

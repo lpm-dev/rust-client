@@ -3049,7 +3049,7 @@ async fn verify_and_stage_for_standalone(
         install_ui::done_untrusted(&format!(
             "Verified Sigstore attestation for {} ({}, integratedTime {})",
             binary_name,
-            format_bytes(staged.byte_len),
+            lpm_common::format_bytes(staged.byte_len as u64),
             audit.integrated_time
         ));
     }
@@ -3353,16 +3353,6 @@ fn humanize_seconds(secs: u64) -> String {
         format!("{m} minute{}", if m == 1 { "" } else { "s" })
     } else {
         format!("{secs} second{}", if secs == 1 { "" } else { "s" })
-    }
-}
-
-fn format_bytes(bytes: usize) -> String {
-    if bytes >= 1_048_576 {
-        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
-    } else if bytes >= 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{bytes} B")
     }
 }
 
@@ -5537,15 +5527,6 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
             .contains(&platform),
             "unexpected platform: {platform}"
         );
-    }
-
-    #[test]
-    fn format_bytes_units() {
-        assert_eq!(format_bytes(500), "500 B");
-        assert_eq!(format_bytes(1024), "1.0 KB");
-        assert_eq!(format_bytes(1536), "1.5 KB");
-        assert_eq!(format_bytes(1_048_576), "1.0 MB");
-        assert_eq!(format_bytes(2_621_440), "2.5 MB");
     }
 
     /// Rate-limit lands on `SelfUpdateRateLimited`, not `Forbidden`.

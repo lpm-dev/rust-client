@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::io::Read as _;
 use std::path::Path;
 
-use lpm_common::LpmError;
+use lpm_common::{LpmError, format_bytes};
 use lpm_security::skill_security::{self, SkillSecurityIssue};
 use sha2::{Digest, Sha256};
 
@@ -154,8 +154,9 @@ fn validate_open_directory(skills_dir: &cap_std::fs::Dir) -> Result<ValidationRe
     }
     if report.total_size_bytes > MAX_TOTAL_SIZE {
         report.errors.push(format!(
-            "total package skills size {} bytes exceeds 100KB limit",
-            report.total_size_bytes
+            "total package skills size {} bytes exceeds {} limit",
+            report.total_size_bytes,
+            format_bytes(MAX_TOTAL_SIZE)
         ));
     }
 
@@ -201,9 +202,10 @@ fn validate_opened_file(
     let security_count = report.security_issues.len();
 
     if size > MAX_SKILL_SIZE {
-        report
-            .errors
-            .push(format!("{display}: exceeds 15KB limit ({size} bytes)"));
+        report.errors.push(format!(
+            "{display}: exceeds {} limit ({size} bytes)",
+            format_bytes(MAX_SKILL_SIZE)
+        ));
         return Ok(());
     }
 
@@ -217,7 +219,8 @@ fn validate_opened_file(
             .saturating_sub(size)
             .saturating_add(bytes.len() as u64);
         report.errors.push(format!(
-            "{display}: exceeds 15KB limit ({} bytes)",
+            "{display}: exceeds {} limit ({} bytes)",
+            format_bytes(MAX_SKILL_SIZE),
             bytes.len()
         ));
         return Ok(());
@@ -597,7 +600,7 @@ mod tests {
             report
                 .errors
                 .iter()
-                .any(|error| error.contains("exceeds 100KB limit"))
+                .any(|error| error.contains("exceeds 100 KiB limit"))
         );
         assert!(retained_bytes <= MAX_TOTAL_SIZE, "{retained_bytes}");
     }

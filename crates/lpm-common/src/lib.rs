@@ -427,22 +427,206 @@ fn apfs_held_back(size: u64) -> u64 {
         .min(33 * 1024 * 1024)
 }
 
-/// Format bytes into a human-readable string (e.g., "1.2 KB", "3.4 MB").
+/// Format bytes into a human-readable string in binary units, as they're
+/// counted (e.g., "1.2 KiB", "3.4 MiB", "5 GiB"), as the LPM.dev Registry
+/// labels them. Switches unit at each 1024, so a 900-byte file never reads
+/// as "0.9 KiB", and a value whose tenth would read 1024.0 takes the next
+/// unit. A whole number only for an exact size, so 5 GiB and a few bytes
+/// reads "5.0 GiB". A tenth halfway between two rounds up, as the
+/// Registry's does.
 pub fn format_bytes(bytes: u64) -> String {
+    format_scaled(bytes, 1, UNITS.len() - 1, Rounding::Nearest, false)
+}
+
+/// Formats a size past a limit it's shown against: to two decimals, rounded
+/// up, so a size a byte past its limit never reads as within it ("500.01
+/// MiB" against 500 MiB), as the LPM.dev Registry states such sizes.
+pub fn format_bytes_past(bytes: u64) -> String {
+    format_scaled(bytes, 2, UNITS.len() - 1, Rounding::Up, false)
+}
+
+/// Formats a usage and the limit it's shown against as the LPM.dev
+/// Registry's billing page does: to two decimals, in GiB at most with
+/// thousands grouped, as limits and prices are stated per GiB. The usage
+/// rounds toward the side of the limit it's on, so usage a few bytes past
+/// its limit reads as past it, as overage bills it ("5.01 GiB / 5 GiB"),
+/// and usage a few bytes short reads as short of it.
+pub fn format_quota(used: u64, limit: u64) -> (String, String) {
+    let rounding = match used.cmp(&limit) {
+        std::cmp::Ordering::Greater => Rounding::Up,
+        std::cmp::Ordering::Less => Rounding::Down,
+        std::cmp::Ordering::Equal => Rounding::Nearest,
+    };
+    (
+        format_scaled(used, 2, GIB_UNIT, rounding, true),
+        format_scaled(limit, 2, GIB_UNIT, Rounding::Nearest, true),
+    )
+}
+
+/// Formats a usage with no limit to show it against, as `format_quota`
+/// shows usage: to two decimals, in GiB at most with thousands grouped.
+pub fn format_usage(used: u64) -> String {
+    format_scaled(used, 2, GIB_UNIT, Rounding::Nearest, true)
+}
+
+const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+const GIB_UNIT: usize = 3;
+
+#[derive(Clone, Copy)]
+enum Rounding {
+    Nearest,
+    Up,
+    Down,
+}
+
+/// `bytes` in its largest unit up to `max_unit` whose shown value is at
+/// least 1, to `decimals` places, rounded as asked in exact integer
+/// arithmetic; a whole number for an exact size.
+fn format_scaled(
+    bytes: u64,
+    decimals: u32,
+    max_unit: usize,
+    rounding: Rounding,
+    grouped: bool,
+) -> String {
     if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else if bytes < 1024 * 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{:.1} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        let shown = if grouped {
+            group_thousands(u128::from(bytes))
+        } else {
+            bytes.to_string()
+        };
+        return format!("{shown} B");
     }
+    let places = 10_u128.pow(decimals);
+    let shown = |scale: u128| {
+        let numerator = u128::from(bytes) * places;
+        match rounding {
+            Rounding::Nearest => (numerator + scale / 2) / scale,
+            Rounding::Up => numerator.div_ceil(scale),
+            Rounding::Down => numerator / scale,
+        }
+    };
+    let mut unit = 1;
+    let mut scale = 1024_u128;
+    while unit < max_unit && shown(scale) >= 1024 * places {
+        unit += 1;
+        scale *= 1024;
+    }
+    let whole = |value: u128| {
+        if grouped {
+            group_thousands(value)
+        } else {
+            value.to_string()
+        }
+    };
+    if u128::from(bytes) % scale == 0 {
+        return format!("{} {}", whole(u128::from(bytes) / scale), UNITS[unit]);
+    }
+    let value = shown(scale);
+    format!(
+        "{}.{:0width$} {}",
+        whole(value / places),
+        value % places,
+        UNITS[unit],
+        width = decimals as usize
+    )
+}
+
+fn group_thousands(value: u128) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_bytes_labels_binary_units() {
+        assert_eq!(format_bytes(500), "500 B");
+        assert_eq!(format_bytes(1024), "1 KiB");
+        assert_eq!(format_bytes(1536), "1.5 KiB");
+        assert_eq!(format_bytes(1_048_576), "1 MiB");
+        assert_eq!(format_bytes(2_621_440), "2.5 MiB");
+        assert_eq!(format_bytes(5 * 1024 * 1024 * 1024), "5 GiB");
+        assert_eq!(format_bytes(5 * 1024 * 1024 * 1024 + 100), "5.0 GiB");
+        assert_eq!(format_bytes(1025 * 1024_u64.pow(3)), "1.0 TiB");
+        assert_eq!(format_bytes(2 * 1024_u64.pow(4)), "2 TiB");
+        assert_eq!(format_bytes(3 * 1024_u64.pow(5)), "3 PiB");
+        assert_eq!(format_bytes(u64::MAX), "16384.0 PiB");
+        // Whose tenth would read 1024.0 takes the next unit.
+        assert_eq!(format_bytes(1_048_525), "1.0 MiB");
+        assert_eq!(format_bytes(1_048_524), "1023.9 KiB");
+    }
+
+    #[test]
+    fn format_bytes_rounds_a_halfway_tenth_up_as_the_registry_does() {
+        assert_eq!(format_bytes(1280), "1.3 KiB");
+        assert_eq!(format_bytes(1229), "1.2 KiB");
+        assert_eq!(
+            format_bytes(5 * 1024_u64.pow(3) + 1024_u64.pow(3) / 4),
+            "5.3 GiB"
+        );
+    }
+
+    #[test]
+    fn format_quota_reads_usage_on_its_side_of_the_limit() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let quota = |used, limit| {
+            let (used, limit) = format_quota(used, limit);
+            format!("{used} / {limit}")
+        };
+        assert_eq!(quota(5 * GIB + 1, 5 * GIB), "5.01 GiB / 5 GiB");
+        assert_eq!(
+            quota(5 * GIB + 51 * 1024 * 1024, 5 * GIB),
+            "5.05 GiB / 5 GiB"
+        );
+        assert_eq!(quota(5 * GIB - 1, 5 * GIB), "4.99 GiB / 5 GiB");
+        assert_eq!(quota(5 * GIB, 5 * GIB), "5 GiB / 5 GiB");
+        assert_eq!(
+            quota(512 * 1024 * 1024 + 104_858, 5 * GIB),
+            "512.10 MiB / 5 GiB"
+        );
+        assert_eq!(quota(0, 5 * GIB), "0 B / 5 GiB");
+    }
+
+    #[test]
+    fn format_usage_reads_usage_as_quotas_do_without_a_limit() {
+        let gib = 1024_u64.pow(3);
+        assert_eq!(format_usage(1253 * gib + gib / 2), "1,253.50 GiB");
+        assert_eq!(format_usage(1023), "1,023 B");
+        assert_eq!(format_usage(2048), "2 KiB");
+        assert_eq!(format_usage(2049), "2.00 KiB");
+        // To nearest: 1.0059 KiB reads 1.01, not 1.00.
+        assert_eq!(format_usage(1030), "1.01 KiB");
+    }
+
+    #[test]
+    fn format_quota_states_sizes_in_gib_at_most_with_thousands_grouped() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(
+            format_quota(1253 * GIB, 1250 * GIB),
+            ("1,253 GiB".into(), "1,250 GiB".into())
+        );
+        assert_eq!(
+            format_quota(1253 * GIB + GIB / 2, 1250 * GIB).0,
+            "1,253.50 GiB"
+        );
+        assert_eq!(format_quota(u64::MAX, u64::MAX).0, "17,179,869,184.00 GiB");
+        assert_eq!(format_bytes_past(500 * 1024 * 1024 + 1), "500.01 MiB");
+        assert_eq!(format_bytes_past(500 * 1024 * 1024), "500 MiB");
+        assert_eq!(format_bytes_past(5 * GIB + 1), "5.01 GiB");
+        // As the Registry groups bytes too ("1,000 B").
+        assert_eq!(format_quota(1000, 2048), ("1,000 B".into(), "2 KiB".into()));
+        assert_eq!(format_bytes(1000), "1000 B");
+    }
 
     /// `df`'s figure for the filesystem holding `path`: its size and the
     /// space free to this user, in bytes.

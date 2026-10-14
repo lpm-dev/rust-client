@@ -300,7 +300,7 @@ jobs:
   test:
     name: Fast tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
@@ -359,6 +359,12 @@ jobs:
 
       - name: Generated npm provenance workflow
         run: scripts/ci/with-hermetic-workflow-cli.sh cargo nextest run --locked -p lpm-workflows --test publish -E 'test(publish_npm_generated_provenance_attaches_sigstore_bundle_to_registry_put)' --no-fail-fast --status-level slow --final-status-level fail
+
+      - name: LPM registry publish limits and preflight workflows
+        run: scripts/ci/with-hermetic-workflow-cli.sh cargo nextest run --locked -p lpm-workflows --test publish --test release -E 'test(/lpm_dev/)' --no-fail-fast --status-level slow --final-status-level fail
+
+      - name: Whoami workflow
+        run: scripts/ci/with-hermetic-workflow-cli.sh cargo nextest run --locked -p lpm-workflows --test whoami --no-fail-fast --status-level slow --final-status-level fail
 
       - name: Native Swift publication workflow
         run: |
@@ -669,7 +675,7 @@ jobs:
     name: Hoisted-mode compat audit (${{ matrix.os }} / ${{ matrix.store_version }})
     if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 45 }}
     # Run the audit fixtures on main, scheduled, and manual CI. The
     # suite catches mode-asymmetric regressions: a fix that lands and
     # accidentally breaks hoisted (or isolated) for a real-world package
