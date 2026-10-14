@@ -2578,20 +2578,77 @@ fn run_macos_validation_tool(
     arguments: &[&OsStr],
     description: &str,
 ) -> Result<std::process::Output, LpmError> {
-    let output = validation::run(program, arguments, description, Duration::from_secs(60))?;
+    let output = run_macos_validation_tool_once(program, arguments, description)?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(LpmError::SelfUpdate(format!(
-            "{description} failed with status {}{}",
-            output.status,
-            if stderr.trim().is_empty() {
-                String::new()
-            } else {
-                format!(": {}", stderr.trim())
-            }
-        )));
+        return Err(macos_validation_failure(description, &output));
     }
     Ok(output)
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_validation_tool_once(
+    program: &str,
+    arguments: &[&OsStr],
+    description: &str,
+) -> Result<std::process::Output, LpmError> {
+    validation::run(program, arguments, description, Duration::from_secs(60))
+}
+
+/// Names the failure in the tool's own words: its stderr, or its stdout
+/// when stderr is empty, which is where `stapler` reports.
+#[cfg(target_os = "macos")]
+fn macos_validation_failure(description: &str, output: &std::process::Output) -> LpmError {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let diagnostic = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    LpmError::SelfUpdate(format!(
+        "{description} failed with status {}{}",
+        output.status,
+        if diagnostic.is_empty() {
+            String::new()
+        } else {
+            format!(": {diagnostic}")
+        }
+    ))
+}
+
+/// `stapler validate` checks the stapled ticket against Apple's CloudKit
+/// record and exits with `EX_NOHOST` when CloudKit doesn't answer.
+#[cfg(target_os = "macos")]
+const STAPLER_CLOUDKIT_UNREACHABLE: i32 = 68;
+
+#[cfg(target_os = "macos")]
+const NOTARIZATION_TICKET_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_secs(2), Duration::from_secs(5)];
+
+/// Validates the bundle's stapled notarization ticket, running `stapler`
+/// again after each of `retry_delays` while CloudKit doesn't answer. Any
+/// other failure, an invalid or missing ticket among them, fails at once.
+#[cfg(target_os = "macos")]
+fn validate_notarization_ticket(
+    stapler: &str,
+    app_bundle: &Path,
+    retry_delays: &[Duration],
+) -> Result<(), LpmError> {
+    const DESCRIPTION: &str = "macOS notarization-ticket validation";
+    let arguments = [OsStr::new("validate"), app_bundle.as_os_str()];
+    let mut retry_delays = retry_delays.iter();
+    loop {
+        let output = run_macos_validation_tool_once(stapler, &arguments, DESCRIPTION)?;
+        if output.status.success() {
+            return Ok(());
+        }
+        match retry_delays.next() {
+            Some(delay) if output.status.code() == Some(STAPLER_CLOUDKIT_UNREACHABLE) => {
+                std::thread::sleep(*delay);
+            }
+            _ => return Err(macos_validation_failure(DESCRIPTION, &output)),
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2726,10 +2783,10 @@ fn validate_macos_app_bundle(app_bundle: &Path) -> Result<(), LpmError> {
         ));
     }
 
-    run_macos_validation_tool(
+    validate_notarization_ticket(
         "/usr/bin/stapler",
-        &[OsStr::new("validate"), app_bundle.as_os_str()],
-        "macOS notarization-ticket validation",
+        app_bundle,
+        &NOTARIZATION_TICKET_RETRY_DELAYS,
     )?;
     run_macos_validation_tool(
         "/usr/sbin/spctl",
@@ -5735,5 +5792,102 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
             elapsed < Duration::from_secs(3),
             "inherited pipe delayed completion: {elapsed:?}"
         );
+    }
+
+    /// A `stapler` that exits with `exit_codes[n]` on its nth run, reporting
+    /// on stdout as the real one does, and records each run's arguments.
+    #[cfg(target_os = "macos")]
+    fn fake_stapler(directory: &Path, exit_codes: &[i32]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let runs = directory.join("runs");
+        let stapler = directory.join("stapler");
+        let codes = exit_codes
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        std::fs::write(
+            &stapler,
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s\\n' \"$*\" >> '{runs}'\n\
+                 code=$(echo '{codes}' | cut -d' ' -f$(($(wc -l < '{runs}'))))\n\
+                 if [ \"$code\" = 0 ]; then echo 'The validate action worked!'; exit 0; fi\n\
+                 echo \"CloudKit's response is inconsistent with expections: (null)\"\n\
+                 echo \"The validate action failed! Error $code.\"\n\
+                 exit \"$code\"\n",
+                runs = runs.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stapler, std::fs::Permissions::from_mode(0o755)).unwrap();
+        stapler
+    }
+
+    #[cfg(target_os = "macos")]
+    fn stapler_runs(directory: &Path) -> Vec<String> {
+        std::fs::read_to_string(directory.join("runs"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn notarization_ticket_check_outlasts_a_brief_cloudkit_outage() {
+        let directory = tempfile::tempdir().unwrap();
+        let stapler = fake_stapler(directory.path(), &[68, 68, 0]);
+
+        validate_notarization_ticket(
+            stapler.to_str().unwrap(),
+            Path::new("/Applications/LPM CLI.app"),
+            &[Duration::ZERO; 2],
+        )
+        .unwrap();
+
+        assert_eq!(
+            stapler_runs(directory.path()),
+            vec!["validate /Applications/LPM CLI.app"; 3]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn notarization_ticket_check_reports_a_lasting_cloudkit_outage_in_stapler_s_words() {
+        let directory = tempfile::tempdir().unwrap();
+        let stapler = fake_stapler(directory.path(), &[68, 68, 68, 0]);
+
+        let error = validate_notarization_ticket(
+            stapler.to_str().unwrap(),
+            Path::new("/Applications/LPM CLI.app"),
+            &[Duration::ZERO; 2],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains("CloudKit's response is inconsistent"),
+            "{error}"
+        );
+        assert_eq!(stapler_runs(directory.path()).len(), 3);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn notarization_ticket_check_rejects_an_invalid_ticket_at_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let stapler = fake_stapler(directory.path(), &[65, 0]);
+
+        let error = validate_notarization_ticket(
+            stapler.to_str().unwrap(),
+            Path::new("/Applications/LPM CLI.app"),
+            &[Duration::ZERO; 2],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("Error 65"), "{error}");
+        assert_eq!(stapler_runs(directory.path()).len(), 1);
     }
 }
