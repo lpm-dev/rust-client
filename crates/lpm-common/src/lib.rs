@@ -7,6 +7,7 @@
 
 pub mod atomic_write;
 pub mod bounded_read;
+pub mod browser;
 pub mod child_env;
 pub mod color;
 pub mod command_name;

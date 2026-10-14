@@ -531,7 +531,7 @@ pub(crate) struct DevArgs {
     #[arg(long)]
     pub(crate) no_env_check: bool,
 
-    /// Require auth token to access the tunnel URL (Pro/Org only).
+    /// Require auth token to access the tunnel URL.
     /// Generates a random token per session and prints it in the tunnel banner.
     #[arg(long)]
     pub(crate) tunnel_auth: bool,

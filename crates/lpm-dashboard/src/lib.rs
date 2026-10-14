@@ -205,7 +205,7 @@ pub fn run_dashboard(
                         // Best-effort: a missing `xdg-open` / no-display CI
                         // shouldn't crash the TUI. The URL is also printed
                         // in the startup banner so the user can copy-paste.
-                        let _ = open::that(url);
+                        let _ = lpm_common::browser::open(url);
                     }
                 }
                 KeyCode::Up => app.scroll_up(),

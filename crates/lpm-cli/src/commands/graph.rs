@@ -254,7 +254,7 @@ pub async fn run(
             ));
 
             // Open in browser unless suppressed (headless / CI).
-            if !no_open && open::that(&out_path).is_err() && !json_output {
+            if !no_open && lpm_common::browser::open(&out_path).is_err() && !json_output {
                 install_ui::warn("Could not open browser automatically");
                 println!(
                     "{}",

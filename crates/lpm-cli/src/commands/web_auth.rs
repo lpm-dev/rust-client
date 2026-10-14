@@ -149,7 +149,7 @@ pub async fn complete_web_auth_challenge(
     }
 
     if open_browser
-        && let Err(e) = open::that(&challenge.auth_url)
+        && let Err(e) = lpm_common::browser::open(&challenge.auth_url)
         && !json_output
     {
         install_ui::warn_untrusted(&format!(

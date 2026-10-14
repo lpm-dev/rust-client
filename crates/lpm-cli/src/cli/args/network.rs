@@ -239,7 +239,7 @@ pub(crate) struct TunnelArgs {
     #[arg(long)]
     pub(crate) org: Option<String>,
 
-    /// Require auth token to access the tunnel URL (Pro/Org only).
+    /// Require auth token to access the tunnel URL.
     #[arg(long)]
     pub(crate) tunnel_auth: bool,
 

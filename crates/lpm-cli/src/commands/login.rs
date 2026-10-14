@@ -158,7 +158,7 @@ pub async fn run(
         &code_challenge,
         &device_name,
     );
-    if open::that(&login_url).is_err() && !json_output {
+    if lpm_common::browser::open(&login_url).is_err() && !json_output {
         install_ui::warn("Could not open browser automatically");
         install_ui::detail_line(login_detail_row("url:", &install_ui::url(&login_url)));
     }

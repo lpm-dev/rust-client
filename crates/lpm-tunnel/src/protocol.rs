@@ -15,7 +15,7 @@ pub enum ClientMessage {
     Hello {
         /// LPM auth token.
         token: String,
-        /// Requested domain (Pro/Org only, None for random).
+        /// Requested domain. None uses the Pro account's `<username>.lpm.fyi`.
         /// Wire format uses "subdomain" for backward compat with relay Worker.
         #[serde(rename = "subdomain")]
         domain: Option<String>,
@@ -92,7 +92,7 @@ pub enum ServerMessage {
         /// Wire format uses "subdomain" for backward compat with relay Worker.
         #[serde(rename = "subdomain")]
         domain: String,
-        /// Full tunnel URL (e.g., `https://abc123.t.lpm.dev`).
+        /// Full tunnel URL (e.g., `https://acme.lpm.fyi`).
         tunnel_url: String,
         /// Session ID for reconnection.
         session_id: String,
@@ -102,15 +102,9 @@ pub enum ServerMessage {
         /// Base domain used by the assigned tunnel domain.
         #[serde(default)]
         base_domain: Option<String>,
-        /// Assignment source: random, account default, or claimed custom domain.
+        /// Assignment source: the account's default domain or a claimed domain.
         #[serde(default)]
         domain_kind: Option<String>,
-        /// Epoch milliseconds when the relay will close the session.
-        #[serde(default)]
-        session_expires_at: Option<u64>,
-        /// Maximum session lifetime in milliseconds. None means uncapped or not advertised.
-        #[serde(default)]
-        session_max_ms: Option<u64>,
         /// Relay limits applied to this session.
         #[serde(default)]
         limits: Option<crate::TunnelLimitMetadata>,
@@ -233,8 +227,6 @@ mod tests {
                 plan,
                 base_domain,
                 domain_kind,
-                session_expires_at,
-                session_max_ms,
                 limits,
             } => {
                 assert_eq!(domain, "abc123");
@@ -243,8 +235,6 @@ mod tests {
                 assert_eq!(plan, None);
                 assert_eq!(base_domain, None);
                 assert_eq!(domain_kind, None);
-                assert_eq!(session_expires_at, None);
-                assert_eq!(session_max_ms, None);
                 assert_eq!(limits, None);
             }
             _ => panic!("expected Hello"),
@@ -255,22 +245,20 @@ mod tests {
     fn deserialize_server_hello_preserves_limit_metadata() {
         let json = r#"{
 			"type": "hello",
-			"subdomain": "abc123.lpm.fyi",
-			"tunnel_url": "https://abc123.lpm.fyi",
+			"subdomain": "acme.lpm.fyi",
+			"tunnel_url": "https://acme.lpm.fyi",
 			"session_id": "sess_001",
-			"plan": "free",
+			"plan": "pro",
 			"base_domain": "lpm.fyi",
-			"domain_kind": "random",
-			"session_expires_at": 1781020800000,
-			"session_max_ms": 3600000,
+			"domain_kind": "account",
 			"limits": {
-				"max_concurrent": 1,
-				"request_rate_limit_per_minute": 4000,
-				"account_rate_limit_per_minute": 4000,
+				"max_concurrent": 3,
+				"request_rate_limit_per_minute": 20000,
+				"account_rate_limit_per_minute": 20000,
 				"per_ip_rate_limit_per_minute": 600,
-				"max_request_body_bytes": 10485760,
-				"max_custom_domains": 0,
-				"tunnel_auth_available": false
+				"max_request_body_bytes": 104857600,
+				"max_custom_domains": 3,
+				"tunnel_auth_available": true
 			}
 		}"#;
         let msg: ServerMessage = serde_json::from_str(json).unwrap();
@@ -279,25 +267,21 @@ mod tests {
                 plan,
                 base_domain,
                 domain_kind,
-                session_expires_at,
-                session_max_ms,
                 limits,
                 ..
             } => {
-                assert_eq!(plan.as_deref(), Some("free"));
+                assert_eq!(plan.as_deref(), Some("pro"));
                 assert_eq!(base_domain.as_deref(), Some("lpm.fyi"));
-                assert_eq!(domain_kind.as_deref(), Some("random"));
-                assert_eq!(session_expires_at, Some(1_781_020_800_000));
-                assert_eq!(session_max_ms, Some(3_600_000));
+                assert_eq!(domain_kind.as_deref(), Some("account"));
                 assert_eq!(
                     limits,
                     Some(crate::TunnelLimitMetadata {
-                        max_concurrent: Some(1),
-                        request_rate_limit_per_minute: Some(4_000),
+                        max_concurrent: Some(3),
+                        request_rate_limit_per_minute: Some(20_000),
                         per_ip_rate_limit_per_minute: Some(600),
-                        max_request_body_bytes: Some(10_485_760),
-                        max_custom_domains: Some(0),
-                        tunnel_auth_available: Some(false),
+                        max_request_body_bytes: Some(104_857_600),
+                        max_custom_domains: Some(3),
+                        tunnel_auth_available: Some(true),
                     })
                 );
             }

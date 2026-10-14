@@ -295,6 +295,21 @@ fn json_error_value(error: &lpm_common::LpmError) -> serde_json::Value {
                 "error": serde_json::Value::Object(detail),
             })
         }
+        lpm_common::LpmError::TunnelAccess {
+            code,
+            message,
+            help,
+        } => serde_json::json!({
+            "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
+            "success": false,
+            "error_code": error.error_code(),
+            "error": {
+                "code": "TUNNEL_ACCESS",
+                "relay_code": code,
+                "message": message,
+                "help": help,
+            }
+        }),
         lpm_common::LpmError::ArtifactUnavailable(context) => serde_json::json!({
             "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
             "success": false,
@@ -853,6 +868,11 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         lpm_common::LpmError::Tunnel(reason) => {
             diagnostic_lines("Tunnel error", Some(reason), error)
         }
+        lpm_common::LpmError::TunnelAccess { code, message, .. } => diagnostic_lines(
+            "Tunnel unavailable",
+            Some(&format!("{message} ({code})")),
+            error,
+        ),
         lpm_common::LpmError::Store(reason) => diagnostic_lines("Store error", Some(reason), error),
         lpm_common::LpmError::ProjectLayout(reason) => {
             diagnostic_lines("Project layout error", Some(reason), error)
