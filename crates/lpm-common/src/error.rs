@@ -514,6 +514,16 @@ pub enum LpmError {
     )]
     Tunnel(String),
 
+    /// The relay refused a tunnel because the account can't run one, such
+    /// as a plan without tunnels. Retrying doesn't help until the account changes.
+    #[error("tunnel unavailable: {message} ({code})")]
+    #[diagnostic(code(lpm::tunnel_access), help("{help}"))]
+    TunnelAccess {
+        code: String,
+        message: String,
+        help: String,
+    },
+
     #[error("store error: {0}")]
     #[diagnostic(
         code(lpm::store),
@@ -739,7 +749,40 @@ pub enum LpmError {
     },
 }
 
+/// Relay codes that mean the account can't run a tunnel.
+pub const TUNNEL_ACCESS_CODES: [&str; 4] = [
+    "plan_required",
+    "domain_required",
+    "billing_inactive",
+    "account_not_found",
+];
+
 impl LpmError {
+    /// The error for a relay refusal with one of [`TUNNEL_ACCESS_CODES`].
+    pub fn tunnel_access(code: &str, message: impl Into<String>) -> Self {
+        let help = match code {
+            "plan_required" => {
+                "Tunnels need a Pro plan, or one of your organization's claimed domains. Upgrade at https://lpm.dev/pricing, or name the organization's domain: `lpm tunnel <port> <domain>` or `lpm dev --domain <domain>`."
+            }
+            "domain_required" => {
+                "Your tunnel URL comes from your lpm.dev username. Set one at https://lpm.dev/dashboard/settings, or name a domain you claimed: `lpm tunnel <port> <domain>` or `lpm dev --domain <domain>`."
+            }
+            // The code comes back for a lapsed Pro account and for an
+            // organization alike, and the relay doesn't say which.
+            "billing_inactive" => {
+                "Billing for the tunnel's account is inactive. For your Pro plan, update your payment method at https://lpm.dev/dashboard/settings/billing; for an organization, an owner can update it in the organization's billing settings on lpm.dev."
+            }
+            _ => {
+                "The tunnel's account is no longer available. Run `lpm login`, then start the tunnel again."
+            }
+        };
+        LpmError::TunnelAccess {
+            code: code.to_owned(),
+            message: message.into(),
+            help: help.to_owned(),
+        }
+    }
+
     /// Machine-readable error code for structured JSON output.
     ///
     /// Used by the CLI's `--json` flag to provide parseable error responses
@@ -787,6 +830,7 @@ impl LpmError {
             LpmError::ScriptPhase { .. } => "script",
             LpmError::Cert(_) => "cert",
             LpmError::Tunnel(_) => "tunnel",
+            LpmError::TunnelAccess { .. } => "tunnel_access",
             LpmError::Store(_) => "store",
             LpmError::ProjectLayout(_) => "project_layout",
             LpmError::ExitCode(_) => "exit_code",
@@ -819,6 +863,22 @@ impl LpmError {
 mod tests {
     use super::*;
     use miette::Diagnostic;
+
+    #[test]
+    fn inactive_billing_points_a_personal_account_and_an_organization_to_their_own_billing() {
+        let LpmError::TunnelAccess { help, .. } = LpmError::tunnel_access(
+            "billing_inactive",
+            "Pro billing is inactive. Update your payment method at https://lpm.dev/dashboard/settings/billing",
+        ) else {
+            panic!("not a tunnel access error");
+        };
+
+        assert!(
+            help.contains("https://lpm.dev/dashboard/settings/billing"),
+            "{help}"
+        );
+        assert!(help.contains("organization's billing settings"), "{help}");
+    }
 
     #[test]
     fn task_error_display() {
@@ -1024,6 +1084,7 @@ mod tests {
             },
             LpmError::Cert("x".into()),
             LpmError::Tunnel("x".into()),
+            LpmError::tunnel_access("plan_required", "x"),
             LpmError::Store("x".into()),
             LpmError::ProjectLayout("x".into()),
             LpmError::ExitCode(1),
