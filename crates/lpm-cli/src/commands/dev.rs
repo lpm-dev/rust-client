@@ -2035,7 +2035,7 @@ pub async fn run(
                     dev_ui::blank_line();
                     dev_ui::done_ready("Local server", multi_started.elapsed());
                     if open_browser {
-                        let _ = open::that(local_url);
+                        let _ = lpm_common::browser::open(local_url);
                     }
                     Ok(())
                     })();
@@ -2476,7 +2476,7 @@ pub async fn run(
                 https,
             )?);
             if should_open_browser(true, no_open, is_ci()) {
-                let _ = open::that(&url);
+                let _ = lpm_common::browser::open(&url);
             }
             frontends = Some(active_frontends);
         } else {

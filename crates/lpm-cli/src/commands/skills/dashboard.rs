@@ -132,7 +132,7 @@ pub(super) async fn run(
     let port = args.port.unwrap_or(0);
     let handle = start(project_dir, args.read_only, port).await?;
     let should_open = !args.no_open && !json_output;
-    let opened = should_open && open::that(&handle.launch_url).is_ok();
+    let opened = should_open && lpm_common::browser::open(&handle.launch_url).is_ok();
 
     if json_output {
         let output = serde_json::json!({

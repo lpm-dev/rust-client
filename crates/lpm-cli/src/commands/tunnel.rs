@@ -954,7 +954,7 @@ async fn run_domains(client: &RegistryClient, json_output: bool) -> Result<(), L
 async fn run_inspect_ui(project_dir: &Path, inspect_port: Option<u16>) -> Result<(), LpmError> {
     let state = project_inspector_state(project_dir)?;
     let handle = lpm_inspect::start(state, inspect_port.unwrap_or(0)).await?;
-    if let Err(error) = open::that(&handle.url) {
+    if let Err(error) = lpm_common::browser::open(&handle.url) {
         install_ui::warn_untrusted(&format!("failed to open inspector in browser: {error}"));
     }
 
@@ -1494,7 +1494,7 @@ async fn wait_for_tunnel_controls(inspector_url: Option<String>) -> Result<(), L
                     TunnelControl::Quit => return Ok(()),
                     TunnelControl::OpenInspector => {
                         if let Some(url) = inspector_url.as_deref()
-                            && let Err(e) = open::that(url)
+                            && let Err(e) = lpm_common::browser::open(url)
                         {
                             install_ui::warn_untrusted(&format!("failed to open inspector: {e}"));
                         }
