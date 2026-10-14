@@ -5,7 +5,7 @@ use std::fmt::Display;
 use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 /// Run the `lpm tunnel` command.
 ///
@@ -407,8 +407,6 @@ fn tunnel_ready_json(
         "plan": session.plan,
         "base_domain": session.base_domain,
         "domain_kind": session.domain_kind,
-        "session_expires_at": session.session_expires_at,
-        "session_max_ms": session.session_max_ms,
         "limits": session.limits,
         "usage": usage,
         "tunnel_auth": tunnel_auth,
@@ -610,9 +608,6 @@ pub(crate) async fn run_start(
                 }
                 if let Some(plan) = session.plan.as_deref() {
                     tunnel_detail("plan", plan);
-                }
-                if let Some(expiry) = tunnel_session_expiry_summary(session) {
-                    tunnel_detail("expires", expiry);
                 }
                 if let Some(limits) = tunnel_limit_summary(session.limits.as_ref()) {
                     tunnel_detail("limits", limits);
@@ -925,16 +920,9 @@ async fn run_domains(client: &RegistryClient, json_output: bool) -> Result<(), L
     if let Some(domains) = result["domains"].as_array() {
         for d in domains {
             let domain = d["domain"].as_str().unwrap_or("?");
-            let plan = d["planRequired"].as_str().unwrap_or("?");
-            let plan_badge = if plan == "free" {
-                install_ui::status_ok("free")
-            } else {
-                install_ui::cyan("pro")
-            };
             install_ui::detail_line(crate::install_ui::terminal_line!(
-                "    {:<15} {}",
-                install_ui::yellow(domain),
-                plan_badge
+                "    {}",
+                install_ui::yellow(domain)
             ));
         }
     }
@@ -1327,12 +1315,6 @@ fn tunnel_detail(label: &'static str, value: impl Display) {
     install_ui::detail_line(format_tunnel_detail(label, value));
 }
 
-pub(crate) fn tunnel_session_expiry_summary(session: &lpm_tunnel::TunnelSession) -> Option<String> {
-    session
-        .session_expires_at
-        .map(|expires_at_ms| format_tunnel_expiry_at(expires_at_ms, current_time_millis()))
-}
-
 pub(crate) fn tunnel_limit_summary(
     limits: Option<&lpm_tunnel::TunnelLimitMetadata>,
 ) -> Option<String> {
@@ -1411,46 +1393,6 @@ fn style_tunnel_detail_value(label: &str, value: &str) -> install_ui::TerminalFr
         "public URL" | "inspector" | "browser" => install_ui::url(value),
         "local" => install_ui::yellow(value),
         _ => install_ui::field(value),
-    }
-}
-
-fn current_time_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
-}
-
-fn format_tunnel_expiry_at(expires_at_ms: u64, now_ms: u64) -> String {
-    if expires_at_ms <= now_ms {
-        return "now".to_string();
-    }
-    format!(
-        "in {}",
-        format_duration_compact_ms(expires_at_ms.saturating_sub(now_ms))
-    )
-}
-
-fn format_duration_compact_ms(ms: u64) -> String {
-    let seconds = ms.saturating_add(999) / 1000;
-    if seconds >= 3600 {
-        let hours = seconds / 3600;
-        let minutes = (seconds % 3600) / 60;
-        if minutes > 0 {
-            format!("{hours}h {minutes}m")
-        } else {
-            format!("{hours}h")
-        }
-    } else if seconds >= 60 {
-        let minutes = seconds / 60;
-        let remaining_seconds = seconds % 60;
-        if remaining_seconds > 0 {
-            format!("{minutes}m {remaining_seconds}s")
-        } else {
-            format!("{minutes}m")
-        }
-    } else {
-        format!("{seconds}s")
     }
 }
 
@@ -2111,15 +2053,13 @@ mod tests {
     #[test]
     fn tunnel_ready_json_preserves_the_complete_local_endpoint() {
         let session = lpm_tunnel::TunnelSession {
-            tunnel_url: "https://orange-moon.lpm.fyi".to_string(),
-            domain: "orange-moon.lpm.fyi".to_string(),
+            tunnel_url: "https://acme.lpm.fyi".to_string(),
+            domain: "acme.lpm.fyi".to_string(),
             session_id: "session-1".to_string(),
             local_port: 5173,
-            plan: Some("free".to_string()),
+            plan: Some("pro".to_string()),
             base_domain: Some("lpm.fyi".to_string()),
-            domain_kind: Some("random".to_string()),
-            session_expires_at: Some(1_800_000),
-            session_max_ms: Some(3_600_000),
+            domain_kind: Some("account".to_string()),
             limits: None,
         };
 
@@ -2137,16 +2077,14 @@ mod tests {
         insta::assert_json_snapshot!(output, @r###"
         {
           "success": true,
-          "tunnel_url": "https://orange-moon.lpm.fyi",
-          "domain": "orange-moon.lpm.fyi",
+          "tunnel_url": "https://acme.lpm.fyi",
+          "domain": "acme.lpm.fyi",
           "local_port": 5173,
           "local_url": "http://[::1]:5173/app/",
           "session_id": "session-1",
-          "plan": "free",
+          "plan": "pro",
           "base_domain": "lpm.fyi",
-          "domain_kind": "random",
-          "session_expires_at": 1800000,
-          "session_max_ms": 3600000,
+          "domain_kind": "account",
           "limits": null,
           "usage": null,
           "tunnel_auth": null,
@@ -2326,21 +2264,6 @@ mod tests {
             tunnel_usage_summary(Some(&usage)).as_deref(),
             Some("100250 / 100000 requests · 250 overage · overage on")
         );
-    }
-
-    #[test]
-    fn tunnel_expiry_formatter_shows_whole_hours() {
-        assert_eq!(format_tunnel_expiry_at(3_600_000, 0), "in 1h");
-    }
-
-    #[test]
-    fn tunnel_expiry_formatter_shows_remaining_minutes() {
-        assert_eq!(format_tunnel_expiry_at(3_660_000, 0), "in 1h 1m");
-    }
-
-    #[test]
-    fn tunnel_expiry_formatter_marks_past_expiry_as_now() {
-        assert_eq!(format_tunnel_expiry_at(5_000, 10_000), "now");
     }
 
     // ── Flag parsing ──

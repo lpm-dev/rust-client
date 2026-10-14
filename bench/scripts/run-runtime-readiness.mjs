@@ -2326,9 +2326,9 @@ async function startFakeRelay(requests) {
       subdomain: 'runtime-readiness.local',
       tunnel_url: 'http://runtime-readiness.local',
       session_id: 'runtime-readiness-session',
-      plan: 'free',
+      plan: 'pro',
       base_domain: 'local',
-      domain_kind: 'random',
+      domain_kind: 'account',
     })));
     requestsSentAt = performance.now();
     for (const [index, relayRequest] of requests.entries()) {
@@ -2485,9 +2485,9 @@ async function startFakeWebSocketRelay() {
       subdomain: 'runtime-readiness.local',
       tunnel_url: 'http://runtime-readiness.local',
       session_id: 'runtime-readiness-websocket-session',
-      plan: 'free',
+      plan: 'pro',
       base_domain: 'local',
-      domain_kind: 'random',
+      domain_kind: 'account',
     })));
     socket.write(webSocketTextFrame(JSON.stringify({
       type: 'ws_upgrade',
