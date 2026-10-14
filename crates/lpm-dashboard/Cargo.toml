@@ -13,7 +13,6 @@ lpm-tunnel = { workspace = true }
 serde_json = { workspace = true }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "underline-color"] }
 crossterm = "0.29"
-open = { workspace = true }
 
 [lints]
 workspace = true
