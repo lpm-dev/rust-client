@@ -7,6 +7,7 @@
 
 pub mod atomic_write;
 pub mod bounded_read;
+pub mod browser;
 pub mod child_env;
 pub mod color;
 pub mod command_name;
@@ -16,9 +17,13 @@ pub mod integrity;
 pub mod known_projects;
 pub mod local_target;
 pub mod lpm_json;
+#[cfg(target_os = "macos")]
+pub mod macos_acl;
 pub mod npmrc;
 pub mod package_instance;
 pub mod package_name;
+#[cfg(unix)]
+pub mod path_trust;
 pub mod paths;
 pub mod peer;
 pub mod platform;
@@ -27,6 +32,9 @@ pub mod project_glob;
 pub mod provenance;
 pub mod symlink;
 pub mod terminal;
+// The 64-bit system call's groups are 32-bit; 32-bit systems have two calls.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+pub mod thread_identity;
 mod utf8_bom;
 
 #[cfg(unix)]
@@ -36,14 +44,17 @@ pub use atomic_write::{
     write_file_atomic_in_dir_with_options, write_file_atomic_with, write_file_atomic_with_options,
 };
 #[cfg(unix)]
+pub use bounded_read::current_uid;
+#[cfg(unix)]
 pub use bounded_read::permissions_are_owner_only;
 pub use bounded_read::{
     BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, NPMRC_FILE_SIZE_CAP_BYTES,
-    TLS_MATERIAL_AGGREGATE_CAP_BYTES, TLS_MATERIAL_FILE_SIZE_CAP_BYTES, read_file_capped,
-    read_file_capped_from_open_file, read_regular_file_capped_with_metadata, read_stream_capped,
-    read_text_file_capped, read_text_file_capped_from_open_file,
-    read_text_file_capped_from_open_file_with_known_size, read_text_file_capped_nofollow,
-    read_text_file_capped_with_metadata, read_text_regular_file_capped_with_metadata,
+    TLS_MATERIAL_AGGREGATE_CAP_BYTES, TLS_MATERIAL_FILE_SIZE_CAP_BYTES, link_count, open_nofollow,
+    read_file_capped, read_file_capped_from_open_file, read_file_capped_unlinked,
+    read_regular_file_capped_with_metadata, read_stream_capped, read_text_file_capped,
+    read_text_file_capped_from_open_file, read_text_file_capped_from_open_file_with_known_size,
+    read_text_file_capped_nofollow, read_text_file_capped_with_metadata,
+    read_text_regular_file_capped_with_metadata,
 };
 pub use command_name::{PortableCommandNameError, validate_portable_command_name};
 pub use error::{
@@ -69,10 +80,11 @@ pub use paths::{
     ExclusiveLockHandle, FsKind, GLOBAL_INSTALL_PATH_BUDGET, INSTALL_READY_MARKER, LpmRoot,
     ProjectLockDirectory, ProjectLockKind, SharedLockHandle, SingleFileExclusiveLockHandle,
     SingleFileSharedLockHandle, acquire_exclusive_lock, acquire_single_file_exclusive_lock,
-    acquire_single_file_exclusive_lock_from_file, acquire_single_file_shared_lock,
+    acquire_single_file_exclusive_lock_from_file,
+    acquire_single_file_exclusive_lock_from_file_within, acquire_single_file_shared_lock,
     acquire_single_file_shared_lock_from_file, as_extended_path, check_install_path_budget,
-    is_local_fs, parent_install_lock_environment, project_install_lock, project_publish_lock,
-    try_acquire_capability_exclusive_lock, try_acquire_exclusive_lock,
+    is_local_fs, open_lock_file_nofollow, parent_install_lock_environment, project_install_lock,
+    project_publish_lock, try_acquire_capability_exclusive_lock, try_acquire_exclusive_lock,
     try_acquire_single_file_exclusive_lock_from_file, try_with_exclusive_lock,
     with_capability_exclusive_lock, with_exclusive_lock, with_exclusive_lock_async,
     with_project_exclusive_lock, with_project_exclusive_lock_async, with_project_shared_lock,
@@ -309,6 +321,112 @@ pub fn is_loopback_host(host: &str) -> bool {
     false
 }
 
+/// The bytes free to this user on the filesystem holding `path`, or its
+/// nearest existing ancestor; None where it can't be read.
+pub fn filesystem_available_bytes(path: &std::path::Path) -> Option<u64> {
+    filesystem_space(path).map(|space| space.available)
+}
+
+/// The bytes a write by this user can take on the filesystem holding
+/// `path`, or its nearest existing ancestor: what it reports free, less
+/// what APFS keeps back from writes (see [`apfs_held_back`]). None where it
+/// can't be read.
+pub fn filesystem_writable_bytes(path: &std::path::Path) -> Option<u64> {
+    filesystem_space(path).map(|space| space.available.saturating_sub(space.held_back))
+}
+
+/// What a filesystem reports free to this user, and how much of that it
+/// keeps back from writes.
+struct FilesystemSpace {
+    available: u64,
+    held_back: u64,
+}
+
+#[cfg(unix)]
+fn filesystem_space(path: &std::path::Path) -> Option<FilesystemSpace> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut probe = path.to_path_buf();
+    while !probe.try_exists().ok()? {
+        if !probe.pop() {
+            return None;
+        }
+    }
+    let path = CString::new(probe.as_os_str().as_bytes()).ok()?;
+    // macOS's `statvfs` counts blocks in 32 bits, which can't hold the free
+    // blocks of a volume with more than 16 TiB free; its `statfs` counts in
+    // 64 bits.
+    #[cfg(target_os = "macos")]
+    let (available, held_back) = {
+        let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: `path` is NUL-terminated and `stats` points to writable,
+        // properly aligned storage that is read only after a successful call.
+        if unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: `statfs` returned success and initialized the output structure.
+        let stats = unsafe { stats.assume_init() };
+        let block = u128::from(stats.f_bsize);
+        let available = u128::from(stats.f_bavail).checked_mul(block)?;
+        let apfs = stats
+            .f_fstypename
+            .iter()
+            .take_while(|&&byte| byte != 0)
+            .map(|&byte| byte as u8)
+            .eq(*b"apfs");
+        let held_back = if apfs {
+            let size = u128::from(stats.f_blocks).checked_mul(block)?;
+            apfs_held_back(u64::try_from(size).unwrap_or(u64::MAX))
+        } else {
+            0
+        };
+        (available, held_back)
+    };
+    // `f_bavail` already leaves out what's reserved for root.
+    #[cfg(not(target_os = "macos"))]
+    let (available, held_back) = {
+        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: `path` is NUL-terminated and `stats` points to writable,
+        // properly aligned storage that is read only after a successful call.
+        if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: `statvfs` returned success and initialized the output structure.
+        let stats = unsafe { stats.assume_init() };
+        (
+            u128::from(stats.f_bavail).checked_mul(u128::from(stats.f_frsize))?,
+            0,
+        )
+    };
+    Some(FilesystemSpace {
+        available: u64::try_from(available).ok()?,
+        held_back,
+    })
+}
+
+#[cfg(not(unix))]
+fn filesystem_space(_path: &std::path::Path) -> Option<FilesystemSpace> {
+    None
+}
+
+/// What APFS reports free on a volume of `size` bytes but refuses writes:
+/// a stream of writes to one file stops with about 2% of the volume and
+/// 460 KB more still reported free, and never more than 32 MiB and 80 KiB,
+/// as measured on volumes of 64 MB to 8 GB. Rounded up by about half a MiB,
+/// which also covers the blocks a file's own metadata takes. That's the
+/// least a write needs: on a fresh volume, writes flushed as they go, or
+/// spread over many files, stopped up to about 16 MB sooner, so a write
+/// counted as fitting can still fail, as on a full disk. APFS sometimes
+/// keeps back less: one run on macOS 26 let a stream take 0.7 MB more of a
+/// 64 MB volume, so a write can also fit in a little more than this counts.
+#[cfg(any(target_os = "macos", test))]
+fn apfs_held_back(size: u64) -> u64 {
+    (size / 50)
+        .saturating_add(1024 * 1024)
+        .min(33 * 1024 * 1024)
+}
+
 /// Format bytes into a human-readable string in binary units, as they're
 /// counted (e.g., "1.2 KiB", "3.4 MiB", "5 GiB"), as the LPM.dev Registry
 /// labels them. Switches unit at each 1024, so a 900-byte file never reads
@@ -508,6 +626,163 @@ mod tests {
         // As the Registry groups bytes too ("1,000 B").
         assert_eq!(format_quota(1000, 2048), ("1,000 B".into(), "2 KiB".into()));
         assert_eq!(format_bytes(1000), "1000 B");
+    }
+
+    /// `df`'s figure for the filesystem holding `path`: its size and the
+    /// space free to this user, in bytes.
+    #[cfg(unix)]
+    fn df(path: &std::path::Path) -> (u64, u64) {
+        let output = std::process::Command::new("/bin/df")
+            .arg("-Pk")
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).unwrap();
+        let fields: Vec<u64> = output
+            .lines()
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .skip(1)
+            .take(3)
+            .map(|field| field.parse().unwrap())
+            .collect();
+        (fields[0] * 1024, fields[2] * 1024)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reads_the_space_free_to_this_user_as_df_does() {
+        let directory = tempfile::tempdir().unwrap();
+        let (size, free) = df(directory.path());
+
+        let available = filesystem_available_bytes(directory.path()).unwrap();
+
+        // Other writers move the figure a little between the two reads; the
+        // space reserved for root, which this user can't use, is far more.
+        assert!(
+            available.abs_diff(free) <= size / 200,
+            "{available} against df's {free} of {size}"
+        );
+        let unmade = filesystem_available_bytes(&directory.path().join("not/yet/made")).unwrap();
+        assert!(unmade.abs_diff(available) <= size / 200);
+    }
+
+    #[test]
+    fn apfs_holds_back_at_least_what_measured_volumes_kept_from_writes() {
+        // A volume's size, and what it still reported free once a write
+        // failed.
+        for (size, kept) in [
+            (104_816_640, 2_564_096),
+            (314_531_840, 6_758_400),
+            (524_247_040, 10_952_704),
+            (1_073_700_864, 21_946_368),
+            (2_147_442_688, 33_636_352),
+            (4_085_211_136, 33_636_352),
+            (8_380_178_432, 33_636_352),
+        ] {
+            let held_back = apfs_held_back(size);
+            assert!(held_back >= kept, "{size}: {held_back} < {kept}");
+            assert!(
+                held_back - kept < 1024 * 1024,
+                "{size}: {held_back} past {kept}"
+            );
+        }
+        assert_eq!(apfs_held_back(u64::MAX), 33 * 1024 * 1024);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn on_any_filesystem_but_apfs_nothing_reported_free_counts_as_kept_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let space = filesystem_space(directory.path()).unwrap();
+        if cfg!(target_os = "macos") && space.held_back > 0 {
+            return;
+        }
+
+        assert_eq!(space.held_back, 0);
+        let writable = filesystem_writable_bytes(directory.path()).unwrap();
+        let available = filesystem_available_bytes(directory.path()).unwrap();
+        let (size, _) = df(directory.path());
+        assert!(writable.abs_diff(available) <= size / 200);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_apfs_a_stream_of_writes_takes_what_it_counts_writable_but_not_all_reported_free() {
+        use std::io::Write as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("volume.sparseimage");
+        let mount_point = directory.path().join("mounted");
+        std::fs::create_dir(&mount_point).unwrap();
+        let hdiutil = |arguments: &[&std::ffi::OsStr]| {
+            let output = std::process::Command::new("/usr/bin/hdiutil")
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "hdiutil {arguments:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        hdiutil(&[
+            "create".as_ref(),
+            "-quiet".as_ref(),
+            "-size".as_ref(),
+            "64m".as_ref(),
+            "-fs".as_ref(),
+            "APFS".as_ref(),
+            "-type".as_ref(),
+            "SPARSE".as_ref(),
+            "-volname".as_ref(),
+            "lpm-common-test".as_ref(),
+            image.as_os_str(),
+        ]);
+        hdiutil(&[
+            "attach".as_ref(),
+            "-quiet".as_ref(),
+            "-nobrowse".as_ref(),
+            "-noautoopen".as_ref(),
+            "-mountpoint".as_ref(),
+            mount_point.as_os_str(),
+            image.as_os_str(),
+        ]);
+        struct Detach<'a>(&'a std::path::Path);
+        impl Drop for Detach<'_> {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("/usr/bin/hdiutil")
+                    .args(["detach", "-force", "-quiet"])
+                    .arg(self.0)
+                    .status();
+            }
+        }
+        let _detach = Detach(&mount_point);
+
+        let space = filesystem_space(&mount_point).unwrap();
+        assert!(space.held_back > 0);
+        let writable = filesystem_writable_bytes(&mount_point).unwrap();
+        let mut filler = std::fs::File::create(mount_point.join("filler")).unwrap();
+        let mut written = 0u64;
+        for chunk in [64 * 1024, 4096] {
+            let block = vec![0; chunk];
+            while filler.write_all(&block).is_ok() {
+                written += chunk as u64;
+            }
+        }
+
+        // How much of its reserve APFS lets a stream take varies by release
+        // and run, so how closely the reserve matches is checked against
+        // measured volumes in `apfs_holds_back_at_least_what_measured_volumes_kept_from_writes`.
+        assert_eq!(writable, space.available - space.held_back);
+        assert!(written >= writable, "wrote {written} of {writable}");
+        assert!(
+            written < space.available,
+            "wrote {written}, all of the {} reported free",
+            space.available
+        );
     }
 
     // ── read_capped_state_file ────────────────────────────────────────

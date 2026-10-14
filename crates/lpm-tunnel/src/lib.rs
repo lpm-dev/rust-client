@@ -3,9 +3,9 @@
 //! Connects to the LPM tunnel relay service, which assigns a public URL
 //! (e.g., `https://acme-api.lpm.llc`) and proxies HTTP requests to the endpoint.
 //!
-//! Supports multiple base domains (lpm.fyi, lpm.llc).
-//! Free users get ephemeral random domains on lpm.fyi.
-//! Pro/Org users can claim persistent domains on any available base domain.
+//! Supports multiple base domains (lpm.fyi, lpm.llc). Tunnels need a Pro or
+//! organization plan; Pro and organization accounts can claim persistent
+//! domains on any available base domain.
 
 pub mod client;
 pub mod protocol;
@@ -122,12 +122,8 @@ pub struct TunnelSession {
     pub plan: Option<String>,
     /// Base domain used by the assigned tunnel domain.
     pub base_domain: Option<String>,
-    /// Assignment source: random, account default, or claimed custom domain.
+    /// Assignment source: the account's default domain or a claimed domain.
     pub domain_kind: Option<String>,
-    /// Epoch milliseconds when the relay will close the session.
-    pub session_expires_at: Option<u64>,
-    /// Maximum session lifetime in milliseconds. None means uncapped or not advertised.
-    pub session_max_ms: Option<u64>,
     /// Relay limits applied to this session.
     pub limits: Option<TunnelLimitMetadata>,
 }
