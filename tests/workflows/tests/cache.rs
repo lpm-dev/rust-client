@@ -84,7 +84,7 @@ async fn cache_status_json_reports_local_usage_and_remote_status() {
         .and(path("/v8/artifacts/status"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "status": "enabled",
-            "usageBytes": 1024,
+            "usageBytes": 2049,
             "limitBytes": 2048
         })))
         .mount(&server)
@@ -126,8 +126,72 @@ async fn cache_status_json_reports_local_usage_and_remote_status() {
     assert!(envelope["local"]["bytes"].as_u64().unwrap_or(0) >= 11);
     assert_eq!(envelope["remote"]["enabled"], serde_json::json!(true));
     assert_eq!(envelope["remote"]["status"], serde_json::json!("enabled"));
-    assert_eq!(envelope["remote"]["usage_bytes"], serde_json::json!(1024));
+    assert_eq!(envelope["remote"]["usage_bytes"], serde_json::json!(2049));
     assert_eq!(envelope["remote"]["limit_bytes"], serde_json::json!(2048));
+    // A byte past the limit reads as past it, as the human line shows it.
+    assert_eq!(envelope["remote"]["usage"], serde_json::json!("2.01 KiB"));
+    assert_eq!(envelope["remote"]["limit"], serde_json::json!("2 KiB"));
+}
+
+#[tokio::test]
+async fn cache_status_reads_an_unlimited_cache_s_usage_in_gib_against_no_limit() {
+    let server = MockServer::start().await;
+    let usage: u64 = 1253 * 1024 * 1024 * 1024 + 512 * 1024 * 1024;
+    Mock::given(method("GET"))
+        .and(path("/v8/artifacts/status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "status": "enabled",
+            "usageBytes": usage,
+            "limitBytes": null
+        })))
+        .mount(&server)
+        .await;
+    let project = TempProject::empty(r#"{"name":"cache-status","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+            "remoteCache": {{
+                "enabled": true,
+                "url": "{}/v8"
+            }}
+        }}"#,
+            server.uri(),
+        ),
+    );
+    let run = |json: bool| {
+        let mut command = lpm(&project);
+        command
+            .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+            .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key");
+        if json {
+            command.arg("--json");
+        }
+        let output = command
+            .args(["cache", "status"])
+            .output()
+            .expect("failed to run lpm cache status");
+        assert!(
+            output.status.success(),
+            "cache status failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+
+    let envelope: serde_json::Value = serde_json::from_str(&run(true)).unwrap();
+    let human = run(false);
+
+    assert_eq!(
+        envelope["remote"]["usage"],
+        serde_json::json!("1,253.50 GiB")
+    );
+    assert_eq!(envelope["remote"]["limit"], serde_json::Value::Null);
+    assert!(
+        human.contains("1,253.50 GiB / Unlimited"),
+        "an unlimited cache should read as its dashboard does, got:\n{human}"
+    );
 }
 
 #[tokio::test]
@@ -577,7 +641,7 @@ async fn cache_status_human_renders_tables_and_slim_completion() {
         "cache status must render local and remote sections, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("1.0 KB / 2.0 KB  █████░░░░░"),
+        stdout.contains("1 KiB / 2 KiB  █████░░░░░"),
         "cache status must render remote usage with a quota bar, got:\n{stdout}"
     );
 

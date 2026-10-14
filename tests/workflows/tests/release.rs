@@ -1763,6 +1763,204 @@ async fn release_publish_checks_the_requested_version_when_the_lpm_package_exist
 }
 
 #[tokio::test]
+async fn release_publish_skips_a_version_lpm_dev_says_it_already_has() {
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"version":"0.0.0","workspaces":["packages/*"]}"#,
+    );
+    let name = "@lpm.dev/acme.published";
+    project.write_file(
+        "packages/published/package.json",
+        &format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+    );
+    // As the Registry answers a version it has: a refusal with its code,
+    // or, from one that sends no code, its message alone.
+    for answer in [
+        serde_json::json!({
+            "error": "Version 1.0.0 already exists. You cannot overwrite versions.",
+            "code": "VERSION_EXISTS",
+        }),
+        serde_json::json!({
+            "error": "Version 1.0.0 already exists. You cannot overwrite versions.",
+        }),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/package/publish-preflight"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(&answer))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let output = lpm_with_registry(&project, &server.uri())
+            .args([
+                "release",
+                "publish",
+                "--all",
+                "--lpm",
+                "--dry-run",
+                "--json",
+            ])
+            .output()
+            .expect("run release publish against a version lpm.dev has");
+
+        assert!(
+            output.status.success(),
+            "release publish failed for {answer}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let result = &parse_json_output(&output.stdout)["results"][0];
+        assert_eq!(result["status"], "skipped", "{answer}: {result}");
+        assert_eq!(result["reason"], "already_published", "{answer}: {result}");
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn release_publish_reports_what_lpm_dev_refuses_in_its_preflight() {
+    let project = TempProject::empty(
+        r#"{"name":"root","private":true,"version":"0.0.0","workspaces":["packages/*"]}"#,
+    );
+    project.write_file(
+        "packages/lapsed/package.json",
+        r#"{"name":"@lpm.dev/acme.lapsed","version":"1.0.0"}"#,
+    );
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(ResponseTemplate::new(402).set_body_json(serde_json::json!({
+            "error": "Organization billing is past due. Package publishing is blocked.",
+            "code": "ORG_BILLING_LAPSED",
+        })))
+        .mount(&server)
+        .await;
+
+    let output = lpm_with_registry(&project, &server.uri())
+        .args([
+            "release",
+            "publish",
+            "--all",
+            "--lpm",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .expect("run release publish against a refused member");
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The refusal is the error any failed request is, with the Registry's
+    // message rather than its body.
+    let envelope = parse_json_output(&output.stdout);
+    assert_eq!(envelope["error_code"], "http", "{stdout}");
+    assert!(
+        stdout.contains("Organization billing is past due.") && !stdout.contains("{\\\"error"),
+        "{stdout}"
+    );
+}
+
+#[tokio::test]
+async fn release_publish_redacts_lpm_dev_s_reflection_of_its_bearer_from_a_refusal() {
+    let token = "test-token-123";
+    for (status, json_body) in [(402, true), (403, true), (403, false), (500, false)] {
+        let project = TempProject::empty(
+            r#"{"name":"root","private":true,"version":"0.0.0","workspaces":["packages/*"]}"#,
+        );
+        project.write_file(
+            "packages/reflected/package.json",
+            r#"{"name":"@lpm.dev/acme.reflected","version":"1.0.0"}"#,
+        );
+        let server = MockServer::start().await;
+        let reflected = format!("Authorization: Bearer {token} may not publish");
+        let response = if json_body {
+            ResponseTemplate::new(status).set_body_json(serde_json::json!({ "error": reflected }))
+        } else {
+            ResponseTemplate::new(status).set_body_string(reflected)
+        };
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/package/publish-preflight"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+
+        for json in [true, false] {
+            let mut command = lpm_with_registry(&project, &server.uri());
+            command
+                .env("LPM_RETRY_BACKOFF_MS_OVERRIDE", "0")
+                .args(["release", "publish", "--all", "--lpm", "--dry-run"])
+                .args(["--token", token]);
+            if json {
+                command.arg("--json");
+            }
+            let output = command.output().expect("run release publish");
+
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{status}: {stdout}");
+            assert!(
+                !stdout.contains(token) && !stderr.contains(token),
+                "bearer leaked ({status}, JSON body: {json_body}, --json: {json})\nstdout: {stdout}\nstderr: {stderr}"
+            );
+            if json_body {
+                assert!(
+                    format!("{stdout}{stderr}").contains("Bearer <redacted> may not publish"),
+                    "{status}, --json: {json}\nstdout: {stdout}\nstderr: {stderr}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn release_publish_reports_a_preflight_refusal_as_the_error_its_status_is() {
+    for (status, error_code) in [
+        (401, "auth_required"),
+        (403, "forbidden"),
+        (404, "not_found"),
+        (429, "rate_limited"),
+    ] {
+        let project = TempProject::empty(
+            r#"{"name":"root","private":true,"version":"0.0.0","workspaces":["packages/*"]}"#,
+        );
+        project.write_file(
+            "packages/refused/package.json",
+            r#"{"name":"@lpm.dev/acme.refused","version":"1.0.0"}"#,
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/package/publish-preflight"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("retry-after", "0")
+                    .set_body_json(serde_json::json!({ "error": "Refused by the registry" })),
+            )
+            .mount(&server)
+            .await;
+
+        let output = lpm_with_registry(&project, &server.uri())
+            .args([
+                "release",
+                "publish",
+                "--all",
+                "--lpm",
+                "--dry-run",
+                "--json",
+            ])
+            .output()
+            .expect("run release publish against a refused member");
+
+        assert!(!output.status.success(), "{status}");
+        let envelope = parse_json_output(&output.stdout);
+        assert_eq!(
+            envelope["error_code"],
+            error_code,
+            "{status}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
+#[tokio::test]
 async fn release_publish_revalidates_fresh_metadata_before_deciding_version_absence() {
     let project = TempProject::empty(
         r#"{"name":"root","private":true,"version":"0.0.0","workspaces":["packages/*"]}"#,

@@ -1,3 +1,4 @@
+use super::transport::{Answered, FailedResponse};
 use super::*;
 
 impl RegistryClient {
@@ -240,22 +241,70 @@ impl RegistryClient {
             .await
     }
 
-    /// Validate publish authorization and version availability without
-    /// reserving a version or creating Registry state.
+    /// Asks the publish preflight whether the Registry would take
+    /// `name@version`: the token's publish authorization and the version's
+    /// availability, and given the `size` of the tarball it would be sent,
+    /// the size cap and the account's storage. It creates no Registry state.
+    /// A refusal comes back with its status and code; a timeout, a rate
+    /// limit, a server error or a network failure is retried first.
     pub async fn publish_preflight(
         &self,
         name: &str,
         version: &str,
-    ) -> Result<PublishPreflightResponse, LpmError> {
-        let url = format!(
+        size: Option<u64>,
+    ) -> Result<PublishPreflightVerdict, LpmError> {
+        let mut url = format!(
             "{}/api/registry/-/package/publish-preflight?name={}&version={}",
             self.base_url,
             urlencoding::encode(name),
             urlencoding::encode(version)
         );
-        let response: PublishPreflightResponse = self
-            .execute_with_recovery(AuthPosture::AuthRequired, || self.get_json(&url))
+        if let Some(size) = size {
+            url.push_str(&format!("&size={size}"));
+        }
+        let answer = self
+            .execute_with_recovery(AuthPosture::AuthRequired, || async {
+                match self
+                    .send_with_retry_keeping_status(self.build_get(&url).await?)
+                    .await?
+                {
+                    Answered::Failed(FailedResponse { status: 401, .. }) => {
+                        Err(LpmError::AuthRequired)
+                    }
+                    answer => Ok(answer),
+                }
+            })
             .await?;
+        let response = match answer {
+            Answered::Success(response) => response,
+            Answered::Failed(FailedResponse {
+                status,
+                retry_after_secs,
+                body,
+            }) => {
+                let json = serde_json::from_str::<serde_json::Value>(&body).ok();
+                let text = |field: &str| {
+                    json.as_ref()
+                        .and_then(|json| json.get(field))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                };
+                let error = text("error").unwrap_or_else(|| {
+                    let status = reqwest::StatusCode::from_u16(status)
+                        .map_or_else(|_| status.to_string(), |status| status.to_string());
+                    format!("HTTP {status}")
+                });
+                return Ok(PublishPreflightVerdict::Refused {
+                    status,
+                    code: text("code"),
+                    error,
+                    body,
+                    retry_after_secs,
+                });
+            }
+        };
+        let response: PublishPreflightResponse =
+            parse_capped_api_json(response, "publish preflight response").await?;
         if !response.success {
             return Err(LpmError::Registry(format!(
                 "publish preflight was denied for {name}@{version}"
@@ -267,7 +316,7 @@ impl RegistryClient {
                 response.name, response.version
             )));
         }
-        Ok(response)
+        Ok(PublishPreflightVerdict::Accepted(response))
     }
 
     /// Read the current publication lifecycle state for an uploaded LPM version.
@@ -726,4 +775,32 @@ fn validate_search_registry_base(base_url: &str) -> Result<(), LpmError> {
         ));
     }
     Ok(())
+}
+
+impl PublishPreflightVerdict {
+    /// The accepted answer, or the refusal as the error any other request's
+    /// failure is (see [`super::transport::failed_answer_error`]), with the
+    /// Registry's message where its body gives one, and the body otherwise.
+    pub fn into_result(self) -> Result<PublishPreflightResponse, LpmError> {
+        match self {
+            Self::Accepted(response) => Ok(response),
+            Self::Refused {
+                status,
+                body,
+                retry_after_secs,
+                ..
+            } => {
+                let message = serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|json| json.get("error")?.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| body.clone());
+                Err(super::transport::failed_answer_error(
+                    status,
+                    &body,
+                    message,
+                    retry_after_secs,
+                ))
+            }
+        }
+    }
 }

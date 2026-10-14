@@ -677,10 +677,51 @@ fn publish_project_changed_error(package_json_path: &Path) -> LpmError {
 }
 
 pub(crate) fn validate_publish_tarball_size(tarball_size: usize) -> Result<(), LpmError> {
-    if tarball_size > MAX_PUBLISH_TARBALL_BYTES {
+    tarball_within(tarball_size, MAX_PUBLISH_TARBALL_BYTES as u64, "")
+}
+
+/// Refuses a tarball the LPM registry would refuse for its size.
+pub(crate) fn validate_lpm_registry_tarball_size(tarball_size: usize) -> Result<(), LpmError> {
+    tarball_within(
+        tarball_size,
+        publish_common::MAX_LPM_REGISTRY_TARBALL_BYTES,
+        " for the LPM registry",
+    )
+}
+
+/// Refuses a publish request of `body_size` bytes that lpm.dev would refuse
+/// for its size, keeping `reserve` bytes of the limit for what the upload
+/// adds after the check, as a provenance bundle.
+pub(crate) fn validate_lpm_registry_body_size(
+    body_size: u64,
+    reserve: u64,
+) -> Result<(), LpmError> {
+    let max = publish_common::MAX_LPM_REGISTRY_BODY_BYTES;
+    if body_size.saturating_add(reserve) > max {
+        let kept = if reserve > 0 {
+            format!(
+                ", less {} kept for its provenance bundle",
+                lpm_common::format_bytes(reserve)
+            )
+        } else {
+            String::new()
+        };
         return Err(LpmError::Registry(format!(
-            "tarball too large: {} (max 500 MiB)",
-            lpm_common::format_bytes(tarball_size as u64)
+            "publish request too large for the LPM registry: {} (max {}{kept}), the tarball in base64 with the package's metadata; publish fewer or smaller files",
+            lpm_common::format_bytes_past(body_size),
+            lpm_common::format_bytes(max)
+        )));
+    }
+    Ok(())
+}
+
+fn tarball_within(tarball_size: usize, max: u64, target: &str) -> Result<(), LpmError> {
+    let size = tarball_size as u64;
+    if size > max {
+        return Err(LpmError::Registry(format!(
+            "tarball too large{target}: {} (max {})",
+            lpm_common::format_bytes_past(size),
+            lpm_common::format_bytes(max)
         )));
     }
     Ok(())
@@ -1099,12 +1140,9 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
         .map_err(swift_inspection_error)?;
     let status = status.map_err(swift_inspection_error)?;
     if !status.success() {
-        let diagnostic = String::from_utf8_lossy(&stderr)
-            .chars()
-            .take(4096)
-            .collect::<String>();
-        let diagnostic = lpm_common::sanitize_terminal_inline(&diagnostic);
-        return Err(swift_inspection_error(format!("{status}: {diagnostic}")));
+        return Err(swift_inspection_error(
+            crate::swift_manifest::swift_failure_reason(&status, &stderr),
+        ));
     }
     serde_json::from_slice::<serde_json::Value>(&stdout).map_err(swift_inspection_error)
 }
@@ -1963,6 +2001,33 @@ mod tests {
         );
 
         assert!(manifest.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_swift_manifest_inspection_says_how_swift_ended() {
+        let fixture = swift_fixture_tarball();
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("swift-fails");
+        write_executable(
+            &executable,
+            "#!/bin/sh\necho 'error: invalid manifest' >&2\nexit 3\n",
+        );
+
+        let error = dump_swift_manifest_from_publish_artifact_with_command(
+            &fixture,
+            executable.as_os_str(),
+            std::time::Duration::from_secs(10),
+            128,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("exit status: 3: error: invalid manifest"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]

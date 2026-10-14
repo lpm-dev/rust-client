@@ -46,7 +46,14 @@ pub fn find_package_swift(dir: &Path) -> Option<PathBuf> {
 /// Get non-test target names from the current SPM package.
 /// Runs `swift package dump-package` and parses the JSON output.
 pub fn get_spm_targets(project_dir: &Path) -> Result<Vec<String>, LpmError> {
-    let mut command = swift_command();
+    spm_targets_with_program(project_dir, std::ffi::OsStr::new("swift"))
+}
+
+fn spm_targets_with_program(
+    project_dir: &Path,
+    program: &std::ffi::OsStr,
+) -> Result<Vec<String>, LpmError> {
+    let mut command = swift_command_for(program);
     command
         .args(["package", "dump-package"])
         .current_dir(project_dir);
@@ -54,10 +61,9 @@ pub fn get_spm_targets(project_dir: &Path) -> Result<Vec<String>, LpmError> {
     let output = run_bounded_swift_output(command, "swift package dump-package")?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(LpmError::Registry(format!(
             "swift package dump-package failed: {}",
-            stderr.trim()
+            swift_failure_reason(&output.status, &output.stderr)
         )));
     }
 
@@ -294,8 +300,32 @@ pub(crate) fn sanitize_swift_environment(command: &mut std::process::Command) {
     }
 }
 
+/// The longest stretch of a failed Swift command's diagnostics a message shows.
+const SWIFT_DIAGNOSTIC_CHARS: usize = 4096;
+
+/// Why a Swift command failed: how it ended (an exit status, or the signal
+/// that killed it), then its diagnostics made safe for one terminal line, or
+/// that it printed none.
+pub(crate) fn swift_failure_reason(status: &std::process::ExitStatus, stderr: &[u8]) -> String {
+    let diagnostic = String::from_utf8_lossy(stderr)
+        .trim()
+        .chars()
+        .take(SWIFT_DIAGNOSTIC_CHARS)
+        .collect::<String>();
+    let diagnostic = lpm_common::sanitize_terminal_inline(&diagnostic);
+    if diagnostic.trim().is_empty() {
+        format!("{status}, without output")
+    } else {
+        format!("{status}: {}", diagnostic.trim())
+    }
+}
+
 pub(crate) fn swift_command() -> std::process::Command {
-    let mut command = std::process::Command::new("swift");
+    swift_command_for(std::ffi::OsStr::new("swift"))
+}
+
+fn swift_command_for(program: &std::ffi::OsStr) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
     sanitize_swift_environment(&mut command);
     command
 }
@@ -1753,6 +1783,58 @@ pub fn remove_wrapper_dependencies(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_swift_failure_names_how_the_process_ended_even_without_output() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let killed = swift_failure_reason(&std::process::ExitStatus::from_raw(9), b"");
+        assert!(killed.starts_with("signal: 9"), "{killed}");
+        assert!(killed.ends_with("without output"), "{killed}");
+
+        let failed = swift_failure_reason(
+            &std::process::ExitStatus::from_raw(1 << 8),
+            b"  error: no such module 'Missing'\n\x1b[31mred\x1b[0m\n",
+        );
+        assert!(
+            failed.starts_with("exit status: 1: error: no such module 'Missing'"),
+            "{failed}"
+        );
+        assert!(!failed.contains('\x1b'), "{failed}");
+
+        let long = swift_failure_reason(
+            &std::process::ExitStatus::from_raw(1 << 8),
+            "x".repeat(10_000).as_bytes(),
+        );
+        assert!(long.chars().count() < 4_200, "{}", long.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_dump_package_says_how_swift_ended() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("swift-fails");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\necho 'error: invalid manifest' >&2\nexit 3\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let error = spm_targets_with_program(directory.path(), program.as_os_str())
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains(
+                "swift package dump-package failed: exit status: 3: error: invalid manifest"
+            ),
+            "{error}"
+        );
+    }
 
     #[test]
     fn swift_environment_scrub_covers_the_shared_baseline_and_its_own_credentials() {

@@ -5,8 +5,16 @@ pub(super) async fn read_request_error_text(
     response: reqwest::Response,
     request: &reqwest::Request,
 ) -> String {
+    read_error_text_redacting(response, request.headers()).await
+}
+
+/// The answer's body, capped, with the credentials `headers` sent redacted.
+pub(super) async fn read_error_text_redacting(
+    response: reqwest::Response,
+    headers: &HeaderMap,
+) -> String {
     let mut text = super::read_capped_error_text(response).await;
-    redact_credentials(&mut text, request.headers());
+    redact_credentials(&mut text, headers);
     text
 }
 

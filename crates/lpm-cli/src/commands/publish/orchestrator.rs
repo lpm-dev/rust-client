@@ -10,6 +10,7 @@ use super::output::{
 use super::prepare::read_publish_manifest;
 use super::prepare::{
     PublishSource, prepare_publish_project_from_manifest, read_publish_manifest_from_source,
+    validate_lpm_registry_body_size, validate_lpm_registry_tarball_size,
     validate_publish_tarball_size,
 };
 use super::provenance::{
@@ -24,14 +25,14 @@ use super::types::{
     LpmPublicationStatus, NpmTargetArtifact, NpmTargetArtifactInput, PublicationWaitResult,
     PublishProject, PublishQualityGateInput, PublishResult, PublishTarget, ResolvedProvenance,
 };
-use super::upload_lpm::publish_to_lpm;
+use super::upload_lpm::{LpmPublishBody, OtpFailure, publish_to_lpm, resolve_lpm_otp};
 use super::version_data::{build_publish_version_data, integrity_to_sha512_hex};
 use super::wait::{DEFAULT_PUBLICATION_WAIT_TIMEOUT, wait_for_lpm_publication_with_oidc};
 use crate::commands::skills::author;
 use crate::commands::{npm_auth, publish_common, publish_npm};
 use crate::{auth, install_ui, oidc, provenance, sigstore};
 use lpm_common::{LpmError, PackageName};
-use lpm_registry::RegistryClient;
+use lpm_registry::{PublishPreflightVerdict, RegistryClient};
 use sha2::{Digest as _, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -315,11 +316,31 @@ impl PublishIntent {
                 } else {
                     client
                 };
-                let preflight = client
-                    .publish_preflight(&resolved.name, &self.package_version)
+                let verdict = client
+                    .publish_preflight(&resolved.name, &self.package_version, None)
                     .await?;
                 drop(light_permit);
-                if !preflight.package_exists {
+                if let PublishPreflightVerdict::Refused {
+                    status,
+                    code,
+                    error,
+                    ..
+                } = &verdict
+                    && lpm_dev_has_the_version(
+                        *status,
+                        code.as_deref(),
+                        error,
+                        &self.package_version,
+                    )
+                {
+                    return Ok(PublishTargetPreflight {
+                        target_display: resolved.target.display_name().to_string(),
+                        version_exists: true,
+                    });
+                }
+                // Any other refusal is the error the request's failure is,
+                // as `--json` reports it.
+                if !verdict.into_result()?.package_exists {
                     false
                 } else {
                     let _metadata_permit = acquire_preflight_permits(permits, permit_limit).await?;
@@ -1160,6 +1181,15 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
         &tarball_data,
         !allow_secrets,
     )?;
+    if targets_lpm {
+        check_lpm_target_tarball(
+            &target_names,
+            &name,
+            &tarball_data,
+            &tarball_hashes,
+            &rewritten_tarballs,
+        )?;
+    }
     let version_data = build_publish_version_data(
         &pkg_json,
         &name,
@@ -1229,6 +1259,28 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
     } else {
         None
     };
+    if targets_lpm {
+        check_lpm_target_body(
+            LpmTargetSource {
+                target_names: &target_names,
+                name: &name,
+                version: &version,
+                version_data: &version_data,
+                tarball_data: &tarball_data,
+                tarball_hashes: &tarball_hashes,
+                rewritten_tarballs: &rewritten_tarballs,
+            },
+            &LpmPublishParts {
+                readme: readme.as_deref(),
+                tarball_files: &tarball_files,
+                quality_result: quality_result.as_ref(),
+                lpm_config: lpm_config.as_ref(),
+                detected_ecosystem: &detected_ecosystem,
+                swift_manifest: swift_manifest.as_ref(),
+            },
+            matches!(provenance_request, ProvenanceRequest::Generate),
+        )?;
+    }
 
     let local_skills_digest =
         has_skills.then(|| author::compute_validated_digest(&validated_skills));
@@ -1399,9 +1451,12 @@ async fn execute_prepared_inner(
     } else {
         client
     };
-    let lpm_whoami_cache = release_clients
-        .filter(|_| !using_registry_oidc)
-        .map(|clients| &clients.lpm_whoami);
+    let local_whoami = tokio::sync::OnceCell::new();
+    let lpm_whoami_cache = Some(
+        release_clients
+            .filter(|_| !using_registry_oidc)
+            .map_or(&local_whoami, |clients| &clients.lpm_whoami),
+    );
 
     // Skills staleness check is an LPM network read, so skip it in --check.
     //
@@ -1447,19 +1502,34 @@ async fn execute_prepared_inner(
         return Ok(PublishExecutionReport::successful(json_output));
     }
 
+    let lpm_source = LpmTargetSource {
+        target_names: &target_names,
+        name: &name,
+        version: &version,
+        version_data: &version_data,
+        tarball_data: &tarball_data,
+        tarball_hashes: &tarball_hashes,
+        rewritten_tarballs: &rewritten_tarballs,
+    };
     if dry_run {
         if targets_lpm {
-            let resolved_lpm_name = target_names.get("lpm").ok_or_else(|| {
-                LpmError::Registry("no resolved LPM.dev package name for publish preflight".into())
-            })?;
-            client
-                .publish_preflight(resolved_lpm_name, &version)
+            let request = lpm_target_request(lpm_source)?;
+            let refusal = match client
+                .publish_preflight(request.name, &version, Some(request.tarball.len() as u64))
                 .await
-                .map_err(|error| {
-                    LpmError::Registry(format!(
-                        "LPM.dev publish preflight failed for {resolved_lpm_name}@{version}: {error}"
-                    ))
-                })?;
+            {
+                Ok(PublishPreflightVerdict::Accepted(_)) => None,
+                Ok(PublishPreflightVerdict::Refused { error, .. }) => {
+                    Some(lpm_common::sanitize_terminal_inline(&error).into_owned())
+                }
+                Err(error) => Some(error.to_string()),
+            };
+            if let Some(refusal) = refusal {
+                return Err(LpmError::Registry(format!(
+                    "LPM.dev publish preflight failed for {}@{version}: {refusal}",
+                    request.name
+                )));
+            }
         }
         if !npm_version_preflighted && targets.iter().any(is_npm_compatible_target) {
             let preflight_client = release_clients
@@ -1574,6 +1644,27 @@ async fn execute_prepared_inner(
         }
     }
 
+    // lpm.dev's second factor is settled before any target publishes too,
+    // so one `--json` can't ask for publishes none. A version lpm.dev
+    // already has needs none, and an account that can't be read yet is the
+    // LPM target's to read again.
+    let mut lpm_dev_has_the_version = None;
+    let otp = if targets_lpm && targets.len() > 1 {
+        lpm_dev_has_the_version =
+            refuse_before_any_publish_what_lpm_dev_refuses(client, lpm_source, &version).await?;
+        if lpm_dev_has_the_version.is_some() {
+            otp
+        } else {
+            match resolve_lpm_otp(client, otp.as_deref(), json_output, lpm_whoami_cache).await {
+                Ok(settled) => settled,
+                Err(OtpFailure::AccountUnread(_)) => otp,
+                Err(OtpFailure::Final(error)) => return Err(error),
+            }
+        }
+    } else {
+        otp
+    };
+
     let provenance_context = match provenance_request {
         ProvenanceRequest::File(_) => None,
         request => materialize_provenance_request(request).await?,
@@ -1596,26 +1687,19 @@ async fn execute_prepared_inner(
             PublishTarget::Lpm => {
                 // Wrap the entire LPM publish path so any error becomes a PublishResult
                 let lpm_result: Result<serde_json::Value, LpmError> = async {
-                    let lpm_name = target_names.get("lpm").map_or(name.as_str(), |s| s.as_str());
-
-                    let lpm_tarball = target_tarball(
-                        lpm_name,
-                        &name,
-                        &tarball_data,
-                        &tarball_hashes,
-                        &rewritten_tarballs,
-                    )?;
-
-                    // Recompute dist hashes from the final rewritten tarball so metadata
-                    // matches the actual uploaded artifact (not the pre-rewrite original).
-                    let mut lpm_version_data = version_data.clone();
-                    lpm_version_data["name"] = serde_json::json!(lpm_name);
-                    lpm_version_data["_id"] =
-                        serde_json::json!(format!("{lpm_name}@{version}"));
-                    lpm_version_data["dist"] = serde_json::json!({
-                        "shasum": lpm_tarball.hashes.shasum,
-                        "integrity": lpm_tarball.hashes.integrity,
-                    });
+                    if let Some(refusal) = &lpm_dev_has_the_version {
+                        return Err(LpmError::Registry(refusal.clone()));
+                    }
+                    let mut request = lpm_target_request(LpmTargetSource {
+                        target_names: &target_names,
+                        name: &name,
+                        version: &version,
+                        version_data: &version_data,
+                        tarball_data: &tarball_data,
+                        tarball_hashes: &tarball_hashes,
+                        rewritten_tarballs: &rewritten_tarballs,
+                    })?;
+                    let lpm_name = request.name;
 
                     // Generate per-target provenance from the final rewritten tarball
                     if let Some(ref provenance) = provenance_context {
@@ -1625,7 +1709,7 @@ async fn execute_prepared_inner(
                                     .into(),
                             ));
                         };
-                        let sha512_hex = integrity_to_sha512_hex(&lpm_tarball.hashes.integrity);
+                        let sha512_hex = integrity_to_sha512_hex(&request.tarball.hashes.integrity);
                         let slsa = provenance::build_slsa_statement(
                             &context.ci,
                             lpm_name,
@@ -1646,11 +1730,11 @@ async fn execute_prepared_inner(
                             install_ui::done("Sigstore provenance generated and recorded in Rekor");
                         }
                         let bundle_json = serde_json::to_value(&bundle).unwrap_or_default();
-                        lpm_version_data["_provenance"] = bundle_json.clone();
-                        lpm_version_data["_npmProvenanceAttestations"] = bundle_json;
+                        request.version_data["_provenance"] = bundle_json.clone();
+                        request.version_data["_npmProvenanceAttestations"] = bundle_json;
                     }
 
-                    let lpm_tarball_data = lpm_tarball.read_data()?;
+                    let lpm_tarball_data = request.tarball.read_data()?;
 
                     let upload_spinner = if json_output {
                         None
@@ -1659,19 +1743,17 @@ async fn execute_prepared_inner(
                     };
                     let response = publish_to_lpm(
                         client,
-                        lpm_name,
-                        &version,
-                        &readme,
+                        request.body(&LpmPublishParts {
+                            readme: readme.as_deref(),
+                            tarball_files: &tarball_files,
+                            quality_result: quality_result.as_ref(),
+                            lpm_config: lpm_config.as_ref(),
+                            detected_ecosystem: &detected_ecosystem,
+                            swift_manifest: swift_manifest.as_ref(),
+                        }),
                         &lpm_tarball_data,
-                        &tarball_files,
-                        lpm_tarball.package_json_size,
-                        &lpm_version_data,
-                        &quality_result,
-                        &lpm_config,
                         otp.as_deref(),
                         json_output,
-                        &detected_ecosystem,
-                        &swift_manifest,
                         lpm_whoami_cache,
                     )
                     .await?;
@@ -2239,12 +2321,224 @@ struct TargetTarball<'a> {
 }
 
 impl TargetTarball<'_> {
+    fn len(&self) -> usize {
+        match self.data {
+            TargetTarballData::Base(data) => data.len(),
+            TargetTarballData::Rewritten(tarball) => tarball.len(),
+        }
+    }
+
     fn read_data(&self) -> Result<std::sync::Arc<Vec<u8>>, LpmError> {
         match self.data {
             TargetTarballData::Base(data) => Ok(std::sync::Arc::clone(data)),
             TargetTarballData::Rewritten(tarball) => tarball.read_data().map(std::sync::Arc::new),
         }
     }
+}
+
+/// lpm.dev's name for the package: its target's, or package.json's.
+fn lpm_target_name<'a>(target_names: &'a HashMap<String, String>, name: &'a str) -> &'a str {
+    target_names.get("lpm").map_or(name, String::as_str)
+}
+
+/// The version metadata lpm.dev receives, named as its target and carrying
+/// the hashes of the tarball it's sent.
+fn lpm_target_version_data(
+    version_data: &serde_json::Value,
+    lpm_name: &str,
+    version: &str,
+    hashes: &publish_common::TarballHashes,
+) -> serde_json::Value {
+    let mut lpm_version_data = version_data.clone();
+    lpm_version_data["name"] = serde_json::json!(lpm_name);
+    lpm_version_data["_id"] = serde_json::json!(format!("{lpm_name}@{version}"));
+    lpm_version_data["dist"] = serde_json::json!({
+        "shasum": hashes.shasum,
+        "integrity": hashes.integrity,
+    });
+    lpm_version_data
+}
+
+/// Refuses, before any target publishes, a tarball lpm.dev would refuse for
+/// its size: the one it's sent, renamed for it where its name differs from
+/// package.json's.
+fn check_lpm_target_tarball(
+    target_names: &HashMap<String, String>,
+    name: &str,
+    tarball_data: &std::sync::Arc<Vec<u8>>,
+    tarball_hashes: &std::sync::Arc<publish_common::TarballHashes>,
+    rewritten_tarballs: &HashMap<String, publish_common::RewrittenTarball>,
+) -> Result<(), LpmError> {
+    let lpm_tarball = target_tarball(
+        lpm_target_name(target_names, name),
+        name,
+        tarball_data,
+        tarball_hashes,
+        rewritten_tarballs,
+    )?;
+    validate_lpm_registry_tarball_size(lpm_tarball.len())
+}
+
+/// What lpm.dev's request is made from: the package as prepared, and the
+/// tarballs prepared for each target.
+#[derive(Clone, Copy)]
+struct LpmTargetSource<'a> {
+    target_names: &'a HashMap<String, String>,
+    name: &'a str,
+    version: &'a str,
+    version_data: &'a serde_json::Value,
+    tarball_data: &'a std::sync::Arc<Vec<u8>>,
+    tarball_hashes: &'a std::sync::Arc<publish_common::TarballHashes>,
+    rewritten_tarballs: &'a HashMap<String, publish_common::RewrittenTarball>,
+}
+
+/// What lpm.dev's request carries beside its tarball and version metadata.
+struct LpmPublishParts<'a> {
+    readme: Option<&'a str>,
+    tarball_files: &'a [publish_common::TarballFile],
+    quality_result: Option<&'a crate::quality::QualityResult>,
+    lpm_config: Option<&'a serde_json::Value>,
+    detected_ecosystem: &'a str,
+    swift_manifest: Option<&'a serde_json::Value>,
+}
+
+/// lpm.dev's request: its name for the package, the tarball it's sent, and
+/// version metadata named as its target and carrying that tarball's hashes.
+/// The size check and the upload both build it here, so the request checked
+/// is the request sent.
+struct LpmTargetRequest<'a> {
+    name: &'a str,
+    version: &'a str,
+    tarball: TargetTarball<'a>,
+    version_data: serde_json::Value,
+}
+
+fn lpm_target_request(source: LpmTargetSource<'_>) -> Result<LpmTargetRequest<'_>, LpmError> {
+    let name = lpm_target_name(source.target_names, source.name);
+    let tarball = target_tarball(
+        name,
+        source.name,
+        source.tarball_data,
+        source.tarball_hashes,
+        source.rewritten_tarballs,
+    )?;
+    let version_data =
+        lpm_target_version_data(source.version_data, name, source.version, tarball.hashes);
+    Ok(LpmTargetRequest {
+        name,
+        version: source.version,
+        tarball,
+        version_data,
+    })
+}
+
+impl LpmTargetRequest<'_> {
+    fn body<'b>(&'b self, parts: &LpmPublishParts<'b>) -> LpmPublishBody<'b> {
+        LpmPublishBody {
+            name: self.name,
+            version: self.version,
+            readme: parts.readme,
+            version_data: &self.version_data,
+            tarball_files: parts.tarball_files,
+            package_json_size_override: self.tarball.package_json_size,
+            quality_result: parts.quality_result,
+            lpm_config: parts.lpm_config,
+            detected_ecosystem: parts.detected_ecosystem,
+            swift_manifest: parts.swift_manifest,
+        }
+    }
+
+    /// The bytes `publish_to_lpm` sends, but for a provenance bundle.
+    fn len(&self, parts: &LpmPublishParts<'_>) -> Result<u64, LpmError> {
+        self.body(parts).len_with(self.tarball.len())
+    }
+}
+
+/// The preflight's code for a version lpm.dev already has.
+const VERSION_EXISTS_CODE: &str = "VERSION_EXISTS";
+
+/// Whether an lpm.dev preflight refusal says lpm.dev already has `version`:
+/// by its code, or, from a Registry that sends none, by the message it
+/// gives that refusal.
+fn lpm_dev_has_the_version(status: u16, code: Option<&str>, error: &str, version: &str) -> bool {
+    match code {
+        Some(code) => code == VERSION_EXISTS_CODE,
+        None => {
+            status == 403
+                && error
+                    .strip_prefix("Version ")
+                    .and_then(|rest| rest.strip_prefix(version))
+                    .is_some_and(|rest| rest.starts_with(" already exists."))
+        }
+    }
+}
+
+/// Whether an lpm.dev preflight refusal is one no retry of the same publish
+/// gets past: the account's storage or package limit, its billing, a second
+/// factor it requires, the tarball's size, or the token's permission. A
+/// version lpm.dev already has, as after a partial publish, isn't one, nor a
+/// request the Registry can't read, a rate limit or a server error, which
+/// the upload judges.
+fn refusal_stops_every_target(status: u16, code: Option<&str>, error: &str, version: &str) -> bool {
+    matches!(status, 402 | 403 | 413) && !lpm_dev_has_the_version(status, code, error, version)
+}
+
+/// Stops a publish to more than one target before any publishes when
+/// lpm.dev refuses it for good, so the other targets don't publish a version
+/// lpm.dev won't take. Returns lpm.dev's refusal of a version it already
+/// has, as after a partial publish, which the other targets still publish.
+/// Any other answer leaves each target to its own upload, as does a
+/// Registry that can't be asked.
+async fn refuse_before_any_publish_what_lpm_dev_refuses(
+    client: &RegistryClient,
+    source: LpmTargetSource<'_>,
+    version: &str,
+) -> Result<Option<String>, LpmError> {
+    let request = lpm_target_request(source)?;
+    let verdict = client
+        .publish_preflight(request.name, version, Some(request.tarball.len() as u64))
+        .await;
+    let Ok(PublishPreflightVerdict::Refused {
+        status,
+        code,
+        error,
+        ..
+    }) = verdict
+    else {
+        return Ok(None);
+    };
+    let error = lpm_common::sanitize_terminal_inline(&error).into_owned();
+    if lpm_dev_has_the_version(status, code.as_deref(), &error, version) {
+        return Ok(Some(error));
+    }
+    if refusal_stops_every_target(status, code.as_deref(), &error, version) {
+        return Err(LpmError::Registry(format!(
+            "LPM.dev refuses {}@{version}, so no target was published: {error}",
+            request.name,
+        )));
+    }
+    Ok(None)
+}
+
+/// Room a `--provenance` publish keeps for its Sigstore bundle, which goes
+/// into lpm.dev's version metadata twice once the upload signs it: twice
+/// the 512 KiB the Registry keeps of one, while a bundle is about 10 KB.
+const PROVENANCE_BODY_RESERVE_BYTES: u64 = 1024 * 1024;
+
+/// Refuses, before any target publishes, a publish request lpm.dev would
+/// refuse for its size, keeping room for a provenance bundle when one is
+/// signed.
+fn check_lpm_target_body(
+    source: LpmTargetSource<'_>,
+    parts: &LpmPublishParts<'_>,
+    provenance: bool,
+) -> Result<(), LpmError> {
+    let reserve = if provenance {
+        PROVENANCE_BODY_RESERVE_BYTES
+    } else {
+        0
+    };
+    validate_lpm_registry_body_size(lpm_target_request(source)?.len(parts)?, reserve)
 }
 
 fn target_tarball<'a>(
@@ -2366,6 +2660,213 @@ fn resolve_npm_compatible_publish_endpoint(
             .and_then(|config| config.tag.as_deref())
             .is_some(),
     }))
+}
+
+#[cfg(test)]
+mod lpm_target_limit_tests {
+    use super::{
+        LpmPublishParts, LpmTargetSource, PROVENANCE_BODY_RESERVE_BYTES, check_lpm_target_body,
+        check_lpm_target_tarball, lpm_dev_has_the_version, lpm_target_request, publish_common,
+        refusal_stops_every_target,
+    };
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    const MIB: usize = 1024 * 1024;
+
+    #[test]
+    fn reads_a_version_lpm_dev_has_from_its_code_or_a_codeless_registry_s_message() {
+        // What a Registry without the code answers.
+        let deployed = "Version 1.0.0 already exists. You cannot overwrite versions.";
+        assert!(lpm_dev_has_the_version(
+            403,
+            Some("VERSION_EXISTS"),
+            "",
+            "1.0.0"
+        ));
+        assert!(lpm_dev_has_the_version(403, None, deployed, "1.0.0"));
+        assert!(!lpm_dev_has_the_version(403, None, deployed, "1.0"));
+        assert!(!lpm_dev_has_the_version(403, None, deployed, "1.0.0-beta"));
+        assert!(!lpm_dev_has_the_version(402, None, deployed, "1.0.0"));
+        assert!(!lpm_dev_has_the_version(
+            403,
+            Some("STORAGE_LIMIT_EXCEEDED"),
+            deployed,
+            "1.0.0"
+        ));
+        assert!(!lpm_dev_has_the_version(
+            403,
+            None,
+            "Insufficient permissions",
+            "1.0.0"
+        ));
+
+        assert!(!refusal_stops_every_target(403, None, deployed, "1.0.0"));
+        assert!(!refusal_stops_every_target(
+            403,
+            Some("VERSION_EXISTS"),
+            "",
+            "1.0.0"
+        ));
+        assert!(refusal_stops_every_target(
+            403,
+            None,
+            "Insufficient permissions",
+            "1.0.0"
+        ));
+        assert!(refusal_stops_every_target(
+            402,
+            Some("ORG_BILLING_LAPSED"),
+            "",
+            "1.0.0"
+        ));
+        assert!(refusal_stops_every_target(413, None, "", "1.0.0"));
+        for status in [400, 404, 408, 429, 500, 503] {
+            assert!(
+                !refusal_stops_every_target(status, None, "", "1.0.0"),
+                "{status}"
+            );
+        }
+    }
+
+    fn hashes() -> Arc<publish_common::TarballHashes> {
+        Arc::new(publish_common::TarballHashes {
+            shasum: "0".repeat(40),
+            integrity: "sha512-AAAA".into(),
+        })
+    }
+
+    fn renamed_to(lpm_name: &str) -> HashMap<String, String> {
+        HashMap::from([("lpm".to_owned(), lpm_name.to_owned())])
+    }
+
+    #[test]
+    fn measures_the_tarball_lpm_dev_is_sent() {
+        let limit = publish_common::MAX_LPM_REGISTRY_TARBALL_BYTES as usize;
+        let past = Arc::new(vec![0_u8; limit + 1]);
+        let within = Arc::new(vec![0_u8; limit]);
+        let no_copies = HashMap::new();
+
+        let error = check_lpm_target_tarball(&HashMap::new(), "pkg", &past, &hashes(), &no_copies)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("tarball too large for the LPM registry"),
+            "{error}"
+        );
+        check_lpm_target_tarball(&HashMap::new(), "pkg", &within, &hashes(), &no_copies).unwrap();
+
+        // Renamed for lpm.dev, it's sent the copy, whatever the packed one's size.
+        let copies = HashMap::from([(
+            "@lpm.dev/acme.pkg".to_owned(),
+            publish_common::RewrittenTarball::spool_base(&[0_u8; 16], hashes()).unwrap(),
+        )]);
+        check_lpm_target_tarball(
+            &renamed_to("@lpm.dev/acme.pkg"),
+            "pkg",
+            &past,
+            &hashes(),
+            &copies,
+        )
+        .unwrap();
+    }
+
+    fn source<'a>(
+        tarball_data: &'a Arc<Vec<u8>>,
+        tarball_hashes: &'a Arc<publish_common::TarballHashes>,
+        version_data: &'a serde_json::Value,
+        no_copies: &'a HashMap<String, publish_common::RewrittenTarball>,
+        target_names: &'a HashMap<String, String>,
+    ) -> LpmTargetSource<'a> {
+        LpmTargetSource {
+            target_names,
+            name: "pkg",
+            version: "1.0.0",
+            version_data,
+            tarball_data,
+            tarball_hashes,
+            rewritten_tarballs: no_copies,
+        }
+    }
+
+    fn parts(tarball_files: &[publish_common::TarballFile]) -> LpmPublishParts<'_> {
+        LpmPublishParts {
+            readme: None,
+            tarball_files,
+            quality_result: None,
+            lpm_config: None,
+            detected_ecosystem: "js",
+            swift_manifest: None,
+        }
+    }
+
+    #[test]
+    fn refuses_a_request_its_file_list_takes_past_the_body_limit_though_its_tarball_is_within_its_own()
+     {
+        // 133.33 MiB of base64 for a tarball at its 100 MiB limit.
+        let tarball = Arc::new(vec![0_u8; 100 * MIB]);
+        let version_data = serde_json::json!({ "name": "pkg", "version": "1.0.0" });
+        let few: Vec<_> = (0..10)
+            .map(|index| publish_common::TarballFile {
+                path: format!("package/{index}.js"),
+                size: 1,
+            })
+            .collect();
+        let many: Vec<_> = (0..100_000)
+            .map(|index| publish_common::TarballFile {
+                path: format!("package/{}/{index}.js", "d".repeat(180)),
+                size: 1,
+            })
+            .collect();
+        let (hashes, no_copies, names) = (hashes(), HashMap::new(), HashMap::new());
+        let source = source(&tarball, &hashes, &version_data, &no_copies, &names);
+
+        check_lpm_target_body(source, &parts(&few), false).unwrap();
+        let error = check_lpm_target_body(source, &parts(&many), false).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("publish request too large for the LPM registry"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn keeps_room_for_a_provenance_bundle_when_one_is_signed() {
+        let version_data = serde_json::json!({ "name": "pkg", "version": "1.0.0" });
+        let (hashes, no_copies, names) = (hashes(), HashMap::new(), HashMap::new());
+        let files = [];
+        let length = |size: usize| {
+            let tarball = Arc::new(vec![0_u8; size]);
+            lpm_target_request(source(&tarball, &hashes, &version_data, &no_copies, &names))
+                .unwrap()
+                .len(&parts(&files))
+                .unwrap()
+        };
+        // Whole groups of 3 bytes, which base64 writes as 4, so the request
+        // grows by exactly 4 bytes a group near the size it's sized for.
+        let room = publish_common::MAX_LPM_REGISTRY_BODY_BYTES - PROVENANCE_BODY_RESERVE_BYTES;
+        let near = (room / 4 * 3) as usize;
+        let groups = (room as i64 - length(near) as i64).div_euclid(4);
+        let fits = (near as i64 + 3 * groups) as usize;
+        assert!(length(fits) <= room && room - length(fits) < 4);
+        let check = |size: usize, provenance: bool| {
+            let tarball = Arc::new(vec![0_u8; size]);
+            let source = source(&tarball, &hashes, &version_data, &no_copies, &names);
+            check_lpm_target_body(source, &parts(&files), provenance)
+        };
+
+        check(fits, true).unwrap();
+        check(fits + 3, false).unwrap();
+        let error = check(fits + 3, true).unwrap_err().to_string();
+        assert!(
+            error.contains("publish request too large for the LPM registry")
+                && error.contains("less 1 MiB kept for its provenance bundle"),
+            "{error}"
+        );
+    }
 }
 
 #[cfg(test)]

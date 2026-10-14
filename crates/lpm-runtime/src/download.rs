@@ -367,12 +367,7 @@ async fn read_download_body(
 }
 
 fn checked_download_size(size: u64) -> Result<usize, LpmError> {
-    let size = usize::try_from(size).map_err(|_| {
-        LpmError::Script(format!(
-            "download size {size} bytes exceeds maximum allowed size of {MAX_DOWNLOAD_SIZE} bytes ({}MB)",
-            MAX_DOWNLOAD_SIZE / (1024 * 1024)
-        ))
-    })?;
+    let size = usize::try_from(size).map_err(|_| LpmError::Script(download_too_large(size)))?;
     validate_download_size(size)?;
     Ok(size)
 }
@@ -762,12 +757,16 @@ const MAX_DOWNLOAD_SIZE: usize = 200 * 1024 * 1024;
 /// after buffering bytes (defence against lying headers / chunked encoding).
 fn validate_download_size(size: usize) -> Result<(), LpmError> {
     if size > MAX_DOWNLOAD_SIZE {
-        return Err(LpmError::Network(format!(
-            "download size {size} bytes exceeds maximum allowed size of {MAX_DOWNLOAD_SIZE} bytes ({}MB)",
-            MAX_DOWNLOAD_SIZE / (1024 * 1024)
-        )));
+        return Err(LpmError::Network(download_too_large(size)));
     }
     Ok(())
+}
+
+fn download_too_large(size: impl std::fmt::Display) -> String {
+    format!(
+        "download size {size} bytes exceeds maximum allowed size of {MAX_DOWNLOAD_SIZE} bytes ({})",
+        lpm_common::format_bytes(MAX_DOWNLOAD_SIZE as u64)
+    )
 }
 
 /// Compare an expected hex-encoded SHA-256 hash against the SHA-256 of raw bytes.
@@ -1543,7 +1542,12 @@ mod tests {
         let result = validate_download_size(MAX_DOWNLOAD_SIZE + 1);
         assert!(result.is_err(), "oversized download must be rejected");
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("exceeds maximum"), "got: {err_msg}");
+        assert!(
+            err_msg.contains(
+                "download size 209715201 bytes exceeds maximum allowed size of 209715200 bytes (200 MiB)"
+            ),
+            "got: {err_msg}"
+        );
     }
 
     // --- Directory and file permissions ---

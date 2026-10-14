@@ -365,6 +365,14 @@ fn local_task_cache_size(path: &Path) -> Result<u64, LpmError> {
 }
 
 pub fn cache_status_json(status: &CacheStatus) -> serde_json::Value {
+    // As the human line shows them: usage on its side of the limit.
+    let (usage, limit) = match (status.remote.usage_bytes, status.remote.limit_bytes) {
+        (Some(usage), Some(limit)) => {
+            let (usage, limit) = lpm_common::format_quota(usage, limit);
+            (Some(usage), Some(limit))
+        }
+        (usage, limit) => (usage.map(lpm_common::format_usage), limit.map(format_bytes)),
+    };
     serde_json::json!({
         "success": true,
         "local": {
@@ -378,9 +386,9 @@ pub fn cache_status_json(status: &CacheStatus) -> serde_json::Value {
             "team": status.remote.team,
             "status": status.remote.status,
             "usage_bytes": status.remote.usage_bytes,
-            "usage": status.remote.usage_bytes.map(format_bytes),
+            "usage": usage,
             "limit_bytes": status.remote.limit_bytes,
-            "limit": status.remote.limit_bytes.map(format_bytes),
+            "limit": limit,
             "error": status.remote.error,
         },
     })
@@ -441,8 +449,7 @@ pub fn print_cache_status_human(status: &CacheStatus) {
             );
         }
         if let (Some(usage), Some(limit)) = (status.remote.usage_bytes, status.remote.limit_bytes) {
-            let usage_display = format_bytes(usage);
-            let limit_display = format_bytes(limit);
+            let (usage_display, limit_display) = lpm_common::format_quota(usage, limit);
             let usage_bar = install_ui::usage_bar(usage, limit, 10);
             let usage_line = if usage_bar.is_empty() {
                 crate::install_ui::terminal_line!(
@@ -461,6 +468,16 @@ pub fn print_cache_status_human(status: &CacheStatus) {
                 )
             };
             println!("{usage_line}");
+        } else if let (Some(usage), None) = (status.remote.usage_bytes, status.remote.limit_bytes) {
+            // A plan whose cache is unlimited reports no limit.
+            println!(
+                "{}",
+                crate::install_ui::terminal_line!(
+                    "  {} {} / Unlimited",
+                    cache_status_label("usage"),
+                    lpm_common::format_usage(usage)
+                )
+            );
         }
     }
     println!();
