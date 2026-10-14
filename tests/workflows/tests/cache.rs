@@ -177,6 +177,53 @@ async fn cache_status_rejects_an_oversized_remote_response() {
     );
 }
 
+#[tokio::test]
+async fn cache_status_reports_a_request_limit_and_when_to_try_again() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v8/artifacts/status"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "90")
+                .set_body_json(serde_json::json!({
+                    "error": "Remote cache limit reached: 3,000 requests a minute",
+                    "retryAfter": 90,
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let project = TempProject::empty(r#"{"name":"cache-status","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{ "remoteCache": {{ "enabled": true, "url": "{}/v8" }} }}"#,
+            server.uri(),
+        ),
+    );
+
+    let output = lpm(&project)
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
+        .args(["--json", "cache", "status"])
+        .output()
+        .expect("failed to run lpm cache status --json");
+
+    assert!(
+        output.status.success(),
+        "cache status must remain best-effort: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cache status must emit valid JSON");
+    assert_eq!(
+        envelope["remote"]["error"],
+        "Remote cache limit reached: 3,000 requests a minute; try again in 2 minutes"
+    );
+    server.verify().await;
+}
+
 #[test]
 fn cache_status_fails_when_lpm_json_is_malformed() {
     let project = TempProject::empty(r#"{"name":"cache-status","version":"1.0.0"}"#);
