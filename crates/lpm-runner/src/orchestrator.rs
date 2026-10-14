@@ -4601,7 +4601,9 @@ setInterval(() => {{}}, 1000);
             ServiceConfig {
                 command: "node never-ready.js".to_string(),
                 port: Some(ready_port),
-                ready_timeout: 3,
+                // Far past the stop's own 2 s grace, so a stop that waited for
+                // readiness can't be mistaken for a slow one.
+                ready_timeout: 30,
                 ..Default::default()
             },
         )]);
@@ -4634,7 +4636,7 @@ setInterval(() => {{}}, 1000);
 
         assert!(result.is_ok(), "orchestrator failed: {result:?}");
         assert!(
-            stop_sent_at.elapsed() < Duration::from_secs(2),
+            stop_sent_at.elapsed() < Duration::from_secs(10),
             "StopAll remained blocked behind initial readiness"
         );
         assert!(
