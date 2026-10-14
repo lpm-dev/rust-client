@@ -4547,7 +4547,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("needs about 3.0 MB free on its disk"),
+                .contains("needs about 3 MiB free on its disk"),
             "{error}"
         );
     }

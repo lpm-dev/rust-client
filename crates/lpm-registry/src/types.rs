@@ -993,6 +993,18 @@ pub struct WhoamiResponse {
 
     #[serde(default)]
     pub limits: Option<WhoamiLimits>,
+
+    /// What publishing does with storage past the plan's limit: `billed`,
+    /// `paused` while billing isn't active, or `blocked`. A Registry that
+    /// predates it sends none.
+    #[serde(default, rename = "storage_overage")]
+    pub storage_overage: Option<String>,
+
+    /// Whether storage already past the plan's limit is billed meanwhile,
+    /// as it is while a subscription is past due, and not while it's paused
+    /// or ended. A Registry that predates it sends none.
+    #[serde(default, rename = "storage_excess_billed")]
+    pub storage_excess_billed: Option<bool>,
 }
 
 /// GET /api/registry/-/package/publish-preflight
@@ -1003,6 +1015,24 @@ pub struct PublishPreflightResponse {
     pub version: String,
     #[serde(rename = "packageExists")]
     pub package_exists: bool,
+}
+
+/// What the publish preflight says of a publish of a given size.
+#[derive(Debug, Clone)]
+pub enum PublishPreflightVerdict {
+    /// The Registry would take the publish.
+    Accepted(PublishPreflightResponse),
+    /// The Registry refuses it: its HTTP status, its `code` where it gives
+    /// one, its message, or `HTTP <status>` where its body has none, the
+    /// body as sent, which a request's failure reports, and a 429's
+    /// `Retry-After` in seconds.
+    Refused {
+        status: u16,
+        code: Option<String>,
+        error: String,
+        body: String,
+        retry_after_secs: u64,
+    },
 }
 
 /// GET /api/registry/-/package/publication-status
@@ -1021,6 +1051,12 @@ pub struct PublicationStatusResponse {
 pub struct WhoamiUsage {
     #[serde(default, rename = "storage_bytes")]
     pub storage_bytes: u64,
+
+    /// The storage the plan's limit counts: on the free plan, all but that
+    /// of packages whose sales exempt them. A Registry that predates it
+    /// sends none.
+    #[serde(default, rename = "counted_storage_bytes")]
+    pub counted_storage_bytes: Option<u64>,
 
     #[serde(default, rename = "private_packages")]
     pub private_packages: u32,

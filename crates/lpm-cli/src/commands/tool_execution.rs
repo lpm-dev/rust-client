@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 /// Maximum size for captured workspace stdout/stderr before truncation.
 /// Mirrors the `MAX_CAPTURED_OUTPUT` constant in `commands::run` so chatty
 /// failing members don't unbound the JSON envelope.
-const MAX_CAPTURED_OUTPUT: usize = 10 * 1024 * 1024; // 10 MB
+const MAX_CAPTURED_OUTPUT: usize = 10 * 1024 * 1024; // 10 MiB
 
 /// Truncate captured output if it exceeds `MAX_CAPTURED_OUTPUT`, cutting at
 /// the last newline boundary to avoid splitting a line.
@@ -20,7 +20,7 @@ fn truncate_output(text: &str) -> String {
         }
         let end = text[..end].rfind('\n').unwrap_or(end);
         format!(
-            "{}...\n\n[output truncated at {}MB]",
+            "{}...\n\n[output truncated at {} MiB]",
             &text[..end],
             MAX_CAPTURED_OUTPUT / (1024 * 1024),
         )
@@ -244,7 +244,7 @@ pub(super) fn selected_schedule_state(
 }
 
 /// Emit the workspace JSON envelope. Stdout/stderr surface ONLY for failed
-/// members and are truncated at the 10MB ceiling.
+/// members and are truncated at the 10 MiB ceiling.
 pub(super) fn emit_envelope(
     results: &[MemberResult],
     total: usize,
@@ -343,7 +343,7 @@ mod tests {
         let huge = "x".repeat(MAX_CAPTURED_OUTPUT + 2_000);
         let result = truncate_output(&huge);
         assert!(
-            result.ends_with("[output truncated at 10MB]"),
+            result.ends_with("[output truncated at 10 MiB]"),
             "expected truncation marker, got tail: {:?}",
             &result[result.len().saturating_sub(60)..]
         );

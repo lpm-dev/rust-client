@@ -1,7 +1,7 @@
 use super::*;
 
 mod error_redaction;
-use error_redaction::read_request_error_text;
+use error_redaction::{read_error_text_redacting, read_request_error_text};
 
 pub(super) enum PublishSafeResponse {
     Response(reqwest::Response),
@@ -473,6 +473,7 @@ impl RegistryClient {
             let req = request_factory()?
                 .build()
                 .map_err(|e| LpmError::Network(format!("failed to build request: {e}")))?;
+            let headers = req.headers().clone();
 
             match lpm_http::send_with_replayable_redirects(self.http.as_ref(), req, Some(payload))
                 .await
@@ -486,7 +487,7 @@ impl RegistryClient {
                         // Non-retryable client errors — fail immediately
                         401 => return Err(LpmError::AuthRequired),
                         403 => {
-                            let body = read_publish_error_text(response, bearer).await;
+                            let body = read_publish_error_text(response, &headers, bearer).await;
                             let duplicate_message = format!(
                                 "Version {published_version} already exists. You cannot overwrite versions."
                             );
@@ -507,14 +508,15 @@ impl RegistryClient {
                             return Err(forbidden_error_from_body(body));
                         }
                         404 => {
-                            let body = read_publish_error_text(response, bearer).await;
+                            let body = read_publish_error_text(response, &headers, bearer).await;
                             return Err(LpmError::NotFound(body));
                         }
 
                         // S4: 500 — do NOT retry. Server may have stored the version.
                         // Check if the version now exists on the registry.
                         500 => {
-                            let body_text = read_publish_error_text(response, bearer).await;
+                            let body_text =
+                                read_publish_error_text(response, &headers, bearer).await;
                             tracing::warn!("publish got HTTP 500 — checking if version was stored");
 
                             match self
@@ -561,7 +563,7 @@ impl RegistryClient {
 
                         // Retryable gateway errors only (NOT 500)
                         502..=504 => {
-                            let body = read_publish_error_text(response, bearer).await;
+                            let body = read_publish_error_text(response, &headers, bearer).await;
                             last_error = Some(LpmError::Http {
                                 status,
                                 message: body,
@@ -594,7 +596,7 @@ impl RegistryClient {
 
                         // Other errors — fail immediately
                         _ => {
-                            let body = read_publish_error_text(response, bearer).await;
+                            let body = read_publish_error_text(response, &headers, bearer).await;
                             return Err(LpmError::Http {
                                 status,
                                 message: body,
@@ -727,6 +729,31 @@ impl RegistryClient {
             client_override,
             auth,
             self.http.as_ref(),
+            FailedAnswer::Error,
+        )
+        .await
+        .and_then(Answered::into_response)
+    }
+
+    /// Sends a request as [`send_with_retry`](Self::send_with_retry) does,
+    /// retrying a timeout, a rate limit, a server error or a network
+    /// failure, but hands back any other answer, and the last one retried,
+    /// with its status, and its body with the request's credentials
+    /// redacted.
+    pub(super) async fn send_with_retry_keeping_status(
+        &self,
+        request_builder: reqwest::RequestBuilder,
+    ) -> Result<Answered, LpmError> {
+        self.validate_base_url()?;
+        let request = request_builder
+            .build()
+            .map_err(|e| LpmError::Network(format!("failed to build request: {e}")))?;
+        self.send_request_with_retry_and_client_provider(
+            request,
+            None,
+            None,
+            self.http.as_ref(),
+            FailedAnswer::Response,
         )
         .await
     }
@@ -743,7 +770,8 @@ impl RegistryClient {
         client_override: Option<reqwest::Client>,
         auth: Option<&crate::npmrc::RegistryAuth>,
         provider: &P,
-    ) -> Result<reqwest::Response, LpmError>
+        failed: FailedAnswer,
+    ) -> Result<Answered, LpmError>
     where
         P: lpm_http::ReplayableHttpClientProvider<Error = LpmError> + Sync,
     {
@@ -800,27 +828,34 @@ impl RegistryClient {
                 Ok(response) => {
                     let status = response.status().as_u16();
                     tracing::event!(name: "headers_observed", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64, status = u64::from(status));
+                    let retried = matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+                        && attempt < MAX_RETRIES;
+                    if failed == FailedAnswer::Response
+                        && !matches!(status, 200..=299 | 304)
+                        && !retried
+                    {
+                        return Ok(Answered::Failed(FailedResponse {
+                            status,
+                            retry_after_secs: parse_retry_after(&response),
+                            body: read_request_error_text(response, &request).await,
+                        }));
+                    }
 
                     match status {
-                        200..=299 | 304 => return Ok(response),
+                        200..=299 | 304 => return Ok(Answered::Success(response)),
 
                         // Non-retryable errors — fail immediately
                         401 => return Err(LpmError::AuthRequired),
-                        403 => {
+                        403 | 404 => {
                             let body = read_request_error_text(response, &request).await;
-                            return Err(forbidden_error_from_body(body));
-                        }
-                        404 => {
-                            let body = read_request_error_text(response, &request).await;
-                            return Err(LpmError::NotFound(body));
+                            return Err(failed_answer_error(status, &body, body.clone(), 0));
                         }
 
                         // Retryable: rate limit
                         429 => {
                             let retry_after = parse_retry_after(&response);
-                            last_error = Some(LpmError::RateLimited {
-                                retry_after_secs: retry_after,
-                            });
+                            last_error =
+                                Some(failed_answer_error(status, "", String::new(), retry_after));
                             if attempt < MAX_RETRIES {
                                 // Honor the test-only backoff override here
                                 // too — see the sibling site in publish-path.
@@ -841,10 +876,7 @@ impl RegistryClient {
                             )
                             .await
                             .unwrap_or_default();
-                            last_error = Some(LpmError::Http {
-                                status,
-                                message: body,
-                            });
+                            last_error = Some(failed_answer_error(status, &body, body.clone(), 0));
                             if attempt < MAX_RETRIES {
                                 let delay = backoff_delay(attempt);
                                 tracing::event!(name: "backoff_start", target: "lpm_install_timeline", tracing::Level::TRACE, attempt = attempt as u64);
@@ -857,10 +889,7 @@ impl RegistryClient {
                         // Other errors — fail immediately
                         _ => {
                             let body = read_request_error_text(response, &request).await;
-                            return Err(LpmError::Http {
-                                status,
-                                message: body,
-                            });
+                            return Err(failed_answer_error(status, &body, body.clone(), 0));
                         }
                     }
                 }
@@ -900,12 +929,86 @@ impl RegistryClient {
     }
 }
 
-async fn read_publish_error_text(response: reqwest::Response, bearer: Option<&str>) -> String {
-    let body = read_capped_error_text(response).await;
+async fn read_publish_error_text(
+    response: reqwest::Response,
+    headers: &reqwest::header::HeaderMap,
+    bearer: Option<&str>,
+) -> String {
+    let body = read_error_text_redacting(response, headers).await;
     match bearer {
         Some(secret) => lpm_common::redact_exact_secret(&body, secret).into_owned(),
         None => body,
     }
+}
+
+/// The error an answer that isn't a success, nor a 401, is: a 403 as
+/// forbidden, or as the error an LPM Worker's `body` names, a 404 as not
+/// found, a 429 as rate limited for `retry_after_secs`, any other as
+/// `Http`, each with `message`.
+pub(super) fn failed_answer_error(
+    status: u16,
+    body: &str,
+    message: String,
+    retry_after_secs: u64,
+) -> LpmError {
+    match status {
+        403 => {
+            super::body::parse_lpm_worker_error_body(body).unwrap_or(LpmError::Forbidden(message))
+        }
+        404 => LpmError::NotFound(message),
+        429 => LpmError::RateLimited { retry_after_secs },
+        _ => LpmError::Http { status, message },
+    }
+}
+
+/// What the retry loop hands back for an answer that isn't a success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FailedAnswer {
+    /// An error: a 401 as `AuthRequired`, any other as
+    /// [`failed_answer_error`] makes it.
+    Error,
+    /// [`Answered::Failed`]: one that isn't retried, and the last one that
+    /// was.
+    Response,
+}
+
+/// The retry loop's answer.
+#[derive(Debug)]
+pub(super) enum Answered {
+    Success(reqwest::Response),
+    /// An answer that isn't a success, which only [`FailedAnswer::Response`]
+    /// hands back.
+    Failed(FailedResponse),
+}
+
+impl Answered {
+    /// The success, or the error a failed answer is.
+    pub(super) fn into_response(self) -> Result<reqwest::Response, LpmError> {
+        match self {
+            Self::Success(response) => Ok(response),
+            Self::Failed(FailedResponse { status: 401, .. }) => Err(LpmError::AuthRequired),
+            Self::Failed(FailedResponse {
+                status,
+                retry_after_secs,
+                body,
+            }) => Err(failed_answer_error(
+                status,
+                &body,
+                body.clone(),
+                retry_after_secs,
+            )),
+        }
+    }
+}
+
+/// An answer that isn't a success, read: its status, the wait its
+/// `Retry-After` asks, and its body, capped, with the request's credentials
+/// redacted, as a server can echo them.
+#[derive(Debug)]
+pub(super) struct FailedResponse {
+    pub(super) status: u16,
+    pub(super) retry_after_secs: u64,
+    pub(super) body: String,
 }
 
 /// Parse `Retry-After` header from a 429 response.

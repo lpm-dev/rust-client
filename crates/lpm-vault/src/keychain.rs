@@ -1145,9 +1145,18 @@ pub(crate) fn mutate_vault_env<T>(
 }
 
 fn warn_if_large(size: usize) {
-    if size > MAX_VAULT_SIZE_WARNING {
-        tracing::warn!("vault data is {size} bytes (approaching ~100KB Keychain limit)");
+    if let Some(warning) = large_env_warning(size) {
+        tracing::warn!("{warning}");
     }
+}
+
+fn large_env_warning(size: usize) -> Option<String> {
+    (size > MAX_VAULT_SIZE_WARNING).then(|| {
+        format!(
+            "env data is {} (approaching the Keychain's ~100 KiB limit)",
+            lpm_common::format_bytes(size as u64)
+        )
+    })
 }
 
 fn write_all_environments_with_storage_after_recovery(
@@ -1812,6 +1821,15 @@ fn project_discovery_shard(probe: (usize, usize), attempt: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_env_data_is_warned_of_in_binary_units() {
+        assert_eq!(
+            large_env_warning(95 * 1024).as_deref(),
+            Some("env data is 95 KiB (approaching the Keychain's ~100 KiB limit)")
+        );
+        assert_eq!(large_env_warning(MAX_VAULT_SIZE_WARNING), None);
+    }
 
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]

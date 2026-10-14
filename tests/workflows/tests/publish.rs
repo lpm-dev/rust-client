@@ -250,6 +250,644 @@ fn publish_dry_run_validates_package() {
     );
 }
 
+#[test]
+fn publish_refuses_a_tarball_past_lpm_dev_s_limit_before_any_target_publishes() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "@lpm.dev/testuser.too-big",
+        "version": "1.0.0",
+        "main": "index.js",
+        "license": "MIT"
+    }"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+    // Incompressible, so the gzipped tarball stays past lpm.dev's 100 MiB.
+    std::fs::write(
+        project.path().join("blob.bin"),
+        incompressible(101 * 1024 * 1024),
+    )
+    .unwrap();
+
+    let output = lpm(&project)
+        .args(["publish", "--dry-run", "--yes", "--json"])
+        .output()
+        .expect("failed to run lpm publish --dry-run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("publish --json must print JSON: {error}\n{stdout}"));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("tarball too large for the LPM registry")),
+        "{stdout}"
+    );
+}
+
+/// `bytes` that gzip can't shrink.
+fn incompressible(bytes: usize) -> Vec<u8> {
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    (0..bytes.div_ceil(8))
+        .flat_map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()
+        })
+        .take(bytes)
+        .collect()
+}
+
+#[test]
+fn publish_refuses_a_request_past_lpm_dev_s_limit_whose_tarball_is_within_its_own() {
+    // The tarball stays under 100 MiB. Its base64, package.json's long field
+    // and a README whose control characters JSON writes six bytes each, sent
+    // twice, take the request past 150 MiB.
+    let filler = "x".repeat(15 * 1024 * 1024);
+    let project = TempProject::empty(&format!(
+        r#"{{
+        "name": "@lpm.dev/testuser.too-big-request",
+        "version": "1.0.0",
+        "main": "index.js",
+        "license": "MIT",
+        "filler": "{filler}"
+    }}"#
+    ));
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file("README.md", &"\u{1}".repeat(1024 * 1024));
+    std::fs::write(
+        project.path().join("blob.bin"),
+        incompressible(96 * 1024 * 1024),
+    )
+    .unwrap();
+
+    let output = lpm(&project)
+        .args(["publish", "--dry-run", "--yes", "--json"])
+        .output()
+        .expect("failed to run lpm publish --dry-run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("publish --json must print JSON: {error}\n{stdout}"));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("publish request too large for the LPM registry")),
+        "{stdout}"
+    );
+}
+
+/// A project publishing to lpm.dev and to an npm-compatible registry at
+/// `registry`.
+fn lpm_and_npm_project(name: &str, registry: &str) -> TempProject {
+    let project = TempProject::empty(&format!(
+        r#"{{
+        "name": "@lpm.dev/testuser.{name}",
+        "version": "1.0.0",
+        "main": "index.js",
+        "license": "MIT"
+    }}"#
+    ));
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{"publish":{{"npm":{{"name":"{name}","registry":"{registry}","access":"public"}}}}}}"#
+        ),
+    );
+    project
+}
+
+fn publish_to_lpm_and_npm(project: &TempProject, registry: &str) -> std::process::Output {
+    let login = lpm(project)
+        .args([
+            "--json",
+            "login",
+            "--login-registry",
+            registry,
+            "--token",
+            CUSTOM_REGISTRY_TOKEN,
+        ])
+        .output()
+        .expect("store the npm registry's token");
+    assert!(login.status.success(), "{login:?}");
+    lpm_with_registry(project, registry)
+        .env("LPM_RETRY_BACKOFF_MS_OVERRIDE", "0")
+        .args([
+            "--json",
+            "publish",
+            "--yes",
+            "--token",
+            "test-token-123",
+            "--lpm",
+            "--npm",
+        ])
+        .output()
+        .expect("run publish")
+}
+
+async fn mount_preflight(mock: &MockRegistry, status: u16, body: serde_json::Value) {
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(body))
+        .mount(mock.server())
+        .await;
+}
+
+async fn preflight_sizes(mock: &MockRegistry) -> Vec<u64> {
+    mock.server()
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/api/registry/-/package/publish-preflight")
+        .filter_map(|request| {
+            request
+                .url
+                .query_pairs()
+                .find(|(key, _)| key == "size")
+                .map(|(_, value)| value.parse().unwrap())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn publish_publishes_no_target_when_lpm_dev_refuses_it_for_good() {
+    for (status, code, error) in [
+        (
+            403,
+            Some("STORAGE_LIMIT_EXCEEDED"),
+            "Storage limit exceeded (100 MiB). Upgrade to Pro for more storage.",
+        ),
+        (
+            402,
+            Some("STORAGE_OVERAGE_PAUSED"),
+            "Storage past what your plan includes is refused until billing is active again.",
+        ),
+        (
+            402,
+            Some("ORG_BILLING_LAPSED"),
+            "Organization billing is past due. Package publishing is blocked.",
+        ),
+        (
+            403,
+            Some("PACKAGE_LIMIT_EXCEEDED"),
+            "Private package limit exceeded (2). Upgrade to Pro for unlimited packages.",
+        ),
+        (
+            413,
+            Some("TARBALL_TOO_LARGE"),
+            "Tarball too large (101 MiB). Maximum single package size is 100 MiB.",
+        ),
+        (403, None, "Token does not have publish permissions"),
+    ] {
+        let mock = MockRegistry::start().await;
+        let mut body = serde_json::json!({ "error": error });
+        if let Some(code) = code {
+            body["code"] = serde_json::json!(code);
+        }
+        mount_preflight(&mock, status, body).await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+            .expect(0)
+            .mount(mock.server())
+            .await;
+        let project = lpm_and_npm_project("refused", &mock.url());
+
+        let output = publish_to_lpm_and_npm(&project, &mock.url());
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(!output.status.success(), "{code:?}: {stdout}");
+        assert!(
+            stdout.contains(
+                "LPM.dev refuses @lpm.dev/testuser.refused@1.0.0, so no target was published"
+            ) && stdout.contains(error),
+            "{code:?}: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(preflight_sizes(&mock).await.len(), 1, "{code:?}");
+    }
+}
+
+#[tokio::test]
+async fn publish_asks_for_lpm_dev_s_second_factor_before_any_target_publishes() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "username": "test@example.com",
+            "profile_username": "testuser",
+            "mfa_enabled": true,
+        })))
+        .mount(mock.server())
+        .await;
+    mount_preflight(
+        &mock,
+        200,
+        serde_json::json!({
+            "success": true,
+            "name": "@lpm.dev/testuser.guarded",
+            "version": "1.0.0",
+            "packageExists": false,
+        }),
+    )
+    .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(mock.server())
+        .await;
+    let project = lpm_and_npm_project("guarded", &mock.url());
+
+    // `--json` can't ask for the code lpm.dev needs, so no target publishes.
+    let output = publish_to_lpm_and_npm(&project, &mock.url());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    // The publish stops as a whole, before any target's result.
+    let envelope = parse_json_output(&output.stdout);
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("2FA required in JSON mode"))
+            && envelope.get("results").is_none(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The uploads a publish made: to lpm.dev's publish route, and to the npm
+/// registry's.
+async fn uploads(mock: &MockRegistry) -> (usize, usize) {
+    let requests = mock.server().received_requests().await.unwrap();
+    let puts = requests
+        .iter()
+        .filter(|request| request.method.as_str() == "PUT");
+    let lpm = puts
+        .clone()
+        .filter(|request| request.url.path().starts_with("/api/registry/"))
+        .count();
+    (lpm, puts.count() - lpm)
+}
+
+async fn mount_accepted_preflight(mock: &MockRegistry, name: &str) {
+    mount_preflight(
+        mock,
+        200,
+        serde_json::json!({
+            "success": true,
+            "name": format!("@lpm.dev/testuser.{name}"),
+            "version": "1.0.0",
+            "packageExists": false,
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn publish_publishes_the_other_targets_when_lpm_dev_s_account_can_t_be_read() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(serde_json::json!({
+            "error": "Service unavailable",
+        })))
+        .mount(mock.server())
+        .await;
+    mount_accepted_preflight(&mock, "unread").await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+        .mount(mock.server())
+        .await;
+    let project = lpm_and_npm_project("unread", &mock.url());
+
+    let output = publish_to_lpm_and_npm(&project, &mock.url());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope = parse_json_output(&output.stdout);
+    let results = envelope["results"].as_array();
+    assert!(
+        results.is_some_and(|results| results.len() == 2),
+        "each target should report its own result:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(uploads(&mock).await, (0, 1), "{stdout}");
+}
+
+#[tokio::test]
+async fn publish_publishes_no_target_when_lpm_dev_refuses_the_token() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": "Unauthorized",
+        })))
+        .mount(mock.server())
+        .await;
+    mount_accepted_preflight(&mock, "unauthorized").await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+        .mount(mock.server())
+        .await;
+    let project = lpm_and_npm_project("unauthorized", &mock.url());
+
+    let output = publish_to_lpm_and_npm(&project, &mock.url());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    let envelope = parse_json_output(&output.stdout);
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("authentication failed"))
+            && envelope.get("results").is_none(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(uploads(&mock).await, (0, 0), "{stdout}");
+}
+
+#[tokio::test]
+async fn publish_asks_no_second_factor_for_a_version_lpm_dev_already_has() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "username": "test@example.com",
+            "profile_username": "testuser",
+            "mfa_enabled": true,
+        })))
+        .mount(mock.server())
+        .await;
+    mount_preflight(
+        &mock,
+        403,
+        serde_json::json!({
+            "error": "Version 1.0.0 already exists. You cannot overwrite versions.",
+            "code": "VERSION_EXISTS",
+        }),
+    )
+    .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({})))
+        .mount(mock.server())
+        .await;
+    let project = lpm_and_npm_project("partial-mfa", &mock.url());
+
+    // As after a partial publish: lpm.dev has the version, npm doesn't.
+    let output = publish_to_lpm_and_npm(&project, &mock.url());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("2FA required"), "{stdout}");
+    let envelope = parse_json_output(&output.stdout);
+    let lpm_error = envelope["results"]
+        .as_array()
+        .and_then(|results| {
+            results
+                .iter()
+                .find(|result| result["registry"] == serde_json::json!("lpm"))
+        })
+        .and_then(|result| result["error"].as_str());
+    assert!(
+        lpm_error.is_some_and(|error| error.contains("already exists")),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(uploads(&mock).await, (0, 1), "{stdout}");
+}
+
+#[tokio::test]
+async fn publish_leaves_each_target_to_its_upload_when_lpm_dev_s_answer_isnt_final() {
+    // A version lpm.dev already has, as after a partial publish, also from
+    // a Registry that answers it without a code, and a server error that
+    // outlasts the retries.
+    for (status, body) in [
+        (
+            403,
+            serde_json::json!({
+                "error": "Version 1.0.0 already exists. You cannot overwrite versions.",
+                "code": "VERSION_EXISTS",
+            }),
+        ),
+        (
+            403,
+            serde_json::json!({
+                "error": "Version 1.0.0 already exists. You cannot overwrite versions.",
+            }),
+        ),
+        (503, serde_json::json!({ "error": "Service unavailable" })),
+        // A request it can't read, an unknown package, a rate limit, and an
+        // answer that can't be read, which leaves the Registry unasked.
+        (400, serde_json::json!({ "error": "Invalid version" })),
+        (404, serde_json::json!({ "error": "Not found" })),
+        (429, serde_json::json!({ "error": "Too many requests" })),
+        (200, serde_json::json!("not a preflight answer")),
+    ] {
+        let mock = MockRegistry::start().await;
+        mock.with_whoami("testuser", "test@example.com").await;
+        mount_preflight(&mock, status, body).await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+                "error": "Version 1.0.0 already exists. You cannot overwrite versions.",
+                "code": "VERSION_EXISTS",
+            })))
+            .mount(mock.server())
+            .await;
+        let project = lpm_and_npm_project("partial", &mock.url());
+
+        let output = publish_to_lpm_and_npm(&project, &mock.url());
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !stdout.contains("so no target was published"),
+            "{status}: {stdout}"
+        );
+        let requests = mock.server().received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.method.as_str() == "PUT"),
+            "{status}: a target should have uploaded, got:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[tokio::test]
+async fn publish_asks_lpm_dev_about_the_tarball_it_is_sent() {
+    let refusing = MockRegistry::start().await;
+    mount_preflight(
+        &refusing,
+        403,
+        serde_json::json!({
+            "error": "Storage limit exceeded (100 MiB). Upgrade to Pro for more storage.",
+            "code": "STORAGE_LIMIT_EXCEEDED",
+        }),
+    )
+    .await;
+    let project = lpm_and_npm_project("sized", &refusing.url());
+    project.write_file("data.bin", &"lpm ".repeat(40_000));
+
+    // A publish to both targets, and a dry run, ask with a size.
+    let multi = publish_to_lpm_and_npm(&project, &refusing.url());
+    assert!(!multi.status.success());
+    let dry_run = lpm_with_registry(&project, &refusing.url())
+        .args(["--json", "publish", "--dry-run", "--yes", "--lpm"])
+        .output()
+        .expect("run publish dry-run");
+    assert!(!dry_run.status.success());
+    let sizes = preflight_sizes(&refusing).await;
+
+    // The upload of the same project sends a tarball of that size.
+    let accepting = MockRegistry::start().await;
+    accepting.with_publish_endpoint().await;
+    accepting.with_whoami("testuser", "test@example.com").await;
+    let published = lpm_with_registry(&project, &accepting.url())
+        .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
+        .output()
+        .expect("run publish");
+    assert!(
+        published.status.success(),
+        "{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    let requests = accepting.server().received_requests().await.unwrap();
+    let upload = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .expect("publish must upload");
+    let payload: serde_json::Value = serde_json::from_slice(&upload.body).unwrap();
+    let attachment = payload["_attachments"]
+        .as_object()
+        .and_then(|attachments| attachments.values().next())
+        .expect("the upload carries its tarball");
+    let uploaded = BASE64
+        .decode(attachment["data"].as_str().unwrap())
+        .unwrap()
+        .len() as u64;
+
+    assert!(uploaded > 0);
+    assert_eq!(sizes, vec![uploaded, uploaded]);
+}
+
+#[tokio::test]
+async fn publish_dry_run_retries_lpm_dev_s_preflight_and_names_its_status() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("<html>unavailable</html>"))
+        .expect(4)
+        .mount(mock.server())
+        .await;
+    let project = lpm_and_npm_project("unavailable", &mock.url());
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_RETRY_BACKOFF_MS_OVERRIDE", "0")
+        .args(["--json", "publish", "--dry-run", "--yes", "--lpm"])
+        .output()
+        .expect("run publish dry-run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("LPM.dev publish preflight failed for @lpm.dev/testuser.unavailable@1.0.0")
+            && stdout.contains("HTTP 503")
+            && !stdout.contains("<html>"),
+        "{stdout}"
+    );
+    mock.server().verify().await;
+}
+
+#[tokio::test]
+async fn publish_dry_run_fails_when_lpm_dev_s_preflight_answer_cant_be_read() {
+    let mock = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publish-preflight"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not a preflight answer"))
+        .mount(mock.server())
+        .await;
+    let project = lpm_and_npm_project("unreadable", &mock.url());
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "publish", "--dry-run", "--yes", "--lpm"])
+        .output()
+        .expect("run publish dry-run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("LPM.dev publish preflight failed for @lpm.dev/testuser.unreadable@1.0.0"),
+        "{stdout}"
+    );
+}
+
+#[tokio::test]
+async fn publish_dry_run_reports_what_lpm_dev_refuses() {
+    let mock = MockRegistry::start().await;
+    mount_preflight(
+        &mock,
+        402,
+        serde_json::json!({
+            "error": "Storage past what your plan includes is refused until billing is active again.",
+            "code": "STORAGE_OVERAGE_PAUSED",
+        }),
+    )
+    .await;
+    let project = lpm_and_npm_project("paused", &mock.url());
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "publish", "--dry-run", "--yes", "--lpm"])
+        .output()
+        .expect("run publish dry-run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("LPM.dev publish preflight failed for @lpm.dev/testuser.paused@1.0.0")
+            && stdout.contains("refused until billing is active again"),
+        "{stdout}"
+    );
+}
+
+#[tokio::test]
+async fn publish_redacts_lpm_dev_s_reflection_of_its_bearer_from_a_refusal() {
+    let token = "test-token-123";
+    let mock = MockRegistry::start().await;
+    mount_preflight(
+        &mock,
+        403,
+        serde_json::json!({ "error": format!("Bearer {token} may not publish") }),
+    )
+    .await;
+    let project = lpm_and_npm_project("reflected", &mock.url());
+
+    for json in [true, false] {
+        let mut command = lpm_with_registry(&project, &mock.url());
+        if json {
+            command.arg("--json");
+        }
+        let output = command
+            .env("LPM_RETRY_BACKOFF_MS_OVERRIDE", "0")
+            .args(["publish", "--yes", "--token", token, "--lpm", "--npm"])
+            .output()
+            .expect("run publish");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stdout}");
+        assert!(
+            !stdout.contains(token) && !stderr.contains(token),
+            "bearer leaked (json: {json})\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            format!("{stdout}{stderr}").contains("Bearer <redacted> may not publish"),
+            "json: {json}\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn publish_dry_run_with_authored_skills_leaves_project_files_unchanged() {
     let mock = MockRegistry::start().await;

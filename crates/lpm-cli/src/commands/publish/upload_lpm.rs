@@ -6,23 +6,103 @@ use lpm_registry::RegistryClient;
 use serde::ser::{SerializeMap as _, SerializeSeq as _};
 use std::io::Write as _;
 
+/// Why lpm.dev's second factor couldn't be settled.
+pub(super) enum OtpFailure {
+    /// The account couldn't be read, as while the Registry is unavailable,
+    /// which a later try may get past.
+    AccountUnread(LpmError),
+    /// A malformed `--otp`, a token lpm.dev refuses, or a code `--json`
+    /// can't ask for, which no retry gets past.
+    Final(LpmError),
+}
+
+impl From<OtpFailure> for LpmError {
+    fn from(failure: OtpFailure) -> Self {
+        match failure {
+            OtpFailure::AccountUnread(error) | OtpFailure::Final(error) => error,
+        }
+    }
+}
+
+/// Whether whoami's failure is lpm.dev refusing the token, which a retry
+/// with it won't get past.
+fn refuses_the_token(error: &LpmError) -> bool {
+    matches!(
+        error,
+        LpmError::AuthRequired
+            | LpmError::SessionExpired
+            | LpmError::EnvTokenRejected
+            | LpmError::Forbidden(_)
+            | LpmError::UnsupportedAuthSource { .. }
+    )
+}
+
+/// The second factor an lpm.dev publish sends: `provided_otp`, checked, or,
+/// for an account with 2FA on, one asked for, which `--json` can't do. Reads
+/// the account through whoami, which also checks the token.
+pub(super) async fn resolve_lpm_otp(
+    client: &RegistryClient,
+    provided_otp: Option<&str>,
+    json_output: bool,
+    whoami_cache: Option<&tokio::sync::OnceCell<lpm_registry::WhoamiResponse>>,
+) -> Result<Option<String>, OtpFailure> {
+    if provided_otp.is_some_and(|code| !is_valid_otp(code)) {
+        return Err(OtpFailure::Final(LpmError::Registry(
+            "--otp must be exactly six ASCII digits".into(),
+        )));
+    }
+    let whoami = match whoami_cache {
+        Some(cache) => cache
+            .get_or_try_init(|| client.whoami())
+            .await
+            .map(|account| account.mfa_enabled),
+        None => client.whoami().await.map(|account| account.mfa_enabled),
+    };
+    let mfa_enabled = match whoami {
+        Ok(mfa_enabled) => mfa_enabled,
+        Err(error) => {
+            let refused = refuses_the_token(&error);
+            let error = LpmError::Registry(format!("authentication failed: {error}"));
+            return Err(if refused {
+                OtpFailure::Final(error)
+            } else {
+                OtpFailure::AccountUnread(error)
+            });
+        }
+    };
+
+    if let Some(code) = provided_otp {
+        return Ok(Some(code.to_owned()));
+    }
+    if mfa_enabled != Some(true) {
+        return Ok(None);
+    }
+    if json_output {
+        return Err(OtpFailure::Final(LpmError::Registry(
+            "2FA required in JSON mode — pass --otp <code> or use a CI token".into(),
+        )));
+    }
+    let code: String = cliclack::input("Enter 2FA code")
+        .validate(|input: &String| {
+            if is_valid_otp(input) {
+                Ok(())
+            } else {
+                Err("Must be a 6-digit code")
+            }
+        })
+        .interact()
+        .map_err(|e| OtpFailure::Final(LpmError::Registry(e.to_string())))?;
+    Ok(Some(code))
+}
+
 /// Publish to the LPM registry (existing behavior).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn publish_to_lpm(
     client: &RegistryClient,
-    name: &str,
-    version: &str,
-    readme: &Option<String>,
+    body: LpmPublishBody<'_>,
     tarball_data: &std::sync::Arc<Vec<u8>>,
-    tarball_files: &[TarballFile],
-    package_json_size_override: Option<u64>,
-    version_data: &serde_json::Value,
-    quality_result: &Option<quality::QualityResult>,
-    lpm_config: &Option<serde_json::Value>,
     provided_otp: Option<&str>,
     json_output: bool,
-    detected_ecosystem: &str,
-    swift_manifest: &Option<serde_json::Value>,
     whoami_cache: Option<&tokio::sync::OnceCell<lpm_registry::WhoamiResponse>>,
 ) -> Result<serde_json::Value, LpmError> {
     // Credentials must not travel over plain HTTP for LPM publish.
@@ -42,78 +122,11 @@ pub(super) async fn publish_to_lpm(
         ));
     }
 
-    // Verify token has publish scope
-    let mfa_enabled = if let Some(cache) = whoami_cache {
-        cache
-            .get_or_try_init(|| client.whoami())
-            .await
-            .map_err(|e| LpmError::Registry(format!("authentication failed: {e}")))?
-            .mfa_enabled
-    } else {
-        client
-            .whoami()
-            .await
-            .map_err(|e| LpmError::Registry(format!("authentication failed: {e}")))?
-            .mfa_enabled
-    };
+    let otp_code = resolve_lpm_otp(client, provided_otp, json_output, whoami_cache).await?;
 
-    // 2FA check — prompt before uploading
-    let otp_code: Option<String> = if let Some(code) = provided_otp {
-        if !is_valid_otp(code) {
-            return Err(LpmError::Registry(
-                "--otp must be exactly six ASCII digits".into(),
-            ));
-        }
-        Some(code.to_owned())
-    } else if mfa_enabled == Some(true) {
-        if json_output {
-            return Err(LpmError::Registry(
-                "2FA required in JSON mode — pass --otp <code> or use a CI token".into(),
-            ));
-        }
-        let code: String = cliclack::input("Enter 2FA code")
-            .validate(|input: &String| {
-                if is_valid_otp(input) {
-                    Ok(())
-                } else {
-                    Err("Must be a 6-digit code")
-                }
-            })
-            .interact()
-            .map_err(|e| LpmError::Registry(e.to_string()))?;
-        Some(code)
-    } else {
-        None
-    };
-
-    let tarball_key = format!(
-        "{}-{}.tgz",
-        name.replace('/', "-").replace('@', ""),
-        version
-    );
-    let swift_metadata = swift_manifest.as_ref().map(extract_swift_metadata);
-    let version_object = version_data.as_object().ok_or_else(|| {
-        LpmError::Registry("prepared publish version metadata must be a JSON object".into())
-    })?;
-    let pack_metadata = LpmPackMetadata::new(tarball_files, package_json_size_override);
-    let lpm_version = LpmVersionPayload {
-        base: version_object,
-        quality_result: quality_result.as_ref(),
-        pack_metadata: &pack_metadata,
-        lpm_config: lpm_config.as_ref(),
-        detected_ecosystem,
-        swift_metadata: swift_metadata.as_ref(),
-    };
-    let prefix = build_lpm_publish_payload_prefix(LpmPublishPayload {
-        name,
-        version,
-        readme: readme.as_deref(),
-        detected_ecosystem,
-        lpm_version: &lpm_version,
-        tarball_key: &tarball_key,
-    })?;
-    let payload = publish_common::prepare_base64_json_publish_body(prefix, tarball_data)?;
-    let published_integrity = version_data
+    let payload = publish_common::prepare_base64_json_publish_body(body.prefix()?, tarball_data)?;
+    let published_integrity = body
+        .version_data
         .get("dist")
         .and_then(|dist| dist.get("integrity"))
         .and_then(serde_json::Value::as_str)
@@ -121,17 +134,70 @@ pub(super) async fn publish_to_lpm(
             LpmError::Registry("prepared publish metadata is missing dist.integrity".into())
         })?;
 
-    let encoded_name = urlencoding::encode(name);
+    let encoded_name = urlencoding::encode(body.name);
     client
         .publish_package(
             &encoded_name,
-            version,
+            body.version,
             published_integrity,
             payload.replayable(),
             otp_code.as_deref(),
             tarball_data.len(),
         )
         .await
+}
+
+/// What an lpm.dev publish request carries, but its tarball.
+pub(super) struct LpmPublishBody<'a> {
+    pub(super) name: &'a str,
+    pub(super) version: &'a str,
+    pub(super) readme: Option<&'a str>,
+    pub(super) version_data: &'a serde_json::Value,
+    pub(super) tarball_files: &'a [TarballFile],
+    pub(super) package_json_size_override: Option<u64>,
+    pub(super) quality_result: Option<&'a quality::QualityResult>,
+    pub(super) lpm_config: Option<&'a serde_json::Value>,
+    pub(super) detected_ecosystem: &'a str,
+    pub(super) swift_manifest: Option<&'a serde_json::Value>,
+}
+
+impl LpmPublishBody<'_> {
+    /// The request's JSON up to the tarball's base64.
+    fn prefix(&self) -> Result<Vec<u8>, LpmError> {
+        let tarball_key = format!(
+            "{}-{}.tgz",
+            self.name.replace('/', "-").replace('@', ""),
+            self.version
+        );
+        let swift_metadata = self.swift_manifest.map(extract_swift_metadata);
+        let version_object = self.version_data.as_object().ok_or_else(|| {
+            LpmError::Registry("prepared publish version metadata must be a JSON object".into())
+        })?;
+        let pack_metadata =
+            LpmPackMetadata::new(self.tarball_files, self.package_json_size_override);
+        let lpm_version = LpmVersionPayload {
+            base: version_object,
+            quality_result: self.quality_result,
+            pack_metadata: &pack_metadata,
+            lpm_config: self.lpm_config,
+            detected_ecosystem: self.detected_ecosystem,
+            swift_metadata: swift_metadata.as_ref(),
+        };
+        build_lpm_publish_payload_prefix(LpmPublishPayload {
+            name: self.name,
+            version: self.version,
+            readme: self.readme,
+            detected_ecosystem: self.detected_ecosystem,
+            lpm_version: &lpm_version,
+            tarball_key: &tarball_key,
+        })
+    }
+
+    /// The length of the request that carries a tarball of `tarball_len`
+    /// bytes, as `publish_to_lpm` sends it.
+    pub(super) fn len_with(&self, tarball_len: usize) -> Result<u64, LpmError> {
+        publish_common::base64_json_publish_body_len(self.prefix()?.len(), tarball_len)
+    }
 }
 
 struct LpmPackMetadata<'a> {
