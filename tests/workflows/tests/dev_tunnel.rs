@@ -1355,8 +1355,9 @@ async fn tunnel_json_reports_a_retry_before_a_successful_reconnection() {
     "#);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tunnel_start_warns_that_capture_history_persists_sensitive_request_data() {
+/// Starts `lpm tunnel 5173` against a relay that greets it and closes, in a
+/// project `prepare` sets up, and returns its stderr.
+async fn tunnel_start_stderr(prepare: impl FnOnce(&Path) + Send + 'static) -> String {
     let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay_url = format!("ws://{}/connect", relay.local_addr().unwrap());
     let relay_task = tokio::spawn(async move {
@@ -1386,6 +1387,7 @@ async fn tunnel_start_warns_that_capture_history_persists_sensitive_request_data
 
     let output_task = tokio::task::spawn_blocking(move || {
         let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+        prepare(project.path());
         let mut command = lpm_spawnable(&project);
         command.env("LPM_TUNNEL_RELAY", relay_url).args([
             "--token",
@@ -1403,13 +1405,113 @@ async fn tunnel_start_warns_that_capture_history_persists_sensitive_request_data
         "tunnel command failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn git(directory: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(directory)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {output:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_start_warns_that_capture_history_persists_sensitive_request_data() {
+    let stderr = tunnel_start_stderr(|_| {}).await;
+
+    assert_eq!(
+        stderr
+            .matches("tunnel webhook capture persists full request/response bodies and headers")
+            .count(),
+        1,
+        "human tunnel startup must disclose capture persistence once:\n{stderr}"
+    );
     assert!(
-        stderr.contains("tunnel webhook capture persists full request/response bodies and headers")
-            && stderr.contains(".lpm/inspector.db")
-            && stderr.contains("mode 0600 on Unix")
+        stderr.contains(".lpm/inspector.db")
+            && stderr.contains("owner-only on Unix")
             && stderr.contains("project ACLs on Windows"),
         "human tunnel startup must disclose capture persistence:\n{stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_start_names_capture_files_git_tracks_and_how_to_stop_it() {
+    let stderr = tunnel_start_stderr(|project| {
+        git(project, &["init", "--quiet"]);
+        std::fs::create_dir(project.join(".lpm")).unwrap();
+        std::fs::write(project.join(".lpm/inspector.db"), b"").unwrap();
+        git(project, &["add", ".lpm/inspector.db"]);
+    })
+    .await;
+
+    assert!(
+        stderr.contains("git tracks '.lpm/inspector.db'")
+            && stderr.contains("run `git rm --cached -- .lpm/inspector.db`")
+            && !stderr.contains("git -C .lpm")
+            && stderr.contains("rotate any credentials"),
+        "tunnel startup must name tracked capture files:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("git ignores it"),
+        "a tracked capture isn't ignored by git:\n{stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_start_asks_a_repository_inside_lpm_about_the_captures_it_tracks() {
+    let stderr = tunnel_start_stderr(|project| {
+        git(project, &["init", "--quiet"]);
+        let lpm_dir = project.join(".lpm");
+        std::fs::create_dir(&lpm_dir).unwrap();
+        git(&lpm_dir, &["init", "--quiet"]);
+        std::fs::write(lpm_dir.join("inspector.db"), b"").unwrap();
+        git(&lpm_dir, &["add", "inspector.db"]);
+    })
+    .await;
+
+    assert!(
+        stderr.contains("git tracks '.lpm/inspector.db'")
+            && stderr.contains("git -C .lpm rm --cached -- inspector.db")
+            && !stderr.contains("git ignores it"),
+        "a repository inside .lpm must answer for the captures it tracks:\n{stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_start_says_git_ignores_captures_once_it_does() {
+    let stderr = tunnel_start_stderr(|project| git(project, &["init", "--quiet"])).await;
+
+    assert!(
+        stderr.contains("; git ignores it") && !stderr.contains("git tracks"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_start_says_to_replace_a_linked_lpm_gitignore_git_doesnt_read() {
+    let outside = tempfile::tempdir().unwrap();
+    let rules = outside.path().join("rules");
+    std::fs::write(&rules, "inspector.db*\n").unwrap();
+    let stderr = tunnel_start_stderr(move |project| {
+        git(project, &["init", "--quiet"]);
+        std::fs::create_dir(project.join(".lpm")).unwrap();
+        std::os::unix::fs::symlink(&rules, project.join(".lpm/.gitignore")).unwrap();
+    })
+    .await;
+
+    assert!(
+        stderr.contains("git doesn't ignore")
+            && stderr.contains(
+                "replace .lpm/.gitignore, which git doesn't read as a file of the project's, \
+                 with a file that holds `inspector.db*`"
+            )
+            && !stderr.contains("git ignores it"),
+        "{stderr}"
     );
 }
 
@@ -1463,6 +1565,45 @@ fn tunnel_list_without_auth_under_json_emits_error_envelope_on_stdout() {
 }
 
 #[test]
+fn tunnel_inspect_reports_a_capture_database_it_cant_open_as_a_disk_error_under_json() {
+    let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+    std::fs::create_dir(project.path().join(".lpm")).unwrap();
+    std::fs::write(project.path().join(".lpm/inspector.db"), b"not a database").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(
+            project.path().join(".lpm/inspector.db"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+
+    let output = lpm(&project)
+        .args(["--json", "tunnel", "inspect"])
+        .output()
+        .expect("failed to run lpm --json tunnel inspect");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let envelope: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("--json tunnel inspect error path must emit JSON: {e}\n---\n{stdout}")
+    });
+    assert_eq!(envelope["success"], serde_json::json!(false));
+    assert_eq!(envelope["error_code"], serde_json::json!("io"));
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|message| message.ends_with(
+                "move it aside together with any inspector.db-wal, inspector.db-shm and \
+                 inspector.db-journal beside it, under names that still start inspector.db \
+                 so git goes on ignoring them, and retry"
+            )),
+        "{envelope}"
+    );
+}
+
+#[test]
 fn tunnel_inspect_without_auth_reads_project_inspector_database_under_json() {
     let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
 
@@ -1501,6 +1642,61 @@ fn tunnel_inspect_without_auth_reads_project_inspector_database_under_json() {
     assert_eq!(rows.len(), 1, "expected one seeded webhook row");
     assert_eq!(rows[0]["provider"], serde_json::json!("Stripe"));
     assert_eq!(rows[0]["status"], serde_json::json!(402));
+}
+
+#[cfg(unix)]
+#[test]
+fn reading_captures_others_could_open_works_while_another_process_records_and_warns() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+    let db_path = project.path().join(".lpm/inspector.db");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let recording = runtime.block_on(async {
+        let state = lpm_inspect::state::InspectorState::with_db(
+            3000,
+            lpm_inspect::db::InspectorDb::open(project.path()).unwrap(),
+        );
+        state
+            .push(captured_webhook("wh-kept", "2026-05-22T10:05:00Z", 200))
+            .await;
+        state.flush().await.unwrap();
+        state
+    });
+    // As an earlier release or a checkout left it.
+    std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let human = lpm(&project).args(["tunnel", "log"]).output().unwrap();
+    let json = lpm(&project)
+        .args(["--json", "tunnel", "log"])
+        .output()
+        .unwrap();
+
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&human.stdout),
+        String::from_utf8_lossy(&human.stderr)
+    );
+    assert!(human.status.success(), "{rendered}");
+    assert!(rendered.contains("is open to other users"), "{rendered}");
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(rows.as_array().map(Vec::len), Some(1));
+    let json_log = String::from_utf8_lossy(&json.stderr);
+    assert!(
+        json_log.contains("is open to other users")
+            && json_log.contains("makes it owner-only where file modes keep other users out"),
+        "{json_log}"
+    );
+    assert_eq!(
+        std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    drop(recording);
 }
 
 #[test]
@@ -1648,7 +1844,15 @@ fn tunnel_inspect_reports_an_actionable_corrupt_database_error() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(rendered.contains(".lpm/inspector.db"));
-    assert!(rendered.contains("Repair or move"));
+    assert!(rendered.contains(
+        "move it aside together with any inspector.db-wal, inspector.db-shm and \
+         inspector.db-journal beside it, under names that still start inspector.db so git \
+         goes on ignoring them, and retry"
+    ));
+    assert!(
+        !rendered.contains("network connection"),
+        "a local database error isn't a network one:\n{rendered}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

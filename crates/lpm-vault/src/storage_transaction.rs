@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
+#[cfg(target_os = "macos")]
+use lpm_common::macos_acl;
 
 const TRANSACTION_LOCK_NAME: &str = ".vault-keychain.lock";
 
@@ -94,7 +96,7 @@ impl VaultStorageDirectory {
                 ));
             }
             #[cfg(target_os = "macos")]
-            macos_acl::clear_directory(&directory).map_err(|error| {
+            macos_acl::clear_extended_acl(&directory).map_err(|error| {
                 format!(
                     "failed to remove extended access control from {}: {error}",
                     display.display()
@@ -340,7 +342,7 @@ impl VaultStorageDirectory {
                 {
                     use cap_std::fs::{Permissions, PermissionsExt as _};
                     #[cfg(target_os = "macos")]
-                    macos_acl::clear_file(file)?;
+                    macos_acl::clear_extended_acl(&*file)?;
                     file.set_permissions(Permissions::from_mode(0o600))?;
                 }
                 file.write_all(contents)?;
@@ -426,7 +428,7 @@ impl VaultStorageDirectory {
             Err(error) => return Err(format!("failed to create {label}: {error}")),
         };
         #[cfg(target_os = "macos")]
-        macos_acl::clear_file(&file)
+        macos_acl::clear_extended_acl(&file)
             .map_err(|error| format!("failed to secure {label}: {error}"))?;
         self.validate_regular_file(&file, OsStr::new(name), true)?;
         if let Err(error) = file.write_all(contents).and_then(|()| file.sync_all()) {
@@ -533,81 +535,6 @@ impl VaultStorageDirectory {
             })?;
         }
         Ok(())
-    }
-}
-
-#[cfg(target_os = "macos")]
-mod macos_acl {
-    use std::ffi::{c_int, c_void};
-    use std::os::fd::AsRawFd as _;
-
-    const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
-
-    unsafe extern "C" {
-        fn acl_free(value: *mut c_void) -> c_int;
-        fn acl_get_fd_np(file_descriptor: c_int, acl_type: c_int) -> *mut c_void;
-        fn acl_init(entry_count: c_int) -> *mut c_void;
-        fn acl_set_fd_np(file_descriptor: c_int, acl: *mut c_void, acl_type: c_int) -> c_int;
-    }
-
-    pub(super) fn has_extended_acl(file: &cap_std::fs::File) -> std::io::Result<bool> {
-        has_extended_acl_fd(file.as_raw_fd())
-    }
-
-    pub(super) fn clear_file(file: &cap_std::fs::File) -> std::io::Result<()> {
-        clear_extended_acl_fd(file.as_raw_fd())
-    }
-
-    pub(super) fn clear_directory(directory: &cap_std::fs::Dir) -> std::io::Result<()> {
-        clear_extended_acl_fd(directory.as_raw_fd())
-    }
-
-    pub(super) fn has_extended_acl_fd(file_descriptor: c_int) -> std::io::Result<bool> {
-        unsafe {
-            *libc::__error() = 0;
-            let acl = acl_get_fd_np(file_descriptor, ACL_TYPE_EXTENDED);
-            if acl.is_null() {
-                let error = *libc::__error();
-                return if error == 0 || error == libc::ENOENT {
-                    Ok(false)
-                } else {
-                    Err(std::io::Error::from_raw_os_error(error))
-                };
-            }
-            if acl_free(acl) == 0 {
-                Ok(true)
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
-        }
-    }
-
-    fn clear_extended_acl_fd(file_descriptor: c_int) -> std::io::Result<()> {
-        unsafe {
-            let acl = acl_init(0);
-            if acl.is_null() {
-                return Err(std::io::Error::last_os_error());
-            }
-            let result = acl_set_fd_np(file_descriptor, acl, ACL_TYPE_EXTENDED);
-            let error = if result == 0 {
-                None
-            } else {
-                Some(std::io::Error::last_os_error())
-            };
-            let free_result = acl_free(acl);
-            if let Some(error) = error {
-                return Err(error);
-            }
-            if free_result != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if has_extended_acl_fd(file_descriptor)? {
-                return Err(std::io::Error::other(
-                    "extended access control remained after removal",
-                ));
-            }
-            Ok(())
-        }
     }
 }
 
@@ -1144,8 +1071,6 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn protected_directory_and_new_files_remove_inherited_access_control() {
-        use std::os::fd::AsRawFd as _;
-
         with_temp_home(|home| {
             let directory = home.join(".lpm");
             std::fs::create_dir(&directory).expect("create .lpm directory");
@@ -1173,13 +1098,10 @@ mod tests {
             let created = std::fs::File::open(directory.join(".created-key"))
                 .expect("open created protected file");
             assert!(
-                !macos_acl::has_extended_acl_fd(opened_directory.as_raw_fd())
+                !macos_acl::has_extended_acl(&opened_directory)
                     .expect("inspect protected directory ACL")
             );
-            assert!(
-                !macos_acl::has_extended_acl_fd(created.as_raw_fd())
-                    .expect("inspect protected file ACL")
-            );
+            assert!(!macos_acl::has_extended_acl(&created).expect("inspect protected file ACL"));
         });
     }
 }

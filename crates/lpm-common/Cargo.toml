@@ -49,6 +49,7 @@ windows-sys = { version = "0.60", features = [
 ] }
 
 [dev-dependencies]
+static_assertions = "1"
 tempfile = "3"
 
 [lints]
