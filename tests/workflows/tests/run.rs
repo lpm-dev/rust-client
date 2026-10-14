@@ -783,6 +783,115 @@ async fn mount_stateful_remote_cache(server: &MockServer, state: RemoteCacheStat
         .await;
 }
 
+/// Answers a lookup that asks for a redirect as the LPM.dev Registry does:
+/// 302 to the artifact's storage path, with its headers on the redirect.
+struct RedirectingGetResponder {
+    state: RemoteCacheState,
+    /// Where the redirect leads, in place of this server's storage.
+    location: Option<String>,
+}
+
+impl Respond for RedirectingGetResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let asked = request
+            .headers
+            .get("x-lpm-download-redirect")
+            .is_some_and(|value| value == "1");
+        let stored = self
+            .state
+            .artifact
+            .lock()
+            .expect("remote cache artifact mutex poisoned")
+            .is_some();
+        if !asked || !stored {
+            return RemoteCacheGetResponder {
+                state: self.state.clone(),
+            }
+            .respond(request);
+        }
+        let hash = request.url.path().rsplit('/').next().unwrap_or_default();
+        let location = self
+            .location
+            .clone()
+            .unwrap_or_else(|| format!("/storage/{hash}"));
+        let mut response = ResponseTemplate::new(302).insert_header("Location", location);
+        if let Some(tag) = self
+            .state
+            .tag
+            .lock()
+            .expect("remote cache tag mutex poisoned")
+            .clone()
+        {
+            response = response.insert_header("x-artifact-tag", tag);
+        }
+        if let Some(sha) = self
+            .state
+            .sha
+            .lock()
+            .expect("remote cache sha mutex poisoned")
+            .clone()
+        {
+            response = response.insert_header("x-artifact-sha", sha);
+        }
+        response
+    }
+}
+
+/// Serves stored artifacts from storage, refusing a request that carries a
+/// token, which a redirect must not pass on.
+struct StorageGetResponder {
+    state: RemoteCacheState,
+    present: bool,
+}
+
+impl Respond for StorageGetResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        if request.headers.contains_key("authorization") {
+            return ResponseTemplate::new(400).set_body_string("token sent to storage");
+        }
+        let artifact = self
+            .state
+            .artifact
+            .lock()
+            .expect("remote cache artifact mutex poisoned")
+            .clone();
+        match artifact {
+            Some(artifact) if self.present => ResponseTemplate::new(200)
+                .insert_header("Content-Length", artifact.len().to_string())
+                .set_body_bytes(artifact),
+            _ => ResponseTemplate::new(404).set_body_string("<Error>NoSuchKey</Error>"),
+        }
+    }
+}
+
+async fn mount_redirecting_remote_cache(
+    server: &MockServer,
+    state: RemoteCacheState,
+    present: bool,
+) {
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(RedirectingGetResponder {
+            state: state.clone(),
+            location: None,
+        })
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/storage/[a-fA-F0-9]+$"))
+        .respond_with(StorageGetResponder {
+            state: state.clone(),
+            present,
+        })
+        .mount(server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(RemoteCachePutResponder { state })
+        .mount(server)
+        .await;
+}
+
 fn remote_cache_project(server: &MockServer, extra_remote_config: &str) -> TempProject {
     let project = TempProject::empty(
         r#"{
@@ -3100,6 +3209,246 @@ async fn run_remote_cache_miss_uploads_and_later_restores_outputs() {
 }
 
 #[tokio::test]
+async fn run_remote_cache_restores_from_the_storage_a_lookup_is_redirected_to_without_the_token() {
+    let server = MockServer::start().await;
+    let state = RemoteCacheState::default();
+    mount_redirecting_remote_cache(&server, state.clone(), true).await;
+    let project = remote_cache_project(&server, "");
+
+    let first = run_build_with_remote_token(&project);
+    assert!(first.status.success());
+    assert!(
+        state
+            .artifact
+            .lock()
+            .expect("remote cache artifact mutex poisoned")
+            .is_some(),
+        "the first run should upload its artifact:\nstderr: {}",
+        String::from_utf8_lossy(&first.stderr),
+    );
+    remove_local_task_cache(&project);
+    remove_project_file(&project, "dist");
+    remove_project_file(&project, "executed-marker");
+
+    let second = run_build_with_remote_token(&project);
+
+    assert!(
+        second.status.success(),
+        "redirected hit run should succeed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+    assert_eq!(project.read_file("dist/value.txt"), "remote-hit");
+    assert!(
+        !project.file_exists("executed-marker"),
+        "a redirected hit must restore outputs without re-running the script:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr),
+    );
+    let storage_reads = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path().starts_with("/storage/"))
+        .count();
+    assert_eq!(storage_reads, 1);
+}
+
+#[tokio::test]
+async fn run_remote_cache_leaves_the_signed_url_out_of_a_failed_download_s_warning() {
+    const CREDENTIAL: &str = "signed-download-credential-7f3a";
+    let server = MockServer::start().await;
+    let state = RemoteCacheState::default();
+    // A port nothing listens on, so the download fails to connect.
+    let storage = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let location = format!("http://{storage}/storage/artifact?verify={CREDENTIAL}");
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(RedirectingGetResponder {
+            state: state.clone(),
+            location: Some(location),
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(RemoteCachePutResponder {
+            state: state.clone(),
+        })
+        .mount(&server)
+        .await;
+    let project = remote_cache_project(&server, "");
+
+    assert!(run_build_with_remote_token(&project).status.success());
+    remove_local_task_cache(&project);
+    remove_project_file(&project, "dist");
+    remove_project_file(&project, "executed-marker");
+
+    let second = run_build_with_remote_token(&project);
+
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(second.status.success(), "{output}");
+    assert!(project.file_exists("executed-marker"), "{output}");
+    assert!(
+        output.contains("remote cache download failed"),
+        "the download should have been tried:\n{output}"
+    );
+    assert!(!output.contains(CREDENTIAL), "{output}");
+    assert!(!output.contains("/storage/artifact"), "{output}");
+}
+
+#[tokio::test]
+async fn run_remote_cache_says_a_refused_download_is_the_download_host_s_not_the_token_s() {
+    let server = MockServer::start().await;
+    let state = RemoteCacheState::default();
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(RedirectingGetResponder {
+            state: state.clone(),
+            location: Some("/expired-download".to_owned()),
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/expired-download$"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("<html>Forbidden</html>"))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(RemoteCachePutResponder {
+            state: state.clone(),
+        })
+        .mount(&server)
+        .await;
+    let project = remote_cache_project(&server, "");
+
+    assert!(run_build_with_remote_token(&project).status.success());
+    remove_local_task_cache(&project);
+    remove_project_file(&project, "dist");
+    remove_project_file(&project, "executed-marker");
+
+    let second = run_build_with_remote_token(&project);
+
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(second.status.success(), "{output}");
+    assert!(project.file_exists("executed-marker"), "{output}");
+    assert!(
+        output.contains("remote cache download returned HTTP 403"),
+        "{output}"
+    );
+    assert!(!output.contains("token permissions"), "{output}");
+}
+
+#[tokio::test]
+async fn run_remote_cache_treats_a_redirect_to_a_missing_artifact_as_a_miss() {
+    let server = MockServer::start().await;
+    let state = RemoteCacheState::default();
+    mount_redirecting_remote_cache(&server, state.clone(), false).await;
+    let project = remote_cache_project(&server, "");
+
+    assert!(run_build_with_remote_token(&project).status.success());
+    remove_local_task_cache(&project);
+    remove_project_file(&project, "dist");
+    remove_project_file(&project, "executed-marker");
+
+    let second = run_build_with_remote_token(&project);
+
+    assert!(second.status.success());
+    assert!(
+        project.file_exists("executed-marker"),
+        "a redirect to a missing artifact must rebuild",
+    );
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        !stderr.contains("remote cache download"),
+        "a missing artifact is a plain miss, not a failed download:\n{stderr}",
+    );
+}
+
+#[tokio::test]
+async fn run_remote_cache_doesnt_fetch_storage_for_a_redirect_without_the_artifacts_hash() {
+    let server = MockServer::start().await;
+    let state = RemoteCacheState::default();
+    mount_redirecting_remote_cache(&server, state.clone(), true).await;
+    let project = remote_cache_project(&server, "");
+
+    assert!(run_build_with_remote_token(&project).status.success());
+    // As for an artifact Turborepo uploaded, which carries no hash.
+    *state.sha.lock().expect("remote cache sha mutex poisoned") = None;
+    remove_local_task_cache(&project);
+    remove_project_file(&project, "dist");
+    remove_project_file(&project, "executed-marker");
+
+    let second = run_build_with_remote_token(&project);
+
+    assert!(second.status.success());
+    assert!(
+        project.file_exists("executed-marker"),
+        "an artifact that can't be verified must rebuild",
+    );
+    let storage_reads = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path().starts_with("/storage/"))
+        .count();
+    assert_eq!(storage_reads, 0);
+}
+
+#[tokio::test]
+async fn run_remote_cache_doesnt_fetch_storage_for_a_redirect_without_the_tag_a_signing_key_needs()
+{
+    let server = MockServer::start().await;
+    let state = RemoteCacheState::default();
+    mount_redirecting_remote_cache(&server, state.clone(), true).await;
+    let project = remote_cache_project(&server, r#", "signature": true"#);
+    let signed_build = || {
+        lpm(&project)
+            .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+            .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
+            .args(["run", "build"])
+            .output()
+            .expect("failed to run signed remote build")
+    };
+
+    assert!(signed_build().status.success());
+    *state.tag.lock().expect("remote cache tag mutex poisoned") = None;
+    remove_local_task_cache(&project);
+    remove_project_file(&project, "dist");
+    remove_project_file(&project, "executed-marker");
+
+    let second = signed_build();
+
+    assert!(second.status.success());
+    assert!(
+        project.file_exists("executed-marker"),
+        "an artifact without its tag must rebuild",
+    );
+    let storage_reads = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path().starts_with("/storage/"))
+        .count();
+    assert_eq!(storage_reads, 0);
+}
+
+#[tokio::test]
 async fn run_remote_cache_accepts_http_ipv6_loopback() {
     let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
     let registry =
@@ -3423,6 +3772,381 @@ async fn run_remote_cache_upload_rebuilds_the_body_after_reactive_session_refres
         "the retried upload must resend the complete artifact body",
     );
     registry.server().verify().await;
+}
+
+/// Two cached tasks, the second depending on the first, so one run makes two
+/// remote-cache lookups and two uploads. The first task takes at least
+/// `assets_ms` to build.
+fn two_task_remote_cache_project(server: &MockServer, assets_ms: u64) -> TempProject {
+    let project = TempProject::empty(&format!(
+        r#"{{
+        "name": "remote-cache-limits",
+        "version": "1.0.0",
+        "scripts": {{
+            "assets": "node -e \"setTimeout(() => {{ const fs=require('fs'); fs.mkdirSync('assets',{{recursive:true}}); fs.writeFileSync('assets/a.txt','a') }}, {assets_ms})\"",
+            "build": "node -e \"const fs=require('fs'); fs.mkdirSync('dist',{{recursive:true}}); fs.writeFileSync('dist/value.txt','built')\""
+        }}
+    }}"#
+    ));
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+            "remoteCache": {{ "enabled": true, "url": "{}/v8" }},
+            "tasks": {{
+                "assets": {{ "cache": true, "outputs": ["assets/**"] }},
+                "build": {{ "cache": true, "outputs": ["dist/**"], "dependsOn": ["assets"] }}
+            }}
+        }}"#,
+            server.uri(),
+        ),
+    );
+    project
+}
+
+fn limit_reached(limit: &str, retry_after: u64) -> ResponseTemplate {
+    ResponseTemplate::new(429)
+        .insert_header("retry-after", retry_after.to_string().as_str())
+        .set_body_json(serde_json::json!({
+            "error": format!("Remote cache limit reached: {limit}"),
+            "retryAfter": retry_after,
+        }))
+}
+
+fn successful_build_stderr(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "a remote cache limit must not fail the build:\n{stderr}"
+    );
+    stderr
+}
+
+fn parallel_remote_cache_project(server: &MockServer) -> TempProject {
+    let project = TempProject::empty(
+        r#"{
+        "name": "remote-cache-parallel",
+        "version": "1.0.0",
+        "scripts": {
+            "one": "node -e \"const fs=require('fs'); fs.mkdirSync('one',{recursive:true}); fs.writeFileSync('one/a.txt','1')\"",
+            "two": "node -e \"const fs=require('fs'); fs.mkdirSync('two',{recursive:true}); fs.writeFileSync('two/a.txt','2')\""
+        }
+    }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+            "remoteCache": {{ "enabled": true, "url": "{}/v8" }},
+            "tasks": {{
+                "one": {{ "cache": true, "outputs": ["one/**"] }},
+                "two": {{ "cache": true, "outputs": ["two/**"] }}
+            }}
+        }}"#,
+            server.uri(),
+        ),
+    );
+    project
+}
+
+fn run_parallel_with_remote_token(project: &TempProject) -> std::process::Output {
+    lpm(project)
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key")
+        .args(["run", "one", "two", "--parallel"])
+        .output()
+        .expect("failed to run lpm run one two --parallel")
+}
+
+fn refused(error: &str) -> ResponseTemplate {
+    ResponseTemplate::new(403)
+        .set_body_json(serde_json::json!({ "error": error }))
+        .set_delay(std::time::Duration::from_millis(400))
+}
+
+#[tokio::test]
+async fn run_remote_cache_says_once_that_it_stops_uploads_refused_at_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(refused(
+            "Token does not have remote cache write permissions",
+        ))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let project = parallel_remote_cache_project(&server);
+
+    let stderr = successful_build_stderr(&run_parallel_with_remote_token(&project));
+
+    assert_eq!(
+        stderr
+            .matches("skipping remote cache uploads for this run")
+            .count(),
+        1,
+        "two uploads refused at once must say so once:\n{stderr}",
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn run_remote_cache_says_once_that_it_stops_lookups_refused_at_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(refused("Token does not have remote cache read permissions"))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "urls": [] })))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let project = parallel_remote_cache_project(&server);
+
+    let stderr = successful_build_stderr(&run_parallel_with_remote_token(&project));
+
+    assert_eq!(
+        stderr
+            .matches("skipping the remote cache for this run")
+            .count(),
+        1,
+        "two lookups refused at once must say so once:\n{stderr}",
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn run_remote_cache_skips_lookups_and_uploads_while_a_lookup_limit_lasts() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(limit_reached("2,000 cache hits a minute", 42))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "urls": [] })))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let project = two_task_remote_cache_project(&server, 0);
+
+    let stderr = successful_build_stderr(&run_build_with_remote_token(&project));
+
+    assert_eq!(project.read_file("dist/value.txt"), "built");
+    assert!(
+        stderr.contains(
+            "Remote cache limit reached: 2,000 cache hits a minute; skipping remote cache lookups and uploads for 42 seconds"
+        ),
+        "the warning should name the limit and the pause:\n{stderr}",
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn run_remote_cache_skips_uploads_while_an_upload_limit_lasts() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(limit_reached("300 uploads a minute", 42))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let project = two_task_remote_cache_project(&server, 0);
+
+    let stderr = successful_build_stderr(&run_build_with_remote_token(&project));
+
+    assert!(
+        stderr.contains(
+            "Remote cache limit reached: 300 uploads a minute; skipping remote cache uploads for 42 seconds"
+        ),
+        "the warning should name the limit and the pause:\n{stderr}",
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn run_remote_cache_looks_up_again_after_a_refusal_of_a_second_and_goes_on() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(limit_reached("2,000 cache hits a minute", 1))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    // The refused lookup, looked up again after its second, and the second
+    // task's.
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "urls": [] })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let project = two_task_remote_cache_project(&server, 0);
+
+    successful_build_stderr(&run_build_with_remote_token(&project));
+
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn run_remote_cache_warns_about_a_limit_after_another_remote_cache_warning() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"^/v8/artifacts/[a-fA-F0-9]+$"))
+        .respond_with(limit_reached("300 uploads a minute", 42))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let project = two_task_remote_cache_project(&server, 0);
+
+    let stderr = successful_build_stderr(&run_build_with_remote_token(&project));
+
+    assert!(
+        stderr.contains("remote cache lookup returned HTTP 500"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "Remote cache limit reached: 300 uploads a minute; skipping remote cache uploads for 42 seconds"
+        ),
+        "an earlier warning must not hide the limit's:\n{stderr}",
+    );
+    server.verify().await;
+}
+
+/// A cache server that advertises every artifact at `advertised_bytes` but
+/// sends only a few of them, so a test can reach the CLI's size limit without
+/// moving that much data. Returns the server's base URL.
+fn oversized_artifact_server(advertised_bytes: u64) -> String {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && matches!(stream.read(&mut byte), Ok(1)) {
+                head.push(byte[0]);
+            }
+            let response = if head.starts_with(b"GET /v8/artifacts/") {
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {advertised_bytes}\r\nx-artifact-sha: {}\r\nconnection: close\r\n\r\npartial",
+                    "0".repeat(64),
+                )
+            } else {
+                "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".into()
+            };
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    url
+}
+
+fn run_read_only_build(project: &TempProject, registry_url: Option<&str>) -> String {
+    let mut command = lpm(project);
+    command
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .env("LPM_REMOTE_CACHE_READ_ONLY", "1")
+        .args(["run", "build"]);
+    match registry_url {
+        Some(url) => command.env("LPM_REGISTRY_URL", url),
+        None => command.env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key"),
+    };
+    let output = command.output().expect("failed to run lpm run build");
+    let stderr = successful_build_stderr(&output);
+    assert_eq!(project.read_file("dist/value.txt"), "built");
+    stderr
+}
+
+fn remote_cache_project_at(url: &str) -> TempProject {
+    let project = TempProject::empty(
+        r#"{
+        "name": "remote-cache-size",
+        "version": "1.0.0",
+        "scripts": {
+            "build": "node -e \"const fs=require('fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/value.txt','built')\""
+        }
+    }"#,
+    );
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{
+            "remoteCache": {{ "enabled": true, "url": "{url}/v8" }},
+            "tasks": {{ "build": {{ "cache": true, "outputs": ["dist/**"] }} }}
+        }}"#
+        ),
+    );
+    project
+}
+
+const MIB: u64 = 1024 * 1024;
+
+#[test]
+fn run_remote_cache_skips_artifacts_over_100_mib_from_the_registry() {
+    let url = oversized_artifact_server(150 * MIB);
+    let project = remote_cache_project_at(&url);
+
+    let stderr = run_read_only_build(&project, Some(&url));
+
+    assert!(
+        stderr.contains("remote cache artifact exceeds the 100 MiB limit; treating it as a miss"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn run_remote_cache_reads_artifacts_up_to_500_mib_from_another_cache_server() {
+    let within = oversized_artifact_server(150 * MIB);
+    let stderr = run_read_only_build(&remote_cache_project_at(&within), None);
+    assert!(
+        stderr.contains("failed to read remote cache artifact") && !stderr.contains("exceeds"),
+        "a 150 MiB artifact is within another server's limit, so the CLI reads it:\n{stderr}"
+    );
+
+    let over = oversized_artifact_server(600 * MIB);
+    let stderr = run_read_only_build(&remote_cache_project_at(&over), None);
+    assert!(
+        stderr.contains("remote cache artifact exceeds the 500 MiB limit; treating it as a miss"),
+        "{stderr}"
+    );
 }
 
 #[tokio::test]

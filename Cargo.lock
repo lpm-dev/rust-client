@@ -3410,6 +3410,7 @@ dependencies = [
  "globset",
  "hex",
  "hmac",
+ "httpdate",
  "ignore",
  "indicatif 0.17.11",
  "insta",
