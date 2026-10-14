@@ -1251,8 +1251,8 @@ async fn remote_cache_http_error(response: reqwest::Response, operation: &str) -
     }
 }
 
-/// The code the cache server gives an upload it couldn't make room for,
-/// whose evictions stay: a later or smaller upload may still fit.
+/// The code the cache server gives an upload it couldn't make room for:
+/// a smaller or later upload may still fit.
 const QUOTA_EXCEEDED_CODE: &str = "REMOTE_CACHE_QUOTA_EXCEEDED";
 
 /// A refused remote cache request: what to tell the user, and the server's
