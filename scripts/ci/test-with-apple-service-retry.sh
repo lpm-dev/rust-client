@@ -89,15 +89,16 @@ transient_timestamp_failures=(
   "The time source for the Timestamp Authority is not available."
   "The timestamp request cannot be handled due to system failure."
   "A timestamp transaction is waiting."
+  "A timestamp transaction was rejected."
 )
-LPM_APPLE_SERVICE_MAX_ATTEMPTS=6 run_helper \
+LPM_APPLE_SERVICE_MAX_ATTEMPTS=7 run_helper \
   "$(lines "${transient_timestamp_failures[@]}" ok)" codesign "${codesign_arguments[@]}"
 [ "$status" -eq 0 ] || fail "codesign recovering from timestamp failures exited $status"
-[ "$calls" -eq 6 ] || fail "codesign recovering from timestamp failures ran $calls times"
+[ "$calls" -eq 7 ] || fail "codesign recovering from timestamp failures ran $calls times"
 assert_every_call_was "${codesign_arguments[@]}"
 grep -Fq "$bundle: A timestamp was expected but was not found." "$fixture/stderr" \
   || fail "codesign's own timestamp failure was not passed through"
-[ "$(grep -c '^::warning::codesign hit a transient Apple service failure' "$fixture/stderr")" -eq 5 ] \
+[ "$(grep -c '^::warning::codesign hit a transient Apple service failure' "$fixture/stderr")" -eq 6 ] \
   || fail "each codesign retry must be announced"
 echo "PASS: codesign retries timestamp-authority outages with its arguments intact"
 
@@ -106,7 +107,7 @@ permanent_failures=(
   "The requested policy is not supported by the Timestamp Authority."
   "An unrecognized or unsupported Algorithm Identifier in timestamp."
   "The timestamp was not trusted."
-  "A timestamp transaction was rejected."
+  "The timestamp was not valid."
 )
 for failure in "${permanent_failures[@]}"; do
   run_helper "$(lines "$failure" ok)" codesign "${codesign_arguments[@]}"

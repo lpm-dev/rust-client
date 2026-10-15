@@ -53,7 +53,10 @@ stderr_path="$output_dir/stderr"
 
 # codesign exits 1 for every signing failure, so its message is the only
 # signal. These Security framework errors mean the timestamp authority didn't
-# deliver; its other timestamp errors, such as an unsupported policy, persist.
+# deliver; its other timestamp errors, such as an untrusted timestamp, persist.
+# The Security framework reports every RFC 3161 rejection with one message,
+# whatever its failInfo, so the authority's temporary systemFailure and
+# timeNotAvailable rejections are only retried by retrying all of them.
 codesign_timestamp_authority_unavailable() {
   grep -qF \
     -e "A timestamp was expected but was not found." \
@@ -61,6 +64,7 @@ codesign_timestamp_authority_unavailable() {
     -e "The time source for the Timestamp Authority is not available." \
     -e "The timestamp request cannot be handled due to system failure." \
     -e "A timestamp transaction is waiting." \
+    -e "A timestamp transaction was rejected." \
     "$stdout_path" "$stderr_path"
 }
 
