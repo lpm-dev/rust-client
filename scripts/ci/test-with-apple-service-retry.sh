@@ -13,32 +13,23 @@ fail() {
   exit 1
 }
 
-# Each fake run consumes the next outcome from $LPM_TEST_OUTCOMES and appends
-# its shell-quoted argv as one line of $LPM_TEST_CALLS.
+# Each fake run consumes the next line of $LPM_TEST_OUTCOMES and appends its
+# shell-quoted argv as one line of $LPM_TEST_CALLS. A codesign outcome other
+# than "ok" is the error it reports for its last argument.
 cat > "$fixture/bin/codesign" <<'EOF'
 #!/bin/bash
 set -euo pipefail
 printf '%q ' "$@" >> "$LPM_TEST_CALLS"
 printf '\n' >> "$LPM_TEST_CALLS"
 count=$(wc -l < "$LPM_TEST_CALLS" | tr -d ' ')
-outcome=$(printf '%s\n' $LPM_TEST_OUTCOMES | sed -n "${count}p")
-bundle=${*: -1}
-case "$outcome" in
-  ok) echo "$bundle: signed app bundle with Mach-O thin (x86_64) [dev.lpm.cli]" >&2 ;;
-  timestamp-missing)
-    echo "$bundle: A timestamp was expected but was not found." >&2
-    exit 1
-    ;;
-  timestamp-unavailable)
-    echo "$bundle: The timestamp service is not available." >&2
-    exit 1
-    ;;
-  identity)
-    echo "error: The specified item could not be found in the keychain." >&2
-    exit 1
-    ;;
-  *) exit 99 ;;
-esac
+outcome=$(printf '%s\n' "$LPM_TEST_OUTCOMES" | sed -n "${count}p")
+target=${*: -1}
+if [ "$outcome" = ok ]; then
+  echo "$target: signed app bundle with Mach-O thin (x86_64) [dev.lpm.cli]" >&2
+  exit 0
+fi
+echo "$target: $outcome" >&2
+exit 1
 EOF
 
 cat > "$fixture/bin/xcrun" <<'EOF'
@@ -47,7 +38,7 @@ set -euo pipefail
 printf '%q ' "$@" >> "$LPM_TEST_CALLS"
 printf '\n' >> "$LPM_TEST_CALLS"
 count=$(wc -l < "$LPM_TEST_CALLS" | tr -d ' ')
-status=$(printf '%s\n' $LPM_TEST_OUTCOMES | sed -n "${count}p")
+status=$(printf '%s\n' "$LPM_TEST_OUTCOMES" | sed -n "${count}p")
 echo "Processing: $3"
 case "$status" in
   0) echo "The $2 action worked!" ;;
@@ -63,6 +54,10 @@ export LPM_APPLE_SERVICE_BACKOFF_SECONDS=0
 export LPM_TEST_CALLS="$fixture/calls"
 bundle="$fixture/signed bundle/LPM CLI.app"
 identity="Developer ID Application: Example (TEAMID1234)"
+
+lines() {
+  printf '%s\n' "$@"
+}
 
 run_helper() {
   outcomes=$1
@@ -88,32 +83,56 @@ codesign_arguments=(
   "$bundle"
 )
 
-run_helper "timestamp-missing timestamp-unavailable ok" codesign "${codesign_arguments[@]}"
+transient_timestamp_failures=(
+  "A timestamp was expected but was not found."
+  "The timestamp service is not available."
+  "The time source for the Timestamp Authority is not available."
+  "The timestamp request cannot be handled due to system failure."
+  "A timestamp transaction is waiting."
+)
+LPM_APPLE_SERVICE_MAX_ATTEMPTS=6 run_helper \
+  "$(lines "${transient_timestamp_failures[@]}" ok)" codesign "${codesign_arguments[@]}"
 [ "$status" -eq 0 ] || fail "codesign recovering from timestamp failures exited $status"
-[ "$calls" -eq 3 ] || fail "codesign recovering from timestamp failures ran $calls times"
+[ "$calls" -eq 6 ] || fail "codesign recovering from timestamp failures ran $calls times"
 assert_every_call_was "${codesign_arguments[@]}"
 grep -Fq "$bundle: A timestamp was expected but was not found." "$fixture/stderr" \
   || fail "codesign's own timestamp failure was not passed through"
-[ "$(grep -c '^::warning::codesign hit a transient Apple service failure' "$fixture/stderr")" -eq 2 ] \
+[ "$(grep -c '^::warning::codesign hit a transient Apple service failure' "$fixture/stderr")" -eq 5 ] \
   || fail "each codesign retry must be announced"
-echo "PASS: codesign retries timestamp-authority failures with its arguments intact"
+echo "PASS: codesign retries timestamp-authority outages with its arguments intact"
 
-run_helper "identity ok" codesign "${codesign_arguments[@]}"
-[ "$status" -eq 1 ] || fail "codesign identity failure exited $status"
-[ "$calls" -eq 1 ] || fail "codesign identity failure was retried ($calls runs)"
-grep -Fq "could not be found in the keychain" "$fixture/stderr" \
-  || fail "codesign's identity failure was not passed through"
-echo "PASS: codesign fails at once on a signing failure unrelated to the timestamp"
+permanent_failures=(
+  "no identity found"
+  "The requested policy is not supported by the Timestamp Authority."
+  "An unrecognized or unsupported Algorithm Identifier in timestamp."
+  "The timestamp was not trusted."
+  "A timestamp transaction was rejected."
+)
+for failure in "${permanent_failures[@]}"; do
+  run_helper "$(lines "$failure" ok)" codesign "${codesign_arguments[@]}"
+  [ "$status" -eq 1 ] || fail "codesign failure '$failure' exited $status"
+  [ "$calls" -eq 1 ] || fail "codesign failure '$failure' was retried ($calls runs)"
+  grep -Fq "$bundle: $failure" "$fixture/stderr" \
+    || fail "codesign's failure '$failure' was not passed through"
+done
+echo "PASS: codesign fails at once when signing or the timestamp request cannot succeed"
+
+missing_bundle="$fixture/timestamp-input/Missing.app"
+run_helper "$(lines "No such file or directory" ok)" codesign --force --timestamp "$missing_bundle"
+[ "$status" -eq 1 ] || fail "codesign of a missing bundle exited $status"
+[ "$calls" -eq 1 ] || fail "a path naming the timestamp made codesign retry ($calls runs)"
+echo "PASS: codesign does not mistake a path naming the timestamp for an outage"
 
 LPM_APPLE_SERVICE_MAX_ATTEMPTS=3 run_helper \
-  "timestamp-missing timestamp-missing timestamp-missing ok" codesign "${codesign_arguments[@]}"
+  "$(lines "${transient_timestamp_failures[0]}" "${transient_timestamp_failures[0]}" "${transient_timestamp_failures[0]}" ok)" \
+  codesign "${codesign_arguments[@]}"
 [ "$status" -eq 1 ] || fail "lasting timestamp outage exited $status"
 [ "$calls" -eq 3 ] || fail "lasting timestamp outage ran codesign $calls times, expected 3"
 grep -Fq "::error::codesign still failed after 3 attempts" "$fixture/stderr" \
   || fail "lasting timestamp outage was not reported"
 echo "PASS: codesign gives up with its own status after the attempt budget"
 
-run_helper "68 68 0" stapler validate "$bundle"
+run_helper "$(lines 68 68 0)" stapler validate "$bundle"
 [ "$status" -eq 0 ] || fail "stapler validate recovering from CloudKit exited $status"
 [ "$calls" -eq 3 ] || fail "stapler validate recovering from CloudKit ran $calls times"
 assert_every_call_was stapler validate "$bundle"
@@ -123,20 +142,20 @@ grep -Fq "The validate action worked!" "$fixture/stdout" \
   || fail "stapler's final success was not passed through"
 echo "PASS: stapler validate retries while the ticketing service does not answer"
 
-run_helper "68 0" stapler staple "$bundle"
+run_helper "$(lines 68 0)" stapler staple "$bundle"
 [ "$status" -eq 0 ] || fail "stapler staple recovering from CloudKit exited $status"
 [ "$calls" -eq 2 ] || fail "stapler staple recovering from CloudKit ran $calls times"
 assert_every_call_was stapler staple "$bundle"
 echo "PASS: stapler staple retries while the ticketing service does not answer"
 
-for status_code in 65 66 67; do
-  run_helper "$status_code 0" stapler validate "$bundle"
+for status_code in 65 66 73 77; do
+  run_helper "$(lines "$status_code" 0)" stapler validate "$bundle"
   [ "$status" -eq "$status_code" ] || fail "stapler status $status_code became $status"
   [ "$calls" -eq 1 ] || fail "stapler status $status_code was retried ($calls runs)"
 done
-echo "PASS: stapler fails at once on a missing, invalid, or revoked ticket"
+echo "PASS: stapler fails at once on a missing, invalid, unwritable, or revoked ticket"
 
-LPM_APPLE_SERVICE_MAX_ATTEMPTS=3 run_helper "68 68 68 0" stapler validate "$bundle"
+LPM_APPLE_SERVICE_MAX_ATTEMPTS=3 run_helper "$(lines 68 68 68 0)" stapler validate "$bundle"
 [ "$status" -eq 68 ] || fail "lasting CloudKit outage exited $status"
 [ "$calls" -eq 3 ] || fail "lasting CloudKit outage ran stapler $calls times, expected 3"
 grep -Fq "::error::stapler validate still failed after 3 attempts" "$fixture/stderr" \

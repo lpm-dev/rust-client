@@ -51,11 +51,22 @@ trap 'rm -rf "$output_dir"' EXIT
 stdout_path="$output_dir/stdout"
 stderr_path="$output_dir/stderr"
 
-# Every errSecTimestamp* message names the timestamp; codesign reports them as
-# "<path>: <message>" and exits 1 like any other signing failure.
+# codesign exits 1 for every signing failure, so its message is the only
+# signal. These Security framework errors mean the timestamp authority didn't
+# deliver; its other timestamp errors, such as an unsupported policy, persist.
+codesign_timestamp_authority_unavailable() {
+  grep -qF \
+    -e "A timestamp was expected but was not found." \
+    -e "The timestamp service is not available." \
+    -e "The time source for the Timestamp Authority is not available." \
+    -e "The timestamp request cannot be handled due to system failure." \
+    -e "A timestamp transaction is waiting." \
+    "$stdout_path" "$stderr_path"
+}
+
 is_transient() {
   case "$service" in
-    codesign) grep -qi timestamp "$stdout_path" "$stderr_path" ;;
+    codesign) codesign_timestamp_authority_unavailable ;;
     stapler) [ "$1" -eq "$STAPLER_TICKETING_SERVICE_UNAVAILABLE" ] ;;
   esac
 }
