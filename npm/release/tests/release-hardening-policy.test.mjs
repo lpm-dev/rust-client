@@ -158,6 +158,31 @@ test("macOS notarization retries submissions and resumes polling by submission I
   assert.match(pack, /needs:[\s\S]*?- notarize-macos/);
 });
 
+test("macOS signing and ticket checks outlast transient Apple service failures", () => {
+  const workflow = read(".github/workflows/release.yml");
+  const preflight = read(".github/workflows/release-preflight.yml");
+  const ci = read(".github/workflows/ci.yml");
+
+  assert.match(
+    workflow,
+    /scripts\/ci\/with-apple-service-retry\.sh" codesign \\\n\s+--force --timestamp --options runtime/,
+  );
+  assert.doesNotMatch(
+    workflow,
+    /^\s*(\/usr\/bin\/)?codesign [^\n]*--timestamp/m,
+    "timestamped signatures must retry the timestamp authority",
+  );
+  assert.doesNotMatch(workflow, /xcrun stapler/, "stapler must retry the ticketing service");
+  assert.deepEqual(
+    [...workflow.matchAll(/with-apple-service-retry\.sh stapler (staple|validate) /g)].map(
+      match => match[1],
+    ),
+    ["staple", "validate", "validate"],
+  );
+  assert.match(preflight, /bash scripts\/ci\/test-with-apple-service-retry\.sh/);
+  assert.match(ci, /bash scripts\/ci\/test-with-apple-service-retry\.sh/);
+});
+
 test("candidate smoke and sealing hard-enforce uploaded artifact digests", () => {
   const workflow = read(".github/workflows/release.yml");
   for (const [jobName, nextJob] of [

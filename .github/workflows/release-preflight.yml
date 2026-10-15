@@ -36,6 +36,8 @@ jobs:
         run: bash scripts/ci/test-macos-keychain-search-list.sh
       - name: Test notarization retry and resume lifecycle
         run: bash scripts/ci/test-notarize-with-retry.sh
+      - name: Test Apple signing-service retries
+        run: bash scripts/ci/test-with-apple-service-retry.sh
       - name: Test fail-closed artifact download lifecycle
         run: bash scripts/ci/test-download-verified-artifact.sh
 

@@ -683,7 +683,8 @@ jobs:
             "$APP_BUNDLE" \
             "$PROFILE_PATH"
 
-          codesign --force --timestamp --options runtime \
+          "$GITHUB_WORKSPACE/scripts/ci/with-apple-service-retry.sh" codesign \
+            --force --timestamp --options runtime \
             --keychain "$APPLE_SIGNING_KEYCHAIN" \
             --entitlements "$APPLE_CODESIGN_ENTITLEMENTS" \
             --sign "$APPLE_CODESIGN_IDENTITY" \
@@ -1016,8 +1017,8 @@ jobs:
         run: |
           set -euo pipefail
           APP_BUNDLE="$RUNNER_TEMP/${{ matrix.binary }}-bundle/LPM CLI.app"
-          xcrun stapler staple "$APP_BUNDLE"
-          xcrun stapler validate "$APP_BUNDLE"
+          scripts/ci/with-apple-service-retry.sh stapler staple "$APP_BUNDLE"
+          scripts/ci/with-apple-service-retry.sh stapler validate "$APP_BUNDLE"
           codesign --verify --strict --verbose=4 "$APP_BUNDLE"
           spctl --assess --type execute --verbose=4 "$APP_BUNDLE"
           ditto -c -k --keepParent --norsrc "$APP_BUNDLE" "${{ matrix.binary }}.zip"
@@ -1743,7 +1744,7 @@ jobs:
             -v wildcard='823S8YKMRW.*' \
             '{ value = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", value); if (value == exact || value == wildcard) found = 1 } END { exit(found ? 0 : 1) }'
 
-          /usr/bin/xcrun stapler validate "$app"
+          scripts/ci/with-apple-service-retry.sh stapler validate "$app"
           /usr/sbin/spctl --assess --type execute --verbose=4 "$app"
 
   seal-candidate:

@@ -209,8 +209,8 @@ test("macOS release workflow provisions, notarizes, staples, and executes the bu
   assert.match(localBuild, /Entitlements:com\.apple\.application-identifier/);
   assert.match(localBuild, /EXPECTED_PROFILE_ACCESS_GROUP="\$EXPECTED_TEAM_ID\.\*"/);
   assert.match(releaseWorkflow, /Contents\/embedded\.provisionprofile/);
-  assert.match(releaseWorkflow, /xcrun stapler staple/);
-  assert.match(releaseWorkflow, /xcrun stapler validate/);
+  assert.match(releaseWorkflow, /with-apple-service-retry\.sh stapler staple "\$APP_BUNDLE"/);
+  assert.match(releaseWorkflow, /with-apple-service-retry\.sh stapler validate "\$APP_BUNDLE"/);
   assert.equal(
     [...releaseWorkflow.matchAll(/ditto -c -k --keepParent --norsrc/g)].length,
     2,
@@ -332,7 +332,8 @@ test("release workflow smoke-tests standalone macOS bundle installation on both 
     "utf8",
   );
   assert.match(npmSmoke, /Contents", "CodeResources"/);
-  assert.match(npmSmoke, /"\/usr\/bin\/xcrun", \["stapler", "validate"/);
+  assert.match(npmSmoke, /scripts\/ci\/with-apple-service-retry\.sh/);
+  assert.match(npmSmoke, /runChecked\(APPLE_SERVICE_RETRY, \["stapler", "validate", appBundle\]\)/);
   assert.match(npmSmoke, /"\/usr\/sbin\/spctl"/);
 });
 
