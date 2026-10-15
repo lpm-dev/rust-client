@@ -99,6 +99,9 @@ jobs:
       - name: Test macOS Keychain search-list helper
         run: bash scripts/ci/test-macos-keychain-search-list.sh
 
+      - name: Test Apple signing-service retry helper
+        run: bash scripts/ci/test-with-apple-service-retry.sh
+
       - name: Test immutable env engine exporter
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 

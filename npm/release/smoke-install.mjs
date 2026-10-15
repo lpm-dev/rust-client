@@ -15,6 +15,10 @@ import {
 } from "./release-artifacts.mjs";
 import { npmInvocation } from "./npm-invocation.mjs";
 
+const APPLE_SERVICE_RETRY = fileURLToPath(
+  new URL("../../scripts/ci/with-apple-service-retry.sh", import.meta.url),
+);
+
 export function smokeInstall({ tarballsDir, expectedPlatform, expectedVersion, prefix }) {
   const releaseVersion = parseReleaseVersion(expectedVersion);
   const tarballRoot = path.resolve(tarballsDir);
@@ -160,7 +164,8 @@ function verifyPlatformSignatures({ platform, nativeRoot, wrapperRoot }) {
       path.join(appBundle, "Contents", "CodeResources"),
       "installed macOS notarization ticket",
     );
-    runChecked("/usr/bin/xcrun", ["stapler", "validate", appBundle]);
+    const ticketValidation = runChecked(APPLE_SERVICE_RETRY, ["stapler", "validate", appBundle]);
+    process.stderr.write(ticketValidation.stderr);
     runChecked("/usr/sbin/spctl", [
       "--assess",
       "--type",
