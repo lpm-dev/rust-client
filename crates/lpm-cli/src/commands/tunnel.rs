@@ -961,11 +961,14 @@ enum CaptureGitFailure {
 }
 
 /// How git's `fatal: ` line starts, with `LC_ALL=C`, where it found no
-/// repository, and where it stopped looking.
+/// repository, and where it stopped looking. Git 2.56 reports a `.git` file
+/// pointing at no repository as "gitfile does not point to a valid
+/// repository: <file>"; earlier releases as "not a git repository: <target>".
 const NO_REPOSITORY_MESSAGE: &str = "not a git repository (or any of the parent directories)";
-const STOPPED_MESSAGES: [&str; 5] = [
+const STOPPED_MESSAGES: [&str; 6] = [
     "not a git repository (or any parent up to mount",
     "not a git repository: ",
+    "gitfile does not point to a valid repository",
     "invalid gitfile format",
     "no path in gitfile",
     "too large to be a .git file",
@@ -3534,6 +3537,10 @@ mod tests {
             ),
             (
                 "fatal: not a git repository: /work/gone/.git\n",
+                CaptureGitFailure::Stopped,
+            ),
+            (
+                "fatal: gitfile does not point to a valid repository: /work/app/.git\n",
                 CaptureGitFailure::Stopped,
             ),
             (
