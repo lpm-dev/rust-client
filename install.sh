@@ -527,32 +527,6 @@ elif [ -n "$SHA_TOOL" ]; then
   fi
 fi
 
-# stapler validate checks the stapled ticket against Apple's CloudKit record
-# and exits with EX_NOHOST when CloudKit doesn't answer.
-STAPLER_CLOUDKIT_UNREACHABLE=68
-
-validate_notarization_ticket() {
-  ticket_bundle="$1"
-  ticket_label="$2"
-  for ticket_retry_delay in 2 5 ""; do
-    ticket_status=0
-    "$MACOS_XCRUN_TOOL" stapler validate "$ticket_bundle" || ticket_status=$?
-    if [ "$ticket_status" -eq 0 ]; then
-      return 0
-    fi
-    if [ "$ticket_status" -ne "$STAPLER_CLOUDKIT_UNREACHABLE" ]; then
-      echo "ERROR: $ticket_label does not contain a valid notarization ticket."
-      return 1
-    fi
-    if [ -z "$ticket_retry_delay" ]; then
-      echo "ERROR: Apple's notarization service did not answer while checking $ticket_label. Try again in a few minutes."
-      return 1
-    fi
-    echo "Apple's notarization service did not answer; checking the notarization ticket again in ${ticket_retry_delay}s..."
-    sleep "$ticket_retry_delay"
-  done
-}
-
 validate_macos_bundle() {
   app_bundle="$1"
   app_label="$2"
@@ -652,7 +626,10 @@ validate_macos_bundle() {
     return 1
   fi
 
-  validate_notarization_ticket "$app_bundle" "$app_label" || return 1
+  if ! "$MACOS_XCRUN_TOOL" stapler validate "$app_bundle"; then
+    echo "ERROR: $app_label does not contain a valid notarization ticket."
+    return 1
+  fi
   if ! "$MACOS_SPCTL_TOOL" --assess --type execute --verbose=4 "$app_bundle"; then
     echo "ERROR: Gatekeeper rejected $app_label."
     return 1
