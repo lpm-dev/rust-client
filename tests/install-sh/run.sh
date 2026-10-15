@@ -179,7 +179,7 @@ write_release_asset() {
 build_clean_path() {
   CLEAN_PATH_DIR="$(mktemp -d)"
   # Tools install.sh shells out to during the integrity flow.
-  for tool in sh id uname mktemp rm basename dirname grep awk curl sed cat tr cut chmod mv mkdir ln find readlink cp; do
+  for tool in sh id uname mktemp rm basename dirname grep awk curl sed cat tr cut chmod mv mkdir ln find readlink cp sleep; do
     src="$(command -v "$tool" 2>/dev/null || true)"
     if [ -n "$src" ]; then
       ln -s "$src" "$CLEAN_PATH_DIR/$tool"
@@ -248,6 +248,7 @@ run_install_sh() {
     LPM_INSTALL_TEST_XCRUN="$test_xcrun" \
     LPM_INSTALL_TEST_INTERRUPT_AFTER="${LPM_INSTALL_TEST_INTERRUPT_AFTER:-}" \
     LPM_MV_FAILURE_COUNT_FILE="${LPM_MV_FAILURE_COUNT_FILE:-}" \
+    LPM_TEST_TOOL_STATE="${LPM_TEST_TOOL_STATE:-}" \
     HOME="$install_root" \
     LPM_INSTALL_INSECURE="${LPM_INSTALL_INSECURE:-}" \
     LPM_INSTALL_VERSION="${LPM_INSTALL_VERSION:-}" \
@@ -719,6 +720,77 @@ if [ "$HOST_OS" = "Darwin" ]; then
     || fail "missing icon declaration failure was unclear: $RUN_OUT"
   rm -rf "$fdir"
   pass "icon-bearing macOS release requires its declared icon"
+
+  # stapler validate exits 68 (EX_NOHOST) while Apple's CloudKit ticket
+  # lookup doesn't answer. Each install validates the downloaded and then
+  # the staged bundle.
+  tool_state="$(mktemp -d)"
+  rm -f "$CLEAN_PATH_DIR/xcrun" "$CLEAN_PATH_DIR/sleep"
+  cat > "$CLEAN_PATH_DIR/xcrun" <<'EOF'
+#!/bin/sh
+[ "$1" = stapler ] && [ "$2" = validate ] && [ "$#" -eq 3 ] || exit 99
+printf '%s\n' "$3" >> "$LPM_TEST_TOOL_STATE/stapler-runs"
+run=$(grep -c '' "$LPM_TEST_TOOL_STATE/stapler-runs")
+status=$(sed -n "${run}p" "$LPM_TEST_TOOL_STATE/stapler-outcomes")
+[ "$status" -eq 0 ] || echo "The validate action failed! Error $status."
+exit "$status"
+EOF
+  cat > "$CLEAN_PATH_DIR/sleep" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$LPM_TEST_TOOL_STATE/sleep-requests"
+EOF
+  chmod +x "$CLEAN_PATH_DIR/xcrun" "$CLEAN_PATH_DIR/sleep"
+  fdir="$(mktemp -d)"
+  printf '{"tag_name": "%s"}\n' "$FIXTURE_VERSION" > "$fdir/api.json"
+  write_release_asset "$fdir" 'notarization-retry-binary-bytes'
+  sha="$($SHA_TOOL "$fdir/$RELEASE_ASSET" | awk '{print $1}')"
+  printf '%s  %s\n' "$sha" "$RELEASE_ASSET" > "$fdir/SHA256SUMS.txt"
+  printf 'dummy-sigstore-bundle' > "$fdir/SHA256SUMS.txt.sigstore"
+  run_with_stapler_outcomes() {
+    printf '%s\n' "$@" > "$tool_state/stapler-outcomes"
+    : > "$tool_state/stapler-runs"
+    : > "$tool_state/sleep-requests"
+    trap 'stop_server' EXIT
+    start_server "$fdir"
+    LPM_TEST_TOOL_STATE="$tool_state" run_install_sh
+    stop_server
+    trap - EXIT
+    STAPLER_RUNS="$(grep -c '' "$tool_state/stapler-runs" || true)"
+    SLEEP_REQUESTS="$(tr '\n' ' ' < "$tool_state/sleep-requests")"
+  }
+
+  run_with_stapler_outcomes 68 68 0 0
+  [ "$RUN_RC" -eq 0 ] \
+    || fail "a brief CloudKit outage failed the install with exit $RUN_RC: $RUN_OUT"
+  [ "$STAPLER_RUNS" -eq 4 ] || fail "brief CloudKit outage ran stapler $STAPLER_RUNS times, expected 4"
+  [ "$SLEEP_REQUESTS" = "2 5 " ] || fail "notarization ticket retries waited '$SLEEP_REQUESTS', expected '2 5 '"
+  echo "$RUN_OUT" | grep -q "checking the notarization ticket again in 2s" \
+    || fail "notarization ticket retry was not announced: $RUN_OUT"
+  [ -L "$RUN_INSTALL_DIR/lpm" ] || fail "install after a brief CloudKit outage did not link lpm"
+  pass "macOS install outlasts a brief CloudKit outage while checking the notarization ticket"
+
+  run_with_stapler_outcomes 68 68 68 0
+  [ "$RUN_RC" -ne 0 ] || fail "a lasting CloudKit outage must fail the install"
+  [ "$STAPLER_RUNS" -eq 3 ] || fail "lasting CloudKit outage ran stapler $STAPLER_RUNS times, expected 3"
+  [ "$SLEEP_REQUESTS" = "2 5 " ] || fail "lasting CloudKit outage waited '$SLEEP_REQUESTS', expected '2 5 '"
+  echo "$RUN_OUT" | grep -q "Apple's notarization service did not answer" \
+    || fail "lasting CloudKit outage was reported as something else: $RUN_OUT"
+  [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "lasting CloudKit outage must not install anything"
+  pass "macOS install fails closed on a lasting CloudKit outage"
+
+  run_with_stapler_outcomes 65 0
+  [ "$RUN_RC" -ne 0 ] || fail "an invalid notarization ticket must fail the install"
+  [ "$STAPLER_RUNS" -eq 1 ] || fail "invalid notarization ticket was retried ($STAPLER_RUNS stapler runs)"
+  [ -z "$SLEEP_REQUESTS" ] || fail "invalid notarization ticket waited '$SLEEP_REQUESTS'"
+  echo "$RUN_OUT" | grep -q "does not contain a valid notarization ticket" \
+    || fail "invalid notarization ticket failure was unclear: $RUN_OUT"
+  [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "invalid notarization ticket must not install anything"
+  pass "macOS install rejects an invalid notarization ticket without retrying"
+
+  rm -rf "$fdir" "$tool_state"
+  printf '#!/bin/sh\nexit 0\n' > "$CLEAN_PATH_DIR/xcrun"
+  rm -f "$CLEAN_PATH_DIR/sleep"
+  ln -s "$(command -v sleep)" "$CLEAN_PATH_DIR/sleep"
 fi
 
 # ── Case 10: manifest 404 fails closed ────────────────────────
