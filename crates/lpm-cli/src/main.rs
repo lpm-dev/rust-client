@@ -44,6 +44,7 @@ pub mod path_onboarding;
 pub mod precedence;
 mod privilege;
 mod project_fs;
+mod project_git;
 mod prompt;
 mod provenance;
 mod provenance_bundle;

@@ -1,4 +1,5 @@
 use crate::install_ui;
+use crate::project_git::{GitDiscoveryFailure, git_discovery_failure, hardened_git_command};
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 use rand::RngCore;
@@ -483,7 +484,7 @@ pub async fn run(
 }
 
 pub(super) fn reject_tracked_npmrc(project_dir: &Path) -> Result<(), LpmError> {
-    let inside = hardened_git_command(project_dir, &["rev-parse", "--is-inside-work-tree"])
+    let inside = npmrc_tracking_git_command(project_dir, &["rev-parse", "--is-inside-work-tree"])
         .output()
         .map_err(|error| {
             LpmError::Script(format!(
@@ -491,9 +492,16 @@ pub(super) fn reject_tracked_npmrc(project_dir: &Path) -> Result<(), LpmError> {
             ))
         })?;
     if !inside.status.success() {
-        let stderr = String::from_utf8_lossy(&inside.stderr);
-        if inside.status.code() == Some(128) && stderr.contains("not a git repository") {
+        let failure = git_discovery_failure(&inside.stderr);
+        if inside.status.code() == Some(128) && failure == GitDiscoveryFailure::NoRepository {
             return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&inside.stderr);
+        if failure == GitDiscoveryFailure::Stopped {
+            return Err(LpmError::Script(format!(
+                "refused to write .npmrc: git stopped at a .git file it can't use, so it can't tell whether .npmrc is tracked ({}). Repair or remove that .git file, then run the command again",
+                lpm_common::sanitize_terminal_inline(stderr.trim())
+            )));
         }
         return Err(LpmError::Script(format!(
             "failed to inspect Git tracking for .npmrc: {}",
@@ -510,7 +518,7 @@ pub(super) fn reject_tracked_npmrc(project_dir: &Path) -> Result<(), LpmError> {
         ));
     }
 
-    let tracked = hardened_git_command(
+    let tracked = npmrc_tracking_git_command(
         project_dir,
         &["ls-files", "--error-unmatch", "--", ".npmrc"],
     )
@@ -535,31 +543,12 @@ pub(super) fn reject_tracked_npmrc(project_dir: &Path) -> Result<(), LpmError> {
     )))
 }
 
-/// A git command for a project that may be untrusted: no `GIT_*` variable
-/// from the environment, no `core.fsmonitor` program, which reading the
-/// index would run, and no repository found as a bare one, which a cloned
-/// project can contain with its own config.
-pub(crate) fn hardened_git_command(project_dir: &Path, args: &[&str]) -> std::process::Command {
-    let mut command = std::process::Command::new("git");
-    command
-        .args([
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "safe.bareRepository=explicit",
-        ])
-        .args(args)
-        .current_dir(project_dir)
-        .env("LC_ALL", "C");
-    for (name, _) in std::env::vars_os() {
-        if name
-            .to_string_lossy()
-            .get(..4)
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_"))
-        {
-            command.env_remove(name);
-        }
-    }
+/// Asks git about `.npmrc` past filesystem boundaries, where git otherwise
+/// stops looking: a repository above a mounted project directory can still
+/// track the file.
+fn npmrc_tracking_git_command(project_dir: &Path, args: &[&str]) -> std::process::Command {
+    let mut command = hardened_git_command(project_dir, args);
+    command.env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1");
     command
 }
 
@@ -1041,5 +1030,95 @@ fn format_days_label(days: u32) -> String {
         "1 day".to_string()
     } else {
         format!("{days} days")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(directory: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(directory)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run git {args:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn refusal(project: &Path) -> String {
+        match reject_tracked_npmrc(project) {
+            Err(LpmError::Script(message)) => message,
+            other => panic!(
+                "expected {} to be refused, got {other:?}",
+                project.display()
+            ),
+        }
+    }
+
+    #[test]
+    fn allows_a_project_outside_any_repository() {
+        let project = tempfile::tempdir().unwrap();
+
+        reject_tracked_npmrc(project.path()).unwrap();
+    }
+
+    #[test]
+    fn allows_an_untracked_npmrc_and_refuses_a_tracked_one() {
+        let project = tempfile::tempdir().unwrap();
+        git(project.path(), &["init", "-q"]);
+        std::fs::write(project.path().join(".npmrc"), "fund=false\n").unwrap();
+
+        reject_tracked_npmrc(project.path()).unwrap();
+
+        git(project.path(), &["add", "--", ".npmrc"]);
+        assert!(refusal(project.path()).contains("Git-tracked .npmrc"));
+    }
+
+    #[test]
+    fn refuses_where_git_stops_at_a_broken_git_file_in_the_project_or_above_it() {
+        for entry in ["gitdir: ../gone/.git\n", "gitdir: \n", "not a pointer\n"] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::write(directory.path().join(".git"), entry).unwrap();
+            let nested = directory.path().join("app");
+            std::fs::create_dir(&nested).unwrap();
+
+            for project in [directory.path(), nested.as_path()] {
+                let message = refusal(project);
+                assert!(
+                    message.contains("can't tell whether .npmrc is tracked"),
+                    "{entry:?} at {}: {message}",
+                    project.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn looks_for_the_repository_past_filesystem_boundaries() {
+        let command = npmrc_tracking_git_command(Path::new("."), &["rev-parse"]);
+
+        assert!(command.get_envs().any(|(name, value)| {
+            name == "GIT_DISCOVERY_ACROSS_FILESYSTEM" && value == Some(std::ffi::OsStr::new("1"))
+        }));
+    }
+
+    #[test]
+    fn refuses_a_broken_git_file_whatever_its_path_says() {
+        let parent = tempfile::tempdir().unwrap();
+        let project = parent.path().join("not a git repository");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join(".git"), "not a pointer\n").unwrap();
+
+        let message = refusal(&project);
+
+        assert!(
+            message.contains("can't tell whether .npmrc is tracked"),
+            "{message}"
+        );
     }
 }
