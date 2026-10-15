@@ -10,9 +10,13 @@ use wiremock::{Mock, ResponseTemplate};
 const FIRST_TOKEN_ID: &str = "11111111-1111-4111-8111-111111111111";
 
 fn git(project: &TempProject, args: &[&str]) {
+    git_in(project.path(), args);
+}
+
+fn git_in(directory: &std::path::Path, args: &[&str]) {
     let output = std::process::Command::new("git")
         .args(args)
-        .current_dir(project.path())
+        .current_dir(directory)
         .output()
         .unwrap_or_else(|error| panic!("failed to run git {args:?}: {error}"));
     assert!(
@@ -166,6 +170,80 @@ async fn setup_local_refuses_to_write_a_tracked_npmrc_before_minting_a_token() {
             .expect("request log")
             .is_empty(),
         "tracked-file refusal must happen before token mutation"
+    );
+}
+
+#[tokio::test]
+async fn setup_local_refuses_a_project_whose_git_file_points_nowhere_before_minting_a_token() {
+    let project = TempProject::empty(r#"{"name":"stray","version":"1.0.0"}"#);
+    project.write_private_file(".git", "gitdir: ../gone/.git\n");
+    let mock = MockRegistry::start().await;
+    mock.with_npmrc_token_replace(14, "2030-01-02T03:04:05Z", 0)
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["setup", "local", "--days", "14"])
+        .output()
+        .expect("run setup local beside a .git file pointing nowhere");
+
+    assert!(
+        !output.status.success(),
+        "a .git file pointing nowhere must be refused"
+    );
+    assert!(!project.file_exists(".npmrc"));
+    assert!(!project.file_exists(".gitignore"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("can't tell whether .npmrc is tracked") && stderr.contains(".git file"),
+        "error must name the .git file git stopped at: {stderr}"
+    );
+    assert!(
+        mock.server()
+            .received_requests()
+            .await
+            .expect("request log")
+            .is_empty(),
+        "the refusal must happen before token mutation"
+    );
+}
+
+#[tokio::test]
+async fn setup_local_refuses_an_npmrc_an_outer_repository_tracks_behind_a_broken_git_file() {
+    let outer = tempfile::TempDir::new().expect("create outer repository");
+    git_in(outer.path(), &["init", "-q"]);
+    let project = TempProject::empty_in(outer.path(), r#"{"name":"nested","version":"1.0.0"}"#);
+    project.write_private_file(".npmrc", "fund=false\n");
+    git_in(
+        outer.path(),
+        &[
+            "add",
+            "--",
+            &project.path().join(".npmrc").to_string_lossy(),
+        ],
+    );
+    project.write_private_file(".git", "gitdir: ../gone/.git\n");
+    let mock = MockRegistry::start().await;
+    mock.with_npmrc_token_replace(14, "2030-01-02T03:04:05Z", 0)
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["setup", "local", "--days", "14"])
+        .output()
+        .expect("run setup local with an outer-tracked npmrc behind a broken .git file");
+
+    assert!(
+        !output.status.success(),
+        "the outer repository's .npmrc must not receive a token"
+    );
+    assert_eq!(project.read_file(".npmrc"), "fund=false\n");
+    assert!(!project.file_exists(".gitignore"));
+    assert!(
+        mock.server()
+            .received_requests()
+            .await
+            .expect("request log")
+            .is_empty(),
+        "the refusal must happen before token mutation"
     );
 }
 

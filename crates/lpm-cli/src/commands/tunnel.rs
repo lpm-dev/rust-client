@@ -1,4 +1,5 @@
 use crate::install_ui;
+use crate::project_git::{GitDiscoveryFailure, git_discovery_failure, hardened_git_command};
 use lpm_common::{LpmError, format_bytes};
 use lpm_registry::RegistryClient;
 use std::fmt::Display;
@@ -960,58 +961,14 @@ enum CaptureGitFailure {
     Unavailable,
 }
 
-/// How git's `fatal: ` line starts, with `LC_ALL=C`, where it found no
-/// repository, and where it stopped looking. Git 2.56 reports a `.git` file
-/// pointing at no repository as "gitfile does not point to a valid
-/// repository: <file>"; earlier releases as "not a git repository: <target>".
-const NO_REPOSITORY_MESSAGE: &str = "not a git repository (or any of the parent directories)";
-const STOPPED_MESSAGES: [&str; 6] = [
-    "not a git repository (or any parent up to mount",
-    "not a git repository: ",
-    "gitfile does not point to a valid repository",
-    "invalid gitfile format",
-    "no path in gitfile",
-    "too large to be a .git file",
-];
-
-/// Reads git's failure from the start of its `fatal: ` line, as the rest can
-/// quote a path, and without regard to case, as releases before 2.17 write
-/// "Not a git repository".
-fn capture_git_failure(stderr: &[u8]) -> CaptureGitFailure {
-    let message = String::from_utf8_lossy(stderr);
-    for line in message.lines() {
-        let Some(reason) = line.strip_prefix("fatal: ") else {
-            continue;
-        };
-        let starts = |start: &str| {
-            reason
-                .get(..start.len())
-                .is_some_and(|text| text.eq_ignore_ascii_case(start))
-        };
-        if starts(NO_REPOSITORY_MESSAGE) {
-            return CaptureGitFailure::NoRepository;
-        }
-        if STOPPED_MESSAGES.into_iter().any(starts) || unreadable_git_file(reason, starts) {
-            return CaptureGitFailure::Stopped;
+impl From<GitDiscoveryFailure> for CaptureGitFailure {
+    fn from(failure: GitDiscoveryFailure) -> Self {
+        match failure {
+            GitDiscoveryFailure::NoRepository => Self::NoRepository,
+            GitDiscoveryFailure::Stopped => Self::Stopped,
+            GitDiscoveryFailure::Refused => Self::Refused,
         }
     }
-    CaptureGitFailure::Refused
-}
-
-/// Whether git's `fatal: ` line says it couldn't open or read a `.git`
-/// file, which it names: "error opening '<path>'" and "error reading
-/// <path>", told from git's other errors that start the same way, such as
-/// "error reading from <file>", by the name.
-fn unreadable_git_file(reason: &str, starts: impl Fn(&str) -> bool) -> bool {
-    let names_a_git_file = |path: &str| path.ends_with("/.git") || path == ".git";
-    if starts("error opening '") {
-        // The path is quoted, then ": " and the system's error; the path
-        // itself can hold a quote.
-        return reason["error opening '".len()..]
-            .rsplit_once("': ")
-            .is_some_and(|(path, _)| names_a_git_file(path));
-    }
-    starts("error reading ") && names_a_git_file(reason["error reading ".len()..].trim_end())
 }
 
 /// A git query of the capture files: the directory it runs in, its
@@ -1319,10 +1276,7 @@ fn capture_git_command(query: &CaptureGitQuery) -> tokio::process::Command {
         args.push("--full-name");
     }
     args.extend(["--", query.pathspec]);
-    tokio::process::Command::from(crate::commands::npmrc::hardened_git_command(
-        &query.directory,
-        &args,
-    ))
+    tokio::process::Command::from(hardened_git_command(&query.directory, &args))
 }
 
 /// Runs a capture query's git command, giving up after `timeout` and
@@ -1341,7 +1295,7 @@ async fn capture_git_output(
         .map_err(|_| CaptureGitFailure::Unavailable)?
         .map_err(|_| CaptureGitFailure::Unavailable)?;
     if !output.status.success() {
-        return Err(capture_git_failure(&output.stderr));
+        return Err(git_discovery_failure(&output.stderr).into());
     }
     Ok(parse_capture_git_files(&output.stdout))
 }
@@ -3497,119 +3451,6 @@ mod tests {
         )
         .unwrap();
         assert!(marks_a_repository(&checkout.join(".git")));
-    }
-
-    #[test]
-    fn reads_git_s_failure_from_the_start_of_its_fatal_line() {
-        for (stderr, failure) in [
-            (
-                "fatal: not a git repository (or any of the parent directories): .git\n",
-                CaptureGitFailure::NoRepository,
-            ),
-            (
-                "fatal: Not a git repository (or any of the parent directories): .git\n",
-                CaptureGitFailure::NoRepository,
-            ),
-            (
-                "fatal: not a git repository (or any parent up to mount point /mnt)\n\
-                 Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).\n",
-                CaptureGitFailure::Stopped,
-            ),
-            (
-                "fatal: Not a git repository (or any parent up to mount point /mnt)\n",
-                CaptureGitFailure::Stopped,
-            ),
-            (
-                "fatal: invalid gitfile format: /work/app/.git\n",
-                CaptureGitFailure::Stopped,
-            ),
-            (
-                "fatal: Invalid gitfile format: /work/app/.git\n",
-                CaptureGitFailure::Stopped,
-            ),
-            (
-                "fatal: no path in gitfile: /work/app/.git\n",
-                CaptureGitFailure::Stopped,
-            ),
-            (
-                "fatal: No path in gitfile: /work/app/.git\n",
-                CaptureGitFailure::Stopped,
-            ),
-            (
-                "fatal: not a git repository: /work/gone/.git\n",
-                CaptureGitFailure::Stopped,
-            ),
-            (
-                "fatal: gitfile does not point to a valid repository: /work/app/.git\n",
-                CaptureGitFailure::Stopped,
-            ),
-            (
-                "fatal: error opening '/work/app/.git': Permission denied\n",
-                CaptureGitFailure::Stopped,
-            ),
-            (
-                "fatal: too large to be a .git file: '/work/app/.git'\n",
-                CaptureGitFailure::Stopped,
-            ),
-            (
-                "fatal: error reading /work/app/.git\n",
-                CaptureGitFailure::Stopped,
-            ),
-            (
-                "fatal: Error reading /work/app/.git\n",
-                CaptureGitFailure::Stopped,
-            ),
-            (
-                "fatal: error reading from /work/app/.git/index: Input/output error\n",
-                CaptureGitFailure::Refused,
-            ),
-            (
-                "fatal: error reading directory '/work/app/src'\n",
-                CaptureGitFailure::Refused,
-            ),
-            (
-                "fatal: error opening '/work/app/.git/index': Permission denied\n",
-                CaptureGitFailure::Refused,
-            ),
-            (
-                "fatal: error opening '/work/it's/app/.git': Permission denied\n",
-                CaptureGitFailure::Stopped,
-            ),
-            (
-                "fatal: error opening '/work/app/x.git': Permission denied\n",
-                CaptureGitFailure::Refused,
-            ),
-            (
-                "fatal: error reading /work/app/x.git\n",
-                CaptureGitFailure::Refused,
-            ),
-            ("fatal: error reading .git\n", CaptureGitFailure::Stopped),
-            (
-                "warning: unable to access '/home/user/.config/git/attributes'\n\
-                 fatal: not a git repository (or any of the parent directories): .git\n",
-                CaptureGitFailure::NoRepository,
-            ),
-            (
-                "fatal: detected dubious ownership in repository at \
-                 '/work/not a git repository (or any of the parent directories)'\n",
-                CaptureGitFailure::Refused,
-            ),
-            (
-                "warning: not a git repository (or any of the parent directories)\n",
-                CaptureGitFailure::Refused,
-            ),
-            (
-                "fatal: detected dubious ownership in repository at '/work/app'\n",
-                CaptureGitFailure::Refused,
-            ),
-            (
-                "fatal: cannot use bare repository '/work/app' (safe.bareRepository is 'explicit')\n",
-                CaptureGitFailure::Refused,
-            ),
-            ("", CaptureGitFailure::Refused),
-        ] {
-            assert_eq!(capture_git_failure(stderr.as_bytes()), failure, "{stderr}");
-        }
     }
 
     #[tokio::test]
