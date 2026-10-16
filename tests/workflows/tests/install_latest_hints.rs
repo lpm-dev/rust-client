@@ -94,12 +94,7 @@ async fn install_latest_hint_authority(
             std::fs::remove_file(project.path().join("lpm.lock")).unwrap();
         }
         let output = lpm_with_registry(&project, &registry.url())
-            .args([
-                "install",
-                "--no-security-summary",
-                "--no-skills",
-                "--no-editor-setup",
-            ])
+            .args(["install", "--no-security-summary", "--no-skills"])
             .assert();
         let rendered = format!(
             "{}{}",
@@ -171,12 +166,7 @@ async fn exact_fallback_and_lock_replay_do_not_retry_history_for_hints() {
             std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
         }
         let output = lpm_with_registry(&project, &registry.url())
-            .args([
-                "install",
-                "--no-security-summary",
-                "--no-skills",
-                "--no-editor-setup",
-            ])
+            .args(["install", "--no-security-summary", "--no-skills"])
             .assert()
             .success();
         let rendered = format!(
@@ -245,12 +235,7 @@ async fn worker_batch_hint(tag: Option<&str>, expected_hint: Option<&str>) {
         .env("LPM_NPM_ROUTE", "proxy")
         .env("LPM_WORKER_RANGE_AWARE_BATCH", "1")
         .env("LPM_WORKER_STREAMING_BATCH", "0")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
     let rendered = format!(

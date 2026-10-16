@@ -39,12 +39,7 @@ async fn install_policy_extension_enforce_blocks_package_candidate_before_downlo
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run install with policy extension");
 
@@ -102,12 +97,7 @@ async fn install_policy_extension_rejects_remote_tarball_url_dependency_before_d
     );
 
     let output = lpm(&project)
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run install with policy extension");
 
@@ -147,12 +137,7 @@ async fn install_policy_extension_blocks_up_to_date_install_from_lockfile_candid
     ));
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -181,7 +166,6 @@ async fn install_policy_extension_blocks_up_to_date_install_from_lockfile_candid
             "--timing",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run warm install with policy extension");
@@ -216,12 +200,7 @@ async fn install_policy_extension_blocks_bare_up_to_date_fast_lane() {
     ));
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -298,12 +277,7 @@ async fn install_policy_extension_runs_once_when_stale_v2_analysis_cache_falls_b
 
     lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -321,12 +295,7 @@ async fn install_policy_extension_runs_once_when_stale_v2_analysis_cache_falls_b
 
     let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run warm install with stale analysis cache");
 
@@ -382,7 +351,6 @@ async fn install_policy_extension_report_mode_continues_and_reports_json_stats()
             "--timing",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run install with policy extension");

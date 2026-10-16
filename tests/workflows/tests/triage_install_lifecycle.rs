@@ -638,7 +638,6 @@ async fn assert_delegated_phases_are_reviewed(
             "--auto-build",
             "--advisor=claude-cli",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .unwrap();

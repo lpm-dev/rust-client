@@ -3264,12 +3264,7 @@ async fn install_panics_after_install_hash_write_rollback_invalidates_hash() {
 // ─── Shared mini-helpers ─────────────────────────────────────────────
 
 fn install_args_with<'a>(packages: &'a [&'a str]) -> Vec<&'a str> {
-    let mut v = vec![
-        "install",
-        "--no-security-summary",
-        "--no-skills",
-        "--no-editor-setup",
-    ];
+    let mut v = vec!["install", "--no-security-summary", "--no-skills"];
     v.extend_from_slice(packages);
     v
 }

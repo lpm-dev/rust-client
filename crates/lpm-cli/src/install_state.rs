@@ -1565,7 +1565,6 @@ fn fast_lane_mode_from_args(args: &[&str]) -> Option<FastLaneMode> {
             | "-D"
             | "--save-dev"
             | "--no-skills"
-            | "--no-editor-setup"
             | "--no-security-summary"
             | "--auto-build"
                 if found_install =>

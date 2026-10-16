@@ -735,7 +735,6 @@ function installCommand(spec, policy) {
         'install',
         '--no-security-summary',
         '--no-skills',
-        '--no-editor-setup',
       ];
     case 'bun':
       return policy === 'ignore' ? ['bun', 'install', '--ignore-scripts'] : ['bun', 'install'];

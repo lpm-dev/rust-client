@@ -501,7 +501,6 @@ async fn install_does_not_report_an_incomplete_source_audit_as_completed() {
             "--audit-after-install",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .unwrap();
@@ -558,12 +557,7 @@ async fn audit_fix_rolls_back_when_verification_metadata_changes_version_identit
     )
     .await;
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
     let served = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));

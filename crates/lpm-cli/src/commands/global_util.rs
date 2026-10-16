@@ -91,7 +91,6 @@ pub(super) async fn run_inner_global_install(
         options.linker_override,
         crate::lpm_skills_config::LpmSkillsPreference::Disabled,
         true,
-        true,
         options.auto_build,
         None,
         None,

@@ -64,13 +64,7 @@ async fn assert_missing_range_override(
         .to_string(),
     );
     let mut command = lpm_with_registry(&project, &mock.url());
-    command.args([
-        "install",
-        "--json",
-        "--no-security-summary",
-        "--no-skills",
-        "--no-editor-setup",
-    ]);
+    command.args(["install", "--json", "--no-security-summary", "--no-skills"]);
     match mode {
         "pubgrub" => {
             command.env("LPM_RESOLVER", "pubgrub");
@@ -188,12 +182,7 @@ async fn pubgrub_preserves_distinct_transitive_alias_versions() {
     );
     let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_RESOLVER", "pubgrub")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("install transitive aliases");
     assert!(

@@ -16,12 +16,7 @@ use tempfile::TempDir;
 fn run_install(project: &TempProject) -> Output {
     lpm(project)
         .env_remove("LPM_TOKEN")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install against verdaccio")
 }

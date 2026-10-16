@@ -263,7 +263,7 @@ function installCommand(manager, timing) {
       lpmBin,
       '--json',
       'install',
-      ...(config.bareInstall ? [] : ['--no-security-summary', '--no-skills', '--no-editor-setup']),
+      ...(config.bareInstall ? [] : ['--no-security-summary', '--no-skills']),
     ];
     if (timing) {
       command.push('--timing');

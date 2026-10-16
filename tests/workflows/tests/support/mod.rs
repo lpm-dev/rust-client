@@ -552,7 +552,6 @@ pub async fn installed_manifest_dependency_graph(linker: &str) -> TempProject {
             linker,
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run manifest dependency graph install");

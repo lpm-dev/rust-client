@@ -556,7 +556,6 @@ pub(super) async fn refresh_dependency_install(
                 None,  // strict_peer_dependencies_override
                 None,  // linker_override
                 crate::lpm_skills_config::LpmSkillsPreference::from_enabled(install_lpm_skills),
-                false, // no_editor_setup
                 true,  // no_security_summary
                 false, // auto_build
                 None,  // target_set: shadcn-style add never targets multiple workspace members

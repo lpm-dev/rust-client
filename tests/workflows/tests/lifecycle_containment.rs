@@ -460,14 +460,7 @@ async fn cancelled_install_preserves_manifest_and_user_files_and_retry_builds() 
     project.write_file("user.txt", "preserve me");
     let before = project.read_file("package.json");
     write_signed_unlock(&project, &["scripts-allow"]);
-    let args = [
-        "install",
-        PACKAGE,
-        "--policy",
-        "allow",
-        "--no-skills",
-        "--no-editor-setup",
-    ];
+    let args = ["install", PACKAGE, "--policy", "allow", "--no-skills"];
     let mut child = support::lpm_spawnable_with_registry(&project, &registry.url())
         .args(args)
         .stdout(Stdio::null())

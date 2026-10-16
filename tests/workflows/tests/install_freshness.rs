@@ -28,13 +28,7 @@ fn with_node_shim(project: &TempProject, command: &mut assert_cmd::Command) {
 
 fn install(project: &TempProject, registry: &str) -> assert_cmd::Command {
     let mut command = lpm_with_registry(project, registry);
-    command.args([
-        "--json",
-        "install",
-        "--no-skills",
-        "--no-editor-setup",
-        "--no-security-summary",
-    ]);
+    command.args(["--json", "install", "--no-skills", "--no-security-summary"]);
     with_node_shim(project, &mut command);
     command
 }

@@ -12,12 +12,7 @@ async fn mount_ms(mock: &MockRegistry) {
 
 async fn install_once(project: &TempProject, mock: &MockRegistry) {
     let output = lpm_with_registry(project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run initial lpm install");
 
@@ -36,7 +31,6 @@ fn install_workspace_once(project: &TempProject) {
             "--no-recursive",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run initial workspace lpm install");
@@ -81,12 +75,7 @@ async fn mutable_install_refreshes_legacy_lockfile_for_future_frozen_installs() 
         .expect("failed to write simulated legacy lockfile");
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run mutable lpm install");
 
@@ -114,12 +103,7 @@ async fn mutable_install_refreshes_legacy_lockfile_for_future_frozen_installs() 
     );
 
     let ci_output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "ci",
-            "--no-skills",
-            "--no-editor-setup",
-            "--no-security-summary",
-        ])
+        .args(["ci", "--no-skills", "--no-security-summary"])
         .output()
         .expect("failed to run lpm ci after lockfile refresh");
 
@@ -161,7 +145,6 @@ async fn frozen_install_rejects_manifest_specifier_drift_without_rewriting_lockf
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install --frozen-lockfile");
@@ -209,12 +192,7 @@ async fn lpm_ci_rejects_manifest_specifier_drift_without_rewriting_lockfile() {
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "ci",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["ci", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run lpm ci with manifest drift");
 
@@ -249,12 +227,7 @@ async fn ci_env_enables_frozen_install_when_lockfile_exists() {
 
     let output = lpm_with_registry(&project, &mock.url())
         .env("CI", "true")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run CI=true lpm install");
 
@@ -297,7 +270,6 @@ async fn ci_auto_frozen_repeat_install_uses_up_to_date_fast_path() {
             "--timing",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run repeated CI=true lpm install");
@@ -372,7 +344,6 @@ async fn frozen_replay_accepts_unchanged_peer_dependency_rules_across_processes(
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run frozen replay with unchanged peer rules");
@@ -402,12 +373,7 @@ async fn lpm_ci_replays_frozen_lockfile_without_rewriting_lockfiles() {
     let lockb_before = std::fs::read(project.path().join("lpm.lockb")).ok();
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "ci",
-            "--no-skills",
-            "--no-editor-setup",
-            "--no-security-summary",
-        ])
+        .args(["ci", "--no-skills", "--no-security-summary"])
         .output()
         .expect("failed to run lpm ci");
 
@@ -445,13 +411,7 @@ async fn lpm_ci_json_reports_success_envelope_without_rewriting_lockfile() {
     let lock_before = project.read_file("lpm.lock");
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "--json",
-            "ci",
-            "--no-skills",
-            "--no-editor-setup",
-            "--no-security-summary",
-        ])
+        .args(["--json", "ci", "--no-skills", "--no-security-summary"])
         .output()
         .expect("failed to run lpm --json ci");
 
@@ -505,12 +465,7 @@ fn lpm_ci_accepts_workspace_member_trusted_dependencies_without_rewriting_lockfi
     let lockb_before = std::fs::read(project.path().join("lpm.lockb")).ok();
 
     let output = lpm(&project)
-        .args([
-            "ci",
-            "--no-skills",
-            "--no-editor-setup",
-            "--no-security-summary",
-        ])
+        .args(["ci", "--no-skills", "--no-security-summary"])
         .output()
         .expect("failed to run lpm ci for workspace trust regression");
 
@@ -575,12 +530,7 @@ fn lpm_ci_rejects_workspace_member_dependency_edge_absent_from_lockfile() {
         .expect("remove node_modules before frozen replay");
 
     let output = lpm(&project)
-        .args([
-            "ci",
-            "--no-skills",
-            "--no-editor-setup",
-            "--no-security-summary",
-        ])
+        .args(["ci", "--no-skills", "--no-security-summary"])
         .output()
         .expect("failed to run lpm ci after member manifest edit");
 

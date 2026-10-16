@@ -238,12 +238,7 @@ console.log(React);
     );
 
     let install = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to seed install before tidy");
     assert!(
@@ -326,7 +321,6 @@ async fn workspace_member_tidy_fix_preserves_the_sibling_root_lockfile_projectio
             "--recursive",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
             "--no-audit-after-install",
         ])
         .output()

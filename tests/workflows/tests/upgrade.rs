@@ -1246,12 +1246,7 @@ async fn upgrade_upgrades_npm_packages_installed_through_configured_lpm_registry
     .await;
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
     project.write_file(

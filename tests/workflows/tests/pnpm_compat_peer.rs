@@ -6,12 +6,7 @@ use std::process::Output;
 use support::mock_registry::{MockRegistry, make_tarball};
 use support::{TempProject, lpm_with_registry};
 
-const INSTALL_ARGS: &[&str] = &[
-    "install",
-    "--no-security-summary",
-    "--no-skills",
-    "--no-editor-setup",
-];
+const INSTALL_ARGS: &[&str] = &["install", "--no-security-summary", "--no-skills"];
 
 #[tokio::test]
 async fn optional_peer_dependency_missing_does_not_warn_or_install_peer() {

@@ -11,7 +11,6 @@ use support::{TempProject, lpm_with_registry};
 const FLAGS: &[&str] = &[
     "--no-security-summary",
     "--no-skills",
-    "--no-editor-setup",
     "--no-audit-after-install",
 ];
 

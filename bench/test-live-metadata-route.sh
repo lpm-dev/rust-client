@@ -117,7 +117,7 @@ jq -s -e 'length == 4' "$RESULTS_FILE" >/dev/null
 jq -s -e 'map(select(.route == "direct" and .metadata_http_response_count == 58)) | length == 2' "$RESULTS_FILE" >/dev/null
 jq -s -e 'map(select(.route == "proxy" and .metadata_http_response_count == 5)) | length == 2' "$RESULTS_FILE" >/dev/null
 
-grep -Fq -- 'install --json --no-security-summary --no-skills --no-editor-setup' "$ARGS_FILE"
+grep -Fq -- 'install --json --no-security-summary --no-skills' "$ARGS_FILE"
 grep -q '^LPM_NPM_ROUTE=direct$' "$ENV_FILE"
 grep -q '^LPM_NPM_ROUTE=proxy$' "$ENV_FILE"
 grep -q '^LPM_STORE_VERSION=v2$' "$ENV_FILE"

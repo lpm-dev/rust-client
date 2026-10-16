@@ -113,12 +113,7 @@ fn budget_gate_enabled() -> bool {
 fn run_install(project: &TempProject) -> Output {
     lpm(project)
         .env_remove("LPM_TOKEN")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install against verdaccio")
 }
@@ -155,8 +150,7 @@ fn run_install_under_time(project: &TempProject) -> (Output, Option<u64>) {
     cmd.arg(&bin);
     cmd.arg("install")
         .arg("--no-security-summary")
-        .arg("--no-skills")
-        .arg("--no-editor-setup");
+        .arg("--no-skills");
     cmd.current_dir(project.path());
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 

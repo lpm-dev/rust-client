@@ -7,12 +7,7 @@ use std::process::Output;
 use support::mock_registry::{MockRegistry, make_tarball};
 use support::{TempProject, lpm, lpm_with_registry};
 
-const INSTALL_ARGS: &[&str] = &[
-    "install",
-    "--no-security-summary",
-    "--no-skills",
-    "--no-editor-setup",
-];
+const INSTALL_ARGS: &[&str] = &["install", "--no-security-summary", "--no-skills"];
 
 #[tokio::test]
 async fn default_catalog_mode_saves_raw_range_when_catalog_range_matches() {
@@ -506,7 +501,6 @@ catalog:
             "--recursive",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run recursive lpm install");

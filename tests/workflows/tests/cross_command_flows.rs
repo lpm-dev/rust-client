@@ -161,7 +161,6 @@ async fn flow_install_patch_patch_commit_install_persists_patch() {
         "install",
         "--no-security-summary",
         "--no-skills",
-        "--no-editor-setup",
     ]);
     let out_b = bootstrap_cmd.output().expect("spawn bootstrap install");
     assert!(
@@ -220,7 +219,6 @@ async fn flow_install_patch_patch_commit_install_persists_patch() {
         "install",
         "--no-security-summary",
         "--no-skills",
-        "--no-editor-setup",
     ]);
     let out3 = install_cmd.output().expect("spawn second lpm install");
     assert!(
@@ -631,7 +629,6 @@ async fn flow_add_install_graph_added_dep_visible() {
             "ms@2.1.3",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn install ms@2.1.3");
@@ -722,7 +719,6 @@ async fn flow_install_upgrade_major_audit_picks_new_version() {
             &format!("{pkg_name}@^1.0.0"),
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn install");
@@ -1307,7 +1303,6 @@ async fn flow_workspace_install_filter_member_a_does_not_mutate_member_b() {
             "--filter",
             "@test/core",
             "--no-skills",
-            "--no-editor-setup",
             "--no-security-summary",
         ])
         .output()
@@ -1350,7 +1345,6 @@ async fn flow_workspace_install_filter_member_a_does_not_mutate_member_b() {
             "--filter",
             "@test/app",
             "--no-skills",
-            "--no-editor-setup",
             "--no-security-summary",
         ])
         .output()
@@ -1458,7 +1452,6 @@ async fn flow_install_uninstall_install_graph_round_trip() {
             "ms@2.1.3",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn install ms@2.1.3 (step 1)");
@@ -1514,7 +1507,6 @@ async fn flow_install_uninstall_install_graph_round_trip() {
             "ms@2.1.3",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn install ms@2.1.3 (step 3)");
@@ -1593,7 +1585,6 @@ async fn flow_cache_clean_then_offline_install_uses_store_or_fails_helpfully() {
             "ms@2.1.3",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn online install");
@@ -1688,7 +1679,6 @@ async fn flow_cache_clean_then_offline_install_uses_store_or_fails_helpfully() {
             "--offline",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn offline install");
