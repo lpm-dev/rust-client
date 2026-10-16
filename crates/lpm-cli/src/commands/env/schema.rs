@@ -105,9 +105,7 @@ pub(super) fn vars_example(
     lpm_common::write_file_atomic_with_options(
         &example_path,
         content.as_bytes(),
-        lpm_common::AtomicWriteOptions::new()
-            .unix_mode(0o600)
-            .sync_file(),
+        lpm_common::AtomicWriteOptions::new().sync_file(),
     )
     .map_err(|e| LpmError::Script(format!("failed to write {example_filename}: {e}")))?;
 
