@@ -1,4 +1,5 @@
 use super::{AvailableLpmPublishPreflight, read_package_json, workspace_project};
+use crate::support::assertions::assert_fault_injection_aborted;
 use crate::support::mock_registry::MockRegistry;
 use crate::support::{TempProject, lpm, lpm_with_registry};
 use wiremock::matchers::{method, path};
@@ -194,13 +195,139 @@ fn release_rejects_conflicting_change_entries_in_any_file_order() {
         ["core 2.0.0\n", "core 3.0.0\n"],
     ] {
         let project = workspace_project();
-        project.write_file(".lpm/changes/a", entries[0]);
-        project.write_file(".lpm/changes/z", entries[1]);
+        project.write_file("lpm-changes/a", entries[0]);
+        project.write_file("lpm-changes/z", entries[1]);
         let out = change(&project, "plan", "patch");
         assert!(!out.status.success(), "accepted conflicting bumps: {out:?}");
         assert_eq!(
             read_package_json(&project, "packages/core/package.json")["version"],
             "1.2.3"
+        );
+    }
+}
+
+#[test]
+fn release_apply_removes_the_change_entries_it_applied() {
+    let project = workspace_project();
+    project.write_file("lpm-changes/core-only", "# core release\ncore minor\n");
+    project.write_file("lpm-changes/mixed", "core minor\napp major\n");
+    project.write_file("lpm-changes/app-only", "app major\n");
+
+    let preview = change(&project, "plan", "patch");
+    assert!(preview.status.success(), "{preview:?}");
+    let preview: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(
+        preview["change_files"],
+        serde_json::json!([
+            {"path": "lpm-changes/core-only", "applied": 1, "remaining": 0},
+            {"path": "lpm-changes/mixed", "applied": 1, "remaining": 1},
+        ])
+    );
+    assert!(project.file_exists("lpm-changes/core-only"));
+
+    let out = change(&project, "apply", "patch");
+
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        read_package_json(&project, "packages/core/package.json")["version"],
+        "1.3.0"
+    );
+    assert!(!project.file_exists("lpm-changes/core-only"));
+    assert_eq!(project.read_file("lpm-changes/mixed"), "app major\n");
+    assert_eq!(project.read_file("lpm-changes/app-only"), "app major\n");
+
+    let again = change(&project, "plan", "patch");
+    let again: serde_json::Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(again["packages"][0]["new_version"], "1.3.1", "{again}");
+}
+
+#[test]
+fn an_interrupted_release_neither_loses_nor_repeats_its_change_entries() {
+    for abort in [
+        "LPM_INTERNAL_TEST_RELEASE_ABORT_AFTER_MANIFEST_WRITES",
+        "LPM_INTERNAL_TEST_RELEASE_ABORT_AFTER_CHANGE_FILES",
+        "LPM_INTERNAL_TEST_RELEASE_ABORT_AFTER_COMMIT",
+    ] {
+        let project = workspace_project();
+        project.write_file("lpm-changes/core-only", "core minor\n");
+        project.write_file("lpm-changes/mixed", "core minor\napp major\n");
+        let interrupted = lpm(&project)
+            .env(abort, "1")
+            .args([
+                "release", "apply", "--filter", "core", "--bump", "patch", "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_fault_injection_aborted(&interrupted);
+
+        let retried = change(&project, "apply", "patch");
+
+        assert!(retried.status.success(), "{abort}: {retried:?}");
+        assert_eq!(
+            read_package_json(&project, "packages/core/package.json")["version"],
+            "1.3.0",
+            "{abort}"
+        );
+        assert!(!project.file_exists("lpm-changes/core-only"), "{abort}");
+        assert_eq!(
+            project.read_file("lpm-changes/mixed"),
+            "app major\n",
+            "{abort}"
+        );
+    }
+}
+
+#[test]
+fn recovery_restores_nothing_when_a_change_file_was_edited_after_the_interruption() {
+    let project = workspace_project();
+    project.write_file("lpm-changes/mixed", "core minor\napp major\n");
+    let interrupted = lpm(&project)
+        .env("LPM_INTERNAL_TEST_RELEASE_ABORT_AFTER_CHANGE_FILES", "1")
+        .args([
+            "release", "apply", "--filter", "core", "--bump", "patch", "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_fault_injection_aborted(&interrupted);
+    project.write_file("lpm-changes/mixed", "app major\ncore patch\n");
+
+    let retried = change(&project, "apply", "patch");
+
+    assert!(!retried.status.success(), "{retried:?}");
+    let json: serde_json::Value = serde_json::from_slice(&retried.stdout).unwrap();
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains("lpm-changes/mixed changed outside the interrupted release"),
+        "{json}"
+    );
+    assert_eq!(
+        read_package_json(&project, "packages/core/package.json")["version"],
+        "1.3.0"
+    );
+    assert_eq!(
+        project.read_file("lpm-changes/mixed"),
+        "app major\ncore patch\n"
+    );
+}
+
+#[test]
+fn release_refuses_change_files_left_in_lpm_state() {
+    for current in [None, Some("core patch\n")] {
+        let project = workspace_project();
+        project.write_file(".lpm/changes/api-update", "core major\n");
+        if let Some(entry) = current {
+            project.write_file("lpm-changes/fix", entry);
+        }
+
+        let out = change(&project, "plan", "patch");
+
+        assert!(!out.status.success(), "{out:?}");
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(
+            json["error"].as_str().unwrap().contains("lpm-changes/"),
+            "{json}"
         );
     }
 }
@@ -553,11 +680,11 @@ fn release_change_files_have_aggregate_and_record_limits() {
     for records in [true, false] {
         let project = workspace_project();
         if records {
-            project.write_file(".lpm/changes/many", &"core patch\n".repeat(100_001));
+            project.write_file("lpm-changes/many", &"core patch\n".repeat(100_001));
         } else {
             let content = format!("#{}", "x".repeat(16 * 1024 * 1024 - 1));
             for i in 0..5 {
-                project.write_file(&format!(".lpm/changes/{i}"), &content);
+                project.write_file(&format!("lpm-changes/{i}"), &content);
             }
         }
         let out = change(&project, "plan", "patch");
@@ -578,14 +705,13 @@ fn release_rejects_linked_change_directories_and_files() {
         let project = workspace_project();
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("entry"), "core major\n").unwrap();
-        std::fs::create_dir_all(project.path().join(".lpm")).unwrap();
         if directory {
-            symlink(outside.path(), project.path().join(".lpm/changes")).unwrap();
+            symlink(outside.path(), project.path().join("lpm-changes")).unwrap();
         } else {
-            std::fs::create_dir(project.path().join(".lpm/changes")).unwrap();
+            std::fs::create_dir(project.path().join("lpm-changes")).unwrap();
             symlink(
                 outside.path().join("entry"),
-                project.path().join(".lpm/changes/entry"),
+                project.path().join("lpm-changes/entry"),
             )
             .unwrap();
         }

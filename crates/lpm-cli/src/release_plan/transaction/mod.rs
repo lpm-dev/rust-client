@@ -64,6 +64,7 @@ impl AppliedReleaseTransaction {
             &self.journal_bytes,
             self.expected_version_parent.as_ref(),
             &self.expected_member_parents,
+            &[],
             primary,
         )
     }
@@ -73,6 +74,25 @@ impl AppliedReleaseTransaction {
 pub(super) fn apply_planned_manifests_with(
     workspace_root: &Path,
     manifests: &[PlannedManifest],
+    operation: ReleaseTransactionOperation,
+    version_git: Option<VersionGitTransaction>,
+    write_manifest: impl FnMut(&ManifestTarget, &[u8]) -> std::io::Result<()>,
+) -> Result<AppliedReleaseTransaction, LpmError> {
+    apply_planned_release_with(
+        workspace_root,
+        manifests,
+        &[],
+        operation,
+        version_git,
+        write_manifest,
+    )
+}
+
+#[cfg(test)]
+pub(super) fn apply_planned_release_with(
+    workspace_root: &Path,
+    manifests: &[PlannedManifest],
+    change_files: &[ChangeFileWrite],
     operation: ReleaseTransactionOperation,
     version_git: Option<VersionGitTransaction>,
     write_manifest: impl FnMut(&ManifestTarget, &[u8]) -> std::io::Result<()>,
@@ -93,6 +113,7 @@ pub(super) fn apply_planned_manifests_with(
             expected_version_parent: None,
         },
         resolved,
+        change_files,
         operation,
         version_git,
         write_manifest,
@@ -106,9 +127,13 @@ pub(super) struct ReleaseWriteContext {
     pub(super) expected_version_parent: Option<cap_std::fs::Dir>,
 }
 
+/// Writes `resolved` manifests, then `change_files`, under one journal: a
+/// failure or an interruption before the commit marker puts all of them
+/// back, and after it none is written again.
 pub(super) fn apply_resolved_manifests_with(
     context: ReleaseWriteContext,
     resolved: Vec<ResolvedPlannedManifest<'_>>,
+    change_files: &[ChangeFileWrite],
     operation: ReleaseTransactionOperation,
     version_git: Option<VersionGitTransaction>,
     mut write_manifest: impl FnMut(&ManifestTarget, &[u8]) -> std::io::Result<()>,
@@ -130,8 +155,11 @@ pub(super) fn apply_resolved_manifests_with(
         })
         .collect::<Result<ManifestDirectoryIdentities, LpmError>>()?;
     let (journal_bytes, commit) =
-        serialize_planned_release_journal(&resolved, operation, version_git)?;
+        serialize_planned_release_journal(&resolved, change_files, operation, version_git)?;
+    ensure_change_files_unchanged(&root, change_files)?;
     persist_release_journal_in(&state, &journal_bytes)?;
+    let all_change_files: Vec<OsString> =
+        change_files.iter().map(|file| file.name.clone()).collect();
     let allowed_manifests = resolved
         .iter()
         .map(|manifest| manifest.target.display.clone())
@@ -167,6 +195,7 @@ pub(super) fn apply_resolved_manifests_with(
                 &journal_bytes,
                 expected_version_parent.as_ref(),
                 &expected_member_parents,
+                &all_change_files,
                 error,
             );
         }
@@ -185,10 +214,25 @@ pub(super) fn apply_resolved_manifests_with(
                 &journal_bytes,
                 expected_version_parent.as_ref(),
                 &expected_member_parents,
+                &all_change_files,
                 error,
             );
         }
     }
+    if let Err(failure) = write_change_files(&root, change_files) {
+        return rollback_after_apply_error(
+            &canonical_root,
+            &root,
+            &state,
+            &allowed_manifests,
+            &journal_bytes,
+            expected_version_parent.as_ref(),
+            &expected_member_parents,
+            &all_change_files[failure.written..],
+            failure.error,
+        );
+    }
+    super::fault_injection::abort_after_change_files();
 
     Ok(AppliedReleaseTransaction {
         canonical_root,
@@ -199,6 +243,258 @@ pub(super) fn apply_resolved_manifests_with(
         commit,
         expected_version_parent,
         expected_member_parents,
+    })
+}
+
+/// Refuses a release whose change files no longer hold what it planned
+/// from, before it writes anything.
+fn ensure_change_files_unchanged(
+    root: &cap_std::fs::Dir,
+    files: &[ChangeFileWrite],
+) -> Result<(), LpmError> {
+    use cap_fs_ext::DirExt as _;
+
+    if files.is_empty() {
+        return Ok(());
+    }
+    let changes = root.open_dir_nofollow(CHANGES_DIR).map_err(LpmError::Io)?;
+    files
+        .iter()
+        .try_for_each(|file| ensure_change_file_unchanged(&changes, file))
+}
+
+fn ensure_change_file_unchanged(
+    changes: &cap_std::fs::Dir,
+    file: &ChangeFileWrite,
+) -> Result<(), LpmError> {
+    let display = format!("{CHANGES_DIR}/{}", file.name.to_string_lossy());
+    if read_change_file(changes, &file.name, &display)? != file.original {
+        return Err(LpmError::Script(format!(
+            "{display} changed during the release; run the release again"
+        )));
+    }
+    Ok(())
+}
+
+/// A failure partway through [`write_change_files`]: the files from
+/// `written` on hold what they held before it ran.
+pub(super) struct ChangeFilesFailure {
+    pub(super) written: usize,
+    pub(super) error: LpmError,
+}
+
+/// Writes what stays of each change file, or removes it, durably, after
+/// checking it still holds what the release planned from, and that
+/// `lpm-changes/` is still the directory written, so a replaced one isn't
+/// left holding the entries the release reports as applied.
+pub(super) fn write_change_files(
+    root: &cap_std::fs::Dir,
+    files: &[ChangeFileWrite],
+) -> Result<(), Box<ChangeFilesFailure>> {
+    use crate::commands::publish_common::DirectoryIdentity;
+    use cap_fs_ext::DirExt as _;
+
+    if files.is_empty() {
+        return Ok(());
+    }
+    let failure =
+        |written: usize| move |error: LpmError| Box::new(ChangeFilesFailure { written, error });
+    let changes = root
+        .open_dir_nofollow(CHANGES_DIR)
+        .map_err(LpmError::Io)
+        .map_err(failure(0))?;
+    let identity = DirectoryIdentity::from_directory(&changes)
+        .map_err(LpmError::Io)
+        .map_err(failure(0))?;
+    for (index, file) in files.iter().enumerate() {
+        ensure_change_file_unchanged(&changes, file).map_err(failure(index))?;
+        match &file.kept {
+            Some(kept) => write_change_file(&changes, &file.name, kept.as_bytes()),
+            None => changes.remove_file(&file.name),
+        }
+        .map_err(LpmError::Io)
+        .map_err(failure(index))?;
+        #[cfg(test)]
+        AFTER_CHANGE_FILE_WRITE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+    }
+    let written = files.len();
+    sync_cap_directory(&changes)
+        .map_err(LpmError::Io)
+        .map_err(failure(written))?;
+    let named = root
+        .open_dir_nofollow(CHANGES_DIR)
+        .and_then(|named| DirectoryIdentity::from_directory(&named));
+    if named.map_err(LpmError::Io).map_err(failure(written))? != identity {
+        return Err(failure(written)(LpmError::Script(format!(
+            "{CHANGES_DIR}/ was replaced during the release; run the release again"
+        ))));
+    }
+    Ok(())
+}
+
+/// Replaces or creates the change file `name`, its content synced; the
+/// caller syncs the directory once for all of them.
+fn write_change_file(
+    changes: &cap_std::fs::Dir,
+    name: &OsStr,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    lpm_common::write_file_atomic_in_dir_with_options(
+        changes,
+        name,
+        lpm_common::AtomicWriteOptions::new().sync_file(),
+        |file| file.write_all(bytes),
+    )
+}
+
+/// A change file an interrupted release consumed, and whether recovery
+/// puts its original back.
+struct RecoveryChangeFile {
+    name: OsString,
+    original: Vec<u8>,
+    restore: bool,
+}
+
+/// Checks every change file an interrupted release journaled, before
+/// anything is put back: each holds its original, or what the release
+/// wrote there, and nothing else. A file in `unwritten`, which the release
+/// running in this process never wrote, is left as it is, whatever it
+/// holds.
+fn validate_recovery_change_files(
+    root: &cap_std::fs::Dir,
+    journal_files: Vec<RecoveryChangeFileEntry<'_>>,
+    unwritten: &[OsString],
+) -> Result<Vec<RecoveryChangeFile>, LpmError> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use cap_fs_ext::DirExt as _;
+
+    if journal_files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let changes = match root.open_dir_nofollow(CHANGES_DIR) {
+        Ok(changes) => Some(changes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(LpmError::Io(error)),
+    };
+    let mut total_original_bytes = 0usize;
+    let mut previous: Option<OsString> = None;
+    let mut files = Vec::with_capacity(journal_files.len());
+    for entry in journal_files {
+        if !valid_sha256_hex(entry.original_sha256)
+            || entry
+                .kept_sha256
+                .is_some_and(|kept| !valid_sha256_hex(kept))
+        {
+            return Err(LpmError::Script(
+                "release journal contains an invalid SHA-256 digest".into(),
+            ));
+        }
+        let original = STANDARD.decode(entry.original_base64).map_err(|error| {
+            LpmError::Script(format!(
+                "release journal contains invalid change file backup encoding: {error}"
+            ))
+        })?;
+        if original.len() as u64 > lpm_common::CONFIG_FILE_SIZE_CAP_BYTES
+            || sha256_hex(&original) != entry.original_sha256
+        {
+            return Err(LpmError::Script(
+                "release journal change file backup failed integrity validation".into(),
+            ));
+        }
+        total_original_bytes = total_original_bytes
+            .checked_add(original.len())
+            .ok_or_else(|| LpmError::Script("release journal size overflow".into()))?;
+        if total_original_bytes > MAX_RELEASE_ORIGINAL_BYTES {
+            return Err(LpmError::Script(
+                "release journal change file backups exceed the aggregate limit".into(),
+            ));
+        }
+        let path = decode_relative_path(entry.path)?;
+        let mut components = path.components();
+        let (Some(std::path::Component::Normal(name)), None) =
+            (components.next(), components.next())
+        else {
+            return Err(LpmError::Script(format!(
+                "release journal change file is not a file in {CHANGES_DIR}/: {}",
+                path.display()
+            )));
+        };
+        let name = name.to_os_string();
+        if previous.as_ref().is_some_and(|previous| previous >= &name) {
+            return Err(LpmError::Script(
+                "release journal change files must be unique and sorted".into(),
+            ));
+        }
+        previous = Some(name.clone());
+        if unwritten.contains(&name) {
+            files.push(RecoveryChangeFile {
+                name,
+                original,
+                restore: false,
+            });
+            continue;
+        }
+        let display = format!("{CHANGES_DIR}/{}", name.to_string_lossy());
+        let current = match &changes {
+            Some(changes) => match read_change_file(changes, &name, &display) {
+                Ok(current) => Some(current.into_bytes()),
+                Err(LpmError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
+        let restore = match (&current, entry.kept_sha256) {
+            (Some(current), _) if *current == original => false,
+            (Some(current), Some(kept)) if sha256_hex(current) == kept => true,
+            (None, None) => true,
+            _ => {
+                return Err(LpmError::Script(format!(
+                    "{display} changed outside the interrupted release transaction; no files were restored and the journal was preserved"
+                )));
+            }
+        };
+        files.push(RecoveryChangeFile {
+            name,
+            original,
+            restore,
+        });
+    }
+    Ok(files)
+}
+
+fn restore_change_files(
+    root: &cap_std::fs::Dir,
+    files: &[RecoveryChangeFile],
+) -> Result<(), LpmError> {
+    use cap_fs_ext::DirExt as _;
+
+    if !files.iter().any(|file| file.restore) {
+        return Ok(());
+    }
+    let changes = match root.open_dir_nofollow(CHANGES_DIR) {
+        Ok(changes) => changes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            root.create_dir(CHANGES_DIR).map_err(LpmError::Io)?;
+            root.open_dir_nofollow(CHANGES_DIR).map_err(LpmError::Io)?
+        }
+        Err(error) => return Err(LpmError::Io(error)),
+    };
+    for file in files.iter().filter(|file| file.restore) {
+        write_change_file(&changes, &file.name, &file.original).map_err(|error| {
+            LpmError::Script(format!(
+                "interrupted release rollback could not restore {CHANGES_DIR}/{}: {error}; the journal was preserved for retry",
+                file.name.to_string_lossy()
+            ))
+        })?;
+    }
+    sync_cap_directory(&changes).map_err(|error| {
+        LpmError::Script(format!(
+            "interrupted release rollback could not sync {CHANGES_DIR}/: {error}; the journal was preserved for retry"
+        ))
     })
 }
 
@@ -372,6 +668,7 @@ fn recover_pending_release_transaction_in_open_root(
         allowed_manifests,
         None,
         None,
+        &[],
     )
 }
 
@@ -382,6 +679,7 @@ fn recover_pending_release_transaction_with_parent(
     allowed_manifests: &[PathBuf],
     expected_version_parent: Option<&cap_std::fs::Dir>,
     expected_member_parents: Option<&ManifestDirectoryIdentities>,
+    unwritten_change_files: &[OsString],
 ) -> Result<RecoveryOutcome, LpmError> {
     let Some(journal_bytes) = read_existing_release_journal_bytes_in(state)? else {
         return recover_commit_marker_without_journal_in(state);
@@ -413,6 +711,8 @@ fn recover_pending_release_transaction_with_parent(
         expected_version_parent,
         expected_member_parents,
     )?;
+    let change_files =
+        validate_recovery_change_files(root, journal.change_files, unwritten_change_files)?;
 
     if let Some(git) = version_git
         && recover_version_git_transaction(canonical_root, &git, &entries)?
@@ -440,6 +740,7 @@ fn recover_pending_release_transaction_with_parent(
             ))
         })?;
     }
+    restore_change_files(root, &change_files)?;
 
     if let Err(error) = remove_release_journal_in(state) {
         let _ = persist_release_journal_in(state, &journal_bytes);
@@ -467,6 +768,8 @@ pub(super) fn recover_commit_marker_without_journal_in(
     })
 }
 
+/// Puts back what the failed release wrote. `unwritten_change_files` names
+/// the change files it never wrote, which keep whatever they hold.
 #[expect(
     clippy::too_many_arguments,
     reason = "rollback retains the same transaction and directory identity context as apply"
@@ -479,6 +782,7 @@ pub(super) fn rollback_after_apply_error<T>(
     trusted_journal_bytes: &[u8],
     expected_version_parent: Option<&cap_std::fs::Dir>,
     expected_member_parents: &ManifestDirectoryIdentities,
+    unwritten_change_files: &[OsString],
     primary: LpmError,
 ) -> Result<T, LpmError> {
     match recover_pending_release_transaction_with_parent(
@@ -488,6 +792,7 @@ pub(super) fn rollback_after_apply_error<T>(
         allowed_manifests,
         expected_version_parent,
         Some(expected_member_parents),
+        unwritten_change_files,
     ) {
         Ok(RecoveryOutcome::RolledBack | RecoveryOutcome::Completed { .. }) => Err(primary),
         Ok(RecoveryOutcome::None) | Err(_) => {
@@ -503,6 +808,7 @@ pub(super) fn rollback_after_apply_error<T>(
                 allowed_manifests,
                 expected_version_parent,
                 Some(expected_member_parents),
+                unwritten_change_files,
             ) {
                 Ok(RecoveryOutcome::RolledBack | RecoveryOutcome::Completed { .. }) => Err(primary),
                 Ok(RecoveryOutcome::None) => Err(LpmError::Script(format!(
@@ -728,6 +1034,47 @@ impl Serialize for StreamingReleaseJournalEntries<'_, '_> {
     }
 }
 
+struct StreamingReleaseJournalChangeFiles<'a> {
+    files: &'a [ChangeFileWrite],
+}
+
+impl StreamingReleaseJournalChangeFiles<'_> {
+    fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+}
+
+impl Serialize for StreamingReleaseJournalChangeFiles<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use serde::ser::SerializeSeq as _;
+
+        #[derive(Serialize)]
+        struct Entry {
+            path: String,
+            original_sha256: String,
+            original_base64: String,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            kept_sha256: Option<String>,
+        }
+
+        let mut entries = serializer.serialize_seq(Some(self.files.len()))?;
+        for file in self.files {
+            entries.serialize_element(&Entry {
+                path: encode_relative_path(Path::new(&file.name))
+                    .map_err(serde::ser::Error::custom)?,
+                original_sha256: sha256_hex(file.original.as_bytes()),
+                original_base64: STANDARD.encode(file.original.as_bytes()),
+                kept_sha256: file.kept.as_ref().map(|kept| sha256_hex(kept.as_bytes())),
+            })?;
+        }
+        entries.end()
+    }
+}
+
 #[derive(Serialize)]
 struct StreamingReleaseApplyJournal<'a, 'manifest> {
     schema_version: u32,
@@ -736,12 +1083,15 @@ struct StreamingReleaseApplyJournal<'a, 'manifest> {
     state: ReleaseApplyJournalState,
     path_encoding: &'static str,
     entries: StreamingReleaseJournalEntries<'a, 'manifest>,
+    #[serde(skip_serializing_if = "StreamingReleaseJournalChangeFiles::is_empty")]
+    change_files: StreamingReleaseJournalChangeFiles<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     version_git: Option<&'a VersionGitJournal>,
 }
 
 pub(super) fn serialize_planned_release_journal(
     manifests: &[ResolvedPlannedManifest<'_>],
+    change_files: &[ChangeFileWrite],
     operation: ReleaseTransactionOperation,
     version_git: Option<VersionGitTransaction>,
 ) -> Result<(Vec<u8>, ReleaseApplyCommit), LpmError> {
@@ -757,6 +1107,9 @@ pub(super) fn serialize_planned_release_journal(
         state: ReleaseApplyJournalState::Applying,
         path_encoding: release_path_encoding(),
         entries: StreamingReleaseJournalEntries { manifests },
+        change_files: StreamingReleaseJournalChangeFiles {
+            files: change_files,
+        },
         version_git: version_git.as_ref(),
     };
     let journal_bytes = serialize_release_journal_value(&journal)?;
@@ -827,6 +1180,7 @@ pub(super) fn build_release_journal_with_version_git(
         state: ReleaseApplyJournalState::Applying,
         path_encoding: release_path_encoding().to_string(),
         entries,
+        change_files: Vec::new(),
         version_git: version_git.map(|git| VersionGitJournal {
             old_head: git.old_head,
             tag: git.tag,
@@ -913,6 +1267,7 @@ pub(super) fn persist_release_journal_in(
 #[cfg(test)]
 std::thread_local! {
     pub(super) static AFTER_RELEASE_STATE_RESOLUTION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    pub(super) static AFTER_CHANGE_FILE_WRITE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     pub(super) static FAIL_NEXT_COMMIT_PERSIST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static FAIL_NEXT_JOURNAL_REMOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static FAIL_NEXT_COMMIT_REMOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

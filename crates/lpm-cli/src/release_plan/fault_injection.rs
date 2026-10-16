@@ -6,6 +6,7 @@ use lpm_common::LpmError;
 
 const ABORT_AFTER_MANIFEST_WRITES_ENV: &str =
     "LPM_INTERNAL_TEST_RELEASE_ABORT_AFTER_MANIFEST_WRITES";
+const ABORT_AFTER_CHANGE_FILES_ENV: &str = "LPM_INTERNAL_TEST_RELEASE_ABORT_AFTER_CHANGE_FILES";
 const ABORT_AFTER_COMMIT_ENV: &str = "LPM_INTERNAL_TEST_RELEASE_ABORT_AFTER_COMMIT";
 const ABORT_AFTER_GIT_STAGE_ENV: &str = "LPM_INTERNAL_TEST_VERSION_ABORT_AFTER_GIT_STAGE";
 
@@ -18,6 +19,7 @@ pub(crate) fn ensure_fault_injection_supported() -> Result<(), LpmError> {
     }
     match [
         ABORT_AFTER_MANIFEST_WRITES_ENV,
+        ABORT_AFTER_CHANGE_FILES_ENV,
         ABORT_AFTER_COMMIT_ENV,
         ABORT_AFTER_GIT_STAGE_ENV,
     ]
@@ -46,6 +48,16 @@ pub(super) fn abort_after_manifest_write(write_count: usize) {
 
 #[cfg(not(feature = "internal-test-sigstore-mock"))]
 pub(super) fn abort_after_manifest_write(_write_count: usize) {}
+
+#[cfg(feature = "internal-test-sigstore-mock")]
+pub(super) fn abort_after_change_files() {
+    if std::env::var_os(ABORT_AFTER_CHANGE_FILES_ENV).is_some() {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(feature = "internal-test-sigstore-mock"))]
+pub(super) fn abort_after_change_files() {}
 
 #[cfg(feature = "internal-test-sigstore-mock")]
 pub(super) fn abort_after_release_commit() {
