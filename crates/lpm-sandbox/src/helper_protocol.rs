@@ -228,6 +228,15 @@ pub enum ParseError {
         /// ([`PROTOCOL_VERSION`]).
         expected: u32,
     },
+    /// A grant named a path that isn't absolute, which would resolve
+    /// against wherever the helper runs.
+    #[error("helper flag `{flag}` needs an absolute path, not `{value}`")]
+    NotAbsolute {
+        /// The grant flag.
+        flag: String,
+        /// The path it was given.
+        value: String,
+    },
 }
 
 /// Parse `argv[1..]` into a [`HelperArgs`].
@@ -330,20 +339,17 @@ where
                 delete_appcontainer_profile = true;
             }
             "--readable-dir" => {
-                let raw = next_value(&mut it, "--readable-dir")?;
-                readable_dirs.push(PathBuf::from(raw));
+                readable_dirs.push(absolute_value(&mut it, "--readable-dir")?);
             }
             "--readable-dir-best-effort" => {
-                let raw = next_value(&mut it, "--readable-dir-best-effort")?;
-                best_effort_readable_dirs.push(PathBuf::from(raw));
+                best_effort_readable_dirs
+                    .push(absolute_value(&mut it, "--readable-dir-best-effort")?);
             }
             "--writable-dir" => {
-                let raw = next_value(&mut it, "--writable-dir")?;
-                writable_dirs.push(PathBuf::from(raw));
+                writable_dirs.push(absolute_value(&mut it, "--writable-dir")?);
             }
             "--secret-read-deny" => {
-                let raw = next_value(&mut it, "--secret-read-deny")?;
-                secret_read_denied_paths.push(PathBuf::from(raw));
+                secret_read_denied_paths.push(absolute_value(&mut it, "--secret-read-deny")?);
             }
             "--working-dir" => {
                 let raw = next_value(&mut it, "--working-dir")?;
@@ -426,6 +432,33 @@ where
 {
     it.next()
         .ok_or_else(|| ParseError::MissingValue(flag.to_string()))
+}
+
+/// The value of `flag`, a grant, which must be an absolute path.
+fn absolute_value<I>(it: &mut I, flag: &str) -> Result<PathBuf, ParseError>
+where
+    I: Iterator<Item = OsString>,
+{
+    let raw = next_value(it, flag)?;
+    if !is_windows_absolute(&raw) {
+        return Err(ParseError::NotAbsolute {
+            flag: flag.to_string(),
+            value: raw.to_string_lossy().into_owned(),
+        });
+    }
+    Ok(PathBuf::from(raw))
+}
+
+/// Whether `path` is absolute as Windows reads it, whichever platform
+/// parses it: a drive with a root, such as `C:\`, or a UNC, device or
+/// verbatim path, such as `\\server\share` or `\\?\C:\`.
+fn is_windows_absolute(path: &std::ffi::OsStr) -> bool {
+    let separator = |byte: &u8| matches!(byte, b'\\' | b'/');
+    match path.as_encoded_bytes() {
+        [first, second, ..] if separator(first) && separator(second) => true,
+        [drive, b':', root, ..] => drive.is_ascii_alphabetic() && separator(root),
+        _ => false,
+    }
 }
 
 fn parse_stdio(flag: &str, raw: &OsString) -> Result<StdioMode, ParseError> {
@@ -561,6 +594,37 @@ mod tests {
             ],
             "best-effort entries are collected in their own bucket",
         );
+    }
+
+    #[test]
+    fn parse_argv_refuses_a_grant_that_is_not_an_absolute_path() {
+        for flag in [
+            "--readable-dir",
+            "--readable-dir-best-effort",
+            "--writable-dir",
+            "--secret-read-deny",
+        ] {
+            for path in [".", "tools", "C:tools", "/tools", "\\tools"] {
+                let mut parts = minimal_required_flags();
+                parts.splice(10..10, [flag, path].iter().copied());
+                let error = parse_argv(make_argv(&parts)).expect_err("a relative grant");
+                assert!(
+                    matches!(&error, ParseError::NotAbsolute { flag: named, .. } if named == flag),
+                    "{flag} {path}: {error}"
+                );
+            }
+            for path in [
+                "C:/projects/p",
+                "C:\\projects\\p",
+                "\\\\?\\C:\\projects\\p",
+                "\\\\server\\share\\tools",
+            ] {
+                let mut parts = minimal_required_flags();
+                parts.splice(10..10, [flag, path].iter().copied());
+                parse_argv(make_argv(&parts))
+                    .unwrap_or_else(|error| panic!("{flag} {path}: {error}"));
+            }
+        }
     }
 
     #[test]

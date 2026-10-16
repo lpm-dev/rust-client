@@ -316,14 +316,12 @@ impl SecretOverlaySpec {
 
     pub(crate) fn build_for_spec(
         spec: &crate::SandboxSpec,
-        build_cache_isolation: bool,
+        readable: &[(PathBuf, crate::landlock_rules::RuleAccess)],
     ) -> Result<Option<Self>, SecretOverlayBuildError> {
         if spec.read_project_full {
             return Ok(None);
         }
         let mut paths = enumerate_project_secrets(&spec.project_dir, &spec.secret_read_allow)?;
-        let readable =
-            crate::landlock_rules::describe_rules_with_isolation(spec, build_cache_isolation);
         // Files outside every Landlock read grant are already denied. They do
         // not need a mount namespace, which can be unavailable in containers.
         paths.retain(|path| readable.iter().any(|(root, _)| path.starts_with(root)));

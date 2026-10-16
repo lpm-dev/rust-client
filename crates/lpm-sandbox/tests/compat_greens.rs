@@ -18,6 +18,7 @@
 //! | `tsc_inplace`      | tsc (project-local build) | `{pkg}/dist/*.js`                                |
 //! | `prisma_generate`  | prisma generate           | `{project}/node_modules/.prisma/client/*.js`     |
 //! | `husky_install`    | husky install             | `{project}/.husky/<hook>`                        |
+//! | `package_dirs_*`   | postinstall in a layout   | `{project}/.lpm/{wrappers,hoisted/nested}/...`   |
 //!
 //! If any of these tests fail after a sandbox allow-list rule change,
 //! the rule change broke a real green pattern — either tighten the
@@ -161,32 +162,57 @@ fn husky_install_shape_succeeds() {
 }
 
 #[test]
-fn lpm_state_write_shape_succeeds() {
-    // Not a "green" in the npm-ecosystem sense, but LPM's own state
-    // writes (under {project}/.lpm) go through the same sandbox
-    // profile and must be permitted. If this breaks, build-state.json
-    // writes from inside scripts (which is uncommon but not
-    // impossible) would silently fail. `{project}/.lpm` is in the
-    // sandbox writable set.
+fn a_package_in_project_state_writes_beside_itself_but_not_into_its_siblings() {
+    // The isolated layout keeps packages under {project}/.lpm/wrappers and
+    // the hoisted layout keeps nested overrides under
+    // {project}/.lpm/hoisted/nested; a postinstall there writes beside its
+    // own package (prisma generate's `node_modules/.prisma` shape), but a
+    // sibling's files stay read-only.
     if !sandbox_supported(SandboxMode::Enforce) {
         return;
     }
-    let fx = SandboxFixture::new("lpm-state-consumer", "1.0.0");
-    let sb = try_build_sandbox(fx.spec.clone(), SandboxMode::Enforce).unwrap();
-    let dotlpm = fx.project_dir.join(".lpm");
-    let script = format!(
-        "\
-        mkdir -p {dir} && \
-        echo '{{}}' > {dir}/state.json",
-        dir = dotlpm.display(),
-    );
-    let status = run_script(sb.as_ref(), &fx.pkg_dir, &script);
-    assert!(
-        status.success(),
-        "write to {}/.lpm must succeed",
-        dotlpm.display()
-    );
-    assert!(dotlpm.join("state.json").exists());
+    let fx = SandboxFixture::new("layout-consumer", "1.0.0").with_private_tmpdir();
+    let [wrappers, hoisted_nested] = lpm_common::project_package_dirs(&fx.project_dir);
+    for (package, beside, sibling) in [
+        (
+            wrappers.join("client@1.0.0/node_modules/client"),
+            wrappers.join("client@1.0.0/node_modules/.prisma/client"),
+            wrappers.join("victim@1.0.0/node_modules/victim"),
+        ),
+        (
+            hoisted_nested.join("client"),
+            hoisted_nested.join("client/node_modules/.prisma/client"),
+            hoisted_nested.join("victim"),
+        ),
+    ] {
+        for directory in [&package, &beside, &sibling] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        let mut spec = fx.spec.clone();
+        spec.package_dir = package.clone();
+        let sb = try_build_sandbox(spec, SandboxMode::Enforce).unwrap();
+
+        let generated = format!(
+            "echo 'module.exports = {{}}' > {}/index.js",
+            beside.display()
+        );
+        let status = run_script(sb.as_ref(), &package, &generated);
+        assert!(
+            status.success(),
+            "write beside {} — {status:?}",
+            package.display()
+        );
+        assert!(beside.join("index.js").exists());
+
+        let poisoned = format!("echo 'attack' > {}/index.js", sibling.display());
+        let status = run_script(sb.as_ref(), &package, &poisoned);
+        assert!(
+            !status.success(),
+            "write into {} — {status:?}",
+            sibling.display()
+        );
+        assert!(!sibling.join("index.js").exists());
+    }
 }
 
 #[test]

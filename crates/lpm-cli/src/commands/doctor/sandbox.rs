@@ -121,23 +121,6 @@ pub(super) fn probe_sandbox_backend_with_global(
         Ok(sb) => {
             let backend = sb.backend_name();
             let os = std::env::consts::OS;
-            // On Windows, `windows-appcontainer` is the strict backend
-            // and needs `lpm-sandbox-helper.exe` next to `lpm.exe`.
-            // Falling back to Low IL means filesystem containment is
-            // available but outbound-network denial is not.
-            if os == "windows" && backend == "windows-il" {
-                return Check::warn(
-                    &doctor_catalog::SANDBOX_HELPER_MISSING,
-                    "windows-il available on windows — falling back from AppContainer \
-                     because `lpm-sandbox-helper.exe` is not located next to \
-                     `lpm.exe`. The Low IL backend contains filesystem \
-                     writes but does NOT deny outbound network. Reinstall lpm \
-                     (`@lpm-registry/cli`) to restore the helper, or override the \
-                     helper location via `LPM_SANDBOX_HELPER=<path>`. With the helper \
-                     present, `lpm doctor` reports `windows-appcontainer` and \
-                     strict mode is available.",
-                );
-            }
             #[cfg(windows)]
             if backend == "windows-appcontainer" {
                 let mut roots = vec![tmpdir];
@@ -221,39 +204,12 @@ pub(super) fn probe_sandbox_backend_with_global(
                     abi,
                     missing,
                 } => {
-                    // both Linux
-                    // (kernel < 6.7 + allow-degraded) and Windows
-                    // (`windows-il` Low IL FALLBACK when the
-                    // `lpm-sandbox-helper.exe` AppContainer launcher
-                    // is missing + allow-degraded) reach this arm.
-                    // The `abi` field carries the discriminator
-                    // (`v1` = Linux landlock V1 fallback; `low-il`
-                    // = Windows Mandatory Integrity Control
-                    // fallback). Pick a platform-honest message —
-                    // a single Linux-shaped string would lie about
-                    // the remediation on Windows.
-                    //
-                    // On Windows the strict-mode cause is now
-                    // "the helper binary that delivers AppContainer
-                    // strict isn't sitting next to lpm.exe." That's
-                    // an npm-install corruption symptom — reinstall
-                    // is the fix.
-                    let cause_and_fix = if abi == "low-il" {
-                        "user requested strict but `lpm-sandbox-helper.exe` is not located \
-                         next to `lpm.exe`; the AppContainer backend (filesystem + \
-                         outbound-network containment) needs the helper to \
-                         deliver strict mode. Falling back to Low IL backend, \
-                         which contains filesystem writes but does NOT deny outbound \
-                         network. Reinstall lpm (`@lpm-registry/cli`) to restore the helper, \
-                         or override the helper location via `LPM_SANDBOX_HELPER=<path>`. \
-                         Switch to `lpm config sandbox --set default` to drop the strict \
-                         request and silence this warning."
-                    } else {
-                        "user requested strict but kernel can't deliver V4; enforces \
-                         filesystem only. Upgrade the kernel to 6.7+ to restore strict \
-                         containment, or switch to `lpm config sandbox --set default` to \
-                         drop the strict request and silence this warning."
-                    };
+                    // Only Linux reaches this arm: kernel < 6.7 with
+                    // allow-degraded.
+                    let cause_and_fix = "user requested strict but kernel can't deliver V4; \
+                         enforces filesystem only. Upgrade the kernel to 6.7+ to restore strict \
+                         containment, or switch to `lpm config sandbox --set default` to drop \
+                         the strict request and silence this warning.";
                     Check::warn(
                         &doctor_catalog::SANDBOX_DEGRADED,
                         &format!(
@@ -282,6 +238,10 @@ pub(super) fn probe_sandbox_backend_with_global(
                  change to sandbox configuration."
             ),
         ),
+        Err(
+            error @ (SandboxError::HelperMissing { .. }
+            | SandboxError::HelperOverrideNotAbsolute { .. }),
+        ) => Check::fail(&doctor_catalog::SANDBOX_HELPER_MISSING, &error.to_string()),
         Err(SandboxError::KernelTooOld {
             detected,
             required,
@@ -403,53 +363,56 @@ mod tests {
         );
     }
 
-    /// On Windows, the active backend is determined by helper-binary
-    /// presence:
-    ///
-    /// - **`windows-appcontainer`** when
-    ///   `lpm-sandbox-helper.exe` is reachable. Pass under default,
-    ///   Pass naming "AppContainer + WFP" under strict.
-    /// - **`windows-il` (fallback)** when the helper
-    ///   binary is missing. Warn surfaces the fallback explicitly
-    ///   with the reinstall remediation, even under default — the
-    ///   user has lost outbound-network containment in strict mode
-    ///   and should know that.
-    /// - **Warn `sandbox_disabled_by_user`** when the user has
-    ///   `[sandbox] mode = "none"` persisted.
-    ///
-    /// A Fail here is a regression — Mandatory Integrity Control
-    /// has been in every Windows release since Vista, and the AppContainer backend's
-    /// AppContainer backend has no preconditions beyond
-    /// "Win32_Security_Isolation surface is reachable" (Windows
-    /// 8+).
-    ///
-    /// The legacy `--unsafe-full-env` partner flag must stay out of
-    /// remediation text; `--no-sandbox` is the supported opt-out.
+    /// On Windows the backend is AppContainer, which needs
+    /// `lpm-sandbox-helper.exe`. A unit-test binary has no helper beside
+    /// it, so the probe fails naming the helper; with `LPM_SANDBOX_HELPER`
+    /// naming one, it goes on to the AppContainer checks. Remediation text
+    /// never names the legacy `--unsafe-full-env` partner flag.
     #[cfg(target_os = "windows")]
     #[test]
-    fn sandbox_probe_on_windows_passes_or_warns_with_known_backend_name() {
+    fn sandbox_probe_on_windows_needs_the_helper() {
         let security = tempfile::tempdir().unwrap();
-        let _env = crate::test_env::ScopedEnv::set(isolated_security_env_vars(security.path()));
-        let c = probe_sandbox_backend();
-        assert!(
-            !matches!(c.severity, Severity::Fail),
-            "Windows sandbox probe must not Fail (AppContainer + Low IL fallback \
-             are both reachable on every supported Windows host). detail={}",
-            c.detail
+        let security_vars = || {
+            isolated_security_env_vars(security.path())
+                .into_iter()
+                .map(|(key, value)| (key, Some(value)))
+        };
+        let missing = {
+            let _env = crate::test_env::ScopedEnv::update(
+                security_vars().chain([("LPM_SANDBOX_HELPER", None)]),
+            );
+            probe_sandbox_backend()
+        };
+        assert_eq!(
+            missing.code(),
+            "sandbox_helper_missing",
+            "{}",
+            missing.detail
         );
-        // Whichever path fired, the detail names the active backend
-        // so users can route the right remediation.
+        assert!(matches!(missing.severity, Severity::Fail));
         assert!(
-            c.detail.contains("windows-il") || c.detail.contains("windows-appcontainer"),
-            "doctor detail must name the active backend; got: {}",
-            c.detail
+            missing.detail.contains("lpm-sandbox-helper.exe"),
+            "{}",
+            missing.detail
         );
-        // legacy partner flag must never appear.
         assert!(
-            !c.detail.contains("--unsafe-full-env"),
-            "legacy partner flag must be gone from doctor output: {}",
-            c.detail
+            missing.detail.contains("--no-sandbox"),
+            "{}",
+            missing.detail
         );
+        assert!(
+            !missing.detail.contains("--unsafe-full-env"),
+            "{}",
+            missing.detail
+        );
+
+        let helper = tempfile::NamedTempFile::new().unwrap();
+        let _env = crate::test_env::ScopedEnv::update(security_vars().chain([(
+            "LPM_SANDBOX_HELPER",
+            Some(helper.path().as_os_str().to_owned()),
+        )]));
+        let found = probe_sandbox_backend();
+        assert_ne!(found.code(), "sandbox_helper_missing", "{}", found.detail);
     }
 
     /// Raw `[sandbox] mode = "none"` in `~/.lpm/config.toml` is a guarded
