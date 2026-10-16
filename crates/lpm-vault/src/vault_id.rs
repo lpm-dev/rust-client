@@ -1,12 +1,25 @@
-//! Vault ID management — generates and reads project vault UUIDs from lpm.json.
+//! The project's env ID, `lpm.json > vault`, and this checkout's env sync
+//! state, which `.lpm/env-sync.json` keeps out of git:
+//! - `personalVersion`: last known personal cloud env version
+//! - `orgVersions.{slug}`: last known shared org env version
+//! - `personalSyncedAt` / `orgSyncedAt.{slug}`: RFC 3339 timestamp of the
+//!   last successful sync observed by this checkout
+//! - `personalPlatformBindings` and `authorityCheckpoints`: the accounts this
+//!   checkout syncs with and the revision floors it has seen
 //!
-//! Also stores optional project-local sync metadata used for vault CAS:
-//! - `vaultSync.personalVersion`: last known personal cloud vault version
-//! - `vaultSync.orgVersions.{slug}`: last known shared org vault version
-//! - `vaultSync.personalSyncedAt` / `vaultSync.orgSyncedAt.{slug}`:
-//!   RFC 3339 timestamp of the last successful sync observed by this checkout
+//! The state file records the env ID it belongs to and applies only while
+//! `lpm.json` names that env. CLIs before it kept the same object in
+//! `lpm.json > vaultSync`; it is read from there until the next write moves it.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+/// This checkout's env sync state, a file in the project's `.lpm/`.
+pub const SYNC_STATE_FILE: &str = "env-sync.json";
+const LEGACY_SYNC_FIELD: &str = "vaultSync";
+const STATE_VAULT_FIELD: &str = "vault";
+const STATE_SYNC_FIELD: &str = "sync";
+
+type JsonMap = serde_json::Map<String, serde_json::Value>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VaultSyncSummary {
@@ -14,13 +27,10 @@ pub struct VaultSyncSummary {
     pub synced_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct VaultManifestSnapshot {
-    #[serde(default)]
     vault: Option<String>,
-    #[serde(default)]
     name: Option<String>,
-    #[serde(default, rename = "vaultSync")]
     vault_sync: Option<serde_json::Value>,
 }
 
@@ -38,20 +48,49 @@ impl VaultManifestSnapshot {
     }
 
     pub fn read(project_dir: &Path) -> Result<Self, String> {
-        let path = project_dir.join("lpm.json");
-        let content = match lpm_common::read_text_file_capped(
-            &path,
-            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-        ) {
-            Ok(content) => content,
-            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(Self::default()),
-            Err(error) => return Err(format!("failed to read lpm.json: {error}")),
-        };
-        Self::parse(&content)
+        let files = lpm_common::read_lpm_json_with_local_state(project_dir, SYNC_STATE_FILE)
+            .map_err(|error| error.to_string())?;
+        Self::from_maps(files.config.as_ref(), files.local.as_ref())
     }
 
-    pub fn parse(content: &str) -> Result<Self, String> {
-        serde_json::from_str(content).map_err(|error| format!("failed to parse lpm.json: {error}"))
+    /// The snapshot for `content`, the `lpm.json` the caller read, with the
+    /// sync state file read after it. `None` is a missing `lpm.json`.
+    pub fn from_config_content(project_dir: &Path, content: Option<&str>) -> Result<Self, String> {
+        let config = content
+            .map(|content| {
+                match serde_json::from_str(lpm_common::strip_utf8_bom_str(content))
+                    .map_err(|error| format!("failed to parse lpm.json: {error}"))?
+                {
+                    serde_json::Value::Object(config) => Ok(config),
+                    _ => Err(
+                        "failed to parse lpm.json: top-level config must be an object".to_owned(),
+                    ),
+                }
+            })
+            .transpose()?;
+        let local = lpm_common::read_project_local_state(project_dir, SYNC_STATE_FILE)
+            .map_err(|error| error.to_string())?;
+        Self::from_maps(config.as_ref(), local.as_ref())
+    }
+
+    fn from_maps(config: Option<&JsonMap>, local: Option<&JsonMap>) -> Result<Self, String> {
+        let string_field = |field: &str| -> Result<Option<String>, String> {
+            match config.and_then(|config| config.get(field)) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(serde_json::Value::String(value)) => Ok(Some(value.clone())),
+                Some(_) => Err(format!("lpm.json {field} field must be a string")),
+            }
+        };
+        Ok(Self {
+            vault: string_field("vault")?,
+            name: string_field("name")?,
+            vault_sync: resolve_sync_state(config, local)?.map(|(sync, _)| sync),
+        })
+    }
+
+    /// The sync state that applies to this snapshot's env, if any.
+    pub fn sync_state(&self) -> Option<&serde_json::Value> {
+        self.vault_sync.as_ref()
     }
 
     pub fn vault_id(&self) -> Result<Option<&str>, String> {
@@ -169,6 +208,95 @@ impl VaultManifestSnapshot {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SyncStateSource {
+    StateFile,
+    LegacyLpmJson,
+}
+
+impl SyncStateSource {
+    fn describe(self) -> String {
+        match self {
+            Self::StateFile => format!(".lpm/{SYNC_STATE_FILE} {STATE_SYNC_FIELD}"),
+            Self::LegacyLpmJson => format!("lpm.json {LEGACY_SYNC_FIELD}"),
+        }
+    }
+}
+
+/// The sync state that applies to the env `config` names: the state file's
+/// when it records that env, else `lpm.json > vaultSync`.
+fn resolve_sync_state(
+    config: Option<&JsonMap>,
+    local: Option<&JsonMap>,
+) -> Result<Option<(serde_json::Value, SyncStateSource)>, String> {
+    let present = |value: &&serde_json::Value| !value.is_null();
+    let vault = config
+        .and_then(|config| config.get("vault"))
+        .filter(present);
+    if let Some(local) = local.filter(|local| !local.is_empty()) {
+        let recorded = local.get(STATE_VAULT_FIELD).filter(present);
+        if recorded.is_some_and(|value| !value.is_string()) {
+            return Err(format!(
+                ".lpm/{SYNC_STATE_FILE} {STATE_VAULT_FIELD} must be a string"
+            ));
+        }
+        if recorded == vault {
+            return Ok(local
+                .get(STATE_SYNC_FIELD)
+                .filter(present)
+                .map(|sync| (sync.clone(), SyncStateSource::StateFile)));
+        }
+    }
+    Ok(config
+        .and_then(|config| config.get(LEGACY_SYNC_FIELD))
+        .filter(present)
+        .map(|sync| (sync.clone(), SyncStateSource::LegacyLpmJson)))
+}
+
+/// The sync state for reads; state that is not an object reads as none.
+fn read_sync_state(project_dir: &Path) -> Result<Option<JsonMap>, String> {
+    let files = lpm_common::read_lpm_json_with_local_state(project_dir, SYNC_STATE_FILE)
+        .map_err(|error| error.to_string())?;
+    Ok(
+        match resolve_sync_state(files.config.as_ref(), files.local.as_ref())? {
+            Some((serde_json::Value::Object(sync), _)) => Some(sync),
+            _ => None,
+        },
+    )
+}
+
+/// Runs `mutate` on `lpm.json` and the sync state under the `lpm.json` lock,
+/// then stores the state in `.lpm/env-sync.json` for the env `lpm.json`
+/// names, removing `lpm.json > vaultSync`.
+fn update_sync_state<T>(
+    project_dir: &Path,
+    mutate: impl FnOnce(&JsonMap, &mut JsonMap) -> Result<T, String>,
+) -> Result<T, String> {
+    lpm_common::update_lpm_json_with_local_state(project_dir, SYNC_STATE_FILE, |files| {
+        let mut sync = match resolve_sync_state(Some(files.config), Some(files.local))? {
+            Some((serde_json::Value::Object(sync), _)) => sync,
+            Some((_, source)) => return Err(format!("{} must be an object", source.describe())),
+            None => JsonMap::new(),
+        };
+        let result = mutate(files.config, &mut sync)?;
+        files.config.remove(LEGACY_SYNC_FIELD);
+        files.local.clear();
+        if !sync.is_empty() {
+            let vault = files
+                .config
+                .get("vault")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            files.local.insert(STATE_VAULT_FIELD.to_owned(), vault);
+            files
+                .local
+                .insert(STATE_SYNC_FIELD.to_owned(), serde_json::Value::Object(sync));
+        }
+        Ok(result)
+    })
+    .map_err(|error| error.to_string())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SyncPrincipal<'a> {
     pub registry_url: &'a str,
@@ -271,11 +399,9 @@ pub fn is_safe_vault_id(id: &str) -> bool {
 
 /// Read the last known personal cloud vault version from `lpm.json`.
 pub fn read_personal_sync_version(project_dir: &Path) -> Option<i32> {
-    let (_, config) = read_lpm_json_value(project_dir).ok()??;
-
-    config
-        .get("vaultSync")
-        .and_then(|v| v.get("personalVersion"))
+    read_sync_state(project_dir)
+        .ok()??
+        .get("personalVersion")
         .and_then(|v| v.as_i64())
         .and_then(|v| i32::try_from(v).ok())
 }
@@ -284,41 +410,28 @@ pub fn read_personal_sync_version_for_principal(
     project_dir: &Path,
     principal: SyncPrincipal<'_>,
 ) -> Option<i32> {
-    let (_, config) = read_lpm_json_value(project_dir).ok()??;
-    let sync = config.get("vaultSync")?.as_object()?;
-    authority_checkpoint_version(sync, SyncVersionTarget::Personal, principal).ok()?
+    let sync = read_sync_state(project_dir).ok()??;
+    authority_checkpoint_version(&sync, SyncVersionTarget::Personal, principal).ok()?
 }
 
 pub fn read_personal_sync_principal_for_registry(
     project_dir: &Path,
     registry_url: &str,
 ) -> Result<Option<String>, String> {
-    let Some((_, config)) = read_lpm_json_value(project_dir)? else {
+    let Some(sync) = read_sync_state(project_dir)? else {
         return Ok(None);
     };
-    let Some(sync) = config
-        .get("vaultSync")
-        .and_then(serde_json::Value::as_object)
-    else {
-        return Ok(None);
-    };
-    active_principal_for_registry(sync, SyncVersionTarget::Personal, registry_url)
+    active_principal_for_registry(&sync, SyncVersionTarget::Personal, registry_url)
 }
 
 pub fn read_personal_platform_principal_for_registry(
     project_dir: &Path,
     registry_url: &str,
 ) -> Result<Option<String>, String> {
-    let Some((_, config)) = read_lpm_json_value(project_dir)? else {
+    let Some(sync) = read_sync_state(project_dir)? else {
         return Ok(None);
     };
-    let Some(sync) = config
-        .get("vaultSync")
-        .and_then(serde_json::Value::as_object)
-    else {
-        return Ok(None);
-    };
-    personal_platform_principal_for_registry(sync, registry_url)
+    personal_platform_principal_for_registry(&sync, registry_url)
 }
 
 pub fn pin_personal_platform_principal_if_vault_matches(
@@ -329,13 +442,12 @@ pub fn pin_personal_platform_principal_if_vault_matches(
     validate_vault_id(expected_vault_id)?;
     validate_sync_principal(principal)?;
     let registry_url = canonical_registry_url(principal.registry_url)?;
-    lpm_common::update_lpm_json(project_dir, |root, _| {
-        if root.get("vault").and_then(serde_json::Value::as_str) != Some(expected_vault_id) {
+    update_sync_state(project_dir, |config, sync| {
+        if config.get("vault").and_then(serde_json::Value::as_str) != Some(expected_vault_id) {
             return Err(
-                "the project vault ID changed while the platform identity was in flight".to_owned(),
+                "the project env ID changed while the platform identity was in flight".to_owned(),
             );
         }
-        let sync = object_entry(root, "vaultSync")?;
         if let Some(sync_principal) =
             active_principal_for_registry(sync, SyncVersionTarget::Personal, &registry_url)?
             && sync_principal != principal.principal_id
@@ -352,27 +464,23 @@ pub fn pin_personal_platform_principal_if_vault_matches(
                         .to_owned(),
                 );
             }
-            return Ok(lpm_common::LpmJsonMutation::Unchanged(()));
+            return Ok(());
         }
         let bindings = object_entry(sync, PERSONAL_PLATFORM_BINDINGS_FIELD)?;
         if bindings.len() >= MAX_PERSONAL_PLATFORM_BINDINGS {
             return Err(format!(
-                "lpm.json vaultSync reached the {MAX_PERSONAL_PLATFORM_BINDINGS}-platform binding limit"
+                "env sync state reached the {MAX_PERSONAL_PLATFORM_BINDINGS}-platform binding limit"
             ));
         }
         bindings.insert(registry_url, sync_principal_value(principal)?);
-        Ok(lpm_common::LpmJsonMutation::Changed(()))
+        Ok(())
     })
-    .map(|_| ())
-    .map_err(|error| error.to_string())
 }
 
 pub fn read_personal_sync_synced_at(project_dir: &Path) -> Option<String> {
-    let (_, config) = read_lpm_json_value(project_dir).ok()??;
-
-    config
-        .get("vaultSync")
-        .and_then(|v| v.get("personalSyncedAt"))
+    read_sync_state(project_dir)
+        .ok()??
+        .get("personalSyncedAt")
         .and_then(|v| v.as_str())
         .map(str::to_string)
 }
@@ -413,8 +521,7 @@ pub fn write_personal_sync_version_for_principal_at(
     synced_at: &str,
 ) -> Result<(), String> {
     validate_sync_principal(principal)?;
-    lpm_common::update_lpm_json(project_dir, |root, _| {
-        let sync = object_entry(root, "vaultSync")?;
+    update_sync_state(project_dir, |_, sync| {
         reject_sync_principal_conflict(sync, SyncVersionTarget::Personal, principal)?;
         let current =
             authority_checkpoint_floor(sync, SyncVersionTarget::Personal, principal.registry_url)?;
@@ -431,10 +538,8 @@ pub fn write_personal_sync_version_for_principal_at(
             "personalSyncedAt".into(),
             serde_json::json!(synced_at.to_string()),
         );
-        Ok(lpm_common::LpmJsonMutation::Changed(()))
+        Ok(())
     })
-    .map(|_| ())
-    .map_err(|error| error.to_string())
 }
 
 pub fn write_personal_sync_version_at(
@@ -442,8 +547,7 @@ pub fn write_personal_sync_version_at(
     version: i32,
     synced_at: &str,
 ) -> Result<(), String> {
-    lpm_common::update_lpm_json(project_dir, |root, _| {
-        let sync = object_entry(root, "vaultSync")?;
+    update_sync_state(project_dir, |_, sync| {
         reject_sync_version_rollback(
             optional_sync_version(sync.get("personalVersion"), "personalVersion")?,
             version,
@@ -453,19 +557,15 @@ pub fn write_personal_sync_version_at(
             "personalSyncedAt".into(),
             serde_json::json!(synced_at.to_string()),
         );
-        Ok(lpm_common::LpmJsonMutation::Changed(()))
+        Ok(())
     })
-    .map(|_| ())
-    .map_err(|error| error.to_string())
 }
 
 /// Read the last known org-shared cloud vault version for an org slug.
 pub fn read_org_sync_version(project_dir: &Path, org_slug: &str) -> Option<i32> {
-    let (_, config) = read_lpm_json_value(project_dir).ok()??;
-
-    config
-        .get("vaultSync")
-        .and_then(|v| v.get("orgVersions"))
+    read_sync_state(project_dir)
+        .ok()??
+        .get("orgVersions")
         .and_then(|v| v.get(org_slug))
         .and_then(|v| v.as_i64())
         .and_then(|v| i32::try_from(v).ok())
@@ -476,9 +576,9 @@ pub fn read_org_sync_version_for_principal(
     org_slug: &str,
     principal: SyncPrincipal<'_>,
 ) -> Option<i32> {
-    let (_, config) = read_lpm_json_value(project_dir).ok()??;
-    let sync = config.get("vaultSync")?.as_object()?;
-    authority_checkpoint_version(sync, SyncVersionTarget::Organization(org_slug), principal).ok()?
+    let sync = read_sync_state(project_dir).ok()??;
+    authority_checkpoint_version(&sync, SyncVersionTarget::Organization(org_slug), principal)
+        .ok()?
 }
 
 pub fn read_org_sync_principal_for_registry(
@@ -486,28 +586,20 @@ pub fn read_org_sync_principal_for_registry(
     org_slug: &str,
     registry_url: &str,
 ) -> Result<Option<String>, String> {
-    let Some((_, config)) = read_lpm_json_value(project_dir)? else {
-        return Ok(None);
-    };
-    let Some(sync) = config
-        .get("vaultSync")
-        .and_then(serde_json::Value::as_object)
-    else {
+    let Some(sync) = read_sync_state(project_dir)? else {
         return Ok(None);
     };
     active_principal_for_registry(
-        sync,
+        &sync,
         SyncVersionTarget::Organization(org_slug),
         registry_url,
     )
 }
 
 pub fn read_org_sync_synced_at(project_dir: &Path, org_slug: &str) -> Option<String> {
-    let (_, config) = read_lpm_json_value(project_dir).ok()??;
-
-    config
-        .get("vaultSync")
-        .and_then(|v| v.get("orgSyncedAt"))
+    read_sync_state(project_dir)
+        .ok()??
+        .get("orgSyncedAt")
         .and_then(|v| v.get(org_slug))
         .and_then(|v| v.as_str())
         .map(str::to_string)
@@ -562,8 +654,7 @@ pub fn write_org_sync_version_for_principal_at(
     synced_at: &str,
 ) -> Result<(), String> {
     validate_sync_principal(principal)?;
-    lpm_common::update_lpm_json(project_dir, |root, _| {
-        let sync = object_entry(root, "vaultSync")?;
+    update_sync_state(project_dir, |_, sync| {
         let target = SyncVersionTarget::Organization(org_slug);
         reject_sync_principal_conflict(sync, target, principal)?;
         let current = authority_checkpoint_floor(sync, target, principal.registry_url)?;
@@ -573,10 +664,8 @@ pub fn write_org_sync_version_for_principal_at(
         org_versions.insert(org_slug.to_string(), serde_json::json!(version));
         object_entry(sync, "orgSyncedAt")?
             .insert(org_slug.to_string(), serde_json::json!(synced_at));
-        Ok(lpm_common::LpmJsonMutation::Changed(()))
+        Ok(())
     })
-    .map(|_| ())
-    .map_err(|error| error.to_string())
 }
 
 pub fn write_org_sync_version_at(
@@ -585,8 +674,7 @@ pub fn write_org_sync_version_at(
     version: i32,
     synced_at: &str,
 ) -> Result<(), String> {
-    lpm_common::update_lpm_json(project_dir, |root, _| {
-        let sync = object_entry(root, "vaultSync")?;
+    update_sync_state(project_dir, |_, sync| {
         let org_versions = object_entry(sync, "orgVersions")?;
         reject_sync_version_rollback(
             optional_sync_version(org_versions.get(org_slug), "orgVersions entry")?,
@@ -595,10 +683,8 @@ pub fn write_org_sync_version_at(
         org_versions.insert(org_slug.to_string(), serde_json::json!(version));
         let org_synced_at = object_entry(sync, "orgSyncedAt")?;
         org_synced_at.insert(org_slug.to_string(), serde_json::json!(synced_at));
-        Ok(lpm_common::LpmJsonMutation::Changed(()))
+        Ok(())
     })
-    .map(|_| ())
-    .map_err(|error| error.to_string())
 }
 
 fn validate_sync_principal(principal: SyncPrincipal<'_>) -> Result<(), String> {
@@ -719,10 +805,10 @@ fn personal_platform_principal_for_registry(
     };
     let bindings = value
         .as_object()
-        .ok_or("lpm.json vaultSync personalPlatformBindings must be an object")?;
+        .ok_or("env sync state personalPlatformBindings must be an object")?;
     if bindings.len() > MAX_PERSONAL_PLATFORM_BINDINGS {
         return Err(format!(
-            "lpm.json vaultSync exceeds the {MAX_PERSONAL_PLATFORM_BINDINGS}-platform binding limit"
+            "env sync state exceeds the {MAX_PERSONAL_PLATFORM_BINDINGS}-platform binding limit"
         ));
     }
     let mut expected_principal = None;
@@ -731,7 +817,7 @@ fn personal_platform_principal_for_registry(
         let (bound_registry, principal_id) = parse_stored_sync_principal(binding)?;
         if canonical_key != *registry_url || bound_registry != canonical_key {
             return Err(
-                "lpm.json vaultSync personal platform binding Registry is inconsistent".to_owned(),
+                "env sync state personal platform binding Registry is inconsistent".to_owned(),
             );
         }
         if canonical_key == expected_registry {
@@ -743,9 +829,7 @@ fn personal_platform_principal_for_registry(
 
 fn validate_checkpoint_organization_slug(slug: &str) -> Result<(), String> {
     if slug.is_empty() || slug.len() > 128 || slug.chars().any(char::is_control) {
-        return Err(
-            "lpm.json vaultSync authority checkpoint organization slug is invalid".to_owned(),
-        );
+        return Err("env sync state authority checkpoint organization slug is invalid".to_owned());
     }
     Ok(())
 }
@@ -763,7 +847,7 @@ fn checkpoint_registries<'a>(
                 .filter(|value| !value.is_null())
                 .map(|value| {
                     value.as_object().ok_or(
-                        "lpm.json vaultSync authority checkpoint organizations must be an object",
+                        "env sync state authority checkpoint organizations must be an object",
                     )
                 })
                 .transpose()?
@@ -773,9 +857,9 @@ fn checkpoint_registries<'a>(
     value
         .filter(|value| !value.is_null())
         .map(|value| {
-            value.as_object().ok_or(
-                "lpm.json vaultSync authority checkpoint registries must be an object".into(),
-            )
+            value
+                .as_object()
+                .ok_or("env sync state authority checkpoint registries must be an object".into())
         })
         .transpose()
 }
@@ -802,16 +886,16 @@ fn validate_checkpoint_registries(
 ) -> Result<(), String> {
     let registries = registries_value
         .as_object()
-        .ok_or("lpm.json vaultSync authority checkpoint registries must be an object")?;
+        .ok_or("env sync state authority checkpoint registries must be an object")?;
     for (registry_url, principals_value) in registries {
         if canonical_registry_url(registry_url)? != *registry_url {
             return Err(
-                "lpm.json vaultSync authority checkpoint registry URL is not canonical".to_owned(),
+                "env sync state authority checkpoint registry URL is not canonical".to_owned(),
             );
         }
         let principals = principals_value
             .as_object()
-            .ok_or("lpm.json vaultSync authority checkpoint principals must be an object")?;
+            .ok_or("env sync state authority checkpoint principals must be an object")?;
         for (principal_id, checkpoint_value) in principals {
             validate_sync_principal(SyncPrincipal {
                 registry_url,
@@ -819,13 +903,13 @@ fn validate_checkpoint_registries(
             })?;
             let checkpoint = checkpoint_value
                 .as_object()
-                .ok_or("lpm.json vaultSync authority checkpoint must be an object")?;
+                .ok_or("env sync state authority checkpoint must be an object")?;
             let version =
                 optional_sync_version(checkpoint.get("version"), "authority checkpoint version")?
-                    .ok_or("lpm.json vaultSync authority checkpoint version is required")?;
+                    .ok_or("env sync state authority checkpoint version is required")?;
             if version <= 0 {
                 return Err(
-                    "lpm.json vaultSync authority checkpoint version must be positive".to_owned(),
+                    "env sync state authority checkpoint version must be positive".to_owned(),
                 );
             }
             if checkpoint
@@ -833,12 +917,12 @@ fn validate_checkpoint_registries(
                 .is_some_and(|value| !value.is_string())
             {
                 return Err(
-                    "lpm.json vaultSync authority checkpoint syncedAt must be a string".to_owned(),
+                    "env sync state authority checkpoint syncedAt must be a string".to_owned(),
                 );
             }
             *count = count
                 .checked_add(1)
-                .ok_or("lpm.json vaultSync authority checkpoint count overflowed")?;
+                .ok_or("env sync state authority checkpoint count overflowed")?;
         }
     }
     Ok(())
@@ -855,7 +939,7 @@ fn validate_authority_checkpoints(
     };
     let scopes = value
         .as_object()
-        .ok_or("lpm.json vaultSync authority checkpoints must be an object")?;
+        .ok_or("env sync state authority checkpoints must be an object")?;
     let mut count = 0usize;
     for (scope, scope_value) in scopes {
         match scope.as_str() {
@@ -863,22 +947,22 @@ fn validate_authority_checkpoints(
                 validate_checkpoint_registries(scope_value, &mut count)?;
             }
             ORGANIZATION_AUTHORITY_CHECKPOINTS_FIELD => {
-                let organizations = scope_value.as_object().ok_or(
-                    "lpm.json vaultSync authority checkpoint organizations must be an object",
-                )?;
+                let organizations = scope_value
+                    .as_object()
+                    .ok_or("env sync state authority checkpoint organizations must be an object")?;
                 for (slug, registries_value) in organizations {
                     validate_checkpoint_organization_slug(slug)?;
                     validate_checkpoint_registries(registries_value, &mut count)?;
                 }
             }
             _ => {
-                return Err("lpm.json vaultSync authority checkpoint scope is invalid".to_owned());
+                return Err("env sync state authority checkpoint scope is invalid".to_owned());
             }
         }
     }
     if count > MAX_SYNC_AUTHORITY_CHECKPOINTS {
         return Err(format!(
-            "lpm.json vaultSync exceeds the {MAX_SYNC_AUTHORITY_CHECKPOINTS}-authority checkpoint limit"
+            "env sync state exceeds the {MAX_SYNC_AUTHORITY_CHECKPOINTS}-authority checkpoint limit"
         ));
     }
     Ok(count)
@@ -932,11 +1016,11 @@ fn authority_checkpoint_floor(
         let version = optional_sync_version(
             checkpoint
                 .as_object()
-                .ok_or("lpm.json vaultSync authority checkpoint must be an object")?
+                .ok_or("env sync state authority checkpoint must be an object")?
                 .get("version"),
             "authority checkpoint version",
         )?
-        .ok_or("lpm.json vaultSync authority checkpoint version is required")?;
+        .ok_or("env sync state authority checkpoint version is required")?;
         Ok(Some(
             floor.map_or(version, |current: i32| current.max(version)),
         ))
@@ -962,10 +1046,10 @@ fn upsert_authority_checkpoint(
     if let Some(existing) = principals.get_mut(principal.principal_id) {
         let checkpoint = existing
             .as_object_mut()
-            .ok_or("lpm.json vaultSync authority checkpoint must be an object")?;
+            .ok_or("env sync state authority checkpoint must be an object")?;
         let current =
             optional_sync_version(checkpoint.get("version"), "authority checkpoint version")?
-                .ok_or("lpm.json vaultSync authority checkpoint version is required")?;
+                .ok_or("env sync state authority checkpoint version is required")?;
         if version < current {
             return reject_sync_version_rollback(Some(current), version);
         }
@@ -975,7 +1059,7 @@ fn upsert_authority_checkpoint(
     }
     if checkpoint_count >= MAX_SYNC_AUTHORITY_CHECKPOINTS {
         return Err(format!(
-            "lpm.json vaultSync reached the {MAX_SYNC_AUTHORITY_CHECKPOINTS}-authority checkpoint limit"
+            "env sync state reached the {MAX_SYNC_AUTHORITY_CHECKPOINTS}-authority checkpoint limit"
         ));
     }
     principals.insert(
@@ -991,15 +1075,15 @@ fn upsert_authority_checkpoint(
 fn parse_stored_sync_principal(value: &serde_json::Value) -> Result<(String, String), String> {
     let object = value
         .as_object()
-        .ok_or("lpm.json vaultSync principal binding must be an object")?;
+        .ok_or("env sync state principal binding must be an object")?;
     let registry_url = object
         .get("registryUrl")
         .and_then(serde_json::Value::as_str)
-        .ok_or("lpm.json vaultSync principal binding registryUrl must be a string")?;
+        .ok_or("env sync state principal binding registryUrl must be a string")?;
     let principal_id = object
         .get("principalId")
         .and_then(serde_json::Value::as_str)
-        .ok_or("lpm.json vaultSync principal binding principalId must be a string")?;
+        .ok_or("env sync state principal binding principalId must be a string")?;
     validate_sync_principal(SyncPrincipal {
         registry_url,
         principal_id,
@@ -1060,15 +1144,14 @@ fn commit_sync_version_if_vault_matches_inner(
     let mut commit_executed = false;
     let mut previous_sync = None;
     let mut committed_sync = None;
-    let update_result = lpm_common::update_lpm_json(project_dir, |root, _| {
-        let current_vault_id = root.get("vault").and_then(|value| value.as_str());
+    let update_result = update_sync_state(project_dir, |config, sync| {
+        let current_vault_id = config.get("vault").and_then(|value| value.as_str());
         if current_vault_id != Some(expected_vault_id) {
             return Err(
-                "the project vault ID changed while the cloud operation was in flight".to_owned(),
+                "the project env ID changed while the cloud operation was in flight".to_owned(),
             );
         }
-        previous_sync = Some(root.get("vaultSync").cloned());
-        let sync = object_entry(root, "vaultSync")?;
+        previous_sync = Some(sync.clone());
         let current_version = if let Some(principal) = principal {
             reject_sync_principal_conflict(sync, target, principal)?;
             authority_checkpoint_floor(sync, target, principal.registry_url)?
@@ -1102,48 +1185,39 @@ fn commit_sync_version_if_vault_matches_inner(
                     .insert(slug.to_owned(), serde_json::json!(synced_at.clone()));
             }
         }
-        committed_sync = Some(root.get("vaultSync").cloned());
+        committed_sync = Some(sync.clone());
 
         let commit = commit
             .take()
             .ok_or_else(|| "cloud operation commit was invoked more than once".to_owned())?;
         commit()?;
         commit_executed = true;
-        Ok(lpm_common::LpmJsonMutation::Changed(()))
+        Ok(())
     });
 
     match update_result {
-        Ok(_) => Ok(()),
-        Err(error) if !commit_executed => Err(error.to_string()),
-        Err(error) => {
-            let metadata_error = error.to_string();
-            let previous_sync = previous_sync.flatten();
-            let committed_sync = committed_sync.flatten();
-            let rollback = lpm_common::update_lpm_json(project_dir, |root, _| {
-                if root.get("vault").and_then(|value| value.as_str()) != Some(expected_vault_id) {
+        Ok(()) => Ok(()),
+        Err(error) if !commit_executed => Err(error),
+        Err(metadata_error) => {
+            let previous_sync = previous_sync.unwrap_or_default();
+            let committed_sync = committed_sync.unwrap_or_default();
+            let rollback = update_sync_state(project_dir, |config, sync| {
+                if config.get("vault").and_then(|value| value.as_str()) != Some(expected_vault_id) {
                     return Err(
-                        "the project vault ID changed before sync metadata rollback".to_owned()
+                        "the project env ID changed before sync metadata rollback".to_owned()
                     );
                 }
-                let current_sync = root.get("vaultSync").cloned();
-                if current_sync == previous_sync {
-                    return Ok(lpm_common::LpmJsonMutation::Unchanged(()));
+                if *sync == previous_sync {
+                    return Ok(());
                 }
-                if current_sync != committed_sync {
+                if *sync != committed_sync {
                     return Err(
                         "sync metadata changed concurrently; refusing to overwrite it during rollback"
                             .to_owned(),
                     );
                 }
-                match &previous_sync {
-                    Some(value) => {
-                        root.insert("vaultSync".to_owned(), value.clone());
-                    }
-                    None => {
-                        root.remove("vaultSync");
-                    }
-                }
-                Ok(lpm_common::LpmJsonMutation::Changed(()))
+                *sync = previous_sync.clone();
+                Ok(())
             });
             match rollback {
                 Ok(_) => Err(metadata_error),
@@ -1166,7 +1240,7 @@ fn optional_sync_version(
         .as_i64()
         .and_then(|version| i32::try_from(version).ok())
         .map(Some)
-        .ok_or_else(|| format!("lpm.json vaultSync.{field_name} must be a 32-bit integer"))
+        .ok_or_else(|| format!("env sync state {field_name} must be a 32-bit integer"))
 }
 
 fn reject_sync_version_rollback(current: Option<i32>, proposed: i32) -> Result<(), String> {
@@ -1181,20 +1255,13 @@ fn reject_sync_version_rollback(current: Option<i32>, proposed: i32) -> Result<(
 }
 
 pub fn read_sync_summary(project_dir: &Path) -> VaultSyncSummary {
-    let Some((_, config)) = read_lpm_json_value(project_dir).ok().flatten() else {
-        return VaultSyncSummary {
+    match read_sync_state(project_dir) {
+        Ok(Some(sync)) => sync_summary(&serde_json::Value::Object(sync)),
+        _ => VaultSyncSummary {
             synced: false,
             synced_at: None,
-        };
-    };
-    let Some(sync) = config.get("vaultSync") else {
-        return VaultSyncSummary {
-            synced: false,
-            synced_at: None,
-        };
-    };
-
-    sync_summary(sync)
+        },
+    }
 }
 
 fn sync_summary(sync: &serde_json::Value) -> VaultSyncSummary {
@@ -1285,22 +1352,6 @@ fn generate_uuid() -> String {
     )
 }
 
-fn read_lpm_json_value(project_dir: &Path) -> Result<Option<(PathBuf, serde_json::Value)>, String> {
-    let lpm_json_path = project_dir.join("lpm.json");
-    let content = match lpm_common::read_text_file_capped(
-        &lpm_json_path,
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    ) {
-        Ok(content) => content,
-        Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
-        Err(error) => return Err(format!("failed to read lpm.json: {error}")),
-    };
-    let config =
-        serde_json::from_str(&content).map_err(|e| format!("failed to parse lpm.json: {e}"))?;
-
-    Ok(Some((lpm_json_path, config)))
-}
-
 fn object_entry<'a>(
     parent: &'a mut serde_json::Map<String, serde_json::Value>,
     key: &str,
@@ -1313,7 +1364,7 @@ fn object_entry<'a>(
     }
     value
         .as_object_mut()
-        .ok_or_else(|| format!("lpm.json {key} field must be an object"))
+        .ok_or_else(|| format!("env sync state {key} must be an object"))
 }
 
 fn rfc3339_now() -> String {
@@ -1453,16 +1504,102 @@ mod tests {
             Some("2026-05-31T08:00:00Z")
         );
 
-        let content = std::fs::read_to_string(dir.path().join("lpm.json")).unwrap();
-        let config: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(config["runtime"]["node"], "22");
-        assert_eq!(config["vault"], "vault-123");
-        assert_eq!(config["vaultSync"]["personalVersion"], 7);
         assert_eq!(
-            config["vaultSync"]["personalSyncedAt"],
-            "2026-05-31T08:00:00Z"
+            std::fs::read_to_string(dir.path().join("lpm.json")).unwrap(),
+            r#"{"runtime":{"node":"22"},"vault":"vault-123"}"#,
+            "sync writes leave lpm.json alone"
         );
+        let state = sync_state_file(dir.path());
+        assert_eq!(state["vault"], "vault-123");
+        assert_eq!(state["sync"]["personalVersion"], 7);
+        assert_eq!(state["sync"]["personalSyncedAt"], "2026-05-31T08:00:00Z");
+    }
+
+    fn sync_state_file(project_dir: &Path) -> serde_json::Value {
+        let content =
+            std::fs::read_to_string(project_dir.join(".lpm").join(SYNC_STATE_FILE)).unwrap();
         assert!(content.ends_with('\n'));
+        serde_json::from_str(&content).unwrap()
+    }
+
+    #[test]
+    fn legacy_sync_state_in_lpm_json_moves_to_the_state_file_on_the_next_write() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"vault":"vault-123","envSchema":{"vars":{}},"vaultSync":{"personalVersion":4,"orgVersions":{"acme":2}}}"#,
+        )
+        .unwrap();
+        assert_eq!(read_personal_sync_version(dir.path()), Some(4));
+
+        write_org_sync_version_at(dir.path(), "acme", 3, "2026-10-16T09:00:00Z").unwrap();
+
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("lpm.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            config,
+            serde_json::json!({"vault": "vault-123", "envSchema": {"vars": {}}})
+        );
+        let state = sync_state_file(dir.path());
+        assert_eq!(state["vault"], "vault-123");
+        assert_eq!(state["sync"]["personalVersion"], 4);
+        assert_eq!(state["sync"]["orgVersions"]["acme"], 3);
+        assert_eq!(read_org_sync_version(dir.path(), "acme"), Some(3));
+    }
+
+    #[test]
+    fn the_state_file_wins_over_sync_state_committed_in_lpm_json() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-123"}"#).unwrap();
+        write_personal_sync_version_at(dir.path(), 9, "2026-10-16T09:00:00Z").unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"vault":"vault-123","vaultSync":{"personalVersion":2}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(read_personal_sync_version(dir.path()), Some(9));
+        write_personal_sync_version_at(dir.path(), 10, "2026-10-16T09:01:00Z").unwrap();
+
+        assert_eq!(read_personal_sync_version(dir.path()), Some(10));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("lpm.json")).unwrap(),
+            "{\n  \"vault\": \"vault-123\"\n}\n"
+        );
+    }
+
+    #[test]
+    fn state_recorded_for_another_env_id_does_not_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-old"}"#).unwrap();
+        write_personal_sync_version_at(dir.path(), 9, "2026-10-16T09:00:00Z").unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-new"}"#).unwrap();
+
+        assert_eq!(read_personal_sync_version(dir.path()), None);
+        write_personal_sync_version_at(dir.path(), 1, "2026-10-16T09:01:00Z").unwrap();
+
+        let state = sync_state_file(dir.path());
+        assert_eq!(state["vault"], "vault-new");
+        assert_eq!(state["sync"]["personalVersion"], 1);
+    }
+
+    #[test]
+    fn a_state_file_with_a_malformed_env_id_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-123"}"#).unwrap();
+        std::fs::create_dir(dir.path().join(".lpm")).unwrap();
+        std::fs::write(
+            dir.path().join(".lpm").join(SYNC_STATE_FILE),
+            r#"{"vault":7,"sync":{"personalVersion":3}}"#,
+        )
+        .unwrap();
+
+        let error = write_personal_sync_version_at(dir.path(), 4, "2026-10-16T09:00:00Z")
+            .expect_err("a state file with a malformed env ID must not be replaced");
+
+        assert!(error.contains("env-sync.json vault"), "{error}");
+        assert!(VaultManifestSnapshot::read(dir.path()).is_err());
     }
 
     #[test]
@@ -1507,9 +1644,11 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(dir.path().join("lpm.json")).unwrap())
                 .unwrap();
 
-        assert_eq!(config["vault"], vault_id);
-        assert_eq!(config["vaultSync"]["personalVersion"], 3);
-        assert_eq!(config["custom"], true);
+        assert_eq!(
+            config,
+            serde_json::json!({"vault": vault_id, "custom": true})
+        );
+        assert_eq!(sync_state_file(dir.path())["sync"]["personalVersion"], 3);
     }
 
     #[test]
@@ -2069,7 +2208,7 @@ mod tests {
         )
         .expect_err("the binding must stay attached to the captured vault ID");
 
-        assert!(error.contains("vault ID changed"), "{error}");
+        assert!(error.contains("env ID changed"), "{error}");
         assert_eq!(std::fs::read(dir.path().join("lpm.json")).unwrap(), before);
     }
 

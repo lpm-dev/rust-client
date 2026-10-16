@@ -2231,6 +2231,16 @@ KEY3=no-quotes"#;
         });
     }
 
+    fn fill_sync_state_to_the_size_cap(project_dir: &Path, vault_id: &str) {
+        let padding = "x".repeat(lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize - 128);
+        std::fs::create_dir_all(project_dir.join(".lpm")).unwrap();
+        std::fs::write(
+            project_dir.join(".lpm").join(vault_id::SYNC_STATE_FILE),
+            format!(r#"{{"vault":"{vault_id}","sync":{{"padding":"{padding}"}}}}"#),
+        )
+        .unwrap();
+    }
+
     #[cfg(debug_assertions)]
     #[test]
     fn remote_commit_rolls_back_vault_when_sync_metadata_write_fails() {
@@ -2239,12 +2249,7 @@ KEY3=no-quotes"#;
             set(dir.path(), &[("BASE", "one")]).unwrap();
             let baseline = try_get_all_environments(dir.path()).unwrap();
             let vault_id = vault_id::read_vault_id(dir.path()).unwrap();
-            let padding = "x".repeat(lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize - 128);
-            std::fs::write(
-                dir.path().join("lpm.json"),
-                format!(r#"{{"vault":"{vault_id}","padding":"{padding}"}}"#),
-            )
-            .unwrap();
+            fill_sync_state_to_the_size_cap(dir.path(), &vault_id);
             let remote = HashMap::from([(
                 "default".to_owned(),
                 HashMap::from([("REMOTE".to_owned(), "two".to_owned())]),
@@ -2274,12 +2279,7 @@ KEY3=no-quotes"#;
             set(dir.path(), &[("BASE", "one")]).unwrap();
             let baseline = try_get_all_environments(dir.path()).unwrap();
             let vault_id = vault_id::read_vault_id(dir.path()).unwrap();
-            let padding = "x".repeat(lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize - 128);
-            std::fs::write(
-                dir.path().join("lpm.json"),
-                format!(r#"{{"vault":"{vault_id}","padding":"{padding}"}}"#),
-            )
-            .unwrap();
+            fill_sync_state_to_the_size_cap(dir.path(), &vault_id);
             let remote = HashMap::from([(
                 "live".to_owned(),
                 HashMap::from([("REMOTE".to_owned(), "two".to_owned())]),

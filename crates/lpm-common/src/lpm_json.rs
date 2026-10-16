@@ -75,109 +75,371 @@ pub enum LpmJsonTransactionError {
     #[error("failed to serialize lpm.json: {0}")]
     Serialize(#[source] serde_json::Error),
 
-    #[error("updated lpm.json at {path} exceeds {limit}-byte limit")]
+    #[error("updated {path} exceeds {limit}-byte limit")]
     TooLarge { path: PathBuf, limit: u64 },
 
-    #[error("failed to write lpm.json at {path}: {source}")]
+    #[error("failed to write {path}: {source}")]
     Write {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
+
+    #[error("refusing to use a symbolic link or junction as project state at {path}")]
+    LinkedLocalState { path: PathBuf },
+
+    #[error("project state path is not a regular file: {path}")]
+    LocalStatePathNotFile { path: PathBuf },
+
+    #[error("failed to read project state: {0}")]
+    ReadLocalState(#[source] BoundedReadError),
+
+    #[error("failed to parse {path}: {source}")]
+    ParseLocalState {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    #[error("{path} must hold a JSON object")]
+    LocalStateNotObject { path: PathBuf },
+
+    #[error("invalid project state file name {0:?}")]
+    InvalidLocalStateName(String),
+}
+
+/// `lpm.json` and a project state file as [`read_lpm_json_with_local_state`]
+/// read them; `None` is a missing file.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LpmJsonAndLocalState {
+    pub config: Option<Map<String, Value>>,
+    pub local: Option<Map<String, Value>>,
+}
+
+/// What an [`update_lpm_json_with_local_state`] mutation edits: `lpm.json`
+/// and a file in the project's `.lpm/` directory, which git never sees.
+pub struct LpmJsonWithLocalState<'a> {
+    pub config: &'a mut Map<String, Value>,
+    pub config_state: LpmJsonFileState,
+    pub local: &'a mut Map<String, Value>,
 }
 
 pub fn update_lpm_json<T>(
     project_dir: &Path,
     mutate: impl FnOnce(&mut Map<String, Value>, LpmJsonFileState) -> Result<LpmJsonMutation<T>, String>,
 ) -> Result<LpmJsonMutation<T>, LpmJsonTransactionError> {
-    let project_dir = std::fs::canonicalize(project_dir).map_err(|source| {
-        LpmJsonTransactionError::ProjectDirectory {
-            path: project_dir.to_path_buf(),
-            source,
-        }
-    })?;
-    let path = project_dir.join("lpm.json");
-    reject_linked_config(&path)?;
-    let state_dir = crate::project_state_dir(&project_dir);
-    reject_linked_state_directory(&state_dir)?;
-    crate::ensure_project_state_dir(&project_dir).map_err(|source| {
-        LpmJsonTransactionError::Write {
-            path: state_dir.clone(),
-            source,
-        }
-    })?;
-    reject_linked_state_directory(&state_dir)?;
-    let lock_path = state_dir.join(".config.lock");
-    reject_linked_lock_file(&lock_path)?;
-    let lock_file = open_lock_nofollow(&lock_path)?;
-    validate_opened_lock(
-        &lock_path,
-        &lock_file
-            .metadata()
-            .map_err(|source| LpmJsonTransactionError::Write {
-                path: lock_path.clone(),
-                source,
-            })?,
-    )?;
-    let _lock =
-        crate::paths::acquire_single_file_exclusive_lock_from_file(lock_file).map_err(|error| {
-            LpmJsonTransactionError::Write {
-                path: lock_path.clone(),
-                source: std::io::Error::other(error),
-            }
-        })?;
-    reject_linked_state_directory(&state_dir)?;
-    reject_linked_lock_file(&lock_path)?;
-    reject_linked_config(&path)?;
+    let locked = LockedProjectConfig::acquire(project_dir)?;
+    let (mut root, file_state) = locked.read_config()?;
+    let result = mutate(&mut root, file_state).map_err(LpmJsonTransactionError::Mutation)?;
+    if result.is_changed() {
+        locked.write_config(root)?;
+    }
+    Ok(result)
+}
 
-    let (content, file_state) = match open_config_nofollow(&path) {
+/// Runs `mutate` under the `lpm.json` lock with `lpm.json` and the project
+/// state file `.lpm/<local_name>`, then writes what it changed: the state
+/// file first, owner-only, then `lpm.json`. A state file left empty is
+/// removed. Writing in that order lets [`read_lpm_json_with_local_state`]
+/// read without the lock while a mutation moves a value from `lpm.json`
+/// into the state file.
+pub fn update_lpm_json_with_local_state<T>(
+    project_dir: &Path,
+    local_name: &str,
+    mutate: impl FnOnce(LpmJsonWithLocalState<'_>) -> Result<T, String>,
+) -> Result<T, LpmJsonTransactionError> {
+    validate_local_state_name(local_name)?;
+    let locked = LockedProjectConfig::acquire(project_dir)?;
+    let (mut config, config_state) = locked.read_config()?;
+    let local_path = locked.state_dir.join(local_name);
+    let mut local = read_local_state(&local_path)?.unwrap_or_default();
+    let original_config = config.clone();
+    let original_local = local.clone();
+
+    let result = mutate(LpmJsonWithLocalState {
+        config: &mut config,
+        config_state,
+        local: &mut local,
+    })
+    .map_err(LpmJsonTransactionError::Mutation)?;
+
+    if local != original_local {
+        locked.recheck()?;
+        write_local_state(&local_path, &local)?;
+    }
+    if config != original_config {
+        locked.write_config(config)?;
+    }
+    Ok(result)
+}
+
+/// Reads `lpm.json`, then `.lpm/<local_name>`, without the lock; see
+/// [`update_lpm_json_with_local_state`] for why that order is consistent.
+/// A missing file reads as `None`.
+pub fn read_lpm_json_with_local_state(
+    project_dir: &Path,
+    local_name: &str,
+) -> Result<LpmJsonAndLocalState, LpmJsonTransactionError> {
+    validate_local_state_name(local_name)?;
+    let config_path = project_dir.join("lpm.json");
+    let config = match open_config_nofollow(&config_path) {
         Ok(file) => {
             let metadata = file.metadata().map_err(|source| BoundedReadError::Io {
-                path: path.clone(),
+                path: config_path.clone(),
                 source,
             })?;
-            validate_opened_config(&path, &metadata)?;
-            let (content, _) =
-                read_text_file_capped_from_open_file(file, &path, CONFIG_FILE_SIZE_CAP_BYTES)?;
-            (Some(content), LpmJsonFileState::Existing)
+            validate_opened_config(&config_path, &metadata)?;
+            let (content, _) = read_text_file_capped_from_open_file(
+                file,
+                &config_path,
+                CONFIG_FILE_SIZE_CAP_BYTES,
+            )?;
+            let value: Value = serde_json::from_str(crate::strip_utf8_bom_str(&content))
+                .map_err(LpmJsonTransactionError::Parse)?;
+            match value {
+                Value::Object(map) => Some(map),
+                _ => return Err(LpmJsonTransactionError::RootNotObject),
+            }
         }
-        Err(BoundedReadError::NotFound { .. }) => (None, LpmJsonFileState::Missing),
+        Err(BoundedReadError::NotFound { .. }) => None,
         Err(error) => return Err(error.into()),
     };
-    let mut value = match content {
-        Some(content) => serde_json::from_str(&content).map_err(LpmJsonTransactionError::Parse)?,
-        None => Value::Object(Map::new()),
-    };
-    let root = value
-        .as_object_mut()
-        .ok_or(LpmJsonTransactionError::RootNotObject)?;
-    let result = mutate(root, file_state).map_err(LpmJsonTransactionError::Mutation)?;
-    if !result.is_changed() {
-        return Ok(result);
-    }
-    reject_linked_state_directory(&state_dir)?;
-    reject_linked_lock_file(&lock_path)?;
-    reject_linked_config(&path)?;
+    let local = read_project_local_state(project_dir, local_name)?;
+    Ok(LpmJsonAndLocalState { config, local })
+}
 
+/// Reads the project state file `.lpm/<local_name>` without the lock. A
+/// missing file reads as `None`.
+pub fn read_project_local_state(
+    project_dir: &Path,
+    local_name: &str,
+) -> Result<Option<Map<String, Value>>, LpmJsonTransactionError> {
+    validate_local_state_name(local_name)?;
+    let state_dir = crate::project_state_dir(project_dir);
+    reject_linked_state_directory(&state_dir)?;
+    read_local_state(&state_dir.join(local_name))
+}
+
+/// The `lpm.json` lock, held for one transaction.
+struct LockedProjectConfig {
+    path: PathBuf,
+    state_dir: PathBuf,
+    lock_path: PathBuf,
+    _lock: crate::paths::SingleFileExclusiveLockHandle,
+}
+
+impl LockedProjectConfig {
+    fn acquire(project_dir: &Path) -> Result<Self, LpmJsonTransactionError> {
+        let project_dir = std::fs::canonicalize(project_dir).map_err(|source| {
+            LpmJsonTransactionError::ProjectDirectory {
+                path: project_dir.to_path_buf(),
+                source,
+            }
+        })?;
+        let path = project_dir.join("lpm.json");
+        reject_linked_config(&path)?;
+        let state_dir = crate::project_state_dir(&project_dir);
+        reject_linked_state_directory(&state_dir)?;
+        crate::ensure_project_state_dir(&project_dir).map_err(|source| {
+            LpmJsonTransactionError::Write {
+                path: state_dir.clone(),
+                source,
+            }
+        })?;
+        reject_linked_state_directory(&state_dir)?;
+        let lock_path = state_dir.join(".config.lock");
+        reject_linked_lock_file(&lock_path)?;
+        let lock_file = open_lock_nofollow(&lock_path)?;
+        validate_opened_lock(
+            &lock_path,
+            &lock_file
+                .metadata()
+                .map_err(|source| LpmJsonTransactionError::Write {
+                    path: lock_path.clone(),
+                    source,
+                })?,
+        )?;
+        let lock = crate::paths::acquire_single_file_exclusive_lock_from_file(lock_file).map_err(
+            |error| LpmJsonTransactionError::Write {
+                path: lock_path.clone(),
+                source: std::io::Error::other(error),
+            },
+        )?;
+        let locked = Self {
+            path,
+            state_dir,
+            lock_path,
+            _lock: lock,
+        };
+        locked.recheck()?;
+        Ok(locked)
+    }
+
+    fn recheck(&self) -> Result<(), LpmJsonTransactionError> {
+        reject_linked_state_directory(&self.state_dir)?;
+        reject_linked_lock_file(&self.lock_path)?;
+        reject_linked_config(&self.path)
+    }
+
+    fn read_config(
+        &self,
+    ) -> Result<(Map<String, Value>, LpmJsonFileState), LpmJsonTransactionError> {
+        let path = &self.path;
+        let (content, file_state) = match open_config_nofollow(path) {
+            Ok(file) => {
+                let metadata = file.metadata().map_err(|source| BoundedReadError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                validate_opened_config(path, &metadata)?;
+                let (content, _) =
+                    read_text_file_capped_from_open_file(file, path, CONFIG_FILE_SIZE_CAP_BYTES)?;
+                (Some(content), LpmJsonFileState::Existing)
+            }
+            Err(BoundedReadError::NotFound { .. }) => (None, LpmJsonFileState::Missing),
+            Err(error) => return Err(error.into()),
+        };
+        let value = match content {
+            Some(content) => serde_json::from_str(crate::strip_utf8_bom_str(&content))
+                .map_err(LpmJsonTransactionError::Parse)?,
+            None => Value::Object(Map::new()),
+        };
+        match value {
+            Value::Object(root) => Ok((root, file_state)),
+            _ => Err(LpmJsonTransactionError::RootNotObject),
+        }
+    }
+
+    fn write_config(&self, root: Map<String, Value>) -> Result<(), LpmJsonTransactionError> {
+        self.recheck()?;
+        let mut rendered = serde_json::to_string_pretty(&Value::Object(root))
+            .map_err(LpmJsonTransactionError::Serialize)?;
+        rendered.push('\n');
+        if rendered.len() as u64 > CONFIG_FILE_SIZE_CAP_BYTES {
+            return Err(LpmJsonTransactionError::TooLarge {
+                path: self.path.clone(),
+                limit: CONFIG_FILE_SIZE_CAP_BYTES,
+            });
+        }
+        write_file_atomic_with_options(
+            &self.path,
+            rendered,
+            AtomicWriteOptions::new().sync_file().sync_parent(),
+        )
+        .map_err(|source| LpmJsonTransactionError::Write {
+            path: self.path.clone(),
+            source,
+        })
+    }
+}
+
+fn validate_local_state_name(name: &str) -> Result<(), LpmJsonTransactionError> {
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(component)), None)
+            if component == std::ffi::OsStr::new(name) =>
+        {
+            Ok(())
+        }
+        _ => Err(LpmJsonTransactionError::InvalidLocalStateName(
+            name.to_owned(),
+        )),
+    }
+}
+
+fn read_local_state(path: &Path) -> Result<Option<Map<String, Value>>, LpmJsonTransactionError> {
+    let file = match open_config_nofollow(path) {
+        Ok(file) => file,
+        Err(BoundedReadError::NotFound { .. }) => return Ok(None),
+        Err(error) => {
+            if std::fs::symlink_metadata(path)
+                .is_ok_and(|metadata| crate::is_symlink_or_junction(&metadata))
+            {
+                return Err(LpmJsonTransactionError::LinkedLocalState {
+                    path: path.to_path_buf(),
+                });
+            }
+            return Err(LpmJsonTransactionError::ReadLocalState(error));
+        }
+    };
+    let metadata = file.metadata().map_err(|source| {
+        LpmJsonTransactionError::ReadLocalState(BoundedReadError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    })?;
+    if crate::is_symlink_or_junction(&metadata) {
+        return Err(LpmJsonTransactionError::LinkedLocalState {
+            path: path.to_path_buf(),
+        });
+    }
+    if !metadata.is_file() {
+        return Err(LpmJsonTransactionError::LocalStatePathNotFile {
+            path: path.to_path_buf(),
+        });
+    }
+    let (content, _) = read_text_file_capped_from_open_file(file, path, CONFIG_FILE_SIZE_CAP_BYTES)
+        .map_err(LpmJsonTransactionError::ReadLocalState)?;
+    match serde_json::from_str(crate::strip_utf8_bom_str(&content)) {
+        Ok(Value::Object(map)) => Ok(Some(map)),
+        Ok(_) => Err(LpmJsonTransactionError::LocalStateNotObject {
+            path: path.to_path_buf(),
+        }),
+        Err(source) => Err(LpmJsonTransactionError::ParseLocalState {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn write_local_state(
+    path: &Path,
+    local: &Map<String, Value>,
+) -> Result<(), LpmJsonTransactionError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if crate::is_symlink_or_junction(&metadata) => {
+            return Err(LpmJsonTransactionError::LinkedLocalState {
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(LpmJsonTransactionError::LocalStatePathNotFile {
+                path: path.to_path_buf(),
+            });
+        }
+        _ => {}
+    }
+    if local.is_empty() {
+        return match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(LpmJsonTransactionError::Write {
+                path: path.to_path_buf(),
+                source,
+            }),
+        };
+    }
     let mut rendered =
-        serde_json::to_string_pretty(&value).map_err(LpmJsonTransactionError::Serialize)?;
+        serde_json::to_string_pretty(local).map_err(LpmJsonTransactionError::Serialize)?;
     rendered.push('\n');
     if rendered.len() as u64 > CONFIG_FILE_SIZE_CAP_BYTES {
         return Err(LpmJsonTransactionError::TooLarge {
-            path,
+            path: path.to_path_buf(),
             limit: CONFIG_FILE_SIZE_CAP_BYTES,
         });
     }
     write_file_atomic_with_options(
-        &path,
+        path,
         rendered,
-        AtomicWriteOptions::new().sync_file().sync_parent(),
+        AtomicWriteOptions::new()
+            .unix_mode(0o600)
+            .sync_file()
+            .sync_parent(),
     )
     .map_err(|source| LpmJsonTransactionError::Write {
-        path: path.clone(),
+        path: path.to_path_buf(),
         source,
-    })?;
-    Ok(result)
+    })
 }
 
 fn open_config_nofollow(path: &Path) -> Result<File, BoundedReadError> {
@@ -187,7 +449,9 @@ fn open_config_nofollow(path: &Path) -> Result<File, BoundedReadError> {
     {
         use std::os::unix::fs::OpenOptionsExt;
 
-        options.custom_flags(libc::O_NOFOLLOW);
+        // Non-blocking, so a FIFO in place of the file fails the regular-file
+        // check instead of waiting for a writer.
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {
@@ -217,7 +481,7 @@ fn open_lock_nofollow(path: &Path) -> Result<File, LpmJsonTransactionError> {
     {
         use std::os::unix::fs::OpenOptionsExt;
 
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {
@@ -476,6 +740,182 @@ mod tests {
         assert!(error.to_string().contains("symbolic link"));
         assert!(!outside_target.exists());
         assert!(!dir.path().join("lpm.json").exists());
+    }
+
+    #[test]
+    fn local_state_moves_out_of_lpm_json_in_one_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"vault":"v1","legacy":{"version":3}}"#,
+        )
+        .unwrap();
+
+        update_lpm_json_with_local_state(dir.path(), "state.json", |files| {
+            let legacy = files.config.remove("legacy").unwrap();
+            files.local.insert("moved".into(), legacy);
+            Ok(())
+        })
+        .unwrap();
+
+        let LpmJsonAndLocalState { config, local } =
+            read_lpm_json_with_local_state(dir.path(), "state.json").unwrap();
+        assert_eq!(
+            Value::Object(config.unwrap()),
+            serde_json::json!({"vault": "v1"})
+        );
+        assert_eq!(
+            Value::Object(local.unwrap()),
+            serde_json::json!({"moved": {"version": 3}})
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(dir.path().join(".lpm/state.json"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn local_state_change_leaves_lpm_json_bytes_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = "{ \"vault\": \"v1\" }";
+        std::fs::write(dir.path().join("lpm.json"), original).unwrap();
+
+        update_lpm_json_with_local_state(dir.path(), "state.json", |files| {
+            files.local.insert("version".into(), serde_json::json!(4));
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("lpm.json")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn local_state_left_empty_is_removed_and_lpm_json_is_not_created() {
+        let dir = tempfile::tempdir().unwrap();
+        update_lpm_json_with_local_state(dir.path(), "state.json", |files| {
+            files.local.insert("version".into(), serde_json::json!(1));
+            Ok(())
+        })
+        .unwrap();
+        assert!(dir.path().join(".lpm/state.json").is_file());
+
+        update_lpm_json_with_local_state(dir.path(), "state.json", |files| {
+            files.local.clear();
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(!dir.path().join(".lpm/state.json").exists());
+        assert!(!dir.path().join("lpm.json").exists());
+    }
+
+    #[test]
+    fn failed_mutation_writes_neither_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lpm.json"), "{}\n").unwrap();
+
+        let error = update_lpm_json_with_local_state(dir.path(), "state.json", |files| {
+            files
+                .config
+                .insert("vault".into(), Value::String("v1".into()));
+            files.local.insert("version".into(), serde_json::json!(1));
+            Err::<(), _>("refused".to_owned())
+        })
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "refused");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("lpm.json")).unwrap(),
+            "{}\n"
+        );
+        assert!(!dir.path().join(".lpm/state.json").exists());
+    }
+
+    #[test]
+    fn local_state_that_is_not_an_object_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".lpm")).unwrap();
+        std::fs::write(dir.path().join(".lpm/state.json"), "[]").unwrap();
+
+        let error = read_lpm_json_with_local_state(dir.path(), "state.json").unwrap_err();
+
+        assert!(matches!(
+            error,
+            LpmJsonTransactionError::LocalStateNotObject { .. }
+        ));
+    }
+
+    #[test]
+    fn local_state_name_must_be_one_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["", "..", "nested/state.json", "/state.json"] {
+            let error = update_lpm_json_with_local_state(dir.path(), name, |_| Ok(())).unwrap_err();
+            assert!(
+                matches!(error, LpmJsonTransactionError::InvalidLocalStateName(_)),
+                "{name:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_lpm_json_or_state_file_is_rejected_without_waiting_for_a_writer() {
+        for fifo in ["lpm.json", ".lpm/state.json"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join(".lpm")).unwrap();
+            let path = dir.path().join(fifo);
+            let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+
+            let (done_tx, done_rx) = mpsc::channel();
+            let project = dir.path().to_path_buf();
+            std::thread::spawn(move || {
+                let read = read_lpm_json_with_local_state(&project, "state.json").is_err();
+                let update = update_lpm_json_with_local_state(&project, "state.json", |files| {
+                    files.local.insert("version".into(), serde_json::json!(1));
+                    Ok(())
+                })
+                .is_err();
+                done_tx.send((read, update)).unwrap();
+            });
+
+            let (read_failed, update_failed) = done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| panic!("{fifo}: blocked waiting for a FIFO writer"));
+            assert!(read_failed && update_failed, "{fifo}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linked_local_state_is_rejected_without_reading_or_modifying_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "{}").unwrap();
+        std::fs::create_dir(dir.path().join(".lpm")).unwrap();
+        symlink(outside.path(), dir.path().join(".lpm/state.json")).unwrap();
+
+        let error = update_lpm_json_with_local_state(dir.path(), "state.json", |files| {
+            files.local.insert("version".into(), serde_json::json!(1));
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            LpmJsonTransactionError::LinkedLocalState { .. }
+        ));
+        assert_eq!(std::fs::read_to_string(outside.path()).unwrap(), "{}");
     }
 
     #[test]

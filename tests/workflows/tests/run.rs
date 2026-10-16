@@ -302,6 +302,7 @@ fn watch_rejects_upstream_dependencies_before_starting_tasks() {
         r#"{"tasks":{"build":{"command":"node build.js","dependsOn":["^build"]}}}"#,
     );
     project.write_file("build.js", "require('fs').writeFileSync('ran','yes');");
+    support::warm_lpm_binary(&project);
     let mut watcher = TaskWatcher::start(&project, "build", &[]);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while watcher.child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
@@ -330,6 +331,7 @@ fn watch_rejects_invalid_tasks_even_when_an_import_is_missing() {
                 .to_string(),
         );
         project.write_file("build.js", "require('fs').writeFileSync('ran','yes');");
+        support::warm_lpm_binary(&project);
         let mut watcher = TaskWatcher::start(&project, "build", &[]);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while watcher.child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {

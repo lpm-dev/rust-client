@@ -45,13 +45,7 @@ fn doctor_accepts_every_supported_top_level_lpm_json_field() {
             "environments": {},
             "cert": {},
             "$schema": "https://cli.lpm.dev/schemas/lpm.json",
-            "vault": "vault-123",
-            "vaultSync": {
-                "personalVersion": 7,
-                "personalSyncedAt": "2026-08-13T09:00:00Z",
-                "orgVersions": {"acme": 4},
-                "orgSyncedAt": {"acme": "2026-08-13T09:01:00Z"}
-            }
+            "vault": "vault-123"
         }"#,
     );
 
@@ -64,6 +58,26 @@ fn doctor_accepts_every_supported_top_level_lpm_json_field() {
     insta::assert_json_snapshot!(
         "doctor_accepts_every_supported_top_level_lpm_json_field",
         config_check
+    );
+}
+
+#[test]
+fn doctor_warns_when_lpm_json_still_carries_env_sync_state() {
+    let project = TempProject::empty(r#"{"name":"doctor-config","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"vault":"vault-123","vaultSync":{"personalVersion":7}}"#,
+    );
+
+    let config_check = doctor_lpm_json_check(&project);
+
+    assert_eq!(
+        config_check["code"], "lpm_json_schema_warnings",
+        "{config_check}"
+    );
+    assert!(
+        config_check.to_string().contains(".lpm/env-sync.json"),
+        "{config_check}"
     );
 }
 
