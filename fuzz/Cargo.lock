@@ -184,7 +184,7 @@ dependencies = [
  "find-msvc-tools",
  "jobserver",
  "libc",
- "shlex",
+ "shlex 2.0.1",
 ]
 
 [[package]]
@@ -616,6 +616,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
 
 [[package]]
+name = "is-docker"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "928bae27f42bc99b60d9ac7334e3a21d10ad8f1835a4e12ec3ec0464765ed1b3"
+dependencies = [
+ "once_cell",
+]
+
+[[package]]
+name = "is-wsl"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "173609498df190136aa7dea1a91db051746d339e18476eed5ca40521f02d7aa5"
+dependencies = [
+ "is-docker",
+ "once_cell",
+]
+
+[[package]]
 name = "is_ci"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -720,7 +739,7 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "lpm-common"
-version = "0.80.0"
+version = "0.81.0"
 dependencies = [
  "base64",
  "cap-fs-ext",
@@ -732,10 +751,12 @@ dependencies = [
  "glob",
  "libc",
  "miette",
+ "open",
  "serde",
  "serde_json",
  "sha1",
  "sha2",
+ "shlex 1.3.0",
  "smallvec",
  "subtle",
  "thiserror 2.0.18",
@@ -747,7 +768,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-extractor"
-version = "0.80.0"
+version = "0.81.0"
 dependencies = [
  "blake3",
  "cap-fs-ext",
@@ -774,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-lockfile"
-version = "0.80.0"
+version = "0.81.0"
 dependencies = [
  "hex",
  "lpm-common",
@@ -791,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-migrate"
-version = "0.80.0"
+version = "0.81.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -810,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-semver"
-version = "0.80.0"
+version = "0.81.0"
 dependencies = [
  "lpm-common",
  "node-semver",
@@ -820,7 +841,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-workspace"
-version = "0.80.0"
+version = "0.81.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -961,6 +982,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "open"
+version = "5.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fbaa89d2ddc8473c78a3adf69eea8cffa28c483b8e02a971ef31527cd0fc92c"
+dependencies = [
+ "is-wsl",
+ "libc",
+ "pathdiff",
+]
+
+[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -994,6 +1026,12 @@ dependencies = [
  "smallvec",
  "windows-link",
 ]
+
+[[package]]
+name = "pathdiff"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
 name = "percent-encoding"
@@ -1225,6 +1263,12 @@ checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
 dependencies = [
  "cc",
 ]
+
+[[package]]
+name = "shlex"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
 name = "shlex"
