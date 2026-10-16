@@ -1412,7 +1412,10 @@ fn is_safe_entry(path: &Path, canonical_root: &Path) -> bool {
 ///
 /// If `files` field exists in package.json, only include those.
 /// Otherwise include everything with common ignores.
-fn collect_package_files(
+/// The project files a publish of `pkg_json` packs, before bundled
+/// dependencies, skills and manifest overrides: package-relative, `/`
+/// separated, sorted. Symbolic links are left out.
+pub(crate) fn collect_package_files(
     pkg_json: &serde_json::Value,
     source_dir: &Dir,
 ) -> Result<Vec<TarballFile>, LpmError> {

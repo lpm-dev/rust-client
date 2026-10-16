@@ -1,71 +1,65 @@
+use crate::commands::publish_common;
 use lpm_common::LpmError;
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use super::file_select::PackageFileSelector;
 #[cfg(unix)]
 use super::paths::canonicalize_or_partial;
 
-/// Files and directories that are NEVER copied to the deploy output.
+/// Names never copied to the deploy output, at any depth, on top of what
+/// `lpm publish` leaves out.
 ///
-/// Exact basename exclusions supplement the `.env` prefix check in the walker.
-///
-/// Categories:
-/// - **LPM internal state**: `node_modules`, `.lpm`, `lpm.lock`, `lpm.lockb`
-///   are recreated by the install pipeline at the deploy output dir, so
-///   copying them is wasted work AND would mask any inconsistency.
-/// - **Secrets** (CRITICAL security boundary): `.env*` files contain
-///   credentials and must NEVER ride along into a deploy output. Even a
-///   developer-only `.env.local` is a footgun if it leaks into a Docker image.
-///   Registry credential files are excluded even when explicitly selected.
-/// - **Version control**: `.git`, `.svn`, `.hg` — the deploy output is not
-///   a repo and shouldn't carry git history.
-/// - **OS / editor cruft**: `.DS_Store`, `Thumbs.db`, swap files.
+/// - **LPM state**: `node_modules`, `.lpm`, `lpm.lock`, `lpm.lockb` are
+///   recreated by the install the deploy runs, so copying them is wasted work
+///   AND would mask any inconsistency.
+/// - **Secrets** (CRITICAL security boundary): every `.env*` file, matched
+///   separately by prefix, and every credential file publish blocks
+///   (`lpm_security::behavioral::secrets::is_blocked_file`). A publish stops
+///   at a credential file `files` selects; a deploy has no secret scan, so it
+///   leaves them out, even a developer-only `.env.local` that would otherwise
+///   ride into a Docker image.
+/// - **Version control and OS cruft**.
 const DEPLOY_DENY_BASENAMES: &[&str] = &[
-    // LPM internal state
     "node_modules",
     ".lpm",
     "lpm.lock",
     "lpm.lockb",
-    // Registry credentials
     ".npmrc",
     ".netrc",
     "_netrc",
-    // Version control
     ".git",
     ".gitignore",
     ".npmignore",
     ".gitattributes",
     ".svn",
     ".hg",
-    // Editor / OS cruft
     ".DS_Store",
     "Thumbs.db",
 ];
 
-/// Stats from a [`copy_member_source`] call. Used by the deploy summary
-/// (human and JSON output paths).
+/// Stats from a [`copy_member_source`] call, reported in the deploy's JSON
+/// summary.
 #[derive(Debug, Clone, Default)]
 pub(in crate::commands::deploy) struct CopyStats {
     pub files_copied: usize,
+    /// Files `lpm publish` would pack that the deploy withholds: `.env*`
+    /// files, credential files and LPM state.
     pub files_skipped: usize,
     pub bytes_copied: u64,
 }
 
-/// Recursively copy `src_dir` into `dst_dir`, skipping any path that matches
-/// the [`DEPLOY_DENY_BASENAMES`] list. Uses hardlink when possible (zero disk
-/// cost on the same filesystem), falls back to file copy for cross-device.
-///
-/// On macOS, falls back to clonefile-via-hardlink semantics — the directory
-/// tree is walked file-by-file rather than as a single clonefile call,
-/// because clonefile would copy denied entries too. Per-file hardlink lets
-/// us apply the deny list cleanly.
+/// Copies the files `lpm publish` would pack from `src_dir` into `dst_dir`,
+/// less [`DEPLOY_DENY_BASENAMES`], `.env*` files and credential files, so a
+/// deploy and a publish read `files`, `.npmignore` and `.gitignore` the same
+/// way, and writes the `lpm.json` a publish ships. Files are hardlinked where
+/// possible (zero disk cost on the same filesystem) and copied otherwise.
 ///
 /// **Security invariants:**
-/// - Files in [`DEPLOY_DENY_BASENAMES`] are NEVER copied (regression-tested).
+/// - Denied names are NEVER copied, at any depth (regression-tested).
 /// - The function only writes inside `dst_dir`. It does not modify `src_dir`.
-/// - Symlinks pointing outside `src_dir` are NOT followed; they are copied
-///   as-is (preserving the link, which the user may have intentionally
-///   created — doesn't second-guess this).
+/// - Symbolic links are not copied, as a publish doesn't pack them, and no
+///   path is resolved outside `src_dir` or `dst_dir`.
 pub(in crate::commands::deploy) fn copy_member_source(
     src_dir: &Path,
     dst_dir: &Path,
@@ -80,102 +74,98 @@ pub(in crate::commands::deploy) fn copy_member_source(
 
     std::fs::create_dir_all(dst_dir)
         .map_err(|e| LpmError::Script(format!("failed to create deploy output dir: {e}")))?;
+    let output = cap_std::fs::Dir::open_ambient_dir(dst_dir, cap_std::ambient_authority())
+        .map_err(|e| LpmError::Script(format!("failed to open deploy output dir: {e}")))?;
 
-    let selector = PackageFileSelector::from_package_dir(src_dir)?;
-    copy_member_source_recursive(src_dir, src_dir, dst_dir, &selector, &mut stats)?;
+    let manifest_path = src_dir.join("package.json");
+    let manifest =
+        lpm_common::read_text_file_capped(&manifest_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+            .map_err(|e| {
+            LpmError::Script(format!(
+                "deploy: failed to read package manifest {manifest_path:?}: {e}"
+            ))
+        })?;
+    let manifest: serde_json::Value =
+        serde_json::from_str(lpm_common::strip_utf8_bom_str(&manifest))
+            .map_err(|e| LpmError::Script(format!("deploy: invalid package.json: {e}")))?;
+    let canonical = src_dir
+        .canonicalize()
+        .map_err(|e| LpmError::Script(format!("deploy: failed to resolve {src_dir:?}: {e}")))?;
+    let select = || -> Result<_, LpmError> {
+        let source = Arc::new(publish_common::open_tarball_source_root(&canonical)?);
+        let files = publish_common::collect_package_files(&manifest, &source)?;
+        let lpm_json = crate::commands::publish::shipped_lpm_json(&source, src_dir)?;
+        Ok((source, files, lpm_json))
+    };
+    let (source, files, lpm_json) = select().map_err(|error| match error {
+        LpmError::Registry(message) => LpmError::Script(format!("deploy: {message}")),
+        other => other,
+    })?;
+
+    let mut created_dirs: HashSet<PathBuf> = HashSet::new();
+    for file in files {
+        if file.path == "lpm.json" {
+            continue;
+        }
+        if deploy_denies(&file.path) {
+            stats.files_skipped += 1;
+            continue;
+        }
+        let relative: PathBuf = file.path.split('/').collect();
+        if let Some(parent) = relative.parent()
+            && !parent.as_os_str().is_empty()
+            && !created_dirs.contains(parent)
+        {
+            output.create_dir_all(parent).map_err(|e| {
+                LpmError::Script(format!(
+                    "failed to create dir {:?}: {e}",
+                    dst_dir.join(parent)
+                ))
+            })?;
+            created_dirs.insert(parent.to_path_buf());
+        }
+        if source.hard_link(&relative, &output, &relative).is_err() {
+            source.copy(&relative, &output, &relative).map_err(|e| {
+                LpmError::Script(format!(
+                    "failed to copy {:?} to {:?}: {e}",
+                    src_dir.join(&relative),
+                    dst_dir.join(&relative)
+                ))
+            })?;
+        }
+        stats.files_copied += 1;
+        stats.bytes_copied += file.size;
+    }
+    if let Some(content) = lpm_json {
+        lpm_common::write_file_atomic_in_dir_with_options(
+            &output,
+            std::ffi::OsStr::new("lpm.json"),
+            lpm_common::AtomicWriteOptions::new(),
+            |file| std::io::Write::write_all(file, &content),
+        )
+        .map_err(|e| {
+            LpmError::Script(format!(
+                "failed to write {:?}: {e}",
+                dst_dir.join("lpm.json")
+            ))
+        })?;
+        stats.files_copied += 1;
+        stats.bytes_copied += content.len() as u64;
+    }
+
     Ok(stats)
 }
 
-/// Inner recursive walker. Separated so the public entry point can do the
-/// one-time `create_dir_all` and stats initialization.
-fn copy_member_source_recursive(
-    root: &Path,
-    src: &Path,
-    dst: &Path,
-    selector: &PackageFileSelector,
-    stats: &mut CopyStats,
-) -> Result<(), LpmError> {
-    let entries = std::fs::read_dir(src)
-        .map_err(|e| LpmError::Script(format!("failed to read source dir {src:?}: {e}")))?;
-
-    for entry in entries {
-        let entry =
-            entry.map_err(|e| LpmError::Script(format!("failed to read directory entry: {e}")))?;
-        let basename = entry.file_name();
-        let basename_str = basename.to_string_lossy();
-
-        // Apply the deny list at every level (not just root) so a nested
-        // .env or node_modules anywhere under the source is excluded.
-        if basename.as_encoded_bytes().starts_with(b".env")
+/// Whether a package-relative `/` path names a file a deploy never copies.
+fn deploy_denies(path: &str) -> bool {
+    path.split('/').any(|segment| {
+        segment
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(".env"))
             || DEPLOY_DENY_BASENAMES
                 .iter()
-                .any(|denied| denied.eq_ignore_ascii_case(basename_str.as_ref()))
-        {
-            stats.files_skipped += 1;
-            continue;
-        }
-
-        let src_path = entry.path();
-        let dst_path = dst.join(&basename);
-
-        let file_type = entry
-            .file_type()
-            .map_err(|e| LpmError::Script(format!("failed to stat {src_path:?}: {e}")))?;
-        let rel_path = src_path.strip_prefix(root).unwrap_or(src_path.as_path());
-        if !selector.should_copy(rel_path, file_type.is_dir()) {
-            stats.files_skipped += 1;
-            continue;
-        }
-
-        if file_type.is_dir() {
-            std::fs::create_dir_all(&dst_path)
-                .map_err(|e| LpmError::Script(format!("failed to create dir {dst_path:?}: {e}")))?;
-            copy_member_source_recursive(root, &src_path, &dst_path, selector, stats)?;
-        } else if file_type.is_symlink() {
-            // Preserve symlinks as-is. Don't follow them — that could escape
-            // the source dir.
-            #[cfg(unix)]
-            {
-                let target = std::fs::read_link(&src_path).map_err(|e| {
-                    LpmError::Script(format!("failed to read symlink {src_path:?}: {e}"))
-                })?;
-                std::os::unix::fs::symlink(&target, &dst_path).map_err(|e| {
-                    LpmError::Script(format!("failed to recreate symlink {dst_path:?}: {e}"))
-                })?;
-                stats.files_copied += 1;
-            }
-            #[cfg(windows)]
-            {
-                // Windows cannot recreate symlinks here without risking
-                // target-type ambiguity. Skip them so deploy never follows
-                // a junction or symlink out of the source member tree.
-                tracing::warn!(
-                    target: "lpm_cli::deploy",
-                    src = %src_path.display(),
-                    "skipping Windows symlink/junction in deploy member tree; refusing to follow out-of-source targets"
-                );
-                stats.files_skipped += 1;
-            }
-            #[cfg(not(any(unix, windows)))]
-            {
-                stats.files_skipped += 1;
-            }
-        } else {
-            // Regular file: hardlink first, fall back to copy.
-            // Hardlinks are zero-cost on the same filesystem and preserve
-            // the source bytes exactly. Cross-device falls through to copy.
-            let bytes = std::fs::metadata(&src_path).map_or(0, |m| m.len());
-            if std::fs::hard_link(&src_path, &dst_path).is_err() {
-                std::fs::copy(&src_path, &dst_path).map_err(|e| {
-                    LpmError::Script(format!("failed to copy {src_path:?} to {dst_path:?}: {e}"))
-                })?;
-            }
-            stats.files_copied += 1;
-            stats.bytes_copied += bytes;
-        }
-    }
-
-    Ok(())
+                .any(|denied| denied.eq_ignore_ascii_case(segment))
+    }) || lpm_security::behavioral::secrets::is_blocked_file(path)
 }
 
 #[cfg(unix)]

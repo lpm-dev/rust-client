@@ -142,6 +142,28 @@ fn published_lpm_json(
         .map_err(|error| LpmError::Registry(error.to_string()))
 }
 
+/// The `lpm.json` a publish of the package in `package_dir` ships, or `None`
+/// when it has none. `display_dir` names the directory in errors.
+pub(crate) fn shipped_lpm_json(
+    package_dir: &Arc<cap_std::fs::Dir>,
+    display_dir: &Path,
+) -> Result<Option<Vec<u8>>, LpmError> {
+    let Some(content) = read_optional_publish_text(
+        package_dir,
+        Path::new("lpm.json"),
+        &display_dir.join("lpm.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )?
+    else {
+        return Ok(None);
+    };
+    let config = lpm_json::parse_lpm_json_with_root(Arc::clone(package_dir), &content)
+        .map_err(LpmError::Registry)?;
+    Ok(Some(
+        published_lpm_json(&config, &content)?.unwrap_or_else(|| content.into_bytes()),
+    ))
+}
+
 pub(crate) fn prepare_publish_project(
     project_dir: &Path,
     scan_secrets: bool,

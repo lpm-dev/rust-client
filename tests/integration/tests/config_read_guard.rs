@@ -30,7 +30,7 @@ const AUDITED_CONFIGURATION_LOADERS: &[&str] = &[
     "crates/lpm-cli/src/commands/audit/discovery.rs",
     "crates/lpm-cli/src/commands/audit/fix.rs",
     "crates/lpm-cli/src/commands/config/io.rs",
-    "crates/lpm-cli/src/commands/deploy/file_select.rs",
+    "crates/lpm-cli/src/commands/deploy/copy.rs",
     "crates/lpm-cli/src/commands/deploy/manifest_rewrite.rs",
     "crates/lpm-cli/src/commands/deploy/paths.rs",
     "crates/lpm-cli/src/commands/dev.rs",
