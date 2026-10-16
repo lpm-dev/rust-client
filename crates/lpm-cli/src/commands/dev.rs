@@ -3839,10 +3839,10 @@ fn normalize_script_binary_name(word: &str) -> Option<String> {
     Some(word.to_string())
 }
 
-/// Copy a regular example only when the destination is absent.
-/// Atomic publication preserves a destination created concurrently.
+/// Copy a regular example only when the destination is absent, keeping the
+/// new `.env` out of git. A destination created concurrently is kept.
 fn auto_copy_env_example(project_dir: &std::path::Path) -> Result<Option<String>, LpmError> {
-    use std::io::{ErrorKind, Write};
+    use std::io::ErrorKind;
 
     let env_file = project_dir.join(".env");
     let example_file = project_dir.join(".env.example");
@@ -3887,36 +3887,36 @@ fn auto_copy_env_example(project_dir: &std::path::Path) -> Result<Option<String>
         }
     }
 
-    let mut temporary = tempfile::NamedTempFile::new_in(project_dir).map_err(LpmError::Io)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        temporary
-            .as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(LpmError::Io)?;
-    }
-    temporary.write_all(&contents).map_err(LpmError::Io)?;
-    temporary.as_file().sync_all().map_err(LpmError::Io)?;
-    match temporary.persist_noclobber(&env_file) {
-        Ok(_) => {
-            dev_ui::warn("No .env file found. Created from .env.example");
-            dev_ui::hint_line("Review .env and fill in missing values");
-            dev_ui::trusted_hint_line(install_ui::terminal_line!(
-                "Or use {} to store project secrets",
-                install_ui::yellow("lpm env vars set"),
-            ));
-            Ok(Some("created from .env.example".to_string()))
+    let write = match lpm_common::project_secret::write_secret_file(
+        project_dir,
+        &env_file,
+        &contents,
+        lpm_common::project_secret::SecretFileOptions {
+            ignore_file: lpm_common::project_secret::IgnoreFile::ProjectGitignore,
+            on_ignore_failure: lpm_common::project_secret::IgnoreFailure::Warn,
+            existing: lpm_common::project_secret::Existing::Keep,
+        },
+    ) {
+        Ok(write) => write,
+        Err(error @ lpm_common::project_secret::SecretFileError::Tracked { .. }) => {
+            dev_ui::warn(&format!("Not creating .env from .env.example: {error}"));
+            return Ok(Some(".env not created: tracked by git".to_string()));
         }
-        Err(error) if error.error.kind() == ErrorKind::AlreadyExists => {
-            Ok(Some(".env loaded".to_string()))
-        }
-        Err(error) => Err(LpmError::Script(format!(
-            "create {}: {}",
-            env_file.display(),
-            error.error
-        ))),
+        Err(error) => return Err(LpmError::from(error)),
+    };
+    if !write.written {
+        return Ok(Some(".env loaded".to_string()));
     }
+    dev_ui::warn("No .env file found. Created from .env.example");
+    for warning in &write.warnings {
+        dev_ui::warn(warning);
+    }
+    dev_ui::hint_line("Review .env and fill in missing values");
+    dev_ui::trusted_hint_line(install_ui::terminal_line!(
+        "Or use {} to store project secrets",
+        install_ui::yellow("lpm env set"),
+    ));
+    Ok(Some("created from .env.example".to_string()))
 }
 
 /// Format a Duration as human-readable (e.g. "42ms" or "3.2s").
@@ -5976,6 +5976,42 @@ mod tests {
 
         let env_content = fs::read_to_string(dir.path().join(".env")).unwrap();
         assert_eq!(env_content, "KEY=value\n");
+    }
+
+    #[test]
+    fn auto_copy_env_example_keeps_the_new_env_out_of_git() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env.example"), "KEY=\n").unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "node_modules\n").unwrap();
+
+        auto_copy_env_example(dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+            "node_modules\n/.env\n"
+        );
+    }
+
+    #[test]
+    fn a_tracked_env_that_was_deleted_is_not_recreated_and_dev_goes_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            lpm_common::project_git::hardened_git_command(dir.path(), args)
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        if !git(&["init", "-q"]) {
+            return;
+        }
+        std::fs::write(dir.path().join(".env"), "KEY=committed\n").unwrap();
+        assert!(git(&["add", ".env"]));
+        std::fs::remove_file(dir.path().join(".env")).unwrap();
+        std::fs::write(dir.path().join(".env.example"), "KEY=\n").unwrap();
+
+        let status = auto_copy_env_example(dir.path()).unwrap();
+
+        assert!(!dir.path().join(".env").exists());
+        assert!(status.is_some_and(|status| status.contains("tracked")));
     }
 
     #[test]

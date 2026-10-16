@@ -694,6 +694,125 @@ fn reusable_object_returns_verified_object_integrity() {
     );
 }
 
+#[cfg(target_os = "macos")]
+fn grant_everyone_access(path: &Path, inheritable: bool) {
+    let rights = if inheritable {
+        "group:everyone allow read,write,list,search,add_file,add_subdirectory,file_inherit,directory_inherit"
+    } else {
+        "group:everyone allow list,search"
+    };
+    let status = std::process::Command::new("/bin/chmod")
+        .args(["+a", rights])
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// An object reused from a tier an earlier release left open to others is
+/// closed to them on reuse.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_reused_object_s_tier_drops_access_an_earlier_release_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::at(dir.path());
+    let sri = synthetic_sri(b"a_reused_object_s_tier_drops_access");
+    let object_dir = write_object(
+        &store,
+        &sri,
+        &[("package.json", b"{\"name\":\"a\"}"), ("index.js", b"//ok")],
+    );
+    let tier = object_dir.parent().unwrap().to_path_buf();
+    grant_everyone_access(&tier, false);
+
+    store
+        .reusable_object_with_policy(&sri, ObjectIntegrityPolicy::Source)
+        .unwrap()
+        .unwrap();
+
+    assert!(!lpm_common::macos_acl::has_extended_acl_at(&tier).unwrap());
+}
+
+/// Each route that reuses an existing object, install's batched checks,
+/// extraction and translation from an existing tree, drops the access an
+/// earlier release left on the objects tier before it reads the object.
+#[cfg(target_os = "macos")]
+#[test]
+fn every_route_that_reuses_an_object_drops_access_left_on_its_tier() {
+    type Reuse = fn(&Store, &str, &Path);
+    let routes: [(&str, Reuse); 3] = [
+        ("batched", |store, sri, _| {
+            let batch = store.reusable_object_validation_batch();
+            store
+                .reusable_object_with_timings_in_batch(sri, &batch)
+                .unwrap()
+                .0
+                .unwrap();
+        }),
+        ("extraction", |store, sri, object_dir| {
+            store
+                .reusable_object_for_extraction(object_dir, sri, ObjectIntegrityPolicy::Source)
+                .unwrap()
+                .unwrap();
+        }),
+        ("existing tree", |store, sri, object_dir| {
+            store
+                .populate_object_from_existing_tree(object_dir, sri, "translating")
+                .unwrap();
+        }),
+    ];
+    for (route, reuse) in routes {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            Store::at_with_object_integrity_policy(dir.path(), ObjectIntegrityPolicy::Source);
+        let sri = synthetic_sri(route.as_bytes());
+        let object_dir = write_object(
+            &store,
+            &sri,
+            &[("package.json", b"{\"name\":\"a\"}"), ("index.js", b"//ok")],
+        );
+        let tier = object_dir.parent().unwrap().to_path_buf();
+        grant_everyone_access(&tier, false);
+
+        reuse(&store, &sri, &object_dir);
+
+        assert!(
+            !lpm_common::macos_acl::has_extended_acl_at(&tier).unwrap(),
+            "{route}"
+        );
+    }
+}
+
+/// A tier a migration creates doesn't take the access its directory hands
+/// down.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_migrated_object_s_tier_drops_access_its_directory_hands_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+    let v2 = Store::from_lpm_root(&lpm_root);
+    let tarball = build_test_tarball(&[
+        (
+            "package.json",
+            b"{\"name\":\"migrated\",\"version\":\"1.0.0\"}",
+        ),
+        ("index.js", b"private"),
+    ]);
+    let (_, sri, _) = v2.extract_object_from_bytes(&tarball, None).unwrap();
+    // The store's directory hands access down to what is made in it.
+    grant_everyone_access(&lpm_root.store_root(), true);
+
+    let v3 = Store::from_lpm_root_v3(&lpm_root);
+    let migrated = v3.reusable_object(&sri).unwrap().unwrap();
+
+    let tier = migrated.path.parent().unwrap();
+    assert!(
+        !lpm_common::macos_acl::has_extended_acl_at(tier).unwrap(),
+        "{}",
+        tier.display()
+    );
+}
+
 #[test]
 fn remove_unusable_object_dir_treats_concurrent_delete_as_success() {
     let dir = tempfile::tempdir().unwrap();
@@ -5219,6 +5338,37 @@ fn ensure_store_tier_dir_locked_tightens_existing_world_readable_dir() {
         mode, 0o700,
         "store-tier dir must be tightened to 0o700 on re-use, got 0o{mode:o}"
     );
+}
+
+/// A store directory doesn't keep the access list entries it takes from
+/// the directory above, which would let another account reach the package
+/// bytes inside whatever its mode.
+#[cfg(target_os = "macos")]
+#[test]
+fn ensure_store_tier_dir_locked_drops_access_the_directory_above_hands_down() {
+    let parent = tempfile::tempdir().unwrap();
+    let status = std::process::Command::new("/bin/chmod")
+        .args([
+            "+a",
+            "group:everyone allow read,write,list,search,add_file,add_subdirectory,file_inherit,directory_inherit",
+        ])
+        .arg(parent.path())
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let created = parent.path().join("objects");
+    let existing = parent.path().join("links");
+    std::fs::create_dir(&existing).unwrap();
+
+    for target in [&created, &existing] {
+        ensure_store_tier_dir_locked(target).unwrap();
+
+        assert!(
+            !lpm_common::macos_acl::has_extended_acl_at(target).unwrap(),
+            "{}",
+            target.display()
+        );
+    }
 }
 
 #[cfg(unix)]

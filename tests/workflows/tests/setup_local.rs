@@ -91,7 +91,7 @@ async fn setup_local_json_writes_scoped_config_gitignore_and_read_only_token() {
         }),
         ".npmrc must contain a generated read-only token, got:\n{npmrc}"
     );
-    assert_eq!(project.read_file(".gitignore"), ".npmrc\n");
+    assert_eq!(project.read_file(".gitignore"), "/.npmrc\n");
 
     #[cfg(unix)]
     {
@@ -333,7 +333,7 @@ async fn setup_local_refreshes_rejected_stored_session_and_retries_once() {
 }
 
 #[tokio::test]
-async fn setup_local_rerun_replaces_only_generated_block_and_deduplicates_gitignore() {
+async fn setup_local_rerun_replaces_only_generated_block_and_keeps_gitignore() {
     let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
     project.write_file(
         ".npmrc",
@@ -359,12 +359,9 @@ async fn setup_local_rerun_replaces_only_generated_block_and_deduplicates_gitign
     assert!(npmrc.contains("registry=https://registry.example.test/"));
     assert!(npmrc.contains("fund=false"));
     assert_eq!(
-        project
-            .read_file(".gitignore")
-            .lines()
-            .filter(|line| line.trim() == ".npmrc")
-            .count(),
-        1
+        project.read_file(".gitignore"),
+        "target\n.npmrc\n.npmrc\n",
+        "an existing rule keeps .npmrc ignored, so the user's .gitignore stays as it is"
     );
 
     let requests = mock.server().received_requests().await.unwrap();
@@ -579,7 +576,8 @@ async fn setup_local_gitignore_write_failure_happens_before_token_creation() {
     )
     .expect("restore project directory permissions");
     assert!(!output.status.success());
-    assert_eq!(project.read_file(".gitignore"), "target\n");
+    // The rule went in before the `.npmrc` write failed, and stays.
+    assert_eq!(project.read_file(".gitignore"), "target\n/.npmrc\n");
     assert!(!project.file_exists(".npmrc"));
     assert!(
         mock.server()
@@ -607,7 +605,7 @@ async fn setup_local_ambiguous_replacement_reuses_pending_credentials_on_retry()
     let pending = project.read_file(".npmrc");
     assert!(pending.contains("# LPM pending project token id: "));
     assert!(!pending.contains("# LPM project token id: "));
-    assert_eq!(project.read_file(".gitignore"), ".npmrc\n");
+    assert_eq!(project.read_file(".gitignore"), "/.npmrc\n");
 
     let second = lpm_with_registry(&project, &mock.url())
         .args(["setup", "local"])
@@ -696,7 +694,7 @@ async fn setup_local_ambiguous_replacement_retains_the_predecessor_bearer_for_re
 }
 
 #[tokio::test]
-async fn setup_local_bounded_registry_rejection_restores_pre_request_files() {
+async fn setup_local_bounded_registry_rejection_restores_npmrc_and_keeps_its_ignore_rule() {
     let project = TempProject::empty(r#"{"name":"setup","version":"1.0.0"}"#);
     let original_npmrc = "registry=https://registry.example.test/\nfund=false\n";
     project.write_file(".npmrc", original_npmrc);
@@ -711,7 +709,9 @@ async fn setup_local_bounded_registry_rejection_restores_pre_request_files() {
 
     assert!(!output.status.success());
     assert_eq!(project.read_file(".npmrc"), original_npmrc);
-    assert_eq!(project.read_file(".gitignore"), "target\n");
+    // The rule only keeps files out of git; another command may have added
+    // its own after it, which taking it out again would remove.
+    assert_eq!(project.read_file(".gitignore"), "target\n/.npmrc\n");
     assert_eq!(
         mock.server().received_requests().await.unwrap().len(),
         1,
@@ -915,7 +915,7 @@ async fn setup_local_malformed_success_response_retains_recoverable_pending_stat
         let npmrc = project.read_file(".npmrc");
         assert!(npmrc.contains("# LPM pending project token id: "));
         assert!(npmrc.contains("/:_authToken=lpm_"));
-        assert_eq!(project.read_file(".gitignore"), ".npmrc\n");
+        assert_eq!(project.read_file(".gitignore"), "/.npmrc\n");
     }
 }
 

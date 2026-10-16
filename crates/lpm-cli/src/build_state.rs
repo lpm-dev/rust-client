@@ -469,17 +469,22 @@ fn read_build_state_secret() -> Result<Option<Vec<u8>>, LpmError> {
     read_build_state_secret_at(&path)
 }
 
+/// The signing secret at `path`, kept to its owner first, as one an earlier
+/// release wrote may not be.
 fn read_build_state_secret_at(path: &Path) -> Result<Option<Vec<u8>>, LpmError> {
-    let raw = match lpm_common::read_text_file_capped_nofollow(path, 256) {
-        Ok(raw) => raw,
-        Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
-        Err(error) => {
-            return Err(LpmError::SecurityApprovalStore(format!(
-                "failed to read build-state signing secret {}: {error}",
-                path.display(),
-            )));
-        }
+    let unreadable = |error: &dyn std::fmt::Display| {
+        LpmError::SecurityApprovalStore(format!(
+            "failed to read build-state signing secret {}: {error}",
+            path.display(),
+        ))
     };
+    let file = match lpm_common::atomic_write::open_owner_only_file(path, false) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(unreadable(&error)),
+    };
+    let (raw, _) = lpm_common::read_text_file_capped_from_open_file(file, path, 256)
+        .map_err(|error| unreadable(&error))?;
     let secret = hex::decode(raw.trim()).map_err(|error| {
         LpmError::SecurityApprovalStore(format!(
             "build-state signing secret {} is corrupt: {error}",
@@ -512,7 +517,9 @@ fn get_or_create_build_state_secret_at(
         std::fs::create_dir_all(parent)?;
     }
     let lock_path = path.with_extension("lock");
-    let _lock = lpm_common::acquire_single_file_exclusive_lock(&lock_path)?;
+    let _lock = lpm_common::acquire_single_file_exclusive_lock_from_file(
+        lpm_common::atomic_write::open_owner_only_file(&lock_path, true)?,
+    )?;
     if let Some(secret) = read_build_state_secret_at(path)? {
         return Ok(secret);
     }
@@ -528,7 +535,7 @@ fn get_or_create_build_state_secret_at(
     lpm_common::write_file_atomic_with(
         path,
         lpm_common::AtomicWriteOptions::new()
-            .unix_mode(0o600)
+            .owner_only()
             .sync_file()
             .sync_parent(),
         |file| -> Result<(), LpmError> {
@@ -1555,6 +1562,47 @@ mod tests {
             blocked_packages: packages,
             authentication_tag: None,
             drift_ignore_override: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_signing_secret_open_to_others_is_kept_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("build-state-secret.hex");
+        let secret = get_or_create_build_state_secret_at(&path, || {}).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(read_build_state_secret_at(&path).unwrap(), Some(secret));
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_signing_secret_drops_access_its_directory_hands_down() {
+        let dir = tempdir().unwrap();
+        let status = std::process::Command::new("/bin/chmod")
+            .args([
+                "+a",
+                "group:everyone allow read,write,list,search,add_file,file_inherit,directory_inherit",
+            ])
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let path = dir.path().join("security/build-state-secret.hex");
+
+        get_or_create_build_state_secret_at(&path, || {}).unwrap();
+
+        for written in [path.clone(), path.with_extension("lock")] {
+            assert!(
+                !lpm_common::macos_acl::has_extended_acl_at(&written).unwrap(),
+                "{}",
+                written.display()
+            );
         }
     }
 

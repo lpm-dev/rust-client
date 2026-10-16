@@ -27,7 +27,7 @@ pub use super::integrity::{
     ReusableObjectCheckTimings, VerifiedObjectIntegrity,
 };
 use super::integrity::{
-    current_tree_content_matches_snapshot, finish_object_rename_after_collision,
+    current_tree_content_matches_snapshot, finish_object_rename_after_collision, harden_tier_of,
     has_local_source_sentinel, is_complete_object_dir, object_dir_is_reusable_or_remove,
     object_integrity_for_link, object_integrity_or_remove, object_integrity_or_remove_with_timings,
     object_integrity_policy_from_env, read_object_integrity, read_tree_snapshot,
@@ -2635,7 +2635,7 @@ impl Store {
             )));
         }
         if let Some(parent) = object_dir.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
+            ensure_store_tier_dir_locked(parent).map_err(|e| {
                 LpmError::Store(format!("failed to create virtual-store objects dir: {e}"))
             })?;
         }
@@ -3571,6 +3571,7 @@ fn link_entry_is_reusable(
     tree_digest: Option<&str>,
     policy: ObjectIntegrityPolicy,
 ) -> Result<bool, LpmError> {
+    harden_tier_of(dir, "links")?;
     if !is_complete_link_entry(dir, key) {
         return Ok(false);
     }

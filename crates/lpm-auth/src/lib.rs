@@ -1178,7 +1178,7 @@ fn write_custom_registries_checked(
         path,
         json,
         lpm_common::AtomicWriteOptions::new()
-            .unix_mode(0o600)
+            .owner_only()
             .sync_file()
             .sync_parent(),
     )
@@ -1439,7 +1439,7 @@ fn write_token_expiries_checked(
         path,
         json,
         lpm_common::AtomicWriteOptions::new()
-            .unix_mode(0o600)
+            .owner_only()
             .sync_file()
             .sync_parent(),
     )
@@ -2425,7 +2425,7 @@ fn write_file_auth_key(key_path: &Path, value: &str) -> Result<(), String> {
         key_path,
         value,
         lpm_common::AtomicWriteOptions::new()
-            .unix_mode(0o600)
+            .owner_only()
             .sync_file()
             .sync_parent(),
     )
@@ -2718,27 +2718,11 @@ fn set_token_in_file(registry_url: &str, token: &str) -> Result<(), String> {
         &path,
         encrypted,
         lpm_common::AtomicWriteOptions::new()
-            .unix_mode(0o600)
+            .owner_only()
             .sync_file()
             .sync_parent(),
     )
     .map_err(|e| format!("write error: {e}"))?;
-
-    #[cfg(windows)]
-    {
-        // Use icacls to restrict to current user only
-        let username = std::env::var("USERNAME").unwrap_or_else(|_| "".to_string());
-        if !username.is_empty() {
-            let _ = std::process::Command::new("icacls")
-                .args([
-                    path.to_str().unwrap_or(""),
-                    "/inheritance:r",
-                    "/grant:r",
-                    &format!("{username}:(R,W)"),
-                ])
-                .output();
-        }
-    }
 
     Ok(())
 }
@@ -2779,7 +2763,7 @@ fn clear_token_from_file(registry_url: &str) -> Result<(), String> {
             &path,
             encrypted,
             lpm_common::AtomicWriteOptions::new()
-                .unix_mode(0o600)
+                .owner_only()
                 .sync_file()
                 .sync_parent(),
         )
@@ -3664,6 +3648,43 @@ mod tests {
             assert!(error.contains("LPM_HOME"), "{error}");
             assert_eq!(get_token_from_file(custom), None);
             assert!(!lpm.join(".gitignore").exists());
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn file_backed_login_state_drops_access_its_directory_hands_down() {
+        with_temp_home(|home| {
+            let status = std::process::Command::new("/bin/chmod")
+                .args([
+                    "+a",
+                    "group:everyone allow read,write,list,search,add_file,file_inherit,directory_inherit",
+                ])
+                .arg(home)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            let lpm = lpm_dir().unwrap();
+            std::fs::create_dir_all(&lpm).unwrap();
+            set_token_in_file("https://registry.example", "token").unwrap();
+            credential_authority::set(
+                "https://registry.example",
+                CredentialKind::Access,
+                CredentialAuthority::active(CredentialBackend::Keychain, "token"),
+            )
+            .unwrap();
+
+            for path in [
+                lpm.join(".key"),
+                credentials_path().unwrap(),
+                credential_authority::path_for_test().unwrap(),
+            ] {
+                assert!(
+                    !lpm_common::macos_acl::has_extended_acl_at(&path).unwrap(),
+                    "{}",
+                    path.display()
+                );
+            }
         });
     }
 

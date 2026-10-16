@@ -1,6 +1,5 @@
 ---
 source: tests/workflows/tests/setup_local.rs
-assertion_line: 48
 expression: envelope
 ---
 {
@@ -11,5 +10,6 @@ expression: envelope
   "scope": "read",
   "expires_at": "2030-01-02T03:04:05Z",
   "expiry_days": 14,
-  "gitignore_updated": true
+  "gitignore_updated": true,
+  "warnings": []
 }

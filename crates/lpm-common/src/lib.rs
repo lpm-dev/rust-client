@@ -25,6 +25,8 @@ pub mod macos_acl;
 pub mod mounts;
 pub mod names;
 pub mod npmrc;
+#[cfg(windows)]
+pub mod owner_only;
 pub mod package_instance;
 pub mod package_name;
 #[cfg(unix)]
@@ -33,7 +35,9 @@ pub mod paths;
 pub mod peer;
 pub mod platform;
 pub mod process_output;
+pub mod project_git;
 pub mod project_glob;
+pub mod project_secret;
 pub mod project_state;
 pub mod provenance;
 pub mod symlink;

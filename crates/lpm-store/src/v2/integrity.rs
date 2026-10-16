@@ -4,7 +4,7 @@ use lpm_common::{LpmError, write_file_atomic};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::fs_util::tmp_sibling;
+use super::fs_util::{harden_store_tier_once, tmp_sibling};
 use super::tree_hash::{
     TreeContentSchema, TreeIntegrities, compute_object_tree_integrities,
     compute_object_tree_integrities_for_schema, compute_tree_metadata_integrity,
@@ -362,6 +362,21 @@ pub(crate) fn source_policy_uses_source_integrity(
     matches!(policy, ObjectIntegrityPolicy::Source) && !has_local_source_sentinel(dir)
 }
 
+/// Keeps the store tier holding the entry `dir` to its owner, once per
+/// process, before anything in it is reused: an earlier release may have
+/// left the tier open to other accounts, and what it holds is readable
+/// through it. `tier` names the tier in the error.
+pub(crate) fn harden_tier_of(dir: &Path, tier: &str) -> Result<(), LpmError> {
+    let Some(parent) = dir.parent() else {
+        return Ok(());
+    };
+    harden_store_tier_once(parent).map_err(|error| {
+        LpmError::Store(format!(
+            "failed to keep the virtual-store {tier} dir private: {error}"
+        ))
+    })
+}
+
 pub(crate) fn object_dir_is_reusable_or_remove(
     dir: &Path,
     context: &str,
@@ -378,6 +393,7 @@ pub(crate) fn object_integrity_or_remove_with_timings(
     timings: &mut ReusableObjectCheckTimings,
     policy: ObjectIntegrityPolicy,
 ) -> Result<Option<VerifiedObjectIntegrity>, LpmError> {
+    harden_tier_of(dir, "objects")?;
     let complete_check_start = std::time::Instant::now();
     let complete = is_complete_object_dir(dir);
     timings.complete_check_ms = timings
@@ -463,6 +479,7 @@ pub(crate) fn object_integrity_or_remove(
     source_sri: &str,
     policy: ObjectIntegrityPolicy,
 ) -> Result<Option<VerifiedObjectIntegrity>, LpmError> {
+    harden_tier_of(dir, "objects")?;
     if !is_complete_object_dir(dir) {
         remove_unusable_object_dir(dir, context)?;
         return Ok(None);

@@ -91,6 +91,22 @@ pub struct V2BaselineIndex {
 
 static PROJECT_INDEX_BUILDS: AtomicU64 = AtomicU64::new(0);
 
+/// Keeps the store's links tier, whose packages a baseline reads and a
+/// rebuild runs, and the objects tier they come from to their owner before
+/// anything there is read: an earlier release may have left them open to
+/// other accounts.
+fn keep_tiers_private(store: &crate::v2::Store) -> std::io::Result<()> {
+    for tier in [store.paths().links_root(), store.paths().objects_root()] {
+        crate::v2::fs_util::harden_store_tier_once(&tier).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("failed to keep {} private: {error}", tier.display()),
+            )
+        })?;
+    }
+    Ok(())
+}
+
 impl V2BaselineIndex {
     /// Project indexes this process has built with [`Self::for_project`].
     pub fn project_index_builds() -> u64 {
@@ -174,6 +190,13 @@ impl V2BaselineIndex {
         use {HashSet, VecDeque};
 
         let links_root = store_v2.paths().links_root();
+        if let Err(error) = keep_tiers_private(store_v2) {
+            tracing::warn!(
+                "not reading installed packages from {}: {error}",
+                links_root.display()
+            );
+            return Self::default();
+        }
         let mut by_coords: HashMap<(String, String), Arc<InstalledPackageBaseline>> =
             HashMap::new();
         let mut by_integrity: HashMap<String, Arc<InstalledPackageBaseline>> = HashMap::new();
@@ -372,6 +395,7 @@ impl V2BaselineIndex {
         let mut graph_digest_by_package_dir = HashMap::new();
         for version in [crate::StoreVersion::V2, crate::StoreVersion::V3] {
             let store_v2 = crate::v2::Store::from_lpm_root_for_version(lpm_root, version);
+            keep_tiers_private(&store_v2).map_err(|error| LpmError::Store(error.to_string()))?;
             for (link_dir, meta) in store_v2.iter_link_entries()? {
                 let key = (meta.name.clone(), meta.version.clone());
                 let package_dir = link_dir.join("node_modules").join(&meta.name);
@@ -748,6 +772,7 @@ fn find_installed_package_baseline_impl(
     let mut selected_across_stores: Option<InstalledPackageBaseline> = None;
     for store_version in [crate::StoreVersion::V2, crate::StoreVersion::V3] {
         let store_v2 = crate::v2::Store::from_lpm_root_for_version(lpm_root, store_version);
+        keep_tiers_private(&store_v2).map_err(|error| LpmError::Store(error.to_string()))?;
         let links_root = store_v2.paths().links_root();
         let read_dir = match std::fs::read_dir(&links_root) {
             Ok(read_dir) => read_dir,
@@ -1220,6 +1245,113 @@ mod tests {
             project_hit.package_dir,
             entry_patched
         );
+    }
+
+    /// The installed packages a rebuild reads and runs, and a patch copies,
+    /// come from links and objects tiers an earlier release may have left
+    /// open to others, which every lookup keeps to their owner before it
+    /// reads anything there.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_baseline_lookup_drops_access_left_on_the_store_tiers() {
+        use crate::v2::link_meta::{LinkMeta, LinkMetaPlatform};
+        use chrono::Utc;
+
+        for route in [
+            "project index",
+            "global index",
+            "lookup",
+            "lookup by identity",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let lpm_root = lpm_common::LpmRoot::from_dir(dir.path());
+            let store = V2Store::from_lpm_root(&lpm_root);
+            let links_root = dir.path().join("store").join("v2").join("links");
+            let link_dir = links_root.join("lodash@1.0.0+aaaaaaaaaaaaaaaa");
+            let sri = synthetic_sri(b"every_baseline_lookup_drops_access_left_on_the_store_tiers");
+            let object_dir = write_object(
+                &store,
+                &sri,
+                &[(
+                    "package.json",
+                    b"{\"name\":\"lodash\",\"version\":\"1.0.0\"}",
+                )],
+            );
+            let pkg_dir = link_dir.join("node_modules").join("lodash");
+            std::fs::create_dir_all(&pkg_dir).unwrap();
+            std::fs::write(
+                pkg_dir.join("package.json"),
+                r#"{"name":"lodash","version":"1.0.0"}"#,
+            )
+            .unwrap();
+            LinkMeta {
+                schema: 1,
+                graph_key: "lodash@1.0.0+aaaaaaaaaaaaaaaa".into(),
+                graph_key_digest_hex: "a".repeat(64),
+                name: "lodash".into(),
+                version: "1.0.0".into(),
+                source_sri: sri.clone(),
+                object_path: object_dir
+                    .strip_prefix(store.paths().root())
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                tree_digest: None,
+                deps: vec![],
+                platform: std::sync::Arc::new(LinkMetaPlatform {
+                    os: "darwin".into(),
+                    cpu: "arm64".into(),
+                    libc: None,
+                }),
+                created_at: Utc::now(),
+                last_referenced_at: Utc::now(),
+            }
+            .write_to(&link_dir)
+            .unwrap();
+            let project = dir.path().join("project");
+            std::fs::create_dir_all(project.join("node_modules")).unwrap();
+            std::os::unix::fs::symlink(&pkg_dir, project.join("node_modules").join("lodash"))
+                .unwrap();
+            let objects_root = store.paths().objects_root();
+            for tier in [&links_root, &objects_root] {
+                let status = std::process::Command::new("/bin/chmod")
+                    .args(["+a", "group:everyone allow list,search"])
+                    .arg(tier)
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+            }
+
+            let found = match route {
+                "project index" => V2BaselineIndex::for_project(&project, &lpm_root)
+                    .lookup("lodash", "1.0.0")
+                    .is_some(),
+                "global index" => V2BaselineIndex::build(&lpm_root)
+                    .unwrap()
+                    .lookup("lodash", "1.0.0")
+                    .is_some(),
+                "lookup" => find_installed_package_baseline(&lpm_root, "lodash", "1.0.0")
+                    .unwrap()
+                    .is_some(),
+                _ => find_installed_package_baseline_by_identity(
+                    &lpm_root,
+                    "lodash",
+                    "1.0.0",
+                    Some(&sri),
+                )
+                .unwrap()
+                .is_some(),
+            };
+
+            assert!(found, "{route}");
+            for tier in [&links_root, &objects_root] {
+                assert!(
+                    !lpm_common::macos_acl::has_extended_acl_at(tier).unwrap(),
+                    "{route}: {}",
+                    tier.display()
+                );
+            }
+        }
     }
 
     /// Direct-bin compatibility rewires `node_modules/<pkg>` to a

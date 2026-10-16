@@ -1069,35 +1069,21 @@ fn compute_device_fingerprint_after_initial_read(after_initial_read: impl FnOnce
             .then(|| trimmed.to_string())
     }
 
+    /// The device-id file's contents, kept to its owner first, as one an
+    /// earlier release wrote may not be.
+    fn read_stored(path: &Path) -> Option<String> {
+        let file = lpm_common::atomic_write::open_owner_only_file(path, false).ok()?;
+        lpm_common::read_text_file_capped_from_open_file(
+            file,
+            path,
+            lpm_common::STATE_FILE_SIZE_CAP_BYTES,
+        )
+        .ok()
+        .map(|(contents, _)| contents)
+    }
+
     fn read_device_id(path: &Path) -> Option<String> {
-        lpm_common::read_text_file_capped(path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
-            .ok()
-            .and_then(|contents| parse_device_id(&contents))
-    }
-
-    #[cfg(unix)]
-    fn open_device_id_lock(path: &Path) -> std::io::Result<std::fs::File> {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(path)?;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        Ok(file)
-    }
-
-    #[cfg(not(unix))]
-    fn open_device_id_lock(path: &Path) -> std::io::Result<std::fs::File> {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(path)
+        read_stored(path).and_then(|contents| parse_device_id(&contents))
     }
 
     let Some(path) = device_id_path() else {
@@ -1107,9 +1093,13 @@ fn compute_device_fingerprint_after_initial_read(after_initial_read: impl FnOnce
         return generate_random_id();
     };
 
-    if let Ok(contents) =
-        lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
-    {
+    // A home git could commit gets no ID. One already there is still read:
+    // the sessions there are bound to it, and revoking them needs it.
+    let exposed = path
+        .parent()
+        .and_then(|parent| super::prepare_lpm_home(parent).err());
+
+    if let Some(contents) = read_stored(&path) {
         if let Some(id) = parse_device_id(&contents) {
             return id;
         }
@@ -1119,20 +1109,18 @@ fn compute_device_fingerprint_after_initial_read(after_initial_read: impl FnOnce
         );
     }
 
-    after_initial_read();
-
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
+    if let Some(e) = exposed {
         tracing::warn!(
-            path = %parent.display(),
-            "failed to create ~/.lpm for device-id ({e}) — using process-local fingerprint"
+            path = %path.display(),
+            "can't keep device-id in the LPM home ({e}) — using process-local fingerprint"
         );
         return generate_random_id();
     }
 
+    after_initial_read();
+
     let lock_path = path.with_file_name("device-id.lock");
-    let lock_file = match open_device_id_lock(&lock_path) {
+    let lock_file = match lpm_common::atomic_write::open_owner_only_file(&lock_path, true) {
         Ok(file) => file,
         Err(e) => {
             tracing::warn!(
@@ -1162,7 +1150,7 @@ fn compute_device_fingerprint_after_initial_read(after_initial_read: impl FnOnce
         &path,
         id.as_bytes(),
         lpm_common::AtomicWriteOptions::new()
-            .unix_mode(0o600)
+            .owner_only()
             .sync_file()
             .sync_parent(),
     ) {
@@ -1219,6 +1207,87 @@ mod tests {
             first.chars().all(|c| c.is_ascii_hexdigit()),
             "fingerprint should be lowercase hex"
         );
+    }
+
+    #[test]
+    fn a_device_fingerprint_is_never_written_where_git_would_commit_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // The LPM home is a repository's root, which no ignore file in it can
+        // keep out of git.
+        let home = tmp.path().join(".lpm");
+        std::fs::create_dir_all(home.join(".git")).unwrap();
+        let _env = ScopedEnv::set([
+            ("HOME", tmp.path().as_os_str().to_owned()),
+            ("LPM_HOME", home.clone().into_os_string()),
+        ]);
+
+        let fingerprint = compute_device_fingerprint();
+
+        assert_eq!(fingerprint.len(), 64);
+        assert!(!home.join("device-id").exists());
+
+        // An ID an earlier release left there is the device its sessions
+        // are bound to, which revoking them needs.
+        let stored = "a".repeat(64);
+        std::fs::write(home.join("device-id"), &stored).unwrap();
+        assert_eq!(compute_device_fingerprint(), stored);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stored_device_id_open_to_others_is_kept_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join(".lpm");
+        std::fs::create_dir_all(&home).unwrap();
+        let stored = "b".repeat(64);
+        std::fs::write(home.join("device-id"), &stored).unwrap();
+        std::fs::set_permissions(
+            home.join("device-id"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        let _env = ScopedEnv::set([
+            ("HOME", tmp.path().as_os_str().to_owned()),
+            ("LPM_HOME", home.clone().into_os_string()),
+        ]);
+
+        assert_eq!(compute_device_fingerprint(), stored);
+
+        let mode = std::fs::metadata(home.join("device-id"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn device_fingerprint_drops_access_its_directory_hands_down() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let status = std::process::Command::new("/bin/chmod")
+            .args([
+                "+a",
+                "group:everyone allow read,write,list,search,add_file,file_inherit,directory_inherit",
+            ])
+            .arg(tmp.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let home = tmp.path().join(".lpm");
+        let _env = ScopedEnv::set([
+            ("HOME", tmp.path().as_os_str().to_owned()),
+            ("LPM_HOME", home.clone().into_os_string()),
+        ]);
+
+        compute_device_fingerprint();
+
+        for name in ["device-id", "device-id.lock"] {
+            assert!(
+                !lpm_common::macos_acl::has_extended_acl_at(&home.join(name)).unwrap(),
+                "{name}"
+            );
+        }
     }
 
     #[test]

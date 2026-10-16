@@ -158,6 +158,13 @@ pub async fn run(
     super::npmrc::reject_tracked_npmrc(project_dir)?;
 
     let npmrc_path = project_dir.join(".npmrc");
+    let (_, ignore_warnings) = lpm_common::project_secret::prepare_secret_destination(
+        project_dir,
+        &npmrc_path,
+        lpm_common::project_secret::IgnoreFile::RepositoryExclude,
+        lpm_common::project_secret::IgnoreFailure::Refuse,
+    )
+    .map_err(LpmError::from)?;
     let existing = match lpm_common::read_text_file_capped_nofollow(
         &npmrc_path,
         lpm_common::NPMRC_FILE_SIZE_CAP_BYTES,
@@ -303,6 +310,7 @@ pub async fn run(
             "storage_backend": storage_status.backend_json_value(),
             "storage_degraded": storage_status.degraded,
             "note": "JSON redacts the bearer; the protected on-disk .npmrc contains the runtime-resolved literal token for npm-compatible clients.",
+            "warnings": ignore_warnings,
         });
         let rendered = serde_json::to_string_pretty(&json)
             .map_err(|error| LpmError::Script(format!("failed to encode JSON output: {error}")))?;
@@ -310,6 +318,9 @@ pub async fn run(
     } else {
         install_ui::done("Generated .npmrc");
         hint_line(&npmrc_path.display().to_string());
+        for warning in &ignore_warnings {
+            crate::output::warn(warning);
+        }
 
         if pending_retirement.is_some() {
             install_ui::phase("Completed pending token retirement using the staged replacement.");

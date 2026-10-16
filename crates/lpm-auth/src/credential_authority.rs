@@ -252,7 +252,7 @@ fn write_store(store: &CredentialAuthorityStore, write: super::HomeWrite) -> Res
         &path,
         json,
         lpm_common::AtomicWriteOptions::new()
-            .unix_mode(0o600)
+            .owner_only()
             .sync_file()
             .sync_parent(),
     )
