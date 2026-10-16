@@ -595,8 +595,7 @@ async fn postinstall_loopback_connect_is_denied_no_loopback_exemption() {
 // Gate: target_os = "windows" AND
 // `assert_cmd::Command::cargo_bin("lpm-sandbox-helper")` resolves
 // to an existing binary. Without the helper the install pipeline
-// falls back to the Low IL backend, which refuses
-// strict mode (without `allow_degraded`) and is covered separately.
+// refuses to run lifecycle scripts in the sandbox at all.
 
 /// `true` when the test runner has explicitly opted into
 /// exercising the Windows AppContainer path via
@@ -688,9 +687,8 @@ async fn windows_postinstall_outbound_connect_is_denied_under_appcontainer_stric
     }
     if !helper_available() {
         let msg = "lpm-sandbox-helper.exe not built — run `cargo build --workspace` \
-             or `cargo build -p lpm-sandbox --bin lpm-sandbox-helper` first. The AppContainer backend 
-             Low IL fallback refuses strict mode without `allow_degraded`, so the AppContainer \
-             backend is the only path that delivers the contract this test pins.";
+             or `cargo build -p lpm-sandbox --bin lpm-sandbox-helper` first. Without it \
+             lifecycle scripts don't run in the sandbox.";
         if require_appcontainer_coverage() {
             panic!(
                 "LPM_TEST_REQUIRE_APPCONTAINER=1 is set, but {msg}. \

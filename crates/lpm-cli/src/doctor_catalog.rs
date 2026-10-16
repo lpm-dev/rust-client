@@ -1819,27 +1819,18 @@ pub static SANDBOX_AVAILABLE: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
-/// on Windows, the
-/// `lpm-sandbox-helper.exe` companion binary that delivers
-/// AppContainer strict-mode (filesystem-write + outbound-network
-/// containment via WFP) is not located next to `lpm.exe`. The
-/// sandbox is still active via the Low IL fallback —
-/// filesystem-write is contained — but **strict mode is
-/// unreachable until the helper is restored**. Distinct catalog
-/// entry from [`SANDBOX_AVAILABLE`] so JSON consumers can detect
-/// the helper-missing case without prose parsing. Severity is
-/// `Warn`: containment is still active for default mode, but the
-/// user has lost the strict-mode upgrade path; reinstalling lpm
-/// restores it.
+/// On Windows, `lpm-sandbox-helper.exe`, which runs lifecycle scripts in
+/// an AppContainer, isn't where lpm looks for it. Lifecycle scripts that
+/// need the sandbox don't run, so severity is `Fail`.
 pub static SANDBOX_HELPER_MISSING: CheckEntry = CheckEntry {
     code: "sandbox_helper_missing",
     name: "Sandbox",
     category: Category::Sandbox,
     tier: Tier::Extended,
-    description: "On Windows, the `lpm-sandbox-helper.exe` companion binary that delivers AppContainer strict-mode (filesystem-write + outbound-network containment) is not located next to `lpm.exe`. The sandbox falls back to the Low IL backend, which contains filesystem writes but does NOT deny outbound network — so `--strict-sandbox` / `[sandbox] mode = \"strict\"` cannot be honored on this install.",
-    when_fires: "Windows host running a  build of `lpm.exe` but missing the companion `lpm-sandbox-helper.exe` in the same directory. Typical causes: corrupted npm install of `@lpm-registry/cli-win32-x64`, manual binary fetch that skipped the helper, or running a dev build that didn't bundle the helper alongside the test binary.",
-    remediation: "Reinstall `@lpm-registry/cli` via your package manager to restore the helper, or set `LPM_SANDBOX_HELPER=<absolute path>` if the helper lives elsewhere on the host. To drop the strict request and silence this warning without restoring the helper, run `lpm config sandbox --set default`.",
-    possible_severities: &[Severity::Warn],
+    description: "On Windows, the `lpm-sandbox-helper.exe` companion binary that runs lifecycle scripts in an AppContainer (filesystem-write containment, plus outbound-network denial in strict mode) is missing. Without it lpm doesn't run lifecycle scripts in the sandbox at all.",
+    when_fires: "Windows host where neither the file `LPM_SANDBOX_HELPER` names nor `lpm-sandbox-helper.exe` beside the running `lpm` exists. Typical causes: a damaged npm install of `@lpm-registry/cli-win32-x64`, a cargo install of the CLI without the helper, or a manually fetched binary without its companion.",
+    remediation: "Reinstall `@lpm-registry/cli` to restore the helper. For a cargo install, install the helper beside lpm with `cargo install --git https://github.com/lpm-dev/rust-client --tag v<version> lpm-sandbox --bin lpm-sandbox-helper`, using the version `lpm --version` reports. If the helper lives elsewhere, set `LPM_SANDBOX_HELPER=<absolute path>`. `--no-sandbox` runs scripts without containment.",
+    possible_severities: &[Severity::Fail],
     auto_fix: None,
 };
 
@@ -1915,7 +1906,7 @@ pub static SANDBOX_UNSUPPORTED_PLATFORM: CheckEntry = CheckEntry {
     category: Category::Sandbox,
     tier: Tier::Extended,
     description: "No supported sandbox backend exists for this platform.",
-    when_fires: "Running on a host where neither Seatbelt nor Landlock is available.",
+    when_fires: "Running on a platform other than macOS, Linux and Windows.",
     remediation: "Scripts that require sandbox containment stop. Use a supported host or an approved change to sandbox configuration.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,

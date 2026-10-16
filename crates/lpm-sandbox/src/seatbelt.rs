@@ -1,7 +1,8 @@
 //! Seatbelt profile synthesis for the macOS `sandbox-exec` backend.
 //!
 //! Project reads follow approved capabilities; writes stay narrow (package store
-//! dir + `node_modules` + `.husky` + `.lpm` + known caches + temp),
+//! dir + `node_modules` + `.husky` + the package's own layout dir in `.lpm` +
+//! known caches + temp),
 //! network allowed by default, process-fork + exec allowed so
 //! `node-gyp` children work.
 //!
@@ -90,14 +91,17 @@ pub(crate) fn render_profile_with_toolchain(
     )?;
     let tmpdir = quoted_path(&canon_tmpdir, "tmpdir")?;
 
-    // node_modules / .husky / .lpm are subpaths of the canonical
-    // project_dir.
+    // node_modules / .husky / the package dirs in .lpm are subpaths of
+    // the canonical project_dir.
     let project_node_modules = quoted_path(
         &canon_project_dir.join("node_modules"),
         "project_dir/node_modules",
     )?;
     let project_husky = quoted_path(&canon_project_dir.join(".husky"), "project_dir/.husky")?;
-    let project_lpm = quoted_path(&canon_project_dir.join(".lpm"), "project_dir/.lpm")?;
+    let package_layout_dir =
+        crate::package_layout_write_dir(&canon_project_dir, &canon_package_dir)
+            .map(|path| quoted_path(&path, "package layout directory"))
+            .transpose()?;
 
     // Extra writable dirs are already filesystem-resolved effective
     // paths. Rendering that exact spelling preserves the validator's
@@ -231,7 +235,8 @@ pub(crate) fn render_profile_with_toolchain(
     // file-write*: narrow but covers the greens. Must contain the
     // package's own store dir (the compat corpus tests write markers
     // here), project `node_modules` (prisma generate),
-    // `.husky` (husky install), `.lpm` (LPM's own state),
+    // `.husky` (husky install), the running package's own layout directory
+    // in `.lpm` (the rest of `.lpm` is LPM's state or other packages),
     // `~/.cache` + `~/.node-gyp` + `~/.npm` (tooling caches), and
     // per-script scratch directory. `/dev/null` permits shell redirection.
     out.push_str("(allow file-write*\n");
@@ -239,7 +244,9 @@ pub(crate) fn render_profile_with_toolchain(
     if !build_cache_isolation {
         out.push_str(&format!("  (subpath {project_node_modules})\n"));
         out.push_str(&format!("  (subpath {project_husky})\n"));
-        out.push_str(&format!("  (subpath {project_lpm})\n"));
+        if let Some(path) = &package_layout_dir {
+            out.push_str(&format!("  (subpath {path})\n"));
+        }
         out.push_str(&format!("  (subpath {home_cache})\n"));
         out.push_str(&format!("  (subpath {home_node_gyp})\n"));
         out.push_str(&format!("  (subpath {home_npm})\n"));
@@ -682,9 +689,38 @@ mod tests {
             ".husky must be writable for husky install: {p}"
         );
         assert!(
-            p.contains("/home/u/proj/.lpm"),
-            ".lpm must be writable for LPM state: {p}"
+            p.contains("(subpath \"/home/u/proj/.lpm/wrappers\")"),
+            "the isolated layout's packages must be readable: {p}"
         );
+        assert!(
+            !p.contains("(subpath \"/home/u/proj/.lpm\")"),
+            "LPM's own project state must stay out of reach: {p}"
+        );
+    }
+
+    fn write_section(profile: &str) -> &str {
+        profile
+            .split("(allow file-write*\n")
+            .nth(1)
+            .unwrap()
+            .split("\n)\n")
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn scripts_write_only_their_own_package_layout_in_project_state() {
+        let store_package = render_profile(&spec(), false).unwrap();
+        assert!(!write_section(&store_package).contains("/home/u/proj/.lpm"));
+
+        let mut wrapped = spec();
+        wrapped.package_dir =
+            PathBuf::from("/home/u/proj/.lpm/wrappers/prisma@5.22.0/node_modules/prisma");
+        let profile = render_profile(&wrapped, false).unwrap();
+        let writes = write_section(&profile);
+        assert!(writes.contains("(subpath \"/home/u/proj/.lpm/wrappers/prisma@5.22.0\")"));
+        assert!(!writes.contains("(subpath \"/home/u/proj/.lpm/wrappers\")"));
+        assert!(!writes.contains("/home/u/proj/.lpm/hoisted"));
     }
 
     #[test]

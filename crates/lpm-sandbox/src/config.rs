@@ -207,6 +207,12 @@ pub fn load_sandbox_write_dirs(
         if let Some(dangerous_reason) = matches_dangerous_root(&lexical_candidate, home_dir) {
             return Err(dangerous_root_error(package_json, i, s, dangerous_reason));
         }
+        if holds_project_state(&lexical_candidate, &project_root) {
+            return Err(project_holding_write_dir_error(package_json, i, s));
+        }
+        if is_inside_project_state(&lexical_candidate, &project_root) {
+            return Err(project_state_write_dir_error(package_json, i, s));
+        }
 
         let (authorized_root, suffix, root_kind) = if was_relative {
             let suffix = lexical_candidate
@@ -241,6 +247,12 @@ pub fn load_sandbox_write_dirs(
             matches_dangerous_root(&effective, effective_home.as_deref())
         {
             return Err(dangerous_root_error(package_json, i, s, dangerous_reason));
+        }
+        if holds_project_state(&effective, &project_root) {
+            return Err(project_holding_write_dir_error(package_json, i, s));
+        }
+        if is_inside_project_state(&effective, &project_root) {
+            return Err(project_state_write_dir_error(package_json, i, s));
         }
 
         resolved.push(effective);
@@ -468,6 +480,56 @@ fn dangerous_root_error(
             "{pj}: `lpm.scripts.sandboxWriteDirs[{index}]` = {authored:?} {reason}. \
              This path is rejected unconditionally — the dangerous-root denylist has final \
              veto over ~/.lpm/config.toml > max-sandbox-write-roots.",
+            pj = package_json.display(),
+        ),
+    }
+}
+
+/// Whether `path` is the project's `.lpm` directory or inside it, spelled
+/// from the configured or the resolved project root. The name compares
+/// without regard to ASCII case, as on case-insensitive filesystems.
+fn is_inside_project_state(path: &Path, project_root: &AuthorizedRoot) -> bool {
+    [&project_root.configured, &project_root.effective]
+        .into_iter()
+        .any(|root| {
+            path.strip_prefix(root)
+                .ok()
+                .and_then(|rest| rest.components().next())
+                .is_some_and(|first| {
+                    first
+                        .as_os_str()
+                        .eq_ignore_ascii_case(lpm_common::PROJECT_STATE_DIR)
+                })
+        })
+}
+
+fn project_state_write_dir_error(
+    package_json: &Path,
+    index: usize,
+    authored: &str,
+) -> SandboxError {
+    SandboxError::InvalidSpec {
+        reason: format!(
+            "{pj}: `lpm.scripts.sandboxWriteDirs[{index}]` = {authored:?} is inside the \
+             project's .lpm directory, which holds LPM's own state (certificates, env sync \
+             state, recovery backups). Lifecycle scripts may write only the package \
+             directories in it, which the sandbox grants without configuration.",
+            pj = package_json.display(),
+        ),
+    }
+}
+
+fn project_holding_write_dir_error(
+    package_json: &Path,
+    index: usize,
+    authored: &str,
+) -> SandboxError {
+    SandboxError::InvalidSpec {
+        reason: format!(
+            "{pj}: `lpm.scripts.sandboxWriteDirs[{index}]` = {authored:?} holds the project, \
+             and with it the project's .lpm directory, which holds LPM's own state \
+             (certificates, env sync state, recovery backups). Name directories inside the \
+             project or beside it instead.",
             pj = package_json.display(),
         ),
     }
@@ -955,6 +1017,16 @@ pub(crate) fn validate_read_file(project: &Path, path: &Path) -> Result<PathBuf,
         ),
     };
     let root = AuthorizedRoot::resolve(project).map_err(|_| invalid())?;
+    if is_inside_project_state(path, &root) {
+        return Err(SandboxError::InvalidSpec {
+            reason: format!(
+                "sandboxReadAllow entry {} is inside the project's .lpm directory, which holds \
+                 LPM's own state (certificates, env sync state, recovery backups). Only an \
+                 approved readProject: \"full\" lets scripts read it.",
+                path.display()
+            ),
+        });
+    }
     let suffix = root.matched_suffix(path).ok_or_else(invalid)?;
     let name = suffix.file_name().ok_or_else(invalid)?;
     let parent = root
@@ -968,21 +1040,81 @@ pub(crate) fn validate_read_file(project: &Path, path: &Path) -> Result<PathBuf,
     }
 }
 
+/// Whether `path` is above the project root, so that a grant there would
+/// reach the project's `.lpm`. The root itself has its own refusal.
+fn holds_project_state(path: &Path, project_root: &AuthorizedRoot) -> bool {
+    [&project_root.configured, &project_root.effective]
+        .into_iter()
+        .any(|root| root != path && root.starts_with(path))
+}
+
+/// Refuses a writable root that holds the project's `.lpm`: a home cache
+/// directory the project sits in, or a `sandboxWriteDirs` entry at or above
+/// the project. Grants on Linux and Windows only add access, so no rule
+/// could keep scripts out of that state again; macOS refuses alike so a
+/// project behaves the same everywhere.
+pub(crate) fn validate_project_state_boundary(
+    spec: &crate::SandboxSpec,
+    build_cache_isolation: bool,
+) -> Result<(), SandboxError> {
+    if build_cache_isolation {
+        return Ok(());
+    }
+    let state_dirs: Vec<PathBuf> = std::iter::once(spec.project_dir.clone())
+        .chain(std::fs::canonicalize(&spec.project_dir).ok())
+        .map(|project| lpm_common::project_state_dir(&project))
+        .collect();
+    let roots = [".cache", ".node-gyp", ".npm"]
+        .into_iter()
+        .map(|name| spec.home_dir.join(name))
+        .chain(spec.extra_write_dirs.iter().cloned());
+    for root in roots {
+        let spellings = std::iter::once(root.clone()).chain(std::fs::canonicalize(&root).ok());
+        let holds_state = spellings
+            .into_iter()
+            .any(|root| state_dirs.iter().any(|state| state.starts_with(&root)));
+        if holds_state {
+            return Err(SandboxError::InvalidSpec {
+                reason: format!(
+                    "lifecycle scripts may write {}, which holds this project and its .lpm \
+                     state (certificates, env sync state, recovery backups), so the sandbox \
+                     can't keep them out of it. Move the project out of {} to run its \
+                     dependencies' scripts in the sandbox",
+                    root.display(),
+                    root.display(),
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_builtin_write_dirs(spec: &crate::SandboxSpec) -> Result<(), SandboxError> {
+    let [wrappers, hoisted_nested] = lpm_common::project_package_dirs(Path::new(""));
+    let project_names = [
+        Path::new("node_modules"),
+        Path::new(".husky"),
+        wrappers.as_path(),
+        hoisted_nested.as_path(),
+    ];
+    let home_names = [
+        Path::new(".cache"),
+        Path::new(".node-gyp"),
+        Path::new(".npm"),
+    ];
     for (base, names) in [
-        (&spec.project_dir, ["node_modules", ".lpm", ".husky"]),
-        (&spec.home_dir, [".cache", ".node-gyp", ".npm"]),
+        (&spec.project_dir, &project_names[..]),
+        (&spec.home_dir, &home_names[..]),
     ] {
-        let invalid = |name: &str| SandboxError::InvalidSpec {
+        let invalid = |name: &Path| SandboxError::InvalidSpec {
             reason: format!(
                 "sandbox writable directory {} must use real directories without symlinks or reparse points",
                 base.join(name).display()
             ),
         };
-        let root = AuthorizedRoot::resolve(base).map_err(|_| invalid(""))?;
+        let root = AuthorizedRoot::resolve(base).map_err(|_| invalid(Path::new("")))?;
         for name in names {
-            root.resolve_descendant(Path::new(name))
-                .map_err(|_| invalid(name))?;
+            root.resolve_descendant(name).map_err(|_| invalid(name))?;
         }
     }
     Ok(())
@@ -1190,6 +1322,39 @@ mod tests {
             error.to_string().contains("whole project"),
             "error explains the write-scope widening: {error}"
         );
+    }
+
+    #[test]
+    fn sandbox_write_dirs_rejects_the_project_state_directory_at_any_spelling() {
+        for entry in [
+            ".lpm",
+            ".lpm/certs",
+            "./.lpm/env",
+            ".LPM/wrappers",
+            "src/../.lpm",
+        ] {
+            let e = fixture(&format!(
+                r#"{{"lpm":{{"scripts":{{"sandboxWriteDirs":["{entry}"]}}}}}}"#
+            ));
+
+            let error = load_minimal(&e).expect_err("project state must not become writable");
+
+            assert!(
+                error.to_string().contains(".lpm directory"),
+                "{entry}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_write_dirs_rejects_an_absolute_path_into_the_project_state_directory() {
+        let e = fixture(r#"{"lpm":{"scripts":{"sandboxWriteDirs":[]}}}"#);
+        let canonical_project = std::fs::canonicalize(&e.project).expect("canonical project");
+        write_single_sandbox_write_dir(&e.package_json, &canonical_project.join(".lpm"));
+
+        let error = load_minimal(&e).expect_err("project state must not become writable");
+
+        assert!(error.to_string().contains(".lpm directory"), "{error}");
     }
 
     #[test]
@@ -1978,6 +2143,31 @@ mod tests {
         let v = load_sandbox_read_allow(&e.package_json, &e.project, &[]).unwrap();
         let canonical_project = e.project.canonicalize().unwrap();
         assert_eq!(v, vec![canonical_project.join(".env")]);
+    }
+
+    #[test]
+    fn read_allow_rejects_files_in_project_state() {
+        for entry in [
+            ".lpm/certs/key.pem",
+            ".LPM/env-sync.json",
+            "./.lpm/inspector.db",
+        ] {
+            let e = fixture(
+                &serde_json::json!({"lpm": {"scripts": {"sandboxReadAllow": [entry]}}}).to_string(),
+            );
+            let error = load_sandbox_read_allow(&e.package_json, &e.project, &[]).unwrap_err();
+            assert!(
+                error.to_string().contains(".lpm directory"),
+                "{entry}: {error}"
+            );
+
+            let user = load_sandbox_read_allow(
+                &e.package_json.with_file_name("absent.json"),
+                &e.project,
+                &[entry.to_string()],
+            );
+            assert!(user.is_err(), "{entry}");
+        }
     }
 
     /// User config `script-read-allow = [".npmrc"]` joins to project.

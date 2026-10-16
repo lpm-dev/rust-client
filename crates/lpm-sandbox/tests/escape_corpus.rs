@@ -165,6 +165,33 @@ fn block_read_of_file_outside_allow_list() {
     let _ = std::fs::remove_dir_all(&secret_dir);
 }
 
+// -------- Project state: LPM's own files in {project}/.lpm --------
+
+#[test]
+fn block_write_into_project_state_directory() {
+    if !sandbox_supported(SandboxMode::Enforce) {
+        return;
+    }
+    let fx = SandboxFixture::new("probe", "1.0.0").with_private_tmpdir();
+    let target = fx.project_dir.join(".lpm").join("env-sync.json");
+
+    assert_sandbox_blocks_write(&fx, &target, &format!("echo '{{}}' > {}", target.display()));
+}
+
+#[test]
+fn block_read_of_project_state_file() {
+    if !sandbox_supported(SandboxMode::Enforce) {
+        return;
+    }
+    let fx = SandboxFixture::new("probe", "1.0.0").with_private_tmpdir();
+    let state = fx.project_dir.join(".lpm");
+    std::fs::create_dir_all(&state).unwrap();
+    let target = state.join("env-sync.json");
+    std::fs::write(&target, br#"{"vault":"v","sync":{"personalVersion":7}}"#).unwrap();
+
+    assert_sandbox_blocks_read(&fx, &target, &format!("cat {}", target.display()));
+}
+
 // -------- Case 2: shell-startup persistence (~/.bashrc-shape) --------
 
 #[test]

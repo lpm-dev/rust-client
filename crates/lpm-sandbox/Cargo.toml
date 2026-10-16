@@ -38,18 +38,17 @@ seccompiler = "0.5"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# Windows backend uses Mandatory Integrity Control (drop child to Low
-# IL) plus a Job Object for kill-tree parity with Unix's process
-# group. `windows-sys` is the Microsoft-published low-level FFI crate
+# Windows backend: an AppContainer that `lpm-sandbox-helper` sets up,
+# plus Job Objects for kill-tree parity with Unix's process group.
+# `windows-sys` is the Microsoft-published low-level FFI crate
 # already used by `lpm-common` for `GetDriveTypeW` — the workspace
 # is on 0.60. Each feature flag below is a separate code-gen unit, so
 # we only enable the namespaces this backend actually touches:
 #   - Win32_Foundation                 HANDLE, BOOL, error codes
-#   - Win32_Security                   PSID / ACL / TOKEN_MANDATORY_LABEL,
-#                                      Get/SetTokenInformation, ConvertString*
-#   - Win32_Security_Authorization     SetNamedSecurityInfoW (mandatory
-#                                      label on allow-set dirs) +
-#                                      ConvertStringSidToSidW
+#   - Win32_Security                   PSID / ACL / ACE and security
+#                                      descriptor primitives
+#   - Win32_Security_Authorization     SetEntriesInAclW + Get/SetNamedSecurityInfoW
+#                                      (AppContainer DACL grants)
 #   - Win32_Security_Isolation         AppContainer surface —
 #                                      CreateAppContainerProfile +
 #                                      DeriveAppContainerSidFromAppContainerName;
@@ -64,9 +63,7 @@ libc = "0.2"
 #                                      for forwarding the helper's stdio to
 #                                      the AppContainer child via
 #                                      STARTUPINFOW.hStd*.
-#   - Win32_System_Threading           CREATE_SUSPENDED creation flag +
-#                                      OpenProcessToken (declared in this
-#                                      namespace by windows-sys).
+#   - Win32_System_Threading           CREATE_SUSPENDED creation flag.
 #                                      CreateMutexW + ReleaseMutex for
 #                                      cross-process AppContainer profile
 #                                      creation serialization.
@@ -78,8 +75,8 @@ libc = "0.2"
 #   - Win32_System_JobObjects          CreateJobObjectW, SetInformationJobObject,
 #                                      AssignProcessToJobObject
 #
-# Note: NtResumeProcess (the function we use to resume the suspended
-# child after dropping its integrity level) is undocumented and not
+# Note: NtResumeProcess (the function `spawn_tracked_command` uses to
+# resume its suspended child once it is in its Job Object) is undocumented and not
 # in windows-sys. We declare its `extern "system"` signature inline
 # in `src/windows.rs` and link against `ntdll.dll` via a `#[link]`
 # attribute on the extern block — same pattern as Sysinternals tools
