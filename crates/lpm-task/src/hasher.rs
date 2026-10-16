@@ -942,7 +942,8 @@ fn for_each_cache_glob_match(
     pattern: &str,
     mut visit: impl FnMut(PathBuf) -> Result<(), LpmError>,
 ) -> Result<(), LpmError> {
-    let rooted = lpm_common::rooted_project_glob(root, pattern);
+    let glob_root = lpm_common::project_glob::project_glob_root(root);
+    let rooted = lpm_common::rooted_project_glob(&glob_root, pattern);
     let entries = glob::glob(&rooted)
         .map_err(|error| LpmError::Task(format!("invalid task cache glob {pattern:?}: {error}")))?;
     for entry in entries {
@@ -951,7 +952,7 @@ fn for_each_cache_glob_match(
                 "failed to expand task cache glob {pattern:?}: {error}"
             ))
         })?;
-        let relative = entry.strip_prefix(root).map_err(|_| {
+        let relative = entry.strip_prefix(&glob_root).map_err(|_| {
             LpmError::Task(format!(
                 "task cache glob path is outside project: {}",
                 entry.display()

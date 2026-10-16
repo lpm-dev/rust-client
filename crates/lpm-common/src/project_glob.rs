@@ -31,14 +31,56 @@ pub fn validate_project_glob(pattern: &str) -> Result<(), String> {
 }
 
 /// Join a validated relative glob to a project path without interpreting
-/// metacharacters that occur in the project path itself.
+/// metacharacters that occur in the project path itself. The path's prefix
+/// and root stay as they are, as `glob` reads them literally: escaped, the
+/// `\\?\C:` that `canonicalize` gives on Windows would name a UNC share.
 pub fn rooted_project_glob(project_dir: &Path, pattern: &str) -> String {
-    let mut rooted = glob::Pattern::escape(project_dir.to_string_lossy().as_ref());
-    if !rooted.ends_with(std::path::MAIN_SEPARATOR) {
-        rooted.push(std::path::MAIN_SEPARATOR);
+    use std::path::{Component, MAIN_SEPARATOR};
+
+    let mut rooted = String::new();
+    for component in project_dir.components() {
+        match component {
+            Component::Prefix(prefix) => rooted.push_str(&prefix.as_os_str().to_string_lossy()),
+            Component::RootDir => rooted.push(MAIN_SEPARATOR),
+            name => {
+                if !rooted.is_empty() && !rooted.ends_with(MAIN_SEPARATOR) {
+                    rooted.push(MAIN_SEPARATOR);
+                }
+                rooted.push_str(&glob::Pattern::escape(&name.as_os_str().to_string_lossy()));
+            }
+        }
+    }
+    if !rooted.is_empty() && !rooted.ends_with(MAIN_SEPARATOR) {
+        rooted.push(MAIN_SEPARATOR);
     }
     rooted.push_str(pattern);
     rooted
+}
+
+/// The path `glob` walks for `project_dir`, which its matches start with:
+/// `project_dir`, but a verbatim UNC path, which `canonicalize` gives on
+/// Windows for a network share or a drive mapped to one, as
+/// `\\server\share\...`, since `glob` reads nothing under a verbatim path
+/// but a drive's.
+pub fn project_glob_root(project_dir: &Path) -> std::borrow::Cow<'_, Path> {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+
+        let mut components = project_dir.components();
+        if let Some(Component::Prefix(prefix)) = components.next()
+            && let Prefix::VerbatimUNC(server, share) = prefix.kind()
+        {
+            let mut root = std::ffi::OsString::from(r"\\");
+            root.push(server);
+            root.push(r"\");
+            root.push(share);
+            let mut path = std::path::PathBuf::from(root);
+            path.extend(components);
+            return std::borrow::Cow::Owned(path);
+        }
+    }
+    std::borrow::Cow::Borrowed(project_dir)
 }
 
 #[cfg(test)]
@@ -85,6 +127,47 @@ mod tests {
                 "valid project glob was rejected: {pattern}"
             );
         }
+    }
+
+    #[test]
+    fn a_canonical_project_path_is_globbed_where_it_is() {
+        use super::project_glob_root;
+
+        let dir = tempfile::tempdir().unwrap();
+        // `\\?\C:\...` on Windows, with a name that holds a glob metacharacter.
+        let project = std::fs::canonicalize(dir.path()).unwrap().join("pro[j]");
+        std::fs::create_dir_all(project.join("dist")).unwrap();
+        std::fs::write(project.join("dist/value.js"), "1").unwrap();
+        let root = project_glob_root(&project);
+
+        // `**` matches directories only; task outputs add `/*` for files.
+        let matched: Vec<_> = glob::glob(&rooted_project_glob(&root, "dist/**/*"))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+
+        let expected = Path::new("dist").join("value.js");
+        assert!(
+            matched
+                .iter()
+                .any(|entry| entry.strip_prefix(&root).ok() == Some(expected.as_path())),
+            "{matched:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_verbatim_share_is_globbed_by_its_share_name() {
+        use super::project_glob_root;
+
+        assert_eq!(
+            project_glob_root(Path::new(r"\\?\UNC\server\share\project")),
+            Path::new(r"\\server\share\project")
+        );
+        assert_eq!(
+            project_glob_root(Path::new(r"\\?\C:\project")),
+            Path::new(r"\\?\C:\project")
+        );
     }
 
     #[test]

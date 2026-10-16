@@ -7,7 +7,8 @@ const RESTORE_OWNER_MAGIC: &[u8] = b"LPMRESTOREOWNER\x01";
 const RESTORE_COMMITTED_NAME: &str = "committed";
 const RESTORE_COMMITTED_MAGIC: &[u8] = b"LPMRESTORECOMMITTED\x01";
 const RESTORE_REGISTRY_MAGIC_V1: &[u8] = b"LPMRESTORERECORD\x01";
-const RESTORE_REGISTRY_MAGIC: &[u8] = b"LPMRESTORERECORD\x02";
+const RESTORE_REGISTRY_MAGIC_V2: &[u8] = b"LPMRESTORERECORD\x02";
+const RESTORE_REGISTRY_MAGIC: &[u8] = b"LPMRESTORERECORD\x03";
 const RESTORE_REGISTRY_DIR: &str = ".task-restores";
 const RESTORE_TOKEN_BYTES: usize = 32;
 const MAX_RESTORE_REGISTRY_BYTES: u64 = 16 * 1024;
@@ -124,11 +125,54 @@ pub(super) fn scan_cache_archive(
     Ok(file_count)
 }
 
+/// Where a restore keeps its staging directory, as a registry record names
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StagingLocation {
+    /// `<project>/.lpm/`, where every restore stages.
+    ProjectState,
+    /// `<project>/`, where restores staged before they moved into `.lpm/`;
+    /// still recovered from records those releases left.
+    ProjectRoot,
+}
+
+impl StagingLocation {
+    fn parent(self, project_dir: &Path) -> PathBuf {
+        match self {
+            Self::ProjectState => lpm_common::project_state_dir(project_dir),
+            Self::ProjectRoot => project_dir.to_path_buf(),
+        }
+    }
+
+    fn open_parent(self, project: &Dir) -> std::io::Result<Dir> {
+        match self {
+            Self::ProjectState => project.open_dir_nofollow(lpm_common::PROJECT_STATE_DIR),
+            Self::ProjectRoot => project.try_clone(),
+        }
+    }
+}
+
+/// A restore's open staging directory and the `outputs` directory in it,
+/// released together: Windows can't remove the staging directory while a
+/// handle to either is open.
+struct OpenStaging {
+    root: Dir,
+    outputs: Dir,
+}
+
+impl OpenStaging {
+    fn into_root(self) -> Dir {
+        let Self { root, outputs } = self;
+        drop(outputs);
+        root
+    }
+}
+
 pub(super) struct StagedOutputs {
     temp_path: PathBuf,
-    staging: Option<Dir>,
+    staging: Option<OpenStaging>,
+    staging_parent: Dir,
     project: Dir,
-    output: Dir,
     canonical_project: PathBuf,
     registry_record: RestoreRegistryRecord,
     token: [u8; RESTORE_TOKEN_BYTES],
@@ -152,15 +196,20 @@ impl StagedOutputs {
         let project = open_project.dir.try_clone()?;
         let registry_record = restore_registry_record(root, &canonical_project)?;
         recover_interrupted_restore(&canonical_project, &registry_record)?;
+        let staging_parent = lpm_common::ensure_project_state_dir_in(&project, &canonical_project)?;
+        let staging_parent_path = StagingLocation::ProjectState.parent(&canonical_project);
         let temp = tempfile::Builder::new()
             .prefix(RESTORE_TEMP_PREFIX)
-            .tempdir_in(&canonical_project)?;
-        let staging_name = temp.path().strip_prefix(&canonical_project).map_err(|_| {
-            LpmError::Task("task cache restore staging directory escaped the project".into())
-        })?;
-        let staging = project.open_dir_nofollow(staging_name)?;
+            .tempdir_in(&staging_parent_path)?;
+        let staging_name = temp
+            .path()
+            .strip_prefix(&staging_parent_path)
+            .map_err(|_| {
+                LpmError::Task("task cache restore staging directory escaped the project".into())
+            })?;
+        let staging = staging_parent.open_dir_nofollow(staging_name)?;
         restrict_open_directory(&staging, "task cache restore staging directory")?;
-        sync_cap_directory(&project)?;
+        sync_cap_directory(&staging_parent)?;
         let mut token = [0u8; RESTORE_TOKEN_BYTES];
         getrandom::fill(&mut token).map_err(|error| {
             LpmError::Task(format!(
@@ -172,14 +221,23 @@ impl StagedOutputs {
         staging.create_dir("backups")?;
         sync_cap_directory(&staging)?;
         let output = staging.open_dir_nofollow("outputs")?;
-        write_restore_registration(&registry_record, temp.path(), &token, false)?;
+        write_restore_registration(
+            &registry_record,
+            temp.path(),
+            StagingLocation::ProjectState,
+            &token,
+            false,
+        )?;
         let temp_path = temp.keep();
 
         Ok(Self {
             temp_path,
-            staging: Some(staging),
+            staging: Some(OpenStaging {
+                root: staging,
+                outputs: output,
+            }),
+            staging_parent,
             project,
-            output,
             canonical_project,
             registry_record,
             token,
@@ -204,7 +262,7 @@ impl StagedOutputs {
         }
 
         let (parent, name) = open_or_create_parent_nofollow(
-            &self.output,
+            &self.open_staging().outputs,
             &relative,
             "staged output",
             DirectoryCreationDurability::Deferred,
@@ -302,13 +360,32 @@ impl StagedOutputs {
     ) -> Result<bool, LpmError> {
         let mut this = self;
         let staging_outputs = this.temp_path.join("outputs");
-        verify_open_directory_path(&this.output, &staging_outputs, "staged task outputs")?;
+        verify_open_directory_path(
+            &this.open_staging().outputs,
+            &staging_outputs,
+            "staged task outputs",
+        )?;
         let declared_files = collect_output_files(&staging_outputs, output_globs)?;
-        verify_open_directory_path(&this.output, &staging_outputs, "staged task outputs")?;
+        verify_open_directory_path(
+            &this.open_staging().outputs,
+            &staging_outputs,
+            "staged task outputs",
+        )?;
         this.files.sort_unstable();
         if this.files != declared_files {
             return Err(LpmError::Task(
                 "task cache archive contains files outside the declared outputs".into(),
+            ));
+        }
+        let mut short_named = ShortNamedDirectories::default();
+        if this
+            .files
+            .iter()
+            .any(|relative| short_named.reaches_withheld(&this.canonical_project, relative))
+        {
+            return Err(LpmError::Task(
+                "task cache archive reaches the project's .lpm, a .git or a project record by a short name"
+                    .into(),
             ));
         }
         verify_open_directory_path(
@@ -332,9 +409,7 @@ impl StagedOutputs {
         this.files.extend(stale_outputs);
 
         let existing_outputs = write_restore_journal_for_plan_open(
-            this.staging
-                .as_ref()
-                .expect("restore staging directory exists"),
+            &this.open_staging().root,
             &this.project,
             &this.canonical_project,
             &this.files,
@@ -344,9 +419,7 @@ impl StagedOutputs {
         let mut transaction = RestoreTransaction::new_with_open_staging(
             this.canonical_project.clone(),
             this.project.try_clone()?,
-            this.staging
-                .as_ref()
-                .expect("restore staging directory exists"),
+            &this.open_staging().root,
             this.files.len(),
         )?;
         let installed_trees =
@@ -417,9 +490,13 @@ impl StagedOutputs {
             }
             return Err(error);
         }
-        if let Err(error) =
-            write_restore_registration(&this.registry_record, &this.temp_path, &this.token, true)
-        {
+        if let Err(error) = write_restore_registration(
+            &this.registry_record,
+            &this.temp_path,
+            StagingLocation::ProjectState,
+            &this.token,
+            true,
+        ) {
             let (error, rollback_failed) = transaction.rollback_error(error);
             drop(transaction);
             if rollback_failed {
@@ -431,16 +508,23 @@ impl StagedOutputs {
         drop(transaction);
         this.cleanup_registry_on_drop = false;
         cleanup_open_staging(
-            &this.project,
+            &this.staging_parent,
             Path::new(this.temp_path.file_name().ok_or_else(|| {
                 LpmError::Task("restore staging directory has no file name".into())
             })?),
             this.staging
                 .take()
-                .expect("restore staging directory exists"),
+                .expect("restore staging directory exists")
+                .into_root(),
         )?;
         remove_restore_registration(&this.registry_record)?;
         Ok(true)
+    }
+
+    fn open_staging(&self) -> &OpenStaging {
+        self.staging
+            .as_ref()
+            .expect("restore staging directory exists")
     }
 
     #[cfg(test)]
@@ -464,7 +548,8 @@ impl Drop for StagedOutputs {
             let cleanup_succeeded = if let Some(staging) = self.staging.take()
                 && let Some(name) = self.temp_path.file_name()
             {
-                cleanup_open_staging(&self.project, Path::new(name), staging).is_ok()
+                cleanup_open_staging(&self.staging_parent, Path::new(name), staging.into_root())
+                    .is_ok()
             } else {
                 true
             };
@@ -773,6 +858,7 @@ fn restore_is_committed(staging: &Dir, restore_dir: &Path) -> Result<bool, LpmEr
 fn write_restore_registration(
     record: &RestoreRegistryRecord,
     restore_dir: &Path,
+    location: StagingLocation,
     token: &[u8; RESTORE_TOKEN_BYTES],
     committed: bool,
 ) -> Result<(), LpmError> {
@@ -799,7 +885,10 @@ fn write_restore_registration(
     let mut record_bytes = Vec::with_capacity(
         RESTORE_REGISTRY_MAGIC.len() + 1 + 4 + name_bytes.len() + RESTORE_TOKEN_BYTES,
     );
-    record_bytes.extend_from_slice(RESTORE_REGISTRY_MAGIC);
+    record_bytes.extend_from_slice(match location {
+        StagingLocation::ProjectState => RESTORE_REGISTRY_MAGIC,
+        StagingLocation::ProjectRoot => RESTORE_REGISTRY_MAGIC_V2,
+    });
     record_bytes.push(u8::from(committed));
     record_bytes.extend_from_slice(&name_len.to_le_bytes());
     record_bytes.extend_from_slice(&name_bytes);
@@ -813,14 +902,21 @@ fn write_restore_registration(
 
 struct RestoreRegistration {
     staging_name: PathBuf,
+    location: StagingLocation,
     token: [u8; RESTORE_TOKEN_BYTES],
     committed: bool,
 }
 
 fn decode_restore_registration(bytes: &[u8]) -> Result<RestoreRegistration, LpmError> {
-    let (mut cursor, committed) = if bytes.starts_with(RESTORE_REGISTRY_MAGIC) {
+    let with_state = [
+        (RESTORE_REGISTRY_MAGIC, StagingLocation::ProjectState),
+        (RESTORE_REGISTRY_MAGIC_V2, StagingLocation::ProjectRoot),
+    ]
+    .into_iter()
+    .find(|(magic, _)| bytes.starts_with(magic));
+    let (mut cursor, location, committed) = if let Some((magic, location)) = with_state {
         let state = *bytes
-            .get(RESTORE_REGISTRY_MAGIC.len())
+            .get(magic.len())
             .ok_or_else(|| LpmError::Task("truncated task cache restore registry record".into()))?;
         let committed = match state {
             0 => false,
@@ -831,9 +927,13 @@ fn decode_restore_registration(bytes: &[u8]) -> Result<RestoreRegistration, LpmE
                 ));
             }
         };
-        (RESTORE_REGISTRY_MAGIC.len() + 1, committed)
+        (magic.len() + 1, location, committed)
     } else if bytes.starts_with(RESTORE_REGISTRY_MAGIC_V1) {
-        (RESTORE_REGISTRY_MAGIC_V1.len(), false)
+        (
+            RESTORE_REGISTRY_MAGIC_V1.len(),
+            StagingLocation::ProjectRoot,
+            false,
+        )
     } else {
         return Err(LpmError::Task(
             "invalid task cache restore registry record".into(),
@@ -874,6 +974,7 @@ fn decode_restore_registration(bytes: &[u8]) -> Result<RestoreRegistration, LpmE
     }
     Ok(RestoreRegistration {
         staging_name,
+        location,
         token,
         committed,
     })
@@ -899,7 +1000,25 @@ pub(super) fn register_restore_for_test(
     let token = [0x5au8; RESTORE_TOKEN_BYTES];
     set_dir_permissions_restricted(restore_dir)?;
     write_restore_owner(restore_dir, &token)?;
-    write_restore_registration(&record, restore_dir, &token, false)
+    write_restore_registration(
+        &record,
+        restore_dir,
+        staging_location_for_test(&canonical_project, restore_dir),
+        &token,
+        false,
+    )
+}
+
+#[cfg(test)]
+fn staging_location_for_test(canonical_project: &Path, restore_dir: &Path) -> StagingLocation {
+    let parent = restore_dir
+        .parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok());
+    if parent.as_deref() == Some(canonical_project) {
+        StagingLocation::ProjectRoot
+    } else {
+        StagingLocation::ProjectState
+    }
 }
 
 #[cfg(test)]
@@ -910,7 +1029,13 @@ pub(super) fn mark_restore_registration_committed_for_test(
 ) -> Result<(), LpmError> {
     let canonical_project = std::fs::canonicalize(project_dir)?;
     let record = restore_registry_record(root, &canonical_project)?;
-    write_restore_registration(&record, restore_dir, &[0x5au8; RESTORE_TOKEN_BYTES], true)
+    write_restore_registration(
+        &record,
+        restore_dir,
+        staging_location_for_test(&canonical_project, restore_dir),
+        &[0x5au8; RESTORE_TOKEN_BYTES],
+        true,
+    )
 }
 
 fn recover_interrupted_restore(
@@ -953,9 +1078,13 @@ fn recover_interrupted_restore(
             return Err(error);
         }
     };
-    let restore_dir = project_dir.join(&registration.staging_name);
+    let restore_dir = registration
+        .location
+        .parent(project_dir)
+        .join(&registration.staging_name);
     recover_registered_restore(
         project_dir,
+        registration.location,
         &restore_dir,
         record,
         &registration.token,
@@ -965,25 +1094,36 @@ fn recover_interrupted_restore(
 
 fn recover_registered_restore(
     project_dir: &Path,
+    location: StagingLocation,
     restore_dir: &Path,
     record: &RestoreRegistryRecord,
     token: &[u8; RESTORE_TOKEN_BYTES],
     committed: bool,
 ) -> Result<(), LpmError> {
     let project = Dir::open_ambient_dir(project_dir, cap_std::ambient_authority())?;
-    let staging_name = restore_dir.strip_prefix(project_dir).map_err(|_| {
-        LpmError::Task(format!(
-            "task cache restore directory is outside the project: {}",
-            restore_dir.display()
-        ))
-    })?;
+    let staging_name = restore_dir
+        .strip_prefix(location.parent(project_dir))
+        .map_err(|_| {
+            LpmError::Task(format!(
+                "task cache restore directory is outside the project: {}",
+                restore_dir.display()
+            ))
+        })?;
     if staging_name.components().count() != 1 {
         return Err(LpmError::Task(format!(
             "invalid task cache restore directory: {}",
             restore_dir.display()
         )));
     }
-    let staging = match project.open_dir_nofollow(staging_name) {
+    let staging_parent = match location.open_parent(&project) {
+        Ok(parent) => parent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            remove_restore_registration(record)?;
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let staging = match staging_parent.open_dir_nofollow(staging_name) {
         Ok(staging) => staging,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             remove_restore_registration(record)?;
@@ -996,7 +1136,7 @@ fn recover_registered_restore(
         return Ok(());
     }
     if committed || restore_is_committed(&staging, restore_dir)? {
-        cleanup_open_staging(&project, staging_name, staging)?;
+        cleanup_open_staging(&staging_parent, staging_name, staging)?;
         remove_restore_registration(record)?;
         return Ok(());
     }
@@ -1004,7 +1144,7 @@ fn recover_registered_restore(
     let journal_file = match open_cap_file_nofollow(&staging, Path::new(RESTORE_JOURNAL_NAME)) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            cleanup_open_staging(&project, staging_name, staging)?;
+            cleanup_open_staging(&staging_parent, staging_name, staging)?;
             remove_restore_registration(record)?;
             return Ok(());
         }
@@ -1099,7 +1239,10 @@ fn recover_registered_restore(
         }
     }
 
-    cleanup_open_staging(&project, staging_name, staging)?;
+    // Windows can't remove the staging directory while a handle to a
+    // directory in it is open.
+    drop((output, backup));
+    cleanup_open_staging(&staging_parent, staging_name, staging)?;
     remove_restore_registration(record)?;
     Ok(())
 }
@@ -1690,12 +1833,6 @@ impl RestoreTransaction {
                 restore_dir.display()
             ))
         })?;
-        if staging_name.components().count() != 1 {
-            return Err(LpmError::Task(format!(
-                "invalid task cache restore staging directory: {}",
-                restore_dir.display()
-            )));
-        }
         let staging = project.open_dir_nofollow(staging_name)?;
         Self::new_with_open_staging(project_dir, project, &staging, output_count)
     }
@@ -2345,10 +2482,16 @@ mod tests {
             error.to_string().contains("nesting"),
             "expected nesting-depth limit error, got: {error}"
         );
-        assert!(
-            std::fs::read_dir(project.path()).unwrap().next().is_none(),
-            "rejected restore created project output"
-        );
+        let entries = std::fs::read_dir(project.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [".lpm"], "rejected restore created project output");
+        let state = std::fs::read_dir(project.path().join(".lpm"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(state, [".gitignore"], "rejected restore left its staging");
     }
 
     fn append_journal_path(bytes: &mut Vec<u8>, path: &[u8]) {
@@ -2362,7 +2505,10 @@ mod tests {
         bytes.extend_from_slice(&2u32.to_le_bytes());
         for had_existing in [0, 1] {
             bytes.push(had_existing);
-            append_journal_path(&mut bytes, b"dist/value.txt");
+            append_journal_path(
+                &mut bytes,
+                &restore_journal_path_bytes(Path::new("dist/value.txt")),
+            );
         }
         bytes.extend_from_slice(&0u32.to_le_bytes());
 
@@ -2382,8 +2528,9 @@ mod tests {
         let mut bytes = RESTORE_JOURNAL_MAGIC.to_vec();
         bytes.extend_from_slice(&0u32.to_le_bytes());
         bytes.extend_from_slice(&2u32.to_le_bytes());
-        append_journal_path(&mut bytes, b"dist/nested");
-        append_journal_path(&mut bytes, b"dist/nested");
+        let nested = restore_journal_path_bytes(Path::new("dist/nested"));
+        append_journal_path(&mut bytes, &nested);
+        append_journal_path(&mut bytes, &nested);
 
         let error = match decode_restore_journal(&bytes) {
             Err(error) => error,

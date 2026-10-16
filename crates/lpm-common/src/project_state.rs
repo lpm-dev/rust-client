@@ -53,6 +53,18 @@ fn ignore_rules(lines: &[u8]) -> impl Iterator<Item = &[u8]> {
         .filter(|pattern| !pattern.is_empty() && !pattern.starts_with(b"#"))
 }
 
+/// The project's committed LPM records at its root, which LPM writes
+/// itself.
+pub const PROJECT_RECORD_FILES: &[&str] = &[
+    "lpm.lock",
+    "lpm.lockb",
+    "lpm-sources.json",
+    "lpm-agent-skills.json",
+];
+
+/// Root directories of the project's committed LPM records.
+pub const PROJECT_RECORD_DIRS: &[&str] = &["lpm-changes"];
+
 /// Whether a deploy output's ignore file lets git commit `path`, a file in
 /// its state directory, `/`-separated and relative to it.
 pub fn deploy_output_commits(path: &str) -> bool {
@@ -61,6 +73,33 @@ pub fn deploy_output_commits(path: &str) -> bool {
             path.strip_prefix(directory)
                 .is_some_and(|rest| rest.starts_with('/'))
         })
+}
+
+/// Whether a path component names a project state directory, as a
+/// filesystem that folds names resolves it: without regard to case, and
+/// without the marks HFS+ ignores.
+pub fn is_project_state_name(name: &OsStr) -> bool {
+    name.eq_ignore_ascii_case(PROJECT_STATE_DIR)
+        || name.to_str().is_some_and(|name| {
+            !name.is_ascii()
+                && crate::names::fold_name(name).eq_ignore_ascii_case(PROJECT_STATE_DIR)
+        })
+}
+
+/// Whether `name` in `parent` is one of `names` there by a short name,
+/// such as `LPM~1` for `.lpm` or `LPM~1.LOC` for `lpm.lock`, which a volume
+/// that makes them (NTFS, FAT) resolves in every open, from any system
+/// (WSL's `/mnt/c`, Linux's ntfs3 and vfat), and only the file's identity
+/// tells from a name of its own. Short names hold a `~`.
+pub fn is_short_name_of<'a>(
+    parent: &Path,
+    name: &OsStr,
+    names: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    name.to_string_lossy().contains('~')
+        && names
+            .into_iter()
+            .any(|long| crate::project_git::same_file(&parent.join(name), &parent.join(long)))
 }
 
 /// The project state directory for `project_dir`, without touching disk.
