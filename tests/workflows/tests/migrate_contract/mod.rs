@@ -69,6 +69,37 @@ fn repeated_conversion_preserves_the_original_rollback_snapshot() {
 }
 
 #[test]
+fn rollback_after_later_changes_restores_nothing_until_forced() {
+    let project = TempProject::from_fixture("migrate-npm");
+    let original_lockfile = project.read_file("package-lock.json");
+    convert_only(&project);
+    let changed_lock = format!("{}\n# after lpm install\n", project.read_file("lpm.lock"));
+    project.write_file("lpm.lock", &changed_lock);
+
+    let output = lpm(&project)
+        .args(["migrate", "--rollback", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("lpm.lock") || stderr.contains("lpm.lock"),
+        "the changed file is named: {stdout}{stderr}"
+    );
+    assert_eq!(project.read_file("lpm.lock"), changed_lock);
+    assert!(project.file_exists(".lpm/migrate-backup/manifest.json"));
+
+    lpm(&project)
+        .args(["migrate", "--rollback", "--force"])
+        .assert()
+        .success();
+    assert!(!project.file_exists("lpm.lock"));
+    assert_eq!(project.read_file("package-lock.json"), original_lockfile);
+}
+
+#[test]
 fn rollback_rejects_dry_run_before_restoring_files() {
     let project = TempProject::from_fixture("migrate-npm");
     convert_only(&project);
@@ -82,7 +113,7 @@ fn rollback_rejects_dry_run_before_restoring_files() {
         "contradictory rollback preview must be rejected"
     );
     assert_eq!(project.read_file("lpm.lock"), lock);
-    assert!(project.file_exists(".lpm-migrate-manifest.json"));
+    assert!(project.file_exists(".lpm/migrate-backup/manifest.json"));
 }
 
 #[test]
@@ -119,13 +150,8 @@ fn rollback_rejects_legacy_paths_outside_the_project() {
 #[test]
 fn migration_refuses_a_linked_backup_destination_without_outside_writes() {
     let project = TempProject::from_fixture("migrate-pnpm");
-    let external = tempfile::NamedTempFile::new().unwrap();
-    std::fs::write(external.path(), "preserve outside bytes").unwrap();
-    std::os::unix::fs::symlink(
-        external.path(),
-        project.path().join("pnpm-lock.yaml.backup"),
-    )
-    .unwrap();
+    let external = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(external.path(), project.path().join(".lpm")).unwrap();
     let output = lpm(&project)
         .args([
             "migrate",
@@ -136,10 +162,7 @@ fn migration_refuses_a_linked_backup_destination_without_outside_writes() {
         ])
         .output()
         .unwrap();
-    assert_eq!(
-        std::fs::read_to_string(external.path()).unwrap(),
-        "preserve outside bytes"
-    );
+    assert_eq!(std::fs::read_dir(external.path()).unwrap().count(), 0);
     assert!(!output.status.success());
     assert!(!project.file_exists("lpm.lock"));
 }
@@ -320,7 +343,7 @@ async fn migration_reports_an_install_failure_as_failure() {
         "a failed install must not be reported as successful migration: {}",
         String::from_utf8_lossy(&output.stdout)
     );
-    assert!(project.file_exists(".lpm-migrate-manifest.json"));
+    assert!(project.file_exists(".lpm/migrate-backup/manifest.json"));
 }
 
 #[test]
@@ -362,13 +385,17 @@ fn rollback_does_not_overwrite_a_hardlinked_outside_file() {
     lpm(&project)
         .args(["migrate", "--rollback"])
         .assert()
+        .failure();
+    lpm(&project)
+        .args(["migrate", "--rollback", "--force"])
+        .assert()
         .success();
     assert_eq!(std::fs::read_to_string(external.path()).unwrap(), "outside");
     assert_eq!(project.read_file("original"), "old");
 }
 
 #[test]
-fn migration_refuses_to_replace_an_untracked_backup() {
+fn migration_leaves_a_user_s_backup_named_file_alone() {
     let project = TempProject::from_fixture("migrate-npm");
     project.write_file("package-lock.json.backup", "previous snapshot");
     lpm(&project)
@@ -380,12 +407,12 @@ fn migration_refuses_to_replace_an_untracked_backup() {
             "--no-ci",
         ])
         .assert()
-        .failure();
+        .success();
     assert_eq!(
         project.read_file("package-lock.json.backup"),
         "previous snapshot"
     );
-    assert!(!project.file_exists("lpm.lock"));
+    assert!(project.file_exists("lpm.lock"));
 }
 
 #[cfg(unix)]
@@ -553,36 +580,47 @@ fn migration_json_preserves_one_error_envelope_when_verification_fails() {
 
 #[cfg(unix)]
 #[test]
-fn rollback_restores_restrictive_backup_permissions() {
+fn rollback_restores_the_original_npmrc_with_its_mode() {
     use std::os::unix::fs::PermissionsExt;
     for existing in [false, true] {
-        let project = TempProject::empty("{}");
-        project.write_file(".npmrc.backup", "private-registry-token");
-        std::fs::set_permissions(
-            project.path().join(".npmrc.backup"),
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .unwrap();
+        let project = TempProject::from_fixture("migrate-npm");
         if existing {
-            project.write_file(".npmrc", "public");
+            project.write_file(".npmrc", "//registry.example/:_authToken=private\n");
             std::fs::set_permissions(
                 project.path().join(".npmrc"),
-                std::fs::Permissions::from_mode(0o644),
+                std::fs::Permissions::from_mode(0o600),
             )
             .unwrap();
         }
         lpm(&project)
+            .args(["migrate", "--no-install", "--skip-verify", "--no-ci"])
+            .assert()
+            .success();
+        assert!(project.read_file(".npmrc").contains("@lpm.dev:registry="));
+        assert!(!project.file_exists(".npmrc.backup"));
+
+        lpm(&project)
             .args(["migrate", "--rollback"])
             .assert()
             .success();
-        assert_eq!(
-            std::fs::metadata(project.path().join(".npmrc"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
+
+        if existing {
+            assert_eq!(
+                project.read_file(".npmrc"),
+                "//registry.example/:_authToken=private\n"
+            );
+            assert_eq!(
+                std::fs::metadata(project.path().join(".npmrc"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        } else {
+            assert!(!project.file_exists(".npmrc"));
+        }
+        assert!(!project.file_exists(".lpm/migrate-backup"));
     }
 }
 
@@ -606,7 +644,7 @@ fn verification_rejects_a_manifest_corrupted_by_postinstall() {
         "invalid verification input must fail: {}",
         String::from_utf8_lossy(&output.stdout)
     );
-    assert!(project.file_exists(".lpm-migrate-manifest.json"));
+    assert!(project.file_exists(".lpm/migrate-backup/manifest.json"));
 }
 
 #[cfg(unix)]
@@ -952,7 +990,7 @@ fn migration_preview_counts_workspace_union_once_and_applies_exclusions() {
     assert_eq!(report["workspace_members"], 2);
     assert!(!project.file_exists("lpm.lock"));
     assert!(!project.file_exists(".lpm"));
-    assert!(!project.file_exists(".lpm-migrate-manifest.json"));
+    assert!(!project.file_exists(".lpm/migrate-backup/manifest.json"));
 }
 
 #[tokio::test]
@@ -1048,7 +1086,7 @@ fn migration_workspace_member_failure_prevents_root_lifecycle_and_keeps_recovery
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["success"], false);
     assert!(!project.file_exists("root-ran"));
-    assert!(project.file_exists(".lpm-migrate-manifest.json"));
+    assert!(project.file_exists(".lpm/migrate-backup/manifest.json"));
 }
 
 #[test]
@@ -1141,6 +1179,11 @@ fn migration_rollback_inside_a_member_retains_local_recovery() {
     lpm(&project)
         .current_dir(project.path().join("packages/app"))
         .args(["migrate", "--rollback"])
+        .assert()
+        .failure();
+    lpm(&project)
+        .current_dir(project.path().join("packages/app"))
+        .args(["migrate", "--rollback", "--force"])
         .assert()
         .success();
     assert_eq!(
@@ -1436,6 +1479,6 @@ fn migration_rejects_workspace_removal_while_waiting_before_conversion() {
         "{report}"
     );
     assert!(!project.file_exists("lpm.lock"));
-    assert!(!project.file_exists(".lpm-migrate-manifest.json"));
+    assert!(!project.file_exists(".lpm/migrate-backup/manifest.json"));
     assert!(!project.file_exists("package-lock.json.backup"));
 }
