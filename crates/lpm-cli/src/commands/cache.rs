@@ -484,7 +484,9 @@ fn run_status(
     session: Option<Arc<lpm_auth::SessionManager>>,
 ) -> Result<(), LpmError> {
     let cwd = std::env::current_dir()?;
-    let status = super::remote_cache::status_for_project(&cwd, session)?;
+    let home = dirs::home_dir();
+    let project_dir = lpm_workspace::find_project_config_root(&cwd, home.as_deref()).unwrap_or(cwd);
+    let status = super::remote_cache::status_for_project(&project_dir, session)?;
     if json_output {
         println!(
             "{}",

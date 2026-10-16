@@ -200,7 +200,8 @@ pub enum SecurityCmd {
 
     /// Show the effective security floor, unlock state, and policy source.
     Status {
-        /// Project root whose active unlocks should be shown. Defaults to the current directory.
+        /// Project root whose active unlocks should be shown. Defaults to the nearest
+        /// directory with a package.json.
         #[arg(long, value_name = "PATH")]
         project: Option<String>,
 
@@ -235,7 +236,13 @@ pub enum ProtectCmd {
     Disable,
 }
 
-pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
+/// `status_dir` is the package `lpm security status` reports without
+/// `--project` or `--global`.
+pub async fn run(
+    cmd: &SecurityCmd,
+    status_dir: Option<PathBuf>,
+    json_output: bool,
+) -> Result<(), LpmError> {
     match cmd {
         SecurityCmd::Unlock {
             scope,
@@ -353,11 +360,11 @@ pub async fn run(cmd: &SecurityCmd, json_output: bool) -> Result<(), LpmError> {
             Ok(())
         }
         SecurityCmd::Status { project, global } => {
-            let target = resolve_status_target(
-                project.as_deref(),
-                *global,
-                std::env::current_dir().map_err(LpmError::Io)?,
-            )?;
+            let package_dir = match status_dir {
+                Some(directory) => directory,
+                None => std::env::current_dir().map_err(LpmError::Io)?,
+            };
+            let target = resolve_status_target(project.as_deref(), *global, package_dir)?;
             let status = if target.kind == UnlockTargetKind::Global {
                 security_approval::load_security_status(None, true)?
             } else {

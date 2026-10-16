@@ -20,7 +20,9 @@ pub(in crate::cli) fn keep_state_ignored_at_exit() {
     let Some(cwd) = STARTED_IN.lock().ok().and_then(|mut slot| slot.take()) else {
         return;
     };
-    keep_project_state_ignored(&cwd);
+    let home = dirs::home_dir();
+    let project_dir = lpm_workspace::find_project_config_root(&cwd, home.as_deref()).unwrap_or(cwd);
+    keep_project_state_ignored(&project_dir);
 }
 
 pub(super) fn run_async_main() -> Result<()> {

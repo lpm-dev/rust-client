@@ -258,17 +258,24 @@ impl NpmrcConfig {
     }
 }
 
-fn npm_project_npmrc(cwd: &Path, home: Option<&Path>) -> ProjectNpmrcOutcome {
-    let Some(project) = lpm_workspace::find_project_root(cwd) else {
-        return ProjectNpmrcOutcome::None;
-    };
-    if home.is_some_and(|home| project == home) {
-        return ProjectNpmrcOutcome::None;
+/// The directory whose `.npmrc` is the project layer for a command run in
+/// `cwd`: the workspace root, else the nearest directory with a
+/// `package.json`, never `home`. Writers of a project `.npmrc` use it so the
+/// file lands where the reader looks.
+pub fn project_npmrc_dir(cwd: &Path, home: Option<&Path>) -> Option<std::path::PathBuf> {
+    let project = lpm_workspace::find_project_root(cwd)?;
+    if home.is_some_and(|home| lpm_workspace::is_same_directory(&project, home)) {
+        return None;
     }
-    let selected = match lpm_workspace::find_workspace_root(&project) {
+    Some(match lpm_workspace::find_workspace_root(&project) {
         Ok(Some(workspace)) => workspace,
-        Ok(None) => project,
-        Err(_) => project,
+        Ok(None) | Err(_) => project,
+    })
+}
+
+fn npm_project_npmrc(cwd: &Path, home: Option<&Path>) -> ProjectNpmrcOutcome {
+    let Some(selected) = project_npmrc_dir(cwd, home) else {
+        return ProjectNpmrcOutcome::None;
     };
     match inspect_npmrc_at(&selected.join(".npmrc")) {
         NpmrcEntry::File(path) => ProjectNpmrcOutcome::File(path),
@@ -821,6 +828,25 @@ mod tests {
         assert_eq!(result.paths[1], home.path().join(".npmrc"));
         assert_eq!(result.paths[2], proj.path().join(".npmrc"));
         assert!(result.warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_home_directory_reached_through_a_link_is_no_project_layer() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        mark_as_project_root(&home);
+        write_npmrc(&home, "registry=https://user/\n");
+        let linked_home = tmp.path().join("linked-home");
+        std::os::unix::fs::symlink(&home, &linked_home).unwrap();
+
+        let direct = NpmrcConfig::discover_layer_paths(&home, Some(&home));
+        let linked = NpmrcConfig::discover_layer_paths(&home, Some(&linked_home));
+
+        assert_eq!(direct.paths.len(), 2, "{:?}", direct.paths);
+        assert_eq!(linked.paths.len(), 2, "{:?}", linked.paths);
+        assert_eq!(linked.project_layer_index, None);
     }
 
     #[test]
