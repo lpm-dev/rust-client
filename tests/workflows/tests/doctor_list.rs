@@ -187,8 +187,6 @@ fn doctor_list_auto_fix_metadata_matches_every_supported_runtime_action() {
         ("deps_sync_drift", "lpm install"),
         ("fmt_other_issue", "lpm fmt"),
         ("fmt_unformatted", "lpm fmt"),
-        ("gitattributes_lockb_unmarked", "update .gitattributes"),
-        ("gitattributes_missing", "update .gitattributes"),
         ("lockfile_binary_corrupt", "reconcile lpm.lockb"),
         ("lockfile_binary_missing", "reconcile lpm.lockb"),
         ("lockfile_binary_stale", "reconcile lpm.lockb"),

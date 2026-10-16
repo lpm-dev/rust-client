@@ -85,61 +85,6 @@ pub(super) fn check_lockfile_state(lockfile: &DiagnosticLockfile) -> Vec<Check> 
     checks
 }
 
-/// Check .gitattributes state: exists and has lpm.lockb binary marker.
-pub(super) fn check_gitattributes_state(
-    project_dir: &Path,
-    lockfile: &DiagnosticLockfile,
-) -> Vec<Check> {
-    let mut checks = Vec::new();
-    let DiagnosticLockfile::Loaded(project) = lockfile else {
-        return checks;
-    };
-    let lockb_path = project.path.with_extension("lockb");
-    let ga_path = project
-        .path
-        .parent()
-        .unwrap_or(project_dir)
-        .join(".gitattributes");
-
-    if lockb_path.exists() || project.path.exists() {
-        match lpm_common::read_text_file_capped_nofollow(
-            &ga_path,
-            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-        ) {
-            Ok(ga_content)
-                if ga_content
-                    .lines()
-                    .any(|line| line.trim() == "lpm.lockb binary") =>
-            {
-                checks.push(Check::pass(
-                    &doctor_catalog::GITATTRIBUTES_LOCKB_MARKED,
-                    "lpm.lockb marked as binary",
-                ));
-            }
-            Ok(_) => {
-                checks.push(Check::warn(
-                    &doctor_catalog::GITATTRIBUTES_LOCKB_UNMARKED,
-                    "lpm.lockb not marked as binary — run lpm install to fix",
-                ));
-            }
-            Err(lpm_common::BoundedReadError::NotFound { .. }) => {
-                checks.push(Check::warn(
-                    &doctor_catalog::GITATTRIBUTES_MISSING,
-                    "missing — run lpm install to create (marks lpm.lockb as binary)",
-                ));
-            }
-            Err(error) => {
-                checks.push(Check::warn(
-                    &doctor_catalog::GITATTRIBUTES_UNREADABLE,
-                    &format!("cannot inspect safely: {error}"),
-                ));
-            }
-        }
-    }
-
-    checks
-}
-
 /// Fix: reconcile `lpm.lockb` with `lpm.lock`.
 pub(super) fn fix_binary_lockfile(project_dir: &Path) -> Result<(), String> {
     let expected_lock_path = lpm_lockfile::Lockfile::read_for_project(project_dir)
@@ -170,16 +115,6 @@ pub(super) fn fix_binary_lockfile(project_dir: &Path) -> Result<(), String> {
         })
     })
     .map_err(|error| error.to_string())
-}
-
-/// Fix: ensure `.gitattributes` marks `lpm.lockb` as binary.
-pub(super) fn fix_gitattributes(project_dir: &Path) -> Result<(), String> {
-    let root = lpm_lockfile::Lockfile::read_for_project(project_dir)
-        .ok()
-        .and_then(|project| project.path.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| project_dir.to_path_buf());
-    lpm_lockfile::ensure_gitattributes(&root)
-        .map_err(|e| format!(".gitattributes update failed: {e}"))
 }
 
 pub(super) fn check_deps_in_sync(
@@ -269,11 +204,6 @@ mod tests {
 
     fn check_lockfile_state_at(project_dir: &Path) -> Vec<Check> {
         check_lockfile_state(&DiagnosticLockfile::load(project_dir))
-    }
-
-    fn check_gitattributes_state_at(project_dir: &Path) -> Vec<Check> {
-        let lockfile = DiagnosticLockfile::load(project_dir);
-        check_gitattributes_state(project_dir, &lockfile)
     }
 
     #[test]
@@ -685,98 +615,6 @@ mod tests {
         assert!(checks[1].detail.contains("corrupt"));
     }
 
-    // ── .gitattributes state checks ─────────────────────────────────────
-
-    #[test]
-    fn gitattributes_check_skipped_without_lockfiles() {
-        let dir = tempfile::tempdir().unwrap();
-        // No lpm.lock or lpm.lockb — should produce no checks
-        let checks = check_gitattributes_state_at(dir.path());
-        assert!(checks.is_empty());
-    }
-
-    #[test]
-    fn gitattributes_check_missing_warns() {
-        let dir = tempfile::tempdir().unwrap();
-        let lf = binary_representable_lockfile();
-        lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
-        // No .gitattributes file
-
-        let checks = check_gitattributes_state_at(dir.path());
-        assert_eq!(checks.len(), 1);
-        assert!(matches!(checks[0].severity, Severity::Warn));
-        assert!(checks[0].detail.contains("missing"));
-    }
-
-    #[test]
-    fn gitattributes_check_without_marker_warns() {
-        let dir = tempfile::tempdir().unwrap();
-        let lf = binary_representable_lockfile();
-        lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
-        std::fs::write(dir.path().join(".gitattributes"), "*.png binary\n").unwrap();
-
-        let checks = check_gitattributes_state_at(dir.path());
-        assert_eq!(checks.len(), 1);
-        assert!(matches!(checks[0].severity, Severity::Warn));
-        assert!(checks[0].detail.contains("not marked as binary"));
-    }
-
-    #[test]
-    fn gitattributes_check_with_marker_passes() {
-        let dir = tempfile::tempdir().unwrap();
-        let lf = binary_representable_lockfile();
-        lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
-        std::fs::write(
-            dir.path().join(".gitattributes"),
-            "# lpm\nlpm.lockb binary\n",
-        )
-        .unwrap();
-
-        let checks = check_gitattributes_state_at(dir.path());
-        assert_eq!(checks.len(), 1);
-        assert!(matches!(checks[0].severity, Severity::Pass));
-        assert!(checks[0].detail.contains("marked as binary"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn linked_gitattributes_is_reported_as_unreadable_without_following_the_target() {
-        use std::os::unix::fs::symlink;
-
-        let dir = tempfile::tempdir().unwrap();
-        let lf = binary_representable_lockfile();
-        lf.write_to_file(&dir.path().join("lpm.lock")).unwrap();
-        let target = dir.path().join("outside-gitattributes");
-        std::fs::write(&target, "lpm.lockb binary\n").unwrap();
-        symlink(&target, dir.path().join(".gitattributes")).unwrap();
-
-        let checks = check_gitattributes_state_at(dir.path());
-        assert_eq!(checks.len(), 1);
-        assert_eq!(checks[0].code(), "gitattributes_unreadable");
-        assert!(matches!(checks[0].severity, Severity::Warn));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn fifo_gitattributes_is_rejected_without_waiting_for_a_writer() {
-        use std::os::unix::ffi::OsStrExt as _;
-
-        let dir = tempfile::tempdir().unwrap();
-        binary_representable_lockfile()
-            .write_to_file(&dir.path().join("lpm.lock"))
-            .unwrap();
-        let path = dir.path().join(".gitattributes");
-        let encoded = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-        // SAFETY: `encoded` is a NUL-terminated path owned by this test.
-        assert_eq!(unsafe { libc::mkfifo(encoded.as_ptr(), 0o600) }, 0);
-        let started = std::time::Instant::now();
-
-        let checks = check_gitattributes_state_at(dir.path());
-
-        assert!(started.elapsed() < std::time::Duration::from_millis(500));
-        assert_eq!(checks[0].code(), "gitattributes_unreadable");
-    }
-
     // ── Fix execution tests ─────────────────────────────────────────────
 
     #[test]
@@ -915,28 +753,5 @@ mod tests {
         let result = fix_binary_lockfile(dir.path());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
-    }
-
-    #[test]
-    fn fix_gitattributes_creates_file() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(!dir.path().join(".gitattributes").exists());
-
-        fix_gitattributes(dir.path()).unwrap();
-
-        let content = std::fs::read_to_string(dir.path().join(".gitattributes")).unwrap();
-        assert!(content.contains("lpm.lockb binary"));
-    }
-
-    #[test]
-    fn fix_gitattributes_appends_to_existing() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".gitattributes"), "*.png binary\n").unwrap();
-
-        fix_gitattributes(dir.path()).unwrap();
-
-        let content = std::fs::read_to_string(dir.path().join(".gitattributes")).unwrap();
-        assert!(content.contains("*.png binary"));
-        assert!(content.contains("lpm.lockb binary"));
     }
 }

@@ -144,14 +144,6 @@ pub(crate) async fn run(
     };
     transaction.commit();
 
-    let gitattributes_ready = match lpm_lockfile::ensure_gitattributes(project_dir) {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::warn!("failed to ensure .gitattributes: {e}");
-            false
-        }
-    };
-
     if options.json_output {
         let json = serde_json::json!({
             "success": true,
@@ -164,7 +156,6 @@ pub(crate) async fn run(
             "agents_status": agents_status.as_str(),
             "lpm_json_path": lpm_json_path_for_json(project_dir, lpm_json_status),
             "lpm_json_status": lpm_json_status.as_str(),
-            "gitattributes_ready": gitattributes_ready,
         });
         println!(
             "{}",
@@ -177,11 +168,6 @@ pub(crate) async fn run(
         }
         if agents_status != FileWriteStatus::Skipped {
             install_ui::done_untrusted(&format!("{} AGENTS.md", agents_status.human_verb()));
-        }
-        if gitattributes_ready {
-            install_ui::done("Added lpm.lockb binary to .gitattributes");
-        } else {
-            install_ui::warn("Could not update .gitattributes");
         }
         install_ui::done_line(crate::install_ui::terminal_line!(
             "Done · initialized {}",

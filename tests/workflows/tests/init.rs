@@ -65,8 +65,8 @@ async fn init_yes_human_output_uses_slim_success() {
         "init should report the AGENTS.md package-manager hint, got:\n{combined}"
     );
     assert!(
-        combined.contains("✓ Added lpm.lockb binary to .gitattributes"),
-        "init should report the binary lockfile git attribute, got:\n{combined}"
+        !combined.contains(".gitattributes"),
+        "init leaves .gitattributes to the project, got:\n{combined}"
     );
     assert!(
         combined.contains("✓ Done · initialized @lpm.dev/neo.package"),
@@ -83,7 +83,7 @@ async fn init_yes_human_output_uses_slim_success() {
 }
 
 #[tokio::test]
-async fn init_yes_json_uses_profile_username_and_creates_gitattributes() {
+async fn init_yes_json_uses_profile_username_and_leaves_gitattributes_alone() {
     let project = blank_project_dir();
     let mock = MockRegistry::start().await;
     mock.with_whoami("neo", "neo@example.com").await;
@@ -110,7 +110,7 @@ async fn init_yes_json_uses_profile_username_and_creates_gitattributes() {
     assert_eq!(envelope["version"], serde_json::json!("1.0.0"));
     assert_eq!(envelope["agents_status"], serde_json::json!("created"));
     assert_eq!(envelope["lpm_json_status"], serde_json::json!("skipped"));
-    assert_eq!(envelope["gitattributes_ready"], serde_json::json!(true));
+    assert!(envelope.get("gitattributes_ready").is_none());
 
     insta::assert_json_snapshot!("init_json_envelope_default_owner", envelope, {
         ".path" => "[PACKAGE_JSON]",
@@ -142,13 +142,8 @@ async fn init_yes_json_uses_profile_username_and_creates_gitattributes() {
         "init must not create provider-specific agent files"
     );
     assert!(
-        project.file_exists(".gitattributes"),
-        "init must pre-create .gitattributes"
-    );
-    let gitattributes = project.read_file(".gitattributes");
-    assert!(
-        gitattributes.contains("lpm.lockb binary"),
-        ".gitattributes must mark lpm.lockb as binary, got:\n{gitattributes}"
+        !project.file_exists(".gitattributes"),
+        "init must not create .gitattributes"
     );
 }
 

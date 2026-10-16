@@ -464,13 +464,11 @@ async fn run_patch_commit_inner(
                 let lockfile_path =
                     crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir);
                 let lockfile_binary_path = lockfile_path.with_extension("lockb");
-                let gitattributes_path = lockfile_path.with_file_name(".gitattributes");
                 let install_hash_path = project_dir.join(".lpm").join("install-hash");
-                let mut optional_paths = Vec::with_capacity(5);
+                let mut optional_paths = Vec::with_capacity(4);
                 optional_paths.push(patch_file_abs.clone());
                 optional_paths.push(lockfile_path);
                 optional_paths.push(lockfile_binary_path);
-                optional_paths.push(gitattributes_path);
                 if let Some(obsolete) = manifest_plan.obsolete_patch.as_ref() {
                     optional_paths.push(project_dir.join(obsolete));
                 }
@@ -592,12 +590,10 @@ pub async fn run_patch_remove(
                         &project_dir,
                     );
                 let lockfile_binary_path = lockfile_path.with_extension("lockb");
-                let gitattributes_path = lockfile_path.with_file_name(".gitattributes");
                 let install_hash_path = project_dir.join(".lpm").join("install-hash");
-                let mut optional_paths = Vec::with_capacity(plan.files_to_delete.len() + 3);
+                let mut optional_paths = Vec::with_capacity(plan.files_to_delete.len() + 2);
                 optional_paths.push(lockfile_path);
                 optional_paths.push(lockfile_binary_path);
-                optional_paths.push(gitattributes_path);
                 optional_paths.extend(
                     plan.files_to_delete
                         .keys()
@@ -1133,19 +1129,11 @@ fn upsert_lockfile_patch_record(
             original_integrity: integrity.to_string(),
         },
     );
-    let lockfile_path = crate::commands::install::workspace_lockfile::write(project_dir, lockfile)
-        .map_err(|e| {
-            LpmError::Script(format!(
-                "failed to write lpm.lock after recording patch checksum: {e}"
-            ))
-        })?;
-    lpm_lockfile::ensure_gitattributes(lockfile_path.parent().unwrap_or(project_dir)).map_err(
-        |e| {
-            LpmError::Script(format!(
-                "failed to ensure .gitattributes after recording patch checksum: {e}"
-            ))
-        },
-    )?;
+    crate::commands::install::workspace_lockfile::write(project_dir, lockfile).map_err(|e| {
+        LpmError::Script(format!(
+            "failed to write lpm.lock after recording patch checksum: {e}"
+        ))
+    })?;
     Ok(true)
 }
 
@@ -1176,19 +1164,11 @@ fn remove_lockfile_patch_records(
     }
 
     lockfile.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION;
-    let lockfile_path = crate::commands::install::workspace_lockfile::write(project_dir, lockfile)
-        .map_err(|e| {
-            LpmError::Script(format!(
-                "failed to write lpm.lock after removing patch records: {e}"
-            ))
-        })?;
-    lpm_lockfile::ensure_gitattributes(lockfile_path.parent().unwrap_or(project_dir)).map_err(
-        |e| {
-            LpmError::Script(format!(
-                "failed to ensure .gitattributes after removing patch checksum records: {e}"
-            ))
-        },
-    )?;
+    crate::commands::install::workspace_lockfile::write(project_dir, lockfile).map_err(|e| {
+        LpmError::Script(format!(
+            "failed to write lpm.lock after removing patch records: {e}"
+        ))
+    })?;
     Ok(true)
 }
 

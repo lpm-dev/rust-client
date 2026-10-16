@@ -337,7 +337,6 @@ async fn migrate_and_install(
     };
 
     let lockb_path = cwd.join("lpm.lockb");
-    let gitattributes_path = cwd.join(".gitattributes");
     let member_lock_paths: Vec<_> = workspace
         .as_ref()
         .filter(|_| !no_install)
@@ -351,13 +350,12 @@ async fn migrate_and_install(
         })
         .collect();
     let mut backup_paths =
-        Vec::with_capacity(5 + patches_plan.to_apply.len() + member_lock_paths.len());
+        Vec::with_capacity(4 + patches_plan.to_apply.len() + member_lock_paths.len());
     backup_paths.extend(member_lock_paths.iter().map(|path| path.as_path()));
     backup_paths.extend([
         result.source.path.as_path(),
         lockfile_path.as_path(),
         lockb_path.as_path(),
-        gitattributes_path.as_path(),
     ]);
     if overrides_plan.has_entries() || patches_plan.has_entries() || peer_rules_plan.has_entries() {
         backup_paths.push(&pkg_json_path);
@@ -374,14 +372,6 @@ async fn migrate_and_install(
         if let Err(e) = result.lockfile.write_all(&lockfile_path) {
             render_migration_failure_with_rollback(&e, &mut migration_backup);
             return Err(LpmError::Script(format!("failed to write lockfile: {e}")));
-        }
-
-        // Ensure .gitattributes marks lpm.lockb as binary
-        if let Err(e) = lpm_lockfile::ensure_gitattributes(cwd) {
-            // Non-fatal: warn but continue
-            if !json {
-                install_ui::warn_untrusted(&format!("failed to update .gitattributes: {e}"));
-            }
         }
 
         // Apply the validated `pnpm.overrides` translation to

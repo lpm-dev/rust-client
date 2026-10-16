@@ -10,7 +10,7 @@ use crate::install_ui;
 
 use super::check::{Check, FixTarget};
 use super::install_fix::run_doctor_install;
-use super::lockfile::{fix_binary_lockfile, fix_gitattributes};
+use super::lockfile::fix_binary_lockfile;
 
 #[derive(Default)]
 pub(super) struct FixReport {
@@ -220,15 +220,6 @@ async fn apply_one(
                 .map(|()| Some("reconciled lpm.lockb".into()))
                 .map_err(LpmError::Script)
         }
-        DoctorFix::UpdateGitAttributes => {
-            phase(
-                json_output,
-                "fixing: ensuring .gitattributes marks lpm.lockb as binary",
-            );
-            fix_gitattributes(project_dir)
-                .map(|()| Some("updated .gitattributes".into()))
-                .map_err(LpmError::Script)
-        }
         DoctorFix::InstallNodeSpec | DoctorFix::InstallNode22 => {
             let spec = target_node_spec(check)?;
             phase_untrusted(json_output, &format!("fixing: lpm use node@{spec}"));
@@ -401,15 +392,12 @@ mod tests {
         let checks = vec![
             Check::warn(&doctor_catalog::LOCKFILE_BINARY_MISSING, "missing"),
             Check::warn(&doctor_catalog::LOCKFILE_BINARY_STALE, "stale"),
-            Check::warn(&doctor_catalog::GITATTRIBUTES_MISSING, "missing"),
+            Check::warn(&doctor_catalog::DEPS_SYNC_DRIFT, "drift"),
         ];
 
         assert_eq!(
             planned_actions(&checks).unwrap(),
-            vec![
-                "reconcile lpm.lockb".to_string(),
-                "update .gitattributes".to_string(),
-            ]
+            vec!["reconcile lpm.lockb".to_string(), "lpm install".to_string()]
         );
     }
 

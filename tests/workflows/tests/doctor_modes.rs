@@ -11,7 +11,7 @@
 //! - **Full sweep (`--all`):** everything else — registry + auth probe,
 //!   tunnel lookup, lint / fmt subprocesses, TypeScript reachability,
 //!   plugin update fetch, global-install hygiene, sandbox probe, full
-//!   manifest-compat sweep, hygiene rows (`.gitattributes`, v2 orphans).
+//!   manifest-compat sweep, hygiene rows (tracked `.lpm/`, v2 orphans).
 //!
 //! Contract pins:
 //! 1. Default omits every Extended-tier code.
@@ -42,9 +42,6 @@ const EXTENDED_SENTINEL_CODES: &[&str] = &[
     "pnpm_overrides_drift",
     "engines_npm_ignored",
     "engines_pnpm_ignored",
-    "gitattributes_lockb_marked",
-    "gitattributes_lockb_unmarked",
-    "gitattributes_missing",
     "v2_store_orphans",
     "store_orphan_analysis_unavailable",
     "lint_clean",
