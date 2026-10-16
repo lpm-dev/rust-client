@@ -823,6 +823,106 @@ fn install_restores_managed_project_skills_on_a_fresh_checkout() {
 }
 
 #[test]
+fn install_with_no_skills_leaves_managed_project_skills_alone() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0","dependencies":{}}"#);
+    seed_standard_skill(
+        &project,
+        "team-skills",
+        "release-notes",
+        "Summarize the relevant commits into concise release notes.",
+    );
+    lpm(&project)
+        .args([
+            "skills",
+            "add",
+            "./team-skills",
+            "--skill",
+            "release-notes",
+            "--agent",
+            "codex",
+            "--project",
+            "--yes",
+        ])
+        .assert()
+        .success();
+    std::fs::remove_dir_all(project.path().join(".lpm")).unwrap();
+    std::fs::remove_file(project.path().join(".agents/skills/release-notes")).unwrap();
+
+    let output = lpm(&project)
+        .args(["install", "--no-skills"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!project.file_exists(".agents/skills/release-notes/SKILL.md"));
+}
+
+#[test]
+fn install_warns_and_goes_on_when_the_managed_skills_record_is_unreadable() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0","dependencies":{}}"#);
+    project.write_file("lpm-agent-skills.json", "{ not json");
+
+    let output = lpm(&project).args(["install", "--json"]).output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let warnings = json["warnings"].to_string();
+    assert!(
+        warnings.contains("managed agent skills were not restored"),
+        "{json}"
+    );
+    assert_eq!(project.read_file("lpm-agent-skills.json"), "{ not json");
+}
+
+#[tokio::test]
+async fn install_warns_and_goes_on_when_the_source_record_is_unreadable() {
+    let registry = MockRegistry::start().await;
+    registry
+        .with_package("left-pad", "1.0.0", &make_tarball("left-pad", "1.0.0"))
+        .await;
+    for dependencies in [
+        serde_json::json!({}),
+        serde_json::json!({"left-pad": "1.0.0"}),
+    ] {
+        let project = TempProject::empty(
+            &serde_json::json!({"name": "skills", "version": "1.0.0", "dependencies": dependencies})
+                .to_string(),
+        );
+        project.write_file("lpm-sources.json", "<<<<<<< HEAD\n{}\n");
+
+        let output = lpm_with_registry(&project, &registry.url())
+            .args(["install", "--json"])
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{dependencies}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            json["warnings"]
+                .to_string()
+                .contains("package skills recorded in lpm-sources.json were not restored"),
+            "{json}"
+        );
+        if dependencies.as_object().is_some_and(|map| !map.is_empty()) {
+            assert!(project.file_exists("lpm.lock"), "the install went on");
+        }
+        assert_eq!(project.read_file("lpm-sources.json"), "<<<<<<< HEAD\n{}\n");
+    }
+}
+
+#[test]
 fn standalone_skills_add_materializes_every_supported_project_agent_target() {
     let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0"}"#);
     seed_standard_skill(
@@ -1770,6 +1870,110 @@ async fn install_restores_the_skills_lpm_add_delivered_at_the_recorded_version()
         .success();
 }
 
+async fn installed_npm_project(name: &str) -> (TempProject, MockRegistry) {
+    let project = TempProject::empty(
+        &serde_json::json!({
+            "name": name,
+            "version": "1.0.0",
+            "dependencies": {"left-pad": "1.0.0"},
+        })
+        .to_string(),
+    );
+    let registry = MockRegistry::start().await;
+    registry
+        .with_package("left-pad", "1.0.0", &make_tarball("left-pad", "1.0.0"))
+        .await;
+    lpm_with_registry(&project, &registry.url())
+        .arg("install")
+        .assert()
+        .success();
+    (project, registry)
+}
+
+#[tokio::test]
+async fn up_to_date_install_restores_a_recorded_skill_source_package_skill() {
+    let (project, registry) = installed_npm_project("pulled-sources").await;
+    project.write_file(
+        "lpm-sources.json",
+        &serde_json::json!({
+            "schemaVersion": 1,
+            "packages": {"@lpm.dev/owner.widget": {
+                "version": "1.4.0",
+                "files": {},
+                "skills": "owner.widget",
+            }},
+        })
+        .to_string(),
+    );
+    registry
+        .with_package_skills_for_version_expected(
+            "owner.widget",
+            "1.4.0",
+            vec![package_skill(
+                "widget-guide",
+                "Use the widget the way this release supports",
+                "Render the widget through its documented props.",
+            )],
+            1,
+        )
+        .await;
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["install", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["up_to_date"], true, "{json}");
+    assert!(project.file_exists(".lpm/skills/owner.widget/widget-guide.md"));
+}
+
+#[tokio::test]
+async fn up_to_date_install_restores_a_recorded_managed_skill() {
+    let (project, registry) = installed_npm_project("pulled-agent-skills").await;
+    seed_standard_skill(
+        &project,
+        "team-skills",
+        "release-notes",
+        "Summarize the relevant commits into concise release notes.",
+    );
+    lpm(&project)
+        .args([
+            "skills",
+            "add",
+            "./team-skills",
+            "--skill",
+            "release-notes",
+            "--agent",
+            "codex",
+            "--project",
+            "--yes",
+        ])
+        .assert()
+        .success();
+    std::fs::remove_dir_all(project.path().join(".lpm/managed-skills")).unwrap();
+    std::fs::remove_file(project.path().join(".agents/skills/release-notes")).unwrap();
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["install", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["up_to_date"], true, "{json}");
+    assert!(project.file_exists(".agents/skills/release-notes/SKILL.md"));
+}
+
 #[tokio::test]
 async fn aliases_at_multiple_versions_share_the_highest_selected_package_skill_set() {
     let name = "@lpm.dev/owner.package";
@@ -1829,20 +2033,53 @@ async fn aliases_at_multiple_versions_share_the_highest_selected_package_skill_s
     }
 }
 
-#[tokio::test]
-async fn install_rejects_an_unsafe_registry_skill_name_before_skill_materialization() {
-    let project = TempProject::empty(
-        r#"{
-            "name": "skills",
-            "version": "1.0.0",
-            "dependencies": {"@lpm.dev/owner.package": "1.0.0"}
-        }"#,
-    );
+const LPM_DEPENDENCY_PROJECT: &str = r#"{
+    "name": "skills",
+    "version": "1.0.0",
+    "dependencies": {"@lpm.dev/owner.package": "1.0.0"}
+}"#;
+
+async fn registry_with_lpm_dependency() -> MockRegistry {
     let registry = MockRegistry::start().await;
     let tarball = make_tarball("@lpm.dev/owner.package", "1.0.0");
     registry
         .with_package("@lpm.dev/owner.package", "1.0.0", &tarball)
         .await;
+    registry
+}
+
+fn install_json(project: &TempProject, registry: &MockRegistry) -> serde_json::Value {
+    let output = lpm_with_registry(project, &registry.url())
+        .args(["install", "--json"])
+        .output()
+        .expect("failed to run lpm install");
+    assert!(
+        output.status.success(),
+        "skills must not fail the install\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        project.file_exists("lpm.lock"),
+        "the lockfile must be written"
+    );
+    serde_json::from_slice(&output.stdout).expect("install stdout must be JSON")
+}
+
+fn install_warnings(json: &serde_json::Value) -> String {
+    json["warnings"]
+        .as_array()
+        .expect("install JSON must carry warnings")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn install_refuses_an_unsafe_registry_skill_name_and_still_installs() {
+    let project = TempProject::empty(LPM_DEPENDENCY_PROJECT);
+    let registry = registry_with_lpm_dependency().await;
     registry
         .with_package_skills_for_version(
             "owner.package",
@@ -1855,42 +2092,74 @@ async fn install_rejects_an_unsafe_registry_skill_name_before_skill_materializat
         )
         .await;
 
-    let output = lpm_with_registry(&project, &registry.url())
-        .arg("install")
-        .output()
-        .expect("failed to run unsafe package skill install");
+    let json = install_json(&project, &registry);
 
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unsafe package skill name"));
+    let warnings = install_warnings(&json);
+    assert!(
+        warnings.contains("@lpm.dev/owner.package@1.0.0 were refused")
+            && warnings.contains("unsafe package skill name"),
+        "{warnings}"
+    );
     assert!(!project.path().join(".lpm/skills/owner.package").exists());
     assert!(!project.path().join("escape.md").exists());
 }
 
 #[tokio::test]
-async fn install_propagates_package_skill_fetch_errors() {
-    let project = TempProject::empty(
-        r#"{
-            "name": "skills",
-            "version": "1.0.0",
-            "dependencies": {"@lpm.dev/owner.package": "1.0.0"}
-        }"#,
-    );
-    let registry = MockRegistry::start().await;
-    let tarball = make_tarball("@lpm.dev/owner.package", "1.0.0");
-    registry
-        .with_package("@lpm.dev/owner.package", "1.0.0", &tarball)
-        .await;
+async fn install_warns_when_package_skills_cannot_be_fetched() {
+    let project = TempProject::empty(LPM_DEPENDENCY_PROJECT);
+    let registry = registry_with_lpm_dependency().await;
     registry
         .with_package_skills_error_for_version("owner.package", "1.0.0", 404)
         .await;
 
-    let output = lpm_with_registry(&project, &registry.url())
-        .arg("install")
-        .output()
-        .expect("failed to run package install with a skills endpoint error");
+    let json = install_json(&project, &registry);
 
-    assert!(!output.status.success());
+    assert!(
+        install_warnings(&json).contains("@lpm.dev/owner.package@1.0.0 could not be fetched"),
+        "{json}"
+    );
     assert!(!project.path().join(".lpm/skills/owner.package").exists());
+}
+
+/// A version whose skills are under review, or ended review without
+/// approved skills, still installs; the skills already in the checkout stay.
+#[tokio::test]
+async fn install_keeps_existing_skills_when_the_registry_offers_none() {
+    for (status, reason) in [
+        ("pending", "are still under security review"),
+        ("processing", "are still under security review"),
+        ("error", "could not be security reviewed"),
+        ("unknown", "could not be security reviewed"),
+        ("rejected", "were rejected by security review"),
+        ("flagged", "did not pass security review"),
+    ] {
+        let project = TempProject::empty(LPM_DEPENDENCY_PROJECT);
+        seed_materialized_package_skills(&project, "owner.package", &[("guide", "original\n")]);
+        let registry = registry_with_lpm_dependency().await;
+        registry
+            .with_package_skills_response(
+                "owner.package",
+                serde_json::json!({
+                    "name": "@lpm.dev/owner.package", "version": "1.0.0", "available": false,
+                    "skillsStatus": status, "skillsCount": 1, "skills": []
+                }),
+            )
+            .await;
+
+        let json = install_json(&project, &registry);
+
+        let warnings = install_warnings(&json);
+        assert!(
+            warnings.contains(&format!(
+                "package skills for @lpm.dev/owner.package@1.0.0 {reason}; existing skills were kept"
+            )),
+            "{status}: {warnings}"
+        );
+        assert_eq!(
+            project.read_file(".lpm/skills/owner.package/guide.md"),
+            "original\n"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3328,6 +3597,7 @@ fn uninstall_preserves_locally_edited_package_skills() {
     );
     seed_materialized_package_skills(&project, "owner.package", &[("guide", "original\n")]);
     project.write_file(".lpm/skills/owner.package/guide.md", "user changes\n");
+    let manifest = project.read_file("package.json");
     let output = lpm(&project)
         .args(["uninstall", "@lpm.dev/owner.package"])
         .output()
@@ -3336,6 +3606,11 @@ fn uninstall_preserves_locally_edited_package_skills() {
     assert_eq!(
         project.read_file(".lpm/skills/owner.package/guide.md"),
         "user changes\n"
+    );
+    assert_eq!(
+        project.read_file("package.json"),
+        manifest,
+        "a refused uninstall leaves the manifest as it was"
     );
 }
 

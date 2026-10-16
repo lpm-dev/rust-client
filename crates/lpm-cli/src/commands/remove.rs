@@ -8,6 +8,7 @@ use cap_std::fs::Dir;
 use lpm_common::LpmError;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{Read as _, Write as _};
@@ -2725,6 +2726,35 @@ struct DependencyUpdatePlan {
     removed: Vec<String>,
 }
 
+/// Whether the manifest this removal leaves behind still depends on the
+/// `@lpm.dev` package `short`, so its install keeps the package's skills.
+fn still_a_dependency(
+    project_dir: &Path,
+    dependency_plan: Option<&DependencyUpdatePlan>,
+    short: &str,
+) -> Result<bool, LpmError> {
+    let manifest = match dependency_plan {
+        Some(plan) => Cow::Borrowed(plan.body.as_slice()),
+        None => match lpm_common::read_file_capped(
+            &project_dir.join("package.json"),
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        ) {
+            Ok(bytes) => Cow::Owned(bytes),
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(false),
+            Err(error) => {
+                return Err(LpmError::Registry(format!(
+                    "failed to read package.json: {error}"
+                )));
+            }
+        },
+    };
+    let manifest: serde_json::Value =
+        serde_json::from_slice(lpm_common::strip_utf8_bom_bytes(&manifest)).map_err(|error| {
+            LpmError::Registry(format!("failed to parse package.json: {error}"))
+        })?;
+    Ok(crate::commands::skills::package::direct_lpm_dependencies(&manifest)?.contains(short))
+}
+
 fn plan_dependency_update(
     project_dir: &Path,
     state: &mut AddedSourcesState,
@@ -2835,6 +2865,8 @@ struct RemoveResult<'a> {
     originals_elsewhere: &'a [String],
     #[serde(skip_serializing_if = "string_slice_is_empty")]
     dependencies_removed: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kept_skills: Option<&'a str>,
 }
 
 fn string_slice_is_empty(values: &&[String]) -> bool {
@@ -2847,6 +2879,9 @@ struct LockedRemoveResult {
     originals_elsewhere: Vec<String>,
     dependencies_removed: Vec<String>,
     cleaned_directories: usize,
+    /// The skill directory left in place because the package is still a
+    /// dependency.
+    kept_skills: Option<String>,
 }
 
 impl LockedRemoveResult {
@@ -2857,6 +2892,7 @@ impl LockedRemoveResult {
             originals_elsewhere: Vec::new(),
             dependencies_removed: Vec::new(),
             cleaned_directories: 0,
+            kept_skills: None,
         }
     }
 }
@@ -2940,13 +2976,27 @@ async fn run_locked(project_dir: &Path, package: &str) -> Result<LockedRemoveRes
         &mut state,
         &record,
     )?;
+    let dependency_plan = plan_dependency_update(project_dir, &mut state, &record)?;
+    let kept_skill_package = record
+        .skill_package_short
+        .as_deref()
+        .map(|short| still_a_dependency(project_dir, dependency_plan.as_ref(), short))
+        .transpose()?
+        .unwrap_or(false);
+    let kept_skills = record
+        .skill_package_short
+        .as_deref()
+        .filter(|short| kept_skill_package && project_dir.join(".lpm/skills").join(short).is_dir())
+        .map(|short| format!(".lpm/skills/{short}/"));
     let skill_plan = plan_skill_removal(
         project_dir,
         &canonical_project,
         &package_key,
-        record.skill_package_short.as_deref(),
+        record
+            .skill_package_short
+            .as_deref()
+            .filter(|_| !kept_skill_package),
     )?;
-    let dependency_plan = plan_dependency_update(project_dir, &mut state, &record)?;
     let manifest_path = project_dir.join("package.json");
     let install_hash = project_dir.join(".lpm/install-hash");
     let (manifest_body, manifest_original, dependencies_removed) =
@@ -3135,6 +3185,7 @@ async fn run_locked(project_dir: &Path, package: &str) -> Result<LockedRemoveRes
         originals_elsewhere,
         dependencies_removed,
         cleaned_directories,
+        kept_skills,
     })
 }
 
@@ -3150,6 +3201,7 @@ fn render_result(
         originals_elsewhere,
         dependencies_removed,
         cleaned_directories,
+        kept_skills,
     } = result;
     if json_output {
         let stdout = std::io::stdout();
@@ -3163,6 +3215,7 @@ fn render_result(
                 preserved: &preserved,
                 originals_elsewhere: &originals_elsewhere,
                 dependencies_removed: &dependencies_removed,
+                kept_skills: kept_skills.as_deref(),
             },
         )
         .map_err(|error| {
@@ -3176,6 +3229,7 @@ fn render_result(
         && preserved.is_empty()
         && originals_elsewhere.is_empty()
         && dependencies_removed.is_empty()
+        && kept_skills.is_none()
     {
         install_ui::warn_line(crate::install_ui::terminal_line!(
             "No tracked source files found for {}",
@@ -3205,6 +3259,12 @@ fn render_result(
             install_ui::dim(&path)
         ));
     }
+    if let Some(directory) = &kept_skills {
+        install_ui::detail_line(crate::install_ui::terminal_line!(
+            "Kept {}: the package is still a dependency",
+            install_ui::dim(&lpm_common::sanitize_terminal_inline(directory))
+        ));
+    }
     if !dependencies_removed.is_empty() {
         install_ui::done_line(crate::install_ui::terminal_line!(
             "Removed {} source-owned dependencies",
@@ -3229,6 +3289,20 @@ fn render_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Editors can save `package.json` with a UTF-8 byte order mark, which
+    /// the package reader takes as any other.
+    #[test]
+    fn a_dependency_in_a_package_json_with_a_byte_order_mark_is_found() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("package.json"),
+            "\u{FEFF}{\"dependencies\":{\"@lpm.dev/fixture.widget\":\"^1.0.0\"}}",
+        )
+        .unwrap();
+        assert!(still_a_dependency(project.path(), None, "fixture.widget").unwrap());
+        assert!(!still_a_dependency(project.path(), None, "fixture.other").unwrap());
+    }
 
     #[test]
     fn overwrite_provenance_rejects_modes_outside_unix_permission_bits() {

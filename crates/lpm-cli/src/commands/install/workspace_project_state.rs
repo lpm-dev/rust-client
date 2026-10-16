@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static NEXT_TRANSACTION_ID: AtomicU64 = AtomicU64::new(0);
 
+const ROLLBACK_DIR_PREFIX: &str = ".workspace-install-rollback-";
+
 const PROJECT_STATE_FILES: &[&str] = &[
     ".gitignore",
     ".lpm/install-hash",
@@ -140,6 +142,9 @@ impl WorkspaceProjectStateTransaction {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => return Err(error),
         };
+        if dot_lpm_existed {
+            sweep_stale_rollback_dirs(project_dir);
+        }
         let package_json = project_dir.join("package.json");
         let package_json_bytes =
             lpm_common::read_file_capped(&package_json, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
@@ -206,7 +211,7 @@ impl WorkspaceProjectStateTransaction {
             loop {
                 let transaction_id = NEXT_TRANSACTION_ID.fetch_add(1, Ordering::Relaxed);
                 let candidate = dot_lpm.join(format!(
-                    ".workspace-install-rollback-{}-{transaction_id}",
+                    "{ROLLBACK_DIR_PREFIX}{}-{transaction_id}",
                     std::process::id()
                 ));
                 match std::fs::create_dir(&candidate) {
@@ -312,6 +317,41 @@ impl Drop for WorkspaceProjectStateTransaction {
     }
 }
 
+/// Removes the rollback directories of workspace installs whose process is
+/// gone. They hold the `node_modules` such an install moved aside, which the
+/// next install rebuilds.
+pub(super) fn sweep_stale_rollback_dirs(project_dir: &Path) {
+    let dot_lpm = project_dir.join(".lpm");
+    if !dot_lpm
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.is_dir() && !lpm_common::is_symlink_or_junction(&metadata))
+    {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(&dot_lpm) else {
+        return;
+    };
+    let own_pid = std::process::id();
+    for entry in entries.flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(rollback_dir_pid) else {
+            continue;
+        };
+        if pid == own_pid || lpm_runner::ports::process_is_running(pid) {
+            continue;
+        }
+        let path = entry.path();
+        if let Err(error) = remove_if_present(&path) {
+            tracing::warn!(path = %path.display(), %error, "failed to remove stale workspace install rollback state");
+        }
+    }
+}
+
+fn rollback_dir_pid(name: &str) -> Option<u32> {
+    let (pid, transaction_id) = name.strip_prefix(ROLLBACK_DIR_PREFIX)?.split_once('-')?;
+    transaction_id.parse::<u64>().ok()?;
+    pid.parse().ok()
+}
+
 fn restore_file(snapshot: &FileSnapshot) -> std::io::Result<()> {
     match &snapshot.original {
         Some(original) => {
@@ -396,6 +436,35 @@ mod tests {
         assert!(project.join("node_modules/new-package").is_dir());
         assert!(!project.join("node_modules/old-package").exists());
         assert!(!backup_root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_removes_only_rollback_dirs_of_exited_installs() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path();
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let exited_pid = exited.id();
+        exited.wait().unwrap();
+        let rollback = |pid: u32| project.join(format!(".lpm/{ROLLBACK_DIR_PREFIX}{pid}-0"));
+        std::fs::create_dir_all(rollback(exited_pid).join("node_modules/old")).unwrap();
+        std::fs::create_dir_all(rollback(std::process::id())).unwrap();
+        std::fs::create_dir_all(rollback(1)).unwrap();
+        std::fs::create_dir_all(project.join(".lpm/.workspace-install-rollback-notes")).unwrap();
+
+        sweep_stale_rollback_dirs(project);
+
+        assert!(!rollback(exited_pid).exists());
+        assert!(rollback(std::process::id()).exists());
+        assert!(
+            rollback(1).exists(),
+            "a running process keeps its rollback state"
+        );
+        assert!(
+            project
+                .join(".lpm/.workspace-install-rollback-notes")
+                .exists()
+        );
     }
 
     #[cfg(unix)]

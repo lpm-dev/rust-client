@@ -690,6 +690,7 @@ pub(super) struct EmptyDependencyInstallInput<'a> {
     pub(super) security_analysis_policy: lpm_store::SecurityAnalysisPolicy,
     pub(super) dependency_engine_policy: &'a crate::engine_check::DependencyEnginePolicy,
     pub(super) current_importer_snapshot: &'a lpm_lockfile::ImporterSnapshot,
+    pub(super) warnings: &'a [String],
 }
 
 pub(super) async fn run_empty_dependency_install_phase(
@@ -716,6 +717,7 @@ pub(super) async fn run_empty_dependency_install_phase(
         security_analysis_policy,
         dependency_engine_policy,
         current_importer_snapshot,
+        warnings,
     } = input;
 
     if cleanup_catalogs_in_pipeline {
@@ -772,6 +774,7 @@ pub(super) async fn run_empty_dependency_install_phase(
                     "total_ms": total_ms,
                 },
             },
+            "warnings": warnings,
             "peer_conflicts": [],
             "peer_issues": peer_issues_json_value(&[], &[]),
             "security": {
