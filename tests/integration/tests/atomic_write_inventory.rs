@@ -235,10 +235,6 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "swaps a validated app bundle and launchers from an exclusively created same-directory TempDir with rollback",
     ),
     (
-        "crates/lpm-cli/src/commands/skills/managed.rs::write_state",
-        "NamedTempFile exclusively creates a randomized sibling before persist",
-    ),
-    (
         "crates/lpm-cli/src/commands/skills/managed.rs::commit_staged_install",
         "publishes an exclusively created skill directory transaction",
     ),

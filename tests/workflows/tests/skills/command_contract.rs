@@ -36,7 +36,7 @@ fn make_claude_only(project: &TempProject) {
 fn readding_checks_compatibility_of_retained_targets_before_writes() {
     let project = managed_project(&["codex"]);
     let before = project.read_file(".agents/skills/release-notes/SKILL.md");
-    let state = project.read_file(".lpm/managed-skills/skills.lock.json");
+    let state = project.read_file("lpm-agent-skills.json");
     make_claude_only(&project);
     lpm(&project)
         .args([
@@ -57,10 +57,7 @@ fn readding_checks_compatibility_of_retained_targets_before_writes() {
         project.read_file(".agents/skills/release-notes/SKILL.md"),
         before
     );
-    assert_eq!(
-        project.read_file(".lpm/managed-skills/skills.lock.json"),
-        state
-    );
+    assert_eq!(project.read_file("lpm-agent-skills.json"), state);
     assert!(!project.path().join(".claude/skills/release-notes").exists());
 }
 
@@ -83,7 +80,7 @@ fn enabling_checks_compatibility_after_disabled_target_content_updates() {
         .args(["skills", "update", "release-notes", "--yes"])
         .assert()
         .success();
-    let state = project.read_file(".lpm/managed-skills/skills.lock.json");
+    let state = project.read_file("lpm-agent-skills.json");
     lpm(&project)
         .args([
             "skills",
@@ -96,10 +93,7 @@ fn enabling_checks_compatibility_after_disabled_target_content_updates() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("not compatible with codex"));
-    assert_eq!(
-        project.read_file(".lpm/managed-skills/skills.lock.json"),
-        state
-    );
+    assert_eq!(project.read_file("lpm-agent-skills.json"), state);
     assert!(!project.path().join(".agents/skills/release-notes").exists());
 }
 

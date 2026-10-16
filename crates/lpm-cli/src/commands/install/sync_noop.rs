@@ -121,8 +121,9 @@ pub(crate) fn is_up_to_date(
         json_output,
     )?;
     let extensions = super::policy_extensions::load_policy_extension_configs(&global)?;
-    let skills_ready = !crate::lpm_skills_config::LpmSkillsPreference::Config.resolve(&global)?
-        || crate::commands::skills::package::materialization_complete(project_dir, package_json);
+    let skills_ready = (!crate::lpm_skills_config::LpmSkillsPreference::Config.resolve(&global)?
+        || crate::commands::skills::package::materialization_complete(project_dir, package_json))
+        && crate::commands::skills::project_skills_ready(project_dir);
     if !extensions.is_empty() || !skills_ready {
         return Ok(false);
     }
