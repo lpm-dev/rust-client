@@ -44,7 +44,7 @@ use manifest_rewrite::{
     apply_dependency_selection_to_deploy_manifest, copy_workspace_dependency_closure,
 };
 use paths::{read_member_name, resolve_deploy_target};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 pub(in crate::commands::deploy) const DEPLOY_WORKSPACE_DIR: &str = ".lpm/deploy-workspace";
@@ -276,6 +276,37 @@ pub async fn run(
     .await?;
 
     let internal_symlinks_retargeted = retarget_internal_node_modules_symlinks(&plan.output_dir)?;
+    // The output's `.lpm` holds its package store and workspace sources,
+    // which travel with it, as git commits it too.
+    let state_ignore = lpm_common::project_state_dir(&plan.output_dir)
+        .join(lpm_common::project_state::PROJECT_STATE_IGNORE_FILE);
+    lpm_common::write_file_atomic_with_options(
+        &state_ignore,
+        lpm_common::project_state::DEPLOY_OUTPUT_STATE_IGNORE.as_bytes(),
+        lpm_common::AtomicWriteOptions::new().unix_mode(0o644),
+    )
+    .map_err(|error| {
+        LpmError::Script(format!(
+            "deploy: failed to write {}, which lets git commit the output's dependencies: {error}",
+            state_ignore.display()
+        ))
+    })?;
+    let tree = OutputTree::read(&plan.output_dir)?;
+    let output_ignore = plan
+        .output_dir
+        .join(lpm_common::project_state::PROJECT_STATE_IGNORE_FILE);
+    lpm_common::write_file_atomic_with_options(
+        &output_ignore,
+        tree.take_backs().as_bytes(),
+        lpm_common::AtomicWriteOptions::new().unix_mode(0o644),
+    )
+    .map_err(|error| {
+        LpmError::Script(format!(
+            "deploy: failed to write {}, which keeps git's rules outside the output from leaving out what the deploy wrote: {error}",
+            output_ignore.display()
+        ))
+    })?;
+    let dependency_ignore_files = tree.dependency_ignore_files;
     drop(deploy_progress);
 
     let elapsed = start.elapsed();
@@ -311,6 +342,7 @@ pub async fn run(
             },
             "pruned_lockfile_packages": pruned_lockfile_packages,
             "internal_symlinks_retargeted": internal_symlinks_retargeted,
+            "dependency_ignore_files": dependency_ignore_files,
             "duration_ms": elapsed.as_millis() as u64,
         });
         println!(
@@ -343,6 +375,22 @@ pub async fn run(
             install_ui::status_ok(&internal_symlinks_retargeted.to_string()),
         );
         deploy_detail_colored("node_modules installed:", install_ui::status_ok("yes"));
+        if !dependency_ignore_files.is_empty() {
+            let directories: Vec<String> = dependency_ignore_files
+                .iter()
+                .map(|path| {
+                    shell_quoted(
+                        path.rsplit_once('/')
+                            .map_or(".", |(directory, _)| directory),
+                    )
+                })
+                .collect();
+            install_ui::warn_line(crate::install_ui::terminal_line!(
+                "{} .gitignore files came with dependencies, and git leaves out what they name; to commit the output, run in it: git add -f -- {}",
+                install_ui::status_ok(&dependency_ignore_files.len().to_string()),
+                &lpm_common::sanitize_terminal_inline(&directories.join(" "))
+            ));
+        }
         install_ui::done_line(crate::install_ui::terminal_line!(
             "Copied source, lockfile, and {} dependencies",
             install_ui::status_ok(dependency_mode.label())
@@ -354,6 +402,149 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// What a deploy wrote into its output, as git reads it.
+struct OutputTree {
+    /// The `.gitignore` files below the output's top but its state
+    /// directory's own, each `/`-separated and relative to it: what
+    /// dependencies brought, as the deploy leaves the member's and its
+    /// sources' out. Git leaves out the files one names whatever the files
+    /// above it say.
+    dependency_ignore_files: Vec<String>,
+    /// The output's top-level entries, with a `/` after a directory.
+    written: Vec<String>,
+}
+
+impl OutputTree {
+    /// Reads `output` without following links.
+    fn read(output: &Path) -> Result<Self, LpmError> {
+        let mut tree = Self {
+            dependency_ignore_files: Vec::new(),
+            written: Vec::new(),
+        };
+        let mut pending = vec![(output.to_path_buf(), PathBuf::new())];
+        while let Some((directory, relative)) = pending.pop() {
+            let top = relative.as_os_str().is_empty();
+            let entries = std::fs::read_dir(&directory).map_err(|error| {
+                LpmError::Script(format!(
+                    "deploy: failed to read {}: {error}",
+                    directory.display()
+                ))
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(LpmError::Io)?;
+                let name = entry.file_name();
+                let path = relative.join(&name);
+                let file_type = entry.file_type().map_err(LpmError::Io)?;
+                // The deploy writes only names its selection read as UTF-8
+                // at the top.
+                if top && let Some(name) = name.to_str() {
+                    tree.written.push(if file_type.is_dir() {
+                        format!("{name}/")
+                    } else {
+                        name.to_owned()
+                    });
+                }
+                if file_type.is_dir() {
+                    pending.push((entry.path(), path));
+                } else if file_type.is_file()
+                    && !top
+                    // Git with `core.ignorecase` reads `.GITIGNORE` too.
+                    && name.eq_ignore_ascii_case(lpm_common::project_state::PROJECT_STATE_IGNORE_FILE)
+                    && relative.as_os_str() != lpm_common::PROJECT_STATE_DIR
+                {
+                    tree.dependency_ignore_files.push(portable_relative(&path));
+                }
+            }
+        }
+        tree.dependency_ignore_files.sort_unstable();
+        tree.written.sort_unstable();
+        Ok(tree)
+    }
+
+    /// The output's own `.gitignore`, which takes back from the rules of
+    /// a repository the output is in, and from global ones, each entry in
+    /// [`Self::written`], every directory in those directories, and all of
+    /// `node_modules`; a rule there for files, such as `*.log`, still
+    /// applies in those directories, and so does every rule for a file or a
+    /// top-level entry added later. A line for each directory below the
+    /// top would take back only what the deploy wrote, but git matches
+    /// every path against every line, which grows with the output's square.
+    /// It only takes back, so a tool that reads it for what to leave out
+    /// leaves out nothing. Git reads `.lpm/.gitignore` in the state
+    /// directory, and a dependency's `.gitignore` in the dependency, over
+    /// it.
+    fn take_backs(&self) -> String {
+        let mut ignore = String::from(
+            "# Written by lpm deploy: git commits what the deploy wrote here,\n\
+             # whatever a rule outside the output says.\n!/.gitignore\n",
+        );
+        // No line can hold a line break, and a wildcard in its place would
+        // take back other names too.
+        for written in self
+            .written
+            .iter()
+            .filter(|written| !written.contains(['\n', '\r']))
+        {
+            let pattern = ignore_pattern_literal(written);
+            ignore.push_str(&format!("!/{pattern}\n"));
+            match written.strip_suffix('/') {
+                Some("node_modules") => ignore.push_str("!/node_modules/**\n"),
+                Some(directory) if directory == lpm_common::PROJECT_STATE_DIR => {}
+                Some(_) => ignore.push_str(&format!("!/{pattern}**/\n")),
+                None => {}
+            }
+        }
+        ignore
+    }
+}
+
+/// `name`, which holds no line break, as a `.gitignore` pattern that
+/// matches it alone: git's glob characters escaped, and spaces at the end,
+/// which git drops, escaped.
+fn ignore_pattern_literal(name: &str) -> String {
+    let kept = name.trim_end_matches(' ');
+    let mut pattern = String::with_capacity(name.len() + 4);
+    for character in kept.chars() {
+        match character {
+            '\\' | '*' | '?' | '[' => {
+                pattern.push('\\');
+                pattern.push(character);
+            }
+            _ => pattern.push(character),
+        }
+    }
+    for _ in kept.len()..name.len() {
+        pattern.push_str("\\ ");
+    }
+    pattern
+}
+
+/// `path`'s components joined with `/`, each as UTF-8 or as near as it
+/// reads.
+fn portable_relative(path: &Path) -> String {
+    let mut portable = String::new();
+    for component in path.components() {
+        if !portable.is_empty() {
+            portable.push('/');
+        }
+        portable.push_str(&component.as_os_str().to_string_lossy());
+    }
+    portable
+}
+
+/// `word` as one POSIX shell word.
+fn shell_quoted(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/._-+@,=".contains(&byte))
+    {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
 }
 
 fn deploy_detail_colored(label: &'static str, value: install_ui::TerminalFragment) {

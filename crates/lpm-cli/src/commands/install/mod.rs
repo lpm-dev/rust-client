@@ -83,7 +83,6 @@ pub(crate) use firewall::{
 pub(crate) use github_source::download_github_archive_to_file;
 pub(crate) use github_source::github_archive_url;
 use github_source::resolve_github_source;
-pub use gitignore::ensure_skills_gitignore;
 use gitignore::*;
 use lifecycle::*;
 use linking::*;

@@ -1305,6 +1305,7 @@ pub(crate) fn open_project_cert_directory(
     let Some(state) = open_or_create_directory(&project, ".lpm", create, ".lpm")? else {
         return Ok(None);
     };
+    lpm_common::keep_state_dir_ignored_or_warn(&state, &project_path.join(".lpm"));
     let Some(certs) = open_or_create_directory(&state, "certs", create, ".lpm/certs")? else {
         return Ok(None);
     };

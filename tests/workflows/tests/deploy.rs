@@ -424,6 +424,263 @@ async fn assert_deploy_excludes_credentials(credential_names: &[&str]) {
     }
 }
 
+#[tokio::test]
+async fn a_committed_deploy_output_keeps_what_the_deploy_wrote_whatever_rules_outside_it_say() {
+    use support::lpm_with_registry;
+    use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_with_files};
+    let package = "@lpm.dev/test.kept-pkg";
+    let tarball = make_tarball_with_files(
+        package,
+        "1.0.0",
+        &[("index.js", b"module.exports = 'kept';\n")],
+    );
+    let registry = MockRegistry::start().await;
+    let metadata = serde_json::json!({
+        "name": package,
+        "dist-tags": {"latest": "1.0.0"},
+        "versions": {"1.0.0": {
+            "name": package,
+            "version": "1.0.0",
+            "main": "index.js",
+            "dist": {
+                "tarball": format!("{}{}", registry.url(), MockRegistry::tarball_path(package, "1.0.0")),
+                "integrity": compute_integrity(&tarball),
+            },
+        }},
+    });
+    registry
+        .with_package_metadata_and_tarballs(package, metadata, &[("1.0.0", tarball)])
+        .await;
+    let project =
+        TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
+    project.write_file(
+        "packages/app/package.json",
+        &format!(
+            r#"{{"name":"app","version":"1.0.0","main":"index.js","dependencies":{{"shared":"workspace:*","{package}":"1.0.0"}}}}"#
+        ),
+    );
+    project.write_file("packages/app/index.js", "require('./dist/lib');\n");
+    project.write_file("packages/app/dist/lib.js", "require('./build/x');\n");
+    project.write_file("packages/app/dist/build/x.js", "require('shared');\n");
+    project.write_file(
+        "packages/shared/package.json",
+        r#"{"name":"shared","version":"1.0.0","main":"index.js"}"#,
+    );
+    project.write_file("packages/shared/index.js", "module.exports = 1;\n");
+    let deploy = |out: &std::path::Path| {
+        let output = lpm_with_registry(&project, &registry.url())
+            .args(["deploy", out.to_str().unwrap(), "--filter", "app"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // What the user adds to the output afterwards still follows their
+        // rules.
+        std::fs::write(out.join(".env"), "TOKEN=placeholder\n").unwrap();
+        std::fs::write(out.join("dist/.env"), "TOKEN=placeholder\n").unwrap();
+    };
+    let scratch = external_output_dir();
+    let global = scratch.path().join("gitconfig");
+    let git = |directory: &std::path::Path, arguments: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(arguments)
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let check = |committed: &str, prefix: &str| {
+        let committed: Vec<&str> = committed
+            .lines()
+            .filter_map(|path| path.strip_prefix(prefix))
+            .collect();
+        for kept in [
+            ".gitignore",
+            "index.js",
+            "dist/lib.js",
+            "dist/build/x.js",
+            ".lpm/.gitignore",
+        ] {
+            assert!(committed.contains(&kept), "{kept}: {committed:#?}");
+        }
+        for payload in [
+            "node_modules/shared",
+            ".lpm/deploy-workspace/",
+            ".lpm/store/",
+        ] {
+            assert!(
+                committed.iter().any(|path| path.starts_with(payload)),
+                "{payload}: {committed:#?}"
+            );
+        }
+        for added in [".env", "dist/.env"] {
+            assert!(!committed.contains(&added), "{added}: {committed:#?}");
+        }
+    };
+
+    // The output inside a repository whose `.gitignore` names what a Node
+    // project builds and installs.
+    std::fs::write(&global, "").unwrap();
+    let repository = scratch.path().join("repository");
+    std::fs::create_dir_all(repository.join("deploy")).unwrap();
+    git(&repository, &["init", "-q"]);
+    std::fs::write(
+        repository.join(".gitignore"),
+        "node_modules/\ndist/\nbuild/\n.lpm/\n.env\n",
+    )
+    .unwrap();
+    deploy(&repository.join("deploy/out"));
+    git(&repository, &["add", "-A"]);
+    check(&git(&repository, &["ls-files"]), "deploy/out/");
+
+    // The output as a repository of its own, under a global excludes file.
+    let excludes = scratch.path().join("excludes");
+    std::fs::write(&excludes, "node_modules\ndist/\nbuild/\n.lpm/\n.env\n").unwrap();
+    std::fs::write(
+        &global,
+        format!(
+            "[core]\n\texcludesFile = {}\n",
+            excludes.to_str().unwrap().replace('\\', "/")
+        ),
+    )
+    .unwrap();
+    let own = scratch.path().join("own");
+    deploy(&own);
+    git(&own, &["init", "-q"]);
+    git(&own, &["add", "-A"]);
+    check(&git(&own, &["ls-files"]), "");
+}
+
+#[tokio::test]
+async fn a_deploy_output_git_commits_keeps_its_dependencies() {
+    use support::lpm_with_registry;
+    use support::mock_registry::MockRegistry;
+    let project =
+        TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"app","version":"1.0.0","main":"index.js","dependencies":{"shared":"workspace:*"}}"#,
+    );
+    project.write_file("packages/app/index.js", "require('shared');\n");
+    project.write_file(
+        "packages/shared/package.json",
+        r#"{"name":"shared","version":"1.0.0","main":"index.js"}"#,
+    );
+    project.write_file("packages/shared/index.js", "module.exports = 1;\n");
+    let registry = MockRegistry::start().await;
+    let out = external_output_dir();
+    let output = lpm_with_registry(&project, &registry.url())
+        .args(["deploy", out.path().to_str().unwrap(), "--filter", "app"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // A host that deploys what git pushes gets what `git add -A` stages.
+    let git = |arguments: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(out.path())
+            .args(arguments)
+            .output()
+            .expect("run git")
+    };
+    assert!(git(&["init", "-q"]).status.success());
+    let offered = || {
+        String::from_utf8_lossy(&git(&["ls-files", "--others", "--exclude-standard"]).stdout)
+            .into_owned()
+    };
+    let check = |offered: &str| {
+        assert!(
+            offered.lines().any(|path| path == ".lpm/.gitignore"),
+            "a clone would lose what keeps the dependencies committed:\n{offered}"
+        );
+        for payload in [".lpm/deploy-workspace/", ".lpm/store/"] {
+            assert!(
+                offered.lines().any(|path| path.starts_with(payload)),
+                "{payload} is left out of git:\n{offered}"
+            );
+        }
+        // Machine-local state stays out, and nothing committed names a path
+        // on this machine.
+        assert!(!offered.contains(".lpm/known-projects.json"), "{offered}");
+        let local_paths = [
+            out.path().to_path_buf(),
+            std::fs::canonicalize(out.path()).unwrap(),
+            std::fs::canonicalize(project.path()).unwrap(),
+        ];
+        for path in offered.lines().filter(|path| path.starts_with(".lpm/")) {
+            let content = std::fs::read(out.path().join(path)).unwrap_or_default();
+            let content = String::from_utf8_lossy(&content);
+            for local in &local_paths {
+                assert!(
+                    !content.contains(&*local.to_string_lossy()),
+                    "{path} names {}",
+                    local.display()
+                );
+            }
+        }
+    };
+    check(&offered());
+
+    // A later command in the output keeps it that way.
+    let later = lpm_with_registry(&project, &registry.url())
+        .current_dir(out.path())
+        .args(["config", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        later.status.success(),
+        "{}",
+        String::from_utf8_lossy(&later.stderr)
+    );
+    check(&offered());
+
+    // A clone keeps them committed.
+    assert!(git(&["add", "-A"]).status.success());
+    let committed = git(&[
+        "-c",
+        "user.name=deploy",
+        "-c",
+        "user.email=deploy@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        "deploy",
+    ]);
+    assert!(
+        committed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&committed.stderr)
+    );
+    let clone = external_output_dir();
+    let cloned = std::process::Command::new("git")
+        .args(["clone", "-q"])
+        .arg(out.path())
+        .arg(clone.path().join("app"))
+        .output()
+        .unwrap();
+    assert!(cloned.status.success());
+    assert_eq!(
+        std::fs::read_to_string(clone.path().join("app/.lpm/.gitignore")).unwrap(),
+        std::fs::read_to_string(out.path().join(".lpm/.gitignore")).unwrap()
+    );
+}
+
 fn assert_deployment_has_no_registry_credentials(directory: &std::path::Path) {
     for entry in std::fs::read_dir(directory).unwrap() {
         let entry = entry.unwrap();
@@ -439,4 +696,75 @@ fn assert_deployment_has_no_registry_credentials(directory: &std::path::Path) {
             assert_deployment_has_no_registry_credentials(&entry.path());
         }
     }
+}
+
+#[tokio::test]
+async fn deploy_names_the_dependency_ignore_files_a_commit_of_the_output_would_obey() {
+    use support::lpm_with_registry;
+    use support::mock_registry::{MockRegistry, compute_integrity, make_tarball_with_files};
+    let package = "@lpm.dev/test.gi-pkg";
+    let tarball = make_tarball_with_files(
+        package,
+        "1.0.0",
+        &[
+            (".gitignore", b"dist/\n"),
+            ("dist/index.js", b"module.exports = 'from dist';\n"),
+        ],
+    );
+    let registry = MockRegistry::start().await;
+    let metadata = serde_json::json!({
+        "name": package,
+        "dist-tags": {"latest": "1.0.0"},
+        "versions": {"1.0.0": {
+            "name": package,
+            "version": "1.0.0",
+            "main": "dist/index.js",
+            "dist": {
+                "tarball": format!("{}{}", registry.url(), MockRegistry::tarball_path(package, "1.0.0")),
+                "integrity": compute_integrity(&tarball),
+            },
+        }},
+    });
+    registry
+        .with_package_metadata_and_tarballs(package, metadata, &[("1.0.0", tarball)])
+        .await;
+    let project =
+        TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
+    project.write_file(
+        "packages/app/package.json",
+        &format!(r#"{{"name":"app","version":"1.0.0","dependencies":{{"{package}":"1.0.0"}}}}"#),
+    );
+    let out = external_output_dir();
+
+    let output = lpm_with_registry(&project, &registry.url())
+        .args([
+            "--json",
+            "deploy",
+            out.path().to_str().unwrap(),
+            "--filter",
+            "app",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary = support::assertions::parse_json_output(&output.stdout);
+    let named: Vec<&str> = summary["dependency_ignore_files"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{summary}"))
+        .iter()
+        .map(|path| path.as_str().unwrap())
+        .collect();
+    assert!(!named.is_empty(), "{summary}");
+    for path in &named {
+        assert!(
+            out.path().join(path).is_file() && path.ends_with("/.gitignore"),
+            "{path}"
+        );
+    }
+    assert!(!named.contains(&".lpm/.gitignore"), "{summary}");
 }

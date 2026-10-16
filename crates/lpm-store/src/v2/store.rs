@@ -2862,7 +2862,7 @@ impl Store {
                 return Err(error);
             }
 
-            replace_local_source_object(&tmp_dir, &object_dir, &canonical_source)?;
+            replace_local_source_object(&tmp_dir, &object_dir)?;
             record_local_source_fingerprint(&object_dir, after_population.as_ref());
             if matches!(
                 self.finish_file_cas_source(

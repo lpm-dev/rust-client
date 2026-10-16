@@ -154,7 +154,7 @@ fn is_complete_local_source_object_dir(dir: &Path) -> bool {
     is_complete_object_dir(dir) && has_local_source_sentinel(dir)
 }
 
-fn write_local_source_sentinel(object_dir: &Path, source_root: &Path) -> Result<(), LpmError> {
+fn write_local_source_sentinel(object_dir: &Path) -> Result<(), LpmError> {
     let path = local_source_sentinel_path(object_dir)?;
     if let Some(parent) = path.parent() {
         ensure_store_tier_dir_locked(parent).map_err(|e| {
@@ -164,7 +164,9 @@ fn write_local_source_sentinel(object_dir: &Path, source_root: &Path) -> Result<
             ))
         })?;
     }
-    std::fs::write(&path, source_root.display().to_string()).map_err(|e| {
+    // Only its presence counts; a path here would name this machine's
+    // directories in a store a deploy output commits.
+    std::fs::write(&path, b"").map_err(|e| {
         LpmError::Store(format!(
             "failed to write virtual-store local-source sentinel at {}: {e}",
             path.display()
@@ -175,10 +177,9 @@ fn write_local_source_sentinel(object_dir: &Path, source_root: &Path) -> Result<
 pub(crate) fn replace_local_source_object(
     tmp_dir: &Path,
     object_dir: &Path,
-    source_root: &Path,
 ) -> Result<(), LpmError> {
     if !object_dir.exists() {
-        return finish_local_source_object_rename(tmp_dir, object_dir, source_root);
+        return finish_local_source_object_rename(tmp_dir, object_dir);
     }
 
     // An unchanged source tree produces a byte-identical snapshot.
@@ -187,11 +188,11 @@ pub(crate) fn replace_local_source_object(
     // sibling install) could otherwise observe as a mixed tree.
     if existing_snapshot_matches_replacement(tmp_dir, object_dir) {
         let _ = std::fs::remove_dir_all(tmp_dir);
-        write_local_source_sentinel(object_dir, source_root)?;
+        write_local_source_sentinel(object_dir)?;
         return Ok(());
     }
 
-    write_local_source_sentinel(object_dir, source_root)?;
+    write_local_source_sentinel(object_dir)?;
 
     let backup_dir = tmp_sibling(object_dir);
     if backup_dir.exists() {
@@ -201,7 +202,7 @@ pub(crate) fn replace_local_source_object(
     match std::fs::rename(object_dir, &backup_dir) {
         Ok(()) => {}
         Err(_) if !object_dir.exists() => {
-            return finish_local_source_object_rename(tmp_dir, object_dir, source_root);
+            return finish_local_source_object_rename(tmp_dir, object_dir);
         }
         Err(e) => {
             let _ = std::fs::remove_dir_all(tmp_dir);
@@ -261,12 +262,8 @@ fn existing_snapshot_matches_replacement(tmp_dir: &Path, object_dir: &Path) -> b
     }
 }
 
-fn finish_local_source_object_rename(
-    tmp_dir: &Path,
-    object_dir: &Path,
-    source_root: &Path,
-) -> Result<(), LpmError> {
-    write_local_source_sentinel(object_dir, source_root)?;
+fn finish_local_source_object_rename(tmp_dir: &Path, object_dir: &Path) -> Result<(), LpmError> {
+    write_local_source_sentinel(object_dir)?;
     match std::fs::rename(tmp_dir, object_dir) {
         Ok(()) => Ok(()),
         Err(_) if is_complete_local_source_object_dir(object_dir) => {

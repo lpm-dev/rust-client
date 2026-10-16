@@ -29,14 +29,34 @@ pub(super) fn run_async_main() -> Result<()> {
             {
                 runtime_builder.max_blocking_threads(cap.get());
             }
-            runtime_builder
+            let result = runtime_builder
                 .build()
                 .expect("failed to create tokio runtime")
-                .block_on(async_main(cli))
+                .block_on(async_main(cli));
+            if let Some(project_dir) = project_dir.as_deref() {
+                keep_project_state_ignored(project_dir);
+            }
+            result
         })
         .expect("failed to spawn async main thread")
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
+/// Keeps the project's `.lpm` out of git after any command, whichever path
+/// wrote state there. The LPM home is left alone when the project is the
+/// home directory itself.
+pub(super) fn keep_project_state_ignored(project_dir: &std::path::Path) {
+    let state_dir = lpm_common::project_state_dir(project_dir);
+    let is_lpm_home = lpm_common::LpmRoot::from_env().is_ok_and(|root| {
+        match (state_dir.canonicalize(), root.root().canonicalize()) {
+            (Ok(state), Ok(home)) => state == home,
+            _ => false,
+        }
+    });
+    if !is_lpm_home {
+        lpm_common::keep_existing_project_state_ignored(project_dir);
+    }
 }
 
 fn install_runtime_worker_threads(

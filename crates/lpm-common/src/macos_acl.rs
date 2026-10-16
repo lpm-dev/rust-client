@@ -147,6 +147,20 @@ unsafe fn allow_entry_changes_in(acl: *mut c_void) -> io::Result<bool> {
     Ok(false)
 }
 
+/// Removes the extended ACL entries the open file or directory has, such as
+/// those it took from its directory. A volume that holds no ACLs leaves
+/// nothing to remove.
+pub fn drop_extended_acl(handle: impl AsFd) -> io::Result<()> {
+    match has_extended_acl(&handle) {
+        Ok(true) => clear_extended_acl(handle),
+        Ok(false) => Ok(()),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOTSUP | libc::EOPNOTSUPP)) => {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Removes every extended ACL entry from the open file or directory, and
 /// checks that none remain.
 pub fn clear_extended_acl(handle: impl AsFd) -> io::Result<()> {

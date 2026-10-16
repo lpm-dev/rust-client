@@ -148,7 +148,8 @@ fn snapshot_project_files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
                     && matches!(
                         relative.file_name().and_then(|name| name.to_str()),
                         Some(
-                            ".install.lock"
+                            ".gitignore"
+                                | ".install.lock"
                                 | ".install.lock.writer-intent"
                                 | ".install.lock.writer-queue"
                                 | ".publish.lock"

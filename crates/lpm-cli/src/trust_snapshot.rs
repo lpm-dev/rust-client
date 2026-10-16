@@ -18,9 +18,9 @@
 //! *approvals themselves* for detection of additions. The two files
 //! have independent lifecycles (build-state invalidates on install
 //! changes; trust-snapshot only on manifest changes), different
-//! schemas, and different consumer concerns. Colocating them in
-//! `.lpm/` keeps them next to `package.json` and behind the existing
-//! `.gitignore` convention for `.lpm/`.
+//! schemas, and different consumer concerns. Both live in `.lpm/`,
+//! which keeps itself out of git, so a committed copy can't stand in
+//! for this machine's record of what it approved.
 //!
 //! ## Schema stability
 //!
@@ -49,12 +49,10 @@ pub const FILENAME: &str = "trust-snapshot.json";
 
 /// One binding captured in the snapshot.
 ///
-/// Minimal 2-field projection of `TrustedDependencyBinding`. We do
-/// NOT capture audit fields (`approved_by`,
-/// `approved_by_model_exact`, etc.) here — those belong to the
-/// manifest's audit trail, not to the "did-the-set-change" diff.
-/// Keeping the snapshot payload lean also means reader / writer
-/// churn stays minimal across future binding-schema extensions.
+/// Minimal 2-field projection of `TrustedDependencyBinding`: only what
+/// the "did-the-set-change" diff compares. Keeping the snapshot lean
+/// keeps reader and writer churn minimal across binding-schema
+/// extensions.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -257,9 +255,7 @@ pub(crate) fn stage_install_snapshot(
 /// preserves the previous snapshot rather than producing a truncated file.
 pub fn write_snapshot(project_dir: &Path, snap: &TrustSnapshot) -> Result<(), LpmError> {
     let path = snapshot_path(project_dir);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(LpmError::Io)?;
-    }
+    lpm_common::ensure_project_state_dir(project_dir)?;
 
     let body = serde_json::to_string_pretty(snap)
         .map_err(|e| LpmError::Registry(format!("failed to serialize trust-snapshot: {e}")))?;

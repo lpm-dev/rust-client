@@ -993,6 +993,135 @@ fn copy_workspace_dependency_closure_copies_unpublished_member_and_localizes_spe
     assert!(output.path().join(local).join("package.json").is_file());
 }
 
+#[cfg(unix)]
+#[test]
+fn the_output_s_gitignore_takes_back_what_the_deploy_wrote_and_nothing_else() {
+    let repository = tempfile::tempdir().unwrap();
+    let git = |arguments: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repository.path())
+            .args(arguments)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        output.stdout
+    };
+    git(&["init", "-q"]);
+    std::fs::write(
+        repository.path().join(".gitignore"),
+        "a*\nspaced*\nline*\nback*\n*]/\ndist/\nsub/\nnode_modules/\n*.log\nlogs/\n.env\n",
+    )
+    .unwrap();
+    let out = repository.path().join("out");
+    let write = |relative: &str| {
+        let path = out.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "x").unwrap();
+    };
+    let written = [
+        "a*b",
+        "spaced ",
+        "\nenv",
+        "back\\slash",
+        "[x]/in.js",
+        "dist/sub/f.js",
+        "node_modules/x/y.js",
+        "node_modules/x/node_modules/z/sub/w.js",
+    ];
+    for relative in written {
+        write(relative);
+    }
+    // No `.gitignore` line can name `line\nbreak`, so the rules outside
+    // apply to it.
+    write("line\nbreak");
+    let tree = OutputTree::read(&out).unwrap();
+    std::fs::write(out.join(".gitignore"), tree.take_backs()).unwrap();
+    for added in [
+        "axb",
+        "spaced",
+        "backxslash",
+        ".env",
+        "dist/sub/late.log",
+        "logs/x.txt",
+    ] {
+        write(added);
+    }
+
+    let offered = git(&["ls-files", "--others", "--exclude-standard", "-z"]);
+    let mut offered: Vec<String> = offered
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect();
+    offered.sort();
+    let mut expected: Vec<String> = written
+        .iter()
+        .chain([&".gitignore"])
+        .map(|relative| format!("out/{relative}"))
+        .collect();
+    expected.push(".gitignore".into());
+    expected.sort();
+    assert_eq!(offered, expected, "{}", tree.take_backs());
+}
+
+#[test]
+fn the_output_walk_names_dependency_ignore_files_under_every_spelling_git_reads() {
+    let out = tempfile::tempdir().unwrap();
+    let write = |relative: &str| {
+        let path = out.path().join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "dist/\n").unwrap();
+    };
+    for relative in [
+        "index.js",
+        "dist/lib.js",
+        ".lpm/.gitignore",
+        ".lpm/store/v2/objects/a/.gitignore",
+        ".lpm/store/v2/objects/b/lib/x.js",
+        "node_modules/c/.GITIGNORE",
+        "node_modules/c/lib/y.js",
+    ] {
+        write(relative);
+    }
+
+    let tree = OutputTree::read(out.path()).unwrap();
+
+    assert_eq!(
+        tree.dependency_ignore_files,
+        [
+            ".lpm/store/v2/objects/a/.gitignore",
+            "node_modules/c/.GITIGNORE",
+        ]
+    );
+    assert_eq!(
+        tree.written,
+        [".lpm/", "dist/", "index.js", "node_modules/"]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_output_walk_reads_directories_whose_names_are_not_utf8() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let out = tempfile::tempdir().unwrap();
+    let directory = out
+        .path()
+        .join(".lpm/store")
+        .join(std::ffi::OsStr::from_bytes(b"pkg-\xff"));
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join(".gitignore"), "dist/\n").unwrap();
+
+    let tree = OutputTree::read(out.path()).unwrap();
+
+    assert_eq!(
+        tree.dependency_ignore_files,
+        [".lpm/store/pkg-\u{FFFD}/.gitignore"]
+    );
+}
+
 #[test]
 fn write_pruned_deploy_lockfile_keeps_only_reachable_registry_packages() {
     let tmp = tempfile::tempdir().unwrap();

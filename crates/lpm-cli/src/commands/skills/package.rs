@@ -215,6 +215,7 @@ pub(crate) fn materialized_skill_names(directory: &Path) -> Option<Vec<String>> 
 pub(crate) fn acquire_mutation_lock(
     project_dir: &Path,
 ) -> Result<lpm_common::ExclusiveLockHandle, LpmError> {
+    lpm_common::ensure_project_state_dir(project_dir)?;
     super::path_security::ensure_contained_directory(
         project_dir,
         &project_dir.join(".lpm"),

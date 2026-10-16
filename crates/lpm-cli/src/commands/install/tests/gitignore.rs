@@ -1,138 +1,86 @@
 use super::*;
 
 #[test]
-fn ensure_skills_gitignore_appends_entry() {
+fn removes_the_blocks_install_appended_and_keeps_everything_else() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
+    std::fs::write(
+        dir.path().join(".gitignore"),
+        "node_modules/\n\n# LPM wrapper tree (auto-generated)\n.lpm/wrappers/\n\n# LPM hoisted state (auto-generated)\n.lpm/hoisted/\ndist/\n\n# LPM Agent Skills (auto-generated)\n.lpm/skills/\n",
+    )
+    .unwrap();
 
-    ensure_skills_gitignore(dir.path());
+    remove_legacy_gitignore_entries(dir.path(), true);
 
-    let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-    assert!(content.contains(".lpm/skills/"), "entry should be added");
-    assert!(
-        content.contains("node_modules/"),
-        "existing content preserved"
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+        "node_modules/\ndist/\n"
     );
 }
 
 #[test]
-fn ensure_skills_gitignore_no_duplicate() {
+fn removes_a_gitignore_install_created_with_nothing_else_in_it() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
+    std::fs::write(
+        dir.path().join(".gitignore"),
+        "# LPM wrapper tree\n.lpm/wrappers/\n\n# LPM hoisted state (auto-generated)\n.lpm/hoisted/\n",
+    )
+    .unwrap();
 
-    ensure_skills_gitignore(dir.path());
-    ensure_skills_gitignore(dir.path());
+    remove_legacy_gitignore_entries(dir.path(), true);
 
-    let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-    let count = content.matches(".lpm/skills/").count();
-    assert_eq!(count, 1, "should not duplicate entry");
+    assert!(!dir.path().join(".gitignore").exists());
 }
 
-// ── — ensure_lpm_wrappers_gitignore ───────────────────
-
 #[test]
-fn ensure_lpm_wrappers_gitignore_appends_entry() {
+fn keeps_the_same_entries_written_another_way() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
+    let content = ".lpm/skills/\n# my own note\n.lpm/wrappers/\n# LPM Agent Skills (auto-generated)\n.lpm/skills/extra\n";
+    std::fs::write(dir.path().join(".gitignore"), content).unwrap();
 
-    ensure_lpm_wrappers_gitignore(dir.path());
+    remove_legacy_gitignore_entries(dir.path(), true);
 
-    let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-    assert!(content.contains(".lpm/wrappers/"), "entry should be added");
-    assert!(
-        content.contains("node_modules/"),
-        "existing content preserved"
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(".gitignore")).unwrap(),
+        content
     );
 }
 
 #[test]
-fn ensure_lpm_wrappers_gitignore_no_duplicate() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
-
-    ensure_lpm_wrappers_gitignore(dir.path());
-    ensure_lpm_wrappers_gitignore(dir.path());
-
-    let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-    let count = content.matches(".lpm/wrappers/").count();
-    assert_eq!(count, 1, "should not duplicate entry");
-}
-
-#[test]
-fn ensure_lpm_wrappers_gitignore_creates_when_no_gitignore() {
-    let dir = tempfile::tempdir().unwrap();
-    // No pre-existing .gitignore — helper must create one.
-    ensure_lpm_wrappers_gitignore(dir.path());
-
-    let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-    assert!(content.contains(".lpm/wrappers/"));
-}
-
-// ── Hoisted-symmetry — ensure_lpm_hoisted_gitignore ──────────────
-
-#[test]
-fn ensure_lpm_hoisted_gitignore_appends_entry() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
-
-    ensure_lpm_hoisted_gitignore(dir.path());
-
-    let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-    assert!(content.contains(".lpm/hoisted/"), "entry should be added");
-    assert!(
-        content.contains("node_modules/"),
-        "existing content preserved"
+fn removes_blocks_from_a_gitignore_with_crlf_line_endings() {
+    assert_eq!(
+        without_legacy_gitignore_blocks(
+            b"target\r\n\r\n# LPM Agent Skills (auto-generated)\r\n.lpm/skills/\r\nout\r\n"
+        ),
+        Some(b"target\r\nout\r\n".to_vec())
     );
 }
 
 #[test]
-fn ensure_lpm_hoisted_gitignore_no_duplicate() {
+fn a_gitignore_without_the_blocks_is_left_untouched() {
+    assert_eq!(without_legacy_gitignore_blocks(b"node_modules/\n"), None);
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
 
-    ensure_lpm_hoisted_gitignore(dir.path());
-    ensure_lpm_hoisted_gitignore(dir.path());
+    remove_legacy_gitignore_entries(dir.path(), true);
 
-    let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-    let count = content.matches(".lpm/hoisted/").count();
-    assert_eq!(count, 1, "should not duplicate entry");
+    assert!(!dir.path().join(".gitignore").exists());
 }
 
+#[cfg(unix)]
 #[test]
-fn ensure_lpm_hoisted_gitignore_creates_when_no_gitignore() {
+fn a_linked_gitignore_is_left_alone() {
     let dir = tempfile::tempdir().unwrap();
-    ensure_lpm_hoisted_gitignore(dir.path());
+    let outside = tempfile::tempdir().unwrap();
+    let target = outside.path().join("rules");
+    std::fs::write(&target, "# LPM Agent Skills\n.lpm/skills/\n").unwrap();
+    std::os::unix::fs::symlink(&target, dir.path().join(".gitignore")).unwrap();
 
-    let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-    assert!(content.contains(".lpm/hoisted/"));
+    remove_legacy_gitignore_entries(dir.path(), true);
+
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "# LPM Agent Skills\n.lpm/skills/\n"
+    );
 }
-
-#[test]
-fn ensure_lpm_hoisted_and_wrappers_coexist_in_gitignore() {
-    // The install entry point calls both helpers unconditionally;
-    // both markers must end up in `.gitignore` regardless of
-    // call order, with no duplicates and no interference.
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
-
-    ensure_lpm_wrappers_gitignore(dir.path());
-    ensure_lpm_hoisted_gitignore(dir.path());
-
-    let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-    assert!(content.contains(".lpm/wrappers/"));
-    assert!(content.contains(".lpm/hoisted/"));
-    assert_eq!(content.matches(".lpm/wrappers/").count(), 1);
-    assert_eq!(content.matches(".lpm/hoisted/").count(), 1);
-
-    // Re-running both is a no-op (idempotent).
-    ensure_lpm_wrappers_gitignore(dir.path());
-    ensure_lpm_hoisted_gitignore(dir.path());
-    let content2 = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-    assert_eq!(content2.matches(".lpm/wrappers/").count(), 1);
-    assert_eq!(content2.matches(".lpm/hoisted/").count(), 1);
-}
-
-// ── — wrapper-layout migration ────────────────────────
 
 #[test]
 fn migrate_legacy_wrapper_layout_wipes_legacy_state() {
