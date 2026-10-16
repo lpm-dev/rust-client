@@ -25,7 +25,19 @@ struct TarballCandidate {
     source_root: Arc<TarballSourceRoot>,
     archive_path: String,
     expected_content_sha256: Option<[u8; 32]>,
-    secret_scan_completed: bool,
+    secret_scan: CandidateScan,
+}
+
+/// What the secret scan has read of a candidate before it is packed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CandidateScan {
+    /// Nothing: the bytes packed are scanned.
+    Pending,
+    /// All of it, pinned by `expected_content_sha256`.
+    Done,
+    /// Its start, which showed binary content that is checked only for a
+    /// private key at its start, in the bytes packed.
+    StartOnly,
 }
 
 impl TarballCandidate {
@@ -353,7 +365,7 @@ fn readme_priority(path: &str) -> Option<usize> {
 fn is_authored_skill_namespace(path: &str) -> bool {
     path.split(['/', '\\'])
         .find(|part| !part.is_empty())
-        .is_some_and(|part| part.eq_ignore_ascii_case(lpm_skill::AUTHORED_SKILLS_DIR))
+        .is_some_and(|part| listed_in(part, &[lpm_skill::AUTHORED_SKILLS_DIR]))
 }
 
 fn is_authored_skill_namespace_path(path: &Path) -> bool {
@@ -361,8 +373,18 @@ fn is_authored_skill_namespace_path(path: &Path) -> bool {
         path.components().next(),
         Some(std::path::Component::Normal(first)) if first
             .to_str()
-            .is_some_and(|part| part.eq_ignore_ascii_case(lpm_skill::AUTHORED_SKILLS_DIR))
+            .is_some_and(|part| listed_in(part, &[lpm_skill::AUTHORED_SKILLS_DIR]))
     )
+}
+
+/// Whether `name` is one of `listed`, ASCII names, regardless of case, as
+/// a file system that sets case aside finds it: `ſ` for `s` and the Kelvin
+/// sign for `k` included, as the credential-file rule reads names.
+pub(crate) fn listed_in(name: &str, listed: &[&str]) -> bool {
+    let folded = lpm_common::names::fold_name(name);
+    listed
+        .iter()
+        .any(|candidate| folded.eq_ignore_ascii_case(candidate))
 }
 
 // ---------------------------------------------------------------------------
@@ -561,7 +583,7 @@ fn prepare_tarball_with_source_root_and_open_hook(
                 source_root: Arc::clone(&project_source_root),
                 archive_path: file.path,
                 expected_content_sha256: None,
-                secret_scan_completed: false,
+                secret_scan: CandidateScan::Pending,
             },
         )?;
     }
@@ -577,7 +599,7 @@ fn prepare_tarball_with_source_root_and_open_hook(
                 source_root: Arc::clone(&project_source_root),
                 archive_path: "package.json".to_string(),
                 expected_content_sha256: None,
-                secret_scan_completed: false,
+                secret_scan: CandidateScan::Pending,
             },
         )?;
     }
@@ -594,7 +616,7 @@ fn prepare_tarball_with_source_root_and_open_hook(
                 source_root: Arc::clone(&project_source_root),
                 archive_path: retained.path.to_string(),
                 expected_content_sha256: None,
-                secret_scan_completed: false,
+                secret_scan: CandidateScan::Pending,
             },
         )?;
     }
@@ -606,6 +628,7 @@ fn prepare_tarball_with_source_root_and_open_hook(
     });
     let validated_authored_skills = options.validated_authored_skills;
     candidates.retain(|candidate| !is_authored_skill_namespace(&candidate.archive_path));
+
     for skill in validated_authored_skills {
         validate_content_override_path(skill.path)?;
         push_tarball_candidate(
@@ -615,7 +638,7 @@ fn prepare_tarball_with_source_root_and_open_hook(
                 source_root: Arc::clone(&project_source_root),
                 archive_path: skill.path.to_string(),
                 expected_content_sha256: None,
-                secret_scan_completed: false,
+                secret_scan: CandidateScan::Pending,
             },
         )?;
     }
@@ -682,6 +705,22 @@ fn prepare_tarball_with_source_root_and_open_hook(
             if opened_size <= LARGE_SECRET_SCAN_PRESCAN_BYTES {
                 continue;
             }
+            let mut opened_file = opened_file;
+            if lpm_security::behavioral::secrets::is_scannable_only_as_text(&candidate.archive_path)
+            {
+                let mut prefix =
+                    Vec::with_capacity(lpm_security::behavioral::secrets::BINARY_SNIFF_BYTES);
+                opened_file
+                    .by_ref()
+                    .take(lpm_security::behavioral::secrets::BINARY_SNIFF_BYTES as u64)
+                    .read_to_end(&mut prefix)
+                    .map_err(LpmError::Io)?;
+                if lpm_security::behavioral::secrets::is_binary_content(&prefix) {
+                    candidate.secret_scan = CandidateScan::StartOnly;
+                    continue;
+                }
+                std::io::Seek::rewind(&mut opened_file).map_err(LpmError::Io)?;
+            }
             let content =
                 read_opened_tarball_file(opened_file, opened_size, &candidate.archive_path)?;
             let mut file_scan = lpm_security::behavioral::secrets::scan_file_content_with_budget(
@@ -694,7 +733,7 @@ fn prepare_tarball_with_source_root_and_open_hook(
             scan.files_scanned += file_scan.files_scanned;
             use sha2::Digest as _;
             candidate.expected_content_sha256 = Some(sha2::Sha256::digest(&content).into());
-            candidate.secret_scan_completed = true;
+            candidate.secret_scan = CandidateScan::Done;
         }
     }
     let (gzipped, (), hashes) = write_gzipped_tar(max_archive_bytes, |builder| {
@@ -735,7 +774,7 @@ fn prepare_tarball_with_source_root_and_open_hook(
             let stream_without_buffering = override_content.is_none()
                 && readme_priority(&candidate.archive_path).is_none()
                 && secret_scan.as_ref().is_none_or(|_| {
-                    candidate.secret_scan_completed
+                    candidate.secret_scan != CandidateScan::Pending
                         || !lpm_security::behavioral::secrets::file_content_requires_scan(
                             &candidate.archive_path,
                         )
@@ -761,13 +800,23 @@ fn prepare_tarball_with_source_root_and_open_hook(
                 header.set_mode(archive_mode);
                 header.set_cksum();
                 let tar_path = format!("package/{}", candidate.archive_path);
-                let mut reader = OptionalSha256Reader::new(
-                    (&mut opened_file).take(opened_size),
-                    candidate.expected_content_sha256.is_some(),
+                let scans_start =
+                    secret_scan.is_some() && candidate.secret_scan != CandidateScan::Done;
+                let mut reader = StartCapture::new(
+                    OptionalSha256Reader::new(
+                        (&mut opened_file).take(opened_size),
+                        candidate.expected_content_sha256.is_some(),
+                    ),
+                    if scans_start {
+                        lpm_security::behavioral::secrets::PRIVATE_KEY_SNIFF_BYTES
+                    } else {
+                        0
+                    },
                 );
                 builder
                     .append_data(&mut header, &tar_path, &mut reader)
                     .map_err(LpmError::Io)?;
+                let (reader, start) = reader.finish();
                 let actual_content_sha256 = reader.finish();
                 if candidate.expected_content_sha256.is_some()
                     && actual_content_sha256 != candidate.expected_content_sha256
@@ -777,13 +826,18 @@ fn prepare_tarball_with_source_root_and_open_hook(
                 if opened_file.metadata().map_err(LpmError::Io)?.len() != opened_size {
                     return Err(unsafe_publish_file_error(&candidate.archive_path));
                 }
-                if !candidate.secret_scan_completed
+                if candidate.secret_scan == CandidateScan::StartOnly
+                    && !lpm_security::behavioral::secrets::is_binary_content(&start)
+                {
+                    return Err(unsafe_publish_file_error(&candidate.archive_path));
+                }
+                if scans_start
                     && let Some((scan, budget)) =
                         secret_scan.as_mut().zip(secret_scan_budget.as_mut())
                 {
                     let mut file_scan =
                         lpm_security::behavioral::secrets::scan_file_content_with_budget(
-                            &[],
+                            &start,
                             &candidate.archive_path,
                             budget,
                         );
@@ -980,6 +1034,36 @@ impl<R: std::io::Read> std::io::Read for OptionalSha256Reader<R> {
         if let Some(hasher) = &mut self.hasher {
             hasher.update(&buffer[..read]);
         }
+        Ok(read)
+    }
+}
+
+/// Passes reads through, keeping a copy of their first `limit` bytes.
+struct StartCapture<R> {
+    inner: R,
+    start: Vec<u8>,
+    limit: usize,
+}
+
+impl<R> StartCapture<R> {
+    fn new(inner: R, limit: usize) -> Self {
+        Self {
+            inner,
+            start: Vec::new(),
+            limit,
+        }
+    }
+
+    fn finish(self) -> (R, Vec<u8>) {
+        (self.inner, self.start)
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for StartCapture<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        let wanted = self.limit - self.start.len();
+        self.start.extend_from_slice(&buffer[..read.min(wanted)]);
         Ok(read)
     }
 }
@@ -1399,6 +1483,14 @@ fn collect_package_files(
     pkg_json: &serde_json::Value,
     source_dir: &Dir,
 ) -> Result<Vec<TarballFile>, LpmError> {
+    let home = LpmHome::active()?;
+    if home.is(&source_dir.dir_metadata()?, source_dir)? {
+        return Err(LpmError::Registry(
+            "the package directory is the LPM home, which holds login and env secrets; \
+             point LPM_HOME at another directory"
+                .to_owned(),
+        ));
+    }
     let mut result = Vec::new();
 
     if let Some(metadata) = safe_cap_metadata(source_dir, Path::new("package.json"))?
@@ -1415,11 +1507,17 @@ fn collect_package_files(
 
     if let Some(files_arr) = pkg_json.get("files").and_then(|f| f.as_array()) {
         let matcher = PublishFilesMatcher::parse(files_arr)?;
-        collect_explicit_matches(source_dir, Path::new(""), &matcher, &mut result)?;
+        collect_explicit_matches(source_dir, Path::new(""), &matcher, home, &mut result)?;
     } else {
-        collect_all_files(source_dir, &mut result)?;
+        collect_all_files(source_dir, home, &mut result)?;
     }
-    collect_required_manifest_files(source_dir, pkg_json, &mut result, &mut Listings::default())?;
+    collect_required_manifest_files(
+        source_dir,
+        pkg_json,
+        home,
+        &mut result,
+        &mut Listings::default(),
+    )?;
 
     for entry in source_dir.entries()? {
         let entry = entry?;
@@ -1450,6 +1548,157 @@ fn collect_package_files(
     result.dedup_by(|left, right| left.path == right.path);
 
     Ok(result)
+}
+
+/// The active LPM home, which no selection of a package's own files walks
+/// into: it holds login and env secrets, and `LPM_HOME="$PWD/.lpm-ci"`
+/// puts it inside a package. Known by identity, so neither another
+/// spelling of its path nor a bind mount leads a walk into it.
+#[derive(Clone, Copy, Default)]
+struct LpmHome(Option<HomeIdentity>);
+
+#[cfg(not(windows))]
+type HomeIdentity = (u64, u64);
+
+/// The volume serial number and the 128-bit file ID, as on ReFS the 64-bit
+/// index `GetFileInformationByHandle` reports doesn't tell files apart; on
+/// a volume that has no 128-bit IDs, that index. Two directories on one
+/// volume get the same kind, so one kind never matches the other.
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HomeIdentity {
+    FileId(u64, [u8; 16]),
+    FileIndex(u32, u64),
+}
+
+impl LpmHome {
+    fn active() -> Result<Self, LpmError> {
+        let root = match lpm_common::LpmRoot::from_env() {
+            Ok(root) => root,
+            Err(LpmError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self(None));
+            }
+            Err(error) => return Err(error),
+        };
+        match home_identity_at(root.root()) {
+            Ok(identity) => Ok(Self(identity)),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(Self(None))
+            }
+            Err(error) => Err(LpmError::Registry(format!(
+                "could not check where the LPM home {} is: {error}",
+                root.root().display()
+            ))),
+        }
+    }
+
+    /// Whether `directory`, opened from the entry `metadata` describes, is
+    /// the LPM home.
+    #[cfg(not(windows))]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "keeps the signature of the Windows check, which reads the directory's handle"
+    )]
+    fn is(self, metadata: &cap_std::fs::Metadata, _directory: &Dir) -> Result<bool, LpmError> {
+        use cap_std::fs::MetadataExt as _;
+        Ok(self.0 == Some((metadata.dev(), metadata.ino())))
+    }
+
+    /// Whether `directory`, opened from the entry `metadata` describes, is
+    /// the LPM home.
+    #[cfg(windows)]
+    fn is(self, _metadata: &cap_std::fs::Metadata, directory: &Dir) -> Result<bool, LpmError> {
+        use std::os::windows::io::AsRawHandle as _;
+        let Some(home) = self.0 else {
+            return Ok(false);
+        };
+        Ok(handle_identity(directory.as_raw_handle()).map_err(LpmError::Io)? == home)
+    }
+}
+
+/// The identity of the directory at `path`, links followed; `None` when it
+/// is something else.
+#[cfg(not(windows))]
+fn home_identity_at(path: &Path) -> std::io::Result<Option<HomeIdentity>> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = std::fs::metadata(path)?;
+    Ok(metadata.is_dir().then(|| (metadata.dev(), metadata.ino())))
+}
+
+/// The identity of the directory at `path`, links followed; `None` when it
+/// is something else.
+#[cfg(windows)]
+fn home_identity_at(path: &Path) -> std::io::Result<Option<HomeIdentity>> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+    };
+
+    let entry = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    if !entry.metadata()?.is_dir() {
+        return Ok(None);
+    }
+    handle_identity(entry.as_raw_handle()).map(Some)
+}
+
+#[cfg(windows)]
+fn handle_identity(handle: std::os::windows::io::RawHandle) -> std::io::Result<HomeIdentity> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = FILE_ID_INFO::default();
+    // SAFETY: the caller keeps the handle open for the call, and
+    // `information` is a writable FILE_ID_INFO of the size passed.
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            (&raw mut information).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if succeeded != 0 {
+        return Ok(HomeIdentity::FileId(
+            information.VolumeSerialNumber,
+            information.FileId.Identifier,
+        ));
+    }
+    let error = std::io::Error::last_os_error();
+    if !matches!(
+        error
+            .raw_os_error()
+            .and_then(|code| u32::try_from(code).ok()),
+        Some(ERROR_INVALID_PARAMETER | ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED)
+    ) {
+        return Err(error);
+    }
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the caller keeps the handle open for the call, and
+    // `information` is writable.
+    if unsafe { GetFileInformationByHandle(handle, &raw mut information) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(HomeIdentity::FileIndex(
+        information.dwVolumeSerialNumber,
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    ))
 }
 
 fn is_npm_always_included_root_file(name: &str) -> bool {
@@ -1696,6 +1945,7 @@ fn collect_explicit_matches(
     directory: &Dir,
     relative_dir: &Path,
     matcher: &PublishFilesMatcher,
+    home: LpmHome,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
     validate_publish_archive_path(relative_dir)?;
@@ -1728,7 +1978,9 @@ fn collect_explicit_matches(
             && matcher.can_match_descendant(&relative)
         {
             let child = open_cap_directory_entry(directory, &name, &relative)?;
-            collect_explicit_matches(&child, &relative, matcher, result)?;
+            if !home.is(&metadata, &child)? {
+                collect_explicit_matches(&child, &relative, matcher, home, result)?;
+            }
         }
     }
     Ok(())
@@ -1737,21 +1989,22 @@ fn collect_explicit_matches(
 fn collect_required_manifest_files(
     source_dir: &Dir,
     pkg_json: &serde_json::Value,
+    home: LpmHome,
     result: &mut Vec<TarballFile>,
     listings: &mut Listings,
 ) -> Result<(), LpmError> {
     for field in ["main", "browser"] {
         if let Some(path) = pkg_json.get(field).and_then(serde_json::Value::as_str) {
-            collect_required_manifest_path(source_dir, field, path, result, listings)?;
+            collect_required_manifest_path(source_dir, field, path, home, result, listings)?;
         }
     }
     match pkg_json.get("bin") {
         Some(serde_json::Value::String(path)) => {
-            collect_required_manifest_path(source_dir, "bin", path, result, listings)?;
+            collect_required_manifest_path(source_dir, "bin", path, home, result, listings)?;
         }
         Some(serde_json::Value::Object(entries)) => {
             for path in entries.values().filter_map(serde_json::Value::as_str) {
-                collect_required_manifest_path(source_dir, "bin", path, result, listings)?;
+                collect_required_manifest_path(source_dir, "bin", path, home, result, listings)?;
             }
         }
         _ => {}
@@ -1763,6 +2016,7 @@ fn collect_required_manifest_path(
     source_dir: &Dir,
     field: &str,
     manifest_path: &str,
+    home: LpmHome,
     result: &mut Vec<TarballFile>,
     listings: &mut Listings,
 ) -> Result<(), LpmError> {
@@ -1785,7 +2039,7 @@ fn collect_required_manifest_path(
     if relative_path.as_os_str().is_empty() {
         return Ok(());
     }
-    collect_exact_publish_path(source_dir, field, &relative_path, result, listings)
+    collect_exact_publish_path(source_dir, field, &relative_path, home, result, listings)
 }
 
 /// Paths no tarball holds, whatever `files`, `.npmignore` or `.gitignore`
@@ -1799,17 +2053,12 @@ fn is_npm_strict_exclusion(path: &str) -> bool {
         .split(['/', '\\'])
         .filter(|segment| !segment.is_empty())
     {
-        if [".git", "node_modules", lpm_common::PROJECT_STATE_DIR]
-            .iter()
-            .any(|excluded| segment.eq_ignore_ascii_case(excluded))
+        if lpm_common::names::is_git_dir_name(segment)
+            || listed_in(segment, &["node_modules", lpm_common::PROJECT_STATE_DIR])
         {
             return true;
         }
-        if segment_count == 0
-            && PROJECT_RECORD_DIRS
-                .iter()
-                .any(|excluded| segment.eq_ignore_ascii_case(excluded))
-        {
+        if segment_count == 0 && listed_in(segment, PROJECT_RECORD_DIRS) {
             return true;
         }
         segment_count += 1;
@@ -1818,25 +2067,20 @@ fn is_npm_strict_exclusion(path: &str) -> bool {
     let Some(file_name) = file_name else {
         return false;
     };
-    if [".npmrc", ".npmignore", ".gitignore"]
-        .iter()
-        .any(|excluded| file_name.eq_ignore_ascii_case(excluded))
-    {
+    if listed_in(file_name, &[".npmrc", ".npmignore", ".gitignore"]) {
         return true;
     }
     if lpm_common::atomic_write::is_atomic_temp_name(file_name) {
         return true;
     }
     segment_count == 1
-        && ROOT_LOCK_FILES
-            .iter()
-            .chain(PROJECT_RECORD_FILES)
-            .any(|excluded| file_name.eq_ignore_ascii_case(excluded))
+        && (listed_in(file_name, ROOT_LOCK_FILES) || listed_in(file_name, PROJECT_RECORD_FILES))
 }
 
 fn collect_cap_directory(
     directory: &Dir,
     relative_dir: &Path,
+    home: LpmHome,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
     validate_publish_archive_path(relative_dir)?;
@@ -1866,7 +2110,9 @@ fn collect_cap_directory(
             }
         } else if metadata.is_dir() {
             let child = open_cap_directory_entry(directory, &name, &relative)?;
-            collect_cap_directory(&child, &relative, result)?;
+            if !home.is(&metadata, &child)? {
+                collect_cap_directory(&child, &relative, home, result)?;
+            }
         }
     }
     Ok(())
@@ -1875,25 +2121,10 @@ fn collect_cap_directory(
 /// Security-sensitive defaults applied in addition to project ignore rules.
 const IGNORE_DIRS: &[&str] = &["node_modules", ".git", ".svn", ".hg", "CVS"];
 
-const IGNORE_FILES: &[&str] = &[
-    ".gitignore",
-    ".npmignore",
-    ".DS_Store",
-    "Thumbs.db",
-    ".env",
-    ".env.local",
-    ".env.live",
-    ".env.development",
-    ".env.production",
-    ".env.staging",
-    ".env.test",
-    ".envrc",
-    "id_rsa",
-    "id_ed25519",
-    "id_ecdsa",
-    ".netrc",
-    ".pgpass",
-];
+/// Files an implicit publish leaves out besides credential files
+/// (`lpm_security::behavioral::secrets::is_blocked_file`). Credential files
+/// `files` selects stay, so the secret scan stops the publish and says so.
+const IGNORE_FILES: &[&str] = &[".gitignore", ".npmignore", ".DS_Store", "Thumbs.db"];
 
 /// The project's committed LPM records, kept out of every tarball.
 const PROJECT_RECORD_FILES: &[&str] = &[
@@ -1914,15 +2145,13 @@ const ROOT_LOCK_FILES: &[&str] = &[
     "bun.lockb",
 ];
 
-fn contains_ascii_case_insensitive(values: &[&str], value: &str) -> bool {
-    values
-        .iter()
-        .any(|candidate| value.eq_ignore_ascii_case(candidate))
-}
-
-fn collect_all_files(source_dir: &Dir, result: &mut Vec<TarballFile>) -> Result<(), LpmError> {
+fn collect_all_files(
+    source_dir: &Dir,
+    home: LpmHome,
+    result: &mut Vec<TarballFile>,
+) -> Result<(), LpmError> {
     let mut matchers = Vec::new();
-    collect_implicit_directory(source_dir, Path::new(""), &mut matchers, 0, result)
+    collect_implicit_directory(source_dir, Path::new(""), &mut matchers, 0, home, result)
 }
 
 fn collect_implicit_directory(
@@ -1930,6 +2159,7 @@ fn collect_implicit_directory(
     relative_dir: &Path,
     matchers: &mut Vec<ignore::gitignore::Gitignore>,
     depth: usize,
+    home: LpmHome,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
     validate_publish_archive_path(relative_dir)?;
@@ -1955,16 +2185,19 @@ fn collect_implicit_directory(
         }
         let display_name = name.to_string_lossy();
         if is_directory {
-            if contains_ascii_case_insensitive(IGNORE_DIRS, &display_name)
+            if listed_in(&display_name, IGNORE_DIRS)
                 || depth == 0 && is_authored_skill_namespace_path(&relative)
                 || is_npm_strict_exclusion(&portable_relative(&relative))
             {
                 continue;
             }
             let child = open_cap_directory_entry(directory, &name, &relative)?;
-            collect_implicit_directory(&child, &relative, matchers, depth + 1, result)?;
+            if !home.is(&metadata, &child)? {
+                collect_implicit_directory(&child, &relative, matchers, depth + 1, home, result)?;
+            }
         } else if metadata.is_file()
-            && !contains_ascii_case_insensitive(IGNORE_FILES, &display_name)
+            && !listed_in(&display_name, IGNORE_FILES)
+            && !lpm_security::behavioral::secrets::is_blocked_file(&display_name)
         {
             let archive_path = portable_relative(&relative);
             if archive_path != "package.json" && !is_npm_strict_exclusion(&archive_path) {
@@ -2059,6 +2292,7 @@ fn collect_exact_publish_path(
     source_dir: &Dir,
     field: &str,
     relative: &Path,
+    home: LpmHome,
     result: &mut Vec<TarballFile>,
     listings: &mut Listings,
 ) -> Result<(), LpmError> {
@@ -2102,7 +2336,9 @@ fn collect_exact_publish_path(
                 }
             } else if metadata.is_dir() {
                 let child = open_cap_directory_entry(&directory, name, &current)?;
-                collect_cap_directory(&child, &current, result)?;
+                if !home.is(&metadata, &child)? {
+                    collect_cap_directory(&child, &current, home, result)?;
+                }
             }
             return Ok(());
         }
@@ -2110,6 +2346,9 @@ fn collect_exact_publish_path(
             return Ok(());
         }
         directory = open_cap_directory_entry(&directory, name, &current)?;
+        if home.is(&metadata, &directory)? {
+            return Ok(());
+        }
     }
     Ok(())
 }
@@ -2324,6 +2563,7 @@ fn collect_bundled_dependencies(
             .collect()
         });
     let mut collector = BundledDependencyCollector {
+        home: LpmHome::active()?,
         project_dir: canonical_project_root,
         project_source_dir,
         canonical_project_root,
@@ -2668,6 +2908,7 @@ fn unverified_bundle_path(name: &str, candidate: &Path) -> LpmError {
 }
 
 struct BundledDependencyCollector<'a> {
+    home: LpmHome,
     project_dir: &'a Path,
     project_source_dir: &'a Dir,
     canonical_project_root: &'a Path,
@@ -2717,6 +2958,11 @@ impl BundledDependencyCollector<'_> {
         expected_name: &str,
         archive_root: &str,
     ) -> Result<(), LpmError> {
+        if self.home.is(&source_dir.dir_metadata()?, source_dir)? {
+            return Err(LpmError::Registry(format!(
+                "bundled dependency `{expected_name}` is the LPM home, which holds login and env secrets"
+            )));
+        }
         let identity = DirectoryIdentity::from_directory(source_dir).map_err(LpmError::Io)?;
         let source_root = Arc::new(TarballSourceRoot {
             path: package_root.to_path_buf(),
@@ -2784,6 +3030,7 @@ impl BundledDependencyCollector<'_> {
             &source_root,
             archive_root,
             &manifest_sha256,
+            self.home,
             self.result,
         )?;
 
@@ -2821,6 +3068,7 @@ impl BundledDependencyCollector<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_bundle_tree(
     directory: &Dir,
     relative_dir: &Path,
@@ -2828,6 +3076,7 @@ fn collect_bundle_tree(
     source_root: &Arc<TarballSourceRoot>,
     archive_root: &str,
     manifest_sha256: &[u8; 32],
+    home: LpmHome,
     result: &mut Vec<TarballCandidate>,
 ) -> Result<(), LpmError> {
     validate_publish_archive_path(relative_dir)?;
@@ -2849,11 +3098,18 @@ fn collect_bundle_tree(
                 package_root.join(&relative).display()
             )));
         }
+        // As files too: a submodule's `.git` is a file.
+        if name.to_str().is_some_and(|name| {
+            lpm_common::names::is_git_dir_name(name)
+                || listed_in(name, &["node_modules", lpm_common::PROJECT_STATE_DIR])
+        }) {
+            continue;
+        }
         if metadata.is_dir() {
-            if name == "node_modules" || name == ".git" || name == ".lpm" {
+            let child = open_cap_directory_entry(directory, &name, &relative)?;
+            if home.is(&metadata, &child)? {
                 continue;
             }
-            let child = open_cap_directory_entry(directory, &name, &relative)?;
             collect_bundle_tree(
                 &child,
                 &relative,
@@ -2861,6 +3117,7 @@ fn collect_bundle_tree(
                 source_root,
                 archive_root,
                 manifest_sha256,
+                home,
                 result,
             )?;
         } else if metadata.is_file() {
@@ -2873,7 +3130,7 @@ fn collect_bundle_tree(
                     archive_path: format!("{archive_root}/{portable}"),
                     expected_content_sha256: (relative == Path::new("package.json"))
                         .then_some(*manifest_sha256),
-                    secret_scan_completed: false,
+                    secret_scan: CandidateScan::Pending,
                 },
             )?;
         }
@@ -4760,7 +5017,14 @@ mod tests {
         let mut result = Vec::new();
         let mut listings = Listings::default();
 
-        collect_required_manifest_files(&source, &manifest, &mut result, &mut listings).unwrap();
+        collect_required_manifest_files(
+            &source,
+            &manifest,
+            LpmHome::default(),
+            &mut result,
+            &mut listings,
+        )
+        .unwrap();
 
         assert_eq!(result.len(), 50);
         // The root and `bin/`, each listed once.
@@ -4930,6 +5194,102 @@ mod tests {
                 "{main}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn names_the_rules_list_match_under_every_case_a_disk_folds() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        // Stored as spelled, and found under the listed names where the disk
+        // folds case beyond ASCII.
+        std::fs::create_dir_all(project.join("node_module\u{17F}/dep")).unwrap();
+        std::fs::write(project.join("node_module\u{17F}/dep/index.js"), "1").unwrap();
+        std::fs::create_dir_all(project.join("lpm-\u{17F}kills/raw")).unwrap();
+        std::fs::write(project.join("lpm-\u{17F}kills/raw/SKILL.md"), "unchecked").unwrap();
+        std::fs::write(project.join("lpm.loc\u{212A}"), "lockfile").unwrap();
+        std::fs::write(project.join("index.js"), "module.exports = 1;").unwrap();
+        if !project.join("node_modules").exists() {
+            return;
+        }
+        for manifest in [
+            serde_json::json!({"name": "folded", "version": "1.0.0"}),
+            serde_json::json!({"name": "folded", "version": "1.0.0", "files": ["*"]}),
+        ] {
+            std::fs::write(
+                project.join("package.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+
+            let (_, files) = create_tarball(project, &manifest).unwrap();
+
+            let paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+            assert_eq!(paths, ["index.js", "package.json"], "{manifest}");
+        }
+    }
+
+    #[test]
+    fn the_active_lpm_home_inside_a_package_never_ships() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        // As `LPM_HOME="$PWD/.lpm-ci"` in CI puts it.
+        let home = project.join(".lpm-ci");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".credentials"), "ciphertext").unwrap();
+        std::fs::write(home.join(".key"), "raw data key").unwrap();
+        std::fs::write(project.join("index.js"), "module.exports = 1;").unwrap();
+        // `LPM_HOME` names it through a link, which no walk follows.
+        #[cfg(unix)]
+        let outside = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let home = {
+            let link = outside.path().join("lpm-home");
+            std::os::unix::fs::symlink(&home, &link).unwrap();
+            link
+        };
+        let _env = crate::test_env::ScopedEnv::set([("LPM_HOME", home.into_os_string())]);
+        for manifest in [
+            serde_json::json!({"name": "ci-home", "version": "1.0.0", "files": ["*"]}),
+            serde_json::json!({"name": "ci-home", "version": "1.0.0", "files": [".lpm-ci/**"]}),
+            serde_json::json!({"name": "ci-home", "version": "1.0.0", "files": [], "main": ".lpm-ci/.key"}),
+            serde_json::json!({"name": "ci-home", "version": "1.0.0", "files": [], "bin": {"ci": ".lpm-ci"}}),
+            serde_json::json!({"name": "ci-home", "version": "1.0.0"}),
+        ] {
+            std::fs::write(
+                project.join("package.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+
+            let (_, files) = create_tarball(project, &manifest).unwrap();
+
+            assert!(
+                !files
+                    .iter()
+                    .any(|file| file.path.to_ascii_lowercase().starts_with(".lpm-ci")),
+                "{manifest}: {files:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_package_directory_that_is_the_lpm_home_is_not_packed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".credentials"), "ciphertext").unwrap();
+        let manifest = serde_json::json!({"name": "home", "version": "1.0.0", "files": ["*"]});
+        std::fs::write(
+            dir.path().join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let _env =
+            crate::test_env::ScopedEnv::set([("LPM_HOME", dir.path().as_os_str().to_owned())]);
+
+        let error = create_tarball(dir.path(), &manifest)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("is the LPM home"), "{error}");
     }
 
     #[test]
@@ -5394,6 +5754,12 @@ mod tests {
         assert!(is_npm_strict_exclusion(".LPM/ReLeAsE-ApPlY/journal.json"));
         assert!(is_npm_strict_exclusion("fixtures/.Lpm/state"));
         assert!(is_npm_strict_exclusion(".GIT/config"));
+        // Git reads these as `.git` on every platform.
+        assert!(is_npm_strict_exclusion("vendor/.git./HEAD"));
+        assert!(is_npm_strict_exclusion("vendor/.Git /HEAD"));
+        assert!(is_npm_strict_exclusion("sub/GIT~1/config"));
+        assert!(is_npm_strict_exclusion("sub/.g\u{200C}it/config"));
+        assert!(!is_npm_strict_exclusion(".github/workflows/ci.yml"));
         assert!(is_npm_strict_exclusion("NODE_MODULES/package.json"));
         assert!(is_npm_strict_exclusion(".NPMRC"));
         assert!(is_npm_strict_exclusion("PACKAGE-LOCK.JSON"));
@@ -5500,6 +5866,90 @@ mod tests {
         let archive = tarball_contents(&tarball);
         assert_eq!(archive["package/node_modules/foo/index.js"], b"foo");
         assert_eq!(archive["package/node_modules/bar/index.js"], b"bar");
+    }
+
+    #[test]
+    fn a_bundled_dependency_never_ships_the_lpm_home_or_lpm_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let foo = project.join("node_modules/foo");
+        let home = foo.join("ci-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".credentials"), "ciphertext").unwrap();
+        std::fs::write(home.join(".key"), "raw data key").unwrap();
+        std::fs::create_dir_all(foo.join(".LPM")).unwrap();
+        std::fs::write(foo.join(".LPM/inspector.db"), "captured headers").unwrap();
+        std::fs::write(
+            foo.join("package.json"),
+            r#"{"name":"foo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(foo.join("index.js"), "foo").unwrap();
+        let manifest = serde_json::json!({
+            "name": "publisher",
+            "version": "1.0.0",
+            "dependencies": {"foo": "1.0.0"},
+            "bundledDependencies": ["foo"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let _env = crate::test_env::ScopedEnv::set([("LPM_HOME", home.into_os_string())]);
+
+        let (_, files) = create_tarball(project, &manifest).unwrap();
+
+        let paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+        assert!(paths.contains(&"node_modules/foo/index.js"), "{paths:?}");
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.contains("ci-home") || path.contains(".LPM")),
+            "{paths:?}"
+        );
+    }
+
+    #[test]
+    fn a_bundled_dependency_ships_no_git_directory_or_gitfile_under_any_name_git_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let foo = project.join("node_modules/foo");
+        for (file, content) in [
+            ("package.json", r#"{"name":"foo","version":"1.0.0"}"#),
+            ("index.js", "foo"),
+            // A submodule's gitfile, and names git reads as `.git`.
+            (".git", "gitdir: ../../placeholder"),
+            ("sub/.git.", "gitdir: ../../placeholder"),
+            ("sub/git~1", "gitdir: ../../placeholder"),
+            ("vendor/.git/HEAD", "ref: refs/heads/main"),
+            ("lib/.lpm", "x"),
+            (".github/ci.yml", "on: push"),
+        ] {
+            let path = foo.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        let manifest = serde_json::json!({
+            "name": "publisher",
+            "version": "1.0.0",
+            "dependencies": {"foo": "1.0.0"},
+            "bundledDependencies": ["foo"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let (_, files) = create_tarball(project, &manifest).unwrap();
+
+        let mut bundled: Vec<&str> = files
+            .iter()
+            .filter_map(|file| file.path.strip_prefix("node_modules/foo/"))
+            .collect();
+        bundled.sort_unstable();
+        assert_eq!(bundled, [".github/ci.yml", "index.js", "package.json"]);
     }
 
     #[test]
@@ -6145,6 +6595,62 @@ mod tests {
                 .iter()
                 .any(|finding| finding.pattern_name == "stripe_live_secret"),
             "the large-file prescan must retain secret findings: {scan:?}",
+        );
+    }
+
+    #[test]
+    fn a_private_key_any_streamed_file_starts_with_stops_the_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let manifest = serde_json::json!({
+            "name": "streamed-private-keys",
+            "version": "1.0.0",
+            "files": ["certs", "bin"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(project.join("certs")).unwrap();
+        std::fs::write(
+            project.join("certs/identity.data"),
+            "Bag Attributes\n-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIFHDBOBgkqhkiG9w0BBQ0w\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(project.join("bin")).unwrap();
+        let mut executable =
+            b"\x7fELF\x02\x01\x01\0\n-----BEGIN OPENSSH PRIVATE KEY-----\n".to_vec();
+        executable.resize(LARGE_SECRET_SCAN_PRESCAN_BYTES as usize + 1, 0);
+        std::fs::write(project.join("bin/tool"), &executable).unwrap();
+
+        let prepared = prepare_tarball(
+            project,
+            &manifest,
+            TarballOptions {
+                scan_secrets: true,
+                ..TarballOptions::default()
+            },
+        )
+        .unwrap();
+        let mut found: Vec<(String, usize)> = prepared
+            .secret_scan
+            .unwrap()
+            .matches
+            .into_iter()
+            .map(|finding| (finding.description, finding.line))
+            .collect();
+        found.sort();
+
+        assert_eq!(
+            found,
+            [
+                (
+                    "Encrypted PKCS #8 private key in certs/identity.data".to_string(),
+                    2
+                ),
+                ("OpenSSH private key in bin/tool".to_string(), 2),
+            ]
         );
     }
 

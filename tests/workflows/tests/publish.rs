@@ -1607,6 +1607,67 @@ fn publish_blocks_gitignored_secret_when_files_explicitly_selects_it() {
 }
 
 #[test]
+fn publish_packs_prebuilt_executables_without_reading_them_as_text() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "prebuilt-cli",
+  "version": "1.0.0",
+  "bin": {"tool": "bin/tool", "big": "bin/big"}
+}"#,
+    );
+    let executable = |size: usize, start: &[u8]| {
+        let mut content = b"\x7fELF\x02\x01\x01\x00\n".to_vec();
+        content.extend_from_slice(start);
+        content.extend_from_slice(b"AKIAIOSFODNN7EXAMPLE\n");
+        content.resize(size, 0);
+        content
+    };
+    std::fs::create_dir(project.path().join("bin")).unwrap();
+    // The second is past the size publish reads ahead of packing.
+    let write = |start: &[u8]| {
+        std::fs::write(
+            project.path().join("bin/tool"),
+            executable(64 * 1024, start),
+        )
+        .unwrap();
+        std::fs::write(
+            project.path().join("bin/big"),
+            executable(9 * 1024 * 1024, start),
+        )
+        .unwrap();
+    };
+    write(b"");
+
+    let output = lpm(&project)
+        .args(["publish", "--check", "--npm"])
+        .output()
+        .expect("run publish with prebuilt executables");
+
+    assert!(
+        output.status.success(),
+        "a native executable's bytes are not a leaked secret\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // Its start is still checked for a private key.
+    write(b"-----BEGIN RSA PRIVATE KEY-----\n");
+    let output = lpm(&project)
+        .args(["publish", "--check", "--npm"])
+        .output()
+        .expect("run publish with keys in prebuilt executables");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    for path in ["bin/tool", "bin/big"] {
+        assert!(
+            stderr.contains(&format!("RSA private key in {path}")),
+            "{path}: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn publish_ignores_secret_outside_final_tarball_file_set() {
     let project = TempProject::empty(
         r#"{
@@ -1661,6 +1722,68 @@ fn publish_blocks_gitignored_blocked_filename_when_files_selects_it() {
         stderr.contains("credentials.json") && stderr.contains("blocked_file"),
         "blocked-file result must preserve the selected path and pattern:\n{stderr}"
     );
+}
+
+#[test]
+fn publish_blocks_an_ssh_key_that_files_selects_through_a_directory() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "selected-ssh-key",
+  "version": "1.0.0",
+  "files": ["index.js", "keys"]
+}"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file("keys/id_rsa", "not a real key");
+
+    let output = lpm(&project)
+        .args(["publish", "--check", "--npm"])
+        .output()
+        .expect("run publish check with a selected key");
+
+    assert!(
+        !output.status.success(),
+        "a selected private key must block publish"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("keys/id_rsa") && stderr.contains("blocked_file"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn publish_check_json_lists_contents_without_credential_files() {
+    let project = TempProject::empty(r#"{"name":"implicit-contents","version":"1.0.0"}"#);
+    project.write_file("index.js", "module.exports = {}");
+    project.write_file("config/.env.preview", "TOKEN=not-real");
+    project.write_file("config/.env.example", "TOKEN=");
+    project.write_file("keys/id_ed25519", "not a real key");
+    project.write_file("lpm.lock", "lockfile");
+
+    let output = lpm(&project)
+        .args(["--json", "publish", "--check", "--npm"])
+        .output()
+        .expect("run publish check");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = parse_json_output(&output.stdout);
+    let paths = json["tarball_files"]
+        .as_array()
+        .expect("check JSON must list tarball files")
+        .iter()
+        .map(|file| file["path"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths,
+        ["config/.env.example", "index.js", "package.json"],
+        "{json}"
+    );
+    assert_eq!(json["files"], 3);
 }
 
 #[test]

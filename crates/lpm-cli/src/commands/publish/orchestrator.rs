@@ -3,8 +3,8 @@ use super::output::{
     DryRunSummary, format_lpm_publication_notice, format_multi_publish_partial_summary,
     format_multi_publish_success_summary, format_publish_retry_detail,
     format_single_publish_success_summary, format_upload_message, lpm_visibility,
-    print_dry_run_summary, print_upload_details, publish_check_json, publish_detail,
-    publish_result_json, visibility_from_access,
+    print_dry_run_summary, print_tarball_contents, print_upload_details, publish_check_json,
+    publish_detail, publish_result_json, tarball_files_json, visibility_from_access,
 };
 #[cfg(test)]
 use super::prepare::read_publish_manifest;
@@ -1487,8 +1487,15 @@ async fn execute_prepared_inner(
     // Check-only and dry-run modes stop before publishing.
     if check_only {
         if emit_summary && json_output {
-            let json = publish_check_json(quality_result.as_ref(), &targets, &target_names);
+            let json = publish_check_json(
+                quality_result.as_ref(),
+                &targets,
+                &target_names,
+                &tarball_files,
+            );
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        } else if emit_summary {
+            print_tarball_contents(&tarball_files);
         }
         return Ok(PublishExecutionReport::successful(json_output));
     }
@@ -1576,6 +1583,7 @@ async fn execute_prepared_inner(
                 "name": name,
                 "version": version,
                 "files": tarball_files.len(),
+                "tarball_files": tarball_files_json(&tarball_files),
                 "tarball_size": tarball_size,
                 "quality": quality_result,
                 "targets": targets.iter().map(|t| {
@@ -1600,6 +1608,7 @@ async fn execute_prepared_inner(
                 targets: &targets,
             };
             print_dry_run_summary(&summary);
+            print_tarball_contents(&tarball_files);
         }
         return Ok(PublishExecutionReport::successful(json_output));
     }

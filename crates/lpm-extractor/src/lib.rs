@@ -1974,18 +1974,21 @@ fn strip_first_component(path: &Path) -> Option<PathBuf> {
 /// npm package tarballs conventionally wrap files under a first `package/`
 /// component. The returned path has that component stripped and rejects any
 /// remaining traversal, root, or platform-prefix components. `None` for the
-/// prefix itself, and for an entry under a `.git` component, which `npm
-/// pack` never packs: a repository in a dependency is one git would read as
-/// its own, running what its config names, where the dependency is
-/// committed, as a deploy output's are.
+/// prefix itself, and for an entry under a component git reads as `.git`
+/// ([`lpm_common::names::is_git_dir_name`]): a repository in a dependency is
+/// one git would read as its own, running what its config names, where the
+/// dependency is committed, as a deploy output's are, and git refuses to
+/// commit a path under any other spelling of it.
 pub fn sanitize_entry_path(path: &Path) -> Result<Option<PathBuf>, LpmError> {
     let Some(relative_path) = strip_first_component(path) else {
         return Ok(None);
     };
-    if relative_path
-        .components()
-        .any(|component| component.as_os_str().eq_ignore_ascii_case(".git"))
-    {
+    if relative_path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(lpm_common::names::is_git_dir_name)
+    }) {
         return Ok(None);
     }
 
@@ -3436,6 +3439,21 @@ mod tests {
             ("deps/.GIT/HEAD", b"ref: refs/heads/main\n"),
             // A submodule's gitfile.
             ("sub/.git", b"gitdir: ../.git/modules/sub\n"),
+            // HFS+ leaves zero-width marks out of names, and Linux
+            // casefolding every default-ignorable code point.
+            ("hfs/.g\u{200C}it/HEAD", b"ref: refs/heads/main\n"),
+            ("casefold/.g\u{200B}it/HEAD", b"ref: refs/heads/main\n"),
+            // Git reads these as `.git` on every platform: Win32 drops the
+            // dots and spaces a name ends with, `git~1` is its NTFS short
+            // name, and a `:` starts an NTFS stream name.
+            ("dot/.git./HEAD", b"ref: refs/heads/main\n"),
+            ("space/.GIT /HEAD", b"ref: refs/heads/main\n"),
+            ("short/git~1/HEAD", b"ref: refs/heads/main\n"),
+            ("short-dot/GIT~1./HEAD", b"ref: refs/heads/main\n"),
+            ("stream/.git:x", b"x"),
+            // Git reads the part after a `\` as a name of its own.
+            ("backslash/x\\.git/HEAD", b"ref: refs/heads/main\n"),
+            ("ci/.github/ci.yml", b"on: push\n"),
         ]);
         let dir = tempfile::tempdir().unwrap();
 
@@ -3445,11 +3463,24 @@ mod tests {
         assert_eq!(
             extracted,
             [
+                PathBuf::from("ci/.github/ci.yml"),
                 PathBuf::from("package.json"),
                 PathBuf::from("vendor/lib.js")
             ]
         );
-        for skipped in ["vendor/.git", "deps/.GIT", "sub/.git"] {
+        for skipped in [
+            "vendor/.git",
+            "deps/.GIT",
+            "sub/.git",
+            "hfs",
+            "casefold",
+            "dot",
+            "space",
+            "short",
+            "short-dot",
+            "stream",
+            "backslash",
+        ] {
             assert!(!dir.path().join(skipped).exists(), "{skipped}");
         }
         let mut listed = list_tarball_contents(&tarball).unwrap();

@@ -29,6 +29,7 @@ cap-std = "4.0.2"
 smallvec = "1"
 open = { workspace = true }
 shlex = { workspace = true }
+unicode-normalization = "0.1"
 
 [target.'cfg(not(windows))'.dependencies]
 sha2 = { workspace = true, features = ["asm"] }
