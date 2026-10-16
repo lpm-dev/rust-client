@@ -2342,23 +2342,21 @@ fn validate_macos_bundle_zip(archive_path: &Path) -> Result<(), LpmError> {
                 "could not inspect macOS app archive entry {index}: {error}"
             ))
         })?;
-        let enclosed = entry.enclosed_name().ok_or_else(|| {
-            LpmError::SelfUpdate(format!(
-                "macOS app archive contains an unsafe path: {}",
-                entry.name()
-            ))
-        })?;
-        let relative = enclosed.to_str().ok_or_else(|| {
+        // ditto extracts the raw entry name, so judge that name rather than zip's
+        // normalized view, which treats `\` as a separator and drops a leading `/`.
+        let raw_name = std::str::from_utf8(entry.name_raw()).map_err(|_| {
             LpmError::SelfUpdate("macOS app archive contains a non-UTF-8 path".to_string())
         })?;
+        let relative = raw_name.strip_suffix('/').unwrap_or(raw_name);
+        if !is_canonical_macos_bundle_path(relative) {
+            return Err(LpmError::SelfUpdate(format!(
+                "macOS app archive contains an unsafe path: {}",
+                relative.escape_debug()
+            )));
+        }
         if !seen.insert(relative.to_string()) {
             return Err(LpmError::SelfUpdate(format!(
                 "macOS app archive contains a duplicate entry: {relative}"
-            )));
-        }
-        if !enclosed.starts_with(MACOS_APP_NAME) || enclosed.components().count() > 8 {
-            return Err(LpmError::SelfUpdate(format!(
-                "macOS app archive contains an unsafe path: {relative}"
             )));
         }
         if let Some(mode) = entry.unix_mode() {
@@ -2386,7 +2384,7 @@ fn validate_macos_bundle_zip(archive_path: &Path) -> Result<(), LpmError> {
         }
 
         if entry.is_dir() {
-            if !allowed_directories.contains(relative.trim_end_matches('/')) {
+            if !allowed_directories.contains(relative) {
                 return Err(LpmError::SelfUpdate(format!(
                     "macOS app archive contains an unexpected entry: {relative}"
                 )));
@@ -2394,9 +2392,9 @@ fn validate_macos_bundle_zip(archive_path: &Path) -> Result<(), LpmError> {
         } else if required.contains(relative) {
             seen_required.insert(relative.to_string());
         } else if !MACOS_OPTIONAL_BUNDLE_FILES.contains(&relative)
-            && !enclosed
-                .file_name()
-                .and_then(OsStr::to_str)
+            && !relative
+                .rsplit('/')
+                .next()
                 .is_some_and(|name| name.starts_with("._"))
         {
             return Err(LpmError::SelfUpdate(format!(
@@ -2413,6 +2411,22 @@ fn validate_macos_bundle_zip(archive_path: &Path) -> Result<(), LpmError> {
         }
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn is_canonical_macos_bundle_path(relative: &str) -> bool {
+    let mut depth = 0;
+    for component in relative.split('/') {
+        let unsafe_component = component.is_empty()
+            || component == "."
+            || component == ".."
+            || component.contains(['\\', '\0']);
+        if unsafe_component || (depth == 0 && component != MACOS_APP_NAME) {
+            return false;
+        }
+        depth += 1;
+    }
+    depth <= 8
 }
 
 #[cfg(target_os = "macos")]
@@ -3450,6 +3464,43 @@ mod tests {
         let error = validate_macos_bundle_zip(unknown.path())
             .expect_err("unknown bundle payloads must fail closed");
         assert!(error.to_string().contains("unexpected entry"));
+    }
+
+    #[test]
+    fn macos_bundle_zip_contract_rejects_names_ditto_would_extract_elsewhere() {
+        use std::io::Write as _;
+
+        for unsafe_name in [
+            "LPM CLI.app\\Contents\\Info.plist",
+            "/LPM CLI.app/Contents/Info.plist",
+            "LPM CLI.app/./Contents/Info.plist",
+            "LPM CLI.app//Contents/Info.plist",
+        ] {
+            let mut archive = tempfile::NamedTempFile::new().unwrap();
+            {
+                let mut writer = zip::ZipWriter::new(archive.as_file_mut());
+                for name in MACOS_REQUIRED_BUNDLE_FILES {
+                    let name = if name.ends_with("/Info.plist") {
+                        unsafe_name
+                    } else {
+                        name
+                    };
+                    writer
+                        .start_file(name, zip::write::SimpleFileOptions::default())
+                        .unwrap();
+                    writer.write_all(b"signed payload").unwrap();
+                }
+                writer.finish().unwrap();
+            }
+
+            let error = validate_macos_bundle_zip(archive.path())
+                .expect_err("a name ditto would extract elsewhere must fail closed");
+
+            assert!(
+                error.to_string().contains("unsafe path"),
+                "{unsafe_name:?} was rejected for the wrong reason: {error}"
+            );
+        }
     }
 
     #[test]

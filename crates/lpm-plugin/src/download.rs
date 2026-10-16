@@ -513,7 +513,7 @@ fn extract_binary_from_zip(
         let enclosed = entry.enclosed_name().ok_or_else(|| {
             LpmError::Plugin(format!(
                 "path traversal detected in plugin ZIP entry: {}",
-                entry.name()
+                String::from_utf8_lossy(entry.name_raw())
             ))
         })?;
         if enclosed.components().count() > lpm_extractor::DEFAULT_MAX_ARCHIVE_PATH_DEPTH {
