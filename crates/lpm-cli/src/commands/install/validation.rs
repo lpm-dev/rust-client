@@ -52,6 +52,9 @@ pub(super) struct LockfileValidationState {
         std::collections::BTreeMap<String, lpm_lockfile::LockedProvenance>,
     pub(super) workspace_root_provider_state_changed: bool,
     pub(super) importer_snapshot_changed: bool,
+    /// Whether `lpm.lock` was resolved with the current overrides; `None`
+    /// when the lockfile holds no authoritative importer record.
+    pub(super) overrides_match_lockfile: Option<bool>,
 }
 
 fn peer_rules_fingerprint(pkg: &lpm_workspace::PackageJson) -> Option<String> {
@@ -220,10 +223,13 @@ pub(super) fn validate_install_lockfile_state(
                 })
                 != Some(current)
         });
-    let importer_snapshot_changed = lockfile_for_validation
+    let locked_importer = lockfile_for_validation
         .as_ref()
-        .and_then(|lockfile| lockfile.importers.get("."))
-        != Some(&current_importer_snapshot);
+        .and_then(|lockfile| lockfile.importers.get("."));
+    let importer_snapshot_changed = locked_importer != Some(&current_importer_snapshot);
+    let overrides_match_lockfile = locked_importer
+        .filter(|locked| importer_snapshot_is_authoritative(locked))
+        .map(|locked| importer_overrides_match(locked, &current_importer_snapshot));
     let prior_verified_provenance = lockfile_for_validation
         .map(|lockfile| lockfile.provenance.clone())
         .unwrap_or_default();
@@ -236,7 +242,17 @@ pub(super) fn validate_install_lockfile_state(
         prior_verified_provenance,
         workspace_root_provider_state_changed,
         importer_snapshot_changed,
+        overrides_match_lockfile,
     })
+}
+
+fn importer_overrides_match(
+    locked: &lpm_lockfile::ImporterSnapshot,
+    current: &lpm_lockfile::ImporterSnapshot,
+) -> bool {
+    locked.lpm_overrides == current.lpm_overrides
+        && locked.overrides == current.overrides
+        && locked.resolutions == current.resolutions
 }
 
 fn validate_frozen_importer_snapshot(

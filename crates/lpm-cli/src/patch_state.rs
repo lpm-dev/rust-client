@@ -1,37 +1,15 @@
+//! Local record of the last install's patch applications,
+//! `<project_dir>/.lpm/patch-state.json`, read by `lpm graph --why` to
+//! decorate patched packages.
 //!
+//! The file is never committed and installs never consult it: `lpm.lock`
+//! records the patch set a resolution used (`patches` plus the importer's
+//! `patches_fingerprint`), so a fresh clone installs the same way as the
+//! checkout that wrote the lockfile.
 //!
-//! Mirrors the [`crate::overrides_state`] pattern for the
-//! `lpm patch` apply trace. The state file persists three things across
-//! installs:
-//!
-//! 1. The deterministic **fingerprint** of the parsed
-//!    `lpm.patchedDependencies` map, so the lockfile fast path can be
-//!    invalidated when the user edits the patch set between runs. Without
-//!    this, the lockfile would silently shadow patch changes and the
-//!    install would skip the apply pass.
-//! 2. The list of **parsed entries**, so introspection commands can
-//!    read what was declared without re-parsing `package.json`.
-//! 3. The list of **applied hits**, so `lpm graph --why <pkg>` can
-//!    decorate the matching package with patch provenance.
-//!
-//! ## Location
-//!
-//! `<project_dir>/.lpm/patch-state.json`. Same convention as
-//! `build-state.json`, `overrides-state.json`, and `install-hash` —
-//! next to `package.json`, survives `rm -rf node_modules`.
-//!
-//! ## Schema versioning
-//!
-//! [`PATCH_STATE_VERSION`] is bumped on every breaking change. Readers
-//! return `None` (and the install pipeline treats the absent state as
-//! "first run") on a version mismatch — forward-compat is never read
-//! state files newer than what we know how to parse.
-//!
-//! ## Atomic writes
-//!
-//! [`write_state`] uses an exclusively created same-directory staging file
-//! and atomic replacement, mirroring the [`crate::overrides_state`] writer.
-//! A crash mid-write leaves the previous state file intact.
+//! [`PATCH_STATE_VERSION`] is bumped on every breaking change; readers
+//! treat other versions as absent. [`write_state`] replaces the file
+//! atomically.
 
 use lpm_common::LpmError;
 use lpm_lockfile::{LockfilePatch, LockfilePatches};
@@ -42,7 +20,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Schema version for the on-disk state file. Bump on breaking changes.
-pub const PATCH_STATE_VERSION: u32 = 1;
+pub const PATCH_STATE_VERSION: u32 = 2;
 
 /// Filename inside `<project_dir>/.lpm/`.
 pub const PATCH_STATE_FILENAME: &str = "patch-state.json";
@@ -50,55 +28,19 @@ pub const PATCH_STATE_FILENAME: &str = "patch-state.json";
 /// Top-level shape of `patch-state.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PatchState {
-    /// Bumped on every breaking change to this struct or to its
-    /// nested types. Readers compare against [`PATCH_STATE_VERSION`]
-    /// and treat any mismatch as "no state".
+    /// Compared against [`PATCH_STATE_VERSION`]; any other value reads as
+    /// no state.
     pub state_version: u32,
-
-    /// Deterministic SHA-256 fingerprint over the parsed
-    /// `patched_dependencies` map. Used by the install pipeline to
-    /// invalidate the lockfile fast path when patches change.
-    pub fingerprint: String,
 
     /// RFC 3339 timestamp of when this state file was written.
     pub captured_at: String,
 
-    /// Every parsed entry in deterministic order. Survives across
-    /// installs even when the lockfile fast path is taken — that's
-    /// what makes the fingerprint comparison meaningful.
-    pub parsed: Vec<ParsedPatchEntry>,
-
-    /// Every patch applied during the most recent install pass. Unlike
-    /// `overrides_state.applied`, this list is rewritten on every
-    /// install (even on the lockfile fast path) because the patch
-    /// engine runs unconditionally after linking.
+    /// Every patch applied by the most recent install that did patch work.
     pub applied: Vec<AppliedPatchHit>,
 }
 
-/// On-disk shape of one parsed `lpm.patchedDependencies` entry.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ParsedPatchEntry {
-    /// The raw selector key as it appears in `package.json` (e.g.
-    /// `"lodash@4.17.21"` or `"@types/node@20.10.0"`).
-    pub raw_key: String,
-
-    /// Package name parsed out of `raw_key`.
-    pub name: String,
-
-    /// Exact version parsed out of `raw_key`.
-    pub version: String,
-
-    /// Project-dir-relative path to the patch file.
-    pub path: String,
-
-    /// SRI integrity hash of the store baseline the patch was authored
-    /// against. Drift from this value during install is a hard error.
-    pub original_integrity: String,
-}
-
 /// On-disk shape of one applied patch hit. Mirrors `AppliedPatch` from
-/// the patch engine but uses owned strings + project-dir-relative
-/// paths so the file is portable across machines.
+/// the patch engine with owned strings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppliedPatchHit {
     pub raw_key: String,
@@ -118,8 +60,8 @@ pub struct AppliedPatchHit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_integrity: Option<String>,
     /// Every physical destination the patch was applied to (one per
-    /// `MaterializedPackage` in the linker's report). Stored as
-    /// project-dir-relative paths.
+    /// `MaterializedPackage` in the linker's report): relative to the
+    /// project when inside it, absolute otherwise (store link trees).
     pub locations: Vec<String>,
     pub files_modified: usize,
     pub files_added: usize,
@@ -127,72 +69,19 @@ pub struct AppliedPatchHit {
 }
 
 impl PatchState {
-    /// Build a fresh state object from the current parsed
-    /// `lpm.patchedDependencies` and the per-install apply trace.
-    pub fn capture(
-        patches: &HashMap<String, PatchedDependencyEntry>,
-        applied: Vec<AppliedPatchHit>,
-    ) -> Self {
-        let parsed = parse_entries(patches);
+    /// Build a fresh state object from an install's apply trace.
+    pub fn capture(applied: Vec<AppliedPatchHit>) -> Self {
         PatchState {
             state_version: PATCH_STATE_VERSION,
-            fingerprint: compute_fingerprint(patches),
             captured_at: rfc3339_now(),
-            parsed,
             applied,
         }
     }
 }
 
-/// Parse the raw `lpm.patchedDependencies` map into a sorted, validated
-/// list of [`ParsedPatchEntry`]. Sorting is by `raw_key` so the on-disk
-/// representation is deterministic regardless of HashMap iteration
-/// order. accepts only `name@exact-version` keys; range
-/// selectors are deferred to — see
-/// [`crate::patch_engine::parse_patch_key`] for the canonical parser
-/// (this function tolerates invalid keys by skipping them so the state
-/// file never blocks introspection of an otherwise-malformed manifest).
-pub fn parse_entries(patches: &HashMap<String, PatchedDependencyEntry>) -> Vec<ParsedPatchEntry> {
-    let mut keys: Vec<&String> = patches.keys().collect();
-    keys.sort();
-    keys.into_iter()
-        .filter_map(|raw_key| {
-            // Use the same `name@version` split shape the patch engine
-            // uses, but tolerate parse failures here so a malformed
-            // entry doesn't poison the state file. The install
-            // pipeline's stricter parser will surface the error.
-            let (name, version) = split_key(raw_key)?;
-            let entry = patches.get(raw_key)?;
-            Some(ParsedPatchEntry {
-                raw_key: raw_key.clone(),
-                name,
-                version,
-                path: entry.path.clone(),
-                original_integrity: entry.original_integrity.clone(),
-            })
-        })
-        .collect()
-}
-
-fn split_key(raw: &str) -> Option<(String, String)> {
-    // Scoped names start with `@` and contain a literal `/`, so the
-    // `@version` separator is the LAST `@` in the key.
-    let at = raw.rfind('@')?;
-    if at == 0 {
-        return None;
-    }
-    let name = &raw[..at];
-    let version = &raw[at + 1..];
-    if name.is_empty() || version.is_empty() {
-        return None;
-    }
-    Some((name.to_string(), version.to_string()))
-}
-
-/// Deterministic fingerprint over the parsed
-/// `lpm.patchedDependencies` map. Used by the install pipeline to
-/// detect drift between the on-disk state file and the current
-/// `package.json`. Format: `sha256-<hex>`.
+/// Deterministic fingerprint over the parsed `lpm.patchedDependencies`
+/// map, recorded as the lockfile importer's `patches_fingerprint`.
+/// Format: `sha256-<hex>`.
 ///
 /// The hash is order-independent: keys are sorted before hashing, and
 /// each `(key, path, originalIntegrity)` triple is fed in with explicit
@@ -433,8 +322,8 @@ mod tests {
         // shared substrings produce distinct fingerprints.
         let m1 = map(&[("foobar@1.0.0", entry("patches/x.patch", ""))]);
         let m2 = map(&[("foo@bar1.0.0", entry("patches/x.patch", ""))]);
-        // (m2's key isn't a valid patch key, but split_key tolerance
-        // is irrelevant — the fingerprint hashes raw bytes only.)
+        // m2's key isn't a valid patch key; the fingerprint hashes raw
+        // bytes only.
         assert_ne!(compute_fingerprint(&m1), compute_fingerprint(&m2));
     }
 
@@ -465,73 +354,26 @@ mod tests {
         assert!(format!("{error}").contains("symbolic link"));
     }
 
-    // ── Parsed entry contracts ───────────────────────────────────────
-
-    #[test]
-    fn parse_entries_splits_unscoped_name() {
-        let m = map(&[(
-            "lodash@4.17.21",
-            entry("patches/lodash@4.17.21.patch", "sha512-aa"),
-        )]);
-        let parsed = parse_entries(&m);
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].name, "lodash");
-        assert_eq!(parsed[0].version, "4.17.21");
-        assert_eq!(parsed[0].raw_key, "lodash@4.17.21");
-    }
-
-    #[test]
-    fn parse_entries_splits_scoped_name_at_last_at() {
-        // Scoped names contain a literal `/` and start with `@`.
-        // The version separator is the LAST `@`, not the first.
-        let m = map(&[(
-            "@types/node@20.10.0",
-            entry("patches/at.patch", "sha512-bb"),
-        )]);
-        let parsed = parse_entries(&m);
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].name, "@types/node");
-        assert_eq!(parsed[0].version, "20.10.0");
-    }
-
-    #[test]
-    fn parse_entries_skips_malformed_keys_silently() {
-        let m = map(&[
-            ("ok@1.0.0", entry("patches/ok.patch", "sha512-aa")),
-            ("missing-version", entry("patches/bad.patch", "sha512-bb")),
-            ("@only-scope", entry("patches/bad2.patch", "sha512-cc")),
-        ]);
-        let parsed = parse_entries(&m);
-        // Only the well-formed key survives.
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].name, "ok");
-    }
-
-    #[test]
-    fn parse_entries_is_sorted_by_raw_key() {
-        let m = map(&[
-            ("zeta@1.0.0", entry("patches/z.patch", "sha512-zz")),
-            ("alpha@1.0.0", entry("patches/a.patch", "sha512-aa")),
-            ("mike@1.0.0", entry("patches/m.patch", "sha512-mm")),
-        ]);
-        let parsed = parse_entries(&m);
-        let keys: Vec<&str> = parsed.iter().map(|p| p.raw_key.as_str()).collect();
-        assert_eq!(keys, vec!["alpha@1.0.0", "mike@1.0.0", "zeta@1.0.0"]);
-    }
-
     // ── Persistence contracts (mirror of overrides_state) ────────────
 
     #[test]
     fn write_then_read_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let m = map(&[("lodash@4.17.21", entry("patches/lodash.patch", "sha512-aa"))]);
-        let state = PatchState::capture(&m, vec![]);
-        write_state(dir.path(), &state).unwrap();
+        let hit = AppliedPatchHit {
+            raw_key: "lodash@4.17.21".into(),
+            name: "lodash".into(),
+            version: "4.17.21".into(),
+            patch_path: "patches/lodash.patch".into(),
+            original_integrity: Some("sha512-aa".into()),
+            locations: vec!["node_modules/lodash".into()],
+            files_modified: 1,
+            files_added: 0,
+            files_deleted: 0,
+        };
+        write_state(dir.path(), &PatchState::capture(vec![hit.clone()])).unwrap();
 
         let read_back = read_state(dir.path()).expect("state file should round-trip");
-        assert_eq!(read_back.fingerprint, state.fingerprint);
-        assert_eq!(read_back.parsed.len(), 1);
-        assert_eq!(read_back.parsed[0].name, "lodash");
+        assert_eq!(read_back.applied, vec![hit]);
     }
 
     #[test]
@@ -547,7 +389,7 @@ mod tests {
         std::fs::create_dir_all(&lpm_dir).unwrap();
         std::fs::write(
             lpm_dir.join(PATCH_STATE_FILENAME),
-            r#"{"state_version":999,"fingerprint":"sha256-x","captured_at":"T00:00:00Z","parsed":[],"applied":[]}"#,
+            r#"{"state_version":999,"captured_at":"T00:00:00Z","applied":[]}"#,
         )
         .unwrap();
         assert!(
@@ -571,8 +413,7 @@ mod tests {
         // Deletion of a non-existent file is fine.
         delete_state(dir.path()).unwrap();
         // Write then delete.
-        let m = map(&[("lodash@4.17.21", entry("patches/lodash.patch", "sha512-aa"))]);
-        write_state(dir.path(), &PatchState::capture(&m, vec![])).unwrap();
+        write_state(dir.path(), &PatchState::capture(vec![])).unwrap();
         delete_state(dir.path()).unwrap();
         assert!(read_state(dir.path()).is_none());
     }

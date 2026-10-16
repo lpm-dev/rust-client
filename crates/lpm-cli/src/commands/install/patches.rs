@@ -71,7 +71,7 @@ pub(super) fn persist_patch_state(
                     .map(|s| s.applied.clone())
                     .unwrap_or_default()
             };
-        let state = patch_state::PatchState::capture(current_patches, applied_hits);
+        let state = patch_state::PatchState::capture(applied_hits);
         if let Err(e) = patch_state::write_state(project_dir, &state) {
             tracing::warn!("failed to write patch-state.json: {e}");
         }

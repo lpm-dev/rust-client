@@ -849,6 +849,7 @@ async fn run_with_options_under_store_lock(
         prior_verified_provenance,
         workspace_root_provider_state_changed,
         importer_snapshot_changed,
+        overrides_match_lockfile,
     } = validate_install_lockfile_state(LockfileValidationInput {
         project_dir,
         lockfile_path: &lockfile_path,
@@ -926,17 +927,15 @@ async fn run_with_options_under_store_lock(
 
     let LockfileDriftState {
         prior_overrides_state,
-        overrides_changed,
+        override_drift,
         prior_patch_state,
-        patches_changed,
         pre_install_direct_versions,
     } = prepare_lockfile_drift_state(LockfileDriftInput {
         project_dir,
         lockfile_path: &lockfile_path,
         pkg: &pkg,
         override_set: &override_set,
-        current_patches: &current_patches,
-        current_patch_fingerprint: &current_patch_fingerprint,
+        overrides_match_lockfile,
     });
 
     let owned_client =
@@ -1013,13 +1012,9 @@ async fn run_with_options_under_store_lock(
             catalog_resolutions: &catalog_resolutions,
             gate_stats: &gate_stats,
             override_set: &override_set,
-            prior_overrides_state: prior_overrides_state.as_ref(),
-            overrides_changed,
+            override_drift: &override_drift,
             current_patches: &current_patches,
             current_lockfile_patches: &current_lockfile_patches,
-            current_patch_fingerprint: &current_patch_fingerprint,
-            prior_patch_state: prior_patch_state.as_ref(),
-            patches_changed,
             auto_install_peers,
             strict_peer_dependencies,
             omit_policy,
@@ -1070,8 +1065,7 @@ async fn run_with_options_under_store_lock(
         gate_stats: &gate_stats,
         frozen_lockfile_active,
         force: force || root_versions::active(project_dir),
-        overrides_changed,
-        patches_changed,
+        overrides_changed: override_drift.changed(),
         workspace_root_provider_state_changed,
         importer_snapshot_changed,
         is_add_invocation,
