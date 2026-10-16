@@ -1577,7 +1577,7 @@ fn collect_output_files(
                         entry.display()
                     ))
                 })?;
-                if is_restore_internal_path(relative) {
+                if is_lpm_state_path(relative) {
                     continue;
                 }
                 validate_archive_path(relative, "task output")?;
@@ -1662,13 +1662,23 @@ fn expand_glob_pattern(pattern: &str) -> Vec<String> {
     patterns
 }
 
-fn is_restore_internal_path(path: &Path) -> bool {
-    path.components().next().is_some_and(|component| {
-        let Component::Normal(name) = component else {
-            return false;
-        };
-        name.to_string_lossy().starts_with(RESTORE_TEMP_PREFIX)
-    })
+/// Whether `path`, relative to the project, is LPM state the cache never
+/// holds: anything in a `.lpm` directory at any depth, a nested project's
+/// included, and the restore staging earlier versions kept at the root.
+fn is_lpm_state_path(path: &Path) -> bool {
+    let mut components = path.components();
+    let first = components.next();
+    first.is_some_and(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .starts_with(RESTORE_TEMP_PREFIX)
+    }) || first
+        .into_iter()
+        .chain(components)
+        .any(|component| {
+            matches!(component, Component::Normal(name) if lpm_common::is_project_state_name(name))
+        })
 }
 
 const MAX_CACHE_LOG_BYTES: u64 = lpm_common::TASK_OUTPUT_CAPTURE_BYTES as u64 + 64;
@@ -1969,6 +1979,37 @@ mod tests {
         slot.lock()
             .unwrap()
             .retain(|candidate| !std::sync::Arc::ptr_eq(&candidate.validated, &barrier.validated));
+    }
+
+    #[test]
+    fn outputs_never_include_lpm_state_at_any_depth_or_case() {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, contents) in [
+            ("dist/app.js", "built"),
+            (".lpm/certs/key.pem", "root key"),
+            ("packages/app/index.js", "member"),
+            ("packages/app/.lpm/env-sync.json", "member state"),
+        ] {
+            let path = dir.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+
+        let files = collect_output_files(dir.path(), &["**/*".into(), ".LPM/**/*".into()]).unwrap();
+
+        assert_eq!(
+            files,
+            [
+                PathBuf::from("dist/app.js"),
+                PathBuf::from("packages/app/index.js")
+            ]
+        );
+        assert!(is_lpm_state_path(Path::new(".Lpm/certs/key.pem")));
+        assert!(is_lpm_state_path(Path::new(
+            ".lpm-cache-restore-x/outputs/a"
+        )));
+        assert!(!is_lpm_state_path(Path::new("dist/.lpm-cache-restore-x")));
+        assert!(!is_lpm_state_path(Path::new("dist/.lpmrc")));
     }
 
     #[test]
@@ -3336,10 +3377,50 @@ mod tests {
     }
 
     #[test]
+    fn a_new_restore_recovers_staging_an_earlier_release_left_at_the_project_root() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        let abandoned = project.path().join(".lpm-cache-restore-earlier-release");
+        fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
+        fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
+        fs::create_dir(project.path().join("dist")).unwrap();
+        fs::write(project.path().join("dist/value.txt"), "replacement").unwrap();
+        fs::write(abandoned.join("backups/dist/value.txt"), "original").unwrap();
+        write_restore_journal(
+            &abandoned,
+            project.path(),
+            &[PathBuf::from("dist/value.txt")],
+        )
+        .unwrap();
+        register_restore_for_test(&cache.root, project.path(), &abandoned).unwrap();
+
+        let staged = StagedOutputs::new(&cache.root, project.path()).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(project.path().join("dist/value.txt")).unwrap(),
+            "original"
+        );
+        assert!(
+            !abandoned.exists(),
+            "recovered restore directory was not removed"
+        );
+        assert_eq!(
+            staged.temp_path().parent(),
+            Some(
+                fs::canonicalize(project.path())
+                    .unwrap()
+                    .join(".lpm")
+                    .as_path()
+            ),
+            "new restores stage inside .lpm"
+        );
+    }
+
+    #[test]
     fn a_new_restore_recovers_an_interrupted_restore_before_staging() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-interrupted");
+        let abandoned = project.path().join(".lpm/.lpm-cache-restore-interrupted");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
         fs::create_dir(project.path().join("dist")).unwrap();
@@ -3373,7 +3454,9 @@ mod tests {
 
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-replaced-backup");
+        let abandoned = project
+            .path()
+            .join(".lpm/.lpm-cache-restore-replaced-backup");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
         fs::create_dir(project.path().join("dist")).unwrap();
@@ -3414,7 +3497,9 @@ mod tests {
     fn cache_clean_preserves_interrupted_restore_recovery_records() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-clean-recovery");
+        let abandoned = project
+            .path()
+            .join(".lpm/.lpm-cache-restore-clean-recovery");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
         fs::create_dir(project.path().join("dist")).unwrap();
@@ -3470,7 +3555,9 @@ mod tests {
     fn interrupted_restore_recovery_removes_a_newly_installed_per_file_output() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-interrupted-new");
+        let abandoned = project
+            .path()
+            .join(".lpm/.lpm-cache-restore-interrupted-new");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
         fs::write(abandoned.join("outputs/dist/value.txt"), "installed").unwrap();
@@ -3522,7 +3609,7 @@ mod tests {
     fn committed_restore_recovery_preserves_published_outputs() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-committed");
+        let abandoned = project.path().join(".lpm/.lpm-cache-restore-committed");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
         fs::create_dir(project.path().join("dist")).unwrap();
@@ -3553,7 +3640,9 @@ mod tests {
     fn committed_restore_recovery_survives_commit_marker_cleanup() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-committed-cleanup");
+        let abandoned = project
+            .path()
+            .join(".lpm/.lpm-cache-restore-committed-cleanup");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
         fs::create_dir(project.path().join("dist")).unwrap();
@@ -3583,7 +3672,7 @@ mod tests {
     fn a_new_restore_removes_an_abandoned_pre_apply_staging_directory() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-staging");
+        let abandoned = project.path().join(".lpm/.lpm-cache-restore-staging");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir(abandoned.join("backups")).unwrap();
         register_restore_for_test(&cache.root, project.path(), &abandoned).unwrap();
@@ -3601,7 +3690,7 @@ mod tests {
     fn interrupted_restore_recovery_ignores_an_unowned_lookalike_directory() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-user-data");
+        let abandoned = project.path().join(".lpm/.lpm-cache-restore-user-data");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
         write_restore_journal(
@@ -3627,7 +3716,7 @@ mod tests {
     fn interrupted_restore_recovery_ignores_a_forged_owner_with_open_permissions() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-forged-owner");
+        let abandoned = project.path().join(".lpm/.lpm-cache-restore-forged-owner");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
         write_restore_journal(
@@ -3655,7 +3744,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let abandoned = project
             .path()
-            .join(".lpm-cache-restore-forged-private-owner");
+            .join(".lpm/.lpm-cache-restore-forged-private-owner");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
         write_restore_journal(
@@ -3681,7 +3770,9 @@ mod tests {
     fn interrupted_restore_recovery_ignores_an_oversized_owner_marker() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-oversized-owner");
+        let abandoned = project
+            .path()
+            .join(".lpm/.lpm-cache-restore-oversized-owner");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
         write_restore_journal(
@@ -3715,7 +3806,7 @@ mod tests {
 
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-linked-backup");
+        let abandoned = project.path().join(".lpm/.lpm-cache-restore-linked-backup");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         register_restore_for_test(&cache.root, project.path(), &abandoned).unwrap();
         fs::create_dir(project.path().join("dist")).unwrap();
@@ -3760,7 +3851,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let abandoned = project
             .path()
-            .join(".lpm-cache-restore-linked-backup-parent");
+            .join(".lpm/.lpm-cache-restore-linked-backup-parent");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir(abandoned.join("backups")).unwrap();
         register_restore_for_test(&cache.root, project.path(), &abandoned).unwrap();
@@ -3801,7 +3892,9 @@ mod tests {
     fn interrupted_restore_recovery_rejects_a_directory_backup() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-directory-backup");
+        let abandoned = project
+            .path()
+            .join(".lpm/.lpm-cache-restore-directory-backup");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist/value.txt")).unwrap();
         register_restore_for_test(&cache.root, project.path(), &abandoned).unwrap();
@@ -3834,7 +3927,9 @@ mod tests {
     fn interrupted_restore_recovery_removes_parent_directories_created_after_the_journal() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-created-parent");
+        let abandoned = project
+            .path()
+            .join(".lpm/.lpm-cache-restore-created-parent");
         fs::create_dir_all(abandoned.join("outputs/dist/nested")).unwrap();
         fs::create_dir(abandoned.join("backups")).unwrap();
         register_restore_for_test(&cache.root, project.path(), &abandoned).unwrap();

@@ -20,6 +20,12 @@ pub const PROJECT_STATE_IGNORE_FILE: &str = ".gitignore";
 pub const PROJECT_STATE_IGNORE: &str =
     "# LPM's machine-local state. Nothing here belongs in git.\n*\n";
 
+/// Whether a path component names a project state directory, without
+/// regard to ASCII case, as case-insensitive filesystems resolve it.
+pub fn is_project_state_name(name: &OsStr) -> bool {
+    name.eq_ignore_ascii_case(PROJECT_STATE_DIR)
+}
+
 /// The project state directory for `project_dir`, without touching disk.
 pub fn project_state_dir(project_dir: &Path) -> PathBuf {
     project_dir.join(PROJECT_STATE_DIR)

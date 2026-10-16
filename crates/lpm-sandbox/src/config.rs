@@ -506,11 +506,7 @@ fn is_inside_project_state(path: &Path, project_root: &AuthorizedRoot) -> bool {
             path.strip_prefix(root)
                 .ok()
                 .and_then(|rest| rest.components().next())
-                .is_some_and(|first| {
-                    first
-                        .as_os_str()
-                        .eq_ignore_ascii_case(lpm_common::PROJECT_STATE_DIR)
-                })
+                .is_some_and(|first| lpm_common::is_project_state_name(first.as_os_str()))
         })
 }
 

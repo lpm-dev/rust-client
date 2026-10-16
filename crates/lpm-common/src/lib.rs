@@ -105,8 +105,8 @@ pub use peer::PeerEdge;
 pub use project_glob::{rooted_project_glob, validate_project_glob};
 pub use project_state::{
     PROJECT_STATE_DIR, ensure_project_state_dir, ensure_project_state_dir_in,
-    keep_existing_project_state_ignored, keep_state_dir_ignored_or_warn, project_package_dirs,
-    project_state_dir,
+    is_project_state_name, keep_existing_project_state_ignored, keep_state_dir_ignored_or_warn,
+    project_package_dirs, project_state_dir,
 };
 pub use provenance::{ProvenanceSnapshot, ProvenanceStatus, npm_package_purl};
 pub use symlink::{

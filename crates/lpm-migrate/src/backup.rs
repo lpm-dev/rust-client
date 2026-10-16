@@ -732,7 +732,7 @@ fn reject_reserved(rel: &str) -> Result<(), LpmError> {
     let first = rel.split('/').next().unwrap_or_default();
     if rel.is_empty()
         || first.eq_ignore_ascii_case(".git")
-        || first.eq_ignore_ascii_case(lpm_common::PROJECT_STATE_DIR)
+        || lpm_common::is_project_state_name(std::ffi::OsStr::new(first))
         || rel == LEGACY_MANIFEST_FILENAME
     {
         return Err(LpmError::Script(
