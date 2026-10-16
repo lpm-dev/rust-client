@@ -641,8 +641,10 @@ fn append_allow_entry(
     reason: &str,
 ) -> Result<(), LpmError> {
     let path = project_dir.join("lpm.toml");
-    let raw = match lpm_common::read_text_file_capped(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-    {
+    let raw = match lpm_common::read_text_file_capped_nofollow(
+        &path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
         Ok(raw) => raw,
         Err(lpm_common::BoundedReadError::NotFound { .. }) => String::new(),
         Err(error) => return Err(LpmError::Registry(error.to_string())),
@@ -681,10 +683,12 @@ fn append_allow_entry(
     table["reason"] = Item::Value(Value::from(reason));
     allow.push(table);
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, doc.to_string()).map_err(LpmError::Io)
+    lpm_common::write_file_atomic_with_options(
+        &path,
+        doc.to_string().as_bytes(),
+        lpm_common::AtomicWriteOptions::new().sync_file(),
+    )
+    .map_err(LpmError::Io)
 }
 
 fn ensure_allow_array(doc: &mut DocumentMut) -> Result<(), LpmError> {
@@ -1006,6 +1010,44 @@ mod tests {
         assert!(raw.contains("save-prefix = \"~\""));
         assert!(raw.contains("[[policy.typosquat.allow]]"));
         assert!(raw.contains("package = \"axois\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_allow_entry_never_writes_through_a_linked_lpm_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("shared.toml"), "save-prefix = \"~\"\n").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("shared.toml"),
+            dir.path().join("lpm.toml"),
+        )
+        .unwrap();
+
+        assert!(append_allow_entry(dir.path(), "axois", "axios", "fixture").is_err());
+
+        assert_eq!(
+            fs::read_to_string(outside.path().join("shared.toml")).unwrap(),
+            "save-prefix = \"~\"\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_allow_entry_keeps_the_file_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lpm.toml");
+        fs::write(&path, "save-prefix = \"~\"\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        append_allow_entry(dir.path(), "axois", "axios", "fixture").unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
     }
 
     #[test]
