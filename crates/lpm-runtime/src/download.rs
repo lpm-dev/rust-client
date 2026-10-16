@@ -697,7 +697,7 @@ fn extract_zip(data: &[u8], dest: &Path) -> Result<(), LpmError> {
                 // enclosed_name() returns None for entries with path traversal
                 return Err(LpmError::Script(format!(
                     "path traversal detected in zip entry: {}",
-                    file.name()
+                    String::from_utf8_lossy(file.name_raw())
                 )));
             }
         };
@@ -714,13 +714,12 @@ fn extract_zip(data: &[u8], dest: &Path) -> Result<(), LpmError> {
             std::io::copy(&mut file, &mut outfile)
                 .map_err(|e| LpmError::Script(format!("failed to extract zip entry: {e}")))?;
 
-            // Set executable permission on Unix for binaries
+            // Entry modes come from a downloaded archive: keep only its execute bits, as
+            // package extraction does, so no entry can be setuid or group/world-writable.
             #[cfg(unix)]
-            {
+            if let Some(mode) = file.unix_mode() {
                 use std::os::unix::fs::PermissionsExt;
-                if let Some(mode) = file.unix_mode() {
-                    std::fs::set_permissions(&outpath, std::fs::Permissions::from_mode(mode))?;
-                }
+                outfile.set_permissions(std::fs::Permissions::from_mode(0o644 | (mode & 0o111)))?;
             }
         }
     }
@@ -1438,6 +1437,47 @@ mod tests {
             !dest.path().join("node-v22.5.0/bin/node").exists(),
             "no partial zip extract on cap failure"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_zip_grants_only_execute_permission_from_entry_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let entries = [
+            ("bun-dist/setuid", 0o104755, 0o755),
+            ("bun-dist/setgid", 0o102755, 0o755),
+            ("bun-dist/world-writable-binary", 0o100777, 0o755),
+            ("bun-dist/world-writable-readme", 0o100666, 0o644),
+            ("bun-dist/owner-only-binary", 0o100700, 0o744),
+        ];
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, archived_mode, _) in entries {
+            writer
+                .start_file(
+                    name,
+                    zip::write::SimpleFileOptions::default()
+                        .external_attributes(archived_mode << 16),
+                )
+                .unwrap();
+            writer.write_all(b"runtime").unwrap();
+        }
+        let archive = writer.finish().unwrap().into_inner();
+        let dest = TempDir::new().unwrap();
+
+        extract_zip(&archive, dest.path()).expect("runtime zip should extract");
+
+        for (name, archived_mode, expected_mode) in entries {
+            let mode = std::fs::metadata(dest.path().join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777;
+            assert_eq!(
+                mode, expected_mode,
+                "{name} archived as {archived_mode:o} extracted as {mode:o}"
+            );
+        }
     }
 
     #[test]

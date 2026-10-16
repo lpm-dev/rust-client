@@ -2345,7 +2345,7 @@ fn validate_macos_bundle_zip(archive_path: &Path) -> Result<(), LpmError> {
         let enclosed = entry.enclosed_name().ok_or_else(|| {
             LpmError::SelfUpdate(format!(
                 "macOS app archive contains an unsafe path: {}",
-                entry.name()
+                String::from_utf8_lossy(entry.name_raw())
             ))
         })?;
         let relative = enclosed.to_str().ok_or_else(|| {
