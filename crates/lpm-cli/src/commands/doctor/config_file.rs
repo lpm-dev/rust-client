@@ -137,6 +137,13 @@ pub(super) fn load_lpm_json(project_dir: &Path) -> DiagnosticLpmJson {
     for path in lpm_runner::lpm_json::unknown_field_paths(&doc) {
         warnings.push(format!("unknown field \"{path}\""));
     }
+    if obj.contains_key("vaultSync") {
+        warnings.push(
+            "\"vaultSync\" is one checkout's env sync state; the next `lpm env pull` or \
+             `lpm env push` moves it to .lpm/env-sync.json, then commit lpm.json without it"
+                .into(),
+        );
+    }
 
     // 3. Validate runtime section
     if let Some(runtime) = obj.get("runtime") {
@@ -378,6 +385,24 @@ mod tests {
             dir.path().join("lpm.json"),
             r#"{
                 "$schema": "https://cli.lpm.dev/schemas/lpm.json",
+                "vault": "vault-123"
+            }"#,
+        )
+        .unwrap();
+        let result = validate_lpm_json(dir.path()).unwrap();
+        assert!(
+            matches!(result.severity, Severity::Pass),
+            "documented fields should be accepted: {}",
+            result.detail
+        );
+    }
+
+    #[test]
+    fn validate_lpm_json_warns_that_committed_sync_state_belongs_in_the_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{
                 "vault": "vault-123",
                 "vaultSync": {
                     "personalVersion": 7,
@@ -390,8 +415,18 @@ mod tests {
         .unwrap();
         let result = validate_lpm_json(dir.path()).unwrap();
         assert!(
-            matches!(result.severity, Severity::Pass),
-            "documented fields should be accepted: {}",
+            matches!(result.severity, Severity::Warn),
+            "{}",
+            result.detail
+        );
+        assert!(
+            result.detail.contains(".lpm/env-sync.json"),
+            "{}",
+            result.detail
+        );
+        assert!(
+            !result.detail.contains("unknown field"),
+            "{}",
             result.detail
         );
     }

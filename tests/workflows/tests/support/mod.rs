@@ -956,6 +956,19 @@ pub fn lpm_spawnable(project: &TempProject) -> std::process::Command {
     lpm_spawnable_from_path(project, &bin)
 }
 
+/// Runs the binary once and waits, so a deadline the caller then starts
+/// measures the command under test rather than the first launch of a
+/// freshly built or staged binary, which macOS scans before it runs.
+pub fn warm_lpm_binary(project: &TempProject) {
+    let status = lpm_spawnable(project)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("run lpm --version");
+    assert!(status.success(), "lpm --version failed: {status}");
+}
+
 pub fn lpm_spawnable_from_path(project: &TempProject, binary: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new(binary);
     cmd.current_dir(project.path());

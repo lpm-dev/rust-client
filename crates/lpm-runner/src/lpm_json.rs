@@ -38,7 +38,7 @@ pub struct LpmJsonConfig {
     #[serde(default)]
     pub name: Option<String>,
 
-    /// Project-local cloud sync metadata maintained by `lpm env`.
+    /// Env sync state that older CLIs kept here; `lpm env` moves it to `.lpm/env-sync.json`.
     #[serde(default, rename = "vaultSync")]
     pub vault_sync: Option<VaultSyncConfig>,
 
