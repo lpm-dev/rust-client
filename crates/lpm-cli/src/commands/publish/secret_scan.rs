@@ -105,7 +105,7 @@ pub(super) fn format_secret_scan_human(scan: &SecretScanResult) -> Vec<SecretSca
     lines
 }
 
-pub(super) fn format_secret_match(
+pub(crate) fn format_secret_match(
     secret_match: &lpm_security::behavioral::secrets::SecretMatch,
 ) -> install_ui::TerminalLine {
     let location = if secret_match.line > 0 {

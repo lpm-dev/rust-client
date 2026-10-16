@@ -924,6 +924,11 @@ pub(crate) struct DeployArgs {
     /// Show what would be deployed without making any filesystem changes.
     #[arg(long)]
     pub(crate) dry_run: bool,
+
+    /// Skip the secret scan of the files the deploy copies (not
+    /// recommended).
+    #[arg(long)]
+    pub(crate) allow_secrets: bool,
 }
 
 #[derive(Args)]

@@ -83,6 +83,19 @@ jobs:
           cargo test --locked -p lpm-cli --bin lpm-rs commands::add::paths::tests
           cargo test --locked -p lpm-cli --bin lpm-rs commands::remove::
           cargo test --locked -p lpm-cli --bin lpm-rs publish_common::tests::a_required_entrypoint_
+          cargo test --locked -p lpm-cli --bin lpm-rs publish_common::tests::entrypoints_sharing_a_directory_share_its_listing
+          cargo test --locked -p lpm-cli --bin lpm-rs commands::deploy::tests::copy_member_source_refuses_
+          cargo test --locked -p lpm-cli --bin lpm-rs commands::deploy::tests::a_file_already_in_the_output_is_never_written_over
+          cargo test --locked -p lpm-cli --bin lpm-rs commands::deploy::tests::a_copied_file_keeps_its_permissions_and_leaves_the_source_alone
+          cargo test --locked -p lpm-cli --bin lpm-rs commands::deploy::tests::copy_member_source_leaves_out_an_lpm_home
+          cargo test --locked -p lpm-cli --bin lpm-rs commands::deploy::tests::the_deploy_secret_scan_
+          cargo test --locked -p lpm-cli --bin lpm-rs commands::deploy::tests::a_file_that_changes_after_the_secret_scan_
+          cargo test --locked -p lpm-cli --bin lpm-rs commands::deploy::tests::a_copy_of_a_file_written_since_its_scan_
+          cargo test --locked -p lpm-cli --bin lpm-rs commands::publish::prepare::tests::published_lpm_json_
+          cargo test --locked -p lpm-cli --bin lpm-rs publish_common::tests::the_active_lpm_home_
+          cargo test --locked -p lpm-cli --bin lpm-rs publish_common::tests::a_package_directory_that_is_the_lpm_home_
+          cargo test --locked -p lpm-cli --bin lpm-rs publish_common::tests::a_bundled_dependency_
+          cargo test --locked -p lpm-cli --bin lpm-rs publish_common::tests::a_private_key_any_streamed_
           cargo test --locked -p lpm-cli --bin lpm-rs install_recovery::
 
       - name: Windows uninstall cleanup contracts

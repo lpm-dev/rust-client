@@ -698,6 +698,274 @@ fn assert_deployment_has_no_registry_credentials(directory: &std::path::Path) {
     }
 }
 
+/// A workspace whose `api` member depends on `util-pkg`, either of which can
+/// have a `main` that a deploy's selection refuses.
+#[cfg(unix)]
+#[test]
+fn deploy_selects_a_large_workspace_closure_within_a_small_descriptor_limit() {
+    const PROVIDERS: usize = 150;
+    let project = TempProject::empty(
+        r#"{"name":"root","version":"1.0.0","private":true,"workspaces":["packages/*"]}"#,
+    );
+    let dependencies = (0..PROVIDERS)
+        .map(|index| format!(r#""p{index}":"workspace:*""#))
+        .collect::<Vec<_>>()
+        .join(",");
+    project.write_file(
+        "packages/app/package.json",
+        &format!(r#"{{"name":"app","version":"1.0.0","dependencies":{{{dependencies}}}}}"#),
+    );
+    for index in 0..PROVIDERS {
+        project.write_file(
+            &format!("packages/p{index}/package.json"),
+            &format!(r#"{{"name":"p{index}","version":"1.0.0","files":[]}}"#),
+        );
+    }
+    let out = external_output_dir();
+
+    // Fewer descriptors than the closure has packages.
+    let output = support::lpm_from_path(&project, std::path::Path::new("/bin/sh"))
+        .args(["-c", r#"ulimit -n 96 && exec "$0" "$@""#])
+        .arg(assert_cmd::cargo::cargo_bin("lpm-rs"))
+        .args([
+            "deploy",
+            out.path().to_str().unwrap(),
+            "--filter",
+            "app",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .expect("run lpm deploy --dry-run");
+
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn workspace_with_refusable_main(api_main: &str, util_main: &str) -> TempProject {
+    let project = TempProject::empty(
+        r#"{"name":"root","version":"1.0.0","private":true,"workspaces":["packages/*"]}"#,
+    );
+    project.write_file(
+        "packages/api/package.json",
+        &format!(
+            r#"{{"name":"api","version":"1.0.0","main":"{api_main}","dependencies":{{"util-pkg":"workspace:*"}}}}"#
+        ),
+    );
+    project.write_file("packages/api/index.js", "module.exports = 1;");
+    project.write_file(
+        "packages/util/package.json",
+        &format!(r#"{{"name":"util-pkg","version":"1.0.0","main":"{util_main}"}}"#),
+    );
+    project.write_file("packages/util/index.js", "module.exports = 2;");
+    project
+}
+
+#[test]
+fn deploy_force_keeps_the_previous_output_when_the_member_s_files_are_refused() {
+    let project = workspace_with_refusable_main("../escape.js", "index.js");
+    let out = external_output_dir();
+    std::fs::write(out.path().join("keep.txt"), "earlier deploy").unwrap();
+
+    let output = lpm(&project)
+        .args([
+            "deploy",
+            out.path().to_str().unwrap(),
+            "--filter",
+            "api",
+            "--force",
+        ])
+        .output()
+        .expect("run lpm deploy --force");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("project-relative path"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(out.path().join("keep.txt")).unwrap(),
+        "earlier deploy"
+    );
+}
+
+#[test]
+fn deploy_leaves_no_output_and_names_a_refused_workspace_provider() {
+    let project = workspace_with_refusable_main("index.js", "../escape.js");
+    let out = external_output_dir();
+
+    let output = lpm(&project)
+        .args(["deploy", out.path().to_str().unwrap(), "--filter", "api"])
+        .output()
+        .expect("run lpm deploy");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("workspace provider \"util-pkg\"")
+            && stderr.contains("project-relative path"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_dir(out.path()).unwrap().count(),
+        0,
+        "a refused deploy wrote to the output"
+    );
+}
+
+#[test]
+fn deploy_dry_run_reports_a_selection_the_deploy_would_refuse() {
+    let project = workspace_with_refusable_main("index.js", "../escape.js");
+    let out = external_output_dir();
+
+    let output = lpm(&project)
+        .args([
+            "--json",
+            "deploy",
+            out.path().to_str().unwrap(),
+            "--filter",
+            "api",
+            "--dry-run",
+        ])
+        .output()
+        .expect("run lpm deploy --dry-run");
+
+    assert!(!output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["success"], false, "{envelope}");
+    assert!(
+        envelope
+            .to_string()
+            .contains("workspace provider \\\"util-pkg\\\""),
+        "{envelope}"
+    );
+}
+
+#[tokio::test]
+async fn deploy_refuses_a_private_key_publish_would_refuse_and_writes_nothing() {
+    use support::lpm_with_registry;
+    use support::mock_registry::MockRegistry;
+    let project = workspace_with_refusable_main("index.js", "index.js");
+    project.write_file(
+        "packages/api/server.pem",
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n",
+    );
+    project.write_file(
+        "packages/util/certs/tls.key",
+        "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkq\n-----END PRIVATE KEY-----\n",
+    );
+    let registry = MockRegistry::start().await;
+    let out = external_output_dir();
+    std::fs::write(out.path().join("keep.txt"), "earlier deploy").unwrap();
+
+    for dry_run in [false, true] {
+        let mut arguments = vec![
+            "--json",
+            "deploy",
+            out.path().to_str().unwrap(),
+            "--filter",
+            "api",
+            "--force",
+        ];
+        if dry_run {
+            arguments.push("--dry-run");
+        }
+        let output = lpm_with_registry(&project, &registry.url())
+            .args(&arguments)
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success(), "dry run: {dry_run}");
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(&output.stdout)));
+        assert_eq!(envelope["error"], "secret_scan_failed", "{envelope}");
+        let found: Vec<(&str, &str, &str, &str)> = envelope["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|found| {
+                (
+                    found["package"].as_str().unwrap(),
+                    found["directory"].as_str().unwrap(),
+                    found["path"].as_str().unwrap(),
+                    found["pattern"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        let separator = std::path::MAIN_SEPARATOR_STR;
+        assert_eq!(
+            found,
+            [
+                (
+                    "api",
+                    &*format!("packages{separator}api"),
+                    "server.pem",
+                    "private_key_rsa"
+                ),
+                (
+                    "util-pkg",
+                    &*format!("packages{separator}util"),
+                    "certs/tls.key",
+                    "private_key_pkcs8"
+                ),
+            ],
+            "{envelope}"
+        );
+        assert_eq!(
+            std::fs::read_dir(out.path()).unwrap().count(),
+            1,
+            "a refused deploy changed the output"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.path().join("keep.txt")).unwrap(),
+            "earlier deploy"
+        );
+    }
+
+    let human = lpm_with_registry(&project, &registry.url())
+        .args([
+            "deploy",
+            out.path().to_str().unwrap(),
+            "--filter",
+            "api",
+            "--force",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(!human.status.success());
+    let stderr = String::from_utf8_lossy(&human.stderr);
+    assert!(
+        stderr.contains("RSA private key in server.pem")
+            && stderr.contains("Deploy blocked")
+            && stderr.contains("--allow-secrets"),
+        "{stderr}"
+    );
+
+    let allowed = lpm_with_registry(&project, &registry.url())
+        .args([
+            "deploy",
+            out.path().to_str().unwrap(),
+            "--filter",
+            "api",
+            "--force",
+            "--allow-secrets",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        allowed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert!(out.path().join("server.pem").is_file());
+}
+
 #[tokio::test]
 async fn deploy_names_the_dependency_ignore_files_a_commit_of_the_output_would_obey() {
     use support::lpm_with_registry;

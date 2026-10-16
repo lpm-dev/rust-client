@@ -27,23 +27,25 @@
 //!   `node_modules` are rewritten to relative symlinks after install.
 
 mod copy;
-mod file_select;
 mod lockfile_prune;
 mod manifest_rewrite;
 mod paths;
+mod secret_scan;
 
 #[cfg(test)]
 mod tests;
 
 use crate::install_ui;
-use copy::{copy_member_source, retarget_internal_node_modules_symlinks};
+use copy::{retarget_internal_node_modules_symlinks, select_member_source, write_member_source};
 use lockfile_prune::write_pruned_deploy_lockfile_if_possible;
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 use manifest_rewrite::{
-    apply_dependency_selection_to_deploy_manifest, copy_workspace_dependency_closure,
+    apply_dependency_selection_to_deploy_manifest, plan_workspace_dependency_closure,
+    write_workspace_dependency_closure,
 };
 use paths::{read_member_name, resolve_deploy_target};
+use secret_scan::DeploySecretScan;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -107,6 +109,7 @@ pub async fn run(
     dev: bool,
     no_optional: bool,
     dry_run: bool,
+    allow_secrets: bool,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let start = Instant::now();
@@ -131,6 +134,23 @@ pub async fn run(
         dependency_mode.label(),
         install_ui::yellow(&member_name)
     );
+
+    // Everything copied is chosen and scanned before anything is written, so
+    // a refusal leaves the output as it was, and a dry run reports what a
+    // deploy would.
+    let mut secrets = (!allow_secrets).then(DeploySecretScan::new);
+    let member = select_member_source(&plan.member_dir, None, secrets.as_mut())?;
+    let closure = plan_workspace_dependency_closure(
+        &plan.output_dir,
+        cwd,
+        &member_name,
+        dependency_mode,
+        no_optional,
+        secrets.as_mut(),
+    )?;
+    if let Some(secrets) = &secrets {
+        secrets.refuse_findings(cwd, json_output)?;
+    }
 
     if dry_run {
         // Dry-run: validation succeeded, but write nothing. Surface the
@@ -193,7 +213,7 @@ pub async fn run(
         })?;
     }
 
-    let copy_stats = copy_member_source(&plan.member_dir, &plan.output_dir)?;
+    let copy_stats = write_member_source(&member, &plan.output_dir)?;
 
     let mut selection_stats = apply_dependency_selection_to_deploy_manifest(
         &plan.output_dir,
@@ -206,13 +226,7 @@ pub async fn run(
         workspace_spec_rewrites,
         workspace_copy_stats,
         workspace_selection_stats,
-    ) = copy_workspace_dependency_closure(
-        &plan.output_dir,
-        cwd,
-        &member_name,
-        dependency_mode,
-        no_optional,
-    )?;
+    ) = write_workspace_dependency_closure(&closure, &plan.output_dir, no_optional)?;
     selection_stats.add(&workspace_selection_stats);
 
     let pruned_lockfile_packages =
@@ -450,8 +464,15 @@ impl OutputTree {
                     pending.push((entry.path(), path));
                 } else if file_type.is_file()
                     && !top
-                    // Git with `core.ignorecase` reads `.GITIGNORE` too.
-                    && name.eq_ignore_ascii_case(lpm_common::project_state::PROJECT_STATE_IGNORE_FILE)
+                    // A file system that folds names reads `.GITIGNORE`,
+                    // and HFS+ the name with a mark it ignores, as
+                    // `.gitignore`.
+                    && name.to_str().is_some_and(|name| {
+                        crate::commands::publish_common::listed_in(
+                            name,
+                            &[lpm_common::project_state::PROJECT_STATE_IGNORE_FILE],
+                        )
+                    })
                     && relative.as_os_str() != lpm_common::PROJECT_STATE_DIR
                 {
                     tree.dependency_ignore_files.push(portable_relative(&path));
@@ -487,13 +508,20 @@ impl OutputTree {
             .iter()
             .filter(|written| !written.contains(['\n', '\r']))
         {
-            let pattern = ignore_pattern_literal(written);
-            ignore.push_str(&format!("!/{pattern}\n"));
-            match written.strip_suffix('/') {
-                Some("node_modules") => ignore.push_str("!/node_modules/**\n"),
-                Some(directory) if directory == lpm_common::PROJECT_STATE_DIR => {}
-                Some(_) => ignore.push_str(&format!("!/{pattern}**/\n")),
-                None => {}
+            // Git on macOS reads a name the disk lists decomposed composed,
+            // and as listed where `core.precomposeunicode` is off.
+            let composed = lpm_common::names::composed(written);
+            let spellings = std::iter::once(written.as_str())
+                .chain((composed != written.as_str()).then_some(composed.as_ref()));
+            for spelling in spellings {
+                let pattern = ignore_pattern_literal(spelling);
+                ignore.push_str(&format!("!/{pattern}\n"));
+                match spelling.strip_suffix('/') {
+                    Some("node_modules") => ignore.push_str("!/node_modules/**\n"),
+                    Some(directory) if directory == lpm_common::PROJECT_STATE_DIR => {}
+                    Some(_) => ignore.push_str(&format!("!/{pattern}**/\n")),
+                    None => {}
+                }
             }
         }
         ignore

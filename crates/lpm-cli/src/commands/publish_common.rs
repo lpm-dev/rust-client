@@ -147,6 +147,42 @@ impl TarballSourceCursor {
     }
 }
 
+/// Opens files of one open directory in turn, as the packer does, keeping
+/// the directories above the last one open: files taken in path order share
+/// their parents' opening, and the cursor holds one path's directories.
+pub(crate) struct SourceFileCursor {
+    root: Arc<TarballSourceRoot>,
+    cursor: TarballSourceCursor,
+}
+
+impl SourceFileCursor {
+    pub(crate) fn new(directory: &Dir) -> Result<Self, LpmError> {
+        Ok(Self {
+            root: Arc::new(TarballSourceRoot {
+                path: PathBuf::new(),
+                directory: Some(directory.try_clone().map_err(LpmError::Io)?),
+                identity: None,
+            }),
+            cursor: TarballSourceCursor::new(),
+        })
+    }
+
+    /// [`open_tarball_source_file`] for `relative`, from the cursor.
+    pub(crate) fn open(
+        &mut self,
+        relative: &Path,
+        archive_path: &str,
+    ) -> Result<(std::fs::File, u64), LpmError> {
+        self.cursor.open_file(&self.root, relative, archive_path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parent_opens(&self) -> usize {
+        self.cursor.parent_open_count
+    }
+}
+
+/// What an open directory or file is on its volume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectoryIdentity {
     #[cfg(unix)]
@@ -1227,11 +1263,15 @@ impl TarballSourceRoot {
 }
 
 impl DirectoryIdentity {
-    #[cfg(unix)]
     pub(crate) fn from_directory(directory: &Dir) -> std::io::Result<Self> {
+        Self::of_open_file(&directory.try_clone()?.into_std_file())
+    }
+
+    #[cfg(unix)]
+    fn of_open_file(file: &std::fs::File) -> std::io::Result<Self> {
         use std::os::unix::fs::MetadataExt as _;
 
-        let metadata = directory.try_clone()?.into_std_file().metadata()?;
+        let metadata = file.metadata()?;
         Ok(Self::Unix {
             device: metadata.dev(),
             inode: metadata.ino(),
@@ -1239,17 +1279,16 @@ impl DirectoryIdentity {
     }
 
     #[cfg(windows)]
-    pub(crate) fn from_directory(directory: &Dir) -> std::io::Result<Self> {
+    fn of_open_file(file: &std::fs::File) -> std::io::Result<Self> {
         use std::os::windows::io::AsRawHandle as _;
         use windows_sys::Win32::Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
         };
 
-        let directory = directory.try_clone()?.into_std_file();
         let mut information = BY_HANDLE_FILE_INFORMATION::default();
-        // SAFETY: the handle belongs to the live directory file, and `information`
+        // SAFETY: the handle belongs to the live open file, and `information`
         // is writable storage of the exact Win32 structure expected by the API.
-        if unsafe { GetFileInformationByHandle(directory.as_raw_handle(), &mut information) } == 0 {
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
             return Err(std::io::Error::last_os_error());
         }
         Ok(Self::Windows {
@@ -1421,7 +1460,17 @@ fn ensure_publish_secret_scan_complete(
     let Some(limit) = scan.limit_exceeded else {
         return Ok(());
     };
-    let maximum = match limit {
+    Err(LpmError::Registry(format!(
+        "publish secret scan stopped at the {} {limit} limit; the artifact was not published",
+        secret_scan_maximum(limit)
+    )))
+}
+
+/// The most of `limit` one secret scan inspects, as a message names it.
+pub(crate) fn secret_scan_maximum(
+    limit: lpm_security::behavioral::secrets::SecretScanLimit,
+) -> String {
+    match limit {
         lpm_security::behavioral::secrets::SecretScanLimit::Files => {
             lpm_security::behavioral::secrets::SECRET_SCAN_MAX_FILES.to_string()
         }
@@ -1432,10 +1481,7 @@ fn ensure_publish_secret_scan_complete(
         lpm_security::behavioral::secrets::SecretScanLimit::Findings => {
             lpm_security::behavioral::secrets::SECRET_SCAN_MAX_FINDINGS.to_string()
         }
-    };
-    Err(LpmError::Registry(format!(
-        "publish secret scan stopped at the {maximum} {limit} limit; the artifact was not published"
-    )))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1504,11 +1550,11 @@ fn is_safe_entry(path: &Path, canonical_root: &Path) -> bool {
 // File collection
 // ---------------------------------------------------------------------------
 
-/// Collect files to include in the tarball.
-///
-/// If `files` field exists in package.json, only include those.
-/// Otherwise include everything with common ignores.
-fn collect_package_files(
+/// The project files a publish of `pkg_json` packs, before bundled
+/// dependencies, skills and manifest overrides: package-relative, `/`
+/// separated, sorted. With a `files` field, the files it selects, and else
+/// every file but the common ignores. Symbolic links are left out.
+pub(crate) fn collect_package_files(
     pkg_json: &serde_json::Value,
     source_dir: &Dir,
 ) -> Result<Vec<TarballFile>, LpmError> {

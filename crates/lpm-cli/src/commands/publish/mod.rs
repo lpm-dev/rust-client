@@ -5,7 +5,7 @@ mod output;
 mod prepare;
 mod provenance;
 mod quality_gate;
-mod secret_scan;
+pub(crate) mod secret_scan;
 mod skills;
 mod swift;
 mod target;
@@ -25,8 +25,8 @@ pub(crate) use orchestrator::{
 };
 pub(crate) use prepare::{
     PublishManifest, PublishSource, bundled_lpm_json, prepare_publish_project,
-    read_publish_manifest_from_source, select_publish_projection, validate_publish_tarball_size,
-    validate_publish_version,
+    read_publish_manifest_from_source, select_publish_projection, shipped_lpm_json,
+    validate_publish_tarball_size, validate_publish_version,
 };
 pub(crate) use provenance::{
     ProvenanceRequest, materialize_provenance_request,
