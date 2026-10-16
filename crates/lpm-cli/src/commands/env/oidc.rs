@@ -834,10 +834,32 @@ pub(super) async fn vars_oidc_pull(
         let content = format_oidc_dotenv(&vars, &env_name);
         let mut keys: Vec<&String> = vars.keys().collect();
         keys.sort();
-        write_oidc_dotenv_file(std::path::Path::new(file), &content)
-            .map_err(|e| LpmError::Script(format!("failed to write {file}: {e}")))?;
+        let destination = std::path::absolute(file)
+            .map_err(|e| LpmError::Script(format!("failed to resolve {file}: {e}")))?;
+        let write = lpm_common::project_secret::write_secret_file(
+            project_dir,
+            &destination,
+            content.as_bytes(),
+            lpm_common::project_secret::SecretFileOptions {
+                ignore_file: lpm_common::project_secret::IgnoreFile::RepositoryExclude,
+                on_ignore_failure: lpm_common::project_secret::IgnoreFailure::Refuse,
+                existing: lpm_common::project_secret::Existing::Replace,
+            },
+        )
+        .map_err(LpmError::from)?;
 
-        if !json_output {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "env": env_name,
+                    "count": keys.len(),
+                    "to": file,
+                    "warnings": write.warnings,
+                })
+            );
+        } else {
+            super::local::print_secret_file_warnings(&write.warnings);
             output::success_line(install_ui::terminal_line!(
                 "wrote {} secret{} to {} (env: {})",
                 install_ui::bold(&keys.len().to_string()),
@@ -875,27 +897,6 @@ fn format_oidc_dotenv(vars: &std::collections::HashMap<String, String>, env_name
         content.push('\n');
     }
     content
-}
-
-fn write_oidc_dotenv_file_with(
-    path: &std::path::Path,
-    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
-) -> std::io::Result<()> {
-    lpm_common::write_file_atomic_with(
-        path,
-        lpm_common::AtomicWriteOptions::new()
-            .unix_mode(0o600)
-            .sync_file(),
-        write,
-    )
-}
-
-fn write_oidc_dotenv_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
-
-    write_oidc_dotenv_file_with(path, |destination| {
-        destination.write_all(content.as_bytes())
-    })
 }
 
 fn resolve_oidc_pull_vault_id(project_dir: &std::path::Path) -> Result<String, LpmError> {
@@ -1011,11 +1012,9 @@ fn build_oidc_pull_error_message(error: &str, hint: &str, code: &str) -> String 
 #[cfg(test)]
 mod oidc_error_hint_tests {
     use std::collections::{HashMap, HashSet};
-    use std::io::Write as _;
 
     use super::{
-        build_oidc_exchange_body, build_oidc_pull_error_message, format_oidc_dotenv,
-        vars_oidc_pull, write_oidc_dotenv_file_with,
+        build_oidc_exchange_body, build_oidc_pull_error_message, format_oidc_dotenv, vars_oidc_pull,
     };
 
     #[tokio::test]
@@ -1086,37 +1085,6 @@ mod oidc_error_hint_tests {
         assert_eq!(
             lpm_env::format_env(&vars, lpm_env::PrintFormat::Dotenv, &HashSet::new()),
             output.lines().skip(2).collect::<Vec<_>>().join("\n")
-        );
-    }
-
-    #[test]
-    fn oidc_dotenv_write_failure_preserves_the_existing_output() {
-        let directory = tempfile::tempdir().unwrap();
-        let output = directory.path().join("secrets.env");
-        std::fs::write(&output, b"ORIGINAL=secret\n").unwrap();
-
-        let error = write_oidc_dotenv_file_with(&output, |destination| {
-            destination.write_all(b"PARTIAL=")?;
-            Err(std::io::Error::other("injected write failure"))
-        })
-        .unwrap_err();
-
-        assert_eq!(error.kind(), std::io::ErrorKind::Other);
-        assert_eq!(std::fs::read(&output).unwrap(), b"ORIGINAL=secret\n");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn oidc_dotenv_output_is_owner_only() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let directory = tempfile::tempdir().unwrap();
-        let output = directory.path().join("secrets.env");
-        super::write_oidc_dotenv_file(&output, "TOKEN=secret\n").unwrap();
-
-        assert_eq!(
-            std::fs::metadata(output).unwrap().permissions().mode() & 0o777,
-            0o600
         );
     }
 

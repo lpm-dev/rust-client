@@ -26,7 +26,6 @@
 
 pub mod crypto;
 mod fallback;
-mod gitignore;
 mod selected_environment;
 pub mod signature;
 pub mod sync;
@@ -510,11 +509,6 @@ fn initialize_environments_from_files_inner(
         initializations,
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     )?;
-    let imported_sources = prepared
-        .iter()
-        .filter(|source| source.secrets.is_some())
-        .map(|source| source.initialization.source_path.clone())
-        .collect::<Vec<_>>();
     let needs_vault_access = prepared.iter().any(|source| {
         source.secrets.is_some()
             || (!source.file_present && source.initialization.create_if_missing)
@@ -539,7 +533,7 @@ fn initialize_environments_from_files_inner(
         .display()
         .to_string();
 
-    let results = with_project_vault_transaction(|directory| {
+    with_project_vault_transaction(|directory| {
         let current_vault_id = vault_id::read_vault_id(project_dir);
         let mut state = match snapshot {
             Some(snapshot) if snapshot.vault_id == current_vault_id => {
@@ -628,13 +622,7 @@ fn initialize_environments_from_files_inner(
         }
 
         Ok(results)
-    })?;
-
-    add_paths_to_gitignore(
-        project_dir,
-        imported_sources.iter().map(std::path::PathBuf::as_path),
-    );
-    Ok(results)
+    })
 }
 
 /// Copy values between two environments in one vault transaction.
@@ -1110,9 +1098,6 @@ pub fn import_env_file(
         move |secrets| merge_imported_secrets(secrets, parsed, overwrite),
     )?;
 
-    // Auto-add the .env file to .gitignore
-    add_to_gitignore(project_dir, env_path);
-
     Ok(imported)
 }
 
@@ -1149,7 +1134,6 @@ pub fn import_env_file_to_env(
         env,
         move |secrets| merge_imported_secrets(secrets, parsed, overwrite),
     )?;
-    add_to_gitignore(project_dir, env_path);
 
     Ok(imported)
 }
@@ -1221,60 +1205,21 @@ fn env_value_layout(value: &str) -> (bool, usize) {
     )
 }
 
-/// Atomically write a dotenv export with owner-only permissions.
-///
-/// The output contains plaintext vault secrets. `std::fs::write`
-/// honours the inherited umask (typically `0o644`), which on shared
-/// hosts exposes credentials to any local uid. Other agents on the
-/// system may also race the write — atomic rename + 0o600 closes
-/// both the perms shape and the read-during-write window.
-fn write_env_file_owner_only(output_path: &Path, content: &[u8]) -> Result<(), String> {
-    lpm_common::write_file_atomic_with_options(
-        output_path,
-        content,
-        lpm_common::AtomicWriteOptions::new()
-            .unix_mode(0o600)
-            .sync_file(),
-    )
-    .map_err(|e| format!("failed to write {}: {e}", output_path.display()))
+/// The default environment's secrets as dotenv lines and their count, or
+/// `None` when it holds none. The caller writes them through
+/// `lpm_common::project_secret`, which keeps the file out of git.
+pub fn export_env_content(project_dir: &Path) -> Result<Option<(String, usize)>, String> {
+    let secrets = try_get_all(project_dir)?;
+    Ok((!secrets.is_empty()).then(|| (format_env_file_content(&secrets), secrets.len())))
 }
 
-/// Export secrets from a specific environment to a .env file.
-///
-/// Returns the number of exported secrets.
-pub fn export_env_file_from_env(
+/// [`export_env_content`] for the environment `env`.
+pub fn export_env_content_from_env(
     project_dir: &Path,
     env: &str,
-    output_path: &Path,
-) -> Result<usize, String> {
+) -> Result<Option<(String, usize)>, String> {
     let secrets = try_get_all_env(project_dir, env)?;
-    if secrets.is_empty() {
-        return Ok(0);
-    }
-
-    let content = format_env_file_content(&secrets);
-    write_env_file_owner_only(output_path, content.as_bytes())?;
-
-    add_to_gitignore(project_dir, output_path);
-
-    Ok(secrets.len())
-}
-
-/// Export vault secrets to a .env file.
-///
-/// Returns the number of exported secrets.
-pub fn export_env_file(project_dir: &Path, output_path: &Path) -> Result<usize, String> {
-    let secrets = try_get_all(project_dir)?;
-    if secrets.is_empty() {
-        return Ok(0);
-    }
-
-    let content = format_env_file_content(&secrets);
-    write_env_file_owner_only(output_path, content.as_bytes())?;
-
-    add_to_gitignore(project_dir, output_path);
-
-    Ok(secrets.len())
+    Ok((!secrets.is_empty()).then(|| (format_env_file_content(&secrets), secrets.len())))
 }
 
 // ─── Platform dispatch ─────────────────────────────────────────────
@@ -1539,19 +1484,6 @@ fn find_closing_quote(value: &str, quote: char) -> Option<usize> {
     None
 }
 
-fn add_to_gitignore(project_dir: &Path, file_path: &Path) {
-    add_paths_to_gitignore(project_dir, std::iter::once(file_path));
-}
-
-fn add_paths_to_gitignore<'a>(project_dir: &Path, file_paths: impl IntoIterator<Item = &'a Path>) {
-    if let Err(error) = gitignore::add_paths(project_dir, file_paths) {
-        tracing::warn!(
-            error = %lpm_common::sanitize_terminal_inline(&error.to_string()),
-            "could not update .gitignore; add secret file paths before committing",
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1708,29 +1640,6 @@ KEY3=no-quotes"#;
         assert_eq!(stored_value.as_ptr(), value_ptr);
     }
 
-    #[test]
-    fn add_to_gitignore_creates_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let env_path = dir.path().join(".env.local");
-
-        add_to_gitignore(dir.path(), &env_path);
-
-        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-        assert!(content.contains(".env.local"));
-    }
-
-    #[test]
-    fn add_to_gitignore_skips_duplicate() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(".gitignore"), ".env.local\n").unwrap();
-
-        let env_path = dir.path().join(".env.local");
-        add_to_gitignore(dir.path(), &env_path);
-
-        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-        assert_eq!(content.matches(".env.local").count(), 1);
-    }
-
     #[cfg(debug_assertions)]
     #[test]
     fn set_and_get_all_round_trip() {
@@ -1861,11 +1770,8 @@ KEY3=no-quotes"#;
             let imported = import_env_file(dir.path(), &env_file, false).unwrap();
             assert_eq!(imported, 2);
 
-            let export_file = dir.path().join(".env.exported");
-            let exported = export_env_file(dir.path(), &export_file).unwrap();
+            let (content, exported) = export_env_content(dir.path()).unwrap().unwrap();
             assert_eq!(exported, 2);
-
-            let content = std::fs::read_to_string(&export_file).unwrap();
             assert!(content.contains("DB=localhost"));
             assert!(content.contains("PORT=3000"));
 
@@ -1895,11 +1801,10 @@ KEY3=no-quotes"#;
             );
             assert_eq!(secrets["PLAIN"], "value");
 
-            let export_file = dir.path().join(".env.multiline.exported");
-            let exported = export_env_file(dir.path(), &export_file).unwrap();
+            let (content, exported) = export_env_content(dir.path()).unwrap().unwrap();
             assert_eq!(exported, 2);
 
-            let reparsed = parse_env_content(&std::fs::read_to_string(&export_file).unwrap());
+            let reparsed = parse_env_content(&content);
             assert_eq!(
                 reparsed["PRIVATE_KEY"],
                 "line one\nline two \"quoted\" \\ path"
@@ -2424,33 +2329,6 @@ KEY3=no-quotes"#;
         });
     }
 
-    /// `export_env_file` materializes plaintext vault secrets to disk.
-    /// On Unix the file must be created at 0o600 — default-umask
-    /// writes (typically 0o644) would expose credentials to every
-    /// other local uid on shared hosts.
-    #[cfg(all(unix, debug_assertions))]
-    #[test]
-    fn export_env_file_is_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-        with_forced_file_vault_backend(|| {
-            let dir = tempfile::tempdir().unwrap();
-            set(dir.path(), &[("DB", "postgres://localhost/x")]).unwrap();
-            let export_file = dir.path().join(".env.export-perms");
-            export_env_file(dir.path(), &export_file).expect("export must succeed");
-            let mode = std::fs::metadata(&export_file)
-                .expect("export file must exist")
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(
-                mode, 0o600,
-                "exported dotenv must be 0o600, got {:#o}",
-                mode
-            );
-            cleanup_vault(dir.path());
-        });
-    }
-
     #[cfg(debug_assertions)]
     #[test]
     fn import_no_overwrite() {
@@ -2489,24 +2367,6 @@ KEY3=no-quotes"#;
 
             let secrets = try_get_all(dir.path()).expect("read vault");
             assert_eq!(secrets["KEY"], "overwritten");
-
-            cleanup_vault(dir.path());
-        });
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn import_adds_to_gitignore() {
-        with_forced_file_vault_backend(|| {
-            let dir = tempfile::tempdir().unwrap();
-
-            let env_file = dir.path().join(".env.local");
-            std::fs::write(&env_file, "KEY=val").unwrap();
-
-            import_env_file(dir.path(), &env_file, false).unwrap();
-
-            let gitignore = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
-            assert!(gitignore.contains(".env.local"));
 
             cleanup_vault(dir.path());
         });

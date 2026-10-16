@@ -1,5 +1,5 @@
 use crate::install_ui;
-use crate::project_git::{GitDiscoveryFailure, git_discovery_failure, hardened_git_command};
+use lpm_common::project_git::{GitDiscoveryFailure, git_discovery_failure, hardened_git_command};
 use lpm_common::{LpmError, format_bytes};
 use lpm_registry::RegistryClient;
 use std::fmt::Display;

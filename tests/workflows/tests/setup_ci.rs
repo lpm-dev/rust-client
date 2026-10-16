@@ -91,27 +91,37 @@ fn setup_ci_refuses_to_write_a_tracked_npmrc() {
 }
 
 #[test]
-fn setup_ci_fails_closed_when_git_tracking_cannot_be_inspected() {
-    let project = TempProject::empty(r#"{"name":"git-unavailable","version":"1.0.0"}"#);
+fn setup_ci_without_git_writes_outside_a_repository_and_refuses_inside_one() {
     let empty_path = tempfile::tempdir().expect("create empty PATH");
+    let setup = |project: &TempProject| {
+        lpm(project)
+            .env("PATH", empty_path.path())
+            .env("LPM_TOKEN", "ci-runtime-token")
+            .args(["setup", "ci", "npmrc"])
+            .output()
+            .expect("run setup ci without git on PATH")
+    };
 
-    let output = lpm(&project)
-        .env("PATH", empty_path.path())
-        .env("LPM_TOKEN", "ci-runtime-token")
-        .args(["setup", "ci", "npmrc"])
-        .output()
-        .expect("run setup ci without git on PATH");
-
+    let outside = TempProject::empty(r#"{"name":"no-repository","version":"1.0.0"}"#);
+    let output = setup(&outside);
     assert!(
-        !output.status.success(),
-        "setup ci must not write a bearer when Git tracking cannot be inspected"
-    );
-    assert!(!project.file_exists(".npmrc"));
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("Git tracking"),
-        "failure must identify the unavailable tracking check: {}",
+        output.status.success(),
+        "no repository can track .npmrc: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(outside.read_file(".npmrc").contains("_authToken"));
+
+    let inside = TempProject::empty(r#"{"name":"git-unavailable","version":"1.0.0"}"#);
+    git(&inside, &["init", "-q"]);
+    let output = setup(&inside);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "setup ci must not write a bearer where git can't tell whether it tracks .npmrc"
+    );
+    assert!(!inside.file_exists(".npmrc"));
+    assert!(stderr.contains("git could not be run"), "{stderr}");
+    assert!(stderr.contains("Put git on PATH"), "{stderr}");
 }
 
 #[test]

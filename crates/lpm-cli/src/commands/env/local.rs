@@ -160,13 +160,21 @@ pub(super) fn env_import(
             lpm_vault::import_env_file(project_dir, &path, overwrite).map_err(LpmError::Script)?
         }
     };
+    let warnings = keep_env_source_ignored(project_dir, &path)?;
 
     if json_output {
         println!(
             "{}",
-            serde_json::json!({"success": true, "imported": count, "from": file, "env": env_label})
+            serde_json::json!({
+                "success": true,
+                "imported": count,
+                "from": file,
+                "env": env_label,
+                "warnings": warnings,
+            })
         );
     } else {
+        print_secret_file_warnings(&warnings);
         output::success_line(install_ui::terminal_line!(
             "imported {} secret{} from {} ({})",
             install_ui::bold(&count.to_string()),
@@ -198,18 +206,42 @@ pub(super) fn env_export(
     let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
     let env_label = resolved_env.as_deref().unwrap_or("default");
 
-    let count = match &resolved_env {
-        Some(env) => lpm_vault::export_env_file_from_env(project_dir, env, &path)
-            .map_err(LpmError::Script)?,
-        None => lpm_vault::export_env_file(project_dir, &path).map_err(LpmError::Script)?,
+    let content = match &resolved_env {
+        Some(env) => lpm_vault::export_env_content_from_env(project_dir, env),
+        None => lpm_vault::export_env_content(project_dir),
+    }
+    .map_err(LpmError::Script)?;
+    let (count, warnings) = match content {
+        None => (0, Vec::new()),
+        Some((content, count)) => {
+            let write = lpm_common::project_secret::write_secret_file(
+                project_dir,
+                &path,
+                content.as_bytes(),
+                lpm_common::project_secret::SecretFileOptions {
+                    ignore_file: lpm_common::project_secret::IgnoreFile::ProjectGitignore,
+                    on_ignore_failure: lpm_common::project_secret::IgnoreFailure::Refuse,
+                    existing: lpm_common::project_secret::Existing::Replace,
+                },
+            )
+            .map_err(|error| LpmError::Script(error.to_string()))?;
+            (count, write.warnings)
+        }
     };
 
     if json_output {
         println!(
             "{}",
-            serde_json::json!({"success": true, "exported": count, "to": file, "env": env_label})
+            serde_json::json!({
+                "success": true,
+                "exported": count,
+                "to": file,
+                "env": env_label,
+                "warnings": warnings,
+            })
         );
     } else {
+        print_secret_file_warnings(&warnings);
         output::success_line(install_ui::terminal_line!(
             "exported {} secret{} to {} ({})",
             install_ui::bold(&count.to_string()),
@@ -219,6 +251,28 @@ pub(super) fn env_export(
         ));
     }
     Ok(())
+}
+
+/// Keeps an env file the user imported from, which holds secrets, out of
+/// git. Failing to is a warning: the import already happened.
+pub(super) fn keep_env_source_ignored(
+    project_dir: &std::path::Path,
+    source: &std::path::Path,
+) -> Result<Vec<String>, LpmError> {
+    lpm_common::project_secret::keep_secret_file_ignored(
+        project_dir,
+        source,
+        lpm_common::project_secret::IgnoreFile::ProjectGitignore,
+        lpm_common::project_secret::IgnoreFailure::Warn,
+    )
+    .map(|(_, warnings)| warnings)
+    .map_err(|error| LpmError::Script(error.to_string()))
+}
+
+pub(super) fn print_secret_file_warnings(warnings: &[String]) {
+    for warning in warnings {
+        output::warn(warning);
+    }
 }
 
 /// Resolve an `--env` flag value to a canonical env name.

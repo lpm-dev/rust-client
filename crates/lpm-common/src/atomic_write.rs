@@ -12,6 +12,7 @@ pub struct AtomicWriteOptions {
     unix_mode: Option<u32>,
     sync_file: bool,
     sync_parent: bool,
+    owner_only: bool,
 }
 
 impl AtomicWriteOptions {
@@ -22,12 +23,23 @@ impl AtomicWriteOptions {
             unix_mode: None,
             sync_file: false,
             sync_parent: false,
+            owner_only: false,
         }
     }
 
     /// Set the exact final Unix mode. This is ignored on non-Unix platforms.
     pub const fn unix_mode(mut self, mode: u32) -> Self {
         self.unix_mode = Some(mode);
+        self
+    }
+
+    /// Give the file to its owner alone before any content reaches it: mode
+    /// 0600 on Unix, without the extended ACL entries macOS gives a new file
+    /// from its directory's inheritable ones, and on Windows a protected DACL
+    /// that grants only the owner and SYSTEM.
+    pub const fn owner_only(mut self) -> Self {
+        self.unix_mode = Some(0o600);
+        self.owner_only = true;
         self
     }
 
@@ -82,8 +94,14 @@ where
 {
     let parent = destination_parent(path).map_err(E::from)?;
     let exact_mode = destination_mode(path, options).map_err(E::from)?;
-    let mut temporary =
-        create_temporary(parent, exact_mode, || random_temp_path(parent)).map_err(E::from)?;
+    let mut temporary = create_temporary(parent, exact_mode, options.owner_only, || {
+        random_temp_path(parent)
+    })
+    .map_err(E::from)?;
+    #[cfg(any(target_os = "macos", windows))]
+    if options.owner_only {
+        restrict_to_owner(temporary.file().map_err(E::from)?).map_err(E::from)?;
+    }
 
     let output = write(temporary.file_mut().map_err(E::from)?)?;
     if let Some(mode) = exact_mode {
@@ -136,9 +154,13 @@ where
         None => capability_destination_mode(directory, destination).map_err(E::from)?,
     };
     let (temporary_name, mut temporary) =
-        create_capability_temporary(directory, exact_mode).map_err(E::from)?;
+        create_capability_temporary(directory, exact_mode, options.owner_only).map_err(E::from)?;
 
     let result = (|| {
+        #[cfg(any(target_os = "macos", windows))]
+        if options.owner_only {
+            restrict_to_owner(&temporary).map_err(E::from)?;
+        }
         let output = write(&mut temporary)?;
         if let Some(mode) = exact_mode {
             set_capability_file_mode(&temporary, mode).map_err(E::from)?;
@@ -163,6 +185,185 @@ where
         let _ = directory.remove_file(&temporary_name);
     }
     result
+}
+
+/// Creates `destination` in `directory` with complete contents, never
+/// replacing an existing entry: the contents go to a temporary file that is
+/// hard-linked, or else renamed without replacing, into place, so readers
+/// see no partial file. Returns `None`, writing nothing, when `destination`
+/// exists. Where the filesystem does neither, the file is created
+/// exclusively and written in place, and removed again if that fails.
+pub fn create_file_atomic_in_dir_with_options<T, E>(
+    directory: &cap_std::fs::Dir,
+    destination: &OsStr,
+    options: AtomicWriteOptions,
+    write: impl FnOnce(&mut cap_std::fs::File) -> Result<T, E>,
+) -> Result<Option<T>, E>
+where
+    E: From<io::Error>,
+{
+    validate_relative_file_name(destination).map_err(E::from)?;
+    let (temporary_name, mut temporary) =
+        create_capability_temporary(directory, options.unix_mode, options.owner_only)
+            .map_err(E::from)?;
+    let result = (|| {
+        #[cfg(any(target_os = "macos", windows))]
+        if options.owner_only {
+            restrict_to_owner(&temporary).map_err(E::from)?;
+        }
+        let output = write(&mut temporary)?;
+        if let Some(mode) = options.unix_mode {
+            set_capability_file_mode(&temporary, mode).map_err(E::from)?;
+        }
+        temporary.sync_all().map_err(E::from)?;
+        let published = match simulated::hard_link(directory, &temporary_name, destination) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
+            Err(_) => {
+                match simulated::rename_without_replacing(
+                    directory,
+                    &temporary_name,
+                    destination,
+                    &temporary,
+                ) {
+                    Ok(renamed) => renamed,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
+                    Err(error) => return Err(E::from(error)),
+                }
+            }
+        };
+        if !published
+            && !copy_into_new_file(directory, &temporary_name, destination, options)
+                .map_err(E::from)?
+        {
+            return Ok(None);
+        }
+        #[cfg(unix)]
+        if options.sync_parent {
+            directory
+                .open(".")
+                .map_err(E::from)?
+                .sync_all()
+                .map_err(E::from)?;
+        }
+        Ok(Some(output))
+    })();
+    drop(temporary);
+    let _ = directory.remove_file(&temporary_name);
+    result
+}
+
+/// Copies the temporary into `destination`, created exclusively, for a
+/// filesystem that neither links nor renames without replacing. A failure
+/// removes the partial file unless something else has replaced it since.
+/// `false` when `destination` exists.
+fn copy_into_new_file(
+    directory: &cap_std::fs::Dir,
+    temporary_name: &OsStr,
+    destination: &OsStr,
+    options: AtomicWriteOptions,
+) -> io::Result<bool> {
+    let mut exclusive = cap_std::fs::OpenOptions::new();
+    exclusive.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        exclusive.mode(options.unix_mode.unwrap_or(0o666));
+    }
+    #[cfg(windows)]
+    if options.owner_only {
+        use cap_std::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Foundation::GENERIC_WRITE;
+        use windows_sys::Win32::Storage::FileSystem::{READ_CONTROL, WRITE_DAC};
+
+        exclusive.access_mode(GENERIC_WRITE | READ_CONTROL | WRITE_DAC);
+    }
+    let mut created = match directory.open_with(destination, &exclusive) {
+        Ok(created) => created,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let copied = (|| {
+        #[cfg(any(target_os = "macos", windows))]
+        if options.owner_only {
+            restrict_to_owner(&created)?;
+        }
+        let mut source = directory.open(temporary_name)?;
+        simulated::copy(&mut source, &mut created)?;
+        created.sync_all()
+    })();
+    if let Err(error) = copied {
+        if is_current_entry(directory, destination, &created).unwrap_or(false) {
+            let _ = directory.remove_file(destination);
+        }
+        return Err(error);
+    }
+    Ok(true)
+}
+
+/// What [`create_file_atomic_in_dir_with_options`] can do on a filesystem:
+/// everything, except where a test takes an ability away.
+mod simulated {
+    use std::ffi::OsStr;
+    use std::io;
+
+    #[cfg(test)]
+    thread_local! {
+        pub(super) static NO_HARD_LINKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(super) static NO_RENAME_WITHOUT_REPLACING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        pub(super) static FAILING_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn hard_link(
+        directory: &cap_std::fs::Dir,
+        from: &OsStr,
+        to: &OsStr,
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        if NO_HARD_LINKS.with(std::cell::Cell::get) {
+            return Err(io::Error::from(io::ErrorKind::Unsupported));
+        }
+        directory.hard_link(from, directory, to)
+    }
+
+    pub(super) fn rename_without_replacing(
+        directory: &cap_std::fs::Dir,
+        from: &OsStr,
+        to: &OsStr,
+        file: &cap_std::fs::File,
+    ) -> io::Result<bool> {
+        #[cfg(test)]
+        if NO_RENAME_WITHOUT_REPLACING.with(std::cell::Cell::get) {
+            return Ok(false);
+        }
+        super::rename_capability_file_without_replacing(directory, from, to, file)
+    }
+
+    pub(super) fn copy(
+        source: &mut cap_std::fs::File,
+        destination: &mut cap_std::fs::File,
+    ) -> io::Result<u64> {
+        let copied = io::copy(source, destination)?;
+        #[cfg(test)]
+        if FAILING_COPY.with(std::cell::Cell::get) {
+            return Err(io::Error::other("injected failure after the copy"));
+        }
+        Ok(copied)
+    }
+}
+
+/// Whether `name` in `directory` is still `file`.
+fn is_current_entry(
+    directory: &cap_std::fs::Dir,
+    name: &OsStr,
+    file: &cap_std::fs::File,
+) -> io::Result<bool> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    let current = directory.open_with(name, &options)?.into_std();
+    Ok(file_identity(&current)? == file_identity(&file.try_clone()?.into_std())?)
 }
 
 fn validate_relative_file_name(name: &OsStr) -> io::Result<()> {
@@ -208,6 +409,7 @@ fn capability_destination_mode(
 fn create_capability_temporary(
     directory: &cap_std::fs::Dir,
     exact_mode: Option<u32>,
+    owner_only: bool,
 ) -> io::Result<(OsString, cap_std::fs::File)> {
     use base64::Engine as _;
 
@@ -231,11 +433,18 @@ fn create_capability_temporary(
         {
             use cap_std::fs::OpenOptionsExt as _;
             use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
-            use windows_sys::Win32::Storage::FileSystem::DELETE;
+            use windows_sys::Win32::Storage::FileSystem::{DELETE, READ_CONTROL, WRITE_DAC};
 
             let _ = exact_mode;
-            options.access_mode(GENERIC_READ | GENERIC_WRITE | DELETE);
+            let security = if owner_only {
+                READ_CONTROL | WRITE_DAC
+            } else {
+                0
+            };
+            options.access_mode(GENERIC_READ | GENERIC_WRITE | DELETE | security);
         }
+        #[cfg(not(windows))]
+        let _ = owner_only;
         #[cfg(not(any(unix, windows)))]
         let _ = exact_mode;
 
@@ -267,6 +476,104 @@ fn set_capability_file_mode(_file: &cap_std::fs::File, _mode: u32) -> io::Result
     Ok(())
 }
 
+/// Renames the temporary to `destination` unless an entry is there, which
+/// is an `AlreadyExists` error. `false` where the filesystem can't rename
+/// that way.
+#[cfg(target_os = "linux")]
+fn rename_capability_file_without_replacing(
+    directory: &cap_std::fs::Dir,
+    temporary_name: &OsStr,
+    destination: &OsStr,
+    _temporary: &cap_std::fs::File,
+) -> io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let from = std::ffi::CString::new(temporary_name.as_bytes())?;
+    let to = std::ffi::CString::new(destination.as_bytes())?;
+    let directory = directory.as_raw_fd();
+    // SAFETY: both names are NUL-terminated and outlive the call, and the
+    // directory descriptor stays open for it.
+    let renamed = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            directory,
+            from.as_ptr(),
+            directory,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if renamed == 0 {
+        return Ok(true);
+    }
+    no_replace_rename_unsupported(io::Error::last_os_error())
+}
+
+#[cfg(target_os = "macos")]
+fn rename_capability_file_without_replacing(
+    directory: &cap_std::fs::Dir,
+    temporary_name: &OsStr,
+    destination: &OsStr,
+    _temporary: &cap_std::fs::File,
+) -> io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let from = std::ffi::CString::new(temporary_name.as_bytes())?;
+    let to = std::ffi::CString::new(destination.as_bytes())?;
+    let directory = directory.as_raw_fd();
+    // SAFETY: both names are NUL-terminated and outlive the call, and the
+    // directory descriptor stays open for it.
+    let renamed = unsafe {
+        libc::renameatx_np(
+            directory,
+            from.as_ptr(),
+            directory,
+            to.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if renamed == 0 {
+        return Ok(true);
+    }
+    no_replace_rename_unsupported(io::Error::last_os_error())
+}
+
+/// `false` for the errors a filesystem without no-replace renames gives.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn no_replace_rename_unsupported(error: io::Error) -> io::Result<bool> {
+    let unsupported = [libc::EINVAL, libc::ENOSYS, libc::ENOTSUP, libc::EOPNOTSUPP];
+    if error
+        .raw_os_error()
+        .is_some_and(|code| unsupported.contains(&code))
+    {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(windows)]
+fn rename_capability_file_without_replacing(
+    directory: &cap_std::fs::Dir,
+    _temporary_name: &OsStr,
+    destination: &OsStr,
+    temporary: &cap_std::fs::File,
+) -> io::Result<bool> {
+    rename_capability_handle(directory, destination, temporary, false).map(|()| true)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn rename_capability_file_without_replacing(
+    _directory: &cap_std::fs::Dir,
+    _temporary_name: &OsStr,
+    _destination: &OsStr,
+    _temporary: &cap_std::fs::File,
+) -> io::Result<bool> {
+    Ok(false)
+}
+
 #[cfg(not(windows))]
 fn replace_capability_file(
     directory: &cap_std::fs::Dir,
@@ -284,6 +591,19 @@ fn replace_capability_file(
     _temporary_name: &OsStr,
     destination: &OsStr,
     temporary: cap_std::fs::File,
+) -> io::Result<()> {
+    rename_capability_handle(directory, destination, &temporary, true)
+}
+
+/// Renames the open `temporary` to `destination` in `directory`, replacing
+/// an entry there only when `replace` is set; an entry that stays is an
+/// `AlreadyExists` error.
+#[cfg(windows)]
+fn rename_capability_handle(
+    directory: &cap_std::fs::Dir,
+    destination: &OsStr,
+    temporary: &cap_std::fs::File,
+    replace: bool,
 ) -> io::Result<()> {
     use std::mem::{offset_of, size_of};
     use std::os::windows::ffi::OsStrExt as _;
@@ -313,7 +633,7 @@ fn replace_capability_file(
     unsafe {
         // SAFETY: storage is aligned and sized for the variable-length rename record. Both
         // handles remain open for each synchronous call, and the UTF-16 filename is copied in full.
-        (*info).Anonymous.ReplaceIfExists = true;
+        (*info).Anonymous.ReplaceIfExists = replace;
         (*info).RootDirectory = directory.as_raw_handle();
         (*info).FileNameLength = file_name_bytes;
         std::ptr::copy_nonoverlapping(
@@ -444,6 +764,7 @@ pub fn is_atomic_temp_name(name: &str) -> bool {
 fn create_temporary(
     parent: &Path,
     exact_mode: Option<u32>,
+    owner_only: bool,
     mut next_path: impl FnMut() -> io::Result<PathBuf>,
 ) -> io::Result<CreatedTemporary> {
     let mut last_collision = None;
@@ -456,7 +777,7 @@ fn create_temporary(
             ));
         }
 
-        match open_temporary(&path, exact_mode) {
+        match open_temporary(&path, exact_mode, owner_only) {
             Ok(file) => return Ok(CreatedTemporary::new(path, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 last_collision = Some(error);
@@ -473,7 +794,7 @@ fn create_temporary(
     }))
 }
 
-fn open_temporary(path: &Path, exact_mode: Option<u32>) -> io::Result<File> {
+fn open_temporary(path: &Path, exact_mode: Option<u32>, owner_only: bool) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create_new(true);
     #[cfg(not(unix))]
@@ -484,7 +805,36 @@ fn open_temporary(path: &Path, exact_mode: Option<u32>) -> io::Result<File> {
 
         options.mode(exact_mode.unwrap_or(0o666));
     }
+    #[cfg(windows)]
+    if owner_only {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+        use windows_sys::Win32::Storage::FileSystem::{DELETE, READ_CONTROL, WRITE_DAC};
+
+        options.access_mode(GENERIC_READ | GENERIC_WRITE | DELETE | READ_CONTROL | WRITE_DAC);
+    }
+    #[cfg(not(windows))]
+    let _ = owner_only;
     options.open(path)
+}
+
+/// Applies [`AtomicWriteOptions::owner_only`] beyond the mode to a file just
+/// created. A macOS volume that holds no ACLs leaves nothing to remove.
+#[cfg(target_os = "macos")]
+fn restrict_to_owner(file: impl std::os::fd::AsFd) -> io::Result<()> {
+    match crate::macos_acl::has_extended_acl(&file) {
+        Ok(true) => crate::macos_acl::clear_extended_acl(&file),
+        Ok(false) => Ok(()),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOTSUP | libc::EOPNOTSUPP)) => {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn restrict_to_owner(file: &impl std::os::windows::io::AsRawHandle) -> io::Result<()> {
+    crate::owner_only::protect_file(file)
 }
 
 #[cfg(unix)]
@@ -630,13 +980,128 @@ fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
     Err(io::Error::other("atomic replacement retry loop exhausted"))
 }
 
+/// A file's device and number, which no other file shares while it
+/// exists.
+#[cfg(unix)]
+pub(crate) fn file_identity(file: &std::fs::File) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = file.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+pub(crate) fn file_identity(file: &std::fs::File) -> io::Result<(u64, u64)> {
+    let information = windows_file_information(file)?;
+    Ok((
+        u64::from(information.dwVolumeSerialNumber),
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    ))
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_file_information(
+    file: &std::fs::File,
+) -> io::Result<windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the handle is valid for the call and `information` is writable.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(information)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn file_identity(_file: &std::fs::File) -> io::Result<(u64, u64)> {
+    Ok((0, 0))
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use super::{AtomicWriteOptions, write_file_atomic_with_options};
-    use super::{create_temporary, write_file_atomic, write_file_atomic_in_dir_with};
+    use super::write_file_atomic_with_options;
+    use super::{
+        AtomicWriteOptions, create_file_atomic_in_dir_with_options, create_temporary, simulated,
+        write_file_atomic, write_file_atomic_in_dir_with,
+    };
     use std::fs;
     use std::io::{self, Write as _};
+
+    fn create(dir: &std::path::Path, contents: &[u8]) -> io::Result<Option<()>> {
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(dir, cap_std::ambient_authority()).unwrap();
+        create_file_atomic_in_dir_with_options(
+            &directory,
+            ".env".as_ref(),
+            AtomicWriteOptions::new().owner_only(),
+            |file| file.write_all(contents),
+        )
+    }
+
+    fn leftover_temporaries(dir: &std::path::Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".lpm-"))
+            .collect()
+    }
+
+    #[test]
+    fn without_hard_links_a_new_file_is_renamed_into_place_whole() {
+        simulated::NO_HARD_LINKS.set(true);
+        let dir = tempfile::tempdir().unwrap();
+
+        let first = create(dir.path(), b"TOKEN=first\n");
+        let second = create(dir.path(), b"TOKEN=second\n");
+        simulated::NO_HARD_LINKS.set(false);
+
+        assert_eq!(first.unwrap(), Some(()));
+        assert_eq!(second.unwrap(), None);
+        assert_eq!(fs::read(dir.path().join(".env")).unwrap(), b"TOKEN=first\n");
+        assert!(leftover_temporaries(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_copy_that_fails_leaves_no_partial_file_for_the_retry_to_keep() {
+        simulated::NO_HARD_LINKS.set(true);
+        simulated::NO_RENAME_WITHOUT_REPLACING.set(true);
+        simulated::FAILING_COPY.set(true);
+        let dir = tempfile::tempdir().unwrap();
+
+        let failed = create(dir.path(), b"TOKEN=complete\n");
+        let destination_after_failure = dir.path().join(".env").exists();
+        simulated::FAILING_COPY.set(false);
+        let retried = create(dir.path(), b"TOKEN=complete\n");
+        simulated::NO_HARD_LINKS.set(false);
+        simulated::NO_RENAME_WITHOUT_REPLACING.set(false);
+
+        assert!(failed.is_err());
+        assert!(!destination_after_failure);
+        assert_eq!(retried.unwrap(), Some(()));
+        assert_eq!(
+            fs::read(dir.path().join(".env")).unwrap(),
+            b"TOKEN=complete\n"
+        );
+        assert!(leftover_temporaries(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_failed_copy_leaves_a_file_that_replaced_it_alone() {
+        simulated::NO_HARD_LINKS.set(true);
+        simulated::NO_RENAME_WITHOUT_REPLACING.set(true);
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".env"), b"USER=kept\n").unwrap();
+
+        let kept = create(dir.path(), b"TOKEN=new\n");
+        simulated::NO_HARD_LINKS.set(false);
+        simulated::NO_RENAME_WITHOUT_REPLACING.set(false);
+
+        assert_eq!(kept.unwrap(), None);
+        assert_eq!(fs::read(dir.path().join(".env")).unwrap(), b"USER=kept\n");
+    }
 
     #[test]
     fn capability_relative_atomic_write_replaces_an_existing_file() {
@@ -765,7 +1230,7 @@ mod tests {
         ];
         let mut index = 0;
 
-        let temporary = create_temporary(dir.path(), None, || {
+        let temporary = create_temporary(dir.path(), None, false, || {
             let candidate = candidates[index].clone();
             index += 1;
             Ok(candidate)
@@ -886,7 +1351,7 @@ mod tests {
         let candidates = [collision.clone(), available.clone()];
         let mut index = 0;
 
-        let temporary = create_temporary(dir.path(), None, || {
+        let temporary = create_temporary(dir.path(), None, false, || {
             let candidate = candidates[index].clone();
             index += 1;
             Ok(candidate)
