@@ -2514,6 +2514,45 @@ fn install_with_no_dependencies_succeeds() {
     );
 }
 
+#[test]
+fn install_keeps_lpm_state_out_of_git_without_a_project_gitignore() {
+    let project =
+        TempProject::empty(r#"{"name":"state-ignored","version":"1.0.0","dependencies":{}}"#);
+
+    let output = lpm(&project).args(["install"]).output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        project.read_file(".lpm/.gitignore"),
+        "# LPM's machine-local state. Nothing here belongs in git.\n*\n"
+    );
+    assert!(!project.file_exists(".gitignore"));
+}
+
+#[test]
+fn install_removes_the_entries_older_installs_appended_to_gitignore() {
+    let project =
+        TempProject::empty(r#"{"name":"legacy-entries","version":"1.0.0","dependencies":{}}"#);
+    project.write_file(
+        ".gitignore",
+        "node_modules/\n\n# LPM wrapper tree (auto-generated)\n.lpm/wrappers/\n\n# LPM hoisted state (auto-generated)\n.lpm/hoisted/\n\n# LPM Agent Skills (auto-generated)\n.lpm/skills/\n",
+    );
+
+    let output = lpm(&project).args(["install"]).output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(project.read_file(".gitignore"), "node_modules/\n");
+    assert!(project.file_exists(".lpm/.gitignore"));
+}
+
 /// Single-writer ownership pin: the empty-deps short-circuit at the
 /// top of `run_with_options_under_store_lock` MUST emit a v6
 /// `.lpm/install-hash` (3 lines: `<hash>\nm:<pkg_ns>:<lock_ns>\nl:<mode>\n`)

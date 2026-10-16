@@ -1508,7 +1508,7 @@ async fn tunnel_start_says_to_replace_a_linked_lpm_gitignore_git_doesnt_read() {
         stderr.contains("git doesn't ignore")
             && stderr.contains(
                 "replace .lpm/.gitignore, which git doesn't read as a file of the project's, \
-                 with a file that holds `inspector.db*`"
+                 with a file that holds `*`, so git ignores all of .lpm"
             )
             && !stderr.contains("git ignores it"),
         "{stderr}"
@@ -1596,8 +1596,8 @@ fn tunnel_inspect_reports_a_capture_database_it_cant_open_as_a_disk_error_under_
             .as_str()
             .is_some_and(|message| message.ends_with(
                 "move it aside together with any inspector.db-wal, inspector.db-shm and \
-                 inspector.db-journal beside it, under names that still start inspector.db \
-                 so git goes on ignoring them, and retry"
+                 inspector.db-journal beside it, renamed alike with each suffix kept and left \
+                 in .lpm so git goes on ignoring them, and retry"
             )),
         "{envelope}"
     );
@@ -1846,8 +1846,8 @@ fn tunnel_inspect_reports_an_actionable_corrupt_database_error() {
     assert!(rendered.contains(".lpm/inspector.db"));
     assert!(rendered.contains(
         "move it aside together with any inspector.db-wal, inspector.db-shm and \
-         inspector.db-journal beside it, under names that still start inspector.db so git \
-         goes on ignoring them, and retry"
+         inspector.db-journal beside it, renamed alike with each suffix kept and left in .lpm \
+         so git goes on ignoring them, and retry"
     ));
     assert!(
         !rendered.contains("network connection"),

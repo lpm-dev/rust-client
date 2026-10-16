@@ -62,7 +62,6 @@ pub(super) async fn install_skills_for_packages(
         total_installed += result.installed;
     }
 
-    ensure_skills_gitignore(project_dir);
     if show_progress {
         output::info(&format!(
             "Materialized {total_installed} package-published skill(s)"

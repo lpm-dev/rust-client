@@ -130,6 +130,9 @@ fn write_record(directory: &Dir, name: &OsStr, bytes: &[u8]) -> io::Result<()> {
 impl Recovery {
     fn state_directory(&self, create: bool) -> io::Result<Option<Dir>> {
         let lpm = self.directory.open_dir_nofollow(".lpm")?;
+        if create {
+            lpm_common::keep_state_dir_ignored_or_warn(&lpm, &self.root.join(".lpm"));
+        }
         match lpm.open_dir_nofollow(DIRECTORY) {
             Ok(directory) => Ok(Some(directory)),
             Err(error) if error.kind() == io::ErrorKind::NotFound && !create => Ok(None),

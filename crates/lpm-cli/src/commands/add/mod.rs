@@ -1636,7 +1636,6 @@ async fn run_locked(
                 Some(&version),
                 &response.skills,
             )?;
-            crate::commands::install::ensure_skills_gitignore(project_dir);
             Ok::<_, LpmError>(result.installed)
         }
         .await;

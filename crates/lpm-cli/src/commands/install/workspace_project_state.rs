@@ -202,8 +202,7 @@ impl WorkspaceProjectStateTransaction {
 
     fn reserve_backup_root(&mut self) -> std::io::Result<&Path> {
         if self.backup_root.is_none() {
-            let dot_lpm = self.project_dir.join(".lpm");
-            std::fs::create_dir_all(&dot_lpm)?;
+            let dot_lpm = lpm_common::ensure_project_state_dir(&self.project_dir)?;
             loop {
                 let transaction_id = NEXT_TRANSACTION_ID.fetch_add(1, Ordering::Relaxed);
                 let candidate = dot_lpm.join(format!(

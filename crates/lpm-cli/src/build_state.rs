@@ -338,8 +338,7 @@ pub fn read_build_state_for_approval(project_dir: &Path) -> Result<Option<BuildS
 /// than corrupting it.
 pub fn write_build_state(project_dir: &Path, state: &BuildState) -> Result<(), LpmError> {
     let write_start = std::time::Instant::now();
-    let lpm_dir = project_dir.join(".lpm");
-    std::fs::create_dir_all(&lpm_dir).map_err(LpmError::Io)?;
+    lpm_common::ensure_project_state_dir(project_dir)?;
 
     let target = build_state_path(project_dir);
     let mut authenticated = state.clone();
@@ -1781,11 +1780,18 @@ mod tests {
         write_build_state(dir.path(), &make_state(vec![])).unwrap();
 
         let lpm_dir = dir.path().join(".lpm");
-        let entries: Vec<_> = std::fs::read_dir(&lpm_dir)
+        let mut entries: Vec<_> = std::fs::read_dir(&lpm_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
-        assert_eq!(entries, [std::ffi::OsString::from(BUILD_STATE_FILENAME)]);
+        entries.sort();
+        assert_eq!(
+            entries,
+            [
+                std::ffi::OsString::from(".gitignore"),
+                std::ffi::OsString::from(BUILD_STATE_FILENAME)
+            ]
+        );
     }
 
     #[test]

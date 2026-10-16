@@ -221,8 +221,7 @@ pub fn read_state(project_dir: &Path) -> Option<OverridesState> {
 /// the `.lpm/` directory if it doesn't exist. A crash before replacement
 /// leaves the previous state intact.
 pub fn write_state(project_dir: &Path, state: &OverridesState) -> Result<(), LpmError> {
-    let lpm_dir = project_dir.join(".lpm");
-    std::fs::create_dir_all(&lpm_dir).map_err(LpmError::Io)?;
+    let lpm_dir = lpm_common::ensure_project_state_dir(project_dir)?;
 
     let json = serde_json::to_string_pretty(state)
         .map_err(|e| LpmError::Script(format!("failed to serialize overrides state: {e}")))?;

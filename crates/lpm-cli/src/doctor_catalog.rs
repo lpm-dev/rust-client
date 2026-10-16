@@ -838,6 +838,30 @@ pub static GITATTRIBUTES_UNREADABLE: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
+pub static PROJECT_STATE_UNTRACKED: CheckEntry = CheckEntry {
+    code: "project_state_untracked",
+    name: ".lpm state",
+    category: Category::ProjectState,
+    tier: Tier::Extended,
+    description: "Git tracks nothing in the project's `.lpm` directory.",
+    when_fires: "The project is in a Git repository with a `.lpm` directory and none of its files are tracked.",
+    remediation: "No action — informational pass.",
+    possible_severities: &[Severity::Pass],
+    auto_fix: None,
+};
+
+pub static PROJECT_STATE_TRACKED: CheckEntry = CheckEntry {
+    code: "project_state_tracked",
+    name: ".lpm state",
+    category: Category::ProjectState,
+    tier: Tier::Extended,
+    description: "Git tracks files in `.lpm`, which holds machine-local state such as install checkpoints, trust snapshots, certificates, and tunnel captures.",
+    when_fires: "`git ls-files` lists files under the project's `.lpm` directory.",
+    remediation: "Run `git rm -r --cached .lpm` and commit. `.lpm` ignores itself, so the files stay out of later commits.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
 pub static DEPS_SYNC_CLEAN: CheckEntry = CheckEntry {
     code: "deps_sync_clean",
     name: "Dependencies",
@@ -2176,6 +2200,8 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &GITATTRIBUTES_LOCKB_UNMARKED,
     &GITATTRIBUTES_MISSING,
     &GITATTRIBUTES_UNREADABLE,
+    &PROJECT_STATE_UNTRACKED,
+    &PROJECT_STATE_TRACKED,
     &DEPS_SYNC_CLEAN,
     &DEPS_SYNC_DRIFT,
     &LOCAL_SOURCE_DIR_OK,
