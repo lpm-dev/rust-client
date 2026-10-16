@@ -53,7 +53,7 @@ pub(super) fn emit_project_env_for_ci(
         CiEnvDestination::DotenvFile(file) => {
             let write = lpm_common::project_secret::write_secret_file(
                 project_dir,
-                &project_dir.join(file),
+                &super::local::invocation_relative(file)?,
                 output.as_bytes(),
                 lpm_common::project_secret::SecretFileOptions {
                     ignore_file: lpm_common::project_secret::IgnoreFile::RepositoryExclude,
@@ -61,7 +61,7 @@ pub(super) fn emit_project_env_for_ci(
                     existing: lpm_common::project_secret::Existing::Replace,
                 },
             )
-            .map_err(|error| LpmError::Script(error.to_string()))?;
+            .map_err(LpmError::from)?;
             if json_output {
                 println!(
                     "{}",

@@ -22,7 +22,8 @@ use super::format::{
 use super::helpers::{
     argv_requests_top_level_version, build_install_global_overrides_with_excludes,
     command_allows_background_update, command_needs_global_state, install_omit_policy_from_cli,
-    maybe_emit_network_fs_warning, print_version_with_notice, resolve_install_project_dir,
+    maybe_emit_network_fs_warning, npmrc_project_dir, package_root_for, print_version_with_notice,
+    project_relative_path, project_root_for, project_root_for_state, resolve_install_project_dir,
     resolve_tunnel_bearer, should_suppress_update_banner, spawn_background_update_check,
     tunnel_action_requires_session, validate_global_install_project_scoped_flags,
     validate_global_install_unsupported_flags, validate_global_uninstall_project_scoped_flags,
@@ -521,7 +522,10 @@ async fn async_main(cli: Cli) -> Result<()> {
             let lifecycle_args::TidyArgs {
                 fix,
             } = args;
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let cwd = package_root_for(
+                &std::env::current_dir().map_err(lpm_common::LpmError::Io)?,
+                cli.json,
+            );
             commands::tidy::run(&client, &cwd, fix, cli.json).await
         }
         Commands::Resolve(args) => {
@@ -1235,7 +1239,10 @@ async fn async_main(cli: Cli) -> Result<()> {
                     commands::uninstall_global::run(&packages[0], cli.json).await
                 }
             } else {
-                let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+                let cwd = package_root_for(
+                    &std::env::current_dir().map_err(lpm_common::LpmError::Io)?,
+                    cli.json,
+                );
                 commands::uninstall::run(
                     &client,
                     &cwd,
@@ -1274,7 +1281,10 @@ async fn async_main(cli: Cli) -> Result<()> {
                     output::warn(&lpm_common::sanitize_terminal_inline(&warning));
                 }
             }
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let invocation_dir = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let cwd = package_root_for(&invocation_dir, cli.json);
+            let path = path
+                .map(|path| project_relative_path(&invocation_dir, &cwd, std::path::Path::new(&path)));
             let config = commands::config::GlobalConfig::load_checked()?;
             let no_skills = !lpm_skills_config::LpmSkillsPreference::from_cli(skills, no_skills)
                 .resolve(&config)?;
@@ -1323,7 +1333,11 @@ async fn async_main(cli: Cli) -> Result<()> {
                     output::warn(&lpm_common::sanitize_terminal_inline(&warning));
                 }
             }
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let invocation_dir = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let cwd = package_root_for(&invocation_dir, cli.json);
+            let provenance_file = provenance_file.map(|path| {
+                project_relative_path(&invocation_dir, &cwd, &path)
+            });
 
             // OIDC auto-exchange happens inside publish::run after package.json
             // is parsed — the origin requires `package` for `scope=publish`.
@@ -1359,7 +1373,10 @@ async fn async_main(cli: Cli) -> Result<()> {
                 tag_prefix,
                 message,
             } = args;
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let cwd = package_root_for(
+                &std::env::current_dir().map_err(lpm_common::LpmError::Io)?,
+                cli.json,
+            );
             let message = commands::version::default_message(message);
             commands::version::run(
                 &cwd,
@@ -1442,7 +1459,8 @@ async fn async_main(cli: Cli) -> Result<()> {
                     output::warn(&lpm_common::sanitize_terminal_inline(&warning));
                 }
             }
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let invocation_dir = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let cwd = package_root_for(&invocation_dir, cli.json);
             match command {
                 StageCommands::Publish {
                     tag,
@@ -1457,6 +1475,9 @@ async fn async_main(cli: Cli) -> Result<()> {
                     ignore_scripts,
                     npm_registry,
                 } => {
+                    let provenance_file = provenance_file.map(|path| {
+                        project_relative_path(&invocation_dir, &cwd, &path)
+                    });
                     commands::stage::publish_current_project(
                         &cwd,
                         commands::stage::StagePublishOptions {
@@ -1620,11 +1641,12 @@ async fn async_main(cli: Cli) -> Result<()> {
                 match target {
                     commands::setup::CiSetupTarget::Npmrc => {
                         let effective_registry = setup_registry.as_deref().unwrap_or(registry_url);
+                        let npmrc_dir = npmrc_project_dir(&cwd, cli.json);
                         commands::setup::run(
                             &client,
                             &session,
                             effective_registry,
-                            &cwd,
+                            &npmrc_dir,
                             cli.json,
                             oidc,
                         )
@@ -1633,7 +1655,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                     commands::setup::CiSetupTarget::Workflow(platform) => {
                         commands::setup::run_ci_platform(
                             platform,
-                            &cwd,
+                            &project_root_for(&cwd, cli.json),
                             env.as_deref()
                                 .unwrap_or(commands::setup::DEFAULT_CI_ENVIRONMENT),
                             cli.json,
@@ -1643,7 +1665,8 @@ async fn async_main(cli: Cli) -> Result<()> {
             }
             SetupAction::Local { days } => {
                 let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-                commands::npmrc::run(&client, &cwd, registry_url, days, cli.json).await
+                let npmrc_dir = npmrc_project_dir(&cwd, cli.json);
+                commands::npmrc::run(&client, &npmrc_dir, registry_url, days, cli.json).await
             }
         },
         Commands::TokenRotate(args) => {
@@ -1653,7 +1676,10 @@ async fn async_main(cli: Cli) -> Result<()> {
             let lifecycle_args::OutdatedArgs {
                 registry_only,
             } = args;
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let cwd = package_root_for(
+                &std::env::current_dir().map_err(lpm_common::LpmError::Io)?,
+                cli.json,
+            );
             commands::outdated::run(
                 &client,
                 &cwd,
@@ -1670,7 +1696,10 @@ async fn async_main(cli: Cli) -> Result<()> {
                 interactive,
                 yes,
             } = args;
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let cwd = package_root_for(
+                &std::env::current_dir().map_err(lpm_common::LpmError::Io)?,
+                cli.json,
+            );
             commands::upgrade::run(
                 &client,
                 &cwd,
@@ -1737,7 +1766,16 @@ async fn async_main(cli: Cli) -> Result<()> {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::policy::run(action, &cwd, cli.json).await
         }
-        Commands::Security(args) => commands::security::run(&args.action, cli.json).await,
+        Commands::Security(args) => {
+            let status_dir = match &args.action {
+                commands::security::SecurityCmd::Status {
+                    project: None,
+                    global: false,
+                } => Some(package_root_for(&std::env::current_dir()?, cli.json)),
+                _ => None,
+            };
+            commands::security::run(&args.action, status_dir, cli.json).await
+        }
         Commands::Cache(args) => {
             let lifecycle_args::CacheArgs { action } = args;
             commands::cache::run(action, cli.json, client.session().cloned()).await
@@ -1750,7 +1788,10 @@ async fn async_main(cli: Cli) -> Result<()> {
             let lifecycle_args::CatalogArgs {
                 action,
             } = args;
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let cwd = package_root_for(
+                &std::env::current_dir().map_err(lpm_common::LpmError::Io)?,
+                cli.json,
+            );
             commands::catalog::run(&cwd, action, cli.json)
         }
         Commands::Global(args) => commands::global::run(&client, args.action, cli.json).await,
@@ -1758,19 +1799,26 @@ async fn async_main(cli: Cli) -> Result<()> {
             let security_args::TrustArgs {
                 action,
             } = args;
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let cwd = package_root_for(
+                &std::env::current_dir().map_err(lpm_common::LpmError::Io)?,
+                cli.json,
+            );
             commands::trust::run(&action, &cwd, cli.json).await
         }
         Commands::Pool => commands::pool::run(&client, cli.json).await,
         Commands::Skills(args) => {
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::skills::run(&client, args.action, &cwd, cli.json).await
+            let invocation_dir = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let cwd = package_root_for(&invocation_dir, cli.json);
+            commands::skills::run(&client, args.action, &cwd, &invocation_dir, cli.json).await
         }
         Commands::Remove(args) => {
             let lifecycle_args::RemoveArgs {
                 package,
             } = args;
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let cwd = package_root_for(
+                &std::env::current_dir().map_err(lpm_common::LpmError::Io)?,
+                cli.json,
+            );
             commands::remove::run(&cwd, &package, cli.json).await
         }
         Commands::Audit(args) => {
@@ -1782,7 +1830,10 @@ async fn async_main(cli: Cli) -> Result<()> {
                 fix,
                 dry_run,
             } = args;
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let cwd = package_root_for(
+                &std::env::current_dir().map_err(lpm_common::LpmError::Io)?,
+                cli.json,
+            );
             if let Some(commands::audit::AuditCmd::Fix { dry_run }) = action.as_ref() {
                 if fix {
                     return Err(lpm_common::LpmError::Script(
@@ -1868,7 +1919,10 @@ async fn async_main(cli: Cli) -> Result<()> {
                 sandbox_log,
                 no_engine_strict,
             } = args;
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let cwd = package_root_for(
+                &std::env::current_dir().map_err(lpm_common::LpmError::Io)?,
+                cli.json,
+            );
             // engines.* enforcement: rebuild executes lifecycle scripts
             // under the project's engine constraints, so the gate runs
             // before any script is selected. Skip in --dry-run since no
@@ -1941,7 +1995,10 @@ async fn async_main(cli: Cli) -> Result<()> {
                 commands::doctor::list(cli.json, code.as_deref(), category.as_deref())
             }
             None => {
-                let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+                let cwd = project_root_for(
+                    &std::env::current_dir().map_err(lpm_common::LpmError::Io)?,
+                    cli.json,
+                );
                 commands::doctor::run(
                     &client,
                     registry_url,
@@ -1971,7 +2028,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 remove,
             } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            let project_dir = lpm_workspace::find_project_root(&cwd).unwrap_or(cwd);
+            let project_dir = project_root_for(&cwd, cli.json);
             commands::r#use::run_cli(&args, list, pin, remove, &project_dir, cli.json).await
         },
         Commands::Env(args) => {
@@ -1979,7 +2036,12 @@ async fn async_main(cli: Cli) -> Result<()> {
                 extra,
             } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
-            commands::env::run(&client, &cwd, &extra, cli.json).await
+            let project_dir = if commands::env::is_account_action(&extra) {
+                cwd
+            } else {
+                project_root_for_state(&cwd, cli.json)?
+            };
+            commands::env::run(&client, &project_dir, &extra, cli.json).await
         },
         Commands::Run(args) => {
             let network_args::RunArgs {
@@ -2003,8 +2065,15 @@ async fn async_main(cli: Cli) -> Result<()> {
                 args,
             } = args;
             lpm_runner::script::set_skip_env_validation(no_env_check);
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let invocation_dir = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let workspace_mode = all || !filter.is_empty() || !filter_prod.is_empty() || affected;
+            // Scripts run in their package's directory, as npm runs them; a
+            // workspace run discovers the workspace from where it was started.
+            let cwd = if workspace_mode {
+                invocation_dir
+            } else {
+                project_root_for(&invocation_dir, cli.json)
+            };
             if workspace_concurrency.is_some() && !workspace_mode {
                 return Err(lpm_common::LpmError::Script(
                     "--workspace-concurrency requires --all, --filter, --filter-prod, or --affected"
@@ -2234,7 +2303,10 @@ async fn async_main(cli: Cli) -> Result<()> {
                             .into(),
                     ));
                 }
-                let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+                let cwd = package_root_for(
+                &std::env::current_dir().map_err(lpm_common::LpmError::Io)?,
+                cli.json,
+            );
                 commands::approve_scripts::run(
                     &client,
                     &cwd,
@@ -2767,7 +2839,10 @@ async fn async_main(cli: Cli) -> Result<()> {
                 args,
             } = args;
             lpm_runner::script::set_skip_env_validation(no_env_check);
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let cwd = project_root_for_state(
+                &std::env::current_dir().map_err(lpm_common::LpmError::Io)?,
+                cli.json,
+            )?;
             let lpm_config = lpm_runner::lpm_json::read_lpm_json(&cwd)
                 .map_err(lpm_common::LpmError::Script)?;
             let runtime_spec = |runtime| {
@@ -2857,7 +2932,12 @@ async fn async_main(cli: Cli) -> Result<()> {
                 fail_on_missing,
                 dry_run,
             } = args;
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let invocation_dir = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let cwd = match action.as_str() {
+                "generate" => project_root_for_state(&invocation_dir, cli.json)?,
+                "status" => project_root_for(&invocation_dir, cli.json),
+                _ => invocation_dir,
+            };
             commands::cert::run(
                 &action,
                 &cwd,
@@ -2925,7 +3005,12 @@ async fn async_main(cli: Cli) -> Result<()> {
                 yes,
                 pid,
             } = args;
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let invocation_dir = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let cwd = if (action == "list" && !all) || action == "reset" {
+                project_root_for(&invocation_dir, cli.json)
+            } else {
+                invocation_dir
+            };
             commands::ports::run(&action, target.as_deref(), &cwd, cli.json, all, yes, pid).await
         }
         Commands::Hosts(args) => commands::hosts::run(&args.action, cli.json, args.yes),
@@ -2941,7 +3026,12 @@ async fn async_main(cli: Cli) -> Result<()> {
                 public_tls_port,
                 forwarder_config,
             } = args;
-            let project_dir = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let invocation_dir = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let project_dir = if matches!(action.as_str(), "start" | "install") {
+                project_root_for(&invocation_dir, cli.json)
+            } else {
+                invocation_dir
+            };
             commands::proxy::run(commands::proxy::ProxyRunOptions {
                 action: &action,
                 project_dir: &project_dir,
@@ -3005,12 +3095,20 @@ async fn async_main(cli: Cli) -> Result<()> {
             if let Some(replay_port) = replay_port {
                 args.push(format!("--port={replay_port}"));
             }
-            let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             // Determine if action is a port number or a named action
             let (effective_action, effective_port) = if let Ok(p) = action.parse::<u16>() {
                 ("start", Some(p))
             } else {
                 (action.as_str(), None)
+            };
+            let invocation_dir = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
+            let cwd = if matches!(
+                effective_action,
+                "claim" | "unclaim" | "release" | "list" | "ls" | "domains"
+            ) {
+                invocation_dir
+            } else {
+                project_root_for_state(&invocation_dir, cli.json)?
             };
             // Only relay-facing tunnel actions need auth. Local log inspection
             // and replay stay useful on a fresh machine and should not depend

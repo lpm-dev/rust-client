@@ -258,17 +258,24 @@ impl NpmrcConfig {
     }
 }
 
-fn npm_project_npmrc(cwd: &Path, home: Option<&Path>) -> ProjectNpmrcOutcome {
-    let Some(project) = lpm_workspace::find_project_root(cwd) else {
-        return ProjectNpmrcOutcome::None;
-    };
+/// The directory whose `.npmrc` is the project layer for a command run in
+/// `cwd`: the workspace root, else the nearest directory with a
+/// `package.json`, never `home`. Writers of a project `.npmrc` use it so the
+/// file lands where the reader looks.
+pub fn project_npmrc_dir(cwd: &Path, home: Option<&Path>) -> Option<std::path::PathBuf> {
+    let project = lpm_workspace::find_project_root(cwd)?;
     if home.is_some_and(|home| project == home) {
-        return ProjectNpmrcOutcome::None;
+        return None;
     }
-    let selected = match lpm_workspace::find_workspace_root(&project) {
+    Some(match lpm_workspace::find_workspace_root(&project) {
         Ok(Some(workspace)) => workspace,
-        Ok(None) => project,
-        Err(_) => project,
+        Ok(None) | Err(_) => project,
+    })
+}
+
+fn npm_project_npmrc(cwd: &Path, home: Option<&Path>) -> ProjectNpmrcOutcome {
+    let Some(selected) = project_npmrc_dir(cwd, home) else {
+        return ProjectNpmrcOutcome::None;
     };
     match inspect_npmrc_at(&selected.join(".npmrc")) {
         NpmrcEntry::File(path) => ProjectNpmrcOutcome::File(path),

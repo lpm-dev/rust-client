@@ -572,8 +572,8 @@ pub static PACKAGE_JSON_MISSING: CheckEntry = CheckEntry {
     category: Category::ProjectState,
     tier: Tier::Fast,
     description: "No `package.json` exists in the project directory.",
-    when_fires: "`<project>/package.json` is missing.",
-    remediation: "Run `lpm init`, or `cd` into your project root before running doctor.",
+    when_fires: "The directory doctor checks has no `package.json`: the nearest one with a `package.json` or `lpm.json`, else the current directory.",
+    remediation: "Run `lpm init` in the project root.",
     possible_severities: &[Severity::Fail],
     auto_fix: None,
 };

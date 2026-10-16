@@ -148,7 +148,7 @@ pub(super) fn env_import(
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let path = project_dir.join(file);
+    let path = invocation_relative(file)?;
 
     let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
     let env_label = resolved_env.as_deref().unwrap_or("default");
@@ -201,7 +201,7 @@ pub(super) fn env_export(
             json_output,
         );
     }
-    let path = project_dir.join(file);
+    let path = invocation_relative(file)?;
 
     let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
     let env_label = resolved_env.as_deref().unwrap_or("default");
@@ -224,7 +224,7 @@ pub(super) fn env_export(
                     existing: lpm_common::project_secret::Existing::Replace,
                 },
             )
-            .map_err(|error| LpmError::Script(error.to_string()))?;
+            .map_err(LpmError::from)?;
             (count, write.warnings)
         }
     };
@@ -253,6 +253,13 @@ pub(super) fn env_export(
     Ok(())
 }
 
+/// `file` as the user typed it, relative to the directory the command ran
+/// in, which can be below the project.
+pub(super) fn invocation_relative(file: &str) -> Result<std::path::PathBuf, LpmError> {
+    std::path::absolute(file)
+        .map_err(|error| LpmError::Script(format!("failed to resolve {file}: {error}")))
+}
+
 /// Keeps an env file the user imported from, which holds secrets, out of
 /// git. Failing to is a warning: the import already happened.
 pub(super) fn keep_env_source_ignored(
@@ -266,7 +273,7 @@ pub(super) fn keep_env_source_ignored(
         lpm_common::project_secret::IgnoreFailure::Warn,
     )
     .map(|(_, warnings)| warnings)
-    .map_err(|error| LpmError::Script(error.to_string()))
+    .map_err(LpmError::from)
 }
 
 pub(super) fn print_secret_file_warnings(warnings: &[String]) {

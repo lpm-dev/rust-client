@@ -468,6 +468,40 @@ async fn stage_publish_provenance_file_invalid_json_fails_before_npm_auth() {
 }
 
 #[tokio::test]
+async fn stage_publish_provenance_file_follows_the_directory_it_runs_in() {
+    let mock = MockRegistry::start().await;
+    let project = stage_project();
+    project.write_file("src/bundle.sigstore", "not json");
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{"publish":{{"npm":{{"name":"@scope/staged-pkg","registry":"{}"}}}}}}"#,
+            mock.url()
+        ),
+    );
+
+    let output = lpm(&project)
+        .current_dir(project.path().join("src"))
+        .env("NPM_ID_TOKEN", NPM_ID_TOKEN)
+        .args([
+            "stage",
+            "publish",
+            "--provenance-file",
+            "bundle.sigstore",
+            "--yes",
+        ])
+        .output()
+        .expect("failed to run lpm stage publish --provenance-file from src");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid provenance file"),
+        "the bundle in src/ must be the one read, got:\n{stderr}"
+    );
+}
+
+#[tokio::test]
 async fn stage_publish_provenance_file_restricted_access_fails_before_file_validation() {
     let mock = MockRegistry::start().await;
     let project = stage_project();

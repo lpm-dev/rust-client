@@ -136,6 +136,42 @@ fn env_generate_ownership_filenames_escape_terminal_controls_once() {
 }
 
 #[test]
+fn env_generate_out_dir_follows_the_directory_it_runs_in() {
+    let project = project();
+    let deep = project.path().join("src").join("deep");
+    std::fs::create_dir_all(&deep).unwrap();
+    let generate = |args: &[&str]| {
+        lpm(&project)
+            .current_dir(&deep)
+            .args(["env", "generate"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    for (args, generated) in [
+        (&["--out-dir", "out-here"][..], deep.join("out-here")),
+        (
+            &["--out-dir", "../out-up"][..],
+            project.path().join("src/out-up"),
+        ),
+        (&[][..], project.path().join("env.generated")),
+    ] {
+        let output = generate(args);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(generated.is_dir(), "{args:?}: {}", generated.display());
+    }
+    let escaped = generate(&["--out-dir", "../../../escaped", "--json"]);
+    assert!(!escaped.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&escaped.stdout).unwrap();
+    assert_eq!(response["diagnostics"][0]["code"], "env.generate_path");
+}
+
+#[test]
 fn env_generate_existing_file_hint_uses_a_nonexistent_output_path() {
     let project = project();
     project.write_file("output", "keep");

@@ -82,6 +82,46 @@ async fn source_add_and_remove_use_in_project_paths_on_native_platforms() {
 }
 
 #[tokio::test]
+async fn source_add_paths_are_relative_to_where_the_command_ran() {
+    let mock = MockRegistry::start().await;
+    for package in ["subdirectory-source", "sibling-source"] {
+        let tarball = make_source_pkg_tarball(
+            package,
+            "1.0.0",
+            json!({"files": [{"src": "hello.txt", "dest": "hello.txt"}]}),
+            &[("hello.txt", package.as_bytes())],
+        );
+        mock.with_package(package, "1.0.0", &tarball).await;
+    }
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    let deep = project.path().join("src/deep");
+    std::fs::create_dir_all(&deep).unwrap();
+
+    for (package, path) in [
+        ("subdirectory-source", "widgets"),
+        ("sibling-source", "../shared"),
+    ] {
+        lpm_with_registry(&project, &mock.url())
+            .current_dir(&deep)
+            .args(["add", package, "--path", path, "--yes", "--no-skills"])
+            .assert()
+            .success();
+    }
+
+    assert_eq!(
+        project.read_file("src/deep/widgets/hello.txt"),
+        "subdirectory-source"
+    );
+    assert_eq!(project.read_file("src/shared/hello.txt"), "sibling-source");
+    let record = project.read_file("lpm-sources.json");
+    assert!(
+        record.contains("\"src/deep/widgets/hello.txt\""),
+        "{record}"
+    );
+    assert!(record.contains("\"src/shared/hello.txt\""), "{record}");
+}
+
+#[tokio::test]
 async fn kill_during_source_copy_is_recovered_before_remove() {
     let mock = MockRegistry::start().await;
     let package = "partial-source-copy";
