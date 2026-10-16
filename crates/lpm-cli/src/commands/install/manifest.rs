@@ -1411,9 +1411,11 @@ pub async fn run_add_packages(
                 required_paths.push(manifest.clone());
                 optional_paths.push(manifest.with_file_name("Package.resolved"));
             } else if let Some(xcodeproj) = xcodeproj_path.as_ref() {
-                let pbxproj = xcodeproj.join("project.pbxproj");
-                required_paths.push(pbxproj.clone());
-                optional_paths.push(pbxproj.with_extension("pbxproj.lpm-backup"));
+                required_paths.push(xcodeproj.join("project.pbxproj"));
+                optional_paths.extend([
+                    crate::xcode_project::project_backup_path(xcodeproj),
+                    crate::xcode_project::legacy_project_backup_path(xcodeproj),
+                ]);
                 optional_paths.extend(
                     crate::xcode_project::native::containers(project_dir, xcodeproj)?
                         .iter()
@@ -1857,9 +1859,11 @@ pub async fn run_install_filtered_add(
                         optional_paths.push(manifest_path.with_file_name("Package.resolved"));
                     }
                     SwiftInstallLocation::Xcode { xcodeproj_path } => {
-                        let pbxproj = xcodeproj_path.join("project.pbxproj");
-                        required_paths.push(pbxproj.clone());
-                        optional_paths.push(pbxproj.with_extension("pbxproj.lpm-backup"));
+                        required_paths.push(xcodeproj_path.join("project.pbxproj"));
+                        optional_paths.extend([
+                            crate::xcode_project::project_backup_path(xcodeproj_path),
+                            crate::xcode_project::legacy_project_backup_path(xcodeproj_path),
+                        ]);
                         optional_paths.extend(
                             crate::xcode_project::native::containers(cwd, xcodeproj_path)?
                                 .iter()

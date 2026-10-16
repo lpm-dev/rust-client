@@ -4,7 +4,7 @@
 //! - Finding .xcodeproj in a directory tree (walking up like find_package_swift)
 //! - Reading and editing project.pbxproj to add local Swift package references
 //! - Generating random 24-char hex object IDs
-//! - Atomic writes with backup for safety
+//! - Atomic writes that keep the previous project.pbxproj in `.lpm/xcode-backups/`
 
 pub(crate) mod native;
 mod repair;
@@ -296,7 +296,7 @@ pub fn link_local_package(
             )?;
             let changed = content != original;
             if changed {
-                write_pbxproj_atomic(&pbxproj, &original, &content)?;
+                write_pbxproj_with_backup(xcodeproj_path, &original, &content)?;
             }
             return Ok(XcodeLinkResult {
                 package_ref_added: false,
@@ -306,7 +306,8 @@ pub fn link_local_package(
         }
         (Some(_), None) | (None, Some(_)) => {
             return Err(LpmError::Registry(format!(
-                "incomplete LPMDependencies link in {project_name}.xcodeproj; restore project.pbxproj.lpm-backup or remove the stale package entries"
+                "incomplete LPMDependencies link in {project_name}.xcodeproj; remove the stale package entries, or restore {} (project.pbxproj before LPM's last edit)",
+                project_backup_path(xcodeproj_path).display()
             )));
         }
         (None, None) => {}
@@ -337,13 +338,6 @@ pub fn link_local_package(
     let product_dep_id = generate_object_id();
     let build_file_id = generate_object_id();
 
-    // Back up pbxproj before first modification
-    let backup_path = pbxproj.with_extension("pbxproj.lpm-backup");
-    if !backup_path.exists() {
-        lpm_common::write_file_atomic(&backup_path, content.as_bytes())
-            .map_err(|e| LpmError::Registry(format!("failed to back up project.pbxproj: {e}")))?;
-    }
-
     // Apply all edits
     let edited = insert_full_package_link(
         &link_content,
@@ -356,8 +350,7 @@ pub fn link_local_package(
         &build_file_id,
     )?;
 
-    // Atomic write
-    write_pbxproj_atomic(&pbxproj, &original, &edited)?;
+    write_pbxproj_with_backup(xcodeproj_path, &original, &edited)?;
 
     Ok(XcodeLinkResult {
         package_ref_added: true,
@@ -1002,20 +995,81 @@ fn find_block_end(content: &str) -> Option<usize> {
 }
 
 /// Write pbxproj content atomically.
-fn write_pbxproj_atomic(
-    pbxproj_path: &Path,
+const PROJECT_BACKUP_DIR: &str = "xcode-backups";
+
+/// Where `project.pbxproj` is kept as it was before LPM's last edit: the
+/// local `.lpm/` beside the `.xcodeproj`, never inside the committed bundle.
+pub(crate) fn project_backup_path(xcodeproj_path: &Path) -> PathBuf {
+    let mut name = xcodeproj_path
+        .file_stem()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
+    name.push(".pbxproj");
+    lpm_common::project_state_dir(xcodeproj_path.parent().unwrap_or(Path::new(".")))
+        .join(PROJECT_BACKUP_DIR)
+        .join(name)
+}
+
+/// The backup earlier releases left inside the `.xcodeproj` bundle.
+pub(crate) fn legacy_project_backup_path(xcodeproj_path: &Path) -> PathBuf {
+    xcodeproj_path.join("project.pbxproj.lpm-backup")
+}
+
+/// Replaces `project.pbxproj` with `content` when it still holds `expected`,
+/// after keeping `expected` at [`project_backup_path`].
+fn write_pbxproj_with_backup(
+    xcodeproj_path: &Path,
     expected: &str,
     content: &str,
 ) -> Result<(), LpmError> {
-    let current = read_pbxproj(pbxproj_path)?;
+    let pbxproj_path = xcodeproj_path.join("project.pbxproj");
+    let current = read_pbxproj(&pbxproj_path)?;
     if current != expected {
         return Err(LpmError::Registry(format!(
             "project.pbxproj changed during install: {}",
             pbxproj_path.display()
         )));
     }
-    lpm_common::write_file_atomic(pbxproj_path, content)
-        .map_err(|e| LpmError::Registry(format!("failed to write pbxproj: {e}")))
+    write_project_backup(xcodeproj_path, expected).map_err(|error| {
+        LpmError::Registry(format!(
+            "failed to back up {} to {}: {error}",
+            pbxproj_path.display(),
+            project_backup_path(xcodeproj_path).display()
+        ))
+    })?;
+    lpm_common::write_file_atomic(&pbxproj_path, content)
+        .map_err(|e| LpmError::Registry(format!("failed to write pbxproj: {e}")))?;
+    let legacy = legacy_project_backup_path(xcodeproj_path);
+    match std::fs::remove_file(&legacy) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(path = %legacy.display(), %error, "failed to remove the earlier project.pbxproj backup");
+        }
+    }
+    Ok(())
+}
+
+fn write_project_backup(xcodeproj_path: &Path, content: &str) -> std::io::Result<()> {
+    use cap_fs_ext::DirExt as _;
+
+    let project_root = xcodeproj_path.parent().unwrap_or(Path::new("."));
+    let root = cap_std::fs::Dir::open_ambient_dir(project_root, cap_std::ambient_authority())?;
+    let state = lpm_common::ensure_project_state_dir_in(&root, project_root)?;
+    match state.create_dir(PROJECT_BACKUP_DIR) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let backups = state.open_dir_nofollow(PROJECT_BACKUP_DIR)?;
+    let backup = project_backup_path(xcodeproj_path);
+    let name = backup.file_name().expect("backup path names a file");
+    lpm_common::write_file_atomic_in_dir_with_options(
+        &backups,
+        name,
+        lpm_common::AtomicWriteOptions::new(),
+        |file| std::io::Write::write_all(file, content.as_bytes()),
+    )
 }
 
 #[cfg(test)]
@@ -1481,16 +1535,55 @@ mod tests {
     #[test]
     fn pbxproj_write_rejects_a_concurrent_change() {
         let directory = tempfile::tempdir().unwrap();
-        let pbxproj = directory.path().join("project.pbxproj");
-        std::fs::write(&pbxproj, "new editor content").unwrap();
+        let xcodeproj = write_xcodeproj(directory.path(), "MyApp", "new editor content");
 
-        let error = write_pbxproj_atomic(&pbxproj, "previous content", "lpm edit").unwrap_err();
+        let error =
+            write_pbxproj_with_backup(&xcodeproj, "previous content", "lpm edit").unwrap_err();
 
         assert!(error.to_string().contains("changed during install"));
         assert_eq!(
-            std::fs::read_to_string(pbxproj).unwrap(),
+            std::fs::read_to_string(xcodeproj.join("project.pbxproj")).unwrap(),
             "new editor content"
         );
+        assert!(!project_backup_path(&xcodeproj).exists());
+    }
+
+    #[test]
+    fn pbxproj_write_keeps_the_previous_content_in_project_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let xcodeproj = write_xcodeproj(directory.path(), "My.App", "before");
+        std::fs::write(legacy_project_backup_path(&xcodeproj), "first ever").unwrap();
+
+        write_pbxproj_with_backup(&xcodeproj, "before", "after").unwrap();
+
+        assert_eq!(
+            project_backup_path(&xcodeproj),
+            directory.path().join(".lpm/xcode-backups/My.App.pbxproj")
+        );
+        assert_eq!(
+            std::fs::read_to_string(project_backup_path(&xcodeproj)).unwrap(),
+            "before"
+        );
+        assert!(!legacy_project_backup_path(&xcodeproj).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pbxproj_backup_never_writes_through_a_linked_backup_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let xcodeproj = write_xcodeproj(directory.path(), "MyApp", "before");
+        std::fs::create_dir(directory.path().join(".lpm")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), directory.path().join(".lpm/xcode-backups"))
+            .unwrap();
+
+        assert!(write_pbxproj_with_backup(&xcodeproj, "before", "after").is_err());
+
+        assert_eq!(
+            std::fs::read_to_string(xcodeproj.join("project.pbxproj")).unwrap(),
+            "before"
+        );
+        assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
     }
 
     #[test]
