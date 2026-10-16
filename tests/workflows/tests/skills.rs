@@ -1687,6 +1687,54 @@ async fn assert_warm_install_refreshes_package_skills(aliased: bool, workspace_m
 }
 
 #[tokio::test]
+async fn install_restores_the_skills_lpm_add_delivered_at_the_recorded_version() {
+    let project =
+        TempProject::empty(r#"{"name":"fresh-clone","version":"1.0.0","dependencies":{}}"#);
+    project.write_file(
+        "lpm-sources.json",
+        &serde_json::json!({
+            "schemaVersion": 1,
+            "packages": {"@lpm.dev/owner.widget": {
+                "version": "1.4.0",
+                "files": {},
+                "skills": "owner.widget",
+            }},
+        })
+        .to_string(),
+    );
+    let registry = MockRegistry::start().await;
+    registry
+        .with_package_skills_for_version_expected(
+            "owner.widget",
+            "1.4.0",
+            vec![package_skill(
+                "widget-guide",
+                "Use the widget the way this release supports",
+                "Render the widget through its documented props.",
+            )],
+            1,
+        )
+        .await;
+
+    lpm_with_registry(&project, &registry.url())
+        .arg("install")
+        .assert()
+        .success();
+
+    assert!(project.file_exists(".lpm/skills/owner.widget/widget-guide.md"));
+    let manifest: serde_json::Value = serde_json::from_str(
+        &project.read_file(".lpm/skills/owner.widget/.lpm-package-skills.json"),
+    )
+    .unwrap();
+    assert_eq!(manifest["version"], "1.4.0");
+
+    lpm_with_registry(&project, &registry.url())
+        .arg("install")
+        .assert()
+        .success();
+}
+
+#[tokio::test]
 async fn aliases_at_multiple_versions_share_the_highest_selected_package_skill_set() {
     let name = "@lpm.dev/owner.package";
     let project = TempProject::empty(

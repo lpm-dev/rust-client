@@ -542,16 +542,14 @@ fn collect_all_source_files(extract_dir: &Path) -> Result<Vec<(String, String)>,
 
 /// Copies a package without `lpm.config.json` as source, leaving out what
 /// describes the package rather than being its source: its manifests, its
-/// authored skills, which `lpm add` installs as skills, and LPM state.
+/// authored skills, which `lpm add` installs as skills, its LPM records and
+/// LPM state.
 fn collect_dir(dir: &Path, root: &Path, files: &mut Vec<(String, String)>) -> Result<(), LpmError> {
-    static SKIP: &[&str] = &[
-        "node_modules",
-        ".git",
-        lpm_common::PROJECT_STATE_DIR,
-        "__tests__",
-        "test",
-        "tests",
-    ];
+    /// Left out under any spelling the disk takes for them, as is any name
+    /// git reads as `.git`.
+    static STATE: &[&str] = &["node_modules", lpm_common::PROJECT_STATE_DIR];
+    static TESTS: &[&str] = &["__tests__", "test", "tests"];
+    let listed_in = crate::commands::publish_common::listed_in;
 
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -559,15 +557,32 @@ fn collect_dir(dir: &Path, root: &Path, files: &mut Vec<(String, String)>) -> Re
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
 
+        // The project's records take these names at its root, as files or
+        // as directories.
+        let is_record = || {
+            dir == root
+                && (listed_in(
+                    &name_str,
+                    crate::commands::publish_common::PROJECT_RECORD_FILES,
+                ) || listed_in(
+                    &name_str,
+                    crate::commands::publish_common::PROJECT_RECORD_DIRS,
+                ))
+        };
+        // As a file or a directory: a vendored submodule's `.git` is a file.
+        if listed_in(&name_str, STATE) || lpm_common::names::is_git_dir_name(&name_str) {
+            continue;
+        }
         if path.is_dir() {
-            if SKIP.contains(&name_str.as_ref())
-                || dir == root && name_str == lpm_skill::AUTHORED_SKILLS_DIR
+            if TESTS.contains(&name_str.as_ref())
+                || dir == root && listed_in(&name_str, &[lpm_skill::AUTHORED_SKILLS_DIR])
+                || is_record()
             {
                 continue;
             }
             collect_dir(&path, root, files)?;
         } else if path.is_file() {
-            if name_str == "package.json" || name_str == "lpm.config.json" {
+            if listed_in(&name_str, &["package.json", "lpm.config.json"]) || is_record() {
                 continue;
             }
             if let Ok(rel) = path.strip_prefix(root) {
@@ -583,6 +598,42 @@ fn collect_dir(dir: &Path, root: &Path, files: &mut Vec<(String, String)>) -> Re
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_package_without_lpm_config_json_brings_none_of_its_project_records() {
+        let extract = tempfile::tempdir().unwrap();
+        for file in [
+            "index.js",
+            "lpm-sources.json",
+            "lpm-agent-skills.json",
+            "lpm.lock",
+            "lpm-changes/next.md",
+            "lpm.lockb/data.bin",
+            "lpm-s\u{200C}ources.json",
+            "LPM-SKILLS/s/SKILL.md",
+            ".Git/hooks/pre-commit",
+            "vendor/.git./HEAD",
+            "lib/GIT~1/config",
+            "lib/Node_Modules/dep/index.js",
+            // As files, a vendored submodule's `.git` among them.
+            "vendor/sub/.git",
+            "vendor/.lpm",
+            "tools/node_modules",
+            "lib/lpm-sources.json",
+        ] {
+            let path = extract.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x").unwrap();
+        }
+
+        let files: Vec<_> = collect_all_source_files(extract.path())
+            .unwrap()
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect();
+
+        assert_eq!(files, ["index.js", "lib/lpm-sources.json"]);
+    }
 
     #[test]
     fn runtime_source_detection_includes_modern_typescript_modules() {

@@ -175,6 +175,10 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "the persist method belongs to L4Cache and delegates to the shared secure writer",
     ),
     (
+        "crates/lpm-cli/src/added_sources_state.rs::settle_existing_copy",
+        "renames a source backup whose digest matches the record over the partial copy an interrupted move left at the record's new name, in the source-backup directory, and syncs the directory before the record names it",
+    ),
+    (
         "crates/lpm-cli/src/commands/remove.rs::move_path",
         "moves preflight-validated project-owned entries into an exclusively created quarantine and records each move for rollback",
     ),

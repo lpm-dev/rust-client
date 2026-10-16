@@ -19,13 +19,39 @@ pub(super) fn validate_source_delivery_namespace(
                 destination.display()
             ))
         })?;
-    if relative.components().next().is_some_and(|component| {
-        matches!(component, std::path::Component::Normal(name) if name.eq_ignore_ascii_case(".lpm"))
-    }) {
+    // A disk that folds names, case or a mark HFS+ ignores, takes any such
+    // spelling for the name itself.
+    let names = |component: std::path::Component<'_>, name: &str| {
+        matches!(component, std::path::Component::Normal(given)
+        if given.to_str().is_some_and(|given| {
+            crate::commands::publish_common::listed_in(given, &[name])
+        }))
+    };
+    if relative
+        .components()
+        .next()
+        .is_some_and(|component| names(component, lpm_common::PROJECT_STATE_DIR))
+    {
         return Err(LpmError::Registry(format!(
             "source delivery cannot write into the reserved .lpm state directory: {}",
             destination.display()
         )));
+    }
+    // LPM writes these itself, `lpm add` and `remove` among them, and a
+    // directory under a record file's name leaves no place for the record.
+    if let Some(std::path::Component::Normal(first)) = relative.components().next()
+        && let Some(first) = first.to_str()
+    {
+        let is_record =
+            |records: &[&str]| crate::commands::publish_common::listed_in(first, records);
+        if is_record(crate::commands::publish_common::PROJECT_RECORD_FILES)
+            || is_record(crate::commands::publish_common::PROJECT_RECORD_DIRS)
+        {
+            return Err(LpmError::Registry(format!(
+                "source delivery cannot write the project record {first}: {}",
+                destination.display()
+            )));
+        }
     }
     Ok(())
 }
@@ -1600,5 +1626,34 @@ mod tests {
         assert_eq!(rollback.directories.len(), 256);
         rollback.rollback_best_effort();
         assert_eq!(std::fs::read_dir(&existing).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn source_delivery_never_writes_the_project_s_lpm_records() {
+        let project = Path::new("/project");
+        for destination in [
+            "lpm-sources.json",
+            "LPM-Sources.json",
+            "lpm-agent-skills.json",
+            "lpm.lock",
+            "lpm-changes/next.md",
+            // As a disk that folds case beyond ASCII resolves them.
+            "lpm-\u{17F}ources.json",
+            "lpm-agent-s\u{212A}ills.json",
+            "lpm-change\u{17F}/next.md",
+            "lpm-change\u{200C}s/next.md",
+            "lpm-sources.json\u{200C}",
+            // A directory where the record has to go.
+            "lpm.lock/copied.txt",
+            "lpm-sources.json/data/x.txt",
+        ] {
+            let error = validate_source_delivery_namespace(project, &project.join(destination))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("project record"), "{destination}: {error}");
+        }
+        // A package's own copy, delivered below the project's root.
+        validate_source_delivery_namespace(project, &project.join("vendor/lpm-sources.json"))
+            .unwrap();
     }
 }
