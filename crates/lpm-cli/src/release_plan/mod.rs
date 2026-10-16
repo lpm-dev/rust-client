@@ -173,8 +173,26 @@ struct ReleaseApplyJournal {
     path_encoding: String,
     #[serde(deserialize_with = "deserialize_release_journal_entries")]
     entries: Vec<ReleaseApplyJournalEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    change_files: Vec<ReleaseChangeFileEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     version_git: Option<VersionGitJournal>,
+}
+
+/// A change file the release consumes: its content before, and the digest
+/// of what stays of it, or none when the release removes it.
+#[cfg(test)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseChangeFileEntry {
+    #[serde(deserialize_with = "deserialize_release_encoded_path")]
+    path: String,
+    #[serde(deserialize_with = "deserialize_release_digest")]
+    original_sha256: String,
+    #[serde(deserialize_with = "deserialize_release_manifest_backup")]
+    original_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kept_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,8 +234,30 @@ struct RecoveryApplyJournal<'a> {
     path_encoding: &'a str,
     #[serde(borrow, deserialize_with = "deserialize_recovery_journal_entries")]
     entries: Vec<RecoveryApplyJournalEntry<'a>>,
+    #[serde(
+        borrow,
+        default,
+        deserialize_with = "deserialize_recovery_change_files"
+    )]
+    change_files: Vec<RecoveryChangeFileEntry<'a>>,
     #[serde(default)]
     version_git: Option<VersionGitJournal>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryChangeFileEntry<'a> {
+    #[serde(borrow, deserialize_with = "deserialize_borrowed_release_encoded_path")]
+    path: &'a str,
+    #[serde(borrow, deserialize_with = "deserialize_borrowed_release_digest")]
+    original_sha256: &'a str,
+    #[serde(
+        borrow,
+        deserialize_with = "deserialize_borrowed_release_manifest_backup"
+    )]
+    original_base64: &'a str,
+    #[serde(borrow, default)]
+    kept_sha256: Option<&'a str>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -305,6 +345,47 @@ where
     }
 
     deserializer.deserialize_seq(EntriesVisitor)
+}
+
+fn deserialize_recovery_change_files<'de, D>(
+    deserializer: D,
+) -> Result<Vec<RecoveryChangeFileEntry<'de>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ChangeFilesVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for ChangeFilesVisitor {
+        type Value = Vec<RecoveryChangeFileEntry<'de>>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_CHANGE_FILES} release journal change files"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut files = Vec::with_capacity(
+                sequence
+                    .size_hint()
+                    .unwrap_or_default()
+                    .min(MAX_CHANGE_FILES),
+            );
+            while let Some(file) = sequence.next_element()? {
+                if files.len() == MAX_CHANGE_FILES {
+                    return Err(serde::de::Error::invalid_length(files.len() + 1, &self));
+                }
+                files.push(file);
+            }
+            Ok(files)
+        }
+    }
+
+    deserializer.deserialize_seq(ChangeFilesVisitor)
 }
 
 fn deserialize_recovery_journal_entries<'de, D>(
@@ -587,6 +668,14 @@ impl ReleasePlan {
         })
     }
 
+    /// The names of the packages the plan releases.
+    pub(crate) fn released_names(&self) -> HashSet<&str> {
+        self.packages
+            .iter()
+            .map(|package| package.name.as_str())
+            .collect()
+    }
+
     pub(crate) fn planned_manifests(&self) -> Result<Vec<PlannedManifest>, LpmError> {
         let mut manifests: BTreeMap<PathBuf, SourceManifest> = BTreeMap::new();
 
@@ -714,8 +803,8 @@ use transaction::*;
 use version_git::*;
 
 pub(crate) use planning::{
-    ensure_unique_selection, load_change_bumps, plan_workspace_from_open_root,
-    sorted_selected_indices, validate_workspace_internal_ranges,
+    CHANGES_DIR, ChangeFileUpdate, ReleaseChanges, ensure_unique_selection, load_release_changes,
+    plan_workspace_from_open_root, sorted_selected_indices, validate_workspace_internal_ranges,
 };
 pub(crate) use transaction::{
     ensure_no_pending_release_transaction, ensure_no_pending_release_transaction_from_open_root,
@@ -1311,7 +1400,7 @@ mod tests {
         };
 
         let (streamed_bytes, commit) =
-            serialize_planned_release_journal(&resolved, operation.clone(), Some(git.clone()))
+            serialize_planned_release_journal(&resolved, &[], operation.clone(), Some(git.clone()))
                 .unwrap();
         let streamed: ReleaseApplyJournal = serde_json::from_slice(&streamed_bytes).unwrap();
         let mut structured =
@@ -1541,6 +1630,157 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn change_files_written_into_a_replaced_directory_stop_the_release() {
+        let workspace = tempfile::tempdir().unwrap();
+        let changes = workspace.path().join(CHANGES_DIR);
+        std::fs::create_dir(&changes).unwrap();
+        std::fs::write(changes.join("a"), "core minor\n").unwrap();
+        std::fs::write(changes.join("b"), "core minor\n").unwrap();
+        let root =
+            cap_std::fs::Dir::open_ambient_dir(workspace.path(), cap_std::ambient_authority())
+                .unwrap();
+        let writes = ["a", "b"].map(|name| ChangeFileWrite {
+            name: name.into(),
+            original: "core minor\n".into(),
+            kept: None,
+        });
+        let swapped = workspace.path().to_path_buf();
+        AFTER_CHANGE_FILE_WRITE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(swapped.join(CHANGES_DIR), swapped.join("displaced")).unwrap();
+                std::fs::create_dir(swapped.join(CHANGES_DIR)).unwrap();
+                for name in ["a", "b"] {
+                    std::fs::write(swapped.join(CHANGES_DIR).join(name), "core minor\n").unwrap();
+                }
+            }));
+        });
+
+        let failure =
+            write_change_files(&root, &writes).expect_err("a replaced directory stops the release");
+
+        assert!(
+            failure
+                .error
+                .to_string()
+                .contains("was replaced during the release"),
+            "{}",
+            failure.error
+        );
+        assert_eq!(failure.written, writes.len());
+    }
+
+    fn release_with_two_change_files() -> (TempDir, Vec<PlannedManifest>, [ChangeFileWrite; 2]) {
+        let workspace = TempDir::new().unwrap();
+        let manifest_path = workspace.path().join("package.json");
+        let original = Arc::<[u8]>::from(br#"{"name":"core","version":"1.0.0"}"#.as_slice());
+        std::fs::write(&manifest_path, original.as_ref()).unwrap();
+        let changes = workspace.path().join(CHANGES_DIR);
+        std::fs::create_dir(&changes).unwrap();
+        for name in ["a", "b"] {
+            std::fs::write(changes.join(name), "core minor\n").unwrap();
+        }
+        let manifests = vec![PlannedManifest {
+            path: manifest_path,
+            original_bytes: original,
+            updated_bytes: br#"{"name":"core","version":"1.1.0"}"#.to_vec(),
+        }];
+        let writes = ["a", "b"].map(|name| ChangeFileWrite {
+            name: name.into(),
+            original: "core minor\n".into(),
+            kept: None,
+        });
+        (workspace, manifests, writes)
+    }
+
+    #[test]
+    fn a_change_file_edited_before_the_release_writes_stops_it_with_nothing_written() {
+        let (workspace, manifests, writes) = release_with_two_change_files();
+        std::fs::write(workspace.path().join(CHANGES_DIR).join("b"), "core major\n").unwrap();
+
+        let error = apply_planned_release_with(
+            workspace.path(),
+            &manifests,
+            &writes,
+            test_operation(),
+            None,
+            write_manifest_target_durable,
+        )
+        .err()
+        .expect("an edited change file stops the release");
+
+        assert!(
+            error
+                .to_string()
+                .contains("lpm-changes/b changed during the release"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(workspace.path().join("package.json")).unwrap(),
+            manifests[0].original_bytes.as_ref()
+        );
+        assert!(workspace.path().join(CHANGES_DIR).join("a").exists());
+        assert!(
+            !workspace
+                .path()
+                .join(".lpm/release-apply/journal.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn a_change_file_edited_while_the_release_writes_them_is_kept_and_the_rest_rolled_back() {
+        let (workspace, manifests, writes) = release_with_two_change_files();
+        let edited = workspace.path().join(CHANGES_DIR).join("b");
+        AFTER_CHANGE_FILE_WRITE.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(&edited, "core major\n").unwrap();
+            }));
+        });
+
+        let error = apply_planned_release_with(
+            workspace.path(),
+            &manifests,
+            &writes,
+            test_operation(),
+            None,
+            write_manifest_target_durable,
+        )
+        .err()
+        .expect("an edited change file stops the release");
+
+        assert!(
+            error
+                .to_string()
+                .contains("lpm-changes/b changed during the release"),
+            "{error}"
+        );
+        assert!(
+            !error.to_string().contains("rollback incomplete"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(workspace.path().join("package.json")).unwrap(),
+            manifests[0].original_bytes.as_ref()
+        );
+        let changes = workspace.path().join(CHANGES_DIR);
+        assert_eq!(
+            std::fs::read_to_string(changes.join("a")).unwrap(),
+            "core minor\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(changes.join("b")).unwrap(),
+            "core major\n"
+        );
+        assert!(
+            !workspace
+                .path()
+                .join(".lpm/release-apply/journal.json")
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn persist_release_journal_does_not_follow_a_replaced_state_directory() {
         let tmp = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
@@ -1710,6 +1950,7 @@ mod tests {
         let resolved = resolve_planned_manifests(&root, &manifests).unwrap();
         let (journal, _) = serialize_planned_release_journal(
             &resolved,
+            &[],
             test_operation(),
             Some(VersionGitTransaction {
                 old_head,
@@ -1927,6 +2168,7 @@ mod tests {
         std::fs::write(&sentinel, b"outside").unwrap();
         let original = b"outside";
         let journal = ReleaseApplyJournal {
+            change_files: Vec::new(),
             schema_version: RELEASE_JOURNAL_SCHEMA_VERSION,
             transaction_id: "0".repeat(RELEASE_TRANSACTION_ID_HEX_BYTES),
             operation: test_operation(),
@@ -1960,6 +2202,7 @@ mod tests {
         let victim = tmp.path().join("victim.txt");
         std::fs::write(&victim, b"current").unwrap();
         let journal = ReleaseApplyJournal {
+            change_files: Vec::new(),
             schema_version: RELEASE_JOURNAL_SCHEMA_VERSION,
             transaction_id: "0".repeat(RELEASE_TRANSACTION_ID_HEX_BYTES),
             operation: test_operation(),
@@ -1997,6 +2240,7 @@ mod tests {
         std::fs::write(&outside_manifest, original).unwrap();
         std::os::unix::fs::symlink(outside.path(), tmp.path().join("linked")).unwrap();
         let journal = ReleaseApplyJournal {
+            change_files: Vec::new(),
             schema_version: RELEASE_JOURNAL_SCHEMA_VERSION,
             transaction_id: "0".repeat(RELEASE_TRANSACTION_ID_HEX_BYTES),
             operation: test_operation(),
@@ -2026,6 +2270,7 @@ mod tests {
     fn recover_pending_release_transaction_preserves_unknown_schema_journal() {
         let tmp = TempDir::new().unwrap();
         let journal = ReleaseApplyJournal {
+            change_files: Vec::new(),
             schema_version: RELEASE_JOURNAL_SCHEMA_VERSION + 1,
             transaction_id: "0".repeat(RELEASE_TRANSACTION_ID_HEX_BYTES),
             operation: test_operation(),

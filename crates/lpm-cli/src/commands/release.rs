@@ -191,8 +191,13 @@ pub(crate) fn plan(
     bump: Option<&VersionBump>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let plan = build_plan_read_only(project_dir, selection, bump)?;
-    emit_plan(&plan, true, json_output)
+    let (plan, changes) = build_plan_read_only(project_dir, selection, bump)?;
+    emit_plan(
+        &plan,
+        &changes.updates_for(&plan.released_names()),
+        true,
+        json_output,
+    )
 }
 
 pub(crate) fn apply(
@@ -203,8 +208,10 @@ pub(crate) fn apply(
     json_output: bool,
 ) -> Result<(), LpmError> {
     if dry_run {
+        let (plan, changes) = build_plan_read_only(project_dir, selection, bump)?;
         return emit_plan(
-            &build_plan_read_only(project_dir, selection, bump)?,
+            &plan,
+            &changes.updates_for(&plan.released_names()),
             true,
             json_output,
         );
@@ -229,16 +236,22 @@ pub(crate) fn apply(
                 return Ok(None);
             }
             let workspace = initial_root.discover(scope.project_path())?;
-            let plan =
+            let (plan, changes) =
                 build_plan_for_workspace(&workspace, &initial_root.directory, selection, bump)?;
             scope.validate()?;
             let planned = plan.planned_manifests()?;
-            scope.write_workspace(&planned, transaction_operation)?;
-            Ok(Some(plan))
+            let released = plan.released_names();
+            scope.write_workspace(
+                &planned,
+                &changes.writes_for(&released),
+                transaction_operation,
+            )?;
+            let consumed = changes.updates_for(&released);
+            Ok(Some((plan, consumed)))
         },
     )?;
     match plan {
-        Some(plan) => emit_plan(&plan, false, json_output),
+        Some((plan, consumed)) => emit_plan(&plan, &consumed, false, json_output),
         None if json_output => {
             println!(
                 "{}",
@@ -1051,7 +1064,7 @@ fn build_plan_read_only(
     project_dir: &Path,
     selection: &ReleaseSelection,
     bump: Option<&VersionBump>,
-) -> Result<ReleasePlan, LpmError> {
+) -> Result<(ReleasePlan, release_plan::ReleaseChanges), LpmError> {
     let (initial_root, lock_directory, scope) = open_release_transaction(project_dir)?;
     lpm_common::with_project_shared_lock(
         lock_directory,
@@ -1059,10 +1072,10 @@ fn build_plan_read_only(
         || {
             scope.ensure_no_pending()?;
             let workspace = initial_root.discover(scope.project_path())?;
-            let plan =
+            let planned =
                 build_plan_for_workspace(&workspace, &initial_root.directory, selection, bump)?;
             scope.validate()?;
-            Ok(plan)
+            Ok(planned)
         },
     )
 }
@@ -1118,16 +1131,21 @@ fn build_plan_for_workspace(
     root: &cap_std::fs::Dir,
     selection: &ReleaseSelection,
     bump: Option<&VersionBump>,
-) -> Result<ReleasePlan, LpmError> {
+) -> Result<(ReleasePlan, release_plan::ReleaseChanges), LpmError> {
     let (graph, selected) = resolve_workspace_selection_for(workspace, selection)?;
     let selected = release_plan::ensure_unique_selection(&selected);
-    let change_bumps = release_plan::load_change_bumps(&workspace.root, root)?;
+    let changes = release_plan::load_release_changes(&workspace.root, root)?;
     let selected_set: HashSet<usize> = selected.iter().copied().collect();
     let sorted = release_plan::sorted_selected_indices(&graph, &selected_set)?;
-    let plan =
-        release_plan::plan_workspace_from_open_root(workspace, root, &sorted, &change_bumps, bump)?;
+    let plan = release_plan::plan_workspace_from_open_root(
+        workspace,
+        root,
+        &sorted,
+        &changes.bumps,
+        bump,
+    )?;
     plan.validate_transaction(&workspace.root, root)?;
-    Ok(plan)
+    Ok((plan, changes))
 }
 
 fn resolve_workspace_selection_for(
@@ -1166,9 +1184,16 @@ fn resolve_workspace_selection_for(
     Ok((graph, selected_set.into_iter().collect()))
 }
 
-fn emit_plan(plan: &ReleasePlan, dry_run: bool, json_output: bool) -> Result<(), LpmError> {
+fn emit_plan(
+    plan: &ReleasePlan,
+    change_files: &[release_plan::ChangeFileUpdate],
+    dry_run: bool,
+    json_output: bool,
+) -> Result<(), LpmError> {
     if json_output {
-        println!("{}", output::format_json_answer(&plan.to_json(dry_run))?);
+        let mut json = plan.to_json(dry_run);
+        json["change_files"] = serde_json::to_value(change_files)?;
+        println!("{}", output::format_json_answer(&json)?);
         return Ok(());
     }
     if plan.packages.is_empty() {
@@ -1180,6 +1205,15 @@ fn emit_plan(plan: &ReleasePlan, dry_run: bool, json_output: bool) -> Result<(),
             "{} {} -> {}",
             package.name, package.old_version, package.new_version
         ));
+    }
+    for change in change_files {
+        let action = match (dry_run, change.remaining) {
+            (true, 0) => "would be removed",
+            (true, _) => "would lose its applied entries",
+            (false, 0) => "removed",
+            (false, _) => "applied entries removed",
+        };
+        install_ui::detail_untrusted(&format!("{} {action}", change.path));
     }
     install_ui::done_untrusted(&format!("planned {} packages", plan.packages.len()));
     Ok(())

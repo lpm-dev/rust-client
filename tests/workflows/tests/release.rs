@@ -496,7 +496,8 @@ fn release_plan_json_reports_bumps_and_internal_dependent_updates() {
           "path": "[core/package.json]",
           "changes": 1
         }
-      ]
+      ],
+      "change_files": []
     }
     "###);
     assert_eq!(
@@ -593,7 +594,8 @@ fn release_apply_updates_selected_package_and_internal_dependents() {
           "path": "[core/package.json]",
           "changes": 1
         }
-      ]
+      ],
+      "change_files": []
     }
     "###);
     assert_eq!(
