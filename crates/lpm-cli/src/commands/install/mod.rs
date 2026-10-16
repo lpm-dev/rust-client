@@ -895,6 +895,9 @@ async fn run_with_options_under_store_lock(
                 install_skills_for_packages(&client, &packages, project_dir, !json_output).await?;
             }
         }
+        if !offline {
+            restore_managed_project_skills(project_dir, json_output).await?;
+        }
         run_empty_dependency_install_phase(EmptyDependencyInstallInput {
             project_dir,
             lpm_root,
@@ -1930,6 +1933,9 @@ async fn run_with_options_under_store_lock(
             install_skills_for_packages(&arc_client, &lpm_packages, project_dir, !json_output)
                 .await?;
         }
+    }
+    if !offline {
+        restore_managed_project_skills(project_dir, json_output).await?;
     }
 
     let lockfile_write_result = run_online_lockfile_write_phase(OnlineLockfileWritePhaseInput {
