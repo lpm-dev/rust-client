@@ -13,6 +13,7 @@ lpm-workspace = { path = "../../crates/lpm-workspace" }
 lpm-migrate = { path = "../../crates/lpm-migrate" }
 lpm-runner = { path = "../../crates/lpm-runner" }
 lpm-security = { path = "../../crates/lpm-security" }
+lpm-skill = { path = "../../crates/lpm-skill" }
 lpm-linker = { path = "../../crates/lpm-linker" }
 lpm-store = { path = "../../crates/lpm-store" }
 lpm-common = { path = "../../crates/lpm-common" }

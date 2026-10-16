@@ -15,7 +15,6 @@ pub(crate) struct PublishManifest {
     pub(crate) package_json_parent: Arc<cap_std::fs::Dir>,
     pub(crate) package_json_parent_identity: Arc<same_file::Handle>,
     pub(crate) package_json_content: String,
-    pub(crate) package_json_override: Option<Vec<u8>>,
     pub(crate) lpm_json_content: Option<String>,
     pub(crate) lpm_json_override: Option<Vec<u8>>,
     pub(crate) env_schema_snapshot: Option<Arc<lpm_env_source::SchemaSnapshot>>,
@@ -129,7 +128,7 @@ pub(crate) fn prepare_publish_project(
     prepare_publish_project_from_manifest(
         manifest,
         workspace.as_ref(),
-        Some(&validation.validated_files),
+        &validation.validated_files,
         scan_secrets,
     )
 }
@@ -299,7 +298,6 @@ pub(crate) fn read_publish_manifest_from_source(
         package_json_parent,
         package_json_parent_identity,
         package_json_content: content,
-        package_json_override: None,
         lpm_json_content,
         lpm_json_override,
         env_schema_snapshot,
@@ -314,39 +312,10 @@ pub(crate) fn read_publish_manifest_from_source(
 pub(crate) fn select_publish_projection(
     source_manifest: PublishManifest,
 ) -> Result<PublishManifest, LpmError> {
-    let Some(publish_config) = source_manifest.pkg_json.get("publishConfig") else {
+    let Some(relative) = publish_common::publish_directory(&source_manifest.pkg_json)? else {
         return Ok(source_manifest);
     };
-    let Some(publish_config) = publish_config.as_object() else {
-        return Err(LpmError::Registry(
-            "package.json \"publishConfig\" must be an object".into(),
-        ));
-    };
-    let Some(directory) = publish_config.get("directory") else {
-        return Ok(source_manifest);
-    };
-    let Some(directory) = directory.as_str() else {
-        return Err(LpmError::Registry(
-            "package.json \"publishConfig.directory\" must be a string".into(),
-        ));
-    };
-    let relative = Path::new(directory);
-    if directory.is_empty()
-        || relative.is_absolute()
-        || relative.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::ParentDir
-                    | std::path::Component::RootDir
-                    | std::path::Component::Prefix(_)
-            )
-        })
-    {
-        return Err(LpmError::Registry(format!(
-            "package.json publishConfig.directory must be a non-empty path inside the package directory (got \"{}\")",
-            lpm_common::sanitize_terminal_inline(directory),
-        )));
-    }
+    let relative = relative.as_path();
 
     let source_root = source_manifest
         .package_json_path
@@ -470,7 +439,7 @@ fn valid_semver_identifiers(identifiers: &str, allow_numeric_leading_zeroes: boo
 pub(super) fn prepare_publish_project_from_manifest(
     manifest: PublishManifest,
     workspace: Option<&lpm_workspace::Workspace>,
-    validated_skills: Option<&[crate::commands::skills::author::ValidatedSkillFile]>,
+    validated_skills: &[crate::commands::skills::author::ValidatedSkillFile],
     scan_secrets: bool,
 ) -> Result<PublishProject, LpmError> {
     prepare_publish_project_from_manifest_with_hook(
@@ -485,7 +454,7 @@ pub(super) fn prepare_publish_project_from_manifest(
 fn prepare_publish_project_from_manifest_with_hook(
     manifest: PublishManifest,
     workspace: Option<&lpm_workspace::Workspace>,
-    validated_skills: Option<&[crate::commands::skills::author::ValidatedSkillFile]>,
+    validated_skills: &[crate::commands::skills::author::ValidatedSkillFile],
     scan_secrets: bool,
     before_tarball_preparation: impl FnOnce(),
 ) -> Result<PublishProject, LpmError> {
@@ -502,7 +471,6 @@ fn prepare_publish_project_from_manifest_with_hook(
         package_json_parent: _,
         package_json_parent_identity: _,
         package_json_content,
-        package_json_override,
         lpm_json_content,
         lpm_json_override,
         env_schema_snapshot,
@@ -512,8 +480,7 @@ fn prepare_publish_project_from_manifest_with_hook(
         publish_config,
         publish_control,
     } = manifest;
-    let mut prepared_package_json =
-        package_json_override.unwrap_or_else(|| package_json_content.into_bytes());
+    let mut prepared_package_json = package_json_content.into_bytes();
     if publish_common::package_json_value_requires_workspace_projection(&pkg_json) {
         let workspace = workspace.ok_or_else(|| {
             LpmError::Registry(
@@ -541,16 +508,14 @@ fn prepare_publish_project_from_manifest_with_hook(
                 content: content.as_bytes(),
             });
     let extra_scan_files = lpm_config_scan.as_slice();
-    let validated_skill_overrides = validated_skills.map(|skills| {
-        skills
-            .iter()
-            .map(|skill| publish_common::PublishContentOverride {
-                path: &skill.archive_path,
-                content: &skill.content,
-                include_if_missing: true,
-            })
-            .collect::<Vec<_>>()
-    });
+    let validated_skill_overrides = validated_skills
+        .iter()
+        .map(|skill| publish_common::PublishContentOverride {
+            path: &skill.archive_path,
+            content: &skill.content,
+            include_if_missing: true,
+        })
+        .collect::<Vec<_>>();
     let mut content_overrides = Vec::with_capacity(2);
     if let Some(content) = lpm_config_content.as_ref() {
         content_overrides.push(publish_common::PublishContentOverride {
@@ -605,7 +570,7 @@ fn prepare_publish_project_from_manifest_with_hook(
             extra_scan_files,
             content_overrides: &content_overrides,
             excluded_paths: &excluded_paths,
-            validated_authored_skills: validated_skill_overrides.as_deref(),
+            validated_authored_skills: &validated_skill_overrides,
         },
         &package_json_parent,
         &project_root,
@@ -1327,7 +1292,7 @@ mod tests {
         std::fs::write(project.path().join("base.json"), r#"{"vars":{"VALUE":{}}}"#).unwrap();
         let manifest = read_publish_manifest(project.path()).unwrap();
         let error =
-            prepare_publish_project_from_manifest_with_hook(manifest, None, None, false, || {
+            prepare_publish_project_from_manifest_with_hook(manifest, None, &[], false, || {
                 std::fs::write(
                     project.path().join("base.json"),
                     r#"{"vars":{"REPLACED":{}}}"#,
@@ -1683,7 +1648,7 @@ mod tests {
         let error = match prepare_publish_project_from_manifest_with_hook(
             manifest,
             None,
-            None,
+            &[],
             false,
             || std::fs::write(project.path().join("lpm.config.json"), replacement).unwrap(),
         ) {
@@ -1714,7 +1679,7 @@ mod tests {
         let manifest = read_publish_manifest(project.path()).unwrap();
 
         let error =
-            prepare_publish_project_from_manifest_with_hook(manifest, None, None, false, || {
+            prepare_publish_project_from_manifest_with_hook(manifest, None, &[], false, || {
                 std::fs::write(project.path().join("lpm.config.json"), replacement).unwrap()
             })
             .err()
@@ -1739,7 +1704,7 @@ mod tests {
         let manifest = read_publish_manifest(project.path()).unwrap();
 
         let error =
-            prepare_publish_project_from_manifest_with_hook(manifest, None, None, false, || {
+            prepare_publish_project_from_manifest_with_hook(manifest, None, &[], false, || {
                 std::fs::remove_file(project.path().join("lpm.config.json")).unwrap()
             })
             .err()
@@ -1759,7 +1724,7 @@ mod tests {
         let manifest = read_publish_manifest(project.path()).unwrap();
 
         let error =
-            prepare_publish_project_from_manifest_with_hook(manifest, None, None, false, || {
+            prepare_publish_project_from_manifest_with_hook(manifest, None, &[], false, || {
                 std::fs::write(
                     project.path().join("lpm.config.json"),
                     r#"{"defaultConfig":{"theme":"late"}}"#,
@@ -1788,7 +1753,7 @@ mod tests {
         let manifest = read_publish_manifest(project.path()).unwrap();
 
         let error =
-            prepare_publish_project_from_manifest_with_hook(manifest, None, None, false, || {
+            prepare_publish_project_from_manifest_with_hook(manifest, None, &[], false, || {
                 std::fs::write(
                     project.path().join("lpm.json"),
                     r#"{"publish":{"registries":["lpm"]}}"#,
@@ -1817,7 +1782,7 @@ mod tests {
         let manifest = read_publish_manifest(project.path()).unwrap();
 
         let error =
-            prepare_publish_project_from_manifest_with_hook(manifest, None, None, false, || {
+            prepare_publish_project_from_manifest_with_hook(manifest, None, &[], false, || {
                 std::fs::remove_file(project.path().join("lpm.json")).unwrap()
             })
             .err()
@@ -1837,7 +1802,7 @@ mod tests {
         let manifest = read_publish_manifest(project.path()).unwrap();
 
         let error =
-            prepare_publish_project_from_manifest_with_hook(manifest, None, None, false, || {
+            prepare_publish_project_from_manifest_with_hook(manifest, None, &[], false, || {
                 std::fs::write(
                     project.path().join("lpm.json"),
                     r#"{"publish":{"registries":["npm"]}}"#,
@@ -1862,7 +1827,7 @@ mod tests {
         let manifest = read_publish_manifest(project.path()).unwrap();
 
         let prepared =
-            prepare_publish_project_from_manifest_with_hook(manifest, None, None, false, || {
+            prepare_publish_project_from_manifest_with_hook(manifest, None, &[], false, || {
                 std::fs::write(project.path().join("README.md"), "archived readme").unwrap()
             })
             .unwrap();
@@ -1878,7 +1843,7 @@ mod tests {
         let manifest = read_publish_manifest(project.path()).unwrap();
 
         let prepared =
-            prepare_publish_project_from_manifest_with_hook(manifest, None, None, false, || {
+            prepare_publish_project_from_manifest_with_hook(manifest, None, &[], false, || {
                 std::fs::remove_file(project.path().join("README.md")).unwrap()
             })
             .unwrap();
@@ -1889,10 +1854,10 @@ mod tests {
     #[test]
     fn stage_preparation_rejects_invalid_authored_package_skills() {
         let project = tempfile::tempdir().unwrap();
-        write_publish_fixture(project.path(), &["index.js", ".lpm/skills"]);
-        std::fs::create_dir_all(project.path().join(".lpm/skills")).unwrap();
+        write_publish_fixture(project.path(), &["index.js"]);
+        std::fs::create_dir_all(project.path().join("lpm-skills")).unwrap();
         std::fs::write(
-            project.path().join(".lpm/skills/invalid.md"),
+            project.path().join("lpm-skills/invalid.md"),
             "not a valid authored package skill",
         )
         .unwrap();

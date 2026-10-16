@@ -540,8 +540,18 @@ fn collect_all_source_files(extract_dir: &Path) -> Result<Vec<(String, String)>,
     Ok(files)
 }
 
+/// Copies a package without `lpm.config.json` as source, leaving out what
+/// describes the package rather than being its source: its manifests, its
+/// authored skills, which `lpm add` installs as skills, and LPM state.
 fn collect_dir(dir: &Path, root: &Path, files: &mut Vec<(String, String)>) -> Result<(), LpmError> {
-    static SKIP: &[&str] = &["node_modules", ".git", "__tests__", "test", "tests"];
+    static SKIP: &[&str] = &[
+        "node_modules",
+        ".git",
+        lpm_common::PROJECT_STATE_DIR,
+        "__tests__",
+        "test",
+        "tests",
+    ];
 
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -550,7 +560,9 @@ fn collect_dir(dir: &Path, root: &Path, files: &mut Vec<(String, String)>) -> Re
         let name_str = name.to_string_lossy();
 
         if path.is_dir() {
-            if SKIP.contains(&name_str.as_ref()) {
+            if SKIP.contains(&name_str.as_ref())
+                || dir == root && name_str == lpm_skill::AUTHORED_SKILLS_DIR
+            {
                 continue;
             }
             collect_dir(&path, root, files)?;
@@ -621,6 +633,30 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(paths, ["a-dir/c.ts", "a.ts", "z-dir/b.ts", "z.ts"]);
+    }
+
+    #[test]
+    fn fallback_source_collection_leaves_out_skills_and_lpm_state() {
+        let extract = tempfile::tempdir().unwrap();
+        for path in [
+            "index.ts",
+            "lpm-skills/usage.md",
+            ".lpm/skills/usage.md",
+            "src/.lpm/state",
+            "src/lpm-skills/kept.ts",
+        ] {
+            let path = extract.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "content").unwrap();
+        }
+
+        let files = collect_all_source_files(extract.path()).unwrap();
+        let paths = files
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, ["index.ts", "src/lpm-skills/kept.ts"]);
     }
 
     #[test]

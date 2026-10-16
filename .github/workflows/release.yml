@@ -362,6 +362,9 @@ jobs:
       - name: Portable env decoder regression
         run: python3 -m unittest discover -s scripts/tests -p test_export_env_validator.py
 
+      - name: Portable skill decoder regression
+        run: python3 -m unittest discover -s scripts/tests -p test_export_skill_validator.py
+
       - name: npm wrapper tests
         run: npm --prefix npm/cli test
 

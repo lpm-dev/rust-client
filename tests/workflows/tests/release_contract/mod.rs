@@ -493,7 +493,7 @@ async fn release_publish_handles_many_members_with_a_bounded_file_descriptor_bud
 }
 
 #[tokio::test]
-async fn release_publish_refreshes_its_generation_after_an_accepted_skills_manifest_update() {
+async fn release_publish_ships_member_skills_without_rewriting_member_manifests() {
     let project =
         TempProject::empty(r#"{"name":"root","private":true,"workspaces":["packages/*"]}"#);
     for index in 0..8 {
@@ -504,7 +504,7 @@ async fn release_publish_refreshes_its_generation_after_an_accepted_skills_manif
         );
     }
     project.write_file(
-        "packages/p0/.lpm/skills/usage.md",
+        "packages/p0/lpm-skills/usage.md",
         "---\nname: usage\ndescription: Complete usage guidance\n---\n# Usage\nUse this package to load application configuration. Import the module, call its public methods, and handle returned errors.\n",
     );
     let registry = MockRegistry::start().await;
@@ -538,7 +538,7 @@ async fn release_publish_refreshes_its_generation_after_an_accepted_skills_manif
     assert!(out.status.success(), "{out:?}");
     assert_eq!(
         read_package_json(&project, "packages/p0/package.json")["files"],
-        serde_json::json!(["index.js", ".lpm/skills"])
+        serde_json::json!(["index.js"])
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     let scans = stderr.matches("publish workspace name scan").count();
