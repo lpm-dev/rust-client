@@ -45,7 +45,7 @@ use self::runtime::{
 };
 use self::script_policy::check_script_policy_surface_with_global;
 use self::sigstore::check_sigstore_verify_posture;
-use self::storage::{auth_storage_check, vault_storage_check};
+use self::storage::{auth_storage_check, lpm_home_default_state_check, vault_storage_check};
 use self::tooling::{
     check_plugins, check_typescript_setup, discover_installed_plugins, run_fmt_check,
     run_lint_check,
@@ -349,6 +349,7 @@ async fn run_inner(
     }
 
     checks.push(vault_storage_check(lpm_vault::storage_backend()));
+    checks.extend(lpm_home_default_state_check());
     checks.extend(check_policy_extensions(
         &global_config,
         global_config_error.as_deref(),

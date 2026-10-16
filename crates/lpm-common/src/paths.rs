@@ -55,6 +55,60 @@ use crate::color::Painted;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+/// `service` as the LPM root from the environment names it in the OS
+/// credential store; see [`LpmRoot::credential_service`]. Without a
+/// resolvable root the bare name is used.
+pub fn credential_service(service: &str) -> String {
+    scoped_service(service, credential_scope_from_env().as_deref())
+}
+
+fn scoped_service(service: &str, scope: Option<&str>) -> String {
+    match scope {
+        Some(scope) => format!("{service}:{scope}"),
+        None => service.to_owned(),
+    }
+}
+
+/// The environment's credential scope, resolved once per value of the
+/// variables that choose the root, as credential-store paths ask for it
+/// on every entry they touch.
+fn credential_scope_from_env() -> Option<String> {
+    type Key = [Option<OsString>; 3];
+    static CACHE: std::sync::Mutex<Option<(Key, Option<String>)>> = std::sync::Mutex::new(None);
+    let key: Key = ["LPM_HOME", "HOME", "USERPROFILE"].map(std::env::var_os);
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((cached, scope)) = cache.as_ref()
+        && *cached == key
+    {
+        return scope.clone();
+    }
+    let scope = LpmRoot::from_env()
+        .ok()
+        .and_then(|root| root.credential_scope());
+    *cache = Some((key, scope.clone()));
+    scope
+}
+
+fn canonical_identity(path: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut current = path;
+    loop {
+        if let Ok(mut canonical) = std::fs::canonicalize(current) {
+            canonical.extend(missing.iter().rev());
+            return canonical;
+        }
+        match (current.parent(), current.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_os_string());
+                current = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 /// Filename of the durable completeness marker written into every
 /// global install root. The marker is written **only after** the
 /// extract / link / lockfile / bin-targets pipeline has fully
@@ -84,16 +138,20 @@ impl LpmRoot {
     /// 2. `$HOME/.lpm` on Unix
     /// 3. `$USERPROFILE\.lpm` on Windows (via `dirs::home_dir`)
     ///
+    /// A relative `$LPM_HOME` is taken against the current directory, so
+    /// every crate resolves the same absolute root.
+    ///
     /// Returns an error only when no home directory can be resolved, which
     /// on a sanely configured system is essentially never. This function
-    /// performs **no** filesystem I/O and is safe to call from any command
-    /// path, including read-only ones like `--help`.
+    /// performs **no** filesystem I/O beyond reading the current directory
+    /// and is safe to call from any command path, including read-only ones
+    /// like `--help`.
     pub fn from_env() -> Result<Self, LpmError> {
         if let Some(explicit) = std::env::var_os("LPM_HOME")
             && !explicit.is_empty()
         {
             return Ok(LpmRoot {
-                home: PathBuf::from(explicit),
+                home: std::path::absolute(PathBuf::from(explicit)).map_err(LpmError::Io)?,
             });
         }
 
@@ -119,6 +177,42 @@ impl LpmRoot {
 
     pub fn root(&self) -> &Path {
         &self.home
+    }
+
+    /// The root's location as one comparable value: canonical where it
+    /// exists, else its nearest existing ancestor made canonical with the
+    /// rest appended, so the value doesn't change when the root is created.
+    pub fn identity(&self) -> PathBuf {
+        canonical_identity(&self.home)
+    }
+
+    /// Whether this is the user's default root, `~/.lpm`, by identity.
+    pub fn is_default(&self) -> bool {
+        dirs::home_dir()
+            .is_some_and(|home| canonical_identity(&home.join(".lpm")) == self.identity())
+    }
+
+    /// `service` as this root names it in the OS credential store. The
+    /// default root keeps the bare name; another root appends a digest of
+    /// its identity, so its login and env keys stay apart from the default
+    /// root's and each root's locks guard only its own entries.
+    pub fn credential_service(&self, service: &str) -> String {
+        scoped_service(service, self.credential_scope().as_deref())
+    }
+
+    /// The suffix [`Self::credential_service`] appends: `None` for the
+    /// default root, else 16 hex digits of a digest of the root's identity.
+    pub fn credential_scope(&self) -> Option<String> {
+        if self.is_default() {
+            return None;
+        }
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(self.identity().as_os_str().as_encoded_bytes());
+        let mut scope = String::with_capacity(16);
+        for byte in &digest[..8] {
+            scope.push_str(&format!("{byte:02x}"));
+        }
+        Some(scope)
     }
 
     // ─── Store ──────────────────────────────────────────────────────
@@ -1747,14 +1841,20 @@ pub fn is_local_fs(path: &Path) -> FsKind {
     }
 }
 
+/// Serializes the crate's tests that change the process environment.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        test_env_lock()
     }
 
     #[cfg(target_os = "linux")]
@@ -1808,7 +1908,55 @@ mod tests {
             std::env::remove_var("LPM_HOME");
         }
 
-        assert_eq!(root.root().as_os_str(), explicit);
+        assert!(root.root().is_absolute());
+        assert_eq!(root.root().file_name().unwrap(), explicit.as_os_str());
+    }
+
+    #[test]
+    fn from_env_takes_a_relative_lpm_home_against_the_current_directory() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::set_var("LPM_HOME", "relative-lpm-home");
+        }
+        let root = LpmRoot::from_env().unwrap();
+        unsafe {
+            std::env::remove_var("LPM_HOME");
+        }
+
+        assert_eq!(
+            root.root(),
+            std::env::current_dir().unwrap().join("relative-lpm-home")
+        );
+    }
+
+    #[test]
+    fn a_root_s_identity_holds_before_and_after_it_exists() {
+        let tmp = TempDir::new().unwrap();
+        let root = LpmRoot::from_dir(tmp.path().join("lpm-home"));
+        let before = root.identity();
+        std::fs::create_dir(root.root()).unwrap();
+
+        assert_eq!(before, root.identity());
+        assert_eq!(before, std::fs::canonicalize(root.root()).unwrap());
+    }
+
+    #[test]
+    fn only_another_root_scopes_its_credential_service_names() {
+        let tmp = TempDir::new().unwrap();
+        let first = LpmRoot::from_dir(tmp.path().join("first"));
+        let second = LpmRoot::from_dir(tmp.path().join("second"));
+
+        let scoped = first.credential_service("dev.lpm.vault");
+        assert!(scoped.starts_with("dev.lpm.vault:"), "{scoped}");
+        assert_eq!(scoped.len(), "dev.lpm.vault:".len() + 16);
+        assert_eq!(scoped, first.credential_service("dev.lpm.vault"));
+        assert_ne!(scoped, second.credential_service("dev.lpm.vault"));
+
+        if let Some(home) = dirs::home_dir() {
+            let default = LpmRoot::from_dir(home.join(".lpm"));
+            assert!(default.is_default());
+            assert_eq!(default.credential_service("dev.lpm.vault"), "dev.lpm.vault");
+        }
     }
 
     #[test]

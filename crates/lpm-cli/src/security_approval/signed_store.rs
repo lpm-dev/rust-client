@@ -162,7 +162,53 @@ fn read_keyring_signing_secret(account: &str) -> Result<Vec<u8>, SigningSecretRe
 fn stored_keychain_signing_secret() -> Result<Vec<u8>, SigningSecretReadError> {
     let account = keyring_account(KEYRING_ACCOUNT)
         .map_err(|e| SigningSecretReadError::Unavailable(e.to_string()))?;
-    read_keyring_signing_secret(&account)
+    match read_keyring_signing_secret(&account) {
+        Err(SigningSecretReadError::Missing) => adopt_earlier_keyring_signing_secret(&account),
+        read => read,
+    }
+}
+
+/// The secret under the account that earlier versions named for this LPM
+/// home, copied to `account`, which replaced it, and kept where it was.
+/// Without one there, the secret is missing.
+fn adopt_earlier_keyring_signing_secret(account: &str) -> Result<Vec<u8>, SigningSecretReadError> {
+    let earlier = earlier_keyring_account(
+        KEYRING_ACCOUNT,
+        std::env::var_os("LPM_HOME").as_deref(),
+        dirs::home_dir().as_deref(),
+    )
+    .filter(|earlier| earlier != account)
+    .ok_or(SigningSecretReadError::Missing)?;
+    let secret = read_keyring_signing_secret(&earlier)?;
+    #[cfg(target_os = "macos")]
+    let _lock = lpm_common::platform::macos_keychain_operation_lock();
+    let copied = keyring::Entry::new(KEYRING_SERVICE, account)
+        .and_then(|entry| entry.set_password(&hex::encode(&secret)));
+    if let Err(error) = copied {
+        tracing::warn!(
+            "security approval signing secret not copied to its current account: {error}"
+        );
+    }
+    Ok(secret)
+}
+
+/// The account earlier versions named for the LPM home `lpm_home` names:
+/// with the variable set, a digest of the home as spelled, where the
+/// current name digests its canonical location and keeps `~/.lpm` bare.
+/// `None` without the variable, when both names agree.
+fn earlier_keyring_account(
+    base: &str,
+    lpm_home: Option<&std::ffi::OsStr>,
+    home: Option<&Path>,
+) -> Option<String> {
+    let lpm_home = lpm_home?;
+    let root = if lpm_home.is_empty() {
+        home?.join(".lpm")
+    } else {
+        PathBuf::from(lpm_home)
+    };
+    let digest = hex::encode(Sha256::digest(root.display().to_string().as_bytes()));
+    Some(format!("{base}:{}", &digest[..16]))
 }
 
 fn stored_signing_secret() -> Result<Vec<u8>, SigningSecretReadError> {
@@ -582,4 +628,39 @@ fn repair_security_state_locked() -> Result<SecurityRepairReport, LpmError> {
         security_dir: security_dir.display().to_string(),
         quarantined,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_earlier_account_digests_lpm_home_as_spelled() {
+        let digest = |root: &str| {
+            let digest = hex::encode(Sha256::digest(root.as_bytes()));
+            format!("signing-secret-v1:{}", &digest[..16])
+        };
+        let home = Path::new("/home/u");
+
+        assert_eq!(
+            earlier_keyring_account("signing-secret-v1", None, Some(home)),
+            None
+        );
+        assert_eq!(
+            earlier_keyring_account(
+                "signing-secret-v1",
+                Some(std::ffi::OsStr::new("/opt/lpm/")),
+                Some(home)
+            ),
+            Some(digest("/opt/lpm/"))
+        );
+        assert_eq!(
+            earlier_keyring_account(
+                "signing-secret-v1",
+                Some(std::ffi::OsStr::new("")),
+                Some(home)
+            ),
+            Some(digest("/home/u/.lpm"))
+        );
+    }
 }

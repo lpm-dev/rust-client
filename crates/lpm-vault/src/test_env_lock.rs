@@ -44,11 +44,11 @@ pub(crate) fn acquire_env_lock() -> std::sync::MutexGuard<'static, ()> {
 ///
 /// `dirs::home_dir()` can use the Windows known-folder API, so tests
 /// that only set `HOME` are not isolated from the real user profile
-/// there. `LPM_TEST_HOME` gives crate path helpers a deterministic
-/// test-only override.
+/// there. `LPM_HOME` points the LPM root, which holds every vault file,
+/// at `<path>/.lpm` on every platform.
 pub(crate) struct HomeEnvSnapshot {
     prior_home: Option<std::ffi::OsString>,
-    prior_lpm_test_home: Option<std::ffi::OsString>,
+    prior_lpm_home: Option<std::ffi::OsString>,
     #[cfg(windows)]
     prior_userprofile: Option<std::ffi::OsString>,
 }
@@ -57,7 +57,7 @@ impl HomeEnvSnapshot {
     pub(crate) fn set(path: &std::path::Path) -> Self {
         let snapshot = Self {
             prior_home: std::env::var_os("HOME"),
-            prior_lpm_test_home: std::env::var_os("LPM_TEST_HOME"),
+            prior_lpm_home: std::env::var_os("LPM_HOME"),
             #[cfg(windows)]
             prior_userprofile: std::env::var_os("USERPROFILE"),
         };
@@ -65,7 +65,7 @@ impl HomeEnvSnapshot {
         // SAFETY: callers hold `ENV_LOCK`, serialising process-wide env mutation.
         unsafe {
             std::env::set_var("HOME", path);
-            std::env::set_var("LPM_TEST_HOME", path);
+            std::env::set_var("LPM_HOME", path.join(".lpm"));
             #[cfg(windows)]
             std::env::set_var("USERPROFILE", path);
         }
@@ -80,9 +80,9 @@ impl HomeEnvSnapshot {
                 Some(value) => std::env::set_var("HOME", value),
                 None => std::env::remove_var("HOME"),
             }
-            match self.prior_lpm_test_home {
-                Some(value) => std::env::set_var("LPM_TEST_HOME", value),
-                None => std::env::remove_var("LPM_TEST_HOME"),
+            match self.prior_lpm_home {
+                Some(value) => std::env::set_var("LPM_HOME", value),
+                None => std::env::remove_var("LPM_HOME"),
             }
             #[cfg(windows)]
             match self.prior_userprofile {

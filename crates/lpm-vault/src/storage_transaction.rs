@@ -17,19 +17,53 @@ static FORCE_DIRECTORY_SYNC_FAILURE: std::sync::atomic::AtomicBool =
 pub(crate) struct VaultStorageDirectory {
     directory: Dir,
     display: PathBuf,
+    /// Why git could commit what is written here, which refuses writes.
+    exposed: Option<std::sync::Arc<str>>,
 }
 
 impl VaultStorageDirectory {
     fn open_lpm() -> Result<Self, String> {
-        let home = crate::lpm_home_dir().ok_or_else(|| "no home directory".to_owned())?;
-        let home_directory = Dir::open_ambient_dir(&home, ambient_authority())
-            .map_err(|error| format!("failed to open home directory: {error}"))?;
-        Self::open_or_create_child(&home_directory, &home, OsStr::new(".lpm"))
+        let root = crate::lpm_root_dir().ok_or_else(|| "no home directory".to_owned())?;
+        let (Some(parent_path), Some(name)) = (root.parent(), root.file_name()) else {
+            return Err(format!(
+                "the LPM home must name a directory: {}",
+                root.display()
+            ));
+        };
+        std::fs::create_dir_all(parent_path).map_err(|error| {
+            format!(
+                "failed to create the LPM home's parent directory {}: {error}",
+                parent_path.display()
+            )
+        })?;
+        let parent = Dir::open_ambient_dir(parent_path, ambient_authority()).map_err(|error| {
+            format!(
+                "failed to open the LPM home's parent directory {}: {error}",
+                parent_path.display()
+            )
+        })?;
+        let mut home = Self::open_or_create_child(&parent, parent_path, name)?;
+        home.exposed = lpm_common::keep_lpm_home_ignored_in(&home.directory, &home.display)
+            .err()
+            .map(std::sync::Arc::from);
+        Ok(home)
     }
 
     pub(crate) fn open_or_create_directory(&self, name: &str) -> Result<Self, String> {
         validate_name(OsStr::new(name))?;
-        Self::open_or_create_child(&self.directory, &self.display, OsStr::new(name))
+        let mut child =
+            Self::open_or_create_child(&self.directory, &self.display, OsStr::new(name))?;
+        child.exposed.clone_from(&self.exposed);
+        Ok(child)
+    }
+
+    fn refuse_if_exposed(&self) -> Result<(), String> {
+        match &self.exposed {
+            Some(reason) => Err(format!(
+                "{reason}, so git could commit the local env secrets saved there; point LPM_HOME at a directory of its own"
+            )),
+            None => Ok(()),
+        }
     }
 
     fn open_or_create_child(
@@ -110,7 +144,11 @@ impl VaultStorageDirectory {
         windows_security::protect_directory(&directory)
             .map_err(|error| format!("failed to secure {}: {error}", display.display()))?;
 
-        Ok(Self { directory, display })
+        Ok(Self {
+            directory,
+            display,
+            exposed: None,
+        })
     }
 
     fn open_lock(&self, name: &str, label: &str) -> Result<std::fs::File, String> {
@@ -332,6 +370,7 @@ impl VaultStorageDirectory {
         contents: &[u8],
         label: &str,
     ) -> Result<(), String> {
+        self.refuse_if_exposed()?;
         validate_name(OsStr::new(name))?;
         validate_contents_size(contents, label)?;
         lpm_common::write_file_atomic_in_dir_with(
@@ -400,6 +439,7 @@ impl VaultStorageDirectory {
         contents: &[u8],
         label: &str,
     ) -> Result<bool, String> {
+        self.refuse_if_exposed()?;
         validate_name(OsStr::new(name))?;
         validate_contents_size(contents, label)?;
         let mut options = OpenOptions::new();
@@ -883,6 +923,30 @@ mod tests {
             .expect_err("oversized digest input must fail closed");
 
             assert!(error.contains("exceeds the 16777216-byte limit"), "{error}");
+        });
+    }
+
+    #[test]
+    fn env_secrets_are_not_written_where_git_would_commit_them() {
+        with_temp_home(|home| {
+            // The LPM home is a repository's root, which no ignore file in it
+            // can keep out of git.
+            std::fs::create_dir_all(home.join(".lpm/.git")).unwrap();
+
+            let error = with_vault_transaction(|directory| {
+                directory.write_owner_only_file("vault.enc", b"ciphertext", "vault")
+            })
+            .unwrap_err();
+
+            assert!(
+                error.contains("env secrets") && error.contains("LPM_HOME"),
+                "{error}"
+            );
+            assert!(!home.join(".lpm/vault.enc").exists());
+            with_vault_transaction(|directory| {
+                directory.read_owner_only_file("vault.enc", "vault")
+            })
+            .unwrap();
         });
     }
 

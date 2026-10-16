@@ -197,6 +197,199 @@ pub fn keep_state_dir_ignored_or_warn(directory: &cap_std::fs::Dir, state_displa
     }
 }
 
+/// Whether an LPM home's `.gitignore` ignores everything LPM writes there,
+/// for every repository that walks into the home, as the file's own rules
+/// decide it: it ignores everything, and may then take back only names LPM
+/// keeps nothing private in, such as a dotfiles repository's `config.toml`.
+fn keeps_lpm_home_out(lines: &[u8]) -> bool {
+    const USERS_OWN: [&[u8]; 2] = [b".gitignore", b"config.toml"];
+    let mut ignored = false;
+    for pattern in ignore_rules(lines) {
+        if let Some(negated) = pattern.strip_prefix(b"!") {
+            let name = negated.strip_prefix(b"/").unwrap_or(negated);
+            if !USERS_OWN.contains(&name) {
+                ignored = false;
+            }
+            continue;
+        }
+        let unanchored = pattern.strip_prefix(b"/").unwrap_or(pattern);
+        if unanchored == b"*" || unanchored == b"**" {
+            ignored = true;
+        }
+    }
+    ignored
+}
+
+/// Why git could commit what an LPM home holds, which LPM couldn't keep out
+/// of git, as the command-start check reports it.
+#[derive(Debug)]
+pub struct LpmHomeExposed {
+    reason: String,
+    at_repository_root: bool,
+}
+
+impl LpmHomeExposed {
+    /// What keeps the home out of git: an ignore file in it that ignores
+    /// everything, or another home. A repository's root gets only the second,
+    /// as such a file would hide the whole repository.
+    #[must_use]
+    pub fn remedy(&self) -> &'static str {
+        if self.at_repository_root {
+            "point LPM_HOME at a directory of its own"
+        } else {
+            "give it a .gitignore that ignores everything (`*`), or point LPM_HOME at a directory of its own"
+        }
+    }
+}
+
+impl std::fmt::Display for LpmHomeExposed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+/// Keeps `root`, an LPM home, out of git as a project's `.lpm` keeps
+/// itself, with a `.gitignore` that ignores everything in it. An LPM home
+/// inside a repository, as `LPM_HOME="$PWD/.lpm-ci"` puts one, would
+/// otherwise offer its login and env secrets to `git add`. Fails with the
+/// reason when a repository is around a home it can't keep out, where
+/// secrets must not be written; elsewhere what it can't do is logged.
+pub fn keep_lpm_home_ignored(root: &Path) -> Result<(), String> {
+    match cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority()) {
+        Ok(directory) => keep_open_lpm_home_ignored(&directory, root),
+        Err(error) => lpm_home_left_in_git(root, &error, false),
+    }
+    .map_err(|exposed| exposed.reason)
+}
+
+/// [`keep_lpm_home_ignored`] for an LPM home a caller opened itself, at
+/// `home_display`.
+pub fn keep_lpm_home_ignored_in(
+    directory: &cap_std::fs::Dir,
+    home_display: &Path,
+) -> Result<(), String> {
+    keep_open_lpm_home_ignored(directory, home_display).map_err(|exposed| exposed.reason)
+}
+
+/// `LPM_HOME` can name a directory LPM doesn't own, so unlike `.lpm`'s, an
+/// ignore file already there is left as it is, and a repository's root,
+/// which the file would hide whole, gets none.
+fn keep_open_lpm_home_ignored(
+    directory: &cap_std::fs::Dir,
+    home_display: &Path,
+) -> Result<(), LpmHomeExposed> {
+    let name = OsStr::new(PROJECT_STATE_IGNORE_FILE);
+    let at_repository_root = directory.symlink_metadata(".git").is_ok();
+    let kept_out = match read_ignore_file(directory, name) {
+        Ok(Some((existing, _))) if keeps_lpm_home_out(&existing) => return Ok(()),
+        Ok(_) if at_repository_root => {
+            Err(std::io::Error::other("it is the root of a git repository"))
+        }
+        Ok(Some(_)) => Err(std::io::Error::other(format!(
+            "its {PROJECT_STATE_IGNORE_FILE} doesn't ignore everything LPM writes there"
+        ))),
+        Ok(None) => crate::write_file_atomic_in_dir_with_options(
+            directory,
+            name,
+            crate::AtomicWriteOptions::new().unix_mode(0o644),
+            |file| std::io::Write::write_all(file, PROJECT_STATE_IGNORE.as_bytes()),
+        ),
+        Err(error) => Err(error),
+    };
+    match kept_out {
+        Ok(()) => Ok(()),
+        Err(error) => lpm_home_left_in_git(home_display, &error, at_repository_root),
+    }
+}
+
+/// Readies the LPM home at `root` for a command, before anything writes
+/// there: keeps it out of git, creating it with its ignore file first where
+/// a repository is around it. Fails where a repository is around a home LPM
+/// can't keep out of git, whose files git could then commit, so the command
+/// must not run.
+pub fn guard_lpm_home(root: &Path) -> Result<(), LpmHomeExposed> {
+    let opened = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority());
+    let directory = match opened {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if !in_a_repository(root) {
+                return Ok(());
+            }
+            match std::fs::create_dir_all(root).and_then(|()| {
+                cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
+            }) {
+                Ok(directory) => directory,
+                Err(error) => return lpm_home_left_in_git(root, &error, false),
+            }
+        }
+        Err(error) => return lpm_home_left_in_git(root, &error, false),
+    };
+    keep_open_lpm_home_ignored(&directory, root)
+}
+
+/// Keeps an existing LPM home at `root` out of git as
+/// [`keep_lpm_home_ignored`] does; creates none. Commands run this when they
+/// finish, so whatever wrote to the home, it ends up ignored. What it can't
+/// do is only logged: the check at the command's start has reported it, and
+/// writers of secrets there refuse on their own.
+pub fn keep_existing_lpm_home_ignored(root: &Path) {
+    let Ok(directory) = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())
+    else {
+        return;
+    };
+    if let Err(exposed) = keep_open_lpm_home_ignored(&directory, root) {
+        tracing::debug!("{exposed}");
+    }
+}
+
+/// Why git could commit what the LPM home at `home` holds, which `error`
+/// kept LPM from ignoring, when a directory at or above it holds a `.git`,
+/// as `home` names it or where it is once links are followed; else that is
+/// only logged.
+fn lpm_home_left_in_git(
+    home: &Path,
+    error: &std::io::Error,
+    at_repository_root: bool,
+) -> Result<(), LpmHomeExposed> {
+    let reason = format!(
+        "could not keep the LPM home {} out of git: {error}",
+        home.display()
+    );
+    if in_a_repository(home) {
+        return Err(LpmHomeExposed {
+            reason,
+            at_repository_root,
+        });
+    }
+    tracing::debug!("{reason}");
+    Ok(())
+}
+
+/// Whether a directory at or above `path` holds a `.git`, as `path` names it
+/// or where it is once links are followed.
+fn in_a_repository(path: &Path) -> bool {
+    let lexically = |path: &Path| {
+        path.ancestors()
+            .any(|directory| std::fs::symlink_metadata(directory.join(".git")).is_ok())
+    };
+    lexically(path) || resolved(path).is_some_and(|resolved| lexically(&resolved))
+}
+
+/// `path` with every link on the way followed, as far as it exists.
+fn resolved(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find_map(|existing| {
+            std::fs::canonicalize(existing)
+                .ok()
+                .map(|resolved| (existing, resolved))
+        })
+        .and_then(|(existing, resolved)| {
+            path.strip_prefix(existing)
+                .ok()
+                .map(|missing| resolved.join(missing))
+        })
+}
+
 /// Keeps an existing `<project_dir>/.lpm` owner-only on Unix and out of git;
 /// does nothing when the project has none. Commands run this when they
 /// finish, so state written by any path ends up private and ignored.
@@ -402,6 +595,212 @@ mod tests {
         keep_existing_project_state_ignored(project.path());
         assert!(!has_acl(&state));
         assert!(!has_acl(&state.join(PROJECT_STATE_IGNORE_FILE)));
+    }
+
+    #[test]
+    fn an_lpm_home_gets_an_ignore_file_but_keeps_one_it_already_has() {
+        let home = tempfile::tempdir().unwrap();
+        keep_lpm_home_ignored(home.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(home.path().join(".gitignore")).unwrap(),
+            PROJECT_STATE_IGNORE
+        );
+
+        // `LPM_HOME` can name a directory LPM doesn't own, such as a project.
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join(".gitignore"), "node_modules/\n").unwrap();
+        keep_lpm_home_ignored(project.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(project.path().join(".gitignore")).unwrap(),
+            "node_modules/\n"
+        );
+
+        // A repository's root, which the file would hide whole.
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repository.path().join(".git")).unwrap();
+        keep_lpm_home_ignored(repository.path()).unwrap_err();
+        assert!(!repository.path().join(".gitignore").exists());
+    }
+
+    #[test]
+    fn an_lpm_home_git_could_commit_is_an_error_and_one_outside_a_repository_is_not() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join(".gitignore"), "node_modules/\n").unwrap();
+        keep_lpm_home_ignored(outside.path()).unwrap();
+
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repository.path().join(".git")).unwrap();
+        let home = repository.path().join("packages/app");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".gitignore"), "node_modules/\n").unwrap();
+        let reason = keep_lpm_home_ignored(&home).unwrap_err();
+        assert!(reason.contains("doesn't ignore everything"), "{reason}");
+
+        std::fs::remove_file(home.join(".gitignore")).unwrap();
+        keep_lpm_home_ignored(&home).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(home.join(".gitignore")).unwrap(),
+            PROJECT_STATE_IGNORE
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_lpm_home_reached_through_a_link_is_judged_where_it_is() {
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repository.path().join(".git")).unwrap();
+        let home = repository.path().join("state");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join(".gitignore"), "cache/\n").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let alias = outside.path().join("lpm-home");
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+
+        keep_lpm_home_ignored(&home).unwrap_err();
+        let reason = keep_lpm_home_ignored(&alias).unwrap_err();
+
+        assert!(reason.contains("doesn't ignore everything"), "{reason}");
+    }
+
+    #[test]
+    fn the_sweep_keeps_an_existing_lpm_home_ignored_and_creates_none() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("lpm-home");
+        keep_existing_lpm_home_ignored(&missing);
+        assert!(!missing.exists());
+
+        std::fs::create_dir(&missing).unwrap();
+        keep_existing_lpm_home_ignored(&missing);
+        assert_eq!(
+            std::fs::read_to_string(missing.join(".gitignore")).unwrap(),
+            PROJECT_STATE_IGNORE
+        );
+    }
+
+    #[test]
+    fn an_lpm_home_is_kept_by_an_ignore_file_that_keeps_only_the_user_s_config_tracked() {
+        let repository = tempfile::tempdir().unwrap();
+        let Ok(init) = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repository.path())
+            .status()
+        else {
+            return;
+        };
+        assert!(init.success());
+        let home = repository.path().join(".lpm");
+        std::fs::create_dir(&home).unwrap();
+        // A dotfiles repository that commits the user's defaults.
+        for kept in [
+            "*\n!.gitignore\n!config.toml\n",
+            "/*\n!/config.toml\n",
+            // As Windows PowerShell 5.1 writes UTF-8, which git reads past.
+            "\u{feff}*\r\n",
+            "\u{feff}*\n!config.toml\n",
+        ] {
+            std::fs::write(home.join(".gitignore"), kept).unwrap();
+            guard_lpm_home(&home).unwrap_or_else(|error| panic!("{kept:?}: {error}"));
+            assert_eq!(
+                std::fs::read_to_string(home.join(".gitignore")).unwrap(),
+                kept
+            );
+        }
+        // Rules that leave something LPM writes there to any repository
+        // that walks into the home, an outer one past a nested repository's
+        // own exclude included.
+        for exposed in [
+            "cache/\n",
+            ".*\n",
+            "*\n!certs/\n!certs/**\n",
+            "*\n!*.pem\n",
+            "\u{feff}cache/\n",
+        ] {
+            std::fs::write(home.join(".gitignore"), exposed).unwrap();
+            let error = guard_lpm_home(&home).unwrap_err().to_string();
+            assert!(
+                error.contains("doesn't ignore everything"),
+                "{exposed:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_lpm_home_at_a_repository_s_root_is_refused_as_that_whatever_ignore_file_it_has() {
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repository.path().join(".git")).unwrap();
+        for ignore_file in [None, Some("node_modules/\n"), Some("cache/\n!*.pem\n")] {
+            let path = repository.path().join(".gitignore");
+            match ignore_file {
+                Some(rules) => std::fs::write(&path, rules).unwrap(),
+                None => drop(std::fs::remove_file(&path)),
+            }
+            let exposed = guard_lpm_home(repository.path()).unwrap_err();
+            assert!(
+                exposed
+                    .to_string()
+                    .contains("it is the root of a git repository"),
+                "{ignore_file:?}: {exposed}"
+            );
+            // A `*` there would hide the whole repository.
+            assert_eq!(
+                exposed.remedy(),
+                "point LPM_HOME at a directory of its own",
+                "{ignore_file:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).ok().as_deref(),
+                ignore_file,
+                "the repository's ignore file is left as it is"
+            );
+        }
+
+        // One whose own ignore file keeps everything out, as a repository
+        // of the user's config would, is kept.
+        std::fs::write(
+            repository.path().join(".gitignore"),
+            "*\n!.gitignore\n!config.toml\n",
+        )
+        .unwrap();
+        guard_lpm_home(repository.path()).unwrap();
+
+        // Below the root, the home can be given an ignore file of its own.
+        let home = repository.path().join(".lpm-ci");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join(".gitignore"), "cache/\n").unwrap();
+        let exposed = guard_lpm_home(&home).unwrap_err();
+        assert!(
+            exposed.remedy().contains("ignores everything (`*`)"),
+            "{exposed}"
+        );
+    }
+
+    #[test]
+    fn a_command_finds_its_lpm_home_ignored_before_anything_writes_there() {
+        // Outside a repository, a home that doesn't exist yet is left to
+        // whatever writes there first.
+        let outside = tempfile::tempdir().unwrap();
+        guard_lpm_home(&outside.path().join("lpm-home")).unwrap();
+        assert!(!outside.path().join("lpm-home").exists());
+
+        // Inside one, it is made with its ignore file first.
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repository.path().join(".git")).unwrap();
+        let home = repository.path().join(".lpm-ci");
+        guard_lpm_home(&home).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(home.join(".gitignore")).unwrap(),
+            PROJECT_STATE_IGNORE
+        );
+
+        // A home there that git could commit doesn't get a command.
+        std::fs::write(home.join(".gitignore"), "cache/\n").unwrap();
+        let error = guard_lpm_home(&home).unwrap_err().to_string();
+        assert!(error.contains("doesn't ignore everything"), "{error}");
+        // Outside a repository the same home is the user's to keep.
+        let elsewhere = outside.path().join("kept");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join(".gitignore"), "cache/\n").unwrap();
+        guard_lpm_home(&elsewhere).unwrap();
     }
 
     #[test]

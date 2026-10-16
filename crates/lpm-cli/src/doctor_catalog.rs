@@ -429,8 +429,9 @@ pub static VAULT_STORAGE_NATIVE_WITH_FALLBACK: CheckEntry = CheckEntry {
          on-disk fallback key is still present and can decrypt the same local encrypted secrets.",
     when_fires: "Running on Linux or Windows after native-key promotion could not remove the \
          encrypted-file fallback key.",
-    remediation: "Check ownership and permissions for ~/.lpm, then run an `lpm env` command again so \
-         LPM CLI can remove ~/.lpm/.vault-fallback-key after verifying the native key.",
+    remediation: "Check ownership and permissions for the LPM home (~/.lpm, or $LPM_HOME), then run \
+         an `lpm env` command again so LPM CLI can remove its .vault-fallback-key after verifying the \
+         native key.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
 };
@@ -440,8 +441,8 @@ pub static VAULT_STORAGE_FALLBACK: CheckEntry = CheckEntry {
     name: "Local secret storage",
     category: Category::Auth,
     tier: Tier::Fast,
-    description: "Local secrets are encrypted with an on-disk key file (~/.lpm/.vault-fallback-key, \
-         0600) using a random 256-bit key and AES-256-GCM. The fallback path is correct cryptographically, \
+    description: "Local secrets are encrypted with an on-disk key file (.vault-fallback-key in the \
+         LPM home, 0600) using a random 256-bit key and AES-256-GCM. The fallback path is correct cryptographically, \
          but any process running as your user can read the key file and decrypt the local secrets — \
          there is no per-app ACL the way macOS Keychain provides. This is a documented \
          platform limitation, not a bug.",
@@ -451,6 +452,21 @@ pub static VAULT_STORAGE_FALLBACK: CheckEntry = CheckEntry {
          primitive on this machine can read local secrets. Do not run untrusted lifecycle \
          scripts in unsandboxed mode. Keep lifecycle scripts sandboxed and unlock or repair the \
          OS secure store so LPM CLI can promote the data key.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
+pub static LPM_HOME_DEFAULT_STATE_UNUSED: CheckEntry = CheckEntry {
+    code: "lpm_home_default_state_unused",
+    name: "LPM home",
+    category: Category::Auth,
+    tier: Tier::Fast,
+    description: "`LPM_HOME` points LPM CLI at another home, which keeps its own login and local \
+         env secrets. The login or local env data in `~/.lpm` is not used while it is set.",
+    when_fires: "`LPM_HOME` names a directory other than `~/.lpm`, and `~/.lpm` holds login or \
+         local env files.",
+    remediation: "Run `lpm login`, and `lpm env pull` in each project, with this `LPM_HOME`, or \
+         unset `LPM_HOME` to use `~/.lpm` again.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
 };
@@ -465,7 +481,7 @@ pub static VAULT_STORAGE_UNAVAILABLE: CheckEntry = CheckEntry {
     when_fires: "Running on Linux or Windows with local encrypted secrets present and no usable local \
          data-key source.",
     remediation: "Unlock Secret Service/Credential Manager, repair the OS secure store, or restore \
-         ~/.lpm/.vault-fallback-key from backup if this machine has not been promoted yet.",
+         .vault-fallback-key in the LPM home from backup if this machine has not been promoted yet.",
     possible_severities: &[Severity::Fail],
     auto_fix: None,
 };
@@ -2157,6 +2173,7 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &VAULT_STORAGE_NATIVE_WITH_FALLBACK,
     &VAULT_STORAGE_FALLBACK,
     &VAULT_STORAGE_UNAVAILABLE,
+    &LPM_HOME_DEFAULT_STATE_UNUSED,
     // Policy extensions
     &POLICY_EXTENSIONS_NOT_CONFIGURED,
     &POLICY_EXTENSIONS_CONFIGURED,

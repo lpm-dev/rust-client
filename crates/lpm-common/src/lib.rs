@@ -5,6 +5,7 @@
 //! [`LpmRoot`] / locking primitives every install pass touches. I/O helpers in
 //! this crate stay small and dependency-light so it remains the workspace floor.
 
+pub mod acceptance;
 pub mod atomic_write;
 pub mod bounded_read;
 pub mod browser;
@@ -87,6 +88,7 @@ pub use package_instance::{PackageInstanceId, ResolutionNodeId, artifact_binding
 pub use package_name::PackageName;
 #[cfg(windows)]
 pub use paths::absolute_extended_path;
+pub use paths::credential_service;
 pub use paths::{
     ExclusiveLockHandle, FsKind, GLOBAL_INSTALL_PATH_BUDGET, INSTALL_READY_MARKER, LpmRoot,
     ProjectLockDirectory, ProjectLockKind, SharedLockHandle, SingleFileExclusiveLockHandle,
@@ -105,7 +107,8 @@ pub use peer::PeerEdge;
 pub use project_glob::{rooted_project_glob, validate_project_glob};
 pub use project_state::{
     PROJECT_STATE_DIR, ensure_project_state_dir, ensure_project_state_dir_in,
-    keep_existing_project_state_ignored, keep_state_dir_ignored_or_warn, project_package_dirs,
+    keep_existing_lpm_home_ignored, keep_existing_project_state_ignored, keep_lpm_home_ignored,
+    keep_lpm_home_ignored_in, keep_state_dir_ignored_or_warn, project_package_dirs,
     project_state_dir,
 };
 pub use provenance::{ProvenanceSnapshot, ProvenanceStatus, npm_package_purl};

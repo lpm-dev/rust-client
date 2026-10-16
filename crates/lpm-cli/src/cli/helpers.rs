@@ -273,6 +273,17 @@ pub(super) fn clap_help_hint_from_argv(args: &[std::ffi::OsString]) -> Option<St
     None
 }
 
+/// Whether `cmd` only takes login state or certificate trust away from the
+/// LPM home, or reports on it, so that it still runs where git could commit
+/// the home and what the home already holds can be cleaned up.
+pub(super) fn adds_no_secrets_to_the_lpm_home(cmd: &Commands) -> bool {
+    match cmd {
+        Commands::Logout(_) => true,
+        Commands::Cert(args) => matches!(args.action.as_str(), "status" | "uninstall"),
+        _ => false,
+    }
+}
+
 pub(super) fn command_needs_global_state(cmd: &Commands) -> bool {
     match cmd {
         // `install -g` (the actual install pipeline is wired; the
@@ -1670,6 +1681,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let _env = crate::test_env::ScopedEnv::set([
             ("HOME", home.path().as_os_str().to_owned()),
+            ("LPM_HOME", home.path().join(".lpm").into_os_string()),
             ("LPM_TOKEN", "loopback-smoke-token".into()),
             ("LPM_FORCE_FILE_AUTH", "1".into()),
         ]);
@@ -1688,6 +1700,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let _env = crate::test_env::ScopedEnv::set([
             ("HOME", home.path().as_os_str().to_owned()),
+            ("LPM_HOME", home.path().join(".lpm").into_os_string()),
             ("LPM_TOKEN", "production-token".into()),
             ("LPM_FORCE_FILE_AUTH", "1".into()),
         ]);

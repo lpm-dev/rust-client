@@ -62,7 +62,7 @@ pub async fn run(
     let mut server_revoked = false;
 
     if targets.clear_lpm && revoke && had_lpm_session && lpm_session_presence_known {
-        let stored_session = Arc::new(session.stored_session_only());
+        let stored_session = Arc::new(session.stored_session_for_revocation());
         match stored_session
             .bearer_string_for(AuthRequirement::SessionRequired)
             .await
@@ -93,10 +93,11 @@ pub async fn run(
                     }
                 }
             }
-            Err(_) => errors.push(
+            Err(LpmError::AuthRequired | LpmError::SessionExpired) => errors.push(
                 "session revocation: the stored credential is not a refresh-backed CLI session"
                     .to_string(),
             ),
+            Err(error) => errors.push(bounded_error("session revocation", &error.to_string())),
         }
     }
 
