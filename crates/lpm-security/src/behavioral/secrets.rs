@@ -324,18 +324,28 @@ const SECRET_PATTERNS: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
-/// Filenames that should NEVER be in a published package.
+/// Credential files that never belong in a published package, besides
+/// `.env` files: shell, network and registry credentials, SSH private keys,
+/// and cloud service-account keys.
 const BLOCKED_FILES: &[&str] = &[
-    ".env",
-    ".env.local",
-    ".env.production",
-    ".env.staging",
-    ".env.development",
-    ".env.live",
+    ".envrc",
+    ".netrc",
+    "_netrc",
+    ".pgpass",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
     "credentials.json",
     "service-account.json",
     "gcloud-key.json",
 ];
+
+/// `.env.<name>` files that hold no secrets by convention and are committed.
+const ENV_TEMPLATE_NAMES: &[&str] = &["example", "sample", "template", "defaults", "vault"];
 
 const MAX_SCANNABLE_FILE_BYTES: usize = 2 * 1024 * 1024;
 
@@ -357,11 +367,25 @@ pub fn scan_content(content: &str, file_path: &str) -> Vec<SecretMatch> {
     scan_content_bounded(content.as_bytes(), file_path, SECRET_SCAN_MAX_FINDINGS).0
 }
 
-/// Check if a filename is a blocked .env or credentials file.
+/// Whether a file, by its name and whatever its directory, holds credentials
+/// that never belong in a published package: `.env` and `.env.<name>`
+/// files other than templates such as `.env.example` or
+/// `.env.production.example`, and the files in [`BLOCKED_FILES`]. Case is
+/// ignored, as on a case-insensitive disk.
 pub fn is_blocked_file(filename: &str) -> bool {
-    let name = filename.rsplit('/').next().unwrap_or(filename);
-    let name = name.rsplit('\\').next().unwrap_or(name);
-    BLOCKED_FILES.iter().any(|b| name.eq_ignore_ascii_case(b))
+    let name = file_name(filename).to_ascii_lowercase();
+    if name == ".env" {
+        return true;
+    }
+    if let Some(variant) = name.strip_prefix(".env.") {
+        let last = variant.rsplit('.').next().unwrap_or(variant);
+        return !ENV_TEMPLATE_NAMES.contains(&last);
+    }
+    BLOCKED_FILES.contains(&name.as_str())
+}
+
+fn file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
 /// Scan one prepared package file without rediscovering it from the filesystem.
@@ -421,6 +445,9 @@ fn scan_file_content_after_file_charge(
     if !is_scannable_file(file_path) {
         return result;
     }
+    if is_scannable_only_as_text(file_path) && is_binary_content(content) {
+        return result;
+    }
     if !budget.consume_bytes(content.len()) {
         result.limit_exceeded = budget.exceeded();
         return result;
@@ -437,18 +464,43 @@ fn scan_file_content_after_file_charge(
     result
 }
 
+/// How much of a file's start [`is_binary_content`] reads.
+pub const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+
+/// Whether content that starts with `prefix` is binary, as git decides it:
+/// a NUL byte in the first [`BINARY_SNIFF_BYTES`]. Native executables (ELF,
+/// Mach-O, PE) all have one in their headers.
+pub fn is_binary_content(prefix: &[u8]) -> bool {
+    prefix[..prefix.len().min(BINARY_SNIFF_BYTES)].contains(&0)
+}
+
+/// Whether `file_path` is read only for being a file without an extension,
+/// such as a `bin/` script or a key file, which can also be a native
+/// executable: its content is scanned only when it is text.
+pub fn is_scannable_only_as_text(file_path: &str) -> bool {
+    file_extension(file_path).is_empty() && !is_scannable_by_name(file_path)
+}
+
+fn file_extension(file_path: &str) -> &str {
+    std::path::Path::new(file_name(file_path))
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+}
+
 fn is_scannable_file(file_path: &str) -> bool {
+    file_extension(file_path).is_empty() || is_scannable_by_name(file_path)
+}
+
+fn is_scannable_by_name(file_path: &str) -> bool {
     const SCANNABLE_EXTENSIONS: &[&str] = &[
         "js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx", "json", "yml", "yaml", "toml", "env",
         "cfg", "conf", "ini", "sh", "bash", "zsh", "py", "rb", "rs", "go", "java", "kt", "swift",
         "md", "txt", "xml", "pem",
     ];
 
-    let path = std::path::Path::new(file_path);
-    let ext = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or("");
+    let name = file_name(file_path);
+    let ext = file_extension(file_path);
     SCANNABLE_EXTENSIONS
         .iter()
         .any(|candidate| ext.eq_ignore_ascii_case(candidate))
@@ -463,7 +515,7 @@ fn is_scannable_file(file_path: &str) -> bool {
             .iter()
             .any(|sensitive| component.eq_ignore_ascii_case(sensitive))
         })
-        || file_path
+        || name
             .get(..4)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(".env"))
         || file_path
@@ -538,8 +590,9 @@ pub fn scan_directory_with_budget(
         let content = if is_blocked_file(&rel_path) || !is_scannable_file(&rel_path) {
             Vec::new()
         } else {
-            match lpm_common::read_file_capped(path, MAX_SCANNABLE_FILE_BYTES as u64) {
-                Ok(content) => content,
+            match read_scannable_content(path, &rel_path) {
+                Ok(Some(content)) => content,
+                Ok(None) => continue,
                 Err(error) => {
                     result.incomplete_reason = Some(format!("cannot scan {rel_path}: {error}"));
                     return result;
@@ -556,6 +609,30 @@ pub fn scan_directory_with_budget(
     }
 
     result
+}
+
+/// The content the scan reads at `path`, or `None` for a file it reads only
+/// as text whose start is binary, which is not read further.
+fn read_scannable_content(
+    path: &std::path::Path,
+    rel_path: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    if is_scannable_only_as_text(rel_path) {
+        use std::io::Read as _;
+        let mut prefix = Vec::with_capacity(BINARY_SNIFF_BYTES);
+        std::fs::File::open(path)
+            .and_then(|file| {
+                file.take(BINARY_SNIFF_BYTES as u64)
+                    .read_to_end(&mut prefix)
+            })
+            .map_err(|error| error.to_string())?;
+        if is_binary_content(&prefix) {
+            return Ok(None);
+        }
+    }
+    lpm_common::read_file_capped(path, MAX_SCANNABLE_FILE_BYTES as u64)
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 fn scan_content_bounded(
@@ -729,11 +806,43 @@ mod tests {
         assert!(is_blocked_file(".env"));
         assert!(is_blocked_file(".env.local"));
         assert!(is_blocked_file(".env.production"));
+        assert!(is_blocked_file(".env.development.local"));
+        assert!(is_blocked_file(".env.preview"));
         assert!(is_blocked_file("path/to/.env"));
+        assert!(is_blocked_file("config\\.ENV.Staging"));
         assert!(is_blocked_file("credentials.json"));
         assert!(!is_blocked_file("app.js"));
         assert!(!is_blocked_file(".env.example"));
+        assert!(!is_blocked_file(".env.production.example"));
+        assert!(!is_blocked_file(".env.sample"));
+        assert!(!is_blocked_file(".environment"));
         assert!(!is_blocked_file("package.json"));
+    }
+
+    #[test]
+    fn blocked_credential_files() {
+        for name in [
+            ".envrc",
+            "keys/id_rsa",
+            "ID_ED25519",
+            ".netrc",
+            "_netrc",
+            ".pgpass",
+            ".pypirc",
+            ".git-credentials",
+            "deploy/service-account.json",
+        ] {
+            assert!(is_blocked_file(name), "{name}");
+        }
+        assert!(!is_blocked_file("keys/id_rsa.pub"));
+    }
+
+    #[test]
+    fn files_without_an_extension_and_nested_env_files_are_scanned() {
+        assert!(file_content_requires_scan("bin/deploy"));
+        assert!(file_content_requires_scan("keys/id_rsa"));
+        assert!(file_content_requires_scan("config/.env.preview"));
+        assert!(!file_content_requires_scan("logo.png"));
     }
 
     #[test]
@@ -826,6 +935,60 @@ mod tests {
         assert_eq!(result.matches.len(), 1);
         assert_eq!(result.matches[0].pattern_name, "npm_token");
         assert_eq!(result.files_scanned, 1);
+    }
+
+    fn native_executable_with_key_text(size: usize) -> Vec<u8> {
+        let mut content = b"\x7fELF\x02\x01\x01\x00".to_vec();
+        content.extend_from_slice(
+            b"\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBA\nAKIAIOSFODNN7EXAMPLE\n",
+        );
+        content.resize(size.max(content.len()), 0);
+        content
+    }
+
+    #[test]
+    fn an_extensionless_native_executable_is_not_scanned_as_text() {
+        let binary = native_executable_with_key_text(64 * 1024);
+        let mut budget = SecretScanBudget::for_operation();
+
+        let executable = scan_file_content_with_budget(&binary, "bin/esbuild", &mut budget);
+        assert!(!executable.has_secrets());
+        assert_eq!(executable.files_scanned, 0);
+
+        let named = scan_file_content_with_budget(&binary, "bin/tool.sh", &mut budget);
+        assert!(named.has_secrets(), "a listed extension keeps its scan");
+
+        let script = scan_file_content_with_budget(
+            b"#!/bin/sh\nexport AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n",
+            "bin/deploy",
+            &mut budget,
+        );
+        assert!(
+            script.has_secrets(),
+            "an extensionless script is still scanned"
+        );
+    }
+
+    #[test]
+    fn a_large_extensionless_executable_leaves_the_directory_scan_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("bin")).unwrap();
+        std::fs::write(
+            dir.path().join("bin/esbuild"),
+            native_executable_with_key_text(MAX_SCANNABLE_FILE_BYTES + 1024),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("bin/deploy"),
+            "#!/bin/sh\nexport AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n",
+        )
+        .unwrap();
+
+        let result = scan_directory(dir.path());
+
+        assert_eq!(result.incomplete_reason, None);
+        assert_eq!(result.files_scanned, 1);
+        assert!(result.has_secrets());
     }
 
     #[test]

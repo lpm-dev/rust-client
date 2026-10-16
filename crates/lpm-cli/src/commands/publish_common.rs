@@ -606,6 +606,7 @@ fn prepare_tarball_with_source_root_and_open_hook(
     });
     let validated_authored_skills = options.validated_authored_skills;
     candidates.retain(|candidate| !is_authored_skill_namespace(&candidate.archive_path));
+
     for skill in validated_authored_skills {
         validate_content_override_path(skill.path)?;
         push_tarball_candidate(
@@ -681,6 +682,22 @@ fn prepare_tarball_with_source_root_and_open_hook(
             )?;
             if opened_size <= LARGE_SECRET_SCAN_PRESCAN_BYTES {
                 continue;
+            }
+            let mut opened_file = opened_file;
+            if lpm_security::behavioral::secrets::is_scannable_only_as_text(&candidate.archive_path)
+            {
+                let mut prefix =
+                    Vec::with_capacity(lpm_security::behavioral::secrets::BINARY_SNIFF_BYTES);
+                opened_file
+                    .by_ref()
+                    .take(lpm_security::behavioral::secrets::BINARY_SNIFF_BYTES as u64)
+                    .read_to_end(&mut prefix)
+                    .map_err(LpmError::Io)?;
+                if lpm_security::behavioral::secrets::is_binary_content(&prefix) {
+                    candidate.secret_scan_completed = true;
+                    continue;
+                }
+                std::io::Seek::rewind(&mut opened_file).map_err(LpmError::Io)?;
             }
             let content =
                 read_opened_tarball_file(opened_file, opened_size, &candidate.archive_path)?;
@@ -1872,25 +1889,10 @@ fn collect_cap_directory(
 /// Security-sensitive defaults applied in addition to project ignore rules.
 const IGNORE_DIRS: &[&str] = &["node_modules", ".git", ".svn", ".hg", "CVS"];
 
-const IGNORE_FILES: &[&str] = &[
-    ".gitignore",
-    ".npmignore",
-    ".DS_Store",
-    "Thumbs.db",
-    ".env",
-    ".env.local",
-    ".env.live",
-    ".env.development",
-    ".env.production",
-    ".env.staging",
-    ".env.test",
-    ".envrc",
-    "id_rsa",
-    "id_ed25519",
-    "id_ecdsa",
-    ".netrc",
-    ".pgpass",
-];
+/// Files an implicit publish leaves out besides credential files
+/// (`lpm_security::behavioral::secrets::is_blocked_file`). Credential files
+/// `files` selects stay, so the secret scan stops the publish and says so.
+const IGNORE_FILES: &[&str] = &[".gitignore", ".npmignore", ".DS_Store", "Thumbs.db"];
 
 /// The project's committed LPM records, kept out of every tarball.
 const PROJECT_RECORD_FILES: &[&str] = &[
@@ -1962,6 +1964,7 @@ fn collect_implicit_directory(
             collect_implicit_directory(&child, &relative, matchers, depth + 1, result)?;
         } else if metadata.is_file()
             && !contains_ascii_case_insensitive(IGNORE_FILES, &display_name)
+            && !lpm_security::behavioral::secrets::is_blocked_file(&display_name)
         {
             let archive_path = portable_relative(&relative);
             if archive_path != "package.json" && !is_npm_strict_exclusion(&archive_path) {

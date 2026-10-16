@@ -591,12 +591,37 @@ fn custom_publish_retry_detail_does_not_expose_registry_path() {
 }
 
 #[test]
+fn publish_check_json_lists_the_tarball_files() {
+    let files = [
+        publish_common::TarballFile {
+            path: "package.json".into(),
+            size: 120,
+        },
+        publish_common::TarballFile {
+            path: "lpm-skills/usage.md".into(),
+            size: 900,
+        },
+    ];
+
+    let json = publish_check_json(None, &[], &std::collections::HashMap::new(), &files);
+
+    assert_eq!(json["files"], 2);
+    assert_eq!(
+        json["tarball_files"],
+        serde_json::json!([
+            {"path": "package.json", "size": 120},
+            {"path": "lpm-skills/usage.md", "size": 900},
+        ])
+    );
+}
+
+#[test]
 fn custom_publish_check_json_exposes_only_registry_origin() {
     let target = PublishTarget::Custom("https://packages.example.test/npm/private-path".into());
     let target_names =
         std::collections::HashMap::from([(target.key(), "custom-package".to_string())]);
 
-    let json = publish_check_json(None, &[target], &target_names);
+    let json = publish_check_json(None, &[target], &target_names, &[]);
 
     assert_eq!(
         json["targets"][0]["registry"],
