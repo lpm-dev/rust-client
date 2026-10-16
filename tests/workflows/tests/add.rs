@@ -33,6 +33,21 @@ use support::{
     wait_for_lock_contention, write_lpm_proxy_npmrc, write_npm_firewall_global_config,
 };
 
+const LEGACY_SOURCE_STATE: &str = ".lpm/added-sources.json";
+
+/// Where `lpm add` keeps its copy of a file it overwrote.
+fn source_backup_path(package: &str, manifest_path: &str) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(package.as_bytes());
+    hasher.update([0]);
+    hasher.update(manifest_path.as_bytes());
+    format!(
+        ".lpm/added-source-backups/{}.bak",
+        hex::encode(hasher.finalize())
+    )
+}
+
 #[tokio::test]
 async fn source_add_and_remove_use_in_project_paths_on_native_platforms() {
     let mock = MockRegistry::start().await;
@@ -2320,7 +2335,7 @@ async fn add_rejects_inline_config_values_outside_the_package_schema_before_muta
             .assert()
             .failure();
         assert!(!project.file_exists("components/Source.ts"));
-        assert!(!project.file_exists(".lpm/added-sources.json"));
+        assert!(!project.file_exists("lpm-sources.json"));
     }
 }
 
@@ -2475,7 +2490,7 @@ async fn add_package_skill_fetch_failure_is_nonfatal_and_json_stays_valid() {
     );
     assert!(project.file_exists("components/Widget.ts"));
     let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-sources.json")).unwrap();
     assert!(
         state["packages"][package]
             .get("skillPackageShort")
@@ -2514,21 +2529,21 @@ async fn add_records_installed_digest_and_original_backup_for_forced_overwrite()
         .success();
 
     let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-sources.json")).unwrap();
     let file = &state["packages"][package]["files"][std::path::Path::new("components")
         .join("Source.ts")
         .to_str()
         .unwrap()];
-    assert_eq!(state["schema_version"], 3);
+    assert_eq!(state["schemaVersion"], 1);
     assert_eq!(file["action"], "overwrite");
     assert_eq!(
-        file["installed_digest"],
+        file["digest"],
         format!("sha256-{}", hex::encode(Sha256::digest(installed)))
     );
-    let backup_path = file["backup_path"].as_str().expect("overwrite backup path");
-    assert_eq!(project.read_file(backup_path), "original project bytes\n");
+    let backup_path = source_backup_path(package, "components/Source.ts");
+    assert_eq!(project.read_file(&backup_path), "original project bytes\n");
     assert_eq!(
-        file["backup_digest"],
+        file["originalDigest"],
         format!(
             "sha256-{}",
             hex::encode(Sha256::digest(b"original project bytes\n"))
@@ -2568,14 +2583,14 @@ async fn add_repeat_after_installed_file_deletion_preserves_original_backup() {
     }
 
     let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-sources.json")).unwrap();
     let file = &state["packages"][package]["files"][std::path::Path::new("components")
         .join("Source.ts")
         .to_str()
         .unwrap()];
     assert_eq!(file["action"], "overwrite");
-    let backup_path = file["backup_path"].as_str().expect("overwrite backup path");
-    assert_eq!(project.read_file(backup_path), "original project bytes\n");
+    let backup_path = source_backup_path(package, "components/Source.ts");
+    assert_eq!(project.read_file(&backup_path), "original project bytes\n");
 }
 
 #[tokio::test]
@@ -2657,7 +2672,7 @@ async fn add_new_version_replaces_unchanged_created_and_overwritten_outputs() {
     }
 
     let overwritten_state: serde_json::Value =
-        serde_json::from_str(&overwritten_project.read_file(".lpm/added-sources.json")).unwrap();
+        serde_json::from_str(&overwritten_project.read_file("lpm-sources.json")).unwrap();
     let overwritten_file =
         &overwritten_state["packages"][package]["files"][std::path::Path::new("components")
             .join("Source.ts")
@@ -2665,12 +2680,10 @@ async fn add_new_version_replaces_unchanged_created_and_overwritten_outputs() {
             .unwrap()];
     assert_eq!(overwritten_file["action"], "overwrite");
     #[cfg(unix)]
-    assert_eq!(overwritten_file["backup_mode"], 0o751);
-    let backup_path = overwritten_file["backup_path"]
-        .as_str()
-        .expect("overwrite backup path");
+    assert_eq!(overwritten_file["originalMode"], 0o751);
+    let backup_path = source_backup_path(package, "components/Source.ts");
     assert_eq!(
-        overwritten_project.read_file(backup_path),
+        overwritten_project.read_file(&backup_path),
         "original project bytes\n"
     );
 }
@@ -2714,15 +2727,8 @@ async fn add_new_version_restores_original_when_a_dropped_overwrite_is_missing()
         ])
         .assert()
         .success();
-    let first_state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
-    let backup_path = first_state["packages"][package]["files"][std::path::Path::new("components")
-        .join("Old.ts")
-        .to_str()
-        .unwrap()]["backup_path"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    assert!(project.file_exists("lpm-sources.json"));
+    let backup_path = source_backup_path(package, "components/Old.ts");
     std::fs::remove_file(project.path().join("components/Old.ts")).unwrap();
 
     lpm_with_registry(&project, &mock.url())
@@ -2742,7 +2748,7 @@ async fn add_new_version_restores_original_when_a_dropped_overwrite_is_missing()
     );
     assert!(!project.file_exists(&backup_path));
     let final_state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-sources.json")).unwrap();
     assert!(
         final_state["packages"][package]["files"]
             .get(
@@ -2794,15 +2800,8 @@ async fn add_rejects_a_tampered_backup_before_restoring_a_dropped_overwrite() {
         ])
         .assert()
         .success();
-    let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
-    let backup_path = state["packages"][package]["files"][std::path::Path::new("components")
-        .join("Old.ts")
-        .to_str()
-        .unwrap()]["backup_path"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    assert!(project.file_exists("lpm-sources.json"));
+    let backup_path = source_backup_path(package, "components/Old.ts");
     project.write_file(&backup_path, "tampered backup bytes\n");
 
     lpm_with_registry(&project, &mock.url())
@@ -2867,7 +2866,7 @@ async fn add_new_version_removes_unchanged_outputs_dropped_by_the_package() {
     assert!(!project.file_exists("components/Old.ts"));
     assert!(project.file_exists("components/New.ts"));
     let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-sources.json")).unwrap();
     let files = state["packages"][package]["files"].as_object().unwrap();
     assert!(!files.contains_key("components/Old.ts"));
     assert!(files.contains_key("components/New.ts"));
@@ -2916,7 +2915,7 @@ async fn add_new_version_prunes_empty_directories_owned_only_by_dropped_outputs(
     assert!(!project.path().join("components/legacy").exists());
     assert!(project.file_exists("components/current/New.ts"));
     let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-sources.json")).unwrap();
     assert_eq!(
         state["packages"][package]["createdDirectories"],
         json!(["components", "components/current"])
@@ -3030,7 +3029,7 @@ async fn add_new_version_rolls_back_when_stale_directory_cleanup_fails_and_succe
         ])
         .assert()
         .success();
-    let state_before = project.read_file(".lpm/added-sources.json");
+    let state_before = project.read_file("lpm-sources.json");
     let legacy = project.path().join("components/legacy");
     std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o555)).unwrap();
 
@@ -3049,7 +3048,7 @@ async fn add_new_version_rolls_back_when_stale_directory_cleanup_fails_and_succe
     assert!(!failed.status.success());
     assert!(project.file_exists("components/legacy/nested/Old.ts"));
     assert!(!project.file_exists("components/current/New.ts"));
-    assert_eq!(project.read_file(".lpm/added-sources.json"), state_before);
+    assert_eq!(project.read_file("lpm-sources.json"), state_before);
 
     std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o755)).unwrap();
     lpm_with_registry(&project, &mock.url())
@@ -3130,7 +3129,7 @@ async fn add_does_not_record_preexisting_destination_directories_as_owned() {
         .success();
 
     let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-sources.json")).unwrap();
     assert!(
         state["packages"][package]
             .get("createdDirectories")
@@ -3195,7 +3194,7 @@ async fn add_new_version_removes_unchanged_dependency_dropped_by_the_package() {
         serde_json::from_str(&project.read_file("package.json")).unwrap();
     assert!(manifest["dependencies"].get(dependency).is_none());
     let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-sources.json")).unwrap();
     assert!(
         state["packages"][package]["dependencies"]
             .get(dependency)
@@ -3267,7 +3266,7 @@ async fn add_new_version_updates_an_unchanged_dependency_owned_by_the_package() 
         serde_json::from_str(&project.read_file("package.json")).unwrap();
     assert_eq!(manifest["dependencies"][dependency], "2.0.0");
     let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-sources.json")).unwrap();
     let ownership = &state["packages"][package]["dependencies"][dependency];
     assert_eq!(ownership["spec"], "2.0.0");
     assert_eq!(ownership["inserted"], true);
@@ -3358,7 +3357,7 @@ async fn add_transfers_dependency_cleanup_ownership_until_the_last_source_drops_
         "1.0.0"
     );
     let state_after_first_drop: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-sources.json")).unwrap();
     assert_eq!(
         state_after_first_drop["packages"][second_package]["dependencies"][dependency]["inserted"],
         true
@@ -3412,7 +3411,7 @@ async fn add_records_dependency_requirement_and_insertion_ownership() {
         .success();
 
     let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-sources.json")).unwrap();
     let requirement = &state["packages"][package]["dependencies"][dependency];
     assert_eq!(requirement["spec"], "1.0.0");
     assert_eq!(requirement["section"], "dependencies");
@@ -3452,7 +3451,7 @@ async fn add_repeat_preserves_dependency_insertion_ownership() {
     }
 
     let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-sources.json")).unwrap();
     assert_eq!(
         state["packages"][package]["dependencies"][dependency]["inserted"],
         true
@@ -3487,7 +3486,7 @@ async fn add_waits_for_the_project_install_lock_before_mutating_source_state() {
         "add must wait while another transaction owns the project install lock"
     );
     assert!(!project.file_exists("components/Source.ts"));
-    assert!(!project.file_exists(".lpm/added-sources.json"));
+    assert!(!project.file_exists("lpm-sources.json"));
     drop(transaction_lock);
 
     let output = child.wait_with_output().expect("finish contending add");
@@ -3532,7 +3531,7 @@ async fn add_rejects_a_workspace_that_appears_while_waiting_for_the_lock() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("appeared while waiting"));
     assert!(!project.file_exists("components/Source.ts"));
-    assert!(!project.file_exists(".lpm/added-sources.json"));
+    assert!(!project.file_exists("lpm-sources.json"));
 }
 
 #[tokio::test]
@@ -3550,7 +3549,7 @@ async fn add_refuses_a_forged_backup_path_before_deleting_outside_files() {
     let outside = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(outside.path(), b"outside sentinel").unwrap();
     project.write_file(
-        ".lpm/added-sources.json",
+        LEGACY_SOURCE_STATE,
         &serde_json::to_string_pretty(&json!({
             "schema_version": 2,
             "packages": {
@@ -3846,7 +3845,7 @@ async fn readd_retains_lower_file_ownership_while_an_overwrite_owner_remains() {
     }
 
     let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-sources.json")).unwrap();
     assert!(
         state["packages"][lower]["files"]
             .get("components/Shared.ts")
@@ -3930,7 +3929,7 @@ async fn add_rejects_an_existing_directory_at_a_file_destination() {
 
     assert!(!output.status.success());
     assert!(project.path().join("components/Source.bin").is_dir());
-    assert!(!project.file_exists(".lpm/added-sources.json"));
+    assert!(!project.file_exists("lpm-sources.json"));
 }
 
 #[tokio::test]
@@ -3966,7 +3965,7 @@ async fn add_rechecks_engine_constraints_after_waiting_for_the_project_lock() {
 
     assert!(!output.status.success());
     assert!(!project.file_exists("components/Source.ts"));
-    assert!(!project.file_exists(".lpm/added-sources.json"));
+    assert!(!project.file_exists("lpm-sources.json"));
 }
 
 #[cfg(unix)]
@@ -4277,7 +4276,7 @@ async fn add_dependency_opt_out_preserves_earlier_dependency_ownership() {
         .success();
     assert_eq!(project.read_file("package.json"), before);
     let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-sources.json")).unwrap();
     assert_eq!(
         state["packages"][package]["dependencies"][dependency]["inserted"],
         true
@@ -4328,7 +4327,7 @@ async fn workspace_source_only_add_does_not_require_or_create_a_dependency_lockf
             !dry_run
         );
         assert_eq!(
-            project.file_exists("packages/app/.lpm/added-sources.json"),
+            project.file_exists("packages/app/lpm-sources.json"),
             !dry_run
         );
     }
@@ -4373,7 +4372,7 @@ async fn add_dry_run_reports_identical_and_stale_source_files_without_mutation()
         ])
         .assert()
         .success();
-    let state = project.read_file(".lpm/added-sources.json");
+    let state = project.read_file("lpm-sources.json");
     let output = lpm_with_registry(&project, &mock.url())
         .args([
             "add",
@@ -4397,7 +4396,7 @@ async fn add_dry_run_reports_identical_and_stale_source_files_without_mutation()
         body["stale_files"],
         json!([{"path":"components/Drop.ts","action":"remove"}])
     );
-    assert_eq!(project.read_file(".lpm/added-sources.json"), state);
+    assert_eq!(project.read_file("lpm-sources.json"), state);
     assert!(project.file_exists("components/Drop.ts"));
 }
 
@@ -4425,7 +4424,7 @@ async fn add_rejects_unknown_package_managers_before_project_mutation() {
             String::from_utf8_lossy(&output.stderr).contains("invalid value 'unknown-manager'")
         );
         assert_eq!(project.read_file("package.json"), manifest);
-        assert!(!project.file_exists(".lpm/added-sources.json"));
+        assert!(!project.file_exists("lpm-sources.json"));
     }
 }
 
@@ -4559,7 +4558,7 @@ async fn add_dry_run_reports_stale_original_restoration_and_dependency_removal()
         ])
         .assert()
         .success();
-    let state = project.read_file(".lpm/added-sources.json");
+    let state = project.read_file("lpm-sources.json");
     let manifest = project.read_file("package.json");
     let output = lpm_with_registry(&project, &mock.url())
         .args([
@@ -4584,7 +4583,7 @@ async fn add_dry_run_reports_stale_original_restoration_and_dependency_removal()
         json!([{"name":leaf,"section":"dependencies","spec":"1.0.0"}])
     );
     assert_eq!(project.read_file("package.json"), manifest);
-    assert_eq!(project.read_file(".lpm/added-sources.json"), state);
+    assert_eq!(project.read_file("lpm-sources.json"), state);
     assert_eq!(project.read_file("components/Restore.ts"), "replacement\n");
 }
 
@@ -4730,10 +4729,10 @@ async fn add_dry_run_preserves_shared_stale_paths_without_reading_them() {
         .assert()
         .success();
     let mut state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-sources.json")).unwrap();
     state["packages"]["second-owner"] = state["packages"][package].clone();
     project.write_file(
-        ".lpm/added-sources.json",
+        "lpm-sources.json",
         &serde_json::to_string_pretty(&state).unwrap(),
     );
     std::fs::remove_file(project.path().join("vendor/Shared.ts")).unwrap();
@@ -5077,7 +5076,7 @@ async fn failed_recursive_add_restores_a_directory_recreated_by_a_child() {
 
 async fn assert_failed_directory_reuse_restores(destination: &str) {
     let (project, mock) = directory_reuse_fixture(destination).await;
-    let state = project.read_file(".lpm/added-sources.json");
+    let state = project.read_file("lpm-sources.json");
     lpm_with_registry(&project, &mock.url())
         .args([
             "add",
@@ -5089,7 +5088,7 @@ async fn assert_failed_directory_reuse_restores(destination: &str) {
         .assert()
         .failure();
     assert_eq!(project.read_file("Sources/Legacy/Old.swift"), "old\n");
-    assert_eq!(project.read_file(".lpm/added-sources.json"), state);
+    assert_eq!(project.read_file("lpm-sources.json"), state);
     assert!(!project.path().join(".lpm/install-recovery").exists());
 }
 
@@ -5103,7 +5102,7 @@ async fn interrupted_recursive_add_recovers_reused_directories_and_resumes_rollb
             Some("after-source-undo"),
         ] {
             let (project, mock) = directory_reuse_fixture(destination).await;
-            let state = project.read_file(".lpm/added-sources.json");
+            let state = project.read_file("lpm-sources.json");
             let mut command = lpm_spawnable_with_registry(&project, &mock.url());
             command.args([
                 "add",
@@ -5137,7 +5136,7 @@ async fn interrupted_recursive_add_recovers_reused_directories_and_resumes_rollb
                 .assert()
                 .success();
             assert_eq!(project.read_file("Sources/Legacy/Old.swift"), "old\n");
-            assert_eq!(project.read_file(".lpm/added-sources.json"), state);
+            assert_eq!(project.read_file("lpm-sources.json"), state);
             assert!(!project.path().join(".lpm/install-recovery").exists());
         }
     }
@@ -5146,7 +5145,7 @@ async fn interrupted_recursive_add_recovers_reused_directories_and_resumes_rollb
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn source_checkpoint_without_its_move_recovers_before_the_next_command() {
     let (project, mock) = directory_reuse_fixture("Legacy").await;
-    let state = project.read_file(".lpm/added-sources.json");
+    let state = project.read_file("lpm-sources.json");
     let mut command = lpm_spawnable_with_registry(&project, &mock.url());
     command.args([
         "add",
@@ -5166,7 +5165,7 @@ async fn source_checkpoint_without_its_move_recovers_before_the_next_command() {
         .assert()
         .success();
     assert_eq!(project.read_file("Sources/Legacy/Old.swift"), "old\n");
-    assert_eq!(project.read_file(".lpm/added-sources.json"), state);
+    assert_eq!(project.read_file("lpm-sources.json"), state);
     assert!(!project.path().join(".lpm/install-recovery").exists());
 }
 

@@ -163,6 +163,12 @@ enum PlannedBackupMutation {
         destination: PathBuf,
         expected_destination: RemovalFileFingerprint,
     },
+    /// Hands a copy to a name nothing holds yet.
+    Move {
+        source: PathBuf,
+        expected_source: RemovalFileFingerprint,
+        destination: PathBuf,
+    },
 }
 
 struct MoveEntry {
@@ -792,19 +798,39 @@ fn plan_skill_removal(
     }))
 }
 
+/// Where the file a recorded overwrite replaced is kept.
+#[derive(Debug)]
+enum RecordedBackup {
+    /// The record isn't an overwrite.
+    NotOverwritten,
+    /// The verified copy on this machine.
+    Here(PathBuf),
+    /// The add ran on another machine, and its copy isn't here.
+    Elsewhere,
+}
+
+impl RecordedBackup {
+    fn here(self) -> Option<PathBuf> {
+        match self {
+            Self::Here(path) => Some(path),
+            Self::NotOverwritten | Self::Elsewhere => None,
+        }
+    }
+}
+
 fn validate_file_record(
     project_dir: &Path,
     package_key: &str,
     manifest_path: &Path,
     file: &AddedSourceFile,
-) -> Result<Option<PathBuf>, LpmError> {
+) -> Result<RecordedBackup, LpmError> {
     match file.action {
         None if file.installed_digest.is_none()
             && file.backup_path.is_none()
             && file.backup_digest.is_none()
             && file.backup_mode.is_none() =>
         {
-            Ok(None)
+            Ok(RecordedBackup::NotOverwritten)
         }
         None => Err(LpmError::Registry(format!(
             "source state for '{}' has incomplete file provenance",
@@ -821,7 +847,7 @@ fn validate_file_record(
                     manifest_path.display()
                 )));
             }
-            Ok(None)
+            Ok(RecordedBackup::NotOverwritten)
         }
         Some(AddedSourceFileAction::Overwrite) => {
             if file.backup_mode.is_some_and(|mode| mode & !0o7777 != 0) {
@@ -847,12 +873,18 @@ fn validate_file_record(
                 manifest_path,
                 recorded_backup,
             )?;
-            crate::added_sources_state::validate_existing_backup(
+            if file.backup_digest.is_none() {
+                return Err(LpmError::Registry(format!(
+                    "source overwrite backup '{}' has no recorded backup integrity",
+                    relative_backup.display()
+                )));
+            }
+            Ok(crate::added_sources_state::local_backup(
                 project_dir,
                 &relative_backup,
                 file.backup_digest.as_deref(),
-            )
-            .map(Some)
+            )?
+            .map_or(RecordedBackup::Elsewhere, RecordedBackup::Here))
         }
     }
 }
@@ -862,6 +894,9 @@ struct FileRemovalPlan {
     backup_mutations: Vec<PlannedBackupMutation>,
     retained: AddedSourceRecord,
     preserved: Vec<String>,
+    /// Files an add on another machine overwrote, kept because their
+    /// originals aren't here.
+    originals_elsewhere: Vec<String>,
 }
 
 fn plan_file_removals(
@@ -900,6 +935,7 @@ fn plan_file_removals(
     let mut transfers = Vec::new();
     let mut retained = AddedSourceRecord::default();
     let mut preserved = Vec::new();
+    let mut originals_elsewhere = Vec::new();
 
     for (manifest_path, file) in &record.files {
         let destination = crate::added_sources_state::resolve_tracked_manifest_path_from_root(
@@ -938,44 +974,75 @@ fn plan_file_removals(
                 .get(candidate_package)
                 .and_then(|record| record.files.get(manifest_path))
                 .expect("successor index references an existing file owner");
+            // A copy that isn't on this machine leaves nothing to move; the
+            // record is handed on all the same.
             let candidate_backup = validate_file_record(
                 project_dir,
                 candidate_package,
                 manifest_path,
                 candidate_file,
             )?
-            .expect("successor index contains overwrite owners only");
-            let candidate_backup_fingerprint =
-                RemovalFileFingerprint::from_path(&candidate_backup)?.ok_or_else(|| {
+            .here();
+            let fingerprint = |path: &Path| {
+                RemovalFileFingerprint::from_path(path)?.ok_or_else(|| {
                     LpmError::Registry(format!(
                         "source overwrite backup disappeared during planning: {}",
-                        candidate_backup.display()
+                        path.display()
                     ))
-                })?;
+                })
+            };
 
             match action {
                 AddedSourceFileAction::Create => {
-                    backup_mutations.push(PlannedBackupMutation::Delete {
-                        path: candidate_backup,
-                        expected: candidate_backup_fingerprint,
-                    });
+                    if let Some(candidate_backup) = candidate_backup {
+                        let expected = fingerprint(&candidate_backup)?;
+                        backup_mutations.push(PlannedBackupMutation::Delete {
+                            path: candidate_backup,
+                            expected,
+                        });
+                    }
                     transfers.push((candidate_package.clone(), manifest_path.clone(), None));
                 }
                 AddedSourceFileAction::Overwrite => {
-                    let source = backup.expect("validated overwrite backup");
-                    let expected_source =
-                        RemovalFileFingerprint::from_path(&source)?.ok_or_else(|| {
-                            LpmError::Registry(format!(
-                                "source overwrite backup disappeared during planning: {}",
-                                source.display()
-                            ))
-                        })?;
-                    backup_mutations.push(PlannedBackupMutation::Promote {
-                        source,
-                        expected_source,
-                        destination: candidate_backup,
-                        expected_destination: candidate_backup_fingerprint,
-                    });
+                    // The successor inherits this file's original: its copy
+                    // becomes that original where it is here, and a copy of
+                    // what this package installed stops standing in for it
+                    // where it isn't.
+                    match (backup.here(), candidate_backup) {
+                        (Some(source), Some(destination)) => {
+                            let expected_source = fingerprint(&source)?;
+                            let expected_destination = fingerprint(&destination)?;
+                            backup_mutations.push(PlannedBackupMutation::Promote {
+                                source,
+                                expected_source,
+                                destination,
+                                expected_destination,
+                            });
+                        }
+                        (Some(source), None)
+                            if candidate_file.action == Some(AddedSourceFileAction::Overwrite) =>
+                        {
+                            let expected_source = fingerprint(&source)?;
+                            backup_mutations.push(PlannedBackupMutation::Move {
+                                source,
+                                expected_source,
+                                destination: project_dir.join(
+                                    crate::added_sources_state::backup_path_for_file(
+                                        candidate_package,
+                                        manifest_path,
+                                    ),
+                                ),
+                            });
+                        }
+                        (None, Some(stale)) => {
+                            let expected = fingerprint(&stale)?;
+                            backup_mutations.push(PlannedBackupMutation::Delete {
+                                path: stale,
+                                expected,
+                            });
+                        }
+                        (Some(_) | None, None) => {}
+                    }
                     transfers.push((
                         candidate_package.clone(),
                         manifest_path.clone(),
@@ -1041,15 +1108,21 @@ fn plan_file_removals(
                 operation: FileRemoval::Delete,
             }),
             AddedSourceFileAction::Create => {}
-            AddedSourceFileAction::Overwrite => removals.push(PlannedFileRemoval {
-                manifest_path: manifest_path.clone(),
-                destination,
-                expected_destination: destination_state,
-                operation: FileRemoval::Restore {
-                    backup: backup.expect("validated overwrite backup"),
-                    original_mode: file.backup_mode,
-                },
-            }),
+            AddedSourceFileAction::Overwrite => match backup {
+                RecordedBackup::Here(backup) => removals.push(PlannedFileRemoval {
+                    manifest_path: manifest_path.clone(),
+                    destination,
+                    expected_destination: destination_state,
+                    operation: FileRemoval::Restore {
+                        backup,
+                        original_mode: file.backup_mode,
+                    },
+                }),
+                RecordedBackup::Elsewhere if exists => originals_elsewhere.push(
+                    crate::added_sources_state::display_manifest_path(manifest_path),
+                ),
+                RecordedBackup::Elsewhere | RecordedBackup::NotOverwritten => {}
+            },
         }
     }
 
@@ -1081,6 +1154,7 @@ fn plan_file_removals(
         backup_mutations,
         retained,
         preserved,
+        originals_elsewhere,
     })
 }
 
@@ -2758,6 +2832,8 @@ struct RemoveResult<'a> {
     #[serde(skip_serializing_if = "string_slice_is_empty")]
     preserved: &'a [String],
     #[serde(skip_serializing_if = "string_slice_is_empty")]
+    originals_elsewhere: &'a [String],
+    #[serde(skip_serializing_if = "string_slice_is_empty")]
     dependencies_removed: &'a [String],
 }
 
@@ -2768,6 +2844,7 @@ fn string_slice_is_empty(values: &&[String]) -> bool {
 struct LockedRemoveResult {
     removed: Vec<String>,
     preserved: Vec<String>,
+    originals_elsewhere: Vec<String>,
     dependencies_removed: Vec<String>,
     cleaned_directories: usize,
 }
@@ -2777,6 +2854,7 @@ impl LockedRemoveResult {
         Self {
             removed: Vec::new(),
             preserved: Vec::new(),
+            originals_elsewhere: Vec::new(),
             dependencies_removed: Vec::new(),
             cleaned_directories: 0,
         }
@@ -2813,25 +2891,37 @@ async fn run_locked(project_dir: &Path, package: &str) -> Result<LockedRemoveRes
     let Some(package_key) = package_key else {
         return Ok(LockedRemoveResult::empty());
     };
-    let state_path = crate::added_sources_state::state_path(project_dir);
-    let state_snapshot = state_snapshot.ok_or_else(|| {
-        LpmError::Registry(format!(
-            "added-source state disappeared while locating '{package_key}'"
-        ))
-    })?;
-    let state_original = RemovalFileFingerprint::from_bytes(&state_snapshot);
+    if !state_snapshot.exists() {
+        return Err(LpmError::Registry(format!(
+            "the source package record disappeared while locating '{package_key}'"
+        )));
+    }
+    let state_originals: Vec<(PathBuf, Option<RemovalFileFingerprint>)> = state_snapshot
+        .files
+        .iter()
+        .map(|(path, bytes)| {
+            (
+                path.clone(),
+                bytes.as_deref().map(RemovalFileFingerprint::from_bytes),
+            )
+        })
+        .collect();
     let mut manifest_transaction =
         crate::manifest_tx::ManifestTransaction::snapshot_install_state(&[], &[], &[]).map_err(
             |error| LpmError::Registry(format!("failed to snapshot source removal state: {error}")),
         )?;
-    manifest_transaction
-        .snapshot_path_with_bytes_if_unchanged(&state_path, state_snapshot)
-        .map_err(|error| {
+    for (path, bytes) in state_snapshot.files {
+        let snapshot = match bytes {
+            Some(bytes) => manifest_transaction.snapshot_path_with_bytes_if_unchanged(&path, bytes),
+            None => manifest_transaction.snapshot_optional_path_with_bytes(&path, None),
+        };
+        snapshot.map_err(|error| {
             LpmError::Registry(format!(
-                "failed to snapshot added-source state '{}': {error}",
-                state_path.display()
+                "failed to snapshot source package record '{}': {error}",
+                path.display()
             ))
         })?;
+    }
 
     let record = state
         .take_package(&package_key)
@@ -2842,6 +2932,7 @@ async fn run_locked(project_dir: &Path, package: &str) -> Result<LockedRemoveRes
         backup_mutations,
         mut retained,
         preserved,
+        originals_elsewhere,
     } = plan_file_removals(
         project_dir,
         &canonical_project,
@@ -2934,6 +3025,20 @@ async fn run_locked(project_dir: &Path, package: &str) -> Result<LockedRemoveRes
                 removal_transaction.quarantine_path(&destination)?;
                 removal_transaction.move_path(&source, &destination)?;
             }
+            PlannedBackupMutation::Move {
+                source,
+                expected_source,
+                destination,
+            } => {
+                if !expected_source.matches_path(&source)?
+                    || RemovalFileFingerprint::from_path(&destination)?.is_some()
+                {
+                    return Err(LpmError::Registry(
+                        "source overwrite provenance changed during removal".to_string(),
+                    ));
+                }
+                removal_transaction.move_path(&source, &destination)?;
+            }
         }
     }
 
@@ -2990,21 +3095,29 @@ async fn run_locked(project_dir: &Path, package: &str) -> Result<LockedRemoveRes
             Err(error) => return Err(LpmError::Io(error)),
         }
     }
-    if !state_original.matches_path(&state_path)? {
-        return Err(LpmError::Registry(
-            "added-source state changed during source removal".to_string(),
-        ));
+    for (path, original) in &state_originals {
+        let unchanged = match original {
+            Some(original) => original.matches_path(path)?,
+            None => RemovalFileFingerprint::from_path(path)?.is_none(),
+        };
+        if !unchanged {
+            return Err(LpmError::Registry(
+                "the source package record changed during source removal".to_string(),
+            ));
+        }
     }
     crate::added_sources_state::write_state(project_dir, &state)?;
     crate::install_recovery::test_pause("after-source-state");
-    manifest_transaction
-        .restore_only_if_current(&state_path)
-        .map_err(|error| {
-            LpmError::Registry(format!(
-                "failed to guard added-source state '{}': {error}",
-                state_path.display()
-            ))
-        })?;
+    for (path, _) in &state_originals {
+        manifest_transaction
+            .restore_only_if_current(path)
+            .map_err(|error| {
+                LpmError::Registry(format!(
+                    "failed to guard source package record '{}': {error}",
+                    path.display()
+                ))
+            })?;
+    }
     manifest_transaction
         .verify_guarded_paths()
         .map_err(|error| LpmError::Registry(error.to_string()))?;
@@ -3019,6 +3132,7 @@ async fn run_locked(project_dir: &Path, package: &str) -> Result<LockedRemoveRes
     Ok(LockedRemoveResult {
         removed,
         preserved,
+        originals_elsewhere,
         dependencies_removed,
         cleaned_directories,
     })
@@ -3033,6 +3147,7 @@ fn render_result(
     let LockedRemoveResult {
         removed,
         preserved,
+        originals_elsewhere,
         dependencies_removed,
         cleaned_directories,
     } = result;
@@ -3046,6 +3161,7 @@ fn render_result(
                 package,
                 removed: &removed,
                 preserved: &preserved,
+                originals_elsewhere: &originals_elsewhere,
                 dependencies_removed: &dependencies_removed,
             },
         )
@@ -3056,7 +3172,11 @@ fn render_result(
         return Ok(());
     }
 
-    if removed.is_empty() && preserved.is_empty() && dependencies_removed.is_empty() {
+    if removed.is_empty()
+        && preserved.is_empty()
+        && originals_elsewhere.is_empty()
+        && dependencies_removed.is_empty()
+    {
         install_ui::warn_line(crate::install_ui::terminal_line!(
             "No tracked source files found for {}",
             install_ui::yellow(package)
@@ -3075,6 +3195,13 @@ fn render_result(
         let path = lpm_common::sanitize_terminal_inline(path);
         install_ui::warn_line(crate::install_ui::terminal_line!(
             "Preserved modified, unverified, or still-owned source file {}",
+            install_ui::dim(&path)
+        ));
+    }
+    for path in &originals_elsewhere {
+        let path = lpm_common::sanitize_terminal_inline(path);
+        install_ui::warn_line(crate::install_ui::terminal_line!(
+            "Kept {}: lpm add replaced it on another machine, so its original isn't here; restore it from version control if you need it",
             install_ui::dim(&path)
         ));
     }

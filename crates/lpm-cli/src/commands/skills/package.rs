@@ -228,6 +228,9 @@ pub(crate) fn materialization_complete(project_dir: &Path, package_json: &str) -
     let Ok(value) = serde_json::from_str::<serde_json::Value>(package_json) else {
         return false;
     };
+    let Ok(added) = added_source_skills(project_dir, &BTreeSet::new()) else {
+        return false;
+    };
     let mut packages = BTreeSet::new();
     for section in ["dependencies", "devDependencies", "optionalDependencies"] {
         let Some(dependencies) = value.get(section).and_then(serde_json::Value::as_object) else {
@@ -246,6 +249,30 @@ pub(crate) fn materialization_complete(project_dir: &Path, package_json: &str) -
     packages
         .iter()
         .all(|package| package_materialization_complete(project_dir, package))
+        && added
+            .iter()
+            .filter(|(name, _)| !packages.contains(name.strip_prefix("@lpm.dev/").unwrap_or(name)))
+            .all(|(name, version)| version_is_materialized(project_dir, name, version))
+}
+
+/// The skills `lpm add` delivered, as `(@lpm.dev/<package>, version)` from
+/// `lpm-sources.json`, for packages other than `direct` dependencies, which
+/// install with their dependency's version.
+pub(crate) fn added_source_skills(
+    project_dir: &Path,
+    direct: &BTreeSet<&str>,
+) -> Result<Vec<(String, String)>, LpmError> {
+    let mut skills: Vec<(String, String)> =
+        crate::added_sources_state::load_skill_versions(project_dir)?
+            .into_iter()
+            .filter_map(|(short, version)| {
+                let name = format!("@lpm.dev/{short}");
+                (!direct.contains(name.as_str())).then_some((name, version))
+            })
+            .collect();
+    skills.sort();
+    skills.dedup_by(|left, right| left.0 == right.0);
+    Ok(skills)
 }
 
 pub(crate) fn version_is_materialized(project_dir: &Path, name: &str, version: &str) -> bool {

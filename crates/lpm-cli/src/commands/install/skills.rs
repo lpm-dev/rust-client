@@ -23,6 +23,27 @@ pub(super) fn selected_package_skills(
         .collect())
 }
 
+/// The skills `lpm-sources.json` records for packages `lpm add` delivered,
+/// other than `direct` dependencies, that aren't in `.lpm/skills/` at the
+/// recorded version, so a fresh checkout gets them back.
+pub(super) fn missing_added_source_skills(
+    project_dir: &Path,
+    direct: &std::collections::BTreeSet<&str>,
+) -> Result<Vec<(String, String)>, LpmError> {
+    Ok(
+        crate::commands::skills::package::added_source_skills(project_dir, direct)?
+            .into_iter()
+            .filter(|(name, version)| {
+                !crate::commands::skills::package::version_is_materialized(
+                    project_dir,
+                    name,
+                    version,
+                )
+            })
+            .collect(),
+    )
+}
+
 pub(super) async fn install_skills_for_packages(
     client: &Arc<RegistryClient>,
     packages: &[(&str, &str)],
