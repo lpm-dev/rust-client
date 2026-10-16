@@ -1,36 +1,15 @@
+//! Local record of the last install's overrides,
+//! `<project_dir>/.lpm/overrides-state.json`. Never committed: `lpm.lock`'s
+//! importer record names the overrides a resolution used, and installs
+//! compare against that. The file keeps the **fingerprint** of the parsed
+//! override set — the only evidence of what a lockfile written before
+//! importer records was resolved with — and the **applied hits**, so
+//! `lpm graph --why` can decorate paths with the override that touched
+//! them.
 //!
-//!
-//! Mirrors the [`crate::build_state`] pattern for the override apply
-//! trace. The state file persists three things across installs:
-//!
-//! 1. The deterministic **fingerprint** of the parsed override set, so
-//!    the lockfile fast path can be invalidated when the user edits
-//!    `lpm.overrides` / `overrides` / `resolutions` between runs. Without
-//!    this, the lockfile would silently shadow override changes.
-//! 2. The list of **parsed entries**, so introspection commands can
-//!    read what was declared without re-parsing `package.json`.
-//! 3. The list of **applied hits**, so `lpm graph --why` can decorate
-//!    paths with the override that touched them.
-//!
-//! ## Location
-//!
-//! `<project_dir>/.lpm/overrides-state.json`. Same convention as
-//! `build-state.json` and `install-hash` — next to `package.json`,
-//! survives `rm -rf node_modules`.
-//!
-//! ## Schema versioning
-//!
-//! [`OVERRIDES_STATE_VERSION`] is bumped on every breaking change.
-//! Readers return `None` (and the install pipeline treats the absent
-//! state as "first run") on a version mismatch — forward-compat is
-//! never read state files newer than what we know how to parse.
-//!
-//! ## Atomic writes
-//!
-//! [`write_state`] uses an exclusively created same-directory staging file
-//! and atomic replacement, mirroring the [`crate::build_state`] writer. A
-//! crash mid-write leaves the previous state file intact rather than
-//! producing a partially-written file the reader chokes on.
+//! [`OVERRIDES_STATE_VERSION`] is bumped on every breaking change; readers
+//! treat other versions as absent. [`write_state`] replaces the file
+//! atomically.
 
 use lpm_common::LpmError;
 use lpm_resolver::{
@@ -54,14 +33,12 @@ pub struct OverridesState {
     /// and treat any mismatch as "no state".
     pub state_version: u32,
     /// Deterministic SHA-256 fingerprint over the parsed override set
-    /// (see [`OverrideSet::fingerprint`]). Used by the install pipeline
-    /// to invalidate the lockfile fast path when overrides change.
+    /// (see [`OverrideSet::fingerprint`]). Installs compare it only when
+    /// the lockfile has no importer record.
     pub fingerprint: String,
     /// RFC 3339 timestamp of when this state file was written.
     pub captured_at: String,
-    /// Every parsed entry in deterministic order. Survives across
-    /// installs even when the lockfile fast path is taken — that's
-    /// what makes the fingerprint comparison meaningful.
+    /// Every parsed entry in deterministic order.
     pub parsed: Vec<ParsedEntry>,
     /// Every override applied during the most recent fresh resolution.
     /// On lockfile-fast-path installs we preserve the previous trace

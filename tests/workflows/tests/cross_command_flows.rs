@@ -107,17 +107,15 @@ fn parse_envelope_labeled(stdout: &[u8], stderr: &[u8], label: &str) -> serde_js
 /// Patch authored via `lpm patch` + `lpm patch-commit` survives a
 /// subsequent `lpm install`. Asserts the on-disk patch file AND the
 /// post-second-install link tree contain the patched bytes. The
-/// second install must be online (mock-registry backed) because
-/// patch-commit does not pre-stage the patch-state fingerprint that
-/// `--offline` requires; bootstrapping that state IS the install's
-/// job after patch-commit.
+/// second install must be online (mock-registry backed): patch-commit
+/// edits package.json, and only an install refreshes the lockfile's
+/// importer record that `--offline` replays against.
 #[tokio::test]
 async fn flow_install_patch_patch_commit_install_persists_patch() {
     let project = TempProject::empty(r#"{"name":"flow-patch-persists","version":"0.0.0"}"#);
 
-    // Mount the package on a mock registry so the post-patch install
-    // can bootstrap the patch-state.json fingerprint that --offline
-    // would otherwise require pre-staged.
+    // Mount the package on a mock registry so the post-patch install can
+    // refresh the lockfile's importer record.
     let mock = MockRegistry::start().await;
     let pkg_json = serde_json::json!({
         "name": "ms",
@@ -215,8 +213,8 @@ async fn flow_install_patch_patch_commit_install_persists_patch() {
         "patch-commit must write the patchedDependencies entry"
     );
 
-    // Step 4: second install — bootstraps patch-state.json + applies
-    // the patch to the link tree.
+    // Step 4: second install — records the patch in the lockfile and
+    // applies it to the link tree.
     let mut install_cmd = lpm_with_registry(&project, &mock.url());
     install_cmd.env("LPM_LINKER", "isolated").args([
         "install",

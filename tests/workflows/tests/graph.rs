@@ -961,27 +961,8 @@ type AppliedPatchTuple<'a> = (
 );
 
 /// Write a synthetic `.lpm/patch-state.json` for `lpm graph --why`
-/// decoration. The `parsed` arm encodes the manifest's
-/// `lpm.patchedDependencies` map; the `applied` arm encodes per-package
-/// apply outcomes.
-fn write_patch_state(
-    project: &TempProject,
-    fingerprint: &str,
-    parsed: &[(&str, &str, &str, &str)],
-    applied: &[AppliedPatchTuple<'_>],
-) {
-    let parsed_json: Vec<serde_json::Value> = parsed
-        .iter()
-        .map(|(raw_key, name, version, path)| {
-            serde_json::json!({
-                "raw_key": raw_key,
-                "name": name,
-                "version": version,
-                "path": path,
-                "original_integrity": "sha512-fixture",
-            })
-        })
-        .collect();
+/// decoration from per-package apply outcomes.
+fn write_patch_state(project: &TempProject, applied: &[AppliedPatchTuple<'_>]) {
     let applied_json: Vec<serde_json::Value> = applied
         .iter()
         .map(
@@ -1000,10 +981,8 @@ fn write_patch_state(
         )
         .collect();
     let state = serde_json::json!({
-        "state_version": 1,
-        "fingerprint": fingerprint,
+        "state_version": 2,
         "captured_at": "2026-04-12T00:00:00Z",
-        "parsed": parsed_json,
         "applied": applied_json,
     });
     project.write_file(
@@ -1022,13 +1001,6 @@ fn graph_why_human_output_shows_patch_trace() {
     write_simple_lockfile(&project, &[("lodash", "4.17.21", &[])]);
     write_patch_state(
         &project,
-        "sha256-test-fp",
-        &[(
-            "lodash@4.17.21",
-            "lodash",
-            "4.17.21",
-            "patches/lodash@4.17.21.patch",
-        )],
         &[(
             "lodash",
             "4.17.21",
@@ -1072,13 +1044,6 @@ fn graph_why_json_output_includes_applied_patches() {
     write_simple_lockfile(&project, &[("lodash", "4.17.21", &[])]);
     write_patch_state(
         &project,
-        "sha256-test-fp",
-        &[(
-            "lodash@4.17.21",
-            "lodash",
-            "4.17.21",
-            "patches/lodash@4.17.21.patch",
-        )],
         &[(
             "lodash",
             "4.17.21",
@@ -1162,16 +1127,8 @@ fn graph_why_includes_original_integrity_in_human_and_json() {
     // on the applied entry (the helper writes "sha512-fixture" by
     // default, which doesn't exercise this path).
     let state = serde_json::json!({
-        "state_version": 1,
-        "fingerprint": "sha256-test",
+        "state_version": 2,
         "captured_at": "2026-04-12T00:00:00Z",
-        "parsed": [{
-            "raw_key": "lodash@4.17.21",
-            "name": "lodash",
-            "version": "4.17.21",
-            "path": "patches/lodash@4.17.21.patch",
-            "original_integrity": test_integrity,
-        }],
         "applied": [{
             "raw_key": "lodash@4.17.21",
             "name": "lodash",

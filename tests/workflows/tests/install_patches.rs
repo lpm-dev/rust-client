@@ -5,9 +5,9 @@
 //! - Idempotent reruns are no-ops (no double-apply, no zero-op summary
 //!   in JSON or human output).
 //! - Drift / missing patch / fuzzy hunk are HARD install errors.
-//! - `--offline` enforces patch-fingerprint integrity (mirror of the
-//!   overrides offline contract).
-//! - State-file lifecycle: created on apply, deleted when patches
+//! - Installs check the declared patches against the ones `lpm.lock`
+//!   records; a fresh clone (no `.lpm/`) replays them, `--offline` too.
+//! - Local state-file lifecycle: created on apply, deleted when patches
 //!   removed.
 //! - `--json` envelope's `applied_patches[]` reflects per-run work,
 //!   not the persisted state.
@@ -143,25 +143,6 @@ fn append_lockfile_patch_records_at(base_dir: &std::path::Path, records: &[(&str
     std::fs::write(base_dir.join("lpm.lock"), toml).unwrap();
 }
 
-/// Mirror of `patch_state::compute_fingerprint`. **MUST stay in sync**
-/// with the resolver — divergence makes the matching-fingerprint tests
-/// fail loudly.
-fn patch_state_fingerprint(entries: &[(&str, &str, &str)]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut keys: Vec<&(&str, &str, &str)> = entries.iter().collect();
-    keys.sort_by(|a, b| a.0.cmp(b.0));
-    let mut h = Sha256::new();
-    for (k, p, integrity) in keys {
-        h.update(k.as_bytes());
-        h.update(b"\x00");
-        h.update(p.as_bytes());
-        h.update(b"\x00");
-        h.update(integrity.as_bytes());
-        h.update(b"\x01");
-    }
-    format!("sha256-{:x}", h.finalize())
-}
-
 type AppliedTuple<'a> = (
     &'a str,       // name
     &'a str,       // version
@@ -172,26 +153,8 @@ type AppliedTuple<'a> = (
     usize,         // deleted
 );
 
-/// Write `.lpm/patch-state.json` capturing parsed + applied entries.
-/// Used both as drift-gate fixture and as graph-decoration fixture.
-fn write_patch_state(
-    project: &TempProject,
-    fingerprint: &str,
-    parsed: &[(&str, &str, &str, &str)],
-    applied: &[AppliedTuple<'_>],
-) {
-    let parsed_json: Vec<serde_json::Value> = parsed
-        .iter()
-        .map(|(raw_key, name, version, path)| {
-            serde_json::json!({
-                "raw_key": raw_key,
-                "name": name,
-                "version": version,
-                "path": path,
-                "original_integrity": "sha512-fixture",
-            })
-        })
-        .collect();
+/// Write `.lpm/patch-state.json` with the given apply trace.
+fn write_patch_state(project: &TempProject, applied: &[AppliedTuple<'_>]) {
     let applied_json: Vec<serde_json::Value> = applied
         .iter()
         .map(
@@ -210,10 +173,8 @@ fn write_patch_state(
         )
         .collect();
     let state = serde_json::json!({
-        "state_version": 1,
-        "fingerprint": fingerprint,
+        "state_version": 2,
         "captured_at": "2026-04-12T00:00:00Z",
-        "parsed": parsed_json,
         "applied": applied_json,
     });
     project.write_file(
@@ -222,12 +183,10 @@ fn write_patch_state(
     );
 }
 
-/// Build a fixture with the seeded store entry, a patch file at
-/// `patches/<key>.patch`, a manifest declaring
-/// `lpm.patchedDependencies`, a lockfile, and a matching
-/// `.lpm/patch-state.json`. Returns the integrity the engine will read
-/// back. The pre-staged state is required so the offline drift gate
-/// accepts the apply pass.
+/// Build a fresh-clone fixture: the seeded store entry, a patch file at
+/// `patches/<key>.patch`, a manifest declaring `lpm.patchedDependencies`,
+/// and a lockfile recording the patch. Returns the integrity the engine
+/// will read back.
 fn build_patch_install_fixture(
     project: &TempProject,
     project_name: &str,
@@ -263,13 +222,6 @@ fn build_patch_install_fixture(
 
     let key = format!("{pkg_name}@{pkg_version}");
     append_lockfile_patch_records(project, &[(&key, &patch_rel, &integrity)]);
-    let fp = patch_state_fingerprint(&[(&key, &patch_rel, &integrity)]);
-    write_patch_state(
-        project,
-        &fp,
-        &[(&key, pkg_name, pkg_version, &patch_rel)],
-        &[],
-    );
     integrity
 }
 
@@ -349,27 +301,6 @@ fn install_patches_in_workspace_member_resolve_path_from_member_manifest() {
     .unwrap();
     write_lockfile_at(&member_dir, &[("lodash", "4.17.21", &[])]);
     append_lockfile_patch_records_at(&member_dir, &[("lodash@4.17.21", patch_rel, &integrity)]);
-    let fingerprint = patch_state_fingerprint(&[("lodash@4.17.21", patch_rel, &integrity)]);
-    let patch_state = serde_json::json!({
-        "state_version": 1,
-        "fingerprint": fingerprint,
-        "captured_at": "2026-04-12T00:00:00Z",
-        "parsed": [{
-            "raw_key": "lodash@4.17.21",
-            "name": "lodash",
-            "version": "4.17.21",
-            "path": patch_rel,
-            "original_integrity": "sha512-fixture",
-        }],
-        "applied": [],
-    });
-    std::fs::create_dir_all(member_dir.join(".lpm")).unwrap();
-    std::fs::write(
-        member_dir.join(".lpm/patch-state.json"),
-        serde_json::to_string_pretty(&patch_state).unwrap(),
-    )
-    .unwrap();
-
     let mut cmd = lpm_isolated(&project, "http://127.0.0.1:1");
     cmd.current_dir(&member_dir)
         .args(["install", "--offline"])
@@ -553,15 +484,6 @@ fn install_patches_hard_errors_on_missing_patch_file() {
         ),
     );
     write_lockfile(&project, &[("lodash", "4.17.21", &[])]);
-    // Pre-stage matching state so the offline drift gate passes; the
-    // missing-file check fires inside the apply pass.
-    let fp = patch_state_fingerprint(&[("lodash@4.17.21", patch_rel, &integrity)]);
-    write_patch_state(
-        &project,
-        &fp,
-        &[("lodash@4.17.21", "lodash", "4.17.21", patch_rel)],
-        &[],
-    );
 
     let out = lpm_isolated(&project, "http://127.0.0.1:1")
         .args(["install", "--offline"])
@@ -706,13 +628,6 @@ fn install_patches_offline_hard_errors_when_patches_change_between_runs() {
         &project,
         &[("lodash@4.17.21", "patches/v1.patch", &integrity)],
     );
-    let fp_v1 = patch_state_fingerprint(&[("lodash@4.17.21", "patches/v1.patch", &integrity)]);
-    write_patch_state(
-        &project,
-        &fp_v1,
-        &[("lodash@4.17.21", "lodash", "4.17.21", "patches/v1.patch")],
-        &[],
-    );
 
     // First install — succeeds with v1 applied.
     lpm_isolated(&project, "http://127.0.0.1:1")
@@ -749,139 +664,95 @@ fn install_patches_offline_hard_errors_when_patches_change_between_runs() {
     );
 }
 
-/// Persisted fingerprint diverges from the current `lpm.patchedDependencies`
-/// fingerprint → offline install hard-errors.
+/// A local patch-state left over from another patch set is a cache, not a
+/// record: the lockfile matches the manifest, so offline replay succeeds
+/// and the cache is rewritten from this install.
 #[test]
-fn install_patches_offline_hard_errors_on_patch_fingerprint_mismatch() {
+fn install_patches_offline_ignores_a_stale_local_patch_state() {
     let project = TempProject::empty("");
-    let integrity = seed_store_package(&project, "lodash", "4.17.21", &[("index.js", "x\n")]);
-    project.write_file(
-        "patches/lodash@4.17.21.patch",
-        "--- a/index.js\n+++ b/index.js\n@@ -1 +1 @@\n-x\n+X\n",
-    );
-    project.write_file(
-        "package.json",
-        &format!(
-            r#"{{
-  "name": "offline-patch-mismatch",
-  "version": "0.0.0",
-  "dependencies": {{ "lodash": "^4.17.0" }},
-  "lpm": {{
-    "patchedDependencies": {{
-      "lodash@4.17.21": {{
-        "path": "patches/lodash@4.17.21.patch",
-        "originalIntegrity": "{integrity}"
-      }}
-    }}
-  }}
-}}"#
-        ),
-    );
-    write_lockfile(&project, &[("lodash", "4.17.21", &[])]);
-    append_lockfile_patch_records(
+    build_patch_install_fixture(
         &project,
-        &[("lodash@4.17.21", "patches/lodash@4.17.21.patch", &integrity)],
+        "offline-stale-patch-state",
+        "lodash",
+        "4.17.21",
+        &[("index.js", "x\n")],
+        "--- a/index.js\n+++ b/index.js\n@@ -1 +1 @@\n-x\n+X\n",
     );
     write_patch_state(
         &project,
-        "sha256-completely-different-from-current",
         &[(
-            "lodash@4.17.21",
-            "lodash",
-            "4.17.21",
-            "patches/lodash@4.17.21.patch",
+            "left-pad",
+            "1.3.0",
+            "patches/left-pad@1.3.0.patch",
+            &[".lpm/wrappers/left-pad@1.3.0/node_modules/left-pad"],
+            1,
+            0,
+            0,
         )],
-        &[],
     );
 
-    let out = lpm_isolated(&project, "http://127.0.0.1:1")
+    lpm_isolated(&project, "http://127.0.0.1:1")
         .args(["install", "--offline"])
-        .output()
-        .expect("spawn lpm install");
-    assert!(
-        !out.status.success(),
-        "fingerprint mismatch must hard-error; stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let combined = strip_ansi(&format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    ));
-    assert!(
-        combined.contains("patch") || combined.contains("fingerprint"),
-        "error must mention patches/fingerprint; got:\n{combined}"
-    );
-    assert!(
-        combined.contains("online") || combined.contains("re-resolve"),
-        "error must point at online recovery; got:\n{combined}"
-    );
+        .assert()
+        .success();
+
+    let state: serde_json::Value =
+        serde_json::from_str(&project.read_file(".lpm/patch-state.json")).unwrap();
+    let applied = state["applied"].as_array().unwrap();
+    assert_eq!(applied.len(), 1, "{state}");
+    assert_eq!(applied[0]["name"], "lodash");
 }
 
-/// `package.json` declares patches but `.lpm/patch-state.json` is
-/// absent — offline cannot prove the lockfile is safe, must refuse.
+/// A fresh clone has the committed lockfile and patch files but no `.lpm/`.
+/// The lockfile records the patches, so offline replay applies them.
 #[test]
-fn install_patches_offline_hard_errors_when_patches_exist_but_no_state_file() {
+fn install_patches_offline_on_a_fresh_clone_applies_the_recorded_patches() {
     let project = TempProject::empty("");
-    let integrity = seed_store_package(&project, "lodash", "4.17.21", &[("index.js", "x\n")]);
-    project.write_file(
-        "patches/lodash@4.17.21.patch",
+    build_patch_install_fixture(
+        &project,
+        "offline-patch-fresh-clone",
+        "lodash",
+        "4.17.21",
+        &[("index.js", "x\n")],
         "--- a/index.js\n+++ b/index.js\n@@ -1 +1 @@\n-x\n+X\n",
     );
-    project.write_file(
-        "package.json",
-        &format!(
-            r#"{{
-  "name": "offline-patch-no-state",
-  "version": "0.0.0",
-  "dependencies": {{ "lodash": "^4.17.0" }},
-  "lpm": {{
-    "patchedDependencies": {{
-      "lodash@4.17.21": {{
-        "path": "patches/lodash@4.17.21.patch",
-        "originalIntegrity": "{integrity}"
-      }}
-    }}
-  }}
-}}"#
-        ),
-    );
-    write_lockfile(&project, &[("lodash", "4.17.21", &[])]);
-    append_lockfile_patch_records(
-        &project,
-        &[("lodash@4.17.21", "patches/lodash@4.17.21.patch", &integrity)],
-    );
-    // Intentionally no patch-state.json.
+    assert!(!project.path().join(".lpm").exists());
 
     let out = lpm_isolated(&project, "http://127.0.0.1:1")
         .args(["install", "--offline"])
         .output()
         .expect("spawn lpm install");
+
     assert!(
-        !out.status.success(),
-        "no-state-file must hard-error; stdout:\n{}\nstderr:\n{}",
+        out.status.success(),
+        "offline install of a fresh clone must succeed; stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let combined = strip_ansi(&format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    ));
-    assert!(
-        combined.contains("patch") || combined.contains("fingerprint"),
-        "error must mention patches/fingerprint; got:\n{combined}"
+    assert_eq!(
+        std::fs::read_to_string(
+            project
+                .path()
+                .join(".lpm/wrappers/lodash@4.17.21/node_modules/lodash/index.js")
+        )
+        .unwrap(),
+        "X\n"
     );
 }
 
-/// Prior state declares patches; current manifest declares NONE →
-/// offline must hard-error rather than silently linking against the
-/// (now-stale) patched lockfile.
+/// The lockfile records a patch the manifest no longer declares → the
+/// install refuses rather than linking a tree resolved for the old set.
 #[test]
-fn install_patches_offline_hard_errors_when_patches_removed_with_prior_state() {
+fn install_patches_offline_hard_errors_when_patches_were_removed_since_the_lockfile() {
     let project = TempProject::empty("");
-    seed_store_package(&project, "lodash", "4.17.21", &[("index.js", "x\n")]);
+    build_patch_install_fixture(
+        &project,
+        "offline-patches-removed",
+        "lodash",
+        "4.17.21",
+        &[("index.js", "x\n")],
+        "--- a/index.js\n+++ b/index.js\n@@ -1 +1 @@\n-x\n+X\n",
+    );
     project.write_file(
         "package.json",
         r#"{
@@ -889,26 +760,6 @@ fn install_patches_offline_hard_errors_when_patches_removed_with_prior_state() {
   "version": "0.0.0",
   "dependencies": { "lodash": "^4.17.0" }
 }"#,
-    );
-    write_lockfile(&project, &[("lodash", "4.17.21", &[])]);
-    write_patch_state(
-        &project,
-        "sha256-prior-fingerprint",
-        &[(
-            "lodash@4.17.21",
-            "lodash",
-            "4.17.21",
-            "patches/lodash@4.17.21.patch",
-        )],
-        &[(
-            "lodash",
-            "4.17.21",
-            "patches/lodash@4.17.21.patch",
-            &[".lpm/wrappers/lodash@4.17.21/node_modules/lodash"],
-            1,
-            0,
-            0,
-        )],
     );
 
     let out = lpm_isolated(&project, "http://127.0.0.1:1")
@@ -927,8 +778,8 @@ fn install_patches_offline_hard_errors_when_patches_removed_with_prior_state() {
         String::from_utf8_lossy(&out.stderr)
     ));
     assert!(
-        combined.contains("patch") || combined.contains("fingerprint"),
-        "error must mention patches/fingerprint; got:\n{combined}"
+        combined.contains("Patch lockfile mismatch") && combined.contains("lodash@4.17.21"),
+        "error must name the patch the lockfile still records; got:\n{combined}"
     );
 }
 
@@ -948,8 +799,7 @@ fn install_patches_deletes_patch_state_file_when_patches_removed() {
 }"#,
     );
     write_lockfile(&project, &[("lodash", "4.17.21", &[])]);
-    let empty_fp = patch_state_fingerprint(&[]);
-    write_patch_state(&project, &empty_fp, &[], &[]);
+    write_patch_state(&project, &[]);
 
     lpm_isolated(&project, "http://127.0.0.1:1")
         .args(["install", "--offline"])
