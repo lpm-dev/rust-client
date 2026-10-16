@@ -219,7 +219,7 @@ pub(crate) struct TarballOptions<'a> {
     pub(crate) extra_scan_files: &'a [PublishScanInput<'a>],
     pub(crate) content_overrides: &'a [PublishContentOverride<'a>],
     pub(crate) excluded_paths: &'a [&'a str],
-    pub(crate) validated_authored_skills: Option<&'a [PublishContentOverride<'a>]>,
+    pub(crate) validated_authored_skills: &'a [PublishContentOverride<'a>],
 }
 
 #[derive(Clone, Copy)]
@@ -351,28 +351,17 @@ fn readme_priority(path: &str) -> Option<usize> {
 }
 
 fn is_authored_skill_namespace(path: &str) -> bool {
-    let mut components = path.split(['/', '\\']).filter(|part| !part.is_empty());
-    components
-        .next()
-        .is_some_and(|part| part.eq_ignore_ascii_case(".lpm"))
-        && components
-            .next()
-            .is_some_and(|part| part.eq_ignore_ascii_case("skills"))
+    path.split(['/', '\\'])
+        .find(|part| !part.is_empty())
+        .is_some_and(|part| part.eq_ignore_ascii_case(lpm_skill::AUTHORED_SKILLS_DIR))
 }
 
 fn is_authored_skill_namespace_path(path: &Path) -> bool {
-    let mut components = path.components();
     matches!(
-        (components.next(), components.next()),
-        (
-            Some(std::path::Component::Normal(first)),
-            Some(std::path::Component::Normal(second))
-        ) if first
+        path.components().next(),
+        Some(std::path::Component::Normal(first)) if first
             .to_str()
-            .is_some_and(|part| part.eq_ignore_ascii_case(".lpm"))
-            && second
-                .to_str()
-                .is_some_and(|part| part.eq_ignore_ascii_case("skills"))
+            .is_some_and(|part| part.eq_ignore_ascii_case(lpm_skill::AUTHORED_SKILLS_DIR))
     )
 }
 
@@ -562,9 +551,7 @@ fn prepare_tarball_with_source_root_and_open_hook(
     });
 
     before_file_collection();
-    let restrict_authored_skills = options.validated_authored_skills.is_some();
-    let project_files =
-        collect_package_files(pkg_json, project_source_dir, restrict_authored_skills)?;
+    let project_files = collect_package_files(pkg_json, project_source_dir)?;
     let mut candidates = Vec::with_capacity(project_files.len());
     for file in project_files {
         push_tarball_candidate(
@@ -617,27 +604,20 @@ fn prepare_tarball_with_source_root_and_open_hook(
             .iter()
             .any(|path| candidate.archive_path == *path)
     });
-    let validated_authored_skills = options.validated_authored_skills.unwrap_or_default();
-    if options.validated_authored_skills.is_some() {
-        candidates.retain(|candidate| {
-            !is_authored_skill_namespace(&candidate.archive_path)
-                || validated_authored_skills
-                    .iter()
-                    .any(|skill| skill.path == candidate.archive_path)
-        });
-        for skill in validated_authored_skills {
-            validate_content_override_path(skill.path)?;
-            push_tarball_candidate(
-                &mut candidates,
-                TarballCandidate {
-                    source_path: None,
-                    source_root: Arc::clone(&project_source_root),
-                    archive_path: skill.path.to_string(),
-                    expected_content_sha256: None,
-                    secret_scan_completed: false,
-                },
-            )?;
-        }
+    let validated_authored_skills = options.validated_authored_skills;
+    candidates.retain(|candidate| !is_authored_skill_namespace(&candidate.archive_path));
+    for skill in validated_authored_skills {
+        validate_content_override_path(skill.path)?;
+        push_tarball_candidate(
+            &mut candidates,
+            TarballCandidate {
+                source_path: None,
+                source_root: Arc::clone(&project_source_root),
+                archive_path: skill.path.to_string(),
+                expected_content_sha256: None,
+                secret_scan_completed: false,
+            },
+        )?;
     }
     collect_bundled_dependencies(
         project_source_dir,
@@ -1418,7 +1398,6 @@ fn is_safe_entry(path: &Path, canonical_root: &Path) -> bool {
 fn collect_package_files(
     pkg_json: &serde_json::Value,
     source_dir: &Dir,
-    restrict_authored_skills: bool,
 ) -> Result<Vec<TarballFile>, LpmError> {
     let mut result = Vec::new();
 
@@ -1436,17 +1415,11 @@ fn collect_package_files(
 
     if let Some(files_arr) = pkg_json.get("files").and_then(|f| f.as_array()) {
         let matcher = PublishFilesMatcher::parse(files_arr)?;
-        collect_explicit_matches(
-            source_dir,
-            Path::new(""),
-            &matcher,
-            restrict_authored_skills,
-            &mut result,
-        )?;
+        collect_explicit_matches(source_dir, Path::new(""), &matcher, &mut result)?;
     } else {
-        collect_all_files(source_dir, restrict_authored_skills, &mut result)?;
+        collect_all_files(source_dir, &mut result)?;
     }
-    collect_required_manifest_files(source_dir, pkg_json, restrict_authored_skills, &mut result)?;
+    collect_required_manifest_files(source_dir, pkg_json, &mut result)?;
 
     for entry in source_dir.entries()? {
         let entry = entry?;
@@ -1723,7 +1696,6 @@ fn collect_explicit_matches(
     directory: &Dir,
     relative_dir: &Path,
     matcher: &PublishFilesMatcher,
-    restrict_authored_skills: bool,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
     validate_publish_archive_path(relative_dir)?;
@@ -1731,7 +1703,7 @@ fn collect_explicit_matches(
         let entry = entry?;
         let name = entry.file_name();
         let relative = relative_dir.join(&name);
-        if restrict_authored_skills && is_authored_skill_namespace_path(&relative) {
+        if is_authored_skill_namespace_path(&relative) {
             continue;
         }
         let Some(metadata) = safe_cap_metadata(directory, Path::new(&name))? else {
@@ -1756,10 +1728,7 @@ fn collect_explicit_matches(
             && matcher.can_match_descendant(&relative)
         {
             let child = open_cap_directory_entry(directory, &name, &relative)?;
-            if is_materialized_package_skill_directory(&relative, &child)? {
-                continue;
-            }
-            collect_explicit_matches(&child, &relative, matcher, restrict_authored_skills, result)?;
+            collect_explicit_matches(&child, &relative, matcher, result)?;
         }
     }
     Ok(())
@@ -1768,21 +1737,20 @@ fn collect_explicit_matches(
 fn collect_required_manifest_files(
     source_dir: &Dir,
     pkg_json: &serde_json::Value,
-    restrict_authored_skills: bool,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
     for field in ["main", "browser"] {
         if let Some(path) = pkg_json.get(field).and_then(serde_json::Value::as_str) {
-            collect_required_manifest_path(source_dir, path, restrict_authored_skills, result)?;
+            collect_required_manifest_path(source_dir, path, result)?;
         }
     }
     match pkg_json.get("bin") {
         Some(serde_json::Value::String(path)) => {
-            collect_required_manifest_path(source_dir, path, restrict_authored_skills, result)?;
+            collect_required_manifest_path(source_dir, path, result)?;
         }
         Some(serde_json::Value::Object(entries)) => {
             for path in entries.values().filter_map(serde_json::Value::as_str) {
-                collect_required_manifest_path(source_dir, path, restrict_authored_skills, result)?;
+                collect_required_manifest_path(source_dir, path, result)?;
             }
         }
         _ => {}
@@ -1793,7 +1761,6 @@ fn collect_required_manifest_files(
 fn collect_required_manifest_path(
     source_dir: &Dir,
     manifest_path: &str,
-    restrict_authored_skills: bool,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
     let normalized = manifest_path.replace('\\', "/");
@@ -1815,30 +1782,34 @@ fn collect_required_manifest_path(
     if relative_path.as_os_str().is_empty() {
         return Ok(());
     }
-    collect_exact_publish_path(source_dir, &relative_path, restrict_authored_skills, result)
+    collect_exact_publish_path(source_dir, &relative_path, result)
 }
 
+/// Paths no tarball holds, whatever `files`, `.npmignore` or `.gitignore`
+/// say: version control and dependency trees, LPM's machine-local `.lpm`
+/// state at any depth, the project's committed LPM records, which describe
+/// the project rather than the package, and registry configuration.
 fn is_npm_strict_exclusion(path: &str) -> bool {
     let mut segment_count = 0;
     let mut file_name: Option<&str> = None;
-    let mut parent_name: Option<&str> = None;
     for segment in path
         .split(['/', '\\'])
         .filter(|segment| !segment.is_empty())
     {
-        if [".git", "node_modules"]
+        if [".git", "node_modules", lpm_common::PROJECT_STATE_DIR]
             .iter()
             .any(|excluded| segment.eq_ignore_ascii_case(excluded))
         {
             return true;
         }
-        if file_name.is_some_and(|previous| previous.eq_ignore_ascii_case(".lpm"))
-            && segment.eq_ignore_ascii_case("release-apply")
+        if segment_count == 0
+            && PROJECT_RECORD_DIRS
+                .iter()
+                .any(|excluded| segment.eq_ignore_ascii_case(excluded))
         {
             return true;
         }
         segment_count += 1;
-        parent_name = file_name;
         file_name = Some(segment);
     }
     let Some(file_name) = file_name else {
@@ -1853,23 +1824,16 @@ fn is_npm_strict_exclusion(path: &str) -> bool {
     if lpm_common::atomic_write::is_atomic_temp_name(file_name) {
         return true;
     }
-    if parent_name.is_some_and(|parent| parent.eq_ignore_ascii_case(".lpm"))
-        && PROJECT_LOCK_FILES
-            .iter()
-            .any(|excluded| file_name.eq_ignore_ascii_case(excluded))
-    {
-        return true;
-    }
     segment_count == 1
         && ROOT_LOCK_FILES
             .iter()
+            .chain(PROJECT_RECORD_FILES)
             .any(|excluded| file_name.eq_ignore_ascii_case(excluded))
 }
 
 fn collect_cap_directory(
     directory: &Dir,
     relative_dir: &Path,
-    restrict_authored_skills: bool,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
     validate_publish_archive_path(relative_dir)?;
@@ -1877,7 +1841,7 @@ fn collect_cap_directory(
         let entry = entry?;
         let name = entry.file_name();
         let relative = relative_dir.join(&name);
-        if restrict_authored_skills && is_authored_skill_namespace_path(&relative) {
+        if is_authored_skill_namespace_path(&relative) {
             continue;
         }
         let Some(metadata) = safe_cap_metadata(directory, Path::new(&name))? else {
@@ -1899,10 +1863,7 @@ fn collect_cap_directory(
             }
         } else if metadata.is_dir() {
             let child = open_cap_directory_entry(directory, &name, &relative)?;
-            if is_materialized_package_skill_directory(&relative, &child)? {
-                continue;
-            }
-            collect_cap_directory(&child, &relative, restrict_authored_skills, result)?;
+            collect_cap_directory(&child, &relative, result)?;
         }
     }
     Ok(())
@@ -1931,14 +1892,16 @@ const IGNORE_FILES: &[&str] = &[
     ".pgpass",
 ];
 
-const PROJECT_LOCK_FILES: &[&str] = &[
-    ".install.lock",
-    ".install.lock.writer-intent",
-    ".install.lock.writer-queue",
-    ".publish.lock",
-    ".publish.lock.writer-intent",
-    ".publish.lock.writer-queue",
+/// The project's committed LPM records, kept out of every tarball.
+const PROJECT_RECORD_FILES: &[&str] = &[
+    "lpm.lock",
+    "lpm.lockb",
+    "lpm-sources.json",
+    "lpm-agent-skills.json",
 ];
+
+/// Root directories of committed LPM records, kept out of every tarball.
+const PROJECT_RECORD_DIRS: &[&str] = &["lpm-changes"];
 
 const ROOT_LOCK_FILES: &[&str] = &[
     "package-lock.json",
@@ -1954,52 +1917,9 @@ fn contains_ascii_case_insensitive(values: &[&str], value: &str) -> bool {
         .any(|candidate| value.eq_ignore_ascii_case(candidate))
 }
 
-fn collect_all_files(
-    source_dir: &Dir,
-    restrict_authored_skills: bool,
-    result: &mut Vec<TarballFile>,
-) -> Result<(), LpmError> {
+fn collect_all_files(source_dir: &Dir, result: &mut Vec<TarballFile>) -> Result<(), LpmError> {
     let mut matchers = Vec::new();
-    collect_implicit_directory(source_dir, Path::new(""), &mut matchers, 0, result)?;
-    if !restrict_authored_skills {
-        collect_implicit_lpm_files(source_dir, result)?;
-    }
-    Ok(())
-}
-
-fn collect_implicit_lpm_files(
-    source_dir: &Dir,
-    result: &mut Vec<TarballFile>,
-) -> Result<(), LpmError> {
-    let Some(lpm_dir) = open_optional_cap_directory(source_dir, Path::new(".lpm"))? else {
-        return Ok(());
-    };
-    let Some(skills_dir) = open_optional_cap_directory(&lpm_dir, Path::new("skills"))? else {
-        return Ok(());
-    };
-    for entry in skills_dir.entries()? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(metadata) = safe_cap_metadata(&skills_dir, Path::new(&name))? else {
-            continue;
-        };
-        let relative = Path::new(".lpm").join("skills").join(&name);
-        if metadata.is_file()
-            && crate::commands::skills::author::is_authored_skill_path(
-                &relative,
-                Path::new(".lpm/skills"),
-            )
-        {
-            push_tarball_file(
-                result,
-                TarballFile {
-                    path: portable_relative(&relative),
-                    size: metadata.len(),
-                },
-            )?;
-        }
-    }
-    Ok(())
+    collect_implicit_directory(source_dir, Path::new(""), &mut matchers, 0, result)
 }
 
 fn collect_implicit_directory(
@@ -2033,7 +1953,8 @@ fn collect_implicit_directory(
         let display_name = name.to_string_lossy();
         if is_directory {
             if contains_ascii_case_insensitive(IGNORE_DIRS, &display_name)
-                || depth == 0 && display_name.eq_ignore_ascii_case(".lpm")
+                || depth == 0 && is_authored_skill_namespace_path(&relative)
+                || is_npm_strict_exclusion(&portable_relative(&relative))
             {
                 continue;
             }
@@ -2043,7 +1964,7 @@ fn collect_implicit_directory(
             && !contains_ascii_case_insensitive(IGNORE_FILES, &display_name)
         {
             let archive_path = portable_relative(&relative);
-            if archive_path != "package.json" {
+            if archive_path != "package.json" && !is_npm_strict_exclusion(&archive_path) {
                 push_tarball_file(
                     result,
                     TarballFile {
@@ -2134,7 +2055,6 @@ fn publish_path_is_ignored(
 fn collect_exact_publish_path(
     source_dir: &Dir,
     relative: &Path,
-    restrict_authored_skills: bool,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
     validate_publish_archive_path(relative)?;
@@ -2146,7 +2066,9 @@ fn collect_exact_publish_path(
             return Ok(());
         };
         current.push(name);
-        if restrict_authored_skills && is_authored_skill_namespace_path(&current) {
+        if is_authored_skill_namespace_path(&current)
+            || is_npm_strict_exclusion(&portable_relative(&current))
+        {
             return Ok(());
         }
         let Some(metadata) = safe_cap_metadata(&directory, Path::new(name))? else {
@@ -2166,9 +2088,7 @@ fn collect_exact_publish_path(
                 }
             } else if metadata.is_dir() {
                 let child = open_cap_directory_entry(&directory, name, &current)?;
-                if !is_materialized_package_skill_directory(&current, &child)? {
-                    collect_cap_directory(&child, &current, restrict_authored_skills, result)?;
-                }
+                collect_cap_directory(&child, &current, result)?;
             }
             return Ok(());
         }
@@ -2202,35 +2122,6 @@ fn open_cap_directory_entry(
     directory
         .open_dir_nofollow(Path::new(name.as_ref()))
         .map_err(|_| unsafe_publish_file_error(&portable_relative(relative)))
-}
-
-fn open_optional_cap_directory(directory: &Dir, name: &Path) -> Result<Option<Dir>, LpmError> {
-    let Some(metadata) = safe_cap_metadata(directory, name)? else {
-        return Ok(None);
-    };
-    if !metadata.is_dir() {
-        return Ok(None);
-    }
-    open_cap_directory_entry(directory, name.as_os_str(), name).map(Some)
-}
-
-fn is_materialized_package_skill_directory(
-    relative: &Path,
-    directory: &Dir,
-) -> Result<bool, LpmError> {
-    let mut segments = relative.iter();
-    if segments.next() != Some(std::ffi::OsStr::new(".lpm"))
-        || segments.next() != Some(std::ffi::OsStr::new("skills"))
-    {
-        return Ok(false);
-    }
-    if segments.next().is_none() || segments.next().is_some() {
-        return Ok(false);
-    }
-    Ok(
-        safe_cap_metadata(directory, Path::new(".lpm-package-skills.json"))?
-            .is_some_and(|metadata| metadata.is_file()),
-    )
 }
 
 fn portable_relative(relative: &Path) -> String {
@@ -2543,6 +2434,45 @@ fn normalize_relative_link_target(base: &Path, target: &Path) -> Option<PathBuf>
         }
     }
     Some(normalized)
+}
+
+/// The directory `publishConfig.directory` names, which a publish packs in
+/// place of the package root; `None` when the package publishes its root.
+pub(crate) fn publish_directory(pkg_json: &serde_json::Value) -> Result<Option<PathBuf>, LpmError> {
+    let Some(publish_config) = pkg_json.get("publishConfig") else {
+        return Ok(None);
+    };
+    let Some(publish_config) = publish_config.as_object() else {
+        return Err(LpmError::Registry(
+            "package.json \"publishConfig\" must be an object".into(),
+        ));
+    };
+    let Some(directory) = publish_config.get("directory") else {
+        return Ok(None);
+    };
+    let Some(directory) = directory.as_str() else {
+        return Err(LpmError::Registry(
+            "package.json \"publishConfig.directory\" must be a string".into(),
+        ));
+    };
+    let relative = Path::new(directory);
+    if directory.is_empty()
+        || relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(LpmError::Registry(format!(
+            "package.json publishConfig.directory must be a non-empty path inside the package directory (got \"{}\")",
+            lpm_common::sanitize_terminal_inline(directory),
+        )));
+    }
+    Ok(Some(relative.to_path_buf()))
 }
 
 pub(crate) fn open_cap_directory_path(
@@ -4694,56 +4624,49 @@ mod tests {
     }
 
     #[test]
-    fn implicit_publish_includes_only_validator_authored_skill_files_under_lpm() {
+    fn implicit_publish_ships_no_unvalidated_skill_files() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path();
-        std::fs::create_dir_all(project.join(".lpm/skills/assets")).unwrap();
+        std::fs::create_dir_all(project.join("lpm-skills/assets")).unwrap();
         std::fs::write(
             project.join("package.json"),
             r#"{"name": "@lpm.dev/test.pkg", "version": "1.0.0"}"#,
         )
         .unwrap();
         std::fs::write(
-            project.join(".lpm/skills/package-usage.md"),
+            project.join("lpm-skills/package-usage.md"),
             valid_authored_skill(),
         )
         .unwrap();
         std::fs::write(
-            project.join(".lpm/skills/author-notes.txt"),
+            project.join("lpm-skills/author-notes.txt"),
             "not an authored package skill",
         )
         .unwrap();
-        std::fs::write(
-            project.join(".lpm/skills/assets/diagram.svg"),
-            "<svg></svg>",
-        )
-        .unwrap();
-        let validation =
-            crate::commands::skills::author::validate_directory(&project.join(".lpm/skills"))
-                .unwrap();
-        assert_eq!(validation.valid_files, vec!["package-usage.md"]);
+        std::fs::write(project.join("lpm-skills/assets/diagram.svg"), "<svg></svg>").unwrap();
         let pkg_json: serde_json::Value =
             serde_json::from_str(r#"{"name": "@lpm.dev/test.pkg", "version": "1.0.0"}"#).unwrap();
 
         let (_, files) = create_tarball(project, &pkg_json).unwrap();
-        let lpm_paths = files
-            .iter()
-            .filter(|file| file.path.starts_with(".lpm/"))
-            .map(|file| file.path.as_str())
-            .collect::<Vec<_>>();
 
-        assert_eq!(lpm_paths, vec![".lpm/skills/package-usage.md"]);
+        assert!(
+            files
+                .iter()
+                .all(|file| !file.path.starts_with("lpm-skills/")),
+            "{:?}",
+            files.iter().map(|file| &file.path).collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn validated_skill_bytes_are_the_bytes_written_to_the_tarball() {
         let project = tempfile::tempdir().unwrap();
-        let skills = project.path().join(".lpm/skills");
+        let skills = project.path().join("lpm-skills");
         std::fs::create_dir_all(&skills).unwrap();
         let manifest = serde_json::json!({
             "name": "publisher",
             "version": "1.0.0",
-            "files": [".lpm/skills"]
+            "files": ["lpm-skills"]
         });
         std::fs::write(
             project.path().join("package.json"),
@@ -4759,7 +4682,7 @@ mod tests {
         )
         .unwrap();
         let retained = [PublishContentOverride {
-            path: ".lpm/skills/safe.md",
+            path: "lpm-skills/safe.md",
             content: validated,
             include_if_missing: true,
         }];
@@ -4768,14 +4691,14 @@ mod tests {
             project.path(),
             &manifest,
             TarballOptions {
-                validated_authored_skills: Some(&retained),
+                validated_authored_skills: &retained,
                 ..TarballOptions::default()
             },
         )
         .unwrap();
 
         assert_eq!(
-            tarball_contents(&prepared.data)["package/.lpm/skills/safe.md"],
+            tarball_contents(&prepared.data)["package/lpm-skills/safe.md"],
             validated
         );
     }
@@ -4783,12 +4706,12 @@ mod tests {
     #[test]
     fn validated_skill_snapshot_is_packed_when_the_source_file_disappears() {
         let project = tempfile::tempdir().unwrap();
-        let skills = project.path().join(".lpm/skills");
+        let skills = project.path().join("lpm-skills");
         std::fs::create_dir_all(&skills).unwrap();
         let manifest = serde_json::json!({
             "name": "publisher",
             "version": "1.0.0",
-            "files": [".lpm/skills"]
+            "files": ["lpm-skills"]
         });
         std::fs::write(
             project.path().join("package.json"),
@@ -4798,7 +4721,7 @@ mod tests {
         let validated =
             b"---\nname: safe\ndescription: Safe guidance\n---\n# Safe\n\nValidated content";
         let retained = [PublishContentOverride {
-            path: ".lpm/skills/safe.md",
+            path: "lpm-skills/safe.md",
             content: validated,
             include_if_missing: true,
         }];
@@ -4807,14 +4730,14 @@ mod tests {
             project.path(),
             &manifest,
             TarballOptions {
-                validated_authored_skills: Some(&retained),
+                validated_authored_skills: &retained,
                 ..TarballOptions::default()
             },
         )
         .unwrap();
 
         assert_eq!(
-            tarball_contents(&prepared.data)["package/.lpm/skills/safe.md"],
+            tarball_contents(&prepared.data)["package/lpm-skills/safe.md"],
             validated
         );
     }
@@ -4825,16 +4748,16 @@ mod tests {
         let manifest = serde_json::json!({
             "name": "publisher",
             "version": "1.0.0",
-            "files": [".LPM/Skills"]
+            "files": ["LPM-Skills"]
         });
-        std::fs::create_dir_all(project.path().join(".LPM/Skills")).unwrap();
+        std::fs::create_dir_all(project.path().join("LPM-Skills")).unwrap();
         std::fs::write(
             project.path().join("package.json"),
             serde_json::to_vec(&manifest).unwrap(),
         )
         .unwrap();
         std::fs::write(
-            project.path().join(".LPM/Skills/unvalidated.md"),
+            project.path().join("LPM-Skills/unvalidated.md"),
             "unvalidated private instructions",
         )
         .unwrap();
@@ -4843,20 +4766,20 @@ mod tests {
             project.path(),
             &manifest,
             TarballOptions {
-                validated_authored_skills: Some(&[]),
+                validated_authored_skills: &[],
                 ..TarballOptions::default()
             },
         )
         .unwrap();
 
-        assert!(prepared.files.iter().all(|file| {
-            !file
-                .path
-                .split('/')
-                .take(2)
-                .zip([".lpm", "skills"])
-                .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
-        }));
+        assert!(
+            prepared
+                .files
+                .iter()
+                .all(|file| !is_authored_skill_namespace(&file.path)),
+            "{:?}",
+            prepared.files
+        );
     }
 
     #[cfg(unix)]
@@ -4865,12 +4788,12 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let project = tempfile::tempdir().unwrap();
-        let skills = project.path().join(".lpm/skills");
+        let skills = project.path().join("lpm-skills");
         let late_private = skills.join("late-private");
         let manifest = serde_json::json!({
             "name": "publisher",
             "version": "1.0.0",
-            "files": [".lpm/skills"]
+            "files": ["lpm-skills"]
         });
         std::fs::create_dir_all(&skills).unwrap();
         std::fs::write(
@@ -4879,7 +4802,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(skills.join("safe.md"), valid_authored_skill()).unwrap();
-        let validation = crate::commands::skills::author::validate_directory(&skills).unwrap();
+        let validation = crate::commands::skills::author::validate_project(project.path()).unwrap();
         assert!(validation.is_valid());
         let retained = validation
             .validated_files
@@ -4895,7 +4818,7 @@ mod tests {
             project.path(),
             &manifest,
             TarballOptions {
-                validated_authored_skills: Some(&retained),
+                validated_authored_skills: &retained,
                 ..TarballOptions::default()
             },
             || {
@@ -4916,7 +4839,7 @@ mod tests {
                 .map(|file| file.path.as_str())
                 .filter(|path| is_authored_skill_namespace(path))
                 .collect::<Vec<_>>(),
-            vec![".lpm/skills/safe.md"]
+            vec!["lpm-skills/safe.md"]
         );
     }
 
@@ -4989,221 +4912,113 @@ mod tests {
     }
 
     #[test]
-    fn create_tarball_excludes_materialized_dependency_skills() {
+    fn lpm_state_never_ships_at_any_depth_even_when_files_lists_it() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path();
-        std::fs::write(
-            project.join("package.json"),
-            r#"{"name": "@lpm.dev/test.pkg", "version": "1.0.0"}"#,
-        )
-        .unwrap();
-        std::fs::write(project.join("index.js"), "module.exports = {}").unwrap();
-        crate::commands::skills::package::materialize(
-            project,
-            "owner.dependency",
-            Some("2.0.0"),
-            &[lpm_registry::Skill {
-                name: "usage".into(),
-                description: None,
-                version: None,
-                globs: Vec::new(),
-                content: Some("dependency guidance".into()),
-                raw_content: None,
-                size_bytes: None,
-            }],
-        )
-        .unwrap();
-        let pkg_json: serde_json::Value =
-            serde_json::from_str(r#"{"name": "@lpm.dev/test.pkg", "version": "1.0.0"}"#).unwrap();
-
-        let (_, files) = create_tarball(project, &pkg_json).unwrap();
-
-        assert!(
-            files
-                .iter()
-                .all(|file| !file.path.starts_with(".lpm/skills/owner.dependency/"))
-        );
-    }
-
-    #[test]
-    fn create_tarball_excludes_materialized_dependency_skills_from_explicit_globs() {
-        let dir = tempfile::tempdir().unwrap();
-        let project = dir.path();
-        std::fs::write(
-            project.join("package.json"),
-            r#"{
-  "name": "@lpm.dev/test.pkg",
-  "version": "1.0.0",
-  "files": [".lpm/skills/**/*"]
-}"#,
-        )
-        .unwrap();
-        crate::commands::skills::package::materialize(
-            project,
-            "owner.dependency",
-            Some("2.0.0"),
-            &[lpm_registry::Skill {
-                name: "dependency-usage".into(),
-                description: None,
-                version: None,
-                globs: Vec::new(),
-                content: Some("dependency guidance".into()),
-                raw_content: None,
-                size_bytes: None,
-            }],
-        )
-        .unwrap();
-        std::fs::write(
-            project.join(".lpm/skills/package-usage.md"),
-            "publisher guidance",
-        )
-        .unwrap();
-        let pkg_json: serde_json::Value = serde_json::from_str(
-            r#"{
-  "name": "@lpm.dev/test.pkg",
-  "version": "1.0.0",
-  "files": [".lpm/skills/**/*"]
-}"#,
-        )
-        .unwrap();
-
-        let (_, files) = create_tarball(project, &pkg_json).unwrap();
-
-        assert!(
-            files
-                .iter()
-                .any(|file| file.path == ".lpm/skills/package-usage.md"),
-            "the explicit glob must retain publisher-authored skills"
-        );
-        assert!(
-            files
-                .iter()
-                .all(|file| !file.path.starts_with(".lpm/skills/owner.dependency/")),
-            "the explicit glob must not bypass ownership filtering"
-        );
-    }
-
-    #[test]
-    fn explicit_publish_can_include_lpm_state_without_including_materialized_skills() {
-        let dir = tempfile::tempdir().unwrap();
-        let project = dir.path();
-        std::fs::create_dir_all(project.join(".lpm/certs")).unwrap();
-        std::fs::write(
-            project.join("package.json"),
-            r#"{
-  "name": "@lpm.dev/test.pkg",
-  "version": "1.0.0",
-  "files": [".lpm/certs/publisher.pem", ".lpm/skills/**/*"]
-}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            project.join(".lpm/certs/publisher.pem"),
-            "deliberately published certificate fixture",
-        )
-        .unwrap();
-        crate::commands::skills::package::materialize(
-            project,
-            "owner.dependency",
-            Some("2.0.0"),
-            &[lpm_registry::Skill {
-                name: "dependency-usage".into(),
-                description: None,
-                version: None,
-                globs: Vec::new(),
-                content: Some("dependency guidance".into()),
-                raw_content: None,
-                size_bytes: None,
-            }],
-        )
-        .unwrap();
-        std::fs::write(
-            project.join(".lpm/skills/package-usage.md"),
-            valid_authored_skill(),
-        )
-        .unwrap();
-        let pkg_json: serde_json::Value = serde_json::from_str(
-            r#"{
-  "name": "@lpm.dev/test.pkg",
-  "version": "1.0.0",
-  "files": [".lpm/certs/publisher.pem", ".lpm/skills/**/*"]
-}"#,
-        )
-        .unwrap();
-
-        let (_, files) = create_tarball(project, &pkg_json).unwrap();
-        let paths = files
-            .iter()
-            .map(|file| file.path.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-
-        assert!(paths.contains(".lpm/certs/publisher.pem"));
-        assert!(paths.contains(".lpm/skills/package-usage.md"));
-        assert!(
-            paths
-                .iter()
-                .all(|path| !path.starts_with(".lpm/skills/owner.dependency/"))
-        );
-    }
-
-    #[test]
-    fn explicit_publish_excludes_release_recovery_state_and_atomic_temporary_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let project = dir.path();
-        std::fs::create_dir_all(project.join(".lpm/release-apply")).unwrap();
-        std::fs::create_dir_all(project.join(".lpm/certs")).unwrap();
-        std::fs::write(
-            project.join(".lpm/release-apply/journal.json"),
-            r#"{"original_base64":"private-manifest-backup"}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            project.join(".lpm-AAAAAAAAAAAAAAAA"),
-            "stale manifest replacement",
-        )
-        .unwrap();
-        for lock in [
-            ".install.lock",
-            ".install.lock.writer-intent",
-            ".install.lock.writer-queue",
-            ".publish.lock",
-            ".publish.lock.writer-intent",
-            ".publish.lock.writer-queue",
+        for path in [
+            ".lpm/certs/key.pem",
+            ".lpm/inspector.db",
+            ".lpm/release-apply/journal.json",
+            ".lpm/.install.lock",
+            ".lpm/skills/owner.dependency/usage.md",
+            "examples/app/.lpm/certs/key.pem",
+            "examples/app/index.js",
         ] {
-            std::fs::write(project.join(".lpm").join(lock), "internal lock").unwrap();
+            let path = project.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "content").unwrap();
         }
-        std::fs::write(project.join(".lpm/certs/public.pem"), "publishable fixture").unwrap();
-        let pkg_json: serde_json::Value = serde_json::from_str(
-            r#"{
-  "name": "@lpm.dev/test.pkg",
-  "version": "1.0.0",
-  "files": [".lpm/**/*", ".lpm-AAAAAAAAAAAAAAAA"]
-}"#,
-        )
-        .unwrap();
+        std::fs::write(project.join(".lpm-AAAAAAAAAAAAAAAA"), "stale replacement").unwrap();
+        for manifest in [
+            serde_json::json!({"name":"@lpm.dev/test.pkg","version":"1.0.0"}),
+            serde_json::json!({
+                "name":"@lpm.dev/test.pkg",
+                "version":"1.0.0",
+                "files":[".lpm/**/*", ".lpm/certs/key.pem", "examples", ".lpm-AAAAAAAAAAAAAAAA"]
+            }),
+        ] {
+            std::fs::write(
+                project.join("package.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
 
-        let (_, files) = create_tarball(project, &pkg_json).unwrap();
-
-        assert!(
-            files
+            let (_, files) = create_tarball(project, &manifest).unwrap();
+            let paths = files
                 .iter()
-                .any(|file| file.path == ".lpm/certs/public.pem")
-        );
-        assert!(files.iter().all(|file| {
-            file.path != ".lpm/release-apply/journal.json"
-                && file.path != ".lpm-AAAAAAAAAAAAAAAA"
-                && !file.path.contains(".install.lock")
-                && !file.path.contains(".publish.lock")
-        }));
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>();
+
+            assert!(paths.contains(&"examples/app/index.js"), "{paths:?}");
+            assert!(
+                paths.iter().all(|path| {
+                    !path.split('/').any(|segment| segment == ".lpm")
+                        && *path != ".lpm-AAAAAAAAAAAAAAAA"
+                }),
+                "{paths:?}"
+            );
+        }
     }
 
     #[test]
-    fn strict_publish_exclusion_matches_release_state_case_insensitively() {
+    fn the_project_s_committed_lpm_records_never_ship() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        for path in [
+            "lpm.lock",
+            "lpm.lockb",
+            "lpm-sources.json",
+            "lpm-agent-skills.json",
+            "lpm-changes/api-update",
+            "index.js",
+            "docs/lpm-changes/notes.md",
+        ] {
+            let path = project.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "content").unwrap();
+        }
+        for manifest in [
+            serde_json::json!({"name":"@lpm.dev/test.pkg","version":"1.0.0"}),
+            serde_json::json!({
+                "name":"@lpm.dev/test.pkg",
+                "version":"1.0.0",
+                "files":["*", "lpm-changes", "docs"]
+            }),
+        ] {
+            std::fs::write(
+                project.join("package.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+
+            let (_, files) = create_tarball(project, &manifest).unwrap();
+            let paths = files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+
+            assert_eq!(
+                paths,
+                ["docs/lpm-changes/notes.md", "index.js", "package.json"]
+                    .into_iter()
+                    .collect(),
+                "{manifest}"
+            );
+        }
+    }
+
+    #[test]
+    fn strict_publish_exclusion_matches_case_insensitively_at_any_depth() {
         assert!(is_npm_strict_exclusion(".LPM/ReLeAsE-ApPlY/journal.json"));
+        assert!(is_npm_strict_exclusion("fixtures/.Lpm/state"));
         assert!(is_npm_strict_exclusion(".GIT/config"));
         assert!(is_npm_strict_exclusion("NODE_MODULES/package.json"));
         assert!(is_npm_strict_exclusion(".NPMRC"));
         assert!(is_npm_strict_exclusion("PACKAGE-LOCK.JSON"));
+        assert!(is_npm_strict_exclusion("LPM.LOCK"));
+        assert!(is_npm_strict_exclusion("LPM-Changes/next"));
+        assert!(!is_npm_strict_exclusion("docs/lpm-changes/next"));
+        assert!(!is_npm_strict_exclusion("examples/lpm.lock"));
     }
 
     #[test]
@@ -5258,54 +5073,6 @@ mod tests {
             files
                 .iter()
                 .any(|file| file.path == "fixtures/owner.package/payload.txt")
-        );
-    }
-
-    #[test]
-    fn implicit_publish_keeps_only_valid_authored_skills_from_project_lpm_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let project = dir.path();
-        std::fs::create_dir_all(project.join(".lpm/skills/nested")).unwrap();
-        std::fs::create_dir_all(project.join(".lpm/certs")).unwrap();
-        std::fs::write(
-            project.join("package.json"),
-            r#"{"name":"@lpm.dev/test.pkg","version":"1.0.0"}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            project.join(".lpm/skills/authored.md"),
-            format!(
-                "---\nname: authored\ndescription: Complete authored guidance\n---\n# Usage\n\n{}",
-                "Use this package safely with concrete steps and examples. ".repeat(4)
-            ),
-        )
-        .unwrap();
-        std::fs::write(project.join(".lpm/skills/nested/ignored.md"), "ignored").unwrap();
-        std::fs::write(project.join(".lpm/certs/lpm.der"), "private certificate").unwrap();
-        std::fs::write(project.join(".lpm/install-hash"), "state").unwrap();
-        std::fs::write(project.join(".lpm/webhook.log"), "runtime log").unwrap();
-        std::fs::create_dir_all(project.join("fixtures/.lpm/skills")).unwrap();
-        std::fs::write(project.join("fixtures/.lpm/skills/example.txt"), "fixture").unwrap();
-
-        let pkg = serde_json::json!({"name":"@lpm.dev/test.pkg","version":"1.0.0"});
-        let (tarball, files) = create_tarball(project, &pkg).unwrap();
-        let paths = files
-            .iter()
-            .map(|file| file.path.as_str())
-            .collect::<Vec<_>>();
-        let archive = tarball_contents(&tarball);
-
-        assert!(paths.contains(&".lpm/skills/authored.md"));
-        assert!(
-            !paths
-                .iter()
-                .any(|path| { path.starts_with(".lpm/") && *path != ".lpm/skills/authored.md" })
-        );
-        assert!(paths.contains(&"fixtures/.lpm/skills/example.txt"));
-        assert!(archive.contains_key("package/.lpm/skills/authored.md"));
-        assert!(
-            archive.keys().all(|path| !path.starts_with("package/.lpm/")
-                || path == "package/.lpm/skills/authored.md")
         );
     }
 
@@ -5814,7 +5581,7 @@ mod tests {
     }
 
     #[test]
-    fn implicit_publish_does_not_filter_nested_lpm_named_fixture_paths() {
+    fn implicit_publish_excludes_nested_lpm_state() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path();
         std::fs::create_dir_all(project.join("fixtures/.lpm/certs")).unwrap();
@@ -5836,7 +5603,7 @@ mod tests {
         assert!(
             files
                 .iter()
-                .any(|file| file.path == "fixtures/.lpm/certs/cert.pem")
+                .all(|file| file.path != "fixtures/.lpm/certs/cert.pem")
         );
     }
 
@@ -6212,7 +5979,7 @@ mod tests {
             .into_iter()
             .map(|file| file.path)
             .collect::<std::collections::BTreeSet<_>>();
-        let expected_paths = [".lpm/skills/package-usage.md", "index.js", "package.json"]
+        let expected_paths = ["index.js", "package.json"]
             .into_iter()
             .map(str::to_string)
             .collect::<std::collections::BTreeSet<_>>();

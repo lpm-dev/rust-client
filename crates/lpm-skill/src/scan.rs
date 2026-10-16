@@ -1,4 +1,4 @@
-//! Security scanning and YAML frontmatter parsing for LPM Agent Skills.
+//! Security scanning and YAML frontmatter parsing for Agent Skill files.
 //!
 //! Detects dangerous patterns that could harm developer environments:
 //! - Shell injection (curl pipe, wget pipe, eval, child_process)

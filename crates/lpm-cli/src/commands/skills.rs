@@ -34,7 +34,7 @@ pub enum SkillsCmd {
     /// Open a local browser dashboard for inspecting and managing skills.
     #[command(visible_alias = "ui")]
     Dashboard(DashboardArgs),
-    /// Validate flat `.lpm/skills/*.md` files against LPM.dev publishing rules.
+    /// Validate the skills in `lpm-skills/` against LPM.dev publishing rules.
     Validate,
     /// Remove installed LPM.dev package skill sets while preserving authored files.
     Clean(CleanArgs),
@@ -300,9 +300,7 @@ async fn run_add(
     let warning_count = selected
         .iter()
         .flat_map(|skill| &skill.findings)
-        .filter(|finding| {
-            finding.severity == lpm_security::skill_security::SkillSecuritySeverity::Warning
-        })
+        .filter(|finding| finding.severity == lpm_skill::SkillSecuritySeverity::Warning)
         .count();
     let confirmation = if warning_count == 0 {
         "Install the planned standalone skills?".to_string()
@@ -997,8 +995,7 @@ fn print_package_inventory(packages: &[(String, Vec<(String, u64)>)]) {
 }
 
 fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError> {
-    let skills_dir = project_dir.join(".lpm").join("skills");
-    let report = author::validate_directory(&skills_dir)?;
+    let report = author::validate_project(project_dir)?;
     if json_output {
         let security = report
             .security_issues
@@ -1023,16 +1020,15 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
                 "errors": report.errors,
                 "security_findings": security,
                 "total_size_bytes": report.total_size_bytes,
-                "ignored_package_sets": report.ignored_package_sets,
                 "quality_impact": if report.valid_files.len() >= 3 { 10 } else if !report.valid_files.is_empty() { 7 } else { 0 },
             }))
             .map_err(|error| LpmError::Registry(format!("failed to serialize validation result: {error}")))?
         );
     } else {
         if !report.directory_found {
-            install_ui::warn("No .lpm/skills/ directory found");
+            install_ui::warn("No lpm-skills/ directory found");
         } else {
-            install_ui::phase("Validating package skills in .lpm/skills/");
+            install_ui::phase("Validating package skills in lpm-skills/");
             for file in &report.valid_files {
                 install_ui::detail_line(crate::install_ui::terminal_line!(
                     "  {} {}",
@@ -1040,13 +1036,6 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
                     file
                 ));
             }
-        }
-        if report.ignored_package_sets > 0 {
-            install_ui::warn_untrusted(&format!(
-                "Ignored {} installed LPM.dev package skill {}",
-                report.ignored_package_sets,
-                plural(report.ignored_package_sets, "set", "sets")
-            ));
         }
         for error in &report.errors {
             install_ui::warn_untrusted(error);
@@ -1062,7 +1051,7 @@ fn validate_skills(project_dir: &Path, json_output: bool) -> Result<(), LpmError
         }
         if report.is_valid() {
             if report.valid_files.is_empty() {
-                install_ui::warn("No publisher-authored .lpm/skills/*.md files found");
+                install_ui::warn("No skills found in lpm-skills/");
             } else {
                 install_ui::done_untrusted(&format!(
                     "{} package {} valid · {}",
@@ -1354,13 +1343,11 @@ fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
 }
 
 fn security_severity_label(
-    severity: lpm_security::skill_security::SkillSecuritySeverity,
+    severity: lpm_skill::SkillSecuritySeverity,
 ) -> install_ui::TerminalFragment {
     match severity {
-        lpm_security::skill_security::SkillSecuritySeverity::Warning => {
-            install_ui::section("warning")
-        }
-        lpm_security::skill_security::SkillSecuritySeverity::Block => install_ui::red("block"),
+        lpm_skill::SkillSecuritySeverity::Warning => install_ui::section("warning"),
+        lpm_skill::SkillSecuritySeverity::Block => install_ui::red("block"),
     }
 }
 
@@ -1434,7 +1421,7 @@ mod tests {
     #[test]
     fn validate_skills_accepts_flat_publisher_files() {
         let project = tempfile::tempdir().unwrap();
-        let skills = project.path().join(".lpm/skills");
+        let skills = project.path().join("lpm-skills");
         std::fs::create_dir_all(&skills).unwrap();
         std::fs::write(
             skills.join("getting-started.md"),
@@ -1453,7 +1440,7 @@ mod tests {
     #[test]
     fn validate_skills_rejects_nested_publisher_files() {
         let project = tempfile::tempdir().unwrap();
-        let nested = project.path().join(".lpm/skills/guides");
+        let nested = project.path().join("lpm-skills/guides");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(
             nested.join("getting-started.md"),

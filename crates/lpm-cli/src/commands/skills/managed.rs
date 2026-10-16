@@ -1217,8 +1217,7 @@ fn dashboard_managed_security(
             "managed canonical SKILL.md is missing or is not UTF-8 text".into(),
         );
     };
-    let (metadata, _, errors) =
-        lpm_security::skill_security::parse_agent_skill_frontmatter(skill_content);
+    let (metadata, _, errors) = lpm_skill::parse_agent_skill_frontmatter(skill_content);
     if !errors.is_empty()
         || metadata.name.as_deref() != Some(expected_name)
         || metadata.description.is_none()
@@ -1322,7 +1321,7 @@ fn dashboard_external_group_item(group: ExternalDashboardGroup) -> SkillInventor
     };
     let description = if group.healthy {
         assessment.skill_content.as_deref().and_then(|content| {
-            lpm_security::skill_security::parse_agent_skill_frontmatter(content)
+            lpm_skill::parse_agent_skill_frontmatter(content)
                 .0
                 .description
         })
@@ -1783,7 +1782,7 @@ fn print_external_view(skill: &ExternalInventory, json_output: bool) -> Result<(
     }
     let path = PathBuf::from(&skill.path).join("SKILL.md");
     let content = std::fs::read_to_string(&path)?;
-    let findings: Vec<_> = lpm_security::skill_security::scan_skill_content(&content)
+    let findings: Vec<_> = lpm_skill::scan_skill_content(&content)
         .into_iter()
         .map(|finding| {
             serde_json::json!({
@@ -2469,9 +2468,7 @@ impl ManagedUpdatePlan {
         self.updates
             .iter()
             .flat_map(|update| &update.candidate_findings)
-            .filter(|finding| {
-                finding.severity == lpm_security::skill_security::SkillSecuritySeverity::Warning
-            })
+            .filter(|finding| finding.severity == lpm_skill::SkillSecuritySeverity::Warning)
             .count()
     }
 }
@@ -2639,7 +2636,7 @@ struct PendingUpdate {
 pub(super) struct FindingIdentity {
     rule_id: String,
     category: String,
-    severity: lpm_security::skill_security::SkillSecuritySeverity,
+    severity: lpm_skill::SkillSecuritySeverity,
     path: String,
     line: usize,
 }
@@ -2793,7 +2790,7 @@ fn scan_canonical_findings(directory: &Path) -> Result<BTreeSet<FindingIdentity>
     let mut findings = BTreeSet::new();
     for (path, content) in files {
         findings.extend(
-            lpm_security::skill_security::scan_skill_content(&content)
+            lpm_skill::scan_skill_content(&content)
                 .into_iter()
                 .map(|finding| FindingIdentity {
                     rule_id: finding.rule_id,
@@ -3268,23 +3265,21 @@ fn styled_target_status(status: TargetStatus, width: usize) -> super::install_ui
     }
 }
 
-fn security_severity(
-    severity: lpm_security::skill_security::SkillSecuritySeverity,
-) -> &'static str {
+fn security_severity(severity: lpm_skill::SkillSecuritySeverity) -> &'static str {
     match severity {
-        lpm_security::skill_security::SkillSecuritySeverity::Warning => "warning",
-        lpm_security::skill_security::SkillSecuritySeverity::Block => "block",
+        lpm_skill::SkillSecuritySeverity::Warning => "warning",
+        lpm_skill::SkillSecuritySeverity::Block => "block",
     }
 }
 
 fn styled_security_severity(
-    severity: lpm_security::skill_security::SkillSecuritySeverity,
+    severity: lpm_skill::SkillSecuritySeverity,
 ) -> super::install_ui::TerminalFragment {
     match severity {
-        lpm_security::skill_security::SkillSecuritySeverity::Warning => {
+        lpm_skill::SkillSecuritySeverity::Warning => {
             super::install_ui::section(security_severity(severity))
         }
-        lpm_security::skill_security::SkillSecuritySeverity::Block => {
+        lpm_skill::SkillSecuritySeverity::Block => {
             super::install_ui::red(security_severity(severity))
         }
     }

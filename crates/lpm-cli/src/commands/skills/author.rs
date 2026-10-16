@@ -1,23 +1,19 @@
-use std::collections::BTreeSet;
+//! A package's authored skills: the direct `.md` files in `lpm-skills/` at
+//! the published root, checked with [`lpm_skill`]'s rules before publish.
+//! They ship in the tarball at the same path. `.lpm/` is never published,
+//! so skills left in `.lpm/skills/` by older versions are reported until
+//! they move.
+
 use std::io::Read as _;
 use std::path::Path;
 
-use lpm_common::{LpmError, format_bytes};
-use lpm_security::skill_security::{self, SkillSecurityIssue};
+use lpm_common::LpmError;
+use lpm_skill::{AUTHORED_SKILLS_DIR, LocatedSecurityIssue, SkillEntry};
 use sha2::{Digest, Sha256};
 
-use super::package;
-
-const MAX_SKILL_SIZE: u64 = 15 * 1024;
-const MAX_TOTAL_SIZE: u64 = 100 * 1024;
-const MAX_SKILL_COUNT: usize = 10;
-const MIN_BODY_LENGTH: usize = 100;
-
-#[derive(Debug)]
-pub(crate) struct LocatedSecurityIssue {
-    pub(crate) path: String,
-    pub(crate) issue: SkillSecurityIssue,
-}
+const SKILLS_PREFIX: &str = "lpm-skills/";
+/// How deep the walk for Markdown in subdirectories of `lpm-skills/` goes.
+const MAX_NESTING: usize = 16;
 
 #[derive(Debug, Default)]
 pub(crate) struct ValidationReport {
@@ -26,9 +22,7 @@ pub(crate) struct ValidationReport {
     pub(crate) errors: Vec<String>,
     pub(crate) security_issues: Vec<LocatedSecurityIssue>,
     pub(crate) total_size_bytes: u64,
-    pub(crate) ignored_package_sets: usize,
     pub(crate) validated_files: Vec<ValidatedSkillFile>,
-    authored_file_count: usize,
 }
 
 #[derive(Debug)]
@@ -48,346 +42,148 @@ impl ValidationReport {
     }
 }
 
-pub(crate) fn validate_directory(skills_dir: &Path) -> Result<ValidationReport, LpmError> {
-    let metadata = match std::fs::symlink_metadata(skills_dir) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ValidationReport::default());
+/// Checks the authored skills a publish of the project at `project_dir`
+/// would ship: those of `publishConfig.directory` when `package.json`
+/// names one, else of the project.
+pub(crate) fn validate_project(project_dir: &Path) -> Result<ValidationReport, LpmError> {
+    let canonical = project_dir.canonicalize().map_err(LpmError::Io)?;
+    let root = crate::commands::publish_common::open_tarball_source_root(&canonical)?;
+    let directory = match lpm_common::read_text_file_capped_nofollow(
+        &canonical.join("package.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    ) {
+        Ok(content) => {
+            let pkg_json: serde_json::Value = serde_json::from_str(lpm_common::strip_utf8_bom_str(
+                &content,
+            ))
+            .map_err(|error| LpmError::Registry(format!("invalid package.json: {error}")))?;
+            crate::commands::publish_common::publish_directory(&pkg_json)?
         }
-        Err(error) => return Err(LpmError::Io(error)),
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
+        Err(error) => return Err(LpmError::Registry(error.to_string())),
     };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(LpmError::Registry(format!(
-            "package skill path is not a regular directory: {}",
-            skills_dir.display()
-        )));
-    }
-
-    let canonical = skills_dir.canonicalize().map_err(LpmError::Io)?;
-    let source_dir = crate::commands::publish_common::open_tarball_source_root(&canonical)?;
-    validate_open_directory(&source_dir)
+    let Some(relative) = directory else {
+        return validate_publish_directory(&root, project_dir);
+    };
+    let published_path = project_dir.join(&relative);
+    let published = crate::commands::publish_common::open_cap_directory_path(&root, &relative)?
+        .ok_or_else(|| {
+            LpmError::Registry(format!(
+                "package.json publishConfig.directory does not exist or is not a safe directory: {}",
+                published_path.display()
+            ))
+        })?;
+    validate_publish_directory(&published, &published_path)
 }
 
+/// Checks the authored skills in an open published root. `project_path`
+/// names the root in errors.
 pub(crate) fn validate_publish_directory(
     project_root: &cap_std::fs::Dir,
     project_path: &Path,
 ) -> Result<ValidationReport, LpmError> {
     use cap_fs_ext::DirExt as _;
 
-    let lpm_dir = match project_root.open_dir_nofollow(".lpm") {
+    let mut host_errors = skills_left_in_lpm_state(project_root)?;
+    let skills_dir = match project_root.open_dir_nofollow(AUTHORED_SKILLS_DIR) {
         Ok(directory) => directory,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ValidationReport::default());
+            host_errors.sort();
+            return Ok(ValidationReport {
+                errors: host_errors,
+                ..ValidationReport::default()
+            });
         }
         Err(_) => {
             return Err(LpmError::Registry(format!(
                 "package skill path is unsafe: {}",
-                project_path.join(".lpm").display()
+                project_path.join(AUTHORED_SKILLS_DIR).display()
             )));
         }
     };
-    let skills_dir = match lpm_dir.open_dir_nofollow("skills") {
-        Ok(directory) => directory,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ValidationReport::default());
-        }
-        Err(_) => {
-            return Err(LpmError::Registry(format!(
-                "package skill path is unsafe: {}",
-                project_path.join(".lpm/skills").display()
-            )));
-        }
-    };
-    validate_open_directory(&skills_dir)
-}
-
-fn validate_open_directory(skills_dir: &cap_std::fs::Dir) -> Result<ValidationReport, LpmError> {
-    use cap_fs_ext::DirExt as _;
-
-    let mut report = ValidationReport {
-        directory_found: true,
-        ..ValidationReport::default()
-    };
-    let mut names = BTreeSet::new();
-    for entry in skills_dir.entries()? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let relative = Path::new(&name);
-        let display = relative.display().to_string();
-        let metadata = skills_dir.symlink_metadata(relative)?;
-        if crate::commands::publish_common::metadata_is_link_or_reparse(&metadata) {
-            report.errors.push(format!(
-                "{}: package skill entries must not be symlinks",
-                display
-            ));
-        } else if metadata.is_file() {
-            if relative
-                .extension()
-                .is_some_and(|extension| extension == "md")
-            {
-                let (file, size) = crate::commands::publish_common::open_tarball_source_file(
-                    skills_dir,
-                    relative,
-                    &format!(".lpm/skills/{display}"),
-                )?;
-                validate_opened_file(file, &display, size, &mut names, &mut report)?;
-                if report.authored_file_count > MAX_SKILL_COUNT {
-                    break;
-                }
-            }
-        } else if metadata.is_dir() {
-            let directory = skills_dir
-                .open_dir_nofollow(relative)
-                .map_err(LpmError::Io)?;
-            if is_materialized_directory(&directory, &name) {
-                report.ignored_package_sets += 1;
-            } else {
-                collect_nested_markdown_errors_from_dir(&directory, relative, &mut report.errors)?;
-            }
-        }
-    }
-
-    if report.authored_file_count > MAX_SKILL_COUNT {
-        report.errors.push(format!(
-            "too many package skills; maximum is {MAX_SKILL_COUNT}"
-        ));
-    }
-    if report.total_size_bytes > MAX_TOTAL_SIZE {
-        report.errors.push(format!(
-            "total package skills size {} bytes exceeds {} limit",
-            report.total_size_bytes,
-            format_bytes(MAX_TOTAL_SIZE)
-        ));
-    }
-
-    report.valid_files.sort();
-    report
-        .validated_files
-        .sort_by(|left, right| left.archive_path.cmp(&right.archive_path));
-    report.errors.sort();
-    report.security_issues.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| left.issue.line_number.cmp(&right.issue.line_number))
-            .then_with(|| left.issue.rule_id.cmp(&right.issue.rule_id))
-    });
-
-    Ok(report)
-}
-
-pub(crate) fn is_authored_skill_path(path: &Path, skills_dir: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(skills_dir) else {
-        return false;
-    };
-    let mut components = relative.components();
-    let Some(std::path::Component::Normal(file_name)) = components.next() else {
-        return false;
-    };
-    components.next().is_none()
-        && Path::new(file_name)
-            .extension()
-            .is_some_and(|extension| extension == "md")
-}
-
-fn validate_opened_file(
-    mut file: std::fs::File,
-    display: &str,
-    size: u64,
-    names: &mut BTreeSet<String>,
-    report: &mut ValidationReport,
-) -> Result<(), LpmError> {
-    report.authored_file_count += 1;
-    report.total_size_bytes = report.total_size_bytes.saturating_add(size);
-    let error_count = report.errors.len();
-    let security_count = report.security_issues.len();
-
-    if size > MAX_SKILL_SIZE {
-        report.errors.push(format!(
-            "{display}: exceeds {} limit ({size} bytes)",
-            format_bytes(MAX_SKILL_SIZE)
-        ));
-        return Ok(());
-    }
-
-    let mut bytes = Vec::with_capacity(size as usize);
-    file.by_ref()
-        .take(MAX_SKILL_SIZE + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_SKILL_SIZE {
-        report.total_size_bytes = report
-            .total_size_bytes
-            .saturating_sub(size)
-            .saturating_add(bytes.len() as u64);
-        report.errors.push(format!(
-            "{display}: exceeds {} limit ({} bytes)",
-            format_bytes(MAX_SKILL_SIZE),
-            bytes.len()
-        ));
-        return Ok(());
-    }
-    let content = std::str::from_utf8(&bytes).map_err(|error| {
-        LpmError::Registry(format!(
-            "{display}: package skill is not valid UTF-8: {error}"
-        ))
-    })?;
-    let (meta, body, frontmatter_errors) = skill_security::parse_skill_frontmatter(content);
-    if !frontmatter_errors.is_empty() {
-        report.errors.extend(
-            frontmatter_errors
-                .into_iter()
-                .map(|error| format!("{display}: {error}")),
-        );
-        return Ok(());
-    }
-
-    if body.trim().encode_utf16().count() < MIN_BODY_LENGTH {
-        report.errors.push(format!(
-            "{display}: content is too short (minimum {MIN_BODY_LENGTH} characters)"
-        ));
-    }
-
-    let Some(parsed_name) = meta.name else {
-        report
-            .errors
-            .push(format!("{display}: package skill name is missing"));
-        return Ok(());
-    };
-    if !names.insert(parsed_name.clone()) {
-        report
-            .errors
-            .push(format!("{display}: duplicate skill name `{parsed_name}`"));
-    }
-
-    report
-        .security_issues
-        .extend(
-            skill_security::scan_skill_content(content)
-                .into_iter()
-                .map(|issue| LocatedSecurityIssue {
-                    path: display.to_string(),
-                    issue,
-                }),
-        );
-
-    if report.errors.len() == error_count
-        && report.security_issues.len() == security_count
-        && report.authored_file_count <= MAX_SKILL_COUNT
-        && report.total_size_bytes <= MAX_TOTAL_SIZE
-    {
-        report.valid_files.push(display.to_string());
-        report.validated_files.push(ValidatedSkillFile {
-            archive_path: format!(".lpm/skills/{display}"),
-            name: parsed_name,
-            content: bytes,
-        });
-    }
-    Ok(())
-}
-
-fn is_materialized_directory(directory: &cap_std::fs::Dir, name: &std::ffi::OsStr) -> bool {
-    let Some(package_name) = name.to_str() else {
-        return false;
-    };
-    let Ok((manifest_file, manifest_size)) =
-        crate::commands::publish_common::open_tarball_source_file(
-            directory,
-            Path::new(package::MANIFEST_FILE),
-            package::MANIFEST_FILE,
-        )
-    else {
-        return false;
-    };
-    if manifest_size > package::MAX_MANIFEST_SIZE {
-        return false;
-    }
-    let Ok(content) = lpm_common::read_text_file_capped_from_open_file_with_known_size(
-        manifest_file,
-        Path::new(package::MANIFEST_FILE),
-        package::MAX_MANIFEST_SIZE,
-        manifest_size,
-    ) else {
-        return false;
-    };
-    let Ok(manifest) = serde_json::from_str::<package::PackageSkillsManifest>(&content) else {
-        return false;
-    };
-    if manifest.schema_version != package::MANIFEST_VERSION
-        || manifest.package != package_name
-        || !manifest
-            .skills
-            .keys()
-            .all(|skill| lpm_common::is_safe_skill_name(skill))
-    {
-        return false;
-    }
-
-    let mut seen = BTreeSet::new();
-    let Ok(entries) = directory.entries() else {
-        return false;
-    };
-    for entry in entries {
-        let Ok(entry) = entry else {
-            return false;
-        };
-        let name = entry.file_name();
-        if name == package::MANIFEST_FILE {
+    let mut entries = Vec::new();
+    collect_entries(&skills_dir, "", 0, &mut entries, &mut host_errors)?;
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut skill_files = 0usize;
+    for entry in &mut entries {
+        if !lpm_skill::is_skill_file(&entry.path) {
             continue;
         }
-        let relative = Path::new(&name);
-        let Ok(metadata) = directory.symlink_metadata(relative) else {
-            return false;
+        skill_files += 1;
+        if skill_files > lpm_skill::MAX_SKILL_COUNT + 1 {
+            break;
+        }
+        if lpm_skill::reads_content(&entry.path, entry.size) {
+            entry.content = Some(read_skill_file(&skills_dir, &entry.path, entry.size)?);
+        }
+    }
+    let report = lpm_skill::validate(SKILLS_PREFIX, &entries);
+
+    let mut errors = host_errors;
+    errors.extend(report.errors);
+    errors.sort();
+    let validated_files = if errors.is_empty() {
+        report
+            .skills
+            .iter()
+            .map(|skill| ValidatedSkillFile {
+                archive_path: format!("{SKILLS_PREFIX}{}", skill.path),
+                name: skill.name.clone(),
+                content: skill.raw.clone().into_bytes(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(ValidationReport {
+        directory_found: true,
+        valid_files: validated_files
+            .iter()
+            .map(|skill| skill.archive_path.clone())
+            .collect(),
+        errors,
+        security_issues: report.security_issues,
+        total_size_bytes: report.total_size,
+        validated_files,
+    })
+}
+
+/// Errors for skills an older version had authors keep directly in
+/// `.lpm/skills/`, which is never published.
+fn skills_left_in_lpm_state(project_root: &cap_std::fs::Dir) -> Result<Vec<String>, LpmError> {
+    use cap_fs_ext::DirExt as _;
+
+    let Ok(state) = project_root.open_dir_nofollow(lpm_common::PROJECT_STATE_DIR) else {
+        return Ok(Vec::new());
+    };
+    let Ok(skills) = state.open_dir_nofollow("skills") else {
+        return Ok(Vec::new());
+    };
+    let mut errors = Vec::new();
+    for entry in skills.entries()? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
         };
-        if crate::commands::publish_common::metadata_is_link_or_reparse(&metadata)
-            || !metadata.is_file()
-            || relative
-                .extension()
-                .is_none_or(|extension| extension != "md")
+        let metadata = skills.symlink_metadata(name)?;
+        if metadata.is_file()
+            && !crate::commands::publish_common::metadata_is_link_or_reparse(&metadata)
+            && lpm_skill::is_skill_file(name)
         {
-            return false;
+            errors.push(format!(
+                ".lpm/skills/{name}: authored skills live in lpm-skills/ — move it to lpm-skills/{name} (.lpm/ is never published or committed)"
+            ));
         }
-        let Some(skill_name) = relative.file_stem().and_then(|name| name.to_str()) else {
-            return false;
-        };
-        let Some(expected_digest) = manifest.skills.get(skill_name) else {
-            return false;
-        };
-        let Ok((file, size)) = crate::commands::publish_common::open_tarball_source_file(
-            directory,
-            relative,
-            &relative.display().to_string(),
-        ) else {
-            return false;
-        };
-        if digest_opened_file(file, size).as_deref() != Some(expected_digest.as_str()) {
-            return false;
-        }
-        seen.insert(skill_name.to_string());
     }
-    seen.len() == manifest.skills.len()
+    Ok(errors)
 }
 
-fn digest_opened_file(mut file: std::fs::File, expected_size: u64) -> Option<String> {
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    let mut remaining = expected_size;
-    while remaining > 0 {
-        let limit = usize::try_from(remaining.min(buffer.len() as u64)).ok()?;
-        let read = file.read(&mut buffer[..limit]).ok()?;
-        if read == 0 {
-            return None;
-        }
-        hasher.update(&buffer[..read]);
-        remaining -= read as u64;
-    }
-    if file.read(&mut buffer[..1]).ok()? != 0 {
-        return None;
-    }
-    Some(format!("{:x}", hasher.finalize()))
-}
-
-fn collect_nested_markdown_errors_from_dir(
+fn collect_entries(
     directory: &cap_std::fs::Dir,
-    relative_root: &Path,
+    relative: &str,
+    depth: usize,
+    entries: &mut Vec<SkillEntry>,
     errors: &mut Vec<String>,
 ) -> Result<(), LpmError> {
     use cap_fs_ext::DirExt as _;
@@ -395,85 +191,67 @@ fn collect_nested_markdown_errors_from_dir(
     for entry in directory.entries()? {
         let entry = entry?;
         let name = entry.file_name();
-        let relative = Path::new(&name);
-        let path = relative_root.join(relative);
-        let metadata = directory.symlink_metadata(relative)?;
+        let Some(name) = name.to_str() else {
+            errors.push(format!(
+                "{SKILLS_PREFIX}{relative}{}: skill file names must be UTF-8",
+                name.to_string_lossy()
+            ));
+            continue;
+        };
+        let path = format!("{relative}{name}");
+        let metadata = directory.symlink_metadata(name)?;
         if crate::commands::publish_common::metadata_is_link_or_reparse(&metadata) {
             errors.push(format!(
-                "{}: package skill entries must not be symlinks",
-                path.display()
+                "{SKILLS_PREFIX}{path}: package skill entries must not be symlinks"
             ));
         } else if metadata.is_dir() {
-            let nested = directory.open_dir_nofollow(relative)?;
-            collect_nested_markdown_errors_from_dir(&nested, &path, errors)?;
+            if depth >= MAX_NESTING {
+                errors.push(format!(
+                    "{SKILLS_PREFIX}{path}: nested too deeply under {SKILLS_PREFIX}"
+                ));
+                continue;
+            }
+            let nested = directory.open_dir_nofollow(name).map_err(LpmError::Io)?;
+            collect_entries(&nested, &format!("{path}/"), depth + 1, entries, errors)?;
         } else if metadata.is_file()
-            && relative
-                .extension()
-                .is_some_and(|extension| extension == "md")
+            && (lpm_skill::is_skill_file(&path) || lpm_skill::is_nested_markdown(&path))
         {
-            errors.push(format!(
-                "{}: package skills must be direct .md files under .lpm/skills/",
-                path.display()
-            ));
+            entries.push(SkillEntry {
+                path,
+                size: metadata.len(),
+                content: None,
+            });
         }
     }
     Ok(())
 }
 
-#[cfg(test)]
-fn sorted_entries(directory: &Path) -> Result<Vec<std::fs::DirEntry>, LpmError> {
-    let mut entries = std::fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    Ok(entries)
+fn read_skill_file(
+    skills_dir: &cap_std::fs::Dir,
+    path: &str,
+    size: u64,
+) -> Result<Vec<u8>, LpmError> {
+    let (file, _) = crate::commands::publish_common::open_tarball_source_file(
+        skills_dir,
+        Path::new(path),
+        &format!("{SKILLS_PREFIX}{path}"),
+    )?;
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.take(lpm_skill::MAX_SKILL_SIZE + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
-fn relative_display(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
-}
-
-#[cfg(test)]
-pub(crate) fn compute_digest(skills_dir: &Path) -> Result<String, LpmError> {
-    let mut entries = Vec::new();
-    for entry in sorted_entries(skills_dir)? {
-        let path = entry.path();
-        let metadata = std::fs::symlink_metadata(&path)?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || path.extension().is_none_or(|extension| extension != "md")
-        {
-            continue;
-        }
-        let content = std::fs::read_to_string(&path)?;
-        let (meta, _, errors) = skill_security::parse_skill_frontmatter(&content);
-        if !errors.is_empty() {
-            return Err(LpmError::Registry(format!(
-                "cannot compute package skill digest for {}: {}",
-                relative_display(skills_dir, &path),
-                errors.join(", ")
-            )));
-        }
-        let name = meta.name.ok_or_else(|| {
-            LpmError::Registry(format!(
-                "cannot compute package skill digest for {}: missing skill name",
-                relative_display(skills_dir, &path)
-            ))
-        })?;
-        entries.push((name, content.into_bytes()));
+pub(crate) fn compute_digest(project_dir: &Path) -> Result<String, LpmError> {
+    let report = validate_project(project_dir)?;
+    if !report.is_valid() {
+        return Err(LpmError::Registry(format!(
+            "cannot compute package skill digest: {}",
+            report.errors.join(", ")
+        )));
     }
-
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut hasher = Sha256::new();
-    for (name, content) in entries {
-        hasher.update(name.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(content);
-        hasher.update(b"\0");
-    }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(compute_validated_digest(&report.validated_files))
 }
 
 pub(crate) fn compute_validated_digest(skills: &[ValidatedSkillFile]) -> String {
@@ -500,174 +278,169 @@ mod tests {
         )
     }
 
-    #[test]
-    fn validate_directory_ignores_manifest_owned_consumer_sets() {
+    fn project_with_skills(files: &[(&str, String)]) -> tempfile::TempDir {
         let project = tempfile::tempdir().unwrap();
-        let skills = project.path().join(".lpm/skills");
-        std::fs::create_dir_all(&skills).unwrap();
-        std::fs::write(skills.join("author.md"), valid_skill("author")).unwrap();
-        package::materialize(
-            project.path(),
-            "owner.package",
-            Some("1.0.0"),
-            &[lpm_registry::Skill {
-                name: "consumer".into(),
-                description: None,
-                version: None,
-                globs: Vec::new(),
-                content: Some(valid_skill("consumer")),
-                raw_content: None,
-                size_bytes: None,
-            }],
-        )
-        .unwrap();
-
-        let report = validate_directory(&skills).unwrap();
-
-        assert_eq!(report.ignored_package_sets, 1);
-        assert_eq!(report.valid_files, vec!["author.md"]);
+        for (path, content) in files {
+            let path = project.path().join("lpm-skills").join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        project
     }
 
     #[test]
-    fn validate_directory_ignores_valid_materialized_skills_larger_than_the_authored_limit() {
+    fn validates_direct_markdown_files_in_lpm_skills() {
+        let project = project_with_skills(&[
+            ("usage.md", valid_skill("usage")),
+            ("notes.txt", "kept out of the package".into()),
+        ]);
+
+        let report = validate_project(project.path()).unwrap();
+
+        assert!(report.is_valid(), "{:?}", report.errors);
+        assert_eq!(report.valid_files, ["lpm-skills/usage.md"]);
+        assert_eq!(
+            report.validated_files[0].archive_path,
+            "lpm-skills/usage.md"
+        );
+        assert_eq!(report.validated_files[0].name, "usage");
+    }
+
+    #[test]
+    fn validates_the_skills_of_the_directory_publish_packs() {
         let project = tempfile::tempdir().unwrap();
-        let skills = project.path().join(".lpm/skills");
-        std::fs::create_dir_all(&skills).unwrap();
-        package::materialize(
-            project.path(),
-            "owner.package",
-            Some("1.0.0"),
-            &[lpm_registry::Skill {
-                name: "consumer".into(),
-                description: None,
-                version: None,
-                globs: Vec::new(),
-                content: Some("x".repeat(MAX_SKILL_SIZE as usize + 1)),
-                raw_content: None,
-                size_bytes: None,
-            }],
+        std::fs::write(
+            project.path().join("package.json"),
+            r#"{"name":"pkg","version":"1.0.0","publishConfig":{"directory":"dist"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(project.path().join("lpm-skills")).unwrap();
+        std::fs::write(
+            project.path().join("lpm-skills/usage.md"),
+            valid_skill("usage"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(project.path().join("dist/lpm-skills")).unwrap();
+        std::fs::write(
+            project.path().join("dist/lpm-skills/broken.md"),
+            "no frontmatter\n",
         )
         .unwrap();
 
-        let report = validate_directory(&skills).unwrap();
+        let report = validate_project(project.path()).unwrap();
 
-        assert_eq!(report.ignored_package_sets, 1);
-        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(!report.is_valid());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("broken.md")),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn a_project_without_lpm_skills_has_nothing_to_validate() {
+        let project = tempfile::tempdir().unwrap();
+
+        let report = validate_project(project.path()).unwrap();
+
+        assert!(!report.directory_found);
+        assert!(report.is_valid());
+    }
+
+    #[test]
+    fn reports_skills_left_in_lpm_state_and_ignores_installed_sets() {
+        let project = tempfile::tempdir().unwrap();
+        let state = project.path().join(".lpm/skills");
+        std::fs::create_dir_all(state.join("owner.package")).unwrap();
+        std::fs::write(state.join("owner.package/usage.md"), valid_skill("usage")).unwrap();
+        std::fs::write(state.join("guide.md"), valid_skill("guide")).unwrap();
+
+        let report = validate_project(project.path()).unwrap();
+
+        assert_eq!(
+            report.errors,
+            [
+                ".lpm/skills/guide.md: authored skills live in lpm-skills/ — move it to lpm-skills/guide.md (.lpm/ is never published or committed)"
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_in_a_subdirectory_fails_validation() {
+        let project = project_with_skills(&[
+            ("usage.md", valid_skill("usage")),
+            ("guides/intro.md", valid_skill("intro")),
+        ]);
+
+        let report = validate_project(project.path()).unwrap();
+
+        assert_eq!(
+            report.errors,
+            [
+                "lpm-skills/guides/intro.md: package skills must be direct .md files under lpm-skills/"
+            ]
+        );
+        assert!(report.validated_files.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_skill_fails_validation() {
+        let project = project_with_skills(&[("usage.md", valid_skill("usage"))]);
+        std::os::unix::fs::symlink(
+            project.path().join("lpm-skills/usage.md"),
+            project.path().join("lpm-skills/linked.md"),
+        )
+        .unwrap();
+
+        let report = validate_project(project.path()).unwrap();
+
+        assert_eq!(
+            report.errors,
+            ["lpm-skills/linked.md: package skill entries must not be symlinks"]
+        );
+    }
+
+    #[test]
+    fn rejects_more_than_ten_skills_and_reads_at_most_one_more() {
+        let files: Vec<(String, String)> = (0..=lpm_skill::MAX_SKILL_COUNT + 3)
+            .map(|index| {
+                let name = format!("skill-{index:02}");
+                (format!("{name}.md"), valid_skill(&name))
+            })
+            .collect();
+        let files: Vec<(&str, String)> = files
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.clone()))
+            .collect();
+        let project = project_with_skills(&files);
+
+        let report = validate_project(project.path()).unwrap();
+
+        assert!(
+            report
+                .errors
+                .contains(&"too many package skills; maximum is 10".to_string())
+        );
         assert!(report.validated_files.is_empty());
     }
 
     #[test]
-    fn validate_directory_rejects_more_than_ten_skills() {
-        let project = tempfile::tempdir().unwrap();
-        let skills = project.path().join(".lpm/skills");
-        std::fs::create_dir_all(&skills).unwrap();
-        for index in 0..=MAX_SKILL_COUNT {
-            let name = format!("skill-{index}");
-            std::fs::write(skills.join(format!("{name}.md")), valid_skill(&name)).unwrap();
-        }
+    fn digest_depends_on_names_and_content() {
+        let first = project_with_skills(&[("usage.md", valid_skill("usage"))]);
+        let second = project_with_skills(&[("usage.md", valid_skill("usage"))]);
+        let changed = project_with_skills(&[("usage.md", valid_skill("usage") + " more")]);
 
-        let report = validate_directory(&skills).unwrap();
-
-        assert!(
-            report
-                .errors
-                .iter()
-                .any(|error| error.contains("maximum is 10"))
+        assert_eq!(
+            compute_digest(first.path()).unwrap(),
+            compute_digest(second.path()).unwrap()
         );
-        assert!(report.validated_files.len() <= MAX_SKILL_COUNT);
-    }
-
-    #[test]
-    fn validation_does_not_retain_skill_bytes_beyond_the_total_limit() {
-        let project = tempfile::tempdir().unwrap();
-        let skills = project.path().join(".lpm/skills");
-        std::fs::create_dir_all(&skills).unwrap();
-        for index in 0..MAX_SKILL_COUNT {
-            let name = format!("skill-{index}");
-            let mut content = valid_skill(&name);
-            content.push_str(&"x".repeat(11 * 1024));
-            std::fs::write(skills.join(format!("{name}.md")), content).unwrap();
-        }
-
-        let report = validate_directory(&skills).unwrap();
-        let retained_bytes = report
-            .validated_files
-            .iter()
-            .map(|skill| skill.content.len() as u64)
-            .sum::<u64>();
-
-        assert!(
-            report
-                .errors
-                .iter()
-                .any(|error| error.contains("exceeds 100 KiB limit"))
-        );
-        assert!(retained_bytes <= MAX_TOTAL_SIZE, "{retained_bytes}");
-    }
-
-    #[test]
-    fn validate_directory_rejects_non_array_globs() {
-        let project = tempfile::tempdir().unwrap();
-        let skills = project.path().join(".lpm/skills");
-        std::fs::create_dir_all(&skills).unwrap();
-        std::fs::write(
-            skills.join("invalid.md"),
-            format!(
-                "---\nname: invalid\ndescription: A complete package skill for validation\nglobs: src/**/*.ts\n---\n# Guide\n\n{}",
-                "This package guidance explains the supported workflow with concrete examples and enough detail for an agent to use it correctly."
-            ),
-        )
-        .unwrap();
-
-        let report = validate_directory(&skills).unwrap();
-
-        assert!(
-            report
-                .errors
-                .iter()
-                .any(|error| error.contains("globs field must be an array"))
-        );
-    }
-
-    #[test]
-    fn validate_directory_accepts_yaml_block_scalar_descriptions() {
-        let project = tempfile::tempdir().unwrap();
-        let skills = project.path().join(".lpm/skills");
-        std::fs::create_dir_all(&skills).unwrap();
-        for (name, style) in [("folded", ">"), ("literal", "|")] {
-            std::fs::write(
-                skills.join(format!("{name}.md")),
-                format!(
-                    "---\nname: {name}\ndescription: {style}\n  A complete package skill\n  for validation\n---\n# Guide\n\n{}",
-                    "This package guidance explains the supported workflow with concrete examples and enough detail for an agent to use it correctly."
-                ),
-            )
-            .unwrap();
-        }
-
-        let report = validate_directory(&skills).unwrap();
-
-        assert!(report.errors.is_empty(), "{:?}", report.errors);
-    }
-
-    #[test]
-    fn validate_directory_trims_body_before_minimum_length_check() {
-        let project = tempfile::tempdir().unwrap();
-        let skills = project.path().join(".lpm/skills");
-        std::fs::create_dir_all(&skills).unwrap();
-        std::fs::write(
-            skills.join("short.md"),
-            "---\nname: short\ndescription: A complete package skill for validation\n---\nshort                                                                                                    ",
-        )
-        .unwrap();
-
-        let report = validate_directory(&skills).unwrap();
-
-        assert!(
-            report
-                .errors
-                .iter()
-                .any(|error| error.contains("content is too short"))
+        assert_ne!(
+            compute_digest(first.path()).unwrap(),
+            compute_digest(changed.path()).unwrap()
         );
     }
 }

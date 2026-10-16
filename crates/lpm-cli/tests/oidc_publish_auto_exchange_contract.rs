@@ -44,7 +44,7 @@ fn write_minimal_project(cwd: &std::path::Path) {
 }
 
 fn write_authored_skill(cwd: &std::path::Path) {
-    let skills_dir = cwd.join(".lpm/skills");
+    let skills_dir = cwd.join("lpm-skills");
     fs::create_dir_all(&skills_dir).unwrap();
     fs::write(
         skills_dir.join("publish.md"),
@@ -670,7 +670,7 @@ async fn publish_check_skips_all_lpm_network_calls_for_skills_packages() {
 
     // Ship a single valid skill so `has_skills && targets_lpm` is true and
     // the skills validation + staleness paths both light up.
-    let skills_dir = cwd.join(".lpm").join("skills");
+    let skills_dir = cwd.join("lpm-skills");
     fs::create_dir_all(&skills_dir).unwrap();
     let skill_body = "---\nname: probe\ndescription: probe skill used to exercise the skills-staleness path during testing\n---\n\nProbe skill body. The skills validator requires at least 100 characters of content past the frontmatter so we pad to satisfy the floor.\n";
     fs::write(skills_dir.join("probe.md"), skill_body).unwrap();

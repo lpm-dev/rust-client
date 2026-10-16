@@ -101,7 +101,7 @@ fn seed_skill(project: &TempProject, pkg: &str, name: &str, body: &str) {
 }
 
 fn seed_publisher_skill(project: &TempProject, name: &str, body: &str) {
-    project.write_file(&format!(".lpm/skills/{name}.md"), body);
+    project.write_file(&format!("lpm-skills/{name}.md"), body);
 }
 
 fn seed_materialized_package_skills(project: &TempProject, package: &str, skills: &[(&str, &str)]) {
@@ -2956,12 +2956,12 @@ fn skills_validate_with_no_skills_dir_succeeds_quietly() {
 
     assert!(
         output.status.success(),
-        "validate on a project without .lpm/skills/ must succeed"
+        "validate on a project without lpm-skills/ must succeed"
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("! No .lpm/skills/ directory found"),
+        stderr.contains("! No lpm-skills/ directory found"),
         "validate without a skills dir must use a slim warning, got:\n{stderr}",
     );
 }
