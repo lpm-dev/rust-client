@@ -172,6 +172,7 @@ pub(super) struct InstallFreshnessInput<'a> {
     pub(super) force: bool,
     pub(super) offline: bool,
     pub(super) no_skills: bool,
+    pub(super) restore_managed_skills: bool,
     pub(super) omit_policy: InstallOmitPolicy,
     pub(super) strict_peer_dependencies: bool,
     pub(super) linker_mode: lpm_linker::LinkerMode,
@@ -376,8 +377,24 @@ pub(super) async fn run_install_freshness_phase(
         && source_analysis_caches_ready
         && (input.policy_extension_configs.is_empty() || fast_path_policy_extension_stats.is_some())
     {
-        let registry_warnings =
+        let mut warnings =
             verify_lpm_install_access(input.client, fast_path_packages, input.json_output).await?;
+        let direct = selected_package_skills(fast_path_packages)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        warnings.extend(
+            install_project_skills(ProjectSkills {
+                client: input.client,
+                project_dir: input.project_dir,
+                dependencies: &[],
+                direct: &direct,
+                package_skills: !input.no_skills,
+                managed_skills: input.restore_managed_skills,
+                json_output: input.json_output,
+            })
+            .await,
+        );
         let policy_extension_stats = if let Some(stats) = fast_path_policy_extension_stats {
             stats
         } else {
@@ -413,7 +430,7 @@ pub(super) async fn run_install_freshness_phase(
                     "schema_version": crate::json_contract::INSTALL_JSON_SCHEMA_VERSION,
                     "success": true,
                     "up_to_date": true,
-                    "warnings": registry_warnings,
+                    "warnings": warnings,
                     "duration_ms": total_ms as u64,
                     "counts": InstallCountSemantics {
                         resolved_package_row_count: fast_path_packages.len(),
