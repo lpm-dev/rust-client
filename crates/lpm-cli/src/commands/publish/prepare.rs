@@ -100,6 +100,75 @@ impl PublishSource {
     }
 }
 
+/// Keys of `lpm.json` that belong to the author's checkout and never ship:
+/// the env's identity and the per-user sync checkpoints.
+const AUTHOR_LOCAL_LPM_JSON_KEYS: [&str; 2] = ["vault", "vaultSync"];
+
+/// The `lpm.json` a package ships, or `None` when the author's bytes ship as
+/// they are: without [`AUTHOR_LOCAL_LPM_JSON_KEYS`], and with the resolved
+/// `envSchema` when its fragments need resolving, so the package carries
+/// its schema whichever files it ships. Other keys keep their values.
+fn published_lpm_json(
+    config: &lpm_json::LpmJsonConfig,
+    content: &str,
+) -> Result<Option<Vec<u8>>, LpmError> {
+    let resolves_schema = config
+        .env_schema_source
+        .as_ref()
+        .is_some_and(|source| source.requires_resolution());
+    let mut root: std::collections::BTreeMap<String, Box<serde_json::value::RawValue>> =
+        serde_json::from_str(lpm_common::strip_utf8_bom_str(content))
+            .map_err(|_| LpmError::Registry("env.invalid_definition".into()))?;
+    let carries_local_keys = AUTHOR_LOCAL_LPM_JSON_KEYS
+        .iter()
+        .any(|key| root.contains_key(*key));
+    if !resolves_schema && !carries_local_keys {
+        return Ok(None);
+    }
+    for key in AUTHOR_LOCAL_LPM_JSON_KEYS {
+        root.remove(key);
+    }
+    if resolves_schema && let Some(schema) = config.env_schema.as_ref() {
+        let effective = lpm_env_source::schema_json(schema)
+            .map_err(|error| LpmError::Registry(error.to_string()))?;
+        root.insert(
+            "envSchema".into(),
+            serde_json::from_slice(&effective)
+                .map_err(|_| LpmError::Registry("env.invalid_definition".into()))?,
+        );
+    }
+    lpm_env_source::bounded_json(&root, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize)
+        .map(Some)
+        .map_err(|error| LpmError::Registry(error.to_string()))
+}
+
+/// A bundled dependency's root `lpm.json` as a publish ships it: without
+/// [`AUTHOR_LOCAL_LPM_JSON_KEYS`], or `None` when its bytes ship as they
+/// are, as they do when it holds none of them or isn't the JSON object LPM
+/// reads.
+pub(crate) fn bundled_lpm_json(content: &[u8]) -> Result<Option<Vec<u8>>, LpmError> {
+    let Ok(text) = std::str::from_utf8(content) else {
+        return Ok(None);
+    };
+    let Ok(mut root) = serde_json::from_str::<
+        std::collections::BTreeMap<String, Box<serde_json::value::RawValue>>,
+    >(lpm_common::strip_utf8_bom_str(text)) else {
+        return Ok(None);
+    };
+    if !AUTHOR_LOCAL_LPM_JSON_KEYS
+        .iter()
+        .any(|key| root.contains_key(*key))
+    {
+        return Ok(None);
+    }
+    for key in AUTHOR_LOCAL_LPM_JSON_KEYS {
+        root.remove(key);
+    }
+    lpm_env_source::bounded_json(&root, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize)
+        .map(Some)
+        .map_err(|error| LpmError::Registry(error.to_string()))
+}
+
 pub(crate) fn prepare_publish_project(
     project_dir: &Path,
     scan_secrets: bool,
@@ -265,33 +334,10 @@ pub(crate) fn read_publish_manifest_from_source(
     let env_schema_snapshot = lpm_config
         .as_ref()
         .and_then(|config| config.env_schema_resolution.clone());
-    let lpm_json_override = lpm_config
-        .as_ref()
-        .filter(|config| {
-            config
-                .env_schema_source
-                .as_ref()
-                .is_some_and(|source| source.requires_resolution())
-        })
-        .and_then(|config| config.env_schema.as_ref())
-        .map(|schema| {
-            let content = lpm_json_content
-                .as_deref()
-                .ok_or_else(|| LpmError::Registry("env.source_context".into()))?;
-            let mut root: std::collections::BTreeMap<String, Box<serde_json::value::RawValue>> =
-                serde_json::from_str(lpm_common::strip_utf8_bom_str(content))
-                    .map_err(|_| LpmError::Registry("env.invalid_definition".into()))?;
-            let effective = lpm_env_source::schema_json(schema)
-                .map_err(|error| LpmError::Registry(error.to_string()))?;
-            root.insert(
-                "envSchema".into(),
-                serde_json::from_slice(&effective)
-                    .map_err(|_| LpmError::Registry("env.invalid_definition".into()))?,
-            );
-            lpm_env_source::bounded_json(&root, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize)
-                .map_err(|error| LpmError::Registry(error.to_string()))
-        })
-        .transpose()?;
+    let lpm_json_override = match (&lpm_config, lpm_json_content.as_deref()) {
+        (Some(config), Some(content)) => published_lpm_json(config, content)?,
+        _ => None,
+    };
     let publish_config = lpm_config.and_then(|c| c.publish);
     Ok(PublishManifest {
         package_json_path,
@@ -1239,6 +1285,75 @@ mod tests {
         )
         .unwrap();
         std::fs::write(project.join("index.js"), "module.exports = {};").unwrap();
+    }
+
+    #[test]
+    fn published_lpm_json_leaves_out_the_author_s_env_identity_and_sync_state() {
+        // `LPM.JSON` or `lpm.jſon` is the project's lpm.json on a disk that
+        // folds case, and ships as that one sanitized file, as it does when
+        // `main` names it.
+        for (spelling, manifest) in [
+            ("lpm.json", None),
+            (
+                "lpm.json",
+                Some(r#"{"name":"publisher","version":"1.0.0"}"#),
+            ),
+            ("LPM.JSON", None),
+            (
+                "LPM.JSON",
+                Some(r#"{"name":"publisher","version":"1.0.0"}"#),
+            ),
+            (
+                "lpm.j\u{17F}on",
+                Some(r#"{"name":"publisher","version":"1.0.0"}"#),
+            ),
+            (
+                "lpm.json",
+                Some(r#"{"name":"publisher","version":"1.0.0","files":[],"main":"lpm.json"}"#),
+            ),
+        ] {
+            let implicit = manifest.is_some();
+            let project = tempfile::tempdir().unwrap();
+            write_publish_fixture(project.path(), &["index.js"]);
+            if let Some(manifest) = manifest {
+                std::fs::write(project.path().join("package.json"), manifest).unwrap();
+            }
+            let original = r#"{"vault":"8c1f0d2e-6a35-4c1b-9f3e-2d7b5a1c9e40","vaultSync":{"personalVersion":3},"tasks":{"build":{"command":"tsc"}},"envSchema":{"vars":{"PORT":{"format":"port"}}}}"#;
+            std::fs::write(project.path().join(spelling), original).unwrap();
+            if !project.path().join("lpm.json").exists() {
+                continue;
+            }
+
+            let prepared = prepare_publish_project(project.path(), false).unwrap();
+
+            let decoder = flate2::read::GzDecoder::new(prepared.tarball_data.as_slice());
+            let mut archive = tar::Archive::new(decoder);
+            let mut packaged = Vec::new();
+            for entry in archive.entries().unwrap() {
+                let mut entry = entry.unwrap();
+                let path = entry.path().unwrap().into_owned();
+                if path.to_string_lossy().to_uppercase().to_lowercase() == "package/lpm.json" {
+                    let mut content = String::new();
+                    entry.read_to_string(&mut content).unwrap();
+                    packaged.push((path, content));
+                }
+            }
+            assert_eq!(packaged.len(), 1, "{spelling} {implicit}: {packaged:?}");
+            assert_eq!(packaged[0].0, Path::new("package/lpm.json"), "{spelling}");
+            let packaged: serde_json::Value = serde_json::from_str(&packaged[0].1).unwrap();
+            assert_eq!(
+                packaged,
+                serde_json::json!({
+                    "envSchema": {"vars": {"PORT": {"format": "port"}}},
+                    "tasks": {"build": {"command": "tsc"}},
+                }),
+                "{spelling}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(project.path().join(spelling)).unwrap(),
+                original
+            );
+        }
     }
 
     #[test]

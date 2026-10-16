@@ -24,8 +24,9 @@ pub(crate) use orchestrator::{
     validate_intent_with_workspace_lock_held, with_publish_install_lock_for_project,
 };
 pub(crate) use prepare::{
-    PublishManifest, PublishSource, prepare_publish_project, read_publish_manifest_from_source,
-    select_publish_projection, validate_publish_tarball_size, validate_publish_version,
+    PublishManifest, PublishSource, bundled_lpm_json, prepare_publish_project,
+    read_publish_manifest_from_source, select_publish_projection, validate_publish_tarball_size,
+    validate_publish_version,
 };
 pub(crate) use provenance::{
     ProvenanceRequest, materialize_provenance_request,
