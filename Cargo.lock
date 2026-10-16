@@ -3714,6 +3714,7 @@ dependencies = [
  "serde_json",
  "serde_json_lenient",
  "serde_yaml",
+ "sha2",
  "tempfile",
  "tracing",
 ]

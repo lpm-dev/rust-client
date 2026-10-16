@@ -49,13 +49,24 @@ pub fn assert_both_lockfiles_exist(project_dir: &Path) {
     assert_binary_lockfile_exists(project_dir);
 }
 
-/// Assert that a backup file exists (used by migrate).
+/// The manifest of the migration backup in `.lpm/migrate-backup/`.
+pub fn migration_backup_manifest(project_dir: &Path) -> serde_json::Value {
+    let path = project_dir.join(".lpm/migrate-backup/manifest.json");
+    serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display())),
+    )
+    .expect("parse the migration backup manifest")
+}
+
+/// Assert that the migration backup holds the original of `original_name`.
 pub fn assert_backup_exists(project_dir: &Path, original_name: &str) {
-    let backup_path = project_dir.join(format!("{original_name}.backup"));
+    let manifest = migration_backup_manifest(project_dir);
     assert!(
-        backup_path.exists(),
-        "backup file not found: {}.backup",
-        original_name
+        manifest["entries"].as_array().is_some_and(|entries| entries
+            .iter()
+            .any(|entry| entry["path"] == original_name && entry["original"].is_object())),
+        "no backup of {original_name} in {manifest}"
     );
 }
 

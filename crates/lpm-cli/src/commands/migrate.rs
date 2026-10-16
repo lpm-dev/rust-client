@@ -15,7 +15,7 @@ use crate::patch_state;
 use lpm_common::LpmError;
 use lpm_common::color::Painted;
 use lpm_lockfile::{LOCKFILE_NAME, LockfilePatch};
-use lpm_migrate::backup::{self, MigrationBackup};
+use lpm_migrate::backup::{self, MigrationBackup, MigrationLock};
 use lpm_registry::RegistryClient;
 use std::path::Path;
 use std::sync::Arc;
@@ -34,12 +34,13 @@ pub async fn run(
     rollback: bool,
     json: bool,
 ) -> Result<(), LpmError> {
-    // --rollback mode: restore from .backup files
     if rollback {
-        return run_rollback(cwd, json);
+        return run_rollback(cwd, force, json);
     }
 
     let workspace = migration_workspace(cwd)?;
+    // Refused before any lock, so that a refusal leaves no `.lpm` behind.
+    refuse_existing_lockfile(cwd, force, dry_run)?;
     let migration = migrate_and_install(
         client,
         cwd,
@@ -92,10 +93,8 @@ pub async fn run(
         }
     }
 
-    // Write final manifest (includes all backed-up and newly created files).
-    // Backups are intentionally NOT cleaned up — they remain on disk so
-    // `lpm migrate --rollback` can undo the migration after success.
-    migration_backup.write_manifest(cwd)?;
+    // The backup stays so `lpm migrate --rollback` can undo the migration.
+    migration_backup.seal()?;
 
     // Summary
     if json {
@@ -142,6 +141,16 @@ fn migration_workspace(cwd: &Path) -> Result<Option<lpm_workspace::Workspace>, L
     Ok(workspace)
 }
 
+fn refuse_existing_lockfile(cwd: &Path, force: bool, dry_run: bool) -> Result<(), LpmError> {
+    if cwd.join(LOCKFILE_NAME).exists() && !force && !dry_run {
+        return Err(LpmError::Script(
+            "lpm.lock already exists. Use --force to overwrite, or --dry-run to preview."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 struct MigrationInstallOptions {
     no_npmrc: bool,
     no_install: bool,
@@ -171,14 +180,15 @@ async fn migrate_and_install(
         ));
     }
 
-    // Check for existing lpm.lock
     let lockfile_path = cwd.join(LOCKFILE_NAME);
-    if lockfile_path.exists() && !force && !dry_run {
-        return Err(LpmError::Script(
-            "lpm.lock already exists. Use --force to overwrite, or --dry-run to preview."
-                .to_string(),
-        ));
-    }
+    // Another migration may finish while this one waits, so it decides and
+    // reads again once the lock is held.
+    let migration_lock = if dry_run {
+        None
+    } else {
+        Some(MigrationLock::acquire(cwd)?)
+    };
+    refuse_existing_lockfile(cwd, force, dry_run)?;
 
     if !json {
         install_ui::phase("Detecting current package manager");
@@ -321,7 +331,10 @@ async fn migrate_and_install(
         return Ok(None);
     }
 
-    let mut migration_backup = MigrationBackup::for_project(cwd)?;
+    let mut migration_backup = match migration_lock {
+        Some(lock) => MigrationBackup::for_project_locked(cwd, lock)?,
+        None => MigrationBackup::for_project(cwd)?,
+    };
 
     let lockb_path = cwd.join("lpm.lockb");
     let gitattributes_path = cwd.join(".gitattributes");
@@ -355,227 +368,239 @@ async fn migrate_and_install(
         }
     }
     migration_backup.backup_files(cwd, &backup_paths)?;
-
-    if let Err(e) = result.lockfile.write_all(&lockfile_path) {
-        render_migration_failure_with_rollback(&e, &migration_backup);
-        return Err(LpmError::Script(format!("failed to write lockfile: {e}")));
-    }
-
-    // Ensure .gitattributes marks lpm.lockb as binary
-    if let Err(e) = lpm_lockfile::ensure_gitattributes(cwd) {
-        // Non-fatal: warn but continue
-        if !json {
-            install_ui::warn_untrusted(&format!("failed to update .gitattributes: {e}"));
-        }
-    }
-
-    // Apply the validated `pnpm.overrides` translation to
-    // `package.json > lpm.overrides`. The plan was already checked for
-    // blocking errors before any disk mutation; reaching here means every
-    // entry in `to_apply` is parsable and non-conflicting.
-    //
-    // On failure: the backup chain (extended above when the plan had
-    // entries) carries package.json, so `migration_backup.rollback()`
-    // restores it cleanly along with the lockfile.
-    if overrides_plan.has_entries() {
-        if let Err(e) = apply_overrides_to_package_json(&pkg_json_path, &overrides_plan.to_apply) {
-            render_migration_failure_with_rollback(&e, &migration_backup);
-            return Err(e);
-        }
-        if !json {
-            let n = overrides_plan.to_apply.len();
-            install_ui::done_untrusted(&format!(
-                "Translated {n} `pnpm.overrides` entr{} -> `lpm.overrides`",
-                if n == 1 { "y" } else { "ies" },
-            ));
-        }
-    }
-
-    // Apply the validated `pnpm.patchedDependencies` translation.
-    // Per-entry: copy the source patch file into LPM's
-    // canonical `patches/<safe_key>.patch` location (skipped for
-    // self-copy entries), then write the matching
-    // `lpm.patchedDependencies[key] = { path, originalIntegrity }`
-    // block to package.json.
-    //
-    // Same rollback contract as the overrides apply: any failure
-    // triggers `migration_backup.rollback()` which restores
-    // package.json, removes any newly-written patch files (tracked
-    // via the v2 manifest's `created` list), and brings the
-    // pre-existing destination paths back from their backups.
-    if patches_plan.has_entries() {
-        if let Err(e) = apply_patches(&pkg_json_path, &patches_plan.to_apply) {
-            render_migration_failure_with_rollback(&e, &migration_backup);
-            return Err(e);
-        }
-        if let Err(e) =
-            record_migrated_patch_records(cwd, &mut result.lockfile, &patches_plan.to_apply)
-                .and_then(|_| {
-                    result.lockfile.write_all(&lockfile_path).map_err(|e| {
-                        LpmError::Script(format!("failed to write lockfile patch records: {e}"))
-                    })
-                })
-        {
-            render_migration_failure_with_rollback(&e, &migration_backup);
-            return Err(e);
-        }
-        if !json {
-            let n = patches_plan.to_apply.len();
-            let copied = patches_plan
-                .to_apply
-                .iter()
-                .filter(|t| !t.is_self_copy)
-                .count();
-            install_ui::done_untrusted(&format!(
-                "Translated {n} `pnpm.patchedDependencies` entr{} -> `lpm.patchedDependencies` \
-                 ({copied} patch file{} copied)",
-                if n == 1 { "y" } else { "ies" },
-                if copied == 1 { "" } else { "s" },
-            ));
-        }
-    }
-
-    // Apply the validated `pnpm.peerDependencyRules` translation to
-    // `lpm.peerDependencyRules`. Three sub-fields are appended/merged
-    // independently. Same rollback contract: any failure triggers
-    // `migration_backup.rollback()` which restores package.json from the
-    // backup taken alongside the lockfile.
-    if peer_rules_plan.has_entries() {
-        if let Err(e) = apply_peer_rules_to_package_json(&pkg_json_path, &peer_rules_plan) {
-            render_migration_failure_with_rollback(&e, &migration_backup);
-            return Err(e);
-        }
-        if !json {
-            let n = peer_rules_plan.ignore_missing_to_apply.len()
-                + peer_rules_plan.allow_any_to_apply.len()
-                + peer_rules_plan.allowed_versions_to_apply.len();
-            install_ui::done_untrusted(&format!(
-                "Translated {n} `pnpm.peerDependencyRules` entr{} -> `lpm.peerDependencyRules`",
-                if n == 1 { "y" } else { "ies" },
-            ));
-        }
-    }
-
-    if !no_npmrc {
-        configure_npmrc(cwd, json, &mut migration_backup)?;
-    }
-
-    // Step N: Install (optional, default on)
-    if !no_install {
-        if !json {
-            install_ui::phase_line(crate::install_ui::terminal_line!(
-                "Running {}…",
-                install_ui::yellow("lpm install")
-            ));
+    // Every exit that keeps the migration records what it wrote, so a later
+    // `--rollback` can tell LPM's writes from the user's.
+    let applied: Result<(), LpmError> = async {
+        if let Err(e) = result.lockfile.write_all(&lockfile_path) {
+            render_migration_failure_with_rollback(&e, &mut migration_backup);
+            return Err(LpmError::Script(format!("failed to write lockfile: {e}")));
         }
 
-        let install_result = if workspace.is_some() {
-            super::install::run_recursive_workspace_install(
-                client,
-                cwd,
-                &[],
-                &[],
-                &[],
-                &[],
-                false,
-                super::install::RecursiveInstallOptions {
-                    json_output: json,
-                    emit_summary: false,
-                    offline: false,
-                    frozen_lockfile: super::install::FrozenLockfileMode::Never,
-                    force: false,
-                    allow_new: false,
-                    strict_integrity: false,
-                    no_engine_strict: false,
-                    strict_peer_dependencies_override: None,
-                    linker_override: None,
-                    lpm_skills_preference: crate::lpm_skills_config::LpmSkillsPreference::Disabled,
-                    no_editor_setup: true,
-                    no_security_summary: true,
-                    auto_build: false,
-                    script_policy_override: None,
-                    advisor_override: None,
-                    min_release_age_override: None,
-                    min_release_age_exclude: Vec::new(),
-                    drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy::default(),
-                    verify_policy: crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
-                    omit_policy: super::install::InstallOmitPolicy::default(),
-                    strict_sandbox: false,
-                    no_sandbox: false,
-                    verbose: false,
-                    audit_after_install: false,
-                    timing: false,
-                    workspace_concurrency: None,
-                },
-            )
-            .await
-        } else {
-            super::root_lifecycle::RootProjectLifecycle::load(cwd)?
-                .run_dev_preinstall(cwd, json)?;
-
-            super::install::run_with_options_with_lpm_root(
-                client,
-                cwd,
-                json,
-                false, // not offline — need to download tarballs
-                super::install::FrozenLockfileMode::Never,
-                false, // force
-                false, // allow_new
-                false, // strict_integrity
-                false, // no_engine_strict
-                None,  // strict_peer_dependencies_override
-                None,  // linker_override
-                crate::lpm_skills_config::LpmSkillsPreference::Disabled,
-                true,  // no_editor_setup — skip editor setup during migration
-                true,  // no_security_summary — migration already showed warnings
-                false, // auto_build
-                None,  // target_set: migrate is single-project
-                None,  // direct_versions_out: migrate does not finalize placeholders
-                None,  // requested_add_count: migrate is not an add-path install
-                None,  // script_policy_override: `lpm migrate` does not expose policy flags
-                None,  // advisor_override: `lpm migrate` does not expose `--advisor`
-                None,  // min_release_age_override: `lpm migrate` uses the chain
-                &[],
-                crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm migrate` enforces drift
-                crate::provenance_fetch::VerifyPolicy::resolve_no_cli(), // verify-policy: `lpm migrate` honors env + config posture chain
-                crate::commands::install::InstallOmitPolicy::default(),
-                // `lpm migrate` does not surface its
-                // own sandbox-mode flags. The env / config / default
-                // chain inside `rebuild::run` still applies.
-                false, // strict_sandbox
-                false, // no_sandbox
-                false, // verbose: internal pipeline, no user-facing Done footer
-                false, // audit_after_install: internal pipeline never runs audit
-                false, // timing: migrate does not expose install's --timing flag
-                &[],
-                !json,
-                json,
-                None,
-                lpm_common::LpmRoot::from_env()?,
-            )
-            .await
-        };
-        match install_result {
-            Ok(()) => {
-                if workspace.is_none() {
-                    super::root_lifecycle::RootProjectLifecycle::load(cwd)?
-                        .run_after_successful_install(cwd, json)?;
-                }
+        // Ensure .gitattributes marks lpm.lockb as binary
+        if let Err(e) = lpm_lockfile::ensure_gitattributes(cwd) {
+            // Non-fatal: warn but continue
+            if !json {
+                install_ui::warn_untrusted(&format!("failed to update .gitattributes: {e}"));
             }
-            Err(e) => {
-                if !json {
-                    eprintln!();
-                    install_ui::warn_untrusted(&format!("Install failed: {e}"));
-                    install_ui::detail_line(crate::install_ui::terminal_line!(
-                        "  {} The lockfile was written successfully. Run {} manually to retry.",
-                        install_ui::dim("hint:"),
-                        install_ui::yellow("lpm install")
-                    ));
-                }
+        }
+
+        // Apply the validated `pnpm.overrides` translation to
+        // `package.json > lpm.overrides`. The plan was already checked for
+        // blocking errors before any disk mutation; reaching here means every
+        // entry in `to_apply` is parsable and non-conflicting.
+        //
+        // On failure: the backup chain (extended above when the plan had
+        // entries) carries package.json, so `migration_backup.rollback()`
+        // restores it cleanly along with the lockfile.
+        if overrides_plan.has_entries() {
+            if let Err(e) =
+                apply_overrides_to_package_json(&pkg_json_path, &overrides_plan.to_apply)
+            {
+                render_migration_failure_with_rollback(&e, &mut migration_backup);
                 return Err(e);
             }
+            if !json {
+                let n = overrides_plan.to_apply.len();
+                install_ui::done_untrusted(&format!(
+                    "Translated {n} `pnpm.overrides` entr{} -> `lpm.overrides`",
+                    if n == 1 { "y" } else { "ies" },
+                ));
+            }
         }
+
+        // Apply the validated `pnpm.patchedDependencies` translation.
+        // Per-entry: copy the source patch file into LPM's
+        // canonical `patches/<safe_key>.patch` location (skipped for
+        // self-copy entries), then write the matching
+        // `lpm.patchedDependencies[key] = { path, originalIntegrity }`
+        // block to package.json.
+        //
+        // Same rollback contract as the overrides apply: any failure
+        // triggers `migration_backup.rollback()` which restores
+        // package.json, removes any newly-written patch files (tracked
+        // via the v2 manifest's `created` list), and brings the
+        // pre-existing destination paths back from their backups.
+        if patches_plan.has_entries() {
+            if let Err(e) = apply_patches(&pkg_json_path, &patches_plan.to_apply) {
+                render_migration_failure_with_rollback(&e, &mut migration_backup);
+                return Err(e);
+            }
+            if let Err(e) =
+                record_migrated_patch_records(cwd, &mut result.lockfile, &patches_plan.to_apply)
+                    .and_then(|_| {
+                        result.lockfile.write_all(&lockfile_path).map_err(|e| {
+                            LpmError::Script(format!("failed to write lockfile patch records: {e}"))
+                        })
+                    })
+            {
+                render_migration_failure_with_rollback(&e, &mut migration_backup);
+                return Err(e);
+            }
+            if !json {
+                let n = patches_plan.to_apply.len();
+                let copied = patches_plan
+                    .to_apply
+                    .iter()
+                    .filter(|t| !t.is_self_copy)
+                    .count();
+                install_ui::done_untrusted(&format!(
+                    "Translated {n} `pnpm.patchedDependencies` entr{} -> `lpm.patchedDependencies` \
+                     ({copied} patch file{} copied)",
+                    if n == 1 { "y" } else { "ies" },
+                    if copied == 1 { "" } else { "s" },
+                ));
+            }
+        }
+
+        // Apply the validated `pnpm.peerDependencyRules` translation to
+        // `lpm.peerDependencyRules`. Three sub-fields are appended/merged
+        // independently. Same rollback contract: any failure triggers
+        // `migration_backup.rollback()` which restores package.json from the
+        // backup taken alongside the lockfile.
+        if peer_rules_plan.has_entries() {
+            if let Err(e) = apply_peer_rules_to_package_json(&pkg_json_path, &peer_rules_plan) {
+                render_migration_failure_with_rollback(&e, &mut migration_backup);
+                return Err(e);
+            }
+            if !json {
+                let n = peer_rules_plan.ignore_missing_to_apply.len()
+                    + peer_rules_plan.allow_any_to_apply.len()
+                    + peer_rules_plan.allowed_versions_to_apply.len();
+                install_ui::done_untrusted(&format!(
+                    "Translated {n} `pnpm.peerDependencyRules` entr{} -> `lpm.peerDependencyRules`",
+                    if n == 1 { "y" } else { "ies" },
+                ));
+            }
+        }
+
+        if !no_npmrc {
+            configure_npmrc(cwd, json, &mut migration_backup)?;
+        }
+
+        // Step N: Install (optional, default on)
+        if !no_install {
+            if !json {
+                install_ui::phase_line(crate::install_ui::terminal_line!(
+                    "Running {}…",
+                    install_ui::yellow("lpm install")
+                ));
+            }
+
+            let install_result = if workspace.is_some() {
+                super::install::run_recursive_workspace_install(
+                    client,
+                    cwd,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    false,
+                    super::install::RecursiveInstallOptions {
+                        json_output: json,
+                        emit_summary: false,
+                        offline: false,
+                        frozen_lockfile: super::install::FrozenLockfileMode::Never,
+                        force: false,
+                        allow_new: false,
+                        strict_integrity: false,
+                        no_engine_strict: false,
+                        strict_peer_dependencies_override: None,
+                        linker_override: None,
+                        lpm_skills_preference:
+                            crate::lpm_skills_config::LpmSkillsPreference::Disabled,
+                        no_editor_setup: true,
+                        no_security_summary: true,
+                        auto_build: false,
+                        script_policy_override: None,
+                        advisor_override: None,
+                        min_release_age_override: None,
+                        min_release_age_exclude: Vec::new(),
+                        drift_ignore_policy: crate::provenance_fetch::DriftIgnorePolicy::default(),
+                        verify_policy: crate::provenance_fetch::VerifyPolicy::resolve_no_cli(),
+                        omit_policy: super::install::InstallOmitPolicy::default(),
+                        strict_sandbox: false,
+                        no_sandbox: false,
+                        verbose: false,
+                        audit_after_install: false,
+                        timing: false,
+                        workspace_concurrency: None,
+                    },
+                )
+                .await
+            } else {
+                super::root_lifecycle::RootProjectLifecycle::load(cwd)?
+                    .run_dev_preinstall(cwd, json)?;
+
+                super::install::run_with_options_with_lpm_root(
+                    client,
+                    cwd,
+                    json,
+                    false, // not offline — need to download tarballs
+                    super::install::FrozenLockfileMode::Never,
+                    false, // force
+                    false, // allow_new
+                    false, // strict_integrity
+                    false, // no_engine_strict
+                    None,  // strict_peer_dependencies_override
+                    None,  // linker_override
+                    crate::lpm_skills_config::LpmSkillsPreference::Disabled,
+                    true,  // no_editor_setup — skip editor setup during migration
+                    true,  // no_security_summary — migration already showed warnings
+                    false, // auto_build
+                    None,  // target_set: migrate is single-project
+                    None,  // direct_versions_out: migrate does not finalize placeholders
+                    None,  // requested_add_count: migrate is not an add-path install
+                    None,  // script_policy_override: `lpm migrate` does not expose policy flags
+                    None,  // advisor_override: `lpm migrate` does not expose `--advisor`
+                    None,  // min_release_age_override: `lpm migrate` uses the chain
+                    &[],
+                    crate::provenance_fetch::DriftIgnorePolicy::default(), // drift-ignore: `lpm migrate` enforces drift
+                    crate::provenance_fetch::VerifyPolicy::resolve_no_cli(), // verify-policy: `lpm migrate` honors env + config posture chain
+                    crate::commands::install::InstallOmitPolicy::default(),
+                    // `lpm migrate` does not surface its
+                    // own sandbox-mode flags. The env / config / default
+                    // chain inside `rebuild::run` still applies.
+                    false, // strict_sandbox
+                    false, // no_sandbox
+                    false, // verbose: internal pipeline, no user-facing Done footer
+                    false, // audit_after_install: internal pipeline never runs audit
+                    false, // timing: migrate does not expose install's --timing flag
+                    &[],
+                    !json,
+                    json,
+                    None,
+                    lpm_common::LpmRoot::from_env()?,
+                )
+                .await
+            };
+            match install_result {
+                Ok(()) => {
+                    if workspace.is_none() {
+                        super::root_lifecycle::RootProjectLifecycle::load(cwd)?
+                            .run_after_successful_install(cwd, json)?;
+                    }
+                }
+                Err(e) => {
+                    if !json {
+                        eprintln!();
+                        install_ui::warn_untrusted(&format!("Install failed: {e}"));
+                        install_ui::detail_line(crate::install_ui::terminal_line!(
+                            "  {} The lockfile was written successfully. Run {} manually to retry.",
+                            install_ui::dim("hint:"),
+                            install_ui::yellow("lpm install")
+                        ));
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(())
     }
+    .await;
+    let sealed = migration_backup.seal();
+    applied?;
+    sealed?;
 
     Ok(Some((result, migration_backup)))
 }
@@ -607,7 +632,7 @@ fn render_detected_source(result: &lpm_migrate::MigrateResult, dry_run: bool) {
     let backups = if dry_run {
         "not written in dry-run"
     } else {
-        ".backup files kept for lpm migrate --rollback"
+        ".lpm/migrate-backup/ kept for lpm migrate --rollback"
     };
     render_migrate_detail("backups:", backups);
 }
@@ -708,8 +733,7 @@ fn configure_npmrc(cwd: &Path, json: bool, backup: &mut MigrationBackup) -> Resu
             install_ui::phase("Updating .npmrc");
         }
 
-        backup.backup_file(&npmrc_path)?;
-        backup.write_manifest(cwd)?;
+        backup.backup_files(cwd, &[npmrc_path.as_path()])?;
 
         let mut new_content = content;
         if !new_content.ends_with('\n') {
@@ -720,7 +744,9 @@ fn configure_npmrc(cwd: &Path, json: bool, backup: &mut MigrationBackup) -> Resu
         if let Err(e) = lpm_common::write_file_atomic_with_options(
             &npmrc_path,
             &new_content,
-            lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+            lpm_common::AtomicWriteOptions::new()
+                .owner_only()
+                .sync_file(),
         ) {
             install_ui::failed_untrusted(&format!("Failed to update .npmrc: {e}"));
             if let Err(re) = backup.rollback() {
@@ -729,6 +755,7 @@ fn configure_npmrc(cwd: &Path, json: bool, backup: &mut MigrationBackup) -> Resu
             return Err(LpmError::Script(format!("failed to write .npmrc: {e}")));
         }
 
+        backup.seal()?;
         if !json {
             install_ui::done("Updated .npmrc");
         }
@@ -737,14 +764,15 @@ fn configure_npmrc(cwd: &Path, json: bool, backup: &mut MigrationBackup) -> Resu
             install_ui::phase("Configuring .npmrc");
         }
 
-        backup.backup_file(&npmrc_path)?;
-        backup.write_manifest(cwd)?;
+        backup.backup_files(cwd, &[npmrc_path.as_path()])?;
 
         let npmrc_content = "@lpm.dev:registry=https://lpm.dev/api/registry/\n";
         if let Err(e) = lpm_common::write_file_atomic_with_options(
             &npmrc_path,
             npmrc_content,
-            lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+            lpm_common::AtomicWriteOptions::new()
+                .owner_only()
+                .sync_file(),
         ) {
             install_ui::failed_untrusted(&format!("Failed to write .npmrc: {e}"));
             if let Err(re) = backup.rollback() {
@@ -753,6 +781,7 @@ fn configure_npmrc(cwd: &Path, json: bool, backup: &mut MigrationBackup) -> Resu
             return Err(LpmError::Script(format!("failed to write .npmrc: {e}")));
         }
 
+        backup.seal()?;
         if !json {
             install_ui::done("Configured .npmrc");
         }
@@ -763,14 +792,16 @@ fn configure_npmrc(cwd: &Path, json: bool, backup: &mut MigrationBackup) -> Resu
 
 fn render_migration_failure_with_rollback(
     error: &impl std::fmt::Display,
-    backup: &MigrationBackup,
+    backup: &mut MigrationBackup,
 ) {
     install_ui::failed_untrusted(&format!("Migration failed: {error}"));
     match backup.rollback() {
         Ok(()) => install_ui::done("Rolled back to original state."),
         Err(rollback_err) => {
             install_ui::failed_untrusted(&format!("Rollback also failed: {rollback_err}"));
-            install_ui::warn("Manual cleanup may be needed. Check .backup files.");
+            install_ui::warn(
+                "Manual cleanup may be needed. The original files are in .lpm/migrate-backup/.",
+            );
         }
     }
 }
@@ -925,8 +956,7 @@ fn generate_ci_template(
     let template = lpm_migrate::ci::generate_template(platform);
     let output_path = lpm_migrate::ci::template_output_path(cwd, platform);
 
-    backup.backup_file(&output_path)?;
-    backup.write_manifest(cwd)?;
+    backup.backup_files(cwd, &[output_path.as_path()])?;
 
     backup::write_output(cwd, &output_path, template.as_bytes()).map_err(|e| {
         LpmError::Script(format!(
@@ -934,6 +964,7 @@ fn generate_ci_template(
             output_path.display()
         ))
     })?;
+    backup.seal()?;
 
     if !json {
         install_ui::done_untrusted(&format!(
@@ -948,20 +979,25 @@ fn generate_ci_template(
     Ok(())
 }
 
-fn run_rollback(cwd: &Path, json: bool) -> Result<(), LpmError> {
+fn run_rollback(cwd: &Path, force: bool, json: bool) -> Result<(), LpmError> {
+    // A migration runs at the workspace root; an earlier CLI could also leave
+    // a backup in a member, which a rollback run there uses.
+    let root = if backup::has_backup(cwd) {
+        cwd.to_path_buf()
+    } else {
+        lpm_workspace::discover_workspace(cwd)
+            .map_err(|error| LpmError::Workspace(error.to_string()))?
+            .map_or_else(|| cwd.to_path_buf(), |workspace| workspace.root)
+    };
     if !json {
         eprintln!(
             "\n{}  {}",
             "lpm migrate --rollback".bold(),
-            "Restoring from backup files...".dimmed()
+            "Restoring the files the migration changed...".dimmed()
         );
     }
 
-    // The backup layer's v2 manifest tracks lpm.lock + lpm.lockb both as
-    // "newly created" (when the migration was fresh) or as restored from
-    // backup (when overwriting). No special-case handling needed here —
-    // every file the migration touched round-trips through the manifest.
-    let restored = backup::rollback_from_backups(cwd)?;
+    let restored = backup::rollback_from_backups(&root, force)?.restored;
 
     if json {
         let output = serde_json::json!({
@@ -971,7 +1007,7 @@ fn run_rollback(cwd: &Path, json: bool) -> Result<(), LpmError> {
         });
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else if restored.is_empty() {
-        eprintln!("  No backup files found. Nothing to restore.");
+        eprintln!("  No migration backup found. Nothing to restore.");
     } else {
         eprintln!();
         for file in &restored {
