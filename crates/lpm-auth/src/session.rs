@@ -987,7 +987,9 @@ fn compute_device_fingerprint_after_initial_read(after_initial_read: impl FnOnce
     use std::path::{Path, PathBuf};
 
     fn device_id_path() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".lpm").join("device-id"))
+        lpm_common::LpmRoot::from_env()
+            .ok()
+            .map(|root| root.root().join("device-id"))
     }
 
     fn generate_random_id() -> String {
@@ -1140,7 +1142,10 @@ mod tests {
     #[test]
     fn device_fingerprint_is_stable_across_calls_under_same_home() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let _env = ScopedEnv::set([("HOME", tmp.path().as_os_str().to_owned())]);
+        let _env = ScopedEnv::set([
+            ("HOME", tmp.path().as_os_str().to_owned()),
+            ("LPM_HOME", tmp.path().join(".lpm").into_os_string()),
+        ]);
         let first = compute_device_fingerprint();
         let second = compute_device_fingerprint();
         assert_eq!(first, second, "fingerprint must persist across calls");
@@ -1154,7 +1159,10 @@ mod tests {
     #[test]
     fn device_fingerprint_returns_same_id_when_initialization_races() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let _env = ScopedEnv::set([("HOME", tmp.path().as_os_str().to_owned())]);
+        let _env = ScopedEnv::set([
+            ("HOME", tmp.path().as_os_str().to_owned()),
+            ("LPM_HOME", tmp.path().join(".lpm").into_os_string()),
+        ]);
         let barrier = Arc::new(std::sync::Barrier::new(2));
 
         let (first, second) = std::thread::scope(|scope| {
@@ -1198,11 +1206,17 @@ mod tests {
         let tmp_a = tempfile::tempdir().unwrap();
         let tmp_b = tempfile::tempdir().unwrap();
         let a = {
-            let _env = ScopedEnv::set([("HOME", tmp_a.path().as_os_str().to_owned())]);
+            let _env = ScopedEnv::set([
+                ("HOME", tmp_a.path().as_os_str().to_owned()),
+                ("LPM_HOME", tmp_a.path().join(".lpm").into_os_string()),
+            ]);
             compute_device_fingerprint()
         };
         let b = {
-            let _env = ScopedEnv::set([("HOME", tmp_b.path().as_os_str().to_owned())]);
+            let _env = ScopedEnv::set([
+                ("HOME", tmp_b.path().as_os_str().to_owned()),
+                ("LPM_HOME", tmp_b.path().join(".lpm").into_os_string()),
+            ]);
             compute_device_fingerprint()
         };
         assert_ne!(
@@ -1222,7 +1236,10 @@ mod tests {
         let path = lpm_dir.join("device-id");
         std::fs::write(&path, b"not-a-valid-hex-digest").unwrap();
 
-        let _env = ScopedEnv::set([("HOME", tmp.path().as_os_str().to_owned())]);
+        let _env = ScopedEnv::set([
+            ("HOME", tmp.path().as_os_str().to_owned()),
+            ("LPM_HOME", tmp.path().join(".lpm").into_os_string()),
+        ]);
         let id = compute_device_fingerprint();
         assert_eq!(id.len(), 64);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
@@ -1517,6 +1534,10 @@ mod tests {
         };
         let scoped = crate::test_env::ScopedEnv::update([
             ("HOME", Some(tempdir.path().as_os_str().to_owned())),
+            (
+                "LPM_HOME",
+                Some(tempdir.path().join(".lpm").into_os_string()),
+            ),
             ("LPM_FORCE_FILE_AUTH", Some("1".into())),
             ("LPM_TOKEN", lpm_token.map(std::ffi::OsString::from)),
             ("CI", ci),
@@ -1997,6 +2018,7 @@ mod refresh_http_tests {
         let tempdir = tempfile::tempdir().expect("create test home tempdir");
         let scoped = crate::test_env::ScopedEnv::set([
             ("HOME", tempdir.path().as_os_str().to_owned()),
+            ("LPM_HOME", tempdir.path().join(".lpm").into_os_string()),
             ("LPM_FORCE_FILE_AUTH", "1".into()),
         ]);
         IsolatedTestEnv {
@@ -2170,6 +2192,7 @@ mod refresh_http_tests {
         let contention_marker = tempdir.path().join("session-lock-contention");
         let _env = crate::test_env::ScopedEnv::set([
             ("HOME", tempdir.path().as_os_str().to_owned()),
+            ("LPM_HOME", tempdir.path().join(".lpm").into_os_string()),
             ("LPM_FORCE_FILE_AUTH", "1".into()),
             (
                 "LPM_TEST_LOCK_CONTENTION_MARKER",
@@ -2459,6 +2482,7 @@ mod refresh_http_tests {
         let contention_marker = tempdir.path().join("metadata-lock-contention");
         let _env = crate::test_env::ScopedEnv::set([
             ("HOME", tempdir.path().as_os_str().to_owned()),
+            ("LPM_HOME", tempdir.path().join(".lpm").into_os_string()),
             ("LPM_FORCE_FILE_AUTH", "1".into()),
             (
                 "LPM_TEST_LOCK_CONTENTION_MARKER",

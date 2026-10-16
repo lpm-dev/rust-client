@@ -39,6 +39,10 @@ const ORG_ASSOCIATIONS_ACCOUNT: &str = "__org_associations__";
 const SYNC_METADATA_RECORD_PREFIX: &str = "__sync_metadata__:";
 const SYNC_METADATA_SCHEMA_VERSION: u8 = 3;
 
+fn service() -> String {
+    lpm_common::credential_service(SERVICE)
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, PartialEq, Eq)]
 pub struct IndexEntry {
     pub id: String,
@@ -266,15 +270,15 @@ struct KeychainProjectStorage;
 
 impl ProjectStorage for KeychainProjectStorage {
     fn read(&mut self, account: &str) -> Result<Option<String>, String> {
-        try_read_keychain_password(SERVICE, account)
+        try_read_keychain_password(&service(), account)
     }
 
     fn write(&mut self, account: &str, value: &str) -> Result<(), String> {
-        write_keychain_password(SERVICE, account, value)
+        write_keychain_password(&service(), account, value)
     }
 
     fn write_verified(&mut self, account: &str, value: &str) -> Result<(), String> {
-        write_keychain_password(SERVICE, account, value)
+        write_keychain_password(&service(), account, value)
     }
 
     fn write_verified_with_access_from(
@@ -283,11 +287,11 @@ impl ProjectStorage for KeychainProjectStorage {
         value: &str,
         source: &str,
     ) -> Result<(), String> {
-        write_string_with_access_from(SERVICE, account, value, source)
+        write_string_with_access_from(&service(), account, value, source)
     }
 
     fn delete(&mut self, account: &str) -> Result<bool, String> {
-        delete_keychain_password(SERVICE, account)
+        delete_keychain_password(&service(), account)
             .map(|outcome| outcome == crate::macos_keychain::KeychainDeleteOutcome::Deleted)
     }
 }
@@ -1007,7 +1011,7 @@ fn try_read_vault_env_unlocked_with_fallback(
     env: &str,
     default_fallback: bool,
 ) -> Result<Option<SecretMap>, String> {
-    let Some(json) = try_read_keychain_password(SERVICE, vault_id)? else {
+    let Some(json) = try_read_keychain_password(&service(), vault_id)? else {
         return Ok(None);
     };
 
@@ -1045,7 +1049,7 @@ pub(crate) fn try_read_all_environments_with_digest_unlocked(
 ) -> Result<(Option<EnvironmentMap>, Option<[u8; 32]>), String> {
     use sha2::Digest as _;
 
-    let Some(json) = try_read_keychain_password(SERVICE, vault_id)? else {
+    let Some(json) = try_read_keychain_password(&service(), vault_id)? else {
         return Ok((None, None));
     };
     let digest = sha2::Sha256::digest(json.as_bytes()).into();
@@ -1058,7 +1062,7 @@ pub(crate) fn try_read_all_environments_with_digest_unlocked(
 pub(crate) fn vault_payload_digest_unlocked(vault_id: &str) -> Result<Option<[u8; 32]>, String> {
     use sha2::Digest as _;
 
-    try_read_keychain_password(SERVICE, vault_id)
+    try_read_keychain_password(&service(), vault_id)
         .map(|json| json.map(|json| sha2::Sha256::digest(json.as_bytes()).into()))
 }
 
@@ -1258,7 +1262,7 @@ pub fn list_vaults() -> Vec<IndexEntry> {
 fn try_read_x25519_private_key_for_account_unlocked(
     account: &str,
 ) -> Result<Option<[u8; 32]>, String> {
-    let Some(encoded) = try_read_keychain_password(SERVICE, account)? else {
+    let Some(encoded) = try_read_keychain_password(&service(), account)? else {
         return Ok(None);
     };
     decode_x25519_private_key(&encoded).map(Some)
@@ -1284,7 +1288,7 @@ fn write_x25519_private_key_for_account_unlocked(
     private_key: &[u8; 32],
 ) -> Result<(), String> {
     let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, private_key);
-    write_keychain_password(SERVICE, account, &encoded)
+    write_keychain_password(&service(), account, &encoded)
 }
 
 pub(crate) fn get_or_create_x25519_keypair_for_account(
@@ -1298,7 +1302,7 @@ pub(crate) fn get_or_create_x25519_keypair_for_account(
 
         let (candidate, _) = crate::crypto::generate_x25519_keypair();
         let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, candidate);
-        let stored = crate::macos_keychain::get_or_insert_string(SERVICE, account, &encoded)?;
+        let stored = crate::macos_keychain::get_or_insert_string(&service(), account, &encoded)?;
         let private = decode_x25519_private_key(&stored)?;
         let public = crate::crypto::x25519_public_from_private(&private);
         Ok((private, public))
@@ -1332,7 +1336,7 @@ fn promote_x25519_private_key_accounts_with_storage(
 }
 
 pub(crate) fn delete_x25519_private_key_for_account(account: &str) -> Result<(), String> {
-    with_keychain_transaction(|| delete_keychain_password(SERVICE, account).map(|_| ()))
+    with_keychain_transaction(|| delete_keychain_password(&service(), account).map(|_| ()))
 }
 
 fn decode_x25519_private_key(encoded: &str) -> Result<[u8; 32], String> {

@@ -423,6 +423,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let env = crate::test_env::ScopedEnv::update([
             ("HOME", Some(dir.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(dir.path().join(".lpm").into_os_string())),
             ("LPM_FORCE_FILE_AUTH", Some(OsString::from("1"))),
             ("LPM_TEST_FAST_SCRYPT", Some(OsString::from("1"))),
             ("LPM_TOKEN", None),

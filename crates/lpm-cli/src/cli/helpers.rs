@@ -1670,6 +1670,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let _env = crate::test_env::ScopedEnv::set([
             ("HOME", home.path().as_os_str().to_owned()),
+            ("LPM_HOME", home.path().join(".lpm").into_os_string()),
             ("LPM_TOKEN", "loopback-smoke-token".into()),
             ("LPM_FORCE_FILE_AUTH", "1".into()),
         ]);
@@ -1688,6 +1689,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let _env = crate::test_env::ScopedEnv::set([
             ("HOME", home.path().as_os_str().to_owned()),
+            ("LPM_HOME", home.path().join(".lpm").into_os_string()),
             ("LPM_TOKEN", "production-token".into()),
             ("LPM_FORCE_FILE_AUTH", "1".into()),
         ]);
