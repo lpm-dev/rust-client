@@ -774,9 +774,7 @@ fn decide_dependency_engine_freshness(
 }
 
 /// Empty installs still need the same durable on-disk markers the
-/// freshness cache keys on: `lpm.lock`, `node_modules/`, and the
-/// standard `lpm.lockb`/`.gitattributes` sidecar written by the main
-/// lockfile path. Without these, the empty-deps short-circuit would
+/// freshness cache keys on: `lpm.lock` and `node_modules/`. Without these, the empty-deps short-circuit would
 /// succeed once but never become warm-cache fresh, so every later
 /// `lpm install`, `lpm dev`, and sync fast-lane probe would fall back
 /// to the slow path despite the manifest already being fully applied.
@@ -793,11 +791,6 @@ pub(super) fn materialize_empty_install_artifacts(
         lockfile
             .write_all(&lockfile_path)
             .map_err(|e| LpmError::Registry(format!("failed to write empty lockfile: {e}")))?;
-    }
-
-    if !workspace_lockfile::active() {
-        lpm_lockfile::ensure_gitattributes(project_dir)
-            .map_err(|e| LpmError::Registry(format!("failed to ensure .gitattributes: {e}")))?;
     }
 
     std::fs::create_dir_all(project_dir.join("node_modules")).map_err(LpmError::Io)?;

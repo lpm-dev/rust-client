@@ -13,6 +13,5 @@ expression: envelope
   "agents_path": "[AGENTS_MD]",
   "agents_status": "created",
   "lpm_json_path": null,
-  "lpm_json_status": "skipped",
-  "gitattributes_ready": true
+  "lpm_json_status": "skipped"
 }

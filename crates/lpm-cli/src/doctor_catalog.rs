@@ -93,7 +93,6 @@ pub enum DoctorFix {
     PruneStore,
     InstallProject,
     ReconcileBinaryLockfile,
-    UpdateGitAttributes,
     InstallNodeSpec,
     InstallNode22,
     InstallBunSpec,
@@ -110,7 +109,6 @@ impl DoctorFix {
             Self::PruneStore => "lpm cache prune --apply",
             Self::InstallProject => "lpm install",
             Self::ReconcileBinaryLockfile => "reconcile lpm.lockb",
-            Self::UpdateGitAttributes => "update .gitattributes",
             Self::InstallNodeSpec => "lpm use node@<spec>",
             Self::InstallNode22 => "lpm use node@22",
             Self::InstallBunSpec => "lpm use bun@<spec>",
@@ -148,8 +146,8 @@ pub enum Tier {
     /// Everything else: registry / auth probes, tunnel diagnostics,
     /// lint / fmt subprocesses, TypeScript / plugin reachability,
     /// global-install hygiene, sandbox probe, manifest-compat sweep,
-    /// project-maintenance rows (`.gitattributes` lockb hygiene,
-    /// virtual-store orphan counts).
+    /// project-maintenance rows (tracked `.lpm/` state, virtual-store
+    /// orphan counts).
     Extended,
 }
 
@@ -804,54 +802,6 @@ pub static LOCKFILE_BINARY_CORRUPT: CheckEntry = CheckEntry {
     remediation: "Run `lpm doctor --fix` to reconcile from `lpm.lock`.",
     possible_severities: &[Severity::Warn],
     auto_fix: Some(DoctorFix::ReconcileBinaryLockfile),
-};
-
-pub static GITATTRIBUTES_LOCKB_MARKED: CheckEntry = CheckEntry {
-    code: "gitattributes_lockb_marked",
-    name: ".gitattributes",
-    category: Category::ProjectState,
-    tier: Tier::Extended,
-    description: "`.gitattributes` marks `lpm.lockb` as binary.",
-    when_fires: "Repo has the recommended `lpm.lockb binary` rule.",
-    remediation: "No action — informational pass.",
-    possible_severities: &[Severity::Pass],
-    auto_fix: None,
-};
-
-pub static GITATTRIBUTES_LOCKB_UNMARKED: CheckEntry = CheckEntry {
-    code: "gitattributes_lockb_unmarked",
-    name: ".gitattributes",
-    category: Category::ProjectState,
-    tier: Tier::Extended,
-    description: "`.gitattributes` exists but does not mark `lpm.lockb` as binary.",
-    when_fires: "Repo has `.gitattributes` without the LPM CLI lockb rule.",
-    remediation: "Add `lpm.lockb binary` to `.gitattributes` so git diffs treat the file correctly.",
-    possible_severities: &[Severity::Warn],
-    auto_fix: Some(DoctorFix::UpdateGitAttributes),
-};
-
-pub static GITATTRIBUTES_MISSING: CheckEntry = CheckEntry {
-    code: "gitattributes_missing",
-    name: ".gitattributes",
-    category: Category::ProjectState,
-    tier: Tier::Extended,
-    description: "No `.gitattributes` found — `lpm.lockb` may be diffed as text.",
-    when_fires: "`<project>/.gitattributes` is missing.",
-    remediation: "Run `lpm init` or add `lpm.lockb binary` to a new `.gitattributes`.",
-    possible_severities: &[Severity::Warn],
-    auto_fix: Some(DoctorFix::UpdateGitAttributes),
-};
-
-pub static GITATTRIBUTES_UNREADABLE: CheckEntry = CheckEntry {
-    code: "gitattributes_unreadable",
-    name: ".gitattributes",
-    category: Category::ProjectState,
-    tier: Tier::Extended,
-    description: "`.gitattributes` is not a safely readable regular UTF-8 file.",
-    when_fires: "The path is linked, special, oversized, invalid UTF-8, or unreadable.",
-    remediation: "Replace it with a regular UTF-8 file, preserve any valid rules, and add `lpm.lockb binary`.",
-    possible_severities: &[Severity::Warn],
-    auto_fix: None,
 };
 
 pub static PROJECT_STATE_UNTRACKED: CheckEntry = CheckEntry {
@@ -2204,10 +2154,6 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &LOCKFILE_BINARY_MISSING,
     &LOCKFILE_BINARY_STALE,
     &LOCKFILE_BINARY_CORRUPT,
-    &GITATTRIBUTES_LOCKB_MARKED,
-    &GITATTRIBUTES_LOCKB_UNMARKED,
-    &GITATTRIBUTES_MISSING,
-    &GITATTRIBUTES_UNREADABLE,
     &PROJECT_STATE_UNTRACKED,
     &PROJECT_STATE_TRACKED,
     &DEPS_SYNC_CLEAN,

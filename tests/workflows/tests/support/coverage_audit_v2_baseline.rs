@@ -320,7 +320,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         id: 10,
         scenarios: 4,
         failure_modes_tested: &[
-            "gitattributes created when lockfile exists without it",
+            "--all --fix leaves .gitattributes to the project",
             "binary lockfile regenerated when toml present",
             "non-fix mode does not mutate",
             "JSON envelope carries fixes-applied array",
@@ -340,7 +340,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         id: 11,
         scenarios: 2,
         failure_modes_tested: &[
-            "yes + json uses profile username + creates gitattributes",
+            "yes + json uses profile username, leaves .gitattributes alone",
             "fallback to literal username when whoami unavailable",
         ],
         failure_modes_known: &[
