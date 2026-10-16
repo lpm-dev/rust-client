@@ -1892,6 +1892,36 @@ async fn xcode_install_reexports_declared_modules_instead_of_the_product_name() 
     );
 }
 
+/// The copy of `project.pbxproj` from before LPM's edit stays in the local
+/// `.lpm/`, not in the committed `.xcodeproj` bundle.
+#[tokio::test]
+async fn xcode_install_keeps_its_project_backup_out_of_the_xcodeproj_bundle() {
+    let mock = MockRegistry::start().await;
+    let cert = mount_swift_package(&mock).await;
+    let project = TempProject::empty(r#"{"name":"xcode-app","version":"1.0.0"}"#);
+    write_xcode_project(&project, "", "MyApp");
+    configure_existing_registry(&project, &mock.url(), &cert);
+    let pbxproj = "MyApp.xcodeproj/project.pbxproj";
+    let original = project.read_file(pbxproj);
+    project.write_file("MyApp.xcodeproj/project.pbxproj.lpm-backup", &original);
+
+    let mut command = lpm_with_registry(&project, &mock.url());
+    configure_fake_swift(&mut command, &project, &["unused"], 0);
+    let output = command
+        .args(["--json", "install", "--yes", SWIFT_PACKAGE])
+        .output()
+        .expect("run Xcode Swift install");
+
+    assert!(output.status.success(), "{}", combined_output(&output));
+    assert_ne!(project.read_file(pbxproj), original);
+    assert_eq!(
+        project.read_file(".lpm/xcode-backups/MyApp.pbxproj"),
+        original
+    );
+    assert!(!project.file_exists("MyApp.xcodeproj/project.pbxproj.lpm-backup"));
+    assert!(project.file_exists(".lpm/.gitignore"));
+}
+
 #[tokio::test]
 async fn failed_xcode_install_restores_project_and_removes_created_wrapper() {
     let mock = MockRegistry::start().await;
@@ -1912,6 +1942,7 @@ async fn failed_xcode_install_restores_project_and_removes_created_wrapper() {
     assert!(!output.status.success());
     assert_eq!(project.read_file(pbxproj), original);
     assert!(!project.file_exists("MyApp.xcodeproj/project.pbxproj.lpm-backup"));
+    assert!(!project.file_exists(".lpm/xcode-backups/MyApp.pbxproj"));
     assert!(!project.file_exists("Packages/LPMDependencies/Package.swift"));
 }
 
