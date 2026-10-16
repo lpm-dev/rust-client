@@ -36,12 +36,7 @@ async fn conflicting_requests_fail_before_manifest_or_registry_changes() {
         let project = TempProject::empty(manifest);
         let output = lpm_with_registry(&project, &registry.url())
             .env("LPM_TYPOSQUAT_GUARD", "0")
-            .args([
-                "install",
-                "--no-skills",
-                "--no-editor-setup",
-                "--no-security-summary",
-            ])
+            .args(["install", "--no-skills", "--no-security-summary"])
             .args(specs)
             .output()
             .unwrap();
@@ -160,12 +155,7 @@ async fn identical_requests_install_one_dependency_with_the_requested_policy() {
         let project = TempProject::empty("{\"name\":\"consumer\"}");
         lpm_with_registry(&project, &registry.url())
             .env("LPM_TYPOSQUAT_GUARD", "0")
-            .args([
-                "install",
-                "--no-skills",
-                "--no-editor-setup",
-                "--no-security-summary",
-            ])
+            .args(["install", "--no-skills", "--no-security-summary"])
             .args(specs)
             .assert()
             .success();
@@ -213,7 +203,6 @@ async fn source_shaped_registry_tags_cannot_replace_requested_package_sources() 
             "install",
             &format!("{name}@{tag}"),
             "--no-skills",
-            "--no-editor-setup",
             "--no-security-summary",
         ])
         .output()
@@ -268,7 +257,6 @@ async fn automatic_catalog_modes_preserve_local_dependency_sources() {
                         "--filter",
                         "app",
                         "--no-skills",
-                        "--no-editor-setup",
                         "--no-security-summary",
                     ])
                     .output()
@@ -375,7 +363,6 @@ async fn automatic_catalog_modes_preserve_existing_alias_sources() {
                 "install",
                 "local-alias",
                 "--no-skills",
-                "--no-editor-setup",
                 "--no-security-summary",
             ])
             .assert()
@@ -431,7 +418,6 @@ async fn automatic_catalog_modes_preserve_key_relative_jsr_sources() {
                 "install",
                 "@std/path",
                 "--no-skills",
-                "--no-editor-setup",
                 "--no-security-summary",
             ])
             .assert()
@@ -486,7 +472,6 @@ async fn bare_reinstall_save_flags_preserve_source_dependencies() {
                     "--filter",
                     "app",
                     "--no-skills",
-                    "--no-editor-setup",
                     "--no-security-summary",
                 ])
                 .assert()
@@ -554,7 +539,6 @@ async fn lpm_scoped_workspace_requests_do_not_fetch_ecosystem_metadata() {
                     "--filter",
                     "app",
                     "--no-skills",
-                    "--no-editor-setup",
                     "--no-security-summary",
                 ])
                 .assert()
@@ -617,7 +601,6 @@ async fn path_shaped_registry_tags_cannot_replace_requested_sources() {
                 "install",
                 &format!("input-package@{tag}"),
                 "--no-skills",
-                "--no-editor-setup",
                 "--no-security-summary",
             ])
             .output()
@@ -709,7 +692,6 @@ async fn catalog_backed_aliases_survive_reinstall_and_save_flags() {
                 "install",
                 "local-alias",
                 "--no-skills",
-                "--no-editor-setup",
                 "--no-security-summary",
             ]);
             if let Some(flag) = flag {
@@ -731,7 +713,6 @@ async fn catalog_backed_aliases_survive_reinstall_and_save_flags() {
                     "install",
                     "--frozen-lockfile",
                     "--no-skills",
-                    "--no-editor-setup",
                     "--no-security-summary",
                 ])
                 .assert()

@@ -7,7 +7,6 @@ use support::{TempProject, lpm, lpm_spawnable, write_npm_firewall_global_config}
 const INSTALL_FLAGS: &[&str] = &[
     "--no-security-summary",
     "--no-skills",
-    "--no-editor-setup",
     "--no-audit-after-install",
 ];
 

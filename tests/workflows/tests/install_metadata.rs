@@ -31,13 +31,7 @@ async fn install_enriches_three_scripted_versions_from_one_cached_history() {
     );
     let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_TIMING_DETAIL", "trace")
-        .args([
-            "--json",
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["--json", "install", "--no-security-summary", "--no-skills"])
         .output()
         .unwrap();
     assert!(

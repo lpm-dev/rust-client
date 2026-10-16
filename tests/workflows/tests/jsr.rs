@@ -27,12 +27,7 @@ async fn install_jsr_specifier_fetches_folded_npm_package_from_jsr_registry() {
     project.write_file(".npmrc", &format!("@jsr:registry={}\n", registry.url()));
 
     lpm_with_registry(&project, "http://127.0.0.1:1")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -67,12 +62,7 @@ async fn install_jsr_version_only_specifier_borrows_dependency_name() {
     project.write_file(".npmrc", &format!("@jsr:registry={}\n", registry.url()));
 
     lpm_with_registry(&project, "http://127.0.0.1:1")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -125,12 +115,7 @@ async fn install_workspace_member_semver_jsr_dependency_installs_alias_dependenc
     );
 
     lpm_with_registry(&project, "http://127.0.0.1:1")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -176,12 +161,7 @@ fn install_rejects_malformed_jsr_package_name_before_registry_fetch() {
     );
 
     let output = lpm_with_registry(&project, "http://127.0.0.1:1")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn lpm install");
 

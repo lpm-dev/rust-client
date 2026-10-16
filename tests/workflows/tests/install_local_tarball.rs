@@ -26,7 +26,7 @@ fn local_tarball_installs_in_default_store_and_replays_after_removal() {
     for args in [vec!["install"], vec!["install", "--force"], vec!["ci"]] {
         lpm(&project)
             .args(args)
-            .args(["--json", "--no-skills", "--no-editor-setup"])
+            .args(["--json", "--no-skills"])
             .assert()
             .success();
         assert_eq!(
@@ -53,7 +53,7 @@ async fn assert_archive_registry_dependencies(v1: bool) {
         lpm_with_registry(&project, &mock.url())
     };
     command
-        .args(["install", "--json", "--no-skills", "--no-editor-setup"])
+        .args(["install", "--json", "--no-skills"])
         .assert()
         .success();
     let lockfile =
@@ -92,14 +92,14 @@ fn local_tarball_serial_linking_and_cold_store_frozen_replay_preserve_bytes() {
     let project = archive_project(serde_json::json!({}));
     lpm(&project)
         .env("LPM_SERIAL_LINK", "1")
-        .args(["install", "--json", "--no-skills", "--no-editor-setup"])
+        .args(["install", "--json", "--no-skills"])
         .assert()
         .success();
     std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
     std::fs::remove_dir_all(project.home().join(".lpm/store")).unwrap();
     lpm(&project)
         .env("LPM_SERIAL_LINK", "1")
-        .args(["ci", "--json", "--no-skills", "--no-editor-setup"])
+        .args(["ci", "--json", "--no-skills"])
         .assert()
         .success();
     assert_eq!(
@@ -112,7 +112,7 @@ fn local_tarball_serial_linking_and_cold_store_frozen_replay_preserve_bytes() {
 fn changed_local_tarball_is_rejected_by_ci_and_refreshed_by_install() {
     let project = archive_project(serde_json::json!({}));
     lpm(&project)
-        .args(["install", "--json", "--no-skills", "--no-editor-setup"])
+        .args(["install", "--json", "--no-skills"])
         .assert()
         .success();
     let original_lock = project.read_file("lpm.lock");
@@ -122,12 +122,12 @@ fn changed_local_tarball_is_rejected_by_ci_and_refreshed_by_install() {
     );
     std::fs::write(project.path().join("fixture.tgz"), archive).unwrap();
     lpm(&project)
-        .args(["ci", "--json", "--no-skills", "--no-editor-setup"])
+        .args(["ci", "--json", "--no-skills"])
         .assert()
         .failure();
     assert_eq!(project.read_file("lpm.lock"), original_lock);
     lpm(&project)
-        .args(["install", "--json", "--no-skills", "--no-editor-setup"])
+        .args(["install", "--json", "--no-skills"])
         .assert()
         .success();
     assert_eq!(
@@ -164,7 +164,7 @@ async fn local_tarball_respects_dependency_range_when_root_requires_another_vers
     let project = archive_project(serde_json::json!({"archive-child":"1.0.0"}));
     project.write_file("package.json", r#"{"name":"archive-consumer","version":"1.0.0","dependencies":{"archive-alias":"file:fixture.tgz","archive-child":"2.0.0"}}"#);
     lpm_with_registry(&project, &mock.url())
-        .args(["install", "--json", "--no-skills", "--no-editor-setup"])
+        .args(["install", "--json", "--no-skills"])
         .assert()
         .success();
     let lock = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock")).unwrap();
@@ -201,7 +201,7 @@ async fn local_tarball_respects_dependency_range_when_root_requires_another_vers
     }
     std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
     lpm_with_registry(&project, &mock.url())
-        .args(["ci", "--json", "--no-skills", "--no-editor-setup"])
+        .args(["ci", "--json", "--no-skills"])
         .assert()
         .success();
     let output = std::process::Command::new("node").current_dir(project.path())
@@ -230,7 +230,7 @@ async fn local_tarball_skips_unavailable_optional_and_development_dependencies()
     );
     std::fs::write(project.path().join("fixture.tgz"), archive).unwrap();
     lpm_with_registry(&project, &mock.url())
-        .args(["install", "--json", "--no-skills", "--no-editor-setup"])
+        .args(["install", "--json", "--no-skills"])
         .assert()
         .success();
     let lock = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock")).unwrap();
@@ -241,7 +241,7 @@ async fn local_tarball_skips_unavailable_optional_and_development_dependencies()
 fn local_tarball_rejects_nested_local_source_dependencies() {
     let project = archive_project(serde_json::json!({"nested":"link:../../outside"}));
     lpm(&project)
-        .args(["install", "--json", "--no-skills", "--no-editor-setup"])
+        .args(["install", "--json", "--no-skills"])
         .assert()
         .failure()
         .stdout(predicates::str::contains(
@@ -261,7 +261,7 @@ async fn local_tarball_preserves_registry_dependency_aliases() {
         .await;
     let project = archive_project(serde_json::json!({"child-alias":"npm:archive-child@1.0.0"}));
     lpm_with_registry(&project, &mock.url())
-        .args(["install", "--json", "--no-skills", "--no-editor-setup"])
+        .args(["install", "--json", "--no-skills"])
         .assert()
         .success();
     let output = std::process::Command::new("node").current_dir(project.path())
@@ -293,7 +293,7 @@ async fn unavailable_archive_optional_range_does_not_use_incompatible_root() {
     std::fs::write(project.path().join("fixture.tgz"), archive).unwrap();
     project.write_file("package.json", r#"{"name":"archive-consumer","version":"1.0.0","dependencies":{"archive-alias":"file:fixture.tgz","archive-child":"2.0.0"}}"#);
     lpm_with_registry(&project, &mock.url())
-        .args(["install", "--json", "--no-skills", "--no-editor-setup"])
+        .args(["install", "--json", "--no-skills"])
         .assert()
         .success();
     let lock = lpm_lockfile::Lockfile::read_from_file(&project.path().join("lpm.lock")).unwrap();

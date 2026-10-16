@@ -485,7 +485,6 @@ async fn scoped_workspace_version_requests_resolve_locally_before_registry_prefl
                     "--filter",
                     "app",
                     "--no-skills",
-                    "--no-editor-setup",
                     "--no-security-summary",
                 ])
                 .output()

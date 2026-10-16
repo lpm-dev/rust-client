@@ -1286,7 +1286,6 @@ async fn mixed_swift_and_javascript_request_routes_each_ecosystem_to_its_manifes
             "--yes",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
             SWIFT_PACKAGE,
             JS_PACKAGE,
         ])
@@ -1418,7 +1417,6 @@ async fn later_javascript_failure_removes_package_resolved_created_by_swift() {
             "--yes",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
             SWIFT_PACKAGE,
             JS_PACKAGE,
         ])
@@ -1490,7 +1488,6 @@ async fn standalone_mixed_failure_restores_swift_manifest_and_created_lockfile()
             "--yes",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
             SWIFT_PACKAGE,
             JS_PACKAGE,
         ])

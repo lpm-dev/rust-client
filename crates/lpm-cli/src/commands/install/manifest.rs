@@ -1317,7 +1317,6 @@ async fn route_explicit_packages(
 pub(crate) struct AddInstallOptions {
     pub(crate) strict_integrity: bool,
     pub(crate) linker_override: Option<lpm_linker::LinkerMode>,
-    pub(crate) no_editor_setup: bool,
     pub(crate) no_security_summary: bool,
     pub(crate) auto_build: bool,
 }
@@ -1578,7 +1577,6 @@ pub async fn run_add_packages(
                 strict_peer_dependencies_override,
                 install_options.linker_override,
                 lpm_skills_preference,
-                install_options.no_editor_setup,
                 install_options.no_security_summary,
                 install_options.auto_build,
                 None, // target_set: legacy single-project path
@@ -2141,7 +2139,6 @@ pub async fn run_install_filtered_add(
                     strict_peer_dependencies_override,
                     install_options.linker_override,
                     lpm_skills_preference,
-                    install_options.no_editor_setup,
                     install_options.no_security_summary,
                     install_options.auto_build,
                     Some(&target_paths),

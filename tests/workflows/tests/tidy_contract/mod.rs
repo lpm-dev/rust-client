@@ -141,12 +141,7 @@ async fn tidy_fix_json_contains_one_report_when_install_scripts_write_stdout() {
     );
     project.write_file("src/index.js", "import 'react';");
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
     let output = lpm_with_registry(&project, &mock.url())
@@ -198,12 +193,7 @@ async fn tidy_fix_json_contains_one_report_when_install_applies_overrides() {
     );
     project.write_file("src/index.js", "import 'parent';");
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
     let output = lpm_with_registry(&project, &mock.url())

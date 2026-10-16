@@ -10,12 +10,7 @@ use support::fault_registry::{
 use support::mock_registry::make_tarball;
 use support::{TempProject, lpm_spawnable_with_registry, lpm_with_registry};
 
-const INSTALL_ARGS: &[&str] = &[
-    "install",
-    "--no-security-summary",
-    "--no-skills",
-    "--no-editor-setup",
-];
+const INSTALL_ARGS: &[&str] = &["install", "--no-security-summary", "--no-skills"];
 
 fn project_with_dep(project_name: &str, dep_name: &str, dep_spec: &str) -> TempProject {
     TempProject::empty(&format!(
@@ -71,12 +66,7 @@ fn ci_with(
         command.env(name, value);
     }
     command
-        .args([
-            "ci",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["ci", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm ci")
 }

@@ -195,7 +195,6 @@ async fn release_age_layers_merge_for_install_without_cross_persistence() {
             CLI_EXCLUDED,
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("install with merged release-age exclusions");

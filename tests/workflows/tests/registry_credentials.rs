@@ -92,13 +92,7 @@ fn read_command(
     let mut command = command(project, registry);
     command.args([operation, PACKAGE]);
     if operation == "add" {
-        command.args([
-            "--path",
-            "copied",
-            "--yes",
-            "--no-skills",
-            "--no-editor-setup",
-        ]);
+        command.args(["--path", "copied", "--yes", "--no-skills"]);
     }
     command
 }

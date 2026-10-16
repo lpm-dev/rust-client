@@ -863,13 +863,7 @@ async fn lpm_add_with_mixed_registry_deps_installs_and_writes_resolved_specs() {
         TempProject::empty(r#"{"name":"add-happy-path","version":"1.0.0","dependencies":{}}"#);
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "add",
-            "source-pkg?withTests=true",
-            "--yes",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["add", "source-pkg?withTests=true", "--yes", "--no-skills"])
         .output()
         .expect("failed to run lpm add");
 
@@ -944,7 +938,6 @@ async fn lpm_add_bare_source_dependency_selects_latest_mature_version() {
             "release-age-source-pkg?withDependency=true",
             "--yes",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run release-age-aware lpm add");
@@ -992,7 +985,6 @@ async fn lpm_add_explicit_source_range_does_not_select_version_below_its_lower_b
             "explicit-release-age-source-pkg?withDependency=true",
             "--yes",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run explicit-range lpm add");
@@ -1040,7 +1032,6 @@ async fn lpm_add_firewall_enforce_blocks_source_package_before_tarball_fetch() {
             "--path",
             "components",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm add with firewall enforce");
@@ -1152,7 +1143,6 @@ async fn lpm_add_config_aware_pkg_ignores_declaration_file_imports_in_phantom_sc
             "--path",
             "components",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run config-aware lpm add");
@@ -1215,14 +1205,7 @@ async fn lpm_add_json_envelope_with_simple_source_pkg_matches_snapshot() {
     let project = TempProject::empty(r#"{"name":"add-snap","version":"1.0.0","dependencies":{}}"#);
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "add",
-            "snap-add-pkg",
-            "--json",
-            "--yes",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["add", "snap-add-pkg", "--json", "--yes", "--no-skills"])
         .output()
         .expect("spawn lpm add --json");
     assert!(
@@ -1282,13 +1265,7 @@ async fn lpm_add_preflight_blocks_deps_source_with_no_consumer_manifest() {
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "add",
-            "needs-deps?withTests=true",
-            "--yes",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["add", "needs-deps?withTests=true", "--yes", "--no-skills"])
         .output()
         .expect("failed to run lpm add");
 
@@ -1388,13 +1365,7 @@ async fn lpm_add_rollback_restores_manifest_and_source_files_on_install_failure(
     let original_manifest_bytes = std::fs::read(project.path().join("package.json")).unwrap();
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "add",
-            "rollback-pkg?withTests=true",
-            "--yes",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["add", "rollback-pkg?withTests=true", "--yes", "--no-skills"])
         .output()
         .expect("failed to run lpm add");
 
@@ -2285,14 +2256,7 @@ async fn add_json_with_declared_dependency_emits_one_document() {
     let project = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "add",
-            package,
-            "--yes",
-            "--json",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["add", package, "--yes", "--json", "--no-skills"])
         .output()
         .unwrap();
 
@@ -2490,7 +2454,7 @@ async fn add_does_not_duplicate_dependency_declared_in_dev_dependencies() {
     ));
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args(["add", package, "--yes", "--no-skills", "--no-editor-setup"])
+        .args(["add", package, "--yes", "--no-skills"])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -3225,7 +3189,7 @@ async fn add_new_version_removes_unchanged_dependency_dropped_by_the_package() {
 
     for spec in [format!("{package}@1.0.0"), format!("{package}@2.0.0")] {
         lpm_with_registry(&project, &mock.url())
-            .args(["add", &spec, "--yes", "--no-skills", "--no-editor-setup"])
+            .args(["add", &spec, "--yes", "--no-skills"])
             .assert()
             .success();
     }
@@ -3297,7 +3261,7 @@ async fn add_new_version_updates_an_unchanged_dependency_owned_by_the_package() 
 
     for spec in [format!("{package}@1.0.0"), format!("{package}@2.0.0")] {
         lpm_with_registry(&project, &mock.url())
-            .args(["add", &spec, "--yes", "--no-skills", "--no-editor-setup"])
+            .args(["add", &spec, "--yes", "--no-skills"])
             .assert()
             .success();
     }
@@ -3385,7 +3349,7 @@ async fn add_transfers_dependency_cleanup_ownership_until_the_last_source_drops_
         format!("{first_package}@2.0.0"),
     ] {
         lpm_with_registry(&project, &mock.url())
-            .args(["add", &spec, "--yes", "--no-skills", "--no-editor-setup"])
+            .args(["add", &spec, "--yes", "--no-skills"])
             .assert()
             .success();
     }
@@ -3409,7 +3373,6 @@ async fn add_transfers_dependency_cleanup_ownership_until_the_last_source_drops_
             &format!("{second_package}@2.0.0"),
             "--yes",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .assert()
         .success();
@@ -3446,7 +3409,7 @@ async fn add_records_dependency_requirement_and_insertion_ownership() {
     let project = TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{}}"#);
 
     lpm_with_registry(&project, &mock.url())
-        .args(["add", package, "--yes", "--no-skills", "--no-editor-setup"])
+        .args(["add", package, "--yes", "--no-skills"])
         .assert()
         .success();
 
@@ -3485,7 +3448,7 @@ async fn add_repeat_preserves_dependency_insertion_ownership() {
 
     for _ in 0..2 {
         lpm_with_registry(&project, &mock.url())
-            .args(["add", package, "--yes", "--no-skills", "--no-editor-setup"])
+            .args(["add", package, "--yes", "--no-skills"])
             .assert()
             .success();
     }
@@ -4131,7 +4094,7 @@ async fn co_tracked_dependency_does_not_block_the_inserting_owners_upgrade() {
         format!("{owner}@2.0.0"),
     ] {
         lpm_with_registry(&project, &mock.url())
-            .args(["add", &spec, "--yes", "--no-skills", "--no-editor-setup"])
+            .args(["add", &spec, "--yes", "--no-skills"])
             .assert()
             .success();
     }

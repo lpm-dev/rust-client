@@ -126,12 +126,7 @@ async fn offline_install_capability_round_trip_end_to_end() {
 
     // ── First install online ──
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -197,7 +192,6 @@ async fn offline_install_capability_round_trip_end_to_end() {
             "--offline",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("offline install run");

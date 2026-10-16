@@ -503,7 +503,6 @@ async fn migrate_and_install(
                         linker_override: None,
                         lpm_skills_preference:
                             crate::lpm_skills_config::LpmSkillsPreference::Disabled,
-                        no_editor_setup: true,
                         no_security_summary: true,
                         auto_build: false,
                         script_policy_override: None,
@@ -539,7 +538,6 @@ async fn migrate_and_install(
                     None,  // strict_peer_dependencies_override
                     None,  // linker_override
                     crate::lpm_skills_config::LpmSkillsPreference::Disabled,
-                    true,  // no_editor_setup — skip editor setup during migration
                     true,  // no_security_summary — migration already showed warnings
                     false, // auto_build
                     None,  // target_set: migrate is single-project

@@ -230,13 +230,7 @@ async fn install_quality_ignores_unavailable_scores_but_keeps_real_zero() {
             .mount(mock.server())
             .await;
         let output = lpm_with_registry(&project, &mock.url())
-            .args([
-                "install",
-                PACKAGE,
-                "--token",
-                "owner-token",
-                "--no-editor-setup",
-            ])
+            .args(["install", PACKAGE, "--token", "owner-token"])
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
@@ -285,7 +279,7 @@ async fn optional_install_quality_denials_do_not_refresh_or_change_credentials()
             .mount(mock.server())
             .await;
         lpm_with_registry(&project, &mock.url())
-            .args(["install", PACKAGE, "--no-editor-setup"])
+            .args(["install", PACKAGE])
             .assert()
             .success();
         assert_eq!(read_credentials(project.home()), before);

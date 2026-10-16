@@ -60,12 +60,7 @@ async fn phantom_scanner_stops_at_nested_package_json() {
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install");
 
@@ -135,12 +130,7 @@ async fn phantom_scanner_skips_tsconfig_path_aliases() {
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install");
 
@@ -209,12 +199,7 @@ async fn phantom_scanner_skips_baseurl_only_root_imports() {
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install");
 
@@ -276,12 +261,7 @@ async fn phantom_scanner_skips_bare_lpm_import_alias_prefixes() {
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install");
 
@@ -368,12 +348,7 @@ async fn phantom_scanner_skips_declared_workspace_member_imports() {
     let mut cmd = lpm_with_registry(&project, &mock.url());
     cmd.current_dir(project.path().join("apps/app"));
     let output = cmd
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install from workspace member");
 
@@ -428,12 +403,7 @@ async fn phantom_scanner_still_reports_real_phantoms_with_install_fix() {
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install");
 
@@ -487,12 +457,7 @@ async fn plus_list_annotates_outdated_direct_dep_with_latest_available() {
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install");
 
@@ -531,12 +496,7 @@ async fn plus_list_omits_annotation_when_already_on_latest() {
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install");
 
@@ -585,12 +545,7 @@ async fn plus_list_omits_annotation_for_an_untagged_prerelease() {
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install");
 
@@ -622,12 +577,7 @@ fn strict_deps_rejects_undeclared_imports_in_empty_and_offline_installs() {
                 "import missing from 'undeclared-dependency';\n",
             );
             let mut command = support::lpm(&project);
-            command.args([
-                "install",
-                "--no-security-summary",
-                "--no-skills",
-                "--no-editor-setup",
-            ]);
+            command.args(["install", "--no-security-summary", "--no-skills"]);
             if json {
                 command.arg("--json");
             }
@@ -690,12 +640,7 @@ async fn strict_deps_checks_source_edits_on_warm_and_offline_installs() {
     );
     project.write_file("src/index.js", "import value from 'declared';\n");
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
     let lockfile = project.read_file("lpm.lock");
@@ -705,13 +650,7 @@ async fn strict_deps_checks_source_edits_on_warm_and_offline_installs() {
     );
     for extra in [&[][..], &["--offline"][..], &["--force"][..]] {
         let output = lpm_with_registry(&project, &mock.url())
-            .args([
-                "install",
-                "--json",
-                "--no-security-summary",
-                "--no-skills",
-                "--no-editor-setup",
-            ])
+            .args(["install", "--json", "--no-security-summary", "--no-skills"])
             .args(extra)
             .output()
             .unwrap();
@@ -788,13 +727,7 @@ async fn strict_deps_accepts_every_manifest_dependency_section() {
     );
     project.write_file("src/index.js", "import a from 'direct';\nimport b from 'development';\nimport c from 'optional';\nimport d from 'peer';\n");
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--json",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--json", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 }
@@ -841,12 +774,7 @@ async fn strict_deps_warns_when_a_declared_peer_is_not_installed() {
     );
     project.write_file("src/index.js", "import missing from 'missing-peer';\n");
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .unwrap();
     assert!(

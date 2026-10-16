@@ -307,7 +307,6 @@ function installCommand(manager, timing) {
       'install',
       '--no-security-summary',
       '--no-skills',
-      '--no-editor-setup',
     ];
     if (timing) {
       command.push('--timing');

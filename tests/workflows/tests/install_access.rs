@@ -42,7 +42,7 @@ async fn cached_install_rechecks(reason: &'static str, relink: bool) {
     let denied = Arc::new(AtomicBool::new(false));
     let registry = registry_with_access_check(denied.clone(), reason).await;
     let project = TempProject::empty(&serde_json::json!({ "name": "access-check", "version": "1.0.0", "dependencies": {ROOT: "1.0.0"} }).to_string());
-    let args = ["install", "--json", "--no-skills", "--no-editor-setup"];
+    let args = ["install", "--json", "--no-skills"];
     lpm_with_registry(&project, &registry.url())
         .args(args)
         .assert()
@@ -102,7 +102,7 @@ async fn fresh_and_up_to_date_installs_show_deprecation_in_json_and_human_output
     );
     for json in [true, true, false] {
         let mut command = lpm_with_registry(&project, &registry.url());
-        command.args(["install", "--no-skills", "--no-editor-setup"]);
+        command.args(["install", "--no-skills"]);
         if json {
             command.arg("--json");
         }

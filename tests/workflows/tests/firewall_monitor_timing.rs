@@ -106,13 +106,7 @@ impl TimedRegistry {
 
     fn install_with(&self, project: &TempProject, extra: &[&str]) -> std::process::Output {
         lpm_with_registry(project, &self.mock.url())
-            .args([
-                "--color",
-                "never",
-                "install",
-                "--no-skills",
-                "--no-editor-setup",
-            ])
+            .args(["--color", "never", "install", "--no-skills"])
             .args(extra)
             .output()
             .expect("run lpm install")
