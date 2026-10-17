@@ -8,6 +8,36 @@ use support::{
     wait_for_lock_contention,
 };
 
+/// The source package record: `lpm-sources.json`, or the earlier
+/// `.lpm/added-sources.json` an older version wrote until a write replaces it.
+fn source_record_text(project: &TempProject) -> String {
+    if project.file_exists("lpm-sources.json") {
+        project.read_file("lpm-sources.json")
+    } else {
+        project.read_file(".lpm/added-sources.json")
+    }
+}
+
+fn read_source_record(project: &TempProject) -> serde_json::Value {
+    serde_json::from_str(&source_record_text(project)).unwrap()
+}
+
+fn source_record_exists(project: &TempProject) -> bool {
+    project.file_exists("lpm-sources.json") || project.file_exists(".lpm/added-sources.json")
+}
+
+/// Where `lpm add` keeps its copy of a file it overwrote.
+fn source_backup_path(package: &str, manifest_path: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(package.as_bytes());
+    hasher.update([0]);
+    hasher.update(manifest_path.as_bytes());
+    format!(
+        ".lpm/added-source-backups/{}.bak",
+        hex::encode(hasher.finalize())
+    )
+}
+
 fn digest(content: &[u8]) -> String {
     format!("sha256-{}", hex::encode(Sha256::digest(content)))
 }
@@ -435,7 +465,7 @@ fn remove_rejects_forged_directory_ownership_before_mutating_files() {
         }))
         .unwrap(),
     );
-    let state_before = project.read_file(".lpm/added-sources.json");
+    let state_before = source_record_text(&project);
 
     let output = lpm(&project)
         .args(["remove", "source-pkg"])
@@ -445,7 +475,7 @@ fn remove_rejects_forged_directory_ownership_before_mutating_files() {
     assert!(!output.status.success());
     assert_eq!(project.read_file("managed/Source.ts"), "managed\n");
     assert!(project.path().join("user-owned").is_dir());
-    assert_eq!(project.read_file(".lpm/added-sources.json"), state_before);
+    assert_eq!(source_record_text(&project), state_before);
 }
 
 #[test]
@@ -490,7 +520,7 @@ fn remove_rolls_back_when_owned_directory_cleanup_fails_and_succeeds_on_retry() 
             }
         }),
     );
-    let state_before = project.read_file(".lpm/added-sources.json");
+    let state_before = source_record_text(&project);
     let legacy = project.path().join("legacy");
     std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o555)).unwrap();
 
@@ -501,7 +531,7 @@ fn remove_rolls_back_when_owned_directory_cleanup_fails_and_succeeds_on_retry() 
 
     assert!(!first.status.success());
     assert_eq!(project.read_file("legacy/nested/Source.ts"), "managed\n");
-    assert_eq!(project.read_file(".lpm/added-sources.json"), state_before);
+    assert_eq!(source_record_text(&project), state_before);
 
     std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o755)).unwrap();
     lpm(&project)
@@ -510,7 +540,7 @@ fn remove_rolls_back_when_owned_directory_cleanup_fails_and_succeeds_on_retry() 
         .success();
 
     assert!(!legacy.exists());
-    assert!(!project.path().join(".lpm/added-sources.json").exists());
+    assert!(!source_record_exists(&project));
 }
 
 #[test]
@@ -534,8 +564,7 @@ fn remove_transfers_shared_directory_ownership_before_the_original_owner() {
         .args(["remove", "source-a"])
         .assert()
         .success();
-    let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    let state: serde_json::Value = read_source_record(&project);
     assert_eq!(
         state["packages"]["source-b"]["createdDirectories"],
         json!(["shared", "shared/nested"])
@@ -601,8 +630,7 @@ fn remove_retained_files_keep_only_their_relevant_directory_ownership() {
         .assert()
         .success();
 
-    let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    let state: serde_json::Value = read_source_record(&project);
     assert_eq!(
         state["packages"]["source-pkg"]["createdDirectories"],
         json!(["owned", "owned/kept"])
@@ -766,7 +794,7 @@ async fn remove_preserves_a_tracked_overwrite_that_the_user_modified() {
         .assert()
         .success();
     project.write_file("custom/Source.ts", "user edit\n");
-    let state_before = project.read_file(".lpm/added-sources.json");
+    let state_before = source_record_text(&project);
 
     let output = lpm(&project)
         .args(["remove", "source-pkg", "--json"])
@@ -775,8 +803,7 @@ async fn remove_preserves_a_tracked_overwrite_that_the_user_modified() {
 
     assert!(output.status.success());
     assert_eq!(project.read_file("custom/Source.ts"), "user edit\n");
-    let state_after: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    let state_after: serde_json::Value = read_source_record(&project);
     let state_before: serde_json::Value = serde_json::from_str(&state_before).unwrap();
     let files_before = &state_before["packages"]["source-pkg"]["files"];
     let key = source_file_key(files_before, "custom/Source.ts");
@@ -811,11 +838,11 @@ async fn remove_rejects_a_tampered_overwrite_backup_before_mutating_the_destinat
         ])
         .assert()
         .success();
-    let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    let state: serde_json::Value = read_source_record(&project);
     let files = &state["packages"]["source-pkg"]["files"];
     let key = source_file_key(files, "custom/Source.ts");
-    let backup = files[&key]["backup_path"].as_str().unwrap();
+    let backup = &source_backup_path("source-pkg", "custom/Source.ts");
+    assert!(files[&key]["originalDigest"].is_string());
     project.write_file(backup, "tampered\n");
 
     let output = lpm(&project)
@@ -891,14 +918,23 @@ async fn remove_rejects_a_forged_overwrite_backup_path_before_mutating_files() {
     let outside = tempfile::tempdir().unwrap();
     let outside_backup = outside.path().join("outside.bak");
     std::fs::write(&outside_backup, b"outside\n").unwrap();
-    let mut state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
-    let files = &mut state["packages"]["source-pkg"]["files"];
-    let key = source_file_key(files, "custom/Source.ts");
-    files[&key]["backup_path"] = json!(outside_backup);
+    // Only the earlier `.lpm/added-sources.json` recorded backup paths.
+    let record = read_source_record(&project);
+    let file = &record["packages"]["source-pkg"]["files"]["custom/Source.ts"];
+    std::fs::remove_file(project.path().join("lpm-sources.json")).unwrap();
     project.write_file(
         ".lpm/added-sources.json",
-        &serde_json::to_string_pretty(&state).unwrap(),
+        &serde_json::to_string_pretty(&json!({
+            "schema_version": 3,
+            "packages": {"source-pkg": {"files": {"custom/Source.ts": {
+                "source": file["source"],
+                "installed_digest": file["digest"],
+                "action": "overwrite",
+                "backup_path": outside_backup,
+                "backup_digest": file["originalDigest"],
+            }}}}
+        }))
+        .unwrap(),
     );
 
     let output = lpm(&project)
@@ -909,6 +945,82 @@ async fn remove_rejects_a_forged_overwrite_backup_path_before_mutating_files() {
     assert!(!output.status.success());
     assert_eq!(project.read_file("custom/Source.ts"), "installed\n");
     assert_eq!(std::fs::read(&outside_backup).unwrap(), b"outside\n");
+}
+
+#[test]
+fn remove_reads_the_earlier_record_and_replaces_it_with_lpm_sources_json() {
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file("components/a.ts", "a\n");
+    project.write_file("components/b.ts", "b\n");
+    write_source_state_v3(
+        &project,
+        json!({
+            "source-a": {"files": {"components/a.ts": created_file(b"a\n")}},
+            "source-b": {"files": {"components/b.ts": created_file(b"b\n")}},
+        }),
+    );
+
+    lpm(&project)
+        .args(["remove", "source-a"])
+        .assert()
+        .success();
+
+    assert!(!project.file_exists("components/a.ts"));
+    assert!(!project.file_exists(".lpm/added-sources.json"));
+    let record = read_source_record(&project);
+    assert_eq!(record["schemaVersion"], 1);
+    assert_eq!(
+        record["packages"]["source-b"]["files"]["components/b.ts"]["digest"],
+        digest(b"b\n")
+    );
+}
+
+#[tokio::test]
+async fn remove_keeps_an_overwritten_file_whose_original_is_on_another_machine() {
+    let mock = MockRegistry::start().await;
+    let tarball = make_source_pkg_tarball(
+        "source-pkg",
+        "1.0.0",
+        json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+        &[("Source.ts", b"installed\n")],
+    );
+    mock.with_package("source-pkg", "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file("custom/Source.ts", "original\n");
+    project.write_file("custom/Created.ts", "unrelated\n");
+    lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            "source-pkg",
+            "--yes",
+            "--force",
+            "--path",
+            "custom",
+            "--no-skills",
+            "--no-install-deps",
+        ])
+        .assert()
+        .success();
+    std::fs::remove_dir_all(project.path().join(".lpm/added-source-backups")).unwrap();
+
+    let output = lpm(&project)
+        .args(["remove", "source-pkg", "--json"])
+        .output()
+        .expect("remove without the local backup");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(project.read_file("custom/Source.ts"), "installed\n");
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["originalsElsewhere"],
+        json!(["custom/Source.ts"]),
+        "{envelope}"
+    );
+    assert!(!source_record_exists(&project));
 }
 
 #[test]
@@ -929,8 +1041,7 @@ fn remove_preserves_a_file_still_tracked_by_another_source_package() {
         .success();
 
     assert_eq!(project.read_file("components/shared.ts"), "shared\n");
-    let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    let state: serde_json::Value = read_source_record(&project);
     assert!(state["packages"].get("source-a").is_none());
     assert!(
         state["packages"]["source-b"]["files"]
@@ -1004,7 +1115,7 @@ fn remove_preflight_failure_keeps_earlier_tracked_files_and_state_unchanged() {
             }
         }),
     );
-    let original_state = project.read_file(".lpm/added-sources.json");
+    let original_state = source_record_text(&project);
 
     let output = lpm(&project)
         .args(["remove", "source-pkg"])
@@ -1013,7 +1124,7 @@ fn remove_preflight_failure_keeps_earlier_tracked_files_and_state_unchanged() {
 
     assert!(!output.status.success());
     assert_eq!(project.read_file("a.ts"), "first\n");
-    assert_eq!(project.read_file(".lpm/added-sources.json"), original_state);
+    assert_eq!(source_record_text(&project), original_state);
 }
 
 #[test]
@@ -1096,8 +1207,7 @@ fn remove_transfers_dependency_ownership_to_another_source_package() {
     let manifest: serde_json::Value =
         serde_json::from_str(&project.read_file("package.json")).unwrap();
     assert_eq!(manifest["dependencies"]["dep"], "^1.0.0");
-    let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    let state: serde_json::Value = read_source_record(&project);
     assert_eq!(
         state["packages"]["source-b"]["dependencies"]["dep"]["inserted"],
         true
@@ -1222,7 +1332,7 @@ fn remove_rejects_a_workspace_that_appears_while_waiting_for_the_lock() {
     let output = child.wait_with_output().expect("finish contending remove");
     assert!(!output.status.success());
     assert!(project.file_exists("tracked.ts"));
-    assert!(project.file_exists(".lpm/added-sources.json"));
+    assert!(source_record_exists(&project));
 }
 
 #[tokio::test]
@@ -1264,7 +1374,7 @@ async fn remove_lower_create_owner_before_upper_overwrite_preserves_complete_cle
         .success();
 
     assert!(!project.file_exists("custom/Source.ts"));
-    assert!(!project.file_exists(".lpm/added-sources.json"));
+    assert!(!source_record_exists(&project));
 }
 
 #[tokio::test]
@@ -1307,7 +1417,93 @@ async fn remove_lower_overwrite_owner_before_upper_overwrite_restores_original_c
         .success();
 
     assert_eq!(project.read_file("custom/Source.ts"), "original\n");
-    assert!(!project.file_exists(".lpm/added-sources.json"));
+    assert!(!source_record_exists(&project));
+}
+
+async fn overwrite_chain_with_one_local_copy(missing: &str) -> TempProject {
+    let mock = MockRegistry::start().await;
+    for (package, content) in [("source-a", b"lower\n"), ("source-b", b"upper\n")] {
+        let tarball = make_source_pkg_tarball(
+            package,
+            "1.0.0",
+            json!({"ecosystem": "js", "files": [{"src": "Source.ts"}]}),
+            &[("Source.ts", content)],
+        );
+        mock.with_package(package, "1.0.0", &tarball).await;
+    }
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    project.write_file("custom/Source.ts", "original\n");
+    for package in ["source-a", "source-b"] {
+        lpm_with_registry(&project, &mock.url())
+            .args([
+                "add",
+                package,
+                "--yes",
+                "--force",
+                "--path",
+                "custom",
+                "--no-install-deps",
+                "--no-skills",
+            ])
+            .assert()
+            .success();
+    }
+    std::fs::remove_file(
+        project
+            .path()
+            .join(source_backup_path(missing, "custom/Source.ts")),
+    )
+    .unwrap();
+    project
+}
+
+#[tokio::test]
+async fn removing_an_overwrite_owner_whose_copy_is_elsewhere_leaves_the_next_owner_consistent() {
+    let project = overwrite_chain_with_one_local_copy("source-a").await;
+
+    lpm(&project)
+        .args(["remove", "source-a"])
+        .assert()
+        .success();
+    let output = lpm(&project)
+        .args(["remove", "source-b", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        envelope["originalsElsewhere"],
+        json!(["custom/Source.ts"]),
+        "{envelope}"
+    );
+    assert_eq!(project.read_file("custom/Source.ts"), "upper\n");
+    assert!(!source_record_exists(&project));
+}
+
+#[tokio::test]
+async fn removing_an_overwrite_owner_hands_its_original_to_the_next_owner_without_a_copy() {
+    let project = overwrite_chain_with_one_local_copy("source-b").await;
+
+    lpm(&project)
+        .args(["remove", "source-a"])
+        .assert()
+        .success();
+    lpm(&project)
+        .args(["remove", "source-b"])
+        .assert()
+        .success();
+
+    assert_eq!(project.read_file("custom/Source.ts"), "original\n");
+    assert!(!source_record_exists(&project));
+    assert!(
+        !project.file_exists(&source_backup_path("source-a", "custom/Source.ts")),
+        "no copy is left behind"
+    );
 }
 
 #[test]
@@ -1354,7 +1550,7 @@ fn remove_rejects_a_package_skill_directory_with_untracked_content() {
         project.read_file(".lpm/skills/owner.widget/user-notes.md"),
         "user\n"
     );
-    assert!(project.file_exists(".lpm/added-sources.json"));
+    assert!(source_record_exists(&project));
 }
 
 #[test]
@@ -1487,7 +1683,7 @@ fn interrupted_source_removal_recovers_quarantined_files_before_the_next_command
         "after-source-directory",
     ] {
         let project = interrupted_removal_fixture();
-        let state = project.read_file(".lpm/added-sources.json");
+        let state = source_record_text(&project);
         let manifest = project.read_file("package.json");
         #[cfg(unix)]
         let directory_inode = {
@@ -1506,11 +1702,7 @@ fn interrupted_source_removal_recovers_quarantined_files_before_the_next_command
             "managed source\n",
             "{stage}"
         );
-        assert_eq!(
-            project.read_file(".lpm/added-sources.json"),
-            state,
-            "{stage}"
-        );
+        assert_eq!(source_record_text(&project), state, "{stage}");
         assert_eq!(project.read_file("package.json"), manifest, "{stage}");
         #[cfg(unix)]
         {
@@ -1559,7 +1751,7 @@ fn committed_source_removal_survives_interruption_before_archive_cleanup() {
         .assert()
         .success();
     assert!(!project.path().join("vendor").exists());
-    assert!(!project.path().join(".lpm/added-sources.json").exists());
+    assert!(!source_record_exists(&project));
     assert!(!project.path().join(".lpm/install-recovery").exists());
     let manifest: serde_json::Value =
         serde_json::from_str(&project.read_file("package.json")).unwrap();
@@ -1574,7 +1766,7 @@ fn source_recovery_resumes_after_a_second_interruption() {
         "after-source-epoch",
     ] {
         let project = interrupted_removal_fixture();
-        let state = project.read_file(".lpm/added-sources.json");
+        let state = source_record_text(&project);
         interrupt_removal(&project, "after-source-directory");
         let mut command = lpm_spawnable(&project);
         command.args(["remove", "unknown-source"]);
@@ -1593,11 +1785,7 @@ fn source_recovery_resumes_after_a_second_interruption() {
             "managed source\n",
             "{stage}"
         );
-        assert_eq!(
-            project.read_file(".lpm/added-sources.json"),
-            state,
-            "{stage}"
-        );
+        assert_eq!(source_record_text(&project), state, "{stage}");
         assert!(!project.path().join(".lpm/install-recovery").exists());
     }
 }
@@ -1757,7 +1945,7 @@ async fn interrupted_backup_promotion_restores_shared_ownership_before_retry() {
             .success();
     }
 
-    let state = project.read_file(".lpm/added-sources.json");
+    let state = source_record_text(&project);
     let mut command = lpm_spawnable(&project);
     command.args(["remove", "source-a"]);
     support::source_recovery::interrupt(
@@ -1770,7 +1958,7 @@ async fn interrupted_backup_promotion_restores_shared_ownership_before_retry() {
         .args(["remove", "unknown-source"])
         .assert()
         .success();
-    assert_eq!(project.read_file(".lpm/added-sources.json"), state);
+    assert_eq!(source_record_text(&project), state);
     assert_eq!(project.read_file("custom/Source.ts"), "upper\n");
     lpm(&project)
         .args(["remove", "source-a"])
@@ -1782,7 +1970,7 @@ async fn interrupted_backup_promotion_restores_shared_ownership_before_retry() {
         .success();
 
     assert_eq!(project.read_file("custom/Source.ts"), "original\n");
-    assert!(!project.file_exists(".lpm/added-sources.json"));
+    assert!(!source_record_exists(&project));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1819,12 +2007,12 @@ async fn interrupted_original_restoration_restores_backup_content_and_modes() {
         ])
         .assert()
         .success();
-    let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/added-sources.json")).unwrap();
+    let state: serde_json::Value = read_source_record(&project);
     let files = &state["packages"]["source-pkg"]["files"];
     let key = source_file_key(files, "custom/Source.ts");
-    let backup = files[&key]["backup_path"].as_str().unwrap();
-    let state_before = project.read_file(".lpm/added-sources.json");
+    let backup = &source_backup_path("source-pkg", "custom/Source.ts");
+    assert!(files[&key]["originalDigest"].is_string());
+    let state_before = source_record_text(&project);
     let mut command = lpm_spawnable(&project);
     command.args(["remove", "source-pkg"]);
     support::source_recovery::interrupt(
@@ -1844,7 +2032,7 @@ async fn interrupted_original_restoration_restores_backup_content_and_modes() {
         .success();
     assert_eq!(project.read_file("custom/Source.ts"), "installed\n");
     assert_eq!(project.read_file(backup), "original\n");
-    assert_eq!(project.read_file(".lpm/added-sources.json"), state_before);
+    assert_eq!(source_record_text(&project), state_before);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;

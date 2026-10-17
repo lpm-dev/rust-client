@@ -5,6 +5,7 @@
 //! into supported agent directories.
 
 pub(crate) mod author;
+pub(crate) use managed::{project_skills_ready, restore_project_skills};
 mod dashboard;
 mod inventory;
 mod managed;

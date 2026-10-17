@@ -12,7 +12,7 @@ use lpm_common::{LpmError, LpmRoot};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -21,6 +21,9 @@ use std::cell::Cell;
 
 const STATE_VERSION: u32 = 1;
 const STATE_FILE: &str = "skills.lock.json";
+/// A project's record of its managed skills, committed at its root; their
+/// content stays in `.lpm/managed-skills/`, where `lpm install` restores it.
+const PROJECT_STATE_FILE: &str = "lpm-agent-skills.json";
 const COPY_MARKER: &str = ".lpm-managed-skill.json";
 
 #[cfg(test)]
@@ -65,10 +68,43 @@ impl Store {
     }
 
     fn state_path(&self) -> PathBuf {
-        self.root.join(STATE_FILE)
+        match self.scope {
+            Scope::Project => self.project_dir.join(PROJECT_STATE_FILE),
+            Scope::Global => self.root.join(STATE_FILE),
+        }
+    }
+
+    /// Where earlier versions kept a project's record, read until the next
+    /// write replaces it.
+    fn legacy_state_path(&self) -> Option<PathBuf> {
+        (self.scope == Scope::Project).then(|| self.root.join(STATE_FILE))
+    }
+
+    /// The source as a project's record holds it: a local source inside the
+    /// project as a `./` path relative to it, so the record means the same
+    /// on every checkout.
+    fn record_descriptor(&self, descriptor: &SourceDescriptor) -> SourceDescriptor {
+        let SourceDescriptor::Local { path, digest } = descriptor else {
+            return descriptor.clone();
+        };
+        if self.scope != Scope::Project || path.starts_with("./") {
+            return descriptor.clone();
+        }
+        let project = self
+            .project_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.project_dir.clone());
+        match Path::new(path).strip_prefix(&project) {
+            Ok(relative) if !relative.as_os_str().is_empty() => SourceDescriptor::Local {
+                path: format!("./{}", portable_path(relative)),
+                digest: digest.clone(),
+            },
+            _ => descriptor.clone(),
+        }
     }
 
     fn canonical_path(&self, source: &SourceDescriptor, skill: &DiscoveredSkill) -> PathBuf {
+        let source = self.record_descriptor(source);
         self.root
             .join("sources")
             .join(stable_hash(&source.stable_identity()))
@@ -147,11 +183,11 @@ impl Store {
         source: &SourceDescriptor,
         skill: &DiscoveredSkill,
     ) -> String {
-        self.canonical_path(source, skill)
-            .strip_prefix(&self.root)
-            .unwrap_or_else(|_| Path::new(""))
-            .display()
-            .to_string()
+        portable_path(
+            self.canonical_path(source, skill)
+                .strip_prefix(&self.root)
+                .unwrap_or_else(|_| Path::new("")),
+        )
     }
 
     fn target_path(&self, agent: AgentTarget, name: &str) -> Result<PathBuf, LpmError> {
@@ -162,7 +198,7 @@ impl Store {
         if self.scope == Scope::Project
             && let Ok(relative) = target.strip_prefix(&self.project_dir)
         {
-            return relative.display().to_string();
+            return portable_path(relative);
         }
         target.display().to_string()
     }
@@ -326,13 +362,29 @@ fn plan_install_for_targets(
     skills: &[&DiscoveredSkill],
     requested_targets: &BTreeMap<AgentTarget, Materialization>,
 ) -> Result<InstallPlan, LpmError> {
-    let state = load_state(store)?;
+    plan_install_against_state(store, &load_state(store)?, tree, skills, requested_targets)
+}
+
+fn plan_install_against_state(
+    store: &Store,
+    state: &ManagedState,
+    tree: &SourceTree,
+    skills: &[&DiscoveredSkill],
+    requested_targets: &BTreeMap<AgentTarget, Materialization>,
+) -> Result<InstallPlan, LpmError> {
     let mut changes = Vec::with_capacity(skills.len() * (requested_targets.len() + 1));
     let mut pending = Vec::with_capacity(skills.len());
+    let descriptor = store.record_descriptor(&tree.descriptor);
+    let source_root = local_source_root(&tree.descriptor);
+    if let Some(root) = &source_root {
+        ensure_source_does_not_hold(root, &store.root)?;
+        ensure_source_does_not_hold(root, &store.state_path())?;
+    }
     for skill in skills {
         let existing = state.skills.get(&skill.name);
         if let Some(existing) = existing
-            && existing.source.stable_identity() != tree.descriptor.stable_identity()
+            && store.record_descriptor(&existing.source).stable_identity()
+                != descriptor.stable_identity()
         {
             return Err(LpmError::Registry(format!(
                 "managed skill name `{}` already belongs to {}; remove it before adding a different source",
@@ -340,7 +392,7 @@ fn plan_install_for_targets(
                 existing.source.display()
             )));
         }
-        let canonical = store.canonical_path(&tree.descriptor, skill);
+        let canonical = store.canonical_path(&descriptor, skill);
         if canonical_matches_skill(tree, skill, &canonical)? {
             changes.push(PlannedChange {
                 action: "reuse managed content".into(),
@@ -359,7 +411,7 @@ fn plan_install_for_targets(
         );
         let mut target_records =
             existing.map_or_else(BTreeMap::new, |record| record.targets.clone());
-        let target_id = managed_target_id(&tree.descriptor, &skill.name);
+        let target_id = managed_target_id(&descriptor, &skill.name);
         for target in target_records.values_mut() {
             target.id.clone_from(&target_id);
         }
@@ -388,6 +440,9 @@ fn plan_install_for_targets(
                 continue;
             }
             let target = store.resolve_target_path(&target_record.path);
+            if let Some(root) = &source_root {
+                ensure_source_does_not_hold(root, &target)?;
+            }
             let existing_target = existing.and_then(|record| record.targets.get(agent));
             if target.symlink_metadata().is_ok()
                 && existing_target
@@ -420,8 +475,8 @@ fn plan_install_for_targets(
             record: ManagedSkillRecord {
                 name: skill.name.clone(),
                 description: skill.description.clone(),
-                source: tree.descriptor.clone(),
-                canonical_dir: store.relative_canonical_path(&tree.descriptor, skill),
+                source: descriptor.clone(),
+                canonical_dir: store.relative_canonical_path(&descriptor, skill),
                 context_tokens: skill.context_tokens,
                 targets: target_records,
             },
@@ -429,6 +484,35 @@ fn plan_install_for_targets(
         });
     }
     Ok(InstallPlan { changes, pending })
+}
+
+/// A local source's directory, which must not hold what installing from it
+/// writes: the source's digest covers every file in it, so it would no
+/// longer match its record, and its next load would find its own targets as
+/// more skills.
+fn local_source_root(descriptor: &SourceDescriptor) -> Option<PathBuf> {
+    match descriptor {
+        SourceDescriptor::Local { path, .. } => {
+            crate::project_fs::canonicalize_with_missing_tail(Path::new(path))
+        }
+        SourceDescriptor::Github { .. } => None,
+    }
+}
+
+fn ensure_source_does_not_hold(source_root: &Path, written: &Path) -> Result<(), LpmError> {
+    let resolved = crate::project_fs::canonicalize_with_missing_tail(written);
+    if resolved
+        .as_deref()
+        .unwrap_or(written)
+        .starts_with(source_root)
+    {
+        return Err(LpmError::Registry(format!(
+            "the skill source {} holds {}, which installing its skills writes; add a directory that holds only skills, such as ./skills",
+            source_root.display(),
+            written.display()
+        )));
+    }
+    Ok(())
 }
 
 pub fn apply_install(
@@ -936,12 +1020,35 @@ fn copy_directory(source: &Path, destination: &Path) -> Result<(), LpmError> {
     Ok(())
 }
 
+/// Whether `target` is this record's to replace or remove: what
+/// [`target_is_materialized`] accepts, or the placeholder Git leaves for its
+/// link.
 fn target_is_owned(target: &Path, record: &TargetRecord, canonical: &Path) -> bool {
+    target_is_materialized(target, record, canonical)
+        || (record.materialization == Materialization::Link
+            && is_link_placeholder(target, &link_destination(canonical, target)))
+}
+
+/// Whether `target` holds the skill as `record` says: a link to the
+/// canonical content, or a copy that carries the record's marker.
+fn target_is_materialized(target: &Path, record: &TargetRecord, canonical: &Path) -> bool {
     match record.materialization {
         Materialization::Link => std::fs::read_link(target)
             .is_ok_and(|path| path == canonical || path == link_destination(canonical, target)),
         Materialization::Copy => copy_marker_matches(target, &record.id),
     }
+}
+
+/// Whether `target` is the file Git checks out for a committed link where
+/// it can't make links, as on Windows with `core.symlinks` off: a regular
+/// file that holds just the link's destination, `/`-separated.
+fn is_link_placeholder(target: &Path, destination: &Path) -> bool {
+    const MAX_PLACEHOLDER_BYTES: u64 = 4096;
+    lpm_common::read_file_capped_unlinked(target, MAX_PLACEHOLDER_BYTES).is_ok_and(
+        |(content, metadata)| {
+            metadata.is_file() && content == portable_path(destination).as_bytes()
+        },
+    )
 }
 
 fn link_destination(canonical: &Path, target: &Path) -> PathBuf {
@@ -977,6 +1084,9 @@ enum TargetStatus {
     CanonicalMissing,
     TargetMissing,
     OwnershipMismatch,
+    /// The file Git checks out for a committed link where it can't make
+    /// links, which holds no skill an agent can read.
+    LinkPlaceholder,
     DisabledTargetPresent,
 }
 
@@ -988,6 +1098,7 @@ impl TargetStatus {
             Self::CanonicalMissing => "canonical missing",
             Self::TargetMissing => "target missing",
             Self::OwnershipMismatch => "ownership mismatch",
+            Self::LinkPlaceholder => "link placeholder",
             Self::DisabledTargetPresent => "disabled target present",
         }
     }
@@ -1011,8 +1122,12 @@ fn diagnose_target(store: &Store, target: &TargetRecord, canonical: &Path) -> Ta
         TargetStatus::CanonicalMissing
     } else if target.enabled && !target_exists {
         TargetStatus::TargetMissing
-    } else if target.enabled && !target_is_owned(&path, target, canonical) {
-        TargetStatus::OwnershipMismatch
+    } else if target.enabled && !target_is_materialized(&path, target, canonical) {
+        if target_is_owned(&path, target, canonical) {
+            TargetStatus::LinkPlaceholder
+        } else {
+            TargetStatus::OwnershipMismatch
+        }
     } else if !target.enabled && target_exists {
         TargetStatus::DisabledTargetPresent
     } else if target.enabled {
@@ -2597,6 +2712,207 @@ where
     })
 }
 
+/// What restoring a project's managed skills did.
+#[derive(Debug, Default)]
+pub struct ProjectSkillsRestore {
+    pub restored: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+/// Whether every managed skill a project records has its content and its
+/// enabled agent targets on this checkout.
+pub fn project_skills_ready(project_dir: &Path) -> bool {
+    let Ok(store) = Store::for_scope(Scope::Project, project_dir) else {
+        return false;
+    };
+    let recorded =
+        store.state_path().exists() || store.legacy_state_path().is_some_and(|path| path.exists());
+    if !recorded {
+        return true;
+    }
+    load_state(&store).is_ok_and(|state| {
+        state
+            .skills
+            .values()
+            .all(|record| record_is_materialized(&store, record))
+    })
+}
+
+fn record_is_materialized(store: &Store, record: &ManagedSkillRecord) -> bool {
+    let canonical = store.root.join(&record.canonical_dir);
+    is_regular_directory(&canonical)
+        && record
+            .targets
+            .values()
+            .all(|target| diagnose_target(store, target, &canonical).healthy)
+}
+
+/// Restores the content and agent targets of the managed skills a project
+/// records but this checkout lacks, from the revisions the record holds:
+/// a GitHub source at its recorded commit, a local source only while its
+/// content still has the recorded digest. What can't be restored is
+/// reported, not raised.
+pub async fn restore_project_skills(project_dir: &Path) -> Result<ProjectSkillsRestore, LpmError> {
+    restore_project_skills_with_loader(project_dir, |input| async move {
+        source::load_update(input, project_dir).await
+    })
+    .await
+}
+
+async fn restore_project_skills_with_loader<F, Fut>(
+    project_dir: &Path,
+    mut load: F,
+) -> Result<ProjectSkillsRestore, LpmError>
+where
+    F: FnMut(source::UpdateSource) -> Fut,
+    Fut: std::future::Future<Output = Result<SourceTree, LpmError>>,
+{
+    let store = Store::for_scope(Scope::Project, project_dir)?;
+    let state = load_state(&store)?;
+    let mut sources = BTreeMap::<&SourceDescriptor, Vec<&ManagedSkillRecord>>::new();
+    for record in state.skills.values() {
+        if !record_is_materialized(&store, record) {
+            sources.entry(&record.source).or_default().push(record);
+        }
+    }
+    let mut summary = ProjectSkillsRestore::default();
+    for (descriptor, records) in sources {
+        let failures = restore_source(&store, &state, descriptor, &records, &mut load).await;
+        for record in records {
+            match failures.get(record.name.as_str()) {
+                Some(error) => summary.warnings.push(format!(
+                    "could not restore managed skill `{}` from {}: {error}",
+                    record.name,
+                    descriptor.display()
+                )),
+                None => summary.restored.push(record.name.clone()),
+            }
+        }
+    }
+    Ok(summary)
+}
+
+/// Restores `records`, which share `descriptor`, from one load of their
+/// source in one batch, returning why each record that failed did.
+async fn restore_source<'a, F, Fut>(
+    store: &Store,
+    state: &ManagedState,
+    descriptor: &SourceDescriptor,
+    records: &[&'a ManagedSkillRecord],
+    load: &mut F,
+) -> BTreeMap<&'a str, String>
+where
+    F: FnMut(source::UpdateSource) -> Fut,
+    Fut: std::future::Future<Output = Result<SourceTree, LpmError>>,
+{
+    let all_failed = |error: &LpmError| {
+        records
+            .iter()
+            .map(|record| (record.name.as_str(), error.to_string()))
+            .collect()
+    };
+    let tree = match load_recorded_source(descriptor, load).await {
+        Ok(tree) => tree,
+        Err(error) => return all_failed(&error),
+    };
+    let discovered = match source::discover(&tree, true) {
+        Ok(discovered) => discovered,
+        Err(error) => return all_failed(&error),
+    };
+    let skills: BTreeMap<&str, &DiscoveredSkill> = discovered
+        .iter()
+        .map(|skill| (skill.name.as_str(), skill))
+        .collect();
+    let mut failures = BTreeMap::new();
+    let mut restoring = Vec::with_capacity(records.len());
+    let mut operations = Vec::with_capacity(records.len());
+    for record in records {
+        match plan_restore(store, state, &tree, &skills, record) {
+            Ok(operation) => {
+                restoring.push(record.name.as_str());
+                operations.push(operation);
+            }
+            Err(error) => {
+                failures.insert(record.name.as_str(), error.to_string());
+            }
+        }
+    }
+    if !operations.is_empty()
+        && let Err(error) = apply_install_batch(store, operations)
+    {
+        failures.extend(restoring.into_iter().map(|name| (name, error.to_string())));
+    }
+    failures
+}
+
+async fn load_recorded_source<F, Fut>(
+    descriptor: &SourceDescriptor,
+    load: &mut F,
+) -> Result<SourceTree, LpmError>
+where
+    F: FnMut(source::UpdateSource) -> Fut,
+    Fut: std::future::Future<Output = Result<SourceTree, LpmError>>,
+{
+    let input = match descriptor {
+        SourceDescriptor::Github {
+            repository,
+            commit,
+            subpath,
+            ..
+        } => source::UpdateSource::Github {
+            repository: repository.clone(),
+            reference: commit.clone(),
+            subpath: subpath.clone(),
+        },
+        SourceDescriptor::Local { path, .. } => source::UpdateSource::Local(path.clone()),
+    };
+    let mut tree = load(input).await?;
+    if tree.descriptor.revision() != descriptor.revision() {
+        return Err(LpmError::Registry(
+            "the source no longer has the recorded revision; run `lpm skills update` to take its current content"
+                .into(),
+        ));
+    }
+    if let (
+        SourceDescriptor::Github { reference, .. },
+        SourceDescriptor::Github {
+            reference: recorded,
+            ..
+        },
+    ) = (&mut tree.descriptor, descriptor)
+    {
+        reference.clone_from(recorded);
+    }
+    Ok(tree)
+}
+
+fn plan_restore<'a>(
+    store: &Store,
+    state: &ManagedState,
+    tree: &'a SourceTree,
+    skills: &BTreeMap<&str, &'a DiscoveredSkill>,
+    record: &ManagedSkillRecord,
+) -> Result<InstallOperation<'a>, LpmError> {
+    let skill = *skills.get(record.name.as_str()).ok_or_else(|| {
+        LpmError::Registry("the recorded revision no longer contains this skill".into())
+    })?;
+    source::ensure_skills_are_safe(&[skill])?;
+    let targets: BTreeMap<_, _> = record
+        .targets
+        .iter()
+        .filter_map(|(agent, target)| target.enabled.then_some((*agent, target.materialization)))
+        .collect();
+    let pending = plan_install_against_state(store, state, tree, &[skill], &targets)?
+        .pending
+        .pop()
+        .ok_or_else(|| LpmError::Registry("managed skill restore planned no record".into()))?;
+    Ok(InstallOperation {
+        tree,
+        skill,
+        pending,
+    })
+}
+
 pub(super) fn apply_update_plan(plan: ManagedUpdatePlan) -> Result<Vec<PlannedChange>, LpmError> {
     let ManagedUpdatePlan {
         store,
@@ -2984,19 +3300,45 @@ fn stores_for(project_dir: &Path, include_global: bool) -> Result<Vec<Store>, Lp
     Ok(stores)
 }
 
+/// The managed skills the store records. A project's earlier record in
+/// `.lpm`, which the committed one replaces on the next write, is read too:
+/// its skills join those of a committed record a teammate made meanwhile,
+/// the committed record's own entry winning for a skill both name.
 fn load_state(store: &Store) -> Result<ManagedState, LpmError> {
-    let path = store.state_path();
-    let content =
-        match lpm_common::read_text_file_capped(&path, lpm_common::STATE_FILE_SIZE_CAP_BYTES) {
-            Ok(content) => content,
-            Err(lpm_common::BoundedReadError::NotFound { .. }) => {
-                return Ok(ManagedState::default());
+    let recorded = read_state_file(store, &store.state_path())?;
+    let earlier = store
+        .legacy_state_path()
+        .map(|legacy| read_state_file(store, &legacy))
+        .transpose()?
+        .flatten();
+    Ok(match (recorded, earlier) {
+        (Some(mut state), Some(earlier)) => {
+            for (name, record) in earlier.skills {
+                state.skills.entry(name).or_insert(record);
             }
+            state
+        }
+        (Some(state), None) | (None, Some(state)) => state,
+        (None, None) => ManagedState::default(),
+    })
+}
+
+fn read_state_file(store: &Store, path: &Path) -> Result<Option<ManagedState>, LpmError> {
+    let content =
+        match lpm_common::read_text_file_capped(path, lpm_common::STATE_FILE_SIZE_CAP_BYTES) {
+            Ok(content) => content,
+            Err(lpm_common::BoundedReadError::NotFound { .. }) => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-    let state: ManagedState = serde_json::from_str(&content).map_err(|error| {
+    let mut state: ManagedState = serde_json::from_str(&content).map_err(|error| {
         LpmError::Registry(format!("failed to parse {}: {error}", path.display()))
     })?;
+    for record in state.skills.values_mut() {
+        with_portable_separators(&mut record.canonical_dir);
+        for target in record.targets.values_mut() {
+            with_portable_separators(&mut target.path);
+        }
+    }
     if state.state_version > STATE_VERSION {
         return Err(LpmError::Registry(format!(
             "{} has state version {} but this lpm supports up to {STATE_VERSION}",
@@ -3005,7 +3347,21 @@ fn load_state(store: &Store) -> Result<ManagedState, LpmError> {
         )));
     }
     validate_managed_state(store, &state)?;
-    Ok(state)
+    Ok(Some(state))
+}
+
+/// Earlier versions wrote a record's relative paths with the platform's
+/// separator, which on Windows other platforms read as part of one name. No
+/// name in a recorded path can hold a `\`, so there it only separates.
+fn with_portable_separators(path: &mut String) {
+    let bytes = path.as_bytes();
+    let rooted = bytes
+        .first()
+        .is_some_and(|byte| matches!(byte, b'/' | b'\\'))
+        || (bytes.first().is_some_and(u8::is_ascii_alphabetic) && bytes.get(1) == Some(&b':'));
+    if !rooted && path.contains('\\') {
+        *path = path.replace('\\', "/");
+    }
 }
 
 fn validate_managed_state(store: &Store, state: &ManagedState) -> Result<(), LpmError> {
@@ -3075,7 +3431,10 @@ fn validate_source_descriptor(source: &SourceDescriptor) -> Result<(), LpmError>
                 && (subpath.is_empty() || safe_relative_path(Path::new(subpath)))
         }
         SourceDescriptor::Local { path, digest } => {
-            Path::new(path).is_absolute()
+            let project_relative = path
+                .strip_prefix("./")
+                .is_some_and(|relative| safe_relative_path(Path::new(relative)));
+            (project_relative || Path::new(path).is_absolute())
                 && digest.len() == 64
                 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
         }
@@ -3118,17 +3477,71 @@ fn write_state(store: &Store, state: &ManagedState) -> Result<(), LpmError> {
     }
     validate_managed_state(store, state)?;
     store.prepare_root()?;
-    let content = serde_json::to_vec_pretty(state).map_err(|error| {
+    let mut content = serde_json::to_vec_pretty(state).map_err(|error| {
         LpmError::Registry(format!("failed to serialize managed skill state: {error}"))
     })?;
-    let mut temporary = tempfile::NamedTempFile::new_in(&store.root).map_err(LpmError::Io)?;
-    temporary.write_all(&content).map_err(LpmError::Io)?;
-    temporary.write_all(b"\n").map_err(LpmError::Io)?;
-    temporary.flush().map_err(LpmError::Io)?;
-    temporary
-        .persist(store.state_path())
-        .map_err(|error| LpmError::Io(error.error))?;
-    Ok(())
+    content.push(b'\n');
+    let path = store.state_path();
+    // The loader merges an earlier record that stays into this one, so
+    // both change together: failing to remove it puts this one back.
+    let legacy = store
+        .legacy_state_path()
+        .filter(|legacy| legacy.symlink_metadata().is_ok());
+    let previous = match &legacy {
+        Some(_) => Some(read_optional_state_bytes(&path)?),
+        None => None,
+    };
+    publish_state_bytes(
+        &path,
+        (store.scope != Scope::Project || !state.skills.is_empty()).then_some(&content[..]),
+    )?;
+    let (Some(legacy), Some(previous)) = (legacy, previous) else {
+        return Ok(());
+    };
+    match std::fs::remove_file(&legacy) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(match publish_state_bytes(&path, previous.as_deref()) {
+            Ok(()) => LpmError::Io(std::io::Error::new(
+                error.kind(),
+                format!("failed to remove {}: {error}", legacy.display()),
+            )),
+            Err(restore_error) => LpmError::Registry(format!(
+                "failed to remove {} ({error}), and {} could not be put back ({restore_error}); remove the earlier record, then check {}",
+                legacy.display(),
+                path.display(),
+                path.display()
+            )),
+        }),
+    }
+}
+
+/// Writes `content` to `path`, or removes the file for `None`.
+fn publish_state_bytes(path: &Path, content: Option<&[u8]>) -> Result<(), LpmError> {
+    match content {
+        Some(content) => lpm_common::write_file_atomic(path, content).map_err(LpmError::Io),
+        None => match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(LpmError::Io(error)),
+        },
+    }
+}
+
+fn read_optional_state_bytes(path: &Path) -> Result<Option<Vec<u8>>, LpmError> {
+    match lpm_common::read_file_capped(path, lpm_common::STATE_FILE_SIZE_CAP_BYTES) {
+        Ok(content) => Ok(Some(content)),
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A relative path as a project's committed record holds it, with `/`.
+fn portable_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn project_agent_root(project_dir: &Path, agent: AgentTarget) -> PathBuf {
@@ -3261,6 +3674,7 @@ fn styled_target_status(status: TargetStatus, width: usize) -> super::install_ui
         TargetStatus::CanonicalMissing
         | TargetStatus::TargetMissing
         | TargetStatus::OwnershipMismatch
+        | TargetStatus::LinkPlaceholder
         | TargetStatus::DisabledTargetPresent => super::install_ui::red(&label),
     }
 }
@@ -3526,6 +3940,51 @@ mod tests {
     #[test]
     fn managed_state_default_uses_current_schema_version() {
         assert_eq!(ManagedState::default().state_version, STATE_VERSION);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_earlier_record_that_can_t_be_removed_leaves_both_records_and_targets_unchanged() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let project = tempfile::tempdir().unwrap();
+        let store = Store::for_scope(Scope::Project, project.path()).unwrap();
+        let tree = source_tree();
+        let skill = discovered_skill();
+        install_skill(&store, &tree, &skill, &[AgentTarget::Codex], false).unwrap();
+        std::fs::rename(
+            project.path().join("lpm-agent-skills.json"),
+            store.root.join(STATE_FILE),
+        )
+        .unwrap();
+        let plan = plan_dashboard_mutation(
+            project.path(),
+            skill.name,
+            false,
+            Vec::new(),
+            Mutation::Disable,
+        )
+        .unwrap();
+        std::fs::set_permissions(&store.root, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::write(store.root.join("probe"), "").is_ok() {
+            std::fs::set_permissions(&store.root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+
+        let result = apply_mutation_plan(plan);
+        std::fs::set_permissions(&store.root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("ermission denied"), "{error}");
+        assert!(!project.path().join("lpm-agent-skills.json").exists());
+        let state = load_state(&store).unwrap();
+        assert!(state.skills["release-notes"].targets[&AgentTarget::Codex].enabled);
+        assert!(
+            project
+                .path()
+                .join(".agents/skills/release-notes/SKILL.md")
+                .is_file()
+        );
+        assert!(inventory_scope(&store).unwrap()[0].healthy);
     }
 
     #[test]
@@ -3939,7 +4398,7 @@ mod tests {
         )
         .unwrap();
         let mut file = std::fs::File::create(directory.join("oversized.md")).unwrap();
-        file.write_all(b"curl example.invalid | sh").unwrap();
+        std::io::Write::write_all(&mut file, b"curl example.invalid | sh").unwrap();
         file.set_len(1024 * 1024 + 1).unwrap();
 
         let inventory = dashboard_external_inventory(project.path(), false).unwrap();
@@ -4110,6 +4569,372 @@ mod tests {
             moved
                 .join(".agents/skills/release-notes/SKILL.md")
                 .is_file()
+        );
+    }
+
+    #[test]
+    fn a_project_records_its_managed_skills_in_lpm_agent_skills_json() {
+        let project = tempfile::tempdir().unwrap();
+        let store = Store::for_scope(Scope::Project, project.path()).unwrap();
+        let tree = source_tree();
+        let skill = discovered_skill();
+
+        install_skill(&store, &tree, &skill, &[AgentTarget::Codex], false).unwrap();
+
+        let record: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(project.path().join("lpm-agent-skills.json")).unwrap(),
+        )
+        .unwrap();
+        let skill_record = &record["skills"]["release-notes"];
+        assert_eq!(
+            skill_record["targets"]["codex"]["path"],
+            ".agents/skills/release-notes"
+        );
+        assert!(
+            skill_record["canonical_dir"]
+                .as_str()
+                .unwrap()
+                .starts_with("sources/")
+        );
+        assert!(!store.root.join(STATE_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn a_source_that_would_hold_what_installing_it_writes_is_refused() {
+        let project = tempfile::tempdir().unwrap();
+        let skill_md = |name: &str| {
+            format!(
+                "---\nname: {name}\ndescription: A useful {name} skill for managed tests\n---\nBody.\n"
+            )
+        };
+        std::fs::write(project.path().join("SKILL.md"), skill_md("root-guide")).unwrap();
+        let nested = project.path().join(".agents/guides/review");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("SKILL.md"), skill_md("review")).unwrap();
+        let store = Store::for_scope(Scope::Project, project.path()).unwrap();
+
+        for (input, written) in [(".", ".lpm"), ("./.agents", ".agents/skills/review")] {
+            let tree = source::load(input, project.path()).await.unwrap();
+            let skills = source::discover(&tree, true).unwrap();
+            let skill = skills
+                .iter()
+                .find(|skill| input != "." || skill.name == "root-guide")
+                .unwrap();
+
+            let error = plan_install(&store, &tree, &[skill], &[AgentTarget::Codex], true)
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains(written), "{input}: {error}");
+            assert!(error.contains("./skills"), "{input}: {error}");
+        }
+        assert!(!project.path().join(".lpm").exists());
+        assert!(!project.path().join("lpm-agent-skills.json").exists());
+        assert!(!project.path().join(".agents/skills").exists());
+    }
+
+    #[test]
+    fn an_earlier_record_written_on_windows_is_read_and_committed_with_slashes() {
+        let project = tempfile::tempdir().unwrap();
+        let store = Store::for_scope(Scope::Project, project.path()).unwrap();
+        let tree = source_tree();
+        let skill = discovered_skill();
+        install_skill(&store, &tree, &skill, &[AgentTarget::Codex], false).unwrap();
+        let mut earlier: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(project.path().join("lpm-agent-skills.json")).unwrap(),
+        )
+        .unwrap();
+        for pointer in [
+            "/skills/release-notes/canonical_dir",
+            "/skills/release-notes/targets/codex/path",
+        ] {
+            let field = earlier.pointer_mut(pointer).unwrap();
+            *field = field.as_str().unwrap().replace('/', "\\").into();
+        }
+        std::fs::remove_file(project.path().join("lpm-agent-skills.json")).unwrap();
+        std::fs::write(
+            store.root.join(STATE_FILE),
+            serde_json::to_vec(&earlier).unwrap(),
+        )
+        .unwrap();
+
+        install_skill(&store, &tree, &skill, &[AgentTarget::ClaudeCode], false).unwrap();
+
+        let committed =
+            std::fs::read_to_string(project.path().join("lpm-agent-skills.json")).unwrap();
+        assert!(!committed.contains('\\'), "{committed}");
+        let inventory = inventory_scope(&store).unwrap();
+        assert!(inventory[0].healthy);
+        assert_eq!(inventory[0].agents.len(), 2);
+    }
+
+    #[test]
+    fn an_earlier_project_record_in_lpm_state_is_read_and_replaced() {
+        let project = tempfile::tempdir().unwrap();
+        let store = Store::for_scope(Scope::Project, project.path()).unwrap();
+        let tree = source_tree();
+        let skill = discovered_skill();
+        install_skill(&store, &tree, &skill, &[AgentTarget::Codex], false).unwrap();
+        std::fs::rename(
+            project.path().join("lpm-agent-skills.json"),
+            store.root.join(STATE_FILE),
+        )
+        .unwrap();
+
+        assert_eq!(load_state(&store).unwrap().skills.len(), 1);
+        install_skill(&store, &tree, &skill, &[AgentTarget::ClaudeCode], false).unwrap();
+
+        assert!(project.path().join("lpm-agent-skills.json").exists());
+        assert!(!store.root.join(STATE_FILE).exists());
+        assert_eq!(
+            load_state(&store).unwrap().skills["release-notes"]
+                .targets
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn an_earlier_record_s_skills_join_a_committed_record_a_teammate_made() {
+        let recorded = |tree: &SourceTree| {
+            let project = tempfile::tempdir().unwrap();
+            let store = Store::for_scope(Scope::Project, project.path()).unwrap();
+            let skill = source::discover(tree, false).unwrap().remove(0);
+            install_skill(&store, tree, &skill, &[AgentTarget::Codex], false).unwrap();
+            std::fs::read(project.path().join("lpm-agent-skills.json")).unwrap()
+        };
+        let mine = recorded(&source_tree());
+        let theirs = recorded(&source_tree_with(
+            "review",
+            &"a".repeat(64),
+            "Review the release notes.",
+        ));
+        let project = tempfile::tempdir().unwrap();
+        let store = Store::for_scope(Scope::Project, project.path()).unwrap();
+        std::fs::write(project.path().join("lpm-agent-skills.json"), theirs).unwrap();
+        std::fs::create_dir_all(&store.root).unwrap();
+        std::fs::write(store.root.join(STATE_FILE), mine).unwrap();
+
+        let state = load_state(&store).unwrap();
+
+        assert_eq!(
+            state.skills.keys().collect::<Vec<_>>(),
+            ["release-notes", "review"]
+        );
+    }
+
+    #[test]
+    fn local_sources_inside_the_project_are_recorded_relative_to_it() {
+        let project = tempfile::tempdir().unwrap();
+        let store = Store::for_scope(Scope::Project, project.path()).unwrap();
+        let inside = project
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("skills/release-notes");
+        let mut tree = source_tree();
+        tree.descriptor = SourceDescriptor::Local {
+            path: inside.display().to_string(),
+            digest: "a".repeat(64),
+        };
+        let skill = source::discover(&tree, false).unwrap().remove(0);
+
+        install_skill(&store, &tree, &skill, &[AgentTarget::Codex], false).unwrap();
+
+        assert_eq!(
+            load_state(&store).unwrap().skills["release-notes"].source,
+            SourceDescriptor::Local {
+                path: "./skills/release-notes".into(),
+                digest: "a".repeat(64),
+            }
+        );
+        assert!(project_skills_ready(project.path()));
+    }
+
+    #[tokio::test]
+    async fn restore_brings_back_missing_content_and_targets_at_the_recorded_revision() {
+        let project = tempfile::tempdir().unwrap();
+        let store = Store::for_scope(Scope::Project, project.path()).unwrap();
+        let tree = source_tree();
+        let skill = discovered_skill();
+        install_skill(&store, &tree, &skill, &[AgentTarget::Codex], false).unwrap();
+        std::fs::remove_dir_all(store.root.join("sources")).unwrap();
+        std::fs::remove_file(project.path().join(".agents/skills/release-notes")).unwrap();
+        assert!(!project_skills_ready(project.path()));
+        let loads = std::cell::Cell::new(0);
+
+        let summary = restore_project_skills_with_loader(project.path(), |_| {
+            loads.set(loads.get() + 1);
+            std::future::ready(Ok(source_tree()))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(summary.restored, ["release-notes"]);
+        assert!(summary.warnings.is_empty(), "{:?}", summary.warnings);
+        assert_eq!(loads.get(), 1);
+        assert!(project_skills_ready(project.path()));
+        assert!(
+            project
+                .path()
+                .join(".agents/skills/release-notes/SKILL.md")
+                .is_file()
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_loads_each_recorded_source_once() {
+        let project = tempfile::tempdir().unwrap();
+        let store = Store::for_scope(Scope::Project, project.path()).unwrap();
+        let mut tree = source_tree();
+        tree.files
+            .extend(source_tree_with("review", &"a".repeat(64), "Review the release notes.").files);
+        let skills = source::discover(&tree, false).unwrap();
+        for skill in &skills {
+            install_skill(&store, &tree, skill, &[AgentTarget::Codex], false).unwrap();
+        }
+        let record = project.path().join("lpm-agent-skills.json");
+        let recorded = std::fs::read(&record).unwrap();
+        std::fs::remove_dir_all(store.root.join("sources")).unwrap();
+        let loads = std::cell::Cell::new(0);
+
+        let summary = restore_project_skills_with_loader(project.path(), |_| {
+            loads.set(loads.get() + 1);
+            std::future::ready(Ok(tree.clone()))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(summary.restored, ["release-notes", "review"]);
+        assert!(summary.warnings.is_empty(), "{:?}", summary.warnings);
+        assert_eq!(loads.get(), 1);
+        assert!(project_skills_ready(project.path()));
+        assert_eq!(std::fs::read(&record).unwrap(), recorded);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_replaces_the_file_git_checks_out_for_a_committed_link() {
+        let project = tempfile::tempdir().unwrap();
+        let store = Store::for_scope(Scope::Project, project.path()).unwrap();
+        install_skill(
+            &store,
+            &source_tree(),
+            &discovered_skill(),
+            &[AgentTarget::Codex],
+            false,
+        )
+        .unwrap();
+        let target = project.path().join(".agents/skills/release-notes");
+        let destination = std::fs::read_link(&target).unwrap();
+        std::fs::remove_dir_all(store.root.join("sources")).unwrap();
+        std::fs::remove_file(&target).unwrap();
+        std::fs::write(&target, portable_path(&destination)).unwrap();
+
+        let summary = restore_project_skills_with_loader(project.path(), |_| {
+            std::future::ready(Ok(source_tree()))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(summary.restored, ["release-notes"]);
+        assert!(target.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(target.join("SKILL.md").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_file_holding_exactly_the_link_destination_is_a_placeholder() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("skill");
+        let destination = Path::new("../../.lpm/managed-skills/sources/x/skill");
+
+        std::fs::write(&target, "../../.lpm/managed-skills/sources/x/skill").unwrap();
+        assert!(is_link_placeholder(&target, destination));
+        std::fs::write(&target, "../../.lpm/managed-skills/sources/x/skill\n").unwrap();
+        assert!(!is_link_placeholder(&target, destination));
+        std::fs::write(&target, "my own notes").unwrap();
+        assert!(!is_link_placeholder(&target, destination));
+        std::fs::remove_file(&target).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        assert!(!is_link_placeholder(&target, destination));
+    }
+
+    #[tokio::test]
+    async fn a_link_placeholder_beside_existing_content_is_unhealthy_and_restored() {
+        let project = tempfile::tempdir().unwrap();
+        let store = Store::for_scope(Scope::Project, project.path()).unwrap();
+        install_skill(
+            &store,
+            &source_tree(),
+            &discovered_skill(),
+            &[AgentTarget::Codex],
+            false,
+        )
+        .unwrap();
+        let target = project.path().join(".agents/skills/release-notes");
+        let destination = std::fs::read_link(&target).unwrap();
+        std::fs::remove_file(&target).unwrap();
+        std::fs::write(&target, portable_path(&destination)).unwrap();
+
+        let state = load_state(&store).unwrap();
+        let record = &state.skills["release-notes"];
+        let diagnosis = diagnose_target(
+            &store,
+            &record.targets[&AgentTarget::Codex],
+            &store.root.join(&record.canonical_dir),
+        );
+        assert!(
+            matches!(diagnosis.status, TargetStatus::LinkPlaceholder),
+            "{diagnosis:?}"
+        );
+        assert!(!inventory_scope(&store).unwrap()[0].healthy);
+
+        let summary = restore_project_skills_with_loader(project.path(), |_| {
+            std::future::ready(Ok(source_tree()))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            summary.restored,
+            ["release-notes"],
+            "{:?}",
+            summary.warnings
+        );
+        assert!(target.join("SKILL.md").is_file());
+        assert!(inventory_scope(&store).unwrap()[0].healthy);
+    }
+
+    #[tokio::test]
+    async fn restore_reports_a_source_that_moved_past_the_recorded_revision() {
+        let project = tempfile::tempdir().unwrap();
+        let store = Store::for_scope(Scope::Project, project.path()).unwrap();
+        install_skill(
+            &store,
+            &source_tree(),
+            &discovered_skill(),
+            &[AgentTarget::Codex],
+            false,
+        )
+        .unwrap();
+        std::fs::remove_dir_all(store.root.join("sources")).unwrap();
+
+        let summary = restore_project_skills_with_loader(project.path(), |_| {
+            std::future::ready(Ok(source_tree_with(
+                "release-notes",
+                &"b".repeat(64),
+                "Changed content.",
+            )))
+        })
+        .await
+        .unwrap();
+
+        assert!(summary.restored.is_empty());
+        assert!(
+            summary.warnings[0].contains("lpm skills update"),
+            "{:?}",
+            summary.warnings
         );
     }
 
