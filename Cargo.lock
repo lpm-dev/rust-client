@@ -3526,12 +3526,14 @@ dependencies = [
 name = "lpm-env-ffi"
 version = "0.81.0"
 dependencies = [
+ "crypto_box",
  "hex",
  "lpm-env",
  "lpm-env-source",
  "serde",
  "serde_json",
  "tempfile",
+ "x25519-dalek",
 ]
 
 [[package]]
