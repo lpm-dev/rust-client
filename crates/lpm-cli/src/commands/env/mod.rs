@@ -29,6 +29,16 @@ mod prelude {
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 
+/// Whether `extra` names an action on the account rather than on a
+/// project: pairing a browser, revoking every pairing, rotating the sharing
+/// key, and listing remote envs. They run anywhere, a project or not.
+pub fn is_account_action(extra: &[String]) -> bool {
+    matches!(
+        extra.first().map(String::as_str),
+        Some("pair" | "unpair" | "rotate-sharing-key" | "list-remote" | "ls-remote")
+    )
+}
+
 /// Handle `lpm env` subcommands.
 ///
 /// Local-file management (`set`, `get`, `list`, `delete`, `import`,
@@ -36,8 +46,6 @@ use lpm_registry::RegistryClient;
 /// `push`, `share`, `pair`, `diff`, `validate`), platform integrations
 /// (`push --to <platform>`, `pull --from <platform>`, `connect`,
 /// `status`), and OIDC policies (`oidc allow`, `oidc list`, `oidc pull`).
-///
-/// Dispatch the arguments captured by the CLI parser.
 pub async fn run(
     client: &RegistryClient,
     project_dir: &std::path::Path,
@@ -133,15 +141,25 @@ pub async fn run(
                 out_dir,
                 adapter,
                 check,
-            } => generate::run(
-                project_dir,
-                environment.env.as_deref(),
-                &scope,
-                &out_dir,
-                adapter,
-                check,
-                json_output,
-            ),
+            } => {
+                let out_dir = match out_dir {
+                    Some(typed) => crate::project_fs::project_relative_path(
+                        &std::env::current_dir().map_err(LpmError::Io)?,
+                        project_dir,
+                        &typed,
+                    ),
+                    None => std::path::PathBuf::from(generate::DEFAULT_OUT_DIR),
+                };
+                generate::run(
+                    project_dir,
+                    environment.env.as_deref(),
+                    &scope,
+                    &out_dir,
+                    adapter,
+                    check,
+                    json_output,
+                )
+            }
             LocalAction::Init { force } => inventory::vars_init(project_dir, force, json_output),
             LocalAction::Ls => inventory::vars_ls(project_dir, json_output),
             LocalAction::Log => remote::env_log(client, project_dir, json_output).await,

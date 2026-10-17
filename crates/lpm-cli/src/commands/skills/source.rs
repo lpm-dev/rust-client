@@ -167,9 +167,11 @@ impl DiscoveredSkill {
     }
 }
 
-pub async fn load(input: &str, project_dir: &Path) -> Result<SourceTree, LpmError> {
-    if is_explicit_local(input) || Path::new(input).exists() {
-        return load_local(input, project_dir);
+/// Loads the source `input` names: a local path, relative to `base`, or a
+/// GitHub location.
+pub async fn load(input: &str, base: &Path) -> Result<SourceTree, LpmError> {
+    if is_explicit_local(input) || base.join(input).exists() {
+        return load_local(input, base);
     }
     let github = GithubLocation::parse(input)?;
     load_github(github).await
@@ -272,12 +274,12 @@ fn is_explicit_local(input: &str) -> bool {
     input.starts_with('.') || Path::new(input).is_absolute()
 }
 
-fn load_local(input: &str, project_dir: &Path) -> Result<SourceTree, LpmError> {
+fn load_local(input: &str, base: &Path) -> Result<SourceTree, LpmError> {
     let supplied = Path::new(input);
     let resolved = if supplied.is_absolute() {
         supplied.to_path_buf()
     } else {
-        project_dir.join(supplied)
+        base.join(supplied)
     };
     let metadata = std::fs::symlink_metadata(&resolved)?;
     if metadata.file_type().is_symlink() {

@@ -33,8 +33,11 @@ pub(super) fn run_async_main() -> Result<()> {
                 .build()
                 .expect("failed to create tokio runtime")
                 .block_on(async_main(cli));
-            if let Some(project_dir) = project_dir.as_deref() {
-                keep_project_state_ignored(project_dir);
+            if let Some(cwd) = project_dir.as_deref() {
+                let home = dirs::home_dir();
+                let project_dir = lpm_workspace::find_project_config_root(cwd, home.as_deref())
+                    .unwrap_or_else(|| cwd.to_path_buf());
+                keep_project_state_ignored(&project_dir);
             }
             result
         })

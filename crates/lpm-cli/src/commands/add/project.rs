@@ -246,7 +246,7 @@ fn strip_json_comments(input: &str) -> String {
 /// Determine target directory for file installation.
 pub(super) fn resolve_target_dir(
     project_dir: &Path,
-    explicit_path: Option<&str>,
+    explicit_path: Option<&Path>,
     ecosystem: &str,
     framework: &str,
     swift_target: Option<&str>,

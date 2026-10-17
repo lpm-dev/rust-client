@@ -238,14 +238,20 @@ pub enum SkillKind {
     External,
 }
 
+/// Runs a skills command for the project at `project_dir`. A local source
+/// path the user gives is relative to `invocation_dir`, where the command
+/// ran.
 pub async fn run(
     client: &RegistryClient,
     action: SkillsCmd,
     project_dir: &Path,
+    invocation_dir: &Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
     match action {
-        SkillsCmd::Add(args) => run_add(client, args, project_dir, json_output).await,
+        SkillsCmd::Add(args) => {
+            run_add(client, args, project_dir, invocation_dir, json_output).await
+        }
         SkillsCmd::List(args) => list_skills(project_dir, &args, json_output),
         SkillsCmd::View(args) => view_skill(project_dir, &args, json_output),
         SkillsCmd::Dashboard(args) => dashboard::run(project_dir, args, json_output).await,
@@ -270,6 +276,7 @@ async fn run_add(
     client: &RegistryClient,
     mut args: AddArgs,
     project_dir: &Path,
+    invocation_dir: &Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let source_input = prompt_for_source(args.source.take(), json_output)?;
@@ -277,7 +284,7 @@ async fn run_add(
         return add_package_skills(client, &source_input, &args, project_dir, json_output).await;
     }
 
-    let tree = source::load(&source_input, project_dir).await?;
+    let tree = source::load(&source_input, invocation_dir).await?;
     let discovered = source::discover(&tree, args.full_depth)?;
     if args.list {
         print_discovery(&tree, &discovered, json_output);

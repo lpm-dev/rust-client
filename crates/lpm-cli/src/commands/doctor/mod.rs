@@ -398,7 +398,7 @@ async fn run_inner(
         Err(lpm_workspace::WorkspaceError::NotFound(_)) => {
             checks.push(Check::fail(
                 &doctor_catalog::PACKAGE_JSON_MISSING,
-                "not found — run: lpm init (or cd to your project root)",
+                "not found — run: lpm init in the project root",
             ));
             None
         }

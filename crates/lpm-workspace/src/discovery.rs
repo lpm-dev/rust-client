@@ -1205,6 +1205,22 @@ pub fn find_project_root(start_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// The project a command run in `start_dir` acts on: the nearest directory
+/// at or above it that holds a `package.json` or an `lpm.json`. The search
+/// stops before `home`, so a stray `~/package.json` never makes the home
+/// directory a project. `None` when no such directory is found.
+pub fn find_project_config_root(start_dir: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    for directory in start_dir.ancestors() {
+        if home.is_some_and(|home| directory == home) {
+            return None;
+        }
+        if directory.join("package.json").is_file() || directory.join("lpm.json").is_file() {
+            return Some(directory.to_path_buf());
+        }
+    }
+    None
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct PnpmWorkspaceManifest {
     #[serde(default)]
@@ -1777,6 +1793,38 @@ pub fn collect_all_dependencies(workspace: &Workspace) -> HashMap<String, String
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn project_config_root_is_the_nearest_package_json_or_lpm_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let nested = project.join("src/deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(project.join("lpm.json"), "{}").unwrap();
+
+        assert_eq!(
+            find_project_config_root(&nested, None),
+            Some(project.clone())
+        );
+
+        std::fs::write(project.join("src/package.json"), "{}").unwrap();
+        assert_eq!(
+            find_project_config_root(&nested, None),
+            Some(project.join("src"))
+        );
+    }
+
+    #[test]
+    fn project_config_root_never_reaches_the_home_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let nested = home.join("notes/drafts");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(home.join("package.json"), "{}").unwrap();
+
+        assert_eq!(find_project_config_root(&nested, Some(&home)), None);
+        assert_eq!(find_project_config_root(&home, Some(&home)), None);
+    }
 
     fn create_package_json(dir: &Path, content: &str) {
         fs::write(dir.join("package.json"), content).unwrap();
