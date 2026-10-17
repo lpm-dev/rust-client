@@ -64,6 +64,9 @@ pub(in crate::release_plan) fn open_release_state_directory_from_open_root(
         }
     };
     validate_lpm_state_parent(&lpm_dir, &lpm_display)?;
+    if create {
+        lpm_common::keep_state_dir_ignored_or_warn(&lpm_dir, &lpm_display);
+    }
 
     open_release_state_directory_from_lpm(&lpm_display, &lpm_dir, create)
 }

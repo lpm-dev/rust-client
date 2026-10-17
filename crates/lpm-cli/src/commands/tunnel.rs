@@ -840,9 +840,9 @@ fn capture_warnings(
             listed(&unignored),
             if ignore_file_skipped {
                 "replace .lpm/.gitignore, which git doesn't read as a file of the \
-                 project's, with a file that holds `inspector.db*`"
+                 project's, with a file that holds `*`, so git ignores all of .lpm"
             } else {
-                "add `inspector.db*` to .lpm/.gitignore"
+                "end .lpm/.gitignore with `*`, so git ignores all of .lpm"
             }
         ));
     }
@@ -3641,12 +3641,14 @@ mod tests {
 
         assert_eq!(
             added[1],
-            "git doesn't ignore '.lpm/inspector.db-wal'; add `inspector.db*` to .lpm/.gitignore"
+            "git doesn't ignore '.lpm/inspector.db-wal'; end .lpm/.gitignore with `*`, so git \
+             ignores all of .lpm"
         );
         assert_eq!(
             replaced[1],
             "git doesn't ignore '.lpm/inspector.db-wal'; replace .lpm/.gitignore, which git \
-             doesn't read as a file of the project's, with a file that holds `inspector.db*`"
+             doesn't read as a file of the project's, with a file that holds `*`, so git ignores \
+             all of .lpm"
         );
     }
 

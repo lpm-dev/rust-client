@@ -106,7 +106,7 @@ impl InspectorDb {
         }
         let _opening = lock_capture_files(&db_path)?;
         remove_replacement_copy(&db_path)?;
-        if let Err(error) = ensure_captures_ignored(&lpm_dir, owner) {
+        if let Err(error) = keep_lpm_dir_ignored(&lpm_dir, owner) {
             tracing::warn!("could not keep tunnel captures out of git: {error}");
         }
         // On a volume that ignores ownership, every user owns the files, so
@@ -1069,7 +1069,7 @@ fn act_as_project_owner(
     let names = ROOTS_CAPTURE_FILES.map(std::ffi::OsStr::new);
     let kept = path_trust::give_root_entries(&lpm_dir, &names, uid, gid)
         .map_err(|error| with_path(&lpm_dir, error))?;
-    // A `.gitignore` root keeps only goes without the captures' line.
+    // A `.gitignore` root keeps is only left without the rule that ignores `.lpm`.
     if let Some(name) = kept.iter().find(|name| *name != ".gitignore") {
         let path = lpm_dir.join(name);
         return Err(std::io::Error::new(
@@ -1122,11 +1122,6 @@ impl CaptureOwner {
         error
     }
 }
-
-/// The `.lpm/.gitignore` line that keeps the capture database and its
-/// SQLite sidecars out of git, since captures hold request headers and
-/// bodies.
-const CAPTURES_IGNORE_LINE: &str = "inspector.db*";
 
 /// How long a connection waits for another's lock, and how long opening
 /// keeps retrying what SQLite refuses at once while another connection is
@@ -1225,16 +1220,16 @@ fn hard_linked(path: &Path, db_path: &Path) -> std::io::Error {
 /// Names the files SQLite keeps beside a capture database, for advice to
 /// move it: they go with it, as an open removes those it finds without a
 /// database, and a WAL not yet folded into the database holds part of it.
-/// Names that still start as the database's keep them in what
-/// `.lpm/.gitignore` ignores.
+/// SQLite pairs them with a database by suffix, so each keeps its own; in
+/// `.lpm`, which ignores everything, git goes on ignoring them.
 fn with_its_sidecars(db_path: &Path) -> String {
     let name = db_path
         .file_name()
         .unwrap_or(db_path.as_os_str())
         .to_string_lossy();
     format!(
-        "together with any {name}-wal, {name}-shm and {name}-journal beside it, under \
-         names that still start {name} so git goes on ignoring them"
+        "together with any {name}-wal, {name}-shm and {name}-journal beside it, renamed \
+         alike with each suffix kept and left in .lpm so git goes on ignoring them"
     )
 }
 
@@ -2038,94 +2033,32 @@ fn refuse_unknown_schema(
     )))
 }
 
-/// A `.gitignore` line as git reads it: without one trailing carriage
-/// return or trailing spaces that aren't escaped. Leading whitespace stays
-/// part of the pattern, as it does for git.
-fn git_pattern(line: &[u8]) -> &[u8] {
-    let line = line.strip_suffix(b"\r").unwrap_or(line);
-    let mut end = line.len();
-    while end > 0 && line[end - 1] == b' ' && !(end >= 2 && line[end - 2] == b'\\') {
-        end -= 1;
-    }
-    &line[..end]
-}
-
-/// Whether these `.gitignore` lines leave the capture files ignored: a rule
-/// covering them, unanchored or anchored to `.lpm/` (`inspector.db*`, or `*`
-/// as a tool directory's ignore file has), after the last negation that
-/// could match one. The lines are bytes, as git reads them.
-fn ignores_captures(lines: &[u8]) -> bool {
-    const COVERING: [&[u8]; 3] = [CAPTURES_IGNORE_LINE.as_bytes(), b"*", b"**"];
-    let mut ignored = false;
-    for line in lines.split(|byte| *byte == b'\n') {
-        let pattern = git_pattern(line);
-        let unanchored = pattern.strip_prefix(b"/").unwrap_or(pattern);
-        if COVERING.contains(&unanchored) {
-            ignored = true;
-        } else if let Some(negated) = pattern.strip_prefix(b"!")
-            && could_name_a_capture_file(negated)
-        {
-            ignored = false;
+/// Makes `.lpm/.gitignore` ignore everything in `.lpm`, as every command
+/// keeps it ([`lpm_common::project_state`]), unless git already reads it so.
+/// One that git wouldn't read as a file of the project's, being a link or
+/// not a regular file, or that its owner keeps from being written, being
+/// read-only or on Unix another user's, is left as it is; the CLI's capture
+/// warning then says git doesn't ignore the captures.
+fn keep_lpm_dir_ignored(lpm_dir: &Path, owner: CaptureOwner) -> std::io::Result<()> {
+    let path = lpm_dir.join(lpm_common::project_state::PROJECT_STATE_IGNORE_FILE);
+    match lpm_common::read_file_capped_unlinked(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
+        Ok((existing, _)) if lpm_common::project_state::ignores_everything(&existing) => {
+            return Ok(());
         }
-    }
-    ignored
-}
-
-/// Whether a negated pattern could match a capture file. Only one of plain
-/// characters that doesn't hold `inspector.db` in any case can't: escapes,
-/// wildcards and ranges can all spell a capture file's name, and a
-/// repository on a case-insensitive disk matches it in any case.
-fn could_name_a_capture_file(pattern: &[u8]) -> bool {
-    const NAME: &[u8] = b"inspector.db";
-    let plain = pattern
-        .iter()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'/' | b'_' | b'-'));
-    !plain
-        || pattern
-            .windows(NAME.len())
-            .any(|window| window.eq_ignore_ascii_case(NAME))
-}
-
-/// Adds [`CAPTURES_IGNORE_LINE`] to `.lpm/.gitignore` unless the file
-/// already ignores the capture files. An ignore file inside `.lpm/` holds
-/// wherever the project sits in a repository, and leaves the project's own
-/// `.gitignore` alone. One that git wouldn't read as a file of the
-/// project's, being a link or not a regular file, or that its owner keeps
-/// from being written, being read-only or on Unix another user's, is left
-/// as it is; the CLI's capture warning then says git doesn't ignore the
-/// captures.
-fn ensure_captures_ignored(lpm_dir: &Path, owner: CaptureOwner) -> std::io::Result<()> {
-    let path = lpm_dir.join(".gitignore");
-    let (existing, metadata) = match lpm_common::read_file_capped_unlinked(
-        &path,
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    ) {
-        Ok((bytes, metadata)) => (bytes, Some(metadata)),
-        Err(lpm_common::BoundedReadError::NotFound { .. }) => (Vec::new(), None),
+        Ok((_, metadata)) => refuse_kept_from_writing(&path, &metadata, owner)?,
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => {}
         Err(error) => return Err(std::io::Error::other(error)),
-    };
-    if ignores_captures(&existing) {
-        return Ok(());
     }
-    if let Some(metadata) = &metadata {
-        refuse_kept_from_writing(&path, metadata, owner)?;
-    }
-    let newline: &[u8] = if existing.windows(2).any(|pair| pair == b"\r\n") {
-        b"\r\n"
-    } else {
-        b"\n"
-    };
-    let mut updated = existing;
-    if !updated.is_empty() && !updated.ends_with(b"\n") {
-        updated.extend_from_slice(newline);
-    }
-    updated.extend_from_slice(b"# LPM tunnel captures hold request headers and bodies.");
-    updated.extend_from_slice(newline);
-    updated.extend_from_slice(CAPTURES_IGNORE_LINE.as_bytes());
-    updated.extend_from_slice(newline);
-    lpm_common::write_file_atomic_with(&path, lpm_common::AtomicWriteOptions::new(), |file| {
-        std::io::Write::write_all(file, &updated)
-    })
+    lpm_common::write_file_atomic_with(
+        &path,
+        lpm_common::AtomicWriteOptions::new().unix_mode(0o644),
+        |file| {
+            std::io::Write::write_all(
+                file,
+                lpm_common::project_state::PROJECT_STATE_IGNORE.as_bytes(),
+            )
+        },
+    )
 }
 
 #[cfg_attr(not(unix), allow(unused_variables))]
@@ -2640,9 +2573,9 @@ mod tests {
 
     /// The advice for the capture database LPM can't use.
     const ADVICE: &str = "move it aside together with any inspector.db-wal, \
-                          inspector.db-shm and inspector.db-journal beside it, under names \
-                          that still start inspector.db so git goes on ignoring them, and \
-                          retry";
+                          inspector.db-shm and inspector.db-journal beside it, renamed alike \
+                          with each suffix kept and left in .lpm so git goes on ignoring \
+                          them, and retry";
 
     thread_local! {
         /// The most pages this thread's database copies may hold, as a
@@ -2698,8 +2631,7 @@ mod tests {
         }
     }
 
-    const CAPTURES_IGNORED: &str =
-        "# LPM tunnel captures hold request headers and bodies.\ninspector.db*\n";
+    const CAPTURES_IGNORED: &str = lpm_common::project_state::PROJECT_STATE_IGNORE;
 
     fn lpm_gitignore(project: &Path) -> String {
         std::fs::read_to_string(project.join(".lpm/.gitignore")).unwrap()
@@ -2746,17 +2678,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opening_adds_the_capture_rule_to_an_lpm_gitignore_of_the_project() {
+    async fn opening_replaces_an_lpm_gitignore_that_leaves_state_tracked() {
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir(project.path().join(".lpm")).unwrap();
         std::fs::write(project.path().join(".lpm/.gitignore"), "skills/").unwrap();
 
         drop(InspectorDb::open(project.path()).unwrap());
 
-        assert_eq!(
-            lpm_gitignore(project.path()),
-            format!("skills/\n{CAPTURES_IGNORED}")
-        );
+        assert_eq!(lpm_gitignore(project.path()), CAPTURES_IGNORED);
     }
 
     fn opened_with_gitignore(content: &[u8]) -> (tempfile::TempDir, Vec<u8>) {
@@ -2769,17 +2698,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opening_leaves_an_lpm_gitignore_git_reads_as_ignoring_captures() {
+    async fn opening_leaves_an_lpm_gitignore_git_reads_as_ignoring_everything() {
         for content in [
-            "inspector.db*\n",
-            "inspector.db*  \n",
-            "inspector.db*\r\n",
-            "/inspector.db*\n",
-            "!inspector.db\ninspector.db*\n",
-            "*\n!.gitignore\n",
-            "*\n!skills/\n!/added-sources.json\n!Skills_2-x\n",
+            "*\n",
+            "*  \n",
+            "*\r\n",
             "/*\n",
             "**\n",
+            "!inspector.db\n*\n",
+            "# notes\n*\n",
         ] {
             let (_project, written) = opened_with_gitignore(content.as_bytes());
             assert_eq!(written, content.as_bytes(), "{content:?}");
@@ -2787,87 +2714,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opening_adds_the_rule_where_git_wouldnt_read_one() {
+    async fn opening_replaces_an_lpm_gitignore_git_reads_as_tracking_some_state() {
         for content in [
-            "  inspector.db*\n",
-            "\tinspector.db*\n",
-            "inspector.db*\t\n",
-            "inspector.db*\\ \n",
-            "inspector.db*\n!inspector.db\n",
-            "inspector.db*\n!*\n",
-            "inspector.db*\n!*.db\n",
-            "inspector.db*\n!inspector*\n",
-            "inspector.db*\n!**\n",
-            "inspector.db*\n!inspector.d?\n",
-            "inspector.db*\n!inspector.d[b]\n",
-            "inspector.db*\n!inspector.d\\b\n",
-            "inspector.db*\n!inspector\\.db\n",
-            "inspector.db*\n!/inspector.d\\b\n",
-            "inspector.db*\n!inspecto\\r.db-wal\n",
-            "inspector.db*\n!Inspector.db\n",
-            "inspector.db*\n!INSPECTOR.DB-WAL\n",
+            "inspector.db*\n",
+            "  *\n",
+            "\t*\n",
+            "*\t\n",
+            "*\\ \n",
+            "*\n!.gitignore\n",
+            "*\n!skills/\n",
             "**\n!INSPECTOR.DB\n",
-            "*\n!.lpm/inspector.db\n",
-            "inspector.db\n",
+            "# *\n",
+            "*\r\r\n",
         ] {
             let (_project, written) = opened_with_gitignore(content.as_bytes());
-            assert_eq!(
-                written,
-                format!("{content}{CAPTURES_IGNORED}").as_bytes(),
-                "{content:?}"
-            );
+            assert_eq!(written, CAPTURES_IGNORED.as_bytes(), "{content:?}");
         }
     }
 
     #[tokio::test]
-    async fn opening_adds_the_rule_to_an_lpm_gitignore_that_isnt_utf8() {
-        let content = b"skills/\n\xff\xfe-notes\n";
+    async fn opening_replaces_an_lpm_gitignore_that_isnt_utf8() {
+        let (_project, written) = opened_with_gitignore(b"skills/\n\xff\xfe-notes\n");
 
-        let (_project, written) = opened_with_gitignore(content);
-
-        let mut expected = content.to_vec();
-        expected.extend_from_slice(CAPTURES_IGNORED.as_bytes());
-        assert_eq!(written, expected);
+        assert_eq!(written, CAPTURES_IGNORED.as_bytes());
     }
 
     #[tokio::test]
     async fn opening_reads_a_rule_beside_lines_that_arent_utf8() {
-        let content = b"\xff\xfe\ninspector.db*\n";
+        let content = b"\xff\xfe\n*\n";
 
         let (_project, written) = opened_with_gitignore(content);
 
         assert_eq!(written, content);
-    }
-
-    #[tokio::test]
-    async fn opening_adds_the_rule_after_one_with_two_carriage_returns_which_git_reads_as_another()
-    {
-        let (_project, written) = opened_with_gitignore(b"inspector.db*\r\r\n");
-
-        assert_eq!(
-            written,
-            b"inspector.db*\r\r\n# LPM tunnel captures hold request headers and bodies.\r\ninspector.db*\r\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn opening_reads_a_negation_ending_in_a_carriage_return_as_git_does() {
-        let (_project, written) = opened_with_gitignore(b"inspector.db*\r\n!Inspector.DB\r\n");
-
-        assert_eq!(
-            written,
-            b"inspector.db*\r\n!Inspector.DB\r\n# LPM tunnel captures hold request headers and bodies.\r\ninspector.db*\r\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn opening_adds_the_rule_with_the_file_s_line_endings() {
-        let (_project, written) = opened_with_gitignore(b"skills/\r\n");
-
-        assert_eq!(
-            written,
-            b"skills/\r\n# LPM tunnel captures hold request headers and bodies.\r\ninspector.db*\r\n"
-        );
     }
 
     #[cfg(unix)]
@@ -3026,8 +2904,8 @@ mod tests {
         assert!(
             error.to_string().ends_with(&format!(
                 "move {} aside together with any inspector.db-wal, inspector.db-shm and \
-                 inspector.db-journal beside it, under names that still start inspector.db \
-                 so git goes on ignoring them, and retry",
+                 inspector.db-journal beside it, renamed alike with each suffix kept and left \
+                 in .lpm so git goes on ignoring them, and retry",
                 db_path.display()
             )),
             "{error}"

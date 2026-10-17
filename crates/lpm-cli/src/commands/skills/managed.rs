@@ -85,6 +85,9 @@ impl Store {
     }
 
     fn prepare_root(&self) -> Result<(), LpmError> {
+        if self.scope == Scope::Project {
+            lpm_common::ensure_project_state_dir(&self.project_dir)?;
+        }
         super::path_security::ensure_contained_directory(
             self.storage_anchor(),
             &self.root,

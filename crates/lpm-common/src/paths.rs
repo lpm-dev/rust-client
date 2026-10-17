@@ -448,66 +448,18 @@ impl ProjectLockDirectory {
         &self.directory
     }
 
-    /// Open or create `.lpm` relative to an already-open project or workspace root.
+    /// Open or create `.lpm` relative to an already-open project or workspace
+    /// root, keeping it out of git ([`crate::project_state`]).
     pub fn open_or_create(
         project_root: &cap_std::fs::Dir,
         project_display: &Path,
     ) -> Result<Self, LpmError> {
-        use cap_fs_ext::DirExt as _;
-
-        let display = project_display.join(".lpm");
-        let directory = match project_root.open_dir_nofollow(".lpm") {
-            Ok(directory) => directory,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                match project_root.create_dir(".lpm") {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(error) => {
-                        return Err(LpmError::Io(std::io::Error::new(
-                            error.kind(),
-                            format!(
-                                "failed to create project lock directory {}: {error}",
-                                display.display()
-                            ),
-                        )));
-                    }
-                }
-                project_root.open_dir_nofollow(".lpm").map_err(|error| {
-                    LpmError::Io(std::io::Error::new(
-                        error.kind(),
-                        format!(
-                            "refusing project lock directory that is not a real directory at {}: {error}",
-                            display.display()
-                        ),
-                    ))
-                })?
-            }
-            Err(error) => {
-                return Err(LpmError::Io(std::io::Error::new(
-                    error.kind(),
-                    format!(
-                        "refusing project lock directory that is not a real directory at {}: {error}",
-                        display.display()
-                    ),
-                )));
-            }
-        };
-        let metadata = directory.dir_metadata().map_err(|error| {
-            LpmError::Io(std::io::Error::new(
-                error.kind(),
-                format!(
-                    "failed to inspect project lock directory {}: {error}",
-                    display.display()
-                ),
-            ))
-        })?;
-        if !metadata.is_dir() || capability_metadata_is_link_or_reparse(&metadata) {
-            return Err(LpmError::Io(std::io::Error::other(format!(
-                "refusing project lock directory that is not a real directory at {}",
-                display.display()
-            ))));
-        }
-        Ok(Self { directory, display })
+        let directory = crate::ensure_project_state_dir_in(project_root, project_display)
+            .map_err(LpmError::Io)?;
+        Ok(Self {
+            directory,
+            display: crate::project_state_dir(project_display),
+        })
     }
 
     /// Clone the retained directory capability for an independent lock acquisition.
@@ -798,12 +750,12 @@ fn open_capability_lock_file(
 }
 
 #[cfg(not(windows))]
-fn capability_metadata_is_link_or_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+pub(crate) fn capability_metadata_is_link_or_reparse(metadata: &cap_std::fs::Metadata) -> bool {
     metadata.is_symlink()
 }
 
 #[cfg(windows)]
-fn capability_metadata_is_link_or_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+pub(crate) fn capability_metadata_is_link_or_reparse(metadata: &cap_std::fs::Metadata) -> bool {
     use cap_std::fs::MetadataExt as _;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 

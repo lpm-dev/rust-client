@@ -1434,8 +1434,7 @@ fn write_install_hash_with_metadata(
     );
     let lock_ns = mtime_ns(&lock_path).unwrap_or(0);
 
-    let hash_dir = project_dir.join(".lpm");
-    std::fs::create_dir_all(&hash_dir)?;
+    let hash_dir = lpm_common::ensure_project_state_dir(project_dir)?;
     let linker_str = linker_mode.as_str();
     let integrity_policy_str = object_integrity_policy.as_str();
     let platform_str = platform_tuple_key(platform);

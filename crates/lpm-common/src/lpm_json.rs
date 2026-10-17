@@ -98,11 +98,13 @@ pub fn update_lpm_json<T>(
     })?;
     let path = project_dir.join("lpm.json");
     reject_linked_config(&path)?;
-    let state_dir = project_dir.join(".lpm");
+    let state_dir = crate::project_state_dir(&project_dir);
     reject_linked_state_directory(&state_dir)?;
-    std::fs::create_dir_all(&state_dir).map_err(|source| LpmJsonTransactionError::Write {
-        path: state_dir.clone(),
-        source,
+    crate::ensure_project_state_dir(&project_dir).map_err(|source| {
+        LpmJsonTransactionError::Write {
+            path: state_dir.clone(),
+            source,
+        }
     })?;
     reject_linked_state_directory(&state_dir)?;
     let lock_path = state_dir.join(".config.lock");
