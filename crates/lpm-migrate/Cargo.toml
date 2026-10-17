@@ -12,6 +12,7 @@ lpm-common.workspace = true
 lpm-semver.workspace = true
 lpm-workspace.workspace = true
 serde = { workspace = true }
+sha2 = { workspace = true }
 serde_json = { workspace = true }
 serde_json_lenient = "0.2.4"
 serde_yaml = "0.9"

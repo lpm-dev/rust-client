@@ -50,6 +50,58 @@ fn migrate_npm_creates_lockfile() {
 }
 
 #[test]
+fn a_migration_waiting_for_another_one_decides_on_what_that_one_left() {
+    use std::io::{BufRead as _, Read as _};
+    let project = TempProject::from_fixture("migrate-npm");
+    let state = project.path().join(".lpm");
+    std::fs::create_dir_all(&state).unwrap();
+    let held = lpm_common::acquire_single_file_exclusive_lock_from_file(
+        lpm_common::open_lock_file_nofollow(&state.join("migrate.lock")).unwrap(),
+    )
+    .unwrap();
+    let mut child = support::lpm_spawnable(&project)
+        .args([
+            "migrate",
+            "--no-install",
+            "--skip-verify",
+            "--no-ci",
+            "--json",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+    let mut waiting = String::new();
+    while !waiting.contains("Waiting for another lpm operation") {
+        waiting.clear();
+        assert_ne!(
+            stderr.read_line(&mut waiting).unwrap(),
+            0,
+            "the migration finished without waiting for the lock"
+        );
+    }
+    project.write_file("lpm.lock", "written while the migration waited\n");
+    drop(held);
+
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    let status = child.wait().unwrap();
+
+    assert!(!status.success(), "{stdout}");
+    assert!(stdout.contains("lpm.lock already exists"), "{stdout}");
+    assert_eq!(
+        project.read_file("lpm.lock"),
+        "written while the migration waited\n"
+    );
+}
+
+#[test]
 fn migrate_npm_creates_backup() {
     let project = TempProject::from_fixture("migrate-npm");
 
@@ -275,8 +327,8 @@ fn migrate_pnpm_overrides_conflict_aborts_before_any_write() {
         "lpm.lock must not exist — abort happened before the lockfile write"
     );
     assert!(
-        !project.path().join("package.json.backup").exists(),
-        "no package.json.backup — the backup chain hadn't started yet"
+        !project.path().join(".lpm/migrate-backup").exists(),
+        "no migration backup — the backup chain hadn't started yet"
     );
 }
 
@@ -453,8 +505,8 @@ fn migrate_pnpm_patches_conflict_aborts_before_any_write() {
         "lpm.lock must not exist — abort happened before the lockfile write"
     );
     assert!(
-        !project.path().join("package.json.backup").exists(),
-        "no package.json.backup — the backup chain hadn't started yet"
+        !project.path().join(".lpm/migrate-backup").exists(),
+        "no migration backup — the backup chain hadn't started yet"
     );
 }
 
@@ -1018,10 +1070,15 @@ fn migrate_refuses_a_linked_npmrc_without_copying_or_modifying_its_target() {
         std::fs::read_to_string(external.path()).expect("read external target"),
         "//registry.npmjs.org/:_authToken=external-secret\n"
     );
-    assert!(
-        !project.file_exists(".npmrc.backup"),
-        "migrate must not copy a linked target into the project"
-    );
+    let copies = project.path().join(".lpm/migrate-backup/files");
+    for copy in std::fs::read_dir(&copies).into_iter().flatten().flatten() {
+        assert!(
+            !std::fs::read_to_string(copy.path())
+                .unwrap_or_default()
+                .contains("external-secret"),
+            "migrate must not copy a linked target into the project"
+        );
+    }
 }
 
 #[test]
