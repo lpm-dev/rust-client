@@ -597,6 +597,9 @@ async fn run_inner(
     // runtime-install gate.
     if all {
         checks.extend(project_state::check_project_state_tracked(project_dir));
+        checks.extend(project_state::check_deploy_output_dependencies_committable(
+            project_dir,
+        ));
     }
 
     // 6c. Dependencies in sync? (lockfile vs package.json)

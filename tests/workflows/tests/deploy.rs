@@ -667,6 +667,26 @@ async fn a_deploy_output_git_commits_keeps_its_dependencies() {
         "{}",
         String::from_utf8_lossy(&committed.stderr)
     );
+    // Committed, the dependencies aren't machine-local state to untrack.
+    let doctor = lpm_with_registry(&project, &registry.url())
+        .current_dir(out.path())
+        .args(["doctor", "--all", "--json"])
+        .output()
+        .unwrap();
+    let report = support::assertions::parse_json_output(&doctor.stdout);
+    let state = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| {
+            check["code"]
+                .as_str()
+                .is_some_and(|code| code.starts_with("project_state_"))
+                && check["check"] == ".lpm state"
+        })
+        .unwrap_or_else(|| panic!("no .lpm state row: {report}"));
+    assert_eq!(state["severity"], "pass", "{state}");
+
     let clone = external_output_dir();
     let cloned = std::process::Command::new("git")
         .args(["clone", "-q"])

@@ -731,6 +731,13 @@ pub(crate) fn locate_work_tree(
     }))
 }
 
+/// The root of the git work tree that holds `dir`, and where `dir` is in
+/// it: `/`-separated and ending in `/`, or `""` at the root. `None` outside
+/// a work tree.
+pub fn work_tree_location(dir: &Path) -> Result<Option<(PathBuf, String)>, GitProbeError> {
+    Ok(locate_work_tree(dir, None)?.map(|work_tree| (work_tree.root, work_tree.prefix)))
+}
+
 /// A work tree whose index can list the paths [`indexes_listing`] was asked
 /// about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1209,6 +1216,37 @@ pub(crate) fn ignores_case(dir: &Path) -> Result<bool, GitProbeError> {
 const UNTRACK_NAMED_ENTRIES: usize = 3;
 
 impl Tracked {
+    /// Keeps the entries `keep` accepts, given each one's path below the
+    /// path it was found for, empty for that path itself. An untrack command
+    /// that names paths rather than entries then names the first directory
+    /// below that path holding a kept entry, never the path itself.
+    pub fn retain_below(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        let mut entries = Vec::with_capacity(self.entries.len());
+        let mut spellings = Vec::with_capacity(self.entries.len());
+        for (entry, spelling) in self.entries.drain(..).zip(self.spellings.drain(..)) {
+            // A repository of the path's own spells the path `.`.
+            let below = if spelling == "." {
+                Some(entry.as_str())
+            } else {
+                entry
+                    .strip_prefix(spelling.as_str())
+                    .and_then(|rest| rest.strip_prefix('/'))
+            };
+            if !keep(below.unwrap_or_default()) {
+                continue;
+            }
+            let spelling = match below.and_then(|below| below.split('/').next()) {
+                Some(first) if spelling == "." => first.to_owned(),
+                Some(first) => format!("{spelling}/{first}"),
+                None => spelling,
+            };
+            entries.push(entry);
+            spellings.push(spelling);
+        }
+        self.entries = entries;
+        self.spellings = spellings;
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
