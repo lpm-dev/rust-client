@@ -822,8 +822,8 @@ pub static PROJECT_STATE_TRACKED: CheckEntry = CheckEntry {
     category: Category::ProjectState,
     tier: Tier::Extended,
     description: "Git tracks files in `.lpm`, which holds machine-local state such as install checkpoints, trust snapshots, certificates, and tunnel captures.",
-    when_fires: "`git ls-files` lists files under the project's `.lpm` directory.",
-    remediation: "Run `git rm -r --cached .lpm` and commit. `.lpm` ignores itself, so the files stay out of later commits.",
+    when_fires: "`git ls-files` lists files under the project's `.lpm` directory, under any spelling the file system takes for it.",
+    remediation: "Run the `git rm --cached` command the warning names, then commit. `.lpm` ignores itself, so the files stay out of later commits.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
 };
