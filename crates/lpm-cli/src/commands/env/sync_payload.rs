@@ -40,26 +40,16 @@ impl CloudManifestSnapshot {
             }),
             _ => None,
         };
-        let vault = match config.as_ref() {
-            Some(config) => {
-                let vault_sync = config
-                    .vault_sync
-                    .as_ref()
-                    .map(serde_json::to_value)
-                    .transpose()
-                    .map_err(|error| {
-                        LpmError::Script(format!(
-                            "failed to retain validated lpm.json sync metadata: {error}"
-                        ))
-                    })?;
-                lpm_vault::vault_id::VaultManifestSnapshot::from_parts(
-                    config.vault.clone(),
-                    config.name.clone(),
-                    vault_sync,
-                )
-            }
-            None => lpm_vault::vault_id::VaultManifestSnapshot::default(),
-        };
+        let vault = lpm_vault::vault_id::VaultManifestSnapshot::from_config_content(
+            project_dir,
+            content.as_deref(),
+        )
+        .map_err(LpmError::Script)?;
+        if let Some(sync) = vault.sync_state() {
+            serde_json::from_value::<lpm_runner::lpm_json::VaultSyncConfig>(sync.clone()).map_err(
+                |error| LpmError::Script(format!("the env sync state is not valid: {error}")),
+            )?;
+        }
         Ok(Self {
             config,
             vault,
@@ -103,8 +93,9 @@ pub(super) fn verify_personal_mutation_snapshot(
     sources: &lpm_env_source::SchemaSnapshot,
 ) -> Result<(), String> {
     let content = read_mutation_manifest_content(project_dir)?;
-    let manifest = lpm_vault::vault_id::VaultManifestSnapshot::parse(
-        lpm_common::strip_utf8_bom_str(&content),
+    let manifest = lpm_vault::vault_id::VaultManifestSnapshot::from_config_content(
+        project_dir,
+        Some(&content),
     )?;
     verify_personal_mutation_manifest(
         &manifest,
@@ -124,8 +115,9 @@ pub(super) fn verify_org_mutation_snapshot(
     sources: &lpm_env_source::SchemaSnapshot,
 ) -> Result<(), String> {
     let content = read_mutation_manifest_content(project_dir)?;
-    let manifest = lpm_vault::vault_id::VaultManifestSnapshot::parse(
-        lpm_common::strip_utf8_bom_str(&content),
+    let manifest = lpm_vault::vault_id::VaultManifestSnapshot::from_config_content(
+        project_dir,
+        Some(&content),
     )?;
     verify_org_mutation_manifest(
         &manifest,
@@ -262,7 +254,7 @@ pub(super) fn personal_sync_checkpoint_warnings(
         warnings.push("The remote update succeeded, but the local key checkpoint could not be stored. Restore local storage access, then pull the latest project revision.");
     }
     if manifest_result.is_err() {
-        warnings.push("The remote update succeeded, but the project revision checkpoint could not be stored. Restore the original project's lpm.json and write access, then pull the latest revision.");
+        warnings.push("The remote update succeeded, but the project revision checkpoint could not be stored. Restore the original project's lpm.json and write access to its .lpm directory, then pull the latest revision.");
     }
     warnings
 }
@@ -622,13 +614,19 @@ mod tests {
         )
         .expect_err("metadata must stay bound to the captured vault ID");
 
-        assert!(error.to_string().contains("vault ID changed"), "{error}");
+        assert!(error.to_string().contains("env ID changed"), "{error}");
         let config: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.path().join("lpm.json")).expect("read replacement"),
         )
         .expect("parse replacement");
         assert_eq!(config["vault"], "vault-replacement");
         assert!(config.get("vaultSync").is_none());
+        assert!(
+            !dir.path()
+                .join(".lpm")
+                .join(lpm_vault::vault_id::SYNC_STATE_FILE)
+                .exists()
+        );
     }
 
     #[test]
@@ -678,13 +676,19 @@ mod tests {
         )
         .expect_err("metadata must stay bound to the captured vault ID");
 
-        assert!(error.to_string().contains("vault ID changed"), "{error}");
+        assert!(error.to_string().contains("env ID changed"), "{error}");
         let config: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.path().join("lpm.json")).expect("read replacement"),
         )
         .expect("parse replacement");
         assert_eq!(config["vault"], "vault-replacement");
         assert!(config.get("vaultSync").is_none());
+        assert!(
+            !dir.path()
+                .join(".lpm")
+                .join(lpm_vault::vault_id::SYNC_STATE_FILE)
+                .exists()
+        );
     }
 
     #[test]

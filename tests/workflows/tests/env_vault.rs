@@ -1828,10 +1828,18 @@ async fn env_pull_overwrites_local_state_with_remote_environments() {
     let synced_config: serde_json::Value =
         serde_json::from_str(&project.read_file("lpm.json")).expect("failed to re-read lpm.json");
     assert_eq!(synced_config["vault"].as_str(), Some(vault_id));
-    assert_eq!(
-        synced_config["vaultSync"]["personalVersion"].as_i64(),
-        Some(7)
+    assert!(
+        synced_config.get("vaultSync").is_none(),
+        "sync state stays out of the committed lpm.json"
     );
+    let sync_state = env_sync_state(&project);
+    assert_eq!(sync_state["vault"].as_str(), Some(vault_id));
+    assert_eq!(sync_state["sync"]["personalVersion"].as_i64(), Some(7));
+}
+
+fn env_sync_state(project: &TempProject) -> serde_json::Value {
+    serde_json::from_str(&project.read_file(".lpm/env-sync.json"))
+        .expect("failed to read the env sync state")
 }
 
 #[tokio::test]
@@ -9397,11 +9405,9 @@ async fn env_push_reports_metadata_warnings_without_changing_success() {
             assert!(display.contains("Invalid metadata was not stored."));
             assert!(display.contains("Upgrade the client and push again."));
         }
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(project.path().join("lpm.json")).unwrap())
-                .unwrap();
         assert_eq!(
-            manifest["vaultSync"]["authorityCheckpoints"]["personal"][mock.url()]["account-1"]["version"],
+            env_sync_state(&project)["sync"]["authorityCheckpoints"]["personal"][mock.url()]["account-1"]
+                ["version"],
             2
         );
     }

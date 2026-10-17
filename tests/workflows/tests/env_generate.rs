@@ -366,6 +366,7 @@ fn env_generate_rejects_a_fifo_root_without_waiting_for_a_writer() {
             .unwrap()
             .success()
     );
+    support::warm_lpm_binary(&project);
     let mut command = support::lpm_spawnable(&project);
     let mut child = command
         .args(["env", "generate", "--check"])

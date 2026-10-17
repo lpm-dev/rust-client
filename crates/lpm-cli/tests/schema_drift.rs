@@ -335,9 +335,11 @@ fn lpm_json_schema_documents_runtime_only_sync_authority_constraints() {
         },
     });
     assert!(validator.is_valid(&noncanonical_registry));
-    let manifest =
-        lpm_vault::vault_id::VaultManifestSnapshot::parse(&noncanonical_registry.to_string())
-            .expect("schema-valid metadata should deserialize");
+    let manifest = lpm_vault::vault_id::VaultManifestSnapshot::from_parts(
+        None,
+        None,
+        Some(noncanonical_registry["vaultSync"].clone()),
+    );
     assert!(
         manifest
             .personal_sync_principal_for_registry("https://lpm.dev")
@@ -358,9 +360,11 @@ fn lpm_json_schema_documents_runtime_only_sync_authority_constraints() {
         },
     });
     assert!(validator.is_valid(&oversized_principal));
-    let manifest =
-        lpm_vault::vault_id::VaultManifestSnapshot::parse(&oversized_principal.to_string())
-            .expect("schema-valid metadata should deserialize");
+    let manifest = lpm_vault::vault_id::VaultManifestSnapshot::from_parts(
+        None,
+        None,
+        Some(oversized_principal["vaultSync"].clone()),
+    );
     assert!(
         manifest
             .personal_sync_principal_for_registry("https://lpm.dev")
@@ -379,9 +383,11 @@ fn lpm_json_schema_documents_runtime_only_sync_authority_constraints() {
         },
     });
     assert!(validator.is_valid(&oversized_organization));
-    let manifest =
-        lpm_vault::vault_id::VaultManifestSnapshot::parse(&oversized_organization.to_string())
-            .expect("schema-valid metadata should deserialize");
+    let manifest = lpm_vault::vault_id::VaultManifestSnapshot::from_parts(
+        None,
+        None,
+        Some(oversized_organization["vaultSync"].clone()),
+    );
     assert!(
         manifest
             .org_sync_principal_for_registry(&multibyte_organization, "https://lpm.dev",)
@@ -408,8 +414,11 @@ fn lpm_json_schema_documents_runtime_only_sync_authority_constraints() {
         },
     });
     assert!(validator.is_valid(&global_capacity));
-    let manifest = lpm_vault::vault_id::VaultManifestSnapshot::parse(&global_capacity.to_string())
-        .expect("schema-valid metadata should deserialize");
+    let manifest = lpm_vault::vault_id::VaultManifestSnapshot::from_parts(
+        None,
+        None,
+        Some(global_capacity["vaultSync"].clone()),
+    );
     assert!(
         manifest
             .personal_sync_principal_for_registry("https://one.example")
