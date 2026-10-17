@@ -3,12 +3,7 @@ mod support;
 use support::mock_registry::{MockRegistry, make_tarball};
 use support::{TempProject, lpm_with_registry};
 
-const INSTALL_ARGS: &[&str] = &[
-    "install",
-    "--no-security-summary",
-    "--no-skills",
-    "--no-editor-setup",
-];
+const INSTALL_ARGS: &[&str] = &["install", "--no-security-summary", "--no-skills"];
 
 #[tokio::test]
 async fn install_explains_transitive_range_that_has_no_matching_version() {

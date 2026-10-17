@@ -35,9 +35,7 @@ use self::check::{Check, FixTarget, format_doctor_issue_summary_colored};
 use self::config_file::load_lpm_json;
 use self::global::check_global_installs;
 use self::local_sources::check_local_source_paths;
-use self::lockfile::{
-    DiagnosticLockfile, check_deps_in_sync, check_gitattributes_state, check_lockfile_state,
-};
+use self::lockfile::{DiagnosticLockfile, check_deps_in_sync, check_lockfile_state};
 use self::manifest::check_manifest_compat;
 use self::policy::check_policy_extensions;
 use self::runtime::{
@@ -229,7 +227,7 @@ pub fn list(
 ///   subprocesses, TypeScript reachability, plugin update fetch,
 ///   global-install hygiene (manifest, PATH, shims, install roots),
 ///   sandbox probe, full manifest-compat sweep, and project-hygiene
-///   rows (`.gitattributes` lockb marker, v2-store orphan stats).
+///   rows (tracked `.lpm/` state, v2-store orphan stats).
 ///
 /// `--fix` operates on whichever set actually emitted — fast-mode
 /// `--fix` cannot repair rows it didn't check.
@@ -595,10 +593,9 @@ async fn run_inner(
     let diagnostic_lockfile = DiagnosticLockfile::load(project_dir);
     checks.extend(check_lockfile_state(&diagnostic_lockfile));
 
-    // 6b. .gitattributes hygiene (Extended) — git-side correctness for
-    // the binary lockfile, not a runtime-install gate.
+    // 6b. Tracked `.lpm/` state (Extended) — git hygiene, not a
+    // runtime-install gate.
     if all {
-        checks.extend(check_gitattributes_state(project_dir, &diagnostic_lockfile));
         checks.extend(project_state::check_project_state_tracked(project_dir));
     }
 

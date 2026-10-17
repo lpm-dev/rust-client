@@ -1338,7 +1338,6 @@ require('node:fs').writeFileSync('hook-complete', 'ok');
                 invocation.args([
                     "install",
                     "--no-skills",
-                    "--no-editor-setup",
                     "--no-security-summary",
                     "--no-audit-after-install",
                 ]);
@@ -1367,7 +1366,6 @@ fn inherited_lifecycle_lock_context_allows_commands_after_parent_release() {
         .args([
             "install",
             "--no-skills",
-            "--no-editor-setup",
             "--no-security-summary",
             "--no-audit-after-install",
         ])
@@ -1407,11 +1405,14 @@ fn nested_workspace_lifecycle_preserves_ancestor_install_lock_context() {
         "packages/app/package.json",
         r#"{"name":"inner-app","version":"1.0.0","scripts":{"postinstall":"node ../../hook.cjs"}}"#,
     );
-    outer.write_file("hook.cjs", r#"
+    outer.write_file(
+        "hook.cjs",
+        r#"
 require('node:child_process').execFileSync(process.env.FIXTURE_LPM_BINARY,
- ['install', '--no-skills', '--no-editor-setup', '--no-security-summary', '--no-audit-after-install'],
+ ['install', '--no-skills', '--no-security-summary', '--no-audit-after-install'],
  { cwd: process.env.FIXTURE_INNER_PROJECT, timeout: 10000, stdio: 'pipe' });
-"#);
+"#,
+    );
     inner.write_file("hook.cjs", r#"
 const assert = require('node:assert/strict');
 const result = require('node:child_process').spawnSync(process.env.FIXTURE_LPM_BINARY,
@@ -1428,7 +1429,6 @@ require('node:fs').writeFileSync('ancestor-checked', 'ok');
         .args([
             "install",
             "--no-skills",
-            "--no-editor-setup",
             "--no-security-summary",
             "--no-audit-after-install",
         ])

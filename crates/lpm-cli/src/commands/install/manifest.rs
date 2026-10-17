@@ -1317,7 +1317,6 @@ async fn route_explicit_packages(
 pub(crate) struct AddInstallOptions {
     pub(crate) strict_integrity: bool,
     pub(crate) linker_override: Option<lpm_linker::LinkerMode>,
-    pub(crate) no_editor_setup: bool,
     pub(crate) no_security_summary: bool,
     pub(crate) auto_build: bool,
 }
@@ -1412,9 +1411,11 @@ pub async fn run_add_packages(
                 required_paths.push(manifest.clone());
                 optional_paths.push(manifest.with_file_name("Package.resolved"));
             } else if let Some(xcodeproj) = xcodeproj_path.as_ref() {
-                let pbxproj = xcodeproj.join("project.pbxproj");
-                required_paths.push(pbxproj.clone());
-                optional_paths.push(pbxproj.with_extension("pbxproj.lpm-backup"));
+                required_paths.push(xcodeproj.join("project.pbxproj"));
+                optional_paths.extend([
+                    crate::xcode_project::project_backup_path(xcodeproj),
+                    crate::xcode_project::legacy_project_backup_path(xcodeproj),
+                ]);
                 optional_paths.extend(
                     crate::xcode_project::native::containers(project_dir, xcodeproj)?
                         .iter()
@@ -1578,7 +1579,6 @@ pub async fn run_add_packages(
                 strict_peer_dependencies_override,
                 install_options.linker_override,
                 lpm_skills_preference,
-                install_options.no_editor_setup,
                 install_options.no_security_summary,
                 install_options.auto_build,
                 None, // target_set: legacy single-project path
@@ -1859,9 +1859,11 @@ pub async fn run_install_filtered_add(
                         optional_paths.push(manifest_path.with_file_name("Package.resolved"));
                     }
                     SwiftInstallLocation::Xcode { xcodeproj_path } => {
-                        let pbxproj = xcodeproj_path.join("project.pbxproj");
-                        required_paths.push(pbxproj.clone());
-                        optional_paths.push(pbxproj.with_extension("pbxproj.lpm-backup"));
+                        required_paths.push(xcodeproj_path.join("project.pbxproj"));
+                        optional_paths.extend([
+                            crate::xcode_project::project_backup_path(xcodeproj_path),
+                            crate::xcode_project::legacy_project_backup_path(xcodeproj_path),
+                        ]);
                         optional_paths.extend(
                             crate::xcode_project::native::containers(cwd, xcodeproj_path)?
                                 .iter()
@@ -2141,7 +2143,6 @@ pub async fn run_install_filtered_add(
                     strict_peer_dependencies_override,
                     install_options.linker_override,
                     lpm_skills_preference,
-                    install_options.no_editor_setup,
                     install_options.no_security_summary,
                     install_options.auto_build,
                     Some(&target_paths),

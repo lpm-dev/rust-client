@@ -98,7 +98,6 @@ async fn successful_install_exports_numeric_timeline_separately_from_json_stdout
             "install",
             "--no-frozen-lockfile",
             "--no-skills",
-            "--no-editor-setup",
             "--no-security-summary",
         ])
         .output()
@@ -169,7 +168,7 @@ fn failed_install_exports_error_timeline_without_replacing_json_error() {
     let directory = project.path().join("timeline");
     let output = lpm(&project)
         .env("LPM_INSTALL_TIMELINE_DIR", &directory)
-        .args(["--json", "install", "--no-skills", "--no-editor-setup"])
+        .args(["--json", "install", "--no-skills"])
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -189,13 +188,7 @@ fn timeline_export_failure_does_not_fail_install_or_corrupt_json() {
             "LPM_INSTALL_TIMELINE_DIR",
             project.path().join("not-a-directory"),
         )
-        .args([
-            "--json",
-            "install",
-            "--no-frozen-lockfile",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["--json", "install", "--no-frozen-lockfile", "--no-skills"])
         .output()
         .unwrap();
     assert!(
@@ -257,7 +250,6 @@ async fn metadata_timeline_correlates_retries_blocking_parse_and_ordered_commit(
             "install",
             "--no-frozen-lockfile",
             "--no-skills",
-            "--no-editor-setup",
             "--no-security-summary",
         ])
         .output()
@@ -421,7 +413,6 @@ async fn assert_install_fetch_ancestry(route: &str) {
             "--timing",
             "--no-frozen-lockfile",
             "--no-skills",
-            "--no-editor-setup",
             "--no-security-summary",
         ]);
     if workspace {

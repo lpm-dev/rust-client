@@ -77,22 +77,11 @@ where
 /// Common install-args set that workflow tests reuse — keeps the
 /// install footprint small and deterministic across the suite.
 fn install_args(spec: &str) -> Vec<&str> {
-    vec![
-        "install",
-        "--no-security-summary",
-        "--no-skills",
-        "--no-editor-setup",
-        spec,
-    ]
+    vec!["install", "--no-security-summary", "--no-skills", spec]
 }
 
-fn bare_install_args() -> [&'static str; 4] {
-    [
-        "install",
-        "--no-security-summary",
-        "--no-skills",
-        "--no-editor-setup",
-    ]
+fn bare_install_args() -> [&'static str; 3] {
+    ["install", "--no-security-summary", "--no-skills"]
 }
 
 fn left_pad_package_json() -> serde_json::Value {
@@ -386,7 +375,6 @@ async fn explicit_tarball_install_never_sends_the_lpm_bearer() {
             "install",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("install explicit tarball from the manifest");
@@ -442,7 +430,6 @@ async fn explicit_tarball_install_without_declared_integrity_is_anonymous() {
             "install",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("install trust-on-first-use tarball");

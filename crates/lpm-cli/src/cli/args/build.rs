@@ -400,10 +400,6 @@ pub(crate) struct CiArgs {
     #[arg(long, id = "ci_no_skills", conflicts_with = "ci_skills")]
     pub(crate) no_skills: bool,
 
-    /// Skip editor auto-integration.
-    #[arg(long)]
-    pub(crate) no_editor_setup: bool,
-
     /// Disable post-install security summary.
     #[arg(long)]
     pub(crate) no_security_summary: bool,

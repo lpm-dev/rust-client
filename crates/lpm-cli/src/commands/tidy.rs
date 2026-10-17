@@ -1156,7 +1156,6 @@ async fn reconcile_install(
         None,
         crate::lpm_skills_config::LpmSkillsPreference::Disabled,
         true,
-        true,
         false,
         None,
         None,

@@ -483,12 +483,7 @@ fn ci_without_lockfile_fails_as_frozen_install() {
     let project = TempProject::empty(r#"{"name":"ci-frozen","version":"1.0.0"}"#);
 
     let output = lpm(&project)
-        .args([
-            "ci",
-            "--no-skills",
-            "--no-editor-setup",
-            "--no-security-summary",
-        ])
+        .args(["ci", "--no-skills", "--no-security-summary"])
         .output()
         .expect("failed to run lpm ci");
 

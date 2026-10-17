@@ -24,12 +24,7 @@ async fn mount_ms(mock: &MockRegistry) {
 async fn seed_lockfile(mock: &MockRegistry) -> String {
     let project = TempProject::empty(PACKAGE_JSON);
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run seed install");
 
@@ -214,7 +209,6 @@ async fn fetch_reads_lockfile_without_manifest_and_enables_offline_frozen_instal
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run offline frozen install");
@@ -626,7 +620,6 @@ async fn fetch_sha256_lockfile_warms_reusable_offline_store() {
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run offline frozen install");

@@ -33,7 +33,6 @@ mkdir -p "$fixture_root/lpm-home" "$(dirname "$output")"
 install_flags=(
   --no-security-summary
   --no-skills
-  --no-editor-setup
   --no-audit-after-install
 )
 hyperfine_args=()

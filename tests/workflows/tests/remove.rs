@@ -344,7 +344,6 @@ async fn remove_reverses_manifest_tracked_custom_path_add_for_bare_package() {
             "--path",
             "custom/widgets",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm add for manifest-backed remove test");

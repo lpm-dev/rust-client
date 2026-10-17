@@ -72,7 +72,6 @@ for (const fixture of fixtures) {
         'install',
         '--no-security-summary',
         '--no-skills',
-        '--no-editor-setup',
       ],
       {
         cwd: projectDir,

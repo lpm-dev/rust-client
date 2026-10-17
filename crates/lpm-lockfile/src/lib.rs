@@ -22,7 +22,7 @@ pub mod source;
 
 pub use binary::{BINARY_LOCKFILE_NAME, BinaryLockfileReader};
 pub use error::LockfileError;
-pub use io::{ProjectLockfile, ensure_gitattributes};
+pub use io::ProjectLockfile;
 pub use model::{
     CatalogSnapshotEntry, CatalogSnapshots, DEFAULT_RESOLVED_WITH, ImporterSnapshot,
     ImporterSnapshots, LOCKFILE_NAME, LOCKFILE_VERSION, LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES,

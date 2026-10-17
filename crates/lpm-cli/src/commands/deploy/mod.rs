@@ -232,7 +232,6 @@ pub async fn run(
         None,  // strict_peer_dependencies_override
         None,  // linker_override
         crate::lpm_skills_config::LpmSkillsPreference::Disabled,
-        true,  // no_editor_setup — same reason
         false, // no_security_summary — keep findings visible in CI
         false, // auto_build — build is a separate concern
         Some(&target_set),

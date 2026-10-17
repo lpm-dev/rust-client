@@ -220,10 +220,6 @@ pub(crate) struct InstallArgs {
     #[arg(long, conflicts_with = "skills")]
     pub(crate) no_skills: bool,
 
-    /// Skip editor auto-integration.
-    #[arg(long)]
-    pub(crate) no_editor_setup: bool,
-
     /// Disable post-install security summary (faster CI).
     #[arg(long)]
     pub(crate) no_security_summary: bool,
@@ -613,10 +609,6 @@ pub(crate) struct AddArgs {
     /// Skip package-published LPM.dev skills auto-install.
     #[arg(long, conflicts_with = "skills")]
     pub(crate) no_skills: bool,
-
-    /// Skip editor auto-integration.
-    #[arg(long)]
-    pub(crate) no_editor_setup: bool,
 
     /// Package manager for dependency installation (lpm, npm, pnpm, yarn, bun, auto).
     #[arg(long, default_value = "lpm", value_parser = ["lpm", "npm", "pnpm", "yarn", "bun", "auto"])]

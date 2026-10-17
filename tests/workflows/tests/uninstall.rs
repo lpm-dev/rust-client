@@ -497,12 +497,7 @@ async fn uninstall_after_real_install_removes_isolated_symlink() {
     );
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -566,7 +561,6 @@ async fn store_v1_rollback_uninstall_removes_hoisted_directory() {
             "hoisted",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .assert()
         .success();

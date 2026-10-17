@@ -38,12 +38,7 @@ async fn assert_install_skips_source_analysis(config: &str) {
                 command.arg("--verbose");
             }
             let output = command
-                .args([
-                    "install",
-                    "source-analysis-preference@1.0.0",
-                    "--no-skills",
-                    "--no-editor-setup",
-                ])
+                .args(["install", "source-analysis-preference@1.0.0", "--no-skills"])
                 .output()
                 .expect("install package with source analysis disabled");
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -91,7 +86,7 @@ async fn firewall_modes_do_not_enable_disabled_source_analysis() {
         );
         let output = lpm_with_registry(&project, &mock.url())
             .env("RUST_LOG", "lpm_rs::security_check=trace")
-            .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
+            .args(["--verbose", "install", "--no-skills"])
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -121,7 +116,7 @@ async fn disabling_source_analysis_skips_warm_install_scan_but_preserves_explici
     let enabled = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
         .env("RUST_LOG", "lpm_rs::security_check=trace")
-        .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
+        .args(["--verbose", "install", "--no-skills"])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&enabled.stderr);
@@ -144,7 +139,7 @@ async fn disabling_source_analysis_skips_warm_install_scan_but_preserves_explici
     let disabled = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
         .env("RUST_LOG", "lpm_rs::security_check=trace")
-        .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
+        .args(["--verbose", "install", "--no-skills"])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&disabled.stderr);
@@ -201,7 +196,7 @@ async fn disabled_source_analysis_preserves_independent_registry_insights() {
         );
         let output = lpm_with_registry(&project, &mock.url())
             .env("RUST_LOG", "lpm_rs::security_check=trace")
-            .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
+            .args(["--verbose", "install", "--no-skills"])
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -229,7 +224,7 @@ async fn audit_separates_capabilities_and_preserves_explicit_policy_failures() {
     );
     write_config(&project, "install-time-source-analysis = true\n");
     let installed = lpm_with_registry(&project, &mock.url())
-        .args(["install", "--no-skills", "--no-editor-setup"])
+        .args(["install", "--no-skills"])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&installed.stderr);
@@ -312,7 +307,7 @@ async fn install_cache_and_audit_agree_on_scoped_runtime_evaluation() {
         write_config(&project, "install-time-source-analysis = true\n");
         let installed = lpm_with_registry(&project, &mock.url())
             .env("LPM_STORE_VERSION", "v2")
-            .args(["install", "--no-skills", "--no-editor-setup"])
+            .args(["install", "--no-skills"])
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&installed.stderr);
@@ -372,7 +367,7 @@ async fn install_audit_and_query_report_secret_uploads_as_critical_findings() {
     write_config(&project, "install-time-source-analysis = true\n");
     let installed = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
-        .args(["install", "--no-skills", "--no-editor-setup"])
+        .args(["install", "--no-skills"])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&installed.stderr);
@@ -466,7 +461,7 @@ async fn audit_and_query_expose_targeted_execution_and_deletion_findings() {
         write_config(&project, "install-time-source-analysis = true\n");
         let installed = lpm_with_registry(&project, &mock.url())
             .env("LPM_STORE_VERSION", "v2")
-            .args(["install", "--no-skills", "--no-editor-setup"])
+            .args(["install", "--no-skills"])
             .output()
             .unwrap();
         assert!(
@@ -582,7 +577,7 @@ async fn assert_summary_uses_exact_metadata(key: &str, version: &str, expected_n
         "install-time-source-analysis = false\nfetch-lpm-security-insights = true\n",
     );
     let output = lpm_with_registry(&project, &mock.url())
-        .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
+        .args(["--verbose", "install", "--no-skills"])
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);

@@ -36,7 +36,6 @@ process.exitCode=Number(process.argv[2]);
                     "--json",
                     "--color=never",
                     "--no-skills",
-                    "--no-editor-setup",
                     "--no-security-summary",
                 ])
                 .output()
@@ -76,7 +75,6 @@ async fn inherited_root_hook_output_retains_direct_child_terminal_control() {
             "install",
             "--color=never",
             "--no-skills",
-            "--no-editor-setup",
             "--no-security-summary",
         ])
         .output()
@@ -173,12 +171,7 @@ async fn root_install_failures_keep_child_exit_codes_and_stop_later_phases() {
             let project = project_with_phases(&names, Some(failed), false);
             let registry = MockRegistry::start().await;
             let mut command = registry_command(&project, &registry);
-            command.args([
-                "install",
-                "--no-skills",
-                "--no-editor-setup",
-                "--no-security-summary",
-            ]);
+            command.args(["install", "--no-skills", "--no-security-summary"]);
             if json {
                 command.arg("--json");
             }
@@ -298,12 +291,7 @@ async fn each_root_install_phase_gets_fresh_npm_context() {
 
     let registry = MockRegistry::start().await;
     let mut command = registry_command(&project, &registry);
-    command.args([
-        "install",
-        "--no-skills",
-        "--no-editor-setup",
-        "--no-security-summary",
-    ]);
+    command.args(["install", "--no-skills", "--no-security-summary"]);
     for key in CONTEXT_KEYS {
         command.env(key, "inherited-poison");
     }
@@ -358,12 +346,7 @@ async fn dependency_lifecycle_phases_receive_the_installed_package_context() {
     );
     support::write_signed_unlock_for(&project, project.path(), &["scripts-allow", "sandbox-none"]);
     registry_command(&project, &registry)
-        .args([
-            "install",
-            "--no-skills",
-            "--no-editor-setup",
-            "--no-security-summary",
-        ])
+        .args(["install", "--no-skills", "--no-security-summary"])
         .assert()
         .success();
     let mut command = registry_command(&project, &registry);
@@ -436,7 +419,6 @@ async fn dependency_binary_fixture(linker: &str, root_conflict: bool) {
         .args([
             "install",
             "--no-skills",
-            "--no-editor-setup",
             "--no-security-summary",
             "--linker",
             linker,
@@ -564,13 +546,7 @@ async fn json_root_failure_reports_phase_and_child_status() {
     let registry = MockRegistry::start().await;
     let project = project_with_phases(&["preinstall"], Some("preinstall"), false);
     let output = registry_command(&project, &registry)
-        .args([
-            "install",
-            "--json",
-            "--no-skills",
-            "--no-editor-setup",
-            "--no-security-summary",
-        ])
+        .args(["install", "--json", "--no-skills", "--no-security-summary"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(42));
@@ -639,12 +615,7 @@ async fn dependency_tools_keep_cache_keys_stable_and_track_live_helper_inputs() 
     );
     support::write_signed_unlock_for(&project, project.path(), &["scripts-allow"]);
     registry_command(&project, &registry)
-        .args([
-            "install",
-            "--no-skills",
-            "--no-editor-setup",
-            "--no-security-summary",
-        ])
+        .args(["install", "--no-skills", "--no-security-summary"])
         .assert()
         .success();
     let rebuild = || {
@@ -707,12 +678,7 @@ async fn native_rebuild_preserves_same_name_dependency_links() {
     );
     support::write_signed_unlock_for(&project, project.path(), &["scripts-allow"]);
     registry_command(&project, &registry)
-        .args([
-            "install",
-            "--no-skills",
-            "--no-editor-setup",
-            "--no-security-summary",
-        ])
+        .args(["install", "--no-skills", "--no-security-summary"])
         .assert()
         .success();
     registry_command(&project, &registry)
@@ -742,12 +708,7 @@ async fn lifecycle_order_includes_scripted_dependencies_behind_unscripted_tools(
     );
     support::write_signed_unlock_for(&project, project.path(), &["scripts-allow", "sandbox-none"]);
     registry_command(&project, &registry)
-        .args([
-            "install",
-            "--no-skills",
-            "--no-editor-setup",
-            "--no-security-summary",
-        ])
+        .args(["install", "--no-skills", "--no-security-summary"])
         .assert()
         .success();
     registry_command(&project, &registry)
@@ -833,12 +794,7 @@ async fn aliased_string_bins_use_the_provider_name_and_broken_edges_do_not_fall_
     );
     support::write_signed_unlock_for(&project, project.path(), &["scripts-allow", "sandbox-none"]);
     registry_command(&project, &registry)
-        .args([
-            "install",
-            "--no-skills",
-            "--no-editor-setup",
-            "--no-security-summary",
-        ])
+        .args(["install", "--no-skills", "--no-security-summary"])
         .assert()
         .success();
     registry_command(&project, &registry)
@@ -890,12 +846,7 @@ fs.writeFileSync('result.txt','ok');
     );
     support::write_signed_unlock_for(&project, project.path(), &["scripts-allow"]);
     registry_command(&project, &registry)
-        .args([
-            "install",
-            "--no-skills",
-            "--no-editor-setup",
-            "--no-security-summary",
-        ])
+        .args(["install", "--no-skills", "--no-security-summary"])
         .assert()
         .success();
     registry_command(&project, &registry)

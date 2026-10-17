@@ -51,7 +51,7 @@ async function main() {
 }
 main().catch(error => {console.error(error); process.exitCode = 1});
 """
-FLAGS = ["--no-security-summary", "--no-skills", "--no-editor-setup", "--no-audit-after-install"]
+FLAGS = ["--no-security-summary", "--no-skills", "--no-audit-after-install"]
 
 
 def main():

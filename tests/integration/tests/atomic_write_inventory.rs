@@ -354,10 +354,6 @@ const REVIEWED_RAW_ATOMIC_WRITERS: &[(&str, &str)] = &[
         "crates/lpm-store/src/v3/cas.rs::replace_with_hardlink",
         "swaps a duplicate object file for its validated CAS hardlink with a randomized rollback backup",
     ),
-    (
-        "crates/lpm-tunnel/src/webhook_log.rs::perform_rotation",
-        "rotates existing log files without writing through temporary leaf paths",
-    ),
 ];
 
 fn rust_sources(root: &Path, sources: &mut Vec<PathBuf>) -> std::io::Result<()> {

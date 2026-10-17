@@ -34,10 +34,7 @@ async fn install_public_package(access_token: Option<&str>, refresh_token: Optio
     );
     let initial = (access_token.is_some() || refresh_token.is_some())
         .then(|| read_credentials(project.home()));
-    for args in [
-        vec!["install", PACKAGE, "--no-editor-setup"],
-        vec!["install", "--no-editor-setup"],
-    ] {
+    for args in [vec!["install", PACKAGE], vec!["install"]] {
         let output = lpm_with_registry(&project, &registry.url())
             .args(args)
             .output()
@@ -138,7 +135,7 @@ async fn protected_install_still_refreshes_after_an_authentication_challenge() {
         }],
     );
     lpm_with_registry(&project, &registry.url())
-        .args(["install", PACKAGE, "--no-editor-setup"])
+        .args(["install", PACKAGE])
         .assert()
         .success();
     assert_eq!(
@@ -258,11 +255,7 @@ async fn install_private_history_with_expired_session(
             "2020-01-01T00:00:00Z"
         });
         lpm_with_registry(&project, &registry.url())
-            .args([
-                "install",
-                &format!("{PACKAGE}@{version}"),
-                "--no-editor-setup",
-            ])
+            .args(["install", &format!("{PACKAGE}@{version}")])
             .assert()
             .success();
     }
@@ -273,7 +266,7 @@ async fn install_private_history_with_expired_session(
     if explicit {
         command.arg(format!("{PACKAGE}@^1.0.0"));
     }
-    command.arg("--no-editor-setup").assert().success();
+    command.assert().success();
     let installed: serde_json::Value = serde_json::from_slice(
         &std::fs::read(
             project
@@ -347,7 +340,6 @@ async fn missing_versions_share_one_failed_session_refresh() {
             "install",
             &format!("{PACKAGE}@1.0.0"),
             &format!("{other_package}@0.9.0"),
-            "--no-editor-setup",
         ])
         .assert()
         .failure();

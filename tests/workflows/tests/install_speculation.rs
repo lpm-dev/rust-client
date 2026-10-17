@@ -77,13 +77,7 @@ async fn install_fetches_optional_tarball_while_other_metadata_is_pending() {
         .env("LPM_GREEDY_FUSION", "1")
         .env("LPM_TIMING_DETAIL", "trace")
         .env("LPM_RETRY_BACKOFF_MS_OVERRIDE", "500")
-        .args([
-            "--json",
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["--json", "install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run optional speculation install");
 

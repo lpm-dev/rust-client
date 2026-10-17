@@ -25,7 +25,6 @@ async fn install_default_allows_suspicious_package_name_without_approval() {
             "--json",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .assert()
         .success();
@@ -144,13 +143,7 @@ async fn install_json_allows_manifest_alias_whose_local_name_resembles_target() 
     enable_typosquat_guard(&project);
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--json",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--json", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install");
 
@@ -210,13 +203,7 @@ async fn install_json_env_can_disable_manifest_typosquat_analysis() {
 
     let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_TYPOSQUAT_GUARD", "0")
-        .args([
-            "install",
-            "--json",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--json", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install");
 
@@ -290,13 +277,7 @@ async fn install_json_global_config_can_disable_manifest_typosquat_analysis() {
     write_signed_typosquat_guard_posture(&project, "off");
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--json",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--json", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install");
 
@@ -367,7 +348,6 @@ async fn install_json_allows_known_legitimate_prismjs_package() {
             "--json",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install");
@@ -407,7 +387,6 @@ async fn install_json_allows_exact_inquirer_package() {
             "--json",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install inquirer");
@@ -447,7 +426,6 @@ async fn install_json_allows_popular_clean_enquirer_package() {
             "--json",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install enquirer");
@@ -491,7 +469,6 @@ async fn install_json_allows_popular_clean_chat_package() {
             "--json",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install chat");
@@ -535,7 +512,6 @@ async fn install_json_allows_legitimate_fsevents_package() {
             "--json",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install fsevents");
@@ -579,7 +555,6 @@ async fn install_json_allows_legitimate_short_serve_package() {
             "--json",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install serve");
@@ -623,13 +598,7 @@ reason = "fixture package name"
     );
 
     let first = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--json",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--json", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run initial lpm install");
     assert!(
@@ -643,13 +612,7 @@ reason = "fixture package name"
 
     let replay = lpm_with_registry(&project, &mock.url())
         .env("CI", "true")
-        .args([
-            "install",
-            "--json",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--json", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run CI replay install");
 
