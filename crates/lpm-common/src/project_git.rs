@@ -673,6 +673,17 @@ pub fn fold_case(name: &str) -> String {
     name.to_lowercase().to_uppercase().to_lowercase()
 }
 
+/// The characters beyond its two ASCII cases that [`fold_case`] reads as
+/// the ASCII letter `letter`.
+pub fn non_ascii_folds(letter: char) -> &'static [char] {
+    match letter.to_ascii_lowercase() {
+        'i' => &['\u{131}'],
+        'k' => &['\u{212A}'],
+        's' => &['\u{17F}'],
+        _ => &[],
+    }
+}
+
 /// The git work tree that holds a directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkTree {
@@ -1293,7 +1304,7 @@ impl Tracked {
 
 /// `word` as one shell word, quoted the way the platform's shells read it
 /// when anything in it is special.
-fn shell_word(word: &str) -> std::borrow::Cow<'_, str> {
+pub fn shell_word(word: &str) -> std::borrow::Cow<'_, str> {
     // PowerShell, the default shell, expands `$` and backticks inside double
     // quotes but reads single quotes literally.
     #[cfg(windows)]
@@ -2083,6 +2094,30 @@ mod tests {
             ("\u{212A}ey", "key"),
         ] {
             assert_eq!(fold_case(name), as_read, "{name}");
+        }
+    }
+
+    #[test]
+    fn names_every_character_that_folds_to_an_ascii_letter() {
+        for character in '\u{80}'..=char::MAX {
+            let folded = fold_case(character.encode_utf8(&mut [0; 4]));
+            let mut folded_chars = folded.chars();
+            if let (Some(single), None) = (folded_chars.next(), folded_chars.next())
+                && single.is_ascii_alphabetic()
+            {
+                assert!(
+                    non_ascii_folds(single).contains(&character),
+                    "{character:?} folds to {single:?}"
+                );
+            }
+        }
+        for letter in ('a'..='z').chain('A'..='Z') {
+            for character in non_ascii_folds(letter) {
+                assert_eq!(
+                    fold_case(character.encode_utf8(&mut [0; 4])),
+                    letter.to_ascii_lowercase().to_string()
+                );
+            }
         }
     }
 
