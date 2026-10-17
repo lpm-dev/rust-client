@@ -369,8 +369,6 @@ fn graph_nested_why_keeps_override_and_patch_records() {
     );
     write_patch_state(
         &project,
-        "fixture",
-        &[("react@1.0.0", "react", "1.0.0", "patches/react.patch")],
         &[(
             "react",
             "1.0.0",

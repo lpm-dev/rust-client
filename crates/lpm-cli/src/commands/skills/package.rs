@@ -116,21 +116,54 @@ pub(crate) fn materialize(
     })
 }
 
+/// Why a registry response offers no skills for a version that has some.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SkillsUnavailable {
+    UnderReview,
+    ReviewFailed,
+    Rejected,
+    NoneApproved,
+    Withheld,
+}
+
+impl SkillsUnavailable {
+    /// `package skills for <label> ...`, saying the installed set is kept.
+    pub(crate) fn message(self, label: &str) -> String {
+        let reason = match self {
+            Self::UnderReview => "are still under security review",
+            Self::ReviewFailed => "could not be security reviewed",
+            Self::Rejected => "were rejected by security review",
+            Self::NoneApproved => "did not pass security review",
+            Self::Withheld => "are not available",
+        };
+        let retry = if self == Self::UnderReview {
+            ". Try again in a few minutes"
+        } else {
+            ""
+        };
+        format!("package skills for {label} {reason}; existing skills were kept{retry}")
+    }
+}
+
+pub(crate) fn unavailable_reason(response: &SkillsResponse) -> Option<SkillsUnavailable> {
+    let names_skills = response.skills_count.unwrap_or(0) > 0 || !response.skills.is_empty();
+    match response.skills_status.as_deref() {
+        Some("pending" | "processing") => Some(SkillsUnavailable::UnderReview),
+        Some("rejected") => Some(SkillsUnavailable::Rejected),
+        Some("approved" | "flagged") | None if response.available != Some(false) => None,
+        Some("flagged") => Some(SkillsUnavailable::NoneApproved),
+        Some("approved") | None => names_skills.then_some(SkillsUnavailable::Withheld),
+        Some(_) => Some(SkillsUnavailable::ReviewFailed),
+    }
+}
+
 pub(crate) fn validate_response(response: &SkillsResponse) -> Result<(), LpmError> {
-    if response
-        .skills_status
-        .as_deref()
-        .is_some_and(|status| !matches!(status, "approved" | "flagged"))
-        || (response.available == Some(false)
-            && (response.skills_status.as_deref() == Some("flagged")
-                || response.skills_count.unwrap_or(0) > 0
-                || !response.skills.is_empty()))
-    {
-        return Err(LpmError::Registry(format!(
-            "package skills are unavailable for {} (review status: {}). Existing skills were preserved. Retry after review completes",
-            response.name,
-            response.skills_status.as_deref().unwrap_or("unavailable")
-        )));
+    if let Some(reason) = unavailable_reason(response) {
+        let label = match response.version.as_deref() {
+            Some(version) => format!("{}@{version}", response.name),
+            None => response.name.clone(),
+        };
+        return Err(LpmError::Registry(reason.message(&label)));
     }
     validate(&response.skills)
 }
@@ -231,21 +264,9 @@ pub(crate) fn materialization_complete(project_dir: &Path, package_json: &str) -
     let Ok(added) = added_source_skills(project_dir, &BTreeSet::new()) else {
         return false;
     };
-    let mut packages = BTreeSet::new();
-    for section in ["dependencies", "devDependencies", "optionalDependencies"] {
-        let Some(dependencies) = value.get(section).and_then(serde_json::Value::as_object) else {
-            continue;
-        };
-        for name in dependencies
-            .keys()
-            .filter(|name| name.starts_with("@lpm.dev/"))
-        {
-            let Ok(name) = PackageName::parse(name) else {
-                return false;
-            };
-            packages.insert(name.short());
-        }
-    }
+    let Ok(packages) = direct_lpm_dependencies(&value) else {
+        return false;
+    };
     packages
         .iter()
         .all(|package| package_materialization_complete(project_dir, package))
@@ -253,6 +274,36 @@ pub(crate) fn materialization_complete(project_dir: &Path, package_json: &str) -
             .iter()
             .filter(|(name, _)| !packages.contains(name.strip_prefix("@lpm.dev/").unwrap_or(name)))
             .all(|(name, version)| version_is_materialized(project_dir, name, version))
+}
+
+/// The `@lpm.dev` packages a manifest depends on directly, by short name,
+/// aliases (`"ui": "npm:@lpm.dev/owner.ui@^1.0.0"`) included: the packages
+/// whose skills an install materializes.
+pub(crate) fn direct_lpm_dependencies(
+    manifest: &serde_json::Value,
+) -> Result<BTreeSet<String>, LpmError> {
+    let mut packages = BTreeSet::new();
+    for section in ["dependencies", "devDependencies", "optionalDependencies"] {
+        let Some(dependencies) = manifest.get(section).and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        for (name, spec) in dependencies {
+            let target = spec
+                .as_str()
+                .and_then(|spec| spec.strip_prefix("npm:"))
+                .map_or(name.as_str(), |aliased| {
+                    aliased
+                        .rfind('@')
+                        .filter(|&at| at > 0)
+                        .map_or(aliased, |at| &aliased[..at])
+                });
+            if target.starts_with("@lpm.dev/") {
+                packages.insert(PackageName::parse(target)?.short());
+            }
+        }
+    }
+    Ok(packages)
 }
 
 /// The skills `lpm add` delivered, as `(@lpm.dev/<package>, version)` from
@@ -448,6 +499,77 @@ mod tests {
             raw_content: None,
             size_bytes: None,
         }
+    }
+
+    fn response(status: Option<&str>, available: Option<bool>, count: u32) -> SkillsResponse {
+        SkillsResponse {
+            name: "@lpm.dev/owner.package".into(),
+            version: Some("1.0.0".into()),
+            available,
+            skills_count: Some(count),
+            skills_status: status.map(str::to_string),
+            skills: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn direct_lpm_dependencies_follow_aliases_to_the_package_they_install() {
+        let manifest = serde_json::json!({
+            "dependencies": {
+                "@lpm.dev/owner.direct": "^1.0.0",
+                "ui": "npm:@lpm.dev/owner.aliased@^2.0.0",
+                "bare": "npm:@lpm.dev/owner.unversioned",
+                "@lpm.dev/owner.renamed": "npm:left-pad@1.3.0",
+            },
+            "devDependencies": { "@lpm.dev/owner.dev": "1.0.0", "react": "^19.0.0" },
+        });
+
+        let packages = direct_lpm_dependencies(&manifest).unwrap();
+
+        assert_eq!(
+            packages.into_iter().collect::<Vec<_>>(),
+            [
+                "owner.aliased",
+                "owner.dev",
+                "owner.direct",
+                "owner.unversioned"
+            ]
+        );
+    }
+
+    #[test]
+    fn unavailable_reason_follows_the_registry_review_states() {
+        use SkillsUnavailable::*;
+        let cases = [
+            (Some("pending"), Some(false), 2, Some(UnderReview)),
+            (Some("processing"), Some(false), 2, Some(UnderReview)),
+            (Some("error"), Some(false), 2, Some(ReviewFailed)),
+            (Some("unknown"), Some(false), 2, Some(ReviewFailed)),
+            (Some("rejected"), Some(false), 2, Some(Rejected)),
+            (Some("flagged"), Some(false), 0, Some(NoneApproved)),
+            (Some("flagged"), Some(true), 1, None),
+            (Some("approved"), Some(true), 2, None),
+            (Some("approved"), Some(false), 2, Some(Withheld)),
+            (None, Some(false), 0, None),
+            (Some("approved"), Some(false), 0, None),
+        ];
+        for (status, available, count, expected) in cases {
+            assert_eq!(
+                unavailable_reason(&response(status, available, count)),
+                expected,
+                "{status:?} available={available:?} count={count}"
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_skills_name_the_version_and_keep_existing_skills() {
+        let error = validate_response(&response(Some("rejected"), Some(false), 1)).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "registry error: package skills for @lpm.dev/owner.package@1.0.0 were rejected by security review; existing skills were kept"
+        );
     }
 
     #[test]

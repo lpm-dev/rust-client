@@ -215,7 +215,8 @@ pub(crate) struct InstallArgs {
     #[arg(long, conflicts_with = "no_skills")]
     pub(crate) skills: bool,
 
-    /// Skip package-published LPM.dev skills auto-install.
+    /// Skip skills for this run: package-published LPM.dev skills and the
+    /// project's recorded agent skills.
     #[arg(long, conflicts_with = "skills")]
     pub(crate) no_skills: bool,
 

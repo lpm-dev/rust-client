@@ -456,6 +456,7 @@ pub(crate) async fn run_with_options_with_lpm_root(
         .unwrap_or_else(|| project_dir.to_path_buf());
     crate::release_plan::ensure_no_pending_release_transaction(&transaction_root)?;
     validation::validate_project_layout(project_dir)?;
+    workspace_project_state::sweep_stale_rollback_dirs(project_dir);
     // `--force` probes Node again, so a reinstall can always refresh the version.
     let node_versions = if force {
         crate::engine_check::NodeVersionReuse::refreshing()
@@ -670,6 +671,8 @@ async fn run_with_options_under_store_lock(
         crate::lpm_insights_config::read_fetch_lpm_security_insights(&global_config)?;
     let requested_v2_mode = store_version.uses_virtual_store();
     let no_skills = !lpm_skills_preference.resolve(&global_config)?;
+    let restore_managed_skills = !offline
+        && lpm_skills_preference != crate::lpm_skills_config::LpmSkillsPreference::Disabled;
     let mut slow_package_timings = SlowPackageTimings::default();
     let mut wf_tail_audit_after_install_ms = 0u128;
 
@@ -690,6 +693,7 @@ async fn run_with_options_under_store_lock(
         force,
         offline,
         no_skills,
+        restore_managed_skills,
         omit_policy,
         strict_peer_dependencies,
         linker_mode,
@@ -849,6 +853,7 @@ async fn run_with_options_under_store_lock(
         prior_verified_provenance,
         workspace_root_provider_state_changed,
         importer_snapshot_changed,
+        overrides_match_lockfile,
     } = validate_install_lockfile_state(LockfileValidationInput {
         project_dir,
         lockfile_path: &lockfile_path,
@@ -884,20 +889,16 @@ async fn run_with_options_under_store_lock(
         if defer_project_linker_layout_maintenance {
             maintain_project_linker_layout(project_dir, json_output);
         }
-        if !offline && !no_skills {
-            let added = missing_added_source_skills(project_dir, &Default::default())?;
-            if !added.is_empty() {
-                let packages: Vec<(&str, &str)> = added
-                    .iter()
-                    .map(|(name, version)| (name.as_str(), version.as_str()))
-                    .collect();
-                let client = Arc::new(client.clone_with_config());
-                install_skills_for_packages(&client, &packages, project_dir, !json_output).await?;
-            }
-        }
-        if !offline {
-            restore_managed_project_skills(project_dir, json_output).await?;
-        }
+        let warnings = install_project_skills(ProjectSkills {
+            client,
+            project_dir,
+            dependencies: &[],
+            direct: &Default::default(),
+            package_skills: !offline && !no_skills,
+            managed_skills: restore_managed_skills,
+            json_output,
+        })
+        .await;
         run_empty_dependency_install_phase(EmptyDependencyInstallInput {
             project_dir,
             lpm_root,
@@ -919,6 +920,7 @@ async fn run_with_options_under_store_lock(
             security_analysis_policy,
             dependency_engine_policy: dependency_engine_policy.as_ref(),
             current_importer_snapshot: &current_importer_snapshot,
+            warnings: &warnings,
         })
         .await?;
         return Ok(());
@@ -926,17 +928,15 @@ async fn run_with_options_under_store_lock(
 
     let LockfileDriftState {
         prior_overrides_state,
-        overrides_changed,
+        override_drift,
         prior_patch_state,
-        patches_changed,
         pre_install_direct_versions,
     } = prepare_lockfile_drift_state(LockfileDriftInput {
         project_dir,
         lockfile_path: &lockfile_path,
         pkg: &pkg,
         override_set: &override_set,
-        current_patches: &current_patches,
-        current_patch_fingerprint: &current_patch_fingerprint,
+        overrides_match_lockfile,
     });
 
     let owned_client =
@@ -1013,13 +1013,9 @@ async fn run_with_options_under_store_lock(
             catalog_resolutions: &catalog_resolutions,
             gate_stats: &gate_stats,
             override_set: &override_set,
-            prior_overrides_state: prior_overrides_state.as_ref(),
-            overrides_changed,
+            override_drift: &override_drift,
             current_patches: &current_patches,
             current_lockfile_patches: &current_lockfile_patches,
-            current_patch_fingerprint: &current_patch_fingerprint,
-            prior_patch_state: prior_patch_state.as_ref(),
-            patches_changed,
             auto_install_peers,
             strict_peer_dependencies,
             omit_policy,
@@ -1070,8 +1066,7 @@ async fn run_with_options_under_store_lock(
         gate_stats: &gate_stats,
         frozen_lockfile_active,
         force: force || root_versions::active(project_dir),
-        overrides_changed,
-        patches_changed,
+        overrides_changed: override_drift.changed(),
         workspace_root_provider_state_changed,
         importer_snapshot_changed,
         is_add_invocation,
@@ -1426,7 +1421,8 @@ async fn run_with_options_under_store_lock(
         }
     }
 
-    let registry_warnings = verify_lpm_install_access(&arc_client, &packages, json_output).await?;
+    let mut install_warnings =
+        verify_lpm_install_access(&arc_client, &packages, json_output).await?;
 
     let policy_extension_stats = run_policy_extensions(
         &policy_extension_configs,
@@ -1917,26 +1913,25 @@ async fn run_with_options_under_store_lock(
         .await;
     }
 
-    // Step 8: Auto-install skills for direct LPM packages
-    if !offline && !no_skills {
-        let mut lpm_packages = selected_package_skills(&packages)?;
-        let direct: std::collections::BTreeSet<&str> =
-            lpm_packages.iter().map(|(name, _)| *name).collect();
-        let added = missing_added_source_skills(project_dir, &direct)?;
-        lpm_packages.extend(
-            added
-                .iter()
-                .map(|(name, version)| (name.as_str(), version.as_str())),
-        );
-
-        if !lpm_packages.is_empty() {
-            install_skills_for_packages(&arc_client, &lpm_packages, project_dir, !json_output)
-                .await?;
-        }
-    }
-    if !offline {
-        restore_managed_project_skills(project_dir, json_output).await?;
-    }
+    let package_skills = !offline && !no_skills;
+    let dependency_skills = if package_skills {
+        selected_package_skills(&packages)?
+    } else {
+        Vec::new()
+    };
+    let direct = dependency_skills.iter().map(|(name, _)| *name).collect();
+    install_warnings.extend(
+        install_project_skills(ProjectSkills {
+            client,
+            project_dir,
+            dependencies: &dependency_skills,
+            direct: &direct,
+            package_skills,
+            managed_skills: restore_managed_skills,
+            json_output,
+        })
+        .await,
+    );
 
     let lockfile_write_result = run_online_lockfile_write_phase(OnlineLockfileWritePhaseInput {
         project_dir,
@@ -2091,7 +2086,7 @@ async fn run_with_options_under_store_lock(
             project_dir,
             lockfile_path: &lockfile_path,
             packages: &packages,
-            registry_warnings: &registry_warnings,
+            warnings: &install_warnings,
             downloaded,
             cached,
             link_result: &link_result,
