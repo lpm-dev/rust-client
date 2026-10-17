@@ -47,6 +47,7 @@ LPMEnvResult lpm_env_check(const uint8_t *schema, size_t schema_length,
  * Curve25519 public key, the form GitHub requires for an Actions secret. Output:
  * the ephemeral public key then the box, plaintext_length + 48 bytes. plaintext
  * may be null only when plaintext_length is 0; at most LPM_ENV_SEAL_INPUT_LIMIT.
+ * A low-order key, which libsodium refuses to open a box for, is invalid input.
  * status: 0=sealed, 2=invalid input, 3=failure or panic. */
 LPMEnvResult lpm_env_seal_box(const uint8_t *public_key, size_t public_key_length,
                             const uint8_t *plaintext, size_t plaintext_length);

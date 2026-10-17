@@ -3533,6 +3533,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "x25519-dalek",
 ]
 
 [[package]]

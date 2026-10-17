@@ -514,7 +514,9 @@ pub unsafe extern "C" fn lpm_env_check(
 /// Encrypt `plaintext` to a Curve25519 public key as a libsodium sealed box
 /// (`crypto_box_seal`), the form GitHub requires for an Actions secret. The
 /// output is the ephemeral public key followed by the box, 48 bytes longer
-/// than the plaintext. Only the recipient's secret key opens it.
+/// than the plaintext. Only the recipient's secret key opens it. A low-order
+/// key, whose shared secret is all zeros, is refused as invalid input, as
+/// libsodium refuses to open a box sealed to one.
 /// # Safety
 /// The key pointer must reference 32 readable bytes. The plaintext pointer
 /// must reference readable bytes for its length during the call, and may be
@@ -543,12 +545,25 @@ pub unsafe extern "C" fn lpm_env_seal_box(
             // SAFETY: The caller supplies a live readable range; its length was bounded above.
             unsafe { std::slice::from_raw_parts(plaintext, plaintext_length) }
         };
+        if !is_contributory(&key) {
+            return failure(2, "env.invalid_input");
+        }
         match crypto_box::PublicKey::from(key).seal(&mut crypto_box::aead::OsRng, plaintext) {
             Ok(sealed) => result(0, sealed, None),
             Err(_) => failure(3, "env.seal_failed"),
         }
     }))
     .unwrap_or_else(|_| failure(3, "env.engine_panic"))
+}
+
+/// Whether X25519 with `key` gives a shared secret that depends on the other
+/// side's key. A small-order point gives all zeros for every clamped secret,
+/// so a box sealed to it would be readable by anyone, and libsodium refuses
+/// to open it.
+fn is_contributory(key: &[u8; crypto_box::KEY_SIZE]) -> bool {
+    x25519_dalek::EphemeralSecret::random_from_rng(crypto_box::aead::OsRng)
+        .diffie_hellman(&x25519_dalek::PublicKey::from(*key))
+        .was_contributory()
 }
 
 /// # Safety
@@ -1415,6 +1430,51 @@ mod tests {
         let largest = vec![0x5a; SEAL_INPUT_LIMIT];
         let sealed = sealed_bytes(seal(public.as_bytes(), &largest));
         assert_eq!(secret.unseal(&sealed).unwrap(), largest);
+    }
+
+    /// The small-order points of Curve25519 as libsodium lists them, each
+    /// also with bit 255 set, which X25519 ignores.
+    fn low_order_keys() -> Vec<[u8; crypto_box::KEY_SIZE]> {
+        let mut keys = Vec::new();
+        for text in [
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0100000000000000000000000000000000000000000000000000000000000000",
+            "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+            "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        ] {
+            let mut key = [0u8; crypto_box::KEY_SIZE];
+            hex::decode_to_slice(text, &mut key).unwrap();
+            keys.push(key);
+            key[31] |= 0x80;
+            keys.push(key);
+        }
+        keys
+    }
+
+    #[test]
+    fn sealing_refuses_a_low_order_key_libsodium_would_refuse_to_open() {
+        for key in low_order_keys() {
+            let shared = x25519_dalek::StaticSecret::from([7u8; crypto_box::KEY_SIZE])
+                .diffie_hellman(&x25519_dalek::PublicKey::from(key));
+            assert!(
+                !shared.was_contributory(),
+                "{} is a low-order point",
+                hex::encode(key)
+            );
+
+            let result = seal(&key, b"value");
+            assert_eq!(result.status, 2, "{} is refused", hex::encode(key));
+            // SAFETY: The result remains owned and unreleased for the complete read.
+            let body = unsafe { std::slice::from_raw_parts(result.data, result.length) };
+            assert_eq!(body, br#"{"abiVersion":1,"code":"env.invalid_input"}"#);
+            // SAFETY: This is the sole release of the returned result.
+            unsafe {
+                lpm_env_release(result);
+            }
+        }
     }
 
     #[test]
