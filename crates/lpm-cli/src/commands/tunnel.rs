@@ -938,9 +938,22 @@ enum CaptureRepository {
     Lpm,
 }
 
-const CAPTURES_PATHSPEC: &str = ":(glob,icase)inspector.db*";
+/// The capture files' names, `inspector.db` and the files beside it, under
+/// any spelling a filesystem takes for them: the glob leaves the letters
+/// another character can stand for to wildcards, as
+/// [`lpm_common::project_git::respelling_glob`] does, and
+/// [`is_capture_name`] drops what else it matches.
+const CAPTURES_PATHSPEC: &str = ":(glob,icase)*n*pector.db*";
 
-const PROJECT_CAPTURES_PATHSPEC: &str = ":(glob,icase).lpm/inspector.db*";
+const PROJECT_CAPTURES_PATHSPEC: &str = ":(glob,icase).lpm/*n*pector.db*";
+
+const CAPTURE_NAME: &str = "inspector.db";
+
+/// Whether `name`, a path git listed, names a capture file under any case.
+fn is_capture_name(name: &str) -> bool {
+    let file_name = name.rsplit('/').next().unwrap_or(name);
+    lpm_common::project_git::fold_case(file_name).starts_with(CAPTURE_NAME)
+}
 
 const CAPTURE_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -1309,6 +1322,9 @@ fn parse_capture_git_files(stdout: &[u8]) -> CaptureGitFiles {
             continue;
         };
         let name = String::from_utf8_lossy(name).into_owned();
+        if !is_capture_name(&name) {
+            continue;
+        }
         // A conflicted file is listed once for each stage, one after another.
         let list = if tag == b'?' {
             &mut files.unignored
@@ -2597,6 +2613,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn names_tracked_capture_files_spelled_with_letters_filesystems_fold() {
+        let respelled = [
+            ".lpm/in\u{17F}pector.db",
+            ".lpm/\u{131}nspector.db-wal",
+            ".lpm/INSPECTOR.DB-shm",
+        ];
+        let project = capture_project(&respelled);
+        std::fs::write(project.path().join(".lpm/connpector.db"), "{}").unwrap();
+        for name in respelled.iter().chain([&".lpm/connpector.db"]) {
+            git(project.path(), &["add", name]);
+        }
+
+        let state = capture_git_state(project.path()).await.unwrap();
+
+        assert_eq!(
+            state.project_tracked,
+            names(&[
+                ".lpm/INSPECTOR.DB-shm",
+                ".lpm/in\u{17F}pector.db",
+                ".lpm/\u{131}nspector.db-wal",
+            ])
+        );
+    }
+
+    #[test]
+    fn the_capture_pathspecs_leave_respellable_letters_to_wildcards() {
+        let glob = lpm_common::project_git::respelling_glob(CAPTURE_NAME);
+        assert_eq!(CAPTURES_PATHSPEC, format!(":(glob,icase){glob}*"));
+        assert_eq!(
+            PROJECT_CAPTURES_PATHSPEC,
+            format!(":(glob,icase).lpm/{glob}*")
+        );
+    }
+
+    #[tokio::test]
     async fn names_a_capture_the_project_tracks_under_another_case_of_lpm() {
         // As a repository committed on a case-insensitive disk carries it.
         let project = capture_project(&[".LPM/inspector.db"]);
@@ -3774,11 +3825,11 @@ mod tests {
         );
         assert_eq!(
             untrack_command(&names(6, ".lpm/"), CaptureRepository::Project),
-            "git rm --cached -- \":(glob,icase).lpm/inspector.db*\""
+            "git rm --cached -- \":(glob,icase).lpm/*n*pector.db*\""
         );
         assert_eq!(
             untrack_command(&names(6, ""), CaptureRepository::Lpm),
-            "git -C .lpm rm --cached -- \":(glob,icase)inspector.db*\""
+            "git -C .lpm rm --cached -- \":(glob,icase)*n*pector.db*\""
         );
     }
 
@@ -3795,7 +3846,7 @@ mod tests {
         ] {
             assert_eq!(
                 untrack_command(&names(&["inspector.db", name]), CaptureRepository::Lpm),
-                "git -C .lpm rm --cached -- \":(glob,icase)inspector.db*\"",
+                "git -C .lpm rm --cached -- \":(glob,icase)*n*pector.db*\"",
                 "{name:?}"
             );
         }
