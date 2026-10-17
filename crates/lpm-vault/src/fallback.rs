@@ -22,6 +22,10 @@ const FALLBACK_KEY_FILE: &str = ".vault-fallback-key";
 const FALLBACK_KEY_PREFIX: &str = "raw:";
 const LOCAL_VAULT_AAD_DOMAIN: &[u8] = b"lpm-vault-local\x01";
 
+fn native_data_key_service() -> String {
+    lpm_common::credential_service(NATIVE_DATA_KEY_SERVICE)
+}
+
 pub(crate) type SecretMap = HashMap<String, String>;
 pub(crate) type EnvironmentMap = HashMap<String, SecretMap>;
 
@@ -62,7 +66,7 @@ impl NativeDataKeyStore for KeyringNativeDataKeyStore {
             return result;
         }
 
-        let entry = keyring::Entry::new(NATIVE_DATA_KEY_SERVICE, NATIVE_DATA_KEY_ACCOUNT)
+        let entry = keyring::Entry::new(&native_data_key_service(), NATIVE_DATA_KEY_ACCOUNT)
             .map_err(|e| format!("native vault data-key entry error: {e}"))?;
         match entry.get_password() {
             Ok(value) => Ok(Some(value)),
@@ -77,7 +81,7 @@ impl NativeDataKeyStore for KeyringNativeDataKeyStore {
             return Err(error);
         }
 
-        let entry = keyring::Entry::new(NATIVE_DATA_KEY_SERVICE, NATIVE_DATA_KEY_ACCOUNT)
+        let entry = keyring::Entry::new(&native_data_key_service(), NATIVE_DATA_KEY_ACCOUNT)
             .map_err(|e| format!("native vault data-key entry error: {e}"))?;
         entry
             .set_password(hex_key)
@@ -111,10 +115,7 @@ fn force_file_data_key() -> bool {
     if !cfg!(debug_assertions) && !crate::acceptance_file_storage_enabled() {
         return false;
     }
-    matches!(
-        std::env::var("LPM_FORCE_FILE_VAULT").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
-    )
+    lpm_common::acceptance::env_flag_enabled("LPM_FORCE_FILE_VAULT")
 }
 
 fn vault_file_name(vault_id: &str) -> String {
@@ -261,9 +262,13 @@ fn write_native_data_key(store: &dyn NativeDataKeyStore, key: &[u8; 32]) -> Resu
 }
 
 fn native_unavailable_without_file_key(error: String) -> String {
+    let key_file = crate::lpm_root_dir().map_or_else(
+        || format!("~/.lpm/{FALLBACK_KEY_FILE}"),
+        |root| root.join(FALLBACK_KEY_FILE).display().to_string(),
+    );
     format!(
         "vault native storage backend is unavailable and no encrypted-file fallback key exists. \
-         Unlock Secret Service/Credential Manager or restore ~/.lpm/.vault-fallback-key. \
+         Unlock Secret Service/Credential Manager or restore {key_file}. \
          Native backend error: {error}"
     )
 }
@@ -1186,10 +1191,7 @@ mod tests {
         assert!(key.chars().all(|c| c.is_alphanumeric()));
 
         // The key must NOT look like the old predictable format
-        let home = crate::lpm_home_dir()
-            .unwrap_or_default()
-            .display()
-            .to_string();
+        let home = dirs::home_dir().unwrap_or_default().display().to_string();
         let user = std::env::var("USER").unwrap_or_default();
         let old_predictable = format!("{home}-{user}-vault");
         assert_ne!(key, old_predictable);

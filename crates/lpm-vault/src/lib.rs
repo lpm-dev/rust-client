@@ -75,40 +75,12 @@ fn force_file_vault_backend() -> bool {
     if !cfg!(debug_assertions) && !acceptance_file_storage_enabled() {
         return false;
     }
-    matches!(
-        std::env::var("LPM_FORCE_FILE_VAULT").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
-    )
+    lpm_common::acceptance::env_flag_enabled("LPM_FORCE_FILE_VAULT")
 }
 
 #[cfg(feature = "acceptance-test-hooks")]
 pub(crate) fn acceptance_file_storage_enabled() -> bool {
-    if !matches!(
-        std::env::var("LPM_ACCEPTANCE_FILE_STORAGE").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
-    ) || std::env::var("ACCEPTANCE_RUN_ID")
-        .ok()
-        .is_none_or(|value| value.trim().is_empty())
-    {
-        return false;
-    }
-
-    let (Some(run_dir), Some(home), Some(lpm_home)) = (
-        std::env::var_os("ACCEPTANCE_RUN_DIR").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
-        std::env::var_os("LPM_HOME").map(PathBuf::from),
-    ) else {
-        return false;
-    };
-    if lpm_home != home.join(".lpm") {
-        return false;
-    }
-
-    let (Ok(run_dir), Ok(home)) = (std::fs::canonicalize(run_dir), std::fs::canonicalize(home))
-    else {
-        return false;
-    };
-    home != run_dir && home.starts_with(run_dir)
+    lpm_common::acceptance::acceptance_storage_isolated()
 }
 
 #[cfg(not(feature = "acceptance-test-hooks"))]
@@ -116,13 +88,11 @@ pub(crate) const fn acceptance_file_storage_enabled() -> bool {
     false
 }
 
-pub(crate) fn lpm_home_dir() -> Option<PathBuf> {
-    #[cfg(test)]
-    if let Some(path) = std::env::var_os("LPM_TEST_HOME") {
-        return Some(PathBuf::from(path));
-    }
-
-    dirs::home_dir()
+/// The LPM root, `$LPM_HOME` or `~/.lpm`, which holds the vault's files.
+pub(crate) fn lpm_root_dir() -> Option<PathBuf> {
+    lpm_common::LpmRoot::from_env()
+        .ok()
+        .map(|root| root.root().to_path_buf())
 }
 
 pub fn storage_backend() -> VaultStorageBackend {
@@ -1632,6 +1602,34 @@ mod tests {
     }
 
     #[test]
+    fn file_storage_follows_lpm_home_instead_of_the_home_directory() {
+        with_forced_file_vault_backend(|| {
+            let home = PathBuf::from(std::env::var_os("HOME").expect("temporary HOME"));
+            let root = home.join("relocated-lpm");
+            unsafe {
+                std::env::set_var("LPM_HOME", &root);
+            }
+            let project = tempfile::tempdir().unwrap();
+
+            set(project.path(), &[("TOKEN", "value")]).unwrap();
+
+            let vault_id = vault_id::read_vault_id(project.path()).unwrap();
+            assert!(
+                root.join("vaults")
+                    .join(format!("{vault_id}.enc"))
+                    .is_file()
+            );
+            assert!(!home.join(".lpm").exists(), "nothing lands in $HOME/.lpm");
+            let environments = try_get_all_environments(project.path()).unwrap();
+            assert!(
+                environments
+                    .values()
+                    .any(|values| values.get("TOKEN").map(String::as_str) == Some("value"))
+            );
+        });
+    }
+
+    #[test]
     fn parse_env_basic() {
         let content = "DB_HOST=localhost\nAPI_KEY=sk-123\nPORT=3000";
         let vars = parse_env_content(content);
@@ -3023,8 +3021,8 @@ KEY3=no-quotes"#;
             "digest" => with_forced_file_vault_backend(|| {
                 use std::io::Write as _;
 
-                let home = crate::lpm_home_dir().expect("temporary vault home");
-                let vaults = home.join(".lpm/vaults");
+                let root = crate::lpm_root_dir().expect("temporary vault home");
+                let vaults = root.join("vaults");
                 std::fs::create_dir_all(&vaults).expect("create vault directory");
                 let path = vaults.join("profile.enc");
                 let mut file = std::fs::File::create(&path).expect("create digest fixture");

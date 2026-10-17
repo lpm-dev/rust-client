@@ -162,6 +162,7 @@ pub fn load_sandbox_write_dirs(
         })?
         .map(|root| root.effective);
 
+    let lpm_root = lpm_common::LpmRoot::from_env().ok();
     let mut resolved = Vec::with_capacity(arr.len());
     for (i, item) in arr.iter().enumerate() {
         let s = item.as_str().ok_or_else(|| SandboxError::InvalidSpec {
@@ -213,6 +214,11 @@ pub fn load_sandbox_write_dirs(
         if is_inside_project_state(&lexical_candidate, &project_root) {
             return Err(project_state_write_dir_error(package_json, i, s));
         }
+        if let Some(root) = &lpm_root
+            && is_inside_lpm_root(&lexical_candidate, root)
+        {
+            return Err(lpm_root_write_dir_error(package_json, i, s, root));
+        }
 
         let (authorized_root, suffix, root_kind) = if was_relative {
             let suffix = lexical_candidate
@@ -253,6 +259,11 @@ pub fn load_sandbox_write_dirs(
         }
         if is_inside_project_state(&effective, &project_root) {
             return Err(project_state_write_dir_error(package_json, i, s));
+        }
+        if let Some(root) = &lpm_root
+            && is_inside_lpm_root(&effective, root)
+        {
+            return Err(lpm_root_write_dir_error(package_json, i, s, root));
         }
 
         resolved.push(effective);
@@ -501,6 +512,28 @@ fn is_inside_project_state(path: &Path, project_root: &AuthorizedRoot) -> bool {
                         .eq_ignore_ascii_case(lpm_common::PROJECT_STATE_DIR)
                 })
         })
+}
+
+/// Whether `path` is the LPM home, `$LPM_HOME` or `~/.lpm`, or inside it.
+fn is_inside_lpm_root(path: &Path, root: &lpm_common::LpmRoot) -> bool {
+    path.starts_with(root.root()) || path.starts_with(root.identity())
+}
+
+fn lpm_root_write_dir_error(
+    package_json: &Path,
+    index: usize,
+    authored: &str,
+    root: &lpm_common::LpmRoot,
+) -> SandboxError {
+    SandboxError::InvalidSpec {
+        reason: format!(
+            "{pj}: `lpm.scripts.sandboxWriteDirs[{index}]` = {authored:?} is inside the LPM \
+             home {home}, which holds LPM's own state (config, store, login, approvals). This \
+             path is rejected unconditionally.",
+            pj = package_json.display(),
+            home = root.root().display(),
+        ),
+    }
 }
 
 fn project_state_write_dir_error(
@@ -1344,6 +1377,24 @@ mod tests {
                 "{entry}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn a_path_inside_the_lpm_home_is_recognized_by_configured_or_resolved_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("lpm-home");
+        std::fs::create_dir(&home).unwrap();
+        let root = lpm_common::LpmRoot::from_dir(&home);
+
+        assert!(is_inside_lpm_root(&home.join("store"), &root));
+        assert!(is_inside_lpm_root(
+            &root.identity().join("config.toml"),
+            &root
+        ));
+        assert!(!is_inside_lpm_root(
+            &tmp.path().join("lpm-home-sibling"),
+            &root
+        ));
     }
 
     #[test]

@@ -29,6 +29,10 @@ mod wrapping_store;
 /// Keyring service name for the vault wrapping key.
 const VAULT_KEY_SERVICE: &str = "dev.lpm.vault-key";
 
+fn vault_key_service() -> String {
+    lpm_common::credential_service(VAULT_KEY_SERVICE)
+}
+
 /// Keyring account name for the vault wrapping key.
 const VAULT_KEY_ACCOUNT: &str = "wrapping-key";
 
@@ -116,7 +120,7 @@ fn get_or_create_wrapping_key_unlocked(
 fn get_or_insert_wrapping_key_in_keyring(candidate: &[u8; 32]) -> Result<[u8; 32], String> {
     let encoded = hex::encode(candidate);
     let stored = crate::macos_keychain::get_or_insert_string(
-        VAULT_KEY_SERVICE,
+        &vault_key_service(),
         VAULT_KEY_ACCOUNT,
         &encoded,
     )?;
@@ -127,23 +131,21 @@ fn force_file_wrapping_key() -> bool {
     if !cfg!(debug_assertions) && !crate::acceptance_file_storage_enabled() {
         return false;
     }
-    matches!(
-        std::env::var("LPM_FORCE_FILE_VAULT").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
-    )
+    lpm_common::acceptance::env_flag_enabled("LPM_FORCE_FILE_VAULT")
 }
 
 /// Read the wrapping key from the system keyring.
 fn try_read_wrapping_key_from_keyring() -> Result<Option<[u8; 32]>, String> {
     #[cfg(target_os = "macos")]
-    let Some(hex_key) = crate::macos_keychain::read_string(VAULT_KEY_SERVICE, VAULT_KEY_ACCOUNT)?
+    let Some(hex_key) =
+        crate::macos_keychain::read_string(&vault_key_service(), VAULT_KEY_ACCOUNT)?
     else {
         return Ok(None);
     };
 
     #[cfg(not(target_os = "macos"))]
     let hex_key = {
-        let entry = keyring::Entry::new(VAULT_KEY_SERVICE, VAULT_KEY_ACCOUNT)
+        let entry = keyring::Entry::new(&vault_key_service(), VAULT_KEY_ACCOUNT)
             .map_err(|error| format!("keyring entry error: {error}"))?;
         match entry.get_password() {
             Ok(value) => value,
@@ -173,7 +175,7 @@ fn decode_wrapping_key(encoded: &str) -> Result<[u8; 32], String> {
 #[cfg(not(target_os = "macos"))]
 fn store_wrapping_key_in_keyring(key: &[u8; 32]) -> Result<(), String> {
     let encoded = hex::encode(key);
-    let entry = keyring::Entry::new(VAULT_KEY_SERVICE, VAULT_KEY_ACCOUNT)
+    let entry = keyring::Entry::new(&vault_key_service(), VAULT_KEY_ACCOUNT)
         .map_err(|error| format!("keyring entry error: {error}"))?;
     entry
         .set_password(&encoded)

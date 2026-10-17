@@ -21,10 +21,26 @@ pub(crate) struct VaultStorageDirectory {
 
 impl VaultStorageDirectory {
     fn open_lpm() -> Result<Self, String> {
-        let home = crate::lpm_home_dir().ok_or_else(|| "no home directory".to_owned())?;
-        let home_directory = Dir::open_ambient_dir(&home, ambient_authority())
-            .map_err(|error| format!("failed to open home directory: {error}"))?;
-        Self::open_or_create_child(&home_directory, &home, OsStr::new(".lpm"))
+        let root = crate::lpm_root_dir().ok_or_else(|| "no home directory".to_owned())?;
+        let (Some(parent_path), Some(name)) = (root.parent(), root.file_name()) else {
+            return Err(format!(
+                "the LPM home must name a directory: {}",
+                root.display()
+            ));
+        };
+        std::fs::create_dir_all(parent_path).map_err(|error| {
+            format!(
+                "failed to create the LPM home's parent directory {}: {error}",
+                parent_path.display()
+            )
+        })?;
+        let parent = Dir::open_ambient_dir(parent_path, ambient_authority()).map_err(|error| {
+            format!(
+                "failed to open the LPM home's parent directory {}: {error}",
+                parent_path.display()
+            )
+        })?;
+        Self::open_or_create_child(&parent, parent_path, name)
     }
 
     pub(crate) fn open_or_create_directory(&self, name: &str) -> Result<Self, String> {

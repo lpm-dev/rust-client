@@ -345,19 +345,8 @@ fn resolve_default_path() -> io::Result<PathBuf> {
     if let Ok(p) = env::var(PATH_ENV_VAR) {
         return Ok(PathBuf::from(p));
     }
-    let lpm_home = env::var_os("LPM_HOME").map(PathBuf::from).or_else(|| {
-        env::var_os("HOME").map(|h| {
-            let mut p = PathBuf::from(h);
-            p.push(".lpm");
-            p
-        })
-    });
-    let Some(root) = lpm_home else {
-        return Err(io::Error::other(
-            "cannot resolve LPM_HOME (no LPM_HOME and no HOME env var)",
-        ));
-    };
-    Ok(root.join("cache").join("l4-verdicts.json"))
+    let root = lpm_common::LpmRoot::from_env().map_err(io::Error::other)?;
+    Ok(root.cache_root().join("l4-verdicts.json"))
 }
 
 /// Inputs to the cache key for one package's classification. Mirrors

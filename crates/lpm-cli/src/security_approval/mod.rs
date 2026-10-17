@@ -147,16 +147,7 @@ fn test_native_auth_override() -> Option<String> {
 
 #[cfg(not(test))]
 fn keyring_account(base: &str) -> Result<String, lpm_common::LpmError> {
-    use sha2::Digest;
-
-    if std::env::var_os("LPM_HOME").is_none() {
-        return Ok(base.to_string());
-    }
-    let root = lpm_common::LpmRoot::from_env()?;
-    let digest = hex::encode(sha2::Sha256::digest(
-        root.root().display().to_string().as_bytes(),
-    ));
-    Ok(format!("{base}:{}", &digest[..16]))
+    Ok(lpm_common::LpmRoot::from_env()?.credential_service(base))
 }
 
 #[cfg(test)]
