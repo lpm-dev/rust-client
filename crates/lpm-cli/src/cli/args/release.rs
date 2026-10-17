@@ -53,7 +53,7 @@ pub(crate) enum ReleaseCommands {
         #[command(flatten)]
         selection: ReleaseSelectionArgs,
 
-        /// Bump level to use for every selected package unless .lpm/changes overrides it.
+        /// Bump level to use for every selected package unless lpm-changes overrides it.
         #[arg(long, value_parser = parse_version_bump)]
         bump: Option<VersionBump>,
     },
@@ -63,7 +63,7 @@ pub(crate) enum ReleaseCommands {
         #[command(flatten)]
         selection: ReleaseSelectionArgs,
 
-        /// Bump level to use for every selected package unless .lpm/changes overrides it.
+        /// Bump level to use for every selected package unless lpm-changes overrides it.
         #[arg(long, value_parser = parse_version_bump)]
         bump: Option<VersionBump>,
 

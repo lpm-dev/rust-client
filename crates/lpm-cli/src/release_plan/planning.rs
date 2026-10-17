@@ -70,7 +70,7 @@ pub(crate) fn plan_workspace_from_open_root(
         let manifest = read(&workspace.members[*index].path)?;
         let Some(bump) = bump_by_name.get(&manifest.name).or(default_bump) else {
             return Err(LpmError::Script(format!(
-                "no bump level provided for workspace package `{}`. Pass --bump or add .lpm/changes entries.",
+                "no bump level provided for workspace package `{}`. Pass --bump or add lpm-changes entries.",
                 manifest.name
             )));
         };
@@ -480,21 +480,143 @@ pub(super) fn replace_dependency_string(
     Ok(())
 }
 
-const MAX_CHANGE_FILES: usize = 10_000;
+pub(super) const MAX_CHANGE_FILES: usize = 10_000;
 const MAX_CHANGE_ENTRIES: usize = 100_000;
 const MAX_CHANGE_BYTES: u64 = 64 * 1024 * 1024;
 
-pub(crate) fn load_change_bumps(
+/// The workspace root directory that holds release change files.
+pub(crate) const CHANGES_DIR: &str = "lpm-changes";
+
+/// The release change files in [`CHANGES_DIR`] and the bumps they ask for.
+#[derive(Debug, Default)]
+pub(crate) struct ReleaseChanges {
+    pub(crate) bumps: HashMap<String, VersionBump>,
+    files: Vec<ChangeFile>,
+}
+
+#[derive(Debug)]
+struct ChangeFile {
+    name: std::ffi::OsString,
+    content: String,
+    /// The zero-based line and package of each entry.
+    entries: Vec<(usize, String)>,
+}
+
+/// What applying a release does to one change file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ChangeFileUpdate {
+    pub(crate) path: String,
+    pub(crate) applied: usize,
+    pub(crate) remaining: usize,
+}
+
+impl ReleaseChanges {
+    /// The change files that hold entries for `released` packages, and how
+    /// many entries applying the release removes from each.
+    pub(crate) fn updates_for(&self, released: &HashSet<&str>) -> Vec<ChangeFileUpdate> {
+        self.files
+            .iter()
+            .filter_map(|file| {
+                let applied = file
+                    .entries
+                    .iter()
+                    .filter(|(_, package)| released.contains(package.as_str()))
+                    .count();
+                (applied > 0).then(|| ChangeFileUpdate {
+                    path: format!("{CHANGES_DIR}/{}", file.name.to_string_lossy()),
+                    applied,
+                    remaining: file.entries.len() - applied,
+                })
+            })
+            .collect()
+    }
+
+    /// What applying the release writes to each change file that holds
+    /// entries for `released` packages: those entries removed, or the file
+    /// removed when no other entry stays, so the next release doesn't
+    /// apply them again. The release transaction makes these writes with
+    /// the manifests'.
+    pub(crate) fn writes_for(&self, released: &HashSet<&str>) -> Vec<ChangeFileWrite> {
+        self.files
+            .iter()
+            .filter_map(|file| {
+                let applied: HashSet<usize> = file
+                    .entries
+                    .iter()
+                    .filter(|(_, package)| released.contains(package.as_str()))
+                    .map(|(line, _)| *line)
+                    .collect();
+                if applied.is_empty() {
+                    return None;
+                }
+                let kept = (applied.len() != file.entries.len()).then(|| {
+                    file.content
+                        .split_inclusive('\n')
+                        .enumerate()
+                        .filter(|(line, _)| !applied.contains(line))
+                        .map(|(_, text)| text)
+                        .collect()
+                });
+                Some(ChangeFileWrite {
+                    name: file.name.clone(),
+                    original: file.content.clone(),
+                    kept,
+                })
+            })
+            .collect()
+    }
+}
+
+/// What a release does to one change file in [`CHANGES_DIR`]: replaces
+/// `original` with what is `kept` of it, or removes the file.
+#[derive(Debug, Clone)]
+pub(crate) struct ChangeFileWrite {
+    pub(crate) name: std::ffi::OsString,
+    pub(crate) original: String,
+    pub(crate) kept: Option<String>,
+}
+
+/// Reads a change file, refusing anything but a regular file.
+pub(super) fn read_change_file(
+    changes: &cap_std::fs::Dir,
+    name: &std::ffi::OsStr,
+    display: &str,
+) -> Result<String, LpmError> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _};
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No).nonblock(true);
+    let file = changes.open_with(name, &options).map_err(LpmError::Io)?;
+    let metadata = file.metadata().map_err(LpmError::Io)?;
+    if !metadata.is_file()
+        || crate::commands::publish_common::metadata_is_link_or_reparse(&metadata)
+    {
+        return Err(LpmError::Script(
+            "release changes require regular files".into(),
+        ));
+    }
+    lpm_common::read_text_file_capped_from_open_file_with_known_size(
+        file.into_std(),
+        Path::new(display),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+        metadata.len(),
+    )
+    .map_err(|error| LpmError::Script(format!("cannot read {display}: {error}")))
+}
+
+pub(crate) fn load_release_changes(
     workspace_root: &Path,
     root: &cap_std::fs::Dir,
-) -> Result<HashMap<String, VersionBump>, LpmError> {
+) -> Result<ReleaseChanges, LpmError> {
     use cap_fs_ext::{
         DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsSyncExt as _,
     };
-    let lpm = root.open_dir_nofollow(".lpm").map_err(LpmError::Io)?;
-    let changes = match lpm.open_dir_nofollow("changes") {
+    reject_changes_left_in_lpm_state(root)?;
+    let changes = match root.open_dir_nofollow(CHANGES_DIR) {
         Ok(directory) => directory,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ReleaseChanges::default());
+        }
         Err(error) => {
             return Err(LpmError::Script(format!(
                 "cannot open release changes directory: {error}"
@@ -502,6 +624,7 @@ pub(crate) fn load_change_bumps(
         }
     };
     let mut bumps = HashMap::new();
+    let mut files = Vec::new();
     let mut paths = Vec::new();
     let mut path_bytes = 0usize;
     for (index, entry) in changes.entries().map_err(LpmError::Io)?.enumerate() {
@@ -551,7 +674,7 @@ pub(crate) fn load_change_bumps(
             ));
         }
         let cap = lpm_common::CONFIG_FILE_SIZE_CAP_BYTES.min(MAX_CHANGE_BYTES - total_bytes);
-        let path = workspace_root.join(".lpm/changes").join(name);
+        let path = workspace_root.join(CHANGES_DIR).join(&name);
         let content = lpm_common::read_text_file_capped_from_open_file_with_known_size(
             file.into_std(),
             &path,
@@ -564,9 +687,34 @@ pub(crate) fn load_change_bumps(
             ))
         })?;
         total_bytes += content.len() as u64;
-        parse_change_file(&content, &path, &mut bumps, &mut records)?;
+        let mut entries = Vec::new();
+        parse_change_file(&content, &path, &mut bumps, &mut records, &mut entries)?;
+        files.push(ChangeFile {
+            name,
+            content,
+            entries,
+        });
     }
-    Ok(bumps)
+    Ok(ReleaseChanges { bumps, files })
+}
+
+/// Change files an older version read from `.lpm/changes/`, which is never
+/// committed, would otherwise be ignored without a word.
+fn reject_changes_left_in_lpm_state(root: &cap_std::fs::Dir) -> Result<(), LpmError> {
+    use cap_fs_ext::DirExt as _;
+
+    let Ok(state) = root.open_dir_nofollow(lpm_common::PROJECT_STATE_DIR) else {
+        return Ok(());
+    };
+    let Ok(legacy) = state.open_dir_nofollow("changes") else {
+        return Ok(());
+    };
+    if legacy.entries().map_err(LpmError::Io)?.next().is_some() {
+        return Err(LpmError::Script(format!(
+            "release change files live in {CHANGES_DIR}/ at the workspace root; move the files in .lpm/changes/ there (.lpm/ is never committed)"
+        )));
+    }
+    Ok(())
 }
 
 fn change_limit_error(kind: &str, limit: usize) -> LpmError {
@@ -580,6 +728,7 @@ pub(super) fn parse_change_file(
     path: &Path,
     bumps: &mut HashMap<String, VersionBump>,
     records: &mut usize,
+    entries: &mut Vec<(usize, String)>,
 ) -> Result<(), LpmError> {
     for (line_idx, line) in content.lines().enumerate() {
         let trimmed = line.trim();
@@ -609,6 +758,7 @@ pub(super) fn parse_change_file(
             )));
         }
         let bump = bump_raw.parse::<VersionBump>()?;
+        entries.push((line_idx, package.to_string()));
         if let Some(existing) = bumps.get(package) {
             if existing != &bump {
                 return Err(LpmError::Script(format!(

@@ -90,9 +90,12 @@ impl VersionTransactionScope {
         plan_manifest(manifest, bump)
     }
 
+    /// Writes the release's `manifests` and `change_files` in one
+    /// transaction.
     pub(crate) fn write_workspace(
         &self,
         manifests: &[PlannedManifest],
+        change_files: &[ChangeFileWrite],
         operation: ReleaseTransactionOperation,
     ) -> Result<(), LpmError> {
         self.validate()?;
@@ -114,6 +117,7 @@ impl VersionTransactionScope {
                 expected_version_parent: None,
             },
             resolved,
+            change_files,
             operation,
             None,
             write_manifest_target_durable,
@@ -152,6 +156,7 @@ impl VersionTransactionScope {
                 expected_version_parent: Some(self.project.try_clone().map_err(LpmError::Io)?),
             },
             resolved,
+            &[],
             operation,
             git,
             write_manifest_target_durable,
