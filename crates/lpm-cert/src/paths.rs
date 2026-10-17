@@ -807,6 +807,22 @@ impl ProjectCertDirectory {
         Ok(Some(ProjectCertMaterial { cert, key }))
     }
 
+    /// Refuses to write a private key where git tracks files, or where it
+    /// can't tell whether it does, git being unable to run in a repository
+    /// included: `.lpm`'s ignore file doesn't hide a tracked path, so the
+    /// next commit of the project would take the key.
+    fn reject_tracked_files(&self) -> Result<(), LpmError> {
+        let Some(project) = self.path.parent().and_then(Path::parent) else {
+            return Ok(());
+        };
+        let certs = format!("{}/certs", lpm_common::PROJECT_STATE_DIR);
+        tracked_certs_refusal(
+            project,
+            &certs,
+            lpm_common::project_git::tracked_entries(project, &[&certs]),
+        )
+    }
+
     pub(crate) fn write_pair(&self, cert: &[u8], key: &[u8]) -> Result<(), LpmError> {
         self.write_pair_with_failpoint(cert, key, || Ok(()))
     }
@@ -818,6 +834,7 @@ impl ProjectCertDirectory {
         after_first_replace: impl FnOnce() -> std::io::Result<()>,
     ) -> Result<(), LpmError> {
         crate::cert::validate_project_key_pair_bytes(cert, key)?;
+        self.reject_tracked_files()?;
         reject_linked_entry(&self.dir, "cert.pem")?;
         reject_linked_entry(&self.dir, "key.pem")?;
         let previous_cert = read_optional_relative_file(&self.dir, "cert.pem")?;
@@ -1415,6 +1432,48 @@ fn tighten_directory_permissions(_dir: &Dir, _label: &str) -> Result<(), LpmErro
     Ok(())
 }
 
+/// The first few of `names`, and how many more there are.
+/// What [`ProjectCertDirectory::reject_tracked_files`] makes of git's answer
+/// for `certs`, the certificate directory in `project`.
+fn tracked_certs_refusal(
+    project: &Path,
+    certs: &str,
+    probe: Result<Option<lpm_common::project_git::Tracked>, lpm_common::project_git::GitProbeError>,
+) -> Result<(), LpmError> {
+    use lpm_common::project_git::{GitProbeError, repository_marker_above};
+    match probe {
+        Ok(None) => Ok(()),
+        Err(GitProbeError::GitMissing(_)) if !repository_marker_above(project) => Ok(()),
+        Ok(Some(tracked)) if tracked.is_empty() => Ok(()),
+        Ok(Some(tracked)) => Err(LpmError::Cert(format!(
+            "git tracks {} in the project's .lpm, so the certificate's private key \
+             would go into the next commit. Run `{}` and commit, then retry",
+            listed(&tracked.entries),
+            tracked.untrack_command()
+        ))),
+        Err(GitProbeError::GitMissing(reason)) => Err(LpmError::Cert(format!(
+            "git could not be run ({reason}) in a project inside a git repository, so LPM \
+             can't tell whether git tracks files in the project's {certs}, and the \
+             certificate's private key could go into the next commit. Put git on PATH, then \
+             retry"
+        ))),
+        Err(GitProbeError::Failed(reason)) => Err(LpmError::Cert(format!(
+            "could not tell whether git tracks files in the project's {certs} ({reason}), \
+             so the certificate's private key could go into the next commit. Repair the \
+             repository, then retry"
+        ))),
+    }
+}
+
+fn listed(names: &[String]) -> String {
+    const SHOWN: usize = 3;
+    let shown = names[..names.len().min(SHOWN)].join(", ");
+    match names.len().saturating_sub(SHOWN) {
+        0 => shown,
+        more => format!("{shown} and {more} more"),
+    }
+}
+
 fn reject_linked_entry(dir: &Dir, name: &str) -> Result<(), LpmError> {
     match dir.symlink_metadata(name) {
         Ok(metadata) if metadata_is_link_or_reparse(&metadata) => Err(LpmError::Cert(format!(
@@ -1643,6 +1702,13 @@ pub(crate) fn reject_linked_project_cert_file(path: &Path) -> Result<(), LpmErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
 
     #[cfg(windows)]
     fn windows_acl_handle(path: &Path, directory: bool) -> std::fs::File {
@@ -2044,6 +2110,134 @@ mod tests {
         assert_eq!(actual_cert, old_cert.as_bytes());
         assert_eq!(actual_key, old_key.as_bytes());
         crate::cert::validate_project_key_pair_bytes(&actual_cert, &actual_key).unwrap();
+    }
+
+    #[test]
+    fn a_key_is_never_written_where_git_tracks_a_file() {
+        if !git_available() {
+            return;
+        }
+        let project = tempfile::tempdir().unwrap();
+        let placeholder = project.path().join(".lpm/certs/key.pem");
+        std::fs::create_dir_all(placeholder.parent().unwrap()).unwrap();
+        std::fs::write(&placeholder, "placeholder").unwrap();
+        for args in [&["init", "-q"][..], &["add", "-f", ".lpm/certs/key.pem"]] {
+            let status = lpm_common::project_git::hardened_git_command(project.path(), args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+        let cert_dir = open_project_cert_directory(project.path(), true)
+            .unwrap()
+            .unwrap();
+        let (root_cert, root_key) = crate::ca::generate_ca().unwrap();
+        let (cert, key) = crate::cert::generate_project_cert(&root_cert, &root_key, &[]).unwrap();
+
+        let error = cert_dir
+            .write_pair(cert.as_bytes(), key.as_bytes())
+            .unwrap_err();
+
+        assert!(error.to_string().contains(".lpm/certs/key.pem"), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("`git -C ") && message.contains(" rm --cached -- .lpm/certs/key.pem`"),
+            "{message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&placeholder).unwrap(),
+            "placeholder"
+        );
+    }
+
+    #[test]
+    fn a_key_is_never_written_where_git_tracks_the_directory_in_another_case() {
+        if !git_available() {
+            return;
+        }
+        let project = tempfile::tempdir().unwrap();
+        let placeholder = project.path().join(".LPM/certs/key.pem");
+        std::fs::create_dir_all(placeholder.parent().unwrap()).unwrap();
+        std::fs::write(&placeholder, "placeholder").unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "core.ignorecase", "true"],
+            &["add", "-f", ".LPM/certs/key.pem"],
+        ] {
+            let status = lpm_common::project_git::hardened_git_command(project.path(), args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+        // Where the disk tells `.LPM` from `.lpm`, the key goes into a file
+        // git doesn't track.
+        if !project.path().join(".lpm/certs/key.pem").exists() {
+            return;
+        }
+        let cert_dir = open_project_cert_directory(project.path(), true)
+            .unwrap()
+            .unwrap();
+        let (root_cert, root_key) = crate::ca::generate_ca().unwrap();
+        let (cert, key) = crate::cert::generate_project_cert(&root_cert, &root_key, &[]).unwrap();
+
+        let error = cert_dir
+            .write_pair(cert.as_bytes(), key.as_bytes())
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("rm --cached -- .LPM/certs/key.pem"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&placeholder).unwrap(),
+            "placeholder"
+        );
+    }
+
+    #[test]
+    fn a_key_is_never_written_where_git_can_t_tell_what_it_tracks() {
+        if !git_available() {
+            return;
+        }
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join(".git"), "gitdir: ../gone/.git\n").unwrap();
+        let cert_dir = open_project_cert_directory(project.path(), true)
+            .unwrap()
+            .unwrap();
+        let (root_cert, root_key) = crate::ca::generate_ca().unwrap();
+        let (cert, key) = crate::cert::generate_project_cert(&root_cert, &root_key, &[]).unwrap();
+
+        let error = cert_dir
+            .write_pair(cert.as_bytes(), key.as_bytes())
+            .unwrap_err();
+
+        assert!(error.to_string().contains("could not tell"), "{error}");
+        assert!(!project.path().join(".lpm/certs/key.pem").exists());
+    }
+
+    #[test]
+    fn a_key_is_never_written_where_git_can_t_be_run_in_a_repository() {
+        use lpm_common::project_git::GitProbeError;
+        let missing = || {
+            Err(GitProbeError::GitMissing(
+                "No such file or directory".into(),
+            ))
+        };
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repository.path().join(".git")).unwrap();
+
+        let error = tracked_certs_refusal(repository.path(), ".lpm/certs", missing()).unwrap_err();
+        assert!(
+            error.to_string().contains("git could not be run"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("Put git on PATH"), "{error}");
+
+        let outside = tempfile::tempdir().unwrap();
+        if !lpm_common::project_git::repository_marker_above(outside.path()) {
+            assert!(tracked_certs_refusal(outside.path(), ".lpm/certs", missing()).is_ok());
+        }
     }
 
     #[test]
