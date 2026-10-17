@@ -102,9 +102,8 @@ pub mod setup;
 /// present in the token but DISABLED, and AppContainer denies the
 /// matching resources as if it weren't listed.
 ///
-/// windows-sys exposes this constant under `Win32_System_SystemServices`
-/// which we don't otherwise need; inlining the literal mirrors the
-/// `SE_GROUP_INTEGRITY` pattern in [`crate::windows`].
+/// windows-sys exposes this constant under `Win32_System_SystemServices`,
+/// which we don't otherwise need, so the literal is inlined.
 const SE_GROUP_ENABLED: u32 = 0x0000_0004;
 // WinNT's ACCESS_ALLOWED_ACE_TYPE. windows-sys exposes it through
 // SystemServices, which would otherwise add an unused feature namespace.
@@ -1010,8 +1009,7 @@ fn grant_dacl_ace_to_tree(
     strict_root: bool,
 ) -> Result<(), AppContainerError> {
     // The root must exist + must not be a reparse point. Missing
-    // paths are silently skipped (matches windows.rs's existing
-    // posture for the SACL walker).
+    // paths are silently skipped.
     let meta = match std::fs::symlink_metadata(root) {
         Ok(m) => m,
         Err(_) => {

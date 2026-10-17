@@ -1,21 +1,12 @@
-//! Parent-side wiring for the AppContainer backend.
+//! Parent-side wiring for the Windows backend.
 //!
 //! This is the half that lives in the `lpm.exe` process — it builds
 //! the helper argv from a [`SandboxedCommand`] and spawns
 //! `lpm-sandbox-helper.exe`, which in turn does the AppContainer
 //! dance (see [`crate::helper_appcontainer`] for the helper-side
-//! mechanism).
-//!
-//! ## Why a separate module
-//!
-//! The [`crate::windows::WindowsSandbox`] stays UNTOUCHED
-//! () — its `decide_posture` table refuses
-//! strict-without-degraded, which is the right answer for the Low
-//! IL fallback path. AppContainer's posture is different: it
-//! always delivers strict (filesystem + network) when requested.
-//! The factory in [`crate`]-side `platform_backend` picks between
-//! the two backends based on whether
-//! [`locate_sandbox_helper`] finds a helper binary.
+//! mechanism). Lifecycle scripts on Windows run only this way: without
+//! the helper, [`locate_sandbox_helper`] refuses with
+//! [`SandboxError::HelperMissing`] rather than run them less contained.
 //!
 //! ## What this module DOES touch in the parent
 //!
@@ -25,8 +16,8 @@
 //! - Captures the MSVC build environment once per process via
 //!   `vcvarsall.bat` so AppContainer'd `node-gyp rebuild` keeps
 //!   working without the COM-denied `vswhere` lookup.
-//! - Probes for the helper binary location (npm sibling, env var
-//!   override) and falls back gracefully if it's missing.
+//! - Probes for the helper binary location (env var override, then the
+//!   directory of the running executable).
 //!
 //! All AppContainer-specific Win32 calls happen INSIDE the helper
 //! — this module is plain `Command::spawn` against an argv vector.
@@ -64,10 +55,7 @@ fn appcontainer_name_for_invocation() -> String {
 
 // ── Backend struct ───────────────────────────────────────────────────
 
-/// AppContainer backend. Constructed by
-/// the factory in [`crate`]-side `platform_backend` when the helper
-/// binary is reachable; otherwise the factory falls back to
-/// [`crate::windows::WindowsSandbox`] (the Low IL path).
+/// AppContainer backend, the one Windows backend.
 #[derive(Debug)]
 pub(crate) struct AppContainerSandbox {
     spec: SandboxSpec,
@@ -79,9 +67,8 @@ pub(crate) struct AppContainerSandbox {
 /// Internal posture tag for the AppContainer backend. Strict means
 /// "no capabilities → full default-deny including outbound network";
 /// Default means "InternetClient capability granted → outbound
-/// network allowed". Unlike the Low IL backend, there is
-/// no `Degraded` variant — AppContainer delivers full strict
-/// (filesystem + network) when requested.
+/// network allowed". There is no `Degraded` variant — AppContainer
+/// delivers full strict (filesystem + network) when requested.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackendPosture {
     /// `deny_outbound_network = false`. Capability list contains
@@ -93,29 +80,21 @@ pub(crate) enum BackendPosture {
 }
 
 impl AppContainerSandbox {
-    /// Construct the backend. `helper_path` is the absolute path to
-    /// `lpm-sandbox-helper.exe` resolved by [`locate_sandbox_helper`].
+    /// Construct the backend, which needs `lpm-sandbox-helper.exe`
+    /// ([`locate_sandbox_helper`]).
     pub(crate) fn new(
         spec: SandboxSpec,
         mode: SandboxMode,
         options: SandboxOptions,
-        helper_path: PathBuf,
     ) -> Result<Self, SandboxError> {
         match mode {
-            SandboxMode::Enforce => {
-                let posture = decide_appcontainer_posture(
-                    options.deny_outbound_network,
-                    options.allow_degraded,
-                );
-                Ok(Self {
-                    spec,
-                    mode,
-                    posture,
-                    helper_path,
-                })
-            }
-            // Same shape as the WindowsSandbox backend: no native
-            // AppContainer "audit-only" primitive, so LogOnly
+            SandboxMode::Enforce => Ok(Self {
+                helper_path: locate_sandbox_helper()?,
+                spec,
+                mode,
+                posture: decide_appcontainer_posture(options.deny_outbound_network),
+            }),
+            // No native AppContainer "audit-only" primitive, so LogOnly
             // surfaces with a clear pointer to --no-sandbox.
             SandboxMode::LogOnly => Err(SandboxError::ModeNotSupportedOnPlatform {
                 platform: "windows".to_string(),
@@ -138,23 +117,10 @@ impl AppContainerSandbox {
     }
 }
 
-/// Posture decision. Pure (inputs in, outcome out).
-///
-/// Unlike [`crate::windows::decide_posture`], this function never
-/// refuses — AppContainer can deliver full strict on every
-/// Windows host that has the helper binary. `allow_degraded` is
-/// accepted for symmetry with the Low IL backend's signature but
-/// unused: there is no "fall back to filesystem-only" arm in the
-/// AppContainer path.
-///
-/// Keeping the two backends' decisions separate (rather than
-/// editing the function in place) preserves the Low IL
-/// fallback's strict-without-degraded refusal contract — see plan
-///
-pub(crate) fn decide_appcontainer_posture(
-    deny_outbound_network: bool,
-    _allow_degraded: bool,
-) -> BackendPosture {
+/// Posture decision. Pure (inputs in, outcome out). Never refuses:
+/// AppContainer delivers strict on every Windows host the helper runs on,
+/// so `allow-degraded` has nothing to fall back to here.
+pub(crate) fn decide_appcontainer_posture(deny_outbound_network: bool) -> BackendPosture {
     if deny_outbound_network {
         BackendPosture::Strict
     } else {
@@ -226,7 +192,7 @@ impl Sandbox for AppContainerSandbox {
         }
         // Narrow-write grants mirror the macOS/Linux writable set.
         // The helper applies these after reads so overlaps keep R+W+X.
-        for dir in crate::windows::writable_allow_set(&self.spec) {
+        for dir in writable_allow_set(&self.spec) {
             helper_cmd.arg("--writable-dir").arg(dir);
         }
         for path in secret_read_denied_paths {
@@ -381,17 +347,38 @@ fn stdio_for_argv(s: SandboxStdio) -> StdioMode {
 /// ACE that AppContainer processes match by default, so no extra
 /// grant is needed.
 ///
-/// `project_dir` is the broad-tree readable root mentioned in the
-/// The narrow writable subset within it
-/// (`node_modules`, `.husky`, `.lpm`) lives in
-/// [`crate::windows::writable_allow_set`]; DACLs are additive so
-/// overlap is fine.
+/// The writable directories in the project ([`writable_allow_set`]) are
+/// granted after these; DACLs are additive, so an overlap keeps write
+/// access.
 pub(crate) fn readable_allow_set(spec: &SandboxSpec) -> Vec<PathBuf> {
     let mut out = Vec::with_capacity(2);
     out.extend(crate::project_reads::allowed_project_reads(spec));
     out.extend(spec.dependency_read_dirs.iter().cloned());
     let nvm = spec.home_dir.join(".nvm").join("versions");
     out.push(nvm);
+    out
+}
+
+/// The directories the lifecycle child may write, in a fixed order: the
+/// package's own directory first, then the project's `node_modules` and
+/// `.husky`, the package's layout directory in `.lpm` when it has one
+/// ([`crate::package_layout_write_dir`]), the per-user caches, the scratch
+/// directory, and `sandboxWriteDirs` last. Matches the macOS Seatbelt
+/// `file-write*` block and the Linux landlock read-write rules.
+pub(crate) fn writable_allow_set(spec: &SandboxSpec) -> Vec<PathBuf> {
+    let mut out = Vec::with_capacity(8 + spec.extra_write_dirs.len());
+    out.push(spec.package_dir.clone());
+    out.push(spec.project_dir.join("node_modules"));
+    out.push(spec.project_dir.join(".husky"));
+    out.extend(crate::package_layout_write_dir(
+        &spec.project_dir,
+        &spec.package_dir,
+    ));
+    out.push(spec.home_dir.join(".cache"));
+    out.push(spec.home_dir.join(".node-gyp"));
+    out.push(spec.home_dir.join(".npm"));
+    out.push(spec.tmpdir.clone());
+    out.extend(spec.extra_write_dirs.iter().cloned());
     out
 }
 
@@ -469,31 +456,21 @@ fn is_under_system_root(candidate: &std::path::Path, system_root: &std::path::Pa
 
 // ── Helper locator ───────────────────────────────────────────────────
 
-/// Find `lpm-sandbox-helper.exe`. Two-step probe:
-///
-/// 1. `LPM_SANDBOX_HELPER` env override (used by integration tests
-///    and advanced deployments).
-/// 2. Sibling of [`std::env::current_exe`] — the npm package
-///    layout places `lpm-sandbox-helper.exe` next to `lpm.exe`.
-///
-/// Returns `None` when neither is reachable; the caller falls back
-/// to the Low IL backend.
-pub fn locate_sandbox_helper() -> Option<PathBuf> {
-    if let Some(raw) = std::env::var_os("LPM_SANDBOX_HELPER") {
-        let p = PathBuf::from(raw);
-        if p.exists() {
-            return Some(p);
-        }
+const HELPER_FILE_NAME: &str = "lpm-sandbox-helper.exe";
+
+/// Find `lpm-sandbox-helper.exe`: the file `LPM_SANDBOX_HELPER` names, else
+/// the one beside the running executable, where the npm package puts it.
+pub(crate) fn locate_sandbox_helper() -> Result<PathBuf, SandboxError> {
+    let overridden = std::env::var_os("LPM_SANDBOX_HELPER").map(PathBuf::from);
+    let beside = std::env::current_exe().ok().and_then(|exe| {
+        exe.parent()
+            .map(|directory| directory.join(HELPER_FILE_NAME))
+    });
+    let searched: Vec<PathBuf> = overridden.into_iter().chain(beside).collect();
+    match searched.iter().find(|path| path.is_file()) {
+        Some(path) => Ok(path.clone()),
+        None => Err(SandboxError::HelperMissing { searched }),
     }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(parent) = exe.parent()
-    {
-        let candidate = parent.join("lpm-sandbox-helper.exe");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
 }
 
 // ── MSVC toolchain env capture ───────────────────────────────────
@@ -752,28 +729,57 @@ mod tests {
 
     #[test]
     fn decide_appcontainer_posture_strict_when_deny_outbound_set() {
-        let p = decide_appcontainer_posture(true, false);
-        assert_eq!(p, BackendPosture::Strict);
+        assert_eq!(decide_appcontainer_posture(true), BackendPosture::Strict);
     }
 
     #[test]
     fn decide_appcontainer_posture_default_when_deny_outbound_unset() {
-        let p = decide_appcontainer_posture(false, false);
-        assert_eq!(p, BackendPosture::Default);
+        assert_eq!(decide_appcontainer_posture(false), BackendPosture::Default);
     }
 
     #[test]
-    fn decide_appcontainer_posture_ignores_allow_degraded() {
-        // AppContainer delivers full strict regardless of
-        // allow_degraded — the flag only matters for the Low IL
-        // fallback path.
-        for ag in [false, true] {
-            assert_eq!(
-                decide_appcontainer_posture(true, ag),
-                BackendPosture::Strict,
-                "allow_degraded={ag} should not affect AppContainer posture",
-            );
-        }
+    fn writable_set_grants_the_package_but_not_project_state() {
+        let spec = make_spec();
+        let set = writable_allow_set(&spec);
+        assert_eq!(
+            set,
+            vec![
+                spec.package_dir.clone(),
+                spec.project_dir.join("node_modules"),
+                spec.project_dir.join(".husky"),
+                spec.home_dir.join(".cache"),
+                spec.home_dir.join(".node-gyp"),
+                spec.home_dir.join(".npm"),
+                spec.tmpdir.clone(),
+            ]
+        );
+    }
+
+    #[test]
+    fn writable_set_adds_the_package_s_own_layout_directory_and_extras_last() {
+        let mut spec = make_spec();
+        spec.package_dir = spec
+            .project_dir
+            .join(".lpm")
+            .join("wrappers")
+            .join("pkg@1.0.0")
+            .join("node_modules")
+            .join("pkg");
+        spec.extra_write_dirs = vec![PathBuf::from("C:/extra1"), PathBuf::from("C:/extra2")];
+        let set = writable_allow_set(&spec);
+
+        let wrapper = spec
+            .project_dir
+            .join(".lpm")
+            .join("wrappers")
+            .join("pkg@1.0.0");
+        assert_eq!(set[3], wrapper);
+        assert!(!set.contains(&spec.project_dir.join(".lpm")));
+        assert!(!set.contains(&spec.project_dir.join(".lpm").join("wrappers")));
+        assert_eq!(
+            set[set.len() - 2..],
+            [PathBuf::from("C:/extra1"), PathBuf::from("C:/extra2")]
+        );
     }
 
     #[test]
@@ -818,28 +824,33 @@ mod tests {
             std::env::remove_var("LPM_SANDBOX_HELPER");
         }
         assert_eq!(
-            located,
+            located.ok(),
             Some(path),
             "LPM_SANDBOX_HELPER override must win when the named file exists",
         );
     }
 
     #[test]
-    fn locate_sandbox_helper_falls_back_to_sibling_or_none_when_env_invalid() {
-        // Point the env override at a guaranteed-nonexistent path;
-        // the locator should ignore it and fall through to the
-        // sibling probe. The sibling probe MAY succeed in a `cargo
-        // run` context if cargo placed `lpm-sandbox-helper.exe`
-        // next to the test binary; we just assert no panic.
+    fn a_missing_helper_is_refused_naming_every_place_looked() {
+        let overridden = PathBuf::from(r"C:\does-not-exist\lpm-sandbox-helper.exe");
         unsafe {
-            std::env::set_var(
-                "LPM_SANDBOX_HELPER",
-                r"C:\does-not-exist\lpm-sandbox-helper.exe",
-            );
+            std::env::set_var("LPM_SANDBOX_HELPER", &overridden);
         }
-        let _ = locate_sandbox_helper();
+        let located = locate_sandbox_helper();
         unsafe {
             std::env::remove_var("LPM_SANDBOX_HELPER");
+        }
+        let beside = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(HELPER_FILE_NAME);
+        match located {
+            Ok(path) => assert_eq!(path, beside, "only the file beside the test may be found"),
+            Err(SandboxError::HelperMissing { searched }) => {
+                assert_eq!(searched, vec![overridden, beside]);
+            }
+            Err(other) => panic!("expected HelperMissing, got {other:?}"),
         }
     }
 

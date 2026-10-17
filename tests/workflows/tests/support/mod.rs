@@ -896,8 +896,8 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
     // `cargo test -p lpm-workflows` without a prior workspace build).
     // Set `LPM_SANDBOX_HELPER` explicitly when the helper exists so
     // workflow tests exercise the AppContainer backend whenever the
-    // binary is actually built; tests that intentionally want the
-    // Low IL fallback can override or unset.
+    // binary is actually built; tests that want a missing helper can
+    // override or unset it.
     #[cfg(target_os = "windows")]
     if let Some(helper) = locate_test_sandbox_helper() {
         cmd.set_env("LPM_SANDBOX_HELPER", helper.as_os_str());
