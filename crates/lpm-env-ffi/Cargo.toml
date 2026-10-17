@@ -5,12 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Versioned static C ABI for authoritative native env schema validation"
+description = "Versioned static C ABI for authoritative native env schema validation and GitHub Actions secret sealing"
 
 [lib]
 crate-type = ["staticlib"]
 
 [dependencies]
+crypto_box.workspace = true
 lpm-env.workspace = true
 lpm-env-source.workspace = true
 serde.workspace = true

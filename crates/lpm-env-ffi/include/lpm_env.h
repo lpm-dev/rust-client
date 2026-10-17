@@ -6,6 +6,7 @@
 #define LPM_ENV_ABI_VERSION 1
 #define LPM_ENV_INPUT_LIMIT (2 * 1024 * 1024)
 #define LPM_ENV_OUTPUT_LIMIT (8 * 1024 * 1024)
+#define LPM_ENV_SEAL_INPUT_LIMIT (64 * 1024)
 
 typedef struct LPMEnvSnapshot LPMEnvSnapshot;
 typedef struct {
@@ -42,6 +43,13 @@ uint32_t lpm_env_verify(const LPMEnvSnapshot *snapshot);
  * ignores case, 2=invalid input, 3=panic, 4=work or output limit. */
 LPMEnvResult lpm_env_check(const uint8_t *schema, size_t schema_length,
                          const uint8_t *input, size_t input_length);
+/* Encrypt plaintext as a libsodium sealed box (crypto_box_seal) to a 32-byte
+ * Curve25519 public key, the form GitHub requires for an Actions secret. Output:
+ * the ephemeral public key then the box, plaintext_length + 48 bytes. plaintext
+ * may be null only when plaintext_length is 0; at most LPM_ENV_SEAL_INPUT_LIMIT.
+ * status: 0=sealed, 2=invalid input, 3=failure or panic. */
+LPMEnvResult lpm_env_seal_box(const uint8_t *public_key, size_t public_key_length,
+                            const uint8_t *plaintext, size_t plaintext_length);
 /* Release only the output buffer after decoding; the snapshot stays live.
  * Exclusively borrow result. Clears data/length; repeated calls are harmless.
  * A matching lpm_env_release is still required for the result. */
