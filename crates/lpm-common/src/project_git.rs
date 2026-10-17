@@ -262,6 +262,40 @@ pub fn repository_marker_above(dir: &Path) -> bool {
         .any(|directory| std::fs::symlink_metadata(directory.join(".git")).is_ok())
 }
 
+/// [`repository_marker_above`] for [`tracked_entries_in_any_repository`]:
+/// a `.git` at or above `dir`, or in a directory on the way from `dir` to
+/// one of `paths`.
+pub fn repository_marker_around(dir: &Path, paths: &[&str]) -> bool {
+    repository_marker_above(dir)
+        || paths.iter().any(|path| {
+            nested_candidates(dir, path)
+                .into_iter()
+                .any(|(directory, _)| std::fs::symlink_metadata(directory.join(".git")).is_ok())
+        })
+}
+
+/// [`tracked_entries`] for `paths` in `dir`, asked of every index that can
+/// list them, as [`indexes_listing`] finds them: the repositories that
+/// track something come back, each once. `None` when no work tree holds
+/// `dir` or any directory on the way to the paths.
+pub fn tracked_entries_in_any_repository(
+    dir: &Path,
+    paths: &[&str],
+) -> Result<Option<Vec<Tracked>>, GitProbeError> {
+    let indexes = indexes_listing(dir, paths, None)?;
+    if indexes.is_empty() {
+        return Ok(None);
+    }
+    let mut found = Vec::new();
+    for index in &indexes {
+        let tracked = index.tracked()?;
+        if !tracked.entries.is_empty() {
+            found.push(tracked);
+        }
+    }
+    Ok(Some(found))
+}
+
 /// The bytes git's index holds at stage 0 for `entry`, a path relative to
 /// the work tree `root`, as stored: no filter or conversion runs. Fails for
 /// an entry with conflicts, which has no stage 0, and past `limit` bytes.
@@ -358,8 +392,26 @@ fn tracked_entries_in_where(
     let root = root.clone();
     let mut queried: Vec<String> = paths
         .iter()
-        .map(|path| format!("{prefix}{}", path.trim_end_matches('/')))
+        .map(|path| format!("{prefix}{path}").trim_end_matches('/').to_owned())
         .collect();
+    // An empty path is the whole work tree, whose every entry counts.
+    if queried.iter().any(String::is_empty) {
+        let listed = run_git(&root, &["ls-files", "-z", "--cached"])?;
+        if !listed.status.success() {
+            return Err(GitProbeError::Failed(git_failure(&listed)));
+        }
+        let entries: Vec<String> = listed
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| String::from_utf8_lossy(entry).into_owned())
+            .collect();
+        return Ok(Tracked {
+            root,
+            spellings: vec![".".to_owned(); entries.len()],
+            entries,
+        });
+    }
     // A path asked by another name than the disk's, an NTFS short name or a
     // linked directory, is asked for under the disk's name too.
     for index in 0..queried.len() {
@@ -1885,6 +1937,103 @@ mod tests {
         }
         assert!(indexed_blob(dir, "untracked.json", 64).is_err());
         assert!(indexed_blob(dir, "lpm.json", 3).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_tracked_under_another_case_counts_though_it_leads_nowhere() {
+        use std::os::unix::fs::MetadataExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let dir = directory.path();
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "core.ignorecase", "false"]);
+        std::os::unix::fs::symlink("missing-target", dir.join(".ENV")).unwrap();
+        git(dir, &["add", "--", ".ENV"]);
+        let same_entry = std::fs::symlink_metadata(dir.join(".env")).is_ok_and(|lower| {
+            std::fs::symlink_metadata(dir.join(".ENV")).unwrap().ino() == lower.ino()
+        });
+        if !same_entry {
+            return;
+        }
+
+        let tracked = tracked_entries(dir, &[".env"]).unwrap().unwrap();
+
+        assert_eq!(tracked.entries, [".ENV"]);
+    }
+
+    #[test]
+    fn asks_each_repository_on_the_way_to_a_path_once() {
+        let outside = tempfile::tempdir().unwrap();
+        assert_eq!(
+            tracked_entries_in_any_repository(outside.path(), &[".lpm/certs"]).unwrap(),
+            None
+        );
+
+        let state_repository = tempfile::tempdir().unwrap();
+        let state = state_repository.path().join(".lpm");
+        std::fs::create_dir_all(state.join("certs")).unwrap();
+        std::fs::write(state.join("certs/key.pem"), "placeholder").unwrap();
+        git(&state, &["init", "-q"]);
+        git(&state, &["add", "certs/key.pem"]);
+        let found = tracked_entries_in_any_repository(state_repository.path(), &[".lpm/certs"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].entries, ["certs/key.pem"]);
+
+        let project = tempfile::tempdir().unwrap();
+        let state = project.path().join(".lpm");
+        std::fs::create_dir_all(state.join("certs")).unwrap();
+        std::fs::write(state.join("certs/key.pem"), "placeholder").unwrap();
+        git(project.path(), &["init", "-q"]);
+        git(project.path(), &["add", "-f", ".lpm/certs/key.pem"]);
+        // Git looks past an empty `.git` directory to the project's repository.
+        std::fs::create_dir(state.join(".git")).unwrap();
+        let found = tracked_entries_in_any_repository(project.path(), &[".lpm/certs"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].entries, [".lpm/certs/key.pem"]);
+        assert_eq!(
+            repository_marker_around(outside.path(), &[".lpm/certs"]),
+            repository_marker_above(outside.path())
+        );
+        assert!(repository_marker_around(project.path(), &[".lpm/certs"]));
+    }
+
+    #[test]
+    fn asks_the_index_around_a_repository_made_inside_its_work_tree() {
+        let outer = tempfile::tempdir().unwrap();
+        let project = outer.path().join("apps/web");
+        std::fs::create_dir_all(project.join(".lpm/certs")).unwrap();
+        std::fs::write(project.join(".lpm/certs/key.pem"), "placeholder").unwrap();
+        git(outer.path(), &["init", "-q"]);
+        git(outer.path(), &["add", "-f", "apps/web/.lpm/certs/key.pem"]);
+        git(&project, &["init", "-q"]);
+        git(&project.join(".lpm"), &["init", "-q"]);
+
+        let found = tracked_entries_in_any_repository(&project, &[".lpm/certs"])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].entries, ["apps/web/.lpm/certs/key.pem"]);
+        assert_eq!(
+            found[0].root.canonicalize().unwrap(),
+            outer.path().canonicalize().unwrap()
+        );
+        let indexes = indexes_listing(&project, &[".lpm/certs"], None).unwrap();
+        assert_eq!(
+            indexes
+                .iter()
+                .map(|index| (index.found, index.paths.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (Found::Holding, vec![".lpm/certs".to_owned()]),
+                (Found::Nested { depth: 1 }, vec!["certs".to_owned()]),
+                (Found::Around, vec!["apps/web/.lpm/certs".to_owned()]),
+            ]
+        );
     }
 
     #[test]
