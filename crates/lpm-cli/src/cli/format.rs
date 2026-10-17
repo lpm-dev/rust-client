@@ -874,6 +874,9 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             error,
         ),
         lpm_common::LpmError::Store(reason) => diagnostic_lines("Store error", Some(reason), error),
+        lpm_common::LpmError::ProjectFile(reason) => {
+            diagnostic_lines("Project file error", Some(reason), error)
+        }
         lpm_common::LpmError::ProjectLayout(reason) => {
             diagnostic_lines("Project layout error", Some(reason), error)
         }

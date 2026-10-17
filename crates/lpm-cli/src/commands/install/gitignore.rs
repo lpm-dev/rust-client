@@ -123,25 +123,13 @@ const LEGACY_GITIGNORE_BLOCKS: [(&[u8], &[u8]); 6] = [
 /// that is a link or not a regular file is left alone.
 pub(super) fn remove_legacy_gitignore_entries(project_dir: &Path, json_output: bool) {
     let path = project_dir.join(".gitignore");
-    let Ok((content, _)) =
-        lpm_common::read_file_capped_unlinked(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-    else {
-        return;
-    };
-    let Some(cleaned) = without_legacy_gitignore_blocks(&content) else {
-        return;
-    };
-    let result = if cleaned.iter().all(u8::is_ascii_whitespace) {
-        std::fs::remove_file(&path)
-    } else {
-        lpm_common::write_file_atomic(&path, &cleaned)
-    };
-    match result {
-        Ok(()) if !json_output => output::info_line(crate::install_ui::terminal_line!(
+    match lpm_common::project_secret::rewrite_ignore_file(&path, without_legacy_gitignore_blocks) {
+        Ok(lpm_common::project_secret::IgnoreRewrite::Unchanged) => {}
+        Ok(_) if !json_output => output::info_line(crate::install_ui::terminal_line!(
             "removed LPM's old entries from {} — .lpm/ now keeps itself out of git",
             install_ui::dim(&path.display().to_string()),
         )),
-        Ok(()) => {}
+        Ok(_) => {}
         Err(error) => tracing::warn!(
             path = %path.display(),
             %error,

@@ -192,6 +192,15 @@ pub(super) fn vars_init(
         });
     }
     let action_results = perform_init_actions(project_dir, &actions, force, snapshot)?;
+    let mut warnings = Vec::new();
+    for (action, result) in actions.iter().zip(&action_results) {
+        if result.file_exists {
+            warnings.extend(super::local::keep_env_source_ignored(
+                project_dir,
+                &project_dir.join(&action.file_path),
+            )?);
+        }
+    }
 
     let json_actions = json_output.then(|| {
         actions
@@ -290,6 +299,7 @@ pub(super) fn vars_init(
                 "environments": json_actions.unwrap_or_default(),
                 "actions": results,
                 "skipped": admitted.skipped,
+                "warnings": warnings,
             })
         );
         return Ok(());
@@ -348,6 +358,7 @@ pub(super) fn vars_init(
     } else {
         output::info("vault already initialized — nothing to do");
     }
+    super::local::print_secret_file_warnings(&warnings);
     println!();
 
     Ok(())

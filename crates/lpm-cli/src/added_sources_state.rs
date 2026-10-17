@@ -327,29 +327,19 @@ fn move_without_replacing_with(
                 cap_std::fs::Dir::open_ambient_dir(directory, cap_std::ambient_authority())
                     .map_err(moved)?;
             let mut source = backups.open(from).map_err(moved)?;
-            let mut options = cap_std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use cap_std::fs::OpenOptionsExt as _;
-                options.mode(0o600);
+            let published = lpm_common::atomic_write::create_file_atomic_in_dir_with_options(
+                &backups,
+                to,
+                lpm_common::AtomicWriteOptions::new()
+                    .owner_only()
+                    .sync_file()
+                    .sync_parent(),
+                |copy| std::io::copy(&mut source, copy).map(|_| ()),
+            )
+            .map_err(moved)?;
+            if published.is_none() {
+                return Ok(());
             }
-            let mut copy = match backups.open_with(to, &options) {
-                Ok(copy) => copy,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-                Err(error) => return Err(moved(error)),
-            };
-            if let Err(error) = std::io::copy(&mut source, &mut copy).and_then(|_| copy.sync_all())
-            {
-                drop(copy);
-                // The partial copy is this call's own: `create_new` made it.
-                let _ = backups.remove_file(to);
-                return Err(moved(error));
-            }
-            #[cfg(unix)]
-            std::fs::File::open(directory)
-                .and_then(|directory| directory.sync_all())
-                .map_err(moved)?;
         }
     }
     std::fs::remove_file(directory.join(from)).map_err(moved)

@@ -37,5 +37,6 @@ expression: value
       "alias": "test:unit",
       "error": "environment alias \"test:unit\" resolves to \"test:unit\": environment name may only contain a-z, 0-9, hyphens, underscores, and dots. Use a portable alias; select it through tasks.<name>.env"
     }
-  ]
+  ],
+  "warnings": []
 }

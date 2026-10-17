@@ -14,7 +14,7 @@ const NAMED_FILES: usize = 3;
 /// or build state can hide the warnings they exist to raise. No row when
 /// git can't answer or the project isn't in a repository.
 pub(super) fn check_project_state_tracked(project_dir: &Path) -> Option<Check> {
-    let mut command = crate::project_git::hardened_git_command(
+    let mut command = lpm_common::project_git::hardened_git_command(
         project_dir,
         &["ls-files", "-z", "--cached", "--", ".lpm"],
     );

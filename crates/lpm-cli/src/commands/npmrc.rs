@@ -1,5 +1,4 @@
 use crate::install_ui;
-use crate::project_git::{GitDiscoveryFailure, git_discovery_failure, hardened_git_command};
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 use rand::RngCore;
@@ -120,22 +119,16 @@ struct PendingSetupToken {
 
 #[derive(Clone, Copy)]
 struct SetupRollback<'a> {
-    gitignore_path: &'a Path,
-    expected_gitignore: &'a str,
-    original_gitignore: Option<&'a str>,
+    gitignore: Option<(&'a Path, &'a str, Option<&'a str>)>,
     npmrc: Option<(&'a Path, &'a str, Option<&'a str>)>,
 }
 
 impl<'a> SetupRollback<'a> {
-    fn new(
-        gitignore_path: &'a Path,
-        expected_gitignore: &'a str,
-        original_gitignore: Option<&'a str>,
-    ) -> Self {
+    /// Restores `.gitignore` to `original` on failure while it still holds
+    /// `expected`, what this run made it; `None` when the run left it alone.
+    fn new(gitignore: Option<(&'a Path, &'a str, Option<&'a str>)>) -> Self {
         Self {
-            gitignore_path,
-            expected_gitignore,
-            original_gitignore,
+            gitignore,
             npmrc: None,
         }
     }
@@ -163,13 +156,10 @@ impl<'a> SetupRollback<'a> {
         {
             errors.push(format!("failed to restore .npmrc: {error}"));
         }
-        if let Err(error) = restore_file_if_unchanged(
-            self.gitignore_path,
-            self.expected_gitignore,
-            self.original_gitignore,
-            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-            false,
-        ) {
+        if let Some((gitignore_path, expected_gitignore, original_gitignore)) = self.gitignore
+            && let Err(error) =
+                remove_appended_rule(gitignore_path, expected_gitignore, original_gitignore)
+        {
             errors.push(format!("failed to restore .gitignore: {error}"));
         }
         errors
@@ -200,7 +190,6 @@ pub async fn run(
 
     let pkg_json_path = project_dir.join("package.json");
     let npmrc_path = project_dir.join(".npmrc");
-    let gitignore_path = project_dir.join(".gitignore");
 
     let package_json_content = match lpm_common::read_text_file_capped(
         &pkg_json_path,
@@ -219,14 +208,6 @@ pub async fn run(
         Err(error) => return Err(error.into()),
     };
     let existing_npmrc = existing_npmrc_state.as_deref().unwrap_or_default();
-    let existing_gitignore = match lpm_common::read_text_file_capped(
-        &gitignore_path,
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    ) {
-        Ok(content) => Some(content),
-        Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
-        Err(error) => return Err(error.into()),
-    };
 
     if package_json_content.is_none() && !json_output {
         install_ui::warn("No package.json found. Run this command in your project root.");
@@ -291,22 +272,28 @@ pub async fn run(
         }
     }
 
-    let current_gitignore = existing_gitignore.as_deref().unwrap_or_default();
-    let mut gitignore_lines: Vec<&str> = current_gitignore
-        .lines()
-        .filter(|line| line.trim() != ".npmrc")
-        .collect();
-    gitignore_lines.push(".npmrc");
-    let updated_gitignore = format!("{}\n", gitignore_lines.join("\n"));
-    let gitignore_updated = updated_gitignore != current_gitignore;
-    let rollback = SetupRollback::new(
-        &gitignore_path,
-        &updated_gitignore,
-        existing_gitignore.as_deref(),
-    );
-    if gitignore_updated {
-        lpm_common::write_file_atomic(&gitignore_path, &updated_gitignore)?;
-    }
+    let gitignore_path = project_dir.join(".gitignore");
+    let original_gitignore = read_optional_gitignore(&gitignore_path)?;
+    let (npmrc_ignore, ignore_warnings) = lpm_common::project_secret::prepare_secret_destination(
+        project_dir,
+        &npmrc_path,
+        lpm_common::project_secret::IgnoreFile::ProjectGitignore,
+        lpm_common::project_secret::IgnoreFailure::Refuse,
+    )
+    .map_err(LpmError::from)?;
+    let updated_gitignore = match npmrc_ignore.added_to() {
+        Some(file) if file == gitignore_path => read_optional_gitignore(&gitignore_path)?
+            .filter(|updated| Some(updated) != original_gitignore.as_ref()),
+        _ => None,
+    };
+    let gitignore_updated = updated_gitignore.is_some();
+    let rollback = SetupRollback::new(updated_gitignore.as_deref().map(|updated| {
+        (
+            gitignore_path.as_path(),
+            updated,
+            original_gitignore.as_deref(),
+        )
+    }));
 
     let previous_marker = pending
         .previous_bearer
@@ -321,11 +308,7 @@ pub async fn run(
         pending.token
     );
     let pending_content = replace_generated_block(existing_npmrc, &pending_config);
-    if let Err(error) = lpm_common::write_file_atomic_with_options(
-        &npmrc_path,
-        &pending_content,
-        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
-    ) {
+    if let Err(error) = write_token_npmrc(&npmrc_path, &pending_content) {
         return Err(rollback_files(LpmError::Io(error), rollback));
     }
     let rollback = rollback.with_npmrc(
@@ -458,6 +441,7 @@ pub async fn run(
             "expires_at": expires_at,
             "expiry_days": days,
             "gitignore_updated": gitignore_updated,
+            "warnings": ignore_warnings,
         });
         let rendered = serde_json::to_string_pretty(&json).map_err(|error| {
             LpmError::Registry(format!("failed to encode JSON output: {error}"))
@@ -465,6 +449,9 @@ pub async fn run(
         println!("{rendered}");
     } else {
         install_ui::done(".npmrc configured with read-only LPM token.");
+        for warning in &ignore_warnings {
+            crate::output::warn(warning);
+        }
         if gitignore_updated {
             install_ui::phase(".npmrc added to .gitignore to prevent token leaks.");
         }
@@ -483,73 +470,80 @@ pub async fn run(
     Ok(())
 }
 
-pub(super) fn reject_tracked_npmrc(project_dir: &Path) -> Result<(), LpmError> {
-    let inside = npmrc_tracking_git_command(project_dir, &["rev-parse", "--is-inside-work-tree"])
-        .output()
-        .map_err(|error| {
-            LpmError::Script(format!(
-                "failed to inspect Git tracking for .npmrc: {error}"
-            ))
-        })?;
-    if !inside.status.success() {
-        let failure = git_discovery_failure(&inside.stderr);
-        if inside.status.code() == Some(128) && failure == GitDiscoveryFailure::NoRepository {
-            return Ok(());
-        }
-        let stderr = String::from_utf8_lossy(&inside.stderr);
-        if failure == GitDiscoveryFailure::Stopped {
-            return Err(LpmError::Script(format!(
-                "refused to write .npmrc: git stopped at a .git file it can't use, so it can't tell whether .npmrc is tracked ({}). Repair or remove that .git file, then run the command again",
-                lpm_common::sanitize_terminal_inline(stderr.trim())
-            )));
-        }
-        return Err(LpmError::Script(format!(
-            "failed to inspect Git tracking for .npmrc: {}",
-            stderr.trim()
-        )));
-    }
-    if inside.stdout == b"false\n" {
-        return Ok(());
-    }
-    if inside.stdout != b"true\n" {
-        return Err(LpmError::Script(
-            "failed to inspect Git tracking for .npmrc: git returned an unexpected repository state"
-                .into(),
-        ));
-    }
+/// Undoes the rule `prepare_secret_destination` appended to `.gitignore` by
+/// truncating it back in place, which works where the directory is
+/// read-only, while the file still holds exactly `expected`.
+fn remove_appended_rule(path: &Path, expected: &str, original: Option<&str>) -> Result<(), String> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
 
-    let tracked = npmrc_tracking_git_command(
-        project_dir,
-        &["ls-files", "--error-unmatch", "--", ".npmrc"],
+    let Some(original) = original.filter(|original| expected.starts_with(original)) else {
+        return restore_file_if_unchanged(
+            path,
+            expected,
+            original,
+            lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+            false,
+        );
+    };
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(format!("{} is not a file path", path.display()));
+    };
+    let directory = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())
+        .map_err(|error| error.to_string())?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).write(true).follow(FollowSymlinks::No);
+    let file = directory
+        .open_with(name, &options)
+        .map_err(|error| error.to_string())?
+        .into_std();
+    let (current, _) = lpm_common::read_text_file_capped_from_open_file(
+        file.try_clone().map_err(|error| error.to_string())?,
+        path,
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     )
-    .output()
-    .map_err(|error| {
-        LpmError::Script(format!(
-            "failed to inspect Git tracking for .npmrc: {error}"
-        ))
-    })?;
-    if tracked.status.success() {
-        return Err(LpmError::Script(
-            "refused to write a Git-tracked .npmrc because it will contain a bearer token; remove .npmrc from the index first"
-                .into(),
-        ));
-    }
-    if tracked.status.code() == Some(1) {
+    .map_err(|error| error.to_string())?;
+    if current == original {
         return Ok(());
     }
-    Err(LpmError::Script(format!(
-        "failed to verify whether .npmrc is Git-tracked: {}",
-        String::from_utf8_lossy(&tracked.stderr).trim()
-    )))
+    if current != expected {
+        return Err(format!(
+            "{} changed concurrently; refusing to overwrite it",
+            path.display()
+        ));
+    }
+    file.set_len(original.len() as u64)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| error.to_string())
 }
 
-/// Asks git about `.npmrc` past filesystem boundaries, where git otherwise
-/// stops looking: a repository above a mounted project directory can still
-/// track the file.
-fn npmrc_tracking_git_command(project_dir: &Path, args: &[&str]) -> std::process::Command {
-    let mut command = hardened_git_command(project_dir, args);
-    command.env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1");
-    command
+fn read_optional_gitignore(path: &Path) -> Result<Option<String>, LpmError> {
+    match lpm_common::read_text_file_capped_nofollow(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
+        Ok(content) => Ok(Some(content)),
+        Err(lpm_common::BoundedReadError::NotFound { .. }) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Refuses an `.npmrc` git tracks, and one in a repository where git can't
+/// tell whether it does, before anything writes the bearer token it will
+/// hold. Outside any repository nothing can track it.
+pub(super) fn reject_tracked_npmrc(project_dir: &Path) -> Result<(), LpmError> {
+    use lpm_common::project_git::{GitProbeError, repository_marker_above, tracked_entries};
+    match tracked_entries(project_dir, &[".npmrc"]) {
+        Ok(None) => Ok(()),
+        Err(GitProbeError::GitMissing(_)) if !repository_marker_above(project_dir) => Ok(()),
+        Ok(Some(tracked)) if tracked.is_empty() => Ok(()),
+        Ok(Some(tracked)) => Err(LpmError::ProjectFile(format!(
+            "refused to write a Git-tracked .npmrc because it will contain a bearer token; untrack it with `{}`, then run the command again",
+            tracked.untrack_command()
+        ))),
+        Err(GitProbeError::GitMissing(reason)) => Err(LpmError::ProjectFile(format!(
+            "refused to write .npmrc: git could not be run ({reason}) in a project inside a git repository, so Git tracking can't be inspected and the bearer token .npmrc will hold could be committed. Put git on PATH, then run the command again"
+        ))),
+        Err(GitProbeError::Failed(reason)) => Err(LpmError::ProjectFile(format!(
+            "refused to write .npmrc: Git tracking can't be inspected, so it can't tell whether .npmrc is tracked ({reason}). Repair the repository, then run the command again"
+        ))),
+    }
 }
 
 fn rollback_files(primary: LpmError, rollback: SetupRollback<'_>) -> LpmError {
@@ -653,12 +647,19 @@ pub(super) fn write_npmrc_if_unchanged(
             path.display()
         )));
     }
+    write_token_npmrc(path, replacement).map_err(LpmError::Io)
+}
+
+/// Writes an `.npmrc` that can hold a token, readable by its owner alone,
+/// whatever access its directory hands down.
+fn write_token_npmrc(path: &Path, contents: &str) -> std::io::Result<()> {
     lpm_common::write_file_atomic_with_options(
         path,
-        replacement,
-        lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
+        contents,
+        lpm_common::AtomicWriteOptions::new()
+            .owner_only()
+            .sync_file(),
     )
-    .map_err(LpmError::Io)
 }
 
 pub(super) fn restore_file_if_unchanged(
@@ -684,12 +685,9 @@ pub(super) fn restore_file_if_unchanged(
     }
 
     match original {
-        Some(contents) if sensitive => lpm_common::write_file_atomic_with_options(
-            path,
-            contents,
-            lpm_common::AtomicWriteOptions::new().unix_mode(0o600),
-        )
-        .map_err(|error| error.to_string()),
+        Some(contents) if sensitive => {
+            write_token_npmrc(path, contents).map_err(|error| error.to_string())
+        }
         Some(contents) => {
             lpm_common::write_file_atomic(path, contents).map_err(|error| error.to_string())
         }
@@ -1050,9 +1048,42 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn token_npmrc_writes_keep_no_access_the_directory_would_hand_down() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let project = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", "group:everyone allow read,file_inherit"])
+            .arg(project.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let npmrc = project.path().join(".npmrc");
+        let private = |path: &Path| {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            !lpm_common::macos_acl::has_extended_acl_at(path).unwrap() && mode == 0o600
+        };
+
+        write_npmrc_if_unchanged(&npmrc, "", "//r/:_authToken=new\n").unwrap();
+        assert!(private(&npmrc));
+
+        std::fs::remove_file(&npmrc).unwrap();
+        std::fs::write(&npmrc, "//r/:_authToken=new\n").unwrap();
+        restore_file_if_unchanged(
+            &npmrc,
+            "//r/:_authToken=new\n",
+            Some("//r/:_authToken=old\n"),
+            lpm_common::NPMRC_FILE_SIZE_CAP_BYTES,
+            true,
+        )
+        .unwrap();
+        assert!(private(&npmrc));
+    }
+
     fn refusal(project: &Path) -> String {
         match reject_tracked_npmrc(project) {
-            Err(LpmError::Script(message)) => message,
+            Err(LpmError::ProjectFile(message)) => message,
             other => panic!(
                 "expected {} to be refused, got {other:?}",
                 project.display()
@@ -1096,15 +1127,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn looks_for_the_repository_past_filesystem_boundaries() {
-        let command = npmrc_tracking_git_command(Path::new("."), &["rev-parse"]);
-
-        assert!(command.get_envs().any(|(name, value)| {
-            name == "GIT_DISCOVERY_ACROSS_FILESYSTEM" && value == Some(std::ffi::OsStr::new("1"))
-        }));
     }
 
     #[test]

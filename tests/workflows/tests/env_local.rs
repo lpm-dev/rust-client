@@ -307,7 +307,8 @@ fn env_json_print_and_ci_export_report_the_resolved_environment() {
       "success": true,
       "exported": 1,
       "to": "ci.env",
-      "env": "default"
+      "env": "default",
+      "warnings": []
     }
     "###);
     assert_eq!(project.read_file("ci.env"), "VALUE=fixture-only");
@@ -1812,15 +1813,19 @@ fn env_import_and_export_warn_when_gitignore_cannot_be_updated() {
             std::fs::set_permissions(&ignore, std::fs::Permissions::from_mode(0o644)).unwrap();
             assert!(output.status.success());
             let stderr = String::from_utf8_lossy(&output.stderr);
+            let warnings = if json {
+                let response = parse_json_stdout(&output, operation);
+                assert_eq!(response["success"], true);
+                response["warnings"].to_string()
+            } else {
+                stderr.to_string()
+            };
             assert!(
-                stderr.contains(".gitignore") && stderr.contains("before committing"),
-                "{operation}: {stderr}"
+                warnings.contains(".gitignore") && warnings.contains("before committing"),
+                "{operation}: {warnings}"
             );
             assert!(!stderr.contains("private-fixture-value"));
             assert_eq!(project.read_file(".gitignore"), "existing\n");
-            if json {
-                assert_eq!(parse_json_stdout(&output, operation)["success"], true);
-            }
             if operation == "export" {
                 assert_eq!(
                     std::fs::metadata(project.path().join("secrets.env"))
@@ -1833,6 +1838,136 @@ fn env_import_and_export_warn_when_gitignore_cannot_be_updated() {
             }
         }
     }
+}
+
+fn git(project: &TempProject, args: &[&str]) -> std::process::Output {
+    std::process::Command::new("git")
+        .args(args)
+        .current_dir(project.path())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("run git")
+}
+
+fn git_repository_project(name: &str) -> Option<TempProject> {
+    let project = TempProject::empty(&format!(r#"{{"name":"{name}"}}"#));
+    if !git(&project, &["init", "-q"]).status.success() {
+        return None;
+    }
+    lpm(&project)
+        .args(["env", "set", "VALUE=private-fixture-value"])
+        .assert()
+        .success();
+    Some(project)
+}
+
+#[test]
+fn env_export_keeps_the_file_out_of_git_before_writing_it() {
+    let Some(project) = git_repository_project("env-export-ignored") else {
+        return;
+    };
+
+    let output = lpm(&project)
+        .args(["env", "export", "secrets.env", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(project.read_file(".gitignore"), "/secrets.env\n");
+    assert!(
+        git(&project, &["check-ignore", "-q", "secrets.env"])
+            .status
+            .success()
+    );
+    assert!(
+        project
+            .read_file("secrets.env")
+            .contains("private-fixture-value")
+    );
+}
+
+#[test]
+fn env_export_refuses_a_file_git_tracks() {
+    let Some(project) = git_repository_project("env-export-tracked") else {
+        return;
+    };
+    project.write_file("secrets.env", "VALUE=\n");
+    assert!(git(&project, &["add", "secrets.env"]).status.success());
+
+    let output = lpm(&project)
+        .args(["env", "export", "secrets.env"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let Some((untrack, _)) = stderr
+        .split_once("untrack it with `")
+        .and_then(|(_, rest)| rest.split_once('`'))
+    else {
+        panic!("no untrack command in {stderr}");
+    };
+    assert!(
+        untrack.ends_with(" rm --cached -- secrets.env"),
+        "{untrack}"
+    );
+    assert_eq!(project.read_file("secrets.env"), "VALUE=\n");
+    assert!(!project.file_exists(".gitignore"));
+
+    #[cfg(unix)]
+    {
+        let elsewhere = tempfile::tempdir().unwrap();
+        let untracked = std::process::Command::new("sh")
+            .args(["-c", untrack])
+            .current_dir(elsewhere.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            untracked.status.success(),
+            "{untrack}: {}",
+            String::from_utf8_lossy(&untracked.stderr)
+        );
+        assert!(
+            git(&project, &["ls-files", "--", "secrets.env"])
+                .stdout
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn ci_export_ignores_the_file_in_the_repository_exclude_list() {
+    let Some(project) = git_repository_project("env-ci-export-excluded") else {
+        return;
+    };
+
+    lpm(&project)
+        .args(["env", "export", "ci.env", "--ci"])
+        .assert()
+        .success();
+
+    assert!(
+        !project.file_exists(".gitignore"),
+        "CI writes leave tracked files alone"
+    );
+    assert!(
+        project
+            .read_file(".git/info/exclude")
+            .lines()
+            .any(|line| line == "/ci.env")
+    );
+    assert!(
+        git(&project, &["check-ignore", "-q", "ci.env"])
+            .status
+            .success()
+    );
 }
 
 #[test]
@@ -1865,8 +2000,12 @@ fn env_export_does_not_append_to_linked_gitignore_targets() {
             std::fs::read_to_string(outside.path()).unwrap(),
             "outside bytes\n"
         );
-        assert!(String::from_utf8_lossy(&output.stderr).contains(".gitignore"));
-        assert_eq!(parse_json_stdout(&output, "export")["success"], true);
+        let response = parse_json_stdout(&output, "export");
+        assert_eq!(response["success"], true);
+        assert!(
+            response["warnings"].to_string().contains(".gitignore"),
+            "{response}"
+        );
     }
 }
 
