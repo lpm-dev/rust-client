@@ -27,7 +27,6 @@
 //!   `node_modules` are rewritten to relative symlinks after install.
 
 mod copy;
-mod file_select;
 mod lockfile_prune;
 mod manifest_rewrite;
 mod paths;

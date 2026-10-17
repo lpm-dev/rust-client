@@ -1,4 +1,5 @@
 use super::types::{LpmPublicationStatus, PublishResult, PublishTarget};
+use crate::commands::publish_common::TarballFile;
 use crate::{install_ui, quality};
 use std::collections::HashMap;
 
@@ -64,6 +65,7 @@ pub(super) fn publish_check_json(
     quality_result: Option<&quality::QualityResult>,
     targets: &[PublishTarget],
     target_names: &HashMap<String, String>,
+    files: &[TarballFile],
 ) -> serde_json::Value {
     let mut json = quality_result
         .and_then(|qr| serde_json::to_value(qr).ok())
@@ -75,6 +77,8 @@ pub(super) fn publish_check_json(
         .expect("publish check JSON seed must be an object");
     obj.insert("success".to_string(), serde_json::Value::Bool(true));
     obj.insert("check".to_string(), serde_json::Value::Bool(true));
+    obj.insert("files".to_string(), serde_json::json!(files.len()));
+    obj.insert("tarball_files".to_string(), tarball_files_json(files));
     obj.insert(
         "targets".to_string(),
         serde_json::Value::Array(
@@ -174,6 +178,35 @@ pub(super) fn publish_detail<T: install_ui::TerminalValue>(label: &str, value: T
         install_ui::dim(&label),
         value
     ));
+}
+
+/// The files a tarball holds, for `--json` previews, as `{"path", "size"}`.
+pub(super) fn tarball_files_json(files: &[TarballFile]) -> serde_json::Value {
+    serde_json::Value::Array(
+        files
+            .iter()
+            .map(|file| serde_json::json!({"path": file.path, "size": file.size}))
+            .collect(),
+    )
+}
+
+/// Lists the files a tarball holds, with their sizes, for previews.
+pub(super) fn print_tarball_contents(files: &[TarballFile]) {
+    install_ui::phase("Package contents");
+    let width = files
+        .iter()
+        .map(|file| file.path.chars().count())
+        .max()
+        .unwrap_or(0);
+    for file in files {
+        let path = lpm_common::sanitize_terminal_inline(&file.path);
+        install_ui::detail_line(crate::install_ui::terminal_line!(
+            "    {}  {}",
+            format!("{path:<width$}"),
+            install_ui::dim(&lpm_common::format_bytes(file.size))
+        ));
+    }
+    install_ui::detail("");
 }
 
 pub(super) fn format_dry_run_files_value(

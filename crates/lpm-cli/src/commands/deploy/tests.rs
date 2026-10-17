@@ -1771,11 +1771,12 @@ fn copy_member_source_skips_nested_node_modules_too() {
         .join("foo");
     std::fs::create_dir_all(&nested).unwrap();
     std::fs::write(nested.join("index.js"), "leaked").unwrap();
+    std::fs::write(src.join("packages").join("inner").join("index.js"), "kept").unwrap();
 
     let dst = tmp.path().join("output");
     copy_member_source(&src, &dst).unwrap();
 
-    assert!(dst.join("packages").join("inner").exists());
+    assert!(dst.join("packages").join("inner").join("index.js").exists());
     assert!(
         !dst.join("packages")
             .join("inner")
@@ -1794,11 +1795,12 @@ fn copy_member_source_skips_nested_dotenv_too() {
     std::fs::create_dir_all(src.join("config")).unwrap();
     std::fs::write(src.join("package.json"), "{}").unwrap();
     std::fs::write(src.join("config").join(".env"), "NESTED_SECRET=oops").unwrap();
+    std::fs::write(src.join("config").join("settings.json"), "{}").unwrap();
 
     let dst = tmp.path().join("output");
     copy_member_source(&src, &dst).unwrap();
 
-    assert!(dst.join("config").exists());
+    assert!(dst.join("config").join("settings.json").exists());
     assert!(
         !dst.join("config").join(".env").exists(),
         "SECURITY: nested .env at any depth must be denied"
@@ -1808,25 +1810,99 @@ fn copy_member_source_skips_nested_dotenv_too() {
 // ── Stats accuracy ─────────────────────────────────────────────────────
 
 #[test]
-fn copy_member_source_returns_stats_with_files_copied_and_skipped() {
+fn copy_member_source_counts_what_it_copies() {
     let tmp = tempfile::tempdir().unwrap();
     let src = build_member_fixture(tmp.path());
     let dst = tmp.path().join("output");
 
     let stats = copy_member_source(&src, &dst).unwrap();
 
-    // The fixture has multiple files in src/ and dist/ plus root files
-    // that should be copied. We don't assert exact counts (fixture may
-    // evolve) — just that the numbers are non-zero and sensible.
-    assert!(
-        stats.files_copied > 0,
-        "should have copied at least one file"
+    assert_eq!(
+        stats.files_copied, 7,
+        "package.json, README.md, LICENSE, tsconfig.json, src/index.ts, src/util.ts, dist/index.js"
     );
-    assert!(
-        stats.files_skipped > 0,
-        "should have skipped at least one denied entry (.env, node_modules, etc.)"
+    assert_eq!(
+        stats.files_skipped, 0,
+        "a publish already leaves out .env, LPM state, VCS files and OS cruft"
     );
-    assert!(stats.bytes_copied > 0);
+    assert_eq!(
+        stats.bytes_copied,
+        std::fs::metadata(src.join("package.json")).unwrap().len()
+            + "# foo\n".len() as u64
+            + "MIT\n".len() as u64
+            + "{}".len() as u64
+            + 2 * "export {}".len() as u64
+            + "module.exports = {}".len() as u64
+    );
+}
+
+#[test]
+fn copy_member_source_withholds_secrets_the_files_field_selects() {
+    // A publish refuses these through its secret scan; a deploy has none,
+    // so it must leave them out of the output on its own.
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("member");
+    std::fs::create_dir_all(src.join("config")).unwrap();
+    std::fs::create_dir_all(src.join("dist")).unwrap();
+    std::fs::write(
+        src.join("package.json"),
+        r#"{"name":"app","version":"1.0.0","files":["dist",".env.production",".env.example","credentials.json",".npmrc","config"]}"#,
+    )
+    .unwrap();
+    std::fs::write(src.join("dist").join("index.js"), "module.exports = {}").unwrap();
+    std::fs::write(src.join(".env.production"), "TOKEN=prod").unwrap();
+    std::fs::write(src.join(".env.example"), "TOKEN=").unwrap();
+    std::fs::write(src.join("credentials.json"), "{}").unwrap();
+    std::fs::write(src.join(".npmrc"), "//registry.npmjs.org/:_authToken=x").unwrap();
+    std::fs::write(src.join("config").join(".ENV.local"), "TOKEN=local").unwrap();
+    std::fs::write(src.join("config").join("routes.json"), "{}").unwrap();
+
+    let dst = tmp.path().join("output");
+    let stats = copy_member_source(&src, &dst).unwrap();
+
+    for withheld in [
+        ".env.production",
+        ".env.example",
+        "credentials.json",
+        ".npmrc",
+        "config/.ENV.local",
+    ] {
+        assert!(
+            !dst.join(withheld).exists(),
+            "SECURITY: {withheld} must not reach a deploy output"
+        );
+    }
+    assert!(dst.join("dist").join("index.js").exists());
+    assert!(dst.join("config").join("routes.json").exists());
+    assert_eq!(
+        stats.files_copied, 3,
+        "package.json, dist/index.js, config/routes.json"
+    );
+    assert_eq!(
+        stats.files_skipped, 4,
+        "the selected .env files and credentials.json"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_member_source_leaves_out_symbolic_links_as_a_publish_does() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside.txt");
+    std::fs::write(&outside, "not part of the member").unwrap();
+    let src = tmp.path().join("member");
+    std::fs::create_dir_all(src.join("src")).unwrap();
+    std::fs::write(src.join("package.json"), "{}").unwrap();
+    std::fs::write(src.join("src").join("index.js"), "module.exports = {}").unwrap();
+    std::os::unix::fs::symlink(&outside, src.join("src").join("linked.txt")).unwrap();
+    std::os::unix::fs::symlink(tmp.path(), src.join("parent")).unwrap();
+
+    let dst = tmp.path().join("output");
+    copy_member_source(&src, &dst).unwrap();
+
+    assert!(dst.join("src").join("index.js").exists());
+    assert!(std::fs::symlink_metadata(dst.join("src").join("linked.txt")).is_err());
+    assert!(std::fs::symlink_metadata(dst.join("parent")).is_err());
 }
 
 // ── Filesystem invariants ──────────────────────────────────────────────
@@ -2159,4 +2235,37 @@ fn strip_dev_dependencies_preserves_other_dep_sections() {
         Some("^2.0.0"),
         "optionalDependencies must survive — only devDependencies are prod-stripped"
     );
+}
+
+/// A deploy ships the `lpm.json` a publish would, whether or not `files`
+/// selects it, and never rewrites the source through a hard link.
+#[test]
+fn copy_member_source_ships_the_lpm_json_a_publish_ships() {
+    let source_lpm_json = r#"{"vault":"vlt_fixture","vaultSync":{"personalVersion":3},"tasks":{"build":{"command":"tsc"}}}"#;
+    for files in [Some(json!(["index.js"])), None] {
+        let source = tempfile::tempdir().unwrap();
+        let mut manifest = json!({"name": "app", "version": "1.0.0"});
+        if let Some(files) = &files {
+            manifest["files"] = files.clone();
+        }
+        std::fs::write(source.path().join("package.json"), manifest.to_string()).unwrap();
+        std::fs::write(source.path().join("index.js"), "module.exports = 1\n").unwrap();
+        std::fs::write(source.path().join("lpm.json"), source_lpm_json).unwrap();
+        let output = tempfile::tempdir().unwrap();
+
+        copy_member_source(source.path(), output.path()).unwrap();
+
+        let shipped: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(output.path().join("lpm.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            shipped,
+            json!({"tasks": {"build": {"command": "tsc"}}}),
+            "files = {files:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.path().join("lpm.json")).unwrap(),
+            source_lpm_json
+        );
+    }
 }

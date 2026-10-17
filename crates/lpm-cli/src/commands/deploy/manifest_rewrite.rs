@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use super::copy::{CopyStats, copy_member_source};
-use super::file_select::normalize_relative_path;
+use super::paths::normalize_relative_path;
 use super::{DEPLOY_WORKSPACE_DIR, DependencyMode, ManifestSelectionStats};
 
 /// The dependency sections in `package.json` that may contain `workspace:*`
