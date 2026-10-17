@@ -519,8 +519,7 @@ mod tests {
         let content =
             std::fs::read_to_string(project.path().join(".lpm/skills/owner.package/guide.md"))
                 .unwrap();
-        let (meta, body, errors) =
-            lpm_security::skill_security::parse_agent_skill_frontmatter(&content);
+        let (meta, body, errors) = lpm_skill::parse_agent_skill_frontmatter(&content);
         assert!(errors.is_empty(), "reconstructed frontmatter: {errors:?}");
         assert_eq!(meta.version.as_deref(), Some("0.8.0"));
         assert_eq!(meta.globs, ["**/*.rs"]);

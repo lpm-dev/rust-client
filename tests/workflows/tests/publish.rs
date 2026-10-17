@@ -112,7 +112,7 @@ fn authored_skills_project(name: &str) -> TempProject {
     ));
     project.write_file("index.js", "module.exports = {}");
     project.write_file(
-        ".lpm/skills/usage.md",
+        "lpm-skills/usage.md",
         concat!(
             "---\n",
             "name: usage\n",
@@ -3534,11 +3534,14 @@ async fn lpm_name_override_is_used_for_the_uploaded_route_and_payload() {
 }
 
 #[tokio::test]
-async fn real_publish_with_authored_skills_persists_effective_manifest_and_notice() {
+async fn real_publish_ships_authored_skills_without_changing_package_json() {
+    use base64::Engine;
+
     let mock = MockRegistry::start().await;
     mock.with_publish_endpoint().await;
     mock.with_whoami("testuser", "test@example.com").await;
     let project = authored_skills_project("@lpm.dev/testuser.real-skills");
+    let before = project.read_file("package.json");
 
     let output = lpm_with_registry(&project, &mock.url())
         .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
@@ -3551,23 +3554,22 @@ async fn real_publish_with_authored_skills_persists_effective_manifest_and_notic
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    let package_json: serde_json::Value =
-        serde_json::from_str(&project.read_file("package.json")).expect("parse package.json");
-    assert_eq!(
-        package_json["files"],
-        serde_json::json!(["index.js", ".lpm/skills"])
-    );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    assert!(
-        combined.contains(
-            "Added \".lpm/skills\" to package.json \"files\" — skills would be excluded otherwise"
-        ),
-        "real publish must retain the manifest update notice:\n{combined}"
-    );
+    assert_eq!(project.read_file("package.json"), before);
+    let requests = mock.server().received_requests().await.unwrap();
+    let upload = requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT")
+        .expect("publish must send one Registry PUT");
+    let payload: serde_json::Value = serde_json::from_slice(&upload.body).unwrap();
+    let attachment = payload["_attachments"]
+        .as_object()
+        .and_then(|attachments| attachments.values().next())
+        .expect("publish payload must contain one tarball attachment");
+    let tarball_data = base64::engine::general_purpose::STANDARD
+        .decode(attachment["data"].as_str().unwrap())
+        .unwrap();
+    let skill = extract_uploaded_file(&tarball_data, "package/lpm-skills/usage.md");
+    assert_eq!(skill, project.read_file("lpm-skills/usage.md").into_bytes());
 }
 
 #[tokio::test]

@@ -18,7 +18,6 @@ pub mod behavioral;
 pub mod provenance;
 pub mod query;
 pub mod script_hash;
-pub mod skill_security;
 pub mod static_gate;
 pub mod triage;
 pub mod typosquatting;

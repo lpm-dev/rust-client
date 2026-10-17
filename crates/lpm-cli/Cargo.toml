@@ -29,6 +29,7 @@ lpm-linker = { workspace = true }
 lpm-lockfile = { workspace = true }
 lpm-workspace = { workspace = true }
 lpm-security = { workspace = true }
+lpm-skill = { workspace = true }
 lpm-triage-advisor = { path = "../lpm-triage-advisor" }
 async-trait = "0.1"
 aho-corasick = "1"
