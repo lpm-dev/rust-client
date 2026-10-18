@@ -1,4 +1,5 @@
-//! Bounded C ABI for the bundled native schema engine. No process environment access.
+//! Bounded C ABI for the bundled native schema engine and GitHub Actions secret
+//! sealing. No process environment access.
 
 use lpm_env_source::{ReplacedGroups, ReplacedRules, SchemaSnapshot, SourceLocation};
 use serde::ser::SerializeStruct;
@@ -21,6 +22,8 @@ const CHECK_ENVIRONMENT_LIMIT: usize = 256;
 /// declaration, enum member, enum UTF-8 byte, group, group member,
 /// selected stored value (including fallback values), plus one.
 const CHECK_WORK_LIMIT: usize = 1 << 18;
+/// The longest value one seal encrypts, above GitHub's 48 KB secret limit.
+const SEAL_INPUT_LIMIT: usize = 64 * 1024;
 
 /// C callers own this result until one matching lpm_env_release call.
 #[repr(C)]
@@ -506,6 +509,61 @@ pub unsafe extern "C" fn lpm_env_check(
         }
     }))
     .unwrap_or_else(|_| failure(3, "env.engine_panic"))
+}
+
+/// Encrypt `plaintext` to a Curve25519 public key as a libsodium sealed box
+/// (`crypto_box_seal`), the form GitHub requires for an Actions secret. The
+/// output is the ephemeral public key followed by the box, 48 bytes longer
+/// than the plaintext. Only the recipient's secret key opens it. A low-order
+/// key, whose shared secret is all zeros, is refused as invalid input, as
+/// libsodium refuses to open a box sealed to one.
+/// # Safety
+/// The key pointer must reference 32 readable bytes. The plaintext pointer
+/// must reference readable bytes for its length during the call, and may be
+/// null only when the length is zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lpm_env_seal_box(
+    public_key: *const u8,
+    public_key_length: usize,
+    plaintext: *const u8,
+    plaintext_length: usize,
+) -> LPMEnvResult {
+    if public_key.is_null()
+        || public_key_length != crypto_box::KEY_SIZE
+        || (plaintext.is_null() && plaintext_length != 0)
+        || plaintext_length > SEAL_INPUT_LIMIT
+    {
+        return failure(2, "env.invalid_input");
+    }
+    catch_unwind(AssertUnwindSafe(|| {
+        let mut key = [0u8; crypto_box::KEY_SIZE];
+        // SAFETY: The caller supplies a live readable range of exactly KEY_SIZE bytes, checked above.
+        key.copy_from_slice(unsafe { std::slice::from_raw_parts(public_key, public_key_length) });
+        let plaintext = if plaintext_length == 0 {
+            &[][..]
+        } else {
+            // SAFETY: The caller supplies a live readable range; its length was bounded above.
+            unsafe { std::slice::from_raw_parts(plaintext, plaintext_length) }
+        };
+        if !is_contributory(&key) {
+            return failure(2, "env.invalid_input");
+        }
+        match crypto_box::PublicKey::from(key).seal(&mut crypto_box::aead::OsRng, plaintext) {
+            Ok(sealed) => result(0, sealed, None),
+            Err(_) => failure(3, "env.seal_failed"),
+        }
+    }))
+    .unwrap_or_else(|_| failure(3, "env.engine_panic"))
+}
+
+/// Whether X25519 with `key` gives a shared secret that depends on the other
+/// side's key. A small-order point gives all zeros for every clamped secret,
+/// so a box sealed to it would be readable by anyone, and libsodium refuses
+/// to open it.
+fn is_contributory(key: &[u8; crypto_box::KEY_SIZE]) -> bool {
+    x25519_dalek::EphemeralSecret::random_from_rng(crypto_box::aead::OsRng)
+        .diffie_hellman(&x25519_dalek::PublicKey::from(*key))
+        .was_contributory()
 }
 
 /// # Safety
@@ -1303,6 +1361,145 @@ mod tests {
             std::fs::write(folder.join("base.json"), r#"{"vars":{"A":{}}}"#).unwrap();
             assert_eq!(lpm_env_verify(result.snapshot), 1);
             lpm_env_release(result);
+        }
+    }
+
+    fn seal(public_key: &[u8], plaintext: &[u8]) -> LPMEnvResult {
+        let plaintext_pointer = if plaintext.is_empty() {
+            std::ptr::null()
+        } else {
+            plaintext.as_ptr()
+        };
+        // SAFETY: Both slices remain live throughout the synchronous call.
+        unsafe {
+            lpm_env_seal_box(
+                public_key.as_ptr(),
+                public_key.len(),
+                plaintext_pointer,
+                plaintext.len(),
+            )
+        }
+    }
+
+    fn sealed_bytes(result: LPMEnvResult) -> Vec<u8> {
+        assert_eq!(result.status, 0);
+        // SAFETY: The result remains owned and unreleased for the complete read.
+        let bytes = unsafe { std::slice::from_raw_parts(result.data, result.length) }.to_vec();
+        // SAFETY: This is the sole release of the returned result.
+        unsafe {
+            lpm_env_release(result);
+        }
+        bytes
+    }
+
+    #[test]
+    fn sealed_boxes_open_with_the_recipient_key_like_libsodium() {
+        // Made with libsodium's crypto_box_seed_keypair and crypto_box_seal.
+        let secret = crypto_box::SecretKey::from_slice(
+            &hex::decode("76bf4ad35f7569b718b6bb9fbd57d9df4e28a10b53504d455917a0893257c365")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(secret.public_key().as_bytes()),
+            "ce145f7279f86e1c1d55d23d50ce327c861c4bd7b76e7895e34d24dc4fa6ab33"
+        );
+        let libsodium = hex::decode("64b4198082cb3ab815809e8ad791739aa39b2525e4aa3a7815db637d7d972750f0d9cd639909286ccc83a4e980ee5f2eb39be96a6bcb41aba5f8407b0180f518fdbdadb151cb264891e1b2265da3").unwrap();
+        let message = "lpm-vault sealed box vector \u{e9}".as_bytes();
+        assert_eq!(secret.unseal(&libsodium).unwrap(), message);
+
+        let sealed = sealed_bytes(seal(secret.public_key().as_bytes(), message));
+        assert_eq!(sealed.len(), message.len() + crypto_box::SEALBYTES);
+        assert_eq!(secret.unseal(&sealed).unwrap(), message);
+        let again = sealed_bytes(seal(secret.public_key().as_bytes(), message));
+        assert_ne!(
+            sealed[..crypto_box::KEY_SIZE],
+            again[..crypto_box::KEY_SIZE],
+            "Each seal uses a fresh ephemeral key"
+        );
+        assert_eq!(secret.unseal(&again).unwrap(), message);
+    }
+
+    #[test]
+    fn sealing_accepts_an_empty_value_and_the_largest_one() {
+        let secret = crypto_box::SecretKey::from([7u8; crypto_box::KEY_SIZE]);
+        let public = secret.public_key();
+        let empty = sealed_bytes(seal(public.as_bytes(), &[]));
+        assert_eq!(empty.len(), crypto_box::SEALBYTES);
+        assert!(secret.unseal(&empty).unwrap().is_empty());
+        let largest = vec![0x5a; SEAL_INPUT_LIMIT];
+        let sealed = sealed_bytes(seal(public.as_bytes(), &largest));
+        assert_eq!(secret.unseal(&sealed).unwrap(), largest);
+    }
+
+    /// The small-order points of Curve25519 as libsodium lists them, each
+    /// also with bit 255 set, which X25519 ignores.
+    fn low_order_keys() -> Vec<[u8; crypto_box::KEY_SIZE]> {
+        let mut keys = Vec::new();
+        for text in [
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0100000000000000000000000000000000000000000000000000000000000000",
+            "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+            "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        ] {
+            let mut key = [0u8; crypto_box::KEY_SIZE];
+            hex::decode_to_slice(text, &mut key).unwrap();
+            keys.push(key);
+            key[31] |= 0x80;
+            keys.push(key);
+        }
+        keys
+    }
+
+    #[test]
+    fn sealing_refuses_a_low_order_key_libsodium_would_refuse_to_open() {
+        for key in low_order_keys() {
+            let shared = x25519_dalek::StaticSecret::from([7u8; crypto_box::KEY_SIZE])
+                .diffie_hellman(&x25519_dalek::PublicKey::from(key));
+            assert!(
+                !shared.was_contributory(),
+                "{} is a low-order point",
+                hex::encode(key)
+            );
+
+            let result = seal(&key, b"value");
+            assert_eq!(result.status, 2, "{} is refused", hex::encode(key));
+            // SAFETY: The result remains owned and unreleased for the complete read.
+            let body = unsafe { std::slice::from_raw_parts(result.data, result.length) };
+            assert_eq!(body, br#"{"abiVersion":1,"code":"env.invalid_input"}"#);
+            // SAFETY: This is the sole release of the returned result.
+            unsafe {
+                lpm_env_release(result);
+            }
+        }
+    }
+
+    #[test]
+    fn sealing_refuses_keys_and_values_it_cannot_take() {
+        let key = [9u8; crypto_box::KEY_SIZE];
+        let mut cases = vec![
+            seal(&key[..31], b"value"),
+            seal(&[9u8; 33], b"value"),
+            seal(&key, &vec![0; SEAL_INPUT_LIMIT + 1]),
+        ];
+        // SAFETY: Null pointers are rejected before anything is read.
+        cases.push(unsafe {
+            lpm_env_seal_box(std::ptr::null(), crypto_box::KEY_SIZE, b"v".as_ptr(), 1)
+        });
+        // SAFETY: Null pointers are rejected before anything is read.
+        cases.push(unsafe { lpm_env_seal_box(key.as_ptr(), key.len(), std::ptr::null(), 1) });
+        for result in cases {
+            assert_eq!(result.status, 2);
+            // SAFETY: The result remains owned and unreleased for the complete read.
+            let body = unsafe { std::slice::from_raw_parts(result.data, result.length) };
+            assert_eq!(body, br#"{"abiVersion":1,"code":"env.invalid_input"}"#);
+            // SAFETY: This is the sole release of the returned result.
+            unsafe {
+                lpm_env_release(result);
+            }
         }
     }
 }
