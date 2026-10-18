@@ -48,6 +48,10 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_IO",
 ] }
 
+[features]
+# Test helpers other crates' tests use: macOS disk images.
+test-support = []
+
 [dev-dependencies]
 static_assertions = "1"
 tempfile = "3"

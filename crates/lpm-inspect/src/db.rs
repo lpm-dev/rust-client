@@ -3451,63 +3451,22 @@ mod tests {
         assert!(!project.path().join(".lpm/inspector.db-copy").exists());
     }
 
-    /// A disk image attached for a test, detached when dropped.
-    #[cfg(target_os = "macos")]
-    struct AttachedImage(std::path::PathBuf);
-
-    #[cfg(target_os = "macos")]
-    impl Drop for AttachedImage {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("/usr/bin/hdiutil")
-                .args(["detach", "-force", "-quiet"])
-                .arg(&self.0)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
-    }
-
     /// Attaches a new HFS+ image of `size` in `directory`, keeping or
     /// ignoring ownership on it.
     #[cfg(target_os = "macos")]
-    fn attach_image(directory: &Path, size: &str, owners: bool) -> AttachedImage {
-        let hdiutil = |arguments: &[&std::ffi::OsStr]| {
-            let output = std::process::Command::new("/usr/bin/hdiutil")
-                .args(arguments)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "hdiutil {arguments:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        };
-        let image = directory.join("volume.dmg");
+    fn attach_image(
+        directory: &Path,
+        size: &str,
+        owners: bool,
+    ) -> lpm_common::test_disk_image::AttachedImage {
         let mount_point = directory.join("mounted");
         std::fs::create_dir(&mount_point).unwrap();
-        hdiutil(&[
-            "create".as_ref(),
-            "-quiet".as_ref(),
-            "-size".as_ref(),
-            size.as_ref(),
-            "-fs".as_ref(),
-            "HFS+".as_ref(),
-            "-volname".as_ref(),
-            "lpm-inspect-test".as_ref(),
-            image.as_os_str(),
-        ]);
-        hdiutil(&[
-            "attach".as_ref(),
-            "-quiet".as_ref(),
-            "-nobrowse".as_ref(),
-            "-noautoopen".as_ref(),
-            "-owners".as_ref(),
-            if owners { "on" } else { "off" }.as_ref(),
-            "-mountpoint".as_ref(),
-            mount_point.as_os_str(),
-            image.as_os_str(),
-        ]);
-        AttachedImage(mount_point)
+        lpm_common::test_disk_image::AttachedImage::new(
+            &directory.join("volume.dmg"),
+            &mount_point,
+            &["-size", size, "-fs", "HFS+", "-volname", "lpm-inspect-test"],
+            &["-owners", if owners { "on" } else { "off" }],
+        )
     }
 
     #[cfg(target_os = "macos")]
@@ -3516,7 +3475,7 @@ mod tests {
     {
         let directory = tempfile::tempdir().unwrap();
         let attached = attach_image(directory.path(), "8m", false);
-        let project = attached.0.join("project");
+        let project = attached.path().join("project");
         std::fs::create_dir(&project).unwrap();
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3548,7 +3507,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         // Room for the retry, which the WAL folded in has grown.
         let attached = attach_image(directory.path(), "16m", true);
-        let project = attached.0.join("project");
+        let project = attached.path().join("project");
         std::fs::create_dir(&project).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3582,8 +3541,8 @@ mod tests {
         drop(writer);
         set_mode(&db_path, 0o644);
         let needed = room_to_copy(&db_path).unwrap();
-        let filler = attached.0.join("filler");
-        let free = lpm_common::filesystem_available_bytes(&attached.0).unwrap();
+        let filler = attached.path().join("filler");
+        let free = lpm_common::filesystem_available_bytes(attached.path()).unwrap();
         std::fs::write(
             &filler,
             vec![0; usize::try_from(free - 200 * 1024).unwrap()],
@@ -3629,7 +3588,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         // Room for the retry, which the WAL folded in has grown.
         let attached = attach_image(directory.path(), "16m", true);
-        let project = attached.0.join("project");
+        let project = attached.path().join("project");
         std::fs::create_dir(&project).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3646,7 +3605,7 @@ mod tests {
         set_mode(&db_path, 0o644);
         // Room for the copy's empty file, but not for SQLite's first 32 KiB
         // of shared memory, which the check's first read sizes.
-        let mut filler = std::fs::File::create(attached.0.join("filler")).unwrap();
+        let mut filler = std::fs::File::create(attached.path().join("filler")).unwrap();
         while filler.write_all(&[0; 4096]).is_ok() {}
         let filled = filler.metadata().unwrap().len();
         filler.set_len(filled - 8 * 1024).unwrap();
@@ -3665,7 +3624,7 @@ mod tests {
         let wal = capture_file(&db_path, "-wal");
         assert!(!wal.exists() || std::fs::metadata(&wal).unwrap().len() == 0);
 
-        std::fs::remove_file(attached.0.join("filler")).unwrap();
+        std::fs::remove_file(attached.path().join("filler")).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
