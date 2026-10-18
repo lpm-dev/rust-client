@@ -53,6 +53,49 @@ pub(super) fn validate_source_delivery_namespace(
             )));
         }
     }
+    // A file there, such as a hook, would run with the next git command.
+    if relative.components().any(|component| {
+        matches!(component, std::path::Component::Normal(given)
+            if given.to_str().is_some_and(lpm_common::names::is_git_dir_name))
+    }) {
+        return Err(LpmError::Registry(format!(
+            "source delivery cannot write into a git directory: {}",
+            destination.display()
+        )));
+    }
+    // NTFS takes a short name, such as `LPM~1.LOC` for `lpm.lock`, for the
+    // name itself in every open: `.git` at any depth, and at the root what
+    // only the root reserves.
+    let mut parent = project_root_canonical.to_path_buf();
+    for (depth, component) in relative.components().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        let reserved_at_root = std::iter::once(lpm_common::PROJECT_STATE_DIR)
+            .chain(
+                crate::commands::publish_common::PROJECT_RECORD_FILES
+                    .iter()
+                    .copied(),
+            )
+            .chain(
+                crate::commands::publish_common::PROJECT_RECORD_DIRS
+                    .iter()
+                    .copied(),
+            )
+            .filter(|_| depth == 0);
+        if lpm_common::project_state::is_short_name_of(
+            &parent,
+            name,
+            std::iter::once(".git").chain(reserved_at_root),
+        ) {
+            return Err(LpmError::Registry(format!(
+                "source delivery cannot write {}: {} is the short name of .lpm, a git directory or a project record",
+                destination.display(),
+                name.to_string_lossy()
+            )));
+        }
+        parent.push(name);
+    }
     Ok(())
 }
 
@@ -970,6 +1013,102 @@ fn open_destination_root(path: &Path) -> std::io::Result<Dir> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_delivery_never_writes_into_a_git_directory() {
+        let project = Path::new("/project");
+        for destination in [
+            ".git/hooks/pre-commit",
+            ".GIT/config",
+            "vendor/sub/.git/hooks/post-checkout",
+            ".g\u{200C}it/hooks/pre-commit",
+            "\u{200E}.git/HEAD",
+            // A Linux casefold directory ignores every default-ignorable
+            // code point, and git reads these as `.git` everywhere.
+            ".g\u{200B}it/HEAD",
+            ".git./hooks/pre-commit",
+            "vendor/.Git /HEAD",
+            "GIT~1/config",
+        ] {
+            let error = validate_source_delivery_namespace(project, &project.join(destination))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("git directory"), "{destination}: {error}");
+        }
+        for destination in [
+            ".github/workflows/ci.yml",
+            "src/git/index.ts",
+            ".gitignore",
+            ".git.d/a",
+        ] {
+            validate_source_delivery_namespace(project, &project.join(destination))
+                .unwrap_or_else(|error| panic!("{destination}: {error}"));
+        }
+    }
+
+    /// A volume that makes short names resolves them from any system; a
+    /// second name for the same file or directory stands in for one here.
+    #[cfg(unix)]
+    #[test]
+    fn source_delivery_refuses_a_short_name_on_any_system() {
+        let project = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::write(root.join("lpm.lock"), "").unwrap();
+        std::fs::hard_link(root.join("lpm.lock"), root.join("LPM~1.LOC")).unwrap();
+        std::fs::create_dir_all(root.join("vendor/.git")).unwrap();
+        std::os::unix::fs::symlink(".git", root.join("vendor/GIT~2")).unwrap();
+        for destination in [
+            root.join("LPM~1.LOC"),
+            root.join("vendor/GIT~2/hooks/pre-commit"),
+        ] {
+            let error = validate_source_delivery_namespace(&root, &destination)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("short name"), "{destination:?}: {error}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn source_delivery_never_writes_a_record_git_or_lpm_through_its_ntfs_short_name() {
+        let project = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::write(root.join("lpm.lock"), "").unwrap();
+        std::fs::create_dir_all(root.join("lpm-changes")).unwrap();
+        std::fs::create_dir_all(root.join("vendor/.git")).unwrap();
+        let short = |path: &str| crate::commands::publish_common::ntfs_short_name(&root.join(path));
+        let Some(lock) = short("lpm.lock") else {
+            // The volume makes no short names.
+            return;
+        };
+        let changes = short("lpm-changes").unwrap();
+        let git = short("vendor/.git").unwrap();
+        for destination in [root.join(&lock), root.join(&changes).join("next.md")] {
+            let error = validate_source_delivery_namespace(&root, &destination)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("short name"), "{destination:?}: {error}");
+        }
+        // `.git`'s short name is usually `GIT~1`, which git reads as `.git`
+        // by its name already; any other is refused as a short name.
+        let destination = root.join("vendor").join(&git).join("hooks/pre-commit");
+        let error = validate_source_delivery_namespace(&root, &destination)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("git directory") || error.contains("short name"),
+            "{destination:?}: {error}"
+        );
+        // A record's name, and `.lpm`, are reserved only at the project's
+        // root, as their own spellings are.
+        std::fs::create_dir_all(root.join("lib/.lpm")).unwrap();
+        std::fs::write(root.join("lib/lpm.lock"), "").unwrap();
+        for nested in ["lib/lpm.lock", "lib/.lpm"] {
+            let short_name = short(nested).unwrap();
+            validate_source_delivery_namespace(&root, &root.join("lib").join(short_name))
+                .unwrap_or_else(|error| panic!("{nested}: {error}"));
+        }
+    }
 
     #[test]
     fn resolve_safe_dest_normal_path_succeeds() {
