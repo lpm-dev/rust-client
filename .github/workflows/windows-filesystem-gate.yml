@@ -101,6 +101,8 @@ jobs:
           cargo test --locked -p lpm-cli --bin lpm-rs commands::deploy::tests::the_deploy_secret_scan_
           cargo test --locked -p lpm-cli --bin lpm-rs commands::deploy::tests::a_file_that_changes_after_the_secret_scan_
           cargo test --locked -p lpm-cli --bin lpm-rs commands::deploy::tests::a_copy_of_a_file_written_since_its_scan_
+          cargo test --locked -p lpm-cli --bin lpm-rs commands::deploy::tests::resolve_deploy_target_
+          cargo test --locked -p lpm-cli --bin lpm-rs commands::deploy::tests::a_view_is_told_by_the_names_that_end_a_path_not_its_drive
           cargo test --locked -p lpm-cli --bin lpm-rs commands::publish::prepare::tests::published_lpm_json_
           cargo test --locked -p lpm-cli --bin lpm-rs publish_common::tests::the_active_lpm_home_
           cargo test --locked -p lpm-cli --bin lpm-rs publish_common::tests::a_package_directory_that_is_the_lpm_home_

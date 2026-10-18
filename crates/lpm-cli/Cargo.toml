@@ -243,6 +243,8 @@ version = "0.11"
 optional = true
 
 [dev-dependencies]
+# Disk images the macOS deploy tests attach.
+lpm-common = { workspace = true, features = ["test-support"] }
 wiremock = "0.6"
 assert_cmd = "2"
 insta = { version = "1", features = ["json"] }

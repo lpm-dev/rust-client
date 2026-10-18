@@ -199,7 +199,7 @@ pub async fn run(
     // workspace, so force-clearing here preserves a clean snapshot without
     // risking source files.
     if force && plan.output_dir.exists() {
-        std::fs::remove_dir_all(&plan.output_dir).map_err(|e| {
+        paths::remove_output(&plan.output_dir).map_err(|e| {
             LpmError::Script(format!(
                 "lpm deploy --force: failed to clear output directory {:?}: {e}",
                 plan.output_dir
