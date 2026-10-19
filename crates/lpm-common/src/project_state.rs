@@ -217,7 +217,25 @@ fn keep_state_dir_owner_only_or_warn(
     }
 }
 
-#[cfg(not(unix))]
+/// Keeps the open state directory to its owner and SYSTEM, letting
+/// sandboxed lifecycle scripts through to what they are granted inside, as
+/// [`crate::owner_only::protect_state_directory`] does; what an earlier
+/// release left inside stops inheriting the project directory's access.
+#[cfg(windows)]
+fn keep_state_dir_owner_only_or_warn(
+    directory: &cap_std::fs::Dir,
+    _metadata: &cap_std::fs::Metadata,
+    state_display: &Path,
+) {
+    if let Err(error) = crate::owner_only::protect_state_directory(directory, true) {
+        tracing::warn!(
+            "could not keep {} to its owner: {error}",
+            state_display.display()
+        );
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn keep_state_dir_owner_only_or_warn(
     _directory: &cap_std::fs::Dir,
     _metadata: &cap_std::fs::Metadata,
@@ -363,6 +381,7 @@ pub fn guard_lpm_home(root: &Path) -> Result<(), LpmHomeExposed> {
         }
         Err(error) => return lpm_home_left_in_git(root, &error, false),
     };
+    keep_lpm_home_owner_only_or_warn(&directory, root);
     keep_open_lpm_home_ignored(&directory, root)
 }
 
@@ -376,10 +395,27 @@ pub fn keep_existing_lpm_home_ignored(root: &Path) {
     else {
         return;
     };
+    keep_lpm_home_owner_only_or_warn(&directory, root);
     if let Err(exposed) = keep_open_lpm_home_ignored(&directory, root) {
         tracing::debug!("{exposed}");
     }
 }
+
+/// Keeps the LPM home to its owner and SYSTEM on Windows, letting
+/// sandboxed lifecycle scripts through to the store they are granted, as
+/// [`crate::owner_only::protect_state_directory`] does for what is created
+/// there from now on. What is already in it keeps its access: store files
+/// are hard links in projects' `node_modules`, and a home in the user's
+/// profile inherits the profile's.
+#[cfg(windows)]
+fn keep_lpm_home_owner_only_or_warn(directory: &cap_std::fs::Dir, root: &Path) {
+    if let Err(error) = crate::owner_only::protect_state_directory(directory, false) {
+        tracing::warn!("could not keep {} to its owner: {error}", root.display());
+    }
+}
+
+#[cfg(not(windows))]
+fn keep_lpm_home_owner_only_or_warn(_directory: &cap_std::fs::Dir, _root: &Path) {}
 
 /// Why git could commit what the LPM home at `home` holds, which `error`
 /// kept LPM from ignoring, when a directory at or above it holds a `.git`,
