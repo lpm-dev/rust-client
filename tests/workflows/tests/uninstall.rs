@@ -100,6 +100,26 @@ fn uninstall_last_dependency_leaves_empty_dependencies_object() {
     );
 }
 
+/// Editors can save `package.json` with a UTF-8 byte order mark, which
+/// npm and the rest of lpm read past.
+#[test]
+fn uninstall_reads_a_package_json_with_a_byte_order_mark() {
+    let project = TempProject::empty(
+        "\u{FEFF}{\"name\":\"marked\",\"version\":\"1.0.0\",\"dependencies\":{\"gone\":\"^1.0.0\",\"kept\":\"^2.0.0\"}}",
+    );
+
+    lpm(&project).args(["uninstall", "gone"]).assert().success();
+
+    let pkg_json: serde_json::Value = serde_json::from_str(
+        project
+            .read_file("package.json")
+            .trim_start_matches('\u{FEFF}'),
+    )
+    .unwrap();
+    assert!(pkg_json["dependencies"].get("gone").is_none());
+    assert_eq!(pkg_json["dependencies"]["kept"], "^2.0.0");
+}
+
 /// Same one-pass scan covers `devDependencies`. There's no separate
 /// `--dev` / `-D` flag on uninstall (unlike install / npm); both sections
 /// are checked unconditionally. This test pins that contract — adding

@@ -535,7 +535,7 @@ fn node_modules_package_field(project_dir: &Path, package: &str, field: &str) ->
     let content =
         lpm_common::read_text_file_capped(&manifest_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
             .ok()?;
-    let manifest: Value = serde_json::from_str(&content).ok()?;
+    let manifest: Value = serde_json::from_str(lpm_common::strip_utf8_bom_str(&content)).ok()?;
     manifest
         .get(field)
         .and_then(Value::as_str)
@@ -556,8 +556,8 @@ fn prune_lockfile_to_current_manifest(
     let manifest_path = project_dir.join("package.json");
     let manifest_content =
         lpm_common::read_text_file_capped(&manifest_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)?;
-    let manifest: Value =
-        serde_json::from_str(&manifest_content).map_err(|e| LpmError::Registry(e.to_string()))?;
+    let manifest: Value = serde_json::from_str(lpm_common::strip_utf8_bom_str(&manifest_content))
+        .map_err(|e| LpmError::Registry(e.to_string()))?;
     let direct_specs = collect_manifest_dependency_specs(&manifest);
     let mut retained_roots = direct_specs.keys().cloned().collect::<HashSet<_>>();
 
@@ -821,8 +821,8 @@ fn uninstall_from_manifest(
         }
         Err(error) => return Err(error.into()),
     };
-    let mut doc: Value =
-        serde_json::from_str(&content).map_err(|e| LpmError::Registry(e.to_string()))?;
+    let mut doc: Value = serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
+        .map_err(|e| LpmError::Registry(e.to_string()))?;
 
     let result = remove_from_manifest(&mut doc, packages);
     if result.removed.is_empty() {
@@ -1217,6 +1217,22 @@ fn print_uninstall_json(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn installed_package_fields_are_read_from_a_package_json_with_a_byte_order_mark() {
+        let project = tempfile::tempdir().unwrap();
+        let package = project.path().join("node_modules").join("marked");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            "\u{FEFF}{\"name\":\"marked\",\"version\":\"1.2.3\"}",
+        )
+        .unwrap();
+        assert_eq!(
+            node_modules_package_field(project.path(), "marked", "version").as_deref(),
+            Some("1.2.3")
+        );
+    }
 
     #[allow(clippy::too_many_arguments)]
     async fn run(

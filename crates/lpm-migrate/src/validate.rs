@@ -75,10 +75,11 @@ fn check_root_deps(lockfile: &Lockfile, project_dir: &Path, warnings: &mut Vec<S
         Err(_) => return, // No package.json — nothing to check
     };
 
-    let json: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(j) => j,
-        Err(_) => return, // Malformed — skip
-    };
+    let json: serde_json::Value =
+        match serde_json::from_str(lpm_common::strip_utf8_bom_str(&content)) {
+            Ok(j) => j,
+            Err(_) => return, // Malformed — skip
+        };
 
     let lockfile_names: HashSet<&str> = lockfile.packages.iter().map(|p| p.name.as_str()).collect();
 
@@ -277,6 +278,24 @@ mod tests {
             root_resolutions: lpm_lockfile::RootResolutions::new(),
             ambient_peer_installs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn root_dependencies_are_read_from_a_package_json_with_a_byte_order_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "\u{FEFF}{\"dependencies\": {\"express\": \"^4.0.0\"}}",
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+
+        check_root_deps(&make_lockfile(Vec::new()), dir.path(), &mut warnings);
+
+        assert_eq!(
+            warnings,
+            ["root dependency 'express' from package.json (dependencies) not found in lockfile"]
+        );
     }
 
     #[test]

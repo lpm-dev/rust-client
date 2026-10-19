@@ -2825,8 +2825,10 @@ fn plan_dependency_update(
     let original =
         lpm_common::read_file_capped(&manifest_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
             .map_err(|error| LpmError::Registry(format!("failed to read package.json: {error}")))?;
-    let mut manifest: serde_json::Value = serde_json::from_slice(&original)
-        .map_err(|error| LpmError::Registry(format!("failed to parse package.json: {error}")))?;
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(lpm_common::strip_utf8_bom_bytes(&original)).map_err(|error| {
+            LpmError::Registry(format!("failed to parse package.json: {error}"))
+        })?;
     let object = manifest
         .as_object_mut()
         .ok_or_else(|| LpmError::Registry("package.json root must be a JSON object".to_string()))?;

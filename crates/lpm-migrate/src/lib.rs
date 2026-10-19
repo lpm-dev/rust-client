@@ -355,7 +355,8 @@ fn read_dep_sets(
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     )
     .ok()?;
-    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let json: serde_json::Value =
+        serde_json::from_str(lpm_common::strip_utf8_bom_str(&content)).ok()?;
 
     let dev_deps = json
         .get("devDependencies")
@@ -385,6 +386,19 @@ fn detect_workspace_members(project_dir: &Path) -> Result<usize, LpmError> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn dependency_sets_are_read_from_a_package_json_with_a_byte_order_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            "\u{FEFF}{\"devDependencies\": {\"vitest\": \"^3.0.0\"}}",
+        )
+        .unwrap();
+        let (dev_deps, optional_deps) = read_dep_sets(dir.path()).unwrap();
+        assert!(dev_deps.contains("vitest"));
+        assert!(optional_deps.is_empty());
+    }
 
     #[test]
     fn workspace_detection_npm_workspaces() {
