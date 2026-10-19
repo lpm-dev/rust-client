@@ -1952,19 +1952,7 @@ impl RestoreTransaction {
     ) -> Result<HashSet<std::ffi::OsString>, LpmError> {
         use rustix::fs::{RenameFlags, renameat_with};
 
-        let mut candidates = HashSet::new();
-        for relative in files {
-            let mut components = relative.components();
-            let Some(Component::Normal(root)) = components.next() else {
-                continue;
-            };
-            if components.next().is_some() {
-                candidates.insert(root.to_os_string());
-            }
-        }
-        let mut candidates: Vec<_> = candidates.into_iter().collect();
-        candidates.sort_unstable();
-
+        let candidates = top_level_tree_candidates(files);
         let mut installed = HashSet::with_capacity(candidates.len());
         for root in candidates {
             match self.project.symlink_metadata(&root) {
@@ -1989,14 +1977,7 @@ impl RestoreTransaction {
                 RenameFlags::NOREPLACE,
             ) {
                 Ok(()) => {}
-                Err(error)
-                    if matches!(
-                        std::io::Error::from(error).kind(),
-                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::DirectoryNotEmpty
-                    ) =>
-                {
-                    continue;
-                }
+                Err(error) if tree_stays_for_files(&std::io::Error::from(error)) => continue,
                 Err(error) => return Err(std::io::Error::from(error).into()),
             }
             let destination = match self.project.open_dir_nofollow(&root) {
@@ -2032,7 +2013,96 @@ impl RestoreTransaction {
         Ok(installed)
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    pub(super) fn install_missing_top_level_trees(
+        &mut self,
+        files: &[PathBuf],
+    ) -> Result<HashSet<std::ffi::OsString>, LpmError> {
+        use cap_fs_ext::OpenOptionsMaybeDirExt as _;
+        use cap_std::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_READ_ATTRIBUTES, SYNCHRONIZE};
+
+        let candidates = top_level_tree_candidates(files);
+        let mut installed = HashSet::with_capacity(candidates.len());
+        for root in candidates {
+            match self.project.symlink_metadata(&root) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => continue,
+                Err(error) => return Err(error.into()),
+            }
+            // The tree moves by this handle, which no one else can rename or
+            // delete while it is open, so it is the tree the staging verified.
+            let mut options = cap_std::fs::OpenOptions::new();
+            options
+                .access_mode(DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+                .maybe_dir(true)
+                .follow(FollowSymlinks::No);
+            let unsafe_tree = |error: &dyn std::fmt::Display| {
+                LpmError::Task(format!(
+                    "staged task cache output tree is unsafe at {}: {error}",
+                    Path::new(&root).display()
+                ))
+            };
+            let source = self
+                .output
+                .open_with(&root, &options)
+                .map_err(|error| unsafe_tree(&error))?;
+            let metadata = source.metadata()?;
+            if !metadata.is_dir() || cap_metadata_is_link_or_reparse(&metadata) {
+                return Err(unsafe_tree(&"not a directory"));
+            }
+            let expected =
+                lpm_common::atomic_write::file_identity(&source.try_clone()?.into_std())?;
+            #[cfg(test)]
+            wait_for_cache_race_barrier(&STAGED_TREE_RACE_BARRIER, &self.project_dir.join(&root));
+            match lpm_common::rename_open_file_noreplace(&self.project, &root, &source) {
+                Ok(()) => {}
+                // A handle another process holds in the tree, as a virus
+                // scanner opens fresh files, refuses the move past the
+                // rename's retries; its files still publish one by one.
+                Err(error)
+                    if tree_stays_for_files(&error)
+                        || matches!(
+                            error.kind(),
+                            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ResourceBusy
+                        ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
+            drop(source);
+            let destination = match self.project.open_dir_nofollow(&root) {
+                Ok(destination) => destination,
+                Err(error) => {
+                    return Err(LpmError::Task(format!(
+                        "task cache output tree changed during publication at {}: {error}",
+                        self.project_dir.join(&root).display()
+                    )));
+                }
+            };
+            let actual =
+                lpm_common::atomic_write::file_identity(&destination.try_clone()?.into_std_file())?;
+            if actual != expected {
+                clean_open_cache_ephemeral(&destination)?;
+                drop(destination);
+                self.project.remove_dir(&root)?;
+                sync_cap_directory(&self.project)?;
+                return Err(LpmError::Task(format!(
+                    "staged task cache output tree changed during publication at {}",
+                    self.project_dir.join(&root).display()
+                )));
+            }
+            self.installed_trees.push(PathBuf::from(&root));
+            installed.insert(root);
+        }
+        if !installed.is_empty() {
+            self.mutated_dirs.insert(PathBuf::new());
+        }
+        Ok(installed)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     pub(super) fn install_missing_top_level_trees(
         &mut self,
         _files: &[PathBuf],
@@ -2404,6 +2474,38 @@ impl RestoreTransaction {
         self.mutated_dirs.clear();
         Ok(())
     }
+}
+
+/// The top-level directories of the outputs a restore installs, sorted:
+/// those it can move into place whole when the project lacks them.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn top_level_tree_candidates(files: &[PathBuf]) -> Vec<std::ffi::OsString> {
+    let mut candidates = HashSet::new();
+    for relative in files {
+        let mut components = relative.components();
+        let Some(Component::Normal(root)) = components.next() else {
+            continue;
+        };
+        if components.next().is_some() {
+            candidates.insert(root.to_os_string());
+        }
+    }
+    let mut candidates: Vec<_> = candidates.into_iter().collect();
+    candidates.sort_unstable();
+    candidates
+}
+
+/// Whether a staged tree that couldn't move whole stays for its files to
+/// be published one by one: the project gained the directory meanwhile, or
+/// the staging is on another volume than the project.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn tree_stays_for_files(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::AlreadyExists
+            | std::io::ErrorKind::DirectoryNotEmpty
+            | std::io::ErrorKind::CrossesDevices
+    )
 }
 
 fn open_directory_nofollow(root: &Dir, relative: &Path, label: &str) -> Result<Dir, LpmError> {

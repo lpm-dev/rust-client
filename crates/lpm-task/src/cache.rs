@@ -46,7 +46,7 @@ static STAGED_OUTPUT_RACE_BARRIER: std::sync::Mutex<Vec<CacheRaceBarrier>> =
 static PUBLISHED_OUTPUT_RACE_BARRIER: std::sync::Mutex<Vec<CacheRaceBarrier>> =
     std::sync::Mutex::new(Vec::new());
 
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
 static STAGED_TREE_RACE_BARRIER: std::sync::Mutex<Vec<CacheRaceBarrier>> =
     std::sync::Mutex::new(Vec::new());
 
@@ -3418,9 +3418,6 @@ mod tests {
         );
     }
 
-    // Only these move an output tree that is missing in the project into
-    // place whole; elsewhere each file is published, and synced, on its own.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn restoring_many_new_outputs_uses_a_bounded_number_of_durability_syncs() {
         let source = tempfile::tempdir().unwrap();
@@ -3778,7 +3775,6 @@ mod tests {
         assert_eq!(staged_identity, destination_identity);
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn restore_rolls_back_an_atomically_installed_output_tree_after_a_later_failure() {
         let project = tempfile::tempdir().unwrap();
