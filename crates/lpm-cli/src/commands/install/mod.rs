@@ -884,6 +884,20 @@ async fn run_with_options_under_store_lock(
         if defer_project_linker_layout_maintenance {
             maintain_project_linker_layout(project_dir, json_output);
         }
+        if !offline && !no_skills {
+            let added = missing_added_source_skills(project_dir, &Default::default())?;
+            if !added.is_empty() {
+                let packages: Vec<(&str, &str)> = added
+                    .iter()
+                    .map(|(name, version)| (name.as_str(), version.as_str()))
+                    .collect();
+                let client = Arc::new(client.clone_with_config());
+                install_skills_for_packages(&client, &packages, project_dir, !json_output).await?;
+            }
+        }
+        if !offline {
+            restore_managed_project_skills(project_dir, json_output).await?;
+        }
         run_empty_dependency_install_phase(EmptyDependencyInstallInput {
             project_dir,
             lpm_root,
@@ -1905,12 +1919,23 @@ async fn run_with_options_under_store_lock(
 
     // Step 8: Auto-install skills for direct LPM packages
     if !offline && !no_skills {
-        let lpm_packages = selected_package_skills(&packages)?;
+        let mut lpm_packages = selected_package_skills(&packages)?;
+        let direct: std::collections::BTreeSet<&str> =
+            lpm_packages.iter().map(|(name, _)| *name).collect();
+        let added = missing_added_source_skills(project_dir, &direct)?;
+        lpm_packages.extend(
+            added
+                .iter()
+                .map(|(name, version)| (name.as_str(), version.as_str())),
+        );
 
         if !lpm_packages.is_empty() {
             install_skills_for_packages(&arc_client, &lpm_packages, project_dir, !json_output)
                 .await?;
         }
+    }
+    if !offline {
+        restore_managed_project_skills(project_dir, json_output).await?;
     }
 
     let lockfile_write_result = run_online_lockfile_write_phase(OnlineLockfileWritePhaseInput {

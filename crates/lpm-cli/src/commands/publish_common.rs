@@ -2488,7 +2488,7 @@ const IGNORE_DIRS: &[&str] = &["node_modules", ".git", ".svn", ".hg", "CVS"];
 const IGNORE_FILES: &[&str] = &[".gitignore", ".npmignore", ".DS_Store", "Thumbs.db"];
 
 /// The project's committed LPM records, kept out of every tarball.
-const PROJECT_RECORD_FILES: &[&str] = &[
+pub(crate) const PROJECT_RECORD_FILES: &[&str] = &[
     "lpm.lock",
     "lpm.lockb",
     "lpm-sources.json",
@@ -2496,7 +2496,7 @@ const PROJECT_RECORD_FILES: &[&str] = &[
 ];
 
 /// Root directories of committed LPM records, kept out of every tarball.
-const PROJECT_RECORD_DIRS: &[&str] = &["lpm-changes"];
+pub(crate) const PROJECT_RECORD_DIRS: &[&str] = &["lpm-changes"];
 
 const ROOT_LOCK_FILES: &[&str] = &[
     "package-lock.json",

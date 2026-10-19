@@ -23,6 +23,55 @@ pub(super) fn selected_package_skills(
         .collect())
 }
 
+/// The skills `lpm-sources.json` records for packages `lpm add` delivered,
+/// other than `direct` dependencies, that aren't in `.lpm/skills/` at the
+/// recorded version, so a fresh checkout gets them back.
+pub(super) fn missing_added_source_skills(
+    project_dir: &Path,
+    direct: &std::collections::BTreeSet<&str>,
+) -> Result<Vec<(String, String)>, LpmError> {
+    Ok(
+        crate::commands::skills::package::added_source_skills(project_dir, direct)?
+            .into_iter()
+            .filter(|(name, version)| {
+                !crate::commands::skills::package::version_is_materialized(
+                    project_dir,
+                    name,
+                    version,
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Restores the managed agent skills `lpm-agent-skills.json` records that
+/// this checkout lacks. What can't be restored is a warning.
+pub(super) async fn restore_managed_project_skills(
+    project_dir: &Path,
+    json_output: bool,
+) -> Result<(), LpmError> {
+    if crate::commands::skills::project_skills_ready(project_dir) {
+        return Ok(());
+    }
+    let summary = crate::commands::skills::restore_project_skills(project_dir).await?;
+    if !json_output {
+        if !summary.restored.is_empty() {
+            output::info(&format!(
+                "Restored {} managed agent skill(s)",
+                summary.restored.len()
+            ));
+        }
+        for warning in &summary.warnings {
+            output::warn(&lpm_common::sanitize_terminal_inline(warning));
+        }
+    } else {
+        for warning in &summary.warnings {
+            tracing::warn!("{warning}");
+        }
+    }
+    Ok(())
+}
+
 pub(super) async fn install_skills_for_packages(
     client: &Arc<RegistryClient>,
     packages: &[(&str, &str)],

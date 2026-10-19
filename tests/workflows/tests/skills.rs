@@ -488,7 +488,7 @@ fn skills_dashboard_disable_applies_only_after_preview_confirmation() {
     assert_eq!(applied["success"], true);
     assert_eq!(applied["action"], "disable");
     assert!(!project.file_exists(".agents/skills/release-notes"));
-    assert!(project.file_exists(".lpm/managed-skills/skills.lock.json"));
+    assert!(project.file_exists("lpm-agent-skills.json"));
 }
 
 #[test]
@@ -774,16 +774,52 @@ fn standalone_skills_add_ignores_disabled_lpm_package_skill_config() {
         "Codex project target must receive the selected managed skill"
     );
     assert!(
-        project
-            .path()
-            .join(".lpm/managed-skills/skills.lock.json")
-            .is_file(),
+        project.path().join("lpm-agent-skills.json").is_file(),
         "managed skill source and target state must be recorded separately from package skills"
     );
     assert!(
         !project.path().join(".lpm/skills/release-notes").exists(),
         "standalone skills must not be converted into package-published skill storage"
     );
+}
+
+#[test]
+fn install_restores_managed_project_skills_on_a_fresh_checkout() {
+    let project = TempProject::empty(r#"{"name":"skills","version":"1.0.0","dependencies":{}}"#);
+    seed_standard_skill(
+        &project,
+        "team-skills",
+        "release-notes",
+        "Summarize the relevant commits into concise release notes.",
+    );
+    lpm(&project)
+        .args([
+            "skills",
+            "add",
+            "./team-skills",
+            "--skill",
+            "release-notes",
+            "--agent",
+            "codex",
+            "--project",
+            "--yes",
+        ])
+        .assert()
+        .success();
+    let record = project.read_file("lpm-agent-skills.json");
+    assert!(record.contains("\"./team-skills\""), "{record}");
+    std::fs::remove_dir_all(project.path().join(".lpm")).unwrap();
+    std::fs::remove_file(project.path().join(".agents/skills/release-notes")).unwrap();
+
+    let output = lpm(&project).arg("install").output().unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(project.file_exists(".agents/skills/release-notes/SKILL.md"));
+    assert_eq!(project.read_file("lpm-agent-skills.json"), record);
 }
 
 #[test]
@@ -1687,6 +1723,54 @@ async fn assert_warm_install_refreshes_package_skills(aliased: bool, workspace_m
 }
 
 #[tokio::test]
+async fn install_restores_the_skills_lpm_add_delivered_at_the_recorded_version() {
+    let project =
+        TempProject::empty(r#"{"name":"fresh-clone","version":"1.0.0","dependencies":{}}"#);
+    project.write_file(
+        "lpm-sources.json",
+        &serde_json::json!({
+            "schemaVersion": 1,
+            "packages": {"@lpm.dev/owner.widget": {
+                "version": "1.4.0",
+                "files": {},
+                "skills": "owner.widget",
+            }},
+        })
+        .to_string(),
+    );
+    let registry = MockRegistry::start().await;
+    registry
+        .with_package_skills_for_version_expected(
+            "owner.widget",
+            "1.4.0",
+            vec![package_skill(
+                "widget-guide",
+                "Use the widget the way this release supports",
+                "Render the widget through its documented props.",
+            )],
+            1,
+        )
+        .await;
+
+    lpm_with_registry(&project, &registry.url())
+        .arg("install")
+        .assert()
+        .success();
+
+    assert!(project.file_exists(".lpm/skills/owner.widget/widget-guide.md"));
+    let manifest: serde_json::Value = serde_json::from_str(
+        &project.read_file(".lpm/skills/owner.widget/.lpm-package-skills.json"),
+    )
+    .unwrap();
+    assert_eq!(manifest["version"], "1.4.0");
+
+    lpm_with_registry(&project, &registry.url())
+        .arg("install")
+        .assert()
+        .success();
+}
+
+#[tokio::test]
 async fn aliases_at_multiple_versions_share_the_highest_selected_package_skill_set() {
     let name = "@lpm.dev/owner.package";
     let project = TempProject::empty(
@@ -2223,7 +2307,7 @@ fn skills_prune_removes_orphaned_links_and_stale_state_records() {
         preview_stdout.contains(
             &project
                 .path()
-                .join(".lpm/managed-skills/skills.lock.json")
+                .join("lpm-agent-skills.json")
                 .display()
                 .to_string()
         ),
@@ -2247,10 +2331,9 @@ fn skills_prune_removes_orphaned_links_and_stale_state_records() {
             .is_err(),
         "prune must remove the orphaned agent link"
     );
-    let state = project.read_file(".lpm/managed-skills/skills.lock.json");
     assert!(
-        !state.contains("release-notes"),
-        "prune must remove the stale state record: {state}"
+        !project.file_exists("lpm-agent-skills.json"),
+        "prune must remove the stale state record"
     );
 }
 
@@ -2593,9 +2676,10 @@ fn skills_remove_all_deletes_every_managed_record_and_target() {
     let envelope = json_command(&project, &["skills", "remove", "--all", "--yes"]);
 
     assert_eq!(envelope["changes"].as_array().map(Vec::len), Some(4));
-    let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/managed-skills/skills.lock.json")).unwrap();
-    assert_eq!(state["skills"], serde_json::json!({}));
+    assert!(
+        !project.file_exists("lpm-agent-skills.json"),
+        "a project without managed skills keeps no record"
+    );
     assert!(!project.path().join(".agents/skills/release-notes").exists());
     assert!(
         !project
@@ -2633,7 +2717,7 @@ fn skills_remove_rejects_symlinked_canonical_parent_without_external_deletion() 
 
     let managed_root = project.path().join(".lpm/managed-skills");
     let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/managed-skills/skills.lock.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-agent-skills.json")).unwrap();
     let canonical_dir = state["skills"]["release-notes"]["canonical_dir"]
         .as_str()
         .unwrap();
@@ -2655,7 +2739,7 @@ fn skills_remove_rejects_symlinked_canonical_parent_without_external_deletion() 
     assert!(external_skill.is_file(), "external content must survive");
     assert!(project.file_exists(".agents/skills/release-notes/SKILL.md"));
     let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/managed-skills/skills.lock.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-agent-skills.json")).unwrap();
     assert!(state["skills"].get("release-notes").is_some());
 }
 
@@ -2687,7 +2771,7 @@ fn skills_update_rejects_symlinked_superseded_parent_without_external_deletion()
 
     let managed_root = project.path().join(".lpm/managed-skills");
     let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/managed-skills/skills.lock.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-agent-skills.json")).unwrap();
     let canonical_dir = state["skills"]["release-notes"]["canonical_dir"]
         .as_str()
         .unwrap();
@@ -2716,7 +2800,7 @@ fn skills_update_rejects_symlinked_superseded_parent_without_external_deletion()
     );
     assert!(external_skill.is_file(), "external content must survive");
     let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/managed-skills/skills.lock.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-agent-skills.json")).unwrap();
     assert_eq!(
         state["skills"]["release-notes"]["canonical_dir"],
         serde_json::json!(canonical_dir)
@@ -2751,14 +2835,14 @@ fn skills_prune_rejects_symlinked_canonical_parent_without_external_deletion() {
 
     let managed_root = project.path().join(".lpm/managed-skills");
     let mut state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/managed-skills/skills.lock.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-agent-skills.json")).unwrap();
     let canonical_dir = state["skills"]["release-notes"]["canonical_dir"]
         .as_str()
         .unwrap()
         .to_string();
     state["skills"]["release-notes"]["targets"] = serde_json::json!({});
     project.write_file(
-        ".lpm/managed-skills/skills.lock.json",
+        "lpm-agent-skills.json",
         &serde_json::to_string_pretty(&state).unwrap(),
     );
     let outside = tempfile::tempdir().unwrap();
@@ -2778,7 +2862,7 @@ fn skills_prune_rejects_symlinked_canonical_parent_without_external_deletion() {
     );
     assert!(external_skill.is_file(), "external content must survive");
     let state: serde_json::Value =
-        serde_json::from_str(&project.read_file(".lpm/managed-skills/skills.lock.json")).unwrap();
+        serde_json::from_str(&project.read_file("lpm-agent-skills.json")).unwrap();
     assert!(state["skills"].get("release-notes").is_some());
 }
 

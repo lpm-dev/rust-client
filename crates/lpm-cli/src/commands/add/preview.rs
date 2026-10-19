@@ -204,10 +204,12 @@ pub(super) fn plan_package(
         Some(state) => state,
         None => {
             let (state, snapshot) = added_sources_state::load_state_with_snapshot(project)?;
-            preview.observed.insert(
-                added_sources_state::state_path(project),
-                snapshot.as_deref().map(added_sources_state::digest_bytes),
-            );
+            for (path, bytes) in snapshot.files {
+                preview.observed.insert(
+                    path,
+                    bytes.as_deref().map(added_sources_state::digest_bytes),
+                );
+            }
             state
         }
     };
@@ -412,6 +414,7 @@ pub(super) fn plan_package(
     }
     state.record_package_delivery(
         &key,
+        version,
         tracked_files,
         std::iter::empty(),
         tracked_dependencies,

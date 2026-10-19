@@ -9,7 +9,7 @@ expression: view
   "description": "A useful release-notes skill for workflow testing",
   "source": {
     "kind": "local",
-    "path": "[project]/team-skills",
+    "path": "./team-skills",
     "digest": "04a4499912b76d5e76efa5a01a17a5f533330fc275ceab7dd24a4b44550e79a3"
   },
   "scope": "project",

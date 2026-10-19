@@ -1089,7 +1089,7 @@ async fn run_locked(
     let lpm_lock_path =
         crate::commands::install::workspace_lockfile::active_lockfile_path(project_dir);
     let lpm_lock_bin_path = lpm_lock_path.with_extension("lockb");
-    let added_sources_state_path = crate::added_sources_state::state_path(project_dir);
+    let added_sources_state_paths = crate::added_sources_state::state_paths(project_dir);
     let (mut added_sources_state, added_sources_state_snapshot) =
         crate::added_sources_state::load_state_with_snapshot(project_dir)?;
     let install_hash_path = project_dir.join(".lpm").join("install-hash");
@@ -1116,13 +1116,15 @@ async fn run_locked(
         &[install_hash_path.as_path()],
     )
     .map_err(|e| LpmError::Registry(format!("failed to snapshot install state: {e}")))?;
-    tx.snapshot_optional_path_with_bytes(&added_sources_state_path, added_sources_state_snapshot)
-        .map_err(|error| {
-            LpmError::Registry(format!(
-                "failed to snapshot added-source state '{}': {error}",
-                added_sources_state_path.display()
-            ))
-        })?;
+    for (path, bytes) in added_sources_state_snapshot.files {
+        tx.snapshot_optional_path_with_bytes(&path, bytes)
+            .map_err(|error| {
+                LpmError::Registry(format!(
+                    "failed to snapshot source package record '{}': {error}",
+                    path.display()
+                ))
+            })?;
+    }
     let package_state_key = target.json_name();
     let previous_package_record = added_sources_state.take_package(&package_state_key);
     let mut created_directories = previous_package_record
@@ -1616,14 +1618,16 @@ async fn run_locked(
     created_directories.retain(|directory| tracked_ancestors.contains(directory));
     added_sources_state.record_package_delivery(
         &package_state_key,
+        &version,
         tracked_files,
         created_directories,
         tracked_dependencies,
         tracked_skill_short,
     );
     crate::added_sources_state::write_state(project_dir, &added_sources_state)?;
-    tx.restore_only_if_current(&added_sources_state_path)
-        .map_err(LpmError::Io)?;
+    for path in &added_sources_state_paths {
+        tx.restore_only_if_current(path).map_err(LpmError::Io)?;
+    }
 
     if !no_skills && let AddTarget::Lpm(pkg) = &target {
         let short_name = pkg.short();
@@ -1646,8 +1650,9 @@ async fn run_locked(
                 let provenance_result =
                     crate::added_sources_state::write_state(project_dir, &added_sources_state)
                         .and_then(|()| {
-                            tx.restore_only_if_current(&added_sources_state_path)
-                                .map_err(LpmError::Io)
+                            added_sources_state_paths.iter().try_for_each(|path| {
+                                tx.restore_only_if_current(path).map_err(LpmError::Io)
+                            })
                         });
                 if let Err(error) = provenance_result {
                     let warning = format!(
