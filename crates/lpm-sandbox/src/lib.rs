@@ -697,6 +697,21 @@ pub enum SandboxError {
         reason: String,
     },
 
+    /// Revoking what a package's Windows AppContainer identity was granted,
+    /// and deleting its profile, failed.
+    #[error(
+        "couldn't remove the sandbox access {package}'s scripts had in {}: {reason}",
+        project.display()
+    )]
+    IdentityCleanupFailed {
+        /// The project the identity belongs to.
+        project: PathBuf,
+        /// The package whose scripts ran in it.
+        package: String,
+        /// What the helper or the filesystem reported.
+        reason: String,
+    },
+
     /// Caller provided a [`SandboxSpec`] the backend can't use, e.g.
     /// a relative `package_dir` or empty `package_name`.
     #[error("invalid sandbox spec: {reason}")]
@@ -1023,6 +1038,35 @@ fn helper_missing_message(searched: &[PathBuf]) -> String {
          scripts without containment",
         version = env!("CARGO_PKG_VERSION"),
     )
+}
+
+/// Removes the sandbox access `package`'s lifecycle scripts were given in
+/// `project_dir`, once the package leaves the project: on Windows, what
+/// its AppContainer identity there was granted, and its profile. `false`
+/// when it had none, as on other systems.
+pub fn release_package_identity(project_dir: &Path, package: &str) -> Result<bool, SandboxError> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_appcontainer::release_package_identity(project_dir, package)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (project_dir, package);
+        Ok(false)
+    }
+}
+
+/// [`release_package_identity`] for every identity whose project no
+/// longer exists, and how many it released.
+pub fn release_identities_of_removed_projects() -> Result<usize, SandboxError> {
+    #[cfg(target_os = "windows")]
+    {
+        windows_appcontainer::release_identities_of_removed_projects()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(0)
+    }
 }
 
 /// User-facing remediation string for [`SandboxError::UnsupportedPlatform`].

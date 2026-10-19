@@ -19,9 +19,13 @@
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
+use std::sync::LazyLock;
 
 use assert_cmd::Command;
 use windows_sys::Win32::Security::Isolation::DeleteAppContainerProfile;
+
+static PROTOCOL_VERSION: LazyLock<String> =
+    LazyLock::new(|| lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string());
 
 const EXIT_ARGV_PARSE: i32 = 64;
 const EXIT_PROTOCOL_MISMATCH: i32 = 65;
@@ -78,7 +82,7 @@ impl Drop for TemporaryAppContainerProfile {
 fn minimal_argv<'a>() -> Vec<&'a str> {
     vec![
         "--protocol-version",
-        "2",
+        PROTOCOL_VERSION.as_str(),
         "--appcontainer-name",
         TEST_APPCONTAINER_NAME,
         "--stdio-stdin",
@@ -146,7 +150,7 @@ fn helper_rejects_missing_appcontainer_name() {
     // MissingFlag branch end-to-end.
     let argv = vec![
         "--protocol-version",
-        "2",
+        PROTOCOL_VERSION.as_str(),
         "--stdio-stdin",
         "null",
         "--stdio-stdout",
@@ -237,7 +241,7 @@ fn helper_supports_concurrent_first_use_and_deletes_temporary_appcontainer_profi
                 .map_err(|error| format!("locate built helper: {error}"))?;
             command.args([
                 "--protocol-version",
-                "2",
+                PROTOCOL_VERSION.as_str(),
                 "--appcontainer-name",
                 appcontainer_name.as_str(),
                 "--stdio-stdin",

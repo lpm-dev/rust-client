@@ -101,6 +101,10 @@ mod windows_main {
     /// is a setup-time failure (DACL grant, profile create, etc.)
     /// and gets surfaced on stderr with [`EXIT_HELPER_FAILED`].
     fn dispatch(args: HelperArgs) -> Result<i32, String> {
+        if args.revoke_only {
+            return lpm_sandbox::helper_appcontainer::run_revoke_only(&args)
+                .map_err(|e| e.to_string());
+        }
         lpm_sandbox::helper_appcontainer::run_appcontainer_spawn(args).map_err(|e| e.to_string())
     }
 }

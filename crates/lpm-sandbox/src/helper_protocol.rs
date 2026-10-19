@@ -40,12 +40,13 @@ use std::path::PathBuf;
 /// Bumping this constant requires coordinated work on both the
 /// parent serializer ([`crate`]-side `AppContainerSandbox::spawn`)
 /// and the helper-side parser; during development the only
-/// valid value is `2`.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// valid value is `3`.
+pub const PROTOCOL_VERSION: u32 = 3;
 
-/// Prefix for production AppContainer profile names. Each lifecycle
-/// invocation appends a unique suffix, preventing one script run from
-/// inheriting DACL grants made for an earlier project.
+/// Prefix for production AppContainer profile names. Each project and
+/// package pair appends a digest of the two, so a package's scripts keep
+/// one identity in a project, and the trees it was granted are recorded
+/// per identity rather than left behind by a new one on every run.
 pub const APPCONTAINER_NAME: &str = "LpmSandboxLifecycleChild";
 
 /// How the helper should configure the lifecycle child's stdio
@@ -109,9 +110,21 @@ pub struct HelperArgs {
     /// a per-invocation name derived from [`APPCONTAINER_NAME`] in
     /// production; an argv flag for future-proofing + testability.
     pub appcontainer_name: String,
-    /// Delete the AppContainer profile when the helper finishes.
-    /// Production enables this for its per-invocation profile.
+    /// Delete the AppContainer profile when the helper finishes, as a
+    /// cleanup run does once a package leaves its project.
     pub delete_appcontainer_profile: bool,
+    /// Where the helper keeps the trees this AppContainer was granted
+    /// (`--grant-record`), so a later run revokes the ones its spec no
+    /// longer grants, and a cleanup run all of them.
+    pub grant_record: Option<PathBuf>,
+    /// Revoke every tree [`grant_record`](Self::grant_record) lists,
+    /// delete the profile if asked to, and exit without a program
+    /// (`--revoke-only`).
+    pub revoke_only: bool,
+    /// Trees already swept of grants to AppContainer profiles that no
+    /// longer exist, as earlier releases' per-run profiles left behind
+    /// (`--sweep-record`), so each tree is swept once.
+    pub sweep_record: Option<PathBuf>,
     /// Directories to grant the AppContainer SID *read* on (RXA)
     /// via DACL ACEs. Mirrors the cross-platform "reads broad"
     /// contract — see [`crate`]-side `readable_allow_set`.
@@ -207,6 +220,10 @@ pub enum ParseError {
     /// `--` separator was present but no program followed it.
     #[error("argv contains `--` but no program path follows it")]
     MissingProgram,
+    /// `--revoke-only` runs no program, so argv with one is a protocol
+    /// break.
+    #[error("`--revoke-only` runs no program, but argv names one after `--`")]
+    ProgramWithRevokeOnly,
     /// A required flag was absent.
     #[error("required flag `--{0}` was not provided")]
     MissingFlag(String),
@@ -253,6 +270,9 @@ pub enum ParseError {
 /// | `--protocol-version` | u32 (must equal [`PROTOCOL_VERSION`]) | required, once |
 /// | `--appcontainer-name` | non-empty string | required, once |
 /// | `--delete-appcontainer-profile` | (flag) | optional |
+/// | `--grant-record` | absolute path | optional, once (required with `--revoke-only`) |
+/// | `--revoke-only` | (flag) | optional: no stdio flags, `--` or program |
+/// | `--sweep-record` | absolute path | optional, once |
 /// | `--readable-dir` | absolute path | zero+ (strict — root-grant failure is fatal) |
 /// | `--readable-dir-best-effort` | absolute path | zero+ (root-grant failure logs WARN + continues) |
 /// | `--writable-dir` | absolute path | zero+ |
@@ -277,6 +297,9 @@ where
     let mut protocol_version: Option<u32> = None;
     let mut appcontainer_name: Option<String> = None;
     let mut delete_appcontainer_profile = false;
+    let mut grant_record: Option<PathBuf> = None;
+    let mut revoke_only = false;
+    let mut sweep_record: Option<PathBuf> = None;
     let mut readable_dirs: Vec<PathBuf> = Vec::new();
     let mut best_effort_readable_dirs: Vec<PathBuf> = Vec::new();
     let mut writable_dirs: Vec<PathBuf> = Vec::new();
@@ -338,6 +361,15 @@ where
             "--delete-appcontainer-profile" => {
                 delete_appcontainer_profile = true;
             }
+            "--grant-record" => {
+                grant_record = Some(absolute_value(&mut it, "--grant-record")?);
+            }
+            "--revoke-only" => {
+                revoke_only = true;
+            }
+            "--sweep-record" => {
+                sweep_record = Some(absolute_value(&mut it, "--sweep-record")?);
+            }
             "--readable-dir" => {
                 readable_dirs.push(absolute_value(&mut it, "--readable-dir")?);
             }
@@ -383,10 +415,21 @@ where
         }
     }
 
-    if !saw_separator {
+    if revoke_only {
+        if saw_separator {
+            return Err(ParseError::ProgramWithRevokeOnly);
+        }
+        if grant_record.is_none() {
+            return Err(ParseError::MissingFlag("grant-record".to_string()));
+        }
+    } else if !saw_separator {
         return Err(ParseError::MissingSeparator);
     }
-    let program = program.ok_or(ParseError::MissingProgram)?;
+    let program = match program {
+        Some(program) => program,
+        None if revoke_only => OsString::new(),
+        None => return Err(ParseError::MissingProgram),
+    };
 
     let protocol_version =
         protocol_version.ok_or_else(|| ParseError::MissingFlag("protocol-version".to_string()))?;
@@ -399,17 +442,22 @@ where
 
     let appcontainer_name = appcontainer_name
         .ok_or_else(|| ParseError::MissingFlag("appcontainer-name".to_string()))?;
-    let stdio_stdin =
-        stdio_stdin.ok_or_else(|| ParseError::MissingFlag("stdio-stdin".to_string()))?;
-    let stdio_stdout =
-        stdio_stdout.ok_or_else(|| ParseError::MissingFlag("stdio-stdout".to_string()))?;
-    let stdio_stderr =
-        stdio_stderr.ok_or_else(|| ParseError::MissingFlag("stdio-stderr".to_string()))?;
+    let stdio = |mode: Option<StdioMode>, flag: &str| match mode {
+        Some(mode) => Ok(mode),
+        None if revoke_only => Ok(StdioMode::Null),
+        None => Err(ParseError::MissingFlag(flag.to_string())),
+    };
+    let stdio_stdin = stdio(stdio_stdin, "stdio-stdin")?;
+    let stdio_stdout = stdio(stdio_stdout, "stdio-stdout")?;
+    let stdio_stderr = stdio(stdio_stderr, "stdio-stderr")?;
 
     Ok(HelperArgs {
         protocol_version,
         appcontainer_name,
         delete_appcontainer_profile,
+        grant_record,
+        revoke_only,
+        sweep_record,
         readable_dirs,
         best_effort_readable_dirs,
         writable_dirs,
@@ -525,7 +573,7 @@ mod tests {
     fn minimal_required_flags() -> Vec<&'static str> {
         vec![
             "--protocol-version",
-            "2",
+            "3",
             "--appcontainer-name",
             "LpmSandboxLifecycleChild",
             "--stdio-stdin",
@@ -537,6 +585,79 @@ mod tests {
             "--",
             "C:/Windows/System32/cmd.exe",
         ]
+    }
+
+    #[test]
+    fn parse_argv_accepts_a_revoke_only_run_without_stdio_or_program() {
+        let parsed = parse_argv(make_argv(&[
+            "--protocol-version",
+            "3",
+            "--appcontainer-name",
+            "LpmSandboxLifecycleChild-0123",
+            "--grant-record",
+            "C:/Users/me/.lpm/sandbox/appcontainers/LpmSandboxLifecycleChild-0123.grants.json",
+            "--revoke-only",
+            "--delete-appcontainer-profile",
+        ]))
+        .expect("a revoke-only argv must parse");
+        assert!(parsed.revoke_only);
+        assert!(parsed.delete_appcontainer_profile);
+        assert!(parsed.grant_record.is_some());
+        assert!(parsed.program.is_empty());
+        assert_eq!(parsed.stdio_stdin, StdioMode::Null);
+    }
+
+    #[test]
+    fn parse_argv_refuses_a_revoke_only_run_without_a_record_or_with_a_program() {
+        let base = [
+            "--protocol-version",
+            "3",
+            "--appcontainer-name",
+            "LpmSandboxLifecycleChild-0123",
+            "--revoke-only",
+        ];
+        assert_eq!(
+            parse_argv(make_argv(&base)).unwrap_err(),
+            ParseError::MissingFlag("grant-record".to_string())
+        );
+        let mut with_program = base.to_vec();
+        with_program.extend([
+            "--grant-record",
+            "C:/record.json",
+            "--",
+            "C:/Windows/System32/cmd.exe",
+        ]);
+        assert_eq!(
+            parse_argv(make_argv(&with_program)).unwrap_err(),
+            ParseError::ProgramWithRevokeOnly
+        );
+    }
+
+    #[test]
+    fn parse_argv_takes_the_records_as_absolute_paths() {
+        for flag in ["--grant-record", "--sweep-record"] {
+            let mut argv = minimal_required_flags();
+            argv.splice(0..0, [flag, "relative/record.json"]);
+            assert!(
+                matches!(
+                    parse_argv(make_argv(&argv)).unwrap_err(),
+                    ParseError::NotAbsolute { .. }
+                ),
+                "{flag}"
+            );
+            let mut argv = minimal_required_flags();
+            argv.splice(0..0, [flag, "C:/Users/me/.lpm/record.json"]);
+            let parsed = parse_argv(make_argv(&argv)).unwrap();
+            let recorded = if flag == "--grant-record" {
+                parsed.grant_record
+            } else {
+                parsed.sweep_record
+            };
+            assert_eq!(
+                recorded,
+                Some(PathBuf::from("C:/Users/me/.lpm/record.json"))
+            );
+        }
     }
 
     #[test]
@@ -838,7 +959,7 @@ mod tests {
         // Drop --stdio-stderr + its value; keep stdin + stdout.
         let parts: Vec<&str> = vec![
             "--protocol-version",
-            "2",
+            "3",
             "--appcontainer-name",
             "LpmSandboxLifecycleChild",
             "--stdio-stdin",
@@ -856,7 +977,7 @@ mod tests {
     fn parse_argv_requires_appcontainer_name() {
         let parts: Vec<&str> = vec![
             "--protocol-version",
-            "2",
+            "3",
             "--stdio-stdin",
             "null",
             "--stdio-stdout",

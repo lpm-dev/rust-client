@@ -83,7 +83,7 @@ console.log('HOOK_OK');
  if ($json.user_sid -ne $sid) { throw 'not running as the expected standard user' }
  $refused = AsUser $setup @('doctor','sandbox-setup','--project',$project,'--tool-dir',$tool,'--apply','--yes')
  if ($refused.Code -eq 0 -or $refused.Err -notmatch 'administrator terminal') { throw 'standard setup must be refused' }
- $base = @('--protocol-version','2','--env-clear','--stdio-stdin','null','--stdio-stdout','inherit','--stdio-stderr','inherit','--working-dir',$project,'--writable-dir',$project,'--readable-dir-best-effort',$tool,'--secret-read-deny',(Join-Path $project '.env'),'--env',('SystemRoot=' + $env:SystemRoot),'--env',('LOCALAPPDATA=' + $project))
+ $base = @('--protocol-version','3','--env-clear','--stdio-stdin','null','--stdio-stdout','inherit','--stdio-stderr','inherit','--working-dir',$project,'--writable-dir',$project,'--readable-dir-best-effort',$tool,'--secret-read-deny',(Join-Path $project '.env'),'--env',('SystemRoot=' + $env:SystemRoot),'--env',('LOCALAPPDATA=' + $project))
  $before = AsUser $helper ($base + @('--appcontainer-name',('LpmBefore' + $PID),'--',(Join-Path $tool 'node.exe'),'hook.cjs'))
  if ($before.Code -eq 0 -or $before.Err -notmatch 'sandbox-setup') { throw 'missing setup should be actionable' }
  for ($iteration=0; $iteration -lt 2; $iteration++) {
