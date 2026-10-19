@@ -68,7 +68,11 @@ pub use error::{
 pub use global_fs::{GlobalInstallDirectory, GlobalInstallsDirectory, GlobalStateDirectories};
 pub use integrity::Integrity;
 pub use local_target::{LocalScheme, LocalTarget};
-pub use lpm_json::{LpmJsonFileState, LpmJsonMutation, LpmJsonTransactionError, update_lpm_json};
+pub use lpm_json::{
+    LpmJsonAndLocalState, LpmJsonFileState, LpmJsonMutation, LpmJsonTransactionError,
+    LpmJsonWithLocalState, read_lpm_json_with_local_state, read_project_local_state,
+    update_lpm_json, update_lpm_json_with_local_state,
+};
 pub use npmrc::{
     NPMRC_DIAGNOSTIC_LIMIT, NPMRC_INTERPOLATED_VALUE_CAP_BYTES, NpmrcIniSetting, NpmrcIniValue,
     NpmrcInterpolationError, decode_npmrc_ini_fragment, interpolate_npmrc_env, npm_config_path,
