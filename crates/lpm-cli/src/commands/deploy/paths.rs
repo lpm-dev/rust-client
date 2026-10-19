@@ -235,3 +235,15 @@ pub(in crate::commands::deploy) fn read_member_name(manifest_path: &Path) -> Str
         .and_then(|v| v.as_str())
         .map_or_else(fallback, |s| s.to_string())
 }
+
+pub(in crate::commands::deploy) fn normalize_relative_path(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().to_string()),
+            std::path::Component::ParentDir => Some("..".to_string()),
+            std::path::Component::CurDir => None,
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}

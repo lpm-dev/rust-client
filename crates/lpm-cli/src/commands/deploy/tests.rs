@@ -74,6 +74,7 @@ async fn run(
         false,
         false,
         dry_run,
+        false,
         json_output,
     )
     .await
@@ -1067,6 +1068,46 @@ fn the_output_s_gitignore_takes_back_what_the_deploy_wrote_and_nothing_else() {
     assert_eq!(offered, expected, "{}", tree.take_backs());
 }
 
+/// HFS+ lists every name decomposed, and APFS one made that way, while git
+/// on macOS matches the composed name.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_output_s_gitignore_takes_back_a_name_git_reads_composed() {
+    let repository = tempfile::tempdir().unwrap();
+    let git = |arguments: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repository.path())
+            .args(arguments)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        output.stdout
+    };
+    git(&["init", "-q"]);
+    git(&["config", "core.precomposeunicode", "true"]);
+    std::fs::write(repository.path().join(".gitignore"), "dist/\n").unwrap();
+    let out = repository.path().join("out");
+    let dist = out.join("cafe\u{301}").join("dist");
+    std::fs::create_dir_all(&dist).unwrap();
+    std::fs::write(dist.join("b.js"), "x").unwrap();
+    let tree = OutputTree::read(&out).unwrap();
+    std::fs::write(out.join(".gitignore"), tree.take_backs()).unwrap();
+
+    let offered = git(&["ls-files", "--others", "--exclude-standard", "-z"]);
+    let offered: Vec<&[u8]> = offered
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .collect();
+    assert!(
+        offered.contains(&"out/caf\u{E9}/dist/b.js".as_bytes()),
+        "{offered:?}\n{}",
+        tree.take_backs()
+    );
+}
+
 #[test]
 fn the_output_walk_names_dependency_ignore_files_under_every_spelling_git_reads() {
     let out = tempfile::tempdir().unwrap();
@@ -1080,9 +1121,11 @@ fn the_output_walk_names_dependency_ignore_files_under_every_spelling_git_reads(
         "dist/lib.js",
         ".lpm/.gitignore",
         ".lpm/store/v2/objects/a/.gitignore",
+        ".lpm/store/v2/objects/b/.git\u{200C}ignore",
         ".lpm/store/v2/objects/b/lib/x.js",
         "node_modules/c/.GITIGNORE",
         "node_modules/c/lib/y.js",
+        "node_modules/d/.g\u{131}tignore",
     ] {
         write(relative);
     }
@@ -1093,7 +1136,9 @@ fn the_output_walk_names_dependency_ignore_files_under_every_spelling_git_reads(
         tree.dependency_ignore_files,
         [
             ".lpm/store/v2/objects/a/.gitignore",
+            ".lpm/store/v2/objects/b/.git\u{200C}ignore",
             "node_modules/c/.GITIGNORE",
+            "node_modules/d/.g\u{131}tignore",
         ]
     );
     assert_eq!(
@@ -1119,6 +1164,59 @@ fn the_output_walk_reads_directories_whose_names_are_not_utf8() {
     assert_eq!(
         tree.dependency_ignore_files,
         [".lpm/store/pkg-\u{FFFD}/.gitignore"]
+    );
+}
+
+#[test]
+fn a_file_cut_short_while_its_scan_read_it_binds_only_what_it_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_at = |name: &str, content: &[u8]| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, content).unwrap();
+        std::fs::File::open(path).unwrap()
+    };
+    // Each file was 70 KiB when it was opened, and ended after 1,000 bytes
+    // when the scan read it: one the scan reads whole, and a binary it reads
+    // the start of.
+    for (name, held) in [("a.txt", vec![b'x'; 1000]), ("a.bin", vec![0u8; 1000])] {
+        let mut secrets = DeploySecretScan::new();
+        let scanned = super::copy::scan_bound(
+            &mut secrets,
+            "pkg",
+            dir.path(),
+            name,
+            std::io::Cursor::new(held.clone()),
+            70 * 1024,
+        )
+        .unwrap();
+
+        let appended = [&held[..], b"\nwritten after the scan\n"].concat();
+        assert!(
+            !scanned.match_file(&file_at(name, &appended)).unwrap(),
+            "{name}"
+        );
+        assert!(scanned.match_file(&file_at(name, &held)).unwrap(), "{name}");
+    }
+
+    // A binary that held more than the start the scan reads still binds that
+    // start only.
+    let held = vec![0u8; 70 * 1024];
+    let mut secrets = DeploySecretScan::new();
+    let scanned = super::copy::scan_bound(
+        &mut secrets,
+        "pkg",
+        dir.path(),
+        "b.bin",
+        std::io::Cursor::new(held.clone()),
+        held.len() as u64,
+    )
+    .unwrap();
+    let mut rewritten_end = held;
+    *rewritten_end.last_mut().unwrap() = 1;
+    assert!(
+        scanned
+            .match_file(&file_at("b.bin", &rewritten_end))
+            .unwrap()
     );
 }
 
@@ -1435,18 +1533,9 @@ fn rewrite_workspace_protocol_unresolvable_member_hard_errors() {
 
 #[test]
 fn rewrite_workspace_protocol_breaks_hardlinks_to_protect_source() {
-    // Regression guard:
-    //
-    // copy_member_source uses hardlinks for performance. A hardlinked
-    // package.json in the deploy output dir SHARES THE SAME INODE as
-    // the source workspace's package.json. A naive `std::fs::write` to
-    // the output's package.json would write through the hardlink and
-    // MUTATE the source — violating the read-only-on-source invariant.
-    //
-    // The fix is in rewrite_workspace_protocol_in_deploy_manifest:
-    // remove the file first to unlink the path from the shared inode,
-    // then write a fresh file. This test simulates the dangerous
-    // pattern by manually hardlinking before the rewrite.
+    // An output package.json that shares the source's inode, which a
+    // hard link makes, must not carry the rewrite into the source: the
+    // rewrite writes a fresh file at the path, never through it.
     let tmp = tempfile::tempdir().unwrap();
     let workspace_root = build_workspace_with_workspace_protocol_dep(tmp.path());
     let source_manifest = workspace_root.join("packages/api/package.json");
@@ -1707,6 +1796,267 @@ fn copy_member_source_preserves_dist_directory() {
 }
 
 #[test]
+fn copy_member_source_leaves_out_an_lpm_home_inside_the_member() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("member");
+    let home = src.join("lpm-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join(".credentials"), "ciphertext").unwrap();
+    std::fs::write(
+        src.join("package.json"),
+        r#"{"name":"pkg","version":"1.0.0","files":["*"]}"#,
+    )
+    .unwrap();
+    std::fs::write(src.join("index.js"), "module.exports = {}").unwrap();
+    let _env = crate::test_env::ScopedEnv::set([("LPM_HOME", home.into_os_string())]);
+
+    let dst = tmp.path().join("output");
+    copy_member_source(&src, &dst).unwrap();
+
+    assert!(dst.join("index.js").exists());
+    assert!(!dst.join("lpm-home").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn copy_member_source_refuses_an_entrypoint_naming_an_env_file_by_its_short_name() {
+    use crate::commands::publish_common::ntfs_short_name;
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("member");
+    std::fs::create_dir_all(src.join(".envs")).unwrap();
+    std::fs::write(
+        src.join(".env-cmdrc"),
+        r#"{"production":{"TOKEN":"private"}}"#,
+    )
+    .unwrap();
+    std::fs::write(src.join(".envs/production.json"), r#"{"TOKEN":"private"}"#).unwrap();
+    // A volume that makes no short names has nothing to check.
+    let (Some(rc), Some(envs)) = (
+        ntfs_short_name(&src.join(".env-cmdrc")),
+        ntfs_short_name(&src.join(".envs")),
+    ) else {
+        return;
+    };
+    for (entrypoint, listed) in [
+        (rc, r#"it is listed as ".env-cmdrc""#.to_owned()),
+        (
+            format!("{envs}/production.json"),
+            format!(r#"{envs:?} is listed as ".envs""#),
+        ),
+    ] {
+        std::fs::write(
+            src.join("package.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "pkg",
+                "version": "1.0.0",
+                "files": [],
+                "main": entrypoint,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = copy_member_source(&src, &tmp.path().join("output"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains(&format!("names {entrypoint:?}, but {listed}")),
+            "{entrypoint}: {error}"
+        );
+    }
+}
+
+#[test]
+fn copy_member_source_withholds_names_under_every_case_a_disk_folds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("member");
+    std::fs::create_dir_all(src.join(".\u{17F}vn")).unwrap();
+    std::fs::write(src.join(".\u{17F}vn/entries"), "svn metadata").unwrap();
+    std::fs::write(src.join(".gitattribute\u{17F}"), "* text=auto\n").unwrap();
+    std::fs::write(src.join("index.js"), "module.exports = {}").unwrap();
+    // `ſ` reaches `s` only where the disk folds case beyond ASCII.
+    if !src.join(".svn").exists() {
+        return;
+    }
+    std::fs::write(
+        src.join("package.json"),
+        r#"{"name":"pkg","version":"1.0.0","files":["*"]}"#,
+    )
+    .unwrap();
+
+    let dst = tmp.path().join("output");
+    copy_member_source(&src, &dst).unwrap();
+
+    let mut copied: Vec<_> = std::fs::read_dir(&dst)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    copied.sort();
+    assert_eq!(copied, ["index.js", "package.json"]);
+}
+
+#[test]
+fn copy_member_source_refuses_a_respelled_entrypoint_and_leaves_the_source_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("member");
+    std::fs::create_dir_all(src.join("lib")).unwrap();
+    std::fs::write(src.join("index.js"), "module.exports = 1;").unwrap();
+    std::fs::write(src.join("lib/index.js"), "module.exports = 2;").unwrap();
+    std::fs::write(src.join(".gitattributes"), "* text=auto\n").unwrap();
+    for (manifest, typed) in [
+        (
+            r#"{"name":"pkg","version":"1.0.0","main":"INDEX.JS"}"#,
+            "INDEX.JS",
+        ),
+        (
+            r#"{"name":"pkg","version":"1.0.0","files":["lib"],"main":"lib/Index.js"}"#,
+            "lib/Index.js",
+        ),
+        // A name deploy withholds, which `ſ` reaches only where the disk
+        // folds case beyond ASCII.
+        (
+            r#"{"name":"pkg","version":"1.0.0","files":[],"main":".gitattribute\u017f"}"#,
+            ".gitattribute\u{17F}",
+        ),
+    ] {
+        // A filesystem that compares names exactly finds none of these.
+        if !src.join(typed).exists() {
+            continue;
+        }
+        std::fs::write(src.join("package.json"), manifest).unwrap();
+        let dst = tmp.path().join("output");
+
+        let error = copy_member_source(&src, &dst).unwrap_err().to_string();
+
+        assert!(
+            error.contains(&format!(
+                "package.json main names {typed:?}, but it is listed as"
+            )),
+            "{manifest}: {error}"
+        );
+        assert!(!dst.exists(), "{manifest}");
+        assert_eq!(
+            std::fs::read_to_string(src.join("index.js")).unwrap(),
+            "module.exports = 1;"
+        );
+        assert_eq!(
+            std::fs::read_to_string(src.join("lib/index.js")).unwrap(),
+            "module.exports = 2;"
+        );
+    }
+}
+
+#[test]
+fn a_file_already_in_the_output_is_never_written_over() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("member")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+    std::fs::write(tmp.path().join("member/index.js"), "module.exports = 1;").unwrap();
+    let open = |name: &str| {
+        cap_std::fs::Dir::open_ambient_dir(tmp.path().join(name), cap_std::ambient_authority())
+            .unwrap()
+    };
+    let (source, output) = (open("member"), open("output"));
+    let relative = Path::new("index.js");
+
+    super::copy::place_file(&source, &output, relative, None).unwrap();
+    let again = super::copy::place_file(&source, &output, relative, None).unwrap_err();
+    std::fs::remove_file(tmp.path().join("output/index.js")).unwrap();
+    std::fs::write(tmp.path().join("output/index.js"), "kept").unwrap();
+    let copied_again = super::copy::copy_new(&source, &output, relative, None).unwrap_err();
+
+    assert_eq!(again.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(copied_again.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("member/index.js")).unwrap(),
+        "module.exports = 1;"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("output/index.js")).unwrap(),
+        "kept"
+    );
+}
+
+#[test]
+fn a_copy_of_a_file_written_since_its_scan_is_taken_back() {
+    use std::io::Write as _;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("member")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("output")).unwrap();
+    let source_file = tmp.path().join("member/index.js");
+    std::fs::write(&source_file, "module.exports = 1;").unwrap();
+    let scanned = super::copy::ScannedBytes::of_whole(b"module.exports = 1;");
+    let open = |name: &str| {
+        cap_std::fs::Dir::open_ambient_dir(tmp.path().join(name), cap_std::ambient_authority())
+            .unwrap()
+    };
+    let relative = Path::new("index.js");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&source_file)
+        .unwrap()
+        .write_all(b"\nmodule.exports.key = 2;")
+        .unwrap();
+
+    let error = super::copy::copy_new(&open("member"), &open("output"), relative, Some(&scanned))
+        .unwrap_err();
+
+    assert!(
+        error.to_string().contains("after the secret scan read it"),
+        "{error}"
+    );
+    assert!(!tmp.path().join("output/index.js").exists());
+    let rescanned = super::copy::ScannedBytes::of_whole(&std::fs::read(&source_file).unwrap());
+    super::copy::copy_new(&open("member"), &open("output"), relative, Some(&rescanned)).unwrap();
+}
+
+#[test]
+fn a_copied_file_keeps_its_permissions_and_leaves_the_source_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("member/bin")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("output/bin")).unwrap();
+    let source_file = tmp.path().join("member/bin/cli.js");
+    std::fs::write(&source_file, "#!/usr/bin/env node\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&source_file, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let open = |name: &str| {
+        cap_std::fs::Dir::open_ambient_dir(tmp.path().join(name), cap_std::ambient_authority())
+            .unwrap()
+    };
+
+    super::copy::copy_new(
+        &open("member"),
+        &open("output"),
+        Path::new("bin/cli.js"),
+        None,
+    )
+    .unwrap();
+
+    let copied = tmp.path().join("output/bin/cli.js");
+    assert_eq!(
+        std::fs::read_to_string(&copied).unwrap(),
+        "#!/usr/bin/env node\n"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&copied).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+    std::fs::write(&copied, "changed").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&source_file).unwrap(),
+        "#!/usr/bin/env node\n"
+    );
+}
+
+#[test]
 fn copy_member_source_honors_package_files_field() {
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("member");
@@ -1816,6 +2166,59 @@ fn copy_member_source_never_copies_any_dotenv_variant() {
 }
 
 #[test]
+fn copy_member_source_never_copies_a_dotenv_file_under_a_spelling_hfs_folds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("member");
+    std::fs::create_dir_all(src.join("config")).unwrap();
+    std::fs::write(
+        src.join("package.json"),
+        r#"{"name":"pkg","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(src.join("index.js"), "module.exports = 1;").unwrap();
+    // HFS+ leaves zero-width and directional marks out of names.
+    let spellings = [".e\u{200C}nv.example", "config/\u{FEFF}.ENV.local"];
+    for spelling in spellings {
+        std::fs::write(src.join(spelling), "API_URL=https://example.invalid\n").unwrap();
+    }
+    let dst = tmp.path().join("output");
+
+    copy_member_source(&src, &dst).unwrap();
+
+    for spelling in spellings {
+        assert!(!dst.join(spelling).exists(), "{spelling}");
+    }
+    assert!(dst.join("index.js").is_file());
+}
+
+#[test]
+fn a_deployed_file_shares_nothing_with_the_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("member");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("package.json"),
+        r#"{"name":"pkg","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(src.join("index.js"), "module.exports = 1;").unwrap();
+    let dst = tmp.path().join("output");
+
+    copy_member_source(&src, &dst).unwrap();
+    std::fs::write(src.join("index.js"), "module.exports = 'edited later';").unwrap();
+    std::fs::write(dst.join("package.json"), "{}").unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(dst.join("index.js")).unwrap(),
+        "module.exports = 1;"
+    );
+    assert_eq!(
+        std::fs::read_to_string(src.join("package.json")).unwrap(),
+        r#"{"name":"pkg","version":"1.0.0"}"#
+    );
+}
+
+#[test]
 fn copy_member_source_never_copies_node_modules() {
     let tmp = tempfile::tempdir().unwrap();
     let src = build_member_fixture(tmp.path());
@@ -1900,11 +2303,12 @@ fn copy_member_source_skips_nested_node_modules_too() {
         .join("foo");
     std::fs::create_dir_all(&nested).unwrap();
     std::fs::write(nested.join("index.js"), "leaked").unwrap();
+    std::fs::write(src.join("packages").join("inner").join("index.js"), "kept").unwrap();
 
     let dst = tmp.path().join("output");
     copy_member_source(&src, &dst).unwrap();
 
-    assert!(dst.join("packages").join("inner").exists());
+    assert!(dst.join("packages").join("inner").join("index.js").exists());
     assert!(
         !dst.join("packages")
             .join("inner")
@@ -1923,11 +2327,12 @@ fn copy_member_source_skips_nested_dotenv_too() {
     std::fs::create_dir_all(src.join("config")).unwrap();
     std::fs::write(src.join("package.json"), "{}").unwrap();
     std::fs::write(src.join("config").join(".env"), "NESTED_SECRET=oops").unwrap();
+    std::fs::write(src.join("config").join("settings.json"), "{}").unwrap();
 
     let dst = tmp.path().join("output");
     copy_member_source(&src, &dst).unwrap();
 
-    assert!(dst.join("config").exists());
+    assert!(dst.join("config").join("settings.json").exists());
     assert!(
         !dst.join("config").join(".env").exists(),
         "SECURITY: nested .env at any depth must be denied"
@@ -1937,25 +2342,99 @@ fn copy_member_source_skips_nested_dotenv_too() {
 // ── Stats accuracy ─────────────────────────────────────────────────────
 
 #[test]
-fn copy_member_source_returns_stats_with_files_copied_and_skipped() {
+fn copy_member_source_counts_what_it_copies() {
     let tmp = tempfile::tempdir().unwrap();
     let src = build_member_fixture(tmp.path());
     let dst = tmp.path().join("output");
 
     let stats = copy_member_source(&src, &dst).unwrap();
 
-    // The fixture has multiple files in src/ and dist/ plus root files
-    // that should be copied. We don't assert exact counts (fixture may
-    // evolve) — just that the numbers are non-zero and sensible.
-    assert!(
-        stats.files_copied > 0,
-        "should have copied at least one file"
+    assert_eq!(
+        stats.files_copied, 7,
+        "package.json, README.md, LICENSE, tsconfig.json, src/index.ts, src/util.ts, dist/index.js"
     );
-    assert!(
-        stats.files_skipped > 0,
-        "should have skipped at least one denied entry (.env, node_modules, etc.)"
+    assert_eq!(
+        stats.files_skipped, 0,
+        "a publish already leaves out .env, LPM state, VCS files and OS cruft"
     );
-    assert!(stats.bytes_copied > 0);
+    assert_eq!(
+        stats.bytes_copied,
+        std::fs::metadata(src.join("package.json")).unwrap().len()
+            + "# foo\n".len() as u64
+            + "MIT\n".len() as u64
+            + "{}".len() as u64
+            + 2 * "export {}".len() as u64
+            + "module.exports = {}".len() as u64
+    );
+}
+
+#[test]
+fn copy_member_source_withholds_secrets_the_files_field_selects() {
+    // A publish refuses these through its secret scan; a deploy has none,
+    // so it must leave them out of the output on its own.
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("member");
+    std::fs::create_dir_all(src.join("config")).unwrap();
+    std::fs::create_dir_all(src.join("dist")).unwrap();
+    std::fs::write(
+        src.join("package.json"),
+        r#"{"name":"app","version":"1.0.0","files":["dist",".env.production",".env.example","credentials.json",".npmrc","config"]}"#,
+    )
+    .unwrap();
+    std::fs::write(src.join("dist").join("index.js"), "module.exports = {}").unwrap();
+    std::fs::write(src.join(".env.production"), "TOKEN=prod").unwrap();
+    std::fs::write(src.join(".env.example"), "TOKEN=").unwrap();
+    std::fs::write(src.join("credentials.json"), "{}").unwrap();
+    std::fs::write(src.join(".npmrc"), "//registry.npmjs.org/:_authToken=x").unwrap();
+    std::fs::write(src.join("config").join(".ENV.local"), "TOKEN=local").unwrap();
+    std::fs::write(src.join("config").join("routes.json"), "{}").unwrap();
+
+    let dst = tmp.path().join("output");
+    let stats = copy_member_source(&src, &dst).unwrap();
+
+    for withheld in [
+        ".env.production",
+        ".env.example",
+        "credentials.json",
+        ".npmrc",
+        "config/.ENV.local",
+    ] {
+        assert!(
+            !dst.join(withheld).exists(),
+            "SECURITY: {withheld} must not reach a deploy output"
+        );
+    }
+    assert!(dst.join("dist").join("index.js").exists());
+    assert!(dst.join("config").join("routes.json").exists());
+    assert_eq!(
+        stats.files_copied, 3,
+        "package.json, dist/index.js, config/routes.json"
+    );
+    assert_eq!(
+        stats.files_skipped, 4,
+        "the selected .env files and credentials.json"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_member_source_leaves_out_symbolic_links_as_a_publish_does() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside.txt");
+    std::fs::write(&outside, "not part of the member").unwrap();
+    let src = tmp.path().join("member");
+    std::fs::create_dir_all(src.join("src")).unwrap();
+    std::fs::write(src.join("package.json"), "{}").unwrap();
+    std::fs::write(src.join("src").join("index.js"), "module.exports = {}").unwrap();
+    std::os::unix::fs::symlink(&outside, src.join("src").join("linked.txt")).unwrap();
+    std::os::unix::fs::symlink(tmp.path(), src.join("parent")).unwrap();
+
+    let dst = tmp.path().join("output");
+    copy_member_source(&src, &dst).unwrap();
+
+    assert!(dst.join("src").join("index.js").exists());
+    assert!(std::fs::symlink_metadata(dst.join("src").join("linked.txt")).is_err());
+    assert!(std::fs::symlink_metadata(dst.join("parent")).is_err());
 }
 
 // ── Filesystem invariants ──────────────────────────────────────────────
@@ -2184,11 +2663,8 @@ fn strip_dev_dependencies_is_noop_when_section_empty() {
 
 #[test]
 fn strip_dev_dependencies_breaks_hardlink_to_protect_source() {
-    // Mirror of the hardlink regression pattern: copy_member_source may
-    // hardlink the output's package.json to the source workspace's. A
-    // naive write inside strip would mutate the source. This test sets
-    // up an explicit hardlink, runs strip, and asserts the source is
-    // untouched while the output is rewritten.
+    // As for the workspace-protocol rewrite: a hard-linked output manifest
+    // must not carry the strip into the source.
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     let output = tmp.path().join("output");
@@ -2288,4 +2764,313 @@ fn strip_dev_dependencies_preserves_other_dep_sections() {
         Some("^2.0.0"),
         "optionalDependencies must survive — only devDependencies are prod-stripped"
     );
+}
+
+/// A deploy ships the `lpm.json` a publish would, whether or not `files`
+/// selects it, and never rewrites the source through a hard link.
+#[test]
+fn copy_member_source_ships_the_lpm_json_a_publish_ships() {
+    let source_lpm_json = r#"{"vault":"vlt_fixture","vaultSync":{"personalVersion":3},"tasks":{"build":{"command":"tsc"}}}"#;
+    for files in [Some(json!(["index.js"])), None] {
+        let source = tempfile::tempdir().unwrap();
+        let mut manifest = json!({"name": "app", "version": "1.0.0"});
+        if let Some(files) = &files {
+            manifest["files"] = files.clone();
+        }
+        std::fs::write(source.path().join("package.json"), manifest.to_string()).unwrap();
+        std::fs::write(source.path().join("index.js"), "module.exports = 1\n").unwrap();
+        std::fs::write(source.path().join("lpm.json"), source_lpm_json).unwrap();
+        let output = tempfile::tempdir().unwrap();
+
+        copy_member_source(source.path(), output.path()).unwrap();
+
+        let shipped: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(output.path().join("lpm.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            shipped,
+            json!({"tasks": {"build": {"command": "tsc"}}}),
+            "files = {files:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(source.path().join("lpm.json")).unwrap(),
+            source_lpm_json
+        );
+    }
+}
+
+#[test]
+fn the_deploy_secret_scan_reads_what_the_deploy_copies_and_nothing_it_withholds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("member");
+    let key = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkq\n";
+    for (path, content) in [
+        ("package.json", r#"{"name":"pkg","version":"1.0.0"}"#),
+        ("index.js", "module.exports = 1;"),
+        ("certs/server.key", key),
+        ("assets/identity.bin", key),
+        (".env.local", key),
+        ("id_rsa", key),
+        ("lpm.lock", key),
+        ("node_modules/dep/key.pem", key),
+    ] {
+        let path = src.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+    std::fs::write(
+        src.join("lpm.json"),
+        format!(r#"{{"note":"sk_live_{}"}}"#, "FAKEFAKEFAKEFAKEFAKE"),
+    )
+    .unwrap();
+
+    let mut scan = super::secret_scan::DeploySecretScan::new();
+    super::copy::select_member_source(&src, None, Some(&mut scan)).unwrap();
+
+    let mut found = scan.found();
+    found.sort_unstable();
+    assert_eq!(
+        found,
+        [
+            ("assets/identity.bin", "private_key_pkcs8"),
+            ("certs/server.key", "private_key_pkcs8"),
+            ("lpm.json", "stripe_live_secret"),
+        ]
+    );
+}
+
+#[test]
+fn the_deploy_secret_scan_opens_shared_directories_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("member");
+    let deep = src.join("dist/assets/chunks");
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(
+        src.join("package.json"),
+        r#"{"name":"pkg","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    for index in 0..50 {
+        std::fs::write(deep.join(format!("{index:02}.js")), "export default 1;").unwrap();
+    }
+    let source =
+        crate::commands::publish_common::open_tarball_source_root(&src.canonicalize().unwrap())
+            .unwrap();
+    let mut opener = crate::commands::publish_common::SourceFileCursor::new(&source).unwrap();
+
+    for index in 0..50 {
+        let path = format!("dist/assets/chunks/{index:02}.js");
+        opener.open(Path::new(&path), &path).unwrap();
+    }
+
+    assert_eq!(opener.parent_opens(), 3);
+}
+
+#[test]
+fn the_deploy_secret_scan_has_no_byte_or_file_limit_of_publish_s() {
+    let mut scan = super::secret_scan::DeploySecretScan::new();
+    let directory = Path::new("/workspace/packages/api");
+    let past_publish_s_limit = lpm_security::behavioral::secrets::SECRET_SCAN_MAX_BYTES + 1;
+
+    scan.scan_file(
+        "api",
+        directory,
+        "data/geo.json",
+        &mut &b"{\"type\":\"FeatureCollection\"}"[..],
+        past_publish_s_limit,
+    )
+    .unwrap();
+    for index in 0..lpm_security::behavioral::secrets::SECRET_SCAN_MAX_FILES {
+        scan.scan_file(
+            "api",
+            directory,
+            &format!("assets/{index}.bin"),
+            &mut &b""[..],
+            0,
+        )
+        .unwrap();
+    }
+
+    assert!(scan.found().is_empty());
+}
+
+#[test]
+fn a_file_that_changes_after_the_secret_scan_is_not_deployed() {
+    use std::io::Write as _;
+    let key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\n";
+    for change in [
+        None,
+        Some("replaced"),
+        Some("rewritten"),
+        Some("rewritten in place, its time set back"),
+        Some("grown past what the scan read"),
+        Some("lpm.json"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("member");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("package.json"),
+            r#"{"name":"pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("index.js"), "module.exports = 1;").unwrap();
+        std::fs::write(src.join("z.pem"), "not yet a key\n").unwrap();
+        // Read only for a key at its start, which a longer file could hold.
+        std::fs::write(src.join("assets.bin"), b"\x89PNG").unwrap();
+        std::fs::write(src.join("lpm.json"), r#"{"note":"plain"}"#).unwrap();
+        let mut scan = super::secret_scan::DeploySecretScan::new();
+        let selection = super::copy::select_member_source(&src, None, Some(&mut scan)).unwrap();
+        assert!(scan.found().is_empty());
+
+        match change {
+            Some("replaced") => {
+                std::fs::write(src.join("z.pem.new"), key).unwrap();
+                std::fs::rename(src.join("z.pem.new"), src.join("z.pem")).unwrap();
+            }
+            Some("rewritten") => {
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(src.join("z.pem"))
+                    .unwrap();
+                file.write_all(key.as_bytes()).unwrap();
+            }
+            Some("rewritten in place, its time set back") => {
+                let path = src.join("z.pem");
+                let scanned = std::fs::metadata(&path).unwrap().modified().unwrap();
+                let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                (&file).write_all(&key.as_bytes()[..14]).unwrap();
+                file.set_modified(scanned).unwrap();
+                assert_eq!(std::fs::metadata(&path).unwrap().len(), 14);
+            }
+            Some("grown past what the scan read") => {
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(src.join("assets.bin"))
+                    .unwrap();
+                file.write_all(key.as_bytes()).unwrap();
+            }
+            Some(_) => std::fs::write(
+                src.join("lpm.json"),
+                format!(r#"{{"note":"sk_live_{}"}}"#, "FAKEFAKEFAKEFAKEFAKE"),
+            )
+            .unwrap(),
+            None => {}
+        }
+        let dst = tmp.path().join("output");
+        let written = super::copy::write_member_source(&selection, &dst);
+
+        let Some(change) = change else {
+            written.unwrap();
+            assert!(dst.join("z.pem").is_file());
+            continue;
+        };
+        let error = written.unwrap_err().to_string();
+        assert!(
+            error.contains("changed while the deploy ran"),
+            "{change}: {error}"
+        );
+        for written in ["z.pem", "assets.bin", "lpm.json"] {
+            let placed = dst.join(written);
+            assert!(
+                !placed.exists() || std::fs::read(&placed).unwrap() != key.as_bytes(),
+                "{change}: {written}"
+            );
+        }
+        assert!(!dst.join("lpm.json").exists(), "{change}");
+    }
+}
+
+/// A scanned file that is no longer a readable file when it is placed
+/// fails the deploy promptly, and the output keeps nothing under its name.
+#[cfg(unix)]
+#[test]
+fn a_file_that_is_no_longer_a_readable_file_after_the_scan_is_not_deployed() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for change in ["a FIFO", "a link", "unreadable"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("member");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("package.json"),
+            r#"{"name":"pkg","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("server.pem"), "not a key\n").unwrap();
+        let mut scan = super::secret_scan::DeploySecretScan::new();
+        let selection = super::copy::select_member_source(&src, None, Some(&mut scan)).unwrap();
+        let path = src.join("server.pem");
+        match change {
+            "a FIFO" => {
+                std::fs::remove_file(&path).unwrap();
+                let made = std::process::Command::new("mkfifo")
+                    .arg(&path)
+                    .status()
+                    .unwrap();
+                assert!(made.success());
+            }
+            "a link" => {
+                let key = tmp.path().join("key.pem");
+                std::fs::write(&key, "-----BEGIN PRIVATE KEY-----\n").unwrap();
+                std::fs::remove_file(&path).unwrap();
+                std::os::unix::fs::symlink(&key, &path).unwrap();
+            }
+            _ => std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap(),
+        }
+        if change == "unreadable" && std::fs::File::open(&path).is_ok() {
+            // Root reads it anyway.
+            continue;
+        }
+        let dst = tmp.path().join("output");
+
+        let (sent, received) = std::sync::mpsc::channel();
+        let output = dst.clone();
+        std::thread::spawn(move || {
+            let _ = sent.send(super::copy::write_member_source(&selection, &output));
+        });
+        let written = received
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("{change}: placement blocked"));
+
+        let error = written.unwrap_err().to_string();
+        assert!(
+            error.contains("changed while the deploy ran"),
+            "{change}: {error}"
+        );
+        assert!(
+            std::fs::symlink_metadata(dst.join("server.pem")).is_err(),
+            "{change}: the output kept the entry"
+        );
+    }
+}
+
+#[test]
+fn a_member_replaced_after_its_files_were_chosen_is_not_copied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("member");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("package.json"),
+        r#"{"name":"pkg","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(src.join("index.js"), "module.exports = 1;").unwrap();
+    let selection = super::copy::select_member_source(&src, None, None).unwrap();
+    // Another directory now stands where the chosen one was.
+    std::fs::rename(&src, tmp.path().join("chosen")).unwrap();
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("package.json"),
+        r#"{"name":"pkg","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(src.join("index.js"), "module.exports = 2;").unwrap();
+    let dst = tmp.path().join("output");
+
+    let error = super::copy::write_member_source(&selection, &dst)
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("changed while the deploy ran"), "{error}");
+    assert!(!dst.exists());
 }

@@ -19,6 +19,7 @@ pub mod local_target;
 pub mod lpm_json;
 #[cfg(target_os = "macos")]
 pub mod macos_acl;
+pub mod names;
 pub mod npmrc;
 pub mod package_instance;
 pub mod package_name;

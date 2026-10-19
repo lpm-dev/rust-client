@@ -25,7 +25,22 @@ struct TarballCandidate {
     source_root: Arc<TarballSourceRoot>,
     archive_path: String,
     expected_content_sha256: Option<[u8; 32]>,
-    secret_scan_completed: bool,
+    secret_scan: CandidateScan,
+    /// A bundled package's own `lpm.json`, which ships as
+    /// `publish::bundled_lpm_json` projects it, read when it is packed.
+    projects_lpm_json: bool,
+}
+
+/// What the secret scan has read of a candidate before it is packed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CandidateScan {
+    /// Nothing: the bytes packed are scanned.
+    Pending,
+    /// All of it, pinned by `expected_content_sha256`.
+    Done,
+    /// Its start, which showed binary content that is checked only for a
+    /// private key at its start, in the bytes packed.
+    StartOnly,
 }
 
 impl TarballCandidate {
@@ -132,6 +147,42 @@ impl TarballSourceCursor {
     }
 }
 
+/// Opens files of one open directory in turn, as the packer does, keeping
+/// the directories above the last one open: files taken in path order share
+/// their parents' opening, and the cursor holds one path's directories.
+pub(crate) struct SourceFileCursor {
+    root: Arc<TarballSourceRoot>,
+    cursor: TarballSourceCursor,
+}
+
+impl SourceFileCursor {
+    pub(crate) fn new(directory: &Dir) -> Result<Self, LpmError> {
+        Ok(Self {
+            root: Arc::new(TarballSourceRoot {
+                path: PathBuf::new(),
+                directory: Some(directory.try_clone().map_err(LpmError::Io)?),
+                identity: None,
+            }),
+            cursor: TarballSourceCursor::new(),
+        })
+    }
+
+    /// [`open_tarball_source_file`] for `relative`, from the cursor.
+    pub(crate) fn open(
+        &mut self,
+        relative: &Path,
+        archive_path: &str,
+    ) -> Result<(std::fs::File, u64), LpmError> {
+        self.cursor.open_file(&self.root, relative, archive_path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parent_opens(&self) -> usize {
+        self.cursor.parent_open_count
+    }
+}
+
+/// What an open directory or file is on its volume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectoryIdentity {
     #[cfg(unix)]
@@ -353,7 +404,7 @@ fn readme_priority(path: &str) -> Option<usize> {
 fn is_authored_skill_namespace(path: &str) -> bool {
     path.split(['/', '\\'])
         .find(|part| !part.is_empty())
-        .is_some_and(|part| part.eq_ignore_ascii_case(lpm_skill::AUTHORED_SKILLS_DIR))
+        .is_some_and(|part| listed_in(part, &[lpm_skill::AUTHORED_SKILLS_DIR]))
 }
 
 fn is_authored_skill_namespace_path(path: &Path) -> bool {
@@ -361,8 +412,18 @@ fn is_authored_skill_namespace_path(path: &Path) -> bool {
         path.components().next(),
         Some(std::path::Component::Normal(first)) if first
             .to_str()
-            .is_some_and(|part| part.eq_ignore_ascii_case(lpm_skill::AUTHORED_SKILLS_DIR))
+            .is_some_and(|part| listed_in(part, &[lpm_skill::AUTHORED_SKILLS_DIR]))
     )
+}
+
+/// Whether `name` is one of `listed`, ASCII names, regardless of case, as
+/// a file system that sets case aside finds it: `ſ` for `s` and the Kelvin
+/// sign for `k` included, as the credential-file rule reads names.
+pub(crate) fn listed_in(name: &str, listed: &[&str]) -> bool {
+    let folded = lpm_common::names::fold_name(name);
+    listed
+        .iter()
+        .any(|candidate| folded.eq_ignore_ascii_case(candidate))
 }
 
 // ---------------------------------------------------------------------------
@@ -561,7 +622,8 @@ fn prepare_tarball_with_source_root_and_open_hook(
                 source_root: Arc::clone(&project_source_root),
                 archive_path: file.path,
                 expected_content_sha256: None,
-                secret_scan_completed: false,
+                secret_scan: CandidateScan::Pending,
+                projects_lpm_json: false,
             },
         )?;
     }
@@ -577,7 +639,8 @@ fn prepare_tarball_with_source_root_and_open_hook(
                 source_root: Arc::clone(&project_source_root),
                 archive_path: "package.json".to_string(),
                 expected_content_sha256: None,
-                secret_scan_completed: false,
+                secret_scan: CandidateScan::Pending,
+                projects_lpm_json: false,
             },
         )?;
     }
@@ -594,7 +657,8 @@ fn prepare_tarball_with_source_root_and_open_hook(
                 source_root: Arc::clone(&project_source_root),
                 archive_path: retained.path.to_string(),
                 expected_content_sha256: None,
-                secret_scan_completed: false,
+                secret_scan: CandidateScan::Pending,
+                projects_lpm_json: false,
             },
         )?;
     }
@@ -606,6 +670,7 @@ fn prepare_tarball_with_source_root_and_open_hook(
     });
     let validated_authored_skills = options.validated_authored_skills;
     candidates.retain(|candidate| !is_authored_skill_namespace(&candidate.archive_path));
+
     for skill in validated_authored_skills {
         validate_content_override_path(skill.path)?;
         push_tarball_candidate(
@@ -615,7 +680,8 @@ fn prepare_tarball_with_source_root_and_open_hook(
                 source_root: Arc::clone(&project_source_root),
                 archive_path: skill.path.to_string(),
                 expected_content_sha256: None,
-                secret_scan_completed: false,
+                secret_scan: CandidateScan::Pending,
+                projects_lpm_json: false,
             },
         )?;
     }
@@ -664,8 +730,9 @@ fn prepare_tarball_with_source_root_and_open_hook(
         for candidate in &mut candidates {
             if !lpm_security::behavioral::secrets::file_content_requires_scan(
                 &candidate.archive_path,
-            ) || options.package_json_content.is_some()
-                && candidate.archive_path == "package.json"
+            ) || candidate.projects_lpm_json
+                || options.package_json_content.is_some()
+                    && candidate.archive_path == "package.json"
                 || options
                     .content_overrides
                     .iter()
@@ -682,6 +749,22 @@ fn prepare_tarball_with_source_root_and_open_hook(
             if opened_size <= LARGE_SECRET_SCAN_PRESCAN_BYTES {
                 continue;
             }
+            let mut opened_file = opened_file;
+            if lpm_security::behavioral::secrets::is_scannable_only_as_text(&candidate.archive_path)
+            {
+                let mut prefix =
+                    Vec::with_capacity(lpm_security::behavioral::secrets::BINARY_SNIFF_BYTES);
+                opened_file
+                    .by_ref()
+                    .take(lpm_security::behavioral::secrets::BINARY_SNIFF_BYTES as u64)
+                    .read_to_end(&mut prefix)
+                    .map_err(LpmError::Io)?;
+                if lpm_security::behavioral::secrets::is_binary_content(&prefix) {
+                    candidate.secret_scan = CandidateScan::StartOnly;
+                    continue;
+                }
+                std::io::Seek::rewind(&mut opened_file).map_err(LpmError::Io)?;
+            }
             let content =
                 read_opened_tarball_file(opened_file, opened_size, &candidate.archive_path)?;
             let mut file_scan = lpm_security::behavioral::secrets::scan_file_content_with_budget(
@@ -694,7 +777,7 @@ fn prepare_tarball_with_source_root_and_open_hook(
             scan.files_scanned += file_scan.files_scanned;
             use sha2::Digest as _;
             candidate.expected_content_sha256 = Some(sha2::Sha256::digest(&content).into());
-            candidate.secret_scan_completed = true;
+            candidate.secret_scan = CandidateScan::Done;
         }
     }
     let (gzipped, (), hashes) = write_gzipped_tar(max_archive_bytes, |builder| {
@@ -711,7 +794,26 @@ fn prepare_tarball_with_source_root_and_open_hook(
                 .chain(validated_authored_skills)
                 .find(|content| content.path == candidate.archive_path)
                 .map(|content| content.content);
-            let override_content = root_manifest_override.or(supplied_override);
+            // One bundled configuration at a time, as it is packed, keeping
+            // the file's mode.
+            let projected = if candidate.projects_lpm_json && supplied_override.is_none() {
+                let (file, size) = source_cursor.open_file(
+                    &candidate.source_root,
+                    candidate.source_path(),
+                    &candidate.archive_path,
+                )?;
+                let mode = publish_file_mode(&file).unwrap_or(0o644);
+                let bytes = read_opened_tarball_file(file, size, &candidate.archive_path)?;
+                Some((
+                    crate::commands::publish::bundled_lpm_json(&bytes)?.unwrap_or(bytes),
+                    mode,
+                ))
+            } else {
+                None
+            };
+            let override_content = root_manifest_override
+                .or(supplied_override)
+                .or(projected.as_ref().map(|(content, _)| content.as_slice()));
             let opened = if override_content.is_some() {
                 None
             } else {
@@ -721,9 +823,11 @@ fn prepare_tarball_with_source_root_and_open_hook(
                     &candidate.archive_path,
                 )?)
             };
-            let archive_mode = opened
-                .as_ref()
-                .map_or(0o644, |(file, _)| publish_file_mode(file).unwrap_or(0o644));
+            let archive_mode = match (&opened, &projected) {
+                (Some((file, _)), _) => publish_file_mode(file).unwrap_or(0o644),
+                (None, Some((_, mode))) => *mode,
+                (None, None) => 0o644,
+            };
             let file_size = override_content.map_or_else(
                 || opened.as_ref().map_or(0, |(_, size)| *size),
                 |content| content.len() as u64,
@@ -735,7 +839,7 @@ fn prepare_tarball_with_source_root_and_open_hook(
             let stream_without_buffering = override_content.is_none()
                 && readme_priority(&candidate.archive_path).is_none()
                 && secret_scan.as_ref().is_none_or(|_| {
-                    candidate.secret_scan_completed
+                    candidate.secret_scan != CandidateScan::Pending
                         || !lpm_security::behavioral::secrets::file_content_requires_scan(
                             &candidate.archive_path,
                         )
@@ -761,13 +865,23 @@ fn prepare_tarball_with_source_root_and_open_hook(
                 header.set_mode(archive_mode);
                 header.set_cksum();
                 let tar_path = format!("package/{}", candidate.archive_path);
-                let mut reader = OptionalSha256Reader::new(
-                    (&mut opened_file).take(opened_size),
-                    candidate.expected_content_sha256.is_some(),
+                let scans_start =
+                    secret_scan.is_some() && candidate.secret_scan != CandidateScan::Done;
+                let mut reader = StartCapture::new(
+                    OptionalSha256Reader::new(
+                        (&mut opened_file).take(opened_size),
+                        candidate.expected_content_sha256.is_some(),
+                    ),
+                    if scans_start {
+                        lpm_security::behavioral::secrets::PRIVATE_KEY_SNIFF_BYTES
+                    } else {
+                        0
+                    },
                 );
                 builder
                     .append_data(&mut header, &tar_path, &mut reader)
                     .map_err(LpmError::Io)?;
+                let (reader, start) = reader.finish();
                 let actual_content_sha256 = reader.finish();
                 if candidate.expected_content_sha256.is_some()
                     && actual_content_sha256 != candidate.expected_content_sha256
@@ -777,13 +891,18 @@ fn prepare_tarball_with_source_root_and_open_hook(
                 if opened_file.metadata().map_err(LpmError::Io)?.len() != opened_size {
                     return Err(unsafe_publish_file_error(&candidate.archive_path));
                 }
-                if !candidate.secret_scan_completed
+                if candidate.secret_scan == CandidateScan::StartOnly
+                    && !lpm_security::behavioral::secrets::is_binary_content(&start)
+                {
+                    return Err(unsafe_publish_file_error(&candidate.archive_path));
+                }
+                if scans_start
                     && let Some((scan, budget)) =
                         secret_scan.as_mut().zip(secret_scan_budget.as_mut())
                 {
                     let mut file_scan =
                         lpm_security::behavioral::secrets::scan_file_content_with_budget(
-                            &[],
+                            &start,
                             &candidate.archive_path,
                             budget,
                         );
@@ -984,6 +1103,36 @@ impl<R: std::io::Read> std::io::Read for OptionalSha256Reader<R> {
     }
 }
 
+/// Passes reads through, keeping a copy of their first `limit` bytes.
+struct StartCapture<R> {
+    inner: R,
+    start: Vec<u8>,
+    limit: usize,
+}
+
+impl<R> StartCapture<R> {
+    fn new(inner: R, limit: usize) -> Self {
+        Self {
+            inner,
+            start: Vec::new(),
+            limit,
+        }
+    }
+
+    fn finish(self) -> (R, Vec<u8>) {
+        (self.inner, self.start)
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for StartCapture<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        let wanted = self.limit - self.start.len();
+        self.start.extend_from_slice(&buffer[..read.min(wanted)]);
+        Ok(read)
+    }
+}
+
 impl<W> HashingWriter<W> {
     fn new(inner: W) -> Self {
         use sha1::Digest as _;
@@ -1114,11 +1263,15 @@ impl TarballSourceRoot {
 }
 
 impl DirectoryIdentity {
-    #[cfg(unix)]
     pub(crate) fn from_directory(directory: &Dir) -> std::io::Result<Self> {
+        Self::of_open_file(&directory.try_clone()?.into_std_file())
+    }
+
+    #[cfg(unix)]
+    fn of_open_file(file: &std::fs::File) -> std::io::Result<Self> {
         use std::os::unix::fs::MetadataExt as _;
 
-        let metadata = directory.try_clone()?.into_std_file().metadata()?;
+        let metadata = file.metadata()?;
         Ok(Self::Unix {
             device: metadata.dev(),
             inode: metadata.ino(),
@@ -1126,17 +1279,16 @@ impl DirectoryIdentity {
     }
 
     #[cfg(windows)]
-    pub(crate) fn from_directory(directory: &Dir) -> std::io::Result<Self> {
+    fn of_open_file(file: &std::fs::File) -> std::io::Result<Self> {
         use std::os::windows::io::AsRawHandle as _;
         use windows_sys::Win32::Storage::FileSystem::{
             BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
         };
 
-        let directory = directory.try_clone()?.into_std_file();
         let mut information = BY_HANDLE_FILE_INFORMATION::default();
-        // SAFETY: the handle belongs to the live directory file, and `information`
+        // SAFETY: the handle belongs to the live open file, and `information`
         // is writable storage of the exact Win32 structure expected by the API.
-        if unsafe { GetFileInformationByHandle(directory.as_raw_handle(), &mut information) } == 0 {
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
             return Err(std::io::Error::last_os_error());
         }
         Ok(Self::Windows {
@@ -1308,7 +1460,17 @@ fn ensure_publish_secret_scan_complete(
     let Some(limit) = scan.limit_exceeded else {
         return Ok(());
     };
-    let maximum = match limit {
+    Err(LpmError::Registry(format!(
+        "publish secret scan stopped at the {} {limit} limit; the artifact was not published",
+        secret_scan_maximum(limit)
+    )))
+}
+
+/// The most of `limit` one secret scan inspects, as a message names it.
+pub(crate) fn secret_scan_maximum(
+    limit: lpm_security::behavioral::secrets::SecretScanLimit,
+) -> String {
+    match limit {
         lpm_security::behavioral::secrets::SecretScanLimit::Files => {
             lpm_security::behavioral::secrets::SECRET_SCAN_MAX_FILES.to_string()
         }
@@ -1319,10 +1481,7 @@ fn ensure_publish_secret_scan_complete(
         lpm_security::behavioral::secrets::SecretScanLimit::Findings => {
             lpm_security::behavioral::secrets::SECRET_SCAN_MAX_FINDINGS.to_string()
         }
-    };
-    Err(LpmError::Registry(format!(
-        "publish secret scan stopped at the {maximum} {limit} limit; the artifact was not published"
-    )))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1391,14 +1550,22 @@ fn is_safe_entry(path: &Path, canonical_root: &Path) -> bool {
 // File collection
 // ---------------------------------------------------------------------------
 
-/// Collect files to include in the tarball.
-///
-/// If `files` field exists in package.json, only include those.
-/// Otherwise include everything with common ignores.
-fn collect_package_files(
+/// The project files a publish of `pkg_json` packs, before bundled
+/// dependencies, skills and manifest overrides: package-relative, `/`
+/// separated, sorted. With a `files` field, the files it selects, and else
+/// every file but the common ignores. Symbolic links are left out.
+pub(crate) fn collect_package_files(
     pkg_json: &serde_json::Value,
     source_dir: &Dir,
 ) -> Result<Vec<TarballFile>, LpmError> {
+    let home = LpmHome::active()?;
+    if home.is(&source_dir.dir_metadata()?, source_dir)? {
+        return Err(LpmError::Registry(
+            "the package directory is the LPM home, which holds login and env secrets; \
+             point LPM_HOME at another directory"
+                .to_owned(),
+        ));
+    }
     let mut result = Vec::new();
 
     if let Some(metadata) = safe_cap_metadata(source_dir, Path::new("package.json"))?
@@ -1415,11 +1582,17 @@ fn collect_package_files(
 
     if let Some(files_arr) = pkg_json.get("files").and_then(|f| f.as_array()) {
         let matcher = PublishFilesMatcher::parse(files_arr)?;
-        collect_explicit_matches(source_dir, Path::new(""), &matcher, &mut result)?;
+        collect_explicit_matches(source_dir, Path::new(""), &matcher, home, &mut result)?;
     } else {
-        collect_all_files(source_dir, &mut result)?;
+        collect_all_files(source_dir, home, &mut result)?;
     }
-    collect_required_manifest_files(source_dir, pkg_json, &mut result, &mut Listings::default())?;
+    collect_required_manifest_files(
+        source_dir,
+        pkg_json,
+        home,
+        &mut result,
+        &mut Listings::default(),
+    )?;
 
     for entry in source_dir.entries()? {
         let entry = entry?;
@@ -1444,12 +1617,440 @@ fn collect_package_files(
         }
     }
 
+    // A disk that folds case finds `package.json` or `lpm.json` under any
+    // case, `ſ` for `s` included, so a root entry spelled so is that file,
+    // which publish ships, rewritten, under its own name only, whether or
+    // not `files` selects it.
+    let renamed = renamed_root_entries(source_dir)?;
+    for (stored, canonical) in &renamed {
+        // A reference reaching the entry as stored would name nothing the
+        // archive holds where names are compared exactly; a pattern that
+        // reaches it breaks the request that did, whatever else it reaches.
+        if let Some((field, reference, kind)) = manifest_path_references(pkg_json)
+            .find(|(_, reference, kind)| reaches_root_entry(reference, stored, *kind))
+        {
+            let stored = lpm_common::sanitize_terminal_inline(stored);
+            let quoted = lpm_common::sanitize_terminal_inline(reference);
+            return Err(LpmError::Registry(if kind == ManifestReference::Pattern {
+                format!(
+                    "package.json {field} reaches {stored:?} through {quoted:?}, but publish ships that file as {canonical:?}; rename the file to that"
+                )
+            } else if kind != ManifestReference::Path
+                && single_component(reference) != Some(stored.as_ref())
+            {
+                format!(
+                    "package.json {field} names {stored:?} through {quoted:?}, but publish ships that file as {canonical:?}; spell it as that"
+                )
+            } else {
+                format!(
+                    "package.json {field} names {stored:?}, but publish ships that file as {canonical:?}; spell it as that"
+                )
+            }));
+        }
+        if let Some(main) = pkg_json.get("main").and_then(serde_json::Value::as_str)
+            && let Some(loaded) = main_file(source_dir, main)?
+            && loaded != *canonical
+            && names_the_same_file(source_dir, &loaded, stored)?
+        {
+            return Err(LpmError::Registry(format!(
+                "package.json main reaches {:?} through {:?}, the extension Node adds, but publish ships that file as {canonical:?}; spell it as that",
+                lpm_common::sanitize_terminal_inline(stored),
+                lpm_common::sanitize_terminal_inline(main)
+            )));
+        }
+    }
+    for file in &mut result {
+        if let Some((_, canonical)) = renamed.iter().find(|(stored, _)| *stored == file.path) {
+            file.path = (*canonical).to_owned();
+        }
+    }
+
     result.retain(|file| !is_npm_strict_exclusion(&file.path));
 
     result.sort_unstable_by(|left, right| left.path.cmp(&right.path));
     result.dedup_by(|left, right| left.path == right.path);
 
     Ok(result)
+}
+
+/// Root files publish reads and ships under their own names, rewritten.
+const PUBLISHED_ROOT_FILES: [&str; 3] = ["package.json", "lpm.json", "lpm.config.json"];
+
+/// The published root file a root entry stored as `name` is on a disk that
+/// folds case, `ſ` for `s` included, when that isn't its own name.
+fn renamed_root_file(name: &str) -> Option<&'static str> {
+    let folded = lpm_common::names::fold_name(name);
+    PUBLISHED_ROOT_FILES
+        .into_iter()
+        .find(|canonical| name != *canonical && folded.eq_ignore_ascii_case(canonical))
+}
+
+/// The root entries of `source_dir` that are a published root file stored
+/// under another spelling, with the name each ships under.
+fn renamed_root_entries(source_dir: &Dir) -> Result<Vec<(String, &'static str)>, LpmError> {
+    let mut renamed = Vec::new();
+    for entry in source_dir.entries().map_err(LpmError::Io)? {
+        let name = entry.map_err(LpmError::Io)?.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if let Some(canonical) = renamed_root_file(name)
+            && names_the_same_file(source_dir, name, canonical)?
+        {
+            renamed.push((name.to_owned(), canonical));
+        }
+    }
+    Ok(renamed)
+}
+
+/// How Node reads a path in package.json.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManifestReference {
+    /// A file path: `main`, `bin`, `browser`, `module`, `types`.
+    Path,
+    /// An `exports` or `imports` target, a URL: its query and fragment
+    /// aren't part of the path and its `%XX` escapes are decoded.
+    Target,
+    /// A target of a subpath pattern, whose every `*` stands for the one
+    /// subpath a request matches.
+    Pattern,
+}
+
+/// Whether the manifest path `reference`, read as `kind` says, names the
+/// root entry `name` as a single component.
+fn reaches_root_entry(reference: &str, name: &str, kind: ManifestReference) -> bool {
+    if kind == ManifestReference::Path {
+        return single_component(reference) == Some(name);
+    }
+    // As a URL parser reads a target: tabs and newlines dropped, controls
+    // and spaces trimmed from its ends, and `\` read as `/`.
+    let url: String = reference
+        .trim_matches(|character: char| character <= ' ')
+        .chars()
+        .filter(|character| !matches!(character, '\t' | '\n' | '\r'))
+        .map(|character| if character == '\\' { '/' } else { character })
+        .collect();
+    let ends: &[char] = if kind == ManifestReference::Pattern {
+        &['?', '#', '*']
+    } else {
+        &['?', '#']
+    };
+    let (path, at_star) = match url.find(ends) {
+        Some(at) => (&url[..at], url[at..].starts_with('*')),
+        None => (url.as_str(), false),
+    };
+    if !at_star {
+        return single_component(path).is_some_and(|component| percent_decoded(component) == name);
+    }
+    // A request's subpath can hold a `?` or `#`, which ends the path
+    // wherever the first `*` puts it, so the pattern reaches every root
+    // name that starts with what comes before that `*`.
+    let start = path.strip_prefix("./").unwrap_or(path);
+    if start.contains('/') {
+        return false;
+    }
+    // An escape the `*` cuts in two is completed by the subpath.
+    start
+        .get(start.len().saturating_sub(2)..)
+        .is_some_and(|end| end.contains('%'))
+        || name.starts_with(&*percent_decoded(start))
+}
+
+/// The root entry Node loads for a `main` of `main`, as its legacy
+/// resolution finds it: the name itself, else the first of it with `.js`,
+/// `.json` or `.node` that is a file.
+fn main_file(source_dir: &Dir, main: &str) -> Result<Option<String>, LpmError> {
+    let Some(name) = single_component(main) else {
+        return Ok(None);
+    };
+    for extension in ["", ".js", ".json", ".node"] {
+        let candidate = format!("{name}{extension}");
+        if safe_cap_metadata(source_dir, Path::new(&candidate))?
+            .is_some_and(|metadata| metadata.is_file())
+        {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+/// `path`'s one named component, if it has one and no other.
+fn single_component(path: &str) -> Option<&str> {
+    let mut named = Path::new(path)
+        .components()
+        .filter(|component| matches!(component, std::path::Component::Normal(_)));
+    match (named.next(), named.next()) {
+        (Some(component), None) => component.as_os_str().to_str(),
+        _ => None,
+    }
+}
+
+/// `text` with its `%XX` escapes decoded; `text` itself where they don't
+/// decode to UTF-8.
+fn percent_decoded(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('%') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escape = (bytes[index] == b'%')
+            .then(|| bytes.get(index + 1..index + 3))
+            .flatten()
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escape {
+            Some(byte) => {
+                decoded.push(byte);
+                index += 3;
+            }
+            None => {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).map_or(std::borrow::Cow::Borrowed(text), std::borrow::Cow::Owned)
+}
+
+/// Every path in package.json that a consumer resolves in the package: the
+/// entrypoints, `module` and the type entries, `exports` and `imports`
+/// targets, and both sides of a `browser` map.
+fn manifest_path_references(
+    pkg_json: &serde_json::Value,
+) -> impl Iterator<Item = (&'static str, &str, ManifestReference)> {
+    /// A subpath key (`./x`, `#x`) decides whether the targets below it are
+    /// a pattern's; the condition keys under it (`import`, `node`) keep
+    /// what it decided.
+    fn targets<'a>(
+        field: &'static str,
+        value: &'a serde_json::Value,
+        kind: ManifestReference,
+        references: &mut Vec<(&'static str, &'a str, ManifestReference)>,
+    ) {
+        match value {
+            serde_json::Value::String(path) => references.push((field, path, kind)),
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    targets(field, value, kind, references);
+                }
+            }
+            serde_json::Value::Object(entries) => {
+                for (key, value) in entries {
+                    let kind = if !key.starts_with(['.', '#']) {
+                        kind
+                    } else if key.contains('*') {
+                        ManifestReference::Pattern
+                    } else {
+                        ManifestReference::Target
+                    };
+                    targets(field, value, kind, references);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut references: Vec<_> = manifest_entrypoints(pkg_json)
+        .map(|(field, path)| (field, path, ManifestReference::Path))
+        .collect();
+    for field in ["module", "types", "typings"] {
+        if let Some(path) = pkg_json.get(field).and_then(serde_json::Value::as_str) {
+            references.push((field, path, ManifestReference::Path));
+        }
+    }
+    for field in ["exports", "imports"] {
+        if let Some(value) = pkg_json.get(field) {
+            targets(field, value, ManifestReference::Target, &mut references);
+        }
+    }
+    if let Some(serde_json::Value::Object(replacements)) = pkg_json.get("browser") {
+        for (replaced, replacement) in replacements {
+            references.push(("browser", replaced, ManifestReference::Path));
+            if let Some(path) = replacement.as_str() {
+                references.push(("browser", path, ManifestReference::Path));
+            }
+        }
+    }
+    references.into_iter()
+}
+
+/// Whether `name` and `canonical`, entries of `directory`, are one file.
+#[cfg(not(windows))]
+fn names_the_same_file(directory: &Dir, name: &str, canonical: &str) -> Result<bool, LpmError> {
+    use cap_std::fs::MetadataExt as _;
+    let (Some(entry), Some(canonical)) = (
+        safe_cap_metadata(directory, Path::new(name))?,
+        safe_cap_metadata(directory, Path::new(canonical))?,
+    ) else {
+        return Ok(false);
+    };
+    Ok((entry.dev(), entry.ino()) == (canonical.dev(), canonical.ino()))
+}
+
+/// Whether `name` and `canonical`, entries of `directory`, are one file:
+/// NTFS stores one name for both.
+#[cfg(windows)]
+fn names_the_same_file(directory: &Dir, name: &str, canonical: &str) -> Result<bool, LpmError> {
+    if safe_cap_metadata(directory, Path::new(canonical))?.is_none()
+        || safe_cap_metadata(directory, Path::new(name))?.is_none()
+    {
+        return Ok(false);
+    }
+    Ok(long_name(directory, std::ffi::OsStr::new(canonical))?
+        == long_name(directory, std::ffi::OsStr::new(name))?)
+}
+
+/// The active LPM home, which no selection of a package's own files walks
+/// into: it holds login and env secrets, and `LPM_HOME="$PWD/.lpm-ci"`
+/// puts it inside a package. Known by identity, so neither another
+/// spelling of its path nor a bind mount leads a walk into it.
+#[derive(Clone, Copy, Default)]
+struct LpmHome(Option<HomeIdentity>);
+
+#[cfg(not(windows))]
+type HomeIdentity = (u64, u64);
+
+/// The volume serial number and the 128-bit file ID, as on ReFS the 64-bit
+/// index `GetFileInformationByHandle` reports doesn't tell files apart; on
+/// a volume that has no 128-bit IDs, that index. Two directories on one
+/// volume get the same kind, so one kind never matches the other.
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HomeIdentity {
+    FileId(u64, [u8; 16]),
+    FileIndex(u32, u64),
+}
+
+impl LpmHome {
+    fn active() -> Result<Self, LpmError> {
+        let root = match lpm_common::LpmRoot::from_env() {
+            Ok(root) => root,
+            Err(LpmError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self(None));
+            }
+            Err(error) => return Err(error),
+        };
+        match home_identity_at(root.root()) {
+            Ok(identity) => Ok(Self(identity)),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(Self(None))
+            }
+            Err(error) => Err(LpmError::Registry(format!(
+                "could not check where the LPM home {} is: {error}",
+                root.root().display()
+            ))),
+        }
+    }
+
+    /// Whether `directory`, opened from the entry `metadata` describes, is
+    /// the LPM home.
+    #[cfg(not(windows))]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "keeps the signature of the Windows check, which reads the directory's handle"
+    )]
+    fn is(self, metadata: &cap_std::fs::Metadata, _directory: &Dir) -> Result<bool, LpmError> {
+        use cap_std::fs::MetadataExt as _;
+        Ok(self.0 == Some((metadata.dev(), metadata.ino())))
+    }
+
+    /// Whether `directory`, opened from the entry `metadata` describes, is
+    /// the LPM home.
+    #[cfg(windows)]
+    fn is(self, _metadata: &cap_std::fs::Metadata, directory: &Dir) -> Result<bool, LpmError> {
+        use std::os::windows::io::AsRawHandle as _;
+        let Some(home) = self.0 else {
+            return Ok(false);
+        };
+        Ok(handle_identity(directory.as_raw_handle()).map_err(LpmError::Io)? == home)
+    }
+}
+
+/// The identity of the directory at `path`, links followed; `None` when it
+/// is something else.
+#[cfg(not(windows))]
+fn home_identity_at(path: &Path) -> std::io::Result<Option<HomeIdentity>> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = std::fs::metadata(path)?;
+    Ok(metadata.is_dir().then(|| (metadata.dev(), metadata.ino())))
+}
+
+/// The identity of the directory at `path`, links followed; `None` when it
+/// is something else.
+#[cfg(windows)]
+fn home_identity_at(path: &Path) -> std::io::Result<Option<HomeIdentity>> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+    };
+
+    let entry = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    if !entry.metadata()?.is_dir() {
+        return Ok(None);
+    }
+    handle_identity(entry.as_raw_handle()).map(Some)
+}
+
+#[cfg(windows)]
+fn handle_identity(handle: std::os::windows::io::RawHandle) -> std::io::Result<HomeIdentity> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = FILE_ID_INFO::default();
+    // SAFETY: the caller keeps the handle open for the call, and
+    // `information` is a writable FILE_ID_INFO of the size passed.
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileIdInfo,
+            (&raw mut information).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if succeeded != 0 {
+        return Ok(HomeIdentity::FileId(
+            information.VolumeSerialNumber,
+            information.FileId.Identifier,
+        ));
+    }
+    let error = std::io::Error::last_os_error();
+    if !matches!(
+        error
+            .raw_os_error()
+            .and_then(|code| u32::try_from(code).ok()),
+        Some(ERROR_INVALID_PARAMETER | ERROR_INVALID_FUNCTION | ERROR_NOT_SUPPORTED)
+    ) {
+        return Err(error);
+    }
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the caller keeps the handle open for the call, and
+    // `information` is writable.
+    if unsafe { GetFileInformationByHandle(handle, &raw mut information) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(HomeIdentity::FileIndex(
+        information.dwVolumeSerialNumber,
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    ))
 }
 
 fn is_npm_always_included_root_file(name: &str) -> bool {
@@ -1696,6 +2297,7 @@ fn collect_explicit_matches(
     directory: &Dir,
     relative_dir: &Path,
     matcher: &PublishFilesMatcher,
+    home: LpmHome,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
     validate_publish_archive_path(relative_dir)?;
@@ -1728,7 +2330,9 @@ fn collect_explicit_matches(
             && matcher.can_match_descendant(&relative)
         {
             let child = open_cap_directory_entry(directory, &name, &relative)?;
-            collect_explicit_matches(&child, &relative, matcher, result)?;
+            if !home.is(&metadata, &child)? {
+                collect_explicit_matches(&child, &relative, matcher, home, result)?;
+            }
         }
     }
     Ok(())
@@ -1737,32 +2341,43 @@ fn collect_explicit_matches(
 fn collect_required_manifest_files(
     source_dir: &Dir,
     pkg_json: &serde_json::Value,
+    home: LpmHome,
     result: &mut Vec<TarballFile>,
     listings: &mut Listings,
 ) -> Result<(), LpmError> {
-    for field in ["main", "browser"] {
-        if let Some(path) = pkg_json.get(field).and_then(serde_json::Value::as_str) {
-            collect_required_manifest_path(source_dir, field, path, result, listings)?;
-        }
-    }
-    match pkg_json.get("bin") {
-        Some(serde_json::Value::String(path)) => {
-            collect_required_manifest_path(source_dir, "bin", path, result, listings)?;
-        }
-        Some(serde_json::Value::Object(entries)) => {
-            for path in entries.values().filter_map(serde_json::Value::as_str) {
-                collect_required_manifest_path(source_dir, "bin", path, result, listings)?;
-            }
-        }
-        _ => {}
+    for (field, path) in manifest_entrypoints(pkg_json) {
+        collect_required_manifest_path(source_dir, field, path, home, result, listings)?;
     }
     Ok(())
+}
+
+/// The `main`, `browser` and `bin` entrypoints `pkg_json` names, each with
+/// its field.
+fn manifest_entrypoints(
+    pkg_json: &serde_json::Value,
+) -> impl Iterator<Item = (&'static str, &str)> {
+    let fields = ["main", "browser"].into_iter().filter_map(|field| {
+        pkg_json
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .map(|path| (field, path))
+    });
+    let bins: Vec<&str> = match pkg_json.get("bin") {
+        Some(serde_json::Value::String(path)) => vec![path.as_str()],
+        Some(serde_json::Value::Object(entries)) => entries
+            .values()
+            .filter_map(serde_json::Value::as_str)
+            .collect(),
+        _ => Vec::new(),
+    };
+    fields.chain(bins.into_iter().map(|path| ("bin", path)))
 }
 
 fn collect_required_manifest_path(
     source_dir: &Dir,
     field: &str,
     manifest_path: &str,
+    home: LpmHome,
     result: &mut Vec<TarballFile>,
     listings: &mut Listings,
 ) -> Result<(), LpmError> {
@@ -1785,7 +2400,7 @@ fn collect_required_manifest_path(
     if relative_path.as_os_str().is_empty() {
         return Ok(());
     }
-    collect_exact_publish_path(source_dir, field, &relative_path, result, listings)
+    collect_exact_publish_path(source_dir, field, &relative_path, home, result, listings)
 }
 
 /// Paths no tarball holds, whatever `files`, `.npmignore` or `.gitignore`
@@ -1799,17 +2414,12 @@ fn is_npm_strict_exclusion(path: &str) -> bool {
         .split(['/', '\\'])
         .filter(|segment| !segment.is_empty())
     {
-        if [".git", "node_modules", lpm_common::PROJECT_STATE_DIR]
-            .iter()
-            .any(|excluded| segment.eq_ignore_ascii_case(excluded))
+        if lpm_common::names::is_git_dir_name(segment)
+            || listed_in(segment, &["node_modules", lpm_common::PROJECT_STATE_DIR])
         {
             return true;
         }
-        if segment_count == 0
-            && PROJECT_RECORD_DIRS
-                .iter()
-                .any(|excluded| segment.eq_ignore_ascii_case(excluded))
-        {
+        if segment_count == 0 && listed_in(segment, PROJECT_RECORD_DIRS) {
             return true;
         }
         segment_count += 1;
@@ -1818,25 +2428,20 @@ fn is_npm_strict_exclusion(path: &str) -> bool {
     let Some(file_name) = file_name else {
         return false;
     };
-    if [".npmrc", ".npmignore", ".gitignore"]
-        .iter()
-        .any(|excluded| file_name.eq_ignore_ascii_case(excluded))
-    {
+    if listed_in(file_name, &[".npmrc", ".npmignore", ".gitignore"]) {
         return true;
     }
     if lpm_common::atomic_write::is_atomic_temp_name(file_name) {
         return true;
     }
     segment_count == 1
-        && ROOT_LOCK_FILES
-            .iter()
-            .chain(PROJECT_RECORD_FILES)
-            .any(|excluded| file_name.eq_ignore_ascii_case(excluded))
+        && (listed_in(file_name, ROOT_LOCK_FILES) || listed_in(file_name, PROJECT_RECORD_FILES))
 }
 
 fn collect_cap_directory(
     directory: &Dir,
     relative_dir: &Path,
+    home: LpmHome,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
     validate_publish_archive_path(relative_dir)?;
@@ -1866,7 +2471,9 @@ fn collect_cap_directory(
             }
         } else if metadata.is_dir() {
             let child = open_cap_directory_entry(directory, &name, &relative)?;
-            collect_cap_directory(&child, &relative, result)?;
+            if !home.is(&metadata, &child)? {
+                collect_cap_directory(&child, &relative, home, result)?;
+            }
         }
     }
     Ok(())
@@ -1875,25 +2482,10 @@ fn collect_cap_directory(
 /// Security-sensitive defaults applied in addition to project ignore rules.
 const IGNORE_DIRS: &[&str] = &["node_modules", ".git", ".svn", ".hg", "CVS"];
 
-const IGNORE_FILES: &[&str] = &[
-    ".gitignore",
-    ".npmignore",
-    ".DS_Store",
-    "Thumbs.db",
-    ".env",
-    ".env.local",
-    ".env.live",
-    ".env.development",
-    ".env.production",
-    ".env.staging",
-    ".env.test",
-    ".envrc",
-    "id_rsa",
-    "id_ed25519",
-    "id_ecdsa",
-    ".netrc",
-    ".pgpass",
-];
+/// Files an implicit publish leaves out besides credential files
+/// (`lpm_security::behavioral::secrets::is_blocked_file`). Credential files
+/// `files` selects stay, so the secret scan stops the publish and says so.
+const IGNORE_FILES: &[&str] = &[".gitignore", ".npmignore", ".DS_Store", "Thumbs.db"];
 
 /// The project's committed LPM records, kept out of every tarball.
 const PROJECT_RECORD_FILES: &[&str] = &[
@@ -1914,15 +2506,13 @@ const ROOT_LOCK_FILES: &[&str] = &[
     "bun.lockb",
 ];
 
-fn contains_ascii_case_insensitive(values: &[&str], value: &str) -> bool {
-    values
-        .iter()
-        .any(|candidate| value.eq_ignore_ascii_case(candidate))
-}
-
-fn collect_all_files(source_dir: &Dir, result: &mut Vec<TarballFile>) -> Result<(), LpmError> {
+fn collect_all_files(
+    source_dir: &Dir,
+    home: LpmHome,
+    result: &mut Vec<TarballFile>,
+) -> Result<(), LpmError> {
     let mut matchers = Vec::new();
-    collect_implicit_directory(source_dir, Path::new(""), &mut matchers, 0, result)
+    collect_implicit_directory(source_dir, Path::new(""), &mut matchers, 0, home, result)
 }
 
 fn collect_implicit_directory(
@@ -1930,6 +2520,7 @@ fn collect_implicit_directory(
     relative_dir: &Path,
     matchers: &mut Vec<ignore::gitignore::Gitignore>,
     depth: usize,
+    home: LpmHome,
     result: &mut Vec<TarballFile>,
 ) -> Result<(), LpmError> {
     validate_publish_archive_path(relative_dir)?;
@@ -1955,16 +2546,19 @@ fn collect_implicit_directory(
         }
         let display_name = name.to_string_lossy();
         if is_directory {
-            if contains_ascii_case_insensitive(IGNORE_DIRS, &display_name)
+            if listed_in(&display_name, IGNORE_DIRS)
                 || depth == 0 && is_authored_skill_namespace_path(&relative)
                 || is_npm_strict_exclusion(&portable_relative(&relative))
             {
                 continue;
             }
             let child = open_cap_directory_entry(directory, &name, &relative)?;
-            collect_implicit_directory(&child, &relative, matchers, depth + 1, result)?;
+            if !home.is(&metadata, &child)? {
+                collect_implicit_directory(&child, &relative, matchers, depth + 1, home, result)?;
+            }
         } else if metadata.is_file()
-            && !contains_ascii_case_insensitive(IGNORE_FILES, &display_name)
+            && !listed_in(&display_name, IGNORE_FILES)
+            && !lpm_security::behavioral::secrets::is_blocked_file(&display_name)
         {
             let archive_path = portable_relative(&relative);
             if archive_path != "package.json" && !is_npm_strict_exclusion(&archive_path) {
@@ -2059,6 +2653,7 @@ fn collect_exact_publish_path(
     source_dir: &Dir,
     field: &str,
     relative: &Path,
+    home: LpmHome,
     result: &mut Vec<TarballFile>,
     listings: &mut Listings,
 ) -> Result<(), LpmError> {
@@ -2086,7 +2681,25 @@ fn collect_exact_publish_path(
         let parent = current.parent().unwrap_or(Path::new(""));
         if !listings.lists(&directory, parent, name)? {
             let listed = listings.names_of(&directory, parent, name)?;
-            return Err(respelled_entrypoint(field, relative, &current, &listed));
+            // A root file publish renames is named as it ships, whatever it
+            // is stored as.
+            let ships_as = (parent.as_os_str().is_empty() && components.peek().is_none())
+                .then(|| {
+                    listed
+                        .iter()
+                        .find_map(|listed| listed.to_str().and_then(renamed_root_file))
+                })
+                .flatten();
+            match ships_as {
+                Some(canonical) if name.to_str() == Some(canonical) => {}
+                Some(canonical) => {
+                    return Err(LpmError::Registry(format!(
+                        "package.json {field} names {:?}, but publish ships that file as {canonical:?}; spell it as that",
+                        lpm_common::sanitize_terminal_inline(&relative.to_string_lossy())
+                    )));
+                }
+                None => return Err(respelled_entrypoint(field, relative, &current, &listed)),
+            }
         }
         if components.peek().is_none() {
             if metadata.is_file() {
@@ -2102,7 +2715,9 @@ fn collect_exact_publish_path(
                 }
             } else if metadata.is_dir() {
                 let child = open_cap_directory_entry(&directory, name, &current)?;
-                collect_cap_directory(&child, &current, result)?;
+                if !home.is(&metadata, &child)? {
+                    collect_cap_directory(&child, &current, home, result)?;
+                }
             }
             return Ok(());
         }
@@ -2110,6 +2725,9 @@ fn collect_exact_publish_path(
             return Ok(());
         }
         directory = open_cap_directory_entry(&directory, name, &current)?;
+        if home.is(&metadata, &directory)? {
+            return Ok(());
+        }
     }
     Ok(())
 }
@@ -2324,6 +2942,7 @@ fn collect_bundled_dependencies(
             .collect()
         });
     let mut collector = BundledDependencyCollector {
+        home: LpmHome::active()?,
         project_dir: canonical_project_root,
         project_source_dir,
         canonical_project_root,
@@ -2668,6 +3287,7 @@ fn unverified_bundle_path(name: &str, candidate: &Path) -> LpmError {
 }
 
 struct BundledDependencyCollector<'a> {
+    home: LpmHome,
     project_dir: &'a Path,
     project_source_dir: &'a Dir,
     canonical_project_root: &'a Path,
@@ -2717,6 +3337,11 @@ impl BundledDependencyCollector<'_> {
         expected_name: &str,
         archive_root: &str,
     ) -> Result<(), LpmError> {
+        if self.home.is(&source_dir.dir_metadata()?, source_dir)? {
+            return Err(LpmError::Registry(format!(
+                "bundled dependency `{expected_name}` is the LPM home, which holds login and env secrets"
+            )));
+        }
         let identity = DirectoryIdentity::from_directory(source_dir).map_err(LpmError::Io)?;
         let source_root = Arc::new(TarballSourceRoot {
             path: package_root.to_path_buf(),
@@ -2784,6 +3409,7 @@ impl BundledDependencyCollector<'_> {
             &source_root,
             archive_root,
             &manifest_sha256,
+            self.home,
             self.result,
         )?;
 
@@ -2821,6 +3447,7 @@ impl BundledDependencyCollector<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_bundle_tree(
     directory: &Dir,
     relative_dir: &Path,
@@ -2828,6 +3455,7 @@ fn collect_bundle_tree(
     source_root: &Arc<TarballSourceRoot>,
     archive_root: &str,
     manifest_sha256: &[u8; 32],
+    home: LpmHome,
     result: &mut Vec<TarballCandidate>,
 ) -> Result<(), LpmError> {
     validate_publish_archive_path(relative_dir)?;
@@ -2849,11 +3477,18 @@ fn collect_bundle_tree(
                 package_root.join(&relative).display()
             )));
         }
+        // As files too: a submodule's `.git` is a file.
+        if name.to_str().is_some_and(|name| {
+            lpm_common::names::is_git_dir_name(name)
+                || listed_in(name, &["node_modules", lpm_common::PROJECT_STATE_DIR])
+        }) {
+            continue;
+        }
         if metadata.is_dir() {
-            if name == "node_modules" || name == ".git" || name == ".lpm" {
+            let child = open_cap_directory_entry(directory, &name, &relative)?;
+            if home.is(&metadata, &child)? {
                 continue;
             }
-            let child = open_cap_directory_entry(directory, &name, &relative)?;
             collect_bundle_tree(
                 &child,
                 &relative,
@@ -2861,10 +3496,18 @@ fn collect_bundle_tree(
                 source_root,
                 archive_root,
                 manifest_sha256,
+                home,
                 result,
             )?;
         } else if metadata.is_file() {
             let portable = portable_relative(&relative);
+            // The package's own `lpm.json` ships as the root package's does,
+            // without its author's env identity.
+            let projects_lpm_json = relative_dir.as_os_str().is_empty()
+                && name
+                    .to_str()
+                    .is_some_and(|name| listed_in(name, &["lpm.json"]))
+                && metadata.len() <= lpm_common::CONFIG_FILE_SIZE_CAP_BYTES;
             push_tarball_candidate(
                 result,
                 TarballCandidate {
@@ -2873,7 +3516,8 @@ fn collect_bundle_tree(
                     archive_path: format!("{archive_root}/{portable}"),
                     expected_content_sha256: (relative == Path::new("package.json"))
                         .then_some(*manifest_sha256),
-                    secret_scan_completed: false,
+                    secret_scan: CandidateScan::Pending,
+                    projects_lpm_json,
                 },
             )?;
         }
@@ -4760,7 +5404,14 @@ mod tests {
         let mut result = Vec::new();
         let mut listings = Listings::default();
 
-        collect_required_manifest_files(&source, &manifest, &mut result, &mut listings).unwrap();
+        collect_required_manifest_files(
+            &source,
+            &manifest,
+            LpmHome::default(),
+            &mut result,
+            &mut listings,
+        )
+        .unwrap();
 
         assert_eq!(result.len(), 50);
         // The root and `bin/`, each listed once.
@@ -4930,6 +5581,381 @@ mod tests {
                 "{main}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn names_the_rules_list_match_under_every_case_a_disk_folds() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        // Stored as spelled, and found under the listed names where the disk
+        // folds case beyond ASCII.
+        std::fs::create_dir_all(project.join("node_module\u{17F}/dep")).unwrap();
+        std::fs::write(project.join("node_module\u{17F}/dep/index.js"), "1").unwrap();
+        std::fs::create_dir_all(project.join("lpm-\u{17F}kills/raw")).unwrap();
+        std::fs::write(project.join("lpm-\u{17F}kills/raw/SKILL.md"), "unchecked").unwrap();
+        std::fs::write(project.join("lpm.loc\u{212A}"), "lockfile").unwrap();
+        std::fs::write(project.join("index.js"), "module.exports = 1;").unwrap();
+        if !project.join("node_modules").exists() {
+            return;
+        }
+        for manifest in [
+            serde_json::json!({"name": "folded", "version": "1.0.0"}),
+            serde_json::json!({"name": "folded", "version": "1.0.0", "files": ["*"]}),
+        ] {
+            std::fs::write(
+                project.join("package.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+
+            let (_, files) = create_tarball(project, &manifest).unwrap();
+
+            let paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+            assert_eq!(paths, ["index.js", "package.json"], "{manifest}");
+        }
+    }
+
+    #[test]
+    fn a_required_entrypoint_naming_a_root_file_publish_renames_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        std::fs::write(project.join("LPM.json"), "{}").unwrap();
+        // Only a disk that folds case takes `LPM.json` for `lpm.json`.
+        if !project.join("lpm.json").exists() {
+            return;
+        }
+        for (field, manifest) in [
+            (
+                "main",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "main": "LPM.json"}),
+            ),
+            (
+                "browser",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "browser": "./LPM.json"}),
+            ),
+            (
+                "bin",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "bin": {"x": "LPM.json"}}),
+            ),
+            (
+                "exports",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": ["LPM.json"], "exports": "./LPM.json"}),
+            ),
+            (
+                "exports",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": ["LPM.json"], "exports": {".": {"import": ["./LPM.json"]}}}),
+            ),
+            (
+                "browser",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": ["LPM.json"], "browser": {"./index.js": "./LPM.json"}}),
+            ),
+            (
+                "browser",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": ["LPM.json"], "browser": {"./LPM.json": false}}),
+            ),
+            (
+                "imports",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": ["LPM.json"], "imports": {"#config": "./LPM.json"}}),
+            ),
+            // Neither the stored spelling nor the shipped one.
+            (
+                "main",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "main": "Lpm.json"}),
+            ),
+            (
+                "bin",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "bin": {"x": "./lpm.JSON"}}),
+            ),
+        ] {
+            std::fs::write(
+                project.join("package.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+
+            let error = create_tarball(project, &manifest)
+                .map(|(_, files)| files)
+                .unwrap_err()
+                .to_string();
+
+            assert!(
+                error.contains(&format!("package.json {field} names "))
+                    && error
+                        .contains(r#"but publish ships that file as "lpm.json"; spell it as that"#),
+                "{manifest}: {error}"
+            );
+        }
+    }
+
+    /// Root files ship under their own names whether or not `files` selects
+    /// them, so a reference to the stored spelling is refused either way,
+    /// subpath patterns included.
+    #[test]
+    fn a_reference_to_a_renamed_root_file_files_doesn_t_select_is_refused() {
+        for (stored, manifest, field) in [
+            (
+                "PACKAGE.json",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "exports": {"./package.json": "./PACKAGE.json"}}),
+                "exports",
+            ),
+            (
+                "LPM.json",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "exports": {"./config": "./LPM.json"}}),
+                "exports",
+            ),
+            (
+                "LPM.json",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "imports": {"#config": "./LPM.json"}}),
+                "imports",
+            ),
+            (
+                "LPM.json",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": ["LPM.json"], "exports": {"./*": "./LPM.*"}}),
+                "exports",
+            ),
+            // Targets are URLs, whose escapes Node decodes.
+            (
+                "LPM.json",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "exports": {"./config": "./LPM%2Ejson"}}),
+                "exports",
+            ),
+            (
+                "LPM.json",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "imports": {"#config/*": "./LPM%2E*"}}),
+                "imports",
+            ),
+            // A query or fragment isn't part of the file a target names.
+            (
+                "LPM.json",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "exports": {"./config": "./LPM.json?variant=1"}}),
+                "exports",
+            ),
+            (
+                "LPM.json",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "exports": {"./config": "./LPM.json#config"}}),
+                "exports",
+            ),
+            (
+                "LPM.json",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "exports": {"./config": "./LPM.json?source=a/b"}}),
+                "exports",
+            ),
+            (
+                "LPM.json",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "exports": {"./config": "./LPM%2Ejson?raw"}}),
+                "exports",
+            ),
+            // The request that reached the stored spelling finds nothing once
+            // published, though another one reaches the shipped name.
+            (
+                "LPM.json",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "exports": {"./*": "./*.json"}}),
+                "exports",
+            ),
+            // A URL parser drops tabs and newlines and trims the ends.
+            (
+                "LPM.json",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "exports": {"./config": "./LP\tM.json"}}),
+                "exports",
+            ),
+            (
+                "LPM.json",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "exports": {"./config": "./LPM.json "}}),
+                "exports",
+            ),
+            // A subpath can hold a `?` or `#`, which ends the path where the
+            // first `*` puts it.
+            (
+                "LPM.json",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "exports": {"./*": "./*suffix"}}),
+                "exports",
+            ),
+            (
+                "LPM.json",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "exports": {"./tool/*": "./L*M.j*on"}}),
+                "exports",
+            ),
+            // Node finds `main`'s file with the extension it adds.
+            (
+                "LPM.json",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "main": "./LPM"}),
+                "main",
+            ),
+            (
+                "LPM.json",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "main": "LPM"}),
+                "main",
+            ),
+            // A condition takes the pattern of the subpath above it.
+            (
+                "LPM.json",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "exports": {"./*": {"node": {"default": "./*.json"}}}}),
+                "exports",
+            ),
+            // Every `*` of a target takes the one subpath a request matches.
+            (
+                "PACKAGE.json",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "exports": {"./config/*": "./P*CK*GE.json"}}),
+                "exports",
+            ),
+            (
+                "pAckAge.json",
+                serde_json::json!({"name": "aliased", "version": "1.0.0", "files": [], "exports": {"./*": "./p*ck*ge.json"}}),
+                "exports",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let project = dir.path();
+            let content = serde_json::to_vec(&manifest).unwrap();
+            if stored.eq_ignore_ascii_case("package.json") {
+                std::fs::write(project.join(stored), &content).unwrap();
+            } else {
+                std::fs::write(project.join(stored), "{}").unwrap();
+                std::fs::write(project.join("package.json"), &content).unwrap();
+            }
+            // Only a disk that folds case takes the stored spelling for the
+            // canonical one.
+            if !project.join(stored.to_lowercase()).exists() {
+                return;
+            }
+
+            let error = create_tarball(project, &manifest)
+                .map(|(_, files)| files)
+                .unwrap_err()
+                .to_string();
+
+            assert!(
+                error.contains(&format!("package.json {field} "))
+                    && error.contains(&format!("{:?}", stored.to_lowercase())),
+                "{manifest}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_root_file_is_known_under_every_spelling_a_filesystem_folds() {
+        for (stored, canonical) in [
+            ("LPM.json", "lpm.json"),
+            ("lp\u{200C}m.json", "lpm.json"),
+            ("PACKAGE\u{FEFF}.json", "package.json"),
+            ("lpm.config.j\u{17F}on", "lpm.config.json"),
+        ] {
+            assert_eq!(renamed_root_file(stored), Some(canonical), "{stored}");
+        }
+        assert_eq!(renamed_root_file("lpm.json"), None);
+        assert_eq!(renamed_root_file("lpm.json5"), None);
+    }
+
+    #[test]
+    fn a_reference_to_a_renamed_root_file_by_the_name_it_ships_under_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        std::fs::write(project.join("LPM.json"), "{}").unwrap();
+        if !project.join("lpm.json").exists() {
+            return;
+        }
+        let manifest = serde_json::json!({
+            "name": "aliased",
+            "version": "1.0.0",
+            "files": [],
+            "main": "lpm.json",
+            // No subpath puts `LPM.json` at the root through a pattern that
+            // starts otherwise or in a directory, and a `main` or `bin` path
+            // has no pattern, nor has a target whose key has none, which
+            // names a file called `LPM.*`.
+            "bin": {"tool": "LPM.*"},
+            "exports": {
+                ".": "./lpm.json",
+                "./x/*": "./X*.json",
+                "./lib/*": "./lib/*.js",
+                "./literal": {"import": "./LPM.*", "default": ["./LPM.*"]},
+            },
+            "imports": {"#literal": "./LPM.*"},
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let (_, files) = create_tarball(project, &manifest).unwrap();
+
+        let paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, ["lpm.json", "package.json"]);
+
+        // As Node finds it, with the extension it adds.
+        let mut manifest = manifest;
+        manifest["main"] = serde_json::json!("./lpm");
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        create_tarball(project, &manifest).unwrap();
+    }
+
+    #[test]
+    fn the_active_lpm_home_inside_a_package_never_ships() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        // As `LPM_HOME="$PWD/.lpm-ci"` in CI puts it.
+        let home = project.join(".lpm-ci");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".credentials"), "ciphertext").unwrap();
+        std::fs::write(home.join(".key"), "raw data key").unwrap();
+        std::fs::write(project.join("index.js"), "module.exports = 1;").unwrap();
+        // `LPM_HOME` names it through a link, which no walk follows.
+        #[cfg(unix)]
+        let outside = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let home = {
+            let link = outside.path().join("lpm-home");
+            std::os::unix::fs::symlink(&home, &link).unwrap();
+            link
+        };
+        let _env = crate::test_env::ScopedEnv::set([("LPM_HOME", home.into_os_string())]);
+        for manifest in [
+            serde_json::json!({"name": "ci-home", "version": "1.0.0", "files": ["*"]}),
+            serde_json::json!({"name": "ci-home", "version": "1.0.0", "files": [".lpm-ci/**"]}),
+            serde_json::json!({"name": "ci-home", "version": "1.0.0", "files": [], "main": ".lpm-ci/.key"}),
+            serde_json::json!({"name": "ci-home", "version": "1.0.0", "files": [], "bin": {"ci": ".lpm-ci"}}),
+            serde_json::json!({"name": "ci-home", "version": "1.0.0"}),
+        ] {
+            std::fs::write(
+                project.join("package.json"),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+
+            let (_, files) = create_tarball(project, &manifest).unwrap();
+
+            assert!(
+                !files
+                    .iter()
+                    .any(|file| file.path.to_ascii_lowercase().starts_with(".lpm-ci")),
+                "{manifest}: {files:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_package_directory_that_is_the_lpm_home_is_not_packed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".credentials"), "ciphertext").unwrap();
+        let manifest = serde_json::json!({"name": "home", "version": "1.0.0", "files": ["*"]});
+        std::fs::write(
+            dir.path().join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let _env =
+            crate::test_env::ScopedEnv::set([("LPM_HOME", dir.path().as_os_str().to_owned())]);
+
+        let error = create_tarball(dir.path(), &manifest)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("is the LPM home"), "{error}");
     }
 
     #[test]
@@ -5394,6 +6420,12 @@ mod tests {
         assert!(is_npm_strict_exclusion(".LPM/ReLeAsE-ApPlY/journal.json"));
         assert!(is_npm_strict_exclusion("fixtures/.Lpm/state"));
         assert!(is_npm_strict_exclusion(".GIT/config"));
+        // Git reads these as `.git` on every platform.
+        assert!(is_npm_strict_exclusion("vendor/.git./HEAD"));
+        assert!(is_npm_strict_exclusion("vendor/.Git /HEAD"));
+        assert!(is_npm_strict_exclusion("sub/GIT~1/config"));
+        assert!(is_npm_strict_exclusion("sub/.g\u{200C}it/config"));
+        assert!(!is_npm_strict_exclusion(".github/workflows/ci.yml"));
         assert!(is_npm_strict_exclusion("NODE_MODULES/package.json"));
         assert!(is_npm_strict_exclusion(".NPMRC"));
         assert!(is_npm_strict_exclusion("PACKAGE-LOCK.JSON"));
@@ -5500,6 +6532,204 @@ mod tests {
         let archive = tarball_contents(&tarball);
         assert_eq!(archive["package/node_modules/foo/index.js"], b"foo");
         assert_eq!(archive["package/node_modules/bar/index.js"], b"bar");
+    }
+
+    #[test]
+    fn a_bundled_dependency_never_ships_the_lpm_home_or_lpm_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let foo = project.join("node_modules/foo");
+        let home = foo.join("ci-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".credentials"), "ciphertext").unwrap();
+        std::fs::write(home.join(".key"), "raw data key").unwrap();
+        std::fs::create_dir_all(foo.join(".LPM")).unwrap();
+        std::fs::write(foo.join(".LPM/inspector.db"), "captured headers").unwrap();
+        std::fs::write(
+            foo.join("package.json"),
+            r#"{"name":"foo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(foo.join("index.js"), "foo").unwrap();
+        let manifest = serde_json::json!({
+            "name": "publisher",
+            "version": "1.0.0",
+            "dependencies": {"foo": "1.0.0"},
+            "bundledDependencies": ["foo"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let _env = crate::test_env::ScopedEnv::set([("LPM_HOME", home.into_os_string())]);
+
+        let (_, files) = create_tarball(project, &manifest).unwrap();
+
+        let paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+        assert!(paths.contains(&"node_modules/foo/index.js"), "{paths:?}");
+        assert!(
+            !paths
+                .iter()
+                .any(|path| path.contains("ci-home") || path.contains(".LPM")),
+            "{paths:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bundled_lpm_json_publish_leaves_as_it_is_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let package = project.join("node_modules/helper");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"name":"helper","version":"1.0.0","scripts":{"postinstall":"./lpm.json"}}"#,
+        )
+        .unwrap();
+        // Not a JSON object, so publish ships it as it is.
+        std::fs::write(package.join("lpm.json"), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            package.join("lpm.json"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let manifest = serde_json::json!({
+            "name": "publisher",
+            "version": "1.0.0",
+            "dependencies": {"helper": "1.0.0"},
+            "bundledDependencies": ["helper"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let (data, _) = create_tarball(project, &manifest).unwrap();
+
+        let mut mode = None;
+        lpm_extractor::visit_tar_archive(
+            flate2::read::GzDecoder::new(data.as_slice()),
+            publish_tar_read_limits(),
+            |entry| {
+                if entry.path().to_string_lossy() == "package/node_modules/helper/lpm.json" {
+                    mode = entry.header().mode().ok();
+                }
+                Ok(std::ops::ControlFlow::<()>::Continue(()))
+            },
+        )
+        .unwrap();
+        assert_eq!(mode, Some(0o755));
+    }
+
+    #[test]
+    fn a_bundled_dependency_s_lpm_json_ships_without_its_author_s_env_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        for (name, dependencies) in [("foo", r#"{"bar":"1.0.0"}"#), ("bar", "{}")] {
+            let package = project.join("node_modules").join(name);
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(
+                package.join("package.json"),
+                format!(r#"{{"name":"{name}","version":"1.0.0","dependencies":{dependencies}}}"#),
+            )
+            .unwrap();
+            std::fs::write(package.join("index.js"), name).unwrap();
+            std::fs::write(
+                package.join("lpm.json"),
+                r#"{"vault":"env-private-owner","vaultSync":{"personalPlatformBindings":{"https://lpm.dev":"private-account-id"}},"runtime":{"node":"22"}}"#,
+            )
+            .unwrap();
+        }
+        let manifest = serde_json::json!({
+            "name": "publisher",
+            "version": "1.0.0",
+            "dependencies": {"foo": "1.0.0"},
+            "bundledDependencies": ["foo"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let (data, _) = create_tarball(project, &manifest).unwrap();
+
+        let mut shipped = std::collections::BTreeMap::new();
+        lpm_extractor::visit_tar_archive(
+            flate2::read::GzDecoder::new(data.as_slice()),
+            publish_tar_read_limits(),
+            |mut entry| {
+                let path = entry.path().to_string_lossy().into_owned();
+                if path.ends_with("/lpm.json") {
+                    let mut content = Vec::new();
+                    entry.read_to_end(&mut content).map_err(LpmError::Io)?;
+                    shipped.insert(
+                        path,
+                        serde_json::from_slice::<serde_json::Value>(&content).unwrap(),
+                    );
+                }
+                Ok(std::ops::ControlFlow::<()>::Continue(()))
+            },
+        )
+        .unwrap();
+        let public = serde_json::json!({"runtime": {"node": "22"}});
+        assert_eq!(
+            shipped,
+            std::collections::BTreeMap::from([
+                (
+                    "package/node_modules/bar/lpm.json".to_owned(),
+                    public.clone()
+                ),
+                ("package/node_modules/foo/lpm.json".to_owned(), public),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_bundled_dependency_ships_no_git_directory_or_gitfile_under_any_name_git_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let foo = project.join("node_modules/foo");
+        for (file, content) in [
+            ("package.json", r#"{"name":"foo","version":"1.0.0"}"#),
+            ("index.js", "foo"),
+            // A submodule's gitfile, and names git reads as `.git`.
+            (".git", "gitdir: ../../placeholder"),
+            ("sub/.git.", "gitdir: ../../placeholder"),
+            ("sub/git~1", "gitdir: ../../placeholder"),
+            ("vendor/.git/HEAD", "ref: refs/heads/main"),
+            ("lib/.lpm", "x"),
+            (".github/ci.yml", "on: push"),
+        ] {
+            let path = foo.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        let manifest = serde_json::json!({
+            "name": "publisher",
+            "version": "1.0.0",
+            "dependencies": {"foo": "1.0.0"},
+            "bundledDependencies": ["foo"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let (_, files) = create_tarball(project, &manifest).unwrap();
+
+        let mut bundled: Vec<&str> = files
+            .iter()
+            .filter_map(|file| file.path.strip_prefix("node_modules/foo/"))
+            .collect();
+        bundled.sort_unstable();
+        assert_eq!(bundled, [".github/ci.yml", "index.js", "package.json"]);
     }
 
     #[test]
@@ -6145,6 +7375,62 @@ mod tests {
                 .iter()
                 .any(|finding| finding.pattern_name == "stripe_live_secret"),
             "the large-file prescan must retain secret findings: {scan:?}",
+        );
+    }
+
+    #[test]
+    fn a_private_key_any_streamed_file_starts_with_stops_the_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let manifest = serde_json::json!({
+            "name": "streamed-private-keys",
+            "version": "1.0.0",
+            "files": ["certs", "bin"]
+        });
+        std::fs::write(
+            project.join("package.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(project.join("certs")).unwrap();
+        std::fs::write(
+            project.join("certs/identity.data"),
+            "Bag Attributes\n-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIFHDBOBgkqhkiG9w0BBQ0w\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(project.join("bin")).unwrap();
+        let mut executable =
+            b"\x7fELF\x02\x01\x01\0\n-----BEGIN OPENSSH PRIVATE KEY-----\n".to_vec();
+        executable.resize(LARGE_SECRET_SCAN_PRESCAN_BYTES as usize + 1, 0);
+        std::fs::write(project.join("bin/tool"), &executable).unwrap();
+
+        let prepared = prepare_tarball(
+            project,
+            &manifest,
+            TarballOptions {
+                scan_secrets: true,
+                ..TarballOptions::default()
+            },
+        )
+        .unwrap();
+        let mut found: Vec<(String, usize)> = prepared
+            .secret_scan
+            .unwrap()
+            .matches
+            .into_iter()
+            .map(|finding| (finding.description, finding.line))
+            .collect();
+        found.sort();
+
+        assert_eq!(
+            found,
+            [
+                (
+                    "Encrypted PKCS #8 private key in certs/identity.data".to_string(),
+                    2
+                ),
+                ("OpenSSH private key in bin/tool".to_string(), 2),
+            ]
         );
     }
 

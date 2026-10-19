@@ -2178,6 +2178,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 dev,
                 no_optional,
                 dry_run,
+                allow_secrets,
             } = args;
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             let output_path = std::path::PathBuf::from(&output);
@@ -2194,6 +2195,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 dev,
                 no_optional,
                 dry_run,
+                allow_secrets,
                 cli.json,
             )
             .await

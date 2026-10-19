@@ -2,8 +2,9 @@ use lpm_common::LpmError;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-use super::copy::{CopyStats, copy_member_source};
-use super::file_select::normalize_relative_path;
+use super::copy::{CopyStats, MemberSelection, select_member_source, write_member_source};
+use super::paths::normalize_relative_path;
+use super::secret_scan::DeploySecretScan;
 use super::{DEPLOY_WORKSPACE_DIR, DependencyMode, ManifestSelectionStats};
 
 /// The dependency sections in `package.json` that may contain `workspace:*`
@@ -94,19 +95,12 @@ pub(in crate::commands::deploy) fn rewrite_workspace_protocol_in_deploy_manifest
     // Otherwise leave the source-copied bytes as-is (preserves any quirks
     // in the source formatting).
     //
-    // CRITICAL: `copy_member_source` uses hardlinks for performance. A
-    // naive `std::fs::write` here would write THROUGH the hardlink and
-    // mutate the source workspace's `package.json`. To preserve the
-    // read-only-on-source invariant, we must `remove_file` first to
-    // unlink the path from the shared inode, then write a fresh file.
-    // This guarantees the source manifest is byte-identical even if the
-    // file copy used a hardlink fast path.
+    // A fresh file at the path, never a write through it: the source
+    // workspace stays as it is even if the output's `package.json` were a
+    // link to it, which `write_member_source`'s copies never make.
     if total_rewritten > 0 {
         let updated = serde_json::to_string_pretty(&doc)
             .map_err(|e| LpmError::Script(format!("failed to serialize deploy manifest: {e}")))?;
-        // Break any potential hardlink by unlinking the path first.
-        // remove_file is idempotent for our purposes — if it doesn't exist
-        // (it should), we still create it below.
         let _ = std::fs::remove_file(&manifest_path);
         std::fs::write(&manifest_path, format!("{updated}\n"))
             .map_err(|e| LpmError::Script(format!("failed to write deploy manifest: {e}")))?;
@@ -131,12 +125,8 @@ pub(in crate::commands::deploy) fn rewrite_workspace_protocol_in_deploy_manifest
 /// Returns the number of devDependency entries that were stripped so the
 /// caller can surface it in the deploy summary.
 ///
-/// **Hardlink safety.** [`copy_member_source`] uses `hard_link` as a
-/// performance fast path, so the output's `package.json` can share an
-/// inode with the source workspace's `package.json`. A naive `write`
-/// would mutate the source. We use the same `remove_file` + fresh
-/// `write` dance as [`rewrite_workspace_protocol_in_deploy_manifest`]
-/// to break the potential hardlink.
+/// The manifest is written as a fresh file at its path, never through it,
+/// as [`rewrite_workspace_protocol_in_deploy_manifest`] writes it.
 pub(in crate::commands::deploy) fn strip_dev_dependencies_from_deploy_manifest(
     output_dir: &Path,
 ) -> Result<usize, LpmError> {
@@ -159,8 +149,8 @@ pub(in crate::commands::deploy) fn strip_dev_dependencies_from_deploy_manifest(
 
     if stripped_count == 0 {
         // Key missing or empty object: nothing to do, nothing to write.
-        // Leaving the (possibly hardlinked) bytes alone preserves source
-        // formatting and avoids an unnecessary write.
+        // Leaving the bytes alone preserves source formatting and avoids an
+        // unnecessary write.
         return Ok(0);
     }
 
@@ -171,8 +161,7 @@ pub(in crate::commands::deploy) fn strip_dev_dependencies_from_deploy_manifest(
     let updated = serde_json::to_string_pretty(&doc)
         .map_err(|e| LpmError::Script(format!("failed to serialize deploy manifest: {e}")))?;
 
-    // Break any potential hardlink to the source manifest, then write a
-    // fresh inode at the path. See the hardlink-safety rationale above.
+    // A fresh file at the path, as above.
     let _ = std::fs::remove_file(&manifest_path);
     std::fs::write(&manifest_path, format!("{updated}\n"))
         .map_err(|e| LpmError::Script(format!("failed to write deploy manifest: {e}")))?;
@@ -344,13 +333,25 @@ fn workspace_dependencies_for_package(
         .collect())
 }
 
-pub(in crate::commands::deploy) fn copy_workspace_dependency_closure(
+/// The workspace packages a deploy copies besides the member, each with its
+/// destination and the files it copies from it, chosen before anything is
+/// written.
+pub(in crate::commands::deploy) struct WorkspaceClosure {
+    providers: Vec<(PathBuf, MemberSelection)>,
+    destination_by_name: HashMap<String, PathBuf>,
+    catalogs: HashMap<String, HashMap<String, String>>,
+}
+
+/// The [`WorkspaceClosure`] `root_member_name` needs in a deploy to
+/// `output_dir`, writing nothing.
+pub(in crate::commands::deploy) fn plan_workspace_dependency_closure(
     output_dir: &Path,
     source_cwd: &Path,
     root_member_name: &str,
     mode: DependencyMode,
     no_optional: bool,
-) -> Result<(usize, usize, CopyStats, ManifestSelectionStats), LpmError> {
+    mut secrets: Option<&mut DeploySecretScan>,
+) -> Result<WorkspaceClosure, LpmError> {
     let workspace = lpm_workspace::discover_workspace(source_cwd)
         .map_err(|e| LpmError::Script(format!("workspace discovery failed: {e}")))?
         .ok_or_else(|| {
@@ -413,8 +414,8 @@ pub(in crate::commands::deploy) fn copy_workspace_dependency_closure(
     selected_names.sort_unstable();
     let mut destination_by_name = HashMap::with_capacity(selected_names.len() + 1);
     destination_by_name.insert(root_member_name.to_string(), output_dir.to_path_buf());
-    // Sibling destinations prevent a nested provider copy from overwriting an
-    // earlier hardlink to the source workspace.
+    // Sibling destinations keep a nested provider's copy from landing in an
+    // earlier one.
     for (index, name) in selected_names.iter().enumerate() {
         destination_by_name.insert(
             (*name).to_string(),
@@ -424,9 +425,7 @@ pub(in crate::commands::deploy) fn copy_workspace_dependency_closure(
         );
     }
 
-    let mut copy_stats = CopyStats::default();
-    let mut selection_stats = ManifestSelectionStats::default();
-    let mut workspace_spec_rewrites = 0;
+    let mut providers = Vec::with_capacity(selected_names.len());
     for name in &selected_names {
         let (_, source_dir) = members_by_name.get(name).ok_or_else(|| {
             LpmError::Script(format!("deploy: workspace provider {name:?} disappeared"))
@@ -434,7 +433,50 @@ pub(in crate::commands::deploy) fn copy_workspace_dependency_closure(
         let destination = destination_by_name
             .get(*name)
             .ok_or_else(|| LpmError::Script(format!("deploy: missing destination for {name:?}")))?;
-        let stats = copy_member_source(source_dir, destination)?;
+        providers.push((
+            destination.clone(),
+            select_member_source(source_dir, Some(name), secrets.as_deref_mut())?,
+        ));
+    }
+    Ok(WorkspaceClosure {
+        providers,
+        destination_by_name,
+        catalogs: workspace.root_package.catalogs.clone(),
+    })
+}
+
+#[cfg(test)]
+pub(in crate::commands::deploy) fn copy_workspace_dependency_closure(
+    output_dir: &Path,
+    source_cwd: &Path,
+    root_member_name: &str,
+    mode: DependencyMode,
+    no_optional: bool,
+) -> Result<(usize, usize, CopyStats, ManifestSelectionStats), LpmError> {
+    let closure = plan_workspace_dependency_closure(
+        output_dir,
+        source_cwd,
+        root_member_name,
+        mode,
+        no_optional,
+        None,
+    )?;
+    write_workspace_dependency_closure(&closure, output_dir, no_optional)
+}
+
+/// Copies `closure`'s packages under `output_dir` and points the copied
+/// manifests' `workspace:` dependencies at them: how many packages, how many
+/// rewritten dependencies.
+pub(in crate::commands::deploy) fn write_workspace_dependency_closure(
+    closure: &WorkspaceClosure,
+    output_dir: &Path,
+    no_optional: bool,
+) -> Result<(usize, usize, CopyStats, ManifestSelectionStats), LpmError> {
+    let mut copy_stats = CopyStats::default();
+    let mut selection_stats = ManifestSelectionStats::default();
+    let mut workspace_spec_rewrites = 0;
+    for (destination, selection) in &closure.providers {
+        let stats = write_member_source(selection, destination)?;
         copy_stats.files_copied += stats.files_copied;
         copy_stats.files_skipped += stats.files_skipped;
         copy_stats.bytes_copied += stats.bytes_copied;
@@ -448,19 +490,19 @@ pub(in crate::commands::deploy) fn copy_workspace_dependency_closure(
         selection_stats.add(&member_selection);
         workspace_spec_rewrites += rewrite_workspace_specs_to_file_paths(
             &manifest_path,
-            &destination_by_name,
-            &workspace.root_package.catalogs,
+            &closure.destination_by_name,
+            &closure.catalogs,
         )?;
     }
 
     workspace_spec_rewrites += rewrite_workspace_specs_to_file_paths(
         &output_dir.join("package.json"),
-        &destination_by_name,
-        &workspace.root_package.catalogs,
+        &closure.destination_by_name,
+        &closure.catalogs,
     )?;
 
     Ok((
-        selected_names.len(),
+        closure.providers.len(),
         workspace_spec_rewrites,
         copy_stats,
         selection_stats,
