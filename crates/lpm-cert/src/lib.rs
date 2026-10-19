@@ -83,10 +83,9 @@ pub fn trust_ca() -> Result<TrustCaResult, LpmError> {
 /// Result of removing the active LPM root from the OS trust store.
 #[derive(Debug)]
 pub struct UninstallCaResult {
-    /// Root certificate path used to identify the trust-store entry.
-    pub cert_path: std::path::PathBuf,
-    /// SHA-256 fingerprint of the removed certificate.
-    pub fingerprint: String,
+    /// SHA-256 fingerprints of the certificates whose trust was removed: the
+    /// on-disk root's, then that of a pending write's root that differs.
+    pub fingerprints: Vec<String>,
 }
 
 /// Remove the active LPM root from the OS trust store and record the exact
@@ -94,16 +93,43 @@ pub struct UninstallCaResult {
 pub fn uninstall_active_ca() -> Result<UninstallCaResult, LpmError> {
     let operation = paths::CertificateOperation::begin()?;
     let ca_cert_path = operation.ca.path("rootCA.pem");
-    if !operation.ca.exists("rootCA.pem")? {
+    let on_disk = if operation.ca.exists("rootCA.pem")? {
+        Some(operation.ca.read("rootCA.pem")?)
+    } else {
+        None
+    };
+    // A pair write left pending, as where git could commit the LPM home,
+    // may hold the authority the trust store holds.
+    let pending_pair = operation.pending_pair_certificate()?;
+    let pending = pending_pair
+        .as_ref()
+        .filter(|pending| on_disk.as_ref() != Some(*pending));
+    let mut fingerprints = Vec::with_capacity(2);
+    for cert_pem in on_disk.iter().chain(pending) {
+        fingerprints.push(uninstall_ca_locked(&operation, cert_pem, &ca_cert_path)?);
+    }
+    if pending_pair.is_some() {
+        operation.retire_pending_pair()?;
+    }
+    if fingerprints.is_empty() {
         return Err(LpmError::Cert(format!(
             "no on-disk CA at {}; nothing to uninstall (the fingerprint of the cert to remove is read from this file)",
             ca_cert_path.display()
         )));
     }
-    let cert_pem = operation.ca.read("rootCA.pem")?;
-    let _generation_guard = operation.acquire_destructive_generation(&cert_pem)?;
-    let fingerprint = cert::fingerprint_hex(&cert::fingerprint_sha256_bytes(&cert_pem)?);
-    match trust::uninstall_ca_bytes(&cert_pem, &ca_cert_path) {
+    Ok(UninstallCaResult { fingerprints })
+}
+
+/// Removes `cert_pem` from the OS trust store and records that in the
+/// audit log; returns the certificate's fingerprint.
+fn uninstall_ca_locked(
+    operation: &paths::CertificateOperation,
+    cert_pem: &[u8],
+    ca_cert_path: &std::path::Path,
+) -> Result<String, LpmError> {
+    let _generation_guard = operation.acquire_destructive_generation(cert_pem)?;
+    let fingerprint = cert::fingerprint_hex(&cert::fingerprint_sha256_bytes(cert_pem)?);
+    match trust::uninstall_ca_bytes(cert_pem, ca_cert_path) {
         Ok(()) => audit::append_best_effort(audit::AuditAction::CaTrustUninstall {
             fingerprint: fingerprint.clone(),
             store: trust_store_label(),
@@ -120,10 +146,7 @@ pub fn uninstall_active_ca() -> Result<UninstallCaResult, LpmError> {
             return Err(error);
         }
     }
-    Ok(UninstallCaResult {
-        cert_path: ca_cert_path,
-        fingerprint,
-    })
+    Ok(fingerprint)
 }
 
 fn trust_ca_locked(ca_dir: &paths::GlobalCaDirectory) -> Result<TrustCaResult, LpmError> {

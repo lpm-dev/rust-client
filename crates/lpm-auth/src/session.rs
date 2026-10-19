@@ -164,6 +164,18 @@ pub struct SessionManager {
     http: tokio::sync::OnceCell<reqwest::Client>,
     auth_storage_notice: Option<Arc<dyn Fn(AuthStorageAccessKind) + Send + Sync + 'static>>,
     auth_storage_notice_bits: AtomicU8,
+    /// Whether a refresh saves the rotated pair, or keeps it in memory for a
+    /// session that is about to be revoked and cleared.
+    persists_refreshed_session: bool,
+    /// The pair a refresh rotated to while `persists_refreshed_session` is
+    /// off: the stored refresh token is spent once the Registry rotates it.
+    unsaved_rotation: std::sync::Mutex<Option<UnsavedRotation>>,
+}
+
+/// A rotated session a revocation keeps in memory instead of saving.
+struct UnsavedRotation {
+    refresh_token: String,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Clone)]
@@ -268,6 +280,8 @@ impl SessionManager {
             http: tokio::sync::OnceCell::new(),
             auth_storage_notice: None,
             auth_storage_notice_bits: AtomicU8::new(0),
+            persists_refreshed_session: true,
+            unsaved_rotation: std::sync::Mutex::new(None),
         }
     }
 
@@ -349,6 +363,14 @@ impl SessionManager {
     }
 
     fn load_refresh_token(&self) -> Result<String, LpmError> {
+        if let Some(rotation) = self
+            .unsaved_rotation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            return Ok(rotation.refresh_token.clone());
+        }
         match crate::get_refresh_token_with_interaction_notice(&self.registry_url, || {
             self.emit_auth_storage_notice(AuthStorageAccessKind::RefreshToken);
         })
@@ -471,7 +493,7 @@ impl SessionManager {
                 let needs_proactive_refresh = self
                     .current_source()?
                     .is_some_and(|s| s.refresh_policy() == RefreshPolicy::IfRefreshable)
-                    && crate::should_refresh_session_access_token(&self.registry_url);
+                    && self.access_token_needs_refresh();
 
                 if !needs_proactive_refresh {
                     return Ok(secret.expose_secret().to_string());
@@ -523,6 +545,19 @@ impl SessionManager {
             http: tokio::sync::OnceCell::new(),
             auth_storage_notice: self.auth_storage_notice.clone(),
             auth_storage_notice_bits: AtomicU8::new(0),
+            persists_refreshed_session: true,
+            unsaved_rotation: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// [`Self::stored_session_only`] for revoking the stored session, which
+    /// is cleared afterwards: a refresh keeps the rotated pair in memory, so
+    /// revoking also works where git could commit the LPM home, which must
+    /// get no new login state.
+    pub fn stored_session_for_revocation(&self) -> Self {
+        Self {
+            persists_refreshed_session: false,
+            ..self.stored_session_only()
         }
     }
 
@@ -653,6 +688,22 @@ impl SessionManager {
         })
     }
 
+    /// Whether the session's access token expires within five minutes, as
+    /// the rotated pair this session keeps says, else as stored.
+    fn access_token_needs_refresh(&self) -> bool {
+        match self
+            .unsaved_rotation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            Some(rotation) => rotation
+                .expires_at
+                .is_none_or(|expiry| expiry <= chrono::Utc::now() + chrono::Duration::minutes(5)),
+            None => crate::should_refresh_session_access_token(&self.registry_url),
+        }
+    }
+
     fn cache_rotated_stored_session(&self, secret: SecretString) {
         if let Ok(mut guard) = self.cached.write() {
             *guard = Some(CachedToken {
@@ -710,7 +761,7 @@ impl SessionManager {
 
             if current_refresh != refresh_before_process_lock
                 && current_access != access_before_process_lock
-                && !crate::should_refresh_session_access_token(&self.registry_url)
+                && !self.access_token_needs_refresh()
                 && let Some(peer_access) = current_access
                 && !peer_access.is_empty()
             {
@@ -723,15 +774,29 @@ impl SessionManager {
             let refreshed = self
                 .do_silent_refresh(rejected_access.as_deref(), &current_refresh)
                 .await?;
-            persist_refresh_backed_session_unlocked(
-                &self.registry_url,
-                &refreshed.token,
-                &refreshed.refresh_token,
-                &refreshed.expires_at,
-            )
-            .map_err(|error| {
-                LpmError::CredentialStorage(format!("failed to persist refreshed session: {error}"))
-            })?;
+            if self.persists_refreshed_session {
+                persist_refresh_backed_session_unlocked(
+                    &self.registry_url,
+                    &refreshed.token,
+                    &refreshed.refresh_token,
+                    &refreshed.expires_at,
+                )
+                .map_err(|error| {
+                    LpmError::CredentialStorage(format!(
+                        "failed to persist refreshed session: {error}"
+                    ))
+                })?;
+            } else {
+                *self
+                    .unsaved_rotation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(UnsavedRotation {
+                    refresh_token: refreshed.refresh_token.clone(),
+                    expires_at: chrono::DateTime::parse_from_rfc3339(&refreshed.expires_at)
+                        .ok()
+                        .map(|expiry| expiry.with_timezone(&chrono::Utc)),
+                });
+            }
 
             let secret = SecretString::from(refreshed.token);
             self.cache_rotated_stored_session(secret.clone());
@@ -987,7 +1052,9 @@ fn compute_device_fingerprint_after_initial_read(after_initial_read: impl FnOnce
     use std::path::{Path, PathBuf};
 
     fn device_id_path() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".lpm").join("device-id"))
+        lpm_common::LpmRoot::from_env()
+            .ok()
+            .map(|root| root.root().join("device-id"))
     }
 
     fn generate_random_id() -> String {
@@ -1140,7 +1207,10 @@ mod tests {
     #[test]
     fn device_fingerprint_is_stable_across_calls_under_same_home() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let _env = ScopedEnv::set([("HOME", tmp.path().as_os_str().to_owned())]);
+        let _env = ScopedEnv::set([
+            ("HOME", tmp.path().as_os_str().to_owned()),
+            ("LPM_HOME", tmp.path().join(".lpm").into_os_string()),
+        ]);
         let first = compute_device_fingerprint();
         let second = compute_device_fingerprint();
         assert_eq!(first, second, "fingerprint must persist across calls");
@@ -1154,7 +1224,10 @@ mod tests {
     #[test]
     fn device_fingerprint_returns_same_id_when_initialization_races() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let _env = ScopedEnv::set([("HOME", tmp.path().as_os_str().to_owned())]);
+        let _env = ScopedEnv::set([
+            ("HOME", tmp.path().as_os_str().to_owned()),
+            ("LPM_HOME", tmp.path().join(".lpm").into_os_string()),
+        ]);
         let barrier = Arc::new(std::sync::Barrier::new(2));
 
         let (first, second) = std::thread::scope(|scope| {
@@ -1198,11 +1271,17 @@ mod tests {
         let tmp_a = tempfile::tempdir().unwrap();
         let tmp_b = tempfile::tempdir().unwrap();
         let a = {
-            let _env = ScopedEnv::set([("HOME", tmp_a.path().as_os_str().to_owned())]);
+            let _env = ScopedEnv::set([
+                ("HOME", tmp_a.path().as_os_str().to_owned()),
+                ("LPM_HOME", tmp_a.path().join(".lpm").into_os_string()),
+            ]);
             compute_device_fingerprint()
         };
         let b = {
-            let _env = ScopedEnv::set([("HOME", tmp_b.path().as_os_str().to_owned())]);
+            let _env = ScopedEnv::set([
+                ("HOME", tmp_b.path().as_os_str().to_owned()),
+                ("LPM_HOME", tmp_b.path().join(".lpm").into_os_string()),
+            ]);
             compute_device_fingerprint()
         };
         assert_ne!(
@@ -1222,7 +1301,10 @@ mod tests {
         let path = lpm_dir.join("device-id");
         std::fs::write(&path, b"not-a-valid-hex-digest").unwrap();
 
-        let _env = ScopedEnv::set([("HOME", tmp.path().as_os_str().to_owned())]);
+        let _env = ScopedEnv::set([
+            ("HOME", tmp.path().as_os_str().to_owned()),
+            ("LPM_HOME", tmp.path().join(".lpm").into_os_string()),
+        ]);
         let id = compute_device_fingerprint();
         assert_eq!(id.len(), 64);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
@@ -1282,6 +1364,8 @@ mod tests {
             http: tokio::sync::OnceCell::new(),
             auth_storage_notice: None,
             auth_storage_notice_bits: AtomicU8::new(0),
+            persists_refreshed_session: true,
+            unsaved_rotation: std::sync::Mutex::new(None),
         }
     }
 
@@ -1296,6 +1380,8 @@ mod tests {
             http: tokio::sync::OnceCell::new(),
             auth_storage_notice: None,
             auth_storage_notice_bits: AtomicU8::new(0),
+            persists_refreshed_session: true,
+            unsaved_rotation: std::sync::Mutex::new(None),
         }
     }
 
@@ -1517,6 +1603,10 @@ mod tests {
         };
         let scoped = crate::test_env::ScopedEnv::update([
             ("HOME", Some(tempdir.path().as_os_str().to_owned())),
+            (
+                "LPM_HOME",
+                Some(tempdir.path().join(".lpm").into_os_string()),
+            ),
             ("LPM_FORCE_FILE_AUTH", Some("1".into())),
             ("LPM_TOKEN", lpm_token.map(std::ffi::OsString::from)),
             ("CI", ci),
@@ -1997,6 +2087,7 @@ mod refresh_http_tests {
         let tempdir = tempfile::tempdir().expect("create test home tempdir");
         let scoped = crate::test_env::ScopedEnv::set([
             ("HOME", tempdir.path().as_os_str().to_owned()),
+            ("LPM_HOME", tempdir.path().join(".lpm").into_os_string()),
             ("LPM_FORCE_FILE_AUTH", "1".into()),
         ]);
         IsolatedTestEnv {
@@ -2035,6 +2126,8 @@ mod refresh_http_tests {
             http: tokio::sync::OnceCell::new(),
             auth_storage_notice: None,
             auth_storage_notice_bits: AtomicU8::new(0),
+            persists_refreshed_session: true,
+            unsaved_rotation: std::sync::Mutex::new(None),
         }
     }
 
@@ -2170,6 +2263,7 @@ mod refresh_http_tests {
         let contention_marker = tempdir.path().join("session-lock-contention");
         let _env = crate::test_env::ScopedEnv::set([
             ("HOME", tempdir.path().as_os_str().to_owned()),
+            ("LPM_HOME", tempdir.path().join(".lpm").into_os_string()),
             ("LPM_FORCE_FILE_AUTH", "1".into()),
             (
                 "LPM_TEST_LOCK_CONTENTION_MARKER",
@@ -2459,6 +2553,7 @@ mod refresh_http_tests {
         let contention_marker = tempdir.path().join("metadata-lock-contention");
         let _env = crate::test_env::ScopedEnv::set([
             ("HOME", tempdir.path().as_os_str().to_owned()),
+            ("LPM_HOME", tempdir.path().join(".lpm").into_os_string()),
             ("LPM_FORCE_FILE_AUTH", "1".into()),
             (
                 "LPM_TEST_LOCK_CONTENTION_MARKER",

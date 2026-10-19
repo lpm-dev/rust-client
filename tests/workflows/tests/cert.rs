@@ -218,6 +218,158 @@ fn cert_trust_json_generates_ca_and_installs_into_isolated_test_store() {
 }
 
 #[test]
+fn cert_uninstall_takes_trust_away_from_a_home_git_could_commit() {
+    let project = TempProject::empty(r#"{"name":"cert-test","version":"1.0.0"}"#);
+    assert_success(
+        &cert_command(&project)
+            .args(["cert", "trust", "--json"])
+            .output()
+            .expect("failed to run lpm cert trust --json"),
+        "lpm cert trust --json",
+    );
+    // The home has since become a repository's root.
+    let home = project.home().join(".lpm");
+    std::fs::remove_file(home.join(".gitignore")).unwrap();
+    std::fs::create_dir(home.join(".git")).unwrap();
+
+    let trust = cert_command(&project)
+        .args(["cert", "trust", "--json"])
+        .output()
+        .expect("failed to run lpm cert trust --json");
+    assert!(!trust.status.success());
+    assert_eq!(
+        json_envelope(&trust, "lpm cert trust --json")["error_code"],
+        "lpm_home"
+    );
+
+    let uninstall = cert_command(&project)
+        .args(["cert", "uninstall", "--json"])
+        .output()
+        .expect("failed to run lpm cert uninstall --json");
+    assert_success(&uninstall, "lpm cert uninstall --json");
+    assert_eq!(
+        json_envelope(&uninstall, "lpm cert uninstall --json")["ca_uninstalled"],
+        serde_json::json!(true)
+    );
+    assert!(!trust_store_entry(&project).exists());
+    let stderr = String::from_utf8_lossy(&uninstall.stderr);
+    assert!(
+        stderr.contains("it is the root of a git repository")
+            && stderr.contains("point LPM_HOME at a directory of its own"),
+        "{stderr}"
+    );
+    assert!(!home.join(".gitignore").exists());
+}
+
+/// Leaves the pair `cert` and `key` as a write that stopped before it
+/// replaced the authority's files would, then makes the LPM home a
+/// repository's root, where git could commit what is written there.
+fn leave_a_pending_pair_in_an_exposed_home(project: &TempProject, cert: &str, key: &str) {
+    let certs = project.home().join(".lpm/certs");
+    std::fs::write(
+        certs.join(".lpm-ca-pair-transaction.json"),
+        serde_json::json!({
+            "cert_name": "rootCA.pem",
+            "key_name": "rootCA-key.pem",
+            "cert_pem": cert,
+            "key_pem": key,
+            "staged_cert_name": ".lpm-cert-staged-cert",
+            "staged_key_name": ".lpm-cert-staged-key",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let home = project.home().join(".lpm");
+    std::fs::remove_file(home.join(".gitignore")).unwrap();
+    std::fs::create_dir(home.join(".git")).unwrap();
+}
+
+#[test]
+fn cert_uninstall_in_a_home_git_could_commit_writes_no_key_a_stopped_write_left() {
+    let project = TempProject::empty(r#"{"name":"cert-test","version":"1.0.0"}"#);
+    assert_success(
+        &cert_command(&project)
+            .args(["cert", "trust", "--json"])
+            .output()
+            .expect("failed to run lpm cert trust --json"),
+        "lpm cert trust --json",
+    );
+    let cert = std::fs::read_to_string(ca_cert_path(&project)).unwrap();
+    let key = std::fs::read_to_string(ca_key_path(&project)).unwrap();
+    std::fs::remove_file(ca_key_path(&project)).unwrap();
+    leave_a_pending_pair_in_an_exposed_home(&project, &cert, &key);
+
+    let uninstall = cert_command(&project)
+        .args(["cert", "uninstall", "--json"])
+        .output()
+        .expect("failed to run lpm cert uninstall --json");
+
+    assert_success(&uninstall, "lpm cert uninstall --json");
+    assert!(!trust_store_entry(&project).exists());
+    assert!(
+        !ca_key_path(&project).exists(),
+        "the authority's key was written where git could commit it"
+    );
+    assert!(
+        !project
+            .home()
+            .join(".lpm/certs/.lpm-ca-pair-transaction.json")
+            .exists(),
+        "the pending write, which holds the authority's key, is left behind"
+    );
+}
+
+#[test]
+fn cert_uninstall_in_a_home_git_could_commit_takes_trust_from_a_pending_authority() {
+    let project = TempProject::empty(r#"{"name":"cert-test","version":"1.0.0"}"#);
+    assert_success(
+        &cert_command(&project)
+            .args(["cert", "trust", "--json"])
+            .output()
+            .expect("failed to run lpm cert trust --json"),
+        "lpm cert trust --json",
+    );
+    // Another authority, trusted in place of the first, which a rotation
+    // stopped before it replaced the first's files.
+    let other_home = project.home().join("other-lpm-home");
+    assert_success(
+        &cert_command(&project)
+            .env("LPM_HOME", &other_home)
+            .args(["cert", "trust", "--json"])
+            .output()
+            .expect("failed to run lpm cert trust --json"),
+        "lpm cert trust --json (other authority)",
+    );
+    let pending_cert = std::fs::read_to_string(other_home.join("certs/rootCA.pem")).unwrap();
+    let pending_key = std::fs::read_to_string(other_home.join("certs/rootCA-key.pem")).unwrap();
+    assert!(trust_store_entry(&project).exists());
+    leave_a_pending_pair_in_an_exposed_home(&project, &pending_cert, &pending_key);
+
+    let uninstall = cert_command(&project)
+        .args(["cert", "uninstall", "--json"])
+        .output()
+        .expect("failed to run lpm cert uninstall --json");
+
+    assert_success(&uninstall, "lpm cert uninstall --json");
+    assert!(
+        !trust_store_entry(&project).exists(),
+        "the pending authority is still trusted"
+    );
+    assert_ne!(
+        std::fs::read_to_string(ca_cert_path(&project)).unwrap(),
+        pending_cert,
+        "nothing pending was written into the exposed home"
+    );
+    assert!(
+        !project
+            .home()
+            .join(".lpm/certs/.lpm-ca-pair-transaction.json")
+            .exists(),
+        "the pending write, which holds the authority's key, is left behind"
+    );
+}
+
+#[test]
 fn cert_uninstall_json_removes_trust_store_entry_but_keeps_ca_files() {
     let project = TempProject::empty(r#"{"name":"cert-test","version":"1.0.0"}"#);
 

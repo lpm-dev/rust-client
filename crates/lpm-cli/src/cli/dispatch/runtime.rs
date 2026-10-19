@@ -2,6 +2,27 @@ use miette::Result;
 
 use super::{Commands, async_main, install_state, parse_cli_or_exit};
 
+/// The directory the command started in, until its project's and the LPM
+/// home's state is kept ignored as it ends.
+static STARTED_IN: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// Has the command keep its state ignored as it ends, on whichever path it
+/// exits.
+pub(in crate::cli) fn keep_state_ignored_at_exit_from(started_in: &std::path::Path) {
+    if let Ok(mut slot) = STARTED_IN.lock() {
+        *slot = Some(started_in.to_path_buf());
+    }
+}
+
+/// Keeps the project's `.lpm` and the LPM home out of git as the command
+/// ends, once.
+pub(in crate::cli) fn keep_state_ignored_at_exit() {
+    let Some(cwd) = STARTED_IN.lock().ok().and_then(|mut slot| slot.take()) else {
+        return;
+    };
+    keep_project_state_ignored(&cwd);
+}
+
 pub(super) fn run_async_main() -> Result<()> {
     // Standalone and recursive installs poll large futures on different threads.
     // Both need this stack budget for debug builds and large workspaces.
@@ -15,6 +36,9 @@ pub(super) fn run_async_main() -> Result<()> {
             runtime_builder.enable_all();
             runtime_builder.thread_stack_size(ASYNC_STACK_BYTES);
             let project_dir = std::env::current_dir().ok();
+            if let Some(cwd) = project_dir.as_deref() {
+                keep_state_ignored_at_exit_from(cwd);
+            }
             if let Some(workers) = install_runtime_worker_threads(
                 cli.command.as_ref(),
                 std::env::var_os("TOKIO_WORKER_THREADS").is_some(),
@@ -33,9 +57,7 @@ pub(super) fn run_async_main() -> Result<()> {
                 .build()
                 .expect("failed to create tokio runtime")
                 .block_on(async_main(cli));
-            if let Some(project_dir) = project_dir.as_deref() {
-                keep_project_state_ignored(project_dir);
-            }
+            keep_state_ignored_at_exit();
             result
         })
         .expect("failed to spawn async main thread")
@@ -43,12 +65,13 @@ pub(super) fn run_async_main() -> Result<()> {
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
-/// Keeps the project's `.lpm` out of git after any command, whichever path
-/// wrote state there. The LPM home is left alone when the project is the
-/// home directory itself.
+/// Keeps the project's `.lpm` and the LPM home out of git after any
+/// command, whichever path wrote state there. A project `.lpm` that is the
+/// LPM home is kept as the LPM home.
 pub(super) fn keep_project_state_ignored(project_dir: &std::path::Path) {
     let state_dir = lpm_common::project_state_dir(project_dir);
-    let is_lpm_home = lpm_common::LpmRoot::from_env().is_ok_and(|root| {
+    let home = lpm_common::LpmRoot::from_env().ok();
+    let is_lpm_home = home.as_ref().is_some_and(|root| {
         match (state_dir.canonicalize(), root.root().canonicalize()) {
             (Ok(state), Ok(home)) => state == home,
             _ => false,
@@ -56,6 +79,9 @@ pub(super) fn keep_project_state_ignored(project_dir: &std::path::Path) {
     });
     if !is_lpm_home {
         lpm_common::keep_existing_project_state_ignored(project_dir);
+    }
+    if let Some(root) = home {
+        lpm_common::keep_existing_lpm_home_ignored(root.root());
     }
 }
 

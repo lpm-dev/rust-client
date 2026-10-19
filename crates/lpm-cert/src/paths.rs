@@ -289,6 +289,9 @@ pub(crate) struct GlobalCaDirectory {
     path: PathBuf,
     dir: Dir,
     read_only: bool,
+    /// Why git could commit what the LPM home holds, where LPM can't keep
+    /// it out: no key is written there.
+    exposed: Option<String>,
 }
 
 impl GlobalCaDirectory {
@@ -354,6 +357,11 @@ impl GlobalCaDirectory {
         key: &[u8],
         after_cert_replace: impl FnOnce() -> Result<(), LpmError>,
     ) -> Result<(), LpmError> {
+        if let Some(reason) = &self.exposed {
+            return Err(LpmError::Cert(format!(
+                "{reason}, so git could commit the certificate authority's private key saved there; point LPM_HOME at a directory of its own"
+            )));
+        }
         let cert_text = std::str::from_utf8(cert)
             .map_err(|error| LpmError::Cert(format!("invalid UTF-8 in CA certificate: {error}")))?;
         let key_text = std::str::from_utf8(key)
@@ -623,6 +631,7 @@ impl CertificateOperation {
             path: path.join("certs"),
             dir,
             read_only: true,
+            exposed: None,
         };
         let lock = ca.acquire_operations_lock()?;
         Ok(Some(Self { ca, _lock: lock }))
@@ -632,10 +641,16 @@ impl CertificateOperation {
         self.ca.exists(GLOBAL_PAIR_TRANSACTION)
     }
 
+    /// Starts an operation, first completing a pair write that stopped
+    /// part way, except where git could commit the LPM home: recovery
+    /// writes the authority's key, so the write stays pending there until
+    /// the home is kept out of git.
     pub(crate) fn begin() -> Result<Self, LpmError> {
         let ca = open_global_ca_directory(true)?;
         let lock = ca.acquire_operations_lock()?;
-        recover_global_pair_transaction(&ca)?;
+        if ca.exposed.is_none() {
+            recover_global_pair_transaction(&ca)?;
+        }
         Ok(Self { ca, _lock: lock })
     }
 
@@ -643,8 +658,40 @@ impl CertificateOperation {
     fn begin_at(home_path: PathBuf) -> Result<Self, LpmError> {
         let ca = open_global_ca_directory_at(home_path, true)?;
         let lock = ca.acquire_operations_lock()?;
-        recover_global_pair_transaction(&ca)?;
+        if ca.exposed.is_none() {
+            recover_global_pair_transaction(&ca)?;
+        }
         Ok(Self { ca, _lock: lock })
+    }
+
+    /// The certificate of a pair write [`Self::begin`] left pending.
+    pub(crate) fn pending_pair_certificate(&self) -> Result<Option<Vec<u8>>, LpmError> {
+        Ok(
+            read_pair_transaction(&self.ca.dir, GLOBAL_PAIR_TRANSACTION)?
+                .map(|transaction| transaction.cert_pem.into_bytes()),
+        )
+    }
+
+    /// Deletes a pair write [`Self::begin`] left pending, with the files it
+    /// staged, once its authority is trusted no more: the journal holds the
+    /// authority's private key.
+    pub(crate) fn retire_pending_pair(&self) -> Result<(), LpmError> {
+        let Some(transaction) = read_pair_transaction(&self.ca.dir, GLOBAL_PAIR_TRANSACTION)?
+        else {
+            return Ok(());
+        };
+        for staged in [&transaction.staged_cert_name, &transaction.staged_key_name] {
+            match self.ca.dir.remove_file(staged) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(LpmError::Cert(format!(
+                        "failed to remove the pending certificate file {staged}: {error}"
+                    )));
+                }
+            }
+        }
+        remove_pair_transaction(&self.ca.dir, GLOBAL_PAIR_TRANSACTION)
     }
 
     pub(crate) fn acquire_runtime_lease(
@@ -756,6 +803,11 @@ fn open_global_ca_directory_at_lpm_root(
     let Some(lpm) = open_or_create_directory(&parent, root_name, create, "$LPM_HOME")? else {
         return Err(LpmError::Cert("global LPM directory does not exist".into()));
     };
+    let exposed = if create {
+        lpm_common::keep_lpm_home_ignored_in(&lpm, &lpm_root_path).err()
+    } else {
+        None
+    };
     let Some(certs) = open_or_create_directory(&lpm, "certs", create, "$LPM_HOME/certs")? else {
         return Err(LpmError::Cert(
             "global certificate directory does not exist".into(),
@@ -765,6 +817,7 @@ fn open_global_ca_directory_at_lpm_root(
         path: lpm_root_path.join("certs"),
         dir: certs,
         read_only: false,
+        exposed,
     })
 }
 
@@ -2008,6 +2061,42 @@ mod tests {
 
         assert_eq!(contents, b"private-key-material");
         assert_windows_owner_system_dacl(&key_path, false);
+    }
+
+    #[test]
+    fn the_certificate_authority_keeps_its_lpm_home_out_of_git_or_writes_no_key_there() {
+        let home = tempfile::tempdir().unwrap();
+        CertificateOperation::begin_at(home.path().to_path_buf()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(home.path().join(".lpm/.gitignore")).unwrap(),
+            lpm_common::project_state::PROJECT_STATE_IGNORE
+        );
+
+        // An LPM home that is a repository's root, which no ignore file in
+        // it can keep out of git: an operation that writes no key there,
+        // as removing the authority's trust doesn't, goes ahead.
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repository.path().join(".lpm/.git")).unwrap();
+        let operation = CertificateOperation::begin_at(repository.path().to_path_buf()).unwrap();
+        let (cert, key) = crate::ca::generate_ca().unwrap();
+
+        let error = operation
+            .ca
+            .write_ca_pair(
+                "rootCA.pem",
+                "rootCA-key.pem",
+                cert.as_bytes(),
+                key.as_bytes(),
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("so git could commit the certificate authority's private key"),
+            "{error}"
+        );
+        assert!(!repository.path().join(".lpm/certs/rootCA-key.pem").exists());
+        assert!(!repository.path().join(".lpm/certs/rootCA.pem").exists());
     }
 
     #[test]

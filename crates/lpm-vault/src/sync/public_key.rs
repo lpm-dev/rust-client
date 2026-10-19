@@ -558,17 +558,15 @@ impl std::fmt::Debug for PendingPublicKey {
 
 #[cfg(all(test, debug_assertions))]
 fn pending_x25519_key_path(scope: &SharingKeyScope) -> Result<std::path::PathBuf, String> {
-    Ok(crate::lpm_home_dir()
+    Ok(crate::lpm_root_dir()
         .ok_or("no home directory")?
-        .join(".lpm")
         .join(scope.pending_file_name()))
 }
 
 #[cfg(all(test, debug_assertions))]
 fn live_x25519_key_path(scope: &SharingKeyScope) -> Result<std::path::PathBuf, String> {
-    Ok(crate::lpm_home_dir()
+    Ok(crate::lpm_root_dir()
         .ok_or("no home directory")?
-        .join(".lpm")
         .join(scope.live_file_name()))
 }
 
@@ -894,10 +892,7 @@ fn force_file_x25519_keypair() -> bool {
     if !cfg!(debug_assertions) && !crate::acceptance_file_storage_enabled() {
         return false;
     }
-    matches!(
-        std::env::var("LPM_FORCE_FILE_VAULT").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
-    )
+    lpm_common::acceptance::env_flag_enabled("LPM_FORCE_FILE_VAULT")
 }
 
 fn get_or_create_file_backed_x25519_keypair(

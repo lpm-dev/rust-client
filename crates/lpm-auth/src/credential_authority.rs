@@ -177,10 +177,24 @@ pub(super) fn set(
     authority: CredentialAuthority,
 ) -> Result<(), String> {
     let mut store = read_store()?;
-    store
-        .credentials
-        .insert(credential_id(registry, kind), authority);
-    write_store(&store)
+    let id = credential_id(registry, kind);
+    // A revocation, or a record of the credential the home already holds, as
+    // a migration or cleanup rewrites it, adds nothing there.
+    let write = match (&authority, store.credentials.get(&id)) {
+        (CredentialAuthority::Revoked, _) => super::HomeWrite::AddsNothing,
+        (
+            CredentialAuthority::Active {
+                credential_digest, ..
+            },
+            Some(CredentialAuthority::Active {
+                credential_digest: held,
+                ..
+            }),
+        ) if held == credential_digest => super::HomeWrite::AddsNothing,
+        _ => super::HomeWrite::Adds,
+    };
+    store.credentials.insert(id, authority);
+    write_store(&store, write)
 }
 
 pub(super) fn clear(registry: &str, kind: CredentialKind) -> Result<(), String> {
@@ -191,7 +205,7 @@ pub(super) fn clear(registry: &str, kind: CredentialKind) -> Result<(), String> 
 
     let mut store = read_store()?;
     store.credentials.remove(&credential_id(registry, kind));
-    write_store(&store)
+    write_store(&store, super::HomeWrite::AddsNothing)
 }
 
 fn credential_id(registry: &str, kind: CredentialKind) -> String {
@@ -225,13 +239,13 @@ fn read_store() -> Result<CredentialAuthorityStore, String> {
     Ok(store)
 }
 
-fn write_store(store: &CredentialAuthorityStore) -> Result<(), String> {
+fn write_store(store: &CredentialAuthorityStore, write: super::HomeWrite) -> Result<(), String> {
     let path = authority_path()?;
     let directory = path
         .parent()
         .ok_or_else(|| "credential authority path has no parent".to_owned())?;
-    std::fs::create_dir_all(directory)
-        .map_err(|error| format!("credential authority mkdir error: {error}"))?;
+    super::prepare_lpm_home_for(directory, write)
+        .map_err(|error| format!("credential authority {error}"))?;
     let json = serde_json::to_vec(store)
         .map_err(|error| format!("credential authority JSON error: {error}"))?;
     lpm_common::write_file_atomic_with_options(

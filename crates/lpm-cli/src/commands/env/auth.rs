@@ -133,6 +133,7 @@ mod tests {
         let home = tempfile::tempdir().expect("create isolated home");
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             ("LPM_TOKEN", Some("sensitive-token".into())),
         ]);
         let registry_url = "http://registry.example";
@@ -165,6 +166,7 @@ mod tests {
         let home = tempfile::tempdir().expect("create isolated home");
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             ("LPM_TOKEN", Some("sensitive-token".into())),
         ]);
         let registry_url = "http://registry.example";
@@ -197,6 +199,7 @@ mod tests {
         let home = tempfile::tempdir().expect("create isolated home");
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             ("LPM_TOKEN", Some("standalone-token".into())),
         ]);
         let registry_url = "https://registry.example";
@@ -229,6 +232,7 @@ mod tests {
         let home = tempfile::tempdir().expect("create isolated home");
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             ("LPM_TOKEN", Some("standalone-token".into())),
         ]);
         let registry_url = "https://registry.example";
@@ -280,6 +284,7 @@ mod tests {
         let home = tempfile::tempdir().expect("create isolated home");
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             ("LPM_FORCE_FILE_AUTH", Some("1".into())),
             ("LPM_TEST_FAST_SCRYPT", Some("1".into())),
             ("LPM_TOKEN", None),

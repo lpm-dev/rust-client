@@ -31,8 +31,11 @@ pub(super) fn probe_sandbox_backend_with_global(
         project_dir: tmpdir.join("lpm-doctor-sandbox-probe"),
         package_name: "lpm-doctor-probe".into(),
         package_version: "0.0.0".into(),
-        store_root: home.join(".lpm").join("store"),
-        home_dir: home.clone(),
+        store_root: lpm_common::LpmRoot::from_env().map_or_else(
+            |_| home.join(".lpm").join("store"),
+            |root| root.store_root(),
+        ),
+        home_dir: home,
         tmpdir: tmpdir.clone(),
         read_project_full: false,
         secret_read_allow: Vec::new(),

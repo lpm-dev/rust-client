@@ -8,6 +8,10 @@ use sha2::{Digest, Sha256};
 pub const PERSONAL_KEY_SCHEME: i32 = 2;
 const ROOT_SERVICE: &str = "dev.lpm.env-personal-root-v2";
 
+fn root_service() -> String {
+    lpm_common::credential_service(ROOT_SERVICE)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PersonalKeyEnvelope {
@@ -77,14 +81,14 @@ pub fn personal_root_key(
         }
         #[cfg(target_os = "macos")]
         {
-            if let Some(encoded) = crate::macos_keychain::read_string(ROOT_SERVICE, &account)? {
+            if let Some(encoded) = crate::macos_keychain::read_string(&root_service(), &account)? {
                 return super::decode_wrapping_key(&encoded);
             }
             if !create {
                 return Err("no personal env root key exists for this registry and account".into());
             }
             let encoded = crate::macos_keychain::get_or_insert_string(
-                ROOT_SERVICE,
+                &root_service(),
                 &account,
                 &hex::encode(generate_aes_key()),
             )?;
@@ -107,7 +111,7 @@ struct PersonalRootStore<'a> {
 #[cfg(not(target_os = "macos"))]
 impl super::wrapping_store::NativeWrappingKeyStore for PersonalRootStore<'_> {
     fn read(&self) -> Result<Option<[u8; 32]>, String> {
-        let entry = keyring::Entry::new(ROOT_SERVICE, self.account)
+        let entry = keyring::Entry::new(&root_service(), self.account)
             .map_err(|error| format!("env root keyring entry: {error}"))?;
         match entry.get_password() {
             Ok(value) => super::decode_wrapping_key(&value).map(Some),
@@ -116,7 +120,7 @@ impl super::wrapping_store::NativeWrappingKeyStore for PersonalRootStore<'_> {
         }
     }
     fn write(&self, candidate: &[u8; 32]) -> Result<(), String> {
-        keyring::Entry::new(ROOT_SERVICE, self.account)
+        keyring::Entry::new(&root_service(), self.account)
             .map_err(|error| format!("env root keyring entry: {error}"))?
             .set_password(&hex::encode(candidate))
             .map_err(|error| format!("env root keyring write: {error}"))

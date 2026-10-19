@@ -507,6 +507,12 @@ pub enum LpmError {
     )]
     Cert(String),
 
+    /// LPM CLI refused to use the LPM home, as where git could commit what
+    /// it holds. The message names the fix.
+    #[error("LPM home error: {0}")]
+    #[diagnostic(code(lpm::lpm_home))]
+    LpmHome(String),
+
     #[error("sandbox error: {0}")]
     #[diagnostic(
         code(lpm::sandbox),
@@ -836,6 +842,7 @@ impl LpmError {
             LpmError::ScriptWithOutput { .. } => "script",
             LpmError::ScriptPhase { .. } => "script",
             LpmError::Cert(_) => "cert",
+            LpmError::LpmHome(_) => "lpm_home",
             LpmError::Sandbox(_) => "sandbox",
             LpmError::Tunnel(_) => "tunnel",
             LpmError::TunnelAccess { .. } => "tunnel_access",
@@ -1091,6 +1098,7 @@ mod tests {
                 stderr: String::new(),
             },
             LpmError::Cert("x".into()),
+            LpmError::LpmHome("x".into()),
             LpmError::Sandbox("x".into()),
             LpmError::Tunnel("x".into()),
             LpmError::tunnel_access("plan_required", "x"),

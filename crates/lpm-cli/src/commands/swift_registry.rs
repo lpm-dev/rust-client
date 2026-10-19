@@ -1104,6 +1104,7 @@ mod tests {
         let xdg = home.path().join("xdg");
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             ("XDG_CONFIG_HOME", Some(xdg.as_os_str().to_owned())),
         ]);
         let native = if cfg!(target_os = "macos") {
@@ -1375,6 +1376,7 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"::1:8443":{"type":"
 "#).unwrap();
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             ("PATH", Some(path)),
             ("XDG_CONFIG_HOME", None),
         ]);
@@ -1406,6 +1408,7 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"::1:8443":{"type":"
         let path = fake_swift_path(home.path());
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             ("PATH", Some(path)),
             ("XDG_CONFIG_HOME", None),
         ]);
@@ -1431,6 +1434,7 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"::1:8443":{"type":"
         let path = fake_swift_path(home.path());
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             ("PATH", Some(path)),
             ("XDG_CONFIG_HOME", None),
         ]);
@@ -1468,6 +1472,7 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
 "#).unwrap();
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             ("PATH", Some(path)),
             ("XDG_CONFIG_HOME", None),
         ]);
@@ -1520,6 +1525,7 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
         let path = fake_swift_path(home.path());
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             ("PATH", Some(path)),
             ("XDG_CONFIG_HOME", None),
             ("LPM_FORCE_FILE_AUTH", Some("1".into())),
@@ -1582,6 +1588,7 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
         let path = fake_swift_path(home.path());
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             ("PATH", Some(path)),
             ("XDG_CONFIG_HOME", None),
             ("LPM_FORCE_FILE_AUTH", Some("1".into())),
@@ -1637,6 +1644,7 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
         let path = fake_swift_path(home.path());
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             ("PATH", Some(path)),
             ("XDG_CONFIG_HOME", None),
             ("LPM_TOKEN", None),
@@ -1663,6 +1671,7 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
         let path = fake_swift_path(home.path());
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             ("PATH", Some(path)),
             ("XDG_CONFIG_HOME", None),
             (
@@ -1704,6 +1713,7 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
         let path = fake_swift_path(home.path());
         let _environment = crate::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             ("PATH", Some(path)),
             ("XDG_CONFIG_HOME", None),
             (

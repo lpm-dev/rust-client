@@ -1,6 +1,7 @@
 use miette::Result;
 
 mod runtime;
+pub(in crate::cli) use runtime::keep_state_ignored_at_exit;
 use runtime::run_async_main;
 
 use crate::{
@@ -20,12 +21,13 @@ use super::format::{
     parse_cli_or_exit,
 };
 use super::helpers::{
-    argv_requests_top_level_version, build_install_global_overrides_with_excludes,
-    command_allows_background_update, command_needs_global_state, install_omit_policy_from_cli,
-    maybe_emit_network_fs_warning, print_version_with_notice, resolve_install_project_dir,
-    resolve_tunnel_bearer, should_suppress_update_banner, spawn_background_update_check,
-    tunnel_action_requires_session, validate_global_install_project_scoped_flags,
-    validate_global_install_unsupported_flags, validate_global_uninstall_project_scoped_flags,
+    adds_no_secrets_to_the_lpm_home, argv_requests_top_level_version,
+    build_install_global_overrides_with_excludes, command_allows_background_update,
+    command_needs_global_state, install_omit_policy_from_cli, maybe_emit_network_fs_warning,
+    print_version_with_notice, resolve_install_project_dir, resolve_tunnel_bearer,
+    should_suppress_update_banner, spawn_background_update_check, tunnel_action_requires_session,
+    validate_global_install_project_scoped_flags, validate_global_install_unsupported_flags,
+    validate_global_uninstall_project_scoped_flags,
 };
 
 pub(crate) fn run() -> Result<()> {
@@ -64,6 +66,7 @@ pub(crate) fn run() -> Result<()> {
         let Ok(cwd) = std::env::current_dir() else {
             return run_async_main();
         };
+        runtime::keep_state_ignored_at_exit_from(&cwd);
         // Start timing BEFORE any disk work, matching install.rs which
         // captures `start` at function entry before `check_install_state`.
         let start = std::time::Instant::now();
@@ -109,7 +112,7 @@ pub(crate) fn run() -> Result<()> {
                     } else {
                         output::success(&format!("up to date ({elapsed_ms}ms)"));
                     }
-                    runtime::keep_project_state_ignored(&cwd);
+                    keep_state_ignored_at_exit();
                     std::process::exit(0);
                 }
                 Ok(false) => {}
@@ -255,6 +258,22 @@ async fn async_main(cli: Cli) -> Result<()> {
             .with(timeline);
 
         registry.init();
+    }
+
+    // Before anything writes to the LPM home, it is kept out of git, or the
+    // command doesn't run.
+    if let Ok(root) = lpm_common::LpmRoot::from_env()
+        && let Err(exposed) = lpm_common::project_state::guard_lpm_home(root.root())
+    {
+        let message = format!(
+            "{exposed}, so git could commit the login state, env secrets and packages saved there; {}",
+            exposed.remedy()
+        );
+        if adds_no_secrets_to_the_lpm_home(&command) {
+            output::warn(&message);
+        } else {
+            exit_with_lpm_error(&lpm_common::LpmError::LpmHome(message), cli.json);
+        }
     }
 
     // Startup gate for `LPM_PROVENANCE_ENFORCE`: an unknown value

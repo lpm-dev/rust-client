@@ -192,12 +192,12 @@ pub fn parse_json_stdout(stdout: &str) -> serde_json::Value {
     })
 }
 
-/// Seed one encrypted, file-backed LPM credential under an isolated test home.
-pub fn seed_lpm_token(home: &Path, registry_url: &str, token: &str) {
-    let lpm_dir = home.join(".lpm");
-    std::fs::create_dir_all(&lpm_dir).expect("create test auth directory");
+/// Seed one encrypted, file-backed LPM credential in an isolated LPM root,
+/// the directory a command under test gets as `LPM_HOME`.
+pub fn seed_lpm_token(lpm_root: &Path, registry_url: &str, token: &str) {
+    std::fs::create_dir_all(lpm_root).expect("create test auth directory");
     std::fs::write(
-        lpm_dir.join(".key"),
+        lpm_root.join(".key"),
         format!("raw:{}", hex::encode(TEST_AUTH_ENCRYPTION_KEY)),
     )
     .expect("write test auth key");
@@ -220,14 +220,14 @@ pub fn seed_lpm_token(home: &Path, registry_url: &str, token: &str) {
         base64::engine::general_purpose::STANDARD.encode(auth_tag),
         base64::engine::general_purpose::STANDARD.encode(encrypted),
     );
-    std::fs::write(lpm_dir.join(".credentials"), encoded).expect("write test credential");
+    std::fs::write(lpm_root.join(".credentials"), encoded).expect("write test credential");
 
     let mut credential_id = sha2::Sha256::new();
     credential_id.update(b"access");
     credential_id.update([0]);
     credential_id.update(registry_url.as_bytes());
     std::fs::write(
-        lpm_dir.join(".credential-authority.json"),
+        lpm_root.join(".credential-authority.json"),
         serde_json::to_vec(&serde_json::json!({
             "version": 1,
             "credentials": {

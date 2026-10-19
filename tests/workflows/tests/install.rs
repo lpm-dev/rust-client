@@ -19537,3 +19537,115 @@ async fn invalid_signature_environment_preserves_saved_verification() {
         assert!(!project.file_exists("node_modules/unsigned-pkg/package.json"));
     }
 }
+
+#[tokio::test]
+async fn a_failed_install_leaves_an_lpm_home_in_the_repository_ignored() {
+    let mock = MockRegistry::start().await;
+    mock.with_package("ms", "2.1.3", &make_tarball("ms", "2.1.3"))
+        .await;
+    let project = TempProject::empty(
+        r#"{"name":"consumer","version":"1.0.0","dependencies":{"ms":"2.1.3"},"scripts":{"postinstall":"exit 3"}}"#,
+    );
+    project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(project.path())
+            .output()
+            .expect("run git")
+    };
+    assert!(git(&["init", "-q"]).status.success());
+    // As `LPM_HOME="$PWD/.lpm-ci"` in CI puts it, before any command made it.
+    let home = project.path().join(".lpm-ci");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .env("LPM_HOME", &home)
+        .args([
+            "install",
+            "--no-frozen-lockfile",
+            "--no-skills",
+            "--no-security-summary",
+        ])
+        .output()
+        .expect("run lpm install");
+
+    assert!(
+        !output.status.success(),
+        "the root postinstall fails the install: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        home.join("store").exists(),
+        "the install fetched into the home"
+    );
+    let status = git(&["status", "--porcelain", "--untracked-files=all"]);
+    let untracked = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        !untracked.lines().any(|line| line.contains(".lpm-ci")),
+        "git could commit the LPM home:\n{untracked}"
+    );
+}
+
+#[test]
+fn a_command_refuses_an_lpm_home_git_could_commit() {
+    let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
+    let home = project.path().join("dotfiles");
+    std::fs::create_dir_all(&home).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&home)
+            .status()
+            .expect("run git")
+            .success()
+    );
+    // The repository's own ignore file, as nearly every root has.
+    std::fs::write(home.join(".gitignore"), "node_modules/\n").unwrap();
+
+    let output = lpm(&project)
+        .env("LPM_HOME", &home)
+        .args(["--json", "config", "list"])
+        .output()
+        .expect("run lpm config list");
+
+    assert!(!output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error_code"], "lpm_home", "{envelope}");
+    let message = envelope.to_string();
+    assert!(
+        message.contains("it is the root of a git repository")
+            && message.contains("point LPM_HOME at a directory of its own")
+            && !message.contains("ignores everything"),
+        "{message}"
+    );
+    let mut entries: Vec<_> = std::fs::read_dir(&home)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        [".git", ".gitignore"],
+        "the refused command wrote to the home"
+    );
+
+    // Commands that only take secrets or trust away, or report, still run,
+    // so what such a home holds can be cleaned up.
+    for args in [&["logout"][..], &["cert", "status"]] {
+        let output = lpm(&project)
+            .env("LPM_HOME", &home)
+            .args(args)
+            .output()
+            .expect("run a cleanup command");
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("root of a git repository"),
+            "{args:?} warns: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

@@ -262,6 +262,60 @@ async fn logout_revoke_refreshes_stale_stored_access_without_expiry_metadata() {
 }
 
 #[tokio::test]
+async fn logout_revoke_revokes_a_session_left_in_a_home_git_could_commit() {
+    let project = TempProject::empty(r#"{"name":"logout-exposed-home","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let device = "d".repeat(64);
+    mock.with_device_refresh_expected(
+        "stored-refresh",
+        &device,
+        "rotated-access",
+        "rotated-refresh",
+        "2030-01-01T00:00:00Z",
+        1,
+    )
+    .await;
+    mock.with_current_principal("rotated-access", "account-1", 1)
+        .await;
+    mock.with_revoke_all_pairings_for_principal_status("rotated-access", "account-1", 200, 1)
+        .await;
+    mock.with_revoke_token("rotated-access").await;
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("stale-access"),
+            refresh_token: Some("stored-refresh"),
+            session_access_expires_at: None,
+        }],
+    );
+    // The device the session was bound to, before the home became a
+    // repository's root.
+    let home = project.home().join(".lpm");
+    std::fs::write(home.join("device-id"), &device).unwrap();
+    let _ = std::fs::remove_file(home.join(".gitignore"));
+    std::fs::create_dir(home.join(".git")).unwrap();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "logout", "--revoke"])
+        .output()
+        .expect("run logout --revoke in an exposed home");
+
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("logout must emit one JSON document");
+    assert_eq!(json["server_revoked"], true, "{json}");
+    assert_eq!(json["pairings_revoked"], true, "{json}");
+    assert_eq!(json["local_cleared"], true, "{json}");
+    assert!(!credentials_path(project.home()).exists());
+}
+
+#[tokio::test]
 async fn logout_revoke_reports_when_stored_session_presence_cannot_be_determined() {
     let project = TempProject::empty(r#"{"name":"logout-presence-failure","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;

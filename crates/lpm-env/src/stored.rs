@@ -26,6 +26,7 @@ const DENIED_ENV_VARS: &[&str] = &[
     "RUBYLIB",
     "PATH",
     "HOME",
+    "LPM_HOME",
     "USER",
     "SHELL",
     "TERM",

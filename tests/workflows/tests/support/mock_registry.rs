@@ -1347,6 +1347,33 @@ impl MockRegistry {
         self
     }
 
+    /// [`Self::with_refresh_expected`] for a refresh that must carry
+    /// `device_fingerprint`, as the Registry refuses a refresh token sent
+    /// from another device.
+    pub async fn with_device_refresh_expected(
+        &self,
+        refresh_token: &str,
+        device_fingerprint: &str,
+        access_token: &str,
+        rotated_refresh_token: &str,
+        expires_at: &str,
+        expected_calls: u64,
+    ) -> &Self {
+        Mock::given(method("POST"))
+            .and(path("/api/cli/refresh"))
+            .and(body_string_contains(refresh_token.to_string()))
+            .and(body_string_contains(device_fingerprint.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": access_token,
+                "refreshToken": rotated_refresh_token,
+                "expiresAt": expires_at,
+            })))
+            .expect(expected_calls)
+            .mount(&self.server)
+            .await;
+        self
+    }
+
     pub async fn with_current_principal(
         &self,
         bearer_token: &str,

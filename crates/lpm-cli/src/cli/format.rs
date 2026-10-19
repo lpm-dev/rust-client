@@ -172,6 +172,7 @@ fn exit_with_clap_error(error: clap::Error, json_output: bool, help_hint: Option
 
 pub(super) fn exit_with_lpm_error(error: &lpm_common::LpmError, json_output: bool) -> ! {
     super::install_timeline::finish("error");
+    super::dispatch::keep_state_ignored_at_exit();
     if json_output && !matches!(error, lpm_common::LpmError::ExitCode(_)) {
         print_json_error(error);
     } else if !json_output && !matches!(error, lpm_common::LpmError::ExitCode(_)) {
@@ -864,6 +865,9 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         }
         lpm_common::LpmError::Cert(reason) => {
             diagnostic_lines("Certificate error", Some(reason), error)
+        }
+        lpm_common::LpmError::LpmHome(reason) => {
+            diagnostic_lines("LPM home error", Some(reason), error)
         }
         lpm_common::LpmError::Sandbox(reason) => {
             diagnostic_lines("Sandbox error", Some(reason), error)

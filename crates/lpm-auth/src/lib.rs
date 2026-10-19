@@ -265,40 +265,12 @@ fn force_file_auth() -> bool {
     if !cfg!(debug_assertions) && !acceptance_file_storage_enabled() {
         return false;
     }
-    matches!(
-        std::env::var("LPM_FORCE_FILE_AUTH").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE")
-    )
+    lpm_common::acceptance::env_flag_enabled("LPM_FORCE_FILE_AUTH")
 }
 
 #[cfg(feature = "acceptance-test-hooks")]
 fn acceptance_file_storage_enabled() -> bool {
-    if !matches!(
-        std::env::var("LPM_ACCEPTANCE_FILE_STORAGE").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE")
-    ) || std::env::var("ACCEPTANCE_RUN_ID")
-        .ok()
-        .is_none_or(|value| value.trim().is_empty())
-    {
-        return false;
-    }
-
-    let (Some(run_dir), Some(home), Some(lpm_home)) = (
-        std::env::var_os("ACCEPTANCE_RUN_DIR").map(std::path::PathBuf::from),
-        std::env::var_os("HOME").map(std::path::PathBuf::from),
-        std::env::var_os("LPM_HOME").map(std::path::PathBuf::from),
-    ) else {
-        return false;
-    };
-    if lpm_home != home.join(".lpm") {
-        return false;
-    }
-
-    let (Ok(run_dir), Ok(home)) = (std::fs::canonicalize(run_dir), std::fs::canonicalize(home))
-    else {
-        return false;
-    };
-    home != run_dir && home.starts_with(run_dir)
+    lpm_common::acceptance::acceptance_storage_isolated()
 }
 
 #[cfg(not(feature = "acceptance-test-hooks"))]
@@ -599,7 +571,7 @@ pub(crate) fn clear_rejected_refresh_session_if_current(
 }
 
 pub(crate) fn clear_login_state_unlocked(registry_url: &str) -> Result<(), String> {
-    if let Some(marker) = dirs::home_dir().map(|h| h.join(".lpm").join(".token-check")) {
+    if let Ok(marker) = lpm_dir().map(|dir| dir.join(".token-check")) {
         let _ = std::fs::remove_file(marker);
     }
 
@@ -1132,7 +1104,7 @@ pub fn set_custom_registry_token_with_backend(
         let mut registries = read_custom_registries_checked_from(&path)?;
         if !registries.iter().any(|registry| registry == registry_url) {
             registries.push(registry_url.to_string());
-            write_custom_registries_checked(&path, &registries)?;
+            write_custom_registries_checked(&path, &registries, HomeWrite::Adds)?;
         }
 
         set_token_with_backend(registry_url, token)
@@ -1149,7 +1121,9 @@ pub fn clear_custom_registry_token(registry_url: &str) -> Result<(), String> {
 
 /// Path to the JSON file tracking custom registry URLs.
 fn custom_registries_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".lpm").join(".custom-registries.json"))
+    lpm_dir()
+        .ok()
+        .map(|dir| dir.join(".custom-registries.json"))
 }
 
 fn custom_registries_lock_path() -> Result<PathBuf, String> {
@@ -1181,7 +1155,11 @@ fn read_custom_registries_checked_from(path: &Path) -> Result<Vec<String>, Strin
         .map_err(|error| format!("custom registry tracking JSON error: {error}"))
 }
 
-fn write_custom_registries_checked(path: &Path, registries: &[String]) -> Result<(), String> {
+fn write_custom_registries_checked(
+    path: &Path,
+    registries: &[String],
+    write: HomeWrite,
+) -> Result<(), String> {
     if registries.is_empty() {
         return match std::fs::remove_file(path) {
             Ok(()) => Ok(()),
@@ -1191,8 +1169,8 @@ fn write_custom_registries_checked(path: &Path, registries: &[String]) -> Result
     }
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("custom registry tracking mkdir error: {error}"))?;
+        prepare_lpm_home_for(parent, write)
+            .map_err(|error| format!("custom registry tracking {error}"))?;
     }
     let json = serde_json::to_string(registries)
         .map_err(|error| format!("custom registry tracking JSON error: {error}"))?;
@@ -1291,7 +1269,7 @@ fn untrack_custom_registry_under_lock(registry_url: &str) -> Result<bool, String
     if registries.len() == original_len {
         return Ok(false);
     }
-    write_custom_registries_checked(&path, &registries)?;
+    write_custom_registries_checked(&path, &registries, HomeWrite::AddsNothing)?;
     Ok(true)
 }
 
@@ -1323,7 +1301,7 @@ pub fn clear_all_custom_registries() -> ClearAllCustomRegistriesResult {
         }
 
         let tracking_cleanup = match tracked {
-            Ok(_) => write_custom_registries_checked(&path, &remaining),
+            Ok(_) => write_custom_registries_checked(&path, &remaining, HomeWrite::AddsNothing),
             Err(error) => Err(error),
         };
         Ok(ClearAllCustomRegistriesResult {
@@ -1421,7 +1399,7 @@ pub fn list_stored_registries() -> Vec<(String, String)> {
 
 /// Token expiry tracking file path.
 fn token_expiry_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".lpm").join(".token-expiry.json"))
+    lpm_dir().ok().map(|dir| dir.join(".token-expiry.json"))
 }
 
 fn token_expiry_lock_path() -> Result<std::path::PathBuf, String> {
@@ -1450,9 +1428,10 @@ fn read_token_expiries_checked() -> Result<HashMap<String, TokenExpiry>, String>
 fn write_token_expiries_checked(
     path: &Path,
     expiries: &HashMap<String, TokenExpiry>,
+    write: HomeWrite,
 ) -> Result<(), String> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| format!("mkdir error: {error}"))?;
+        prepare_lpm_home_for(parent, write)?;
     }
     let json =
         serde_json::to_string_pretty(expiries).map_err(|error| format!("json error: {error}"))?;
@@ -1468,6 +1447,7 @@ fn write_token_expiries_checked(
 }
 
 fn mutate_token_expiries(
+    write: HomeWrite,
     mutation: impl FnOnce(&mut HashMap<String, TokenExpiry>) -> bool,
 ) -> Result<(), String> {
     let path = token_expiry_path().ok_or("could not determine token-expiry path")?;
@@ -1476,7 +1456,7 @@ fn mutate_token_expiries(
         let mut expiries = read_token_expiries_checked_from(&path)
             .map_err(lpm_common::LpmError::CredentialStorage)?;
         if mutation(&mut expiries) {
-            write_token_expiries_checked(&path, &expiries)
+            write_token_expiries_checked(&path, &expiries, write)
                 .map_err(lpm_common::LpmError::CredentialStorage)?;
         }
         Ok(())
@@ -1491,7 +1471,7 @@ pub fn read_token_expiries() -> std::collections::HashMap<String, TokenExpiry> {
 
 /// Store a token expiry reminder.
 pub fn set_token_expiry(registry: &str, expires: &str) {
-    if let Err(error) = mutate_token_expiries(|expiries| {
+    if let Err(error) = mutate_token_expiries(HomeWrite::Adds, |expiries| {
         let entry = expiries.entry(registry.to_string()).or_default();
         entry.expires = expires.to_string();
         entry.reminded_7d = false;
@@ -1514,7 +1494,7 @@ pub(crate) fn set_session_access_token_expiry_checked(
     registry: &str,
     expires_at: &str,
 ) -> Result<(), String> {
-    mutate_token_expiries(|expiries| {
+    mutate_token_expiries(HomeWrite::Adds, |expiries| {
         let entry = expiries.entry(registry.to_string()).or_default();
         entry.session_access_expires_at = Some(expires_at.to_string());
         entry.expires.clear();
@@ -1568,7 +1548,9 @@ pub fn clear_token_expiry(registry: &str) {
 
 /// Remove token-expiry metadata and report storage failures to the caller.
 pub fn clear_token_expiry_checked(registry: &str) -> Result<(), String> {
-    mutate_token_expiries(|expiries| expiries.remove(registry).is_some())
+    mutate_token_expiries(HomeWrite::AddsNothing, |expiries| {
+        expiries.remove(registry).is_some()
+    })
 }
 
 /// Check token expiries and return warnings for tokens expiring soon.
@@ -1634,7 +1616,7 @@ pub fn is_otp_required(registry: &str) -> bool {
 
 /// Set the OTP/2FA preference for a registry.
 pub fn set_otp_required(registry: &str, required: bool) {
-    if let Err(error) = mutate_token_expiries(|expiries| {
+    if let Err(error) = mutate_token_expiries(HomeWrite::Adds, |expiries| {
         let entry = expiries.entry(registry.to_string()).or_default();
         entry.otp_required = required;
         true
@@ -1789,7 +1771,7 @@ pub async fn store_rotated_access_token_if_current(
                 registry, CredentialKind::Access, replacement,
                 || set_token_in_keychain(registry, replacement),
             )?;
-            mutate_token_expiries(|expiries| {
+            mutate_token_expiries(HomeWrite::Adds, |expiries| {
                 let entry = expiries.entry(registry.to_owned()).or_default();
                 entry.reminded_7d = false;
                 entry.reminded_1d = false;
@@ -2045,7 +2027,7 @@ fn keychain_service() -> std::borrow::Cow<'static, str> {
         }
     }
 
-    std::borrow::Cow::Borrowed(KEYCHAIN_SERVICE)
+    std::borrow::Cow::Owned(lpm_common::credential_service(KEYCHAIN_SERVICE))
 }
 
 fn get_password_from_keychain_account(account: &str) -> Option<String> {
@@ -2264,10 +2246,45 @@ fn clear_token_from_keychain(registry_url: &str) -> Result<(), String> {
 
 // ─── Encrypted File ────────────────────────────────────────────────
 
-/// Get the `~/.lpm/` directory path.
+/// The LPM root, `$LPM_HOME` or `~/.lpm`, which holds login state.
 fn lpm_dir() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("could not determine home directory")?;
-    Ok(home.join(".lpm"))
+    lpm_common::LpmRoot::from_env()
+        .map(|root| root.root().to_path_buf())
+        .map_err(|error| format!("could not determine the LPM home: {error}"))
+}
+
+/// What a write leaves in the LPM home's login state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HomeWrite {
+    /// Login state the home didn't hold.
+    Adds,
+    /// Nothing the home didn't hold: less login state, as logging out leaves
+    /// it, or another record of a credential it holds.
+    AddsNothing,
+}
+
+/// Creates `directory`, the LPM home, and keeps it out of git, before
+/// login state is written there. A home in a repository that it can't be
+/// kept out of is refused.
+fn prepare_lpm_home(directory: &Path) -> Result<(), String> {
+    prepare_lpm_home_for(directory, HomeWrite::Adds)
+}
+
+/// [`prepare_lpm_home`] for a write that may add nothing: that goes ahead in
+/// a home git could commit, so logging out still removes what the home
+/// holds.
+fn prepare_lpm_home_for(directory: &Path, write: HomeWrite) -> Result<(), String> {
+    std::fs::create_dir_all(directory).map_err(|error| format!("mkdir error: {error}"))?;
+    match lpm_common::keep_lpm_home_ignored(directory) {
+        Ok(()) => Ok(()),
+        Err(reason) if write == HomeWrite::AddsNothing => {
+            tracing::debug!("{reason}");
+            Ok(())
+        }
+        Err(reason) => Err(format!(
+            "{reason}, so git could commit the login state saved there; point LPM_HOME at a directory of its own"
+        )),
+    }
 }
 
 fn credentials_path() -> Result<PathBuf, String> {
@@ -2397,7 +2414,7 @@ fn write_file_auth_key(key_path: &Path, value: &str) -> Result<(), String> {
     let directory = key_path
         .parent()
         .ok_or_else(|| "auth data-key path has no parent".to_owned())?;
-    std::fs::create_dir_all(directory).map_err(|error| format!("mkdir error: {error}"))?;
+    prepare_lpm_home(directory)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2417,10 +2434,7 @@ fn write_file_auth_key(key_path: &Path, value: &str) -> Result<(), String> {
 
 #[cfg(test)]
 fn get_auth_key_material() -> Result<AuthKeyMaterial, String> {
-    let key_path = dirs::home_dir()
-        .ok_or("no home directory")?
-        .join(".lpm")
-        .join(".key");
+    let key_path = lpm_dir()?.join(".key");
 
     if key_path.exists() {
         let value =
@@ -2447,17 +2461,16 @@ fn get_auth_key_material() -> Result<AuthKeyMaterial, String> {
     const KEY_SERVICE: &str = "dev.lpm.credentials-key";
     const KEY_ACCOUNT: &str = "encryption-key";
 
-    let key_path = dirs::home_dir()
-        .ok_or("no home directory")?
-        .join(".lpm")
-        .join(".key");
+    let key_path = lpm_dir()?.join(".key");
 
     let keyring_probe = if force_file_auth() {
         Ok(None)
     } else {
         #[cfg(target_os = "macos")]
         let _lock = lpm_common::platform::macos_keychain_operation_lock();
-        match keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT).and_then(|entry| entry.get_password()) {
+        match keyring::Entry::new(&lpm_common::credential_service(KEY_SERVICE), KEY_ACCOUNT)
+            .and_then(|entry| entry.get_password())
+        {
             Ok(value) => Ok(Some(value)),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(error) => Err(format!("failed to read native auth data key: {error}")),
@@ -2505,7 +2518,7 @@ fn get_auth_key_material() -> Result<AuthKeyMaterial, String> {
     } else {
         #[cfg(target_os = "macos")]
         let _lock = lpm_common::platform::macos_keychain_operation_lock();
-        keyring::Entry::new(KEY_SERVICE, KEY_ACCOUNT)
+        keyring::Entry::new(&lpm_common::credential_service(KEY_SERVICE), KEY_ACCOUNT)
             .and_then(|entry| entry.set_password(&value))
             .is_ok()
     };
@@ -2700,8 +2713,7 @@ fn set_token_in_file(registry_url: &str, token: &str) -> Result<(), String> {
     let json_str = serde_json::to_string(&store).map_err(|e| format!("json error: {e}"))?;
     let encrypted = encrypt(&json_str)?;
 
-    let dir = lpm_dir()?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir error: {e}"))?;
+    prepare_lpm_home(&lpm_dir()?)?;
     lpm_common::write_file_atomic_with_options(
         &path,
         encrypted,
@@ -2897,6 +2909,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let _env = super::test_env::ScopedEnv::update([
             ("HOME", Some(temp.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(temp.path().join(".lpm").into_os_string())),
             (DISABLE_HOST_CLI_AUTH_ENV, Some("1".into())),
         ]);
 
@@ -2915,6 +2928,27 @@ mod tests {
             CredentialAuthority::active(CredentialBackend::EncryptedFileFallback, token),
         )
         .expect("mark test credential authoritative");
+    }
+
+    #[test]
+    fn file_login_state_follows_lpm_home_instead_of_the_home_directory() {
+        with_temp_home(|home| {
+            let root = home.join("relocated-lpm");
+            let _env = LocalEnvGuard::update([
+                ("LPM_FORCE_FILE_AUTH", Some("1".into())),
+                ("LPM_HOME", Some(root.clone().into_os_string())),
+            ]);
+
+            set_token_in_file("https://registry.example", "relocated-token")
+                .expect("store a file-backed token");
+
+            assert!(root.join(".credentials").is_file());
+            assert!(!home.join(".lpm").exists(), "nothing lands in $HOME/.lpm");
+            assert_eq!(
+                get_token_from_file("https://registry.example").as_deref(),
+                Some("relocated-token")
+            );
+        });
     }
 
     #[test]
@@ -3543,6 +3577,121 @@ mod tests {
         });
     }
 
+    #[test]
+    fn file_backed_login_state_keeps_the_lpm_home_out_of_git() {
+        with_temp_home(|_| {
+            set_token_in_file("https://registry.example", "token").unwrap();
+
+            let ignore = std::fs::read_to_string(lpm_dir().unwrap().join(".gitignore")).unwrap();
+            assert!(
+                lpm_common::project_state::ignores_everything(ignore.as_bytes()),
+                "{ignore:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn file_backed_login_state_is_refused_where_git_would_commit_it() {
+        let home = tempfile::tempdir().unwrap();
+        // `LPM_HOME` names a repository's root, which no ignore file in it
+        // can keep out of git.
+        let repository = home.path().join("repository");
+        std::fs::create_dir_all(repository.join(".git")).unwrap();
+        let _env = super::test_env::ScopedEnv::update([
+            ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(repository.clone().into_os_string())),
+            (DISABLE_HOST_CLI_AUTH_ENV, Some("1".into())),
+        ]);
+
+        let error = set_token_in_file("https://registry.example", "token").unwrap_err();
+
+        assert!(error.contains("LPM_HOME"), "{error}");
+        assert!(!repository.join(".credentials").exists());
+    }
+
+    #[test]
+    fn rewriting_the_record_of_a_held_credential_adds_nothing_to_a_home_git_could_commit() {
+        with_temp_home(|home| {
+            let registry = "https://registry.example";
+            mark_file_credential_authoritative(registry, CredentialKind::Access, "token");
+            let lpm = home.join(".lpm");
+            std::fs::remove_file(lpm.join(".gitignore")).unwrap();
+            std::fs::create_dir(lpm.join(".git")).unwrap();
+
+            // As a keychain migration records where the credential now is.
+            credential_authority::set(
+                registry,
+                CredentialKind::Access,
+                CredentialAuthority::committed_keychain("token"),
+            )
+            .unwrap();
+
+            let error = credential_authority::set(
+                registry,
+                CredentialKind::Access,
+                CredentialAuthority::active(CredentialBackend::Keychain, "another token"),
+            )
+            .unwrap_err();
+            assert!(error.contains("LPM_HOME"), "{error}");
+        });
+    }
+
+    #[test]
+    fn logging_out_takes_login_state_away_from_a_home_git_could_commit() {
+        with_temp_home(|home| {
+            let _env = LocalEnvGuard::update([("LPM_FORCE_FILE_AUTH", Some("1".into()))]);
+            let lpm = home.join(".lpm");
+            let custom = "https://npm.example.com";
+            let other = "https://registry.example";
+            // Login state an earlier release left before the home became a
+            // repository's root.
+            for registry in [custom, other] {
+                set_custom_registry_token_with_backend(registry, "token").unwrap();
+                set_token_expiry(registry, "2099-01-01");
+            }
+            std::fs::remove_file(lpm.join(".gitignore")).unwrap();
+            std::fs::create_dir(lpm.join(".git")).unwrap();
+
+            clear_custom_registry_token(custom).unwrap();
+
+            assert_eq!(get_token_from_file(custom), None);
+            assert_eq!(get_token_from_file(other).as_deref(), Some("token"));
+            let expiries = read_token_expiries();
+            assert!(!expiries.contains_key(custom) && expiries.contains_key(other));
+            assert_eq!(list_custom_registries(), [other]);
+            // Nothing new is saved there.
+            let error = set_custom_registry_token_with_backend(custom, "token").unwrap_err();
+            assert!(error.contains("LPM_HOME"), "{error}");
+            assert_eq!(get_token_from_file(custom), None);
+            assert!(!lpm.join(".gitignore").exists());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_login_state_is_refused_where_git_would_commit_it_through_a_link() {
+        let home = tempfile::tempdir().unwrap();
+        // A directory in a repository whose own ignore file doesn't cover
+        // login state, reached through a link outside the repository.
+        let repository = home.path().join("repository");
+        std::fs::create_dir_all(repository.join(".git")).unwrap();
+        let state = repository.join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::write(state.join(".gitignore"), "cache/\n").unwrap();
+        let alias = home.path().join("lpm-home");
+        std::os::unix::fs::symlink(&state, &alias).unwrap();
+        let _env = super::test_env::ScopedEnv::update([
+            ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(alias.into_os_string())),
+            (DISABLE_HOST_CLI_AUTH_ENV, Some("1".into())),
+        ]);
+
+        let error = set_token_in_file("https://registry.example", "token").unwrap_err();
+
+        assert!(error.contains("LPM_HOME"), "{error}");
+        assert!(!state.join(".credentials").exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn session_lock_uses_owner_only_file_and_directory_permissions() {
@@ -3963,6 +4112,7 @@ mod tests {
         );
         let _env = super::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             (
                 "NPM_CONFIG_USERCONFIG",
                 Some(userconfig.as_os_str().to_owned()),
@@ -3985,6 +4135,7 @@ mod tests {
         );
         let _env = super::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             ("NPM_CONFIG_USERCONFIG", Some("~/custom.npmrc".into())),
             ("npm_config_userconfig", None),
         ]);
@@ -4012,6 +4163,7 @@ mod tests {
         std::fs::set_permissions(&userconfig, std::fs::Permissions::from_mode(0o622)).unwrap();
         let _env = super::test_env::ScopedEnv::update([
             ("HOME", Some(home.path().as_os_str().to_owned())),
+            ("LPM_HOME", Some(home.path().join(".lpm").into_os_string())),
             (
                 "NPM_CONFIG_USERCONFIG",
                 Some(userconfig.as_os_str().to_owned()),
