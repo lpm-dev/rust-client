@@ -63,6 +63,19 @@ pub(super) fn validate_source_delivery_namespace(
             destination.display()
         )));
     }
+    // So would one in a git directory under another name, as a bare
+    // repository such as `vendor/tool.git` is.
+    if let Some(git_directory) = destination
+        .ancestors()
+        .take_while(|ancestor| ancestor.starts_with(project_root_canonical))
+        .find(|ancestor| lpm_common::git_directory::is_git_directory(ancestor))
+    {
+        return Err(LpmError::Registry(format!(
+            "source delivery cannot write into a git directory: {} is in {}",
+            destination.display(),
+            git_directory.display()
+        )));
+    }
     // NTFS takes a short name, such as `LPM~1.LOC` for `lpm.lock`, for the
     // name itself in every open: `.git` at any depth, and at the root what
     // only the root reserves.
@@ -1028,6 +1041,30 @@ mod tests {
             validate_source_delivery_namespace(project, &project.join(destination))
                 .unwrap_or_else(|error| panic!("{destination}: {error}"));
         }
+    }
+
+    #[test]
+    fn source_delivery_never_writes_into_a_git_directory_under_another_name() {
+        let project = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let bare = root.join("vendor").join("tool.git");
+        for directory in ["objects", "refs"] {
+            std::fs::create_dir_all(bare.join(directory)).unwrap();
+        }
+        std::fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(root.join("vendor").join("notes.git")).unwrap();
+
+        for destination in [bare.join("hooks").join("pre-commit"), bare.join("config")] {
+            let error = validate_source_delivery_namespace(&root, &destination)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("git directory"), "{destination:?}: {error}");
+        }
+        validate_source_delivery_namespace(
+            &root,
+            &root.join("vendor").join("notes.git").join("hooks.md"),
+        )
+        .unwrap();
     }
 
     /// A volume that makes short names resolves them from any system; a
