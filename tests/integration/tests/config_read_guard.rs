@@ -77,7 +77,6 @@ const AUDITED_CONFIGURATION_LOADERS: &[&str] = &[
     "crates/lpm-cli/src/commands/uninstall.rs",
     "crates/lpm-cli/src/commands/upgrade.rs",
     "crates/lpm-cli/src/commands/use.rs",
-    "crates/lpm-cli/src/constraints.rs",
     "crates/lpm-cli/src/install_state.rs",
     "crates/lpm-cli/src/intelligence.rs",
     "crates/lpm-cli/src/manifest_tx.rs",
