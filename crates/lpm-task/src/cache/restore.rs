@@ -394,13 +394,17 @@ impl StagedOutputs {
             "task cache project directory",
         )?;
         let install_count = this.files.len();
-        let mut stale_outputs = collect_output_files(&this.canonical_project, output_globs)?;
+        let stored_outputs = collect_output_files(&this.canonical_project, output_globs)?;
         verify_open_directory_path(
             &this.project,
             &this.canonical_project,
             "task cache project directory",
         )?;
-        stale_outputs.retain(|relative| !this.seen_paths.contains(relative));
+        let stale_outputs: Vec<PathBuf> = stored_outputs
+            .iter()
+            .filter(|relative| !this.seen_paths.contains(*relative))
+            .cloned()
+            .collect();
         if install_count.saturating_add(stale_outputs.len()) > MAX_CACHE_ARCHIVE_ENTRIES {
             return Err(LpmError::Task(format!(
                 "task cache restore exceeds entry-count cap ({MAX_CACHE_ARCHIVE_ENTRIES} entries)"
@@ -408,13 +412,17 @@ impl StagedOutputs {
         }
         this.files.extend(stale_outputs);
 
-        let existing_outputs = write_restore_journal_for_plan_open(
+        let mut files = std::mem::take(&mut this.files);
+        let planned = write_restore_journal_for_plan_open(
             &this.open_staging().root,
             &this.project,
             &this.canonical_project,
-            &this.files,
+            &mut files,
             install_count,
-        )?;
+            &stored_outputs,
+        );
+        this.files = files;
+        let existing_outputs = planned?;
 
         let mut transaction = RestoreTransaction::new_with_open_staging(
             this.canonical_project.clone(),
@@ -578,15 +586,28 @@ fn write_restore_journal_for_plan(
 ) -> Result<Vec<bool>, LpmError> {
     let restore = Dir::open_ambient_dir(restore_dir, cap_std::ambient_authority())?;
     let project = Dir::open_ambient_dir(project_dir, cap_std::ambient_authority())?;
-    write_restore_journal_for_plan_open(&restore, &project, project_dir, files, install_count)
+    let mut stored = files.to_vec();
+    stored.sort_unstable();
+    write_restore_journal_for_plan_open(
+        &restore,
+        &project,
+        project_dir,
+        &mut files.to_vec(),
+        install_count,
+        &stored,
+    )
 }
 
+/// Journals the restore of `files`: the first `install_count` from the
+/// archive, the rest stale outputs to remove. `stored_outputs` are the
+/// outputs as the project's directories store their names, sorted.
 fn write_restore_journal_for_plan_open(
     restore: &Dir,
     project: &Dir,
     project_dir: &Path,
-    files: &[PathBuf],
+    files: &mut Vec<PathBuf>,
     install_count: usize,
+    stored_outputs: &[PathBuf],
 ) -> Result<Vec<bool>, LpmError> {
     use std::io::BufWriter;
 
@@ -596,7 +617,7 @@ fn write_restore_journal_for_plan_open(
         )));
     }
     let (existing_outputs, missing_directories) =
-        analyze_restore_plan(project, project_dir, files, install_count)?;
+        analyze_restore_plan(project, project_dir, files, install_count, stored_outputs)?;
     write_open_file_atomic_with(
         restore,
         std::ffi::OsStr::new(RESTORE_JOURNAL_NAME),
@@ -659,11 +680,15 @@ fn write_restore_journal_for_plan_open(
 fn analyze_restore_plan(
     project: &Dir,
     project_dir: &Path,
-    files: &[PathBuf],
+    files: &mut Vec<PathBuf>,
     install_count: usize,
+    stored_outputs: &[PathBuf],
 ) -> Result<(Vec<bool>, Vec<PathBuf>), LpmError> {
+    use cap_fs_ext::MetadataExt as _;
+
     let mut missing = HashSet::new();
     let mut existing_outputs = Vec::with_capacity(files.len());
+    let mut identities = Vec::with_capacity(files.len());
     let mut cached_parent: Option<(PathBuf, Option<Dir>)> = None;
 
     for (index, relative) in files.iter().enumerate() {
@@ -723,6 +748,7 @@ fn analyze_restore_plan(
             .and_then(|(_, parent)| parent.as_ref())
         else {
             existing_outputs.push(false);
+            identities.push(None);
             continue;
         };
         match parent.symlink_metadata(name) {
@@ -732,7 +758,10 @@ fn analyze_restore_plan(
                     project_dir.join(relative).display()
                 )));
             }
-            Ok(metadata) if metadata.is_file() => existing_outputs.push(true),
+            Ok(metadata) if metadata.is_file() => {
+                existing_outputs.push(true);
+                identities.push(Some((metadata.dev(), metadata.ino())));
+            }
             Ok(_) => {
                 return Err(LpmError::Task(format!(
                     "task cache restore destination has an incompatible entry: {}",
@@ -741,14 +770,62 @@ fn analyze_restore_plan(
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 existing_outputs.push(false);
+                identities.push(None);
             }
             Err(error) => return Err(error.into()),
         }
     }
+    keep_stale_outputs_that_are_other_files(
+        files,
+        &mut existing_outputs,
+        &identities,
+        install_count,
+        stored_outputs,
+    );
 
     let mut missing: Vec<_> = missing.into_iter().collect();
     missing.sort_unstable_by_key(|path| std::cmp::Reverse(path.components().count()));
     Ok((existing_outputs, missing))
+}
+
+/// Drops each stale output that is the file an archived output replaces,
+/// reached by another spelling of its name, as a volume that folds case or
+/// Unicode forms takes one: macOS and Windows volumes do by default. The
+/// archive's path then names no stored entry, and the stale one is that
+/// entry, which removing after the install would delete. A stale output
+/// with the identity of an archived path the directory stores is another
+/// link to the same file, and is removed as before.
+fn keep_stale_outputs_that_are_other_files(
+    files: &mut Vec<PathBuf>,
+    existing_outputs: &mut Vec<bool>,
+    identities: &[Option<(u64, u64)>],
+    install_count: usize,
+    stored_outputs: &[PathBuf],
+) {
+    if files.len() == install_count {
+        return;
+    }
+    let replaced: HashSet<(u64, u64)> = files[..install_count]
+        .iter()
+        .zip(&identities[..install_count])
+        .filter_map(|(relative, identity)| {
+            identity.filter(|_| stored_outputs.binary_search(relative).is_err())
+        })
+        .collect();
+    if replaced.is_empty() {
+        return;
+    }
+    let keep: Vec<bool> = identities
+        .iter()
+        .enumerate()
+        .map(|(index, identity)| {
+            index < install_count || identity.is_none_or(|identity| !replaced.contains(&identity))
+        })
+        .collect();
+    let mut kept = keep.iter();
+    files.retain(|_| *kept.next().expect("one decision per output"));
+    let mut kept = keep.iter();
+    existing_outputs.retain(|_| *kept.next().expect("one decision per output"));
 }
 
 struct RestoreRegistryRecord {

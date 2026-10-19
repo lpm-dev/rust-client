@@ -2692,6 +2692,84 @@ mod tests {
         assert!(!target.path().join("dist/stale.txt").exists());
     }
 
+    /// On a volume that ignores case, as macOS and Windows volumes do by
+    /// default, an output renamed only in case is the file the archive
+    /// restores, not a stale output to remove after it.
+    #[test]
+    fn restore_replaces_an_output_renamed_only_in_case() {
+        let cache = TestCache::new();
+        let outputs = ["dist/**".to_string()];
+        for (cached, renamed) in [("value.txt", "Value.txt"), ("Other.txt", "other.txt")] {
+            let project = tempfile::tempdir().unwrap();
+            let dist = project.path().join("dist");
+            fs::create_dir_all(&dist).unwrap();
+            fs::write(dist.join(cached), "cached").unwrap();
+            if !dist.join(cached.to_uppercase()).exists() {
+                return;
+            }
+            let key = unique_key("case-only-rename");
+            cache
+                .store(&key, project.path(), "build", &outputs, "", "", 1)
+                .unwrap();
+            fs::remove_file(dist.join(cached)).unwrap();
+            fs::write(dist.join(renamed), "renamed").unwrap();
+
+            cache.restore(&key, project.path(), &outputs).unwrap();
+
+            let names: Vec<_> = fs::read_dir(&dist)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(names, [cached], "{renamed} → {cached}");
+            assert_eq!(fs::read_to_string(dist.join(cached)).unwrap(), "cached");
+        }
+    }
+
+    #[test]
+    fn restore_keeps_a_file_whose_directory_was_renamed_only_in_case() {
+        let cache = TestCache::new();
+        let outputs = ["**/*.txt".to_string()];
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project.path().join("dist")).unwrap();
+        fs::write(project.path().join("dist/value.txt"), "cached").unwrap();
+        if !project.path().join("DIST").exists() {
+            return;
+        }
+        let key = unique_key("case-only-directory-rename");
+        cache
+            .store(&key, project.path(), "build", &outputs, "", "", 1)
+            .unwrap();
+        fs::rename(project.path().join("dist"), project.path().join("Dist")).unwrap();
+        fs::write(project.path().join("Dist/value.txt"), "renamed").unwrap();
+
+        cache.restore(&key, project.path(), &outputs).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(project.path().join("dist/value.txt")).unwrap(),
+            "cached"
+        );
+    }
+
+    #[test]
+    fn restore_removes_a_stale_output_linked_to_a_restored_one() {
+        let cache = TestCache::new();
+        let outputs = ["dist/**".to_string()];
+        let project = tempfile::tempdir().unwrap();
+        let dist = project.path().join("dist");
+        fs::create_dir_all(&dist).unwrap();
+        fs::write(dist.join("kept.txt"), "cached").unwrap();
+        let key = unique_key("linked-stale-output");
+        cache
+            .store(&key, project.path(), "build", &outputs, "", "", 1)
+            .unwrap();
+        fs::hard_link(dist.join("kept.txt"), dist.join("linked.txt")).unwrap();
+
+        cache.restore(&key, project.path(), &outputs).unwrap();
+
+        assert_eq!(fs::read_to_string(dist.join("kept.txt")).unwrap(), "cached");
+        assert!(!dist.join("linked.txt").exists());
+    }
+
     #[test]
     fn remote_artifact_rejects_cache_key_mismatch() {
         let cache = TestCache::new();
