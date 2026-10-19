@@ -295,9 +295,13 @@ fn check_global_manifest_validity(root: &lpm_common::LpmRoot) -> Check {
 }
 
 fn check_bin_dir_on_path(root: &lpm_common::LpmRoot) -> Check {
+    check_bin_dir_on_path_in(root, &std::env::var("PATH").unwrap_or_default())
+}
+
+/// [`check_bin_dir_on_path`] against the `PATH` value `path_env`.
+fn check_bin_dir_on_path_in(root: &lpm_common::LpmRoot, path_env: &str) -> Check {
     let bin_dir = root.bin_dir();
-    let path_env = std::env::var("PATH").unwrap_or_default();
-    if crate::path_onboarding::is_bin_dir_on_path_str(&bin_dir, &path_env) {
+    if crate::path_onboarding::is_bin_dir_on_path_str(&bin_dir, path_env) {
         Check::pass(
             &doctor_catalog::GLOBAL_BIN_ON_PATH,
             &bin_dir.display().to_string(),
@@ -839,8 +843,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = LpmRoot::from_dir(tmp.path());
         let bin = root.bin_dir().display().to_string();
-        let _env = crate::test_env::ScopedEnv::set([("PATH", bin.into())]);
-        let check = check_bin_dir_on_path(&root);
+        let check = check_bin_dir_on_path_in(&root, &bin);
         assert!(matches!(check.severity, Severity::Pass));
     }
 
@@ -848,8 +851,7 @@ mod tests {
     fn check_bin_dir_on_path_warns_when_bin_dir_missing_from_path() {
         let tmp = tempfile::tempdir().unwrap();
         let root = LpmRoot::from_dir(tmp.path());
-        let _env = crate::test_env::ScopedEnv::set([("PATH", "/usr/bin:/bin".into())]);
-        let check = check_bin_dir_on_path(&root);
+        let check = check_bin_dir_on_path_in(&root, "/usr/bin:/bin");
         assert!(matches!(check.severity, Severity::Warn));
         assert!(check.detail.contains("Fix hint"));
     }

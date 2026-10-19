@@ -971,27 +971,39 @@ mod tests {
         );
     }
 
+    /// Whether this process runs only the test `name`, so it may set the
+    /// process environment, which discovery reads and which every other
+    /// test in a shared process reads too; otherwise runs `name` alone in a
+    /// child process of this test binary and asserts that it passed.
+    fn alone_in_a_process(name: &str) -> bool {
+        const ALONE: &str = "LPM_REGISTRY_TEST_ALONE";
+        if std::env::var_os(ALONE).is_some_and(|alone| alone == name) {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                format!("npmrc::discovery::tests::{name}").as_str(),
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env(ALONE, name)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{name} alone in a process:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
     #[test]
     fn filesystem_discovery_honors_userconfig_and_globalconfig_overrides() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
-        impl Drop for RestoreEnv {
-            fn drop(&mut self) {
-                for (name, value) in self.0.drain(..) {
-                    // SAFETY: this test holds ENV_LOCK for the mutation window.
-                    unsafe {
-                        match value {
-                            Some(value) => std::env::set_var(name, value),
-                            None => std::env::remove_var(name),
-                        }
-                    }
-                }
-            }
+        if !alone_in_a_process("filesystem_discovery_honors_userconfig_and_globalconfig_overrides")
+        {
+            return;
         }
-
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = TempDir::new().unwrap();
         let project = root.path().join("project");
         fs::create_dir_all(&project).unwrap();
@@ -1005,20 +1017,13 @@ mod tests {
             set_npmrc_mode(&global, 0o600);
             set_npmrc_mode(&user, 0o600);
         }
-        let restore = RestoreEnv(
-            ["NPM_CONFIG_GLOBALCONFIG", "NPM_CONFIG_USERCONFIG"]
-                .into_iter()
-                .map(|name| (name, std::env::var_os(name)))
-                .collect(),
-        );
-        // SAFETY: this test holds ENV_LOCK and restores both values on drop.
+        // SAFETY: this process runs only this test, on one thread.
         unsafe {
             std::env::set_var("NPM_CONFIG_GLOBALCONFIG", &global);
             std::env::set_var("NPM_CONFIG_USERCONFIG", &user);
         }
 
         let cfg = NpmrcConfig::load_from_filesystem(&project);
-        drop(restore);
         assert_eq!(
             cfg.scope_registries["@global"].base_url.as_ref(),
             "https://global.example"
@@ -1032,24 +1037,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn writable_user_config_cannot_redirect_global_config_discovery() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
-        impl Drop for RestoreEnv {
-            fn drop(&mut self) {
-                for (name, value) in self.0.drain(..) {
-                    unsafe {
-                        match value {
-                            Some(value) => std::env::set_var(name, value),
-                            None => std::env::remove_var(name),
-                        }
-                    }
-                }
-            }
+        if !alone_in_a_process("writable_user_config_cannot_redirect_global_config_discovery") {
+            return;
         }
-
-        let _guard = ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = TempDir::new().unwrap();
         let project = root.path().join("project");
         fs::create_dir_all(&project).unwrap();
@@ -1073,12 +1063,7 @@ mod tests {
             "npm_config_prefix",
             "PREFIX",
         ];
-        let restore = RestoreEnv(
-            names
-                .into_iter()
-                .map(|name| (name, std::env::var_os(name)))
-                .collect(),
-        );
+        // SAFETY: this process runs only this test, on one thread.
         unsafe {
             for name in names {
                 std::env::remove_var(name);
@@ -1087,7 +1072,6 @@ mod tests {
         }
 
         let config = NpmrcConfig::load_from_filesystem(&project);
-        drop(restore);
 
         assert!(!config.scope_registries.contains_key("@redirected"));
         assert!(

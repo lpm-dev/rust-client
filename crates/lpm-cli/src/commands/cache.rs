@@ -690,8 +690,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn clean_without_subcategory_clears_all_cache_dirs_only() {
+    #[test]
+    fn clean_without_subcategory_clears_all_cache_dirs_only() {
         let tmp = TempDir::new().unwrap();
         let root = setup(&tmp);
 
@@ -703,11 +703,7 @@ mod tests {
         // Plant store state to prove we DON'T touch it.
         populate(&root.store_v1().join("react@19.0.0"), &["index.js"]);
 
-        // Drive the command via its public surface.
-        let _env = scoped_lpm_home(tmp.path());
-        run(CacheCmd::Clean { category: None }, true, None)
-            .await
-            .unwrap();
+        run_clean(&root, None, true).unwrap();
 
         assert!(!root.cache_metadata().exists(), "metadata should be gone");
         assert!(!root.cache_tasks().exists(), "tasks should be gone");
@@ -719,8 +715,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn clean_with_subcategory_touches_only_that_subcategory() {
+    #[test]
+    fn clean_with_subcategory_touches_only_that_subcategory() {
         let tmp = TempDir::new().unwrap();
         let root = setup(&tmp);
 
@@ -729,16 +725,7 @@ mod tests {
         populate(&root.cache_dlx().join("hash1"), &["package.json"]);
         populate(&root.cache_mcp().join("runtime"), &["package.json"]);
 
-        let _env = scoped_lpm_home(tmp.path());
-        run(
-            CacheCmd::Clean {
-                category: Some(CacheCategory::Metadata),
-            },
-            true,
-            None,
-        )
-        .await
-        .unwrap();
+        run_clean(&root, Some(CacheCategory::Metadata), true).unwrap();
 
         assert!(!root.cache_metadata().exists());
         assert!(root.cache_tasks().join("b.json").exists());
@@ -746,8 +733,8 @@ mod tests {
         assert!(root.cache_mcp().join("runtime/package.json").exists());
     }
 
-    #[tokio::test]
-    async fn clean_mcp_refuses_to_delete_an_in_use_runtime() {
+    #[test]
+    fn clean_mcp_refuses_to_delete_an_in_use_runtime() {
         let tmp = TempDir::new().unwrap();
         let root = setup(&tmp);
         populate(&root.cache_mcp().join("runtime"), &["package.json"]);
@@ -763,16 +750,7 @@ mod tests {
         });
         held_rx.recv().unwrap();
 
-        let _env = scoped_lpm_home(tmp.path());
-        let error = run(
-            CacheCmd::Clean {
-                category: Some(CacheCategory::Mcp),
-            },
-            true,
-            None,
-        )
-        .await
-        .unwrap_err();
+        let error = run_clean(&root, Some(CacheCategory::Mcp), true).unwrap_err();
         assert!(error.to_string().contains("in use"));
         assert!(root.cache_mcp().join("runtime/package.json").exists());
 
@@ -780,8 +758,8 @@ mod tests {
         holder.join().unwrap().unwrap();
     }
 
-    #[tokio::test]
-    async fn clean_does_not_touch_store_even_without_subcategory() {
+    #[test]
+    fn clean_does_not_touch_store_even_without_subcategory() {
         // `cache clean` must never reach into the store, regardless of flags.
         let tmp = TempDir::new().unwrap();
         let root = setup(&tmp);
@@ -790,10 +768,7 @@ mod tests {
         populate(&root.store_v1().join("lodash@4.17.21"), &["index.js"]);
         populate(&root.store_v1().join("react@19.0.0"), &["index.js"]);
 
-        let _env = scoped_lpm_home(tmp.path());
-        run(CacheCmd::Clean { category: None }, true, None)
-            .await
-            .unwrap();
+        run_clean(&root, None, true).unwrap();
 
         assert!(!root.cache_metadata().exists());
         assert!(root.store_v1().join("lodash@4.17.21").exists());
@@ -821,20 +796,17 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn banner_writes_marker_on_first_cache_clean_with_store_activity() {
+    #[test]
+    fn banner_writes_marker_on_first_cache_clean_with_store_activity() {
         let tmp = TempDir::new().unwrap();
         let root = setup(&tmp);
         populate(&root.store_v1().join("pkg@1.0.0"), &["index.js"]);
         populate(&root.cache_metadata(), &["a.json"]);
 
-        let _env = scoped_lpm_home(tmp.path());
         // Human-readable path triggers the notice; JSON path deliberately
         // does not (see emit_clean_json callers). This test exercises the
         // human branch.
-        run(CacheCmd::Clean { category: None }, false, None)
-            .await
-            .unwrap();
+        run_clean(&root, None, false).unwrap();
 
         assert!(
             root.cache_clean_notice_marker().exists(),
@@ -842,17 +814,14 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn banner_is_idempotent_second_run_noop() {
+    #[test]
+    fn banner_is_idempotent_second_run_noop() {
         let tmp = TempDir::new().unwrap();
         let root = setup(&tmp);
         populate(&root.store_v1().join("pkg@1.0.0"), &["index.js"]);
         populate(&root.cache_metadata(), &["a.json"]);
 
-        let _env = scoped_lpm_home(tmp.path());
-        run(CacheCmd::Clean { category: None }, false, None)
-            .await
-            .unwrap();
+        run_clean(&root, None, false).unwrap();
         // Capture marker mtime; second run must not rewrite it.
         let first_mtime = std::fs::metadata(root.cache_clean_notice_marker())
             .unwrap()
@@ -860,9 +829,7 @@ mod tests {
             .unwrap();
 
         populate(&root.cache_metadata(), &["a.json"]);
-        run(CacheCmd::Clean { category: None }, false, None)
-            .await
-            .unwrap();
+        run_clean(&root, None, false).unwrap();
 
         let second_mtime = std::fs::metadata(root.cache_clean_notice_marker())
             .unwrap()

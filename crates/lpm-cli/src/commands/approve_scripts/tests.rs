@@ -69,34 +69,23 @@ async fn run(
     .await
 }
 
-struct RawEnvRestore {
-    key: &'static str,
-    value: Option<OsString>,
-}
-
-impl RawEnvRestore {
-    fn capture(key: &'static str) -> Self {
-        Self {
-            key,
-            value: std::env::var_os(key),
-        }
-    }
-}
-
-impl Drop for RawEnvRestore {
-    fn drop(&mut self) {
-        unsafe {
-            match &self.value {
-                Some(value) => std::env::set_var(self.key, value),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
+/// The security test backend without its automatic approval, so a guarded
+/// mutation asks for one.
+fn security_test_backend_without_auto_approval() -> crate::test_env::ScopedEnv {
+    crate::test_env::ScopedEnv::update(security_test_env_vars().map(|(key, value)| {
+        let value = (key != TEST_SECURITY_AUTH_RESULT_ENV).then_some(value);
+        (key, value)
+    }))
 }
 
 #[test]
 fn ensure_security_test_backend_restores_auto_approval_env() {
-    let _restore = RawEnvRestore::capture(TEST_SECURITY_AUTH_RESULT_ENV);
+    if !crate::test_env::alone_in_a_process(
+        "commands::approve_scripts::tests::ensure_security_test_backend_restores_auto_approval_env",
+    ) {
+        return;
+    }
+    // SAFETY: this process runs only this test.
     unsafe {
         std::env::remove_var(TEST_SECURITY_AUTH_RESULT_ENV);
     }
@@ -145,11 +134,7 @@ fn reviewed_project_trust_write_records_managed_approval() {
 
 #[test]
 fn unreviewed_project_trust_write_still_requires_security_approval() {
-    let _restore = RawEnvRestore::capture(TEST_SECURITY_AUTH_RESULT_ENV);
-    let _security_backend = ensure_security_test_backend();
-    unsafe {
-        std::env::remove_var(TEST_SECURITY_AUTH_RESULT_ENV);
-    }
+    let _security_backend = security_test_backend_without_auto_approval();
     let dir = tempdir().unwrap();
     write_default_manifest(dir.path());
     let trusted = trusted_esbuild_binding();
@@ -801,15 +786,12 @@ async fn approve_scripts_specific_package_not_in_blocked_set_errors() {
 
 #[tokio::test]
 async fn approve_scripts_unknown_package_errors_before_security_store_read() {
-    let _home_restore = RawEnvRestore::capture("LPM_HOME");
-    let _secret_restore = RawEnvRestore::capture(TEST_SECURITY_SECRET_ENV);
-    let _auth_restore = RawEnvRestore::capture(TEST_SECURITY_AUTH_RESULT_ENV);
     let lpm_home = tempdir().unwrap();
-    unsafe {
-        std::env::set_var("LPM_HOME", lpm_home.path());
-        std::env::set_var(TEST_SECURITY_SECRET_ENV, "not-hex");
-        std::env::set_var(TEST_SECURITY_AUTH_RESULT_ENV, "error");
-    }
+    let _env = crate::test_env::ScopedEnv::set([
+        ("LPM_HOME", lpm_home.path().as_os_str().to_owned()),
+        (TEST_SECURITY_SECRET_ENV, "not-hex".into()),
+        (TEST_SECURITY_AUTH_RESULT_ENV, "error".into()),
+    ]);
 
     let dir = tempdir().unwrap();
     write_default_manifest(dir.path());

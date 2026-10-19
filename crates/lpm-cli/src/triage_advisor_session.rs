@@ -1242,15 +1242,12 @@ mod tests {
         // every request).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("l4.json");
-        unsafe {
-            // Test must run with the cache enabled regardless of
-            // the host env. Setting via env::set_var is unsafe in
-            // multi-threaded contexts, but the cache disable check
-            // only reads at open time and we control that here.
-            std::env::set_var("LPM_L4_CACHE", "1");
-            std::env::set_var("LPM_L4_CACHE_PATH", path.display().to_string());
-        }
-        let cache = Arc::new(L4Cache::open_at(path.clone(), DEFAULT_TTL_FOR_TEST).unwrap());
+        // Enabled whatever the host's environment says: opening reads the
+        // switch, and only then.
+        let cache = {
+            let _env = crate::test_env::ScopedEnv::set([("LPM_L4_CACHE", "1".into())]);
+            Arc::new(L4Cache::open_at(path.clone(), DEFAULT_TTL_FOR_TEST).unwrap())
+        };
 
         // Cold run: adapter returns Approve, cache should miss then
         // insert.

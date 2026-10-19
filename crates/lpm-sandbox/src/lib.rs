@@ -1011,7 +1011,7 @@ pub fn spawn_tracked_command(
             use std::os::unix::process::CommandExt;
             command.process_group(0);
         }
-        command.spawn().map_err(|error| SandboxError::SpawnFailed {
+        spawn_once_its_program_is_closed(command).map_err(|error| SandboxError::SpawnFailed {
             reason: error.to_string(),
         })
     }
@@ -1067,6 +1067,36 @@ pub fn release_identities_of_removed_projects() -> Result<usize, SandboxError> {
     {
         Ok(0)
     }
+}
+
+/// Spawns `command`, waiting out ETXTBSY: a program this process just wrote
+/// can't be executed while a child another thread forked before its write
+/// was closed still holds it open, which lasts until that child execs.
+#[cfg(not(target_os = "windows"))]
+fn spawn_once_its_program_is_closed(
+    command: &mut std::process::Command,
+) -> std::io::Result<std::process::Child> {
+    let mut pause = std::time::Duration::from_millis(5);
+    for _ in 0..6 {
+        match command.spawn() {
+            Err(error) if is_busy_text(&error) => {
+                std::thread::sleep(pause);
+                pause *= 2;
+            }
+            spawned => return spawned,
+        }
+    }
+    command.spawn()
+}
+
+#[cfg(unix)]
+fn is_busy_text(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ETXTBSY)
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+fn is_busy_text(_error: &std::io::Error) -> bool {
+    false
 }
 
 /// User-facing remediation string for [`SandboxError::UnsupportedPlatform`].
@@ -1262,6 +1292,32 @@ mod tests {
             dependency_read_dirs: Vec::new(),
             extra_write_dirs: Vec::new(),
         }
+    }
+
+    /// A program this process, or a child another thread forked, still
+    /// holds open for writing can't be executed yet (ETXTBSY); the spawn
+    /// waits for the writer to close it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_child_starts_once_the_writer_of_its_program_closes_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("probe");
+        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&program)
+            .unwrap();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            drop(writer);
+        });
+
+        let mut child = spawn_tracked_command(&mut std::process::Command::new(&program)).unwrap();
+
+        assert!(child.wait().unwrap().success());
+        closer.join().unwrap();
     }
 
     #[test]

@@ -245,30 +245,8 @@ mod tests {
     // ─── env_force_color parser ────────────────────────────────────────
 
     fn run_with_force_color<F: FnOnce()>(value: Option<&str>, body: F) {
-        // SAFETY: each test runs serially inside a single `cargo test`
-        // process. `set_var` / `remove_var` are not re-entrant but the
-        // sequence here is straight-line — no parallel reads of the env.
-        // The serial mutex below guards against parallel test execution
-        // racing on the same variable.
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _g = ENV_LOCK.lock().unwrap();
-        let prior = std::env::var_os("FORCE_COLOR");
-        // SAFETY: unsafe set_env is on stable as of Rust 1.86; the lock
-        // makes this serial across this module's tests.
-        unsafe {
-            match value {
-                Some(v) => std::env::set_var("FORCE_COLOR", v),
-                None => std::env::remove_var("FORCE_COLOR"),
-            }
-        }
+        let _env = crate::test_env::ScopedEnv::update([("FORCE_COLOR", value.map(Into::into))]);
         body();
-        unsafe {
-            match prior {
-                Some(v) => std::env::set_var("FORCE_COLOR", v),
-                None => std::env::remove_var("FORCE_COLOR"),
-            }
-        }
     }
 
     #[test]

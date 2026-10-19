@@ -2972,39 +2972,46 @@ mod tests {
 
     #[test]
     fn assign_service_ports_keeps_available_declared_port() {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        // A port found free can be taken by a parallel test before the
+        // allocator checks it; that one is moved, so the test picks again.
+        for _ in 0..8 {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
 
-        let mut services = HashMap::new();
-        services.insert(
-            "web".to_string(),
-            ServiceConfig {
-                command: "true".to_string(),
-                port: Some(port),
-                ..Default::default()
-            },
-        );
-        let dir = tempfile::TempDir::new().unwrap();
+            let mut services = HashMap::new();
+            services.insert(
+                "web".to_string(),
+                ServiceConfig {
+                    command: "true".to_string(),
+                    port: Some(port),
+                    ..Default::default()
+                },
+            );
+            let dir = tempfile::TempDir::new().unwrap();
 
-        let mut allocation = ports::PortAllocation::acquire_for_root_and_lease_dir(
-            lpm_common::LpmRoot::from_dir(dir.path().join(".lpm")),
-            dir.path().join("port-leases"),
-        )
-        .unwrap();
-        let assigned_ports = assign_service_ports(
-            dir.path(),
-            &services,
-            &mut allocation,
-            None,
-            None,
-            false,
-            None,
-        )
-        .unwrap();
+            let mut allocation = ports::PortAllocation::acquire_for_root_and_lease_dir(
+                lpm_common::LpmRoot::from_dir(dir.path().join(".lpm")),
+                dir.path().join("port-leases"),
+            )
+            .unwrap();
+            let assigned_ports = assign_service_ports(
+                dir.path(),
+                &services,
+                &mut allocation,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
 
-        assert_eq!(assigned_ports.port_map.get("web"), Some(&port));
-        assert!(assigned_ports.reassignments.is_empty());
+            if assigned_ports.port_map.get("web") == Some(&port) {
+                assert!(assigned_ports.reassignments.is_empty());
+                return;
+            }
+        }
+        panic!("the allocator moved a declared port that was free, eight times");
     }
 
     #[test]

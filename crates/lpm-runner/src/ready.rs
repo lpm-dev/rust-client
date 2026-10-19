@@ -688,8 +688,10 @@ mod tests {
             let read = stream.read(&mut request).unwrap();
             assert!(read > 0);
             stream.write_all(b"HTTP/1.0 200 ").unwrap();
-            stream.write_all(&vec![b'x'; 9 * 1024]).unwrap();
-            stream.write_all(b"\r\n").unwrap();
+            // The client stops reading at 8 KiB and closes, so the rest may
+            // meet a reset connection.
+            let _ = stream.write_all(&vec![b'x'; 9 * 1024]);
+            let _ = stream.write_all(b"\r\n");
         });
 
         let status = ureq_get(&format!("http://{address}/health"));

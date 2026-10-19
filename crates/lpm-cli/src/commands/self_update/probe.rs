@@ -301,10 +301,11 @@ fn matches_ignore_ascii_case(value: &str, expected: &[&str]) -> bool {
         .any(|candidate| value.eq_ignore_ascii_case(candidate))
 }
 
-pub(super) fn sanitized_current_path(excluded_root: Option<&Path>) -> Result<OsString, LpmError> {
-    let path = std::env::var_os("PATH").ok_or_else(|| {
-        LpmError::SelfUpdate("cannot verify self-update because PATH is unset".to_string())
-    })?;
+/// `path`, a `PATH` value, without the entries an update must not run from.
+pub(super) fn sanitized_path(
+    path: &std::ffi::OsStr,
+    excluded_root: Option<&Path>,
+) -> Result<OsString, LpmError> {
     let resolved_excluded_root = excluded_root
         .map(resolve_for_containment)
         .transpose()
@@ -1897,14 +1898,11 @@ mod tests {
             tempfile::tempdir_in(super::super::canonical_account_home().unwrap()).unwrap();
         let bin = directory.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
-        let _environment = crate::test_env::ScopedEnv::set([(
-            "PATH",
-            std::env::join_paths([bin.as_path()]).unwrap(),
-        )]);
-        let sanitized_path = sanitized_current_path(None).unwrap();
+        let sanitized =
+            sanitized_path(&std::env::join_paths([bin.as_path()]).unwrap(), None).unwrap();
 
         let environment = ChildEnvironment::from_current(
-            &sanitized_path,
+            &sanitized,
             Some(directory.path()),
             directory.path(),
             &bin.join("lpm"),
@@ -1959,7 +1957,6 @@ mod tests {
         std::fs::write(&manager, b"").unwrap();
         entries.push(excluded_bin);
         let joined = std::env::join_paths(&entries).unwrap();
-        let _environment = crate::test_env::ScopedEnv::set([("PATH", joined)]);
         let account_home = super::super::canonical_account_home().unwrap();
         let current_executable = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
         let args = [OsString::from("install"), OsString::from("lpm@1.2.3")];
@@ -1968,12 +1965,12 @@ mod tests {
         let bound = match mode.as_str() {
             "fixture" => None,
             "sanitize" => {
-                let sanitized = sanitized_current_path(Some(&excluded_root)).unwrap();
+                let sanitized = sanitized_path(&joined, Some(&excluded_root)).unwrap();
                 assert_eq!(std::env::split_paths(&sanitized).count(), entry_count);
                 None
             }
             "bind" => {
-                let sanitized = sanitized_current_path(Some(&excluded_root)).unwrap();
+                let sanitized = sanitized_path(&joined, Some(&excluded_root)).unwrap();
                 let bound = BoundUpdateCommand::bind(
                     "npm",
                     &args,
@@ -2845,11 +2842,7 @@ mod tests {
         std::fs::write(untrusted.join("identity"), "replacement").unwrap();
         let alias = directory.path().join("alias");
         lpm_common::create_dir_symlink_or_junction(&trusted, &alias).unwrap();
-        let sanitized = {
-            let _environment =
-                crate::test_env::ScopedEnv::set([("PATH", alias.as_os_str().to_owned())]);
-            sanitized_current_path(None).unwrap()
-        };
+        let sanitized = sanitized_path(alias.as_os_str(), None).unwrap();
         lpm_common::remove_path_entry(&alias).unwrap();
         lpm_common::create_dir_symlink_or_junction(&untrusted, &alias).unwrap();
         let entries = std::env::split_paths(&sanitized).collect::<Vec<_>>();
@@ -2889,11 +2882,7 @@ mod tests {
         let alias = shared.join("alias");
         symlink(&trusted, &alias).unwrap();
         symlink(alias.join("node"), bin.join("node")).unwrap();
-        let sanitized = {
-            let _environment =
-                crate::test_env::ScopedEnv::set([("PATH", bin.as_os_str().to_owned())]);
-            sanitized_current_path(None).unwrap()
-        };
+        let sanitized = sanitized_path(bin.as_os_str(), None).unwrap();
         std::fs::remove_file(&alias).unwrap();
         symlink(&replacement, &alias).unwrap();
         let _ = Command::new("/usr/bin/env")
@@ -2963,11 +2952,7 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         symlink(component.join("../../trusted/node"), bin.join("node")).unwrap();
-        let sanitized = {
-            let _environment =
-                crate::test_env::ScopedEnv::set([("PATH", bin.as_os_str().to_owned())]);
-            sanitized_current_path(None).unwrap()
-        };
+        let sanitized = sanitized_path(bin.as_os_str(), None).unwrap();
         std::fs::remove_dir(&component).unwrap();
         symlink(replacement.join("tree/child"), &component).unwrap();
         let _ = Command::new("/usr/bin/env")

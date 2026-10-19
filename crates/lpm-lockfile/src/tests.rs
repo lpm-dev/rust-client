@@ -4529,7 +4529,12 @@ fn validated_workspace_projection_does_not_recompute_loaded_package_addresses() 
     union
         .absorb_importer("packages/app", importer_lockfile("app-dep", "1.0.0"))
         .unwrap();
-    let encoded = union.to_toml().expect("serialize workspace union");
+    // Text no other test parses: the process-wide parse cache answers a text
+    // parsed before, counting no load.
+    let encoded = format!(
+        "{}\n# validated_workspace_projection_does_not_recompute_loaded_package_addresses\n",
+        union.to_toml().expect("serialize workspace union")
+    );
     crate::model::reset_workspace_package_id_call_count();
     let validated =
         crate::ValidatedLockfile::from_toml(&encoded).expect("validate workspace union");

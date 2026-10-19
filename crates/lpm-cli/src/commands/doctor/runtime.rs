@@ -184,6 +184,11 @@ mod tests {
     #[test]
     fn system_runtime_probe_does_not_inherit_ambient_secrets() {
         use std::os::unix::fs::PermissionsExt as _;
+        if !crate::test_env::alone_in_a_process(
+            "commands::doctor::runtime::tests::system_runtime_probe_does_not_inherit_ambient_secrets",
+        ) {
+            return;
+        }
 
         let project = tempfile::tempdir().unwrap();
         let bin = tempfile::tempdir().unwrap();
@@ -196,9 +201,7 @@ mod tests {
         let mut permissions = node.metadata().unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&node, permissions).unwrap();
-        let prior_path = std::env::var_os("PATH");
-        let prior_secret = std::env::var_os("LPM_DOCTOR_RUNTIME_UNIQUE_SECRET");
-        // SAFETY: both variables are restored before the test returns.
+        // SAFETY: this process runs only this test, on one thread.
         unsafe {
             std::env::set_var("PATH", bin.path());
             std::env::set_var("LPM_DOCTOR_RUNTIME_UNIQUE_SECRET", "must-not-leak");
@@ -206,14 +209,6 @@ mod tests {
 
         let version = get_system_node_version(project.path());
 
-        match prior_path {
-            Some(value) => unsafe { std::env::set_var("PATH", value) },
-            None => unsafe { std::env::remove_var("PATH") },
-        }
-        match prior_secret {
-            Some(value) => unsafe { std::env::set_var("LPM_DOCTOR_RUNTIME_UNIQUE_SECRET", value) },
-            None => unsafe { std::env::remove_var("LPM_DOCTOR_RUNTIME_UNIQUE_SECRET") },
-        }
         assert!(
             version.is_none(),
             "runtime probe inherited a secret: {version:?}"
