@@ -1,0 +1,16 @@
+[package]
+name = "lpm-skill"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent Skill file rules for LPM: frontmatter, publish limits, and security patterns"
+
+[dependencies]
+regex = "1"
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+
+[lints]
+workspace = true

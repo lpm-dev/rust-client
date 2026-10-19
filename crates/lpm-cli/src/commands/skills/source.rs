@@ -2,9 +2,7 @@ use super::AgentTarget;
 use flate2::read::GzDecoder;
 use futures::StreamExt;
 use lpm_common::LpmError;
-use lpm_security::skill_security::{
-    SkillSecuritySeverity, parse_agent_skill_frontmatter, scan_skill_content,
-};
+use lpm_skill::{SkillSecuritySeverity, parse_agent_skill_frontmatter, scan_skill_content};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};

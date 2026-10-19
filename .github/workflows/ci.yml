@@ -123,6 +123,9 @@ jobs:
       - name: Build portable env validator
         run: cargo build --locked --release -p lpm-env-wasm --target wasm32-unknown-unknown
 
+      - name: Build portable skill validator
+        run: cargo build --locked --release -p lpm-skill-wasm --target wasm32-unknown-unknown
+
       - name: Check formatting
         run: cargo fmt --check
 
@@ -196,6 +199,9 @@ jobs:
 
       - name: Portable env decoder regression
         run: python3 -m unittest discover -s scripts/tests -p test_export_env_validator.py
+
+      - name: Portable skill decoder regression
+        run: python3 -m unittest discover -s scripts/tests -p test_export_skill_validator.py
 
       - name: npm wrapper tests
         run: npm --prefix npm/cli test

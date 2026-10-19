@@ -19,7 +19,7 @@ use super::provenance::{
 };
 use super::quality_gate::run_publish_quality_gate;
 use super::secret_scan::run_publish_secret_scan;
-use super::skills::{ManifestWriteMode, compute_published_skills_digest, ensure_lpm_in_files};
+use super::skills::compute_published_skills_digest;
 use super::target::resolve_targets;
 use super::types::{
     LpmPublicationStatus, NpmTargetArtifact, NpmTargetArtifactInput, PublicationWaitResult,
@@ -1033,7 +1033,6 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
     npm_version_preflighted: bool,
 ) -> Result<PreparedPublish, LpmError> {
     let publish_started = std::time::Instant::now();
-    let mut publish_manifest = publish_manifest;
     let (targets, target_names) = resolve_publish_targets(
         &publish_manifest,
         cli_npm,
@@ -1091,19 +1090,11 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
         }
 
         let has_authored_skills = !validation.validated_files.is_empty();
-        if has_authored_skills && targets_lpm {
-            if !json_output {
-                install_ui::done_untrusted(&format!(
-                    "{} skill(s) validated",
-                    validation.valid_files.len()
-                ));
-            }
-            let write_mode = if dry_run || check_only {
-                ManifestWriteMode::ReadOnly
-            } else {
-                ManifestWriteMode::Persist
-            };
-            ensure_lpm_in_files(&mut publish_manifest, write_mode)?;
+        if has_authored_skills && targets_lpm && !json_output {
+            install_ui::done_untrusted(&format!(
+                "{} skill(s) validated",
+                validation.valid_files.len()
+            ));
         }
         validation.validated_files
     };
@@ -1128,7 +1119,7 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
     } = prepare_publish_project_from_manifest(
         publish_manifest,
         workspace,
-        Some(&validated_skills),
+        &validated_skills,
         !allow_secrets,
     )?;
     let publish_config_ref = publish_config.as_ref();

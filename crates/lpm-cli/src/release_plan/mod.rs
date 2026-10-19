@@ -723,14 +723,6 @@ pub(crate) use transaction::{
 };
 pub(crate) use version_git::create_version_commit_and_tag;
 
-pub(crate) fn write_publish_manifest_relative_durable(
-    parent: &cap_std::fs::Dir,
-    file_name: &OsStr,
-    bytes: &[u8],
-) -> std::io::Result<()> {
-    transaction::write_relative_file_durable(parent, file_name, bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

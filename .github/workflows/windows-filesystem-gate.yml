@@ -82,6 +82,7 @@ jobs:
           cargo test --locked -p lpm-cli --bin lpm-rs directory_transaction
           cargo test --locked -p lpm-cli --bin lpm-rs commands::add::paths::tests
           cargo test --locked -p lpm-cli --bin lpm-rs commands::remove::
+          cargo test --locked -p lpm-cli --bin lpm-rs publish_common::tests::a_required_entrypoint_
           cargo test --locked -p lpm-cli --bin lpm-rs install_recovery::
 
       - name: Windows uninstall cleanup contracts

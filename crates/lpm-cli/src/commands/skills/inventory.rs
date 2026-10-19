@@ -54,7 +54,7 @@ impl DashboardAction {
 pub(super) struct SecurityFinding {
     pub(super) rule_id: String,
     pub(super) category: String,
-    pub(super) severity: lpm_security::skill_security::SkillSecuritySeverity,
+    pub(super) severity: lpm_skill::SkillSecuritySeverity,
     pub(super) path: String,
     pub(super) line: usize,
 }
@@ -73,9 +73,7 @@ impl SecurityAssessment {
     pub(super) fn scanned(findings: Vec<SecurityFinding>) -> Self {
         let warning_count = findings
             .iter()
-            .filter(|finding| {
-                finding.severity == lpm_security::skill_security::SkillSecuritySeverity::Warning
-            })
+            .filter(|finding| finding.severity == lpm_skill::SkillSecuritySeverity::Warning)
             .count();
         let block_count = findings.len() - warning_count;
         Self {
@@ -399,9 +397,9 @@ fn parse_detail_frontmatter(
         );
     };
     let (metadata, body, warnings) = if kind == SkillInventoryKind::Package {
-        lpm_security::skill_security::parse_skill_frontmatter(raw)
+        lpm_skill::parse_skill_frontmatter(raw)
     } else {
-        lpm_security::skill_security::parse_agent_skill_frontmatter(raw)
+        lpm_skill::parse_agent_skill_frontmatter(raw)
     };
     (
         SkillContentMetadata {
@@ -528,11 +526,9 @@ fn package_inventory(project_dir: &Path) -> Result<Vec<SkillInventoryItem>, LpmE
                 .to_string();
             observed.insert(name.clone());
             let (content, security) = read_and_scan(&path);
-            let description = content.as_deref().and_then(|content| {
-                lpm_security::skill_security::parse_skill_frontmatter(content)
-                    .0
-                    .description
-            });
+            let description = content
+                .as_deref()
+                .and_then(|content| lpm_skill::parse_skill_frontmatter(content).0.description);
             let context_tokens = content
                 .as_deref()
                 .map(|content| content.chars().count().div_ceil(4));
@@ -670,7 +666,7 @@ pub(super) fn read_and_scan(path: &Path) -> (Option<String>, SecurityAssessment)
         || path.display().to_string(),
         |name| name.to_string_lossy().into(),
     );
-    let findings = lpm_security::skill_security::scan_skill_content(&content)
+    let findings = lpm_skill::scan_skill_content(&content)
         .into_iter()
         .map(|finding| SecurityFinding {
             rule_id: finding.rule_id,
@@ -734,7 +730,7 @@ pub(super) fn read_and_scan_directory(directory: &Path) -> DirectoryAssessment {
         };
         context_chars = context_chars.saturating_add(content.chars().count());
         findings.extend(
-            lpm_security::skill_security::scan_skill_content(&content)
+            lpm_skill::scan_skill_content(&content)
                 .into_iter()
                 .map(|finding| SecurityFinding {
                     rule_id: finding.rule_id,

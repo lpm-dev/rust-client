@@ -1,0 +1,21 @@
+[package]
+name = "lpm-skill-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+base64 = { workspace = true }
+lpm-skill = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+wasm-bindgen = "=0.2.122"
+
+[lints]
+workspace = true
