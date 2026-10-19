@@ -565,6 +565,98 @@ pub(super) fn validate_global_uninstall_project_scoped_flags(
     Ok(())
 }
 
+/// The project a project-scoped command run in `cwd` acts on: the nearest
+/// directory at or above it holding a `package.json` or an `lpm.json`,
+/// stopping before the home directory; `cwd` itself when there is none. Says
+/// which directory it chose when it isn't `cwd`. User-typed relative paths
+/// still resolve against `cwd`, the process's directory.
+pub(super) fn project_root_for(cwd: &std::path::Path, json_output: bool) -> std::path::PathBuf {
+    let home = dirs::home_dir();
+    let root = lpm_workspace::find_project_config_root(cwd, home.as_deref())
+        .unwrap_or_else(|| cwd.to_path_buf());
+    if root != cwd && !json_output {
+        crate::install_ui::phase_untrusted(&format!(
+            "Using the project at {} (nearest package.json or lpm.json).",
+            root.display(),
+        ));
+    }
+    root
+}
+
+pub(super) use crate::project_fs::project_relative_path;
+
+/// The package a package-management command run in `cwd` acts on: the
+/// nearest directory at or above it with a `package.json`, stopping before
+/// the home directory; `cwd` when there is none, so the command reports the
+/// missing manifest itself.
+pub(super) fn package_root_for(cwd: &std::path::Path, json_output: bool) -> std::path::PathBuf {
+    package_root_below(cwd, dirs::home_dir().as_deref(), json_output)
+}
+
+fn package_root_below(
+    cwd: &std::path::Path,
+    home: Option<&std::path::Path>,
+    json_output: bool,
+) -> std::path::PathBuf {
+    let root = lpm_workspace::find_package_root(cwd, home).unwrap_or_else(|| cwd.to_path_buf());
+    if root != cwd && !json_output {
+        crate::install_ui::phase_untrusted(&format!(
+            "No package.json in {}; using {} (nearest ancestor manifest).",
+            cwd.display(),
+            root.display(),
+        ));
+    }
+    root
+}
+
+/// [`project_root_for`] for a command that writes project state, which it
+/// refuses where the project's `.lpm` would be the LPM home itself: in the
+/// home directory with no project around it, or in a project that is the
+/// home directory.
+pub(super) fn project_root_for_state(
+    cwd: &std::path::Path,
+    json_output: bool,
+) -> Result<std::path::PathBuf, lpm_common::LpmError> {
+    let root = project_root_for(cwd, json_output);
+    let state = lpm_common::project_state_dir(&root);
+    let is_lpm_home = lpm_common::LpmRoot::from_env()
+        .is_ok_and(|home| lpm_common::LpmRoot::from_dir(&state).identity() == home.identity());
+    if is_lpm_home {
+        let is_project = root.join("package.json").is_file() || root.join("lpm.json").is_file();
+        return Err(lpm_common::LpmError::ProjectFile(if is_project {
+            format!(
+                "{} is LPM's own home, so the project can't keep its state there; set \
+                 LPM_HOME to a directory outside the project",
+                state.display()
+            )
+        } else {
+            format!(
+                "{} is not inside a project: its .lpm is LPM's own home. Run the command in \
+                 a directory with a package.json or an lpm.json",
+                root.display()
+            )
+        }));
+    }
+    Ok(root)
+}
+
+/// The directory whose `.npmrc` installs read for `cwd`, the workspace root
+/// or else the nearest `package.json` directory, for commands that write a
+/// project `.npmrc`; `cwd` without a `package.json` around it, where npm
+/// itself reads one.
+pub(super) fn npmrc_project_dir(cwd: &std::path::Path, json_output: bool) -> std::path::PathBuf {
+    let home = dirs::home_dir();
+    let dir = lpm_registry::npmrc::project_npmrc_dir(cwd, home.as_deref())
+        .unwrap_or_else(|| cwd.to_path_buf());
+    if dir != cwd && !json_output {
+        crate::install_ui::phase_untrusted(&format!(
+            "Writing the .npmrc that installs read, at {}.",
+            dir.display(),
+        ));
+    }
+    dir
+}
+
 /// Resolve the directory that the install dispatcher should treat as
 /// the project root for this invocation. Three outcomes:
 ///
@@ -1714,6 +1806,34 @@ mod tests {
             err.to_string()
                 .contains("requires a refresh-backed `lpm login` session"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_package_command_finds_no_manifest_above_the_home_directory() {
+        let parent = tempfile::tempdir().unwrap();
+        std::fs::write(
+            parent.path().join("package.json"),
+            r#"{"name":"parent","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        // The home directory inside a project, as a container with a root
+        // `package.json` and `HOME=/root` lays one out.
+        let home = parent.path().join("home");
+        let work = home.join("work");
+        let package = home.join("package/src");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            home.join("package/package.json"),
+            r#"{"name":"package","version":"1.0.0"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(package_root_below(&work, Some(&home), true), work);
+        assert_eq!(
+            package_root_below(&package, Some(&home), true),
+            home.join("package")
         );
     }
 }

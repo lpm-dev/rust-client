@@ -1205,6 +1205,108 @@ pub fn find_project_root(start_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// The package a command run in `start_dir` acts on: the nearest directory
+/// at or above it that holds a `package.json`. The search stops before
+/// `home`, so neither a stray `~/package.json` nor a project the home
+/// directory sits in makes one. `None` when no such directory is found.
+pub fn find_package_root(start_dir: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    nearest_below_home(start_dir, home, |directory| {
+        directory.join("package.json").is_file()
+    })
+}
+
+/// The project a command run in `start_dir` acts on: the nearest directory
+/// at or above it that holds a `package.json` or an `lpm.json`. The search
+/// stops before `home`, so a stray `~/package.json` never makes the home
+/// directory a project. `None` when no such directory is found.
+pub fn find_project_config_root(start_dir: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    nearest_below_home(start_dir, home, |directory| {
+        directory.join("package.json").is_file() || directory.join("lpm.json").is_file()
+    })
+}
+
+/// Whether `a` and `b` name the same directory, by name or by identity, as
+/// a link or another spelling of the same path does.
+pub fn is_same_directory(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (directory_identity(a), directory_identity(b)),
+            (Some(a), Some(b)) if a == b
+        )
+}
+
+/// What tells two names of one directory apart from two directories.
+#[derive(PartialEq, Eq)]
+enum DirectoryIdentity {
+    #[cfg(unix)]
+    Inode { device: u64, inode: u64 },
+    #[cfg(windows)]
+    Handle(same_file::Handle),
+}
+
+/// The identity of the directory at `path`, following links; `None` for
+/// anything else. On Unix it comes from metadata, which needs no read access
+/// to the directory and opens nothing, so a FIFO there can't block it; on
+/// Windows from a handle opened without access rights.
+fn directory_identity(path: &Path) -> Option<DirectoryIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = std::fs::metadata(path).ok()?;
+        metadata.is_dir().then(|| DirectoryIdentity::Inode {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // `FILE_FLAG_BACKUP_SEMANTICS`, without which a directory doesn't
+        // open; `same_file::Handle::from_path` would ask to read it too.
+        const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        if !std::fs::metadata(path).ok()?.is_dir() {
+            return None;
+        }
+        let directory = std::fs::OpenOptions::new()
+            .access_mode(0)
+            .custom_flags(BACKUP_SEMANTICS)
+            .open(path)
+            .ok()?;
+        same_file::Handle::from_file(directory)
+            .ok()
+            .map(DirectoryIdentity::Handle)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// The nearest of `start_dir` and its ancestors that `matches`, searching
+/// no further than the directory below `home`. The home directory is
+/// recognized by identity as well as by name, so `HOME` set through a link,
+/// or `/tmp` for the `/private/tmp` the working directory reads as, still
+/// stops the search.
+fn nearest_below_home(
+    start_dir: &Path,
+    home: Option<&Path>,
+    matches: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let home_identity = home.and_then(directory_identity);
+    let is_home = |directory: &Path| {
+        home == Some(directory)
+            || home_identity
+                .as_ref()
+                .is_some_and(|home| directory_identity(directory).as_ref() == Some(home))
+    };
+    start_dir
+        .ancestors()
+        .take_while(|directory| !is_home(directory))
+        .find(|directory| matches(directory))
+        .map(Path::to_path_buf)
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct PnpmWorkspaceManifest {
     #[serde(default)]
@@ -1777,6 +1879,130 @@ pub fn collect_all_dependencies(workspace: &Workspace) -> HashMap<String, String
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn project_config_root_is_the_nearest_package_json_or_lpm_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let nested = project.join("src/deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(project.join("lpm.json"), "{}").unwrap();
+
+        assert_eq!(
+            find_project_config_root(&nested, None),
+            Some(project.clone())
+        );
+
+        std::fs::write(project.join("src/package.json"), "{}").unwrap();
+        assert_eq!(
+            find_project_config_root(&nested, None),
+            Some(project.join("src"))
+        );
+    }
+
+    #[test]
+    fn project_config_root_never_reaches_the_home_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let nested = home.join("notes/drafts");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(home.join("package.json"), "{}").unwrap();
+
+        assert_eq!(find_project_config_root(&nested, Some(&home)), None);
+        assert_eq!(find_project_config_root(&home, Some(&home)), None);
+    }
+
+    /// `parent/package.json` around a home directory with an empty `work`
+    /// directory and a package of its own.
+    fn home_inside_a_project(tmp: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let parent = tmp.join("parent");
+        let home = parent.join("home");
+        std::fs::create_dir_all(home.join("work")).unwrap();
+        std::fs::create_dir_all(home.join("package/src")).unwrap();
+        std::fs::write(parent.join("package.json"), "{}").unwrap();
+        std::fs::write(parent.join("lpm.json"), "{}").unwrap();
+        std::fs::write(home.join("package/package.json"), "{}").unwrap();
+        (parent, home.join("work"), home.join("package"))
+    }
+
+    #[test]
+    fn package_root_stops_before_the_home_directory_and_finds_a_package_below_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (parent, work, package) = home_inside_a_project(tmp.path());
+        let home = parent.join("home");
+
+        assert_eq!(find_package_root(&work, Some(&home)), None);
+        assert_eq!(
+            find_package_root(&package.join("src"), Some(&home)),
+            Some(package)
+        );
+        assert_eq!(find_package_root(&work, None), Some(parent));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_home_boundary_holds_however_a_path_spells_the_home_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (parent, work, package) = home_inside_a_project(tmp.path());
+        // `HOME` names a link to the directory the walk passes through.
+        let linked_home = tmp.path().join("linked-home");
+        std::os::unix::fs::symlink(parent.join("home"), &linked_home).unwrap();
+
+        assert_eq!(find_package_root(&work, Some(&linked_home)), None);
+        assert_eq!(find_project_config_root(&work, Some(&linked_home)), None);
+        assert_eq!(
+            find_package_root(&package.join("src"), Some(&linked_home)),
+            Some(package.clone())
+        );
+        assert_eq!(
+            find_project_config_root(&package.join("src"), Some(&linked_home)),
+            Some(package)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_home_boundary_needs_no_read_access_to_the_home_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (parent, work, _) = home_inside_a_project(tmp.path());
+        let home = parent.join("home");
+        let linked_home = tmp.path().join("linked-home");
+        std::os::unix::fs::symlink(&home, &linked_home).unwrap();
+        // Searchable but not readable, as an account's home can be.
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o111)).unwrap();
+
+        let package_root = find_package_root(&work, Some(&linked_home));
+        let project_root = find_project_config_root(&work, Some(&linked_home));
+        let same = is_same_directory(&home, &linked_home);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(package_root, None);
+        assert_eq!(project_root, None);
+        assert!(same);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_home_that_is_no_directory_doesn_t_hold_up_the_search() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (parent, work, _) = home_inside_a_project(tmp.path());
+        // A FIFO, which opening for reading waits on.
+        let fifo = tmp.path().join("home-fifo");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(find_package_root(&work, Some(&fifo)));
+        });
+
+        let found = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the search waited on the FIFO");
+        assert_eq!(found, Some(parent));
+    }
 
     fn create_package_json(dir: &Path, content: &str) {
         fs::write(dir.join("package.json"), content).unwrap();

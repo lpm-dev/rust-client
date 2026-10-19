@@ -83,7 +83,7 @@ mod parse;
 mod types;
 
 pub use config::NpmrcConfig;
-pub use discovery::LayerDiscovery;
+pub use discovery::{LayerDiscovery, project_npmrc_dir};
 pub use types::{
     AuthScope, OriginKey, OriginTlsOverrides, RegistryAuth, RegistryKind, RegistryTarget,
     TaggedBool, TaggedPath, TaggedRoot, TlsOverrides,

@@ -4,6 +4,9 @@ use super::arguments::Scope;
 use lpm_common::LpmError;
 use std::path::Path;
 
+/// Where `lpm env generate` writes without `--out-dir`, at the project root.
+pub(super) const DEFAULT_OUT_DIR: &str = "env.generated";
+
 pub(super) fn run(
     project: &Path,
     environment: Option<&str>,
