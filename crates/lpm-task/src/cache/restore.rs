@@ -1497,62 +1497,16 @@ fn publish_staged_file(
     destination_parent: &Dir,
     destination_name: &std::ffi::OsStr,
 ) -> Result<(), LpmError> {
-    use std::io::{Read as _, Seek as _, Write as _};
-
-    let mut source = source.into_std();
-    let metadata = source.metadata()?;
-    source.rewind()?;
     let (temporary_name, temporary) = create_private_restore_file(destination_parent)?;
-    let mut temporary = temporary.into_std();
     let result = (|| {
-        let size = metadata.len();
-        {
-            let mut limited = (&mut source).take(size);
-            std::io::copy(&mut limited, &mut temporary)?;
-            if limited.limit() != 0 {
-                return Err(LpmError::Task(
-                    "staged task cache output became shorter while it was copied".into(),
-                ));
-            }
-        }
-        let mut extra = [0u8; 1];
-        if source.read(&mut extra)? != 0 || source.metadata()?.len() != size {
-            return Err(LpmError::Task(
-                "staged task cache output changed size while it was copied".into(),
-            ));
-        }
-        temporary.set_times(std::fs::FileTimes::new().set_modified(metadata.modified()?))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            temporary.set_permissions(std::fs::Permissions::from_mode(
-                metadata.permissions().mode() & 0o777,
-            ))?;
-        }
-        temporary.flush()?;
-        sync_restore_file(&temporary)?;
-        let temporary_identity = same_file::Handle::from_file(temporary.try_clone()?)?;
-        drop(temporary);
-        match source_parent.remove_file_or_symlink(source_name) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        destination_parent.hard_link(Path::new(&temporary_name), source_parent, source_name)?;
-        let receipt = open_optional_regular_file(
+        let temporary_identity = copy_staged_file(source, temporary)?;
+        link_publication_receipt(
+            destination_parent,
+            &temporary_name,
             source_parent,
-            source_name.as_os_str(),
-            "task cache restore publication receipt",
-        )?
-        .ok_or_else(|| {
-            LpmError::Task("task cache restore publication receipt disappeared".into())
-        })?;
-        if same_file::Handle::from_file(receipt.into_std())? != temporary_identity {
-            return Err(LpmError::Task(
-                "task cache restore publication receipt changed while it was created".into(),
-            ));
-        }
-        sync_cap_directory(source_parent)?;
+            source_name,
+            &temporary_identity,
+        )?;
         match rename_staged_file_noreplace(
             destination_parent,
             Path::new(&temporary_name),
@@ -1577,6 +1531,115 @@ fn publish_staged_file(
     result
 }
 
+/// Copies the verified staged output, read through its open handle, into
+/// `temporary` with its modification time and mode, durably, and closes
+/// both, as FAT can't rename or remove a name a handle holds open.
+fn copy_staged_file(
+    source: cap_std::fs::File,
+    temporary: cap_std::fs::File,
+) -> Result<same_file::Handle, LpmError> {
+    use std::io::{Read as _, Seek as _, Write as _};
+
+    let mut source = source.into_std();
+    let metadata = source.metadata()?;
+    source.rewind()?;
+    let mut temporary = temporary.into_std();
+    let size = metadata.len();
+    {
+        let mut limited = (&mut source).take(size);
+        std::io::copy(&mut limited, &mut temporary)?;
+        if limited.limit() != 0 {
+            return Err(LpmError::Task(
+                "staged task cache output became shorter while it was copied".into(),
+            ));
+        }
+    }
+    let mut extra = [0u8; 1];
+    if source.read(&mut extra)? != 0 || source.metadata()?.len() != size {
+        return Err(LpmError::Task(
+            "staged task cache output changed size while it was copied".into(),
+        ));
+    }
+    drop(source);
+    temporary.set_times(std::fs::FileTimes::new().set_modified(metadata.modified()?))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temporary.set_permissions(std::fs::Permissions::from_mode(
+            metadata.permissions().mode() & 0o777,
+        ))?;
+    }
+    temporary.flush()?;
+    sync_restore_file(&temporary)?;
+    Ok(same_file::Handle::from_file(temporary)?)
+}
+
+/// Replaces the staged output with a hard link to its published copy,
+/// which recovery takes as proof that the published file is the restore's
+/// own. A volume without hard links, as exFAT and FAT are, keeps the
+/// staged file, and recovery leaves a new output it can't prove is its
+/// own where it is.
+fn link_publication_receipt(
+    destination_parent: &Dir,
+    temporary_name: &str,
+    source_parent: &Dir,
+    source_name: &Path,
+    temporary_identity: &same_file::Handle,
+) -> Result<(), LpmError> {
+    let receipt_name = random_private_name(".lpm-cache-receipt-")?;
+    match destination_parent.hard_link(
+        Path::new(temporary_name),
+        source_parent,
+        Path::new(&receipt_name),
+    ) {
+        Ok(()) => {}
+        Err(error) if volume_lacks_hard_links(&error) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    let receipt = open_optional_regular_file(
+        source_parent,
+        std::ffi::OsStr::new(&receipt_name),
+        "task cache restore publication receipt",
+    )?
+    .ok_or_else(|| LpmError::Task("task cache restore publication receipt disappeared".into()))?;
+    if &same_file::Handle::from_file(receipt.into_std())? != temporary_identity {
+        let _ = source_parent.remove_file_or_symlink(&receipt_name);
+        return Err(LpmError::Task(
+            "task cache restore publication receipt changed while it was created".into(),
+        ));
+    }
+    source_parent.rename(Path::new(&receipt_name), source_parent, source_name)?;
+    sync_cap_directory(source_parent)?;
+    Ok(())
+}
+
+/// Whether a hard link failed because the volume keeps none: exFAT and FAT
+/// report `ENOTSUP` on macOS, `EPERM` on Linux, and
+/// `ERROR_INVALID_FUNCTION` or `ERROR_NOT_SUPPORTED` on Windows.
+fn volume_lacks_hard_links(error: &std::io::Error) -> bool {
+    let Some(code) = error.raw_os_error() else {
+        return false;
+    };
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use rustix::io::Errno;
+
+        let unsupported = [Errno::NOTSUP, Errno::OPNOTSUPP];
+        #[cfg(target_os = "linux")]
+        let unsupported = [unsupported[0], unsupported[1], Errno::PERM];
+        unsupported.iter().any(|errno| errno.raw_os_error() == code)
+    }
+    #[cfg(windows)]
+    {
+        matches!(code, 1 | 50)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        let _ = code;
+        false
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn rename_staged_file_noreplace(
     source_parent: &Dir,
@@ -1586,14 +1649,37 @@ fn rename_staged_file_noreplace(
 ) -> Result<(), std::io::Error> {
     use rustix::fs::{RenameFlags, renameat_with};
 
-    renameat_with(
+    match renameat_with(
         source_parent,
         source_name,
         destination_parent,
         Path::new(destination_name),
         RenameFlags::NOREPLACE,
-    )
-    .map_err(std::io::Error::from)
+    ) {
+        Err(error) if lacks_noreplace_rename(error) => {
+            // exFAT and FAT on macOS have no rename that refuses an existing
+            // name, so this checks, then renames, which leaves a window
+            // such a volume can't close.
+            match destination_parent.symlink_metadata(destination_name) {
+                Ok(_) => Err(std::io::ErrorKind::AlreadyExists.into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    source_parent.rename(source_name, destination_parent, destination_name)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        result => result.map_err(std::io::Error::from),
+    }
+}
+
+/// Whether a no-replace rename failed because the volume has none, as
+/// exFAT and FAT on macOS report. Linux gives `ENOTSUP` and `EOPNOTSUPP` one
+/// number.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn lacks_noreplace_rename(error: rustix::io::Errno) -> bool {
+    use rustix::io::Errno;
+
+    error == Errno::NOTSUP || error == Errno::OPNOTSUPP || error == Errno::INVAL
 }
 
 #[cfg(windows)]
@@ -1977,7 +2063,12 @@ impl RestoreTransaction {
                 RenameFlags::NOREPLACE,
             ) {
                 Ok(()) => {}
-                Err(error) if tree_stays_for_files(&std::io::Error::from(error)) => continue,
+                Err(error)
+                    if lacks_noreplace_rename(error)
+                        || tree_stays_for_files(&std::io::Error::from(error)) =>
+                {
+                    continue;
+                }
                 Err(error) => return Err(std::io::Error::from(error).into()),
             }
             let destination = match self.project.open_dir_nofollow(&root) {

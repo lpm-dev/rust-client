@@ -2792,6 +2792,62 @@ mod tests {
         }
     }
 
+    /// exFAT and FAT drives, as external and removable disks often are,
+    /// keep no hard links and no Unix ownership.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restore_works_on_volumes_without_hard_links() {
+        for filesystem in ["ExFAT", "MS-DOS FAT32"] {
+            let directory = tempfile::tempdir().unwrap();
+            let image = directory.path().join("volume.dmg");
+            let mount_point = directory.path().join("mounted");
+            fs::create_dir(&mount_point).unwrap();
+            let _attached = lpm_common::test_disk_image::AttachedImage::new(
+                &image,
+                &mount_point,
+                &["-size", "64m", "-fs", filesystem, "-volname", "LPMTASK"],
+                &[],
+            );
+            let cache = TestCache::new();
+            let outputs = ["dist/**".to_string(), "out/**".to_string()];
+            let project = mount_point.join("project");
+            fs::create_dir_all(project.join("dist/nested")).unwrap();
+            fs::create_dir_all(project.join("out")).unwrap();
+            fs::write(project.join("dist/value.txt"), "cached").unwrap();
+            fs::write(project.join("dist/nested/deep.txt"), "cached deep").unwrap();
+            fs::write(project.join("out/tree.txt"), "cached tree").unwrap();
+            let key = unique_key("no-hard-links");
+            cache
+                .store(&key, &project, "build", &outputs, "", "", 1)
+                .unwrap_or_else(|error| panic!("{filesystem}: store failed: {error}"));
+            fs::write(project.join("dist/value.txt"), "changed").unwrap();
+            fs::remove_dir_all(project.join("dist/nested")).unwrap();
+            fs::remove_dir_all(project.join("out")).unwrap();
+            fs::write(project.join("dist/stale.txt"), "stale").unwrap();
+
+            cache
+                .restore(&key, &project, &outputs)
+                .unwrap_or_else(|error| panic!("{filesystem}: restore failed: {error}"));
+
+            assert_eq!(
+                fs::read_to_string(project.join("dist/value.txt")).unwrap(),
+                "cached",
+                "{filesystem}"
+            );
+            assert_eq!(
+                fs::read_to_string(project.join("dist/nested/deep.txt")).unwrap(),
+                "cached deep",
+                "{filesystem}"
+            );
+            assert_eq!(
+                fs::read_to_string(project.join("out/tree.txt")).unwrap(),
+                "cached tree",
+                "{filesystem}"
+            );
+            assert!(!project.join("dist/stale.txt").exists(), "{filesystem}");
+        }
+    }
+
     #[test]
     fn restore_keeps_a_file_whose_directory_was_renamed_only_in_case() {
         let cache = TestCache::new();
