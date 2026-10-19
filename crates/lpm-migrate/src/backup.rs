@@ -1,307 +1,797 @@
-//! Persistent migration snapshots and rollback within a project boundary.
+//! Migration snapshots in `<project>/.lpm/migrate-backup/` and a rollback
+//! that undoes only what the migration wrote.
+//!
+//! The store holds a copy of each managed file as it was before the first
+//! migration, named by its SHA-256, and a manifest recording, per file, that
+//! original and what the migration left there. A rollback restores a file
+//! only while it still holds what the migration wrote, or is missing; a file
+//! changed since, one whose migration stopped before recording what it
+//! wrote, or one a later migration found holding content LPM can't
+//! attribute, is reported and left alone unless the caller forces it. One
+//! migration or rollback runs in a project at a time.
 
 mod files;
 
 use lpm_common::LpmError;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
-const MANIFEST_FILENAME: &str = ".lpm-migrate-manifest.json";
-const MANIFEST_VERSION: u32 = 2;
+const LEGACY_MANIFEST_FILENAME: &str = ".lpm-migrate-manifest.json";
+const BACKUP_DIR: &str = "migrate-backup";
+const BLOBS_DIR: &str = "files";
+const MANIFEST_FILE: &str = "manifest.json";
+const MANIFEST_VERSION: u32 = 3;
+/// In the state directory beside the store, which a rollback removes.
+const LOCK_FILE: &str = "migrate.lock";
 
-#[derive(Debug, Deserialize, Serialize)]
-struct BackupEntry {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Original {
+    sha256: String,
+    mode: u32,
+}
+
+/// What the migration left at a path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum Written {
+    File {
+        sha256: String,
+    },
+    Absent,
+    /// Imported from a backup an earlier CLI made, which didn't record it.
+    Unknown,
+}
+
+/// What a migration found at a path whose content LPM couldn't attribute
+/// to an earlier one, and which differed from the original.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum Found {
+    File { sha256: String },
+    Absent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Entry {
+    /// Project-relative, `/`-separated.
+    path: String,
+    /// `None` when the file didn't exist before the migration.
+    original: Option<Original>,
+    /// `None` until the migration records what it wrote, and after a
+    /// migration that stopped first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    written: Option<Written>,
+    /// What migrations wrote over that LPM couldn't attribute, from the one
+    /// overwritten longest ago to the latest, each one the store keeps; a
+    /// rollback replaces it only when forced.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    found: Vec<Found>,
+}
+
+impl Entry {
+    /// Whether LPM knows what the migration left at the path.
+    fn attributed(&self) -> bool {
+        matches!(self.written, Some(Written::File { .. } | Written::Absent))
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Manifest {
+    version: u32,
+    entries: Vec<Entry>,
+    #[serde(default)]
+    created_directories: Vec<String>,
+    /// The SHA-256 of the earlier CLI's manifest this one was imported
+    /// from, so a load can finish removing what the import superseded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    imported_legacy: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyEntry {
     original: String,
     backup: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct Manifest {
-    #[serde(default = "legacy_version")]
-    version: u32,
+#[derive(Debug, Deserialize)]
+struct LegacyManifest {
     #[serde(default)]
-    backups: Vec<BackupEntry>,
+    backups: Vec<LegacyEntry>,
     #[serde(default)]
     created: Vec<String>,
 }
 
-fn legacy_version() -> u32 {
-    1
+/// Tracks the files a migration manages across retries until a rollback.
+#[derive(Debug)]
+pub struct MigrationBackup {
+    project_dir: PathBuf,
+    entries: Vec<Entry>,
+    tracked: HashSet<String>,
+    created_directories: Vec<String>,
+    /// The backup earlier migrations left, which a failed migration puts
+    /// back.
+    earlier: Option<Manifest>,
+    /// The paths this migration backed up, with what each held before it.
+    before: HashMap<String, Option<Original>>,
+    finished: bool,
+    /// Set while importing an earlier CLI's backup; see
+    /// [`Manifest::imported_legacy`].
+    imported_legacy: Option<String>,
+    _lock: Option<MigrationLock>,
 }
 
-/// Tracks original files across migration retries until rollback or cleanup.
-#[derive(Debug, Default)]
-pub struct MigrationBackup {
-    backups: Vec<(PathBuf, PathBuf, bool)>,
-    project_dir: Option<PathBuf>,
-    tracked: HashSet<PathBuf>,
+/// Held while a migration or a rollback runs, so another one in the same
+/// project can't prune the copies it relies on or act on files this one
+/// is about to change. A migration takes it before it reads what it
+/// migrates.
+pub struct MigrationLock {
+    _held: lpm_common::SingleFileExclusiveLockHandle,
+}
+
+impl std::fmt::Debug for MigrationLock {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("MigrationLock")
+    }
+}
+
+impl MigrationLock {
+    /// Waits for any other migration or rollback of `project_dir`.
+    pub fn acquire(project_dir: &Path) -> Result<Self, LpmError> {
+        let state = lpm_common::ensure_project_state_dir(project_dir)?;
+        let file = lpm_common::open_lock_file_nofollow(&state.join(LOCK_FILE))?;
+        Ok(Self {
+            _held: lpm_common::acquire_single_file_exclusive_lock_from_file(file)?,
+        })
+    }
+}
+
+/// The outcome of [`rollback_from_backups`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RollbackReport {
+    /// Files restored, and `<path> (removed)` for files the migration created.
+    pub restored: Vec<String>,
 }
 
 impl MigrationBackup {
-    /// Create an empty tracker. Use `for_project` to resume persistent snapshots.
-    pub fn new() -> Self {
-        Self::default()
+    /// Loads the snapshots of earlier migrations of `project_dir`, importing
+    /// a backup an earlier CLI made beside the files. A file changed since
+    /// a migration wrote it is snapshotted again as it is now, so a rollback
+    /// undoes only LPM's writes.
+    pub fn for_project(project_dir: &Path) -> Result<Self, LpmError> {
+        Self::for_project_locked(project_dir, MigrationLock::acquire(project_dir)?)
     }
 
-    /// Load and validate the original snapshots from an earlier migration.
-    pub fn for_project(project_dir: &Path) -> Result<Self, LpmError> {
-        let mut tracker = Self {
-            backups: Vec::new(),
-            project_dir: Some(project_dir.to_path_buf()),
-            tracked: HashSet::new(),
+    /// [`Self::for_project`] under `lock`, which the migration took before
+    /// it read what it migrates.
+    pub fn for_project_locked(project_dir: &Path, lock: MigrationLock) -> Result<Self, LpmError> {
+        let mut tracker = Self::empty(project_dir);
+        tracker._lock = Some(lock);
+        let manifest = read_or_import_manifest(project_dir)?;
+        let Some(manifest) = manifest else {
+            return Ok(tracker);
         };
-        if let Some(manifest) = read_manifest(project_dir)? {
-            let entries = manifest_entries(project_dir, manifest)?;
-            validate_entries(project_dir, &entries)?;
-            tracker.tracked = entries.iter().map(|(path, _, _)| path.clone()).collect();
-            tracker.backups = entries;
+        validate_manifest(project_dir, &manifest)?;
+        tracker.created_directories = manifest.created_directories;
+        let mut resnapshot = false;
+        for mut entry in manifest.entries {
+            let path = project_dir.join(&entry.path);
+            let current = files::current_state(project_dir, &path)?;
+            let changed_since = match &entry.written {
+                Some(Written::File { sha256 }) => {
+                    current.as_ref().map(|(current, _)| current) != Some(sha256)
+                }
+                Some(Written::Absent) => current.is_some(),
+                Some(Written::Unknown) | None => false,
+            };
+            if changed_since {
+                // What the file holds now is the user's, and LPM leaves it
+                // there unless this migration writes the file: a later edit
+                // is then a change after the migration, not content LPM
+                // can't attribute.
+                entry.written = Some(match &current {
+                    Some((sha256, _)) => Written::File {
+                        sha256: sha256.clone(),
+                    },
+                    None => Written::Absent,
+                });
+                entry.original = match current {
+                    Some(_) => Some(tracker.store(&path)?),
+                    None => None,
+                };
+                entry.found.clear();
+                resnapshot = true;
+            }
+            tracker.tracked.insert(entry.path.clone());
+            tracker.entries.push(entry);
         }
+        if resnapshot {
+            tracker.write_manifest()?;
+        }
+        tracker.prune_store()?;
+        tracker.earlier = Some(Manifest {
+            version: MANIFEST_VERSION,
+            entries: tracker.entries.clone(),
+            created_directories: tracker.created_directories.clone(),
+            imported_legacy: None,
+        });
         Ok(tracker)
     }
 
-    /// Preserve a file once, or record its absence before the first write.
+    fn empty(project_dir: &Path) -> Self {
+        Self {
+            project_dir: project_dir.to_path_buf(),
+            entries: Vec::new(),
+            tracked: HashSet::new(),
+            created_directories: Vec::new(),
+            earlier: None,
+            before: HashMap::new(),
+            finished: false,
+            imported_legacy: None,
+            _lock: None,
+        }
+    }
+
+    /// Snapshots `path` once, or records that it is absent, before the
+    /// migration first writes it. For a path an earlier migration manages,
+    /// contents LPM can't attribute to it are kept as found, since they may
+    /// be the user's, beside the original the backup keeps.
     pub fn backup_file(&mut self, path: &Path) -> Result<(), LpmError> {
-        let root = self.project_dir.as_deref().unwrap_or_else(|| {
-            path.ancestors()
-                .skip(1)
-                .find(|ancestor| ancestor.is_dir())
-                .unwrap_or(Path::new("."))
-        });
-        files::validate(root, path)?;
-        if self.tracked.contains(path) {
+        let root = self.project_dir.clone();
+        files::validate(&root, path)?;
+        let rel = portable(files::relative(&root, path)?);
+        reject_reserved(&rel)?;
+        if self.before.contains_key(&rel) {
             return Ok(());
         }
-        let backup = backup_path(path);
-        files::validate(root, &backup)?;
-        if files::exists(root, &backup)? {
-            return Err(LpmError::Script(format!(
-                "refusing to replace an untracked backup {}; restore or move it before migration",
-                backup.display()
-            )));
+        let before = if files::exists(&root, path)? {
+            Some(self.store(path)?)
+        } else {
+            None
+        };
+        if self.tracked.contains(&rel) {
+            let entry = self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.path == rel)
+                .ok_or_else(|| LpmError::Script("migration backup lost an entry".into()))?;
+            let found = match &before {
+                Some(found) => Found::File {
+                    sha256: found.sha256.clone(),
+                },
+                None => Found::Absent,
+            };
+            let differs = before.as_ref().map(|found| &found.sha256)
+                != entry.original.as_ref().map(|original| &original.sha256);
+            if !entry.attributed() && differs {
+                // Found again, it is the newest copy.
+                entry.found.retain(|kept| kept != &found);
+                entry.found.push(found);
+            }
+            entry.written = None;
+            self.before.insert(rel, before);
+            return Ok(());
         }
-        let existed = files::exists(root, path)?;
-        if existed {
-            files::create_backup(root, path, &backup)?;
+        let mut ancestor = path.parent();
+        let mut missing = Vec::new();
+        while let Some(directory) = ancestor
+            && directory != root
+            && files::directory_missing(&root, directory)?
+        {
+            missing.push(portable(files::relative(&root, directory)?));
+            ancestor = directory.parent();
         }
-        self.tracked.insert(path.to_path_buf());
-        self.backups.push((path.to_path_buf(), backup, existed));
+        for directory in missing.into_iter().rev() {
+            if !self.created_directories.contains(&directory) {
+                self.created_directories.push(directory);
+            }
+        }
+        self.tracked.insert(rel.clone());
+        self.entries.push(Entry {
+            path: rel.clone(),
+            original: before.clone(),
+            written: None,
+            found: Vec::new(),
+        });
+        self.before.insert(rel, before);
         Ok(())
     }
 
-    /// Validate a batch before taking snapshots and persist its inventory before writes.
+    /// Validates a batch, snapshots it, and persists the inventory before
+    /// any of it is written.
     pub fn backup_files(&mut self, project_dir: &Path, paths: &[&Path]) -> Result<(), LpmError> {
+        debug_assert_eq!(project_dir, self.project_dir);
         for path in paths {
             files::validate(project_dir, path)?;
-            if !self.tracked.contains(*path) {
-                let backup = backup_path(path);
-                if files::exists(project_dir, &backup)? {
-                    return Err(LpmError::Script(format!(
-                        "refusing to replace an untracked backup {}; restore or move it before migration",
-                        backup.display()
-                    )));
-                }
-            }
         }
         for path in paths {
             if let Err(error) = self.backup_file(path) {
-                self.write_manifest(project_dir)?;
+                self.write_manifest()?;
                 return Err(error);
             }
         }
-        self.write_manifest(project_dir)
+        self.write_manifest()
     }
 
-    /// Restore snapshots without deleting recovery state, so a failed rollback can be retried.
-    pub fn rollback(&self) -> Result<(), LpmError> {
-        let plans = self
-            .backups
-            .iter()
-            .map(|(original, backup, existed)| {
-                let root = self
-                    .project_dir
-                    .as_deref()
-                    .unwrap_or_else(|| original.parent().unwrap_or(Path::new(".")));
-                files::Restore::prepare(root, original, backup, *existed)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        for mut plan in plans {
-            plan.apply()?;
+    /// Records what the migration left at each path it backed up, so a
+    /// later rollback can tell LPM's writes from the user's. Call after
+    /// writes, on success and on every failure that keeps the migration.
+    pub fn seal(&mut self) -> Result<(), LpmError> {
+        if self.finished {
+            return Ok(());
         }
-        Ok(())
+        for entry in &mut self.entries {
+            if !self.before.contains_key(&entry.path) {
+                continue;
+            }
+            let path = self.project_dir.join(&entry.path);
+            entry.written = Some(match files::current_state(&self.project_dir, &path)? {
+                Some((sha256, _)) => Written::File { sha256 },
+                None => Written::Absent,
+            });
+        }
+        self.write_manifest()
     }
 
-    /// Persist the original snapshot inventory before a managed file changes.
-    pub fn write_manifest(&self, project_dir: &Path) -> Result<(), LpmError> {
-        let mut manifest = Manifest {
-            version: MANIFEST_VERSION,
-            backups: Vec::new(),
-            created: Vec::new(),
+    /// Within the failed migration that is running, restores each path it
+    /// backed up to what it held before, and puts back the backup earlier
+    /// migrations left, or removes the backup when there was none.
+    pub fn rollback(&mut self) -> Result<(), LpmError> {
+        let Some((_, blobs)) = files::backup_store(&self.project_dir, false)? else {
+            return Ok(());
         };
-        for (original, backup, existed) in &self.backups {
-            let original = files::relative(project_dir, original)?
-                .to_string_lossy()
-                .replace('\\', "/");
-            if *existed {
-                manifest.backups.push(BackupEntry {
-                    original,
-                    backup: files::relative(project_dir, backup)?
-                        .to_string_lossy()
-                        .replace('\\', "/"),
-                });
-            } else {
-                manifest.created.push(original);
+        for entry in &self.entries {
+            let Some(before) = self.before.get(&entry.path) else {
+                continue;
+            };
+            files::restore(
+                &self.project_dir,
+                &self.project_dir.join(&entry.path),
+                &blobs,
+                before
+                    .as_ref()
+                    .map(|original| (original.sha256.as_str(), original.mode)),
+            )?;
+        }
+        // Windows can't remove a directory that a handle holds open.
+        drop(blobs);
+        match self.earlier.take() {
+            Some(earlier) => {
+                let created: Vec<String> = self
+                    .created_directories
+                    .iter()
+                    .filter(|directory| !earlier.created_directories.contains(directory))
+                    .cloned()
+                    .collect();
+                remove_created_directories(&self.project_dir, &created)?;
+                self.entries = earlier.entries;
+                self.created_directories = earlier.created_directories;
+                self.write_manifest()?;
+                self.prune_store()?;
+            }
+            None => {
+                remove_created_directories(&self.project_dir, &self.created_directories)?;
+                remove_store(&self.project_dir)?;
             }
         }
-        files::write(
-            project_dir,
-            &project_dir.join(MANIFEST_FILENAME),
-            &serde_json::to_vec_pretty(&manifest)?,
-        )
+        self.finished = true;
+        Ok(())
     }
 
-    /// Remove snapshots after the caller accepts the migration.
-    pub fn cleanup_backups(&self) -> Result<(), LpmError> {
-        for (original, backup, existed) in &self.backups {
-            if *existed {
-                let root = self
-                    .project_dir
-                    .as_deref()
-                    .unwrap_or_else(|| original.parent().unwrap_or(Path::new(".")));
-                files::remove(root, backup)?;
-            }
-        }
-        let root = self
-            .project_dir
-            .as_deref()
-            .or_else(|| self.backups.first().and_then(|(path, _, _)| path.parent()));
-        if let Some(root) = root {
-            files::remove(root, &root.join(MANIFEST_FILENAME))?;
-        }
-        Ok(())
+    /// Removes the stored copies no entry refers to.
+    fn prune_store(&self) -> Result<(), LpmError> {
+        let Some((_, blobs)) = files::backup_store(&self.project_dir, false)? else {
+            return Ok(());
+        };
+        let referenced: HashSet<&str> = self
+            .entries
+            .iter()
+            .flat_map(|entry| {
+                let found = entry.found.iter().filter_map(|found| match found {
+                    Found::File { sha256 } => Some(sha256.as_str()),
+                    Found::Absent => None,
+                });
+                entry
+                    .original
+                    .as_ref()
+                    .map(|original| original.sha256.as_str())
+                    .into_iter()
+                    .chain(found)
+            })
+            .collect();
+        files::remove_blobs_except(&blobs, &referenced)
+    }
+
+    fn store(&self, path: &Path) -> Result<Original, LpmError> {
+        let (_, blobs) = files::backup_store(&self.project_dir, true)?
+            .ok_or_else(|| LpmError::Script("could not create the migration backup".into()))?;
+        let (sha256, mode) = files::store_blob(&self.project_dir, path, &blobs)?;
+        Ok(Original { sha256, mode })
+    }
+
+    fn write_manifest(&self) -> Result<(), LpmError> {
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            entries: self.entries.clone(),
+            created_directories: self.created_directories.clone(),
+            imported_legacy: self.imported_legacy.clone(),
+        };
+        let (backup, _) = files::backup_store(&self.project_dir, true)?
+            .ok_or_else(|| LpmError::Script("could not create the migration backup".into()))?;
+        lpm_common::write_file_atomic_in_dir_with_options(
+            &backup,
+            std::ffi::OsStr::new(MANIFEST_FILE),
+            lpm_common::AtomicWriteOptions::new()
+                .unix_mode(0o600)
+                .sync_file()
+                .sync_parent(),
+            |file| -> Result<(), LpmError> {
+                std::io::Write::write_all(file, &serde_json::to_vec_pretty(&manifest)?)?;
+                Ok(())
+            },
+        )
     }
 }
 
-fn backup_path(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_os_string();
-    name.push(".backup");
-    PathBuf::from(name)
+enum Decision<'a> {
+    Unchanged,
+    Restore,
+    Changed,
+    Unattributed,
+    Found(&'a [Found]),
+}
+
+/// Where the backup in `project_dir` keeps what migrations found, newest
+/// first, as paths that resolve from any directory.
+fn describe_found(project_dir: &Path, versions: &[Found]) -> String {
+    let kept: Vec<String> = versions
+        .iter()
+        .rev()
+        .filter_map(|found| match found {
+            Found::File { sha256 } => Some(
+                project_dir
+                    .join(lpm_common::PROJECT_STATE_DIR)
+                    .join(BACKUP_DIR)
+                    .join(BLOBS_DIR)
+                    .join(sha256)
+                    .display()
+                    .to_string(),
+            ),
+            Found::Absent => None,
+        })
+        .collect();
+    let missing = versions.contains(&Found::Absent);
+    match (kept.is_empty(), missing) {
+        (false, false) => format!("kept at {}", kept.join(", ")),
+        (false, true) => format!("kept at {}; missing before a migration", kept.join(", ")),
+        (true, _) => "missing before a migration".to_owned(),
+    }
+}
+
+/// Whether `project_dir` holds a migration backup, in the store or in the
+/// form an earlier CLI left beside the files.
+pub fn has_backup(project_dir: &Path) -> bool {
+    project_dir
+        .join(lpm_common::PROJECT_STATE_DIR)
+        .join(BACKUP_DIR)
+        .join(MANIFEST_FILE)
+        .exists()
+        || project_dir.join(LEGACY_MANIFEST_FILENAME).exists()
+}
+
+/// Undoes a previous migration of `project_dir`: restores each managed file
+/// that still holds what the migration wrote, or is missing, and removes the
+/// files and directories it created. When a file changed since, or LPM
+/// can't tell whether it holds the migration's write, nothing is restored
+/// unless `force` is set, which restores it anyway. A complete rollback
+/// removes the backup.
+pub fn rollback_from_backups(project_dir: &Path, force: bool) -> Result<RollbackReport, LpmError> {
+    if !has_backup(project_dir) {
+        return Ok(RollbackReport::default());
+    }
+    let _lock = MigrationLock::acquire(project_dir)?;
+    let backup = MigrationBackup::load_for_rollback(project_dir)?;
+    let Some((_, blobs)) = files::backup_store(project_dir, false)? else {
+        return Ok(RollbackReport::default());
+    };
+    let mut plans = Vec::with_capacity(backup.entries.len());
+    let mut changed = Vec::new();
+    let mut unattributed = Vec::new();
+    let mut found = Vec::new();
+    for entry in &backup.entries {
+        let path = project_dir.join(&entry.path);
+        let current = files::current_state(project_dir, &path)?;
+        let original = entry.original.as_ref().map(|original| &original.sha256);
+        let current_sha = current.as_ref().map(|(sha256, _)| sha256);
+        // A complete rollback removes the backup, and with it what
+        // migrations found, so that takes `force` whatever the file holds.
+        let decision = if !entry.found.is_empty() {
+            Decision::Found(&entry.found)
+        } else if current_sha == original {
+            Decision::Unchanged
+        } else if current.is_none() {
+            Decision::Restore
+        } else {
+            match &entry.written {
+                Some(Written::File { sha256 }) if current_sha == Some(sha256) => Decision::Restore,
+                Some(Written::File { .. } | Written::Absent) => Decision::Changed,
+                Some(Written::Unknown) | None => Decision::Unattributed,
+            }
+        };
+        match decision {
+            Decision::Changed => changed.push(entry.path.clone()),
+            Decision::Unattributed => unattributed.push(entry.path.clone()),
+            Decision::Found(versions) => found.push(format!(
+                "{} ({})",
+                entry.path,
+                describe_found(project_dir, versions)
+            )),
+            Decision::Unchanged | Decision::Restore => {}
+        }
+        plans.push((entry, path, decision));
+    }
+    if !force && (!changed.is_empty() || !unattributed.is_empty() || !found.is_empty()) {
+        let mut reasons = Vec::with_capacity(3);
+        if !changed.is_empty() {
+            reasons.push(format!(
+                "these files changed after the migration: {}",
+                changed.join(", ")
+            ));
+        }
+        if !unattributed.is_empty() {
+            reasons.push(format!(
+                "LPM can't tell whether these files hold what the migration wrote, because it \
+                 stopped before recording it or an earlier CLI made it: {}",
+                unattributed.join(", ")
+            ));
+        }
+        if !found.is_empty() {
+            reasons.push(format!(
+                "migrations wrote over content in these files that LPM can't attribute to an \
+                 earlier one, which the backup keeps, newest first: {}",
+                found.join(", ")
+            ));
+        }
+        return Err(LpmError::ProjectFile(format!(
+            "{}; so nothing was restored. Run `lpm migrate --rollback --force` to restore the \
+             copies the backup keeps from before the migrations anyway, or restore them yourself",
+            reasons.join("; ")
+        )));
+    }
+    let mut report = RollbackReport::default();
+    for (entry, path, decision) in plans {
+        if matches!(decision, Decision::Unchanged) {
+            continue;
+        }
+        let stored = entry
+            .original
+            .as_ref()
+            .map(|original| (original.sha256.as_str(), original.mode));
+        if files::restore(project_dir, &path, &blobs, stored)? {
+            report.restored.push(match stored {
+                Some(_) => entry.path.clone(),
+                None => format!("{} (removed)", entry.path),
+            });
+        }
+    }
+    // Windows can't remove a directory that a handle holds open.
+    drop(blobs);
+    remove_created_directories(project_dir, &backup.created_directories)?;
+    remove_store(project_dir)?;
+    Ok(report)
+}
+
+impl MigrationBackup {
+    fn load_for_rollback(project_dir: &Path) -> Result<Self, LpmError> {
+        let manifest = read_or_import_manifest(project_dir)?;
+        let manifest = manifest.unwrap_or_default();
+        validate_manifest(project_dir, &manifest)?;
+        let mut backup = Self::empty(project_dir);
+        backup.tracked = manifest
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+        backup.entries = manifest.entries;
+        backup.created_directories = manifest.created_directories;
+        Ok(backup)
+    }
+}
+
+fn remove_created_directories(project_dir: &Path, directories: &[String]) -> Result<(), LpmError> {
+    let mut directories: Vec<&String> = directories.iter().collect();
+    directories.sort_by_key(|directory| std::cmp::Reverse(directory.matches('/').count()));
+    for directory in directories {
+        files::remove_empty_directory(project_dir, &project_dir.join(directory))?;
+    }
+    Ok(())
+}
+
+fn remove_store(project_dir: &Path) -> Result<(), LpmError> {
+    let project = cap_std::fs::Dir::open_ambient_dir(project_dir, cap_std::ambient_authority())?;
+    let state = match cap_fs_ext::DirExt::open_dir_nofollow(&project, lpm_common::PROJECT_STATE_DIR)
+    {
+        Ok(state) => state,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    match state.remove_dir_all(BACKUP_DIR) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn read_manifest(project_dir: &Path) -> Result<Option<Manifest>, LpmError> {
-    let path = project_dir.join(MANIFEST_FILENAME);
-    let Some(contents) = files::read(project_dir, &path, lpm_common::STATE_FILE_SIZE_CAP_BYTES)?
-    else {
+    let Some((backup, _)) = files::backup_store(project_dir, false)? else {
         return Ok(None);
     };
-    let manifest: Manifest = serde_json::from_slice(&contents)
-        .map_err(|error| LpmError::Script(format!("failed to parse backup manifest: {error}")))?;
-    if !matches!(manifest.version, 1 | MANIFEST_VERSION) {
+    let mut options = cap_std::fs::OpenOptions::new();
+    cap_fs_ext::OpenOptionsFollowExt::follow(options.read(true), cap_fs_ext::FollowSymlinks::No);
+    let file = match backup.open_with(MANIFEST_FILE, &options) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let (contents, _) = lpm_common::read_text_file_capped_from_open_file(
+        file.into_std(),
+        Path::new(MANIFEST_FILE),
+        lpm_common::STATE_FILE_SIZE_CAP_BYTES,
+    )
+    .map_err(|error| LpmError::Script(format!("failed to read the migration backup: {error}")))?;
+    let manifest: Manifest = serde_json::from_str(&contents).map_err(|error| {
+        LpmError::Script(format!("failed to parse the migration backup: {error}"))
+    })?;
+    if manifest.version != MANIFEST_VERSION {
         return Err(LpmError::Script(format!(
-            "unsupported backup manifest version {}",
+            "unsupported migration backup version {}",
             manifest.version
         )));
     }
     Ok(Some(manifest))
 }
 
-fn manifest_entries(
-    project_dir: &Path,
-    manifest: Manifest,
-) -> Result<Vec<(PathBuf, PathBuf, bool)>, LpmError> {
-    let mut entries = Vec::with_capacity(manifest.backups.len() + manifest.created.len());
-    let mut paths = HashSet::with_capacity(entries.capacity() * 2);
-    for entry in manifest.backups {
+/// Moves a backup an earlier CLI made, `.lpm-migrate-manifest.json` and
+/// `<file>.backup` copies beside the files, into the store. It recorded
+/// nothing about what the migration wrote, so a rollback of it restores a
+/// changed file only when forced.
+/// The store's manifest, after finishing the cleanup of an earlier CLI's
+/// backup an import left, or the one imported from that backup.
+fn read_or_import_manifest(project_dir: &Path) -> Result<Option<Manifest>, LpmError> {
+    let Some(manifest) = read_manifest(project_dir)? else {
+        return import_legacy(project_dir);
+    };
+    if let Some(imported) = &manifest.imported_legacy
+        && let Some((contents, legacy)) = read_legacy_manifest(project_dir)?
+        && &sha256_hex(&contents) == imported
+    {
+        remove_legacy_backup(project_dir, &legacy)?;
+    }
+    Ok(Some(manifest))
+}
+
+fn read_legacy_manifest(project_dir: &Path) -> Result<Option<(Vec<u8>, LegacyManifest)>, LpmError> {
+    let Some(contents) = files::read(
+        project_dir,
+        &project_dir.join(LEGACY_MANIFEST_FILENAME),
+        lpm_common::STATE_FILE_SIZE_CAP_BYTES,
+    )?
+    else {
+        return Ok(None);
+    };
+    let legacy = serde_json::from_slice(&contents)
+        .map_err(|error| LpmError::Script(format!("failed to parse backup manifest: {error}")))?;
+    Ok(Some((contents, legacy)))
+}
+
+/// Removes the copies an earlier CLI kept beside the files, then its
+/// manifest, once the store holds them.
+fn remove_legacy_backup(project_dir: &Path, legacy: &LegacyManifest) -> Result<(), LpmError> {
+    for entry in &legacy.backups {
+        files::remove(
+            project_dir,
+            &resolve_manifest_path(project_dir, &entry.backup)?,
+        )?;
+    }
+    files::remove(project_dir, &project_dir.join(LEGACY_MANIFEST_FILENAME))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+fn import_legacy(project_dir: &Path) -> Result<Option<Manifest>, LpmError> {
+    let Some((contents, legacy)) = read_legacy_manifest(project_dir)? else {
+        return Ok(None);
+    };
+    let mut backup = MigrationBackup::empty(project_dir);
+    for entry in &legacy.backups {
         let original = resolve_manifest_path(project_dir, &entry.original)?;
-        let backup = resolve_manifest_path(project_dir, &entry.backup)?;
-        if !entry.backup.ends_with(".backup")
-            || !paths.insert(original.clone())
-            || !paths.insert(backup.clone())
-        {
+        let copy = resolve_manifest_path(project_dir, &entry.backup)?;
+        if !entry.backup.ends_with(".backup") {
             return Err(LpmError::Script(
                 "conflicting or invalid backup manifest paths".into(),
             ));
         }
-        entries.push((original, backup, true));
-    }
-    for entry in manifest.created {
-        let path = resolve_manifest_path(project_dir, &entry)?;
-        if !paths.insert(path.clone()) {
+        let rel = portable(files::relative(project_dir, &original)?);
+        reject_reserved(&rel)?;
+        if !backup.tracked.insert(rel.clone()) {
             return Err(LpmError::Script("duplicate backup manifest path".into()));
         }
-        entries.push((path.clone(), backup_path(&path), false));
+        // The copy's own mode is all an earlier release left of the
+        // original's; on Unix it kept every copy owner-only.
+        let (sha256, mode) = {
+            let (_, blobs) = files::backup_store(project_dir, true)?
+                .ok_or_else(|| LpmError::Script("could not create the migration backup".into()))?;
+            files::store_blob(project_dir, &copy, &blobs)?
+        };
+        backup.entries.push(Entry {
+            path: rel,
+            original: Some(Original { sha256, mode }),
+            written: Some(Written::Unknown),
+            found: Vec::new(),
+        });
     }
-    for path in paths {
-        let rel = files::relative(project_dir, &path)?;
-        if rel == Path::new(MANIFEST_FILENAME) || rel.starts_with(".git") {
-            return Err(LpmError::Script(
-                "backup manifest targets reserved project state".into(),
-            ));
+    for created in &legacy.created {
+        let path = resolve_manifest_path(project_dir, created)?;
+        let rel = portable(files::relative(project_dir, &path)?);
+        reject_reserved(&rel)?;
+        if !backup.tracked.insert(rel.clone()) {
+            return Err(LpmError::Script("duplicate backup manifest path".into()));
         }
+        backup.entries.push(Entry {
+            path: rel,
+            original: None,
+            written: Some(Written::Unknown),
+            found: Vec::new(),
+        });
     }
-    Ok(entries)
+    backup.imported_legacy = Some(sha256_hex(&contents));
+    backup.write_manifest()?;
+    remove_legacy_backup(project_dir, &legacy)?;
+    read_manifest(project_dir)
 }
 
-fn validate_entries(
-    project_dir: &Path,
-    entries: &[(PathBuf, PathBuf, bool)],
-) -> Result<(), LpmError> {
-    for (original, backup, existed) in entries {
-        files::Restore::prepare(project_dir, original, backup, *existed)?;
+fn validate_manifest(project_dir: &Path, manifest: &Manifest) -> Result<(), LpmError> {
+    let mut seen = HashSet::with_capacity(manifest.entries.len());
+    for entry in &manifest.entries {
+        reject_reserved(&entry.path)?;
+        resolve_manifest_path(project_dir, &entry.path)?;
+        if !seen.insert(entry.path.as_str()) {
+            return Err(LpmError::Script("duplicate backup manifest path".into()));
+        }
+    }
+    for directory in &manifest.created_directories {
+        reject_reserved(directory)?;
+        resolve_manifest_path(project_dir, directory)?;
     }
     Ok(())
 }
 
-/// Restore every validated snapshot, then remove backups and recovery state.
-/// Legacy manifests and root-level backup files use the same containment checks.
-pub fn rollback_from_backups(project_dir: &Path) -> Result<Vec<String>, LpmError> {
-    let manifest = match read_manifest(project_dir)? {
-        Some(manifest) => manifest,
-        None => {
-            let mut manifest = Manifest {
-                version: MANIFEST_VERSION,
-                backups: Vec::new(),
-                created: Vec::new(),
-            };
-            for entry in std::fs::read_dir(project_dir)? {
-                let name = entry?.file_name().to_string_lossy().into_owned();
-                if let Some(original) = name.strip_suffix(".backup") {
-                    manifest.backups.push(BackupEntry {
-                        original: original.to_owned(),
-                        backup: name,
-                    });
-                }
-            }
-            manifest
-        }
-    };
-    let entries = manifest_entries(project_dir, manifest)?;
-    let mut plans = entries
-        .iter()
-        .map(|(original, backup, existed)| {
-            files::Restore::prepare(project_dir, original, backup, *existed)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut restored = Vec::with_capacity(plans.len());
-    for ((original, _, existed), plan) in entries.iter().zip(&mut plans) {
-        if plan.apply()? {
-            let name = relativize_to_posix(original, project_dir);
-            restored.push(if *existed {
-                name
-            } else {
-                format!("{name} (removed)")
-            });
-        }
+/// Rejects paths that are LPM's or git's own state rather than project files.
+fn reject_reserved(rel: &str) -> Result<(), LpmError> {
+    let first = rel.split('/').next().unwrap_or_default();
+    if rel.is_empty()
+        || first.eq_ignore_ascii_case(".git")
+        || first.eq_ignore_ascii_case(lpm_common::PROJECT_STATE_DIR)
+        || rel == LEGACY_MANIFEST_FILENAME
+    {
+        return Err(LpmError::Script(
+            "backup manifest targets reserved project state".into(),
+        ));
     }
-    for (original, backup, existed) in &entries {
-        if *existed {
-            files::remove(project_dir, backup)?;
-        } else {
-            files::cleanup_empty_parents(project_dir, original)?;
-        }
-    }
-    files::remove(project_dir, &project_dir.join(MANIFEST_FILENAME))?;
-    Ok(restored)
+    Ok(())
+}
+
+fn portable(rel: &Path) -> String {
+    rel.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Reject linked ancestors and non-regular destinations before migration writes.
@@ -338,7 +828,9 @@ pub fn write_output(project_dir: &Path, path: &Path, contents: &[u8]) -> Result<
 pub fn resolve_manifest_path(project_dir: &Path, rel: &str) -> Result<PathBuf, LpmError> {
     let rel_path = Path::new(rel);
 
-    if rel_path.is_absolute() {
+    // `/etc/passwd` is rooted but not absolute on Windows, which wants a
+    // drive too; it names no file in the project either way.
+    if rel_path.is_absolute() || rel_path.has_root() {
         return Err(LpmError::Script(format!(
             "backup manifest entry rejected: absolute path `{rel}` is not allowed"
         )));
@@ -407,693 +899,852 @@ pub fn resolve_manifest_path(project_dir: &Path, rel: &str) -> Result<PathBuf, L
     Ok(joined)
 }
 
-/// Convert an absolute path to a project-relative POSIX string for the
-/// manifest. Falls back to `path.display()` if the path can't be made
-/// relative — that's a programmer error (we should never back up a file
-/// outside the project root) but we don't want a panic in the rollback
-/// path.
-fn relativize_to_posix(path: &Path, project_dir: &Path) -> String {
-    let rel = path
-        .strip_prefix(project_dir)
-        .map_or_else(|_| path.to_path_buf(), |p| p.to_path_buf());
-
-    rel.components()
-        .filter_map(|c| match c {
-            Component::Normal(s) => s.to_str().map(String::from),
-            Component::CurDir => None,
-            // ParentDir / Prefix / RootDir shouldn't appear after a clean
-            // strip_prefix, but if they do we render them best-effort.
-            other => Some(format!("{}", other.as_os_str().to_string_lossy())),
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
 
-    #[test]
-    fn backup_and_rollback_cycle() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("lpm.lock");
+    fn project() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
 
-        // Create original file
-        fs::write(&file_path, "original content").unwrap();
+    fn migrate(project: &Path, files: &[(&str, &str)]) -> MigrationBackup {
+        let mut backup = MigrationBackup::for_project(project).unwrap();
+        let paths: Vec<PathBuf> = files.iter().map(|(path, _)| project.join(path)).collect();
+        let refs: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+        backup.backup_files(project, &refs).unwrap();
+        for (path, contents) in files {
+            let path = project.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+        backup.seal().unwrap();
+        backup
+    }
 
-        // Back it up
-        let mut backup = MigrationBackup::new();
-        backup.backup_file(&file_path).unwrap();
-
-        // Modify the file
-        fs::write(&file_path, "modified content").unwrap();
-        assert_eq!(fs::read_to_string(&file_path).unwrap(), "modified content");
-
-        // Rollback
-        backup.rollback().unwrap();
-        assert_eq!(fs::read_to_string(&file_path).unwrap(), "original content");
+    fn store(project: &Path) -> PathBuf {
+        project.join(".lpm").join(BACKUP_DIR)
     }
 
     #[test]
-    fn nonexistent_file_rollback_removes_new_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("lpm.lock");
+    fn backups_live_in_the_self_ignoring_state_directory() {
+        let dir = project();
+        fs::write(dir.path().join("package-lock.json"), "{}").unwrap();
 
-        // File doesn't exist yet
-        assert!(!file_path.exists());
+        migrate(
+            dir.path(),
+            &[("package-lock.json", "{}"), ("lpm.lock", "v1")],
+        );
 
-        // Back it up (records that it didn't exist)
-        let mut backup = MigrationBackup::new();
-        backup.backup_file(&file_path).unwrap();
-
-        // Create the file (simulating migration writing it)
-        fs::write(&file_path, "new content").unwrap();
-        assert!(file_path.exists());
-
-        // Rollback should remove it
-        backup.rollback().unwrap();
-        assert!(!file_path.exists());
+        assert!(store(dir.path()).join(MANIFEST_FILE).is_file());
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".lpm/.gitignore")).unwrap(),
+            lpm_common::project_state::PROJECT_STATE_IGNORE
+        );
+        assert!(!dir.path().join("package-lock.json.backup").exists());
+        assert!(!dir.path().join(LEGACY_MANIFEST_FILENAME).exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for entry in fs::read_dir(store(dir.path()).join(BLOBS_DIR)).unwrap() {
+                let mode = entry.unwrap().metadata().unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600);
+            }
+        }
     }
 
     #[test]
-    fn cleanup_removes_backup_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("lpm.lock");
+    fn rollback_undoes_the_migration_and_removes_the_backup() {
+        let dir = project();
+        fs::write(dir.path().join("package.json"), "original").unwrap();
+        migrate(
+            dir.path(),
+            &[("package.json", "migrated"), ("lpm.lock", "lock")],
+        );
 
-        fs::write(&file_path, "content").unwrap();
+        let report = rollback_from_backups(dir.path(), false).unwrap();
 
-        let mut backup = MigrationBackup::new();
-        backup.backup_file(&file_path).unwrap();
-
-        // Backup file should exist
-        let backup_path = dir.path().join("lpm.lock.backup");
-        assert!(backup_path.exists());
-
-        // Clean up
-        backup.cleanup_backups().unwrap();
-        assert!(!backup_path.exists());
-    }
-
-    // Extensionless dotfiles backup path
-    #[test]
-    fn backup_path_dotfile_without_extension() {
-        let dir = tempfile::tempdir().unwrap();
-        let npmrc = dir.path().join(".npmrc");
-        fs::write(&npmrc, "token=secret").unwrap();
-
-        let mut backup = MigrationBackup::new();
-        backup.backup_file(&npmrc).unwrap();
-
-        // Must be .npmrc.backup, NOT .npmrc.file.backup
-        let expected_backup = dir.path().join(".npmrc.backup");
-        assert!(expected_backup.exists(), "expected .npmrc.backup to exist");
-
-        // Roundtrip: rollback must restore to .npmrc
-        fs::write(&npmrc, "modified").unwrap();
-        backup.rollback().unwrap();
-        assert_eq!(fs::read_to_string(&npmrc).unwrap(), "token=secret");
+        assert_eq!(
+            report.restored,
+            ["package.json".to_owned(), "lpm.lock (removed)".to_owned()]
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("package.json")).unwrap(),
+            "original"
+        );
+        assert!(!dir.path().join("lpm.lock").exists());
+        assert!(!store(dir.path()).exists());
     }
 
     #[test]
-    fn backup_path_regular_extension() {
-        let dir = tempfile::tempdir().unwrap();
-        let lock = dir.path().join("package-lock.json");
-        fs::write(&lock, "{}").unwrap();
+    fn a_file_changed_after_the_migration_stops_the_rollback_until_forced() {
+        let dir = project();
+        fs::write(dir.path().join("package.json"), "original").unwrap();
+        migrate(
+            dir.path(),
+            &[("package.json", "migrated"), ("lpm.lock", "lock")],
+        );
+        fs::write(dir.path().join("lpm.lock"), "lock after lpm install foo").unwrap();
 
-        let mut backup = MigrationBackup::new();
-        backup.backup_file(&lock).unwrap();
+        let error = rollback_from_backups(dir.path(), false).unwrap_err();
 
-        let expected = dir.path().join("package-lock.json.backup");
-        assert!(expected.exists(), "expected package-lock.json.backup");
+        assert!(error.to_string().contains("lpm.lock"), "{error}");
+        assert!(error.to_string().contains("--force"), "{error}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("package.json")).unwrap(),
+            "migrated",
+            "nothing is restored while a file changed"
+        );
+        assert!(store(dir.path()).join(MANIFEST_FILE).exists());
+
+        let report = rollback_from_backups(dir.path(), true).unwrap();
+        assert_eq!(report.restored.len(), 2);
+        assert!(!dir.path().join("lpm.lock").exists());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("package.json")).unwrap(),
+            "original"
+        );
     }
 
     #[test]
-    fn rollback_from_backups_dotfile() {
-        let dir = tempfile::tempdir().unwrap();
-        let backup_path = dir.path().join(".npmrc.backup");
-        fs::write(&backup_path, "original").unwrap();
-        let npmrc = dir.path().join(".npmrc");
-        fs::write(&npmrc, "modified").unwrap();
+    fn a_file_deleted_after_the_migration_is_restored() {
+        let dir = project();
+        fs::write(dir.path().join("package-lock.json"), "npm lock").unwrap();
+        migrate(dir.path(), &[("package-lock.json", "npm lock")]);
+        fs::remove_file(dir.path().join("package-lock.json")).unwrap();
 
-        let restored = rollback_from_backups(dir.path()).unwrap();
-        assert!(restored.contains(&".npmrc".to_string()));
-        assert_eq!(fs::read_to_string(&npmrc).unwrap(), "original");
+        let report = rollback_from_backups(dir.path(), false).unwrap();
+
+        assert_eq!(report.restored, ["package-lock.json".to_owned()]);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("package-lock.json")).unwrap(),
+            "npm lock"
+        );
     }
 
-    // Backup permissions
     #[cfg(unix)]
     #[test]
-    fn backup_file_permissions_restricted() {
-        use std::os::unix::fs::PermissionsExt;
+    fn a_restored_file_keeps_its_original_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = project();
+        let script = dir.path().join("package.json");
+        fs::write(&script, "original").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        migrate(dir.path(), &[("package.json", "migrated")]);
 
-        let dir = tempfile::tempdir().unwrap();
-        let npmrc = dir.path().join(".npmrc");
-        fs::write(&npmrc, "token=secret").unwrap();
-        // Make it world-readable
-        fs::set_permissions(&npmrc, fs::Permissions::from_mode(0o644)).unwrap();
+        rollback_from_backups(dir.path(), false).unwrap();
 
-        let mut backup = MigrationBackup::new();
-        backup.backup_file(&npmrc).unwrap();
-
-        let backup_path = dir.path().join(".npmrc.backup");
-        let mode = fs::metadata(&backup_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(
-            mode, 0o600,
-            "backup should be owner-only (0600), got {:o}",
-            mode
-        );
-    }
-
-    // Manifest-based rollback
-    #[test]
-    fn rollback_from_backups_only_restores_manifested_files() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // Create two backup files
-        fs::write(dir.path().join(".npmrc.backup"), "real backup").unwrap();
-        fs::write(dir.path().join("rogue.txt.backup"), "injected").unwrap();
-
-        // Write v1-shape manifest (no `version` field) listing only .npmrc.
-        // Older LPM versions wrote this shape; the legacy scan path must
-        // still honor it after the v2 upgrade.
-        let manifest = serde_json::json!({
-            "backups": [
-                {"original": ".npmrc", "backup": ".npmrc.backup"}
-            ]
-        });
-        fs::write(
-            dir.path().join(".lpm-migrate-manifest.json"),
-            serde_json::to_string(&manifest).unwrap(),
-        )
-        .unwrap();
-
-        // Create target files
-        fs::write(dir.path().join(".npmrc"), "modified").unwrap();
-        fs::write(dir.path().join("rogue.txt"), "should stay").unwrap();
-
-        let restored = rollback_from_backups(dir.path()).unwrap();
-
-        // Only .npmrc should be restored
-        assert!(restored.contains(&".npmrc".to_string()));
-        assert!(!restored.contains(&"rogue.txt".to_string()));
-        assert_eq!(
-            fs::read_to_string(dir.path().join(".npmrc")).unwrap(),
-            "real backup"
-        );
-        assert_eq!(
-            fs::read_to_string(dir.path().join("rogue.txt")).unwrap(),
-            "should stay"
-        );
-        // rogue backup should still exist (not cleaned up)
-        assert!(dir.path().join("rogue.txt.backup").exists());
-    }
-
-    #[test]
-    fn rollback_from_backups_restores() {
-        let dir = tempfile::tempdir().unwrap();
-
-        // Create a backup file
-        let backup_path = dir.path().join("lpm.lock.backup");
-        fs::write(&backup_path, "original lockfile").unwrap();
-
-        // Create the current file (modified version)
-        let file_path = dir.path().join("lpm.lock");
-        fs::write(&file_path, "migrated lockfile").unwrap();
-
-        // Rollback from backups
-        let restored = rollback_from_backups(dir.path()).unwrap();
-
-        assert!(restored.contains(&"lpm.lock".to_string()));
-        assert_eq!(fs::read_to_string(&file_path).unwrap(), "original lockfile");
-        assert!(!backup_path.exists()); // Backup should be removed
-    }
-
-    #[test]
-    fn rollback_from_backups_empty_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let restored = rollback_from_backups(dir.path()).unwrap();
-        assert!(restored.is_empty());
-    }
-
-    #[test]
-    fn backup_multiple_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let lock_path = dir.path().join("lpm.lock");
-        let npmrc_path = dir.path().join(".npmrc");
-
-        fs::write(&lock_path, "old lock").unwrap();
-        fs::write(&npmrc_path, "old npmrc").unwrap();
-
-        let mut backup = MigrationBackup::new();
-        backup.backup_file(&lock_path).unwrap();
-        backup.backup_file(&npmrc_path).unwrap();
-
-        fs::write(&lock_path, "new lock").unwrap();
-        fs::write(&npmrc_path, "new npmrc").unwrap();
-
-        backup.rollback().unwrap();
-
-        assert_eq!(fs::read_to_string(&lock_path).unwrap(), "old lock");
-        assert_eq!(fs::read_to_string(&npmrc_path).unwrap(), "old npmrc");
-    }
-
-    #[test]
-    fn write_manifest_replaces_existing_file_without_mutating_other_hardlinks() {
-        let dir = tempfile::tempdir().unwrap();
-        let first_created = dir.path().join("first-created");
-        let second_created = dir.path().join("second-created");
-        let manifest_path = dir.path().join(MANIFEST_FILENAME);
-        let prior_manifest_link = dir.path().join("prior-manifest.json");
-
-        let mut backup = MigrationBackup::new();
-        backup.backup_file(&first_created).unwrap();
-        backup.write_manifest(dir.path()).unwrap();
-        fs::hard_link(&manifest_path, &prior_manifest_link).unwrap();
-        let prior_manifest = fs::read(&prior_manifest_link).unwrap();
-
-        backup.backup_file(&second_created).unwrap();
-        backup.write_manifest(dir.path()).unwrap();
-
-        assert_eq!(fs::read(&prior_manifest_link).unwrap(), prior_manifest);
-    }
-
-    #[test]
-    fn rollback_post_success_removes_newly_created_files() {
-        // Simulates: migrate creates lpm.lock (new) and backs up .npmrc (existed).
-        // After success, backups persist. `--rollback` should:
-        // - restore .npmrc from backup
-        // - remove the newly created lpm.lock
-        let dir = tempfile::tempdir().unwrap();
-
-        // .npmrc existed before migration
-        fs::write(dir.path().join(".npmrc"), "original npmrc").unwrap();
-
-        // Simulate migration: backup .npmrc, backup lpm.lock (doesn't exist yet)
-        let mut backup = MigrationBackup::new();
-        backup.backup_file(&dir.path().join(".npmrc")).unwrap();
-        backup.backup_file(&dir.path().join("lpm.lock")).unwrap(); // records as "did not exist"
-
-        // Migration writes new files
-        fs::write(dir.path().join(".npmrc"), "modified with @lpm.dev scope").unwrap();
-        fs::write(dir.path().join("lpm.lock"), "migrated lockfile content").unwrap();
-
-        // Write manifest (like migrate.rs does after success)
-        backup.write_manifest(dir.path()).unwrap();
-
-        // Verify manifest contains both categories
-        let manifest_content =
-            fs::read_to_string(dir.path().join(".lpm-migrate-manifest.json")).unwrap();
-        let manifest: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
-        assert_eq!(manifest["version"], 2);
-        assert!(
-            !manifest["backups"].as_array().unwrap().is_empty(),
-            "should have backup entries"
-        );
-        assert!(
-            !manifest["created"].as_array().unwrap().is_empty(),
-            "should have created entries"
-        );
-
-        // Now simulate `lpm migrate --rollback`
-        let restored = rollback_from_backups(dir.path()).unwrap();
-
-        // .npmrc should be restored from backup
-        assert!(
-            restored.iter().any(|r| r == ".npmrc"),
-            "should restore .npmrc, got: {:?}",
-            restored
-        );
-        assert_eq!(
-            fs::read_to_string(dir.path().join(".npmrc")).unwrap(),
-            "original npmrc"
-        );
-
-        // lpm.lock should be removed (it was newly created)
-        assert!(
-            restored.iter().any(|r| r.contains("lpm.lock")),
-            "should remove lpm.lock, got: {:?}",
-            restored
-        );
-        assert!(
-            !dir.path().join("lpm.lock").exists(),
-            "lpm.lock should have been removed"
-        );
-
-        // Manifest should be cleaned up
-        assert!(
-            !dir.path().join(".lpm-migrate-manifest.json").exists(),
-            "manifest should be removed after rollback"
+            fs::metadata(&script).unwrap().permissions().mode() & 0o777,
+            0o755
         );
     }
 
     #[test]
-    fn rollback_post_success_with_no_newly_created_files() {
-        // When all files existed before (e.g., --force overwrite), no "created" entries
-        let dir = tempfile::tempdir().unwrap();
-
-        fs::write(dir.path().join("lpm.lock"), "old lockfile").unwrap();
-        fs::write(dir.path().join(".npmrc"), "old npmrc").unwrap();
-
-        let mut backup = MigrationBackup::new();
-        backup.backup_file(&dir.path().join("lpm.lock")).unwrap();
-        backup.backup_file(&dir.path().join(".npmrc")).unwrap();
-
-        // Overwrite both
-        fs::write(dir.path().join("lpm.lock"), "new lockfile").unwrap();
-        fs::write(dir.path().join(".npmrc"), "new npmrc").unwrap();
-
-        backup.write_manifest(dir.path()).unwrap();
-
-        let restored = rollback_from_backups(dir.path()).unwrap();
-        assert_eq!(restored.len(), 2);
-        assert_eq!(
-            fs::read_to_string(dir.path().join("lpm.lock")).unwrap(),
-            "old lockfile"
-        );
-        assert_eq!(
-            fs::read_to_string(dir.path().join(".npmrc")).unwrap(),
-            "old npmrc"
-        );
-    }
-
-    // ── v2 manifest: nested-path round-trip ────────────────────────────
-
-    #[test]
-    fn v2_manifest_writes_project_relative_posix_paths() {
-        // The on-disk manifest must record project-relative POSIX paths,
-        // not absolute paths or platform-specific separators. Pinning the
-        // wire format directly so cross-platform manifests stay portable.
-        let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join("patches")).unwrap();
-        let nested = dir.path().join("patches").join("react@18.0.0.patch");
-        fs::write(&nested, "diff --git a/x b/y").unwrap();
-
-        let mut backup = MigrationBackup::new();
-        backup.backup_file(&nested).unwrap();
-        backup.write_manifest(dir.path()).unwrap();
-
-        let raw = fs::read_to_string(dir.path().join(".lpm-migrate-manifest.json")).unwrap();
-        let m: serde_json::Value = serde_json::from_str(&raw).unwrap();
-
-        assert_eq!(m["version"], 2);
-        assert_eq!(
-            m["backups"][0]["original"], "patches/react@18.0.0.patch",
-            "original must be project-relative POSIX"
-        );
-        assert_eq!(
-            m["backups"][0]["backup"], "patches/react@18.0.0.patch.backup",
-            "backup must be project-relative POSIX"
-        );
-    }
-
-    #[test]
-    fn v2_rollback_restores_nested_existing_file() {
-        // A patch file under patches/ that existed before migration, was
-        // modified by migrate, and must be restored on rollback.
-        let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join("patches")).unwrap();
-        let nested = dir.path().join("patches").join("react@18.0.0.patch");
-        fs::write(&nested, "original patch content").unwrap();
-
-        let mut backup = MigrationBackup::new();
-        backup.backup_file(&nested).unwrap();
-        backup.write_manifest(dir.path()).unwrap();
-
-        // Migrate "modifies" the patch.
-        fs::write(&nested, "migrated patch content").unwrap();
-
-        let restored = rollback_from_backups(dir.path()).unwrap();
-        assert!(
-            restored.iter().any(|r| r == "patches/react@18.0.0.patch"),
-            "expected nested path in restored list, got: {:?}",
-            restored
-        );
-        assert_eq!(
-            fs::read_to_string(&nested).unwrap(),
-            "original patch content"
-        );
-    }
-
-    #[test]
-    fn v2_rollback_removes_nested_created_file_and_empty_parent() {
-        // The migrate-creates-from-nothing case: project had no patches/
-        // dir, migration created `patches/foo.patch`. Rollback must
-        // remove the file AND clean up the now-empty `patches/` dir.
-        let dir = tempfile::tempdir().unwrap();
-        let patches_dir = dir.path().join("patches");
-        let nested = patches_dir.join("foo@1.0.0.patch");
-
-        // Sanity: neither exists pre-migration.
-        assert!(!patches_dir.exists());
-
-        let mut backup = MigrationBackup::new();
-        backup.backup_file(&nested).unwrap(); // records existed=false
-
-        // Migrate writes the file (and creates the dir).
-        fs::create_dir_all(&patches_dir).unwrap();
-        fs::write(&nested, "patch body").unwrap();
-
-        backup.write_manifest(dir.path()).unwrap();
-
-        let restored = rollback_from_backups(dir.path()).unwrap();
-
-        assert!(
-            restored
-                .iter()
-                .any(|r| r.contains("patches/foo@1.0.0.patch")),
-            "expected nested created path in restored list, got: {:?}",
-            restored
-        );
-        assert!(!nested.exists(), "nested file should have been removed");
-        assert!(
-            !patches_dir.exists(),
-            "empty patches/ directory should have been cleaned up"
-        );
-    }
-
-    #[test]
-    fn v2_rollback_keeps_non_empty_directory_with_user_content() {
-        // Migration created `patches/migrated.patch` BUT the user also
-        // had their own `patches/manual.patch` from before. Rollback
-        // must remove only the migrated file and leave the directory
-        // (because the user file is still in it).
-        let dir = tempfile::tempdir().unwrap();
-        let patches_dir = dir.path().join("patches");
-        fs::create_dir_all(&patches_dir).unwrap();
-        let user_file = patches_dir.join("manual.patch");
-        fs::write(&user_file, "user-authored").unwrap();
-
-        let migrated = patches_dir.join("auto.patch");
-
-        let mut backup = MigrationBackup::new();
-        backup.backup_file(&migrated).unwrap(); // existed=false
-        fs::write(&migrated, "auto body").unwrap();
-
-        backup.write_manifest(dir.path()).unwrap();
-
-        let _ = rollback_from_backups(dir.path()).unwrap();
-
-        assert!(!migrated.exists(), "migrated file should be removed");
-        assert!(user_file.exists(), "user file must survive rollback");
-        assert!(
-            patches_dir.exists(),
-            "patches/ must survive — it has user content"
-        );
-        assert_eq!(fs::read_to_string(&user_file).unwrap(), "user-authored");
-    }
-
-    #[test]
-    fn v2_rollback_restores_nested_existing_after_modification_chain() {
-        // Mixed: one root file (.npmrc, existed), one nested file
-        // (patches/x.patch, existed). Both modified by migrate. Rollback
-        // restores both correctly.
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join(".npmrc"), "orig npmrc").unwrap();
-        fs::create_dir_all(dir.path().join("patches")).unwrap();
-        let patch = dir.path().join("patches").join("x.patch");
-        fs::write(&patch, "orig patch").unwrap();
-
-        let mut backup = MigrationBackup::new();
-        backup.backup_file(&dir.path().join(".npmrc")).unwrap();
-        backup.backup_file(&patch).unwrap();
-
-        fs::write(dir.path().join(".npmrc"), "new npmrc").unwrap();
-        fs::write(&patch, "new patch").unwrap();
-
-        backup.write_manifest(dir.path()).unwrap();
-
-        let restored = rollback_from_backups(dir.path()).unwrap();
-        assert!(restored.iter().any(|r| r == ".npmrc"));
-        assert!(restored.iter().any(|r| r == "patches/x.patch"));
-        assert_eq!(
-            fs::read_to_string(dir.path().join(".npmrc")).unwrap(),
-            "orig npmrc"
-        );
-        assert_eq!(fs::read_to_string(&patch).unwrap(), "orig patch");
-    }
-
-    // ── Path containment ───────────────────────────────────────────────
-
-    #[test]
-    fn v2_rollback_rejects_absolute_path_in_manifest() {
-        let dir = tempfile::tempdir().unwrap();
-        let manifest = serde_json::json!({
-            "version": 2,
-            "backups": [
-                {"original": "/etc/passwd", "backup": "/etc/passwd.backup"}
+    fn only_directories_the_migration_created_are_removed() {
+        let dir = project();
+        fs::create_dir(dir.path().join("patches")).unwrap();
+        migrate(
+            dir.path(),
+            &[
+                ("patches/a.patch", "patch"),
+                (".github/workflows/ci.lpm.yml", "ci"),
             ],
-            "created": [],
-        });
-        fs::write(
-            dir.path().join(".lpm-migrate-manifest.json"),
-            serde_json::to_string(&manifest).unwrap(),
-        )
-        .unwrap();
-
-        let err = rollback_from_backups(dir.path()).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("absolute path"),
-            "expected absolute-path error, got: {msg}"
         );
+
+        rollback_from_backups(dir.path(), false).unwrap();
+
+        assert!(
+            dir.path().join("patches").is_dir(),
+            "the user's directory stays"
+        );
+        assert!(!dir.path().join(".github").exists());
     }
 
     #[test]
-    fn v2_rollback_rejects_parent_dir_in_manifest() {
-        let dir = tempfile::tempdir().unwrap();
-        let manifest = serde_json::json!({
-            "version": 2,
-            "backups": [],
-            "created": ["../escape.txt"],
-        });
-        fs::write(
-            dir.path().join(".lpm-migrate-manifest.json"),
-            serde_json::to_string(&manifest).unwrap(),
-        )
-        .unwrap();
-
-        let err = rollback_from_backups(dir.path()).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("`..`"),
-            "expected parent-dir error, got: {msg}"
+    fn a_retry_keeps_the_first_snapshot_but_not_over_the_user_s_edits() {
+        let dir = project();
+        fs::write(dir.path().join("package.json"), "P0").unwrap();
+        fs::write(dir.path().join(".npmrc"), "N0").unwrap();
+        migrate(
+            dir.path(),
+            &[("package.json", "P-migrated"), (".npmrc", "N-migrated")],
         );
-    }
+        fs::write(dir.path().join("package.json"), "P1-user").unwrap();
 
-    #[test]
-    fn v2_rollback_rejects_parent_dir_mid_path() {
-        // An attacker might bury `..` mid-path expecting only leading
-        // segments to be checked. Component iteration catches it.
-        let dir = tempfile::tempdir().unwrap();
-        let manifest = serde_json::json!({
-            "version": 2,
-            "backups": [
-                {"original": "patches/../../../etc/passwd",
-                 "backup": "patches/x.backup"}
+        migrate(
+            dir.path(),
+            &[
+                ("package.json", "P-migrated-again"),
+                (".npmrc", "N-migrated"),
             ],
-            "created": [],
-        });
-        fs::write(
-            dir.path().join(".lpm-migrate-manifest.json"),
-            serde_json::to_string(&manifest).unwrap(),
-        )
-        .unwrap();
-
-        let err = rollback_from_backups(dir.path()).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("`..`"),
-            "expected parent-dir error, got: {msg}"
         );
+        rollback_from_backups(dir.path(), false).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("package.json")).unwrap(),
+            "P1-user",
+            "the rollback undoes only LPM's write over the user's edit"
+        );
+        assert_eq!(fs::read_to_string(dir.path().join(".npmrc")).unwrap(), "N0");
     }
 
     #[test]
+    fn an_edit_a_migration_left_alone_is_the_user_s_and_a_later_one_rolls_back_to_it() {
+        let dir = project();
+        let template = ".github/workflows/ci.lpm.yml";
+        drop(migrate(dir.path(), &[(template, "W1")]));
+        fs::write(dir.path().join(template), "edit1").unwrap();
+        // A migration that re-snapshots the template but doesn't write it.
+        drop(migrate(dir.path(), &[]));
+        fs::write(dir.path().join(template), "edit2").unwrap();
+
+        let refusal = rollback_from_backups(dir.path(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refusal
+                .contains("these files changed after the migration: .github/workflows/ci.lpm.yml"),
+            "{refusal}"
+        );
+        assert!(!refusal.contains("stopped before recording"), "{refusal}");
+
+        drop(migrate(dir.path(), &[(template, "W3")]));
+        rollback_from_backups(dir.path(), false).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join(template)).unwrap(),
+            "edit2",
+            "the rollback returns the template to the edit made before the last migration"
+        );
+    }
+
+    fn legacy_npmrc_migration(project: &Path) {
+        fs::write(project.join(".npmrc"), "N-migrated-by-an-earlier-cli").unwrap();
+        fs::write(project.join(".npmrc.backup"), "N0").unwrap();
+        fs::write(
+            project.join(LEGACY_MANIFEST_FILENAME),
+            serde_json::json!({
+                "version": 2,
+                "backups": [{"original": ".npmrc", "backup": ".npmrc.backup"}],
+                "created": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_interrupted_migration_s_files_are_not_restored_over_later_edits_unless_forced() {
+        let dir = project();
+        fs::write(dir.path().join("package.json"), "original").unwrap();
+        let mut backup = MigrationBackup::for_project(dir.path()).unwrap();
+        backup
+            .backup_files(
+                dir.path(),
+                &[
+                    &dir.path().join("package.json"),
+                    &dir.path().join("lpm.lock"),
+                ],
+            )
+            .unwrap();
+        fs::write(dir.path().join("package.json"), "half-migrated").unwrap();
+        fs::write(dir.path().join("lpm.lock"), "lock").unwrap();
+        drop(backup);
+        fs::write(
+            dir.path().join("package.json"),
+            "edited after the interruption",
+        )
+        .unwrap();
+
+        let error = rollback_from_backups(dir.path(), false).unwrap_err();
+
+        assert!(error.to_string().contains("package.json"), "{error}");
+        assert!(error.to_string().contains("lpm.lock"), "{error}");
+        assert!(error.to_string().contains("--force"), "{error}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("package.json")).unwrap(),
+            "edited after the interruption"
+        );
+        assert!(dir.path().join("lpm.lock").exists());
+
+        rollback_from_backups(dir.path(), true).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("package.json")).unwrap(),
+            "original"
+        );
+        assert!(!dir.path().join("lpm.lock").exists());
+    }
+
+    #[test]
+    fn an_interrupted_migration_s_missing_files_are_restored_without_force() {
+        let dir = project();
+        fs::write(dir.path().join("package-lock.json"), "npm lock").unwrap();
+        let mut backup = MigrationBackup::for_project(dir.path()).unwrap();
+        backup
+            .backup_files(dir.path(), &[&dir.path().join("package-lock.json")])
+            .unwrap();
+        drop(backup);
+        fs::remove_file(dir.path().join("package-lock.json")).unwrap();
+
+        let report = rollback_from_backups(dir.path(), false).unwrap();
+
+        assert_eq!(report.restored, ["package-lock.json".to_owned()]);
+    }
+
+    #[test]
+    fn a_migration_claims_only_the_files_it_backed_up() {
+        let dir = project();
+        legacy_npmrc_migration(dir.path());
+        fs::write(dir.path().join(".npmrc"), "N-edited").unwrap();
+        migrate(dir.path(), &[("lpm.lock", "lock")]);
+
+        let error = rollback_from_backups(dir.path(), false).unwrap_err();
+
+        assert!(error.to_string().contains(".npmrc"), "{error}");
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".npmrc")).unwrap(),
+            "N-edited"
+        );
+    }
+
+    /// What the copies a refused rollback names for `path` hold, newest
+    /// first.
+    fn kept_copies(project: &Path, error: &LpmError, path: &str) -> Vec<String> {
+        let message = error.to_string();
+        let Some((kept, _)) = message
+            .split_once(&format!("{path} (kept at "))
+            .and_then(|(_, rest)| rest.split_once(')'))
+        else {
+            panic!("no kept copy of {path} in {message}");
+        };
+        kept.split(", ")
+            .map(|kept| {
+                assert!(
+                    Path::new(kept).is_absolute(),
+                    "{kept} resolves from anywhere"
+                );
+                fs::read_to_string(project.join(kept)).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_migration_over_content_lpm_cannot_attribute_keeps_it_and_the_original() {
+        let dir = project();
+        legacy_npmrc_migration(dir.path());
+        fs::write(dir.path().join(".npmrc"), "N-edited").unwrap();
+
+        migrate(dir.path(), &[(".npmrc", "N-migrated-again")]);
+        migrate(dir.path(), &[("lpm.lock", "lock")]);
+        let error = rollback_from_backups(dir.path(), false).unwrap_err();
+
+        assert!(error.to_string().contains("--force"), "{error}");
+        assert_eq!(kept_copies(dir.path(), &error, ".npmrc"), ["N-edited"]);
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".npmrc")).unwrap(),
+            "N-migrated-again"
+        );
+        rollback_from_backups(dir.path(), true).unwrap();
+        assert_eq!(fs::read_to_string(dir.path().join(".npmrc")).unwrap(), "N0");
+    }
+
+    #[test]
+    fn a_retry_after_an_interruption_rolls_back_to_before_the_first_migration_only_when_forced() {
+        let dir = project();
+        fs::write(dir.path().join("package.json"), "original").unwrap();
+        let mut interrupted = MigrationBackup::for_project(dir.path()).unwrap();
+        interrupted
+            .backup_files(dir.path(), &[&dir.path().join("package.json")])
+            .unwrap();
+        fs::write(dir.path().join("package.json"), "half-migrated").unwrap();
+        drop(interrupted);
+
+        migrate(dir.path(), &[("package.json", "migrated")]);
+        let error = rollback_from_backups(dir.path(), false).unwrap_err();
+
+        assert_eq!(
+            kept_copies(dir.path(), &error, "package.json"),
+            ["half-migrated"]
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("package.json")).unwrap(),
+            "migrated"
+        );
+        rollback_from_backups(dir.path(), true).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("package.json")).unwrap(),
+            "original"
+        );
+    }
+
     #[cfg(unix)]
-    fn v2_rollback_rejects_symlinked_ancestor_for_nonexistent_leaf() {
-        // Without canonicalizing the nearest existing ancestor, a manifest
-        // restore target like `patches/foo.patch` would silently write
-        // outside the project root when `patches/` is a symlink to an
-        // external directory and the leaf doesn't exist yet.
-        //
-        // The component-level `..` check doesn't catch this because the
-        // path string contains no `..` — the escape hops through a
-        // symlink. The leaf-only `joined.exists()` canonicalize is also
-        // not enough because the restore target is intentionally absent
-        // when rollback is about to write it.
-        let project = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
+    #[test]
+    fn an_interrupted_import_of_an_earlier_cli_s_backup_finishes_its_cleanup_later() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = project();
+        let workflows = dir.path().join(".github/workflows");
+        fs::create_dir_all(&workflows).unwrap();
+        fs::write(dir.path().join(".npmrc"), "N-migrated").unwrap();
+        fs::write(dir.path().join(".npmrc.backup"), "N0").unwrap();
+        fs::write(workflows.join("ci.yml"), "W-migrated").unwrap();
+        fs::write(workflows.join("ci.yml.backup"), "W0").unwrap();
+        fs::write(
+            dir.path().join(LEGACY_MANIFEST_FILENAME),
+            serde_json::json!({
+                "version": 2,
+                "backups": [
+                    {"original": ".npmrc", "backup": ".npmrc.backup"},
+                    {"original": ".github/workflows/ci.yml", "backup": ".github/workflows/ci.yml.backup"},
+                ],
+                "created": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::set_permissions(&workflows, fs::Permissions::from_mode(0o555)).unwrap();
+        if fs::write(workflows.join("probe"), "").is_ok() {
+            fs::set_permissions(&workflows, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let interrupted = MigrationBackup::for_project(dir.path());
+        fs::set_permissions(&workflows, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(interrupted.is_err());
 
-        // patches -> outside (symlink)
-        std::os::unix::fs::symlink(outside.path(), project.path().join("patches")).unwrap();
+        drop(MigrationBackup::for_project(dir.path()).unwrap());
 
-        // Pre-create a `.backup` file the manifest will reference.
-        // Place it inside the project root (legitimate location); the
-        // attack vector is the RESTORE TARGET via the symlinked ancestor.
-        fs::write(project.path().join("loot.backup"), "stolen content").unwrap();
+        assert!(!dir.path().join(LEGACY_MANIFEST_FILENAME).exists());
+        assert!(!workflows.join("ci.yml.backup").exists());
+        rollback_from_backups(dir.path(), true).unwrap();
+        assert_eq!(fs::read_to_string(dir.path().join(".npmrc")).unwrap(), "N0");
+        assert_eq!(fs::read_to_string(workflows.join("ci.yml")).unwrap(), "W0");
+        assert!(!has_backup(dir.path()));
+    }
 
-        let manifest = serde_json::json!({
-            "version": 2,
-            "backups": [
-                {
-                    "original": "patches/restored.patch",
-                    "backup": "loot.backup",
+    #[test]
+    fn content_a_retry_finds_again_is_named_as_the_newest_copy() {
+        let dir = project();
+        legacy_npmrc_migration(dir.path());
+        for content in ["N-a", "N-b"] {
+            fs::write(dir.path().join(".npmrc"), content).unwrap();
+            let mut interrupted = MigrationBackup::for_project(dir.path()).unwrap();
+            interrupted
+                .backup_files(dir.path(), &[&dir.path().join(".npmrc")])
+                .unwrap();
+            fs::write(dir.path().join(".npmrc"), "N-half-migrated").unwrap();
+            drop(interrupted);
+        }
+        fs::write(dir.path().join(".npmrc"), "N-a").unwrap();
+
+        migrate(dir.path(), &[(".npmrc", "N-migrated-again")]);
+        let error = rollback_from_backups(dir.path(), false).unwrap_err();
+
+        assert_eq!(kept_copies(dir.path(), &error, ".npmrc"), ["N-a", "N-b"]);
+    }
+
+    #[test]
+    fn every_retry_over_content_lpm_cannot_attribute_keeps_what_it_found() {
+        let dir = project();
+        legacy_npmrc_migration(dir.path());
+        let mut interrupted = MigrationBackup::for_project(dir.path()).unwrap();
+        interrupted
+            .backup_files(dir.path(), &[&dir.path().join(".npmrc")])
+            .unwrap();
+        fs::write(dir.path().join(".npmrc"), "N-half-migrated").unwrap();
+        drop(interrupted);
+        fs::write(dir.path().join(".npmrc"), "N-user").unwrap();
+
+        migrate(dir.path(), &[(".npmrc", "N-migrated-again")]);
+        migrate(dir.path(), &[("lpm.lock", "lock")]);
+        let error = rollback_from_backups(dir.path(), false).unwrap_err();
+
+        assert_eq!(
+            kept_copies(dir.path(), &error, ".npmrc"),
+            ["N-user", "N-migrated-by-an-earlier-cli"]
+        );
+        rollback_from_backups(dir.path(), true).unwrap();
+        assert_eq!(fs::read_to_string(dir.path().join(".npmrc")).unwrap(), "N0");
+    }
+
+    #[test]
+    fn a_missing_file_still_needs_force_while_the_backup_keeps_what_a_migration_found() {
+        let dir = project();
+        legacy_npmrc_migration(dir.path());
+        migrate(dir.path(), &[(".npmrc", "N-migrated-again")]);
+        fs::remove_file(dir.path().join(".npmrc")).unwrap();
+
+        let error = rollback_from_backups(dir.path(), false).unwrap_err();
+
+        assert_eq!(
+            kept_copies(dir.path(), &error, ".npmrc"),
+            ["N-migrated-by-an-earlier-cli"]
+        );
+        assert!(!dir.path().join(".npmrc").exists());
+        rollback_from_backups(dir.path(), true).unwrap();
+        assert_eq!(fs::read_to_string(dir.path().join(".npmrc")).unwrap(), "N0");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_owner_only_copy_an_earlier_release_kept_comes_back_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        for destination in [None, Some(0o644)] {
+            let dir = project();
+            legacy_npmrc_migration(dir.path());
+            let npmrc = dir.path().join(".npmrc");
+            fs::set_permissions(
+                dir.path().join(".npmrc.backup"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            match destination {
+                Some(mode) => {
+                    fs::set_permissions(&npmrc, fs::Permissions::from_mode(mode)).unwrap()
                 }
+                None => fs::remove_file(&npmrc).unwrap(),
+            }
+
+            rollback_from_backups(dir.path(), true).unwrap();
+
+            assert_eq!(fs::read_to_string(&npmrc).unwrap(), "N0");
+            assert_eq!(
+                fs::metadata(&npmrc).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "destination {destination:?}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_private_file_and_its_backup_drop_access_the_directory_passes_on() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = project();
+        let chmod = |args: &[&str], path: &Path| {
+            let status = std::process::Command::new("/bin/chmod")
+                .args(args)
+                .arg(path)
+                .status()
+                .unwrap();
+            assert!(status.success(), "chmod {args:?}");
+        };
+        chmod(
+            &[
+                "+a",
+                "group:everyone allow read,list,search,file_inherit,directory_inherit",
             ],
-            "created": [],
-        });
-        fs::write(
-            project.path().join(".lpm-migrate-manifest.json"),
-            serde_json::to_string(&manifest).unwrap(),
+            dir.path(),
+        );
+        let npmrc = dir.path().join(".npmrc");
+        fs::write(&npmrc, "//registry.npmjs.org/:_authToken=secret\n").unwrap();
+        fs::set_permissions(&npmrc, fs::Permissions::from_mode(0o600)).unwrap();
+        chmod(&["-N"], &npmrc);
+        let has_acl = |path: &Path| {
+            lpm_common::macos_acl::has_extended_acl(fs::File::open(path).unwrap()).unwrap()
+        };
+        assert!(!has_acl(&npmrc));
+
+        let mut backup = MigrationBackup::for_project(dir.path()).unwrap();
+        backup.backup_files(dir.path(), &[&npmrc]).unwrap();
+        write_output(
+            dir.path(),
+            &npmrc,
+            b"//registry.npmjs.org/:_authToken=secret\n@lpm.dev:registry=x\n",
         )
         .unwrap();
+        backup.seal().unwrap();
+        drop(backup);
 
-        let err = rollback_from_backups(project.path()).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("outside the project root"),
-            "expected containment error for symlinked ancestor, got: {msg}"
+        assert!(!has_acl(&npmrc), "the rewritten .npmrc");
+        assert_eq!(
+            fs::metadata(&npmrc).unwrap().permissions().mode() & 0o777,
+            0o600
         );
+        for directory in [store(dir.path()), store(dir.path()).join(BLOBS_DIR)] {
+            assert!(!has_acl(&directory), "{}", directory.display());
+        }
+        for blob in fs::read_dir(store(dir.path()).join(BLOBS_DIR)).unwrap() {
+            assert!(!has_acl(&blob.unwrap().path()), "a stored copy");
+        }
 
-        // The outside dir must remain untouched — no file was written there.
-        let outside_entries: Vec<_> = fs::read_dir(outside.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .collect();
+        rollback_from_backups(dir.path(), false).unwrap();
+        assert!(!has_acl(&npmrc), "the restored .npmrc");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_file_kept_to_its_owner_comes_back_kept_to_its_owner() {
+        let dir = project();
+        let status = std::process::Command::new("icacls")
+            .arg(dir.path())
+            .args(["/grant", "*S-1-5-32-545:(OI)(CI)R"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let npmrc = dir.path().join(".npmrc");
+        let token = b"//registry.npmjs.org/:_authToken=secret\n";
+        lpm_common::write_file_atomic_with_options(
+            &npmrc,
+            token,
+            lpm_common::AtomicWriteOptions::new().owner_only(),
+        )
+        .unwrap();
+        let kept_out = |path: &Path| {
+            lpm_common::owner_only::keeps_others_out(&fs::File::open(path).unwrap()).unwrap()
+        };
+        assert!(kept_out(&npmrc));
+
+        let mut backup = MigrationBackup::for_project(dir.path()).unwrap();
+        backup.backup_files(dir.path(), &[&npmrc]).unwrap();
+        fs::remove_file(&npmrc).unwrap();
+        fs::write(&npmrc, "replaced\n").unwrap();
+        assert!(!kept_out(&npmrc));
+        backup.rollback().unwrap();
+        drop(backup);
+        assert_eq!(fs::read(&npmrc).unwrap(), token);
+        assert!(kept_out(&npmrc), "restored by the migration that failed");
+
+        let mut backup = MigrationBackup::for_project(dir.path()).unwrap();
+        backup.backup_files(dir.path(), &[&npmrc]).unwrap();
+        write_output(
+            dir.path(),
+            &npmrc,
+            b"//registry.npmjs.org/:_authToken=secret\n@lpm.dev:registry=x\n",
+        )
+        .unwrap();
+        backup.seal().unwrap();
+        drop(backup);
+        assert!(kept_out(&npmrc), "the rewritten .npmrc");
+
+        rollback_from_backups(dir.path(), false).unwrap();
+        assert_eq!(fs::read(&npmrc).unwrap(), token);
+        assert!(kept_out(&npmrc), "restored by a later rollback");
+
+        legacy_npmrc_migration(dir.path());
+        fs::remove_file(dir.path().join(".npmrc.backup")).unwrap();
+        lpm_common::write_file_atomic_with_options(
+            &dir.path().join(".npmrc.backup"),
+            b"N0",
+            lpm_common::AtomicWriteOptions::new().owner_only(),
+        )
+        .unwrap();
+        fs::remove_file(&npmrc).unwrap();
+        rollback_from_backups(dir.path(), true).unwrap();
+        assert_eq!(fs::read(&npmrc).unwrap(), b"N0");
+        assert!(kept_out(&npmrc), "restored from an earlier release's copy");
+    }
+
+    #[test]
+    fn another_migration_waits_for_a_running_one_and_leaves_its_copies() {
+        let dir = project();
+        let package = dir.path().join("package.json");
+        fs::write(&package, "P0").unwrap();
+        migrate(dir.path(), &[("package.json", "P1")]);
+        let mut running = MigrationBackup::for_project(dir.path()).unwrap();
+        running.backup_files(dir.path(), &[&package]).unwrap();
+        fs::write(&package, "P2").unwrap();
+
+        let project_dir = dir.path().to_path_buf();
+        let other = std::thread::spawn(move || {
+            drop(MigrationBackup::for_project(&project_dir).unwrap());
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let other_finished_early = other.is_finished();
+        running.rollback().unwrap();
+        drop(running);
+        other.join().unwrap();
+
+        assert!(!other_finished_early, "the other migration waits");
+        assert_eq!(fs::read_to_string(&package).unwrap(), "P1");
+        rollback_from_backups(dir.path(), false).unwrap();
+        assert_eq!(fs::read_to_string(&package).unwrap(), "P0");
+    }
+
+    #[test]
+    fn a_failed_retry_puts_back_only_its_own_writes_and_the_earlier_backup() {
+        let dir = project();
+        fs::write(dir.path().join("package.json"), "P0").unwrap();
+        fs::write(dir.path().join(".npmrc"), "N0").unwrap();
+        migrate(
+            dir.path(),
+            &[("package.json", "P-migrated"), (".npmrc", "N-migrated")],
+        );
+        let earlier = fs::read(store(dir.path()).join(MANIFEST_FILE)).unwrap();
+
+        let mut retry = MigrationBackup::for_project(dir.path()).unwrap();
+        let paths = [dir.path().join("package.json"), dir.path().join("lpm.lock")];
+        retry
+            .backup_files(dir.path(), &[paths[0].as_path(), paths[1].as_path()])
+            .unwrap();
+        fs::write(&paths[0], "P-half-migrated-again").unwrap();
+        fs::write(&paths[1], "lock").unwrap();
+        retry.rollback().unwrap();
+
+        assert_eq!(fs::read_to_string(&paths[0]).unwrap(), "P-migrated");
+        assert!(!paths[1].exists());
+        assert_eq!(
+            fs::read(store(dir.path()).join(MANIFEST_FILE)).unwrap(),
+            earlier
+        );
+        assert_eq!(
+            fs::read_dir(store(dir.path()).join(BLOBS_DIR))
+                .unwrap()
+                .count(),
+            2,
+            "the retry's copies are removed"
+        );
+        drop(retry);
+        rollback_from_backups(dir.path(), false).unwrap();
+        assert_eq!(fs::read_to_string(&paths[0]).unwrap(), "P0");
+        assert_eq!(fs::read_to_string(dir.path().join(".npmrc")).unwrap(), "N0");
+    }
+
+    #[test]
+    fn in_process_rollback_restores_everything_and_removes_the_backup() {
+        let dir = project();
+        fs::write(dir.path().join("package.json"), "original").unwrap();
+        let mut backup = MigrationBackup::for_project(dir.path()).unwrap();
+        let paths = [dir.path().join("package.json"), dir.path().join("lpm.lock")];
+        backup
+            .backup_files(dir.path(), &[paths[0].as_path(), paths[1].as_path()])
+            .unwrap();
+        fs::write(&paths[0], "half-migrated").unwrap();
+        fs::write(&paths[1], "lock").unwrap();
+
+        backup.rollback().unwrap();
+        backup.seal().unwrap();
+
+        assert_eq!(fs::read_to_string(&paths[0]).unwrap(), "original");
+        assert!(!paths[1].exists());
         assert!(
-            outside_entries.is_empty(),
-            "rollback must not write through the symlinked ancestor; \
-             found in outside dir: {:?}",
-            outside_entries
-                .iter()
-                .map(|e| e.file_name())
-                .collect::<Vec<_>>()
+            !store(dir.path()).exists(),
+            "sealing after a rollback writes nothing"
         );
     }
 
-    // ── Immediate-failure rollback (MigrationBackup::rollback) ──────────
+    #[test]
+    fn a_backup_from_an_earlier_cli_is_imported_and_needs_force_where_files_differ() {
+        let dir = project();
+        fs::write(dir.path().join("package-lock.json"), "migrated-over").unwrap();
+        fs::write(dir.path().join("package-lock.json.backup"), "npm lock").unwrap();
+        fs::write(dir.path().join("lpm.lock"), "lock").unwrap();
+        fs::write(
+            dir.path().join(LEGACY_MANIFEST_FILENAME),
+            serde_json::json!({
+                "version": 2,
+                "backups": [{"original": "package-lock.json", "backup": "package-lock.json.backup"}],
+                "created": ["lpm.lock"],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let error = rollback_from_backups(dir.path(), false).unwrap_err();
+        assert!(error.to_string().contains("--force"), "{error}");
+        assert!(!dir.path().join(LEGACY_MANIFEST_FILENAME).exists());
+        assert!(!dir.path().join("package-lock.json.backup").exists());
+
+        rollback_from_backups(dir.path(), true).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("package-lock.json")).unwrap(),
+            "npm lock"
+        );
+        assert!(!dir.path().join("lpm.lock").exists());
+    }
 
     #[test]
-    fn immediate_rollback_removes_nested_created_file() {
-        // The immediate-failure path doesn't clean up empty parent dirs
-        // (see doc on `rollback`), but it MUST still remove a nested
-        // file that the migration created mid-flow before the error.
-        let dir = tempfile::tempdir().unwrap();
-        let patches_dir = dir.path().join("patches");
-        let nested = patches_dir.join("react@18.0.0.patch");
+    fn without_a_backup_nothing_is_restored_and_stray_backup_files_stay() {
+        let dir = project();
+        fs::write(dir.path().join("config.json"), "mine").unwrap();
+        fs::write(dir.path().join("config.json.backup"), "also mine").unwrap();
 
-        let mut backup = MigrationBackup::new();
-        backup.backup_file(&nested).unwrap(); // existed=false
+        let report = rollback_from_backups(dir.path(), true).unwrap();
 
-        // Simulate migration creating both before erroring out.
-        fs::create_dir_all(&patches_dir).unwrap();
-        fs::write(&nested, "partial migration").unwrap();
+        assert!(report.restored.is_empty());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("config.json")).unwrap(),
+            "mine"
+        );
+        assert!(dir.path().join("config.json.backup").exists());
+    }
 
-        backup.rollback().unwrap();
+    #[test]
+    fn manifest_entries_naming_lpm_or_git_state_are_rejected() {
+        for path in [".lpm/env-sync.json", ".git/config", ".LPM/x"] {
+            let dir = project();
+            fs::create_dir_all(store(dir.path()).join(BLOBS_DIR)).unwrap();
+            fs::write(
+                store(dir.path()).join(MANIFEST_FILE),
+                serde_json::json!({
+                    "version": MANIFEST_VERSION,
+                    "entries": [{"path": path, "original": null}],
+                })
+                .to_string(),
+            )
+            .unwrap();
 
-        assert!(!nested.exists(), "nested created file must be removed");
-        // patches_dir may or may not exist — immediate path doesn't
-        // promise dir cleanup. The post-success path (`rollback_from_backups`)
-        // is the one that owns that responsibility.
+            let error = rollback_from_backups(dir.path(), true).unwrap_err();
+
+            assert!(error.to_string().contains("reserved"), "{path}: {error}");
+        }
+    }
+
+    #[test]
+    fn legacy_manifest_paths_outside_the_project_are_rejected() {
+        for (backups, created, expected) in [
+            (
+                serde_json::json!([{"original": "/etc/passwd", "backup": "/etc/passwd.backup"}]),
+                serde_json::json!([]),
+                "absolute path",
+            ),
+            (
+                serde_json::json!([]),
+                serde_json::json!(["../escape.txt"]),
+                "`..`",
+            ),
+            (
+                serde_json::json!([{"original": "patches/../../../etc/passwd", "backup": "patches/x.backup"}]),
+                serde_json::json!([]),
+                "`..`",
+            ),
+        ] {
+            let dir = project();
+            fs::write(
+                dir.path().join(LEGACY_MANIFEST_FILENAME),
+                serde_json::json!({"version": 2, "backups": backups, "created": created})
+                    .to_string(),
+            )
+            .unwrap();
+
+            let error = rollback_from_backups(dir.path(), true).unwrap_err();
+
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_legacy_restore_target_through_a_linked_directory_is_rejected() {
+        let dir = project();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("patches")).unwrap();
+        fs::write(dir.path().join("loot.backup"), "stolen content").unwrap();
+        fs::write(
+            dir.path().join(LEGACY_MANIFEST_FILENAME),
+            serde_json::json!({
+                "version": 2,
+                "backups": [{"original": "patches/restored.patch", "backup": "loot.backup"}],
+                "created": [],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let error = rollback_from_backups(dir.path(), true).unwrap_err();
+
+        assert!(
+            error.to_string().contains("outside the project root"),
+            "{error}"
+        );
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 }

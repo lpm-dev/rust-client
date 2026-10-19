@@ -50,6 +50,129 @@ fn migrate_npm_creates_lockfile() {
 }
 
 #[test]
+fn a_migration_waiting_for_another_one_decides_on_what_that_one_left() {
+    use std::io::{BufRead as _, Read as _};
+    let project = TempProject::from_fixture("migrate-npm");
+    let state = project.path().join(".lpm");
+    std::fs::create_dir_all(&state).unwrap();
+    let held = lpm_common::acquire_single_file_exclusive_lock_from_file(
+        lpm_common::open_lock_file_nofollow(&state.join("migrate.lock")).unwrap(),
+    )
+    .unwrap();
+    let mut child = support::lpm_spawnable(&project)
+        .args([
+            "migrate",
+            "--no-install",
+            "--skip-verify",
+            "--no-ci",
+            "--json",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+    let mut waiting = String::new();
+    while !waiting.contains("Waiting for another lpm operation") {
+        waiting.clear();
+        assert_ne!(
+            stderr.read_line(&mut waiting).unwrap(),
+            0,
+            "the migration finished without waiting for the lock"
+        );
+    }
+    project.write_file("lpm.lock", "written while the migration waited\n");
+    drop(held);
+
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    let status = child.wait().unwrap();
+
+    assert!(!status.success(), "{stdout}");
+    assert!(stdout.contains("lpm.lock already exists"), "{stdout}");
+    assert_eq!(
+        project.read_file("lpm.lock"),
+        "written while the migration waited\n"
+    );
+}
+
+#[test]
+fn a_migration_refused_for_an_existing_lockfile_leaves_the_project_as_it_was() {
+    for workspace in [false, true] {
+        let project = TempProject::from_fixture("migrate-npm");
+        if workspace {
+            project.write_file(
+                "package.json",
+                r#"{"name":"npm-migrate-test","version":"1.0.0","workspaces":["packages/*"],"dependencies":{"ms":"2.1.3"}}"#,
+            );
+            project.write_file(
+                "packages/app/package.json",
+                r#"{"name":"app","version":"1.0.0"}"#,
+            );
+        }
+        project.write_file("lpm.lock", "kept\n");
+
+        let output = lpm(&project)
+            .args(["migrate", "--no-install"])
+            .output()
+            .expect("failed to run lpm migrate");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "workspace {workspace}: {stderr}");
+        assert!(stderr.contains("lpm.lock already exists"), "{stderr}");
+        assert_eq!(project.read_file("lpm.lock"), "kept\n");
+        assert!(
+            !project.path().join(".lpm").exists(),
+            "workspace {workspace}"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn migrate_writes_npmrc_without_access_its_directory_hands_down() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for existing in [Some("//registry.npmjs.org/:_authToken=secret\n"), None] {
+        let project = TempProject::from_fixture("migrate-npm");
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", "group:everyone allow read,file_inherit"])
+            .arg(project.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        if let Some(contents) = existing {
+            project.write_file(".npmrc", contents);
+        }
+
+        let output = lpm(&project)
+            .args(["migrate", "--no-install", "--force"])
+            .output()
+            .expect("failed to run lpm migrate");
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let npmrc = project.path().join(".npmrc");
+        assert!(project.read_file(".npmrc").contains("@lpm.dev:registry="));
+        assert_eq!(
+            std::fs::metadata(&npmrc).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            !lpm_common::macos_acl::has_extended_acl_at(&npmrc).unwrap(),
+            "existing .npmrc: {existing:?}"
+        );
+    }
+}
+
+#[test]
 fn migrate_npm_creates_backup() {
     let project = TempProject::from_fixture("migrate-npm");
 
@@ -275,8 +398,8 @@ fn migrate_pnpm_overrides_conflict_aborts_before_any_write() {
         "lpm.lock must not exist — abort happened before the lockfile write"
     );
     assert!(
-        !project.path().join("package.json.backup").exists(),
-        "no package.json.backup — the backup chain hadn't started yet"
+        !project.path().join(".lpm/migrate-backup").exists(),
+        "no migration backup — the backup chain hadn't started yet"
     );
 }
 
@@ -453,8 +576,8 @@ fn migrate_pnpm_patches_conflict_aborts_before_any_write() {
         "lpm.lock must not exist — abort happened before the lockfile write"
     );
     assert!(
-        !project.path().join("package.json.backup").exists(),
-        "no package.json.backup — the backup chain hadn't started yet"
+        !project.path().join(".lpm/migrate-backup").exists(),
+        "no migration backup — the backup chain hadn't started yet"
     );
 }
 
@@ -1018,10 +1141,15 @@ fn migrate_refuses_a_linked_npmrc_without_copying_or_modifying_its_target() {
         std::fs::read_to_string(external.path()).expect("read external target"),
         "//registry.npmjs.org/:_authToken=external-secret\n"
     );
-    assert!(
-        !project.file_exists(".npmrc.backup"),
-        "migrate must not copy a linked target into the project"
-    );
+    let copies = project.path().join(".lpm/migrate-backup/files");
+    for copy in std::fs::read_dir(&copies).into_iter().flatten().flatten() {
+        assert!(
+            !std::fs::read_to_string(copy.path())
+                .unwrap_or_default()
+                .contains("external-secret"),
+            "migrate must not copy a linked target into the project"
+        );
+    }
 }
 
 #[test]

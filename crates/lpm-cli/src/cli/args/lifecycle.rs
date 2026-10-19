@@ -1068,11 +1068,13 @@ pub(crate) struct MigrateArgs {
     #[arg(long)]
     pub(crate) dry_run: bool,
 
-    /// Overwrite an existing lpm.lock.
+    /// Overwrite an existing lpm.lock. With --rollback, also restore files
+    /// changed after the migration, files LPM can't tell it wrote, and files
+    /// whose earlier content the backup keeps, each to the backup's copy.
     #[arg(long)]
     pub(crate) force: bool,
 
-    /// Restore files from .backup copies created by a previous migration.
+    /// Undo a previous migration from its backup in .lpm/migrate-backup/.
     #[arg(long, conflicts_with = "dry_run")]
     pub(crate) rollback: bool,
 

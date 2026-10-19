@@ -462,10 +462,14 @@ fn migrate_backup_and_rollback_cycle() {
     let original_content = std::fs::read_to_string(fixture.join("package-lock.json")).unwrap();
     std::fs::write(&source_lockfile, &original_content).unwrap();
 
-    // Create backup tracker and back up source lockfile
-    let mut backup = lpm_migrate::backup::MigrationBackup::new();
-    backup.backup_file(&source_lockfile).unwrap();
-    backup.write_manifest(dir.path()).unwrap();
+    let lockfile_path = dir.path().join("lpm.lock");
+    let mut backup = lpm_migrate::backup::MigrationBackup::for_project(dir.path()).unwrap();
+    backup
+        .backup_files(
+            dir.path(),
+            &[source_lockfile.as_path(), lockfile_path.as_path()],
+        )
+        .unwrap();
 
     // Write migration result
     let result = lpm_migrate::migrate(dir.path()).unwrap();
@@ -473,19 +477,23 @@ fn migrate_backup_and_rollback_cycle() {
         result.lockfile.metadata.lockfile_version,
         lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS
     );
-    let lockfile_path = dir.path().join("lpm.lock");
     result.lockfile.write_all(&lockfile_path).unwrap();
-
-    // Verify migration artifacts exist
+    backup.seal().unwrap();
+    drop(backup);
     assert!(lockfile_path.exists());
+    std::fs::write(&source_lockfile, "{}").unwrap();
 
-    // Rollback
-    let restored = lpm_migrate::backup::rollback_from_backups(dir.path()).unwrap();
+    let error = lpm_migrate::backup::rollback_from_backups(dir.path(), false).unwrap_err();
+    assert!(error.to_string().contains("package-lock.json"), "{error}");
+    let restored = lpm_migrate::backup::rollback_from_backups(dir.path(), true)
+        .unwrap()
+        .restored;
     assert!(
         restored.contains(&"package-lock.json".to_string()),
         "package-lock.json should be restored, got: {:?}",
         restored
     );
+    assert!(!lockfile_path.exists());
 
     // Verify original content is restored
     let restored_content = std::fs::read_to_string(&source_lockfile).unwrap();
