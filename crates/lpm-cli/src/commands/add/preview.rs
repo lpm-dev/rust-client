@@ -152,9 +152,11 @@ impl PreviewState {
                 path,
                 Some(added_sources_state::digest_bytes(content.as_bytes())),
             );
-            self.manifest = Some(serde_json::from_str(&content).map_err(|error| {
-                LpmError::Registry(format!("failed to parse package.json: {error}"))
-            })?);
+            self.manifest = Some(
+                serde_json::from_str(lpm_common::strip_utf8_bom_str(&content)).map_err(
+                    |error| LpmError::Registry(format!("failed to parse package.json: {error}")),
+                )?,
+            );
         }
         self.manifest
             .as_mut()

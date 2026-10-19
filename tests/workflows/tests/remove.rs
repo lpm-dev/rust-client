@@ -1152,6 +1152,37 @@ fn remove_deletes_an_unchanged_exclusively_owned_dependency() {
 }
 
 #[test]
+fn remove_deletes_an_owned_dependency_from_a_package_json_with_a_byte_order_mark() {
+    let project = TempProject::empty(
+        "\u{FEFF}{\"name\":\"host\",\"version\":\"1.0.0\",\"dependencies\":{\"dep\":\"^1.0.0\",\"kept\":\"^2.0.0\"}}",
+    );
+    write_source_state(
+        &project,
+        json!({
+            "source-pkg": {
+                "dependencies": {
+                    "dep": {"spec": "^1.0.0", "section": "dependencies", "inserted": true}
+                }
+            }
+        }),
+    );
+
+    lpm(&project)
+        .args(["remove", "source-pkg"])
+        .assert()
+        .success();
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        project
+            .read_file("package.json")
+            .trim_start_matches('\u{FEFF}'),
+    )
+    .unwrap();
+    assert!(manifest["dependencies"].get("dep").is_none());
+    assert_eq!(manifest["dependencies"]["kept"], "^2.0.0");
+}
+
+#[test]
 fn remove_preserves_a_source_owned_dependency_that_the_user_changed() {
     let project =
         TempProject::empty(r#"{"name":"host","version":"1.0.0","dependencies":{"dep":"^2.0.0"}}"#);

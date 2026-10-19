@@ -199,7 +199,7 @@ pub(crate) fn resolve_effective_linker_from_bytes(
     cfg: &GlobalConfig,
     project_dir: &Path,
 ) -> Result<LinkerMode, String> {
-    let pkg: PackageJson = match serde_json::from_str(pkg_content) {
+    let pkg: PackageJson = match serde_json::from_str(lpm_common::strip_utf8_bom_str(pkg_content)) {
         Ok(p) => p,
         Err(_) => return Ok(LinkerMode::default()),
     };
@@ -425,6 +425,17 @@ mod tests {
             resolve_effective_linker(None, &pkg, &empty_cfg(), &project).unwrap(),
             LinkerMode::Hoisted,
             "`package.json > lpm > linker` wins over workspace auto-detection",
+        );
+    }
+
+    #[test]
+    fn a_package_json_with_a_byte_order_mark_keeps_its_linker() {
+        let _env = ScopedEnv::update([("LPM_LINKER", None)]);
+        let pkg_content = "\u{FEFF}{\"name\":\"marked\",\"lpm\":{\"linker\":\"isolated\"}}";
+        let (_dir, project) = temp_project(pkg_content);
+        assert_eq!(
+            resolve_effective_linker_from_bytes(None, pkg_content, &empty_cfg(), &project).unwrap(),
+            LinkerMode::Isolated,
         );
     }
 }

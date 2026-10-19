@@ -63,6 +63,19 @@ pub(super) fn validate_source_delivery_namespace(
             destination.display()
         )));
     }
+    // So would one in a git directory under another name, as a bare
+    // repository such as `vendor/tool.git` is.
+    if let Some(git_directory) = destination
+        .ancestors()
+        .take_while(|ancestor| ancestor.starts_with(project_root_canonical))
+        .find(|ancestor| lpm_common::git_directory::is_git_directory(ancestor))
+    {
+        return Err(LpmError::Registry(format!(
+            "source delivery cannot write into a git directory: {} is in {}",
+            destination.display(),
+            git_directory.display()
+        )));
+    }
     // NTFS takes a short name, such as `LPM~1.LOC` for `lpm.lock`, for the
     // name itself in every open: `.git` at any depth, and at the root what
     // only the root reserves.
@@ -346,7 +359,7 @@ pub(super) fn prepare_safe_dest_parent_tracked(
         target_root_canonical,
         rollback,
         on_created,
-        |current, name, _| create_owned_directory_noreplace(current, name),
+        |current, name, _| create_destination_directory(current, name),
         |directory| directory.canonicalize(),
     )
 }
@@ -468,26 +481,12 @@ struct CreatedDirectory {
     children: Vec<usize>,
 }
 
-fn create_owned_directory_noreplace(parent: &Dir, name: &OsStr) -> std::io::Result<Dir> {
-    let (private_name, directory) =
-        crate::directory_transaction::create_private_directory(parent, "add-parent")?;
-    match crate::directory_transaction::publish_directory_noreplace(
-        parent,
-        &directory,
-        &private_name,
-        parent,
-        name,
-    ) {
-        Ok(()) => Ok(directory),
-        Err(publication_error) => {
-            match crate::directory_transaction::discard_private_directory(directory) {
-                Ok(()) => Err(publication_error),
-                Err(cleanup_error) => Err(std::io::Error::other(format!(
-                    "{publication_error}; could not discard private directory: {cleanup_error}"
-                ))),
-            }
-        }
-    }
+/// Creates `name` in `parent` as `mkdir` does, so a delivered directory gets
+/// the mode the umask gives and the ACL entries its parent passes on, as the
+/// project's other directories do.
+fn create_destination_directory(parent: &Dir, name: &OsStr) -> std::io::Result<Dir> {
+    parent.create_dir(name)?;
+    crate::directory_transaction::open_directory_shared(parent, name)
 }
 
 fn prepare_safe_dest_parent_with(
@@ -581,9 +580,6 @@ fn prepare_safe_dest_parent_with(
                         directory.display()
                     ))
                 })?;
-                // Windows directory readers deny delete sharing. Release the
-                // publication handle's DELETE access before opening the reader.
-                drop(created_child);
                 canonical_current.push(name);
                 let child = current.open_dir_nofollow(name).map_err(|error| {
                     LpmError::Registry(format!(
@@ -832,7 +828,8 @@ fn remove_tracked_directory_branch(
         }
     };
     let (private_name, private_directory) =
-        match crate::directory_transaction::create_private_directory(&parent, "rollback") {
+        match crate::directory_transaction::create_private_directory_in_project(&parent, "rollback")
+        {
             Ok(created) => created,
             Err(error) => {
                 errors.push(format!("{}: {error}", canonical.display()));
@@ -1044,6 +1041,30 @@ mod tests {
             validate_source_delivery_namespace(project, &project.join(destination))
                 .unwrap_or_else(|error| panic!("{destination}: {error}"));
         }
+    }
+
+    #[test]
+    fn source_delivery_never_writes_into_a_git_directory_under_another_name() {
+        let project = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let bare = root.join("vendor").join("tool.git");
+        for directory in ["objects", "refs"] {
+            std::fs::create_dir_all(bare.join(directory)).unwrap();
+        }
+        std::fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(root.join("vendor").join("notes.git")).unwrap();
+
+        for destination in [bare.join("hooks").join("pre-commit"), bare.join("config")] {
+            let error = validate_source_delivery_namespace(&root, &destination)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("git directory"), "{destination:?}: {error}");
+        }
+        validate_source_delivery_namespace(
+            &root,
+            &root.join("vendor").join("notes.git").join("hooks.md"),
+        )
+        .unwrap();
     }
 
     /// A volume that makes short names resolves them from any system; a
@@ -1469,7 +1490,7 @@ mod tests {
             &mut rollback,
             |directory| recorded.push(directory.to_path_buf()),
             |current, name, directory| {
-                let created = create_owned_directory_noreplace(current, name)?;
+                let created = create_destination_directory(current, name)?;
                 std::fs::rename(directory, &displaced)?;
                 std::fs::create_dir(directory)?;
                 Ok(created)
@@ -1527,7 +1548,7 @@ mod tests {
             &canonical_project,
             &mut rollback,
             |_| {},
-            |current, name, _| create_owned_directory_noreplace(current, name),
+            |current, name, _| create_destination_directory(current, name),
             |directory| {
                 canonicalizations += 1;
                 directory.canonicalize()
@@ -1556,7 +1577,7 @@ mod tests {
             &canonical_project,
             &mut rollback,
             |_| {},
-            |current, name, _| create_owned_directory_noreplace(current, name),
+            |current, name, _| create_destination_directory(current, name),
             |directory| {
                 canonicalizations += 1;
                 if canonicalizations == 2 {
@@ -1765,6 +1786,59 @@ mod tests {
         assert_eq!(rollback.directories.len(), 256);
         rollback.rollback_best_effort();
         assert_eq!(std::fs::read_dir(&existing).unwrap().count(), 0);
+    }
+
+    /// What decides who may use a directory: its mode, or its DACL.
+    #[cfg(unix)]
+    fn directory_access(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[cfg(windows)]
+    fn directory_access(path: &Path) -> String {
+        let directory = Dir::open_ambient_dir(path, cap_std::ambient_authority()).unwrap();
+        crate::commands::remove::windows_directory_security::test_sddl(&directory).unwrap()
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn source_delivery_creates_destination_directories_as_mkdir_does() {
+        let project = tempfile::tempdir().unwrap();
+        let canonical_project = project.path().canonicalize().unwrap();
+        let reference = canonical_project.join("made-by-mkdir");
+        std::fs::create_dir(&reference).unwrap();
+        let parent = canonical_project.join("src").join("ui");
+
+        prepare_safe_dest_parent(&parent, &canonical_project).unwrap();
+
+        let expected = directory_access(&reference);
+        assert_eq!(directory_access(&canonical_project.join("src")), expected);
+        assert_eq!(directory_access(&parent), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_delivery_creates_and_rolls_back_directories_in_a_group_writable_project() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let project = tempfile::tempdir().unwrap();
+        let canonical_project = project.path().canonicalize().unwrap();
+        std::fs::set_permissions(&canonical_project, std::fs::Permissions::from_mode(0o775))
+            .unwrap();
+        let mut rollback = CreatedDirectoryRollback::new(&canonical_project).unwrap();
+
+        prepare_safe_dest_parent_tracked(
+            &canonical_project.join("src/ui"),
+            &canonical_project,
+            &mut rollback,
+            |_| {},
+        )
+        .unwrap();
+        assert!(canonical_project.join("src/ui").is_dir());
+
+        assert_eq!(rollback.cleanup(), "");
+        assert!(!canonical_project.join("src").exists());
     }
 
     #[test]

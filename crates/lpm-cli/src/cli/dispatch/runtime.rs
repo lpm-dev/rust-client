@@ -121,7 +121,8 @@ fn install_runtime_worker_threads(
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     )
     .ok()?;
-    let package: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let package: serde_json::Value =
+        serde_json::from_str(lpm_common::strip_utf8_bom_str(&content)).ok()?;
     if !package.is_object()
         || package.get("workspaces").is_some()
         || project_dir.join("Package.swift").exists()
@@ -159,6 +160,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn install_runtime_reads_a_package_json_with_a_byte_order_mark() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join("package.json"), "\u{FEFF}{}").unwrap();
+        let cli = Cli::try_parse_from(["lpm", "install"]).unwrap();
+        assert_eq!(
+            install_runtime_worker_threads(cli.command.as_ref(), false, 18, Some(project.path())),
+            Some(2),
+        );
     }
 
     #[test]

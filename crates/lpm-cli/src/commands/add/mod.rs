@@ -339,8 +339,10 @@ fn reconcile_stale_dependencies(
     let content =
         lpm_common::read_text_file_capped(&manifest_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
             .map_err(|error| LpmError::Registry(format!("failed to read package.json: {error}")))?;
-    let mut manifest: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|error| LpmError::Registry(format!("failed to parse package.json: {error}")))?;
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(lpm_common::strip_utf8_bom_str(&content)).map_err(|error| {
+            LpmError::Registry(format!("failed to parse package.json: {error}"))
+        })?;
     let changed = !plan::remove_unchanged_dependencies(&mut manifest, &stale)?.is_empty();
     if changed {
         let mut body = serde_json::to_vec_pretty(&manifest).map_err(|error| {

@@ -353,7 +353,7 @@ fn publish_with(
     io: &impl PublicationIo,
 ) -> Result<(), Error> {
     let old = destination.existing(true)?;
-    let (private_name, private) = code(transaction::create_private_directory(
+    let (private_name, private) = code(transaction::create_private_directory_in_project(
         &destination.parent,
         "env-generated",
     ))?;

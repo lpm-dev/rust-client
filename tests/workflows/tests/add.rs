@@ -81,6 +81,63 @@ async fn source_add_and_remove_use_in_project_paths_on_native_platforms() {
     assert_eq!(project.read_file("keep.txt"), "unrelated work");
 }
 
+#[cfg(unix)]
+fn run_under_umask_002(mut command: std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    unsafe {
+        // SAFETY: `umask` is async-signal-safe and touches no memory.
+        command.pre_exec(|| {
+            libc::umask(0o002);
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn source_add_and_remove_work_in_a_group_writable_project() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mock = MockRegistry::start().await;
+    let package = "group-writable-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"files": [{"src": "hello.txt", "dest": "nested/hello.txt"}]}),
+        &[("hello.txt", b"managed source")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+    let mode = |relative: &str| {
+        std::fs::metadata(project.path().join(relative))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    };
+
+    let mut add = lpm_spawnable_with_registry(&project, &mock.url());
+    add.args(["add", package, "--path", "ui", "--yes", "--no-skills"]);
+    run_under_umask_002(add);
+
+    assert_eq!(project.read_file("ui/nested/hello.txt"), "managed source");
+    assert_eq!(mode("ui"), 0o775);
+    assert_eq!(mode("ui/nested"), 0o775);
+
+    let mut remove = lpm_spawnable_with_registry(&project, &mock.url());
+    remove.args(["remove", package]);
+    run_under_umask_002(remove);
+
+    assert!(!project.file_exists("ui"));
+}
+
 #[tokio::test]
 async fn source_add_paths_are_relative_to_where_the_command_ran() {
     let mock = MockRegistry::start().await;
@@ -4588,6 +4645,90 @@ async fn add_dry_run_reports_stale_original_restoration_and_dependency_removal()
     assert_eq!(project.read_file("package.json"), manifest);
     assert_eq!(project.read_file("lpm-sources.json"), state);
     assert_eq!(project.read_file("components/Restore.ts"), "replacement\n");
+}
+
+#[tokio::test]
+async fn source_update_drops_a_stale_dependency_from_a_package_json_with_a_byte_order_mark() {
+    let mock = MockRegistry::start().await;
+    let package = "marked-manifest-source";
+    let leaf = "bom-leaf";
+    let first = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"ecosystem":"js","files":[{"src":"Keep.ts"}],"configSchema":{"enabled":{"type":"boolean","default":true}},"dependencies":{"enabled":{"true":["bom-leaf@1.0.0"]}}}),
+        &[("Keep.ts", b"keep\n")],
+    );
+    let second = make_source_pkg_tarball(
+        package,
+        "2.0.0",
+        json!({"ecosystem":"js","files":[{"src":"Keep.ts"}],"dependencies":{}}),
+        &[("Keep.ts", b"keep\n")],
+    );
+    let meta = mock
+        .mount_full_package_metadata_routes(
+            package,
+            "2.0.0",
+            &[
+                ("1.0.0", json!({}), Some(first)),
+                ("2.0.0", json!({}), Some(second)),
+            ],
+        )
+        .await;
+    let leaf_bytes = make_tarball_from_pkg_json(json!({"name":leaf,"version":"1.0.0"}), &[]);
+    mock.with_package(leaf, "1.0.0", &leaf_bytes).await;
+    mock.with_batch_metadata(vec![
+        meta,
+        mock.package_metadata(leaf, "1.0.0", &leaf_bytes),
+    ])
+    .await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    lpm_with_registry(&project, &mock.url())
+        .args(["add", &format!("{package}@1.0.0"), "--yes", "--no-skills"])
+        .assert()
+        .success();
+    let manifest = format!("\u{FEFF}{}", project.read_file("package.json"));
+    project.write_file("package.json", &manifest);
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "add",
+            &format!("{package}@2.0.0"),
+            "--yes",
+            "--no-skills",
+            "--dry-run",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        body["dependencies_removed"],
+        json!([{"name":leaf,"section":"dependencies","spec":"1.0.0"}])
+    );
+    assert_eq!(project.read_file("package.json"), manifest);
+
+    lpm_with_registry(&project, &mock.url())
+        .args(["add", &format!("{package}@2.0.0"), "--yes", "--no-skills"])
+        .assert()
+        .success();
+    let updated: serde_json::Value = serde_json::from_str(
+        project
+            .read_file("package.json")
+            .trim_start_matches('\u{FEFF}'),
+    )
+    .unwrap();
+    assert!(
+        updated
+            .get("dependencies")
+            .and_then(|dependencies| dependencies.get(leaf))
+            .is_none(),
+        "{updated:#}"
+    );
 }
 
 #[cfg(unix)]

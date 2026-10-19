@@ -841,7 +841,8 @@ pub(super) fn read_trusted_deps_from_manifest(
     let content =
         lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
             .ok()?;
-    let manifest: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let manifest: serde_json::Value =
+        serde_json::from_str(lpm_common::strip_utf8_bom_str(&content)).ok()?;
     // `trustedDependencies` sits under `lpm.trustedDependencies` per
     // the manifest schema; also accept it at the top level for
     // leniency against older package.json shapes the test suite
@@ -851,6 +852,22 @@ pub(super) fn read_trusted_deps_from_manifest(
         .and_then(|lpm| lpm.get("trustedDependencies"))
         .or_else(|| manifest.get("trustedDependencies"))?;
     serde_json::from_value::<lpm_workspace::TrustedDependencies>(raw.clone()).ok()
+}
+
+#[cfg(test)]
+mod trusted_dependencies_tests {
+    use super::read_trusted_deps_from_manifest;
+
+    #[test]
+    fn trusted_dependencies_are_read_from_a_package_json_with_a_byte_order_mark() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("package.json"),
+            "\u{FEFF}{\"lpm\":{\"trustedDependencies\":[\"esbuild\"]}}",
+        )
+        .unwrap();
+        assert!(read_trusted_deps_from_manifest(project.path()).is_some());
+    }
 }
 
 /// Resolve installed source identities for advisor request tests.

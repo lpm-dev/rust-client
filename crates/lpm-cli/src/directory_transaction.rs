@@ -78,7 +78,25 @@ pub(crate) fn directory_identity(_directory: &Dir) -> std::io::Result<DirectoryI
     ))
 }
 
+/// A uniquely named directory in `parent` that only the current user can
+/// enter, opened without following links. `parent` must be the current
+/// user's alone: theirs, writable by no one else, without an ACL letting
+/// others in.
 pub(crate) fn create_private_directory(
+    parent: &Dir,
+    purpose: &str,
+) -> std::io::Result<(OsString, Dir)> {
+    ensure_exclusively_controlled(parent)?;
+    create_private_directory_with(parent, purpose, |_, _| Ok(()))
+}
+
+/// [`create_private_directory`] in a directory of the project a command works
+/// on, which others may be able to write: a group-writable one under the
+/// umask 002 many Linux systems give users, another user's, or one with an
+/// ACL. Whoever can write `parent` already controls what it holds; the
+/// directory is still the current user's alone, and publishing it checks its
+/// identity before and after the move.
+pub(crate) fn create_private_directory_in_project(
     parent: &Dir,
     purpose: &str,
 ) -> std::io::Result<(OsString, Dir)> {
@@ -124,8 +142,8 @@ fn create_private_directory_with(
 }
 
 #[cfg(unix)]
-fn create_and_open_private_directory(parent: &Dir, name: &OsStr) -> std::io::Result<Dir> {
-    use cap_std::fs::{DirBuilderExt as _, MetadataExt as _};
+fn ensure_exclusively_controlled(parent: &Dir) -> std::io::Result<()> {
+    use cap_std::fs::MetadataExt as _;
 
     let metadata = parent.dir_metadata()?;
     let current_uid = unsafe {
@@ -141,6 +159,22 @@ fn create_and_open_private_directory(parent: &Dir, name: &OsStr) -> std::io::Res
             "private transaction parent is not exclusively controlled by the current user",
         ));
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "keeps the parent check's signature consistent with the fallible Unix implementation"
+)]
+fn ensure_exclusively_controlled(_parent: &Dir) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_and_open_private_directory(parent: &Dir, name: &OsStr) -> std::io::Result<Dir> {
+    use cap_std::fs::DirBuilderExt as _;
+
     let mut builder = cap_std::fs::DirBuilder::new();
     builder.mode(0o700);
     parent.create_dir_with(name, &builder)?;

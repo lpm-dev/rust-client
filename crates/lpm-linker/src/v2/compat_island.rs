@@ -185,7 +185,8 @@ fn collect_project_package_bin_names(
 }
 
 fn package_name_from_manifest(content: &[u8]) -> Option<String> {
-    let parsed: serde_json::Value = serde_json::from_slice(content).ok()?;
+    let parsed: serde_json::Value =
+        serde_json::from_slice(lpm_common::strip_utf8_bom_bytes(content)).ok()?;
     parsed.get("name")?.as_str().map(str::to_string)
 }
 
@@ -1272,5 +1273,18 @@ mod tests {
         );
         std::fs::write(destination_file, b"modified").unwrap();
         assert_eq!(std::fs::read(source_file).unwrap(), b"original");
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::package_name_from_manifest;
+
+    #[test]
+    fn package_name_is_read_from_a_manifest_with_a_byte_order_mark() {
+        assert_eq!(
+            package_name_from_manifest(b"\xEF\xBB\xBF{\"name\":\"marked\"}").as_deref(),
+            Some("marked")
+        );
     }
 }
