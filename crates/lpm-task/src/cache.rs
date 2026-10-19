@@ -67,6 +67,10 @@ static CACHE_STORE_STAGING_RACE_BARRIER: std::sync::Mutex<Vec<CacheRaceBarrier>>
     std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
+static CACHE_PROBE_RACE_BARRIER: std::sync::Mutex<Vec<CacheRaceBarrier>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
 #[derive(Clone)]
 struct StagedFileFinalizeFailure {
     project: PathBuf,
@@ -399,18 +403,31 @@ pub fn has_cache_hit(key: &str) -> bool {
     has_cache_hit_with_root(&root, key)
 }
 
+/// Probes under the shared locks a restore takes, without the project's: a
+/// store or clean then waits instead of replacing an entry the probe holds
+/// open, which Windows refuses, and a probe of a missing entry doesn't hold
+/// up restores in the project.
 fn has_cache_hit_with_root(root: &LpmRoot, key: &str) -> bool {
     let Ok(Some(cache)) = open_task_cache(root, false) else {
         return false;
     };
-    open_cache_entry(&cache, key).is_ok_and(|entry| {
-        open_cache_entry_file(&entry, "meta.json", "task cache metadata")
-            .is_ok_and(|file| file.is_some())
-            && open_cache_entry_file(&entry, "stdout.log", "task cache replay log")
-                .is_ok_and(|file| file.is_some())
-            && open_cache_entry_file(&entry, "stderr.log", "task cache replay log")
-                .is_ok_and(|file| file.is_some())
+    let Ok(entry_lock) = cache_entry_lock_path(root, key) else {
+        return false;
+    };
+    lpm_common::with_shared_lock(root.cache_clean_lock(), || {
+        let _entry_lock = lpm_common::acquire_single_file_shared_lock(entry_lock)?;
+        Ok(open_cache_entry(&cache, key).is_ok_and(|entry| {
+            #[cfg(test)]
+            wait_for_cache_race_barrier(&CACHE_PROBE_RACE_BARRIER, &entry.path);
+            ["meta.json", "stdout.log", "stderr.log"]
+                .into_iter()
+                .all(|name| {
+                    open_cache_entry_file(&entry, name, "task cache entry file")
+                        .is_ok_and(|file| file.is_some())
+                })
+        }))
     })
+    .unwrap_or(false)
 }
 
 /// Restore cached outputs to the project directory.
@@ -2339,6 +2356,56 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join("dist/index.js")).unwrap(),
             "built output"
+        );
+    }
+
+    #[test]
+    fn a_store_waits_for_a_probe_reading_the_same_entry() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join("dist")).unwrap();
+        fs::write(project.path().join("dist/out.txt"), "built").unwrap();
+        let key = unique_key("probe-store-race");
+        let outputs = ["dist/**".to_string()];
+        cache
+            .store(&key, project.path(), "build", &outputs, "", "", 1)
+            .unwrap();
+        let barrier = install_race_barrier(&CACHE_PROBE_RACE_BARRIER, cache.entry(&key));
+        let probe = {
+            let (root, key) = (cache.root.clone(), key.clone());
+            std::thread::spawn(move || has_cache_hit_with_root(&root, &key))
+        };
+        barrier.validated.wait();
+        let (stored, store_finished) = std::sync::mpsc::channel();
+        let store = {
+            let (root, project) = (cache.root, project.path().to_path_buf());
+            std::thread::spawn(move || {
+                let result = store_cache_with_root(
+                    &root,
+                    &key,
+                    &project,
+                    "build",
+                    &["dist/**".into()],
+                    "",
+                    "",
+                    1,
+                );
+                stored.send(()).unwrap();
+                result
+            })
+        };
+
+        let replaced_while_read = store_finished
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_ok();
+        barrier.resume.wait();
+        clear_race_barrier(&CACHE_PROBE_RACE_BARRIER, &barrier);
+
+        assert!(probe.join().unwrap());
+        store.join().unwrap().unwrap();
+        assert!(
+            !replaced_while_read,
+            "a store replaced the entry while a probe was reading it"
         );
     }
 
