@@ -97,6 +97,10 @@ static STAGING_CLEANUP_FAILURE: std::sync::Mutex<Option<std::ffi::OsString>> =
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
+static STAGING_CLEANUP_LEFTOVER: std::sync::Mutex<Option<std::ffi::OsString>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
 std::thread_local! {
     static RESTORE_DURABILITY_SYNC_COUNT: std::cell::Cell<Option<usize>> = const {
         std::cell::Cell::new(None)
@@ -4130,6 +4134,31 @@ mod tests {
         assert!(
             !abandoned.exists(),
             "failed cleanup removed its recovery registration"
+        );
+    }
+
+    /// Windows keeps a deleted entry, and so its directory, while another
+    /// process, as a virus scanner, holds it open.
+    #[test]
+    fn staging_left_non_empty_by_cleanup_remains_discoverable_for_the_next_restore() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        let staged = StagedOutputs::new(&cache.root, project.path()).unwrap();
+        let abandoned = staged.temp_path().to_path_buf();
+        *STAGING_CLEANUP_LEFTOVER.lock().unwrap() = Some(
+            abandoned
+                .file_name()
+                .expect("restore staging directory name")
+                .to_os_string(),
+        );
+
+        drop(staged);
+        assert!(abandoned.exists());
+        drop(StagedOutputs::new(&cache.root, project.path()).unwrap());
+
+        assert!(
+            !abandoned.exists(),
+            "a staging directory cleanup left behind lost its recovery registration"
         );
     }
 

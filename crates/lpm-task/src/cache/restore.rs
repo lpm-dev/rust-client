@@ -515,7 +515,7 @@ impl StagedOutputs {
         transaction.mark_committed();
         drop(transaction);
         this.cleanup_registry_on_drop = false;
-        cleanup_open_staging(
+        if cleanup_open_staging(
             &this.staging_parent,
             Path::new(this.temp_path.file_name().ok_or_else(|| {
                 LpmError::Task("restore staging directory has no file name".into())
@@ -524,8 +524,10 @@ impl StagedOutputs {
                 .take()
                 .expect("restore staging directory exists")
                 .into_root(),
-        )?;
-        remove_restore_registration(&this.registry_record)?;
+            &this.token,
+        )? {
+            remove_restore_registration(&this.registry_record)?;
+        }
         Ok(true)
     }
 
@@ -556,8 +558,13 @@ impl Drop for StagedOutputs {
             let cleanup_succeeded = if let Some(staging) = self.staging.take()
                 && let Some(name) = self.temp_path.file_name()
             {
-                cleanup_open_staging(&self.staging_parent, Path::new(name), staging.into_root())
-                    .is_ok()
+                cleanup_open_staging(
+                    &self.staging_parent,
+                    Path::new(name),
+                    staging.into_root(),
+                    &self.token,
+                )
+                .is_ok_and(|removed| removed)
             } else {
                 true
             };
@@ -1213,16 +1220,18 @@ fn recover_registered_restore(
         return Ok(());
     }
     if committed || restore_is_committed(&staging, restore_dir)? {
-        cleanup_open_staging(&staging_parent, staging_name, staging)?;
-        remove_restore_registration(record)?;
+        if cleanup_open_staging(&staging_parent, staging_name, staging, token)? {
+            remove_restore_registration(record)?;
+        }
         return Ok(());
     }
     let journal_path = restore_dir.join(RESTORE_JOURNAL_NAME);
     let journal_file = match open_cap_file_nofollow(&staging, Path::new(RESTORE_JOURNAL_NAME)) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            cleanup_open_staging(&staging_parent, staging_name, staging)?;
-            remove_restore_registration(record)?;
+            if cleanup_open_staging(&staging_parent, staging_name, staging, token)? {
+                remove_restore_registration(record)?;
+            }
             return Ok(());
         }
         Err(error) => return Err(error.into()),
@@ -1319,8 +1328,9 @@ fn recover_registered_restore(
     // Windows can't remove the staging directory while a handle to a
     // directory in it is open.
     drop((output, backup));
-    cleanup_open_staging(&staging_parent, staging_name, staging)?;
-    remove_restore_registration(record)?;
+    if cleanup_open_staging(&staging_parent, staging_name, staging, token)? {
+        remove_restore_registration(record)?;
+    }
     Ok(())
 }
 
@@ -1340,7 +1350,16 @@ fn recovery_output_was_installed(
     Ok(staged_identity == destination_identity)
 }
 
-fn cleanup_open_staging(project: &Dir, staging_name: &Path, staging: Dir) -> Result<(), LpmError> {
+/// Removes a restore's staging directory and says whether it is gone. One
+/// that stays, as Windows keeps a directory while another process holds a
+/// deleted entry in it open, gets its owner token back, so the registry
+/// record that the caller then keeps still leads a later restore to it.
+fn cleanup_open_staging(
+    project: &Dir,
+    staging_name: &Path,
+    staging: Dir,
+    token: &[u8; RESTORE_TOKEN_BYTES],
+) -> Result<bool, LpmError> {
     #[cfg(test)]
     {
         let mut failure = STAGING_CLEANUP_FAILURE
@@ -1355,19 +1374,42 @@ fn cleanup_open_staging(project: &Dir, staging_name: &Path, staging: Dir) -> Res
         }
     }
     clean_open_cache_ephemeral(&staging)?;
+    #[cfg(test)]
+    {
+        let mut leftover = STAGING_CLEANUP_LEFTOVER
+            .lock()
+            .expect("staging cleanup leftover lock");
+        if leftover.as_deref() == staging_name.file_name() {
+            leftover.take();
+            staging.write("leftover", b"held open elsewhere")?;
+        }
+    }
+    let identity = lpm_common::atomic_write::file_identity(&staging.try_clone()?.into_std_file())?;
     drop(staging);
     match project.remove_dir(staging_name) {
-        Ok(()) => sync_cap_directory(project)?,
+        Ok(()) => {
+            sync_cap_directory(project)?;
+            Ok(true)
+        }
         Err(error)
             if matches!(
                 error.kind(),
-                std::io::ErrorKind::NotFound
-                    | std::io::ErrorKind::DirectoryNotEmpty
-                    | std::io::ErrorKind::NotADirectory
-            ) => {}
-        Err(error) => return Err(error.into()),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+            let staging = project.open_dir_nofollow(staging_name)?;
+            if lpm_common::atomic_write::file_identity(&staging.try_clone()?.into_std_file())?
+                == identity
+            {
+                write_restore_owner_open(&staging, token)?;
+            }
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
     }
-    Ok(())
 }
 
 fn restore_owner_matches_open(
