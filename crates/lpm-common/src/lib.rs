@@ -49,6 +49,8 @@ pub mod test_disk_image;
 pub mod thread_identity;
 mod utf8_bom;
 
+#[cfg(windows)]
+pub use atomic_write::rename_open_file_noreplace;
 #[cfg(unix)]
 pub use atomic_write::replace_symlink_atomic;
 pub use atomic_write::{

@@ -3717,6 +3717,39 @@ mod tests {
     }
 
     #[test]
+    fn restore_never_replaces_an_output_that_appears_while_it_publishes() {
+        let project = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir_in(project.path()).unwrap();
+        fs::create_dir_all(staging.path().join("outputs/dist")).unwrap();
+        fs::create_dir(staging.path().join("backups")).unwrap();
+        fs::write(staging.path().join("outputs/dist/value.txt"), "cached").unwrap();
+        fs::create_dir(project.path().join("dist")).unwrap();
+        let destination = project.path().join("dist/value.txt");
+        let barrier = install_race_barrier(&STAGED_OUTPUT_RACE_BARRIER, destination.clone());
+        let project_path = project.path().to_path_buf();
+        let staging_path = staging.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            let mut transaction = RestoreTransaction::new(project_path, &staging_path, 1).unwrap();
+            match transaction.install(Path::new("dist/value.txt"), false) {
+                Ok(()) => transaction.commit(),
+                Err(error) => Err(transaction.rollback_error(error).0),
+            }
+        });
+        barrier.validated.wait();
+        fs::write(&destination, "written meanwhile").unwrap();
+        barrier.resume.wait();
+
+        let result = worker.join().unwrap();
+        clear_race_barrier(&STAGED_OUTPUT_RACE_BARRIER, &barrier);
+
+        assert!(result.is_err(), "restore replaced an output that appeared");
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            "written meanwhile"
+        );
+    }
+
+    #[test]
     fn restore_keeps_an_inode_receipt_for_each_published_file_until_commit() {
         let project = tempfile::tempdir().unwrap();
         let staging = tempfile::tempdir_in(project.path()).unwrap();

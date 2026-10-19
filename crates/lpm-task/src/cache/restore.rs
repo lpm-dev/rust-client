@@ -1603,7 +1603,15 @@ fn rename_staged_file_noreplace(
     destination_parent: &Dir,
     destination_name: &std::ffi::OsStr,
 ) -> Result<(), std::io::Error> {
-    source_parent.rename(source_name, destination_parent, Path::new(destination_name))
+    use cap_std::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, SYNCHRONIZE};
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .access_mode(DELETE | SYNCHRONIZE)
+        .follow(FollowSymlinks::No);
+    let staged = source_parent.open_with(source_name, &options)?;
+    lpm_common::rename_open_file_noreplace(destination_parent, destination_name, &staged)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
