@@ -32,6 +32,7 @@ same-file = "1"
 rustix = { version = "1.1", features = ["fs"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dev-dependencies]
+lpm-common = { workspace = true, features = ["test-support"] }
 rustix = { version = "1.1", features = ["time"] }
 
 [target.'cfg(windows)'.dependencies]

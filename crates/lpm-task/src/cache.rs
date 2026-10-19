@@ -46,7 +46,7 @@ static STAGED_OUTPUT_RACE_BARRIER: std::sync::Mutex<Vec<CacheRaceBarrier>> =
 static PUBLISHED_OUTPUT_RACE_BARRIER: std::sync::Mutex<Vec<CacheRaceBarrier>> =
     std::sync::Mutex::new(Vec::new());
 
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
 static STAGED_TREE_RACE_BARRIER: std::sync::Mutex<Vec<CacheRaceBarrier>> =
     std::sync::Mutex::new(Vec::new());
 
@@ -64,6 +64,10 @@ static CACHE_FILE_READ_RACE_BARRIER: std::sync::Mutex<Vec<CacheRaceBarrier>> =
 
 #[cfg(test)]
 static CACHE_STORE_STAGING_RACE_BARRIER: std::sync::Mutex<Vec<CacheRaceBarrier>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+static CACHE_PROBE_RACE_BARRIER: std::sync::Mutex<Vec<CacheRaceBarrier>> =
     std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
@@ -90,6 +94,10 @@ static BACKUP_SYNC_FAILURE: std::sync::Mutex<Option<BackupSyncFailure>> =
 
 #[cfg(test)]
 static STAGING_CLEANUP_FAILURE: std::sync::Mutex<Option<std::ffi::OsString>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static STAGING_CLEANUP_LEFTOVER: std::sync::Mutex<Option<std::ffi::OsString>> =
     std::sync::Mutex::new(None);
 
 #[cfg(test)]
@@ -399,18 +407,31 @@ pub fn has_cache_hit(key: &str) -> bool {
     has_cache_hit_with_root(&root, key)
 }
 
+/// Probes under the shared locks a restore takes, without the project's: a
+/// store or clean then waits instead of replacing an entry the probe holds
+/// open, which Windows refuses, and a probe of a missing entry doesn't hold
+/// up restores in the project.
 fn has_cache_hit_with_root(root: &LpmRoot, key: &str) -> bool {
     let Ok(Some(cache)) = open_task_cache(root, false) else {
         return false;
     };
-    open_cache_entry(&cache, key).is_ok_and(|entry| {
-        open_cache_entry_file(&entry, "meta.json", "task cache metadata")
-            .is_ok_and(|file| file.is_some())
-            && open_cache_entry_file(&entry, "stdout.log", "task cache replay log")
-                .is_ok_and(|file| file.is_some())
-            && open_cache_entry_file(&entry, "stderr.log", "task cache replay log")
-                .is_ok_and(|file| file.is_some())
+    let Ok(entry_lock) = cache_entry_lock_path(root, key) else {
+        return false;
+    };
+    lpm_common::with_shared_lock(root.cache_clean_lock(), || {
+        let _entry_lock = lpm_common::acquire_single_file_shared_lock(entry_lock)?;
+        Ok(open_cache_entry(&cache, key).is_ok_and(|entry| {
+            #[cfg(test)]
+            wait_for_cache_race_barrier(&CACHE_PROBE_RACE_BARRIER, &entry.path);
+            ["meta.json", "stdout.log", "stderr.log"]
+                .into_iter()
+                .all(|name| {
+                    open_cache_entry_file(&entry, name, "task cache entry file")
+                        .is_ok_and(|file| file.is_some())
+                })
+        }))
     })
+    .unwrap_or(false)
 }
 
 /// Restore cached outputs to the project directory.
@@ -1577,6 +1598,7 @@ fn collect_output_files(
 ) -> Result<Vec<PathBuf>, LpmError> {
     let mut files = HashSet::new();
     let mut short_named = ShortNamedDirectories::default();
+    let mut git_directories = GitDirectories::default();
     let glob_root = lpm_common::project_glob::project_glob_root(project_dir);
 
     for pattern in output_globs {
@@ -1615,6 +1637,7 @@ fn collect_output_files(
                 })?;
                 if is_never_an_output(relative)
                     || short_named.reaches_withheld(project_dir, relative)
+                    || git_directories.contain(project_dir, relative)
                 {
                     continue;
                 }
@@ -1698,6 +1721,36 @@ fn expand_glob_pattern(pattern: &str) -> Vec<String> {
         patterns.push(format!("{pattern}/*"));
     }
     patterns
+}
+
+/// Which directories of a project are git directories under a name that
+/// doesn't say so, as a bare repository at `vendor/tool.git` is, found once
+/// per directory during one pass over a set of paths.
+#[derive(Default)]
+struct GitDirectories(HashMap<PathBuf, bool>);
+
+impl GitDirectories {
+    /// Whether `relative`, a file in `project_dir`, is in a git directory,
+    /// where a restored hook would run with the next git command there.
+    fn contain(&mut self, project_dir: &Path, relative: &Path) -> bool {
+        let mut directory = PathBuf::new();
+        for component in relative.parent().into_iter().flat_map(Path::components) {
+            directory.push(component);
+            let is_git_directory = match self.0.get(&directory) {
+                Some(&known) => known,
+                None => {
+                    let found =
+                        lpm_common::git_directory::is_git_directory(&project_dir.join(&directory));
+                    self.0.insert(directory.clone(), found);
+                    found
+                }
+            };
+            if is_git_directory {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// What [`ShortNamedDirectories::reaches_withheld`] found for each path
@@ -2342,6 +2395,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_store_waits_for_a_probe_reading_the_same_entry() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join("dist")).unwrap();
+        fs::write(project.path().join("dist/out.txt"), "built").unwrap();
+        let key = unique_key("probe-store-race");
+        let outputs = ["dist/**".to_string()];
+        cache
+            .store(&key, project.path(), "build", &outputs, "", "", 1)
+            .unwrap();
+        let barrier = install_race_barrier(&CACHE_PROBE_RACE_BARRIER, cache.entry(&key));
+        let probe = {
+            let (root, key) = (cache.root.clone(), key.clone());
+            std::thread::spawn(move || has_cache_hit_with_root(&root, &key))
+        };
+        barrier.validated.wait();
+        let (stored, store_finished) = std::sync::mpsc::channel();
+        let store = {
+            let (root, project) = (cache.root, project.path().to_path_buf());
+            std::thread::spawn(move || {
+                let result = store_cache_with_root(
+                    &root,
+                    &key,
+                    &project,
+                    "build",
+                    &["dist/**".into()],
+                    "",
+                    "",
+                    1,
+                );
+                stored.send(()).unwrap();
+                result
+            })
+        };
+
+        let replaced_while_read = store_finished
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_ok();
+        barrier.resume.wait();
+        clear_race_barrier(&CACHE_PROBE_RACE_BARRIER, &barrier);
+
+        assert!(probe.join().unwrap());
+        store.join().unwrap().unwrap();
+        assert!(
+            !replaced_while_read,
+            "a store replaced the entry while a probe was reading it"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn failed_cache_store_does_not_delete_a_replacement_staging_directory() {
@@ -2690,6 +2793,210 @@ mod tests {
             "remote output"
         );
         assert!(!target.path().join("dist/stale.txt").exists());
+    }
+
+    /// On a volume that ignores case, as macOS and Windows volumes do by
+    /// default, an output renamed only in case is the file the archive
+    /// restores, not a stale output to remove after it.
+    #[test]
+    fn restore_replaces_an_output_renamed_only_in_case() {
+        let cache = TestCache::new();
+        let outputs = ["dist/**".to_string()];
+        for (cached, renamed) in [("value.txt", "Value.txt"), ("Other.txt", "other.txt")] {
+            let project = tempfile::tempdir().unwrap();
+            let dist = project.path().join("dist");
+            fs::create_dir_all(&dist).unwrap();
+            fs::write(dist.join(cached), "cached").unwrap();
+            if !dist.join(cached.to_uppercase()).exists() {
+                return;
+            }
+            let key = unique_key("case-only-rename");
+            cache
+                .store(&key, project.path(), "build", &outputs, "", "", 1)
+                .unwrap();
+            fs::remove_file(dist.join(cached)).unwrap();
+            fs::write(dist.join(renamed), "renamed").unwrap();
+
+            cache.restore(&key, project.path(), &outputs).unwrap();
+
+            let names: Vec<_> = fs::read_dir(&dist)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert_eq!(names, [cached], "{renamed} → {cached}");
+            assert_eq!(fs::read_to_string(dist.join(cached)).unwrap(), "cached");
+        }
+    }
+
+    /// exFAT and FAT drives, as external and removable disks often are,
+    /// keep no hard links and no Unix ownership.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restore_works_on_volumes_without_hard_links() {
+        for filesystem in ["ExFAT", "MS-DOS FAT32"] {
+            let directory = tempfile::tempdir().unwrap();
+            let image = directory.path().join("volume.dmg");
+            let mount_point = directory.path().join("mounted");
+            fs::create_dir(&mount_point).unwrap();
+            let _attached = lpm_common::test_disk_image::AttachedImage::new(
+                &image,
+                &mount_point,
+                &["-size", "64m", "-fs", filesystem, "-volname", "LPMTASK"],
+                &[],
+            );
+            let cache = TestCache::new();
+            let outputs = ["dist/**".to_string(), "out/**".to_string()];
+            let project = mount_point.join("project");
+            fs::create_dir_all(project.join("dist/nested")).unwrap();
+            fs::create_dir_all(project.join("out")).unwrap();
+            fs::write(project.join("dist/value.txt"), "cached").unwrap();
+            fs::write(project.join("dist/nested/deep.txt"), "cached deep").unwrap();
+            fs::write(project.join("out/tree.txt"), "cached tree").unwrap();
+            let key = unique_key("no-hard-links");
+            cache
+                .store(&key, &project, "build", &outputs, "", "", 1)
+                .unwrap_or_else(|error| panic!("{filesystem}: store failed: {error}"));
+            fs::write(project.join("dist/value.txt"), "changed").unwrap();
+            fs::remove_dir_all(project.join("dist/nested")).unwrap();
+            fs::remove_dir_all(project.join("out")).unwrap();
+            fs::write(project.join("dist/stale.txt"), "stale").unwrap();
+
+            cache
+                .restore(&key, &project, &outputs)
+                .unwrap_or_else(|error| panic!("{filesystem}: restore failed: {error}"));
+
+            assert_eq!(
+                fs::read_to_string(project.join("dist/value.txt")).unwrap(),
+                "cached",
+                "{filesystem}"
+            );
+            assert_eq!(
+                fs::read_to_string(project.join("dist/nested/deep.txt")).unwrap(),
+                "cached deep",
+                "{filesystem}"
+            );
+            assert_eq!(
+                fs::read_to_string(project.join("out/tree.txt")).unwrap(),
+                "cached tree",
+                "{filesystem}"
+            );
+            assert!(!project.join("dist/stale.txt").exists(), "{filesystem}");
+        }
+    }
+
+    #[test]
+    fn restore_keeps_a_file_whose_directory_was_renamed_only_in_case() {
+        let cache = TestCache::new();
+        let outputs = ["**/*.txt".to_string()];
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project.path().join("dist")).unwrap();
+        fs::write(project.path().join("dist/value.txt"), "cached").unwrap();
+        if !project.path().join("DIST").exists() {
+            return;
+        }
+        let key = unique_key("case-only-directory-rename");
+        cache
+            .store(&key, project.path(), "build", &outputs, "", "", 1)
+            .unwrap();
+        fs::rename(project.path().join("dist"), project.path().join("Dist")).unwrap();
+        fs::write(project.path().join("Dist/value.txt"), "renamed").unwrap();
+
+        cache.restore(&key, project.path(), &outputs).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(project.path().join("dist/value.txt")).unwrap(),
+            "cached"
+        );
+    }
+
+    #[test]
+    fn restore_removes_a_stale_output_linked_to_a_restored_one() {
+        let cache = TestCache::new();
+        let outputs = ["dist/**".to_string()];
+        let project = tempfile::tempdir().unwrap();
+        let dist = project.path().join("dist");
+        fs::create_dir_all(&dist).unwrap();
+        fs::write(dist.join("kept.txt"), "cached").unwrap();
+        let key = unique_key("linked-stale-output");
+        cache
+            .store(&key, project.path(), "build", &outputs, "", "", 1)
+            .unwrap();
+        fs::hard_link(dist.join("kept.txt"), dist.join("linked.txt")).unwrap();
+
+        cache.restore(&key, project.path(), &outputs).unwrap();
+
+        assert_eq!(fs::read_to_string(dist.join("kept.txt")).unwrap(), "cached");
+        assert!(!dist.join("linked.txt").exists());
+    }
+
+    fn make_bare_repository(path: &Path) {
+        for directory in ["objects", "refs", "hooks"] {
+            fs::create_dir_all(path.join(directory)).unwrap();
+        }
+        fs::write(path.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
+    #[test]
+    fn outputs_never_take_or_prune_files_in_a_git_directory_under_another_name() {
+        let cache = TestCache::new();
+        let outputs = ["vendor/**".to_string()];
+        let project = tempfile::tempdir().unwrap();
+        let bare = project.path().join("vendor/tool.git");
+        make_bare_repository(&bare);
+        fs::write(bare.join("hooks/pre-commit"), "the repository's hook").unwrap();
+        fs::write(project.path().join("vendor/lib.js"), "cached").unwrap();
+        let key = unique_key("bare-repository-outputs");
+        cache
+            .store(&key, project.path(), "build", &outputs, "", "", 1)
+            .unwrap();
+        fs::write(bare.join("hooks/post-commit"), "added since").unwrap();
+        fs::write(project.path().join("vendor/lib.js"), "changed").unwrap();
+
+        cache.restore(&key, project.path(), &outputs).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(project.path().join("vendor/lib.js")).unwrap(),
+            "cached"
+        );
+        assert_eq!(
+            fs::read_to_string(bare.join("hooks/post-commit")).unwrap(),
+            "added since"
+        );
+        assert_eq!(
+            fs::read_to_string(bare.join("hooks/pre-commit")).unwrap(),
+            "the repository's hook"
+        );
+    }
+
+    #[test]
+    fn restore_never_writes_into_a_git_directory_in_the_project() {
+        let cache = TestCache::new();
+        let outputs = ["vendor/**".to_string()];
+        let source = tempfile::tempdir().unwrap();
+        fs::create_dir_all(source.path().join("vendor/tool.git/hooks")).unwrap();
+        fs::write(
+            source.path().join("vendor/tool.git/hooks/pre-commit"),
+            "cached",
+        )
+        .unwrap();
+        let key = unique_key("restore-into-bare-repository");
+        cache
+            .store(&key, source.path(), "build", &outputs, "", "", 1)
+            .unwrap();
+        let project = tempfile::tempdir().unwrap();
+        make_bare_repository(&project.path().join("vendor/tool.git"));
+
+        let error = cache
+            .restore(&key, project.path(), &outputs)
+            .expect_err("a restore wrote into a git directory");
+
+        assert!(error.to_string().contains("git directory"), "{error}");
+        assert!(
+            !project
+                .path()
+                .join("vendor/tool.git/hooks/pre-commit")
+                .exists()
+        );
     }
 
     #[test]
@@ -3273,9 +3580,6 @@ mod tests {
         );
     }
 
-    // Only these move an output tree that is missing in the project into
-    // place whole; elsewhere each file is published, and synced, on its own.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn restoring_many_new_outputs_uses_a_bounded_number_of_durability_syncs() {
         let source = tempfile::tempdir().unwrap();
@@ -3572,6 +3876,68 @@ mod tests {
     }
 
     #[test]
+    fn restore_never_replaces_an_output_that_appears_while_it_publishes() {
+        let project = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir_in(project.path()).unwrap();
+        fs::create_dir_all(staging.path().join("outputs/dist")).unwrap();
+        fs::create_dir(staging.path().join("backups")).unwrap();
+        fs::write(staging.path().join("outputs/dist/value.txt"), "cached").unwrap();
+        fs::create_dir(project.path().join("dist")).unwrap();
+        let destination = project.path().join("dist/value.txt");
+        let barrier = install_race_barrier(&STAGED_OUTPUT_RACE_BARRIER, destination.clone());
+        let project_path = project.path().to_path_buf();
+        let staging_path = staging.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            let mut transaction = RestoreTransaction::new(project_path, &staging_path, 1).unwrap();
+            match transaction.install(Path::new("dist/value.txt"), false) {
+                Ok(()) => transaction.commit(),
+                Err(error) => Err(transaction.rollback_error(error).0),
+            }
+        });
+        barrier.validated.wait();
+        fs::write(&destination, "written meanwhile").unwrap();
+        barrier.resume.wait();
+
+        let result = worker.join().unwrap();
+        clear_race_barrier(&STAGED_OUTPUT_RACE_BARRIER, &barrier);
+
+        assert!(result.is_err(), "restore replaced an output that appeared");
+        assert_eq!(
+            fs::read_to_string(&destination).unwrap(),
+            "written meanwhile"
+        );
+    }
+
+    /// NTFS gives `.git` the short name `GIT~1` when a volume makes short
+    /// names, as `git init` while a restore runs would.
+    #[cfg(windows)]
+    #[test]
+    fn restore_never_descends_into_git_by_a_short_name_it_gained_meanwhile() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project.path().join(".git/hooks")).unwrap();
+        if !project.path().join("GIT~1").exists() {
+            return;
+        }
+        let staging = tempfile::tempdir_in(project.path()).unwrap();
+        fs::create_dir_all(staging.path().join("outputs/GIT~1/hooks")).unwrap();
+        fs::create_dir(staging.path().join("backups")).unwrap();
+        fs::write(
+            staging.path().join("outputs/GIT~1/hooks/pre-commit"),
+            "hook",
+        )
+        .unwrap();
+        let mut transaction =
+            RestoreTransaction::new(project.path().to_path_buf(), staging.path(), 1).unwrap();
+
+        let error = transaction
+            .install(Path::new("GIT~1/hooks/pre-commit"), false)
+            .expect_err("a restore wrote into .git by its short name");
+
+        assert!(error.to_string().contains("short name"), "{error}");
+        assert!(!project.path().join(".git/hooks/pre-commit").exists());
+    }
+
+    #[test]
     fn restore_keeps_an_inode_receipt_for_each_published_file_until_commit() {
         let project = tempfile::tempdir().unwrap();
         let staging = tempfile::tempdir_in(project.path()).unwrap();
@@ -3600,7 +3966,6 @@ mod tests {
         assert_eq!(staged_identity, destination_identity);
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn restore_rolls_back_an_atomically_installed_output_tree_after_a_later_failure() {
         let project = tempfile::tempdir().unwrap();
@@ -3900,6 +4265,31 @@ mod tests {
         assert!(
             !abandoned.exists(),
             "failed cleanup removed its recovery registration"
+        );
+    }
+
+    /// Windows keeps a deleted entry, and so its directory, while another
+    /// process, as a virus scanner, holds it open.
+    #[test]
+    fn staging_left_non_empty_by_cleanup_remains_discoverable_for_the_next_restore() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        let staged = StagedOutputs::new(&cache.root, project.path()).unwrap();
+        let abandoned = staged.temp_path().to_path_buf();
+        *STAGING_CLEANUP_LEFTOVER.lock().unwrap() = Some(
+            abandoned
+                .file_name()
+                .expect("restore staging directory name")
+                .to_os_string(),
+        );
+
+        drop(staged);
+        assert!(abandoned.exists());
+        drop(StagedOutputs::new(&cache.root, project.path()).unwrap());
+
+        assert!(
+            !abandoned.exists(),
+            "a staging directory cleanup left behind lost its recovery registration"
         );
     }
 

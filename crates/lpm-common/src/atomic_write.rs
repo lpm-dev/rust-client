@@ -595,6 +595,18 @@ fn replace_capability_file(
     rename_capability_handle(directory, destination, &temporary, true)
 }
 
+/// Renames the open `file`, which needs `DELETE` access, to `destination`
+/// in `directory`, failing with `AlreadyExists` when an entry is there:
+/// the no-replace rename `MoveFileEx` has no flag for.
+#[cfg(windows)]
+pub fn rename_open_file_noreplace(
+    directory: &cap_std::fs::Dir,
+    destination: &OsStr,
+    file: &cap_std::fs::File,
+) -> io::Result<()> {
+    rename_capability_handle(directory, destination, file, false)
+}
+
 /// Renames the open `temporary` to `destination` in `directory`, replacing
 /// an entry there only when `replace` is set; an entry that stays is an
 /// `AlreadyExists` error.

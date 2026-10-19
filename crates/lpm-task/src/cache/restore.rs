@@ -388,19 +388,34 @@ impl StagedOutputs {
                     .into(),
             ));
         }
+        let mut git_directories = GitDirectories::default();
+        if let Some(relative) = this
+            .files
+            .iter()
+            .find(|relative| git_directories.contain(&this.canonical_project, relative))
+        {
+            return Err(LpmError::Task(format!(
+                "task cache archive writes into a git directory in the project: {}",
+                relative.display()
+            )));
+        }
         verify_open_directory_path(
             &this.project,
             &this.canonical_project,
             "task cache project directory",
         )?;
         let install_count = this.files.len();
-        let mut stale_outputs = collect_output_files(&this.canonical_project, output_globs)?;
+        let stored_outputs = collect_output_files(&this.canonical_project, output_globs)?;
         verify_open_directory_path(
             &this.project,
             &this.canonical_project,
             "task cache project directory",
         )?;
-        stale_outputs.retain(|relative| !this.seen_paths.contains(relative));
+        let stale_outputs: Vec<PathBuf> = stored_outputs
+            .iter()
+            .filter(|relative| !this.seen_paths.contains(*relative))
+            .cloned()
+            .collect();
         if install_count.saturating_add(stale_outputs.len()) > MAX_CACHE_ARCHIVE_ENTRIES {
             return Err(LpmError::Task(format!(
                 "task cache restore exceeds entry-count cap ({MAX_CACHE_ARCHIVE_ENTRIES} entries)"
@@ -408,13 +423,17 @@ impl StagedOutputs {
         }
         this.files.extend(stale_outputs);
 
-        let existing_outputs = write_restore_journal_for_plan_open(
+        let mut files = std::mem::take(&mut this.files);
+        let planned = write_restore_journal_for_plan_open(
             &this.open_staging().root,
             &this.project,
             &this.canonical_project,
-            &this.files,
+            &mut files,
             install_count,
-        )?;
+            &stored_outputs,
+        );
+        this.files = files;
+        let existing_outputs = planned?;
 
         let mut transaction = RestoreTransaction::new_with_open_staging(
             this.canonical_project.clone(),
@@ -507,7 +526,7 @@ impl StagedOutputs {
         transaction.mark_committed();
         drop(transaction);
         this.cleanup_registry_on_drop = false;
-        cleanup_open_staging(
+        if cleanup_open_staging(
             &this.staging_parent,
             Path::new(this.temp_path.file_name().ok_or_else(|| {
                 LpmError::Task("restore staging directory has no file name".into())
@@ -516,8 +535,10 @@ impl StagedOutputs {
                 .take()
                 .expect("restore staging directory exists")
                 .into_root(),
-        )?;
-        remove_restore_registration(&this.registry_record)?;
+            &this.token,
+        )? {
+            remove_restore_registration(&this.registry_record)?;
+        }
         Ok(true)
     }
 
@@ -548,8 +569,13 @@ impl Drop for StagedOutputs {
             let cleanup_succeeded = if let Some(staging) = self.staging.take()
                 && let Some(name) = self.temp_path.file_name()
             {
-                cleanup_open_staging(&self.staging_parent, Path::new(name), staging.into_root())
-                    .is_ok()
+                cleanup_open_staging(
+                    &self.staging_parent,
+                    Path::new(name),
+                    staging.into_root(),
+                    &self.token,
+                )
+                .is_ok_and(|removed| removed)
             } else {
                 true
             };
@@ -578,15 +604,28 @@ fn write_restore_journal_for_plan(
 ) -> Result<Vec<bool>, LpmError> {
     let restore = Dir::open_ambient_dir(restore_dir, cap_std::ambient_authority())?;
     let project = Dir::open_ambient_dir(project_dir, cap_std::ambient_authority())?;
-    write_restore_journal_for_plan_open(&restore, &project, project_dir, files, install_count)
+    let mut stored = files.to_vec();
+    stored.sort_unstable();
+    write_restore_journal_for_plan_open(
+        &restore,
+        &project,
+        project_dir,
+        &mut files.to_vec(),
+        install_count,
+        &stored,
+    )
 }
 
+/// Journals the restore of `files`: the first `install_count` from the
+/// archive, the rest stale outputs to remove. `stored_outputs` are the
+/// outputs as the project's directories store their names, sorted.
 fn write_restore_journal_for_plan_open(
     restore: &Dir,
     project: &Dir,
     project_dir: &Path,
-    files: &[PathBuf],
+    files: &mut Vec<PathBuf>,
     install_count: usize,
+    stored_outputs: &[PathBuf],
 ) -> Result<Vec<bool>, LpmError> {
     use std::io::BufWriter;
 
@@ -596,7 +635,7 @@ fn write_restore_journal_for_plan_open(
         )));
     }
     let (existing_outputs, missing_directories) =
-        analyze_restore_plan(project, project_dir, files, install_count)?;
+        analyze_restore_plan(project, project_dir, files, install_count, stored_outputs)?;
     write_open_file_atomic_with(
         restore,
         std::ffi::OsStr::new(RESTORE_JOURNAL_NAME),
@@ -659,11 +698,15 @@ fn write_restore_journal_for_plan_open(
 fn analyze_restore_plan(
     project: &Dir,
     project_dir: &Path,
-    files: &[PathBuf],
+    files: &mut Vec<PathBuf>,
     install_count: usize,
+    stored_outputs: &[PathBuf],
 ) -> Result<(Vec<bool>, Vec<PathBuf>), LpmError> {
+    use cap_fs_ext::MetadataExt as _;
+
     let mut missing = HashSet::new();
     let mut existing_outputs = Vec::with_capacity(files.len());
+    let mut identities = Vec::with_capacity(files.len());
     let mut cached_parent: Option<(PathBuf, Option<Dir>)> = None;
 
     for (index, relative) in files.iter().enumerate() {
@@ -723,6 +766,7 @@ fn analyze_restore_plan(
             .and_then(|(_, parent)| parent.as_ref())
         else {
             existing_outputs.push(false);
+            identities.push(None);
             continue;
         };
         match parent.symlink_metadata(name) {
@@ -732,7 +776,10 @@ fn analyze_restore_plan(
                     project_dir.join(relative).display()
                 )));
             }
-            Ok(metadata) if metadata.is_file() => existing_outputs.push(true),
+            Ok(metadata) if metadata.is_file() => {
+                existing_outputs.push(true);
+                identities.push(Some((metadata.dev(), metadata.ino())));
+            }
             Ok(_) => {
                 return Err(LpmError::Task(format!(
                     "task cache restore destination has an incompatible entry: {}",
@@ -741,14 +788,62 @@ fn analyze_restore_plan(
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 existing_outputs.push(false);
+                identities.push(None);
             }
             Err(error) => return Err(error.into()),
         }
     }
+    keep_stale_outputs_that_are_other_files(
+        files,
+        &mut existing_outputs,
+        &identities,
+        install_count,
+        stored_outputs,
+    );
 
     let mut missing: Vec<_> = missing.into_iter().collect();
     missing.sort_unstable_by_key(|path| std::cmp::Reverse(path.components().count()));
     Ok((existing_outputs, missing))
+}
+
+/// Drops each stale output that is the file an archived output replaces,
+/// reached by another spelling of its name, as a volume that folds case or
+/// Unicode forms takes one: macOS and Windows volumes do by default. The
+/// archive's path then names no stored entry, and the stale one is that
+/// entry, which removing after the install would delete. A stale output
+/// with the identity of an archived path the directory stores is another
+/// link to the same file, and is removed as before.
+fn keep_stale_outputs_that_are_other_files(
+    files: &mut Vec<PathBuf>,
+    existing_outputs: &mut Vec<bool>,
+    identities: &[Option<(u64, u64)>],
+    install_count: usize,
+    stored_outputs: &[PathBuf],
+) {
+    if files.len() == install_count {
+        return;
+    }
+    let replaced: HashSet<(u64, u64)> = files[..install_count]
+        .iter()
+        .zip(&identities[..install_count])
+        .filter_map(|(relative, identity)| {
+            identity.filter(|_| stored_outputs.binary_search(relative).is_err())
+        })
+        .collect();
+    if replaced.is_empty() {
+        return;
+    }
+    let keep: Vec<bool> = identities
+        .iter()
+        .enumerate()
+        .map(|(index, identity)| {
+            index < install_count || identity.is_none_or(|identity| !replaced.contains(&identity))
+        })
+        .collect();
+    let mut kept = keep.iter();
+    files.retain(|_| *kept.next().expect("one decision per output"));
+    let mut kept = keep.iter();
+    existing_outputs.retain(|_| *kept.next().expect("one decision per output"));
 }
 
 struct RestoreRegistryRecord {
@@ -1136,16 +1231,18 @@ fn recover_registered_restore(
         return Ok(());
     }
     if committed || restore_is_committed(&staging, restore_dir)? {
-        cleanup_open_staging(&staging_parent, staging_name, staging)?;
-        remove_restore_registration(record)?;
+        if cleanup_open_staging(&staging_parent, staging_name, staging, token)? {
+            remove_restore_registration(record)?;
+        }
         return Ok(());
     }
     let journal_path = restore_dir.join(RESTORE_JOURNAL_NAME);
     let journal_file = match open_cap_file_nofollow(&staging, Path::new(RESTORE_JOURNAL_NAME)) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            cleanup_open_staging(&staging_parent, staging_name, staging)?;
-            remove_restore_registration(record)?;
+            if cleanup_open_staging(&staging_parent, staging_name, staging, token)? {
+                remove_restore_registration(record)?;
+            }
             return Ok(());
         }
         Err(error) => return Err(error.into()),
@@ -1242,8 +1339,9 @@ fn recover_registered_restore(
     // Windows can't remove the staging directory while a handle to a
     // directory in it is open.
     drop((output, backup));
-    cleanup_open_staging(&staging_parent, staging_name, staging)?;
-    remove_restore_registration(record)?;
+    if cleanup_open_staging(&staging_parent, staging_name, staging, token)? {
+        remove_restore_registration(record)?;
+    }
     Ok(())
 }
 
@@ -1263,7 +1361,16 @@ fn recovery_output_was_installed(
     Ok(staged_identity == destination_identity)
 }
 
-fn cleanup_open_staging(project: &Dir, staging_name: &Path, staging: Dir) -> Result<(), LpmError> {
+/// Removes a restore's staging directory and says whether it is gone. One
+/// that stays, as Windows keeps a directory while another process holds a
+/// deleted entry in it open, gets its owner token back, so the registry
+/// record that the caller then keeps still leads a later restore to it.
+fn cleanup_open_staging(
+    project: &Dir,
+    staging_name: &Path,
+    staging: Dir,
+    token: &[u8; RESTORE_TOKEN_BYTES],
+) -> Result<bool, LpmError> {
     #[cfg(test)]
     {
         let mut failure = STAGING_CLEANUP_FAILURE
@@ -1278,19 +1385,42 @@ fn cleanup_open_staging(project: &Dir, staging_name: &Path, staging: Dir) -> Res
         }
     }
     clean_open_cache_ephemeral(&staging)?;
+    #[cfg(test)]
+    {
+        let mut leftover = STAGING_CLEANUP_LEFTOVER
+            .lock()
+            .expect("staging cleanup leftover lock");
+        if leftover.as_deref() == staging_name.file_name() {
+            leftover.take();
+            staging.write("leftover", b"held open elsewhere")?;
+        }
+    }
+    let identity = lpm_common::atomic_write::file_identity(&staging.try_clone()?.into_std_file())?;
     drop(staging);
     match project.remove_dir(staging_name) {
-        Ok(()) => sync_cap_directory(project)?,
+        Ok(()) => {
+            sync_cap_directory(project)?;
+            Ok(true)
+        }
         Err(error)
             if matches!(
                 error.kind(),
-                std::io::ErrorKind::NotFound
-                    | std::io::ErrorKind::DirectoryNotEmpty
-                    | std::io::ErrorKind::NotADirectory
-            ) => {}
-        Err(error) => return Err(error.into()),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+            let staging = project.open_dir_nofollow(staging_name)?;
+            if lpm_common::atomic_write::file_identity(&staging.try_clone()?.into_std_file())?
+                == identity
+            {
+                write_restore_owner_open(&staging, token)?;
+            }
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
     }
-    Ok(())
 }
 
 fn restore_owner_matches_open(
@@ -1420,62 +1550,16 @@ fn publish_staged_file(
     destination_parent: &Dir,
     destination_name: &std::ffi::OsStr,
 ) -> Result<(), LpmError> {
-    use std::io::{Read as _, Seek as _, Write as _};
-
-    let mut source = source.into_std();
-    let metadata = source.metadata()?;
-    source.rewind()?;
     let (temporary_name, temporary) = create_private_restore_file(destination_parent)?;
-    let mut temporary = temporary.into_std();
     let result = (|| {
-        let size = metadata.len();
-        {
-            let mut limited = (&mut source).take(size);
-            std::io::copy(&mut limited, &mut temporary)?;
-            if limited.limit() != 0 {
-                return Err(LpmError::Task(
-                    "staged task cache output became shorter while it was copied".into(),
-                ));
-            }
-        }
-        let mut extra = [0u8; 1];
-        if source.read(&mut extra)? != 0 || source.metadata()?.len() != size {
-            return Err(LpmError::Task(
-                "staged task cache output changed size while it was copied".into(),
-            ));
-        }
-        temporary.set_times(std::fs::FileTimes::new().set_modified(metadata.modified()?))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            temporary.set_permissions(std::fs::Permissions::from_mode(
-                metadata.permissions().mode() & 0o777,
-            ))?;
-        }
-        temporary.flush()?;
-        sync_restore_file(&temporary)?;
-        let temporary_identity = same_file::Handle::from_file(temporary.try_clone()?)?;
-        drop(temporary);
-        match source_parent.remove_file_or_symlink(source_name) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        destination_parent.hard_link(Path::new(&temporary_name), source_parent, source_name)?;
-        let receipt = open_optional_regular_file(
+        let temporary_identity = copy_staged_file(source, temporary)?;
+        link_publication_receipt(
+            destination_parent,
+            &temporary_name,
             source_parent,
-            source_name.as_os_str(),
-            "task cache restore publication receipt",
-        )?
-        .ok_or_else(|| {
-            LpmError::Task("task cache restore publication receipt disappeared".into())
-        })?;
-        if same_file::Handle::from_file(receipt.into_std())? != temporary_identity {
-            return Err(LpmError::Task(
-                "task cache restore publication receipt changed while it was created".into(),
-            ));
-        }
-        sync_cap_directory(source_parent)?;
+            source_name,
+            &temporary_identity,
+        )?;
         match rename_staged_file_noreplace(
             destination_parent,
             Path::new(&temporary_name),
@@ -1500,6 +1584,115 @@ fn publish_staged_file(
     result
 }
 
+/// Copies the verified staged output, read through its open handle, into
+/// `temporary` with its modification time and mode, durably, and closes
+/// both, as FAT can't rename or remove a name a handle holds open.
+fn copy_staged_file(
+    source: cap_std::fs::File,
+    temporary: cap_std::fs::File,
+) -> Result<same_file::Handle, LpmError> {
+    use std::io::{Read as _, Seek as _, Write as _};
+
+    let mut source = source.into_std();
+    let metadata = source.metadata()?;
+    source.rewind()?;
+    let mut temporary = temporary.into_std();
+    let size = metadata.len();
+    {
+        let mut limited = (&mut source).take(size);
+        std::io::copy(&mut limited, &mut temporary)?;
+        if limited.limit() != 0 {
+            return Err(LpmError::Task(
+                "staged task cache output became shorter while it was copied".into(),
+            ));
+        }
+    }
+    let mut extra = [0u8; 1];
+    if source.read(&mut extra)? != 0 || source.metadata()?.len() != size {
+        return Err(LpmError::Task(
+            "staged task cache output changed size while it was copied".into(),
+        ));
+    }
+    drop(source);
+    temporary.set_times(std::fs::FileTimes::new().set_modified(metadata.modified()?))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temporary.set_permissions(std::fs::Permissions::from_mode(
+            metadata.permissions().mode() & 0o777,
+        ))?;
+    }
+    temporary.flush()?;
+    sync_restore_file(&temporary)?;
+    Ok(same_file::Handle::from_file(temporary)?)
+}
+
+/// Replaces the staged output with a hard link to its published copy,
+/// which recovery takes as proof that the published file is the restore's
+/// own. A volume without hard links, as exFAT and FAT are, keeps the
+/// staged file, and recovery leaves a new output it can't prove is its
+/// own where it is.
+fn link_publication_receipt(
+    destination_parent: &Dir,
+    temporary_name: &str,
+    source_parent: &Dir,
+    source_name: &Path,
+    temporary_identity: &same_file::Handle,
+) -> Result<(), LpmError> {
+    let receipt_name = random_private_name(".lpm-cache-receipt-")?;
+    match destination_parent.hard_link(
+        Path::new(temporary_name),
+        source_parent,
+        Path::new(&receipt_name),
+    ) {
+        Ok(()) => {}
+        Err(error) if volume_lacks_hard_links(&error) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    let receipt = open_optional_regular_file(
+        source_parent,
+        std::ffi::OsStr::new(&receipt_name),
+        "task cache restore publication receipt",
+    )?
+    .ok_or_else(|| LpmError::Task("task cache restore publication receipt disappeared".into()))?;
+    if &same_file::Handle::from_file(receipt.into_std())? != temporary_identity {
+        let _ = source_parent.remove_file_or_symlink(&receipt_name);
+        return Err(LpmError::Task(
+            "task cache restore publication receipt changed while it was created".into(),
+        ));
+    }
+    source_parent.rename(Path::new(&receipt_name), source_parent, source_name)?;
+    sync_cap_directory(source_parent)?;
+    Ok(())
+}
+
+/// Whether a hard link failed because the volume keeps none: exFAT and FAT
+/// report `ENOTSUP` on macOS, `EPERM` on Linux, and
+/// `ERROR_INVALID_FUNCTION` or `ERROR_NOT_SUPPORTED` on Windows.
+fn volume_lacks_hard_links(error: &std::io::Error) -> bool {
+    let Some(code) = error.raw_os_error() else {
+        return false;
+    };
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use rustix::io::Errno;
+
+        let unsupported = [Errno::NOTSUP, Errno::OPNOTSUPP];
+        #[cfg(target_os = "linux")]
+        let unsupported = [unsupported[0], unsupported[1], Errno::PERM];
+        unsupported.iter().any(|errno| errno.raw_os_error() == code)
+    }
+    #[cfg(windows)]
+    {
+        matches!(code, 1 | 50)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        let _ = code;
+        false
+    }
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn rename_staged_file_noreplace(
     source_parent: &Dir,
@@ -1509,14 +1702,37 @@ fn rename_staged_file_noreplace(
 ) -> Result<(), std::io::Error> {
     use rustix::fs::{RenameFlags, renameat_with};
 
-    renameat_with(
+    match renameat_with(
         source_parent,
         source_name,
         destination_parent,
         Path::new(destination_name),
         RenameFlags::NOREPLACE,
-    )
-    .map_err(std::io::Error::from)
+    ) {
+        Err(error) if lacks_noreplace_rename(error) => {
+            // exFAT and FAT on macOS have no rename that refuses an existing
+            // name, so this checks, then renames, which leaves a window
+            // such a volume can't close.
+            match destination_parent.symlink_metadata(destination_name) {
+                Ok(_) => Err(std::io::ErrorKind::AlreadyExists.into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    source_parent.rename(source_name, destination_parent, destination_name)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        result => result.map_err(std::io::Error::from),
+    }
+}
+
+/// Whether a no-replace rename failed because the volume has none, as
+/// exFAT and FAT on macOS report. Linux gives `ENOTSUP` and `EOPNOTSUPP` one
+/// number.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn lacks_noreplace_rename(error: rustix::io::Errno) -> bool {
+    use rustix::io::Errno;
+
+    error == Errno::NOTSUP || error == Errno::OPNOTSUPP || error == Errno::INVAL
 }
 
 #[cfg(windows)]
@@ -1526,7 +1742,15 @@ fn rename_staged_file_noreplace(
     destination_parent: &Dir,
     destination_name: &std::ffi::OsStr,
 ) -> Result<(), std::io::Error> {
-    source_parent.rename(source_name, destination_parent, Path::new(destination_name))
+    use cap_std::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, SYNCHRONIZE};
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .access_mode(DELETE | SYNCHRONIZE)
+        .follow(FollowSymlinks::No);
+    let staged = source_parent.open_with(source_name, &options)?;
+    lpm_common::rename_open_file_noreplace(destination_parent, destination_name, &staged)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
@@ -1867,19 +2091,7 @@ impl RestoreTransaction {
     ) -> Result<HashSet<std::ffi::OsString>, LpmError> {
         use rustix::fs::{RenameFlags, renameat_with};
 
-        let mut candidates = HashSet::new();
-        for relative in files {
-            let mut components = relative.components();
-            let Some(Component::Normal(root)) = components.next() else {
-                continue;
-            };
-            if components.next().is_some() {
-                candidates.insert(root.to_os_string());
-            }
-        }
-        let mut candidates: Vec<_> = candidates.into_iter().collect();
-        candidates.sort_unstable();
-
+        let candidates = top_level_tree_candidates(files);
         let mut installed = HashSet::with_capacity(candidates.len());
         for root in candidates {
             match self.project.symlink_metadata(&root) {
@@ -1905,10 +2117,8 @@ impl RestoreTransaction {
             ) {
                 Ok(()) => {}
                 Err(error)
-                    if matches!(
-                        std::io::Error::from(error).kind(),
-                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::DirectoryNotEmpty
-                    ) =>
+                    if lacks_noreplace_rename(error)
+                        || tree_stays_for_files(&std::io::Error::from(error)) =>
                 {
                     continue;
                 }
@@ -1947,7 +2157,96 @@ impl RestoreTransaction {
         Ok(installed)
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    pub(super) fn install_missing_top_level_trees(
+        &mut self,
+        files: &[PathBuf],
+    ) -> Result<HashSet<std::ffi::OsString>, LpmError> {
+        use cap_fs_ext::OpenOptionsMaybeDirExt as _;
+        use cap_std::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_READ_ATTRIBUTES, SYNCHRONIZE};
+
+        let candidates = top_level_tree_candidates(files);
+        let mut installed = HashSet::with_capacity(candidates.len());
+        for root in candidates {
+            match self.project.symlink_metadata(&root) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => continue,
+                Err(error) => return Err(error.into()),
+            }
+            // The tree moves by this handle, which no one else can rename or
+            // delete while it is open, so it is the tree the staging verified.
+            let mut options = cap_std::fs::OpenOptions::new();
+            options
+                .access_mode(DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+                .maybe_dir(true)
+                .follow(FollowSymlinks::No);
+            let unsafe_tree = |error: &dyn std::fmt::Display| {
+                LpmError::Task(format!(
+                    "staged task cache output tree is unsafe at {}: {error}",
+                    Path::new(&root).display()
+                ))
+            };
+            let source = self
+                .output
+                .open_with(&root, &options)
+                .map_err(|error| unsafe_tree(&error))?;
+            let metadata = source.metadata()?;
+            if !metadata.is_dir() || cap_metadata_is_link_or_reparse(&metadata) {
+                return Err(unsafe_tree(&"not a directory"));
+            }
+            let expected =
+                lpm_common::atomic_write::file_identity(&source.try_clone()?.into_std())?;
+            #[cfg(test)]
+            wait_for_cache_race_barrier(&STAGED_TREE_RACE_BARRIER, &self.project_dir.join(&root));
+            match lpm_common::rename_open_file_noreplace(&self.project, &root, &source) {
+                Ok(()) => {}
+                // A handle another process holds in the tree, as a virus
+                // scanner opens fresh files, refuses the move past the
+                // rename's retries; its files still publish one by one.
+                Err(error)
+                    if tree_stays_for_files(&error)
+                        || matches!(
+                            error.kind(),
+                            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ResourceBusy
+                        ) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            }
+            drop(source);
+            let destination = match self.project.open_dir_nofollow(&root) {
+                Ok(destination) => destination,
+                Err(error) => {
+                    return Err(LpmError::Task(format!(
+                        "task cache output tree changed during publication at {}: {error}",
+                        self.project_dir.join(&root).display()
+                    )));
+                }
+            };
+            let actual =
+                lpm_common::atomic_write::file_identity(&destination.try_clone()?.into_std_file())?;
+            if actual != expected {
+                clean_open_cache_ephemeral(&destination)?;
+                drop(destination);
+                self.project.remove_dir(&root)?;
+                sync_cap_directory(&self.project)?;
+                return Err(LpmError::Task(format!(
+                    "staged task cache output tree changed during publication at {}",
+                    self.project_dir.join(&root).display()
+                )));
+            }
+            self.installed_trees.push(PathBuf::from(&root));
+            installed.insert(root);
+        }
+        if !installed.is_empty() {
+            self.mutated_dirs.insert(PathBuf::new());
+        }
+        Ok(installed)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     pub(super) fn install_missing_top_level_trees(
         &mut self,
         _files: &[PathBuf],
@@ -2116,7 +2415,7 @@ impl RestoreTransaction {
         }
         let mut parent = self.project.try_clone()?;
         let mut current_path = PathBuf::new();
-        for component in parent_path.components() {
+        for (depth, component) in parent_path.components().enumerate() {
             let Component::Normal(name) = component else {
                 return Err(LpmError::Task(format!(
                     "invalid task cache restore path: {}",
@@ -2125,7 +2424,10 @@ impl RestoreTransaction {
             };
             current_path.push(name);
             match parent.open_dir_nofollow(name) {
-                Ok(next) => parent = next,
+                Ok(next) => {
+                    refuse_short_name_of_withheld(&parent, name, &next, depth == 0)?;
+                    parent = next;
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
                     parent.create_dir(name)?;
                     self.created_dirs.push(current_path.clone());
@@ -2321,6 +2623,38 @@ impl RestoreTransaction {
     }
 }
 
+/// The top-level directories of the outputs a restore installs, sorted:
+/// those it can move into place whole when the project lacks them.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn top_level_tree_candidates(files: &[PathBuf]) -> Vec<std::ffi::OsString> {
+    let mut candidates = HashSet::new();
+    for relative in files {
+        let mut components = relative.components();
+        let Some(Component::Normal(root)) = components.next() else {
+            continue;
+        };
+        if components.next().is_some() {
+            candidates.insert(root.to_os_string());
+        }
+    }
+    let mut candidates: Vec<_> = candidates.into_iter().collect();
+    candidates.sort_unstable();
+    candidates
+}
+
+/// Whether a staged tree that couldn't move whole stays for its files to
+/// be published one by one: the project gained the directory meanwhile, or
+/// the staging is on another volume than the project.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn tree_stays_for_files(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::AlreadyExists
+            | std::io::ErrorKind::DirectoryNotEmpty
+            | std::io::ErrorKind::CrossesDevices
+    )
+}
+
 fn open_directory_nofollow(root: &Dir, relative: &Path, label: &str) -> Result<Dir, LpmError> {
     let mut current = root.try_clone()?;
     for component in relative.components() {
@@ -2338,6 +2672,45 @@ fn open_directory_nofollow(root: &Dir, relative: &Path, label: &str) -> Result<D
         })?;
     }
     Ok(current)
+}
+
+/// Refuses `opened`, the directory `name` in `parent` led to, when `name`
+/// is a short name of a directory the cache never writes into, as NTFS and
+/// FAT resolve `GIT~1` to `.git`. The restore checked its paths' names
+/// before it began; this binds the check to the directory it opened, as a
+/// `git init` while the restore runs can give a new `.git` such a name.
+fn refuse_short_name_of_withheld(
+    parent: &Dir,
+    name: &std::ffi::OsStr,
+    opened: &Dir,
+    at_root: bool,
+) -> Result<(), LpmError> {
+    use cap_fs_ext::MetadataExt as _;
+
+    if !name.to_string_lossy().contains('~') {
+        return Ok(());
+    }
+    let opened = opened.dir_metadata()?;
+    let identity = (opened.dev(), opened.ino());
+    let records = lpm_common::project_state::PROJECT_RECORD_DIRS
+        .iter()
+        .filter(|_| at_root)
+        .copied();
+    for withheld in [lpm_common::PROJECT_STATE_DIR, ".git"]
+        .into_iter()
+        .chain(records)
+    {
+        if parent
+            .symlink_metadata(withheld)
+            .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == identity)
+        {
+            return Err(LpmError::Task(format!(
+                "task cache restore reaches {withheld} by its short name {}",
+                name.to_string_lossy()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn open_existing_parent_nofollow(
