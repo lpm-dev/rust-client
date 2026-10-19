@@ -17,6 +17,7 @@ mod local_sources;
 mod lockfile;
 mod manifest;
 mod policy;
+mod project_state;
 mod runtime;
 mod sandbox;
 mod sandbox_setup;
@@ -597,6 +598,7 @@ async fn run_inner(
     // the binary lockfile, not a runtime-install gate.
     if all {
         checks.extend(check_gitattributes_state(project_dir, &diagnostic_lockfile));
+        checks.extend(project_state::check_project_state_tracked(project_dir));
     }
 
     // 6c. Dependencies in sync? (lockfile vs package.json)

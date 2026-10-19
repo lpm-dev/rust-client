@@ -109,6 +109,7 @@ pub(crate) fn run() -> Result<()> {
                     } else {
                         output::success(&format!("up to date ({elapsed_ms}ms)"));
                     }
+                    runtime::keep_project_state_ignored(&cwd);
                     std::process::exit(0);
                 }
                 Ok(false) => {}

@@ -32,5 +32,6 @@ expression: envelope
   },
   "pruned_lockfile_packages": 0,
   "internal_symlinks_retargeted": 0,
+  "dependency_ignore_files": [],
   "duration_ms": "[DURATION]"
 }

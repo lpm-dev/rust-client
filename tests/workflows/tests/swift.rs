@@ -356,25 +356,40 @@ fn fake_swift_configuration(
         .map(|name| serde_json::json!({"name": name, "type": "regular"}))
         .collect();
     let dump_package = serde_json::json!({"targets": target_values}).to_string();
-    let swift_path = bin_dir.join(fake_swift_executable_name(cfg!(windows)));
     let fixture = assert_cmd::cargo::cargo_bin("workflows-swift-fixture");
-    std::fs::copy(fixture, &swift_path).expect("copy compiled Swift fixture");
-    set_executable(&swift_path);
-    let xcode_path = bin_dir.join(if cfg!(windows) {
-        "xcodebuild.exe"
-    } else {
-        "xcodebuild"
-    });
-    std::fs::copy(&swift_path, &xcode_path).unwrap();
-    set_executable(&xcode_path);
-
-    let xcrun_path = bin_dir.join(if cfg!(windows) { "xcrun.exe" } else { "xcrun" });
-    std::fs::copy(&swift_path, &xcrun_path).unwrap();
-    set_executable(&xcrun_path);
+    place_fixture(
+        &fixture,
+        &bin_dir.join(fake_swift_executable_name(cfg!(windows))),
+    );
+    place_fixture(
+        &fixture,
+        &bin_dir.join(if cfg!(windows) {
+            "xcodebuild.exe"
+        } else {
+            "xcodebuild"
+        }),
+    );
+    place_fixture(
+        &fixture,
+        &bin_dir.join(if cfg!(windows) { "xcrun.exe" } else { "xcrun" }),
+    );
     let existing_path = std::env::var_os("PATH").unwrap_or_default();
     let paths = std::iter::once(bin_dir).chain(std::env::split_paths(&existing_path));
     let path = std::env::join_paths(paths).expect("construct PATH with fake Swift");
     (path, dump_package)
+}
+
+/// Copies the Swift fixture to `destination` as a new file. A test that runs
+/// a second command places the fixture again, and macOS kills a signed
+/// executable that was rewritten in place after it ran (`SIGKILL`).
+fn place_fixture(fixture: &std::path::Path, destination: &std::path::Path) {
+    match std::fs::remove_file(destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("remove {}: {error}", destination.display()),
+    }
+    std::fs::copy(fixture, destination).expect("copy compiled Swift fixture");
+    set_executable(destination);
 }
 
 fn configure_fake_swift_lockfile_write(command: &mut assert_cmd::Command, content: &str) {

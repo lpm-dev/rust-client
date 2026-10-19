@@ -1973,11 +1973,21 @@ fn strip_first_component(path: &Path) -> Option<PathBuf> {
 ///
 /// npm package tarballs conventionally wrap files under a first `package/`
 /// component. The returned path has that component stripped and rejects any
-/// remaining traversal, root, or platform-prefix components.
+/// remaining traversal, root, or platform-prefix components. `None` for the
+/// prefix itself, and for an entry under a `.git` component, which `npm
+/// pack` never packs: a repository in a dependency is one git would read as
+/// its own, running what its config names, where the dependency is
+/// committed, as a deploy output's are.
 pub fn sanitize_entry_path(path: &Path) -> Result<Option<PathBuf>, LpmError> {
     let Some(relative_path) = strip_first_component(path) else {
         return Ok(None);
     };
+    if relative_path
+        .components()
+        .any(|component| component.as_os_str().eq_ignore_ascii_case(".git"))
+    {
+        return Ok(None);
+    }
 
     for component in relative_path.components() {
         match component {
@@ -3414,6 +3424,37 @@ mod tests {
         );
         // Just the prefix directory itself → None
         assert_eq!(strip_first_component(Path::new("package")), None);
+    }
+
+    #[test]
+    fn a_tarball_s_git_entries_are_never_extracted() {
+        let tarball = create_test_tarball_with_entries(&[
+            ("package.json", b"{}"),
+            ("vendor/lib.js", b"module.exports = 1;"),
+            ("vendor/.git/HEAD", b"ref: refs/heads/main\n"),
+            ("vendor/.git/config", b"[core]\n"),
+            ("deps/.GIT/HEAD", b"ref: refs/heads/main\n"),
+            // A submodule's gitfile.
+            ("sub/.git", b"gitdir: ../.git/modules/sub\n"),
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut extracted = extract_tarball(&tarball, dir.path()).unwrap();
+        extracted.sort();
+
+        assert_eq!(
+            extracted,
+            [
+                PathBuf::from("package.json"),
+                PathBuf::from("vendor/lib.js")
+            ]
+        );
+        for skipped in ["vendor/.git", "deps/.GIT", "sub/.git"] {
+            assert!(!dir.path().join(skipped).exists(), "{skipped}");
+        }
+        let mut listed = list_tarball_contents(&tarball).unwrap();
+        listed.sort();
+        assert_eq!(listed, extracted);
     }
 
     #[test]

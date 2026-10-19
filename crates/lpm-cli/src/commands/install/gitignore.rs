@@ -100,118 +100,87 @@ pub(super) fn migrate_legacy_wrapper_layout(project_dir: &Path, json_output: boo
 
 pub(super) fn maintain_project_linker_layout(project_dir: &Path, json_output: bool) {
     migrate_legacy_wrapper_layout(project_dir, json_output);
-    ensure_lpm_wrappers_gitignore(project_dir);
-    ensure_lpm_hoisted_gitignore(project_dir);
+    remove_legacy_gitignore_entries(project_dir, json_output);
 }
 
-/// — ensure `.gitignore` contains an entry for
-/// `.lpm/wrappers/`.
-///
-/// Mirrors [`ensure_skills_gitignore`] — runtime "ensure once" pattern,
-/// idempotent, OpenOptions-append to minimize the read-then-write TOCTOU
-/// window.
-///
-/// Why runtime instead of template emission: existing projects also
-/// need the entry, and the repo has a precedent for runtime
-/// `.gitignore` maintenance for sibling `.lpm/*` paths. Template-only
-/// would silently miss every project that already has a `.gitignore`
-/// at install time.
-pub fn ensure_lpm_wrappers_gitignore(project_dir: &Path) {
-    let gitignore_path = project_dir.join(".gitignore");
-    let marker = ".lpm/wrappers/";
+/// The comment and entry pairs `lpm install` and `lpm add` appended to the
+/// project's `.gitignore` before `.lpm` kept itself out of git
+/// ([`lpm_common::project_state`]), as they wrote them: with the comment
+/// they used when appending, or the shorter one when they created the file.
+const LEGACY_GITIGNORE_BLOCKS: [(&[u8], &[u8]); 6] = [
+    (b"# LPM wrapper tree (auto-generated)", b".lpm/wrappers/"),
+    (b"# LPM wrapper tree", b".lpm/wrappers/"),
+    (b"# LPM hoisted state (auto-generated)", b".lpm/hoisted/"),
+    (b"# LPM hoisted state", b".lpm/hoisted/"),
+    (b"# LPM Agent Skills (auto-generated)", b".lpm/skills/"),
+    (b"# LPM Agent Skills", b".lpm/skills/"),
+];
 
-    if let Some(content) = read_gitignore(&gitignore_path) {
-        if content.lines().any(|l| l.trim() == marker) {
-            return; // Already present
-        }
-        use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&gitignore_path)
-        {
-            if !content.ends_with('\n') {
-                let _ = writeln!(file);
-            }
-            let _ = writeln!(file);
-            let _ = writeln!(file, "# LPM wrapper tree (auto-generated)");
-            let _ = writeln!(file, "{marker}");
-        }
+/// Removes the blocks in [`LEGACY_GITIGNORE_BLOCKS`] from the project's
+/// `.gitignore`, with the blank line an append put before each, and the
+/// file itself when nothing else is left in it. Anything else in the file,
+/// including the same entries written another way, stays. A `.gitignore`
+/// that is a link or not a regular file is left alone.
+pub(super) fn remove_legacy_gitignore_entries(project_dir: &Path, json_output: bool) {
+    let path = project_dir.join(".gitignore");
+    let Ok((content, _)) =
+        lpm_common::read_file_capped_unlinked(&path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+    else {
+        return;
+    };
+    let Some(cleaned) = without_legacy_gitignore_blocks(&content) else {
+        return;
+    };
+    let result = if cleaned.iter().all(u8::is_ascii_whitespace) {
+        std::fs::remove_file(&path)
     } else {
-        let _ = std::fs::write(&gitignore_path, format!("# LPM wrapper tree\n{marker}\n"));
+        lpm_common::write_file_atomic(&path, &cleaned)
+    };
+    match result {
+        Ok(()) if !json_output => output::info_line(crate::install_ui::terminal_line!(
+            "removed LPM's old entries from {} — .lpm/ now keeps itself out of git",
+            install_ui::dim(&path.display().to_string()),
+        )),
+        Ok(()) => {}
+        Err(error) => tracing::warn!(
+            path = %path.display(),
+            %error,
+            "failed to remove LPM's old .gitignore entries"
+        ),
     }
 }
 
-/// Hoisted-symmetry follow-up — ensure `.gitignore` contains an entry
-/// for `.lpm/hoisted/`.
-///
-/// Mirrors [`ensure_lpm_wrappers_gitignore`] structurally (idempotent
-/// append, OpenOptions append-mode) but writes a separate marker so
-/// each linker mode owns its own `.gitignore` entry. This matters for
-/// projects that opted into hoisted-mode AFTER an isolated install
-/// landed the `.lpm/wrappers/` marker — without this helper, hoisted
-/// state would silently land in commits even though wrapper state
-/// was correctly ignored.
-pub fn ensure_lpm_hoisted_gitignore(project_dir: &Path) {
-    let gitignore_path = project_dir.join(".gitignore");
-    let marker = ".lpm/hoisted/";
-
-    if let Some(content) = read_gitignore(&gitignore_path) {
-        if content.lines().any(|l| l.trim() == marker) {
-            return; // Already present
-        }
-        use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&gitignore_path)
-        {
-            if !content.ends_with('\n') {
-                let _ = writeln!(file);
+/// The `.gitignore` bytes without [`LEGACY_GITIGNORE_BLOCKS`], or `None`
+/// when it holds none of them.
+pub(super) fn without_legacy_gitignore_blocks(content: &[u8]) -> Option<Vec<u8>> {
+    let lines: Vec<&[u8]> = content.split_inclusive(|byte| *byte == b'\n').collect();
+    let text = |line: &[u8]| -> Vec<u8> {
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        line.strip_suffix(b"\r").unwrap_or(line).to_vec()
+    };
+    let mut kept: Vec<&[u8]> = Vec::with_capacity(lines.len());
+    let mut removed = false;
+    let mut index = 0;
+    while index < lines.len() {
+        let comment = text(lines[index]);
+        let entry = lines.get(index + 1).map(|line| text(line));
+        let is_block = LEGACY_GITIGNORE_BLOCKS
+            .iter()
+            .any(|(block_comment, block_entry)| {
+                comment == *block_comment && entry.as_deref() == Some(*block_entry)
+            });
+        if is_block {
+            if kept.last().is_some_and(|line| text(line).is_empty()) {
+                kept.pop();
             }
-            let _ = writeln!(file);
-            let _ = writeln!(file, "# LPM hoisted state (auto-generated)");
-            let _ = writeln!(file, "{marker}");
-        }
-    } else {
-        let _ = std::fs::write(&gitignore_path, format!("# LPM hoisted state\n{marker}\n"));
-    }
-}
-
-/// Ensure `.gitignore` contains an entry for `.lpm/skills/`.
-pub fn ensure_skills_gitignore(project_dir: &Path) {
-    let gitignore_path = project_dir.join(".gitignore");
-    let marker = ".lpm/skills/";
-
-    if let Some(content) = read_gitignore(&gitignore_path) {
-        if content.lines().any(|l| l.trim() == marker) {
-            return; // Already present
-        }
-        // Append using OpenOptions to reduce TOCTOU window vs read-then-write
-        use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&gitignore_path)
-        {
-            if !content.ends_with('\n') {
-                let _ = writeln!(file);
-            }
-            let _ = writeln!(file);
-            let _ = writeln!(file, "# LPM Agent Skills (auto-generated)");
-            let _ = writeln!(file, "{marker}");
-        }
-    } else {
-        let _ = std::fs::write(&gitignore_path, format!("# LPM Agent Skills\n{marker}\n"));
-    }
-}
-
-fn read_gitignore(path: &Path) -> Option<String> {
-    match lpm_common::read_text_file_capped(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
-        Ok(content) => Some(content),
-        Err(lpm_common::BoundedReadError::NotFound { .. }) => None,
-        Err(error) => {
-            tracing::warn!(path = %path.display(), %error, "failed to inspect .gitignore");
-            Some(String::new())
+            removed = true;
+            index += 2;
+        } else {
+            kept.push(lines[index]);
+            index += 1;
         }
     }
+    removed.then(|| kept.concat())
 }
 
 //: `read_auto_build_config` was removed as part of
