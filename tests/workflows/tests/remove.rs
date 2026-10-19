@@ -1575,6 +1575,41 @@ fn remove_deletes_only_editor_links_declared_by_the_package_skill_manifest() {
     );
 }
 
+/// The package `lpm add` delivered is also a dependency, whose install
+/// materializes the same skills: removing the delivered source keeps them.
+#[test]
+fn remove_keeps_the_skills_of_a_package_that_is_still_a_dependency() {
+    for (name, spec) in [
+        ("@lpm.dev/owner.widget", "^1.0.0"),
+        ("widget", "npm:@lpm.dev/owner.widget@^1.0.0"),
+    ] {
+        let project = TempProject::empty(
+            &json!({"name": "host", "version": "1.0.0", "dependencies": {name: spec}}).to_string(),
+        );
+        write_materialized_package_skill(&project, "owner.widget", "guide", "managed\n");
+        write_owned_cursor_link(&project, "owner.widget", "guide");
+        write_source_state(
+            &project,
+            json!({
+                "@lpm.dev/owner.widget": {"skillPackageShort": "owner.widget"}
+            }),
+        );
+
+        lpm(&project)
+            .args(["remove", "owner.widget"])
+            .assert()
+            .success();
+
+        assert_eq!(
+            project.read_file(".lpm/skills/owner.widget/guide.md"),
+            "managed\n",
+            "{spec}"
+        );
+        assert!(project.file_exists(".cursor/rules/owner.widget--guide.md"));
+        assert!(!source_record_exists(&project));
+    }
+}
+
 #[test]
 fn remove_preserves_a_preexisting_directory_after_its_last_managed_file_is_deleted() {
     let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);

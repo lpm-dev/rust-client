@@ -73,7 +73,6 @@ pub(super) struct LockfileSelectionInput<'a> {
     pub(super) frozen_lockfile_active: bool,
     pub(super) force: bool,
     pub(super) overrides_changed: bool,
-    pub(super) patches_changed: bool,
     pub(super) workspace_root_provider_state_changed: bool,
     pub(super) importer_snapshot_changed: bool,
     pub(super) is_add_invocation: bool,
@@ -133,7 +132,6 @@ pub(super) fn select_lockfile_install_plan(
 
     if input.force
         || input.overrides_changed
-        || input.patches_changed
         || input.workspace_root_provider_state_changed
         || input.importer_snapshot_changed
         || input.is_add_invocation
@@ -692,6 +690,7 @@ pub(super) struct EmptyDependencyInstallInput<'a> {
     pub(super) security_analysis_policy: lpm_store::SecurityAnalysisPolicy,
     pub(super) dependency_engine_policy: &'a crate::engine_check::DependencyEnginePolicy,
     pub(super) current_importer_snapshot: &'a lpm_lockfile::ImporterSnapshot,
+    pub(super) warnings: &'a [String],
 }
 
 pub(super) async fn run_empty_dependency_install_phase(
@@ -718,6 +717,7 @@ pub(super) async fn run_empty_dependency_install_phase(
         security_analysis_policy,
         dependency_engine_policy,
         current_importer_snapshot,
+        warnings,
     } = input;
 
     if cleanup_catalogs_in_pipeline {
@@ -774,6 +774,7 @@ pub(super) async fn run_empty_dependency_install_phase(
                     "total_ms": total_ms,
                 },
             },
+            "warnings": warnings,
             "peer_conflicts": [],
             "peer_issues": peer_issues_json_value(&[], &[]),
             "security": {
@@ -825,15 +826,52 @@ pub(super) struct LockfileDriftInput<'a> {
     pub(super) lockfile_path: &'a Path,
     pub(super) pkg: &'a lpm_workspace::PackageJson,
     pub(super) override_set: &'a OverrideSet,
-    pub(super) current_patches: &'a HashMap<String, PatchedDependencyEntry>,
-    pub(super) current_patch_fingerprint: &'a str,
+    pub(super) overrides_match_lockfile: Option<bool>,
+}
+
+/// How the current overrides compare with the ones `lpm.lock` was resolved
+/// with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum OverrideDrift {
+    Unchanged,
+    /// The lockfile's importer record names other overrides.
+    Lockfile,
+    /// The lockfile has no importer record, and the last install's override
+    /// fingerprint differs from the current one.
+    LocalFingerprint {
+        recorded: String,
+    },
+    /// The lockfile has no importer record, and no install recorded one.
+    Unrecorded,
+}
+
+impl OverrideDrift {
+    pub(super) fn changed(&self) -> bool {
+        *self != Self::Unchanged
+    }
+
+    fn offline_detail(&self, override_set: &OverrideSet) -> String {
+        match self {
+            Self::Unchanged => unreachable!("offline reports only changed overrides"),
+            Self::Lockfile => {
+                "the overrides in package.json differ from the ones lpm.lock was resolved with"
+                    .to_string()
+            }
+            Self::LocalFingerprint { recorded } => format!(
+                "lpm.lock does not record its overrides, and the last install's override fingerprint {recorded} differs from the current {}",
+                override_set.fingerprint()
+            ),
+            Self::Unrecorded => {
+                "lpm.lock does not record the overrides it was resolved with".to_string()
+            }
+        }
+    }
 }
 
 pub(super) struct LockfileDriftState {
     pub(super) prior_overrides_state: Option<overrides_state::OverridesState>,
-    pub(super) overrides_changed: bool,
+    pub(super) override_drift: OverrideDrift,
     pub(super) prior_patch_state: Option<patch_state::PatchState>,
-    pub(super) patches_changed: bool,
     pub(super) pre_install_direct_versions: HashMap<String, String>,
 }
 
@@ -843,32 +881,29 @@ pub(super) fn prepare_lockfile_drift_state(input: LockfileDriftInput<'_>) -> Loc
         lockfile_path,
         pkg,
         override_set,
-        current_patches,
-        current_patch_fingerprint,
+        overrides_match_lockfile,
     } = input;
 
     let prior_overrides_state = overrides_state::read_state(project_dir);
-    let overrides_changed = prior_overrides_state
-        .as_ref()
-        .map_or(!override_set.is_empty(), |s| {
-            s.fingerprint != override_set.fingerprint()
-        });
-    if overrides_changed {
+    let override_drift = match overrides_match_lockfile {
+        Some(true) => OverrideDrift::Unchanged,
+        Some(false) => OverrideDrift::Lockfile,
+        // Lockfiles written before importer records name no overrides; the
+        // last install's local fingerprint is the only evidence left.
+        None => match prior_overrides_state.as_ref() {
+            Some(state) if state.fingerprint == override_set.fingerprint() => {
+                OverrideDrift::Unchanged
+            }
+            Some(state) => OverrideDrift::LocalFingerprint {
+                recorded: state.fingerprint.clone(),
+            },
+            None if override_set.is_empty() => OverrideDrift::Unchanged,
+            None => OverrideDrift::Unrecorded,
+        },
+    };
+    if override_drift.changed() {
         tracing::debug!(
-            "overrides changed since last install (fingerprint drift) - \
-             invalidating lockfile fast path"
-        );
-    }
-
-    let prior_patch_state = patch_state::read_state(project_dir);
-    let patches_changed = prior_patch_state
-        .as_ref()
-        .map_or(!current_patches.is_empty(), |s| {
-            s.fingerprint != current_patch_fingerprint
-        });
-    if patches_changed {
-        tracing::debug!(
-            "patches changed since last install (fingerprint drift) - \
+            "overrides differ from the lockfile's ({override_drift:?}) - \
              invalidating lockfile fast path"
         );
     }
@@ -885,9 +920,8 @@ pub(super) fn prepare_lockfile_drift_state(input: LockfileDriftInput<'_>) -> Loc
 
     LockfileDriftState {
         prior_overrides_state,
-        overrides_changed,
-        prior_patch_state,
-        patches_changed,
+        override_drift,
+        prior_patch_state: patch_state::read_state(project_dir),
         pre_install_direct_versions,
     }
 }
@@ -902,13 +936,9 @@ pub(super) struct OfflineInstallInput<'a> {
     pub(super) catalog_resolutions: &'a [lpm_workspace::CatalogProtocolResolution],
     pub(super) gate_stats: &'a GateStats,
     pub(super) override_set: &'a OverrideSet,
-    pub(super) prior_overrides_state: Option<&'a crate::overrides_state::OverridesState>,
-    pub(super) overrides_changed: bool,
+    pub(super) override_drift: &'a OverrideDrift,
     pub(super) current_patches: &'a HashMap<String, PatchedDependencyEntry>,
     pub(super) current_lockfile_patches: &'a lpm_lockfile::LockfilePatches,
-    pub(super) current_patch_fingerprint: &'a str,
-    pub(super) prior_patch_state: Option<&'a crate::patch_state::PatchState>,
-    pub(super) patches_changed: bool,
     pub(super) auto_install_peers: bool,
     pub(super) strict_peer_dependencies: bool,
     pub(super) omit_policy: InstallOmitPolicy,
@@ -960,13 +990,9 @@ pub(super) async fn run_offline_install_phase(
         catalog_resolutions,
         gate_stats,
         override_set,
-        prior_overrides_state,
-        overrides_changed,
+        override_drift,
         current_patches,
         current_lockfile_patches,
-        current_patch_fingerprint,
-        prior_patch_state,
-        patches_changed,
         auto_install_peers,
         strict_peer_dependencies,
         omit_policy,
@@ -1004,43 +1030,10 @@ pub(super) async fn run_offline_install_phase(
         current_importer_snapshot,
     } = input;
 
-    if overrides_changed {
-        let detail = match prior_overrides_state {
-            Some(prior) => format!(
-                "previous fingerprint {} differs from current {}",
-                prior.fingerprint,
-                override_set.fingerprint()
-            ),
-            None if !override_set.is_empty() => {
-                "no previously-recorded override fingerprint; the lockfile may have \
-                 been generated without these overrides"
-                    .to_string()
-            }
-            None => "override state inconsistency".to_string(),
-        };
+    if override_drift.changed() {
         return Err(LpmError::Registry(format!(
-            "--offline: override set differs from the lockfile's recorded set ({detail}). \
-             Run `lpm install` (online) to re-resolve, then retry --offline."
-        )));
-    }
-
-    if patches_changed {
-        let detail = match prior_patch_state {
-            Some(prior) => format!(
-                "previous fingerprint {} differs from current {}",
-                prior.fingerprint, current_patch_fingerprint
-            ),
-            None if !current_patches.is_empty() => {
-                "no previously-recorded patch fingerprint; the lockfile may have \
-                 been written without these patches"
-                    .to_string()
-            }
-            None => "patch state inconsistency".to_string(),
-        };
-        return Err(LpmError::Registry(format!(
-            "--offline: lpm.patchedDependencies differs from the previously-recorded \
-             patch set ({detail}). Run `lpm install` (online) to re-resolve, then retry \
-             --offline."
+            "--offline: {}. Run `lpm install` online to re-resolve, then retry --offline.",
+            override_drift.offline_detail(override_set)
         )));
     }
 

@@ -10,8 +10,9 @@
 //!    are removed, and the fingerprint changes when the override set
 //!    changes.
 //! 3. **Offline safety** — `--offline` cannot re-resolve, so any
-//!    drift between the persisted overrides-state and the current
-//!    `lpm.overrides` is a hard error rather than a silent stale-link.
+//!    drift between the overrides `lpm.lock` was resolved with and the
+//!    current ones is a hard error rather than a silent stale-link. A
+//!    fresh clone (no `.lpm/`) replays the lockfile.
 //! 4. **Replacement semantics** — an override replaces each consumer's
 //!    declared range, including when a transitive pin excludes the target.
 //! 5. **Workspace inheritance** — root overrides apply to every member;
@@ -663,111 +664,42 @@ fn install_overrides_rejects_invalid_range_in_selector() {
     );
 }
 
-// ─── Offline safety: state vs current overrides ─────────────────────────
+// ─── Offline safety: the lockfile's overrides vs current overrides ──────
 
-/// Stale state with applied overrides + non-empty deps + EMPTY current
-/// overrides → offline must hard-error. We can't re-resolve offline, so
-/// silently completing the install would link against the (now-stale)
-/// override-shifted lockfile and leave a ghost state file on disk.
-#[test]
-fn offline_install_hard_errors_when_overrides_removed_with_prior_state() {
-    let project = TempProject::empty(
-        r#"{
-  "name": "offline-overrides-removed",
-  "version": "0.0.0",
-  "dependencies": { "lodash": "^4.17.0" }
-}"#,
-    );
-    write_lockfile(&project, &[("lodash", "4.17.20", &[])]);
-    seed_store_package(&project, "lodash", "4.17.20");
-    write_overrides_state(
-        &project,
-        "sha256-stale-fp",
-        &[("lodash", "4.17.20")],
-        &[("lodash", "4.17.21", "4.17.20", None)],
-    );
-
-    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
+fn offline_install(project: &TempProject) -> std::process::Output {
+    lpm_with_registry(project, "http://127.0.0.1:1")
         .args(["install", "--offline"])
         .output()
-        .expect("spawn lpm install");
-    assert!(
-        !out.status.success(),
-        "offline install must hard error when overrides are removed but state lingers; \
-         stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+        .expect("spawn lpm install")
+}
 
+fn assert_offline_override_drift(out: &std::process::Output) {
     let combined = strip_ansi(&format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     ));
     assert!(
-        combined.contains("override") || combined.contains("fingerprint"),
-        "error must mention overrides/fingerprint; got:\n{combined}"
+        !out.status.success(),
+        "offline install must refuse overrides lpm.lock was not resolved with:\n{combined}"
     );
     assert!(
-        combined.contains("online") || combined.contains("re-resolve"),
+        combined.contains("overrides") && combined.contains("lpm.lock"),
+        "error must name the overrides and the lockfile; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("online"),
         "error must point at the recovery path (run online); got:\n{combined}"
     );
 }
 
-/// Stale state fingerprint X + non-empty deps + CURRENT overrides whose
-/// fingerprint is Y (different) → offline must hard-error rather than
-/// silently ignoring the user's override edits.
+/// A fresh clone has the committed lockfile but no `.lpm/`. The lockfile
+/// records the overrides it was resolved with, so offline replay works.
 #[test]
-fn offline_install_hard_errors_on_overrides_fingerprint_mismatch() {
+fn offline_install_on_a_fresh_clone_uses_the_overrides_the_lockfile_records() {
     let project = TempProject::empty(
         r#"{
-  "name": "offline-fingerprint-mismatch",
-  "version": "0.0.0",
-  "dependencies": { "lodash": "^4.17.0" },
-  "lpm": { "overrides": { "lodash": "5.0.0" } }
-}"#,
-    );
-    write_lockfile(&project, &[("lodash", "4.17.20", &[])]);
-    seed_store_package(&project, "lodash", "4.17.20");
-    write_overrides_state(
-        &project,
-        "sha256-totally-different-fp-from-current",
-        &[("lodash", "4.17.20")],
-        &[],
-    );
-
-    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
-        .args(["install", "--offline"])
-        .output()
-        .expect("spawn lpm install");
-    assert!(
-        !out.status.success(),
-        "offline install with fingerprint mismatch must hard error; \
-         stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let combined = strip_ansi(&format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    ));
-    assert!(
-        combined.contains("override") || combined.contains("fingerprint"),
-        "error must mention overrides/fingerprint; got:\n{combined}"
-    );
-}
-
-/// Non-empty deps + CURRENT overrides + NO persisted state file →
-/// offline must hard-error. Without a fingerprint to verify against,
-/// we can't prove the lockfile was generated under the current
-/// override set, so the safe behavior is to refuse.
-#[test]
-fn offline_install_hard_errors_when_overrides_exist_but_no_state_file() {
-    let project = TempProject::empty(
-        r#"{
-  "name": "offline-no-prior-state",
+  "name": "offline-fresh-clone",
   "version": "0.0.0",
   "dependencies": { "lodash": "^4.17.0" },
   "lpm": { "overrides": { "lodash": "4.17.20" } }
@@ -775,29 +707,139 @@ fn offline_install_hard_errors_when_overrides_exist_but_no_state_file() {
     );
     write_lockfile(&project, &[("lodash", "4.17.20", &[])]);
     seed_store_package(&project, "lodash", "4.17.20");
-    // Intentionally no overrides-state.json.
 
-    let out = lpm_with_registry(&project, "http://127.0.0.1:1")
-        .args(["install", "--offline"])
+    let out = offline_install(&project);
+
+    assert!(
+        out.status.success(),
+        "offline install of a fresh clone must succeed; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The lockfile was resolved with an override the manifest no longer has.
+#[test]
+fn offline_install_hard_errors_when_overrides_were_removed_since_the_lockfile() {
+    let with_override = r#"{
+  "name": "offline-overrides-removed",
+  "version": "0.0.0",
+  "dependencies": { "lodash": "^4.17.0" },
+  "lpm": { "overrides": { "lodash": "4.17.20" } }
+}"#;
+    let project = TempProject::empty(with_override);
+    write_lockfile(&project, &[("lodash", "4.17.20", &[])]);
+    seed_store_package(&project, "lodash", "4.17.20");
+    project.write_file(
+        "package.json",
+        r#"{
+  "name": "offline-overrides-removed",
+  "version": "0.0.0",
+  "dependencies": { "lodash": "^4.17.0" }
+}"#,
+    );
+
+    assert_offline_override_drift(&offline_install(&project));
+}
+
+/// The manifest's override changed after the lockfile was resolved. A stale
+/// local state file that happens to match must not hide it.
+#[test]
+fn offline_install_hard_errors_when_overrides_changed_since_the_lockfile() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "offline-overrides-changed",
+  "version": "0.0.0",
+  "dependencies": { "lodash": "^4.17.0" },
+  "lpm": { "overrides": { "lodash": "4.17.20" } }
+}"#,
+    );
+    write_lockfile(&project, &[("lodash", "4.17.20", &[])]);
+    seed_store_package(&project, "lodash", "4.17.20");
+    project.write_file(
+        "package.json",
+        &project
+            .read_file("package.json")
+            .replace(r#""lodash": "4.17.20""#, r#""lodash": "5.0.0""#),
+    );
+    let fingerprint = override_state_fingerprint(&[("lpm.overrides", "lodash", "5.0.0")]);
+    write_overrides_state(&project, &fingerprint, &[("lodash", "5.0.0")], &[]);
+
+    assert_offline_override_drift(&offline_install(&project));
+}
+
+/// Overrides added after the lockfile was resolved: the lockfile cannot
+/// show that its versions satisfy them.
+#[test]
+fn offline_install_hard_errors_when_overrides_were_added_since_the_lockfile() {
+    let project = TempProject::empty(
+        r#"{
+  "name": "offline-overrides-added",
+  "version": "0.0.0",
+  "dependencies": { "lodash": "^4.17.0" }
+}"#,
+    );
+    write_lockfile(&project, &[("lodash", "4.17.20", &[])]);
+    seed_store_package(&project, "lodash", "4.17.20");
+    project.write_file(
+        "package.json",
+        r#"{
+  "name": "offline-overrides-added",
+  "version": "0.0.0",
+  "dependencies": { "lodash": "^4.17.0" },
+  "lpm": { "overrides": { "lodash": "4.17.20" } }
+}"#,
+    );
+
+    assert_offline_override_drift(&offline_install(&project));
+}
+
+/// A fresh clone with overrides takes the lockfile fast path online too,
+/// instead of re-resolving and rewriting the committed lockfile.
+#[tokio::test]
+async fn a_fresh_clone_with_overrides_installs_from_the_lockfile() {
+    let mock = MockRegistry::start().await;
+    mount_force_override_packages(&mock).await;
+    let project = TempProject::empty(
+        r#"{
+  "name": "fresh-clone-overrides",
+  "version": "1.0.0",
+  "dependencies": { "override-consumer": "1.0.0" },
+  "lpm": { "overrides": { "override-target": "2.0.0" } }
+}"#,
+    );
+    let first = install_without_optional_setup(&project, &mock.url());
+    assert!(
+        first.status.success(),
+        "first install must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+    );
+    let committed = project.read_file("lpm.lock");
+    std::fs::remove_dir_all(project.path().join(".lpm")).unwrap();
+    std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "install",
+            "--json",
+            "--no-security-summary",
+            "--no-skills",
+            "--no-editor-setup",
+        ])
         .output()
-        .expect("spawn lpm install");
-    assert!(
-        !out.status.success(),
-        "offline install with overrides but no state file must hard error; \
-         stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+        .expect("spawn fresh-clone install");
 
-    let combined = strip_ansi(&format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    ));
     assert!(
-        combined.contains("override") || combined.contains("fingerprint"),
-        "error must mention overrides/fingerprint; got:\n{combined}"
+        output.status.success(),
+        "fresh-clone install must succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("install stdout must be JSON");
+    assert_eq!(json["used_lockfile"], true, "{json}");
+    assert_eq!(project.read_file("lpm.lock"), committed);
 }
 
 /// Positive case: matching fingerprint + non-empty deps + matching

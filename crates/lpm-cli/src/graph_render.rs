@@ -3736,9 +3736,7 @@ mod tests {
     fn fake_patch_state(name: &str) -> crate::patch_state::PatchState {
         crate::patch_state::PatchState {
             state_version: crate::patch_state::PATCH_STATE_VERSION,
-            fingerprint: "sha256-fake-patch".to_string(),
             captured_at: "T00:00:00Z".to_string(),
-            parsed: vec![],
             applied: vec![crate::patch_state::AppliedPatchHit {
                 raw_key: format!("{name}@1.2.3"),
                 name: name.to_string(),
@@ -3812,9 +3810,7 @@ mod tests {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
         let state = crate::patch_state::PatchState {
             state_version: crate::patch_state::PATCH_STATE_VERSION,
-            fingerprint: "sha256-legacy".to_string(),
             captured_at: "T00:00:00Z".to_string(),
-            parsed: vec![],
             applied: vec![crate::patch_state::AppliedPatchHit {
                 raw_key: "ms@1.2.3".to_string(),
                 name: "ms".to_string(),
@@ -3845,9 +3841,7 @@ mod tests {
         let graph = DepGraph::from_lockfile(&mock_packages(), &direct_deps(), "test-app@1.0.0");
         let state = crate::patch_state::PatchState {
             state_version: crate::patch_state::PATCH_STATE_VERSION,
-            fingerprint: "sha256-zero".to_string(),
             captured_at: "T00:00:00Z".to_string(),
-            parsed: vec![],
             applied: vec![crate::patch_state::AppliedPatchHit {
                 raw_key: "ms@1.2.3".to_string(),
                 name: "ms".to_string(),
