@@ -83,6 +83,8 @@ pub(crate) fn ensure_store_tier_dir_locked(path: &Path) -> std::io::Result<()> {
         Err(error) => return Err(error),
     };
 
+    #[cfg(target_os = "macos")]
+    drop_inherited_access(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -97,6 +99,52 @@ pub(crate) fn ensure_store_tier_dir_locked(path: &Path) -> std::io::Result<()> {
         let _ = metadata;
         Ok(())
     }
+}
+
+/// [`ensure_store_tier_dir_locked`] for an existing tier a reuse reads,
+/// which an earlier release may have left open to others, once per process:
+/// later reuses from the same tier check nothing. A missing tier is left
+/// for the writer that creates it.
+pub(crate) fn harden_store_tier_once(path: &Path) -> std::io::Result<()> {
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, Mutex, PoisonError};
+
+    static HARDENED: LazyLock<Mutex<HashSet<PathBuf>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
+    if HARDENED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(path)
+    {
+        return Ok(());
+    }
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        _ => {}
+    }
+    ensure_store_tier_dir_locked(path)?;
+    HARDENED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(path.to_path_buf());
+    Ok(())
+}
+
+/// Drops the access list entries the store directory at `path` took from
+/// the directory above it, which grant access its mode doesn't, and pass on
+/// to everything extracted inside.
+#[cfg(target_os = "macos")]
+fn drop_inherited_access(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    if !lpm_common::macos_acl::has_extended_acl_at(path)? {
+        return Ok(());
+    }
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(::libc::O_DIRECTORY | ::libc::O_NOFOLLOW | ::libc::O_CLOEXEC)
+        .open(path)?;
+    lpm_common::macos_acl::drop_extended_acl(&directory)
 }
 
 /// Recursively copy `src/` to `dst/`. Used by the v1 → v2 cache-hit

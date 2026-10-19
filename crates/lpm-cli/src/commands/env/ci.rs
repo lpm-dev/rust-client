@@ -51,21 +51,31 @@ pub(super) fn emit_project_env_for_ci(
             ));
         }
         CiEnvDestination::DotenvFile(file) => {
-            lpm_common::write_file_atomic_with_options(
+            let write = lpm_common::project_secret::write_secret_file(
+                project_dir,
                 &project_dir.join(file),
                 output.as_bytes(),
-                lpm_common::AtomicWriteOptions::new()
-                    .unix_mode(0o600)
-                    .sync_file(),
+                lpm_common::project_secret::SecretFileOptions {
+                    ignore_file: lpm_common::project_secret::IgnoreFile::RepositoryExclude,
+                    on_ignore_failure: lpm_common::project_secret::IgnoreFailure::Refuse,
+                    existing: lpm_common::project_secret::Existing::Replace,
+                },
             )
-            .map_err(|e| LpmError::Script(format!("failed to write {file}: {e}")))?;
+            .map_err(|error| LpmError::Script(error.to_string()))?;
             if json_output {
                 println!(
                     "{}",
-                    serde_json::json!({"success":true, "exported":env_vars.len(), "to":file, "env":resolved_env.as_deref().unwrap_or("default")})
+                    serde_json::json!({
+                        "success": true,
+                        "exported": env_vars.len(),
+                        "to": file,
+                        "env": resolved_env.as_deref().unwrap_or("default"),
+                        "warnings": write.warnings,
+                    })
                 );
                 return Ok(());
             }
+            super::local::print_secret_file_warnings(&write.warnings);
             install_ui::done_line(crate::install_ui::terminal_line!(
                 "Wrote {} vars to {}",
                 install_ui::status_ok(&env_vars.len().to_string()),

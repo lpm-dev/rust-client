@@ -61,7 +61,7 @@ pub(super) fn decode(password: &str, directory: &Path) -> Result<[u8; 32], Strin
                 &cache_path,
                 encoded,
                 lpm_common::AtomicWriteOptions::new()
-                    .unix_mode(0o600)
+                    .owner_only()
                     .sync_file()
                     .sync_parent(),
             );

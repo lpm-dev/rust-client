@@ -546,6 +546,12 @@ pub enum LpmError {
     )]
     Store(String),
 
+    /// LPM CLI refused to touch a project file, such as a secret file git
+    /// tracks. The message names the fix.
+    #[error("project file error: {0}")]
+    #[diagnostic(code(lpm::project_file))]
+    ProjectFile(String),
+
     #[error("project layout error: {0}")]
     #[diagnostic(
         code(lpm::project_layout),
@@ -847,6 +853,7 @@ impl LpmError {
             LpmError::Tunnel(_) => "tunnel",
             LpmError::TunnelAccess { .. } => "tunnel_access",
             LpmError::Store(_) => "store",
+            LpmError::ProjectFile(_) => "project_file",
             LpmError::ProjectLayout(_) => "project_layout",
             LpmError::ExitCode(_) => "exit_code",
             LpmError::Io(_) => "io",
@@ -1103,6 +1110,7 @@ mod tests {
             LpmError::Tunnel("x".into()),
             LpmError::tunnel_access("plan_required", "x"),
             LpmError::Store("x".into()),
+            LpmError::ProjectFile("x".into()),
             LpmError::ProjectLayout("x".into()),
             LpmError::ExitCode(1),
             LpmError::Io(std::io::Error::other("x")),
