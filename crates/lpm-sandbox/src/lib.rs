@@ -48,7 +48,7 @@
 //! |----------|--------------------------|---------------------------|----------------------------|
 //! | macOS    | Seatbelt (`sandbox-exec`), `(deny default)` + narrow allows; **full outbound network denied**, no loopback exemption — every socket family / type covered. | Seatbelt w/ `(allow (with report) default)` fallback | [`NoopSandbox`] |
 //! | Linux    | landlock V4 (kernel 6.7+) + seccomp-bpf layered together — filesystem + **outbound TCP** (landlock: BindTcp + ConnectTcp) + **direct UDP / raw / AF_PACKET / AF_NETLINK** (seccomp: `socket(2)` deny matrix). AF_UNIX intentionally allowed for legitimate IPC; resolver-mediated DNS remains host-dependent (NSS via AF_UNIX or TCP fallback). Kernels < 6.7 return [`SandboxError::KernelTooOld`] by default; explicit opt-in via `[sandbox] allow-degraded = true` falls back to V1 filesystem-only (no seccomp layer either) with a one-line stderr warning per install. | [`SandboxError::ModeNotSupportedOnPlatform`] — no native observe-only | [`NoopSandbox`] |
-//! | Windows  | Mandatory Integrity Control (drop child to Low IL) + Job Object for kill-tree. Filesystem-write containment only — outbound network denial is **not** implemented; under default mode the posture is [`SandboxPosture::Default`]. Strict mode (`deny_outbound_network = true`) refuses with [`SandboxError::UnsupportedPlatform`] unless `allow_degraded = true`, in which case the backend succeeds with [`SandboxPosture::Degraded`] (`missing = "network-containment"`). | [`SandboxError::ModeNotSupportedOnPlatform`] — Mandatory Integrity Control has no native observe-only either | [`NoopSandbox`] |
+//! | Windows  | AppContainer, set up by the `lpm-sandbox-helper.exe` companion binary, + Job Object for kill-tree. Filesystem-write containment with per-invocation DACL grants; strict mode also denies outbound network (empty capability list). Without the helper, construction refuses with [`SandboxError::HelperMissing`]. | [`SandboxError::ModeNotSupportedOnPlatform`] — AppContainer has no native observe-only | [`NoopSandbox`] |
 //!
 //! [`SandboxMode::Disabled`] always succeeds with a [`NoopSandbox`]:
 //! the `--no-sandbox` escape hatch must be reachable from every
@@ -68,7 +68,7 @@
 #![warn(missing_docs)]
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -91,16 +91,12 @@ mod seccomp;
 // Per-process resource limits (RLIMIT_NPROC / NOFILE / CPU) wired
 // into the Unix backends' `pre_exec` closures. Defense-in-depth
 // against fork-bomb / fd-exhaustion / CPU-spinner DoS from a
-// lifecycle script. macOS + Linux only — Windows uses
-// `JOB_OBJECT_LIMIT_*` instead, wired in `windows.rs`.
+// lifecycle script. macOS + Linux only.
 #[cfg(unix)]
 mod rlimits;
 
-// Windows backend via Mandatory Integrity Control (drop
-// child to Low IL) + Job Object for kill-tree parity with Unix's
-// process group. See [`windows`] module docs for the mechanism + the
-// platform-asymmetric posture mapping (Default OK; Strict needs
-// WFP layer).
+// Windows process-tree tracking (Job Objects) for
+// [`spawn_tracked_command`] and the timeout-kill path.
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -118,10 +114,8 @@ pub mod helper_protocol;
 #[cfg(target_os = "windows")]
 pub mod helper_appcontainer;
 
-// Parent-side AppContainer backend (lives in
-// `lpm.exe`, drives the helper binary). The factory below picks
-// this backend over [`windows::WindowsSandbox`] when
-// `locate_sandbox_helper` finds the helper.
+// Parent-side AppContainer backend (lives in `lpm.exe`, drives the
+// helper binary). The Windows backend the factory below returns.
 #[cfg(target_os = "windows")]
 mod windows_appcontainer;
 
@@ -137,10 +131,12 @@ mod windows_appcontainer;
 // `/dev/null`, …) that aren't absolute on Windows, so on a Windows
 // test host they'd surface as InvalidSpec rejections — pure noise
 // for a Linux-only consumer. The Windows backend has its own
-// allow-set rendering (`crate::windows::writable_allow_set`) and
-// its own tests.
+// allow-set rendering (`crate::windows_appcontainer::writable_allow_set`)
+// and its own tests.
 #[cfg(any(target_os = "linux", all(test, not(target_os = "windows"))))]
 mod landlock_rules;
+#[cfg(any(target_os = "linux", all(test, unix)))]
+mod mount_aliases;
 
 // posture-decision helper. Pure (string in, decision out),
 // platform-neutral so the macOS-host unit tests exercise the same
@@ -150,8 +146,8 @@ mod landlock_rules;
 // developer's machine without spinning up a Linux VM. Non-Linux
 // production builds skip the module — they have no consumer.
 //
-// the Windows backend has its own
-// `decide_posture` (`crate::windows::decide_posture`), so this
+// the Windows backend has its own posture decision
+// (`crate::windows_appcontainer::decide_appcontainer_posture`), so this
 // Linux-shaped one stays gated off on Windows builds. Same
 // rationale as `landlock_rules` above.
 #[cfg(any(target_os = "linux", all(test, not(target_os = "windows"))))]
@@ -202,7 +198,8 @@ pub struct SandboxSpec {
     pub package_dir: PathBuf,
     /// Absolute path to the project root (the directory containing
     /// `package.json`). Readable broadly; writable under narrow subpaths
-    /// (`node_modules`, `.husky`, `.lpm`).
+    /// (`node_modules`, `.husky`, and in `.lpm` only the running package's
+    /// own layout directory, [`package_layout_write_dir`]).
     pub project_dir: PathBuf,
     /// Package identity for profile interpolation + denial messages.
     /// e.g. `"prisma"` or `"@napi-rs/canvas"`.
@@ -600,9 +597,9 @@ impl SandboxedCommand {
 /// denial line.
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxError {
-    /// The current platform has no sandbox backend. Windows
-    /// and non-{macOS,Linux} unix variants hit this arm. [`remediation`]
-    /// is the user-facing next-step string.
+    /// The current platform has no sandbox backend: anything other than
+    /// macOS, Linux and Windows. [`remediation`] is the user-facing
+    /// next-step string.
     ///
     /// [`remediation`]: SandboxError::UnsupportedPlatform::remediation
     #[error("sandbox unavailable on {platform} — {remediation}")]
@@ -612,6 +609,33 @@ pub enum SandboxError {
         /// User-facing next-step. Directs to the escape hatch or the
         /// deferral as appropriate.
         remediation: String,
+    },
+
+    /// On Windows, `lpm-sandbox-helper.exe`, which runs lifecycle scripts
+    /// in an AppContainer, isn't where lpm looks for it: the file
+    /// `LPM_SANDBOX_HELPER` names, then the running executable's
+    /// directory. Lifecycle scripts don't run without it.
+    #[error("{}", helper_missing_message(searched))]
+    HelperMissing {
+        /// Where lpm looked: the file `LPM_SANDBOX_HELPER` named when it
+        /// was set, then the one beside the running executable when that
+        /// directory is known.
+        searched: Vec<PathBuf>,
+    },
+
+    /// On Windows, `LPM_SANDBOX_HELPER` names the helper by a relative
+    /// path, which would resolve against whatever directory lpm runs in,
+    /// such as a cloned repository's, and start a file from there outside
+    /// the sandbox.
+    #[error(
+        "LPM_SANDBOX_HELPER is {}, which isn't an absolute path, so it would name a file in \
+         whatever directory lpm runs in. Set it to the absolute path of lpm-sandbox-helper.exe, \
+         or unset it to use the helper beside lpm",
+        value.display()
+    )]
+    HelperOverrideNotAbsolute {
+        /// The value `LPM_SANDBOX_HELPER` holds.
+        value: PathBuf,
     },
 
     /// Linux kernel is older than the landlock ABI level the sandbox
@@ -760,6 +784,7 @@ pub fn new_for_platform_with_options(
     }
 
     validate_spec(&spec)?;
+    config::validate_project_state_boundary(&spec, options.build_cache_isolation)?;
     platform_backend(spec, mode, options)
 }
 
@@ -793,36 +818,9 @@ fn platform_backend(
     mode: SandboxMode,
     options: SandboxOptions,
 ) -> Result<Box<dyn Sandbox>, SandboxError> {
-    // Prefer the AppContainer backend when its helper binary is
-    // reachable. AppContainer delivers full strict (filesystem-write
-    // containment + outbound network denial); the Mandatory Integrity
-    // Control backend remains as the fallback path when the helper
-    // binary is missing (npm install corruption, manual binary fetch,
-    // dev-build that didn't bundle the helper).
-    //
-    // The two backends keep separate posture decisions
-    // ([`windows::decide_posture`] vs
-    // [`windows_appcontainer::decide_appcontainer_posture`]) so
-    // The AppContainer backend must not accidentally weaken the
-    // Low IL backend's strict-without-degraded refusal contract.
-    if let Some(helper_path) = windows_appcontainer::locate_sandbox_helper() {
-        return Ok(Box::new(windows_appcontainer::AppContainerSandbox::new(
-            spec,
-            mode,
-            options,
-            helper_path,
-        )?));
-    }
-    // Helper missing: log once at info-level so the active backend
-    // is observable, then fall back to the 46.2 Low IL path. The
-    // doctor surface ([`crate::Sandbox::backend_name`]) carries the
-    // same signal for users.
-    tracing::info!(
-        target: "lpm_sandbox::windows",
-        "lpm-sandbox-helper.exe not found next to lpm.exe; falling back to \
-         the Low IL backend (no outbound-network containment)",
-    );
-    Ok(Box::new(windows::WindowsSandbox::new(spec, mode, options)?))
+    Ok(Box::new(windows_appcontainer::AppContainerSandbox::new(
+        spec, mode, options,
+    )?))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -837,6 +835,33 @@ fn platform_backend(
     })
 }
 
+/// The directory in the project's `.lpm` that holds the running package in
+/// a v1 layout, which its scripts may write beside the package: its wrapper
+/// in the isolated layout, `wrappers/<id>/`, whose `node_modules/` holds the
+/// package and what it generates there, or its entry in the hoisted
+/// layout's `hoisted/nested/`. Other packages' directories there stay
+/// read-only: their files can be hardlinks into the shared store.
+pub(crate) fn package_layout_write_dir(project_dir: &Path, package_dir: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let [wrappers, nested] = lpm_common::project_package_dirs(project_dir);
+    let normal = |component: Option<Component<'_>>| match component {
+        Some(Component::Normal(name)) => Some(name.to_os_string()),
+        _ => None,
+    };
+    if let Ok(rest) = package_dir.strip_prefix(&wrappers) {
+        return Some(wrappers.join(normal(rest.components().next())?));
+    }
+    let rest = package_dir.strip_prefix(&nested).ok()?;
+    let mut components = rest.components();
+    let first = normal(components.next())?;
+    let entry = nested.join(&first);
+    if first.to_string_lossy().starts_with('@') {
+        return Some(entry.join(normal(components.next())?));
+    }
+    Some(entry)
+}
+
 /// Ensure the "standard" writable subpaths referenced by the sandbox
 /// profile actually exist on disk, creating any that don't.
 ///
@@ -848,19 +873,13 @@ fn platform_backend(
 /// fail without this helper — they'd try to create `.husky`
 /// themselves and hit the sandbox rule gap.
 ///
-/// also pre-creates every entry of
-/// `spec.extra_write_dirs`. Before this, a user-declared
-/// `sandboxWriteDirs: ["build-output"]` entry would be accepted by
-/// the validator and then silently denied at runtime — the Windows
-/// backend's `apply_low_il_label` skips nonexistent paths, the
-/// script would try to `mkdir build-output` against a Medium-IL
-/// `project_dir` it can't write to, and the install would fail. The
-/// Seatbelt + landlock backends had the same hazard but it was less
-/// visible because POSIX `mkdir` against a Medium-IL parent fails
-/// with a clearer message; on Windows the failure mode was an opaque
-/// ERROR_ACCESS_DENIED. Pre-creating means every `extra_write_dirs`
-/// entry exists when `apply_low_il_label` / landlock / Seatbelt sees
-/// it, so the label / rule actually lands and the script can write.
+/// also pre-creates every entry of `spec.extra_write_dirs`. Every
+/// backend grants only paths that exist, so a user-declared
+/// `sandboxWriteDirs: ["build-output"]` entry that doesn't would be
+/// accepted by the validator and then denied at runtime: the script's
+/// own `mkdir build-output` in the read-only project directory fails.
+/// Pre-creating means every entry exists when the backend renders its
+/// grants, so the script can write there.
 ///
 /// Callers (build.rs production path + compat-corpus test fixtures)
 /// invoke this once before spawning scripts. Paths that already
@@ -873,10 +892,9 @@ pub fn prepare_writable_dirs(spec: &SandboxSpec) -> Result<(), SandboxError> {
     config::validate_builtin_write_dirs(spec)?;
     // Built-in writable subpaths first. These mirror the
     // standard-allow-set entries every backend renders into its
-    // profile / ruleset / IL label.
+    // profile / ruleset / DACL grants.
     let builtin = [
         spec.project_dir.join(".husky"),
-        spec.project_dir.join(".lpm"),
         spec.project_dir.join("node_modules"),
         spec.home_dir.join(".cache"),
         spec.home_dir.join(".node-gyp"),
@@ -925,33 +943,29 @@ fn ensure_writable_dir_exists(p: &std::path::Path) -> Result<(), SandboxError> {
 /// the [`Sandbox::spawn`] path puts the lifecycle child in its own
 /// group via `process_group(0)`.
 ///
-/// On Windows the lifecycle child is attached to a Job Object with
-/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, but the parent retains a
-/// handle to the Job (held inside the sandbox crate so descendants
-/// survive `Child::wait`). Calling `child.kill()` only terminates
-/// the root process; descendants survive until parent exit. Routing
-/// through this function instead calls `TerminateJobObject` which
-/// the kernel propagates to every member of the tree, then drops
-/// the cached handle so the kernel reclaims the Job.
+/// On Windows a [`spawn_tracked_command`] child is attached to a Job
+/// Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` whose handle the
+/// sandbox crate keeps, so `child.kill()` alone ends only the root
+/// process. This calls `TerminateJobObject`, which ends every member of
+/// the tree, then closes the handle. A sandboxed lifecycle child is the
+/// AppContainer helper, which holds its script's Job Object itself:
+/// killing the helper closes that Job and ends the tree.
 ///
 /// Idempotent: PIDs without a tracked entry (Unix; Windows children
-/// that exited normally; PIDs from non-sandboxed spawns) are silent
-/// no-ops. Always pair with `Child::kill()` for belt-and-suspenders
-/// behavior on platforms where the tracker isn't populated.
+/// that exited normally; sandboxed lifecycle children) are silent
+/// no-ops. Always pair with `Child::kill()`.
 pub fn terminate_sandbox_tree(_pid: u32) {
     #[cfg(target_os = "windows")]
     windows::terminate_sandbox_tree(_pid);
 }
 
-/// Release the sandbox-tracker entry for a child that exited
-/// normally (no timeout, no panic). On Unix this is a no-op. On
-/// Windows it drops the cached Job-Object handle so the kernel can
-/// reclaim it — without this, the tracker accumulates one open
-/// HANDLE per successful lifecycle script for the parent's lifetime.
-///
-/// Production callers in the install pipeline invoke this after a
-/// `Child::wait` returns naturally; the timeout-kill path uses
-/// [`terminate_sandbox_tree`] instead which also handles release.
+/// Release the tracker entry for a [`spawn_tracked_command`] child that
+/// exited normally (no timeout, no panic). On Unix this is a no-op. On
+/// Windows it closes the cached Job Object handle, which also ends any
+/// descendant the child left running; without it the tracker keeps one
+/// open HANDLE per tracked command for the parent's lifetime. The
+/// timeout-kill path uses [`terminate_sandbox_tree`] instead, which also
+/// releases the entry.
 ///
 /// Idempotent: missing entries are silent no-ops.
 pub fn release_sandbox_tracker(_pid: u32) {
@@ -960,7 +974,7 @@ pub fn release_sandbox_tracker(_pid: u32) {
 }
 
 /// Spawn a command in an OS process-tree container without applying
-/// filesystem, network, or integrity-level restrictions.
+/// filesystem or network restrictions.
 ///
 /// Unix starts the child in a new process group. Windows starts it
 /// suspended, attaches a kill-on-close Job Object, and resumes it only
@@ -988,6 +1002,29 @@ pub fn spawn_tracked_command(
     }
 }
 
+fn helper_missing_message(searched: &[PathBuf]) -> String {
+    let location = if searched.is_empty() {
+        "beside the running lpm".to_string()
+    } else {
+        let places: Vec<String> = searched
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        format!("at {}", places.join(" or "))
+    };
+    format!(
+        "lpm-sandbox-helper.exe, which runs lifecycle scripts in an AppContainer, isn't \
+         {location}. Reinstall `@lpm-registry/cli` with the package manager that installed lpm \
+         to restore it. For a cargo install, install it beside lpm with `cargo install --git \
+         https://github.com/lpm-dev/rust-client --tag v{version} lpm-sandbox --bin \
+         lpm-sandbox-helper`. For a binary from a GitHub release, save that release's \
+         lpm-sandbox-helper-win32-x64.exe beside it as lpm-sandbox-helper.exe. If it lives \
+         elsewhere, set LPM_SANDBOX_HELPER to its path, or re-run with --no-sandbox to run \
+         scripts without containment",
+        version = env!("CARGO_PKG_VERSION"),
+    )
+}
+
 /// User-facing remediation string for [`SandboxError::UnsupportedPlatform`].
 ///
 /// Centralized so unsupported platforms share consistent wording and
@@ -995,13 +1032,9 @@ pub fn spawn_tracked_command(
 ///
 /// The remediation names `--no-sandbox` as a single flag.
 ///
-/// Windows has a real backend (`windows::WindowsSandbox`), so the
-/// legacy "Windows isn't supported" special case is gone. The
-/// Windows strict-mode refusal
-/// path generates its OWN remediation via
-/// `windows::strict_not_yet_supported_remediation`; this generic
-/// helper only fires for unsupported platforms (FreeBSD, OpenBSD,
-/// illumos, etc.).
+/// Only platforms without a backend (FreeBSD, OpenBSD, illumos, etc.)
+/// reach it; a Windows install without its helper gets
+/// [`SandboxError::HelperMissing`] instead.
 pub fn unsupported_remediation(platform: &str) -> String {
     format!(
         "{platform} has no LPM sandbox backend. Re-run with \
@@ -1223,12 +1256,6 @@ mod tests {
 
     #[test]
     fn error_display_unsupported_platform_mentions_platform_and_remediation() {
-        // Windows is no longer unsupported,
-        // so we exercise the generic-unsupported path here with a
-        // platform that genuinely has no backend (FreeBSD). The
-        // Windows-specific strict-not-yet-supported remediation is
-        // generated by the Windows backend itself and tested in
-        // [`windows::tests`].
         let e = SandboxError::UnsupportedPlatform {
             platform: "freebsd".into(),
             remediation: unsupported_remediation("freebsd"),
@@ -1240,6 +1267,52 @@ mod tests {
         assert!(
             !msg.contains("--unsafe-full-env"),
             "legacy partner flag must be gone: {msg}",
+        );
+    }
+
+    #[test]
+    fn a_missing_helper_names_where_lpm_looked_and_how_to_restore_it() {
+        let message = SandboxError::HelperMissing {
+            searched: vec![
+                PathBuf::from(r"D:\tools\lpm-sandbox-helper.exe"),
+                PathBuf::from(r"C:\Users\u\.cargo\bin\lpm-sandbox-helper.exe"),
+            ],
+        }
+        .to_string();
+        assert!(
+            message.contains(
+                r"isn't at D:\tools\lpm-sandbox-helper.exe or C:\Users\u\.cargo\bin\lpm-sandbox-helper.exe."
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("Reinstall `@lpm-registry/cli`"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "cargo install --git https://github.com/lpm-dev/rust-client --tag v{} lpm-sandbox --bin lpm-sandbox-helper",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains(
+                "save that release's lpm-sandbox-helper-win32-x64.exe beside it as \
+                 lpm-sandbox-helper.exe"
+            ),
+            "{message}"
+        );
+        assert!(message.contains("LPM_SANDBOX_HELPER"), "{message}");
+        assert!(message.contains("--no-sandbox"), "{message}");
+
+        let unknown = SandboxError::HelperMissing {
+            searched: Vec::new(),
+        }
+        .to_string();
+        assert!(
+            unknown.contains("isn't beside the running lpm."),
+            "{unknown}"
         );
     }
 
@@ -1321,10 +1394,9 @@ mod tests {
     /// follow-up: every entry of `spec.extra_write_dirs`
     /// must exist on disk after `prepare_writable_dirs` returns.
     /// Without this, a user-declared `sandboxWriteDirs: ["build-output"]`
-    /// would survive validation but be silently denied at runtime
-    /// (the Windows backend's `apply_low_il_label` skips nonexistent
-    /// paths, the script then tries `mkdir build-output` against a
-    /// Medium-IL `project_dir`, and fails with ERROR_ACCESS_DENIED).
+    /// would survive validation but be denied at runtime: backends
+    /// grant only paths that exist, and the script's own `mkdir` in the
+    /// read-only project directory fails.
     #[test]
     fn prepare_writable_dirs_rejects_regular_file_builtin_root() {
         let root = tempfile::tempdir().unwrap();
@@ -1398,7 +1470,10 @@ mod tests {
 
         // Builtins:
         assert!(project.join(".husky").exists(), "missing .husky");
-        assert!(project.join(".lpm").exists(), "missing .lpm");
+        assert!(
+            !project.join(".lpm").exists(),
+            "the package dirs in .lpm are granted only where an install made them"
+        );
         assert!(
             project.join("node_modules").exists(),
             "missing node_modules"
@@ -1436,6 +1511,48 @@ mod tests {
             !s.contains("isn't supported"),
             "legacy Windows-special wording must be gone: {s}",
         );
+    }
+
+    #[test]
+    fn a_package_s_layout_directory_is_its_wrapper_or_nested_entry() {
+        let project = Path::new("/p");
+        let layout = |package: &str| package_layout_write_dir(project, Path::new(package));
+
+        assert_eq!(
+            layout("/p/.lpm/wrappers/a@1.0.0/node_modules/a"),
+            Some(PathBuf::from("/p/.lpm/wrappers/a@1.0.0"))
+        );
+        assert_eq!(
+            layout("/p/.lpm/hoisted/nested/a"),
+            Some(PathBuf::from("/p/.lpm/hoisted/nested/a"))
+        );
+        assert_eq!(
+            layout("/p/.lpm/hoisted/nested/@s/a/node_modules/b"),
+            Some(PathBuf::from("/p/.lpm/hoisted/nested/@s/a"))
+        );
+        assert_eq!(layout("/p/.lpm/wrappers"), None);
+        assert_eq!(layout("/p/node_modules/a"), None);
+        assert_eq!(layout("/store/a@1.0.0"), None);
+    }
+
+    #[test]
+    fn a_writable_root_holding_the_project_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join(".cache").join("checkout");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut inside_cache = sample_spec();
+        inside_cache.home_dir = home.path().to_path_buf();
+        inside_cache.project_dir = project;
+
+        let error = config::validate_project_state_boundary(&inside_cache, false).unwrap_err();
+        assert!(error.to_string().contains(".cache"), "{error}");
+        assert!(config::validate_project_state_boundary(&inside_cache, true).is_ok());
+
+        let mut beside = inside_cache;
+        beside.home_dir = home.path().join("elsewhere");
+        assert!(config::validate_project_state_boundary(&beside, false).is_ok());
+        beside.extra_write_dirs = vec![home.path().join(".cache")];
+        assert!(config::validate_project_state_boundary(&beside, false).is_err());
     }
 
     #[test]
@@ -1660,19 +1777,28 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn factory_returns_windows_backend_on_windows() {
-        // real backend via Mandatory
-        // Integrity Control + Job Object. Default options yield the
-        // relaxed default — filesystem-write containment only,
-        // network allowed. Construction has no kernel-version gate
-        // (MIC has been in every Windows release since Vista), so
-        // the only acceptable outcomes are `Ok` with backend name
-        // `windows-il`. A failure here means the FFI binding broke;
-        // surface it as a panic.
-        let sb = new_for_platform(sample_spec(), SandboxMode::Enforce).expect(
-            "Windows factory must succeed on a host that supports Mandatory Integrity Control",
-        );
-        assert_eq!(sb.backend_name(), "windows-il");
+    fn factory_returns_appcontainer_backend_with_the_helper_and_refuses_without() {
+        // A unit-test binary lives in `deps/`, where cargo never puts the
+        // helper, so only the override can find one.
+        unsafe {
+            std::env::remove_var("LPM_SANDBOX_HELPER");
+        }
+        match new_for_platform(sample_spec(), SandboxMode::Enforce) {
+            Err(SandboxError::HelperMissing { searched }) => assert_eq!(searched.len(), 1),
+            Err(other) => panic!("expected HelperMissing, got {other:?}"),
+            Ok(sb) => panic!("got {} without a helper", sb.backend_name()),
+        }
+
+        let helper = tempfile::NamedTempFile::new().unwrap();
+        unsafe {
+            std::env::set_var("LPM_SANDBOX_HELPER", helper.path());
+        }
+        let sb = new_for_platform(sample_spec(), SandboxMode::Enforce);
+        unsafe {
+            std::env::remove_var("LPM_SANDBOX_HELPER");
+        }
+        let sb = sb.expect("the helper the override names is used");
+        assert_eq!(sb.backend_name(), "windows-appcontainer");
         assert_eq!(sb.mode(), SandboxMode::Enforce);
         assert_eq!(sb.posture(), SandboxPosture::Default);
     }

@@ -507,6 +507,13 @@ pub enum LpmError {
     )]
     Cert(String),
 
+    #[error("sandbox error: {0}")]
+    #[diagnostic(
+        code(lpm::sandbox),
+        help("Run `lpm doctor --all` to see what the lifecycle script sandbox needs here.")
+    )]
+    Sandbox(String),
+
     #[error("tunnel error: {0}")]
     #[diagnostic(
         code(lpm::tunnel),
@@ -829,6 +836,7 @@ impl LpmError {
             LpmError::ScriptWithOutput { .. } => "script",
             LpmError::ScriptPhase { .. } => "script",
             LpmError::Cert(_) => "cert",
+            LpmError::Sandbox(_) => "sandbox",
             LpmError::Tunnel(_) => "tunnel",
             LpmError::TunnelAccess { .. } => "tunnel_access",
             LpmError::Store(_) => "store",
@@ -1083,6 +1091,7 @@ mod tests {
                 stderr: String::new(),
             },
             LpmError::Cert("x".into()),
+            LpmError::Sandbox("x".into()),
             LpmError::Tunnel("x".into()),
             LpmError::tunnel_access("plan_required", "x"),
             LpmError::Store("x".into()),
@@ -1191,6 +1200,7 @@ mod tests {
     #[test]
     fn error_code_specific_values() {
         assert_eq!(LpmError::AuthRequired.error_code(), "auth_required");
+        assert_eq!(LpmError::Sandbox("x".into()).error_code(), "sandbox");
         assert_eq!(
             LpmError::CredentialStorage("x".into()).error_code(),
             "credential_storage"

@@ -68,6 +68,15 @@ pub fn project_state_dir(project_dir: &Path) -> PathBuf {
     project_dir.join(PROJECT_STATE_DIR)
 }
 
+/// The directories in the project state directory that hold installed
+/// packages: the isolated layout's `wrappers/` and the hoisted layout's
+/// `hoisted/nested/`. A package's lifecycle scripts may read and write
+/// them; the rest of `.lpm` is LPM's own state, which scripts may not touch.
+pub fn project_package_dirs(project_dir: &Path) -> [PathBuf; 2] {
+    let state = project_state_dir(project_dir);
+    [state.join("wrappers"), state.join("hoisted").join("nested")]
+}
+
 /// Opens `<project_dir>/.lpm`, creating it owner-only when missing, and
 /// keeps it owner-only on Unix and out of git. A link at `.lpm` is refused.
 /// Failing to restrict the directory or to write the ignore file is logged,

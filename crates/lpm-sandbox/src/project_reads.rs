@@ -6,9 +6,10 @@ pub(crate) fn allowed_project_reads(spec: &SandboxSpec) -> Vec<PathBuf> {
         return vec![spec.project_dir.clone()];
     }
     let mut paths = Vec::with_capacity(12 + spec.secret_read_allow.len());
-    for name in ["node_modules", ".lpm", ".husky"] {
+    for name in ["node_modules", ".husky"] {
         paths.push(spec.project_dir.join(name));
     }
+    paths.extend(lpm_common::project_package_dirs(&spec.project_dir));
     if let Ok(entries) = std::fs::read_dir(&spec.project_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();

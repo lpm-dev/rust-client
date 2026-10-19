@@ -8,7 +8,8 @@
 //! Rule layout:
 //! - Project reads follow approved capabilities; toolchain and system reads stay available.
 //! - Writes narrow (package store dir + `node_modules` + `.husky` +
-//!   `.lpm` + known caches + temp + extras from `sandboxWriteDirs`).
+//!   the package dirs in `.lpm` + known caches + temp + extras from
+//!   `sandboxWriteDirs`).
 //! - No blanket home-dir read — `~/.ssh`, `~/.aws`, `~/.config/**`
 //!   outside `~/.cache`/`~/.node-gyp`/`~/.npm` stay denied by default.
 //!
@@ -146,7 +147,9 @@ pub(crate) fn describe_rules_with_isolation(
     } else {
         rules.push((spec.project_dir.join("node_modules"), RuleAccess::ReadWrite));
         rules.push((spec.project_dir.join(".husky"), RuleAccess::ReadWrite));
-        rules.push((spec.project_dir.join(".lpm"), RuleAccess::ReadWrite));
+        if let Some(path) = crate::package_layout_write_dir(&spec.project_dir, &spec.package_dir) {
+            rules.push((path, RuleAccess::ReadWrite));
+        }
         rules.push((spec.home_dir.join(".cache"), RuleAccess::ReadWrite));
         rules.push((spec.home_dir.join(".node-gyp"), RuleAccess::ReadWrite));
         rules.push((spec.home_dir.join(".npm"), RuleAccess::ReadWrite));
@@ -232,9 +235,35 @@ mod tests {
             "/home/u/proj/.husky",
             RuleAccess::ReadWrite
         ));
+        for packages in [
+            "/home/u/proj/.lpm/wrappers",
+            "/home/u/proj/.lpm/hoisted/nested",
+        ] {
+            assert!(contains_rule(&rules, packages, RuleAccess::Read));
+            assert!(!contains_rule(&rules, packages, RuleAccess::ReadWrite));
+        }
+        assert!(
+            !rules
+                .iter()
+                .any(|(path, _)| path == std::path::Path::new("/home/u/proj/.lpm")),
+            "LPM's own project state must stay out of reach"
+        );
+    }
+
+    #[test]
+    fn a_package_in_project_state_writes_only_its_own_layout_directory() {
+        let mut nested = spec();
+        nested.package_dir = PathBuf::from("/home/u/proj/.lpm/hoisted/nested/@scope/client");
+        let rules = describe_rules(&nested);
+
         assert!(contains_rule(
             &rules,
-            "/home/u/proj/.lpm",
+            "/home/u/proj/.lpm/hoisted/nested/@scope/client",
+            RuleAccess::ReadWrite
+        ));
+        assert!(!contains_rule(
+            &rules,
+            "/home/u/proj/.lpm/hoisted/nested",
             RuleAccess::ReadWrite
         ));
     }

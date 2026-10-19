@@ -969,7 +969,7 @@ async fn run_under_store_lock(
             extra_write_dirs: extra_write_dirs.clone(),
         };
         lpm_sandbox::prepare_writable_dirs(&prepare_spec)
-            .map_err(|e| LpmError::Registry(format!("{e}")))?;
+            .map_err(|e| LpmError::Sandbox(e.to_string()))?;
     }
 
     let mut effective_sandbox_posture = lpm_sandbox::SandboxPosture::Disabled;
@@ -1014,7 +1014,7 @@ async fn run_under_store_lock(
             sandbox_mode,
             sandbox_options.clone(),
         )
-        .map_err(|e| LpmError::Registry(format!("sandbox unavailable: {e}")))?;
+        .map_err(|e| LpmError::Sandbox(e.to_string()))?;
         effective_sandbox_posture = probe_sandbox.posture();
         // per-install warning: emitted once when the
         // probe's effective posture is `Degraded`. The structured

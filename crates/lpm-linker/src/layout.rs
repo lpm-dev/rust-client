@@ -545,6 +545,16 @@ mod tests {
     }
 
     #[test]
+    fn package_roots_in_project_state_are_the_ones_the_sandbox_lets_scripts_write() {
+        let dir = tmp_project();
+        let layout = LayoutPaths::for_project(dir.path());
+        assert_eq!(
+            lpm_common::project_package_dirs(dir.path()),
+            [layout.isolated_wrapper_root(), layout.hoisted_nested_root()]
+        );
+    }
+
+    #[test]
     fn isolated_wrapper_root_is_project_root_sibling_in_61_1() {
         let dir = tmp_project();
         let layout = LayoutPaths::for_project(dir.path());

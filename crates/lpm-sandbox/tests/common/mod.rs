@@ -74,6 +74,16 @@ impl SandboxFixture {
         self
     }
 
+    /// Gives the scripts their own scratch `TMPDIR` inside the fixture, as
+    /// rebuild does, in place of the shared `/tmp`, which on Linux also holds
+    /// the fixture's project and so would grant it.
+    pub fn with_private_tmpdir(mut self) -> Self {
+        let tmpdir = self._tmp.path().join("script-tmp");
+        std::fs::create_dir_all(&tmpdir).expect("mkdir script tmpdir");
+        self.spec.tmpdir = tmpdir;
+        self
+    }
+
     /// Root of the fixture's tempdir. Useful for creating siblings
     /// of `pkg_dir` / `project_dir` that intentionally fall OUTSIDE
     /// the spec's allow list (e.g. escape-corpus probe files).
@@ -104,15 +114,12 @@ pub fn try_build_sandbox(spec: SandboxSpec, mode: SandboxMode) -> Option<Box<dyn
 /// The integration corpora in this directory
 /// (`compat_greens.rs`, `escape_corpus.rs`) drive sandboxed children
 /// via POSIX shell scripts (`/bin/sh -c "mkdir -p ..; echo > ..."`).
-/// On Windows the WindowsSandbox backend works fine, but `/bin/sh`
-/// isn't on the platform — the corpora's `run_script` helper would
-/// fail at the spawn step rather than test the sandbox property. We
-/// short-circuit here so those tests soft-skip on Windows rather
-/// than hard-fail on a missing shell; the Windows-specific
-/// containment contract is exercised by the inline tests in
-/// `crates/lpm-sandbox/src/windows.rs` (`spawns_a_trivial_benign_command_under_enforce`,
-/// `write_into_package_dir_under_enforce_succeeds`) which use
-/// `cmd.exe` directly.
+/// On Windows `/bin/sh` isn't on the platform — the corpora's
+/// `run_script` helper would fail at the spawn step rather than test
+/// the sandbox property. We short-circuit here so those tests
+/// soft-skip on Windows rather than hard-fail on a missing shell; the
+/// Windows containment contract is exercised through the helper by
+/// `helper_filesystem.rs`, `helper_network.rs` and `helper_basic.rs`.
 pub fn sandbox_supported(mode: SandboxMode) -> bool {
     #[cfg(target_os = "windows")]
     {

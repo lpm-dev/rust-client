@@ -11,10 +11,9 @@
 //! make ordinary `sh -c "mkdir ..."` forks fail with `EAGAIN` on busy
 //! desktop sessions before the sandboxed script does anything risky.
 //!
-//! Windows applies the corresponding `JOB_OBJECT_LIMIT_*` flags
-//! on the job object; that path is wired in `windows.rs` rather
-//! than here because the Windows job-attach already exists as a
-//! dedicated subsystem.
+//! Windows lifecycle scripts get none of these: the AppContainer
+//! helper's Job Object only ties the script's process tree to the
+//! helper's lifetime.
 //!
 //! # Why these values
 //!
@@ -39,18 +38,15 @@
 //! pids. Proper per-script process isolation would need
 //! `cgroup.pids` on Linux; tracked separately.
 //!
-//! # Address-space cap rationale (and why it differs from Windows)
+//! # Address-space cap rationale
 //!
-//! Windows sets `JOB_OBJECT_LIMIT_PROCESS_MEMORY = 2 GiB` per
-//! descendant, measured against the per-process commit charge —
-//! roughly anonymous private allocations + heap. Unix `RLIMIT_AS`
-//! is the closest cross-platform analog but measures *virtual
-//! address space*, which on 64-bit Unix includes the JIT mmap
+//! `RLIMIT_AS` measures *virtual address space*, not committed
+//! memory, which on 64-bit Unix includes the JIT mmap
 //! pages V8/JavaScriptCore reserve eagerly, every shared-lib
 //! mapping, large file-backed mmaps in tooling, and the guard
-//! pages between thread stacks. A 2 GiB cap that's comfortable
-//! under Windows accounting would break legitimate Node + V8 +
-//! electron-rebuild + LLVM-link install steps on Unix.
+//! pages between thread stacks. A 2 GiB cap would break
+//! legitimate Node + V8 + electron-rebuild + LLVM-link install
+//! steps.
 //!
 //! 8 GiB is the chosen floor: it caps a malicious script's
 //! unbounded-allocate-until-OOM (which would otherwise consume
@@ -59,8 +55,7 @@
 //! observed legitimate cases (LLVM linking a large Rust binary
 //! peaks around 4 GiB virtual; node-gyp + electron-rebuild
 //! sit under 2 GiB; V8 with `--max-old-space-size=4096` reserves
-//! ~5 GiB virtual). The asymmetry with the Windows 2 GiB number
-//! is intentional and reflects the different accounting models.
+//! ~5 GiB virtual).
 
 #![cfg(unix)]
 
@@ -80,8 +75,7 @@ pub(crate) const MAX_CPU_SECONDS: u64 = 600;
 pub(crate) const MAX_PROCESSES: u64 = 4096;
 
 /// Per-process virtual-address-space cap. See the module-level
-/// "address-space cap rationale" for why this is 8 GiB on Unix
-/// rather than the 2 GiB the Windows job-object enforces.
+/// "address-space cap rationale" for why this is 8 GiB.
 pub(crate) const MAX_ADDRESS_SPACE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Install the resource limits inside a sandboxed child's
@@ -133,8 +127,7 @@ mod tests {
 
     #[test]
     fn max_address_space_pinned_at_8_gib() {
-        // Regression guard. Lowering this to ~2 GiB (matching the
-        // Windows commit cap) would break V8 / electron-rebuild /
+        // Regression guard. Lowering this to ~2 GiB would break V8 / electron-rebuild /
         // LLVM-link installs that reserve >2 GiB of virtual address
         // space legitimately on 64-bit Unix. See the module
         // "address-space cap rationale" doc-comment before bumping

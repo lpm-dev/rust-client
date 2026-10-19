@@ -865,6 +865,9 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         lpm_common::LpmError::Cert(reason) => {
             diagnostic_lines("Certificate error", Some(reason), error)
         }
+        lpm_common::LpmError::Sandbox(reason) => {
+            diagnostic_lines("Sandbox error", Some(reason), error)
+        }
         lpm_common::LpmError::Tunnel(reason) => {
             diagnostic_lines("Tunnel error", Some(reason), error)
         }

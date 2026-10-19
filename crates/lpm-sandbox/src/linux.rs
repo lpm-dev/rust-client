@@ -406,6 +406,11 @@ impl Sandbox for LandlockSandbox {
         for (index, path) in self.spec.extra_write_dirs.iter().enumerate() {
             crate::config::revalidate_effective_write_dir(path, index)?;
         }
+        let rules = crate::landlock_rules::describe_rules_with_isolation(
+            &self.spec,
+            self.build_cache_isolation,
+        );
+        crate::mount_aliases::refuse_state_aliases(&self.spec, &rules)?;
 
         let mut command = Command::new(&cmd.program);
         command.args(&cmd.args);
@@ -432,11 +437,11 @@ impl Sandbox for LandlockSandbox {
         // `landlock_add_rule` via Ruleset::add_rule) happens here in
         // normal multi-threaded context. The child's pre_exec body
         // only touches direct syscalls.
-        let ruleset =
-            build_parent_side_ruleset(&self.spec, &self.posture, self.build_cache_isolation)
-                .map_err(|e| SandboxError::ProfileRenderFailed {
-                    reason: format!("landlock ruleset build failed: {e}"),
-                })?;
+        let ruleset = build_parent_side_ruleset(&self.posture, &rules).map_err(|e| {
+            SandboxError::ProfileRenderFailed {
+                reason: format!("landlock ruleset build failed: {e}"),
+            }
+        })?;
 
         // compile the seccomp socket(2) deny filter
         // parent-side. Like the landlock ruleset, all the
@@ -465,13 +470,11 @@ impl Sandbox for LandlockSandbox {
         // CString construction, and ID-map formatting never happen after
         // fork. Preparation uncertainty is fatal: treating an incomplete
         // protection set as an empty one would expose project secrets.
-        let overlay_spec = crate::linux_secret_overlay::SecretOverlaySpec::build_for_spec(
-            &self.spec,
-            self.build_cache_isolation,
-        )
-        .map_err(|error| SandboxError::ProfileRenderFailed {
-            reason: format!("secret overlay preparation failed: {error}"),
-        })?;
+        let overlay_spec =
+            crate::linux_secret_overlay::SecretOverlaySpec::build_for_spec(&self.spec, &rules)
+                .map_err(|error| SandboxError::ProfileRenderFailed {
+                    reason: format!("secret overlay preparation failed: {error}"),
+                })?;
         if let Some(ref s) = overlay_spec {
             tracing::debug!(
                 count = s.paths.len(),
@@ -782,9 +785,8 @@ fn probe_landlock_at(abi: ABI, with_network: bool) -> Result<(), RulesetError> {
 /// landlock then default-denies every TCP bind / connect, which is
 /// the kernel-level outbound network denial ships.
 fn build_parent_side_ruleset(
-    spec: &SandboxSpec,
     posture: &BackendPosture,
-    build_cache_isolation: bool,
+    rules: &[(std::path::PathBuf, RuleAccess)],
 ) -> Result<RulesetCreated, RulesetError> {
     let abi = posture.abi();
     let rw = AccessFs::from_all(abi);
@@ -799,14 +801,12 @@ fn build_parent_side_ruleset(
         builder = builder.handle_access(AccessNet::from_all(abi))?;
     }
     let mut ruleset = builder.create()?;
-    for (path, access) in
-        crate::landlock_rules::describe_rules_with_isolation(spec, build_cache_isolation)
-    {
+    for (path, access) in rules {
         use std::os::unix::fs::OpenOptionsExt;
         let fd = match std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(&path)
+            .open(path)
         {
             Ok(fd) => fd,
             Err(e) => {
@@ -819,7 +819,7 @@ fn build_parent_side_ruleset(
             _ => continue,
         };
         let is_file = !metadata.is_dir();
-        let access_bits = rule_access_bits(access, abi, is_file);
+        let access_bits = rule_access_bits(*access, abi, is_file);
         ruleset = ruleset.add_rule(PathBeneath::new(fd, access_bits))?;
     }
     Ok(ruleset)
@@ -1104,7 +1104,8 @@ mod tests {
                 detected_kernel: "5.15.0-test".to_string(),
             },
         ] {
-            match build_parent_side_ruleset(&spec, &posture, false) {
+            let rules = crate::landlock_rules::describe_rules_with_isolation(&spec, false);
+            match build_parent_side_ruleset(&posture, &rules) {
                 Ok(_) => {} // ruleset built, missing extra was skipped
                 Err(e) => {
                     // Only acceptable error: the kernel doesn't support
