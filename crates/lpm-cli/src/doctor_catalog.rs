@@ -93,7 +93,6 @@ pub enum DoctorFix {
     PruneStore,
     InstallProject,
     ReconcileBinaryLockfile,
-    UpdateGitAttributes,
     InstallNodeSpec,
     InstallNode22,
     InstallBunSpec,
@@ -110,7 +109,6 @@ impl DoctorFix {
             Self::PruneStore => "lpm cache prune --apply",
             Self::InstallProject => "lpm install",
             Self::ReconcileBinaryLockfile => "reconcile lpm.lockb",
-            Self::UpdateGitAttributes => "update .gitattributes",
             Self::InstallNodeSpec => "lpm use node@<spec>",
             Self::InstallNode22 => "lpm use node@22",
             Self::InstallBunSpec => "lpm use bun@<spec>",
@@ -148,8 +146,8 @@ pub enum Tier {
     /// Everything else: registry / auth probes, tunnel diagnostics,
     /// lint / fmt subprocesses, TypeScript / plugin reachability,
     /// global-install hygiene, sandbox probe, manifest-compat sweep,
-    /// project-maintenance rows (`.gitattributes` lockb hygiene,
-    /// virtual-store orphan counts).
+    /// project-maintenance rows (tracked `.lpm/` state, virtual-store
+    /// orphan counts).
     Extended,
 }
 
@@ -806,61 +804,13 @@ pub static LOCKFILE_BINARY_CORRUPT: CheckEntry = CheckEntry {
     auto_fix: Some(DoctorFix::ReconcileBinaryLockfile),
 };
 
-pub static GITATTRIBUTES_LOCKB_MARKED: CheckEntry = CheckEntry {
-    code: "gitattributes_lockb_marked",
-    name: ".gitattributes",
-    category: Category::ProjectState,
-    tier: Tier::Extended,
-    description: "`.gitattributes` marks `lpm.lockb` as binary.",
-    when_fires: "Repo has the recommended `lpm.lockb binary` rule.",
-    remediation: "No action — informational pass.",
-    possible_severities: &[Severity::Pass],
-    auto_fix: None,
-};
-
-pub static GITATTRIBUTES_LOCKB_UNMARKED: CheckEntry = CheckEntry {
-    code: "gitattributes_lockb_unmarked",
-    name: ".gitattributes",
-    category: Category::ProjectState,
-    tier: Tier::Extended,
-    description: "`.gitattributes` exists but does not mark `lpm.lockb` as binary.",
-    when_fires: "Repo has `.gitattributes` without the LPM CLI lockb rule.",
-    remediation: "Add `lpm.lockb binary` to `.gitattributes` so git diffs treat the file correctly.",
-    possible_severities: &[Severity::Warn],
-    auto_fix: Some(DoctorFix::UpdateGitAttributes),
-};
-
-pub static GITATTRIBUTES_MISSING: CheckEntry = CheckEntry {
-    code: "gitattributes_missing",
-    name: ".gitattributes",
-    category: Category::ProjectState,
-    tier: Tier::Extended,
-    description: "No `.gitattributes` found — `lpm.lockb` may be diffed as text.",
-    when_fires: "`<project>/.gitattributes` is missing.",
-    remediation: "Run `lpm init` or add `lpm.lockb binary` to a new `.gitattributes`.",
-    possible_severities: &[Severity::Warn],
-    auto_fix: Some(DoctorFix::UpdateGitAttributes),
-};
-
-pub static GITATTRIBUTES_UNREADABLE: CheckEntry = CheckEntry {
-    code: "gitattributes_unreadable",
-    name: ".gitattributes",
-    category: Category::ProjectState,
-    tier: Tier::Extended,
-    description: "`.gitattributes` is not a safely readable regular UTF-8 file.",
-    when_fires: "The path is linked, special, oversized, invalid UTF-8, or unreadable.",
-    remediation: "Replace it with a regular UTF-8 file, preserve any valid rules, and add `lpm.lockb binary`.",
-    possible_severities: &[Severity::Warn],
-    auto_fix: None,
-};
-
 pub static PROJECT_STATE_UNTRACKED: CheckEntry = CheckEntry {
     code: "project_state_untracked",
     name: ".lpm state",
     category: Category::ProjectState,
     tier: Tier::Extended,
-    description: "Git tracks nothing in the project's `.lpm` directory.",
-    when_fires: "The project is in a Git repository with a `.lpm` directory and none of its files are tracked.",
+    description: "Git tracks nothing in the project's `.lpm` directory that belongs to the machine.",
+    when_fires: "The project is in a Git repository with a `.lpm` directory and none of its files are tracked, other than the dependencies a deploy output's `.lpm` commits: its `.gitignore`, `store/`, and `deploy-workspace/`.",
     remediation: "No action — informational pass.",
     possible_severities: &[Severity::Pass],
     auto_fix: None,
@@ -872,8 +822,32 @@ pub static PROJECT_STATE_TRACKED: CheckEntry = CheckEntry {
     category: Category::ProjectState,
     tier: Tier::Extended,
     description: "Git tracks files in `.lpm`, which holds machine-local state such as install checkpoints, trust snapshots, certificates, and tunnel captures.",
-    when_fires: "`git ls-files` lists files under the project's `.lpm` directory.",
-    remediation: "Run `git rm -r --cached .lpm` and commit. `.lpm` ignores itself, so the files stay out of later commits.",
+    when_fires: "`git ls-files` lists files under the project's `.lpm` directory, under any spelling the file system takes for it, other than the dependencies a deploy output's `.lpm` commits: its `.gitignore`, `store/`, and `deploy-workspace/`.",
+    remediation: "Run the `git rm --cached` command the warning names, then commit. `.lpm` ignores itself, so the files stay out of later commits. In a deploy output, the command leaves the committed dependencies alone.",
+    possible_severities: &[Severity::Warn],
+    auto_fix: None,
+};
+
+pub static DEPLOY_OUTPUT_DEPENDENCIES_COMMITTABLE: CheckEntry = CheckEntry {
+    code: "deploy_output_dependencies_committable",
+    name: "Deploy output",
+    category: Category::ProjectState,
+    tier: Tier::Extended,
+    description: "Git ignores none of the files a deploy output's dependencies are: `node_modules`, `.lpm/store`, and `.lpm/deploy-workspace`, each asked of the repository that commits it, the output's or one of `.lpm`'s own.",
+    when_fires: "The project is a deploy output in a Git work tree, or its `.lpm` is a repository of its own, and `git ls-files --others --ignored --exclude-standard` in each lists nothing under those paths.",
+    remediation: "No action — informational pass.",
+    possible_severities: &[Severity::Pass],
+    auto_fix: None,
+};
+
+pub static DEPLOY_OUTPUT_DEPENDENCIES_IGNORED: CheckEntry = CheckEntry {
+    code: "deploy_output_dependencies_ignored",
+    name: "Deploy output",
+    category: Category::ProjectState,
+    tier: Tier::Extended,
+    description: "Git ignores files a deploy output's dependencies are, or the whole output, so a commit of the output leaves them out and a clone can't load them.",
+    when_fires: "The project is a deploy output in a Git work tree, or its `.lpm` is a repository of its own, and a rule Git reads ignores files under `node_modules`, `.lpm/store`, or `.lpm/deploy-workspace`: a `.gitignore` a dependency brought, or any rule once the output's own `.gitignore` no longer takes them back; or a rule above the output ignores the output as a whole.",
+    remediation: "Run the `git add -f` commands the warning names, one for each repository, then commit; for an output ignored as a whole, change the rule the warning names.",
     possible_severities: &[Severity::Warn],
     auto_fix: None,
 };
@@ -2204,12 +2178,10 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &LOCKFILE_BINARY_MISSING,
     &LOCKFILE_BINARY_STALE,
     &LOCKFILE_BINARY_CORRUPT,
-    &GITATTRIBUTES_LOCKB_MARKED,
-    &GITATTRIBUTES_LOCKB_UNMARKED,
-    &GITATTRIBUTES_MISSING,
-    &GITATTRIBUTES_UNREADABLE,
     &PROJECT_STATE_UNTRACKED,
     &PROJECT_STATE_TRACKED,
+    &DEPLOY_OUTPUT_DEPENDENCIES_COMMITTABLE,
+    &DEPLOY_OUTPUT_DEPENDENCIES_IGNORED,
     &DEPS_SYNC_CLEAN,
     &DEPS_SYNC_DRIFT,
     &LOCAL_SOURCE_DIR_OK,

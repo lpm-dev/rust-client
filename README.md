@@ -215,7 +215,7 @@ Preparation is outside the measured interval. Manager and state order rotate bet
 Lifecycle scripts are disabled. Other security and release-age settings retain product defaults, except the explicit firewall monitor run.
 LPM's default release age is zero and its firewall is off. npm retains its default audit behavior.
 
-LPM uses V2 and `--json --no-security-summary --no-skills --no-editor-setup`.
+LPM uses V2 and `--json --no-security-summary --no-skills`.
 This is not a comparison with identical security settings or dependency graphs.
 
 **Six states:** First install and Fresh / warm have no lockfile or installed tree, with cold and warm dependency caches respectively.

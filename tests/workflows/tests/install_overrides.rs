@@ -266,12 +266,7 @@ fn install_without_optional_setup(
     registry_url: &str,
 ) -> std::process::Output {
     lpm_with_registry(project, registry_url)
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn lpm install")
 }
@@ -358,13 +353,7 @@ async fn install_json_omits_unchanged_override_selection() {
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--json",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--json", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn JSON install");
     assert!(
@@ -404,12 +393,7 @@ async fn workspace_member_inherits_root_override() {
     let mut command = lpm_with_registry(&project, &mock.url());
     command
         .current_dir(project.path().join("packages/app"))
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ]);
+        .args(["install", "--no-security-summary", "--no-skills"]);
     let output = command.output().expect("spawn workspace member install");
     assert!(
         output.status.success(),
@@ -493,7 +477,6 @@ async fn install_override_does_not_bypass_minimum_release_age() {
             "--min-release-age=1080000",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn policy-gated override install");
@@ -537,12 +520,7 @@ fn install_warns_when_nested_top_level_override_value_is_ignored() {
     );
 
     let output = lpm(&project)
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn install with nested override");
     assert!(
@@ -820,13 +798,7 @@ async fn a_fresh_clone_with_overrides_installs_from_the_lockfile() {
     std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--json",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--json", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn fresh-clone install");
 
@@ -938,12 +910,7 @@ async fn install_does_not_follow_preplanted_overrides_state_temp_hardlink() {
     .unwrap();
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn lpm install");
 
@@ -1008,12 +975,7 @@ async fn install_root_link_uses_the_version_selected_by_an_override() {
     mount_peer_override_packages(&mock).await;
     let project = peer_override_project();
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("install override with a second peer-selected version");
     assert!(
@@ -1048,7 +1010,6 @@ async fn install_root_link_uses_the_version_selected_by_an_override() {
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("replay override selection from lockfile");
@@ -1074,12 +1035,7 @@ async fn install_override_applies_to_required_peer_binding() {
     let project = peer_override_project();
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("install override with a required peer");
     assert!(

@@ -161,7 +161,6 @@ async fn flow_install_patch_patch_commit_install_persists_patch() {
         "install",
         "--no-security-summary",
         "--no-skills",
-        "--no-editor-setup",
     ]);
     let out_b = bootstrap_cmd.output().expect("spawn bootstrap install");
     assert!(
@@ -220,7 +219,6 @@ async fn flow_install_patch_patch_commit_install_persists_patch() {
         "install",
         "--no-security-summary",
         "--no-skills",
-        "--no-editor-setup",
     ]);
     let out3 = install_cmd.output().expect("spawn second lpm install");
     assert!(
@@ -485,10 +483,9 @@ fn flow_install_rebuild_approve_scripts_rebuild_approval_lifecycle() {
 // catches: the fixes doctor applied actually produce a healthy state for
 // install; install does not re-trigger the same fixable issues.
 
-/// `doctor --fix` writes the `.gitattributes` line + regenerates the
-/// binary lockfile when only `lpm.lock` exists. A subsequent install
-/// must NOT re-trigger the same fixable findings (i.e., `doctor --fix`
-/// is idempotent across an install round-trip).
+/// `doctor --fix` on a project with only `lpm.lock` leaves a state a
+/// subsequent offline install accepts, and neither command adds a
+/// `.gitattributes` the project didn't have.
 #[test]
 fn flow_doctor_fix_install_post_fix_install_is_clean() {
     let project = TempProject::empty(r#"{"name":"flow-doctor-fix","version":"0.0.0"}"#);
@@ -512,29 +509,15 @@ fn flow_doctor_fix_install_post_fix_install_is_clean() {
     lockfile
         .write_all(&project.path().join("lpm.lock"))
         .expect("write doctor fixture lockfile");
-    assert!(
-        !project.file_exists(".gitattributes"),
-        "precondition: .gitattributes must be absent so doctor --fix has work"
-    );
 
     // Step 1: doctor --fix --yes applies the fixes. The command may
     // exit non-zero if unrelated environmental checks (PATH, sandbox
-    // version, etc.) fail, but the load-bearing claim is that the
-    // *fixable* findings get fixed regardless. Assert the on-disk
-    // side effect, not the exit code.
-    // `.gitattributes` is Extended-tier, so the default fast preset
-    // skips the check (and therefore the auto-fix). Pass `--all` so
-    // both the lockb regen (Fast-tier) and the .gitattributes write
-    // (Extended-tier) get exercised.
+    // version, etc.) fail; `--all` covers every fixable row.
     let _out_fix = lpm_with_registry(&project, "http://127.0.0.1:1")
         .env("LPM_LINKER", "isolated")
         .args(["doctor", "--all", "--fix", "--yes", "--json"])
         .output()
         .expect("spawn doctor --all --fix");
-    assert!(
-        project.file_exists(".gitattributes"),
-        "doctor --fix must create .gitattributes regardless of unrelated check failures"
-    );
 
     // Step 2: install --offline. Must succeed cleanly against the
     // doctored state (no re-introduction of the fixed issues).
@@ -550,15 +533,9 @@ fn flow_doctor_fix_install_post_fix_install_is_clean() {
         String::from_utf8_lossy(&out_install.stderr)
     );
 
-    // Step 3: assert install did NOT undo doctor's fix. The
-    // .gitattributes file must persist across the install round-trip.
-    // (Doctor's exit code in the post-install state may still be
-    // non-zero due to unrelated warnings — global bin PATH, sandbox
-    // version drift, etc. — but the cross-command claim is "install
-    // does not undo doctor --fix's side effects.")
     assert!(
-        project.file_exists(".gitattributes"),
-        "install must not undo the .gitattributes that doctor --fix wrote"
+        !project.file_exists(".gitattributes"),
+        "doctor --fix and install must not add a .gitattributes"
     );
 
     // Sanity: a follow-up `doctor --json` invocation still parses
@@ -631,7 +608,6 @@ async fn flow_add_install_graph_added_dep_visible() {
             "ms@2.1.3",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn install ms@2.1.3");
@@ -722,7 +698,6 @@ async fn flow_install_upgrade_major_audit_picks_new_version() {
             &format!("{pkg_name}@^1.0.0"),
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn install");
@@ -1307,7 +1282,6 @@ async fn flow_workspace_install_filter_member_a_does_not_mutate_member_b() {
             "--filter",
             "@test/core",
             "--no-skills",
-            "--no-editor-setup",
             "--no-security-summary",
         ])
         .output()
@@ -1350,7 +1324,6 @@ async fn flow_workspace_install_filter_member_a_does_not_mutate_member_b() {
             "--filter",
             "@test/app",
             "--no-skills",
-            "--no-editor-setup",
             "--no-security-summary",
         ])
         .output()
@@ -1458,7 +1431,6 @@ async fn flow_install_uninstall_install_graph_round_trip() {
             "ms@2.1.3",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn install ms@2.1.3 (step 1)");
@@ -1514,7 +1486,6 @@ async fn flow_install_uninstall_install_graph_round_trip() {
             "ms@2.1.3",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn install ms@2.1.3 (step 3)");
@@ -1593,7 +1564,6 @@ async fn flow_cache_clean_then_offline_install_uses_store_or_fails_helpfully() {
             "ms@2.1.3",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn online install");
@@ -1688,7 +1658,6 @@ async fn flow_cache_clean_then_offline_install_uses_store_or_fails_helpfully() {
             "--offline",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn offline install");

@@ -1020,14 +1020,14 @@ fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
 /// A file's device and number, which no other file shares while it
 /// exists.
 #[cfg(unix)]
-pub(crate) fn file_identity(file: &std::fs::File) -> io::Result<(u64, u64)> {
+pub fn file_identity(file: &std::fs::File) -> io::Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt as _;
     let metadata = file.metadata()?;
     Ok((metadata.dev(), metadata.ino()))
 }
 
 #[cfg(windows)]
-pub(crate) fn file_identity(file: &std::fs::File) -> io::Result<(u64, u64)> {
+pub fn file_identity(file: &std::fs::File) -> io::Result<(u64, u64)> {
     let information = windows_file_information(file)?;
     Ok((
         u64::from(information.dwVolumeSerialNumber),
@@ -1052,7 +1052,7 @@ pub(crate) fn windows_file_information(
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn file_identity(_file: &std::fs::File) -> io::Result<(u64, u64)> {
+pub fn file_identity(_file: &std::fs::File) -> io::Result<(u64, u64)> {
     Ok((0, 0))
 }
 

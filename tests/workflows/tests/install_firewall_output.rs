@@ -55,13 +55,7 @@ async fn install_with_verdict(
     let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
     write_npm_firewall_global_config(&project, mode);
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "--color",
-            color,
-            "install",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["--color", color, "install", "--no-skills"])
         .args(packages.iter().map(|name| format!("{name}@1.0.0")))
         .output()
         .unwrap()
@@ -201,12 +195,7 @@ async fn firewall_monitor_continues_after_oidc_exchange_failure_but_enforce_stop
             write_npm_firewall_global_config(&project, mode);
             let output = lpm_with_registry(&project, &mock.url())
                 .env("LPM_OIDC_TOKEN", "unusable-ci-assertion")
-                .args([
-                    "install",
-                    "firewall-oidc@1.0.0",
-                    "--no-skills",
-                    "--no-editor-setup",
-                ])
+                .args(["install", "firewall-oidc@1.0.0", "--no-skills"])
                 .output()
                 .unwrap();
             let stderr = String::from_utf8_lossy(&output.stderr);

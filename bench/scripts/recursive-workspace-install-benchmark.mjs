@@ -157,7 +157,6 @@ function makeManagerSpec(manager, binary) {
         'install',
         '--no-security-summary',
         '--no-skills',
-        '--no-editor-setup',
         '--no-audit-after-install',
       ],
       primaryLockfileNames: ['lpm.lock'],

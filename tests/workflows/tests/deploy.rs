@@ -667,6 +667,26 @@ async fn a_deploy_output_git_commits_keeps_its_dependencies() {
         "{}",
         String::from_utf8_lossy(&committed.stderr)
     );
+    // Committed, the dependencies aren't machine-local state to untrack.
+    let doctor = lpm_with_registry(&project, &registry.url())
+        .current_dir(out.path())
+        .args(["doctor", "--all", "--json"])
+        .output()
+        .unwrap();
+    let report = support::assertions::parse_json_output(&doctor.stdout);
+    let state = report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| {
+            check["code"]
+                .as_str()
+                .is_some_and(|code| code.starts_with("project_state_"))
+                && check["check"] == ".lpm state"
+        })
+        .unwrap_or_else(|| panic!("no .lpm state row: {report}"));
+    assert_eq!(state["severity"], "pass", "{state}");
+
     let clone = external_output_dir();
     let cloned = std::process::Command::new("git")
         .args(["clone", "-q"])
@@ -763,6 +783,88 @@ fn workspace_with_refusable_main(api_main: &str, util_main: &str) -> TempProject
     );
     project.write_file("packages/util/index.js", "module.exports = 2;");
     project
+}
+
+#[test]
+fn deploy_force_never_clears_the_lpm_home_or_the_home_directory() {
+    let project = workspace_with_refusable_main("index.js", "index.js");
+    let out = external_output_dir();
+    let elsewhere = external_output_dir();
+    // The LPM home inside the output, the output inside the LPM home, and
+    // an output that holds the home directory.
+    let layouts = [
+        (
+            out.path().to_path_buf(),
+            out.path().join(".lpm"),
+            project.home().to_path_buf(),
+        ),
+        (
+            out.path().join("deploy"),
+            out.path().to_path_buf(),
+            project.home().to_path_buf(),
+        ),
+        (
+            out.path().to_path_buf(),
+            elsewhere.path().join("lpm-home"),
+            out.path().join("user"),
+        ),
+    ];
+    // The home directory and LPM home inside the output, as links outside
+    // it name them.
+    #[cfg(unix)]
+    let linked = {
+        let real = out.path().join("linked-user");
+        std::fs::create_dir_all(&real).unwrap();
+        let alias = elsewhere.path().join("home-alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        // And an output that a link leads into the LPM home.
+        let lpm_home = elsewhere.path().join("linked-lpm-home");
+        std::fs::create_dir_all(lpm_home.join("store")).unwrap();
+        let store_alias = elsewhere.path().join("store-alias");
+        std::os::unix::fs::symlink(lpm_home.join("store"), &store_alias).unwrap();
+        [
+            (out.path().to_path_buf(), alias.join(".lpm"), alias),
+            (
+                store_alias.join("v2"),
+                lpm_home,
+                project.home().to_path_buf(),
+            ),
+        ]
+    };
+    #[cfg(not(unix))]
+    let linked: [(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf); 0] = [];
+    for (output, lpm_home, home) in layouts.into_iter().chain(linked) {
+        let marker = lpm_home.join("certs/rootCA-key.pem");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, "private").unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("notes.txt"), "mine").unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(output.join("keep.txt"), "earlier deploy").unwrap();
+
+        let result = lpm(&project)
+            .env("LPM_HOME", &lpm_home)
+            .env("HOME", &home)
+            .args([
+                "deploy",
+                output.to_str().unwrap(),
+                "--filter",
+                "api",
+                "--force",
+            ])
+            .output()
+            .expect("run lpm deploy --force");
+
+        assert!(
+            !result.status.success(),
+            "{}: {}",
+            output.display(),
+            String::from_utf8_lossy(&result.stdout)
+        );
+        assert!(marker.is_file(), "{}", output.display());
+        assert!(home.join("notes.txt").is_file(), "{}", output.display());
+        assert!(output.join("keep.txt").is_file(), "{}", output.display());
+    }
 }
 
 #[test]

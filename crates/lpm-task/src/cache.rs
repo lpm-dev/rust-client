@@ -14,7 +14,7 @@ use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::fs::Dir;
 use lpm_common::{LpmError, LpmRoot};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, Write};
 use std::path::{Component, Path, PathBuf};
 
@@ -226,11 +226,17 @@ fn open_or_create_directory(
     }
 }
 
+/// Keeps a cache directory to its owner: mode 0700, and on macOS without
+/// the access list entries it took from the directory above, which grant
+/// what the mode doesn't and pass on to everything cached in it.
 #[cfg(unix)]
 fn restrict_open_directory(dir: &Dir, label: &str) -> Result<(), LpmError> {
     use cap_std::fs::PermissionsExt as _;
 
-    dir.set_permissions(".", cap_std::fs::Permissions::from_mode(0o700))
+    let restricted = dir.set_permissions(".", cap_std::fs::Permissions::from_mode(0o700));
+    #[cfg(target_os = "macos")]
+    let restricted = restricted.and_then(|()| lpm_common::macos_acl::drop_extended_acl(dir));
+    restricted
         .map_err(|error| LpmError::Task(format!("failed to restrict {label} permissions: {error}")))
 }
 
@@ -601,13 +607,21 @@ fn store_cache_locked(
     let (staging_name, staging) = create_private_cache_directory(&cache.tasks)?;
     #[cfg(test)]
     wait_for_cache_race_barrier(&CACHE_STORE_STAGING_RACE_BARRIER, &cache.path);
+    let identity = |directory: &Dir| -> Result<(u64, u64), LpmError> {
+        Ok(lpm_common::atomic_write::file_identity(
+            &directory.try_clone()?.into_std_file(),
+        )?)
+    };
+    let mut staging = Some(staging);
+    let mut staged_identity = None;
     let result = (|| {
-        write_private_cache_file(&staging, "stdout.log", stdout.as_bytes())?;
-        write_private_cache_file(&staging, "stderr.log", stderr.as_bytes())?;
+        let open = staging.as_ref().expect("the staging directory is open");
+        write_private_cache_file(open, "stdout.log", stdout.as_bytes())?;
+        write_private_cache_file(open, "stderr.log", stderr.as_bytes())?;
         let output_file_count = if output_globs.is_empty() {
             0
         } else {
-            let mut archive = create_private_cache_file(&staging, "outputs.tar.gz")?;
+            let mut archive = create_private_cache_file(open, "outputs.tar.gz")?;
             create_archive_in_file(project_dir, output_globs, &mut archive)?
         };
         let meta = CacheMeta {
@@ -618,18 +632,20 @@ fn store_cache_locked(
         };
         let meta_json = serde_json::to_vec_pretty(&meta)
             .map_err(|error| LpmError::Task(format!("failed to serialize cache meta: {error}")))?;
-        write_private_cache_file(&staging, "meta.json", &meta_json)?;
-        sync_open_directory(&staging)?;
+        write_private_cache_file(open, "meta.json", &meta_json)?;
+        sync_open_directory(open)?;
+        let staged = identity(open)?;
+        staged_identity = Some(staged);
+        // Windows can't rename a directory a handle holds open, so the
+        // published entry is compared with the staged one by identity.
+        staging = None;
 
         remove_open_directory_entry(&cache.tasks, std::ffi::OsStr::new(key))?;
         cache
             .tasks
             .rename(Path::new(&staging_name), &cache.tasks, Path::new(key))?;
         sync_open_directory(&cache.tasks)?;
-        let published = cache.tasks.open_dir_nofollow(key)?;
-        let staged_identity = same_file::Handle::from_file(staging.try_clone()?.into_std_file())?;
-        let published_identity = same_file::Handle::from_file(published.into_std_file())?;
-        if staged_identity != published_identity {
+        if identity(&cache.tasks.open_dir_nofollow(key)?)? != staged {
             return Err(LpmError::Task(format!(
                 "task cache entry changed while it was published: {}",
                 entry.display()
@@ -638,7 +654,16 @@ fn store_cache_locked(
         Ok(())
     })();
     if result.is_err() {
-        let _ = cleanup_private_cache_directory(&cache.tasks, &staging_name, staging);
+        // Closed for the publication, the staging directory is cleaned up
+        // only while its name still holds the one staged.
+        let staging = staging.or_else(|| {
+            let reopened = cache.tasks.open_dir_nofollow(&staging_name).ok()?;
+            (staged_identity.is_some() && identity(&reopened).ok() == staged_identity)
+                .then_some(reopened)
+        });
+        if let Some(staging) = staging {
+            let _ = cleanup_private_cache_directory(&cache.tasks, &staging_name, staging);
+        }
     }
     result?;
     tracing::debug!("cached task output to {}", entry.display());
@@ -735,6 +760,15 @@ fn open_cache_entry(cache: &OpenTaskCache, key: &str) -> Result<OpenCacheEntry, 
             cache.path.join(key).display()
         ))
     })?;
+    // An entry another account could write, as one an earlier release left
+    // under a directory that hands access down, may hold what it put there.
+    #[cfg(target_os = "macos")]
+    if lpm_common::macos_acl::has_extended_acl(&dir).unwrap_or(true) {
+        return Err(LpmError::Task(format!(
+            "task cache entry {} is open to other accounts, so it isn't restored",
+            cache.path.join(key).display()
+        )));
+    }
     Ok(OpenCacheEntry {
         dir,
         path: cache.path.join(key),
@@ -1542,13 +1576,15 @@ fn collect_output_files(
     output_globs: &[String],
 ) -> Result<Vec<PathBuf>, LpmError> {
     let mut files = HashSet::new();
+    let mut short_named = ShortNamedDirectories::default();
+    let glob_root = lpm_common::project_glob::project_glob_root(project_dir);
 
     for pattern in output_globs {
         lpm_common::validate_project_glob(pattern).map_err(|reason| {
             LpmError::Task(format!("invalid output glob {pattern:?}: {reason}"))
         })?;
         for expanded in expand_glob_pattern(pattern) {
-            let rooted = lpm_common::rooted_project_glob(project_dir, &expanded);
+            let rooted = lpm_common::rooted_project_glob(&glob_root, &expanded);
             let entries = glob::glob(&rooted).map_err(|error| {
                 LpmError::Task(format!("invalid output glob {pattern:?}: {error}"))
             })?;
@@ -1571,13 +1607,15 @@ fn collect_output_files(
                 if !metadata.is_file() {
                     continue;
                 }
-                let relative = entry.strip_prefix(project_dir).map_err(|_| {
+                let relative = entry.strip_prefix(&glob_root).map_err(|_| {
                     LpmError::Task(format!(
                         "task output is outside project path: {}",
                         entry.display()
                     ))
                 })?;
-                if is_restore_internal_path(relative) {
+                if is_never_an_output(relative)
+                    || short_named.reaches_withheld(project_dir, relative)
+                {
                     continue;
                 }
                 validate_archive_path(relative, "task output")?;
@@ -1662,12 +1700,80 @@ fn expand_glob_pattern(pattern: &str) -> Vec<String> {
     patterns
 }
 
-fn is_restore_internal_path(path: &Path) -> bool {
-    path.components().next().is_some_and(|component| {
-        let Component::Normal(name) = component else {
-            return false;
-        };
+/// What [`ShortNamedDirectories::reaches_withheld`] found for each path
+/// with a `~` in its last name during one pass over a set of paths, so
+/// files sharing a directory share one comparison.
+#[derive(Default)]
+struct ShortNamedDirectories(HashMap<PathBuf, bool>);
+
+impl ShortNamedDirectories {
+    /// Whether `relative`, a path in `project_dir`, is or passes through
+    /// what the cache never holds ([`is_never_an_output`]) by a short name,
+    /// such as `LPM~1` for `.lpm` or `LPM-SO~1.JSO` for `lpm-sources.json`,
+    /// which spelling can't tell: a `.lpm` or a `.git` at any depth, and the
+    /// project's LPM records at its root.
+    fn reaches_withheld(&mut self, project_dir: &Path, relative: &Path) -> bool {
+        use lpm_common::project_state::{PROJECT_RECORD_DIRS, PROJECT_RECORD_FILES};
+        let mut path = PathBuf::new();
+        for (depth, component) in relative.components().enumerate() {
+            let parent = project_dir.join(&path);
+            path.push(component);
+            let Component::Normal(name) = component else {
+                continue;
+            };
+            if !name.to_string_lossy().contains('~') {
+                continue;
+            }
+            let reaches = match self.0.get(&path) {
+                Some(&reaches) => reaches,
+                None => {
+                    let records = PROJECT_RECORD_FILES
+                        .iter()
+                        .chain(PROJECT_RECORD_DIRS)
+                        .filter(|_| depth == 0)
+                        .copied();
+                    let reaches = lpm_common::project_state::is_short_name_of(
+                        &parent,
+                        name,
+                        [lpm_common::PROJECT_STATE_DIR, ".git"]
+                            .into_iter()
+                            .chain(records),
+                    );
+                    self.0.insert(path.clone(), reaches);
+                    reaches
+                }
+            };
+            if reaches {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Whether `path`, relative to the project, is something the cache never
+/// holds: anything in a `.lpm` directory at any depth, a nested project's
+/// included, the restore staging earlier versions kept at the root, a git
+/// directory under any name git reads as one, where a restored hook would
+/// run, and the project's LPM records at its root, which LPM writes itself.
+fn is_never_an_output(path: &Path) -> bool {
+    use lpm_common::project_state::{PROJECT_RECORD_DIRS, PROJECT_RECORD_FILES};
+    let mut components = path.components();
+    let first = components.next();
+    first.is_some_and(|component| {
+        let name = component.as_os_str();
         name.to_string_lossy().starts_with(RESTORE_TEMP_PREFIX)
+            || name.to_str().is_some_and(|name| {
+                let folded = lpm_common::names::fold_name(name);
+                PROJECT_RECORD_FILES
+                    .iter()
+                    .chain(PROJECT_RECORD_DIRS)
+                    .any(|record| folded.eq_ignore_ascii_case(record))
+            })
+    }) || first.into_iter().chain(components).any(|component| {
+        matches!(component, Component::Normal(name)
+            if lpm_common::is_project_state_name(name)
+                || name.to_str().is_some_and(lpm_common::names::is_git_dir_name))
     })
 }
 
@@ -1738,6 +1844,8 @@ fn set_open_file_permissions_restricted(file: &std::fs::File) -> Result<(), LpmE
     use std::os::unix::fs::PermissionsExt;
 
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    #[cfg(target_os = "macos")]
+    lpm_common::macos_acl::drop_extended_acl(file)?;
     Ok(())
 }
 
@@ -1969,6 +2077,217 @@ mod tests {
         slot.lock()
             .unwrap()
             .retain(|candidate| !std::sync::Arc::ptr_eq(&candidate.validated, &barrier.validated));
+    }
+
+    #[test]
+    fn outputs_never_include_lpm_state_at_any_depth_or_case() {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, contents) in [
+            ("dist/app.js", "built"),
+            (".lpm/certs/key.pem", "root key"),
+            ("packages/app/index.js", "member"),
+            ("packages/app/.lpm/env-sync.json", "member state"),
+        ] {
+            let path = dir.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+
+        let files = collect_output_files(dir.path(), &["**/*".into(), ".LPM/**/*".into()]).unwrap();
+
+        assert_eq!(
+            files,
+            [
+                PathBuf::from("dist/app.js"),
+                PathBuf::from("packages/app/index.js")
+            ]
+        );
+        assert!(is_never_an_output(Path::new(".Lpm/certs/key.pem")));
+        // HFS+ leaves zero-width and directional marks out of names.
+        assert!(is_never_an_output(Path::new(".lp\u{200C}m/certs/key.pem")));
+        assert!(is_never_an_output(Path::new(
+            "pkg/\u{FEFF}.LPM/install-hash"
+        )));
+        assert!(is_never_an_output(Path::new(
+            ".lpm-cache-restore-x/outputs/a"
+        )));
+        assert!(!is_never_an_output(Path::new("dist/.lpm-cache-restore-x")));
+        assert!(!is_never_an_output(Path::new("dist/.lpmrc")));
+    }
+
+    #[test]
+    fn outputs_never_include_git_directories_or_the_project_s_lpm_records() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in [
+            "dist/a.js",
+            ".git/hooks/pre-commit",
+            "vendor/.git./HEAD",
+            "sub/GIT~1/config",
+            "lpm-sources.json",
+            "LPM-agent-skills.json",
+            "lpm.lock",
+            "lpm-changes/next.md",
+            ".github/workflows/ci.yml",
+            "dist/lpm-sources.json",
+        ] {
+            let path = dir.path().join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "placeholder").unwrap();
+        }
+
+        let files = collect_output_files(
+            dir.path(),
+            &["**/*".into(), ".git/**/*".into(), "lpm-sources.json".into()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            files,
+            [
+                PathBuf::from(".github/workflows/ci.yml"),
+                PathBuf::from("dist/a.js"),
+                PathBuf::from("dist/lpm-sources.json"),
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn outputs_reached_through_lpm_s_ntfs_short_name_are_never_collected() {
+        use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".lpm/certs")).unwrap();
+        fs::write(dir.path().join(".lpm/certs/key.pem"), "key").unwrap();
+        fs::create_dir(dir.path().join("dist")).unwrap();
+        fs::write(dir.path().join("dist/app.js"), "app").unwrap();
+        let long: Vec<u16> = dir
+            .path()
+            .join(".lpm")
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let mut short = vec![0u16; 1024];
+        // SAFETY: both buffers are valid for the lengths passed.
+        let length =
+            unsafe { GetShortPathNameW(long.as_ptr(), short.as_mut_ptr(), short.len() as u32) };
+        let short = std::ffi::OsString::from_wide(&short[..length as usize]);
+        let Some(name) = Path::new(&short)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| length > 0 && name.contains('~'))
+        else {
+            // The volume makes no short names.
+            return;
+        };
+
+        let files = collect_output_files(dir.path(), &[format!("{name}/**/*"), "dist/**/*".into()])
+            .unwrap();
+
+        assert_eq!(files, [PathBuf::from("dist/app.js")]);
+        assert!(
+            ShortNamedDirectories::default()
+                .reaches_withheld(dir.path(), &Path::new(&name).join("certs/key.pem"))
+        );
+    }
+
+    /// A volume that makes short names, NTFS or FAT, resolves them from any
+    /// system (WSL's `/mnt/c`, Linux's ntfs3 and vfat); a second name for
+    /// the same file stands in for one here.
+    #[cfg(unix)]
+    #[test]
+    fn outputs_reached_through_a_short_name_are_never_collected_on_any_system() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lpm-sources.json"), "{}").unwrap();
+        fs::hard_link(
+            dir.path().join("lpm-sources.json"),
+            dir.path().join("LPM-SO~1.JSO"),
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join(".lpm/certs")).unwrap();
+        fs::write(dir.path().join(".lpm/certs/key.pem"), "key").unwrap();
+        std::os::unix::fs::symlink(".lpm", dir.path().join("LPM~1")).unwrap();
+        fs::create_dir(dir.path().join("dist")).unwrap();
+        fs::write(dir.path().join("dist/app.js"), "app").unwrap();
+
+        let files = collect_output_files(
+            dir.path(),
+            &[
+                "LPM-SO~1.JSO".into(),
+                "LPM~1/**/*".into(),
+                "dist/**/*".into(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(files, [PathBuf::from("dist/app.js")]);
+    }
+
+    /// The name NTFS made up for `path`, where its volume makes them.
+    #[cfg(windows)]
+    fn short_name(path: &Path) -> Option<String> {
+        use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+        let long: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut short = vec![0u16; 1024];
+        // SAFETY: both buffers are valid for the lengths passed.
+        let length =
+            unsafe { GetShortPathNameW(long.as_ptr(), short.as_mut_ptr(), short.len() as u32) };
+        let short = std::ffi::OsString::from_wide(&short[..length as usize]);
+        Path::new(&short)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| length > 0 && name.contains('~'))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn outputs_reached_through_a_record_s_or_git_s_ntfs_short_name_are_never_collected() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("lpm-changes")).unwrap();
+        fs::write(dir.path().join("lpm-changes/next.md"), "x").unwrap();
+        fs::write(dir.path().join("lpm-sources.json"), "{}").unwrap();
+        fs::create_dir_all(dir.path().join("sub/.git/hooks")).unwrap();
+        fs::write(dir.path().join("sub/.git/hooks/pre-commit"), "x").unwrap();
+        fs::create_dir(dir.path().join("dist")).unwrap();
+        fs::write(dir.path().join("dist/app.js"), "app").unwrap();
+        let Some(changes) = short_name(&dir.path().join("lpm-changes")) else {
+            // The volume makes no short names.
+            return;
+        };
+        let sources = short_name(&dir.path().join("lpm-sources.json")).unwrap();
+        let git = short_name(&dir.path().join("sub/.git")).unwrap();
+        let withheld = [
+            Path::new(&changes).join("next.md"),
+            PathBuf::from(&sources),
+            Path::new("sub").join(&git).join("hooks/pre-commit"),
+        ];
+
+        let files = collect_output_files(
+            dir.path(),
+            &[
+                format!("{changes}/**/*"),
+                sources,
+                format!("sub/{git}/**/*"),
+                "dist/**/*".into(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(files, [PathBuf::from("dist/app.js")]);
+        let mut short_named = ShortNamedDirectories::default();
+        for relative in &withheld {
+            assert!(
+                short_named.reaches_withheld(dir.path(), relative),
+                "{relative:?}"
+            );
+        }
+        // A record's short name is one only at the root.
+        fs::create_dir(dir.path().join("nested")).unwrap();
+        fs::write(dir.path().join("nested/lpm-sources.json"), "{}").unwrap();
+        let nested = short_name(&dir.path().join("nested/lpm-sources.json")).unwrap();
+        assert!(!short_named.reaches_withheld(dir.path(), &Path::new("nested").join(nested)));
     }
 
     #[test]
@@ -2954,6 +3273,9 @@ mod tests {
         );
     }
 
+    // Only these move an output tree that is missing in the project into
+    // place whole; elsewhere each file is published, and synced, on its own.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn restoring_many_new_outputs_uses_a_bounded_number_of_durability_syncs() {
         let source = tempfile::tempdir().unwrap();
@@ -3099,6 +3421,9 @@ mod tests {
         );
     }
 
+    // Windows refuses to rename the staging directory while the restore
+    // holds it open, so there it can't be replaced at all.
+    #[cfg(unix)]
     #[test]
     fn restore_rejects_replacement_of_staging_before_output_glob_validation() {
         use flate2::Compression;
@@ -3139,6 +3464,20 @@ mod tests {
             fs::read_to_string(staging_path.join("outputs/dist/value.txt")).unwrap(),
             "attacker"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_restore_s_staging_directory_cannot_be_replaced_while_it_is_open() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        let staged = StagedOutputs::new(&cache.root, project.path()).unwrap();
+
+        let error =
+            fs::rename(staged.temp_path(), project.path().join("moved-staging")).unwrap_err();
+
+        // ERROR_SHARING_VIOLATION.
+        assert_eq!(error.raw_os_error(), Some(32), "{error}");
     }
 
     #[cfg(unix)]
@@ -3336,10 +3675,50 @@ mod tests {
     }
 
     #[test]
+    fn a_new_restore_recovers_staging_an_earlier_release_left_at_the_project_root() {
+        let cache = TestCache::new();
+        let project = tempfile::tempdir().unwrap();
+        let abandoned = project.path().join(".lpm-cache-restore-earlier-release");
+        fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
+        fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
+        fs::create_dir(project.path().join("dist")).unwrap();
+        fs::write(project.path().join("dist/value.txt"), "replacement").unwrap();
+        fs::write(abandoned.join("backups/dist/value.txt"), "original").unwrap();
+        write_restore_journal(
+            &abandoned,
+            project.path(),
+            &[PathBuf::from("dist/value.txt")],
+        )
+        .unwrap();
+        register_restore_for_test(&cache.root, project.path(), &abandoned).unwrap();
+
+        let staged = StagedOutputs::new(&cache.root, project.path()).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(project.path().join("dist/value.txt")).unwrap(),
+            "original"
+        );
+        assert!(
+            !abandoned.exists(),
+            "recovered restore directory was not removed"
+        );
+        assert_eq!(
+            staged.temp_path().parent(),
+            Some(
+                fs::canonicalize(project.path())
+                    .unwrap()
+                    .join(".lpm")
+                    .as_path()
+            ),
+            "new restores stage inside .lpm"
+        );
+    }
+
+    #[test]
     fn a_new_restore_recovers_an_interrupted_restore_before_staging() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-interrupted");
+        let abandoned = project.path().join(".lpm/.lpm-cache-restore-interrupted");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
         fs::create_dir(project.path().join("dist")).unwrap();
@@ -3373,7 +3752,9 @@ mod tests {
 
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-replaced-backup");
+        let abandoned = project
+            .path()
+            .join(".lpm/.lpm-cache-restore-replaced-backup");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
         fs::create_dir(project.path().join("dist")).unwrap();
@@ -3414,7 +3795,9 @@ mod tests {
     fn cache_clean_preserves_interrupted_restore_recovery_records() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-clean-recovery");
+        let abandoned = project
+            .path()
+            .join(".lpm/.lpm-cache-restore-clean-recovery");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
         fs::create_dir(project.path().join("dist")).unwrap();
@@ -3470,7 +3853,9 @@ mod tests {
     fn interrupted_restore_recovery_removes_a_newly_installed_per_file_output() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-interrupted-new");
+        let abandoned = project
+            .path()
+            .join(".lpm/.lpm-cache-restore-interrupted-new");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
         fs::write(abandoned.join("outputs/dist/value.txt"), "installed").unwrap();
@@ -3522,7 +3907,7 @@ mod tests {
     fn committed_restore_recovery_preserves_published_outputs() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-committed");
+        let abandoned = project.path().join(".lpm/.lpm-cache-restore-committed");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
         fs::create_dir(project.path().join("dist")).unwrap();
@@ -3553,7 +3938,9 @@ mod tests {
     fn committed_restore_recovery_survives_commit_marker_cleanup() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-committed-cleanup");
+        let abandoned = project
+            .path()
+            .join(".lpm/.lpm-cache-restore-committed-cleanup");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
         fs::create_dir(project.path().join("dist")).unwrap();
@@ -3583,7 +3970,7 @@ mod tests {
     fn a_new_restore_removes_an_abandoned_pre_apply_staging_directory() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-staging");
+        let abandoned = project.path().join(".lpm/.lpm-cache-restore-staging");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir(abandoned.join("backups")).unwrap();
         register_restore_for_test(&cache.root, project.path(), &abandoned).unwrap();
@@ -3601,7 +3988,7 @@ mod tests {
     fn interrupted_restore_recovery_ignores_an_unowned_lookalike_directory() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-user-data");
+        let abandoned = project.path().join(".lpm/.lpm-cache-restore-user-data");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
         write_restore_journal(
@@ -3627,7 +4014,7 @@ mod tests {
     fn interrupted_restore_recovery_ignores_a_forged_owner_with_open_permissions() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-forged-owner");
+        let abandoned = project.path().join(".lpm/.lpm-cache-restore-forged-owner");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
         write_restore_journal(
@@ -3655,7 +4042,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let abandoned = project
             .path()
-            .join(".lpm-cache-restore-forged-private-owner");
+            .join(".lpm/.lpm-cache-restore-forged-private-owner");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
         write_restore_journal(
@@ -3681,7 +4068,9 @@ mod tests {
     fn interrupted_restore_recovery_ignores_an_oversized_owner_marker() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-oversized-owner");
+        let abandoned = project
+            .path()
+            .join(".lpm/.lpm-cache-restore-oversized-owner");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist")).unwrap();
         write_restore_journal(
@@ -3715,7 +4104,7 @@ mod tests {
 
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-linked-backup");
+        let abandoned = project.path().join(".lpm/.lpm-cache-restore-linked-backup");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         register_restore_for_test(&cache.root, project.path(), &abandoned).unwrap();
         fs::create_dir(project.path().join("dist")).unwrap();
@@ -3760,7 +4149,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let abandoned = project
             .path()
-            .join(".lpm-cache-restore-linked-backup-parent");
+            .join(".lpm/.lpm-cache-restore-linked-backup-parent");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir(abandoned.join("backups")).unwrap();
         register_restore_for_test(&cache.root, project.path(), &abandoned).unwrap();
@@ -3801,7 +4190,9 @@ mod tests {
     fn interrupted_restore_recovery_rejects_a_directory_backup() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-directory-backup");
+        let abandoned = project
+            .path()
+            .join(".lpm/.lpm-cache-restore-directory-backup");
         fs::create_dir_all(abandoned.join("outputs/dist")).unwrap();
         fs::create_dir_all(abandoned.join("backups/dist/value.txt")).unwrap();
         register_restore_for_test(&cache.root, project.path(), &abandoned).unwrap();
@@ -3834,7 +4225,9 @@ mod tests {
     fn interrupted_restore_recovery_removes_parent_directories_created_after_the_journal() {
         let cache = TestCache::new();
         let project = tempfile::tempdir().unwrap();
-        let abandoned = project.path().join(".lpm-cache-restore-created-parent");
+        let abandoned = project
+            .path()
+            .join(".lpm/.lpm-cache-restore-created-parent");
         fs::create_dir_all(abandoned.join("outputs/dist/nested")).unwrap();
         fs::create_dir(abandoned.join("backups")).unwrap();
         register_restore_for_test(&cache.root, project.path(), &abandoned).unwrap();

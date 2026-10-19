@@ -199,7 +199,7 @@ pub async fn run(
     // workspace, so force-clearing here preserves a clean snapshot without
     // risking source files.
     if force && plan.output_dir.exists() {
-        std::fs::remove_dir_all(&plan.output_dir).map_err(|e| {
+        paths::remove_output(&plan.output_dir).map_err(|e| {
             LpmError::Script(format!(
                 "lpm deploy --force: failed to clear output directory {:?}: {e}",
                 plan.output_dir
@@ -247,7 +247,6 @@ pub async fn run(
         None,  // strict_peer_dependencies_override
         None,  // linker_override
         crate::lpm_skills_config::LpmSkillsPreference::Disabled,
-        true,  // no_editor_setup — same reason
         false, // no_security_summary — keep findings visible in CI
         false, // auto_build — build is a separate concern
         Some(&target_set),

@@ -140,7 +140,8 @@ pub(super) fn load_lpm_json(project_dir: &Path) -> DiagnosticLpmJson {
     if obj.contains_key("vaultSync") {
         warnings.push(
             "\"vaultSync\" is one checkout's env sync state; the next `lpm env pull` or \
-             `lpm env push` moves it to .lpm/env-sync.json, then commit lpm.json without it"
+             `lpm env push` moves it to .lpm/env-sync.json, or drops it when git has it \
+             committed, then commit lpm.json without it"
                 .into(),
         );
     }

@@ -290,6 +290,524 @@ fn resolve_deploy_target_with_output_inside_workspace_member_dir_also_errors() {
     assert!(err.to_string().contains("inside the workspace"));
 }
 
+/// macOS names the data volume's directories through firmlinks too
+/// (`/System/Volumes/Data/private/var/…` for `/private/var/…`), a spelling
+/// `canonicalize` keeps apart from the other; `--force` then cleared the
+/// workspace.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_output_naming_the_workspace_another_way_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("ws");
+    write_workspace_fixture(&workspace, &[("api", "packages/api")]);
+    let firmlinked = |path: &Path| {
+        Path::new("/System/Volumes/Data")
+            .join(path.canonicalize().unwrap().strip_prefix("/").unwrap())
+    };
+    if !lpm_workspace::is_same_directory(&firmlinked(&workspace), &workspace) {
+        return;
+    }
+
+    for (output, refusal) in [
+        (firmlinked(tmp.path()), "overlaps the workspace"),
+        (firmlinked(&workspace), "inside the workspace"),
+        (firmlinked(&workspace).join("dist"), "inside the workspace"),
+        // The data volume's root, which no canonical ancestor names.
+        (
+            Path::new("/System/Volumes/Data").to_path_buf(),
+            "overlaps the workspace",
+        ),
+    ] {
+        let error = resolve_deploy_target(&workspace, &output, &["api".to_string()], true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(refusal), "{}: {error}", output.display());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_force_deploy_never_clears_a_mount_point() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("ws");
+    write_workspace_fixture(&workspace, &[("api", "packages/api")]);
+    // A file system of its own on every Unix.
+    let mounted = Path::new("/dev");
+
+    let error = resolve_deploy_target(&workspace, mounted, &["api".to_string()], true)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("is a mount point"), "{error}");
+    let error = resolve_deploy_target(&workspace, mounted, &["api".to_string()], false)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("is not empty"), "{error}");
+}
+
+/// The mounts as the system lists them.
+fn mounts() -> super::paths::Mounts {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        super::paths::Mounts::read().unwrap()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        super::paths::Mounts::read()
+    }
+}
+
+/// An overlap a mount makes is seen only in the system's list of mounts.
+#[test]
+fn a_deploy_stops_where_the_mounts_can_t_be_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let error = super::paths::validate_output_dir(tmp.path(), Path::new("out"), false, || {
+        Err(std::io::Error::other("no mount table"))
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("can't read the system's mounts") && error.contains("no mount table"),
+        "{error}"
+    );
+}
+
+/// A deploy writes a directory, so an output that is a file is refused,
+/// and `--force` leaves the file as it was.
+#[test]
+fn an_output_that_is_a_file_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("ws");
+    write_workspace_fixture(&workspace, &[("api", "packages/api")]);
+    let file = tmp.path().join("notes.txt");
+    std::fs::write(&file, "kept").unwrap();
+    for force in [false, true] {
+        let error = resolve_deploy_target(&workspace, &file, &["api".to_string()], force)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is not a directory"), "{error}");
+    }
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "kept");
+}
+
+/// Git runs a git directory's hooks and reads its config, so a deploy
+/// writes into none: a repository's `.git` under any name git reads as one,
+/// a bare repository, or a directory a `.git` file points at.
+#[test]
+fn an_output_in_a_git_directory_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("ws");
+    write_workspace_fixture(&workspace, &[("api", "packages/api")]);
+    let git_directory = |directory: &Path| {
+        for name in ["objects", "refs/heads", "hooks"] {
+            std::fs::create_dir_all(directory.join(name)).unwrap();
+        }
+        std::fs::write(directory.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    };
+    git_directory(&tmp.path().join("victim/.git"));
+    git_directory(&tmp.path().join("bare.git"));
+    git_directory(&tmp.path().join("separate"));
+    for output in [
+        "victim/.git",
+        "victim/.git/hooks",
+        "victim/.git/hooks/new",
+        "victim/.GIT/hooks",
+        "victim/git~1/hooks",
+        "elsewhere/.git",
+        "bare.git/hooks",
+        "separate/hooks",
+    ] {
+        for force in [false, true] {
+            let error = resolve_deploy_target(
+                &workspace,
+                &tmp.path().join(output),
+                &["api".to_string()],
+                force,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.contains("is in the git directory"),
+                "{output}: {error}"
+            );
+        }
+    }
+    resolve_deploy_target(
+        &workspace,
+        &tmp.path().join("victim/out"),
+        &["api".to_string()],
+        false,
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn the_mount_table_names_the_mount_points_below_a_directory() {
+    assert!(super::paths::mount_point_within(Path::new("/"), &mounts()).is_some());
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(
+        super::paths::mount_point_within(tmp.path(), &mounts()),
+        None
+    );
+}
+
+/// Mounts are told by their paths alone, so one that can't answer, such as
+/// a network share whose server is gone, can't stall the check.
+#[cfg(unix)]
+#[test]
+fn a_mount_below_the_output_is_told_by_its_path_alone() {
+    let mounts = [
+        PathBuf::from("/"),
+        PathBuf::from("/nonexistent/stalled-share"),
+        PathBuf::from("/nonexistent/out/vol"),
+    ];
+    let within = |spellings: &[&str]| {
+        let spellings: Vec<PathBuf> = spellings.iter().map(PathBuf::from).collect();
+        super::paths::mounts_within(&mounts, &spellings)
+    };
+    assert_eq!(
+        within(&["/nonexistent/out"]),
+        Some(PathBuf::from("/nonexistent/out/vol"))
+    );
+    assert_eq!(within(&["/nonexistent/outside"]), None);
+    assert_eq!(within(&["/nonexistent/ou"]), None);
+}
+
+/// A bind mount shows a directory under a path no ancestor walk reaches,
+/// as toolbox's `/run/host` shows the host's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_directory_a_bind_mount_shows_is_inside_what_holds_its_files() {
+    let table = lpm_common::mounts::parse_mount_table(
+        b"22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+          30 22 8:2 /u /home/u rw - ext4 /dev/sda2 rw\n\
+          40 22 8:1 / /run/host rw - ext4 /dev/sda1 rw\n\
+          41 40 8:2 / /run/host/home rw - ext4 /dev/sda2 rw\n",
+    )
+    .unwrap();
+    let located = |inner: &str, outer: &str| {
+        super::paths::located_within(&table, Path::new(inner), Path::new(outer))
+    };
+    assert!(located("/home/u", "/run/host/home"));
+    assert!(located("/home/u/ws", "/run/host"));
+    assert!(!located("/home/u", "/run/host/home/v"));
+    assert!(!located("/home/u", "/tmp/out"));
+}
+
+/// The removal searches the output's parent and never lists it, as
+/// `remove_dir_all` doesn't: a shared deploy root this user may write and
+/// search, but not read, holds an output `--force` clears.
+#[cfg(unix)]
+#[test]
+fn an_output_in_a_directory_this_user_can_t_list_is_removed() {
+    use std::os::unix::fs::PermissionsExt as _;
+    if lpm_common::current_uid() == 0 {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("deploys");
+    let out = parent.join("api");
+    std::fs::create_dir_all(out.join("sub")).unwrap();
+    std::fs::write(out.join("old.txt"), "x").unwrap();
+    std::fs::write(out.join("sub/old.txt"), "x").unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+    let removed = super::paths::remove_output(&out);
+
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    removed.unwrap();
+    assert!(!out.exists());
+}
+
+/// NFS mounts are placed by the server directory their source names: a
+/// view of the home's parent mounted with other options, so on another
+/// device, or under another name, holds the home, and another export of the
+/// same server doesn't.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn directories_on_nfs_are_placed_by_the_server_directory_their_source_names() {
+    let table = lpm_common::mounts::parse_mount_table(
+        b"22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+          50 22 0:52 / /home/u rw - nfs4 fs1:/export/home/u rw,vers=4.2,addr=10.0.0.5\n\
+          51 22 0:53 / /net/fs1 rw - nfs4 fs1:/ rw,vers=4.2,soft,addr=10.0.0.5\n\
+          52 22 0:52 / /proj/app rw - nfs4 fs1:/export/proj/app rw,vers=4.2,addr=10.0.0.5\n\
+          53 22 0:52 / /m/home-u rw - nfs4 fs1:/export/home/u rw,vers=4.2,addr=10.0.0.5\n\
+          54 22 0:52 / /m/view rw - nfs4 fs1:/export rw,vers=4.2,addr=10.0.0.5\n",
+    )
+    .unwrap();
+    let located = |inner: &str, outer: &str| {
+        super::paths::located_within(&table, Path::new(inner), Path::new(outer))
+    };
+    assert!(located("/home/u", "/net/fs1/export/home"));
+    assert!(located("/m/home-u", "/m/view/home"));
+    assert!(!located("/home/u/deploy/out", "/proj/app"));
+    assert!(!located("/home/u", "/net/fs1/export/proj"));
+}
+
+/// macOS lists an NFS mount's source as `getfsstat`'s `f_mntfromname`.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_macos_nfs_volume_is_placed_by_its_source() {
+    let volume =
+        super::paths::nfs_volume(PathBuf::from("/net/fs1/export"), b"fs1:/export", "nfs").unwrap();
+    assert_eq!(
+        volume.shows,
+        Some(("nfs fs1 ".to_string(), PathBuf::from("/export")))
+    );
+    assert!(
+        super::paths::nfs_volume(PathBuf::from("/Volumes/x"), b"/dev/disk4s1", "apfs").is_none()
+    );
+}
+
+#[test]
+fn a_view_of_a_directory_under_its_own_names_holds_it() {
+    let same = |shown: &Path, inner: &Path| {
+        shown == Path::new("/net/fs1/export/home/u") && inner == Path::new("/home/u")
+    };
+    let shows = |inner: &str, outer: &str| {
+        super::paths::shows_by_identity(Path::new(inner), Path::new(outer), same)
+    };
+    assert!(shows("/home/u", "/net/fs1/export/home"));
+    assert!(shows("/home/u", "/net/fs1/export"));
+    assert!(!shows("/home/u", "/net/fs2"));
+    assert!(!shows("/home/v", "/net/fs1/export/home"));
+}
+
+/// A Windows path's drive and root come before its names; joined onto
+/// another path, they would name the path itself again.
+#[cfg(windows)]
+#[test]
+fn a_view_is_told_by_the_names_that_end_a_path_not_its_drive() {
+    let same = |shown: &Path, inner: &Path| shown == inner;
+    assert!(!super::paths::shows_by_identity(
+        Path::new(r"C:\ws\proj"),
+        Path::new(r"C:\out"),
+        same
+    ));
+    assert!(super::paths::shows_by_identity(
+        Path::new(r"C:\ws\proj"),
+        Path::new(r"C:\ws"),
+        |shown: &Path, inner: &Path| shown == Path::new(r"C:\ws\proj") && inner == shown
+    ));
+}
+
+/// A link in the output that leads to a directory is removed, not entered,
+/// so the directory isn't in the output.
+#[cfg(unix)]
+#[test]
+fn a_link_in_the_output_to_a_directory_doesn_t_put_it_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    std::fs::create_dir_all(root.join("home/u")).unwrap();
+    std::fs::create_dir(root.join("out")).unwrap();
+    std::os::unix::fs::symlink(root.join("home/u"), root.join("out/u")).unwrap();
+    assert!(!super::paths::shows_by_identity(
+        &root.join("home/u"),
+        &root.join("out"),
+        super::paths::is_same_directory_reached_directly
+    ));
+    std::fs::create_dir_all(root.join("view/u")).unwrap();
+    assert!(super::paths::is_same_directory_reached_directly(
+        &root.join("view/u"),
+        &root.join("view/u")
+    ));
+}
+
+/// The removal would stop at a mount point below the output with part of
+/// the output deleted, so `--force` refuses the output before it removes
+/// anything.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_force_deploy_never_clears_a_directory_holding_a_mount_point() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("ws");
+    write_workspace_fixture(&workspace, &[("api", "packages/api")]);
+    let out = tmp.path().join("out");
+    let volume = out.join("vol");
+    std::fs::create_dir_all(&volume).unwrap();
+    std::fs::write(out.join("old.txt"), "x").unwrap();
+    let image = tmp.path().join("volume.dmg");
+    let _attached = lpm_common::test_disk_image::AttachedImage::new(
+        &image,
+        &volume,
+        &["-size", "2m", "-fs", "HFS+", "-volname", "lpm-deploy-held"],
+        &[],
+    );
+    std::fs::write(volume.join("precious.txt"), "kept").unwrap();
+
+    // The output as `/` names it, and as the data volume's mount point
+    // does, where `getfsstat` lists the image's mount from `/`.
+    let canonical = std::fs::canonicalize(&out).unwrap();
+    let data_volume = Path::new("/System/Volumes/Data").join(canonical.strip_prefix("/").unwrap());
+    for output in [out, data_volume] {
+        let error = resolve_deploy_target(&workspace, &output, &["api".to_string()], true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("holds the mount point"),
+            "{output:?}: {error}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(volume.join("precious.txt")).unwrap(),
+        "kept"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn removing_an_output_removes_links_not_what_they_lead_to() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("out");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(out.join("a/b/c")).unwrap();
+    std::fs::write(out.join("a/b/c/d.txt"), "x").unwrap();
+    std::fs::write(out.join("top.txt"), "x").unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("kept.txt"), "kept").unwrap();
+    std::os::unix::fs::symlink(&outside, out.join("a/link")).unwrap();
+
+    super::paths::remove_output(&out).unwrap();
+
+    assert!(!out.exists());
+    assert_eq!(
+        std::fs::read_to_string(outside.join("kept.txt")).unwrap(),
+        "kept"
+    );
+}
+
+/// Linux before 5.8 has `statx` say nothing of a mount's root; then the
+/// mounts the two descriptors are on tell, and nothing telling refuses.
+#[test]
+fn a_mount_the_kernel_doesn_t_report_is_told_by_mount_ids() {
+    use super::paths::mount_answer;
+    let ids = |parent: u64, directory: u64| move || Ok((parent, directory));
+    assert!(mount_answer(Some(true), ids(1, 1)).unwrap());
+    assert!(!mount_answer(Some(false), ids(1, 2)).unwrap());
+    assert!(mount_answer(None, ids(1, 2)).unwrap());
+    assert!(!mount_answer(None, ids(3, 3)).unwrap());
+    assert!(mount_answer(None, || Err(std::io::Error::other("no fdinfo"))).is_err());
+    assert_eq!(
+        super::paths::parse_mount_id(b"pos:\t0\nflags:\t02100000\nmnt_id:\t42\nino:\t7\n"),
+        Some(42)
+    );
+    assert_eq!(super::paths::parse_mount_id(b"pos:\t0\n"), None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_directory_and_its_parent_on_one_mount_share_its_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join("child")).unwrap();
+    let parent = std::fs::File::open(tmp.path()).unwrap();
+    let child = std::fs::File::open(tmp.path().join("child")).unwrap();
+    assert_eq!(
+        super::paths::mount_id(&parent).unwrap(),
+        super::paths::mount_id(&child).unwrap()
+    );
+}
+
+/// A volume mounted below the output after the guard looked stops the
+/// removal at its mount point, leaving the volume's files.
+#[cfg(target_os = "macos")]
+#[test]
+fn removing_an_output_never_enters_a_volume_mounted_in_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("out");
+    let volume = out.join("deep/vol");
+    std::fs::create_dir_all(&volume).unwrap();
+    let image = tmp.path().join("volume.dmg");
+    let _attached = lpm_common::test_disk_image::AttachedImage::new(
+        &image,
+        &volume,
+        &[
+            "-size",
+            "2m",
+            "-fs",
+            "HFS+",
+            "-volname",
+            "lpm-deploy-removal",
+        ],
+        &[],
+    );
+    std::fs::write(volume.join("precious.txt"), "kept").unwrap();
+
+    let error = super::paths::remove_output(&out).unwrap_err().to_string();
+
+    assert!(error.contains("another volume"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(volume.join("precious.txt")).unwrap(),
+        "kept"
+    );
+}
+
+/// The data volume's mount point, and with it the home directory, is below
+/// `/System/Volumes`, which is no ancestor of the home directory's path.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_output_holding_the_data_volume_s_mount_point_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("ws");
+    write_workspace_fixture(&workspace, &[("api", "packages/api")]);
+    for output in ["/System/Volumes", "/System"] {
+        let error =
+            resolve_deploy_target(&workspace, Path::new(output), &["api".to_string()], true)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            [
+                "overlaps the workspace",
+                "holds the home directory",
+                "overlaps the LPM home"
+            ]
+            .iter()
+            .any(|reason| error.contains(reason)),
+            "{output}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_mount_point_is_told_from_a_directory_and_a_link_to_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(!super::paths::is_mount_point(tmp.path(), &mounts()));
+    #[cfg(unix)]
+    {
+        for mounted in ["/", "/dev"] {
+            assert!(
+                super::paths::is_mount_point(Path::new(mounted), &mounts()),
+                "{mounted}"
+            );
+        }
+        let link = tmp.path().join("dev");
+        std::os::unix::fs::symlink("/dev", &link).unwrap();
+        assert!(!super::paths::is_mount_point(&link, &mounts()));
+    }
+    #[cfg(windows)]
+    {
+        let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        assert!(super::paths::is_mount_point(
+            Path::new(&format!("{drive}\\")),
+            &mounts()
+        ));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn the_mount_table_lists_the_mount_points_by_path() {
+    for mounted in ["/", "/proc"] {
+        assert!(
+            super::paths::listed_in_mount_table(Path::new(mounted), &mounts()),
+            "{mounted}"
+        );
+    }
+    assert!(!super::paths::listed_in_mount_table(
+        tempfile::tempdir().unwrap().path(),
+        &mounts()
+    ));
+}
+
 // ── regression (High): self-loop guard bypass ────
 
 #[cfg(unix)]

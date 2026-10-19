@@ -15,12 +15,7 @@ async fn missing_install_artifacts_do_not_bypass_frozen_lockfile_validation() {
             r#"{"name":"cached-consumer","version":"1.0.0","dependencies":{"cached-dep":"1.0.0"}}"#,
         );
         lpm_with_registry(&project, &mock.url())
-            .args([
-                "install",
-                "--no-skills",
-                "--no-editor-setup",
-                "--no-security-summary",
-            ])
+            .args(["install", "--no-skills", "--no-security-summary"])
             .assert()
             .success();
         let path = project.path().join(missing);
@@ -35,7 +30,6 @@ async fn missing_install_artifacts_do_not_bypass_frozen_lockfile_validation() {
                 "install",
                 "--frozen-lockfile",
                 "--no-skills",
-                "--no-editor-setup",
                 "--no-security-summary",
             ])
             .assert()
@@ -75,7 +69,6 @@ async fn cached_reinstall_keeps_package_bytes_and_force_refetches_each_registry_
         "install",
         "--no-frozen-lockfile",
         "--no-skills",
-        "--no-editor-setup",
         "--no-security-summary",
     ];
     lpm_with_registry(&project, &mock.url())

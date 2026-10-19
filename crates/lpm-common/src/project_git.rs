@@ -262,6 +262,40 @@ pub fn repository_marker_above(dir: &Path) -> bool {
         .any(|directory| std::fs::symlink_metadata(directory.join(".git")).is_ok())
 }
 
+/// [`repository_marker_above`] for [`tracked_entries_in_any_repository`]:
+/// a `.git` at or above `dir`, or in a directory on the way from `dir` to
+/// one of `paths`.
+pub fn repository_marker_around(dir: &Path, paths: &[&str]) -> bool {
+    repository_marker_above(dir)
+        || paths.iter().any(|path| {
+            nested_candidates(dir, path)
+                .into_iter()
+                .any(|(directory, _)| std::fs::symlink_metadata(directory.join(".git")).is_ok())
+        })
+}
+
+/// [`tracked_entries`] for `paths` in `dir`, asked of every index that can
+/// list them, as [`indexes_listing`] finds them: the repositories that
+/// track something come back, each once. `None` when no work tree holds
+/// `dir` or any directory on the way to the paths.
+pub fn tracked_entries_in_any_repository(
+    dir: &Path,
+    paths: &[&str],
+) -> Result<Option<Vec<Tracked>>, GitProbeError> {
+    let indexes = indexes_listing(dir, paths, None)?;
+    if indexes.is_empty() {
+        return Ok(None);
+    }
+    let mut found = Vec::new();
+    for index in &indexes {
+        let tracked = index.tracked()?;
+        if !tracked.entries.is_empty() {
+            found.push(tracked);
+        }
+    }
+    Ok(Some(found))
+}
+
 /// The bytes git's index holds at stage 0 for `entry`, a path relative to
 /// the work tree `root`, as stored: no filter or conversion runs. Fails for
 /// an entry with conflicts, which has no stage 0, and past `limit` bytes.
@@ -358,8 +392,26 @@ fn tracked_entries_in_where(
     let root = root.clone();
     let mut queried: Vec<String> = paths
         .iter()
-        .map(|path| format!("{prefix}{}", path.trim_end_matches('/')))
+        .map(|path| format!("{prefix}{path}").trim_end_matches('/').to_owned())
         .collect();
+    // An empty path is the whole work tree, whose every entry counts.
+    if queried.iter().any(String::is_empty) {
+        let listed = run_git(&root, &["ls-files", "-z", "--cached"])?;
+        if !listed.status.success() {
+            return Err(GitProbeError::Failed(git_failure(&listed)));
+        }
+        let entries: Vec<String> = listed
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| String::from_utf8_lossy(entry).into_owned())
+            .collect();
+        return Ok(Tracked {
+            root,
+            spellings: vec![".".to_owned(); entries.len()],
+            entries,
+        });
+    }
     // A path asked by another name than the disk's, an NTFS short name or a
     // linked directory, is asked for under the disk's name too.
     for index in 0..queried.len() {
@@ -621,6 +673,17 @@ pub fn fold_case(name: &str) -> String {
     name.to_lowercase().to_uppercase().to_lowercase()
 }
 
+/// The characters beyond its two ASCII cases that [`fold_case`] reads as
+/// the ASCII letter `letter`.
+pub fn non_ascii_folds(letter: char) -> &'static [char] {
+    match letter.to_ascii_lowercase() {
+        'i' => &['\u{131}'],
+        'k' => &['\u{212A}'],
+        's' => &['\u{17F}'],
+        _ => &[],
+    }
+}
+
 /// The git work tree that holds a directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkTree {
@@ -677,6 +740,13 @@ pub(crate) fn locate_work_tree(
         prefix: prefix.to_owned(),
         git_path,
     }))
+}
+
+/// The root of the git work tree that holds `dir`, and where `dir` is in
+/// it: `/`-separated and ending in `/`, or `""` at the root. `None` outside
+/// a work tree.
+pub fn work_tree_location(dir: &Path) -> Result<Option<(PathBuf, String)>, GitProbeError> {
+    Ok(locate_work_tree(dir, None)?.map(|work_tree| (work_tree.root, work_tree.prefix)))
 }
 
 /// A work tree whose index can list the paths [`indexes_listing`] was asked
@@ -1157,6 +1227,37 @@ pub(crate) fn ignores_case(dir: &Path) -> Result<bool, GitProbeError> {
 const UNTRACK_NAMED_ENTRIES: usize = 3;
 
 impl Tracked {
+    /// Keeps the entries `keep` accepts, given each one's path below the
+    /// path it was found for, empty for that path itself. An untrack command
+    /// that names paths rather than entries then names the first directory
+    /// below that path holding a kept entry, never the path itself.
+    pub fn retain_below(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        let mut entries = Vec::with_capacity(self.entries.len());
+        let mut spellings = Vec::with_capacity(self.entries.len());
+        for (entry, spelling) in self.entries.drain(..).zip(self.spellings.drain(..)) {
+            // A repository of the path's own spells the path `.`.
+            let below = if spelling == "." {
+                Some(entry.as_str())
+            } else {
+                entry
+                    .strip_prefix(spelling.as_str())
+                    .and_then(|rest| rest.strip_prefix('/'))
+            };
+            if !keep(below.unwrap_or_default()) {
+                continue;
+            }
+            let spelling = match below.and_then(|below| below.split('/').next()) {
+                Some(first) if spelling == "." => first.to_owned(),
+                Some(first) => format!("{spelling}/{first}"),
+                None => spelling,
+            };
+            entries.push(entry);
+            spellings.push(spelling);
+        }
+        self.entries = entries;
+        self.spellings = spellings;
+    }
+
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -1203,7 +1304,7 @@ impl Tracked {
 
 /// `word` as one shell word, quoted the way the platform's shells read it
 /// when anything in it is special.
-fn shell_word(word: &str) -> std::borrow::Cow<'_, str> {
+pub fn shell_word(word: &str) -> std::borrow::Cow<'_, str> {
     // PowerShell, the default shell, expands `$` and backticks inside double
     // quotes but reads single quotes literally.
     #[cfg(windows)]
@@ -1887,6 +1988,103 @@ mod tests {
         assert!(indexed_blob(dir, "lpm.json", 3).is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_link_tracked_under_another_case_counts_though_it_leads_nowhere() {
+        use std::os::unix::fs::MetadataExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let dir = directory.path();
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "core.ignorecase", "false"]);
+        std::os::unix::fs::symlink("missing-target", dir.join(".ENV")).unwrap();
+        git(dir, &["add", "--", ".ENV"]);
+        let same_entry = std::fs::symlink_metadata(dir.join(".env")).is_ok_and(|lower| {
+            std::fs::symlink_metadata(dir.join(".ENV")).unwrap().ino() == lower.ino()
+        });
+        if !same_entry {
+            return;
+        }
+
+        let tracked = tracked_entries(dir, &[".env"]).unwrap().unwrap();
+
+        assert_eq!(tracked.entries, [".ENV"]);
+    }
+
+    #[test]
+    fn asks_each_repository_on_the_way_to_a_path_once() {
+        let outside = tempfile::tempdir().unwrap();
+        assert_eq!(
+            tracked_entries_in_any_repository(outside.path(), &[".lpm/certs"]).unwrap(),
+            None
+        );
+
+        let state_repository = tempfile::tempdir().unwrap();
+        let state = state_repository.path().join(".lpm");
+        std::fs::create_dir_all(state.join("certs")).unwrap();
+        std::fs::write(state.join("certs/key.pem"), "placeholder").unwrap();
+        git(&state, &["init", "-q"]);
+        git(&state, &["add", "certs/key.pem"]);
+        let found = tracked_entries_in_any_repository(state_repository.path(), &[".lpm/certs"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].entries, ["certs/key.pem"]);
+
+        let project = tempfile::tempdir().unwrap();
+        let state = project.path().join(".lpm");
+        std::fs::create_dir_all(state.join("certs")).unwrap();
+        std::fs::write(state.join("certs/key.pem"), "placeholder").unwrap();
+        git(project.path(), &["init", "-q"]);
+        git(project.path(), &["add", "-f", ".lpm/certs/key.pem"]);
+        // Git looks past an empty `.git` directory to the project's repository.
+        std::fs::create_dir(state.join(".git")).unwrap();
+        let found = tracked_entries_in_any_repository(project.path(), &[".lpm/certs"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].entries, [".lpm/certs/key.pem"]);
+        assert_eq!(
+            repository_marker_around(outside.path(), &[".lpm/certs"]),
+            repository_marker_above(outside.path())
+        );
+        assert!(repository_marker_around(project.path(), &[".lpm/certs"]));
+    }
+
+    #[test]
+    fn asks_the_index_around_a_repository_made_inside_its_work_tree() {
+        let outer = tempfile::tempdir().unwrap();
+        let project = outer.path().join("apps/web");
+        std::fs::create_dir_all(project.join(".lpm/certs")).unwrap();
+        std::fs::write(project.join(".lpm/certs/key.pem"), "placeholder").unwrap();
+        git(outer.path(), &["init", "-q"]);
+        git(outer.path(), &["add", "-f", "apps/web/.lpm/certs/key.pem"]);
+        git(&project, &["init", "-q"]);
+        git(&project.join(".lpm"), &["init", "-q"]);
+
+        let found = tracked_entries_in_any_repository(&project, &[".lpm/certs"])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].entries, ["apps/web/.lpm/certs/key.pem"]);
+        assert_eq!(
+            found[0].root.canonicalize().unwrap(),
+            outer.path().canonicalize().unwrap()
+        );
+        let indexes = indexes_listing(&project, &[".lpm/certs"], None).unwrap();
+        assert_eq!(
+            indexes
+                .iter()
+                .map(|index| (index.found, index.paths.clone()))
+                .collect::<Vec<_>>(),
+            [
+                (Found::Holding, vec![".lpm/certs".to_owned()]),
+                (Found::Nested { depth: 1 }, vec!["certs".to_owned()]),
+                (Found::Around, vec!["apps/web/.lpm/certs".to_owned()]),
+            ]
+        );
+    }
+
     #[test]
     fn case_is_set_aside_as_a_case_insensitive_filesystem_sets_it_aside() {
         for (name, as_read) in [
@@ -1896,6 +2094,30 @@ mod tests {
             ("\u{212A}ey", "key"),
         ] {
             assert_eq!(fold_case(name), as_read, "{name}");
+        }
+    }
+
+    #[test]
+    fn names_every_character_that_folds_to_an_ascii_letter() {
+        for character in '\u{80}'..=char::MAX {
+            let folded = fold_case(character.encode_utf8(&mut [0; 4]));
+            let mut folded_chars = folded.chars();
+            if let (Some(single), None) = (folded_chars.next(), folded_chars.next())
+                && single.is_ascii_alphabetic()
+            {
+                assert!(
+                    non_ascii_folds(single).contains(&character),
+                    "{character:?} folds to {single:?}"
+                );
+            }
+        }
+        for letter in ('a'..='z').chain('A'..='Z') {
+            for character in non_ascii_folds(letter) {
+                assert_eq!(
+                    fold_case(character.encode_utf8(&mut [0; 4])),
+                    letter.to_ascii_lowercase().to_string()
+                );
+            }
         }
     }
 

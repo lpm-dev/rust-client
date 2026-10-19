@@ -213,3 +213,86 @@ fn local_output_can_be_a_regular_file_named_outputs() {
         "cached"
     );
 }
+
+#[cfg(target_os = "macos")]
+fn grant_everyone_access(path: &Path, inheritable: bool) {
+    let rights = if inheritable {
+        "group:everyone allow read,write,list,search,add_file,add_subdirectory,file_inherit,directory_inherit"
+    } else {
+        "group:everyone allow read,write,list,search,add_file"
+    };
+    let status = std::process::Command::new("/bin/chmod")
+        .args(["+a", rights])
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// The cache keeps task output, `.env` files included, from accounts the
+/// LPM home's directory hands access to.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_cache_entry_drops_access_its_directory_hands_down() {
+    let home = tempfile::tempdir().unwrap();
+    grant_everyone_access(home.path(), true);
+    let root = LpmRoot::from_dir(home.path());
+    let project = tempfile::tempdir().unwrap();
+    fs::write(project.path().join(".env"), "PRIVATE_TOKEN=secret\n").unwrap();
+
+    store_cache_with_root(
+        &root,
+        "deadbeef",
+        project.path(),
+        "build",
+        &[".env".into()],
+        "PRIVATE_TOKEN=stdout-secret\n",
+        "",
+        1,
+    )
+    .unwrap();
+
+    let entry = root.cache_tasks().join("deadbeef");
+    for path in [
+        root.cache_tasks(),
+        entry.clone(),
+        entry.join("stdout.log"),
+        entry.join("outputs.tar.gz"),
+    ] {
+        assert!(
+            !lpm_common::macos_acl::has_extended_acl_at(&path).unwrap(),
+            "{}",
+            path.display()
+        );
+    }
+}
+
+/// An entry another account could write, as one an earlier release left,
+/// isn't restored.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_cache_entry_open_to_other_accounts_is_not_restored() {
+    let home = tempfile::tempdir().unwrap();
+    let root = LpmRoot::from_dir(home.path());
+    let source = tempfile::tempdir().unwrap();
+    fs::write(source.path().join("value.txt"), "cached").unwrap();
+    store_cache_with_root(
+        &root,
+        "deadbeef",
+        source.path(),
+        "build",
+        &["value.txt".into()],
+        "",
+        "",
+        1,
+    )
+    .unwrap();
+    grant_everyone_access(&root.cache_tasks().join("deadbeef"), false);
+    let project = tempfile::tempdir().unwrap();
+
+    let restored =
+        restore_cache_with_root(&root, "deadbeef", project.path(), &["value.txt".into()]);
+
+    assert!(restored.is_err());
+    assert!(!project.path().join("value.txt").exists());
+}

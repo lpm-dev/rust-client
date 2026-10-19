@@ -49,7 +49,6 @@ async fn assert_install_removes_obsolete_binary(workspace: bool) {
         "install",
         "--no-frozen-lockfile",
         "--no-skills",
-        "--no-editor-setup",
         "--no-security-summary",
     ];
     if workspace {
@@ -209,12 +208,7 @@ async fn assert_refreshes_published_version(mode: Option<(&str, &str)>) {
     let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
     project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "freshly-published@1.0.0",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "freshly-published@1.0.0", "--no-skills"])
         .assert()
         .success();
 
@@ -237,12 +231,7 @@ async fn assert_refreshes_published_version(mode: Option<(&str, &str)>) {
         command.env(key, value);
     }
     command
-        .args([
-            "install",
-            "freshly-published@1.1.0",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "freshly-published@1.1.0", "--no-skills"])
         .assert()
         .success();
     let installed: serde_json::Value =
@@ -260,12 +249,7 @@ async fn missing_version_refresh_is_bounded_and_preserves_the_installed_project(
     let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
     project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "missing-new-version@1.0.0",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "missing-new-version@1.0.0", "--no-skills"])
         .assert()
         .success();
     let manifest = project.read_file("package.json");
@@ -274,12 +258,7 @@ async fn missing_version_refresh_is_bounded_and_preserves_the_installed_project(
     mock.with_package(package, "1.0.0", &tarball).await;
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "missing-new-version@1.1.0",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "missing-new-version@1.1.0", "--no-skills"])
         .assert()
         .failure();
 
@@ -309,12 +288,7 @@ async fn metadata_refresh_does_not_bypass_revoked_custom_registry_access() {
     let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
     project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "access-revoked@1.0.0",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "access-revoked@1.0.0", "--no-skills"])
         .assert()
         .success();
     let manifest = project.read_file("package.json");
@@ -330,12 +304,7 @@ async fn metadata_refresh_does_not_bypass_revoked_custom_registry_access() {
         .await;
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "access-revoked@1.1.0",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "access-revoked@1.1.0", "--no-skills"])
         .assert()
         .failure();
 
@@ -362,12 +331,7 @@ async fn failed_metadata_refresh_keeps_optional_dependencies_optional() {
         let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
         project.write_file(".npmrc", &format!("registry={}/\n", mock.url()));
         lpm_with_registry(&project, &mock.url())
-            .args([
-                "install",
-                "optional-refresh@1.0.0",
-                "--no-skills",
-                "--no-editor-setup",
-            ])
+            .args(["install", "optional-refresh@1.0.0", "--no-skills"])
             .assert()
             .success();
         project.write_file("package.json", r#"{"name":"consumer","version":"1.0.0","optionalDependencies":{"optional-refresh":"1.1.0"}}"#);
@@ -376,10 +340,7 @@ async fn failed_metadata_refresh_keeps_optional_dependencies_optional() {
         if let Some((key, value)) = mode {
             command.env(key, value);
         }
-        command
-            .args(["install", "--no-skills", "--no-editor-setup"])
-            .assert()
-            .success();
+        command.args(["install", "--no-skills"]).assert().success();
         assert!(
             !project
                 .path()
@@ -408,7 +369,7 @@ async fn assert_unavailable_publication_message(status: Option<&str>, json: bool
     let project = TempProject::empty(r#"{"name":"publication-message","version":"1.0.0"}"#);
     let original = project.read_file("package.json");
     let mut command = lpm_with_registry(&project, &mock.url());
-    command.args(["install", name, "--no-skills", "--no-editor-setup"]);
+    command.args(["install", name, "--no-skills"]);
     if json {
         command.arg("--json");
     }
@@ -737,12 +698,7 @@ async fn mutable_install_repairs_stale_root_resolutions_after_dependency_ranges_
     );
 
     let initial = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run initial install");
     assert!(
@@ -807,12 +763,7 @@ async fn mutable_install_repairs_stale_root_resolutions_after_dependency_ranges_
     );
 
     let updated = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run mutable install after range changes");
     assert!(
@@ -857,12 +808,7 @@ async fn mutable_install_re_resolves_v12_lockfile_and_offline_fails_closed() {
     );
 
     let initial = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("install current lockfile");
     assert!(
@@ -895,7 +841,6 @@ async fn mutable_install_re_resolves_v12_lockfile_and_offline_fails_closed() {
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run frozen legacy replay");
@@ -912,7 +857,6 @@ async fn mutable_install_re_resolves_v12_lockfile_and_offline_fails_closed() {
             "--offline",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run offline legacy replay");
@@ -924,12 +868,7 @@ async fn mutable_install_re_resolves_v12_lockfile_and_offline_fails_closed() {
     );
 
     let online = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run online legacy upgrade");
     assert!(
@@ -956,12 +895,7 @@ fn install_without_dependencies_uses_slim_status_output() {
     let project = TempProject::empty(r#"{"name":"empty-install","version":"1.0.0"}"#);
 
     let output = lpm(&project)
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install");
 
@@ -995,12 +929,7 @@ fn install_rejects_malformed_global_config() {
     .unwrap();
 
     let output = lpm(&project)
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install");
 
@@ -1044,12 +973,7 @@ async fn install_enabled_typosquat_guard_rejects_oversized_project_config_before
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run install with oversized project config");
 
@@ -1099,12 +1023,7 @@ async fn install_rejects_oversized_global_config_before_registry_access() {
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run install with oversized global config");
 
@@ -1148,12 +1067,7 @@ async fn install_rejects_oversized_project_npmrc_before_registry_access() {
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run install with oversized project .npmrc");
 
@@ -1187,12 +1101,7 @@ async fn install_rejects_oversized_package_manifest_before_registry_access() {
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run install with oversized package.json");
 
@@ -1232,12 +1141,7 @@ async fn install_rejects_oversized_pnpm_workspace_manifest_before_registry_acces
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run install with oversized pnpm-workspace.yaml");
 
@@ -1272,12 +1176,7 @@ fn install_accepts_project_config_exactly_at_the_limit() {
     );
 
     let output = lpm(&project)
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run install with maximum-size project config");
 
@@ -1305,12 +1204,7 @@ async fn install_fast_lane_rejects_malformed_firewall_config() {
     );
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -1378,12 +1272,7 @@ fs.appendFileSync('root-lifecycle.log', `${phase}:${event}:${pkg}:${marker}\n`);
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install");
 
@@ -1426,13 +1315,7 @@ async fn install_add_does_not_run_root_prepare_lifecycle() {
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "ms",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "ms", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install ms");
 
@@ -1458,7 +1341,6 @@ fn install_resolver_phase_colors_registry_host_when_color_is_forced() {
             "install",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install");
@@ -1501,13 +1383,7 @@ async fn install_add_in_empty_dir_auto_creates_package_json() {
     std::fs::remove_file(project.path().join("package.json")).unwrap();
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "ms",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "ms", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install");
 
@@ -1575,7 +1451,6 @@ async fn install_add_walks_up_to_parent_package_json() {
         "ms",
         "--no-security-summary",
         "--no-skills",
-        "--no-editor-setup",
     ]);
     let output = cmd.output().expect("failed to run lpm install");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1699,7 +1574,6 @@ async fn install_add_with_dist_tag_resolves_tagged_prerelease_and_saves_exact() 
             &format!("{package_name}@beta"),
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install");
@@ -1789,12 +1663,7 @@ async fn assert_install_range_prefers_satisfying_latest_dist_tag(resolver: Optio
     ));
     project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
     let mut command = lpm_with_registry(&project, &mock.url());
-    command.args([
-        "install",
-        "--no-security-summary",
-        "--no-skills",
-        "--no-editor-setup",
-    ]);
+    command.args(["install", "--no-security-summary", "--no-skills"]);
     if let Some(resolver) = resolver {
         command.env("LPM_RESOLVER", resolver);
     }
@@ -1864,7 +1733,6 @@ async fn install_bare_walks_up_to_parent_package_json() {
         "install",
         "--no-security-summary",
         "--no-skills",
-        "--no-editor-setup",
     ]);
     let output = cmd.output().expect("failed to run lpm install");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1900,12 +1768,7 @@ async fn install_default_emits_no_audit_summary_line() {
         r#"{"name":"audit-off","version":"1.0.0","dependencies":{"ms":"^2.1.3"}}"#,
     );
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install");
 
@@ -1939,7 +1802,6 @@ async fn install_with_audit_after_install_flag_appends_summary_line() {
             "--audit-after-install",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install");
@@ -1977,7 +1839,6 @@ async fn install_osv_outage_suppresses_audit_after_install_summary() {
             "--audit-after-install",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install");
@@ -2037,7 +1898,6 @@ async fn install_audit_after_install_counts_lpm_registry_advisories() {
             "--audit-after-install",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install");
@@ -2096,7 +1956,7 @@ async fn install_without_audit_after_install_ignores_lpm_registry_advisories() {
         r#"{{"name":"ordinary-install-advisory","version":"1.0.0","dependencies":{{"{package}":"1.0.0"}}}}"#
     ));
     let output = lpm_with_registry(&project, &mock.url())
-        .args(["install", "--no-skills", "--no-editor-setup"])
+        .args(["install", "--no-skills"])
         .output()
         .expect("failed to run ordinary install");
 
@@ -2168,7 +2028,6 @@ async fn install_audit_after_install_preserves_individual_critical_findings() {
             "--audit-after-install",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run install with audit-after-install");
@@ -2198,7 +2057,6 @@ async fn install_audit_after_install_preserves_individual_critical_findings() {
             "--audit-after-install",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to rerun audit-enabled install in JSON mode");
@@ -2235,7 +2093,6 @@ async fn install_no_audit_after_install_overrides_env() {
             "--no-audit-after-install",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install");
@@ -2266,12 +2123,7 @@ async fn install_env_audit_after_install_appends_summary_line() {
     let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
         .env("LPM_AUDIT_AFTER_INSTALL", "1")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install");
 
@@ -2302,7 +2154,6 @@ async fn install_audit_after_install_attaches_summary_to_json_envelope() {
             "--audit-after-install",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install");
@@ -2380,12 +2231,7 @@ async fn install_audit_after_install_enabled_via_config_file() {
 
     let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install");
 
@@ -2429,7 +2275,6 @@ async fn install_audit_after_install_failure_does_not_fail_install() {
             "--audit-after-install",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install");
@@ -2680,12 +2525,7 @@ async fn install_empty_graph_removes_links_for_the_last_dependency() {
     );
 
     let first = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to install the initial dependency");
     assert!(
@@ -2705,12 +2545,7 @@ async fn install_empty_graph_removes_links_for_the_last_dependency() {
     }"#,
     );
     let second = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to install the empty graph");
 
@@ -3145,12 +2980,7 @@ async fn install_single_package_via_mock_registry() {
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install");
 
@@ -3218,13 +3048,7 @@ async fn install_json_envelope_with_one_package_matches_snapshot() {
     // not the linker behavior — pinning the linker keeps the shape
     // assertion meaningful.
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--json",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--json", "--no-security-summary", "--no-skills"])
         .env("LPM_LINKER", "isolated")
         .output()
         .expect("failed to run lpm install --json");
@@ -3293,7 +3117,6 @@ async fn install_json_timing_flag_exposes_waterfall_without_detail() {
             "--timing",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install --json --timing");
@@ -3345,13 +3168,7 @@ async fn install_json_timing_env_exposes_waterfall_without_detail() {
     );
     let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_TIMING", "1")
-        .args([
-            "install",
-            "--json",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--json", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run LPM_TIMING=1 lpm install --json");
 
@@ -3385,13 +3202,7 @@ async fn warm_installs_parse_the_lockfile_and_index_the_store_once() {
     let install_detail = || -> serde_json::Value {
         let output = lpm_with_registry(&project, &mock.url())
             .env("LPM_TIMING_DETAIL", "1")
-            .args([
-                "install",
-                "--json",
-                "--no-security-summary",
-                "--no-skills",
-                "--no-editor-setup",
-            ])
+            .args(["install", "--json", "--no-security-summary", "--no-skills"])
             .output()
             .expect("failed to run lpm install --json");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3443,13 +3254,7 @@ async fn fresh_checkouts_resolve_from_stored_metadata_projections() {
     let install = || -> (serde_json::Value, String) {
         let output = lpm_with_registry(&project, &mock.url())
             .env("LPM_TIMING_DETAIL", "trace")
-            .args([
-                "install",
-                "--json",
-                "--no-security-summary",
-                "--no-skills",
-                "--no-editor-setup",
-            ])
+            .args(["install", "--json", "--no-security-summary", "--no-skills"])
             .output()
             .expect("failed to run lpm install --json");
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3498,13 +3303,7 @@ async fn install_json_timing_detail_env_exposes_install_substage_probes() {
     );
     let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_TIMING_DETAIL", "1")
-        .args([
-            "install",
-            "--json",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--json", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install --json");
 
@@ -3901,13 +3700,7 @@ async fn install_fetch_overlap_threshold_one_keeps_install_output_authoritative(
         .env("LPM_STORE_VERSION", "v2")
         .env("LPM_TIMING_DETAIL", "1")
         .env("LPM_FETCH_OVERLAP_MIN_SELECTED", "1")
-        .args([
-            "install",
-            "--json",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--json", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install --json");
 
@@ -3994,12 +3787,7 @@ async fn frozen_install_rejects_unreachable_package_before_any_network_request()
     );
 
     let initial = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("create exact-graph lockfile fixture");
     assert!(
@@ -4048,7 +3836,6 @@ async fn frozen_install_rejects_unreachable_package_before_any_network_request()
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run frozen replay with unreachable package row");
@@ -4081,12 +3868,7 @@ async fn install_experimental_spike_replays_frozen_lockfile_and_emits_json() {
 
     let lockfile_output = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to create lockfile fixture");
     assert!(
@@ -4111,7 +3893,6 @@ async fn install_experimental_spike_replays_frozen_lockfile_and_emits_json() {
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run experimental installer spike");
@@ -4160,7 +3941,6 @@ async fn install_experimental_spike_live_graph_requires_benchmark_ack() {
             "--timing",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run unsupported experimental installer spike");
@@ -4207,7 +3987,6 @@ async fn install_experimental_spike_live_graph_requires_parity_deny() {
             "--timing",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run unsupported experimental installer spike");
@@ -4251,7 +4030,6 @@ async fn install_experimental_spike_lockfile_graph_requires_lockfile_gates() {
             "--timing",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run unsupported experimental installer spike");
@@ -4298,7 +4076,6 @@ async fn install_experimental_spike_live_graph_does_not_write_install_hash() {
             "--timing",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run experimental installer spike");
@@ -4384,7 +4161,6 @@ async fn install_experimental_spike_live_graph_applies_patched_dependencies() {
             "--timing",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run experimental installer spike");
@@ -4504,7 +4280,6 @@ async fn install_experimental_spike_prunes_descendants_of_platform_skipped_optio
             "--timing",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run experimental installer spike");
@@ -4577,7 +4352,6 @@ async fn install_experimental_spike_live_graph_accepts_overrides_with_parity_den
             "--timing",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run experimental installer spike");
@@ -4657,7 +4431,6 @@ async fn install_experimental_spike_live_graph_links_file_source_with_transitive
             "--timing",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run experimental installer spike");
@@ -4727,7 +4500,6 @@ async fn install_experimental_spike_live_graph_links_workspace_member_source_wit
             "--timing",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run experimental installer spike");
@@ -4780,12 +4552,7 @@ async fn install_experimental_spike_live_graph_rejects_frozen_lockfile_invocatio
 
     let lockfile_output = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to seed lockfile before frozen experimental rejection");
     assert!(
@@ -4809,7 +4576,6 @@ async fn install_experimental_spike_live_graph_rejects_frozen_lockfile_invocatio
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run unsupported experimental installer spike");
@@ -4844,13 +4610,7 @@ async fn install_json_timing_detail_trace_exposes_slow_package_buckets() {
     project.write_file(".npmrc", &format!("registry={}\n", mock.url()));
     let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_TIMING_DETAIL", "trace")
-        .args([
-            "install",
-            "--json",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--json", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install --json");
 
@@ -5047,12 +4807,7 @@ async fn install_lockfile_content_matches_snapshot() {
     );
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -5111,7 +4866,6 @@ async fn install_json_output_contains_package_list() {
             "--timing",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         // greedy-fusion is now the global install
         // default. This test asserts the PubGrub-walker arm's
@@ -5267,12 +5021,7 @@ async fn install_lockfile_reuse_is_fast_path() {
 
     // First install: resolves + downloads
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -5280,12 +5029,7 @@ async fn install_lockfile_reuse_is_fast_path() {
 
     // Second install: should hit the fast path (up to date)
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run second install");
 
@@ -5342,12 +5086,7 @@ async fn install_up_to_date_json_includes_flag() {
 
     // First install
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -5355,13 +5094,7 @@ async fn install_up_to_date_json_includes_flag() {
     // env-gated setup-only timing detail on the true fast-exit path.
     let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_TIMING_DETAIL", "trace")
-        .args([
-            "install",
-            "--json",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--json", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run second install --json");
 
@@ -5425,12 +5158,7 @@ async fn install_fast_lane_json_omits_timing_by_default() {
     );
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -5506,23 +5234,12 @@ async fn warm_install_with_direct_bin_dep_is_up_to_date() {
     );
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--json",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--json", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run warm install --json");
     assert!(output.status.success());
@@ -5580,12 +5297,7 @@ async fn install_offline_with_store_succeeds() {
 
     // First install online: populates store + lockfile
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -5604,7 +5316,6 @@ async fn install_offline_with_store_succeeds() {
             "--offline",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run offline install");
@@ -5634,7 +5345,6 @@ async fn install_offline_firewall_monitor_relinks_and_reports_offline_skip_json(
             "--timing",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run offline install with firewall monitor");
@@ -5682,7 +5392,6 @@ async fn install_package_shows_firewall_active_badge_when_public_npm_verdicts_ar
             "firewall-install@1.0.0",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run install with firewall monitor");
@@ -5723,7 +5432,6 @@ async fn install_package_omits_firewall_badge_when_firewall_is_off() {
             "plain-install@1.0.0",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run install with firewall off");
@@ -5759,7 +5467,6 @@ async fn install_offline_firewall_enforce_fails_closed_before_linking() {
             "--offline",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run offline install with firewall enforce");
@@ -5796,7 +5503,6 @@ async fn install_offline_firewall_enforce_uses_public_lockfile_source_when_npmrc
             "--offline",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run offline install with drifted npmrc");
@@ -5840,12 +5546,7 @@ async fn install_offline_with_default_v2_store_relinks_from_object_store() {
 
     let online = lpm_with_registry(&project, &mock.url())
         .env_remove("LPM_STORE_VERSION")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run online v2 install");
     assert!(
@@ -5867,7 +5568,6 @@ async fn install_offline_with_default_v2_store_relinks_from_object_store() {
             "--offline",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run offline v2 install");
@@ -5910,12 +5610,7 @@ async fn install_explicit_v3_lazily_migrates_v2_object_offline_without_rewriting
 
     let seeded = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to seed the v2 store");
     assert!(
@@ -5941,7 +5636,6 @@ async fn install_explicit_v3_lazily_migrates_v2_object_offline_without_rewriting
             "--offline",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run offline v2-to-v3 migration");
@@ -5999,12 +5693,7 @@ async fn install_default_v2_lazily_migrates_v3_object_offline_without_rewriting_
 
     let seeded = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v3")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to seed the v3 store");
     assert!(
@@ -6030,7 +5719,6 @@ async fn install_default_v2_lazily_migrates_v3_object_offline_without_rewriting_
             "--offline",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run offline v3-to-v2 migration");
@@ -6091,12 +5779,7 @@ async fn store_verify_deep_detects_same_size_v3_blob_tampering() {
 
     let installed = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v3")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("install v3 deep-verification fixture");
     assert!(
@@ -6161,12 +5844,7 @@ async fn cache_prune_keeps_shared_v3_blob_until_its_last_package_reference_is_re
 
     let initial = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v3")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("install shared CAS fixture");
     assert!(
@@ -6191,12 +5869,7 @@ async fn cache_prune_keeps_shared_v3_blob_until_its_last_package_reference_is_re
         .expect("remove prior links before relinking one package");
     let one_reference = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v3")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("remove the first package reference");
     assert!(
@@ -6239,12 +5912,7 @@ async fn cache_prune_keeps_shared_v3_blob_until_its_last_package_reference_is_re
         .expect("remove prior links before relinking an empty project");
     let no_references = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v3")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("remove the last package reference");
     assert!(
@@ -6302,12 +5970,7 @@ async fn install_source_analysis_defaults_off_and_opt_in_backfills_cache_without
 
     let disabled = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to install with source analysis disabled");
     assert!(
@@ -6336,12 +5999,7 @@ async fn install_source_analysis_defaults_off_and_opt_in_backfills_cache_without
     std::fs::write(&config_path, "install-time-source-analysis = true\n").unwrap();
     let enabled = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to reinstall after enabling source analysis");
     assert!(
@@ -6391,7 +6049,7 @@ async fn install_disabled_lpm_insights_skips_enrichment_request_but_keeps_local_
 
     let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
-        .args(["install", "--no-skills", "--no-editor-setup"])
+        .args(["install", "--no-skills"])
         .output()
         .expect("failed to install with LPM insights disabled");
     assert!(
@@ -6443,12 +6101,7 @@ async fn install_v2_tree_integrity_cache_hit_repairs_tampered_object_before_link
     let first = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
         .env("LPM_V2_OBJECT_INTEGRITY", "tree")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run first v2 install");
     assert!(
@@ -6477,12 +6130,7 @@ async fn install_v2_tree_integrity_cache_hit_repairs_tampered_object_before_link
     let second = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
         .env("LPM_V2_OBJECT_INTEGRITY", "tree")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run second v2 install");
     assert!(
@@ -6518,12 +6166,7 @@ async fn install_source_policy_migrates_legacy_tree_link_entry_without_stale_war
     let legacy = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
         .env("LPM_V2_OBJECT_INTEGRITY", "tree")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to seed legacy tree-mode v2 install");
     assert!(
@@ -6550,12 +6193,7 @@ async fn install_source_policy_migrates_legacy_tree_link_entry_without_stale_war
     let migrated = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
         .env("LPM_V2_OBJECT_INTEGRITY", "source")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to migrate legacy tree-mode v2 link entry");
     let stdout = String::from_utf8_lossy(&migrated.stdout);
@@ -6596,12 +6234,7 @@ async fn install_tree_policy_migrates_snapshotful_source_object_without_refetch_
     let source = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
         .env("LPM_V2_OBJECT_INTEGRITY", "source")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to seed source-mode v2 install");
     assert!(
@@ -6639,12 +6272,7 @@ async fn install_tree_policy_migrates_snapshotful_source_object_without_refetch_
     let migrated = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
         .env("LPM_V2_OBJECT_INTEGRITY", "tree")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to migrate source-mode v2 link entry");
     let stdout = String::from_utf8_lossy(&migrated.stdout);
@@ -6690,12 +6318,7 @@ async fn install_tree_policy_refetches_snapshotless_source_object_without_stale_
     let source = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
         .env("LPM_V2_OBJECT_INTEGRITY", "source")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to seed source-mode v2 install");
     assert!(
@@ -6734,12 +6357,7 @@ async fn install_tree_policy_refetches_snapshotless_source_object_without_stale_
     let migrated = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
         .env("LPM_V2_OBJECT_INTEGRITY", "tree")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to repair snapshotless source-mode v2 object");
     let stdout = String::from_utf8_lossy(&migrated.stdout);
@@ -6788,12 +6406,7 @@ async fn install_without_harness_overrides_uses_shipped_v2_layout() {
 
     let output = lpm_with_registry(&project, &mock.url())
         .env_remove("LPM_STORE_VERSION")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run install with shipped defaults");
 
@@ -6857,7 +6470,6 @@ async fn install_with_explicit_v1_uses_v1_store_and_isolated_linker() {
             "isolated",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run explicit v1 install");
@@ -6900,12 +6512,7 @@ async fn install_offline_json_empty_fingerprints_emit_null() {
     );
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -6921,7 +6528,6 @@ async fn install_offline_json_empty_fingerprints_emit_null() {
             "--json",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run offline install --json");
@@ -7029,13 +6635,7 @@ async fn bare_add_persists_finalized_manifest_in_lockfile_and_stays_up_to_date()
     );
 
     let add = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "ms",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "ms", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run bare package add");
     assert!(
@@ -7069,12 +6669,7 @@ async fn bare_add_persists_finalized_manifest_in_lockfile_and_stays_up_to_date()
     let lockfile_before = project.read_file(lpm_lockfile::LOCKFILE_NAME);
 
     let reinstall = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run immediate install after bare add");
     assert!(
@@ -7135,7 +6730,7 @@ async fn npm_only_install_separates_capabilities_from_noncritical_security_findi
         .success();
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args(["install", "--no-skills", "--no-editor-setup"])
+        .args(["install", "--no-skills"])
         .output()
         .expect("run npm-only install with a behavioral finding");
     assert!(
@@ -7195,7 +6790,7 @@ async fn verbose_npm_only_install_reports_noncritical_finding_details() {
         .success();
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
+        .args(["--verbose", "install", "--no-skills"])
         .output()
         .expect("run verbose npm-only install with behavioral findings");
     assert!(
@@ -7242,12 +6837,7 @@ async fn install_security_summary_ignores_forged_store_analysis_sidecars() {
 
     let first = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("install behavioral fixture");
     assert!(
@@ -7276,7 +6866,7 @@ async fn install_security_summary_ignores_forged_store_analysis_sidecars() {
 
     let second = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
-        .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
+        .args(["--verbose", "install", "--no-skills"])
         .output()
         .expect("run warm install with forged analysis sidecar");
     assert!(
@@ -7326,7 +6916,7 @@ async fn install_hides_info_only_behavioral_metadata_by_default() {
         .success();
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args(["install", "--no-skills", "--no-editor-setup"])
+        .args(["install", "--no-skills"])
         .output()
         .expect("run install with Info behavioral metadata");
 
@@ -7354,7 +6944,7 @@ async fn verbose_install_shows_info_metadata_with_matching_query_hint() {
         .success();
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args(["--verbose", "install", "--no-skills", "--no-editor-setup"])
+        .args(["--verbose", "install", "--no-skills"])
         .output()
         .expect("run verbose install with Info behavioral metadata");
 
@@ -7442,13 +7032,7 @@ async fn install_bare_writes_caret_resolved_not_wildcard() {
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "ms",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "ms", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install ms");
 
@@ -7523,23 +7107,12 @@ async fn install_add_with_transitive_same_name_keeps_only_the_new_direct_version
     );
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "chalk",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "chalk", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install add-path for direct/transitive name collision");
 
@@ -7602,12 +7175,7 @@ async fn uninstall_then_reinstall_same_packages_reports_only_readded_direct_deps
     );
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -7633,7 +7201,6 @@ async fn uninstall_then_reinstall_same_packages_reports_only_readded_direct_deps
             "beta",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to re-add previously removed deps");
@@ -7686,13 +7253,7 @@ async fn install_existing_dep_bare_reinstall_no_churn() {
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "ms",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "ms", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install ms");
 
@@ -7767,7 +7328,6 @@ async fn install_filtered_from_member_dir_reads_workspace_root_lpm_toml() {
             "app",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run filtered install from member dir");
@@ -7849,7 +7409,6 @@ catalog:
             "app",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run filtered install with strict catalog mismatch");
@@ -7914,13 +7473,7 @@ async fn install_honors_project_lpm_toml_save_prefix_tilde() {
     project.write_file("lpm.toml", "save-prefix = \"~\"\n");
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "ms",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "ms", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install ms");
 
@@ -7958,13 +7511,7 @@ async fn install_rejects_lpm_toml_with_wildcard_save_prefix() {
     project.write_file("lpm.toml", "save-prefix = \"*\"\n");
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "ms",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "ms", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install ms");
 
@@ -8010,7 +7557,6 @@ async fn install_explicit_range_beats_project_config_save_prefix() {
             "ms@^2.0.0",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install ms@^2.0.0");
@@ -8051,7 +7597,6 @@ async fn install_with_exact_flag_saves_pinned_version() {
             "--exact",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install ms --exact");
@@ -8092,7 +7637,6 @@ async fn install_with_tilde_flag_saves_tilde_resolved() {
             "--tilde",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install ms --tilde");
@@ -8134,7 +7678,6 @@ async fn install_with_save_prefix_tilde_saves_tilde_resolved() {
             "~",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install ms --save-prefix '~'");
@@ -8275,12 +7818,7 @@ async fn install_failure_rolls_back_lockfile_and_invalidates_install_hash() {
 
     // 1. Successful install populates lpm.lock + .lpm/install-hash.
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -8314,7 +7852,6 @@ async fn install_failure_rolls_back_lockfile_and_invalidates_install_hash() {
             "definitely-not-in-mock-registry",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to spawn lpm install");
@@ -8409,13 +7946,7 @@ async fn install_failure_restores_original_manifest_bytes() {
         .expect("must be able to read package.json before install");
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "ms",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "ms", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install ms");
 
@@ -8488,12 +8019,7 @@ async fn install_node_modules_package_json_has_correct_fields() {
     );
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -8570,12 +8096,7 @@ async fn install_creates_bin_symlink_for_binary_package() {
     );
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -8666,12 +8187,7 @@ require('framework-plugin').run();
 
     let install = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run v2 install for bin compatibility layout");
     assert!(
@@ -8713,12 +8229,7 @@ async fn install_file_local_dependency_links_into_node_modules() {
     project.write_file("packages/local-pkg/index.js", "module.exports = {};");
 
     lpm(&project)
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -8790,12 +8301,7 @@ async fn install_v2_links_same_name_version_edges_to_their_declared_sources() {
 
     let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run source identity v2 install");
 
@@ -8898,12 +8404,7 @@ async fn warm_v2_lockfile_peer_install_resolves_peer_after_relink() {
 
     let cold = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run cold v2 install");
     assert!(
@@ -8938,13 +8439,7 @@ async fn warm_v2_lockfile_peer_install_resolves_peer_after_relink() {
 
     let warm = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
-        .args([
-            "--json",
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["--json", "install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run warm v2 install");
     assert!(
@@ -9026,12 +8521,7 @@ async fn warm_v2_lockfile_install_preserves_blocked_metadata_when_registry_unava
 
     let cold = lpm_with_registry(&project, &registry_url)
         .env("LPM_STORE_VERSION", "v2")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run cold v2 install");
     assert!(
@@ -9052,13 +8542,7 @@ async fn warm_v2_lockfile_install_preserves_blocked_metadata_when_registry_unava
 
     let warm = lpm_with_registry(&project, &registry_url)
         .env("LPM_STORE_VERSION", "v2")
-        .args([
-            "--json",
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["--json", "install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run warm v2 install");
     assert!(
@@ -9112,12 +8596,7 @@ async fn install_lockfile_is_deterministic_across_fresh_installs() {
         );
 
         lpm_with_registry(&project, registry_url)
-            .args([
-                "install",
-                "--no-security-summary",
-                "--no-skills",
-                "--no-editor-setup",
-            ])
+            .args(["install", "--no-security-summary", "--no-skills"])
             .assert()
             .success();
 
@@ -9183,12 +8662,7 @@ fn store_v1_rollback_workspace_star_dep_links_member_source() {
     );
 
     lpm_v1(&project)
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -9226,12 +8700,7 @@ fn install_workspace_star_dep_accepts_member_without_version() {
     project.write_file("packages/no-ver/package.json", r#"{"name":"no-ver"}"#);
 
     lpm(&project)
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .env("LPM_STORE_VERSION", "v2")
         .assert()
         .success();
@@ -9275,12 +8744,7 @@ fn store_v1_rollback_workspace_caret_dep_links_member_source() {
     );
 
     lpm_v1(&project)
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -9344,12 +8808,7 @@ async fn install_direct_workspace_dep_installs_member_registry_deps_under_v2_sto
     let mut cmd = lpm_with_registry(&project, &mock.url());
     cmd.env("LPM_STORE_VERSION", "v2");
     let output = cmd
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run direct workspace install under v2 store");
 
@@ -9430,12 +8889,7 @@ async fn install_direct_workspace_dep_resolves_workspace_child_under_v2_store() 
     let mut cmd = lpm(&project);
     cmd.env("LPM_STORE_VERSION", "v2");
     let output = cmd
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run direct workspace install under v2 store");
 
@@ -9551,12 +9005,7 @@ exports.peer = require("@smoke/cycle-a").name
     cmd.current_dir(&app_dir);
     cmd.env("LPM_STORE_VERSION", "v2");
     let output = cmd
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run v2 install with registry re-entry cycle");
 
@@ -9678,7 +9127,6 @@ async fn store_v1_rollback_hoisted_mode_places_transitive_dep_at_root() {
             "hoisted",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .assert()
         .success();
@@ -9720,12 +9168,7 @@ async fn install_auto_installs_required_peer_dependencies_by_default() {
     );
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -9776,12 +9219,7 @@ async fn manifest_alias_preserves_canonical_ambient_peer_across_frozen_offline_r
     );
 
     let initial = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("install manifest alias beside canonical ambient peer");
     assert!(
@@ -9810,7 +9248,6 @@ async fn manifest_alias_preserves_canonical_ambient_peer_across_frozen_offline_r
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("replay manifest alias beside canonical ambient peer");
@@ -9851,12 +9288,7 @@ async fn install_resolves_root_optional_dependency() {
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("install root optional dependency");
 
@@ -9898,12 +9330,7 @@ async fn install_missing_root_optional_dependency_replays_frozen_and_offline() {
     );
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
     assert!(
@@ -9917,7 +9344,6 @@ async fn install_missing_root_optional_dependency_replays_frozen_and_offline() {
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .assert()
         .success();
@@ -9928,7 +9354,6 @@ async fn install_missing_root_optional_dependency_replays_frozen_and_offline() {
             "--offline",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .assert()
         .success();
@@ -9948,12 +9373,7 @@ fn install_skips_missing_optional_file_and_link_roots() {
     );
 
     let output = lpm(&project)
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("install missing optional local roots");
 
@@ -10023,12 +9443,7 @@ async fn install_optional_dep_failure_does_not_abort_install() {
     );
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -10077,12 +9492,7 @@ async fn run_transitive_dependency_failure_case(resolver: Option<&str>, parent_o
         r#"{"name":"transitive-failure","version":"1.0.0","dependencies":{"failure-host":"1.0.0"}}"#,
     );
     let mut command = lpm_with_registry(&project, &mock.url());
-    command.args([
-        "install",
-        "--no-security-summary",
-        "--no-skills",
-        "--no-editor-setup",
-    ]);
+    command.args(["install", "--no-security-summary", "--no-skills"]);
     if let Some(resolver) = resolver {
         command.env("LPM_RESOLVER", resolver);
     }
@@ -10187,12 +9597,7 @@ async fn pubgrub_keeps_shared_descendant_failure_fatal_when_any_path_is_required
         }"#,
     );
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .env("LPM_RESOLVER", "pubgrub")
         .output()
         .expect("run shared-path PubGrub failure install");
@@ -10225,12 +9630,7 @@ fn dependency_engine_install_command(
 ) -> assert_cmd::Command {
     let mut command = lpm_with_registry(project, registry_url);
     configure_fake_node(&mut command, project, "20.0.0");
-    command.args([
-        "install",
-        "--no-security-summary",
-        "--no-skills",
-        "--no-editor-setup",
-    ]);
+    command.args(["install", "--no-security-summary", "--no-skills"]);
     command
 }
 
@@ -10439,12 +9839,7 @@ fn strict_install_skips_incompatible_optional_file_dependency_from_local_source(
     let mut command = lpm(&project);
     configure_fake_node(&mut command, &project, "20.0.0");
     let output = command
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run local optional dependency-engine install");
 
@@ -10484,12 +9879,7 @@ fn install_accepts_versionless_transitive_link_dependency() {
     );
 
     let output = lpm(&project)
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("install versionless transitive link dependency");
 
@@ -10530,12 +9920,7 @@ fn install_does_not_auto_install_optional_peer_from_local_dependency() {
     );
 
     let output = lpm(&project)
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("install local dependency with an absent optional peer");
 
@@ -10765,7 +10150,6 @@ async fn experimental_resolver_skips_missing_optional_registry_dependency_from_l
             "--timing",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run experimental optional metadata failure install");
@@ -10809,12 +10193,7 @@ fn strict_install_skips_incompatible_optional_workspace_dependency_from_local_so
     let mut command = lpm(&project);
     configure_fake_node(&mut command, &project, "20.0.0");
     let output = command
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run optional workspace dependency from local source install");
 
@@ -10870,12 +10249,7 @@ fn optional_local_parent_engine_skip_prunes_required_workspace_descendant_link()
     let mut command = lpm(&project);
     configure_fake_node(&mut command, &project, "20.0.0");
     let output = command
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run inherited optional workspace descendant install");
 
@@ -10916,12 +10290,7 @@ fn v1_store_rejects_required_workspace_member_with_incompatible_node_engine() {
     let mut command = lpm_v1(&project);
     configure_fake_node(&mut command, &project, "20.0.0");
     let output = command
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run v1 workspace dependency-engine install");
 
@@ -10959,12 +10328,7 @@ fn v1_store_skips_optional_workspace_member_with_incompatible_node_engine() {
     let mut command = lpm_v1(&project);
     configure_fake_node(&mut command, &project, "20.0.0");
     let output = command
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run v1 optional workspace dependency-engine install");
 
@@ -11004,7 +10368,6 @@ fn v1_store_omit_optional_does_not_link_workspace_member() {
             "--omit=optional",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .assert()
         .success();
@@ -11035,12 +10398,7 @@ fn offline_v2_omit_optional_does_not_reintroduce_workspace_member() {
 
     lpm(&project)
         .env("LPM_STORE_VERSION", "v2")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
     assertions::assert_in_node_modules(project.path(), "workspace-optional");
@@ -11055,7 +10413,6 @@ fn offline_v2_omit_optional_does_not_reintroduce_workspace_member() {
             "--omit=optional",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .assert()
         .success();
@@ -11099,12 +10456,7 @@ fn optional_dependency_overrides_duplicate_required_local_source_dependency() {
     let mut command = lpm(&project);
     configure_fake_node(&mut command, &project, "20.0.0");
     let output = command
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run duplicate local dependency override install");
 
@@ -11332,12 +10684,7 @@ async fn install_optional_platform_dep_selects_newest_then_skips_current_host() 
     );
 
     let output = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run platform parity install");
     assert!(
@@ -11400,7 +10747,6 @@ async fn install_omit_optional_keeps_lockfile_graph_without_fetching_or_linking_
             "--omit=optional",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .assert()
         .success();
@@ -11438,7 +10784,6 @@ async fn install_omit_optional_keeps_lockfile_graph_without_fetching_or_linking_
             "--omit=optional",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .assert()
         .success();
@@ -11481,7 +10826,6 @@ async fn install_omit_optional_prunes_transitive_optional_dependency_from_requir
             "--omit=optional",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .assert()
         .success();
@@ -11544,7 +10888,6 @@ async fn install_omit_optional_strict_peers_ignores_missing_peer_of_omitted_pack
             "--strict-peer-dependencies",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run strict omit-optional install");
@@ -11624,7 +10967,6 @@ async fn install_omit_optional_strict_integrity_ignores_unverified_omitted_packa
             "--strict-integrity",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .assert()
         .success();
@@ -11688,7 +11030,6 @@ async fn install_omit_optional_prunes_registry_child_promoted_from_file_source()
             "--omit=optional",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .assert()
         .success();
@@ -11755,7 +11096,6 @@ async fn install_combined_omit_prunes_dev_file_source_and_its_optional_registry_
             "--omit=dev,optional",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .assert()
         .success();
@@ -11805,13 +11145,7 @@ async fn install_prod_omits_dev_dependencies_from_disk_but_keeps_lockfile_entrie
     );
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--prod",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--prod", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -11834,7 +11168,6 @@ async fn install_prod_omits_dev_dependencies_from_disk_but_keeps_lockfile_entrie
             "--omit=dev",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .assert()
         .success();
@@ -11877,13 +11210,7 @@ async fn frozen_offline_combined_omit_retains_required_ambient_peer_for_producti
     );
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--prod",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--prod", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
     assertions::assert_in_node_modules(project.path(), "prod-peer-provider");
@@ -11898,7 +11225,6 @@ async fn frozen_offline_combined_omit_retains_required_ambient_peer_for_producti
             "--omit=dev,optional",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .assert()
         .success();
@@ -11937,12 +11263,7 @@ async fn install_omit_dev_after_full_install_does_not_use_up_to_date_fast_path()
     );
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -11957,7 +11278,6 @@ async fn install_omit_dev_after_full_install_does_not_use_up_to_date_fast_path()
             "--timing",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run second lpm install --omit=dev");
@@ -12006,7 +11326,6 @@ async fn install_omit_dev_does_not_prefetch_dev_only_packages() {
             "--json",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("failed to run lpm install --json --omit=dev");
@@ -12111,13 +11430,7 @@ async fn credentialed_registry_overlap_install(
         .env("LPM_STORE_VERSION", "v2")
         .env("LPM_TIMING_DETAIL", "1")
         .env("LPM_FETCH_OVERLAP_MIN_SELECTED", "1")
-        .args([
-            "install",
-            "--json",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--json", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run lpm install --json");
 
@@ -12226,12 +11539,7 @@ async fn install_lockfile_integrity_matches_stored_tarball_sha512() {
     );
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -12294,12 +11602,7 @@ async fn install_tarball_url_with_declared_sri_writes_non_registry_lockfile_entr
     ));
 
     let output = lpm(&project)
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn lpm install");
 
@@ -12376,12 +11679,7 @@ async fn install_github_dependency_at_commit_writes_replayable_lockfile_entry() 
 
     let output = lpm(&project)
         .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run GitHub dependency install");
 
@@ -12431,12 +11729,7 @@ async fn install_skips_unavailable_optional_github_dependency() {
 
     let output = lpm(&project)
         .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("install unavailable optional GitHub dependency");
 
@@ -12508,7 +11801,6 @@ async fn recursive_workspace_install_and_offline_replay_preserve_member_github_d
             "--recursive",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run recursive workspace GitHub dependency install");
@@ -12574,7 +11866,6 @@ async fn recursive_workspace_install_and_offline_replay_preserve_member_github_d
             "--offline",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run frozen offline recursive workspace GitHub replay");
@@ -12633,12 +11924,7 @@ async fn install_github_dependency_at_branch_locks_resolved_commit() {
     let output = lpm(&project)
         .env("LPM_GITHUB_API_BASE_URL", github.uri())
         .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run GitHub branch dependency install");
 
@@ -12670,12 +11956,7 @@ fn install_github_dependency_rejects_credentials_without_disclosure() {
 }}"#,
     ));
     let output = lpm(&project)
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run credential-bearing GitHub dependency install");
 
@@ -12714,12 +11995,7 @@ async fn install_github_dependency_refuses_archive_redirect() {
     ));
     let output = lpm(&project)
         .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run redirected GitHub dependency install");
 
@@ -12765,12 +12041,7 @@ async fn install_github_dependency_rejects_oversized_archive_before_reading_body
     ));
     let output = lpm(&project)
         .env("LPM_GITHUB_CODELOAD_BASE_URL", format!("http://{address}"))
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run oversized GitHub dependency install");
     server.join().expect("join raw GitHub server");
@@ -12813,12 +12084,7 @@ async fn install_github_dependency_replays_frozen_lockfile_offline() {
     ));
     let first = lpm(&project)
         .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run initial GitHub dependency install");
     assert!(first.status.success());
@@ -12834,7 +12100,6 @@ async fn install_github_dependency_replays_frozen_lockfile_offline() {
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run frozen offline GitHub replay");
@@ -12874,12 +12139,7 @@ async fn install_github_dependency_fails_offline_when_store_is_missing() {
     ));
     let first = lpm(&project)
         .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run initial GitHub dependency install");
     assert!(first.status.success());
@@ -12896,7 +12156,6 @@ async fn install_github_dependency_fails_offline_when_store_is_missing() {
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run frozen offline GitHub replay without store");
@@ -12948,12 +12207,7 @@ async fn install_github_dependencies_keep_two_commits_of_same_package_distinct()
     ));
     let output = lpm(&project)
         .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("install two commits of one GitHub package");
 
@@ -13002,12 +12256,7 @@ async fn install_github_dependency_writes_deterministic_lockfile_bytes() {
     for project in [&first, &second] {
         let output = lpm(project)
             .env("LPM_GITHUB_CODELOAD_BASE_URL", github.uri())
-            .args([
-                "install",
-                "--no-security-summary",
-                "--no-skills",
-                "--no-editor-setup",
-            ])
+            .args(["install", "--no-security-summary", "--no-skills"])
             .output()
             .expect("install deterministic GitHub dependency fixture");
         assert!(
@@ -13226,12 +12475,7 @@ fn install_workspace_accepts_utf8_bom_prefixed_member_manifest() {
     );
 
     let output = lpm(&project)
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run recursive workspace install");
 
@@ -13460,12 +12704,7 @@ async fn install_registry_transitive_keeps_registry_and_workspace_instances_sepa
     let mut cmd = lpm_with_registry(&project, &mock.url());
     cmd.current_dir(project.path().join("apps/app"));
     let output = cmd
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run workspace external re-entry install");
 
@@ -13585,12 +12824,7 @@ async fn assert_registry_transitive_uses_registry_when_workspace_version_does_no
         cmd.env("LPM_GREEDY_FUSION", "0");
     }
     let output = cmd
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run install with a nonmatching workspace package version");
 
@@ -13680,12 +12914,7 @@ async fn install_registry_transitive_uses_registry_when_workspace_version_matche
     let mut cmd = lpm_with_registry(&project, &mock.url());
     cmd.current_dir(project.path().join("apps/app"));
     let output = cmd
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("install registry consumer beside same-version workspace member");
 
@@ -13785,12 +13014,7 @@ async fn install_registry_transitive_keeps_registry_and_workspace_instances_sepa
     cmd.env("LPM_STORE_VERSION", "v2");
     cmd.current_dir(project.path().join("apps/app"));
     let output = cmd
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run workspace external re-entry install under v2 store");
 
@@ -13875,12 +13099,7 @@ fn install_workspace_self_dependency_fails_without_writing_artifacts() {
     let mut cmd = lpm(&project);
     cmd.current_dir(project.path().join("packages/self-loop"));
     let output = cmd
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to run workspace self-dependency install");
 
@@ -13930,12 +13149,7 @@ fn install_workspace_dev_self_dependency_succeeds_without_creating_a_self_link()
     let mut cmd = lpm(&project);
     cmd.current_dir(project.path().join("packages/dev-self"));
     let output = cmd
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("run workspace dev self-dependency install");
 
@@ -14019,12 +13233,7 @@ fn store_v1_rollback_file_dedupe_transitives_link_member_sources_at_root() {
 // pre-pass, the alias-vs-canonical disambiguation, and ghost workspace
 // transitives failing closed both online and offline.
 
-const WORKSPACE_INSTALL_FLAGS: &[&str] = &[
-    "install",
-    "--no-security-summary",
-    "--no-skills",
-    "--no-editor-setup",
-];
+const WORKSPACE_INSTALL_FLAGS: &[&str] = &["install", "--no-security-summary", "--no-skills"];
 
 fn assert_root_symlink_exists(project: &TempProject, root_name: &str) {
     let link = project.path().join("node_modules").join(root_name);
@@ -14086,7 +13295,6 @@ fn recursive_frozen_replay_accepts_dependency_free_workspace_importer() {
             "--timing",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
             "--no-audit-after-install",
         ])
         .output()
@@ -14113,7 +13321,6 @@ fn recursive_frozen_replay_accepts_dependency_free_workspace_importer() {
             "--timing",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
             "--no-audit-after-install",
         ])
         .output()
@@ -14171,7 +13378,6 @@ async fn recursive_frozen_replay_accepts_parent_relative_workspace_peer_sources(
             "--recursive",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn initial recursive install");
@@ -14205,7 +13411,6 @@ async fn recursive_frozen_replay_accepts_parent_relative_workspace_peer_sources(
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn frozen recursive replay");
@@ -14250,7 +13455,6 @@ fn recursive_frozen_replay_accepts_aliased_file_workspace_member_identity() {
             "--recursive",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn initial recursive install");
@@ -14268,7 +13472,6 @@ fn recursive_frozen_replay_accepts_aliased_file_workspace_member_identity() {
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn frozen recursive replay");
@@ -14335,7 +13538,6 @@ fn recursive_lockfile_records_canonical_alias_for_transitive_file_workspace_memb
             "--recursive",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn recursive install");
@@ -14411,7 +13613,6 @@ async fn recursive_workspace_root_dependency_satisfies_member_transitive_peer() 
             "--recursive",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn recursive install");
@@ -14503,7 +13704,6 @@ async fn recursive_omit_optional_does_not_expose_root_optional_peer_provider_to_
             "--omit=optional",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn recursive omit-optional install");
@@ -14607,7 +13807,6 @@ async fn recursive_workspace_root_local_dependency_satisfies_member_transitive_p
             "--recursive",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn recursive install");
@@ -14650,7 +13849,6 @@ async fn recursive_workspace_root_local_dependency_satisfies_member_transitive_p
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn frozen recursive replay");
@@ -14723,7 +13921,6 @@ async fn recursive_workspace_root_local_dependency_closure_satisfies_member_tran
             "--recursive",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn recursive install");
@@ -14829,7 +14026,6 @@ async fn recursive_workspace_root_peer_context_replays_frozen_and_offline() {
             "--recursive",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn initial recursive install");
@@ -14852,7 +14048,6 @@ async fn recursive_workspace_root_peer_context_replays_frozen_and_offline() {
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn frozen offline recursive replay");
@@ -14960,7 +14155,6 @@ async fn recursive_workspace_root_provider_change_invalidates_member_peer_contex
             "--recursive",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn initial recursive install");
@@ -14988,7 +14182,6 @@ async fn recursive_workspace_root_provider_change_invalidates_member_peer_contex
             "--recursive",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn recursive install after root provider change");
@@ -15072,7 +14265,6 @@ async fn recursive_workspace_root_provider_outside_peer_range_remains_strict_err
             "--recursive",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn strict recursive install");
@@ -15181,7 +14373,6 @@ async fn recursive_workspace_root_provider_closure_preserves_root_override_conte
             "--recursive",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn recursive install with importer-specific overrides");
@@ -15262,7 +14453,6 @@ async fn recursive_workspace_root_provider_closure_preserves_registry_route_cont
             "--recursive",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn recursive install with package-specific routes");
@@ -15342,7 +14532,6 @@ async fn recursive_frozen_replay_ignores_registry_roots_injected_by_workspace_so
             "--recursive",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn initial recursive install");
@@ -15373,7 +14562,6 @@ async fn recursive_frozen_replay_ignores_registry_roots_injected_by_workspace_so
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn frozen recursive replay");
@@ -15535,7 +14723,6 @@ fn recursive_install_timing_distinguishes_command_work_from_target_observations(
             "--timing",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn recursive lpm install with timing");
@@ -15700,12 +14887,7 @@ async fn recursive_install_does_not_commit_any_importer_when_preparation_fails()
 
     let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn recursive install with one failing importer");
 
@@ -15811,12 +14993,7 @@ async fn recursive_install_rolls_back_non_union_importer_when_later_importer_fai
 
     let output = lpm_with_registry(&project, &mock.url())
         .env("LPM_STORE_VERSION", "v2")
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn recursive install with a later non-union failure");
 
@@ -15904,7 +15081,6 @@ async fn recursive_resolve_ahead_matches_sequential_lockfile_bytes() {
             "deny",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run sequential recursive install");
@@ -15925,7 +15101,6 @@ async fn recursive_resolve_ahead_matches_sequential_lockfile_bytes() {
             "deny",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run resolve-ahead recursive install");
@@ -16071,7 +15246,6 @@ async fn recursive_fresh_resolution_matches_metadata_cache_warm_resolution() {
             "deny",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run cold recursive install");
@@ -16122,7 +15296,6 @@ async fn recursive_fresh_resolution_matches_metadata_cache_warm_resolution() {
             "deny",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run metadata-cache-warm recursive install");
@@ -16164,7 +15337,6 @@ async fn legacy_metadata_cache_schema_cannot_change_install_lockfile() {
                 "deny",
                 "--no-security-summary",
                 "--no-skills",
-                "--no-editor-setup",
             ])
             .output()
             .expect("run metadata-schema install")
@@ -16377,7 +15549,6 @@ async fn assert_forced_resolution_preserves_prior_unpacked_size(route: &str) {
             "deny",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run initial unpacked-size install");
@@ -16397,7 +15568,6 @@ async fn assert_forced_resolution_preserves_prior_unpacked_size(route: &str) {
             "deny",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run forced unpacked-size install");
@@ -16471,7 +15641,6 @@ fn offline_install_reruns_workspace_member_bfs_expansion() {
             "--offline",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn lpm install --offline");
@@ -16521,7 +15690,6 @@ fn offline_install_handles_f9_deduped_workspace_member() {
             "--offline",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn lpm install --offline");
@@ -16595,7 +15763,6 @@ async fn offline_install_mixed_registry_and_file_dep_uses_lockfile_fast_path() {
             "--offline",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn lpm install --offline");
@@ -16659,7 +15826,6 @@ fn local_source_manifest_drift_re_resolves_online_and_fails_offline_and_frozen()
             "--offline",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run offline install after local-source drift");
@@ -16676,7 +15842,6 @@ fn local_source_manifest_drift_re_resolves_online_and_fails_offline_and_frozen()
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run frozen install after local-source drift");
@@ -16702,7 +15867,6 @@ fn local_source_manifest_drift_re_resolves_online_and_fails_offline_and_frozen()
             "--offline",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .assert()
         .success();
@@ -16769,7 +15933,6 @@ fn frozen_replay_rejects_local_manifest_mutation_before_materialization() {
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ]);
     let mut child = command.spawn().expect("spawn paused frozen install");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -16853,7 +16016,6 @@ fn store_v1_rollback_workspace_alias_and_transitive_target_get_root_links() {
             "--offline",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn lpm install --offline");
@@ -16957,7 +16119,6 @@ fn offline_install_workspace_ghost_transitive_after_manifest_edit_fails_closed()
             "--offline",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn lpm install --offline");
@@ -17186,13 +16347,7 @@ async fn install_default_accepts_newly_published_package_without_approval() {
     mount_release_age_pkg(&mock, &iso8601_n_secs_ago(60)).await;
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--json",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--json", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
     assert!(project.file_exists(&format!("node_modules/{RELEASE_AGE_PKG}/package.json")));
@@ -17326,12 +16481,7 @@ async fn warm_public_npm_lockfile_project_for_offline_firewall(mode: &str) -> Te
     );
 
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -17706,12 +16856,7 @@ async fn install_does_not_verify_registry_signatures_by_default() {
     mount_unsigned_signature_pkg(&mock).await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn lpm install");
 
@@ -17734,12 +16879,7 @@ async fn install_config_signatures_true_blocks_unsigned_registry_package() {
     mount_unsigned_signature_pkg(&mock).await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn lpm install");
 
@@ -17771,12 +16911,7 @@ async fn install_config_signatures_true_blocks_malformed_registry_signature() {
     mount_malformed_signature_pkg(&mock).await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn lpm install");
 
@@ -17808,12 +16943,7 @@ async fn install_config_signatures_true_blocks_mismatched_registry_signature() {
     mount_mismatched_signature_pkg(&mock).await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn lpm install");
 
@@ -17862,12 +16992,7 @@ async fn install_config_signatures_true_verifies_a_range_dependency_signed_by_a_
     mount_package_signed_by_a_retired_key(&mock).await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn lpm install");
 
@@ -17893,12 +17018,7 @@ async fn install_config_signatures_true_accepts_signed_registry_package() {
     mount_signed_signature_pkg(&mock).await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn lpm install");
 
@@ -17926,12 +17046,7 @@ async fn install_config_signatures_true_persists_registry_signature_metadata_in_
     mount_signed_signature_pkg(&mock).await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn lpm install");
 
@@ -17972,12 +17087,7 @@ async fn install_range_selects_older_version_when_latest_is_inside_release_age_w
     mount_release_age_range_pkg(&mock).await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn lpm install");
 
@@ -18009,12 +17119,7 @@ async fn assert_install_latest_fallback_never_exceeds_rolled_back_dist_tag(resol
     mount_release_age_rolled_back_latest_pkg(&mock).await;
 
     let mut command = lpm_with_registry(&project, &mock.url());
-    command.args([
-        "install",
-        "--no-security-summary",
-        "--no-skills",
-        "--no-editor-setup",
-    ]);
+    command.args(["install", "--no-security-summary", "--no-skills"]);
     if let Some(resolver) = resolver {
         command.env("LPM_RESOLVER", resolver);
     }
@@ -18059,12 +17164,7 @@ async fn install_keeps_newer_parent_when_only_transitive_child_is_inside_release
     mount_release_age_transitive_fallback_pkgs(&mock).await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn lpm install");
 
@@ -18097,12 +17197,7 @@ async fn install_strict_release_age_selects_mature_transitive_path() {
     mount_release_age_transitive_fallback_pkgs(&mock).await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn lpm install");
 
@@ -18231,7 +17326,6 @@ async fn install_strict_release_age_hydrates_platform_metadata_for_mature_option
             "deny",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("run strict release-age install");
@@ -18285,12 +17379,7 @@ async fn install_strict_release_age_revalidates_fresh_lockfile_entry() {
     write_signed_unlock(&project, &["cooldown-bypass"]);
 
     let initial = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn initial lpm install");
     assert!(
@@ -18321,7 +17410,6 @@ async fn install_strict_release_age_revalidates_fresh_lockfile_entry() {
             "--frozen-lockfile",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn strict lockfile replay");
@@ -18344,12 +17432,7 @@ async fn install_strict_release_age_allows_custom_registry_without_publish_times
     mount_release_age_pkg_without_publish_time(&mock).await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn strict release-age install");
 
@@ -18376,12 +17459,7 @@ async fn install_package_json_min_release_age_exclude_allows_fresh_direct_depend
     mount_release_age_pkg(&mock, &iso8601_n_secs_ago(3_600)).await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn lpm install");
 
@@ -18409,12 +17487,7 @@ async fn install_package_json_version_release_age_exclude_allows_only_the_select
     mount_release_age_pkg(&mock, &iso8601_n_secs_ago(3_600)).await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn version-excluded lpm install");
 
@@ -18442,12 +17515,7 @@ async fn install_package_json_version_release_age_exclude_does_not_allow_another
     mount_release_age_pkg(&mock, &iso8601_n_secs_ago(3_600)).await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn differently-versioned exclusion install");
 
@@ -18468,12 +17536,7 @@ async fn install_package_json_scoped_wildcard_release_age_exclude_allows_package
     mount_release_age_pkg(&mock, &iso8601_n_secs_ago(3_600)).await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn scope-excluded lpm install");
 
@@ -18501,7 +17564,6 @@ async fn install_min_release_age_exclude_cli_allows_fresh_direct_dependency() {
             RELEASE_AGE_PKG,
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .expect("spawn lpm install");
@@ -18532,12 +17594,7 @@ async fn install_min_release_age_exclude_matches_alias_target_canonical_name() {
     mount_release_age_alias_target_pkg(&mock, &iso8601_n_secs_ago(3_600)).await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn lpm install");
 
@@ -18567,12 +17624,7 @@ async fn install_min_release_age_exclude_does_not_match_alias_local_name() {
     mount_release_age_alias_target_pkg(&mock, &iso8601_n_secs_ago(3_600)).await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn lpm install");
 
@@ -18594,12 +17646,7 @@ async fn install_trust_policy_no_downgrade_blocks_exact_version_that_drops_trust
     mount_trust_downgrade_pkg(&mock).await;
 
     let out = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn lpm install");
 
@@ -18904,12 +17951,7 @@ async fn install_invalidates_freshness_cache_on_lpm_linker_flip() {
     // default isolated layout. After this completes, .lpm/install-hash
     // contains a hash keyed on `linker_mode = isolated`.
     let first = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn first install");
     assert!(
@@ -18922,12 +17964,7 @@ async fn install_invalidates_freshness_cache_on_lpm_linker_flip() {
     // Sanity: a no-flag re-install should be "up to date" because the
     // resolved linker still matches what the cache encoded.
     let cached = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn cached re-install");
     assert!(cached.status.success());
@@ -18950,12 +17987,7 @@ async fn install_invalidates_freshness_cache_on_lpm_linker_flip() {
         lpm_linker::LinkerMode::Isolated => "hoisted",
     };
     let flipped = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .env("LPM_LINKER", opposite)
         .output()
         .expect("spawn flipped re-install");
@@ -18989,8 +18021,8 @@ async fn install_invalidates_freshness_cache_on_lpm_linker_flip() {
 ///
 /// The fast lane is gated by `argv_qualifies_for_fast_lane()`
 /// ([install_state.rs:681](../../crates/lpm-cli/src/install_state.rs)).
-/// `--registry`, `--insecure`, `--no-skills`, `--no-editor-setup`,
-/// `--no-security-summary`, and any other install flag disqualify it,
+/// `--registry`, `--insecure`, `--no-skills`, `--no-security-summary`,
+/// and any other install flag disqualify it,
 /// so the bad-env repro MUST be a plain bare `lpm install` to actually
 /// hit the fast lane. The warm phase still uses `lpm_with_registry`
 /// because that's how the mock-backed install lands a real warm cache;
@@ -19034,12 +18066,7 @@ async fn install_invalid_lpm_linker_surfaces_through_sync_fast_lane() {
     // for the load-bearing assertion below — the warm install just has
     // to land state on disk.
     let warmed = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("spawn warm install");
     assert!(
@@ -19379,13 +18406,7 @@ async fn install_reports_exact_pool_graph_and_retries_it_on_an_unchanged_project
     for _ in 0..2 {
         let output = lpm_with_registry(&project, &mock.url())
             .env("LPM_TOKEN", "pool-graph-fixture")
-            .args([
-                "install",
-                "--no-skills",
-                "--no-editor-setup",
-                "--no-security-summary",
-                "--json",
-            ])
+            .args(["install", "--no-skills", "--no-security-summary", "--json"])
             .output()
             .expect("install graph fixture");
         assert!(
@@ -19451,13 +18472,7 @@ async fn install_retries_legacy_pool_roots_after_an_old_registry_rejects_graphs(
     for _ in 0..2 {
         let output = lpm_with_registry(&project, &mock.url())
             .env("LPM_TOKEN", "rollback-fixture")
-            .args([
-                "install",
-                "--json",
-                "--no-skills",
-                "--no-editor-setup",
-                "--no-security-summary",
-            ])
+            .args(["install", "--json", "--no-skills", "--no-security-summary"])
             .output()
             .expect("install against older registry");
         assert!(
@@ -19520,12 +18535,7 @@ async fn invalid_signature_environment_preserves_saved_verification() {
         write_signatures_global_config(&project, true);
         let out = lpm_with_registry(&project, &mock.url())
             .env("LPM_VERIFY_REGISTRY_SIGNATURES", raw)
-            .args([
-                "install",
-                "--no-security-summary",
-                "--no-skills",
-                "--no-editor-setup",
-            ])
+            .args(["install", "--no-security-summary", "--no-skills"])
             .output()
             .unwrap();
         assert!(!out.status.success(), "{raw:?}: unsigned package installed");

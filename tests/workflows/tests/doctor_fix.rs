@@ -184,50 +184,25 @@ fn seed_orphaned_store_link(project: &TempProject) -> std::path::PathBuf {
     link_dir
 }
 
-// ─── gitattributes_missing fix ────────────────────────────────────────
+// ─── .gitattributes stays the project's ───────────────────────────────
 
 #[test]
-fn doctor_fix_creates_gitattributes_when_lockfile_exists_without_it() {
+fn doctor_all_fix_does_not_add_a_gitattributes() {
     let project = TempProject::empty(r#"{"name":"doctor-gitattr","version":"1.0.0"}"#);
     seed_healthy_hoisted_install(&project);
     seed_minimal_lockfile(&project);
-    // Crucially: NO .gitattributes file. lpm.lock exists, so the
-    // GITATTRIBUTES_MISSING warn fires.
-    assert!(
-        !project.file_exists(".gitattributes"),
-        "preconditions: .gitattributes must not exist before --fix"
-    );
 
-    // `.gitattributes` hygiene is Extended-tier, so the default fast
-    // preset doesn't check it. Add `--all` so the warn fires and the
-    // auto-fix branch runs.
     let output = lpm_doctor_offline(&project)
-        .arg("doctor")
-        .arg("--all")
-        .arg("--fix")
-        .arg("--yes")
+        .args(["doctor", "--all", "--fix", "--yes", "--json"])
         .output()
         .expect("failed to run lpm doctor --all --fix");
 
-    // Doctor's exit code reflects whether any failing checks remain.
-    // Registry/auth always fail in this offline harness, so non-zero
-    // exit is expected; we only assert the fix-branch side effect.
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        project.file_exists(".gitattributes"),
-        "doctor --all --fix must create .gitattributes when lpm.lock is present and the file is missing\noutput:\n{combined}"
+        !project.file_exists(".gitattributes"),
+        "doctor --all --fix must not write .gitattributes\noutput:\n{stdout}"
     );
-
-    let content = project.read_file(".gitattributes");
-    assert!(
-        content.contains("lpm.lockb binary"),
-        ".gitattributes must mark lpm.lockb as binary, got:\n{content}"
-    );
+    assert!(!stdout.contains("gitattributes"), "{stdout}");
 }
 
 // ─── lockfile_binary_missing fix ──────────────────────────────────────
@@ -396,8 +371,7 @@ fn doctor_fix_json_envelope_carries_fix_outcome_arrays() {
         .as_array()
         .expect("fixes_failed must be an array even when no fixes fail");
 
-    // Sanity: at least one fix should have run (gitattributes,
-    // lpm.lockb, or both, depending on doctor's check order).
+    // Sanity: the seeded project's missing lpm.lockb gets reconciled.
     assert!(
         !fixes.is_empty(),
         "doctor --fix --json on the seeded project must report at least one fix, got: {envelope}",
@@ -743,11 +717,7 @@ fn workspace_member_doctor_uses_its_projection_and_repairs_root_lockfile_hygiene
         !project.file_exists("lpm.lockb"),
         "doctor must remove an obsolete binary cache that cannot represent workspace projections"
     );
-    assert!(
-        project
-            .read_file(".gitattributes")
-            .contains("lpm.lockb binary")
-    );
+    assert!(!project.file_exists(".gitattributes"));
     assert!(!app_dir.join("lpm.lock").exists());
     assert!(!app_dir.join("lpm.lockb").exists());
     assert!(!app_dir.join(".gitattributes").exists());
@@ -805,7 +775,6 @@ fn doctor_human_summary_reports_failed_repairs() {
     let project = TempProject::empty(r#"{"name":"doctor-fix-failure","version":"1.0.0"}"#);
     seed_healthy_hoisted_install(&project);
     seed_minimal_lockfile(&project);
-    project.write_file(".gitattributes", "lpm.lockb binary\n");
     seed_verified_plugin_with_binary(&project, "biome", "2.5.9", b"#!/bin/sh\nif [ \"$3\" = \"--write\" ]; then echo 'failed repair' >&2; exit 9; fi\necho 'Formatter would have printed fixture.js' >&2\nexit 1\n");
     let output = lpm_doctor_offline(&project)
         .env("LPM_PLUGIN_GITHUB_API_BASE", "http://127.0.0.1:1")
@@ -835,7 +804,6 @@ async fn doctor_failed_plugin_repairs_identify_each_target() {
     let project = TempProject::empty(r#"{"name":"doctor-plugin-failures","version":"1.0.0"}"#);
     seed_healthy_hoisted_install(&project);
     seed_minimal_lockfile(&project);
-    project.write_file(".gitattributes", "lpm.lockb binary\n");
     let server = MockServer::start().await;
     for (name, version, route, tag) in [
         (
@@ -930,7 +898,6 @@ fn doctor_report_after_manifest_repair(
     );
     project.write_file("packages/a/package.json", member_a);
     project.write_file("packages/b/package.json", member_b);
-    project.write_file(".gitattributes", "lpm.lockb binary\n");
     project.write_file("lpm.json", r#"{"tools":{"biome":"2.5.9"}}"#);
     seed_healthy_hoisted_install(&project);
     seed_minimal_lockfile(&project);

@@ -223,10 +223,6 @@ pub(super) fn run_online_lockfile_write_phase(
             input.lockfile_path,
             "write",
         )?);
-        if !workspace_lockfile::active() {
-            lpm_lockfile::ensure_gitattributes(input.project_dir)
-                .map_err(|e| LpmError::Registry(format!("failed to ensure .gitattributes: {e}")))?;
-        }
         return Ok(result);
     }
 

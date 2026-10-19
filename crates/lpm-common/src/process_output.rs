@@ -13,12 +13,45 @@ pub fn output_capped(
     timeout: Duration,
     stdout_limit: usize,
 ) -> io::Result<Output> {
+    capture_probe(command, None, timeout, stdout_limit)
+}
+
+/// [`output_capped`], with `input`, a few bytes the probe reads before it
+/// answers, written to its stdin, which is then closed.
+pub fn output_capped_with_input(
+    command: &mut Command,
+    input: &[u8],
+    timeout: Duration,
+    stdout_limit: usize,
+) -> io::Result<Output> {
+    capture_probe(command, Some(input), timeout, stdout_limit)
+}
+
+fn capture_probe(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    timeout: Duration,
+    stdout_limit: usize,
+) -> io::Result<Output> {
     let started = Instant::now();
     command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let mut probe = Probe::spawn(command)?;
+    if let Some(input) = input {
+        use std::io::Write as _;
+        let mut stdin = probe
+            .child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("probe stdin is unavailable"))?;
+        stdin.write_all(input)?;
+    }
     let mut reader = probe
         .child
         .stdout

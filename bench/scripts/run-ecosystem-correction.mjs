@@ -641,7 +641,6 @@ function baseLpmArgs() {
     '--timing',
     '--no-security-summary',
     '--no-skills',
-    '--no-editor-setup',
     '--no-audit-after-install',
     '--no-engine-strict',
   ];

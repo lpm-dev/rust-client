@@ -860,6 +860,22 @@ impl ProjectCertDirectory {
         Ok(Some(ProjectCertMaterial { cert, key }))
     }
 
+    /// Refuses to write a private key where git tracks files, or where it
+    /// can't tell whether it does, git being unable to run in a repository
+    /// included: `.lpm`'s ignore file doesn't hide a tracked path, so the
+    /// next commit of the project would take the key.
+    fn reject_tracked_files(&self) -> Result<(), LpmError> {
+        let Some(project) = self.path.parent().and_then(Path::parent) else {
+            return Ok(());
+        };
+        let certs = format!("{}/certs", lpm_common::PROJECT_STATE_DIR);
+        tracked_certs_refusal(
+            project,
+            &certs,
+            lpm_common::project_git::tracked_entries_in_any_repository(project, &[&certs]),
+        )
+    }
+
     pub(crate) fn write_pair(&self, cert: &[u8], key: &[u8]) -> Result<(), LpmError> {
         self.write_pair_with_failpoint(cert, key, || Ok(()))
     }
@@ -871,6 +887,7 @@ impl ProjectCertDirectory {
         after_first_replace: impl FnOnce() -> std::io::Result<()>,
     ) -> Result<(), LpmError> {
         crate::cert::validate_project_key_pair_bytes(cert, key)?;
+        self.reject_tracked_files()?;
         reject_linked_entry(&self.dir, "cert.pem")?;
         reject_linked_entry(&self.dir, "key.pem")?;
         let previous_cert = read_optional_relative_file(&self.dir, "cert.pem")?;
@@ -1071,6 +1088,9 @@ fn recover_project_pair_transaction(directory: &ProjectCertDirectory) -> Result<
     let cert = transaction.cert_pem.as_bytes();
     let key = transaction.key_pem.as_bytes();
     crate::cert::validate_project_key_pair_bytes(cert, key)?;
+    // Recovery writes the key as `write_pair` does, so it refuses where that
+    // would, and keeps the journal for once git no longer tracks the key.
+    directory.reject_tracked_files()?;
     restore_relative_file(&directory.dir, &transaction.cert_name, Some(cert), 0o644)?;
     restore_relative_file(&directory.dir, &transaction.key_name, Some(key), 0o600)?;
     let _ = directory.dir.remove_file(&transaction.staged_cert_name);
@@ -1192,7 +1212,7 @@ fn read_bounded_relative_file_with_permissions(
     label: &str,
     protect: bool,
 ) -> Result<Vec<u8>, LpmError> {
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     let _ = protect;
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 
@@ -1219,6 +1239,14 @@ fn read_bounded_relative_file_with_permissions(
     if protect {
         windows_security::protect_cap_file(&file).map_err(|error| {
             LpmError::Cert(format!("failed to protect {label} path {name}: {error}"))
+        })?;
+    }
+    #[cfg(target_os = "macos")]
+    if protect {
+        lpm_common::macos_acl::drop_extended_acl(&file).map_err(|error| {
+            LpmError::Cert(format!(
+                "failed to remove the access list entries of {label} path {name}: {error}"
+            ))
         })?;
     }
     let metadata = file.metadata().map_err(|error| {
@@ -1451,7 +1479,14 @@ fn tighten_directory_permissions(dir: &Dir, label: &str) -> Result<(), LpmError>
             LpmError::Cert(format!(
                 "failed to tighten project certificate directory `{label}`: {error}"
             ))
-        })
+        })?;
+    #[cfg(target_os = "macos")]
+    lpm_common::macos_acl::drop_extended_acl(dir).map_err(|error| {
+        LpmError::Cert(format!(
+            "failed to remove the access list entries of certificate directory `{label}`: {error}"
+        ))
+    })?;
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -1466,6 +1501,60 @@ fn tighten_directory_permissions(dir: &Dir, label: &str) -> Result<(), LpmError>
 #[cfg(not(any(unix, windows)))]
 fn tighten_directory_permissions(_dir: &Dir, _label: &str) -> Result<(), LpmError> {
     Ok(())
+}
+
+/// What [`ProjectCertDirectory::reject_tracked_files`] makes of git's answer
+/// for `certs`, the certificate directory in `project`.
+fn tracked_certs_refusal(
+    project: &Path,
+    certs: &str,
+    probe: Result<
+        Option<Vec<lpm_common::project_git::Tracked>>,
+        lpm_common::project_git::GitProbeError,
+    >,
+) -> Result<(), LpmError> {
+    use lpm_common::project_git::{GitProbeError, repository_marker_around};
+    match probe {
+        Ok(None) => Ok(()),
+        Err(GitProbeError::GitMissing(_)) if !repository_marker_around(project, &[certs]) => Ok(()),
+        Ok(Some(found)) if found.is_empty() => Ok(()),
+        Ok(Some(found)) => {
+            let entries: Vec<String> = found
+                .iter()
+                .flat_map(|tracked| tracked.entries.iter().cloned())
+                .collect();
+            let commands: Vec<String> = found
+                .iter()
+                .map(|tracked| format!("`{}`", tracked.untrack_command()))
+                .collect();
+            Err(LpmError::Cert(format!(
+                "git tracks {} in the project's .lpm, so the certificate's private key \
+                 would go into the next commit. Run {} and commit, then retry",
+                listed(&entries),
+                commands.join(" and ")
+            )))
+        }
+        Err(GitProbeError::GitMissing(reason)) => Err(LpmError::Cert(format!(
+            "git could not be run ({reason}), and a git repository holds the project or its \
+             {certs}, so LPM can't tell whether git tracks files there, and the certificate's \
+             private key could go into the next commit. Put git on PATH, then retry"
+        ))),
+        Err(GitProbeError::Failed(reason)) => Err(LpmError::Cert(format!(
+            "could not tell whether git tracks files in the project's {certs} ({reason}), \
+             so the certificate's private key could go into the next commit. Repair the \
+             repository, then retry"
+        ))),
+    }
+}
+
+/// The first few of `names`, and how many more there are.
+fn listed(names: &[String]) -> String {
+    const SHOWN: usize = 3;
+    let shown = names[..names.len().min(SHOWN)].join(", ");
+    match names.len().saturating_sub(SHOWN) {
+        0 => shown,
+        more => format!("{shown} and {more} more"),
+    }
 }
 
 fn reject_linked_entry(dir: &Dir, name: &str) -> Result<(), LpmError> {
@@ -1527,6 +1616,16 @@ fn create_temporary(dir: &Dir, mode: u32) -> Result<(String, cap_std::fs::File),
                     let _ = dir.remove_file(&name);
                     return Err(LpmError::Cert(format!(
                         "failed to protect temporary certificate file: {error}"
+                    )));
+                }
+                // A directory LPM doesn't keep, where a key is written on
+                // request, can pass access list entries on to it.
+                #[cfg(target_os = "macos")]
+                if let Err(error) = lpm_common::macos_acl::drop_extended_acl(&file) {
+                    drop(file);
+                    let _ = dir.remove_file(&name);
+                    return Err(LpmError::Cert(format!(
+                        "failed to remove the access list entries of a temporary certificate file: {error}"
                     )));
                 }
                 return Ok((name, file));
@@ -1696,6 +1795,13 @@ pub(crate) fn reject_linked_project_cert_file(path: &Path) -> Result<(), LpmErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
 
     #[cfg(windows)]
     fn windows_acl_handle(path: &Path, directory: bool) -> std::fs::File {
@@ -2063,6 +2169,117 @@ mod tests {
         assert_windows_owner_system_dacl(&key_path, false);
     }
 
+    #[cfg(target_os = "macos")]
+    fn grant_everyone_access(path: &Path, inherited: bool) {
+        let entry = if inherited {
+            "group:everyone allow read,write,list,search,add_file,add_subdirectory,file_inherit,directory_inherit"
+        } else {
+            "group:everyone allow read,write"
+        };
+        let status = std::process::Command::new("/bin/chmod")
+            .args(["+a", entry])
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_project_with_inheritable_everyone_access() -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("permissive-parent");
+        std::fs::create_dir(&parent).unwrap();
+        grant_everyone_access(&parent, true);
+        let project = parent.join("project");
+        std::fs::create_dir(&project).unwrap();
+        (root, project)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_no_extended_acl(path: &Path) {
+        assert!(
+            !lpm_common::macos_acl::has_extended_acl_at(path).unwrap(),
+            "{} keeps access list entries",
+            path.display()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn project_certificate_directories_drop_inherited_access_entries() {
+        let (_root, project) = macos_project_with_inheritable_everyone_access();
+
+        open_project_cert_directory(&project, true)
+            .unwrap()
+            .unwrap();
+
+        assert_no_extended_acl(&project.join(".lpm"));
+        assert_no_extended_acl(&project.join(".lpm/certs"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn temporary_and_key_files_drop_inherited_access_entries() {
+        let (_root, project) = macos_project_with_inheritable_everyone_access();
+        let cert_dir = open_project_cert_directory(&project, true)
+            .unwrap()
+            .unwrap();
+        let (temporary_name, temporary) = create_temporary(&cert_dir.dir, 0o600).unwrap();
+        assert_no_extended_acl(&cert_dir.path().join(&temporary_name));
+        drop(temporary);
+        cert_dir.dir.remove_file(&temporary_name).unwrap();
+
+        // A key written where the user asks, in a directory LPM doesn't own.
+        let key_path = project.join("exported-key.pem");
+        crate::write_key_file(&key_path, b"private-key-material").unwrap();
+        assert_no_extended_acl(&key_path);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pair_and_rotation_journals_drop_inherited_access_entries() {
+        let (root, project) = macos_project_with_inheritable_everyone_access();
+        let cert_dir = open_project_cert_directory(&project, true)
+            .unwrap()
+            .unwrap();
+        let transaction = PairTransaction {
+            cert_name: "cert.pem".to_string(),
+            key_name: "key.pem".to_string(),
+            cert_pem: "certificate".to_string(),
+            key_pem: "private-key-material".to_string(),
+            staged_cert_name: ".lpm-cert-00000000000000000000000000000000".to_string(),
+            staged_key_name: ".lpm-cert-11111111111111111111111111111111".to_string(),
+        };
+        write_pair_transaction(&cert_dir.dir, PROJECT_PAIR_TRANSACTION, &transaction).unwrap();
+        assert_no_extended_acl(&cert_dir.path().join(PROJECT_PAIR_TRANSACTION));
+
+        let global_home = root.path().join("global-home");
+        std::fs::create_dir(&global_home).unwrap();
+        grant_everyone_access(&global_home, true);
+        let ca = open_global_ca_directory_at(global_home, true).unwrap();
+        ca.write("rootCA.rotation.json", b"private-key-material", 0o600)
+            .unwrap();
+        assert_no_extended_acl(&ca.path("rootCA.rotation.json"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reopening_existing_certificate_artifact_drops_access_entries() {
+        let (_root, project) = macos_project_with_inheritable_everyone_access();
+        let cert_dir = open_project_cert_directory(&project, true)
+            .unwrap()
+            .unwrap();
+        let key_path = cert_dir.path().join("recovery-key.pem");
+        std::fs::write(&key_path, b"private-key-material").unwrap();
+        grant_everyone_access(&key_path, false);
+
+        let contents =
+            read_bounded_relative_file(&cert_dir.dir, "recovery-key.pem", "recovery").unwrap();
+
+        assert_eq!(contents, b"private-key-material");
+        assert_no_extended_acl(&key_path);
+    }
+
     #[test]
     fn the_certificate_authority_keeps_its_lpm_home_out_of_git_or_writes_no_key_there() {
         let home = tempfile::tempdir().unwrap();
@@ -2133,6 +2350,230 @@ mod tests {
         assert_eq!(actual_cert, old_cert.as_bytes());
         assert_eq!(actual_key, old_key.as_bytes());
         crate::cert::validate_project_key_pair_bytes(&actual_cert, &actual_key).unwrap();
+    }
+
+    #[test]
+    fn a_key_is_never_written_where_git_tracks_a_file() {
+        if !git_available() {
+            return;
+        }
+        let project = tempfile::tempdir().unwrap();
+        let placeholder = project.path().join(".lpm/certs/key.pem");
+        std::fs::create_dir_all(placeholder.parent().unwrap()).unwrap();
+        std::fs::write(&placeholder, "placeholder").unwrap();
+        for args in [&["init", "-q"][..], &["add", "-f", ".lpm/certs/key.pem"]] {
+            let status = lpm_common::project_git::hardened_git_command(project.path(), args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+        let cert_dir = open_project_cert_directory(project.path(), true)
+            .unwrap()
+            .unwrap();
+        let (root_cert, root_key) = crate::ca::generate_ca().unwrap();
+        let (cert, key) = crate::cert::generate_project_cert(&root_cert, &root_key, &[]).unwrap();
+
+        let error = cert_dir
+            .write_pair(cert.as_bytes(), key.as_bytes())
+            .unwrap_err();
+
+        assert!(error.to_string().contains(".lpm/certs/key.pem"), "{error}");
+        let message = error.to_string();
+        assert!(
+            message.contains("`git -C ") && message.contains(" rm --cached -- .lpm/certs/key.pem`"),
+            "{message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&placeholder).unwrap(),
+            "placeholder"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_pair_is_never_recovered_where_git_tracks_its_key() {
+        if !git_available() {
+            return;
+        }
+        let project = tempfile::tempdir().unwrap();
+        let cert_dir = open_project_cert_directory(project.path(), true)
+            .unwrap()
+            .unwrap();
+        let (root_cert, root_key) = crate::ca::generate_ca().unwrap();
+        let (cert, key) = crate::cert::generate_project_cert(&root_cert, &root_key, &[]).unwrap();
+        // A replacement that stopped before finishing, beside a key file git
+        // tracks.
+        let transaction = PairTransaction {
+            cert_name: "cert.pem".to_string(),
+            key_name: "key.pem".to_string(),
+            cert_pem: cert,
+            key_pem: key,
+            staged_cert_name: ".lpm-cert-00000000000000000000000000000000".to_string(),
+            staged_key_name: ".lpm-cert-11111111111111111111111111111111".to_string(),
+        };
+        write_pair_transaction(&cert_dir.dir, PROJECT_PAIR_TRANSACTION, &transaction).unwrap();
+        drop(cert_dir);
+        let placeholder = project.path().join(".lpm/certs/key.pem");
+        std::fs::write(&placeholder, "placeholder").unwrap();
+        for args in [&["init", "-q"][..], &["add", "-f", ".lpm/certs/key.pem"]] {
+            let status = lpm_common::project_git::hardened_git_command(project.path(), args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+
+        let error = open_project_cert_directory(project.path(), true)
+            .err()
+            .unwrap();
+
+        assert!(error.to_string().contains(".lpm/certs/key.pem"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&placeholder).unwrap(),
+            "placeholder"
+        );
+        assert!(
+            project
+                .path()
+                .join(".lpm/certs")
+                .join(PROJECT_PAIR_TRANSACTION)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn a_key_is_never_written_where_a_repository_inside_lpm_tracks_it() {
+        if !git_available() {
+            return;
+        }
+        for nested in [".lpm", ".lpm/certs"] {
+            let project = tempfile::tempdir().unwrap();
+            let placeholder = project.path().join(".lpm/certs/key.pem");
+            std::fs::create_dir_all(placeholder.parent().unwrap()).unwrap();
+            std::fs::write(&placeholder, "placeholder").unwrap();
+            let repository = project.path().join(nested);
+            let tracked = placeholder
+                .strip_prefix(&repository)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .replace('\\', "/");
+            for args in [&["init", "-q"][..], &["add", "-f", &tracked]] {
+                let status = lpm_common::project_git::hardened_git_command(&repository, args)
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "git {args:?}");
+            }
+            let cert_dir = open_project_cert_directory(project.path(), true)
+                .unwrap()
+                .unwrap();
+            let (root_cert, root_key) = crate::ca::generate_ca().unwrap();
+            let (cert, key) =
+                crate::cert::generate_project_cert(&root_cert, &root_key, &[]).unwrap();
+
+            let error = cert_dir
+                .write_pair(cert.as_bytes(), key.as_bytes())
+                .unwrap_err();
+
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!(" rm --cached -- {tracked}`")),
+                "{nested}: {message}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&placeholder).unwrap(),
+                "placeholder"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_is_never_written_where_git_tracks_the_directory_in_another_case() {
+        if !git_available() {
+            return;
+        }
+        let project = tempfile::tempdir().unwrap();
+        let placeholder = project.path().join(".LPM/certs/key.pem");
+        std::fs::create_dir_all(placeholder.parent().unwrap()).unwrap();
+        std::fs::write(&placeholder, "placeholder").unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "core.ignorecase", "true"],
+            &["add", "-f", ".LPM/certs/key.pem"],
+        ] {
+            let status = lpm_common::project_git::hardened_git_command(project.path(), args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        }
+        // Where the disk tells `.LPM` from `.lpm`, the key goes into a file
+        // git doesn't track.
+        if !project.path().join(".lpm/certs/key.pem").exists() {
+            return;
+        }
+        let cert_dir = open_project_cert_directory(project.path(), true)
+            .unwrap()
+            .unwrap();
+        let (root_cert, root_key) = crate::ca::generate_ca().unwrap();
+        let (cert, key) = crate::cert::generate_project_cert(&root_cert, &root_key, &[]).unwrap();
+
+        let error = cert_dir
+            .write_pair(cert.as_bytes(), key.as_bytes())
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("rm --cached -- .LPM/certs/key.pem"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&placeholder).unwrap(),
+            "placeholder"
+        );
+    }
+
+    #[test]
+    fn a_key_is_never_written_where_git_can_t_tell_what_it_tracks() {
+        if !git_available() {
+            return;
+        }
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(project.path().join(".git"), "gitdir: ../gone/.git\n").unwrap();
+        let cert_dir = open_project_cert_directory(project.path(), true)
+            .unwrap()
+            .unwrap();
+        let (root_cert, root_key) = crate::ca::generate_ca().unwrap();
+        let (cert, key) = crate::cert::generate_project_cert(&root_cert, &root_key, &[]).unwrap();
+
+        let error = cert_dir
+            .write_pair(cert.as_bytes(), key.as_bytes())
+            .unwrap_err();
+
+        assert!(error.to_string().contains("could not tell"), "{error}");
+        assert!(!project.path().join(".lpm/certs/key.pem").exists());
+    }
+
+    #[test]
+    fn a_key_is_never_written_where_git_can_t_be_run_in_a_repository() {
+        use lpm_common::project_git::GitProbeError;
+        let missing = || {
+            Err(GitProbeError::GitMissing(
+                "No such file or directory".into(),
+            ))
+        };
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repository.path().join(".git")).unwrap();
+
+        let error = tracked_certs_refusal(repository.path(), ".lpm/certs", missing()).unwrap_err();
+        assert!(
+            error.to_string().contains("git could not be run"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("Put git on PATH"), "{error}");
+
+        let outside = tempfile::tempdir().unwrap();
+        if !lpm_common::project_git::repository_marker_above(outside.path()) {
+            assert!(tracked_certs_refusal(outside.path(), ".lpm/certs", missing()).is_ok());
+        }
     }
 
     #[test]

@@ -9,7 +9,9 @@
 //!
 //! The state file records the env ID it belongs to and applies only while
 //! `lpm.json` names that env. CLIs before it kept the same object in
-//! `lpm.json > vaultSync`; it is read from there until the next write moves it.
+//! `lpm.json > vaultSync`; it is read from there until the next write moves
+//! it, unless git has it committed: a committed one came to every checkout,
+//! so it is no checkout's own and reads as none.
 
 use std::path::Path;
 
@@ -20,6 +22,8 @@ const STATE_VAULT_FIELD: &str = "vault";
 const STATE_SYNC_FIELD: &str = "sync";
 
 type JsonMap = serde_json::Map<String, serde_json::Value>;
+type GitProbe =
+    Result<Option<Vec<lpm_common::project_git::Tracked>>, lpm_common::project_git::GitProbeError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VaultSyncSummary {
@@ -50,7 +54,7 @@ impl VaultManifestSnapshot {
     pub fn read(project_dir: &Path) -> Result<Self, String> {
         let files = lpm_common::read_lpm_json_with_local_state(project_dir, SYNC_STATE_FILE)
             .map_err(|error| error.to_string())?;
-        Self::from_maps(files.config.as_ref(), files.local.as_ref())
+        Self::from_maps(project_dir, files.config.as_ref(), files.local.as_ref())
     }
 
     /// The snapshot for `content`, the `lpm.json` the caller read, with the
@@ -70,10 +74,14 @@ impl VaultManifestSnapshot {
             .transpose()?;
         let local = lpm_common::read_project_local_state(project_dir, SYNC_STATE_FILE)
             .map_err(|error| error.to_string())?;
-        Self::from_maps(config.as_ref(), local.as_ref())
+        Self::from_maps(project_dir, config.as_ref(), local.as_ref())
     }
 
-    fn from_maps(config: Option<&JsonMap>, local: Option<&JsonMap>) -> Result<Self, String> {
+    fn from_maps(
+        project_dir: &Path,
+        config: Option<&JsonMap>,
+        local: Option<&JsonMap>,
+    ) -> Result<Self, String> {
         let string_field = |field: &str| -> Result<Option<String>, String> {
             match config.and_then(|config| config.get(field)) {
                 None | Some(serde_json::Value::Null) => Ok(None),
@@ -84,7 +92,7 @@ impl VaultManifestSnapshot {
         Ok(Self {
             vault: string_field("vault")?,
             name: string_field("name")?,
-            vault_sync: resolve_sync_state(config, local)?.map(|(sync, _)| sync),
+            vault_sync: resolve_sync_state(project_dir, config, local)?.map(|(sync, _)| sync),
         })
     }
 
@@ -224,8 +232,10 @@ impl SyncStateSource {
 }
 
 /// The sync state that applies to the env `config` names: the state file's
-/// when it records that env, else `lpm.json > vaultSync`.
+/// when it records that env, else `lpm.json > vaultSync` when git hasn't
+/// committed it. A state file git tracks is refused.
 fn resolve_sync_state(
+    project_dir: &Path,
     config: Option<&JsonMap>,
     local: Option<&JsonMap>,
 ) -> Result<Option<(serde_json::Value, SyncStateSource)>, String> {
@@ -241,16 +251,105 @@ fn resolve_sync_state(
             ));
         }
         if recorded == vault {
-            return Ok(local
-                .get(STATE_SYNC_FIELD)
-                .filter(present)
-                .map(|sync| (sync.clone(), SyncStateSource::StateFile)));
+            let Some(sync) = local.get(STATE_SYNC_FIELD).filter(present) else {
+                return Ok(None);
+            };
+            reject_tracked_state_file(project_dir)?;
+            return Ok(Some((sync.clone(), SyncStateSource::StateFile)));
         }
     }
     Ok(config
         .and_then(|config| config.get(LEGACY_SYNC_FIELD))
         .filter(present)
+        .filter(|_| !committed_legacy_sync_state(project_dir))
         .map(|sync| (sync.clone(), SyncStateSource::LegacyLpmJson)))
+}
+
+/// Whether git has `lpm.json > vaultSync` in its index, under whatever
+/// spelling it gives `lpm.json`, so the field reaches other checkouts. Yes
+/// when git can't tell, as in a repository where git can't be run; no
+/// outside a repository or for an untracked `lpm.json`.
+fn committed_legacy_sync_state(project_dir: &Path) -> bool {
+    committed_in_index(
+        project_dir,
+        lpm_common::project_git::tracked_entries_in_any_repository(project_dir, &["lpm.json"]),
+    )
+}
+
+fn committed_in_index(project_dir: &Path, probe: GitProbe) -> bool {
+    use lpm_common::project_git::{GitProbeError, indexed_blob, repository_marker_above};
+    let found = match probe {
+        Ok(Some(found)) => found,
+        Ok(None) => return false,
+        Err(GitProbeError::GitMissing(_)) => return repository_marker_above(project_dir),
+        Err(GitProbeError::Failed(_)) => return true,
+    };
+    found.iter().any(|tracked| {
+        tracked.entries.iter().any(|entry| {
+            match indexed_blob(
+                &tracked.root,
+                entry,
+                lpm_common::CONFIG_FILE_SIZE_CAP_BYTES as usize,
+            ) {
+                Ok(blob) => serde_json::from_slice::<serde_json::Value>(
+                    lpm_common::strip_utf8_bom_bytes(&blob),
+                )
+                .map_or(true, |indexed| {
+                    indexed
+                        .get(LEGACY_SYNC_FIELD)
+                        .is_some_and(|sync| !sync.is_null())
+                }),
+                Err(_) => true,
+            }
+        })
+    })
+}
+
+/// Refuses a `.lpm/env-sync.json` that git tracks: the state in it isn't
+/// this checkout's, and this checkout's would go into the next commit.
+/// Where git can't tell, it warns, once, and lets the state be used: `.lpm`
+/// ignores itself, so the file is almost never tracked, and it holds no
+/// secret.
+fn reject_tracked_state_file(project_dir: &Path) -> Result<(), String> {
+    let state_file = format!("{}/{SYNC_STATE_FILE}", lpm_common::PROJECT_STATE_DIR);
+    state_file_refusal(
+        project_dir,
+        &state_file,
+        lpm_common::project_git::tracked_entries_in_any_repository(project_dir, &[&state_file]),
+    )
+}
+
+fn state_file_refusal(project_dir: &Path, state_file: &str, probe: GitProbe) -> Result<(), String> {
+    use lpm_common::project_git::{GitProbeError, repository_marker_around};
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let reason = match probe {
+        Ok(None) => return Ok(()),
+        Ok(Some(found)) if found.is_empty() => return Ok(()),
+        Ok(Some(found)) => {
+            let commands: Vec<String> = found
+                .iter()
+                .map(|tracked| format!("`{}`", tracked.untrack_command()))
+                .collect();
+            return Err(format!(
+                "git tracks {state_file}, which holds this checkout's env sync state; untrack it \
+                 with {}, then run the command again",
+                commands.join(" and ")
+            ));
+        }
+        Err(GitProbeError::GitMissing(_))
+            if !repository_marker_around(project_dir, &[state_file]) =>
+        {
+            return Ok(());
+        }
+        Err(error) => error,
+    };
+    WARNED.call_once(|| {
+        tracing::warn!(
+            "could not tell whether git tracks {state_file} ({reason}); if it does, untrack it, \
+             as it holds this checkout's env sync state"
+        );
+    });
+    Ok(())
 }
 
 /// The sync state for reads; state that is not an object reads as none.
@@ -258,7 +357,7 @@ fn read_sync_state(project_dir: &Path) -> Result<Option<JsonMap>, String> {
     let files = lpm_common::read_lpm_json_with_local_state(project_dir, SYNC_STATE_FILE)
         .map_err(|error| error.to_string())?;
     Ok(
-        match resolve_sync_state(files.config.as_ref(), files.local.as_ref())? {
+        match resolve_sync_state(project_dir, files.config.as_ref(), files.local.as_ref())? {
             Some((serde_json::Value::Object(sync), _)) => Some(sync),
             _ => None,
         },
@@ -273,12 +372,17 @@ fn update_sync_state<T>(
     mutate: impl FnOnce(&JsonMap, &mut JsonMap) -> Result<T, String>,
 ) -> Result<T, String> {
     lpm_common::update_lpm_json_with_local_state(project_dir, SYNC_STATE_FILE, |files| {
-        let mut sync = match resolve_sync_state(Some(files.config), Some(files.local))? {
+        let resolved = resolve_sync_state(project_dir, Some(files.config), Some(files.local))?;
+        let checked_state_file = matches!(resolved, Some((_, SyncStateSource::StateFile)));
+        let mut sync = match resolved {
             Some((serde_json::Value::Object(sync), _)) => sync,
             Some((_, source)) => return Err(format!("{} must be an object", source.describe())),
             None => JsonMap::new(),
         };
         let result = mutate(files.config, &mut sync)?;
+        if !sync.is_empty() && !checked_state_file {
+            reject_tracked_state_file(project_dir)?;
+        }
         files.config.remove(LEGACY_SYNC_FIELD);
         files.local.clear();
         if !sync.is_empty() {
@@ -1522,6 +1626,199 @@ mod tests {
         serde_json::from_str(&content).unwrap()
     }
 
+    fn git(dir: &Path, args: &[&str]) -> bool {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.test"])
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    #[test]
+    fn a_vault_sync_git_has_under_another_spelling_is_ignored_where_git_ignores_case() {
+        let dir = tempfile::tempdir().unwrap();
+        if !git(dir.path(), &["init", "-q"]) {
+            return;
+        }
+        let config = r#"{"vault":"vault-123","vaultSync":{"personalVersion":4}}"#;
+        std::fs::write(dir.path().join("LPM.JSON"), config).unwrap();
+        assert!(git(dir.path(), &["config", "core.ignorecase", "true"]));
+        assert!(git(dir.path(), &["add", "LPM.JSON"]));
+        assert!(git(dir.path(), &["commit", "-q", "-m", "fixture"]));
+        std::fs::write(dir.path().join("lpm.json"), config).unwrap();
+        // Where the disk tells them apart, `lpm.json` is another, untracked
+        // file whose state is this checkout's own.
+        let one_file = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .is_ok_and(|entry| entry.file_name().eq_ignore_ascii_case("lpm.json"))
+            })
+            .count()
+            == 1;
+
+        assert_eq!(
+            read_personal_sync_version(dir.path()),
+            if one_file { None } else { Some(4) }
+        );
+    }
+
+    #[test]
+    fn a_state_file_git_tracks_is_refused_for_reads_and_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        if !git(dir.path(), &["init", "-q"]) {
+            return;
+        }
+        std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-123"}"#).unwrap();
+        std::fs::create_dir(dir.path().join(".lpm")).unwrap();
+        std::fs::write(
+            dir.path().join(".lpm").join(SYNC_STATE_FILE),
+            r#"{"vault":"vault-123","sync":{"personalVersion":9}}"#,
+        )
+        .unwrap();
+        assert_eq!(read_personal_sync_version(dir.path()), Some(9));
+        assert!(git(
+            dir.path(),
+            &["add", "-f", &format!(".lpm/{SYNC_STATE_FILE}")]
+        ));
+
+        let error = VaultManifestSnapshot::read(dir.path()).unwrap_err();
+        assert!(error.contains("git tracks .lpm/env-sync.json"), "{error}");
+        assert!(
+            error.contains("rm --cached -- .lpm/env-sync.json"),
+            "{error}"
+        );
+        assert_eq!(read_personal_sync_version(dir.path()), None);
+
+        std::fs::remove_file(dir.path().join(".lpm").join(SYNC_STATE_FILE)).unwrap();
+        let error =
+            write_org_sync_version_at(dir.path(), "acme", 3, "2026-10-16T09:00:00Z").unwrap_err();
+        assert!(error.contains("git tracks .lpm/env-sync.json"), "{error}");
+        assert!(!dir.path().join(".lpm").join(SYNC_STATE_FILE).exists());
+    }
+
+    #[test]
+    fn a_state_file_a_repository_of_lpm_s_own_tracks_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        if !git(dir.path(), &["init", "-q"]) {
+            return;
+        }
+        std::fs::write(dir.path().join("lpm.json"), r#"{"vault":"vault-123"}"#).unwrap();
+        let state = dir.path().join(".lpm");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::write(
+            state.join(SYNC_STATE_FILE),
+            r#"{"vault":"vault-123","sync":{"personalVersion":9}}"#,
+        )
+        .unwrap();
+        assert!(git(&state, &["init", "-q"]));
+        assert!(git(&state, &["add", "-f", SYNC_STATE_FILE]));
+
+        let error = VaultManifestSnapshot::read(dir.path()).unwrap_err();
+
+        assert!(error.contains("git tracks .lpm/env-sync.json"), "{error}");
+        assert!(error.contains("rm --cached -- env-sync.json"), "{error}");
+        assert_eq!(read_personal_sync_version(dir.path()), None);
+    }
+
+    #[test]
+    fn git_unable_to_run_in_a_repository_counts_as_committed_but_leaves_the_state_file_usable() {
+        use lpm_common::project_git::GitProbeError;
+        fn missing<T>() -> Result<T, GitProbeError> {
+            Err(GitProbeError::GitMissing(
+                "No such file or directory".into(),
+            ))
+        }
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir(repository.path().join(".git")).unwrap();
+        let member = repository.path().join("member");
+        std::fs::create_dir(&member).unwrap();
+
+        assert!(committed_in_index(&member, missing()));
+        assert!(committed_in_index(
+            &member,
+            Err(GitProbeError::Failed("dubious ownership".into()))
+        ));
+        assert_eq!(
+            state_file_refusal(&member, ".lpm/env-sync.json", missing()),
+            Ok(())
+        );
+        assert_eq!(
+            state_file_refusal(
+                &member,
+                ".lpm/env-sync.json",
+                Err(GitProbeError::Failed("dubious ownership".into()))
+            ),
+            Ok(())
+        );
+
+        let outside = tempfile::tempdir().unwrap();
+        if !lpm_common::project_git::repository_marker_above(outside.path()) {
+            assert!(!committed_in_index(outside.path(), missing()));
+        }
+    }
+
+    #[test]
+    fn a_committed_vault_sync_is_no_checkout_s_own_and_reads_as_none() {
+        let dir = tempfile::tempdir().unwrap();
+        if !git(dir.path(), &["init", "-q"]) {
+            return;
+        }
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"vault":"vault-123","vaultSync":{"personalVersion":4}}"#,
+        )
+        .unwrap();
+        assert_eq!(read_personal_sync_version(dir.path()), Some(4));
+
+        assert!(git(dir.path(), &["add", "lpm.json"]));
+        assert!(git(dir.path(), &["commit", "-q", "-m", "fixture"]));
+
+        assert_eq!(read_personal_sync_version(dir.path()), None);
+        assert!(
+            VaultManifestSnapshot::read(dir.path())
+                .unwrap()
+                .sync_state()
+                .is_none()
+        );
+        write_org_sync_version_at(dir.path(), "acme", 3, "2026-10-16T09:00:00Z").unwrap();
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("lpm.json")).unwrap())
+                .unwrap();
+        assert_eq!(config, serde_json::json!({"vault": "vault-123"}));
+        let state = sync_state_file(dir.path());
+        assert_eq!(state["sync"]["personalVersion"], serde_json::Value::Null);
+        assert_eq!(state["sync"]["orgVersions"]["acme"], 3);
+    }
+
+    #[test]
+    fn a_vault_sync_an_index_around_the_project_s_repository_holds_reads_as_none() {
+        let outer = tempfile::tempdir().unwrap();
+        if !git(outer.path(), &["init", "-q"]) {
+            return;
+        }
+        let project = outer.path().join("app");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(
+            project.join("lpm.json"),
+            r#"{"vault":"vault-123","vaultSync":{"personalVersion":7}}"#,
+        )
+        .unwrap();
+        assert!(git(outer.path(), &["add", "app/lpm.json"]));
+        assert!(git(outer.path(), &["commit", "-q", "-m", "fixture"]));
+        // The project became a repository of its own later; the outer index
+        // still lists its lpm.json.
+        assert!(git(&project, &["init", "-q"]));
+
+        assert!(committed_legacy_sync_state(&project));
+        assert_eq!(read_personal_sync_version(&project), None);
+    }
+
     #[test]
     fn legacy_sync_state_in_lpm_json_moves_to_the_state_file_on_the_next_write() {
         let dir = tempfile::tempdir().unwrap();
@@ -1546,6 +1843,29 @@ mod tests {
         assert_eq!(state["sync"]["personalVersion"], 4);
         assert_eq!(state["sync"]["orgVersions"]["acme"], 3);
         assert_eq!(read_org_sync_version(dir.path(), "acme"), Some(3));
+    }
+
+    #[test]
+    fn a_committed_lpm_json_with_a_byte_order_mark_is_read_like_the_work_tree_s() {
+        let dir = tempfile::tempdir().unwrap();
+        if !git(dir.path(), &["init", "-q"]) {
+            return;
+        }
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            "\u{feff}{\"vault\":\"vault-123\"}",
+        )
+        .unwrap();
+        assert!(git(dir.path(), &["add", "lpm.json"]));
+        assert!(git(dir.path(), &["commit", "-q", "-m", "fixture"]));
+        std::fs::write(
+            dir.path().join("lpm.json"),
+            r#"{"vault":"vault-123","vaultSync":{"personalVersion":3}}"#,
+        )
+        .unwrap();
+
+        assert!(!committed_legacy_sync_state(dir.path()));
+        assert_eq!(read_personal_sync_version(dir.path()), Some(3));
     }
 
     #[test]

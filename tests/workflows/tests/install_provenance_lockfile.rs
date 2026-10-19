@@ -156,12 +156,7 @@ fn project_for_version(version: &str) -> TempProject {
 
 fn install(project: &TempProject, mock: &MockRegistry, extra: &[&str]) -> std::process::Output {
     let mut command = lpm_with_registry(project, &mock.url());
-    command.args([
-        "install",
-        "--no-security-summary",
-        "--no-skills",
-        "--no-editor-setup",
-    ]);
+    command.args(["install", "--no-security-summary", "--no-skills"]);
     command.args(extra);
     command.output().expect("run lpm install")
 }

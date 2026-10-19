@@ -61,12 +61,7 @@ async fn install_latest(scripted: bool) {
         r#"{"name":"latest-install","version":"1.0.0","dependencies":{"latest-package":"^1.0.0"}}"#,
     );
     let output = lpm_with_registry(&project, &registry.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
     let installed: serde_json::Value =
@@ -124,12 +119,7 @@ async fn optional_latest_keeps_portable_platform_metadata_without_fetching_paylo
         r#"{"name":"optional-latest-install","version":"1.0.0","optionalDependencies":{"optional-latest":"^1.0.0"}}"#,
     );
     lpm_with_registry(&project, &registry.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
     let lock = project.read_file("lpm.lock");
@@ -222,12 +212,7 @@ async fn credentialed_npm_registry_install_uses_the_direct_npm_documents() {
         "registry=https://registry.npmjs.org/\n//registry.npmjs.org/:_authToken=npm-token\n",
     );
     lpm_with_registry(&project, &registry.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 

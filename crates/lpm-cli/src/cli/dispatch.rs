@@ -580,7 +580,6 @@ async fn async_main(cli: Cli) -> Result<()> {
                 linker,
                 skills,
                 no_skills,
-                no_editor_setup,
                 no_security_summary,
                 timing,
                 auto_build,
@@ -689,7 +688,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                     &alias,
                 )
                 .map_err(lpm_common::LpmError::Script)?;
-                let _ = (no_skills, no_editor_setup, no_security_summary, catalog);
+                let _ = (no_skills, no_security_summary, catalog);
 
                 let mut overrides = build_install_global_overrides_with_excludes(
                     allow_new,
@@ -953,7 +952,6 @@ async fn async_main(cli: Cli) -> Result<()> {
             let add_options = commands::install::AddInstallOptions {
                 strict_integrity,
                 linker_override: linker.map(LinkerCli::into_linker_mode),
-                no_editor_setup: no_editor_setup || cfg.get_bool("noEditorSetup").unwrap_or(false),
                 no_security_summary: no_security_summary
                     || cfg.get_bool("noSecuritySummary").unwrap_or(false),
                 auto_build: auto_build || cfg.get_bool("autoBuild").unwrap_or(false),
@@ -996,8 +994,6 @@ async fn async_main(cli: Cli) -> Result<()> {
                             .into(),
                     ))
                 } else {
-                    let eff_no_editor =
-                        no_editor_setup || cfg.get_bool("noEditorSetup").unwrap_or(false);
                     let eff_no_sec =
                         no_security_summary || cfg.get_bool("noSecuritySummary").unwrap_or(false);
                     let eff_timing = timing;
@@ -1033,7 +1029,6 @@ async fn async_main(cli: Cli) -> Result<()> {
                                     cli_strict_peer_dependencies,
                                 linker_override: cli_linker,
                                 lpm_skills_preference,
-                                no_editor_setup: eff_no_editor,
                                 no_security_summary: eff_no_sec,
                                 auto_build: eff_auto_build,
                                 script_policy_override: cli_script_policy_override,
@@ -1071,7 +1066,6 @@ async fn async_main(cli: Cli) -> Result<()> {
                             cli_strict_peer_dependencies,
                             cli_linker,
                             lpm_skills_preference,
-                            eff_no_editor,
                             eff_no_sec,
                             eff_auto_build,
                             None,
@@ -1288,7 +1282,6 @@ async fn async_main(cli: Cli) -> Result<()> {
                 no_install_deps,
                 skills,
                 no_skills,
-                no_editor_setup,
                 pm,
                 alias,
                 target,
@@ -1318,7 +1311,6 @@ async fn async_main(cli: Cli) -> Result<()> {
                 dry_run,
                 no_install_deps,
                 no_skills,
-                no_editor_setup,
                 no_engine_strict,
                 &pm,
                 alias.as_deref(),
@@ -2671,7 +2663,6 @@ async fn async_main(cli: Cli) -> Result<()> {
                 linker,
                 skills,
                 no_skills,
-                no_editor_setup,
                 no_security_summary,
                 auto_build,
                 no_engine_strict,
@@ -2705,8 +2696,6 @@ async fn async_main(cli: Cli) -> Result<()> {
             let eff_allow_new = allow_new || cfg.get_bool("allowNew").unwrap_or(false);
             let lpm_skills_preference =
                 lpm_skills_config::LpmSkillsPreference::from_cli(skills, no_skills);
-            let eff_no_editor =
-                no_editor_setup || cfg.get_bool("noEditorSetup").unwrap_or(false);
             let eff_no_sec =
                 no_security_summary || cfg.get_bool("noSecuritySummary").unwrap_or(false);
             let eff_auto_build = auto_build || cfg.get_bool("autoBuild").unwrap_or(false);
@@ -2809,7 +2798,6 @@ async fn async_main(cli: Cli) -> Result<()> {
                 cli_strict_peer_dependencies,
                 cli_linker,
                 lpm_skills_preference,
-                eff_no_editor,
                 eff_no_sec,
                 eff_auto_build,
                 None,

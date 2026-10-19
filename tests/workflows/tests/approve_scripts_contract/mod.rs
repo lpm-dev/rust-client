@@ -45,7 +45,6 @@ async fn artifact_project() -> (TempProject, MockRegistry, [String; 2]) {
             "deny",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .unwrap();
@@ -269,7 +268,6 @@ async fn auto_build_keeps_an_unexecuted_local_sibling_in_the_approval_queue() {
                 "--json",
                 "--no-security-summary",
                 "--no-skills",
-                "--no-editor-setup",
             ])
             .output()
             .unwrap();
@@ -416,7 +414,6 @@ async fn offline_capture_keeps_local_archives_with_the_same_coordinates_distinct
             "--json",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ]);
         if offline {
             command.arg("--offline");
@@ -466,7 +463,6 @@ async fn v1_review_displays_the_exact_local_source_scripts() {
             "--json",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .output()
         .unwrap();

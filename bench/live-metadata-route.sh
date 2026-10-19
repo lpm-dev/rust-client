@@ -180,7 +180,7 @@ run_lpm_json() {
 			LPM_NPM_ROUTE="$route" \
 			LPM_HTTP="$HTTP_MODE" \
 			NO_COLOR=1 \
-			"$BIN" install --json --no-security-summary --no-skills --no-editor-setup \
+			"$BIN" install --json --no-security-summary --no-skills \
 				>"$output_file" 2>"$stderr_file"
 	)
 }

@@ -329,12 +329,7 @@ async fn install_one_with_pkg_json(
     .await;
 
     lpm_with_registry(project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 }
@@ -408,12 +403,7 @@ async fn install_signature_fixture_project(
     mock.with_batch_metadata(batch).await;
 
     lpm_with_registry(project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 }
@@ -436,12 +426,7 @@ async fn audit_signatures_verifies_a_range_dependency_signed_by_a_retired_key() 
         .mount(mock.server())
         .await;
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -710,12 +695,7 @@ async fn install_vulnerable_direct_dep_with_fixed_version(
     .await;
 
     lpm_with_registry(project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -1560,7 +1540,6 @@ async fn workspace_member_audit_fix_preserves_the_sibling_root_lockfile_projecti
             "--no-recursive",
             "--no-security-summary",
             "--no-skills",
-            "--no-editor-setup",
         ])
         .assert()
         .success();
@@ -1654,12 +1633,7 @@ async fn audit_fix_apply_installs_the_exact_version_reported_by_dry_run() {
     )
     .await;
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
     mark_lockfile_package_as_public_npm(&project, "vuln-pkg");
@@ -1918,12 +1892,7 @@ async fn audit_fix_json_remains_one_document_when_nested_install_applies_overrid
     )
     .await;
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
     mark_lockfile_package_as_public_npm(&project, "vuln-pkg");
@@ -2025,12 +1994,7 @@ async fn audit_fix_chooses_patch_on_installed_maintained_line() {
     )
     .await;
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
     mark_lockfile_package_as_public_npm(&project, "vuln-pkg");
@@ -2074,12 +2038,7 @@ async fn audit_fix_does_not_apply_transitive_version_advisory_to_safe_direct_ins
     )
     .await;
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
     mark_lockfile_package_as_public_npm(&project, "vuln-pkg");
@@ -2265,12 +2224,7 @@ async fn audit_fix_plans_lpm_registry_advisory_remediation() {
     )
     .await;
     lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .assert()
         .success();
 
@@ -3384,12 +3338,7 @@ async fn audit_human_output_shows_local_critical_finding_for_lpm_package() {
     ));
 
     let install = lpm_with_registry(&project, &mock.url())
-        .args([
-            "install",
-            "--no-security-summary",
-            "--no-skills",
-            "--no-editor-setup",
-        ])
+        .args(["install", "--no-security-summary", "--no-skills"])
         .output()
         .expect("failed to install local Critical fixture");
     assert!(

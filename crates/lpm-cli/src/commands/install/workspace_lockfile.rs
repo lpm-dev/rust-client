@@ -399,7 +399,6 @@ impl WorkspaceLockfileCoordinator {
         };
 
         let path = self.root.join(lpm_lockfile::LOCKFILE_NAME);
-        lpm_lockfile::ensure_gitattributes(&self.root).map_err(lockfile_error)?;
         if !self.migration_pending
             && self
                 .existing

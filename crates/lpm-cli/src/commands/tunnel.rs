@@ -784,6 +784,11 @@ fn capture_warnings(
                      broken .git file), so check that git ignores and doesn't track \
                      .lpm/inspector.db*"
                 }
+                CaptureRepository::Around => {
+                    "git didn't answer for a repository around the project's (it couldn't \
+                     run, took over 2 s, refused, or stopped at a filesystem boundary or a \
+                     broken .git file), so check that it doesn't track .lpm/inspector.db*"
+                }
             }
             .to_string(),
         );
@@ -795,33 +800,52 @@ fn capture_warnings(
                 .to_string(),
         );
     }
-    if !state.project_tracked.is_empty() || !state.lpm_tracked.is_empty() {
+    if !state.project_tracked.is_empty()
+        || !state.lpm_tracked.is_empty()
+        || !state.around_tracked.is_empty()
+    {
+        let project_from = if state.project_tracked_from_top {
+            NamedFrom::Top
+        } else {
+            NamedFrom::Here
+        };
         let tracked: Vec<String> = state
             .project_tracked
             .iter()
-            .cloned()
+            .map(|name| match project_from {
+                NamedFrom::Here => name.clone(),
+                NamedFrom::Top => format!(".lpm/{}", file_name(name)),
+            })
             .chain(state.lpm_tracked.iter().map(|name| format!(".lpm/{name}")))
+            .chain(state.around_tracked.iter().flat_map(|(_, names)| {
+                names.iter().map(|name| format!(".lpm/{}", file_name(name)))
+            }))
             .collect();
         let commands: Vec<String> = [
             (
                 &state.project_tracked,
-                CaptureRepository::Project,
-                state.project_spelling_unknown,
+                untrack_prefix(CaptureRepository::Project).to_owned(),
+                project_from,
             ),
-            (&state.lpm_tracked, CaptureRepository::Lpm, false),
+            (
+                &state.lpm_tracked,
+                untrack_prefix(CaptureRepository::Lpm).to_owned(),
+                NamedFrom::Here,
+            ),
         ]
         .into_iter()
-        .filter(|(names, _, _)| !names.is_empty())
-        .map(|(names, repository, spelling_unknown)| {
-            format!(
-                "`{}`",
-                if spelling_unknown {
-                    untrack_every_capture(repository)
-                } else {
-                    untrack_command(names, repository)
-                }
+        .chain(state.around_tracked.iter().map(|(directory, names)| {
+            (
+                names,
+                format!(
+                    "git -C {} rm --cached",
+                    lpm_common::project_git::shell_word(&directory.to_string_lossy())
+                ),
+                NamedFrom::Here,
             )
-        })
+        }))
+        .filter(|(names, _, _)| !names.is_empty())
+        .map(|(names, prefix, from)| format!("`{}`", untrack_command(names, &prefix, from)))
         .collect();
         warnings.push(format!(
             "git tracks {}, so captures there can be committed and stay in its history; \
@@ -903,14 +927,18 @@ struct CaptureGitFiles {
 /// How git treats the capture files.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct CaptureGitState {
-    /// Those the project's repository tracks, by name in the project.
+    /// Those the project's repository tracks, by name in the project, or,
+    /// with `project_tracked_from_top`, from the repository's top.
     project_tracked: Vec<String>,
-    /// Whether `project_tracked` is spelled as git in `.lpm` lists it, when
-    /// the project's query didn't answer: the index may spell the directory
-    /// otherwise, as an upstream `.LPM/` on a case-insensitive disk.
-    project_spelling_unknown: bool,
+    /// Whether `project_tracked` is named as git in `.lpm` names it, from the
+    /// repository's top, when the project's query didn't answer.
+    project_tracked_from_top: bool,
     /// Those a repository of `.lpm`'s own tracks, by name in `.lpm`.
     lpm_tracked: Vec<String>,
+    /// Those a repository around the project's tracks, as its index can
+    /// still list files from before the project's repository was made: the
+    /// directory its query ran in, and the names from there.
+    around_tracked: Vec<(PathBuf, Vec<String>)>,
     /// Those git neither tracks nor ignores, by name in `.lpm`.
     unignored: Vec<String>,
     /// Whether git refused to answer for `.lpm`, as for one that looks like a
@@ -928,6 +956,7 @@ impl CaptureGitState {
             && self.unanswered.is_empty()
             && self.project_tracked.is_empty()
             && self.lpm_tracked.is_empty()
+            && self.around_tracked.is_empty()
             && self.unignored.is_empty()
     }
 }
@@ -937,11 +966,50 @@ impl CaptureGitState {
 enum CaptureRepository {
     Project,
     Lpm,
+    /// One around the project's repository.
+    Around,
 }
 
-const CAPTURES_PATHSPEC: &str = ":(glob,icase)inspector.db*";
+/// The capture files' names, `inspector.db` and the files beside it, under
+/// any spelling a filesystem takes for them: the glob leaves the letters
+/// another character can stand for to wildcards and allows a mark HFS+
+/// ignores anywhere, as [`lpm_common::project_git::respelling_glob`] does,
+/// and [`is_capture_name`] drops what else it matches.
+const CAPTURES_PATHSPEC: &str = ":(glob,icase)*n*p*e*c*t*o*r*.*d*b*";
 
-const PROJECT_CAPTURES_PATHSPEC: &str = ":(glob,icase).lpm/inspector.db*";
+/// The project's query matches from the repository's top, as git matches
+/// the directory it runs in by its spelling in the index, case and all; its
+/// `.lpm` glob also takes the dots or spaces Win32 path lookup drops from a
+/// name's end. On Windows it also takes the names with a `~`, which NTFS
+/// can resolve as the short name of `.lpm` or of a capture file.
+/// [`in_project_state`] keeps the project's own capture files.
+const PROJECT_CAPTURES_QUERY: &[&str] = if cfg!(windows) {
+    &[
+        ":(top,glob,icase)**/*.*l*p*m*/*n*p*e*c*t*o*r*.*d*b*",
+        ":(top,glob)**/*~*/*",
+        ":(top,glob,icase)**/*.*l*p*m*/*~*",
+    ]
+} else {
+    &[":(top,glob,icase)**/*.*l*p*m*/*n*p*e*c*t*o*r*.*d*b*"]
+};
+
+/// The query in `.lpm`, which on Windows also takes the names there with a
+/// `~`, as NTFS can resolve one as the short name of a capture file.
+const LPM_CAPTURES_QUERY: &[&str] = if cfg!(windows) {
+    &[CAPTURES_PATHSPEC, ":(glob)*~*"]
+} else {
+    &[CAPTURES_PATHSPEC]
+};
+
+const CAPTURE_NAME: &str = "inspector.db";
+
+/// Whether `name`, a path git listed, names a capture file under any case
+/// and with any mark HFS+ ignores, whichever volume holds it.
+fn is_capture_name(name: &str) -> bool {
+    let file_name = name.rsplit('/').next().unwrap_or(name);
+    lpm_common::project_git::fold_case(&lpm_common::names::fold_name(file_name))
+        .starts_with(CAPTURE_NAME)
+}
 
 const CAPTURE_GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -978,7 +1046,7 @@ impl From<GitDiscoveryFailure> for CaptureGitFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CaptureGitQuery {
     directory: PathBuf,
-    pathspec: &'static str,
+    pathspecs: &'static [&'static str],
     unignored: bool,
     full_name: bool,
 }
@@ -1010,7 +1078,7 @@ where
     let lpm_exists = lpm_dir.is_dir();
     let project = ask(CaptureGitQuery {
         directory: project_dir.to_path_buf(),
-        pathspec: PROJECT_CAPTURES_PATHSPEC,
+        pathspecs: PROJECT_CAPTURES_QUERY,
         unignored: false,
         full_name: false,
     });
@@ -1019,7 +1087,7 @@ where
             Some(
                 ask(CaptureGitQuery {
                     directory: lpm_dir.clone(),
-                    pathspec: CAPTURES_PATHSPEC,
+                    pathspecs: LPM_CAPTURES_QUERY,
                     unignored: true,
                     full_name: true,
                 })
@@ -1029,7 +1097,23 @@ where
             None
         }
     };
-    let (project, inside) = tokio::join!(project, inside);
+    // Each repository around the project's, by the `.git` above the one
+    // that holds the project.
+    let around_dirs: Vec<PathBuf> = project_dir
+        .ancestors()
+        .filter(|directory| marks_a_repository(&directory.join(".git")))
+        .skip(1)
+        .map(Path::to_path_buf)
+        .collect();
+    let around = futures::future::join_all(around_dirs.iter().map(|directory| {
+        ask(CaptureGitQuery {
+            directory: directory.clone(),
+            pathspecs: PROJECT_CAPTURES_QUERY,
+            unignored: false,
+            full_name: false,
+        })
+    }));
+    let (project, inside, around) = tokio::join!(project, inside, around);
 
     let mut state = CaptureGitState::default();
     // Whether git found a repository the project is in; only where git
@@ -1044,7 +1128,13 @@ where
     };
     let project_answered = match project {
         Ok(files) => {
-            state.project_tracked = files.tracked;
+            let mut directories = std::collections::HashMap::new();
+            state.project_tracked = files
+                .tracked
+                .iter()
+                .filter(|name| in_project_state(project_dir, project_dir, name, &mut directories))
+                .cloned()
+                .collect();
             true
         }
         // In a repository, a query that fails is no answer, git refusing
@@ -1064,24 +1154,29 @@ where
     };
     let inside_answered = match inside {
         Some(Ok(files)) => {
+            // Every name the query lists is in `.lpm`, whichever
+            // repository's top it starts from.
             let (own, project_files): (Vec<String>, Vec<String>) = files
                 .tracked
                 .into_iter()
+                .filter(|name| {
+                    is_capture_name(name)
+                        || (may_be_short_name(file_name(name))
+                            && is_capture_on_disk(&lpm_dir.join(file_name(name))))
+                })
                 .partition(|name| !name.contains('/'));
             state.lpm_tracked = own;
             // Git in `.lpm` lists what the project's repository tracks
             // there, which the project's query has when it answers; when it
             // doesn't, they're what's known of them.
             if !project_answered {
-                state.project_tracked = project_files
-                    .iter()
-                    .map(|name| format!(".lpm/{}", file_name(name)))
-                    .collect();
-                state.project_spelling_unknown = !state.project_tracked.is_empty();
+                state.project_tracked_from_top = !project_files.is_empty();
+                state.project_tracked = project_files;
             }
             state.unignored = files
                 .unignored
                 .iter()
+                .filter(|name| is_capture_name(name))
                 .map(|name| file_name(name).to_owned())
                 .collect();
             true
@@ -1103,7 +1198,74 @@ where
         }
         None => false,
     };
-    (project_answered || inside_answered || in_repository || own_repository).then_some(state)
+    for (directory, answer) in around_dirs.iter().zip(around) {
+        match answer {
+            Ok(files) => {
+                let mut directories = std::collections::HashMap::new();
+                let tracked: Vec<String> = files
+                    .tracked
+                    .iter()
+                    .filter(|name| in_project_state(directory, project_dir, name, &mut directories))
+                    .cloned()
+                    .collect();
+                if !tracked.is_empty() {
+                    state.around_tracked.push((directory.clone(), tracked));
+                }
+            }
+            Err(CaptureGitFailure::NoRepository) => {}
+            Err(_) => {
+                if !state.unanswered.contains(&CaptureRepository::Around) {
+                    state.unanswered.push(CaptureRepository::Around);
+                }
+            }
+        }
+    }
+    (project_answered
+        || inside_answered
+        || in_repository
+        || own_repository
+        || !around_dirs.is_empty())
+    .then_some(state)
+}
+
+/// Whether `name`, a file a query lists relative to `listed_from`, is a
+/// capture file in `project_dir`'s own `.lpm`: named so, or by another
+/// spelling of the directory, or on NTFS of the file, that is the same on
+/// disk. `directories` keeps what each spelling of a directory was found to
+/// be.
+fn in_project_state<'name>(
+    listed_from: &Path,
+    project_dir: &Path,
+    name: &'name str,
+    directories: &mut std::collections::HashMap<&'name str, bool>,
+) -> bool {
+    let Some((directory, file)) = name.rsplit_once('/') else {
+        return false;
+    };
+    let in_state = *directories.entry(directory).or_insert_with(|| {
+        (directory == ".lpm" && listed_from == project_dir)
+            || lpm_common::project_git::same_file(
+                &listed_from.join(directory),
+                &project_dir.join(".lpm"),
+            )
+    });
+    in_state
+        && (is_capture_name(file)
+            || (may_be_short_name(file) && is_capture_on_disk(&listed_from.join(name))))
+}
+
+/// Whether `name` can be an NTFS short name, which holds a `~`.
+fn may_be_short_name(name: &str) -> bool {
+    cfg!(windows) && name.contains('~')
+}
+
+/// Whether `path` resolves to a capture file, under its own name.
+fn is_capture_on_disk(path: &Path) -> bool {
+    std::fs::canonicalize(path).is_ok_and(|resolved| {
+        resolved
+            .file_name()
+            .is_some_and(|name| is_capture_name(&name.to_string_lossy()))
+    })
 }
 
 /// The part of a name git lists after its last directory.
@@ -1119,7 +1281,8 @@ fn capture_git_command(query: &CaptureGitQuery) -> tokio::process::Command {
     if query.full_name {
         args.push("--full-name");
     }
-    args.extend(["--", query.pathspec]);
+    args.push("--");
+    args.extend(query.pathspecs);
     tokio::process::Command::from(hardened_git_command(&query.directory, &args))
 }
 
@@ -1153,6 +1316,9 @@ fn parse_capture_git_files(stdout: &[u8]) -> CaptureGitFiles {
             continue;
         };
         let name = String::from_utf8_lossy(name).into_owned();
+        if !is_capture_name(&name) && !may_be_short_name(&name) {
+            continue;
+        }
         // A conflicted file is listed once for each stage, one after another.
         let list = if tag == b'?' {
             &mut files.unignored
@@ -1196,32 +1362,152 @@ fn listed(names: &[String]) -> String {
     }
 }
 
-/// The command, run in the project directory, that stops `repository`
-/// tracking `tracked`: their names when the warning can list them all, and
-/// otherwise the repository's capture pathspec, which every shell reads
-/// alike in double quotes.
-fn untrack_command(tracked: &[String], repository: CaptureRepository) -> String {
-    if tracked.len() <= LISTED_FILES && tracked.iter().all(|name| is_plain(name)) {
-        format!("{} {}", untrack_prefix(repository), tracked.join(" "))
-    } else {
-        untrack_every_capture(repository)
-    }
+/// Where the names a capture query lists start: the directory it ran in, or
+/// the top of its repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NamedFrom {
+    Here,
+    Top,
 }
 
-/// The command that stops `repository` tracking every capture file, by the
-/// capture pathspec, matched without regard to case.
-fn untrack_every_capture(repository: CaptureRepository) -> String {
-    let pathspec = match repository {
-        CaptureRepository::Project => PROJECT_CAPTURES_PATHSPEC,
-        CaptureRepository::Lpm => CAPTURES_PATHSPEC,
+/// The command, run in the project directory, that stops the repository
+/// whose `git … rm --cached` is `prefix` tracking `tracked` and nothing else:
+/// their names when there are no more than the warning lists and each reads
+/// alike in every shell, and otherwise patterns matching the capture names
+/// in each directory they're in, with the names no pattern matches, NTFS
+/// short names of capture files and names with a mark HFS+ ignores, named
+/// too, quoted as the patterns are.
+fn untrack_command(tracked: &[String], prefix: &str, from: NamedFrom) -> String {
+    let top = if from == NamedFrom::Top { "top," } else { "" };
+    let (options, words): (&str, Vec<String>) = if tracked.len() <= LISTED_FILES
+        && tracked
+            .iter()
+            .all(|name| reads_alike_in_double_quotes(name))
+    {
+        let words = tracked
+            .iter()
+            .map(|name| {
+                if from == NamedFrom::Here && is_plain(name) {
+                    name.clone()
+                } else {
+                    format!(":({top}literal){name}")
+                }
+            })
+            .collect();
+        ("", words)
+    } else {
+        let mut directories: Vec<&str> = tracked
+            .iter()
+            .map(|name| name.rsplit_once('/').map_or("", |(directory, _)| directory))
+            .collect();
+        directories.sort_unstable();
+        directories.dedup();
+        let words = directories
+            .into_iter()
+            .flat_map(capture_patterns)
+            .map(|pattern| format!(":({top}glob){pattern}"))
+            .chain(
+                tracked
+                    .iter()
+                    .filter(|name| {
+                        let file = file_name(name);
+                        ((!is_capture_name(name) && file.contains('~'))
+                            || file.chars().any(lpm_common::names::is_ignored_in_names))
+                            && !name.chars().any(char::is_control)
+                    })
+                    .map(|name| format!(":({top}literal){name}")),
+            )
+            .collect();
+        // `git rm` fails on a pattern that matches nothing.
+        (" --ignore-unmatch", words)
     };
-    format!("{} \"{pathspec}\"", untrack_prefix(repository))
+    let mut command = format!("{prefix}{options} --");
+    for word in &words {
+        command.push(' ');
+        if is_plain(word) {
+            command.push_str(word);
+        } else if reads_alike_in_double_quotes(word) {
+            command.push('"');
+            command.push_str(word);
+            command.push('"');
+        } else {
+            command.push_str(&lpm_common::project_git::shell_word(word));
+        }
+    }
+    command
+}
+
+/// Whether `word` reads the same in double quotes to sh, PowerShell and
+/// cmd: it holds nothing any of them expands, escapes or ends the quotes
+/// at there, PowerShell's typographic double quotes included, and no
+/// control character.
+fn reads_alike_in_double_quotes(word: &str) -> bool {
+    !word.is_empty()
+        && !word.chars().any(|c| {
+            c.is_control()
+                || matches!(
+                    c,
+                    '"' | '$' | '`' | '\\' | '%' | '!' | '\u{201C}' | '\u{201D}' | '\u{201E}'
+                )
+        })
+}
+
+/// Glob patterns that match, in `directory`, the names [`is_capture_name`]
+/// takes and no others: `inspector.db` with each letter in either ASCII
+/// case or as a character that folds to it, and anything after.
+fn capture_patterns(directory: &str) -> Vec<String> {
+    let mut patterns = vec![if directory.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", glob_escaped(directory))
+    }];
+    for character in CAPTURE_NAME.chars() {
+        let choices: Vec<String> = if character.is_ascii_alphabetic() {
+            std::iter::once(format!(
+                "[{}{}]",
+                character.to_ascii_lowercase(),
+                character.to_ascii_uppercase()
+            ))
+            .chain(
+                lpm_common::project_git::non_ascii_folds(character)
+                    .iter()
+                    .map(char::to_string),
+            )
+            .collect()
+        } else {
+            vec![glob_escaped(character.encode_utf8(&mut [0; 4]))]
+        };
+        patterns = patterns
+            .iter()
+            .flat_map(|pattern| {
+                choices
+                    .iter()
+                    .map(move |choice| format!("{pattern}{choice}"))
+            })
+            .collect();
+    }
+    for pattern in &mut patterns {
+        pattern.push('*');
+    }
+    patterns
+}
+
+/// `text` with the characters a git glob reads as special escaped.
+fn glob_escaped(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        if matches!(character, '*' | '?' | '[' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 fn untrack_prefix(repository: CaptureRepository) -> &'static str {
     match repository {
-        CaptureRepository::Project => "git rm --cached --",
-        CaptureRepository::Lpm => "git -C .lpm rm --cached --",
+        CaptureRepository::Project | CaptureRepository::Around => "git rm --cached",
+        CaptureRepository::Lpm => "git -C .lpm rm --cached",
     }
 }
 
@@ -2441,15 +2727,381 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn names_tracked_capture_files_spelled_with_letters_filesystems_fold() {
+        let respelled = [
+            ".lpm/in\u{17F}pector.db",
+            ".lpm/\u{131}nspector.db-wal",
+            ".lpm/INSPECTOR.DB-shm",
+        ];
+        let project = capture_project(&respelled);
+        std::fs::write(project.path().join(".lpm/connpector.db"), "{}").unwrap();
+        for name in respelled.iter().chain([&".lpm/connpector.db"]) {
+            git(project.path(), &["add", name]);
+        }
+
+        let state = capture_git_state(project.path()).await.unwrap();
+
+        assert_eq!(
+            state.project_tracked,
+            names(&[
+                ".lpm/INSPECTOR.DB-shm",
+                ".lpm/in\u{17F}pector.db",
+                ".lpm/\u{131}nspector.db-wal",
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn names_a_capture_tracked_under_another_spelling_of_the_project_s_directory() {
+        let repository = capture_project(&["DIR/.lpm/inspector.db", "DIR/sub/.lpm/inspector.db"]);
+        git(repository.path(), &["add", "DIR"]);
+        let root = repository.path();
+        std::fs::rename(root.join("DIR"), root.join("moving")).unwrap();
+        std::fs::rename(root.join("moving"), root.join("dir")).unwrap();
+        // On a disk that tells `DIR` from `dir`, the project is another directory.
+        if !root.join("DIR").exists() {
+            return;
+        }
+
+        let state = capture_git_state(&root.join("dir")).await.unwrap();
+
+        assert_eq!(state.project_tracked, names(&["../DIR/.lpm/inspector.db"]));
+        assert!(!state.kept_out());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn names_a_capture_tracked_under_an_ntfs_short_name() {
+        use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+        let short_name = |path: &Path| -> Option<String> {
+            let long: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let mut short = vec![0u16; 1024];
+            // SAFETY: both buffers are valid for the lengths passed.
+            let length =
+                unsafe { GetShortPathNameW(long.as_ptr(), short.as_mut_ptr(), short.len() as u32) };
+            let short = std::ffi::OsString::from_wide(&short[..length as usize]);
+            Path::new(&short)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .filter(|name| length > 0 && name.contains('~'))
+        };
+        let project = capture_project(&[
+            ".lpm/inspector.db",
+            ".lpm/inspector.db-wal",
+            ".lpm/added-sources.json",
+        ]);
+        let lpm_dir = project.path().join(".lpm");
+        let (Some(lpm), Some(db), Some(sources)) = (
+            short_name(&lpm_dir),
+            short_name(&lpm_dir.join("inspector.db")),
+            short_name(&lpm_dir.join("added-sources.json")),
+        ) else {
+            // The volume makes no short names.
+            return;
+        };
+        let blob = std::process::Command::new("git")
+            .args(["hash-object", "-w", ".lpm/inspector.db"])
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(blob.status.success(), "{blob:?}");
+        let blob = String::from_utf8(blob.stdout).unwrap();
+        // As a commit made where those were the names carries them.
+        for entry in [
+            format!("{lpm}/inspector.db-wal"),
+            format!(".lpm/{db}"),
+            format!(".lpm/{sources}"),
+        ] {
+            git(
+                project.path(),
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("100644,{},{entry}", blob.trim()),
+                ],
+            );
+        }
+
+        let state = capture_git_state(project.path()).await.unwrap();
+
+        let mut tracked = state.project_tracked.clone();
+        tracked.sort();
+        assert_eq!(
+            tracked,
+            [format!(".lpm/{db}"), format!("{lpm}/inspector.db-wal")]
+        );
+        assert!(!state.kept_out());
+
+        // A repository of `.lpm`'s own that tracks a capture by its short name.
+        let lpm_project = capture_project(&[".lpm/inspector.db", ".lpm/added-sources.json"]);
+        let lpm_dir = lpm_project.path().join(".lpm");
+        let (Some(db), Some(sources)) = (
+            short_name(&lpm_dir.join("inspector.db")),
+            short_name(&lpm_dir.join("added-sources.json")),
+        ) else {
+            return;
+        };
+        git(&lpm_dir, &["init", "--quiet"]);
+        let blob = std::process::Command::new("git")
+            .args(["hash-object", "-w", "inspector.db"])
+            .current_dir(&lpm_dir)
+            .output()
+            .unwrap();
+        assert!(blob.status.success(), "{blob:?}");
+        let blob = String::from_utf8(blob.stdout).unwrap();
+        for entry in [&db, &sources] {
+            git(
+                &lpm_dir,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("100644,{},{entry}", blob.trim()),
+                ],
+            );
+        }
+
+        let state = capture_git_state(lpm_project.path()).await.unwrap();
+
+        assert_eq!(state.lpm_tracked, [db]);
+        assert!(!state.kept_out());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn names_a_capture_tracked_under_lpm_with_a_trailing_dot_or_space() {
+        let project = capture_project(&[".lpm/inspector.db", ".lpm/inspector.db-wal"]);
+        let blob = std::process::Command::new("git")
+            .args(["hash-object", "-w", ".lpm/inspector.db"])
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(blob.status.success(), "{blob:?}");
+        let blob = String::from_utf8(blob.stdout).unwrap();
+        // As a commit made where `core.protectNTFS` was off carries them.
+        for entry in [".lpm./inspector.db", ".lpm /inspector.db-wal"] {
+            git(
+                project.path(),
+                &[
+                    "-c",
+                    "core.protectNTFS=false",
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("100644,{},{entry}", blob.trim()),
+                ],
+            );
+        }
+
+        let state = capture_git_state(project.path()).await.unwrap();
+
+        let mut tracked = state.project_tracked.clone();
+        tracked.sort();
+        assert_eq!(
+            tracked,
+            names(&[".lpm /inspector.db-wal", ".lpm./inspector.db"])
+        );
+        assert!(!state.kept_out());
+    }
+
+    /// Runs the untrack command a warning gives, as a shell reads it, and
+    /// returns what the project's index still tracks.
+    #[cfg(unix)]
+    fn run_untrack_command(project: &Path, warnings: &[String]) -> Vec<String> {
+        let command = warnings
+            .iter()
+            .find_map(|warning| {
+                warning
+                    .split('`')
+                    .skip(1)
+                    .step_by(2)
+                    .find(|part| part.starts_with("git "))
+            })
+            .unwrap_or_else(|| panic!("no command in {warnings:?}"));
+        let ran = std::process::Command::new("sh")
+            .args(["-c", command])
+            .current_dir(project)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(ran.status.success(), "{command}: {ran:?}");
+        let listed = std::process::Command::new("git")
+            .args(["ls-files", "-z"])
+            .current_dir(project)
+            .output()
+            .unwrap();
+        let mut tracked: Vec<String> = listed
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|name| !name.is_empty())
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .collect();
+        tracked.sort();
+        tracked
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_untrack_command_takes_the_tracked_captures_and_nothing_else() {
+        let others = [
+            ".lpm/companion-inspector.db",
+            ".lpm/connpector.db",
+            ".lpm/inspector.d",
+            ".lpm/inspect\u{200C}.db",
+            "inspector.db",
+            "sub/.lpm/inspector.db",
+        ];
+        for captures in [
+            &[".lpm/inspector.db", ".lpm/\u{131}nspector.db-wal"][..],
+            &[
+                ".lpm/INSPECTOR.DB-shm",
+                ".lpm/Inspector.db-journal",
+                ".lpm/inspector.db",
+                ".lpm/inspector.db.bak",
+                ".lpm/\u{131}nspector.db-wal",
+                ".lpm/\u{131}nspector.dbx",
+            ][..],
+            &[
+                ".lpm/INSPECTOR.DB-shm",
+                ".lpm/Inspector.db-journal",
+                ".lpm/inspector.db",
+                ".lpm/inspector.db.bak",
+                ".lpm/insp\u{200C}ector.db-wal",
+                ".lpm/\u{FEFF}inspector.dbx",
+            ][..],
+        ] {
+            let project = capture_project(&[captures, &others[..]].concat());
+            git(project.path(), &["add", "-A"]);
+
+            let state = capture_git_state(project.path()).await.unwrap();
+            let mut tracked = state.project_tracked.clone();
+            tracked.sort();
+            assert_eq!(tracked, names(captures));
+            let warnings = capture_warnings(Some(&state), false, CaptureStore::OwnerOnly);
+
+            assert_eq!(
+                run_untrack_command(project.path(), &warnings),
+                names(&others),
+                "{warnings:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_pattern_command_still_names_a_capture_tracked_by_a_short_name() {
+        // `INSPEC~1.DB` stands for an NTFS short name the check found to be
+        // a capture file on disk, which no capture pattern matches; a `$` in
+        // its directory needs quoting in every shell.
+        for directory in [".lpm", "app$dev/.lpm"] {
+            let captures: Vec<String> = [
+                "INSPEC~1.DB",
+                "inspector.db",
+                "inspector.db-journal",
+                "inspector.db-shm",
+                "inspector.db-wal",
+                "inspector.db.bak",
+            ]
+            .iter()
+            .map(|name| format!("{directory}/{name}"))
+            .collect();
+            let other = format!("{directory}/OTHER~1.DB");
+            let mut files: Vec<&str> = captures.iter().map(String::as_str).collect();
+            files.push(&other);
+            let project = capture_project(&files);
+            git(project.path(), &["add", "-A"]);
+            let command = untrack_command(
+                &captures,
+                untrack_prefix(CaptureRepository::Project),
+                NamedFrom::Here,
+            );
+            let warnings = [format!("run `{command}`")];
+
+            assert!(command.contains("--ignore-unmatch"), "{command}");
+            assert_eq!(
+                run_untrack_command(project.path(), &warnings),
+                [other],
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_capture_pathspecs_leave_respellable_letters_to_wildcards() {
+        let glob = lpm_common::project_git::respelling_glob(CAPTURE_NAME);
+        let state = lpm_common::project_git::respelling_glob(lpm_common::PROJECT_STATE_DIR);
+        assert_eq!(CAPTURES_PATHSPEC, format!(":(glob,icase){glob}"));
+        assert_eq!(
+            PROJECT_CAPTURES_QUERY[0],
+            format!(":(top,glob,icase)**/{state}/{glob}")
+        );
+        // HFS+ leaves zero-width and directional marks out of names.
+        assert!(is_capture_name(".lpm/inspector.d\u{200C}b-wal"));
+        assert!(!is_capture_name(".lpm/inspect\u{200C}.db"));
+    }
+
+    #[tokio::test]
     async fn names_a_capture_the_project_tracks_under_another_case_of_lpm() {
         // As a repository committed on a case-insensitive disk carries it.
         let project = capture_project(&[".LPM/inspector.db"]);
         git(project.path(), &["add", ".LPM/inspector.db"]);
+        // On a disk that tells `.LPM` from `.lpm`, it's another directory.
+        if !project.path().join(".lpm").exists() {
+            let state = capture_git_state(project.path()).await.unwrap();
+            assert!(state.project_tracked.is_empty(), "{state:?}");
+            return;
+        }
 
         let state = capture_git_state(project.path()).await.unwrap();
 
         assert_eq!(state.project_tracked, names(&[".LPM/inspector.db"]));
         assert!(!state.kept_out());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn asks_a_repository_around_the_project_s_about_the_captures() {
+        // An outer repository committed the capture before `app` became a
+        // repository of its own, so its index still lists the file.
+        let outer = capture_project(&["app/.lpm/inspector.db"]);
+        git(outer.path(), &["add", "-f", "app/.lpm/inspector.db"]);
+        let project = outer.path().join("app");
+        git(&project, &["init", "--quiet"]);
+        std::fs::write(project.join(".lpm/.gitignore"), "*\n").unwrap();
+
+        let state = capture_git_state(&project).await.unwrap();
+
+        assert!(state.project_tracked.is_empty(), "{state:?}");
+        assert!(!state.kept_out(), "{state:?}");
+        let warnings = capture_warnings(Some(&state), false, CaptureStore::OwnerOnly);
+        assert!(!warnings[0].contains("git ignores it"), "{warnings:?}");
+        let command = warnings
+            .iter()
+            .find_map(|warning| {
+                warning
+                    .split('`')
+                    .skip(1)
+                    .step_by(2)
+                    .find(|part| part.starts_with("git "))
+            })
+            .unwrap_or_else(|| panic!("no command in {warnings:?}"));
+        let ran = std::process::Command::new("sh")
+            .args(["-c", command])
+            .current_dir(&project)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(ran.status.success(), "{command}: {ran:?}");
+        let listed = std::process::Command::new("git")
+            .args(["ls-files", "--", "app/.lpm"])
+            .current_dir(outer.path())
+            .output()
+            .unwrap();
+        assert!(listed.stdout.is_empty(), "{command}: {listed:?}");
     }
 
     #[tokio::test]
@@ -2464,7 +3116,11 @@ mod tests {
         assert!(state.project_tracked.is_empty());
         assert_eq!(state.lpm_tracked, names(&["inspector.db"]));
         assert_eq!(
-            untrack_command(&state.lpm_tracked, CaptureRepository::Lpm),
+            untrack_command(
+                &state.lpm_tracked,
+                untrack_prefix(CaptureRepository::Lpm),
+                NamedFrom::Here
+            ),
             "git -C .lpm rm --cached -- inspector.db"
         );
     }
@@ -2663,13 +3319,13 @@ mod tests {
             vec![
                 CaptureGitQuery {
                     directory: project.path().to_path_buf(),
-                    pathspec: PROJECT_CAPTURES_PATHSPEC,
+                    pathspecs: PROJECT_CAPTURES_QUERY,
                     unignored: false,
                     full_name: false,
                 },
                 CaptureGitQuery {
                     directory: lpm_dir,
-                    pathspec: CAPTURES_PATHSPEC,
+                    pathspecs: LPM_CAPTURES_QUERY,
                     unignored: true,
                     full_name: true,
                 },
@@ -2681,8 +3337,9 @@ mod tests {
             state,
             Some(CaptureGitState {
                 project_tracked: names(&[".lpm/inspector.db"]),
-                project_spelling_unknown: false,
+                project_tracked_from_top: false,
                 lpm_tracked: Vec::new(),
+                around_tracked: Vec::new(),
                 unignored: names(&["inspector.db-wal"]),
                 lpm_unasked: false,
                 unanswered: Vec::new(),
@@ -2694,18 +3351,20 @@ mod tests {
     async fn keeps_the_project_s_names_for_its_tracked_files_when_both_answer() {
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir(project.path().join(".lpm")).unwrap();
+        // Another spelling of the project's directory, as an index can hold.
+        let respelled = format!(
+            "../{}/.lpm/inspector.db",
+            project.path().file_name().unwrap().to_str().unwrap()
+        );
 
         let (state, _) = state_from_answers(
             project.path(),
-            Ok(files(&[".LPM/inspector.db"], &[])),
-            Ok(files(&[".LPM/inspector.db"], &[])),
+            Ok(files(&[&respelled], &[])),
+            Ok(files(&["Packages/App/.lpm/inspector.db"], &[])),
         )
         .await;
 
-        assert_eq!(
-            state.unwrap().project_tracked,
-            names(&[".LPM/inspector.db"])
-        );
+        assert_eq!(state.unwrap().project_tracked, names(&[&respelled]));
     }
 
     #[tokio::test]
@@ -2890,7 +3549,7 @@ mod tests {
             let (lpm_tracked, project_tracked) = if own {
                 (names(&["inspector.db"]), Vec::new())
             } else {
-                (Vec::new(), names(&[".lpm/inspector.db"]))
+                (Vec::new(), names(&[listed]))
             };
             assert_eq!(
                 (state.lpm_tracked, state.project_tracked),
@@ -3158,22 +3817,25 @@ mod tests {
         let (state, _) = state_from_answers(
             project.path(),
             Err(CaptureGitFailure::Unavailable),
-            Ok(files(&[".lpm/inspector.db"], &[])),
+            Ok(files(&["Packages/App/.lpm/inspector.db"], &[])),
         )
         .await;
 
         let state = state.unwrap();
-        assert_eq!(state.project_tracked, names(&[".lpm/inspector.db"]));
+        assert_eq!(
+            state.project_tracked,
+            names(&["Packages/App/.lpm/inspector.db"])
+        );
         assert_eq!(state.unanswered, vec![CaptureRepository::Project]);
-        assert!(state.project_spelling_unknown);
+        assert!(state.project_tracked_from_top);
         let warnings = warnings_for(Some(state), false);
-        // Git in `.lpm` may spell the directory otherwise than the index, so
-        // the command matches every capture file without regard to case.
-        let command = format!("`git rm --cached -- \"{PROJECT_CAPTURES_PATHSPEC}\"`");
+        // Git in `.lpm` names the file from the repository's top, which may
+        // spell the project's directory otherwise than the disk.
+        let command = "`git rm --cached -- \":(top,literal)Packages/App/.lpm/inspector.db\"`";
         assert!(
             warnings.iter().any(
                 |warning| warning.starts_with("git tracks '.lpm/inspector.db'")
-                    && warning.contains(&command)
+                    && warning.contains(command)
             ),
             "{warnings:?}"
         );
@@ -3218,8 +3880,9 @@ mod tests {
     ) -> CaptureGitState {
         CaptureGitState {
             project_tracked: names(project_tracked),
-            project_spelling_unknown: false,
+            project_tracked_from_top: false,
             lpm_tracked: names(lpm_tracked),
+            around_tracked: Vec::new(),
             unignored: names(unignored),
             lpm_unasked: false,
             unanswered: Vec::new(),
@@ -3410,8 +4073,21 @@ mod tests {
         );
     }
 
+    /// The patterns for the capture names in `directory`, as the command
+    /// quotes them.
+    fn quoted_capture_patterns(magic: &str, directory: &str) -> String {
+        ["[iI]", "\u{131}"]
+            .into_iter()
+            .flat_map(|i| ["[sS]", "\u{17F}"].map(|s| (i, s)))
+            .map(|(i, s)| {
+                format!("\":({magic}){directory}{i}[nN]{s}[pP][eE][cC][tT][oO][rR].[dD][bB]*\"")
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     #[test]
-    fn untracks_listed_names_or_every_capture_file_past_the_list() {
+    fn untracks_listed_names_or_the_capture_names_in_their_directories_past_the_list() {
         let names = |count: usize, prefix: &str| -> Vec<String> {
             (0..count)
                 .map(|index| format!("{prefix}inspector.db{index}"))
@@ -3419,34 +4095,88 @@ mod tests {
         };
 
         assert_eq!(
-            untrack_command(&names(5, ".lpm/"), CaptureRepository::Project),
+            untrack_command(
+                &names(5, ".lpm/"),
+                untrack_prefix(CaptureRepository::Project),
+                NamedFrom::Here
+            ),
             "git rm --cached -- .lpm/inspector.db0 .lpm/inspector.db1 \
              .lpm/inspector.db2 .lpm/inspector.db3 .lpm/inspector.db4"
         );
+        let mut respelled = names(5, ".lpm/");
+        respelled.push("../DIR/.lpm/inspector.db".into());
         assert_eq!(
-            untrack_command(&names(6, ".lpm/"), CaptureRepository::Project),
-            "git rm --cached -- \":(glob,icase).lpm/inspector.db*\""
+            untrack_command(
+                &respelled,
+                untrack_prefix(CaptureRepository::Project),
+                NamedFrom::Here
+            ),
+            format!(
+                "git rm --cached --ignore-unmatch -- {} {}",
+                quoted_capture_patterns("glob", "../DIR/.lpm/"),
+                quoted_capture_patterns("glob", ".lpm/")
+            )
         );
         assert_eq!(
-            untrack_command(&names(6, ""), CaptureRepository::Lpm),
-            "git -C .lpm rm --cached -- \":(glob,icase)inspector.db*\""
+            untrack_command(
+                &names(6, ""),
+                untrack_prefix(CaptureRepository::Lpm),
+                NamedFrom::Here
+            ),
+            format!(
+                "git -C .lpm rm --cached --ignore-unmatch -- {}",
+                quoted_capture_patterns("glob", "")
+            )
+        );
+        assert_eq!(
+            untrack_command(
+                &names(6, "A/.lpm/"),
+                untrack_prefix(CaptureRepository::Project),
+                NamedFrom::Top
+            ),
+            format!(
+                "git rm --cached --ignore-unmatch -- {}",
+                quoted_capture_patterns("top,glob", "A/.lpm/")
+            )
         );
     }
 
     #[test]
-    fn untracks_every_capture_file_when_a_name_has_other_characters() {
+    fn untracks_a_name_by_itself_only_where_every_shell_reads_it_alike() {
         for name in [
+            "in\u{17F}pector.db",
             "inspector db",
-            "inspector\u{201d}.db",
             "inspector\u{2019}.db",
+            "inspector[1]*.db",
+        ] {
+            assert_eq!(
+                untrack_command(
+                    &names(&["inspector.db", name]),
+                    untrack_prefix(CaptureRepository::Lpm),
+                    NamedFrom::Here
+                ),
+                format!("git -C .lpm rm --cached -- inspector.db \":(literal){name}\""),
+                "{name:?}"
+            );
+        }
+        for name in [
+            "inspector\u{201d}.db",
             "!'$(touch x)'.db",
             "inspector\".db",
             "%PATH%.db",
+            "inspector\u{1b}[2J.db",
             "",
         ] {
             assert_eq!(
-                untrack_command(&names(&["inspector.db", name]), CaptureRepository::Lpm),
-                "git -C .lpm rm --cached -- \":(glob,icase)inspector.db*\"",
+                untrack_command(
+                    &names(&["inspector.db", name]),
+                    untrack_prefix(CaptureRepository::Lpm),
+                    NamedFrom::Here
+                ),
+                format!(
+                    "git -C .lpm rm --cached --ignore-unmatch -- {}",
+                    quoted_capture_patterns("glob", "")
+                ),
                 "{name:?}"
             );
         }

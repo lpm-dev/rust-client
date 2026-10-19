@@ -377,6 +377,32 @@ fn env_example_never_changes_a_linked_destination() {
     assert_eq!(project.read_file("sentinel.txt"), "original");
 }
 
+/// `.env.example` holds no values and is committed, so it gets the mode any
+/// new project file gets, not owner-only.
+#[cfg(unix)]
+#[test]
+fn env_example_is_created_like_any_other_project_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let project = TempProject::empty(r#"{"name":"env-example-mode"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"envSchema":{"vars":{"VALUE":{"description":"A value"}}}}"#,
+    );
+    std::fs::File::create(project.path().join("reference.txt")).unwrap();
+
+    lpm(&project).args(["env", "example"]).assert().success();
+
+    let mode = |name: &str| {
+        std::fs::metadata(project.path().join(name))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode(".env.example"), mode("reference.txt"));
+}
+
 #[test]
 fn env_export_round_trips_multiline_values_through_project_loading() {
     let project = TempProject::empty(r#"{"name":"env-export-round-trip"}"#);
