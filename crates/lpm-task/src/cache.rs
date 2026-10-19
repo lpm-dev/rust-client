@@ -1598,6 +1598,7 @@ fn collect_output_files(
 ) -> Result<Vec<PathBuf>, LpmError> {
     let mut files = HashSet::new();
     let mut short_named = ShortNamedDirectories::default();
+    let mut git_directories = GitDirectories::default();
     let glob_root = lpm_common::project_glob::project_glob_root(project_dir);
 
     for pattern in output_globs {
@@ -1636,6 +1637,7 @@ fn collect_output_files(
                 })?;
                 if is_never_an_output(relative)
                     || short_named.reaches_withheld(project_dir, relative)
+                    || git_directories.contain(project_dir, relative)
                 {
                     continue;
                 }
@@ -1719,6 +1721,36 @@ fn expand_glob_pattern(pattern: &str) -> Vec<String> {
         patterns.push(format!("{pattern}/*"));
     }
     patterns
+}
+
+/// Which directories of a project are git directories under a name that
+/// doesn't say so, as a bare repository at `vendor/tool.git` is, found once
+/// per directory during one pass over a set of paths.
+#[derive(Default)]
+struct GitDirectories(HashMap<PathBuf, bool>);
+
+impl GitDirectories {
+    /// Whether `relative`, a file in `project_dir`, is in a git directory,
+    /// where a restored hook would run with the next git command there.
+    fn contain(&mut self, project_dir: &Path, relative: &Path) -> bool {
+        let mut directory = PathBuf::new();
+        for component in relative.parent().into_iter().flat_map(Path::components) {
+            directory.push(component);
+            let is_git_directory = match self.0.get(&directory) {
+                Some(&known) => known,
+                None => {
+                    let found =
+                        lpm_common::git_directory::is_git_directory(&project_dir.join(&directory));
+                    self.0.insert(directory.clone(), found);
+                    found
+                }
+            };
+            if is_git_directory {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// What [`ShortNamedDirectories::reaches_withheld`] found for each path
@@ -2895,6 +2927,76 @@ mod tests {
 
         assert_eq!(fs::read_to_string(dist.join("kept.txt")).unwrap(), "cached");
         assert!(!dist.join("linked.txt").exists());
+    }
+
+    fn make_bare_repository(path: &Path) {
+        for directory in ["objects", "refs", "hooks"] {
+            fs::create_dir_all(path.join(directory)).unwrap();
+        }
+        fs::write(path.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
+    #[test]
+    fn outputs_never_take_or_prune_files_in_a_git_directory_under_another_name() {
+        let cache = TestCache::new();
+        let outputs = ["vendor/**".to_string()];
+        let project = tempfile::tempdir().unwrap();
+        let bare = project.path().join("vendor/tool.git");
+        make_bare_repository(&bare);
+        fs::write(bare.join("hooks/pre-commit"), "the repository's hook").unwrap();
+        fs::write(project.path().join("vendor/lib.js"), "cached").unwrap();
+        let key = unique_key("bare-repository-outputs");
+        cache
+            .store(&key, project.path(), "build", &outputs, "", "", 1)
+            .unwrap();
+        fs::write(bare.join("hooks/post-commit"), "added since").unwrap();
+        fs::write(project.path().join("vendor/lib.js"), "changed").unwrap();
+
+        cache.restore(&key, project.path(), &outputs).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(project.path().join("vendor/lib.js")).unwrap(),
+            "cached"
+        );
+        assert_eq!(
+            fs::read_to_string(bare.join("hooks/post-commit")).unwrap(),
+            "added since"
+        );
+        assert_eq!(
+            fs::read_to_string(bare.join("hooks/pre-commit")).unwrap(),
+            "the repository's hook"
+        );
+    }
+
+    #[test]
+    fn restore_never_writes_into_a_git_directory_in_the_project() {
+        let cache = TestCache::new();
+        let outputs = ["vendor/**".to_string()];
+        let source = tempfile::tempdir().unwrap();
+        fs::create_dir_all(source.path().join("vendor/tool.git/hooks")).unwrap();
+        fs::write(
+            source.path().join("vendor/tool.git/hooks/pre-commit"),
+            "cached",
+        )
+        .unwrap();
+        let key = unique_key("restore-into-bare-repository");
+        cache
+            .store(&key, source.path(), "build", &outputs, "", "", 1)
+            .unwrap();
+        let project = tempfile::tempdir().unwrap();
+        make_bare_repository(&project.path().join("vendor/tool.git"));
+
+        let error = cache
+            .restore(&key, project.path(), &outputs)
+            .expect_err("a restore wrote into a git directory");
+
+        assert!(error.to_string().contains("git directory"), "{error}");
+        assert!(
+            !project
+                .path()
+                .join("vendor/tool.git/hooks/pre-commit")
+                .exists()
+        );
     }
 
     #[test]

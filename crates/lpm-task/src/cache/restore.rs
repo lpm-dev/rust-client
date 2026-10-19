@@ -388,6 +388,17 @@ impl StagedOutputs {
                     .into(),
             ));
         }
+        let mut git_directories = GitDirectories::default();
+        if let Some(relative) = this
+            .files
+            .iter()
+            .find(|relative| git_directories.contain(&this.canonical_project, relative))
+        {
+            return Err(LpmError::Task(format!(
+                "task cache archive writes into a git directory in the project: {}",
+                relative.display()
+            )));
+        }
         verify_open_directory_path(
             &this.project,
             &this.canonical_project,
