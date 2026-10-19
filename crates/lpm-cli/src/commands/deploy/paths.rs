@@ -168,6 +168,9 @@ pub(in crate::commands::deploy) fn validate_output_dir(
         )));
     }
 
+    #[cfg(unix)]
+    refuse_changeable_output(&normalized, output_dir)?;
+
     // Empty / force check. Non-existent paths are fine — the copy step
     // will create them. For `--force` on a non-empty existing dir, this
     // function only suppresses the non-empty error; the actual cleanup
@@ -208,6 +211,124 @@ pub(in crate::commands::deploy) fn validate_output_dir(
     }
 
     Ok(normalized)
+}
+
+/// Refuses an output whose path another user can change: a directory on
+/// the way, or the output itself, whose entries someone other than the
+/// user and root may rename, remove or replace, as
+/// [`lpm_common::path_trust`] reads them. They could swap what the path
+/// leads to between the deploy's checks and its writes, which go by name.
+/// A path that doesn't exist yet is checked as far as it does.
+#[cfg(unix)]
+fn refuse_changeable_output(output: &Path, typed: &Path) -> Result<(), LpmError> {
+    let existing = output
+        .ancestors()
+        .find(|ancestor| std::fs::symlink_metadata(ancestor).is_ok())
+        .unwrap_or_else(|| Path::new("/"));
+    match lpm_common::path_trust::first_changeable_directory(existing, lpm_common::current_uid()) {
+        Ok(None) => Ok(()),
+        Ok(Some(changeable)) => Err(LpmError::Script(format!(
+            "lpm deploy: other users can change {} ({}), so they could redirect what the deploy \
+             writes to output directory {typed:?}. Choose an output whose directories only you, \
+             or root, can change.",
+            changeable.directory.display(),
+            changeable.reason
+        ))),
+        Err(error) => Err(LpmError::Script(format!(
+            "lpm deploy: can't check who can change output directory {typed:?}: {error}"
+        ))),
+    }
+}
+
+/// The deploy output from its creation to the deploy's last write: made by
+/// the deploy where it doesn't exist yet, on a path no other user can
+/// change, and checked to be the same directory between the deploy's
+/// steps, which write into it by name.
+pub(in crate::commands::deploy) struct Output {
+    path: PathBuf,
+    identity: (u64, u64),
+}
+
+impl Output {
+    /// Creates `path` and its missing parents with no write access for
+    /// group or others, whatever the umask lets through, so no one else
+    /// adds to them while the deploy runs, or takes an empty directory
+    /// that is there. Refuses one that appears meanwhile.
+    pub(in crate::commands::deploy) fn prepare(path: &Path) -> Result<Self, LpmError> {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => create_output(path)?,
+            Err(error) => {
+                return Err(LpmError::Script(format!(
+                    "lpm deploy: can't inspect output directory {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+        #[cfg(unix)]
+        refuse_changeable_output(path, path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            identity: output_identity(path)?,
+        })
+    }
+
+    /// Stops the deploy when its output path no longer leads to the
+    /// directory it prepared.
+    pub(in crate::commands::deploy) fn verify(&self) -> Result<(), LpmError> {
+        if output_identity(&self.path)? == self.identity {
+            Ok(())
+        } else {
+            Err(LpmError::Script(format!(
+                "lpm deploy: output directory {} changed while the deploy ran, so it stopped. \
+                 Check what replaced it, then deploy again.",
+                self.path.display()
+            )))
+        }
+    }
+}
+
+fn create_output(path: &Path) -> Result<(), LpmError> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o755);
+    }
+    let failed = |error: std::io::Error| {
+        LpmError::Script(format!(
+            "lpm deploy: failed to create output directory {}: {error}",
+            path.display()
+        ))
+    };
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        builder.recursive(true).create(parent).map_err(failed)?;
+    }
+    match builder.recursive(false).create(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(LpmError::Script(format!(
+                "lpm deploy: output directory {} appeared as the deploy was about to create it. \
+                 Check what made it, then deploy again.",
+                path.display()
+            )))
+        }
+        Err(error) => Err(failed(error)),
+    }
+}
+
+/// The directory `path` leads to, as the deploy's writes by name reach it.
+fn output_identity(path: &Path) -> Result<(u64, u64), LpmError> {
+    cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())
+        .and_then(|directory| lpm_common::atomic_write::file_identity(&directory.into_std_file()))
+        .map_err(|error| {
+            LpmError::Script(format!(
+                "lpm deploy: can't open output directory {}: {error}",
+                path.display()
+            ))
+        })
 }
 
 /// The git directory `output` is in or is: an ancestor, as `output` names
