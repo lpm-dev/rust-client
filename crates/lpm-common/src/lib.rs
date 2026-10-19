@@ -32,6 +32,8 @@ pub mod project_glob;
 pub mod provenance;
 pub mod symlink;
 pub mod terminal;
+#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
+pub mod test_disk_image;
 // The 64-bit system call's groups are 32-bit; 32-bit systems have two calls.
 #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 pub mod thread_identity;
@@ -717,49 +719,21 @@ mod tests {
         let image = directory.path().join("volume.sparseimage");
         let mount_point = directory.path().join("mounted");
         std::fs::create_dir(&mount_point).unwrap();
-        let hdiutil = |arguments: &[&std::ffi::OsStr]| {
-            let output = std::process::Command::new("/usr/bin/hdiutil")
-                .args(arguments)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "hdiutil {arguments:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        };
-        hdiutil(&[
-            "create".as_ref(),
-            "-quiet".as_ref(),
-            "-size".as_ref(),
-            "64m".as_ref(),
-            "-fs".as_ref(),
-            "APFS".as_ref(),
-            "-type".as_ref(),
-            "SPARSE".as_ref(),
-            "-volname".as_ref(),
-            "lpm-common-test".as_ref(),
-            image.as_os_str(),
-        ]);
-        hdiutil(&[
-            "attach".as_ref(),
-            "-quiet".as_ref(),
-            "-nobrowse".as_ref(),
-            "-noautoopen".as_ref(),
-            "-mountpoint".as_ref(),
-            mount_point.as_os_str(),
-            image.as_os_str(),
-        ]);
-        struct Detach<'a>(&'a std::path::Path);
-        impl Drop for Detach<'_> {
-            fn drop(&mut self) {
-                let _ = std::process::Command::new("/usr/bin/hdiutil")
-                    .args(["detach", "-force", "-quiet"])
-                    .arg(self.0)
-                    .status();
-            }
-        }
-        let _detach = Detach(&mount_point);
+        let _attached = crate::test_disk_image::AttachedImage::new(
+            &image,
+            &mount_point,
+            &[
+                "-size",
+                "64m",
+                "-fs",
+                "APFS",
+                "-type",
+                "SPARSE",
+                "-volname",
+                "lpm-common-test",
+            ],
+            &[],
+        );
 
         let space = filesystem_space(&mount_point).unwrap();
         assert!(space.held_back > 0);
