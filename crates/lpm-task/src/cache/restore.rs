@@ -2415,7 +2415,7 @@ impl RestoreTransaction {
         }
         let mut parent = self.project.try_clone()?;
         let mut current_path = PathBuf::new();
-        for component in parent_path.components() {
+        for (depth, component) in parent_path.components().enumerate() {
             let Component::Normal(name) = component else {
                 return Err(LpmError::Task(format!(
                     "invalid task cache restore path: {}",
@@ -2424,7 +2424,10 @@ impl RestoreTransaction {
             };
             current_path.push(name);
             match parent.open_dir_nofollow(name) {
-                Ok(next) => parent = next,
+                Ok(next) => {
+                    refuse_short_name_of_withheld(&parent, name, &next, depth == 0)?;
+                    parent = next;
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
                     parent.create_dir(name)?;
                     self.created_dirs.push(current_path.clone());
@@ -2669,6 +2672,45 @@ fn open_directory_nofollow(root: &Dir, relative: &Path, label: &str) -> Result<D
         })?;
     }
     Ok(current)
+}
+
+/// Refuses `opened`, the directory `name` in `parent` led to, when `name`
+/// is a short name of a directory the cache never writes into, as NTFS and
+/// FAT resolve `GIT~1` to `.git`. The restore checked its paths' names
+/// before it began; this binds the check to the directory it opened, as a
+/// `git init` while the restore runs can give a new `.git` such a name.
+fn refuse_short_name_of_withheld(
+    parent: &Dir,
+    name: &std::ffi::OsStr,
+    opened: &Dir,
+    at_root: bool,
+) -> Result<(), LpmError> {
+    use cap_fs_ext::MetadataExt as _;
+
+    if !name.to_string_lossy().contains('~') {
+        return Ok(());
+    }
+    let opened = opened.dir_metadata()?;
+    let identity = (opened.dev(), opened.ino());
+    let records = lpm_common::project_state::PROJECT_RECORD_DIRS
+        .iter()
+        .filter(|_| at_root)
+        .copied();
+    for withheld in [lpm_common::PROJECT_STATE_DIR, ".git"]
+        .into_iter()
+        .chain(records)
+    {
+        if parent
+            .symlink_metadata(withheld)
+            .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == identity)
+        {
+            return Err(LpmError::Task(format!(
+                "task cache restore reaches {withheld} by its short name {}",
+                name.to_string_lossy()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn open_existing_parent_nofollow(

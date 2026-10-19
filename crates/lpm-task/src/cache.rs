@@ -3908,6 +3908,35 @@ mod tests {
         );
     }
 
+    /// NTFS gives `.git` the short name `GIT~1` when a volume makes short
+    /// names, as `git init` while a restore runs would.
+    #[cfg(windows)]
+    #[test]
+    fn restore_never_descends_into_git_by_a_short_name_it_gained_meanwhile() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project.path().join(".git/hooks")).unwrap();
+        if !project.path().join("GIT~1").exists() {
+            return;
+        }
+        let staging = tempfile::tempdir_in(project.path()).unwrap();
+        fs::create_dir_all(staging.path().join("outputs/GIT~1/hooks")).unwrap();
+        fs::create_dir(staging.path().join("backups")).unwrap();
+        fs::write(
+            staging.path().join("outputs/GIT~1/hooks/pre-commit"),
+            "hook",
+        )
+        .unwrap();
+        let mut transaction =
+            RestoreTransaction::new(project.path().to_path_buf(), staging.path(), 1).unwrap();
+
+        let error = transaction
+            .install(Path::new("GIT~1/hooks/pre-commit"), false)
+            .expect_err("a restore wrote into .git by its short name");
+
+        assert!(error.to_string().contains("short name"), "{error}");
+        assert!(!project.path().join(".git/hooks/pre-commit").exists());
+    }
+
     #[test]
     fn restore_keeps_an_inode_receipt_for_each_published_file_until_commit() {
         let project = tempfile::tempdir().unwrap();
