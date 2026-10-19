@@ -81,6 +81,63 @@ async fn source_add_and_remove_use_in_project_paths_on_native_platforms() {
     assert_eq!(project.read_file("keep.txt"), "unrelated work");
 }
 
+#[cfg(unix)]
+fn run_under_umask_002(mut command: std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    unsafe {
+        // SAFETY: `umask` is async-signal-safe and touches no memory.
+        command.pre_exec(|| {
+            libc::umask(0o002);
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn source_add_and_remove_work_in_a_group_writable_project() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mock = MockRegistry::start().await;
+    let package = "group-writable-source";
+    let tarball = make_source_pkg_tarball(
+        package,
+        "1.0.0",
+        json!({"files": [{"src": "hello.txt", "dest": "nested/hello.txt"}]}),
+        &[("hello.txt", b"managed source")],
+    );
+    mock.with_package(package, "1.0.0", &tarball).await;
+    let project = TempProject::empty(r#"{"name":"host","version":"1.0.0"}"#);
+    std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+    let mode = |relative: &str| {
+        std::fs::metadata(project.path().join(relative))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    };
+
+    let mut add = lpm_spawnable_with_registry(&project, &mock.url());
+    add.args(["add", package, "--path", "ui", "--yes", "--no-skills"]);
+    run_under_umask_002(add);
+
+    assert_eq!(project.read_file("ui/nested/hello.txt"), "managed source");
+    assert_eq!(mode("ui"), 0o775);
+    assert_eq!(mode("ui/nested"), 0o775);
+
+    let mut remove = lpm_spawnable_with_registry(&project, &mock.url());
+    remove.args(["remove", package]);
+    run_under_umask_002(remove);
+
+    assert!(!project.file_exists("ui"));
+}
+
 #[tokio::test]
 async fn source_add_paths_are_relative_to_where_the_command_ran() {
     let mock = MockRegistry::start().await;

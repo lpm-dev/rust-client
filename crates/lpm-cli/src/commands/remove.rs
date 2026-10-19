@@ -1698,15 +1698,14 @@ fn quarantine_and_prune_owned_directory(
         .map_err(LpmError::Io);
     }
     let expected_identity = directory_identity(&opened).map_err(LpmError::Io)?;
-    let (private_name, private_directory) = crate::directory_transaction::create_private_directory(
-        parent, "prune",
-    )
-    .map_err(|error| {
-        LpmError::Registry(format!(
-            "could not stage owned directory '{}': {error}",
-            node.relative.display()
-        ))
-    })?;
+    let (private_name, private_directory) =
+        crate::directory_transaction::create_private_directory_in_project(parent, "prune")
+            .map_err(|error| {
+                LpmError::Registry(format!(
+                    "could not stage owned directory '{}': {error}",
+                    node.relative.display()
+                ))
+            })?;
     if let Err(error) = on_operation(
         PruneDirectoryOperation::Quarantine,
         parent,
@@ -2106,7 +2105,9 @@ fn restore_or_open_owned_directory(
             };
             on_operation(RestoreDirectoryOperation::Create);
             let (private_name, child) =
-                match crate::directory_transaction::create_private_directory(parent, "restore") {
+                match crate::directory_transaction::create_private_directory_in_project(
+                    parent, "restore",
+                ) {
                     Ok(created) => created,
                     Err(error) => {
                         errors.push(format!(
@@ -2434,7 +2435,7 @@ fn restore_directory_security(
 }
 
 #[cfg(windows)]
-mod windows_directory_security {
+pub(crate) mod windows_directory_security {
     use std::os::windows::io::AsRawHandle as _;
     use std::ptr::null_mut;
 
@@ -2626,7 +2627,7 @@ mod windows_directory_security {
     }
 
     #[cfg(test)]
-    pub(super) fn test_sddl(directory: &Dir) -> std::io::Result<String> {
+    pub(crate) fn test_sddl(directory: &Dir) -> std::io::Result<String> {
         snapshot(directory).map(|snapshot| snapshot.sddl)
     }
 
@@ -2649,8 +2650,11 @@ mod windows_directory_security {
             assert_eq!(expected.protected, protected);
             assert!(!expected.sddl.contains('\0'));
             let (private_name, restored) =
-                crate::directory_transaction::create_private_directory(&parent, "restore-test")
-                    .unwrap();
+                crate::directory_transaction::create_private_directory_in_project(
+                    &parent,
+                    "restore-test",
+                )
+                .unwrap();
             restore(&restored, &expected).unwrap();
             crate::directory_transaction::publish_directory_noreplace(
                 &parent,
@@ -3686,6 +3690,29 @@ mod tests {
             opens <= 512,
             "deep prune and rollback performed {opens} component opens"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_directory_prune_works_in_a_group_writable_project() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join("legacy/nested")).unwrap();
+        for directory in [project.path(), &project.path().join("legacy")] {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o775)).unwrap();
+        }
+        let canonical_project = project.path().canonicalize().unwrap();
+
+        let cleanup = prune_owned_empty_directories(
+            &canonical_project,
+            vec![PathBuf::from("legacy"), PathBuf::from("legacy/nested")],
+        )
+        .unwrap();
+        assert_eq!(cleanup.removed(), 2);
+        cleanup.commit();
+
+        assert!(!project.path().join("legacy").exists());
     }
 
     #[cfg(any(unix, windows))]

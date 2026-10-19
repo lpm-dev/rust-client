@@ -32,6 +32,29 @@ fn generation_replaces_owned_output_and_preserves_the_published_directory() {
     assert_eq!(std::fs::read_dir(project.path()).unwrap().count(), 2);
 }
 
+#[cfg(unix)]
+#[test]
+fn generation_works_in_a_group_writable_project() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let project = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(project.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+    let path = Path::new("env.generated");
+    let output = generated("value");
+
+    write(project.path(), path, &output, false, || Ok(())).unwrap();
+    write(
+        project.path(),
+        path,
+        &generated("changed"),
+        false,
+        || Ok(()),
+    )
+    .unwrap();
+
+    write(project.path(), path, &generated("changed"), true, || Ok(())).unwrap();
+}
+
 #[test]
 fn checks_of_missing_output_do_not_create_locks_or_directories() {
     let project = tempfile::tempdir().unwrap();
