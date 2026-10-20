@@ -1840,6 +1840,54 @@ fn link_packages_v2_removes_stale_root_symlinks_without_wiping_node_modules() {
 }
 
 #[test]
+fn link_packages_v2_leaves_another_writer_s_temporaries_and_removes_abandoned_ones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = V2Store::at(tmp.path().join("store"));
+    let project = tmp.path().join("project");
+    let node_modules = project.join("node_modules");
+    std::fs::create_dir_all(node_modules.join("@scope")).unwrap();
+    let a_sri = synthetic_sri(b"v2/reconcile/temporaries");
+    write_object(
+        &store,
+        &a_sri,
+        &[("package.json", b"{\"name\":\"a\",\"version\":\"1.0.0\"}")],
+    );
+    // A workspace member links into the root's node_modules while the root
+    // is linked, each link written as an atomic-write temporary and then
+    // renamed into place.
+    let in_flight = node_modules.join(".lpm-AAAAAAAAAAAAAAAA");
+    let scoped_in_flight = node_modules.join("@scope").join(".lpm-BBBBBBBBBBBBBBBB");
+    let abandoned = node_modules.join(".lpm-CCCCCCCCCCCCCCCC");
+    for path in [&in_flight, &scoped_in_flight, &abandoned] {
+        std::fs::write(path, b"").unwrap();
+    }
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 60 * 60);
+    std::fs::File::options()
+        .write(true)
+        .open(&abandoned)
+        .unwrap()
+        .set_modified(long_ago)
+        .unwrap();
+
+    link_packages_v2(
+        &project,
+        vec![target("a", "1.0.0", &a_sri, true)],
+        &store,
+        LinkerMode::Isolated,
+        None,
+    )
+    .unwrap();
+
+    assert!(node_modules.join("a").exists());
+    assert!(in_flight.exists(), "another writer's temporary was removed");
+    assert!(
+        scoped_in_flight.exists(),
+        "another writer's temporary in a scope was removed"
+    );
+    assert!(!abandoned.exists(), "an abandoned temporary was kept");
+}
+
+#[test]
 fn link_packages_v2_self_reference() {
     let tmp = tempfile::tempdir().unwrap();
     let store = V2Store::at(tmp.path().join("store"));

@@ -88,6 +88,10 @@ pub(super) fn reconcile_project_node_modules(
         if name == ".bin" {
             continue;
         }
+        if lpm_common::atomic_write::is_atomic_temp_name(&name) {
+            remove_abandoned_temporary(&path)?;
+            continue;
+        }
         let is_real_dir = path
             .symlink_metadata()
             .map(|metadata| metadata.is_dir() && !is_symlink_or_junction(&metadata))
@@ -127,7 +131,12 @@ pub(super) fn reconcile_scoped_root_dir(
     for entry in entries.flatten() {
         let child_path = entry.path();
         let child_name = entry.file_name();
-        let full_name = format!("{scope_name}/{}", child_name.to_string_lossy());
+        let child_name = child_name.to_string_lossy();
+        if lpm_common::atomic_write::is_atomic_temp_name(&child_name) {
+            remove_abandoned_temporary(&child_path)?;
+            continue;
+        }
+        let full_name = format!("{scope_name}/{child_name}");
         if !desired.contains(&full_name) {
             remove_node_modules_entry(&child_path, "stale scoped root entry")?;
         }
@@ -135,17 +144,44 @@ pub(super) fn reconcile_scoped_root_dir(
     Ok(())
 }
 
-pub(super) fn remove_node_modules_entry(path: &Path, label: &str) -> Result<(), LpmError> {
-    match path.symlink_metadata() {
-        Ok(_) => {}
-        Err(_) => return Ok(()),
+/// How old an atomic-write temporary in `node_modules` must be before the
+/// linker takes it for one its writer abandoned. Another linker writing the
+/// same directory, a workspace member's or another install's, replaces its
+/// links through such temporaries, and renames each into place within
+/// milliseconds.
+const ABANDONED_TEMPORARY_AGE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+fn remove_abandoned_temporary(path: &Path) -> Result<(), LpmError> {
+    let abandoned = path
+        .symlink_metadata()
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|modified| {
+            modified
+                .elapsed()
+                .is_ok_and(|age| age >= ABANDONED_TEMPORARY_AGE)
+        });
+    if abandoned {
+        remove_node_modules_entry(path, "abandoned temporary")?;
     }
-    remove_path_entry(path).map_err(|e| {
-        LpmError::Store(format!(
-            "virtual-store linker: failed to remove {label} at {}: {e}",
-            path.display()
-        ))
-    })
+    Ok(())
+}
+
+pub(super) fn remove_node_modules_entry(path: &Path, label: &str) -> Result<(), LpmError> {
+    match remove_path_entry(path) {
+        // Gone already, as another linker writing this directory can rename
+        // or remove an entry between this one listing it and removing it.
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && path.symlink_metadata().is_err() =>
+        {
+            Ok(())
+        }
+        result => result.map_err(|e| {
+            LpmError::Store(format!(
+                "virtual-store linker: failed to remove {label} at {}: {e}",
+                path.display()
+            ))
+        }),
+    }
 }
 
 /// Create `<project>/node_modules/<root_link_name>` symlinks pointing
