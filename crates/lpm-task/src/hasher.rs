@@ -598,7 +598,10 @@ fn validation_metadata_identity_bytes(
     #[cfg(windows)]
     let bytes = {
         let mut bytes = bytes;
-        append_windows_file_identity(&mut bytes, windows_path_identity(path, follow));
+        append_windows_file_identity(
+            &mut bytes,
+            windows_path_identity(path, follow, !object_only),
+        );
         bytes
     };
     #[cfg(not(windows))]
@@ -614,7 +617,7 @@ pub(crate) fn archive_metadata_identity_bytes(
     #[cfg(windows)]
     let bytes = {
         let mut bytes = bytes;
-        append_windows_file_identity(&mut bytes, windows_handle_identity(file));
+        append_windows_file_identity(&mut bytes, windows_handle_identity(file, true));
         bytes
     };
     #[cfg(not(windows))]
@@ -628,11 +631,17 @@ struct WindowsFileIdentity {
     volume_serial_number: u32,
     number_of_links: u32,
     file_index: u64,
+    /// The file's update sequence number in its volume's change journal,
+    /// when asked for and the volume keeps a journal. Every change to the
+    /// file advances it. NTFS stamps write times from a clock that ticks
+    /// every 1-15 ms, so a same-size rewrite within one tick leaves
+    /// everything else a file's identity holds as it was.
+    usn: Option<i64>,
 }
 
 #[cfg(windows)]
 fn append_windows_file_identity(bytes: &mut Vec<u8>, identity: Option<WindowsFileIdentity>) {
-    bytes.reserve(25);
+    bytes.reserve(34);
     let Some(identity) = identity else {
         bytes.push(0);
         return;
@@ -645,11 +654,18 @@ fn append_windows_file_identity(bytes: &mut Vec<u8>, identity: Option<WindowsFil
     ] {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
+    match identity.usn {
+        Some(usn) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&usn.to_le_bytes());
+        }
+        None => bytes.push(0),
+    }
 }
 
 #[cfg(windows)]
 pub(crate) fn path_object_identity(path: &Path) -> Option<(u64, u64)> {
-    let identity = windows_path_identity(path, false)?;
+    let identity = windows_path_identity(path, false, false)?;
     Some((
         u64::from(identity.volume_serial_number),
         identity.file_index,
@@ -657,7 +673,7 @@ pub(crate) fn path_object_identity(path: &Path) -> Option<(u64, u64)> {
 }
 
 #[cfg(windows)]
-fn windows_path_identity(path: &Path, follow: bool) -> Option<WindowsFileIdentity> {
+fn windows_path_identity(path: &Path, follow: bool, usn: bool) -> Option<WindowsFileIdentity> {
     use std::os::windows::fs::OpenOptionsExt as _;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
@@ -676,11 +692,11 @@ fn windows_path_identity(path: &Path, follow: bool) -> Option<WindowsFileIdentit
         .custom_flags(flags)
         .open(path)
         .ok()?;
-    windows_handle_identity(&file)
+    windows_handle_identity(&file, usn)
 }
 
 #[cfg(windows)]
-fn windows_handle_identity(file: &std::fs::File) -> Option<WindowsFileIdentity> {
+fn windows_handle_identity(file: &std::fs::File, usn: bool) -> Option<WindowsFileIdentity> {
     use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
@@ -697,7 +713,58 @@ fn windows_handle_identity(file: &std::fs::File) -> Option<WindowsFileIdentity> 
         number_of_links: information.nNumberOfLinks,
         file_index: (u64::from(information.nFileIndexHigh) << 32)
             | u64::from(information.nFileIndexLow),
+        usn: if usn { windows_handle_usn(file) } else { None },
     })
+}
+
+/// The update sequence number of `file` in its volume's change journal, or
+/// `None` where the volume keeps no journal.
+#[cfg(windows)]
+fn windows_handle_usn(file: &std::fs::File) -> Option<i64> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::{FSCTL_READ_FILE_USN_DATA, READ_FILE_USN_DATA};
+
+    /// A change-journal record: its fixed fields, then the file's name of at
+    /// most 255 UTF-16 units.
+    #[repr(C, align(8))]
+    struct Record([u8; 768]);
+
+    // Version 2 records hold 64-bit file references and version 3 the
+    // 128-bit ones ReFS uses; in both the USN follows the two references.
+    let request = READ_FILE_USN_DATA {
+        MinMajorVersion: 2,
+        MaxMajorVersion: 3,
+    };
+    let mut record = Record([0; 768]);
+    let mut returned = 0u32;
+    // SAFETY: the handle belongs to the live `File`, the request and the
+    // record are valid for the sizes passed, and the call completes before
+    // it returns.
+    let succeeded = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            FSCTL_READ_FILE_USN_DATA,
+            (&raw const request).cast(),
+            size_of::<READ_FILE_USN_DATA>() as u32,
+            (&raw mut record).cast(),
+            size_of::<Record>() as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    } != 0;
+    if !succeeded {
+        return None;
+    }
+    let record = record.0.get(..returned as usize)?;
+    let usn_offset = match u16::from_le_bytes(record.get(4..6)?.try_into().ok()?) {
+        2 => 24,
+        3 => 40,
+        _ => return None,
+    };
+    Some(i64::from_le_bytes(
+        record.get(usn_offset..usn_offset + 8)?.try_into().ok()?,
+    ))
 }
 
 fn hash_record(hasher: &mut Sha256, kind: u8, fields: &[&[u8]]) {
@@ -1716,8 +1783,8 @@ mod tests {
         fs::write(&first, "same object").unwrap();
         fs::hard_link(&first, &second).unwrap();
 
-        let first_identity = windows_path_identity(&first, true).unwrap();
-        let second_identity = windows_path_identity(&second, true).unwrap();
+        let first_identity = windows_path_identity(&first, true, false).unwrap();
+        let second_identity = windows_path_identity(&second, true, false).unwrap();
 
         assert_eq!(first_identity, second_identity);
     }
@@ -1731,8 +1798,8 @@ mod tests {
         fs::write(&first, "same content").unwrap();
         fs::write(&second, "same content").unwrap();
 
-        let first_identity = windows_path_identity(&first, true).unwrap();
-        let second_identity = windows_path_identity(&second, true).unwrap();
+        let first_identity = windows_path_identity(&first, true, false).unwrap();
+        let second_identity = windows_path_identity(&second, true, false).unwrap();
 
         assert_ne!(first_identity, second_identity);
     }

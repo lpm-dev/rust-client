@@ -3434,6 +3434,65 @@ mod tests {
         );
     }
 
+    /// Rewrites `path` with `contents`, as long as it was, and puts its write
+    /// time back, as a rewrite within one tick of the clock NTFS stamps write
+    /// times from leaves it.
+    fn rewrite_keeping_write_time(path: &Path, contents: &str) {
+        let written_at = fs::metadata(path).unwrap().modified().unwrap();
+        fs::write(path, contents).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(written_at)
+            .unwrap();
+        assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), written_at);
+    }
+
+    #[test]
+    fn cache_snapshot_rejects_a_same_size_rewrite_that_keeps_its_write_time() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join("dist")).unwrap();
+        let output = project.path().join("dist/value.txt");
+        fs::write(&output, "before").unwrap();
+        let archive_path = project.path().join("outputs.tar.gz");
+        let barrier = install_race_barrier(&ARCHIVE_SIZE_RACE_BARRIER, output.clone());
+        let project_path = project.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            create_archive(&project_path, &["dist/**".into()], &archive_path)
+        });
+
+        barrier.validated.wait();
+        rewrite_keeping_write_time(&output, "after!");
+        barrier.resume.wait();
+        let result = worker.join().unwrap();
+        clear_race_barrier(&ARCHIVE_SIZE_RACE_BARRIER, &barrier);
+
+        assert!(
+            result.is_err(),
+            "a same-size rewrite that kept its write time was archived"
+        );
+    }
+
+    #[test]
+    fn output_validation_sees_a_same_size_rewrite_that_keeps_its_write_time() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join("dist")).unwrap();
+        let output = project.path().join("dist/value.txt");
+        fs::write(&output, "before").unwrap();
+        let validation =
+            crate::hasher::capture_task_output_validation(project.path(), &["dist/**".into()])
+                .unwrap();
+        assert!(validation.is_unchanged().unwrap());
+
+        rewrite_keeping_write_time(&output, "after!");
+
+        assert!(
+            !validation.is_unchanged().unwrap(),
+            "a same-size rewrite that kept its write time went unseen"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn restore_remote_artifact_rejects_preexisting_symlink_destination() {
