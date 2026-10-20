@@ -61,6 +61,39 @@ fn deploy_dry_run_writes_nothing_to_output_dir() {
     );
 }
 
+/// Another user who can rename entries in a directory on the output's path
+/// could swap what it leads to between the deploy's checks and its writes.
+#[cfg(unix)]
+#[test]
+fn deploy_refuses_an_output_other_users_could_redirect() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let project = TempProject::from_fixture("workspace-monorepo");
+    let out = external_output_dir();
+    let shared = out.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    for dry_run in [true, false] {
+        let mut command = lpm(&project);
+        command.args([
+            "deploy",
+            shared.join("app").to_str().unwrap(),
+            "--filter",
+            "@test/utils",
+        ]);
+        if dry_run {
+            command.arg("--dry-run");
+        }
+        let output = command.output().expect("failed to run lpm deploy");
+
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("other users can change"), "{stderr}");
+        assert_eq!(std::fs::read_dir(&shared).unwrap().count(), 0);
+    }
+}
+
 #[test]
 fn deploy_dry_run_json_envelope_carries_resolved_plan() {
     let project = TempProject::from_fixture("workspace-monorepo");

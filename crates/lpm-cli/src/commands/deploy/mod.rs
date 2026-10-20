@@ -205,15 +205,11 @@ pub async fn run(
                 plan.output_dir
             ))
         })?;
-        std::fs::create_dir_all(&plan.output_dir).map_err(|e| {
-            LpmError::Script(format!(
-                "lpm deploy --force: failed to recreate empty output directory {:?}: {e}",
-                plan.output_dir
-            ))
-        })?;
     }
+    let output = paths::Output::prepare(&plan.output_dir)?;
 
     let copy_stats = write_member_source(&member, &plan.output_dir)?;
+    output.verify()?;
 
     let mut selection_stats = apply_dependency_selection_to_deploy_manifest(
         &plan.output_dir,
@@ -231,6 +227,7 @@ pub async fn run(
 
     let pruned_lockfile_packages =
         write_pruned_deploy_lockfile_if_possible(cwd, &plan.output_dir)?.unwrap_or(0);
+    output.verify()?;
 
     let target_set: Vec<String> = vec![plan.output_dir.display().to_string()];
 
@@ -288,7 +285,9 @@ pub async fn run(
     )
     .await?;
 
+    output.verify()?;
     let internal_symlinks_retargeted = retarget_internal_node_modules_symlinks(&plan.output_dir)?;
+    output.verify()?;
     // The output's `.lpm` holds its package store and workspace sources,
     // which travel with it, as git commits it too.
     let state_ignore = lpm_common::project_state_dir(&plan.output_dir)
@@ -319,6 +318,7 @@ pub async fn run(
             output_ignore.display()
         ))
     })?;
+    output.verify()?;
     let dependency_ignore_files = tree.dependency_ignore_files;
     drop(deploy_progress);
 

@@ -356,6 +356,73 @@ fn mounts() -> super::paths::Mounts {
     }
 }
 
+/// Another user who can rename, remove or replace an entry on the output's
+/// path could redirect what the deploy writes there by name.
+#[cfg(unix)]
+#[test]
+fn an_output_other_users_could_redirect_is_refused() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let shared = tmp.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+    for output in ["shared/out", "shared/nested/out", "shared"] {
+        let error =
+            super::paths::validate_output_dir(
+                tmp.path(),
+                Path::new(output),
+                false,
+                || Ok(mounts()),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("other users can change"),
+            "{output}: {error}"
+        );
+    }
+}
+
+/// Only an entry's owner can move it out of a sticky directory, as `/tmp`.
+#[cfg(unix)]
+#[test]
+fn an_output_in_a_sticky_directory_anyone_can_write_is_accepted() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let shared = tmp.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    super::paths::validate_output_dir(tmp.path(), Path::new("shared/out"), false, || Ok(mounts()))
+        .unwrap();
+}
+
+#[test]
+fn the_deploy_creates_its_output_and_its_missing_parents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("nested/out");
+
+    let output = super::paths::Output::prepare(&path).unwrap();
+
+    assert!(path.is_dir());
+    output.verify().unwrap();
+    super::paths::Output::prepare(&path).unwrap();
+}
+
+#[test]
+fn the_deploy_stops_when_its_output_is_replaced_between_steps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("out");
+    let output = super::paths::Output::prepare(&path).unwrap();
+
+    std::fs::rename(&path, tmp.path().join("moved")).unwrap();
+    std::fs::create_dir(&path).unwrap();
+
+    let error = output.verify().unwrap_err().to_string();
+    assert!(error.contains("changed while the deploy ran"), "{error}");
+}
+
 /// An overlap a mount makes is seen only in the system's list of mounts.
 #[test]
 fn a_deploy_stops_where_the_mounts_can_t_be_read() {
