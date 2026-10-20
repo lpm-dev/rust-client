@@ -1128,6 +1128,14 @@ impl CaptureOwner {
 /// busy.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+fn busy_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(timeout) = tests::BUSY_WAIT.get() {
+        return timeout;
+    }
+    BUSY_TIMEOUT
+}
+
 /// How long opening waits for another LPM process to finish opening the
 /// capture files, which takes longest when one replaces a large database.
 const OPEN_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1835,7 +1843,7 @@ fn harden_connection(connection: &Connection) -> Result<(), rusqlite::Error> {
     connection.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
     connection.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
     connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, LONGEST_VALUE_BYTES)?;
-    connection.busy_timeout(BUSY_TIMEOUT)?;
+    connection.busy_timeout(busy_timeout())?;
     connection.execute_batch("PRAGMA cell_size_check=ON; PRAGMA secure_delete=ON;")
 }
 
@@ -1889,7 +1897,7 @@ fn keep_wal_files(connection: &Connection) -> Result<(), rusqlite::Error> {
 fn use_wal(connection: &Connection) -> Result<(), rusqlite::Error> {
     use rand::Rng as _;
 
-    let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
+    let deadline = std::time::Instant::now() + busy_timeout();
     loop {
         match connection.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(())) {
             Err(error) if is_busy(&error) && std::time::Instant::now() < deadline => {
@@ -2585,6 +2593,10 @@ mod tests {
         /// How long this thread's opens wait for the lock, in place of
         /// [`OPEN_LOCK_TIMEOUT`], for a test of the wait itself.
         pub(super) static OPEN_LOCK_WAIT: std::cell::Cell<Option<std::time::Duration>> =
+            const { std::cell::Cell::new(None) };
+        /// How long the connections this thread opens wait for another's
+        /// lock, in place of [`BUSY_TIMEOUT`].
+        pub(super) static BUSY_WAIT: std::cell::Cell<Option<std::time::Duration>> =
             const { std::cell::Cell::new(None) };
         /// The free space this thread's replacements find on their disk.
         pub(super) static AVAILABLE_BYTES: std::cell::Cell<Option<u64>> =
@@ -5090,6 +5102,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn clearing_history_from_two_handles_at_once_succeeds() {
+        // Each clear waits for the other's, whose checkpoint syncs to disk
+        // while it holds the lock, which a loaded machine can keep past the
+        // busy timeout. A clear that refuses without waiting, as a deferred
+        // transaction does, fails at once whatever the timeout.
+        BUSY_WAIT.set(Some(std::time::Duration::from_secs(60)));
         let project = tempfile::tempdir().unwrap();
         let first = InspectorDb::open(project.path()).unwrap();
         let second = InspectorDb::open(project.path()).unwrap();
