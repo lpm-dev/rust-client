@@ -94,6 +94,7 @@ use windows_sys::Win32::System::Threading::{
 use crate::helper_protocol::{HelperArgs, StdioMode, split_env_entry};
 
 /// Explicit setup for Windows sandbox filesystem permissions.
+mod identity;
 pub mod setup;
 
 /// `SE_GROUP_ENABLED` from winnt.h. The Attributes field of every
@@ -199,6 +200,16 @@ pub enum AppContainerError {
         path: PathBuf,
         /// `WIN32_ERROR` returned by the call.
         win32_error: u32,
+    },
+    /// Reading or writing a record of an AppContainer's grants, or of the
+    /// trees already swept, failed.
+    #[error("failed to update the AppContainer grant record {path}: {source}")]
+    GrantRecord {
+        /// The record.
+        path: PathBuf,
+        /// Filesystem error returned while writing or removing it.
+        #[source]
+        source: std::io::Error,
     },
     /// Inspecting a secret-deny path failed before its DACL could be updated.
     #[error("failed to inspect AppContainer DACL policy path {path}: {source}")]
@@ -628,7 +639,13 @@ impl Drop for AttrListGuard {
 /// variant so stderr is self-diagnosable.
 pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError> {
     // 1. Derive (or create) the AppContainer SID. Production supplies
-    //    a per-invocation name; integration tests can reuse a named profile.
+    //    the project and package's stable name and holds it until the
+    //    child exits, so no other run of it changes its grants meanwhile.
+    let _identity = args
+        .grant_record
+        .as_ref()
+        .map(|_| identity::lock(&args.appcontainer_name))
+        .transpose()?;
     let sid = create_or_reuse_appcontainer_sid(&args.appcontainer_name)?;
     let mut profile_cleanup =
         AppContainerProfileCleanup::new(&args.appcontainer_name, args.delete_appcontainer_profile);
@@ -640,6 +657,29 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
     }
 
     let prepared_access = setup::prepare(&args, &sid)?;
+
+    // What this run grants, minus what the identity was granted before
+    // and no longer is; and once, grants that profiles of earlier
+    // releases, one per run, left on these trees.
+    let granted: Vec<PathBuf> = args
+        .best_effort_readable_dirs
+        .iter()
+        .chain(&args.readable_dirs)
+        .chain(&args.writable_dirs)
+        .cloned()
+        .collect();
+    if let Some(record) = &args.grant_record {
+        identity::revoke_stale_grants(record, &granted, sid.0)?;
+    }
+    if let Some(record) = &args.sweep_record {
+        let owned: Vec<PathBuf> = args
+            .readable_dirs
+            .iter()
+            .chain(&args.writable_dirs)
+            .cloned()
+            .collect();
+        identity::sweep_dead_grants(record, &owned, sid.0)?;
+    }
 
     // 2. Snapshot secret DACLs, then apply this invocation's allow-set.
     //    Secret policy lands last and the snapshots are restored after exit.
@@ -690,6 +730,9 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
             FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE,
             /* strict_root */ true,
         )?;
+    }
+    if let Some(record) = &args.grant_record {
+        identity::record_grants(record, &granted)?;
     }
     for path in &args.secret_read_denied_paths {
         protect_secret_path_from_appcontainer(path, sid.0)?;
@@ -874,10 +917,10 @@ pub fn run_appcontainer_spawn(args: HelperArgs) -> Result<i32, AppContainerError
 /// subsequent calls.
 ///
 /// `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS) = 0x800700B7` is the
-/// expected steady-state return — the profile dir at
-/// `%USERPROFILE%\AppData\Local\Packages\<name>\` persists across
-/// reboots until explicitly deleted via `DeleteAppContainerProfile`,
-/// which we deliberately don't call (the profile persists until explicitly deleted).
+/// expected steady-state return: a package's profile, at
+/// `%USERPROFILE%\AppData\Local\Packages\<name>\`, lasts across runs and
+/// reboots until the package leaves its project and a cleanup run deletes
+/// it.
 fn create_or_reuse_appcontainer_sid(name: &str) -> Result<SidGuard, AppContainerError> {
     let _creation_lock = acquire_profile_creation_lock()?;
     let wide_name = str_to_wide_with_nul(name);
@@ -910,22 +953,58 @@ fn create_or_reuse_appcontainer_sid(name: &str) -> Result<SidGuard, AppContainer
     if hr == already_exists_hr {
         // Profile registered in a prior run. Derive the SID for the
         // same name to keep DACL grants idempotent across runs.
-        let mut sid2: PSID = ptr::null_mut();
-        // SAFETY: wide_name lives in this frame.
-        let hr2 =
-            unsafe { DeriveAppContainerSidFromAppContainerName(wide_name.as_ptr(), &mut sid2) };
-        if hr2 == 0 {
-            return Ok(SidGuard(sid2));
-        }
-        return Err(AppContainerError::DeriveSid {
-            name: name.to_owned(),
-            hresult: hr2,
-        });
+        return derive_appcontainer_sid(name);
     }
     Err(AppContainerError::CreateProfile {
         name: name.to_owned(),
         hresult: hr,
     })
+}
+
+/// The SID the AppContainer profile `name` has, or would have: a digest
+/// of the name, whether or not the profile exists.
+fn derive_appcontainer_sid(name: &str) -> Result<SidGuard, AppContainerError> {
+    let wide_name = str_to_wide_with_nul(name);
+    let mut sid: PSID = ptr::null_mut();
+    // SAFETY: wide_name lives in this frame and `sid` is a writable out pointer.
+    let hr = unsafe { DeriveAppContainerSidFromAppContainerName(wide_name.as_ptr(), &mut sid) };
+    if hr == 0 {
+        return Ok(SidGuard(sid));
+    }
+    Err(AppContainerError::DeriveSid {
+        name: name.to_owned(),
+        hresult: hr,
+    })
+}
+
+/// Revokes every tree the grant record names from the identity, removes
+/// the record and, when asked, deletes the profile: the cleanup an
+/// identity gets once its package leaves the project.
+pub fn run_revoke_only(args: &HelperArgs) -> Result<i32, AppContainerError> {
+    let Some(record) = args.grant_record.as_deref() else {
+        return Err(AppContainerError::GrantRecord {
+            path: PathBuf::new(),
+            source: std::io::Error::other("--revoke-only needs --grant-record"),
+        });
+    };
+    let _identity = identity::lock(&args.appcontainer_name)?;
+    let sid = derive_appcontainer_sid(&args.appcontainer_name)?;
+    identity::revoke_all(record, sid.0)?;
+    if args.delete_appcontainer_profile {
+        let wide_name = str_to_wide_with_nul(&args.appcontainer_name);
+        // SAFETY: `wide_name` is null-terminated and lives through the call.
+        let hresult = unsafe { DeleteAppContainerProfile(wide_name.as_ptr()) };
+        // HRESULT_FROM_WIN32 of ERROR_FILE_NOT_FOUND and ERROR_NOT_FOUND: no
+        // profile is left to delete.
+        let gone = [0x8007_0002_u32 as i32, 0x8007_0490_u32 as i32];
+        if hresult != 0 && !gone.contains(&hresult) {
+            return Err(AppContainerError::DeleteProfile {
+                name: args.appcontainer_name.clone(),
+                hresult,
+            });
+        }
+    }
+    Ok(0)
 }
 
 fn acquire_profile_creation_lock() -> Result<ProfileCreationLock, AppContainerError> {
@@ -1099,79 +1178,77 @@ fn grant_dacl_ace_to_tree(
     }
 
     if meta.is_dir() {
-        let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            let entries = match std::fs::read_dir(&dir) {
-                Ok(it) => it,
-                Err(e) => {
-                    tracing::debug!(
-                        target: "lpm_sandbox::helper_appcontainer",
-                        "skip DACL walk of {}: read_dir failed: {e}",
-                        dir.display(),
-                    );
-                    continue;
-                }
-            };
-            use rayon::prelude::*;
-            static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> =
-                std::sync::OnceLock::new();
-            let entries = entries.flatten().collect::<Vec<_>>();
-            // The SID remains owned by the caller until all scoped pool work completes.
-            let sid_address = sid as usize;
-            let grant = |entry| grant_dacl_directory_entry(entry, sid_address as PSID, access_mask);
-            let children = if entries.len() > 1 {
-                let pool = POOL.get_or_init(|| {
-                    rayon::ThreadPoolBuilder::new()
-                        .num_threads(
-                            std::thread::available_parallelism().map_or(1, |n| n.get().min(4)),
-                        )
-                        .build()
-                        .ok()
-                });
-                match pool {
-                    Some(pool) => pool.install(|| {
-                        entries
-                            .into_par_iter()
-                            .filter_map(grant)
-                            .collect::<Vec<_>>()
-                    }),
-                    None => entries.into_iter().filter_map(grant).collect(),
-                }
-            } else {
-                entries.into_iter().filter_map(grant).collect()
-            };
-            stack.extend(children);
-        }
+        // The SID remains owned by the caller until the walk completes.
+        let sid_address = sid as usize;
+        visit_entries_below(root, &move |path| {
+            if let Err(error) = set_dacl_ace_on(
+                path,
+                sid_address as PSID,
+                access_mask,
+                OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+            ) {
+                tracing::debug!(path = %path.display(), "skip DACL grant: {error}");
+            }
+        });
     }
 
     Ok(())
 }
 
-fn grant_dacl_directory_entry(
-    entry: std::fs::DirEntry,
-    sid: PSID,
-    access_mask: u32,
-) -> Option<PathBuf> {
-    let path = entry.path();
-    let metadata = match entry.metadata() {
-        Ok(metadata) => metadata,
-        Err(error) => {
-            tracing::debug!(path = %path.display(), "skip DACL metadata: {error}");
+/// Calls `visit` on every entry below `root` that isn't a reparse point,
+/// descending into its directories but not through a link, a few
+/// directories' entries at a time in parallel.
+fn visit_entries_below(root: &Path, visit: &(dyn Fn(&Path) + Sync)) {
+    use rayon::prelude::*;
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+
+    let step = |entry: std::fs::DirEntry| {
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::debug!(path = %path.display(), "skip DACL metadata: {error}");
+                return None;
+            }
+        };
+        if is_reparse_point(&metadata) {
             return None;
         }
+        visit(&path);
+        metadata.is_dir().then_some(path)
     };
-    if is_reparse_point(&metadata) {
-        return None;
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(it) => it,
+            Err(e) => {
+                tracing::debug!(
+                    target: "lpm_sandbox::helper_appcontainer",
+                    "skip DACL walk of {}: read_dir failed: {e}",
+                    dir.display(),
+                );
+                continue;
+            }
+        };
+        let entries = entries.flatten().collect::<Vec<_>>();
+        let children = if entries.len() > 1 {
+            let pool = POOL.get_or_init(|| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(std::thread::available_parallelism().map_or(1, |n| n.get().min(4)))
+                    .build()
+                    .ok()
+            });
+            match pool {
+                Some(pool) => {
+                    pool.install(|| entries.into_par_iter().filter_map(step).collect::<Vec<_>>())
+                }
+                None => entries.into_iter().filter_map(step).collect(),
+            }
+        } else {
+            entries.into_iter().filter_map(step).collect()
+        };
+        stack.extend(children);
     }
-    if let Err(error) = set_dacl_ace_on(
-        &path,
-        sid,
-        access_mask,
-        OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
-    ) {
-        tracing::debug!(path = %path.display(), "skip DACL grant: {error}");
-    }
-    metadata.is_dir().then_some(path)
 }
 
 fn has_inheritable_appcontainer_access(path: &Path, access_mask: u32) -> bool {
@@ -1355,6 +1432,20 @@ fn dacl_without_allowed_aces_for_sid(
     old_dacl: *const ACL,
     sid: PSID,
 ) -> Result<Vec<u32>, AppContainerError> {
+    // SAFETY: both SIDs are valid for the comparison.
+    dacl_without_allowed_aces_where(path, old_dacl, |ace_sid| unsafe {
+        EqualSid(ace_sid, sid) != 0
+    })
+    .map(|(filtered, _)| filtered)
+}
+
+/// `old_dacl` without the access-allowed ACEs whose SID `drops` picks,
+/// every other ACE copied unchanged and in order, and how many it left out.
+fn dacl_without_allowed_aces_where(
+    path: &Path,
+    old_dacl: *const ACL,
+    drops: impl Fn(PSID) -> bool,
+) -> Result<(Vec<u32>, usize), AppContainerError> {
     // SAFETY: `old_dacl` is non-null and owned by the live security descriptor.
     let old_acl_size = unsafe { (*old_dacl).AclSize } as usize;
     // Preserve ACL_REVISION_DS when the existing DACL contains object-specific ACEs.
@@ -1377,6 +1468,7 @@ fn dacl_without_allowed_aces_for_sid(
 
     // SAFETY: the ACL header belongs to the security descriptor and is readable.
     let ace_count = unsafe { (*old_dacl).AceCount } as u32;
+    let mut removed = 0;
     for index in 0..ace_count {
         let mut ace: *mut std::ffi::c_void = ptr::null_mut();
         // SAFETY: `index` is bounded by the ACL's AceCount.
@@ -1388,17 +1480,16 @@ fn dacl_without_allowed_aces_for_sid(
             });
         }
         let header = ace as *const windows_sys::Win32::Security::ACE_HEADER;
-        // SAFETY: every ACE begins with a valid ACE_HEADER.
-        let removes_invocation_grant = unsafe {
-            if (*header).AceType == ACCESS_ALLOWED_ACE_TYPE {
+        // SAFETY: every ACE begins with a valid ACE_HEADER, and an allowed
+        // ACE's SID starts at `SidStart`.
+        let dropped = unsafe {
+            (*header).AceType == ACCESS_ALLOWED_ACE_TYPE && {
                 let allowed = ace as *const ACCESS_ALLOWED_ACE;
-                let ace_sid = ptr::addr_of!((*allowed).SidStart) as PSID;
-                EqualSid(ace_sid, sid) != 0
-            } else {
-                false
+                drops(ptr::addr_of!((*allowed).SidStart) as PSID)
             }
         };
-        if removes_invocation_grant {
+        if dropped {
+            removed += 1;
             continue;
         }
         // SAFETY: the complete ACE byte range is valid and copied unchanged into the new ACL.
@@ -1418,7 +1509,7 @@ fn dacl_without_allowed_aces_for_sid(
             });
         }
     }
-    Ok(filtered)
+    Ok((filtered, removed))
 }
 
 fn set_dacl_ace_on(

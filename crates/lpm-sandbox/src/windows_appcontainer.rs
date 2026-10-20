@@ -27,11 +27,9 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::helper_protocol::{APPCONTAINER_NAME, PROTOCOL_VERSION, StdioMode};
 use crate::{
@@ -39,18 +37,188 @@ use crate::{
     SandboxedCommand,
 };
 
-static APPCONTAINER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// The AppContainer profile `package`'s lifecycle scripts run in, in
+/// `project_dir`: one per project and package, named by a digest of the
+/// two, within the 64 characters a profile name may have. Each run grants
+/// it again and the helper revokes from it what its spec no longer
+/// grants, so its access doesn't build up across runs, and no new
+/// identity is left in every tree each run.
+fn appcontainer_name_for(project_dir: &Path, package: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
 
-fn appcontainer_name_for_invocation() -> String {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64;
-    let sequence = APPCONTAINER_SEQUENCE.fetch_add(1, Ordering::Relaxed) as u32;
-    format!(
-        "{APPCONTAINER_NAME}-{:08x}{timestamp:016x}{sequence:08x}",
-        std::process::id()
-    )
+    let project = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(comparable_path(&project).as_bytes());
+    hasher.update([0]);
+    hasher.update(package.as_bytes());
+    let mut name = format!("{APPCONTAINER_NAME}-");
+    for byte in &hasher.finalize()[..16] {
+        write!(name, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    name
+}
+
+/// `path` as Windows compares paths: case-insensitively, either
+/// separator, without a verbatim prefix or a trailing separator.
+fn comparable_path(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('/', "\\").to_lowercase();
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    text.trim_end_matches('\\').to_owned()
+}
+
+/// Where the LPM home keeps each identity's records: the trees the helper
+/// granted it, and the project and package it belongs to.
+fn identity_records() -> Option<PathBuf> {
+    lpm_common::LpmRoot::from_env()
+        .ok()
+        .map(|root| root.root().join("sandbox").join("appcontainers"))
+}
+
+/// The trees already swept of grants to profiles of earlier releases.
+fn sweep_record() -> Option<PathBuf> {
+    lpm_common::LpmRoot::from_env()
+        .ok()
+        .map(|root| root.root().join("sandbox").join("swept-trees.json"))
+}
+
+fn grant_record_path(records: &Path, name: &str) -> PathBuf {
+    records.join(format!("{name}.grants.json"))
+}
+
+fn identity_record_path(records: &Path, name: &str) -> PathBuf {
+    records.join(format!("{name}.identity.json"))
+}
+
+/// The project and package an identity belongs to, as the parent records
+/// them for a later cleanup.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct IdentityRecord {
+    version: u32,
+    project: PathBuf,
+    package: String,
+}
+
+const IDENTITY_RECORD_VERSION: u32 = 1;
+
+/// Records which project and package `name` belongs to, unless that is
+/// recorded already.
+fn record_identity(records: &Path, name: &str, project: &Path, package: &str) {
+    let path = identity_record_path(records, name);
+    if path.exists() {
+        return;
+    }
+    let record = IdentityRecord {
+        version: IDENTITY_RECORD_VERSION,
+        project: project.to_path_buf(),
+        package: package.to_owned(),
+    };
+    let bytes = serde_json::to_vec_pretty(&record).expect("an identity record serializes");
+    if let Err(error) =
+        std::fs::create_dir_all(records).and_then(|()| lpm_common::write_file_atomic(&path, bytes))
+    {
+        tracing::warn!(
+            "couldn't record the sandbox identity of {package} in {}, so removing the package \
+             won't remove the access its scripts had: {error}",
+            project.display()
+        );
+    }
+}
+
+pub(crate) fn release_package_identity(
+    project_dir: &Path,
+    package: &str,
+) -> Result<bool, SandboxError> {
+    let Some(records) = identity_records() else {
+        return Ok(false);
+    };
+    let name = appcontainer_name_for(project_dir, package);
+    if !identity_record_path(&records, &name).exists() {
+        return Ok(false);
+    }
+    release_identity(&records, &name, project_dir, package)?;
+    Ok(true)
+}
+
+pub(crate) fn release_identities_of_removed_projects() -> Result<usize, SandboxError> {
+    let Some(records) = identity_records() else {
+        return Ok(0);
+    };
+    let entries = match std::fs::read_dir(&records) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(SandboxError::IdentityCleanupFailed {
+                project: records,
+                package: String::new(),
+                reason: error.to_string(),
+            });
+        }
+    };
+    let mut released = 0;
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name
+            .to_str()
+            .and_then(|file_name| file_name.strip_suffix(".identity.json"))
+        else {
+            continue;
+        };
+        let Some(record) = std::fs::read(entry.path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<IdentityRecord>(&bytes).ok())
+            .filter(|record| record.version == IDENTITY_RECORD_VERSION)
+        else {
+            continue;
+        };
+        if record.project.exists() {
+            continue;
+        }
+        release_identity(&records, name, &record.project, &record.package)?;
+        released += 1;
+    }
+    Ok(released)
+}
+
+/// Has the helper revoke what `name` was granted and delete its profile,
+/// then removes its identity record.
+fn release_identity(
+    records: &Path,
+    name: &str,
+    project: &Path,
+    package: &str,
+) -> Result<(), SandboxError> {
+    let failed = |reason: String| SandboxError::IdentityCleanupFailed {
+        project: project.to_path_buf(),
+        package: package.to_owned(),
+        reason,
+    };
+    let output = Command::new(locate_sandbox_helper()?)
+        .arg("--protocol-version")
+        .arg(PROTOCOL_VERSION.to_string())
+        .arg("--appcontainer-name")
+        .arg(name)
+        .arg("--grant-record")
+        .arg(grant_record_path(records, name))
+        .arg("--revoke-only")
+        .arg("--delete-appcontainer-profile")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|error| failed(error.to_string()))?;
+    if !output.status.success() {
+        return Err(failed(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    match std::fs::remove_file(identity_record_path(records, name)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(failed(error.to_string())),
+    }
 }
 
 // ── Backend struct ───────────────────────────────────────────────────
@@ -155,10 +323,22 @@ impl Sandbox for AppContainerSandbox {
         helper_cmd
             .arg("--protocol-version")
             .arg(PROTOCOL_VERSION.to_string());
-        helper_cmd
-            .arg("--appcontainer-name")
-            .arg(appcontainer_name_for_invocation())
-            .arg("--delete-appcontainer-profile");
+        let name = appcontainer_name_for(&self.spec.project_dir, &self.spec.package_name);
+        helper_cmd.arg("--appcontainer-name").arg(&name);
+        if let Some(records) = identity_records() {
+            record_identity(
+                &records,
+                &name,
+                &self.spec.project_dir,
+                &self.spec.package_name,
+            );
+            helper_cmd
+                .arg("--grant-record")
+                .arg(grant_record_path(&records, &name));
+        }
+        if let Some(record) = sweep_record() {
+            helper_cmd.arg("--sweep-record").arg(record);
+        }
 
         // Broad-read grants (the cross-platform "reads broad"
         // contract). The helper applies DACL R+X ACEs on these.
@@ -881,13 +1061,21 @@ mod tests {
     }
 
     #[test]
-    fn appcontainer_profile_names_are_unique_and_within_windows_limit() {
-        let first = appcontainer_name_for_invocation();
-        let second = appcontainer_name_for_invocation();
+    fn a_package_keeps_one_appcontainer_per_project_within_the_windows_limit() {
+        let project = Path::new(r"C:\Users\me\project");
+        let name = appcontainer_name_for(project, "esbuild");
 
-        assert_ne!(first, second);
-        assert!(first.starts_with(APPCONTAINER_NAME));
-        assert!(first.len() <= 64, "AppContainer profile name was {first:?}");
+        assert_eq!(
+            name,
+            appcontainer_name_for(Path::new(r"c:/users/me/project/"), "esbuild")
+        );
+        assert_ne!(name, appcontainer_name_for(project, "sharp"));
+        assert_ne!(
+            name,
+            appcontainer_name_for(Path::new(r"C:\Users\me\other"), "esbuild")
+        );
+        assert!(name.starts_with(APPCONTAINER_NAME));
+        assert!(name.len() <= 64, "AppContainer profile name was {name:?}");
     }
 
     #[test]

@@ -91,6 +91,7 @@ pub(crate) fn cleanup_removed_packages(
             crate::editor_skills::remove_editor_skills(project_dir, &package.short());
         }
     }
+    let mut gone: Vec<&str> = Vec::with_capacity(removed.len());
     for name in removed {
         if pruned.retained_roots.contains(name) {
             continue;
@@ -98,6 +99,7 @@ pub(crate) fn cleanup_removed_packages(
         freed_bytes =
             freed_bytes.saturating_add(cleanup_bin_shims_for_package(&node_modules, name)?);
         freed_bytes = freed_bytes.saturating_add(remove_node_modules_entry(&node_modules, name)?);
+        gone.push(name);
     }
     for package in &orphaned {
         if pruned.retained_roots.contains(&package.name)
@@ -110,6 +112,10 @@ pub(crate) fn cleanup_removed_packages(
             .saturating_add(cleanup_bin_shims_for_package(&node_modules, &package.name)?);
         freed_bytes =
             freed_bytes.saturating_add(remove_node_modules_entry(&node_modules, &package.name)?);
+        gone.push(&package.name);
+    }
+    for name in gone {
+        release_sandbox_identity(project_dir, name);
     }
 
     let cleaned_empty_dirs = cleanup_empty_scope_dirs(&node_modules, removed, &orphaned)?;
@@ -119,6 +125,15 @@ pub(crate) fn cleanup_removed_packages(
         cleaned_empty_dirs,
         freed_bytes,
     })
+}
+
+/// Removes the sandbox access `package`'s scripts had in the project, as
+/// Windows keeps it with the package's AppContainer identity; a failure
+/// leaves it to `lpm cache clean` once the project is gone, and is told.
+fn release_sandbox_identity(project_dir: &Path, package: &str) {
+    if let Err(error) = lpm_sandbox::release_package_identity(project_dir, package) {
+        tracing::warn!("{error}");
+    }
 }
 
 fn invalidate_install_hash_marker(project_dir: &Path) -> Result<(), LpmError> {

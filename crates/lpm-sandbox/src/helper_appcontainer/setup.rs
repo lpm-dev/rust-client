@@ -522,7 +522,7 @@ fn lock_object(identity: Identity) -> Result<ProfileCreationLock, AppContainerEr
     lock_named(&name)
 }
 
-fn lock_named(name: &str) -> Result<ProfileCreationLock, AppContainerError> {
+pub(super) fn lock_named(name: &str) -> Result<ProfileCreationLock, AppContainerError> {
     let wide = str_to_wide_with_nul(name);
     let sddl = str_to_wide_with_nul("D:(A;;0x00100001;;;AU)(A;;GA;;;SY)");
     let mut descriptor = ptr::null_mut();
@@ -570,6 +570,23 @@ pub(super) fn update_ace(
     let (handle, identity) = open_permissions(path, true)?;
     let _lock = lock_object(identity)?;
     update_open_ace(&handle, path, sid, grant)
+}
+
+/// Removes the access-allowed ACEs whose SID `drops` picks from `path`'s
+/// DACL, under the lock every DACL update here takes, and says how many
+/// it removed. A DACL it would leave as it is isn't written.
+pub(super) fn remove_allowed_aces_where(
+    path: &Path,
+    drops: impl Fn(PSID) -> bool,
+) -> Result<usize, AppContainerError> {
+    let (handle, identity) = open_permissions(path, true)?;
+    let _lock = lock_object(identity)?;
+    let (old, _descriptor) = read_dacl(&handle, path)?;
+    let (mut filtered, removed) = super::dacl_without_allowed_aces_where(path, old, drops)?;
+    if removed > 0 {
+        write_dacl(&handle, path, filtered.as_mut_ptr().cast())?;
+    }
+    Ok(removed)
 }
 
 fn update_open_ace(

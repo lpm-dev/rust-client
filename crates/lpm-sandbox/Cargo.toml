@@ -74,6 +74,8 @@ libc = "0.2"
 #                                      spawn dance in the helper binary.
 #   - Win32_System_JobObjects          CreateJobObjectW, SetInformationJobObject,
 #                                      AssignProcessToJobObject
+#   - Win32_System_Registry            RegOpenKeyExW, to read which
+#                                      AppContainer profiles still exist
 #
 # Note: NtResumeProcess (the function `spawn_tracked_command` uses to
 # resume its suspended child once it is in its Job Object) is undocumented and not
@@ -101,6 +103,7 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_Threading",
     "Win32_System_JobObjects",
     "Win32_System_IO",
+    "Win32_System_Registry",
 ] }
 
 [dev-dependencies]

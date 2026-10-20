@@ -800,7 +800,14 @@ fn open_global_ca_directory_at_lpm_root(
                 parent_path.display()
             ))
         })?;
-    let Some(lpm) = open_or_create_directory(&parent, root_name, create, "$LPM_HOME")? else {
+    let Some(lpm) = open_or_create_directory(
+        &parent,
+        root_name,
+        create,
+        "$LPM_HOME",
+        DirectoryKind::LpmHome,
+    )?
+    else {
         return Err(LpmError::Cert("global LPM directory does not exist".into()));
     };
     let exposed = if create {
@@ -808,7 +815,14 @@ fn open_global_ca_directory_at_lpm_root(
     } else {
         None
     };
-    let Some(certs) = open_or_create_directory(&lpm, "certs", create, "$LPM_HOME/certs")? else {
+    let Some(certs) = open_or_create_directory(
+        &lpm,
+        "certs",
+        create,
+        "$LPM_HOME/certs",
+        DirectoryKind::Certificates,
+    )?
+    else {
         return Err(LpmError::Cert(
             "global certificate directory does not exist".into(),
         ));
@@ -1383,11 +1397,25 @@ pub(crate) fn open_project_cert_directory(
                 project_path.display()
             ))
         })?;
-    let Some(state) = open_or_create_directory(&project, ".lpm", create, ".lpm")? else {
+    let Some(state) = open_or_create_directory(
+        &project,
+        ".lpm",
+        create,
+        ".lpm",
+        DirectoryKind::ProjectState,
+    )?
+    else {
         return Ok(None);
     };
     lpm_common::keep_state_dir_ignored_or_warn(&state, &project_path.join(".lpm"));
-    let Some(certs) = open_or_create_directory(&state, "certs", create, ".lpm/certs")? else {
+    let Some(certs) = open_or_create_directory(
+        &state,
+        "certs",
+        create,
+        ".lpm/certs",
+        DirectoryKind::Certificates,
+    )?
+    else {
         return Ok(None);
     };
     let directory = ProjectCertDirectory {
@@ -1398,18 +1426,33 @@ pub(crate) fn open_project_cert_directory(
     Ok(Some(directory))
 }
 
+/// What a directory on the way to certificates is, which decides the access
+/// it keeps.
+#[derive(Clone, Copy)]
+enum DirectoryKind {
+    /// The LPM home, which sandboxed lifecycle scripts pass through to the
+    /// store they are granted.
+    LpmHome,
+    /// A project's `.lpm`, which they pass through to what they are
+    /// granted in it.
+    ProjectState,
+    /// A `certs` directory, its owner's alone.
+    Certificates,
+}
+
 fn open_or_create_directory(
     parent: &Dir,
     name: &str,
     create: bool,
     label: &str,
+    kind: DirectoryKind,
 ) -> Result<Option<Dir>, LpmError> {
     let open = || open_directory_nofollow(parent, name);
 
     match open() {
         Ok(dir) => {
             verify_path_identity(parent, name, &dir, label)?;
-            tighten_directory_permissions(&dir, label)?;
+            tighten_directory_permissions(&dir, label, kind)?;
             Ok(Some(dir))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => Ok(None),
@@ -1425,7 +1468,7 @@ fn open_or_create_directory(
             }
             let dir = open()?;
             verify_path_identity(parent, name, &dir, label)?;
-            tighten_directory_permissions(&dir, label)?;
+            tighten_directory_permissions(&dir, label, kind)?;
             Ok(Some(dir))
         }
         Err(error) => Err(LpmError::Cert(format!(
@@ -1471,7 +1514,11 @@ fn verify_path_identity(
 }
 
 #[cfg(unix)]
-fn tighten_directory_permissions(dir: &Dir, label: &str) -> Result<(), LpmError> {
+fn tighten_directory_permissions(
+    dir: &Dir,
+    label: &str,
+    _kind: DirectoryKind,
+) -> Result<(), LpmError> {
     use cap_std::fs::PermissionsExt as _;
 
     dir.set_permissions(".", cap_std::fs::Permissions::from_mode(0o700))
@@ -1490,8 +1537,21 @@ fn tighten_directory_permissions(dir: &Dir, label: &str) -> Result<(), LpmError>
 }
 
 #[cfg(windows)]
-fn tighten_directory_permissions(dir: &Dir, label: &str) -> Result<(), LpmError> {
-    windows_security::protect_directory(dir).map_err(|error| {
+fn tighten_directory_permissions(
+    dir: &Dir,
+    label: &str,
+    kind: DirectoryKind,
+) -> Result<(), LpmError> {
+    let protected = match kind {
+        DirectoryKind::LpmHome => {
+            lpm_common::owner_only::protect_state_directory(dir, false).map(drop)
+        }
+        DirectoryKind::ProjectState => {
+            lpm_common::owner_only::protect_state_directory(dir, true).map(drop)
+        }
+        DirectoryKind::Certificates => windows_security::protect_directory(dir),
+    };
+    protected.map_err(|error| {
         LpmError::Cert(format!(
             "failed to protect certificate directory `{label}`: {error}"
         ))
@@ -1499,7 +1559,11 @@ fn tighten_directory_permissions(dir: &Dir, label: &str) -> Result<(), LpmError>
 }
 
 #[cfg(not(any(unix, windows)))]
-fn tighten_directory_permissions(_dir: &Dir, _label: &str) -> Result<(), LpmError> {
+fn tighten_directory_permissions(
+    _dir: &Dir,
+    _label: &str,
+    _kind: DirectoryKind,
+) -> Result<(), LpmError> {
     Ok(())
 }
 
@@ -2097,6 +2161,15 @@ mod tests {
 
         assert_windows_owner_system_dacl(&project.join(".lpm"), true);
         assert_windows_owner_system_dacl(&project.join(".lpm/certs"), true);
+        let sddl = |path: &Path| {
+            windows_security::descriptor_sddl(&windows_acl_handle(path, true)).unwrap()
+        };
+        assert!(
+            sddl(&project.join(".lpm")).contains(";;;AC)"),
+            "sandboxed scripts can't pass through .lpm: {}",
+            sddl(&project.join(".lpm"))
+        );
+        assert!(!sddl(&project.join(".lpm/certs")).contains(";;;AC)"));
     }
 
     #[cfg(windows)]

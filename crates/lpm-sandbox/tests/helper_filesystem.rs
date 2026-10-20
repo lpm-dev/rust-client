@@ -121,7 +121,7 @@ fn helper_preserves_an_extended_drive_working_directory() {
 fn helper_argv_base() -> Vec<String> {
     vec![
         "--protocol-version".into(),
-        "2".into(),
+        lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string(),
         "--appcontainer-name".into(),
         format!(
             "LpmFilesystemTest-{}-{}",

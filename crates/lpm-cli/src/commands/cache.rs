@@ -207,10 +207,27 @@ fn run_clean(
                 });
             }
 
+            // Windows keeps the sandbox access a package's scripts had in a
+            // project with an AppContainer identity of the project's.
+            let released_identities = if category.is_none() {
+                lpm_sandbox::release_identities_of_removed_projects().unwrap_or_else(|error| {
+                    install_ui::warn_untrusted(&error.to_string());
+                    0
+                })
+            } else {
+                0
+            };
+
             if json_output {
                 emit_clean_json(&cleaned, &skipped);
             } else {
                 emit_clean_human(&cleaned, &skipped);
+                if released_identities > 0 {
+                    install_ui::done_untrusted(&format!(
+                        "Removed the sandbox access of {released_identities} package{} in projects that no longer exist",
+                        if released_identities == 1 { "" } else { "s" }
+                    ));
+                }
             }
 
             // One-time notice: warn users who ran `lpm cache clean` expecting

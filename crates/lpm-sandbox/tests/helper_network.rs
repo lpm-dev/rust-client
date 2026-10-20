@@ -39,13 +39,17 @@
 
 use assert_cmd::Command;
 use std::net::TcpListener;
+use std::sync::LazyLock;
+
+static PROTOCOL_VERSION: LazyLock<String> =
+    LazyLock::new(|| lpm_sandbox::helper_protocol::PROTOCOL_VERSION.to_string());
 
 const TEST_APPCONTAINER_NAME: &str = "LpmSandboxHelperIntegrationTest";
 
 fn minimal_argv(grant_internet: bool) -> Vec<&'static str> {
     let mut v = vec![
         "--protocol-version",
-        "2",
+        PROTOCOL_VERSION.as_str(),
         "--appcontainer-name",
         TEST_APPCONTAINER_NAME,
         "--stdio-stdin",
