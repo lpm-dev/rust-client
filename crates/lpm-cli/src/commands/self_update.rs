@@ -244,7 +244,11 @@ pub async fn run(
         cargo_source_commit.as_deref(),
         cargo_install_root.as_deref(),
     )?;
-    let sanitized_path = sanitized_path_for_method(&method, environment_exclusion_root.as_deref())?;
+    let sanitized_path = sanitized_path_for_method(
+        &method,
+        environment_exclusion_root.as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    )?;
     let bound_update_command = external_update_command
         .as_ref()
         .map(|command| {
@@ -428,15 +432,20 @@ pub async fn run(
     Ok(())
 }
 
+/// The `PATH` value `path`, sanitized, that a package-manager update runs
+/// with; a standalone update runs none and needs no `PATH`.
 fn sanitized_path_for_method(
     method: &InstallMethod,
     environment_exclusion_root: Option<&Path>,
+    path: Option<&std::ffi::OsStr>,
 ) -> Result<Option<OsString>, LpmError> {
     if method == &InstallMethod::Standalone {
-        Ok(None)
-    } else {
-        probe::sanitized_current_path(environment_exclusion_root).map(Some)
+        return Ok(None);
     }
+    let path = path.ok_or_else(|| {
+        LpmError::SelfUpdate("cannot verify self-update because PATH is unset".to_string())
+    })?;
+    probe::sanitized_path(path, environment_exclusion_root).map(Some)
 }
 
 fn should_install_update(
@@ -3392,12 +3401,11 @@ mod tests {
 
     #[test]
     fn standalone_update_does_not_require_or_scan_path() {
-        let _environment = crate::test_env::ScopedEnv::update([("PATH", None)]);
-
         assert_eq!(
-            sanitized_path_for_method(&InstallMethod::Standalone, None).unwrap(),
+            sanitized_path_for_method(&InstallMethod::Standalone, None, None).unwrap(),
             None
         );
+        assert!(sanitized_path_for_method(&InstallMethod::Npm, None, None).is_err());
     }
 
     #[test]

@@ -64,6 +64,15 @@ fn run_dev_tty(
     let mut master = unsafe { File::from_raw_fd(master_fd) };
     // SAFETY: each descriptor is uniquely owned after successful openpty.
     let slave = unsafe { File::from_raw_fd(slave_fd) };
+    // Close-on-exec, so a command another test in this process starts holds
+    // neither end, which would keep this terminal from hanging up.
+    for descriptor in [master.as_raw_fd(), slave.as_raw_fd()] {
+        // SAFETY: the descriptor is valid; fcntl only sets its flag.
+        assert_eq!(
+            unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
     // SAFETY: the descriptor is valid; fcntl only changes its read mode.
     let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
     assert!(flags >= 0);
@@ -139,7 +148,9 @@ fn run_dev_tty(
         std::thread::sleep(Duration::from_millis(10));
     }
     drop(master);
-    let deadline = Instant::now() + Duration::from_secs(1);
+    // A loaded runner can take seconds to wind `lpm` down once the terminal
+    // hangs up; a passing run returns as soon as it exits.
+    let deadline = Instant::now() + Duration::from_secs(10);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break Some(status);

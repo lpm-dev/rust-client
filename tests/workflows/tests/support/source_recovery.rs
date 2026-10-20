@@ -15,7 +15,9 @@ pub fn interrupt(mut command: Command, marker: &Path, stage: &str, source_path: 
         command.env("LPM_TEST_SOURCE_RECOVERY_PATH", path);
     }
     let mut child = command.spawn().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(15);
+    // A loaded Windows runner can take more than 15 seconds to get there;
+    // a passing run stops waiting as soon as it does.
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !marker.exists() {
         if let Some(status) = child.try_wait().unwrap() {
             output.rewind().unwrap();

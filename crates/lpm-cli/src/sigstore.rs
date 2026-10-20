@@ -1344,6 +1344,13 @@ mod tests {
 
     #[tokio::test]
     async fn numeric_loopback_sigstore_request_bypasses_proxy_environment() {
+        // Every HTTP client this process builds while the proxy variables
+        // are set would send its requests to the proxy.
+        if !crate::test_env::alone_in_a_process(
+            "sigstore::tests::numeric_loopback_sigstore_request_bypasses_proxy_environment",
+        ) {
+            return;
+        }
         let origin = MockServer::start().await;
         Mock::given(method("POST"))
             .and(match_path("/api/v2/signingCert"))

@@ -643,22 +643,18 @@ mod tests {
 
     #[test]
     fn diagnostic_tools_do_not_inherit_ambient_secrets() {
-        let secret_name = "LPM_DOCTOR_TOOL_UNIQUE_SECRET";
-        let prior = std::env::var_os(secret_name);
-        // SAFETY: this uniquely named variable is scoped to this test and restored below.
-        unsafe { std::env::set_var(secret_name, "must-not-leak") };
-
-        let output = run_tool_with_timeout(
-            Path::new("/bin/sh"),
-            &["-c", "printf '%s' \"$LPM_DOCTOR_TOOL_UNIQUE_SECRET\""],
-            Path::new("/"),
-            None,
-        );
-
-        match prior {
-            Some(value) => unsafe { std::env::set_var(secret_name, value) },
-            None => unsafe { std::env::remove_var(secret_name) },
-        }
+        let output = {
+            let _env = crate::test_env::ScopedEnv::set([(
+                "LPM_DOCTOR_TOOL_UNIQUE_SECRET",
+                "must-not-leak".into(),
+            )]);
+            run_tool_with_timeout(
+                Path::new("/bin/sh"),
+                &["-c", "printf '%s' \"$LPM_DOCTOR_TOOL_UNIQUE_SECRET\""],
+                Path::new("/"),
+                None,
+            )
+        };
         let (stdout, _, _) = output.expect("run diagnostic environment probe");
         assert!(
             stdout.is_empty(),

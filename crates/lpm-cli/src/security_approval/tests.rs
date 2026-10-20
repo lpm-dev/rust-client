@@ -784,15 +784,10 @@ fn security_status_filters_unlocks_to_the_requested_project() {
 
 #[test]
 fn automation_mode_includes_json() {
-    let original_auth = std::env::var_os(TEST_AUTH_RESULT_ENV);
-    unsafe {
-        std::env::remove_var(TEST_AUTH_RESULT_ENV);
-    }
-    let automation = is_automation(true);
-    match original_auth {
-        Some(value) => unsafe { std::env::set_var(TEST_AUTH_RESULT_ENV, value) },
-        None => unsafe { std::env::remove_var(TEST_AUTH_RESULT_ENV) },
-    }
+    let automation = {
+        let _env = crate::test_env::ScopedEnv::update([(TEST_AUTH_RESULT_ENV, None)]);
+        is_automation(true)
+    };
     assert!(automation);
 }
 

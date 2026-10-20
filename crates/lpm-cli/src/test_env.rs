@@ -95,6 +95,31 @@ impl Drop for ScopedEnv {
     }
 }
 
+/// Whether this process runs only the test `path` (its full name, such as
+/// `commands::doctor::runtime::tests::a_test`), so it may set the process
+/// environment, which every test sharing a process reads; otherwise runs
+/// `path` alone in a child process of this test binary and asserts that it
+/// passed.
+#[cfg(test)]
+pub(crate) fn alone_in_a_process(path: &str) -> bool {
+    const ALONE: &str = "LPM_CLI_TEST_ALONE";
+    if std::env::var_os(ALONE).is_some_and(|alone| alone == path) {
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([path, "--exact", "--test-threads=1"])
+        .env(ALONE, path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{path} alone in a process:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

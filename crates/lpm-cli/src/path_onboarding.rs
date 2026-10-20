@@ -221,11 +221,14 @@ pub fn is_bin_dir_on_path_str(bin_dir: &Path, path_env: &str) -> bool {
 }
 
 pub fn maybe_show_path_hint(root: &LpmRoot, json_output: bool) -> PathHintReport {
+    show_path_hint_for(root, json_output, std::env::var("PATH").ok().as_deref())
+}
+
+/// [`maybe_show_path_hint`] for the `PATH` value `path_env`.
+fn show_path_hint_for(root: &LpmRoot, json_output: bool, path_env: Option<&str>) -> PathHintReport {
     let bin_dir = root.bin_dir();
     let marker_path = root.path_hint_marker();
-    let on_path = std::env::var("PATH")
-        .ok()
-        .is_some_and(|path_env| is_bin_dir_on_path_str(&bin_dir, &path_env));
+    let on_path = path_env.is_some_and(|path_env| is_bin_dir_on_path_str(&bin_dir, path_env));
     let marker_already_present = marker_path.exists();
 
     // Two no-banner branches:
@@ -320,15 +323,6 @@ fn write_marker_best_effort(marker_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Set `$PATH` for the duration of `body`, restore on drop.
-    /// `body` runs while we hold the env lock — no parallel test can
-    /// observe a torn PATH state. RAII via a guard struct: cleanup
-    /// runs even on panic.
-    fn with_path_env<R>(value: &str, body: impl FnOnce() -> R) -> R {
-        let _env = crate::test_env::ScopedEnv::set([("PATH", value.into())]);
-        body()
-    }
 
     // ─── Shell detection ─────────────────────────────────────────────
 
@@ -590,9 +584,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = LpmRoot::from_dir(tmp.path());
         let bin = root.bin_dir();
-        let report = with_path_env(&bin.display().to_string(), || {
-            maybe_show_path_hint(&root, false)
-        });
+        let report = show_path_hint_for(&root, false, Some(&bin.display().to_string()));
 
         assert!(report.on_path);
         assert!(!report.banner_printed);
@@ -607,7 +599,7 @@ mod tests {
     fn hint_does_not_print_in_json_mode_but_marks_and_reports() {
         let tmp = tempfile::tempdir().unwrap();
         let root = LpmRoot::from_dir(tmp.path());
-        let report = with_path_env("", || maybe_show_path_hint(&root, true));
+        let report = show_path_hint_for(&root, true, Some(""));
 
         assert!(!report.on_path);
         assert!(
@@ -627,7 +619,7 @@ mod tests {
         std::fs::create_dir_all(root.path_hint_marker().parent().unwrap()).unwrap();
         std::fs::write(root.path_hint_marker(), b"already").unwrap();
 
-        let report = with_path_env("", || maybe_show_path_hint(&root, false));
+        let report = show_path_hint_for(&root, false, Some(""));
 
         assert!(report.marker_already_present);
         assert!(!report.banner_printed);
@@ -642,7 +634,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = LpmRoot::from_dir(tmp.path());
         // No marker exists yet, PATH does not contain bin_dir.
-        let report = with_path_env("/usr/bin:/bin", || maybe_show_path_hint(&root, false));
+        let report = show_path_hint_for(&root, false, Some("/usr/bin:/bin"));
 
         assert!(!report.on_path);
         assert!(!report.marker_already_present);

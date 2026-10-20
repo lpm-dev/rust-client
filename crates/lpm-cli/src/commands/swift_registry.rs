@@ -1027,9 +1027,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::OnceLock;
     use tempfile::TempDir;
-    use tokio::sync::Mutex as AsyncMutex;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1099,7 +1097,6 @@ mod tests {
 
     #[tokio::test]
     async fn native_platform_configuration_is_validated_instead_of_an_unused_legacy_file() {
-        let _guard = home_env_lock().lock().await;
         let home = TempDir::new().unwrap();
         let xdg = home.path().join("xdg");
         let _environment = crate::test_env::ScopedEnv::update([
@@ -1125,9 +1122,8 @@ mod tests {
 
     #[tokio::test]
     async fn signing_configuration_rejects_invalid_shapes_without_replacing_bytes() {
-        let _guard = home_env_lock().lock().await;
         let home = TempDir::new().unwrap();
-        let _home = HomeOverride::new(home.path());
+        let _home = home_override(home.path());
         let path = write_global_signing_trust(home.path(), &serde_json::json!({}));
         let cases = [
             "broken json",
@@ -1173,9 +1169,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn signing_configuration_preserves_swiftpm_global_directory_alias() {
-        let _guard = home_env_lock().lock().await;
         let home = TempDir::new().unwrap();
-        let _home = HomeOverride::new(home.path());
+        let _home = home_override(home.path());
         let native = home.path().join("Library/org.swift.swiftpm/configuration");
         fs::create_dir_all(&native).unwrap();
         fs::write(
@@ -1209,9 +1204,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn signing_configuration_rejects_symlinks_without_replacing_them() {
-        let _guard = home_env_lock().lock().await;
         let home = TempDir::new().unwrap();
-        let _home = HomeOverride::new(home.path());
+        let _home = home_override(home.path());
         let path = write_global_signing_trust(home.path(), &serde_json::json!({}));
         let target = home.path().join("shared.json");
         fs::rename(&path, &target).unwrap();
@@ -1228,9 +1222,8 @@ mod tests {
 
     #[tokio::test]
     async fn signing_configuration_concurrent_hosts_keep_each_override() {
-        let _guard = home_env_lock().lock().await;
         let home = TempDir::new().unwrap();
-        let _home = HomeOverride::new(home.path());
+        let _home = home_override(home.path());
         let path = write_global_signing_trust(
             home.path(),
             &serde_json::json!({"unrelated": "x".repeat(500_000)}),
@@ -1258,10 +1251,9 @@ mod tests {
 
     #[tokio::test]
     async fn automatic_setup_rejects_invalid_configuration_before_certificate_changes() {
-        let _guard = home_env_lock().lock().await;
         let home = TempDir::new().unwrap();
         let package = TempDir::new().unwrap();
-        let _home = HomeOverride::new(home.path());
+        let _home = home_override(home.path());
         let server = MockServer::start().await;
         write_matching_package_scope(package.path(), &server.uri());
         let path = write_global_signing_trust(home.path(), &serde_json::json!({}));
@@ -1364,7 +1356,6 @@ exit 64
     #[cfg(unix)]
     #[tokio::test]
     async fn staged_login_and_signing_trust_use_native_ipv6_host_keys() {
-        let _guard = home_env_lock().lock().await;
         let home = TempDir::new().unwrap();
         let path = fake_swift_path(home.path());
         fs::write(home.path().join("fake-swift-bin/swift"), r#"#!/bin/sh
@@ -1403,7 +1394,6 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"::1:8443":{"type":"
     #[cfg(unix)]
     #[tokio::test]
     async fn rejected_fresh_login_leaves_the_global_configuration_absent() {
-        let _guard = home_env_lock().lock().await;
         let home = TempDir::new().unwrap();
         let path = fake_swift_path(home.path());
         let _environment = crate::test_env::ScopedEnv::update([
@@ -1429,7 +1419,6 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"::1:8443":{"type":"
     #[cfg(unix)]
     #[tokio::test]
     async fn successful_fresh_login_writes_required_native_fields_before_later_setup_steps() {
-        let _guard = home_env_lock().lock().await;
         let home = TempDir::new().unwrap();
         let path = fake_swift_path(home.path());
         let _environment = crate::test_env::ScopedEnv::update([
@@ -1458,7 +1447,6 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"::1:8443":{"type":"
     #[cfg(unix)]
     #[tokio::test]
     async fn native_login_preserves_existing_global_configuration_extensions() {
-        let _guard = home_env_lock().lock().await;
         let home = TempDir::new().unwrap();
         let path = fake_swift_path(home.path());
         fs::write(home.path().join("fake-swift-bin/swift"), r#"#!/bin/sh
@@ -1507,7 +1495,6 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
     #[cfg(unix)]
     #[tokio::test]
     async fn swift_registry_retries_rejected_stored_session_after_refresh() {
-        let _lock = home_env_lock().lock().await;
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/cli/refresh"))
@@ -1568,7 +1555,6 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
     #[cfg(unix)]
     #[tokio::test]
     async fn refresh_retry_suppresses_the_speculative_swiftpm_failure_output() {
-        let _lock = home_env_lock().lock().await;
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/cli/refresh"))
@@ -1638,7 +1624,6 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
     #[tokio::test]
     async fn anonymous_https_setup_skips_rejected_credentials_but_requires_certificate_verification()
      {
-        let _lock = home_env_lock().lock().await;
         let home = TempDir::new().unwrap();
         let package = TempDir::new().unwrap();
         let path = fake_swift_path(home.path());
@@ -1663,7 +1648,6 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
     #[cfg(unix)]
     #[tokio::test]
     async fn automatic_setup_reports_swiftpm_login_failure() {
-        let _lock = home_env_lock().lock().await;
         let server = MockServer::start().await;
         let home = TempDir::new().expect("create isolated home");
         let package = TempDir::new().expect("create Swift package directory");
@@ -1703,7 +1687,6 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
     #[cfg(unix)]
     #[tokio::test]
     async fn automatic_setup_authenticates_when_the_registry_scope_already_matches() {
-        let _lock = home_env_lock().lock().await;
         let server = MockServer::start().await;
         let registry_url = server.uri().replacen("http://", "https://", 1);
         let home = TempDir::new().expect("create isolated home");
@@ -1773,11 +1756,6 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
     /// Serialize tests that mutate the process-wide `HOME` env var, so they
     /// don't trample each other under `cargo test` parallelism. Async-aware
     /// so the guard can be held across `.await` points (wiremock setup).
-    fn home_env_lock() -> &'static AsyncMutex<()> {
-        static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| AsyncMutex::new(()))
-    }
-
     fn strip_ansi(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
         let mut chars = s.chars().peekable();
@@ -1797,45 +1775,14 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
         out
     }
 
-    /// RAII override of `HOME`. Drop restores the prior value (or removes
-    /// the var if there was none). Must be held alongside `home_env_lock()`.
-    struct HomeOverride {
-        prior: Option<std::ffi::OsString>,
-        prior_xdg: Option<std::ffi::OsString>,
-    }
-
-    impl HomeOverride {
-        fn new(home: &std::path::Path) -> Self {
-            let prior = std::env::var_os("HOME");
-            let prior_xdg = std::env::var_os("XDG_CONFIG_HOME");
-            // SAFETY: caller holds home_env_lock(), serializing env mutation
-            // across the test module.
-            unsafe {
-                std::env::set_var("HOME", home);
-                if cfg!(windows) {
-                    std::env::set_var("XDG_CONFIG_HOME", home.join("swiftpm-test-config"));
-                } else {
-                    std::env::remove_var("XDG_CONFIG_HOME");
-                }
-            };
-            HomeOverride { prior, prior_xdg }
-        }
-    }
-
-    impl Drop for HomeOverride {
-        fn drop(&mut self) {
-            // SAFETY: still inside the home_env_lock()-protected section.
-            unsafe {
-                match &self.prior_xdg {
-                    Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                    None => std::env::remove_var("XDG_CONFIG_HOME"),
-                }
-                match &self.prior {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
+    /// `HOME` set to `home` until the guard drops, with `XDG_CONFIG_HOME`
+    /// inside it on Windows and unset elsewhere.
+    fn home_override(home: &std::path::Path) -> crate::test_env::ScopedEnv {
+        let xdg = cfg!(windows).then(|| home.join("swiftpm-test-config").into_os_string());
+        crate::test_env::ScopedEnv::update([
+            ("HOME", Some(home.as_os_str().to_owned())),
+            ("XDG_CONFIG_HOME", xdg),
+        ])
     }
 
     // Cert idempotency should check file size, not just existence.
@@ -1941,9 +1888,8 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
 
     #[test]
     fn signing_trust_preserves_existing_authentication_configuration() {
-        let _guard = home_env_lock().blocking_lock();
         let home = TempDir::new().unwrap();
-        let _home = HomeOverride::new(home.path());
+        let _home = home_override(home.path());
         let config = serde_json::json!({
             "version": 1,
             "authentication": {
@@ -1964,9 +1910,8 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
     /// users with an off-line origin would think setup was done.
     #[tokio::test]
     async fn install_signing_certificate_errors_on_http_404() {
-        let _guard = home_env_lock().lock().await;
         let temp_home = TempDir::new().unwrap();
-        let _home = HomeOverride::new(temp_home.path());
+        let _home = home_override(temp_home.path());
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1996,9 +1941,8 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
     /// Same justification as the 404 case.
     #[tokio::test]
     async fn install_signing_certificate_errors_on_truncated_body() {
-        let _guard = home_env_lock().lock().await;
         let temp_home = TempDir::new().unwrap();
-        let _home = HomeOverride::new(temp_home.path());
+        let _home = home_override(temp_home.path());
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -2028,9 +1972,8 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
     /// `CertOutcome::Installed`.
     #[tokio::test]
     async fn install_signing_certificate_writes_cert_to_swiftpm_trust_store() {
-        let _guard = home_env_lock().lock().await;
         let temp_home = TempDir::new().unwrap();
-        let _home = HomeOverride::new(temp_home.path());
+        let _home = home_override(temp_home.path());
 
         let server = MockServer::start().await;
         let cert_bytes = valid_der_certificate();
@@ -2060,9 +2003,8 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
     /// retains matching local bytes without rewriting them.
     #[tokio::test]
     async fn install_signing_certificate_skips_when_valid_cert_already_installed() {
-        let _guard = home_env_lock().lock().await;
         let temp_home = TempDir::new().unwrap();
-        let _home = HomeOverride::new(temp_home.path());
+        let _home = home_override(temp_home.path());
 
         let cert_path =
             test_swiftpm_root(temp_home.path()).join("security/trusted-root-certs/lpm.der");
@@ -2096,9 +2038,8 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
     /// defeat the explicit re-fetch the user asked for.
     #[tokio::test]
     async fn install_signing_certificate_force_propagates_download_failure() {
-        let _guard = home_env_lock().lock().await;
         let temp_home = TempDir::new().unwrap();
-        let _home = HomeOverride::new(temp_home.path());
+        let _home = home_override(temp_home.path());
 
         // Seed a valid cert on disk that --force should override.
         let cert_path =
@@ -2133,9 +2074,8 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
     /// contents stay aligned.
     #[test]
     fn configure_signing_trust_writes_registry_override_for_lpm_host() {
-        let _guard = home_env_lock().blocking_lock();
         let temp_home = TempDir::new().unwrap();
-        let _home = HomeOverride::new(temp_home.path());
+        let _home = home_override(temp_home.path());
 
         let outcome =
             configure_signing_trust("https://lpm.dev", true).expect("trust config should succeed");
@@ -2242,10 +2182,9 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
 
     #[tokio::test]
     async fn automatic_setup_repairs_a_missing_certificate_when_scope_and_trust_match() {
-        let _guard = home_env_lock().lock().await;
         let home = TempDir::new().unwrap();
         let package = TempDir::new().unwrap();
-        let _home = HomeOverride::new(home.path());
+        let _home = home_override(home.path());
         let server = MockServer::start().await;
         let certificate = valid_der_certificate();
         mount_signing_certificate(&server, certificate.clone()).await;
@@ -2264,10 +2203,9 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
 
     #[tokio::test]
     async fn automatic_setup_replaces_a_malformed_local_certificate() {
-        let _guard = home_env_lock().lock().await;
         let home = TempDir::new().unwrap();
         let package = TempDir::new().unwrap();
-        let _home = HomeOverride::new(home.path());
+        let _home = home_override(home.path());
         let server = MockServer::start().await;
         let certificate = valid_der_certificate();
         mount_signing_certificate(&server, certificate.clone()).await;
@@ -2286,10 +2224,9 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
 
     #[tokio::test]
     async fn automatic_setup_replaces_a_stale_but_valid_local_certificate() {
-        let _guard = home_env_lock().lock().await;
         let home = TempDir::new().unwrap();
         let package = TempDir::new().unwrap();
-        let _home = HomeOverride::new(home.path());
+        let _home = home_override(home.path());
         let server = MockServer::start().await;
         let expected = valid_der_certificate();
         let stale = valid_der_certificate();
@@ -2310,10 +2247,9 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
 
     #[tokio::test]
     async fn automatic_setup_adds_a_missing_signing_trust_policy() {
-        let _guard = home_env_lock().lock().await;
         let home = TempDir::new().unwrap();
         let package = TempDir::new().unwrap();
-        let _home = HomeOverride::new(home.path());
+        let _home = home_override(home.path());
         let server = MockServer::start().await;
         let certificate = valid_der_certificate();
         mount_signing_certificate(&server, certificate.clone()).await;
@@ -2335,10 +2271,9 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
 
     #[tokio::test]
     async fn automatic_setup_repairs_incorrect_default_signing_policy() {
-        let _guard = home_env_lock().lock().await;
         let home = TempDir::new().unwrap();
         let package = TempDir::new().unwrap();
-        let _home = HomeOverride::new(home.path());
+        let _home = home_override(home.path());
         let server = MockServer::start().await;
         let certificate = valid_der_certificate();
         mount_signing_certificate(&server, certificate.clone()).await;
@@ -2365,10 +2300,9 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
 
     #[tokio::test]
     async fn automatic_setup_retains_stricter_default_signing_policies() {
-        let _guard = home_env_lock().lock().await;
         let home = TempDir::new().unwrap();
         let package = TempDir::new().unwrap();
-        let _home = HomeOverride::new(home.path());
+        let _home = home_override(home.path());
         let server = MockServer::start().await;
         let certificate = valid_der_certificate();
         mount_signing_certificate(&server, certificate.clone()).await;
@@ -2408,10 +2342,9 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
 
     #[tokio::test]
     async fn automatic_setup_surfaces_certificate_repair_failure() {
-        let _guard = home_env_lock().lock().await;
         let home = TempDir::new().unwrap();
         let package = TempDir::new().unwrap();
-        let _home = HomeOverride::new(home.path());
+        let _home = home_override(home.path());
         let server = MockServer::start().await;
         mount_signing_certificate(&server, valid_der_certificate()).await;
         write_matching_package_scope(package.path(), &server.uri());
@@ -2437,10 +2370,9 @@ printf '%s' '{"version":1,"registries":{},"authentication":{"lpm.dev":{"type":"t
     async fn automatic_setup_retains_matching_certificate_and_complete_trust_without_rewrites() {
         use std::os::unix::fs::MetadataExt;
 
-        let _guard = home_env_lock().lock().await;
         let home = TempDir::new().unwrap();
         let package = TempDir::new().unwrap();
-        let _home = HomeOverride::new(home.path());
+        let _home = home_override(home.path());
         let server = MockServer::start().await;
         let certificate = valid_der_certificate();
         mount_signing_certificate(&server, certificate.clone()).await;
