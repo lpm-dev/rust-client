@@ -1684,12 +1684,17 @@ fn validate_chunk_header_paths(chunk: &str, patch_file: &Path) -> Result<(), Lpm
         if line.starts_with("@@") {
             break;
         }
-        let raw = line
+        let raw = if let Some(rest) = line
             .strip_prefix("--- ")
             .or_else(|| line.strip_prefix("+++ "))
-            .or_else(|| line.strip_prefix("rename from "))
-            .or_else(|| line.strip_prefix("rename to "));
-        let Some(raw) = raw else {
+        {
+            header_file_name(rest, patch_file)?
+        } else if let Some(rest) = line
+            .strip_prefix("rename from ")
+            .or_else(|| line.strip_prefix("rename to "))
+        {
+            std::borrow::Cow::Borrowed(rest)
+        } else {
             continue;
         };
         if raw == "/dev/null" {
@@ -1698,10 +1703,44 @@ fn validate_chunk_header_paths(chunk: &str, patch_file: &Path) -> Result<(), Lpm
         let raw = raw
             .strip_prefix("a/")
             .or_else(|| raw.strip_prefix("b/"))
-            .unwrap_or(raw);
+            .unwrap_or(&raw);
         validate_apply_path(raw, patch_file)?;
     }
     Ok(())
+}
+
+/// The path a `---` or `+++` header names, read as diffy reads it to apply
+/// the patch: up to a tab, as `diff -u` puts the file's time after one, and
+/// unquoted where git quotes it.
+fn header_file_name<'a>(
+    rest: &'a str,
+    patch_file: &Path,
+) -> Result<std::borrow::Cow<'a, str>, LpmError> {
+    let name = rest.split_once('\t').map_or(rest, |(name, _)| name);
+    let Some(quoted) = name
+        .strip_prefix('"')
+        .and_then(|name| name.strip_suffix('"'))
+    else {
+        return Ok(std::borrow::Cow::Borrowed(name));
+    };
+    let mut unquoted = String::with_capacity(quoted.len());
+    let mut chars = quoted.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            unquoted.push(character);
+            continue;
+        }
+        unquoted.push(match chars.next() {
+            Some('n') => '\n',
+            Some('t') => '\t',
+            Some('0') => '\0',
+            Some('r') => '\r',
+            Some('"') => '"',
+            Some('\\') => '\\',
+            _ => return Err(illegal_patch_path(patch_file, name)),
+        });
+    }
+    Ok(std::borrow::Cow::Owned(unquoted))
 }
 
 fn read_baseline_bytes(
@@ -2978,6 +3017,60 @@ mod tests {
         assert_eq!(result.files_deleted, 0);
         let written = std::fs::read_to_string(m.destination.join("x.js")).unwrap();
         assert_eq!(written, "line1\nlineTWO\nline3\n");
+    }
+
+    #[test]
+    fn apply_reads_header_paths_up_to_a_gnu_diff_timestamp() {
+        let (_home, store, integrity) =
+            fake_store_entry("lodash", "4.17.21", &[("x.js", b"line1\nline2\nline3\n")]);
+        let (_dir, m) =
+            fake_materialized("lodash", "4.17.21", &[("x.js", b"line1\nline2\nline3\n")]);
+        // `diff -u` puts each file's time after a tab.
+        let patch = write_patch(
+            "--- a/x.js\t2026-05-08 16:47:54\n+++ b/x.js\t2026-05-08 16:47:54\n\
+             @@ -1,3 +1,3 @@\n line1\n-line2\n+lineTWO\n line3\n",
+        );
+
+        let result =
+            apply_patch(&[&m], patch.path(), &integrity, &store, "lodash", "4.17.21").unwrap();
+        assert_eq!(result.files_modified, 1);
+        let written = std::fs::read_to_string(m.destination.join("x.js")).unwrap();
+        assert_eq!(written, "line1\nlineTWO\nline3\n");
+    }
+
+    #[test]
+    fn apply_reads_quoted_header_paths_as_git_writes_them() {
+        let (_home, store, integrity) =
+            fake_store_entry("lodash", "4.17.21", &[("x.js", b"line1\nline2\nline3\n")]);
+        let (_dir, m) =
+            fake_materialized("lodash", "4.17.21", &[("x.js", b"line1\nline2\nline3\n")]);
+        let patch = write_patch(
+            "--- \"a/x.js\"\n+++ \"b/x.js\"\n@@ -1,3 +1,3 @@\n line1\n-line2\n+lineTWO\n line3\n",
+        );
+
+        let result =
+            apply_patch(&[&m], patch.path(), &integrity, &store, "lodash", "4.17.21").unwrap();
+        assert_eq!(result.files_modified, 1);
+    }
+
+    #[test]
+    fn apply_rejects_illegal_header_paths_behind_a_timestamp_or_quotes() {
+        let (_home, store, integrity) = fake_store_entry("lodash", "4.17.21", &[("x.js", b"a\n")]);
+        let (_dir, m) = fake_materialized("lodash", "4.17.21", &[("x.js", b"a\n")]);
+        for header in [
+            "--- a/../escape.js\t2026-05-08 16:47:54\n+++ b/../escape.js\t2026-05-08 16:47:54\n",
+            "--- \"a/x\\tb.js\"\n+++ \"b/x\\tb.js\"\n",
+            "--- \"a/x\\q.js\"\n+++ \"b/x\\q.js\"\n",
+        ] {
+            let patch = write_patch(&format!("{header}@@ -1 +1 @@\n-a\n+b\n"));
+
+            let err = apply_patch(&[&m], patch.path(), &integrity, &store, "lodash", "4.17.21")
+                .unwrap_err();
+            assert!(
+                format!("{err}").contains("illegal path"),
+                "{header:?}: {err}"
+            );
+        }
     }
 
     #[test]
