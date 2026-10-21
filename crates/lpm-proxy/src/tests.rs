@@ -72,14 +72,18 @@ fn status(host: &str, upstream_port: u16, lease_id: u64) -> RouteStatus {
 }
 
 #[cfg(unix)]
-fn forwarder_state(pid: u32, tls_addr: Option<String>) -> ProxyDaemonState {
+fn forwarder_state(
+    pid: u32,
+    tls_addr: Option<&str>,
+    http_redirect_addr: Option<&str>,
+) -> ProxyDaemonState {
     ProxyDaemonState {
         public_tls_addr: None,
         pid,
         endpoint: Some("/tmp/lpm-proxy.sock".to_string()),
         http_addr: None,
-        http_redirect_addr: None,
-        tls_addr,
+        http_redirect_addr: http_redirect_addr.map(str::to_string),
+        tls_addr: tls_addr.map(str::to_string),
         routes: Vec::new(),
     }
 }
@@ -176,19 +180,26 @@ async fn control_response_times_out_when_the_client_does_not_read() {
 
 #[cfg(unix)]
 #[test]
-fn unix_forwarder_guard_validates_current_user_live_state() {
+fn unix_forwarder_guard_resolves_each_listener_the_live_user_daemon_advertises() {
     let dir = tempfile::tempdir().unwrap();
     let state_path = dir.path().join("proxy.json");
-    let backend_addr = "127.0.0.1:9443".parse().unwrap();
     write_state_file(
         &state_path,
-        &forwarder_state(std::process::id(), Some(format!("https://{backend_addr}"))),
+        &forwarder_state(
+            std::process::id(),
+            Some("https://127.0.0.1:52443"),
+            Some("http://127.0.0.1:52080"),
+        ),
     )
     .unwrap();
-    let guard =
-        UnixForwarderGuard::new(&state_path, current_effective_uid(), backend_addr).unwrap();
 
-    guard.validate().unwrap();
+    for (target, expected) in [
+        (ForwarderTarget::Https, "127.0.0.1:52443"),
+        (ForwarderTarget::HttpRedirect, "127.0.0.1:52080"),
+    ] {
+        let guard = UnixForwarderGuard::new(&state_path, current_effective_uid(), target);
+        assert_eq!(guard.resolve().unwrap(), expected.parse().unwrap());
+    }
 }
 
 #[cfg(unix)]
@@ -198,17 +209,16 @@ fn unix_forwarder_guard_rejects_world_accessible_state_file() {
 
     let dir = tempfile::tempdir().unwrap();
     let state_path = dir.path().join("proxy.json");
-    let backend_addr = "127.0.0.1:9443".parse().unwrap();
     write_state_file(
         &state_path,
-        &forwarder_state(std::process::id(), Some(format!("https://{backend_addr}"))),
+        &forwarder_state(std::process::id(), Some("https://127.0.0.1:9443"), None),
     )
     .unwrap();
     std::fs::set_permissions(&state_path, std::fs::Permissions::from_mode(0o644)).unwrap();
     let guard =
-        UnixForwarderGuard::new(&state_path, current_effective_uid(), backend_addr).unwrap();
+        UnixForwarderGuard::new(&state_path, current_effective_uid(), ForwarderTarget::Https);
 
-    let err = guard.validate().unwrap_err();
+    let err = guard.resolve().unwrap_err();
 
     assert!(
         err.to_string()
@@ -218,12 +228,12 @@ fn unix_forwarder_guard_rejects_world_accessible_state_file() {
 
 #[cfg(unix)]
 #[test]
-fn validate_forwarder_daemon_state_rejects_unadvertised_backend() {
-    let state = forwarder_state(std::process::id(), Some("https://127.0.0.1:9443".into()));
+fn validate_forwarder_daemon_state_rejects_a_listener_the_daemon_does_not_advertise() {
+    let state = forwarder_state(std::process::id(), Some("https://127.0.0.1:9443"), None);
     let err = validate_forwarder_daemon_state(
         &state,
         current_effective_uid(),
-        "127.0.0.1:9444".parse().unwrap(),
+        ForwarderTarget::HttpRedirect,
         |_| true,
         |_| Some(current_effective_uid()),
     )
@@ -231,18 +241,56 @@ fn validate_forwarder_daemon_state_rejects_unadvertised_backend() {
 
     assert!(
         err.to_string()
-            .contains("does not advertise backend listener")
+            .contains("does not advertise an HTTP redirect listener"),
+        "{err}"
     );
 }
 
 #[cfg(unix)]
 #[test]
+fn validate_forwarder_daemon_state_accepts_only_unprivileged_ipv4_localhost_backends() {
+    for (advertised, expected) in [
+        (
+            "https://10.0.0.1:9443",
+            "expected 127.0.0.1 with port >=1024",
+        ),
+        (
+            "https://127.0.0.2:9443",
+            "expected 127.0.0.1 with port >=1024",
+        ),
+        ("https://[::1]:9443", "expected 127.0.0.1 with port >=1024"),
+        (
+            "https://0.0.0.0:9443",
+            "expected 127.0.0.1 with port >=1024",
+        ),
+        (
+            "https://127.0.0.1:443",
+            "expected 127.0.0.1 with port >=1024",
+        ),
+        ("not-an-address", "unparseable"),
+    ] {
+        let state = forwarder_state(std::process::id(), Some(advertised), None);
+        let err = validate_forwarder_daemon_state(
+            &state,
+            current_effective_uid(),
+            ForwarderTarget::Https,
+            |_| true,
+            |_| Some(current_effective_uid()),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains(expected), "{advertised}: {err}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn validate_forwarder_daemon_state_rejects_stale_pid() {
-    let state = forwarder_state(424_242, Some("https://127.0.0.1:9443".into()));
+    let state = forwarder_state(424_242, Some("https://127.0.0.1:9443"), None);
     let err = validate_forwarder_daemon_state(
         &state,
         current_effective_uid(),
-        "127.0.0.1:9443".parse().unwrap(),
+        ForwarderTarget::Https,
         |_| false,
         |_| Some(current_effective_uid()),
     )
@@ -256,11 +304,11 @@ fn validate_forwarder_daemon_state_rejects_stale_pid() {
 fn validate_forwarder_daemon_state_rejects_process_uid_mismatch() {
     let uid = current_effective_uid();
     let other_uid = if uid == u32::MAX { uid - 1 } else { uid + 1 };
-    let state = forwarder_state(std::process::id(), Some("https://127.0.0.1:9443".into()));
+    let state = forwarder_state(std::process::id(), Some("https://127.0.0.1:9443"), None);
     let err = validate_forwarder_daemon_state(
         &state,
         uid,
-        "127.0.0.1:9443".parse().unwrap(),
+        ForwarderTarget::Https,
         |_| true,
         |_| Some(other_uid),
     )
@@ -270,41 +318,127 @@ fn validate_forwarder_daemon_state_rejects_process_uid_mismatch() {
 }
 
 #[cfg(unix)]
-#[tokio::test]
-async fn guarded_tcp_forwarder_relays_only_when_user_daemon_state_matches() {
+async fn spawn_tagged_backend(tag: &'static [u8]) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let backend_addr = backend_listener.local_addr().unwrap();
-    let dir = tempfile::tempdir().unwrap();
-    let state_path = dir.path().join("proxy.json");
-    write_state_file(
-        &state_path,
-        &forwarder_state(std::process::id(), Some(format!("https://{backend_addr}"))),
-    )
-    .unwrap();
-    let backend_task = tokio::spawn(async move {
-        let (mut stream, _) = backend_listener.accept().await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
         let mut request = [0u8; 4];
         stream.read_exact(&mut request).await.unwrap();
         assert_eq!(&request, b"ping");
-        stream.write_all(b"pong").await.unwrap();
+        stream.write_all(tag).await.unwrap();
     });
-    let rule = TcpForwarderRule::new("127.0.0.1:0".parse().unwrap(), backend_addr).unwrap();
-    let guard =
-        UnixForwarderGuard::new(&state_path, current_effective_uid(), backend_addr).unwrap();
-    let forwarder = start_guarded_tcp_forwarder(rule, guard).await.unwrap();
+    (addr, task)
+}
+
+#[cfg(unix)]
+async fn forwarded_reply(forwarder: &TcpForwarderHandle) -> Vec<u8> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut client = tokio::net::TcpStream::connect(forwarder.addr())
         .await
         .unwrap();
     client.write_all(b"ping").await.unwrap();
-    let mut response = [0u8; 4];
-    client.read_exact(&mut response).await.unwrap();
+    let mut response = Vec::new();
+    // A rejected connection is closed with its request unread, which resets it.
+    match tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut response))
+        .await
+        .expect("forwarded connection did not finish")
+    {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(error) => panic!("read forwarded reply: {error}"),
+    }
+    response
+}
 
-    assert_eq!(&response, b"pong");
-    backend_task.await.unwrap();
+#[cfg(unix)]
+#[tokio::test]
+async fn guarded_tcp_forwarder_follows_the_backend_the_user_daemon_advertises() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_path = dir.path().join("proxy.json");
+    let guard =
+        UnixForwarderGuard::new(&state_path, current_effective_uid(), ForwarderTarget::Https);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let forwarder = start_guarded_tcp_forwarder(listener, guard).unwrap();
+
+    let (first_addr, first_backend) = spawn_tagged_backend(b"first").await;
+    write_state_file(
+        &state_path,
+        &forwarder_state(
+            std::process::id(),
+            Some(&format!("https://{first_addr}")),
+            None,
+        ),
+    )
+    .unwrap();
+    assert_eq!(forwarded_reply(&forwarder).await, b"first");
+    first_backend.await.unwrap();
+
+    // The daemon restarted on another free port; the forwarder follows its new state.
+    let (second_addr, second_backend) = spawn_tagged_backend(b"second").await;
+    write_state_file(
+        &state_path,
+        &forwarder_state(
+            std::process::id(),
+            Some(&format!("https://{second_addr}")),
+            None,
+        ),
+    )
+    .unwrap();
+    assert_eq!(forwarded_reply(&forwarder).await, b"second");
+    second_backend.await.unwrap();
+
+    // A stopped daemon's state receives nothing, even while its backend still listens.
+    let stale_backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stale_addr = stale_backend.local_addr().unwrap();
+    write_state_file(
+        &state_path,
+        &forwarder_state(
+            reaped_child_pid(),
+            Some(&format!("https://{stale_addr}")),
+            None,
+        ),
+    )
+    .unwrap();
+    assert!(forwarded_reply(&forwarder).await.is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), stale_backend.accept())
+            .await
+            .is_err(),
+        "the forwarder connected to a stopped daemon's backend"
+    );
     forwarder.shutdown();
+}
+
+/// A PID that belonged to a process which has already exited and been reaped.
+#[cfg(unix)]
+fn reaped_child_pid() -> u32 {
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn guarded_tcp_forwarder_refuses_a_non_loopback_listener() {
+    let dir = tempfile::tempdir().unwrap();
+    let guard = UnixForwarderGuard::new(
+        dir.path().join("proxy.json"),
+        current_effective_uid(),
+        ForwarderTarget::Https,
+    );
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+
+    let err = start_guarded_tcp_forwarder(listener, guard)
+        .err()
+        .expect("a guarded forwarder must not listen beyond loopback");
+
+    assert!(err.to_string().contains("must be loopback"), "{err}");
 }
 
 #[cfg(target_os = "linux")]

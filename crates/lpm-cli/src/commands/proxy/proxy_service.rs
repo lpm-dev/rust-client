@@ -47,10 +47,13 @@ pub(super) fn run_install(
         return Ok(());
     }
 
-    install_proxy_service_platform(&plan.user_service)?;
+    // The forwarder goes first: it follows whatever listeners the running
+    // daemon advertises, so a declined elevation prompt leaves the previous
+    // user service and forwarder working together.
     if let Some(forwarder) = &plan.privileged_forwarder {
         install_privileged_forwarder_platform(forwarder)?;
     }
+    install_proxy_service_platform(&plan.user_service)?;
     if json_output {
         print_service_json("install", true, false, &plan);
     } else {
@@ -250,7 +253,7 @@ impl PrivilegedForwarderSpec {
                     target_uid,
                     replace_existing,
                 )?;
-                let backend_options = privileged_backend_options(external_options)?;
+                let backend_options = privileged_backend_options(external_options);
                 let service_path = privileged_forwarder_service_path("dev.lpm.proxy.forwarder");
                 let stdout_log = privileged_forwarder_stdout_log();
                 let stderr_log = privileged_forwarder_stderr_log();
@@ -266,7 +269,6 @@ impl PrivilegedForwarderSpec {
                     root.proxy_state(),
                     exe.clone(),
                     external_options,
-                    backend_options,
                 )?;
                 Ok(Self {
                     label: "dev.lpm.proxy.forwarder",
@@ -350,26 +352,18 @@ impl PrivilegedForwarderConfig {
         state_path: PathBuf,
         binary_path: PathBuf,
         external_options: lpm_proxy::ProxyDaemonOptions,
-        backend_options: lpm_proxy::ProxyDaemonOptions,
     ) -> Result<Self, LpmError> {
         let mut rules = Vec::with_capacity(2);
-        if let (Some(external_port), Some(backend_port)) =
-            (external_options.tls_port, backend_options.tls_port)
-        {
+        if let Some(external_port) = external_options.tls_port {
             rules.push(PrivilegedForwarderRuleConfig::new(
-                "https",
+                lpm_proxy::ForwarderTarget::Https,
                 external_port,
-                backend_port,
             ));
         }
-        if let (Some(external_port), Some(backend_port)) = (
-            external_options.http_redirect_port,
-            backend_options.http_redirect_port,
-        ) {
+        if let Some(external_port) = external_options.http_redirect_port {
             rules.push(PrivilegedForwarderRuleConfig::new(
-                "httpRedirect",
+                lpm_proxy::ForwarderTarget::HttpRedirect,
                 external_port,
-                backend_port,
             ));
         }
         if rules.is_empty() {
@@ -387,21 +381,37 @@ impl PrivilegedForwarderConfig {
     }
 }
 
+/// One low-port listener of the root forwarder.
+///
+/// The rule names the user-daemon listener it delivers to rather than a
+/// backend address: the forwarder resolves that address from the daemon's
+/// guarded state for each connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct PrivilegedForwarderRuleConfig {
-    pub(super) name: String,
+    #[serde(rename = "name")]
+    pub(super) target: lpm_proxy::ForwarderTarget,
     pub(super) listen_addr: SocketAddr,
-    pub(super) target_addr: SocketAddr,
+    /// Ignored. Earlier releases pinned the backend here and cannot parse a
+    /// config without it, which would also stop them from uninstalling this
+    /// forwarder after a downgrade. New configs record the former default
+    /// port, which the daemon no longer binds, so an earlier forwarder that
+    /// reads one relays nothing instead of failing to start.
+    #[serde(rename = "targetAddr")]
+    pub(super) legacy_target_addr: SocketAddr,
 }
 
 impl PrivilegedForwarderRuleConfig {
     #[cfg_attr(windows, allow(dead_code))]
-    pub(super) fn new(name: &str, listen_port: u16, target_port: u16) -> Self {
+    pub(super) fn new(target: lpm_proxy::ForwarderTarget, listen_port: u16) -> Self {
+        let legacy_target_port = match target {
+            lpm_proxy::ForwarderTarget::Https => 9443,
+            lpm_proxy::ForwarderTarget::HttpRedirect => 9080,
+        };
         Self {
-            name: name.to_string(),
+            target,
             listen_addr: loopback_socket_addr(listen_port),
-            target_addr: loopback_socket_addr(target_port),
+            legacy_target_addr: loopback_socket_addr(legacy_target_port),
         }
     }
 }
@@ -470,46 +480,21 @@ pub(super) fn validate_privileged_external_options(
     Ok(())
 }
 
+/// Backend listeners for the user daemon behind the privileged forwarder.
+///
+/// The daemon binds free loopback ports each time it starts, and the
+/// forwarder follows the addresses it advertises, so another program holding
+/// a port the daemon used before cannot keep the service from starting.
 #[cfg_attr(windows, allow(dead_code))]
-fn privileged_backend_options(
+pub(super) fn privileged_backend_options(
     external_options: lpm_proxy::ProxyDaemonOptions,
-) -> Result<lpm_proxy::ProxyDaemonOptions, LpmError> {
-    let mut reserved = Vec::with_capacity(2);
-    let tls_port = if external_options.tls_port.is_some() {
-        Some(find_available_backend_port(9443, &mut reserved)?)
-    } else {
-        None
-    };
-    let http_redirect_port = if external_options.http_redirect_port.is_some() {
-        Some(find_available_backend_port(9080, &mut reserved)?)
-    } else {
-        None
-    };
-    Ok(lpm_proxy::ProxyDaemonOptions {
+) -> lpm_proxy::ProxyDaemonOptions {
+    lpm_proxy::ProxyDaemonOptions {
         public_tls_port: external_options.tls_port,
         http_port: None,
-        http_redirect_port,
-        tls_port,
-    })
-}
-
-#[cfg_attr(windows, allow(dead_code))]
-fn find_available_backend_port(start: u16, reserved: &mut Vec<u16>) -> Result<u16, LpmError> {
-    for port in start..=u16::MAX {
-        if reserved.contains(&port) {
-            continue;
-        }
-        if matches!(
-            lpm_runner::ports::check_port(port),
-            lpm_runner::ports::PortStatus::Free
-        ) {
-            reserved.push(port);
-            return Ok(port);
-        }
+        http_redirect_port: external_options.http_redirect_port.map(|_| 0),
+        tls_port: external_options.tls_port.map(|_| 0),
     }
-    Err(LpmError::Script(format!(
-        "could not find an available proxy backend port at or above {start}"
-    )))
 }
 
 #[cfg_attr(windows, allow(dead_code))]
@@ -518,11 +503,10 @@ pub(super) fn reject_conflicting_privileged_forwarder_owner(
     target_uid: u32,
     replace_existing: bool,
 ) -> Result<(), LpmError> {
-    match read_existing_privileged_forwarder_config(config_path)? {
-        Some(config) if config.target_uid != target_uid && !replace_existing => {
+    match read_existing_privileged_forwarder_owner(config_path)? {
+        Some(owner_uid) if owner_uid != target_uid && !replace_existing => {
             Err(LpmError::Script(format!(
-                "privileged proxy forwarder is already owned by UID {}; refusing to replace it for UID {target_uid}. Re-run `lpm proxy install --privileged-ports --replace` to intentionally replace it, or delete {} with administrator approval.",
-                config.target_uid,
+                "privileged proxy forwarder is already owned by UID {owner_uid}; refusing to replace it for UID {target_uid}. Re-run `lpm proxy install --privileged-ports --replace` to intentionally replace it, or delete {} with administrator approval.",
                 config_path.display()
             )))
         }
@@ -535,19 +519,24 @@ pub(super) fn reject_removing_foreign_privileged_forwarder(
     config_path: &Path,
     target_uid: u32,
 ) -> Result<(), LpmError> {
-    match read_existing_privileged_forwarder_config(config_path)? {
-        Some(config) if config.target_uid != target_uid => Err(LpmError::Script(format!(
-            "privileged proxy forwarder is owned by UID {}; refusing to remove it as UID {target_uid}",
-            config.target_uid
+    match read_existing_privileged_forwarder_owner(config_path)? {
+        Some(owner_uid) if owner_uid != target_uid => Err(LpmError::Script(format!(
+            "privileged proxy forwarder is owned by UID {owner_uid}; refusing to remove it as UID {target_uid}"
         ))),
         _ => Ok(()),
     }
 }
 
+/// Read only the owning UID, so ownership checks keep working across config
+/// formats from other releases.
 #[cfg_attr(windows, allow(dead_code))]
-fn read_existing_privileged_forwarder_config(
-    config_path: &Path,
-) -> Result<Option<PrivilegedForwarderConfig>, LpmError> {
+fn read_existing_privileged_forwarder_owner(config_path: &Path) -> Result<Option<u32>, LpmError> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ForwarderOwner {
+        target_uid: u32,
+    }
+
     let bytes =
         match lpm_common::read_file_capped(config_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES) {
             Ok(bytes) => bytes,
@@ -559,12 +548,14 @@ fn read_existing_privileged_forwarder_config(
                 )));
             }
         };
-    serde_json::from_slice(&bytes).map(Some).map_err(|err| {
-        LpmError::Script(format!(
-            "parse existing privileged proxy forwarder config {}: {err}",
-            config_path.display()
-        ))
-    })
+    serde_json::from_slice::<ForwarderOwner>(&bytes)
+        .map(|owner| Some(owner.target_uid))
+        .map_err(|err| {
+            LpmError::Script(format!(
+                "parse existing privileged proxy forwarder config {}: {err}",
+                config_path.display()
+            ))
+        })
 }
 
 #[cfg_attr(windows, allow(dead_code))]
@@ -672,6 +663,14 @@ fn privileged_forwarder_json(spec: &PrivilegedForwarderSpec) -> serde_json::Valu
         "args": spec.start_args,
         "targetUid": spec.config.target_uid,
         "statePath": spec.config.state_path,
-        "rules": spec.config.rules,
+        "rules": spec
+            .config
+            .rules
+            .iter()
+            .map(|rule| serde_json::json!({
+                "name": rule.target,
+                "listenAddr": rule.listen_addr,
+            }))
+            .collect::<Vec<_>>(),
     })
 }

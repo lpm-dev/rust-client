@@ -236,7 +236,7 @@ fn privileged_external_options_rejects_high_external_tls_port() {
 }
 
 #[test]
-fn privileged_forwarder_config_maps_low_listeners_to_backend_targets() {
+fn privileged_forwarder_config_maps_low_listeners_to_user_daemon_listeners() {
     let config = PrivilegedForwarderConfig::new(
         501,
         PathBuf::from("/tmp/lpm home/proxy.json"),
@@ -247,28 +247,117 @@ fn privileged_forwarder_config_maps_low_listeners_to_backend_targets() {
             http_redirect_port: Some(80),
             tls_port: Some(443),
         },
+    )
+    .unwrap();
+
+    assert_eq!(
+        config
+            .rules
+            .iter()
+            .map(|rule| (rule.target, rule.listen_addr))
+            .collect::<Vec<_>>(),
+        vec![
+            (lpm_proxy::ForwarderTarget::Https, loopback_socket_addr(443)),
+            (
+                lpm_proxy::ForwarderTarget::HttpRedirect,
+                loopback_socket_addr(80)
+            ),
+        ]
+    );
+}
+
+#[test]
+fn privileged_forwarder_config_stays_readable_by_releases_that_pinned_the_backend() {
+    let config = PrivilegedForwarderConfig::new(
+        501,
+        PathBuf::from("/tmp/lpm home/proxy.json"),
+        PathBuf::from("/tmp/LPM Bin/lpm-rs"),
         lpm_proxy::ProxyDaemonOptions {
             public_tls_port: None,
             http_port: None,
-            http_redirect_port: Some(9080),
-            tls_port: Some(9443),
+            http_redirect_port: Some(80),
+            tls_port: Some(443),
         },
     )
     .unwrap();
 
     assert_eq!(
-        config.rules,
+        serde_json::to_value(&config.rules).unwrap(),
+        serde_json::json!([
+            {"name": "https", "listenAddr": "127.0.0.1:443", "targetAddr": "127.0.0.1:9443"},
+            {"name": "httpRedirect", "listenAddr": "127.0.0.1:80", "targetAddr": "127.0.0.1:9080"},
+        ])
+    );
+}
+
+#[test]
+fn privileged_forwarder_reads_configs_that_pinned_a_backend_address() {
+    let config: PrivilegedForwarderConfig = serde_json::from_value(serde_json::json!({
+        "targetUid": 501,
+        "statePath": "/tmp/lpm home/proxy.json",
+        "binaryPath": "/tmp/LPM Bin/lpm-rs",
+        "rules": [
+            {"name": "https", "listenAddr": "127.0.0.1:443", "targetAddr": "127.0.0.1:9444"},
+            {"name": "httpRedirect", "listenAddr": "127.0.0.1:80", "targetAddr": "127.0.0.1:9081"},
+        ],
+    }))
+    .unwrap();
+
+    assert_eq!(
+        config
+            .rules
+            .iter()
+            .map(|rule| (rule.target, rule.listen_addr))
+            .collect::<Vec<_>>(),
         vec![
-            PrivilegedForwarderRuleConfig {
-                name: "https".to_string(),
-                listen_addr: loopback_socket_addr(443),
-                target_addr: loopback_socket_addr(9443),
-            },
-            PrivilegedForwarderRuleConfig {
-                name: "httpRedirect".to_string(),
-                listen_addr: loopback_socket_addr(80),
-                target_addr: loopback_socket_addr(9080),
-            },
+            (lpm_proxy::ForwarderTarget::Https, loopback_socket_addr(443)),
+            (
+                lpm_proxy::ForwarderTarget::HttpRedirect,
+                loopback_socket_addr(80)
+            ),
+        ]
+    );
+}
+
+#[test]
+fn listener_announcement_names_a_free_port_instead_of_port_zero() {
+    assert_eq!(
+        listener_announcement("HTTPS", 0),
+        "HTTPS on a free 127.0.0.1 port"
+    );
+    assert_eq!(
+        listener_announcement("HTTP redirect", 9080),
+        "HTTP redirect on 127.0.0.1:9080"
+    );
+}
+
+#[test]
+fn privileged_backend_options_bind_free_ports_behind_the_public_listeners() {
+    let backend = privileged_backend_options(lpm_proxy::ProxyDaemonOptions {
+        public_tls_port: None,
+        http_port: None,
+        http_redirect_port: Some(80),
+        tls_port: Some(443),
+    });
+
+    assert_eq!(
+        backend,
+        lpm_proxy::ProxyDaemonOptions {
+            public_tls_port: Some(443),
+            http_port: None,
+            http_redirect_port: Some(0),
+            tls_port: Some(0),
+        }
+    );
+    assert_eq!(
+        listener_args(backend),
+        vec![
+            "--public-tls-port",
+            "443",
+            "--tls-port",
+            "0",
+            "--http-redirect-port",
+            "0"
         ]
     );
 }
@@ -446,23 +535,18 @@ fn sample_service_spec() -> ProxyServiceSpec {
 }
 
 fn sample_forwarder_spec() -> PrivilegedForwarderSpec {
-    let backend_options = lpm_proxy::ProxyDaemonOptions {
+    let external_options = lpm_proxy::ProxyDaemonOptions {
         public_tls_port: None,
         http_port: None,
-        http_redirect_port: Some(9080),
-        tls_port: Some(9443),
+        http_redirect_port: Some(80),
+        tls_port: Some(443),
     };
+    let backend_options = privileged_backend_options(external_options);
     let config = PrivilegedForwarderConfig::new(
         501,
         PathBuf::from("/tmp/lpm home/proxy.json"),
         PathBuf::from("/tmp/LPM Bin/lpm-rs"),
-        lpm_proxy::ProxyDaemonOptions {
-            public_tls_port: None,
-            http_port: None,
-            http_redirect_port: Some(80),
-            tls_port: Some(443),
-        },
-        backend_options,
+        external_options,
     )
     .unwrap();
     PrivilegedForwarderSpec {
@@ -494,12 +578,6 @@ fn write_forwarder_config(path: &Path, target_uid: u32) {
             http_port: None,
             http_redirect_port: Some(80),
             tls_port: Some(443),
-        },
-        lpm_proxy::ProxyDaemonOptions {
-            public_tls_port: None,
-            http_port: None,
-            http_redirect_port: Some(9080),
-            tls_port: Some(9443),
         },
     )
     .unwrap();
