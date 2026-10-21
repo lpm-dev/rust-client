@@ -1,3 +1,4 @@
+mod forwarder_executable;
 mod proxy_platform;
 mod proxy_service;
 
@@ -235,6 +236,13 @@ async fn run_status(json_output: bool) -> Result<(), LpmError> {
     }
 
     render_status_human(&status);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(executable) = proxy_service::replaceable_installed_forwarder_executable() {
+        install_ui::warn_untrusted(&format!(
+            "the privileged forwarder starts as root from {}, which a non-root user can replace; run `lpm proxy install --privileged-ports` to install a root-owned copy",
+            executable.display()
+        ));
+    }
     Ok(())
 }
 

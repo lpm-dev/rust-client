@@ -552,6 +552,10 @@ fn sample_forwarder_spec() -> PrivilegedForwarderSpec {
     PrivilegedForwarderSpec {
         label: "dev.lpm.proxy.forwarder",
         exe: PathBuf::from("/tmp/LPM Bin/lpm-rs"),
+        executable: super::forwarder_executable::ForwarderExecutable::plan(
+            Path::new("/home/dev/.lpm/bin/lpm-rs"),
+            PathBuf::from("/tmp/LPM Bin"),
+        ),
         start_args: vec![
             "proxy".to_string(),
             "forwarder".to_string(),

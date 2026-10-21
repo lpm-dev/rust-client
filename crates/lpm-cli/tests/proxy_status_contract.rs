@@ -310,6 +310,20 @@ fn proxy_install_privileged_ports_dry_run_reports_forwarder_plan_with_clean_fds(
 
     let forwarder = &json["privilegedForwarder"];
     assert_eq!(forwarder["service"], "dev.lpm.proxy.forwarder");
+    let root_owned_dir = if cfg!(target_os = "macos") {
+        "/Library/Application Support/LPM/Forwarder/"
+    } else {
+        "/opt/lpm/proxy-forwarder/"
+    };
+    let executable = forwarder["executable"].as_str().unwrap();
+    assert!(
+        executable.starts_with(root_owned_dir),
+        "the root forwarder must run a root-owned copy, not the installing user's executable: {forwarder}"
+    );
+    assert_ne!(
+        std::path::Path::new(executable),
+        std::path::Path::new(env!("CARGO_BIN_EXE_lpm-rs"))
+    );
     assert_eq!(forwarder["args"][0], "proxy");
     assert_eq!(forwarder["args"][1], "forwarder");
     assert_eq!(forwarder["args"][2], "--forwarder-config");

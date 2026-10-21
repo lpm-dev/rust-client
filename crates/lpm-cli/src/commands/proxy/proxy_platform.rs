@@ -1,3 +1,7 @@
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use super::forwarder_executable::{
+    install_forwarder_executable, require_root_controlled, uninstall_forwarder_executable,
+};
 use super::proxy_service::{PrivilegedForwarderSpec, ProxyServiceSpec};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::proxy_service::{
@@ -115,6 +119,13 @@ pub(super) fn install_privileged_forwarder_platform(
         spec.config.target_uid,
         spec.replace_existing,
     )?;
+    require_root_controlled(spec.executable.install_dir()).map_err(|error| {
+        LpmError::Script(format!(
+            "cannot install the privileged forwarder under {}: {error}",
+            spec.executable.install_dir().display()
+        ))
+    })?;
+    install_forwarder_executable(&spec.executable, Path::new("sudo"))?;
     let config_source = write_privileged_staging_file(
         spec,
         "proxy-forwarder.json",
@@ -162,7 +173,7 @@ pub(super) fn uninstall_privileged_forwarder_platform(
             .arg(&spec.config_path),
     )?;
     run_checked_inherited(Command::new("sudo").args(["systemctl", "daemon-reload"]))?;
-    Ok(())
+    uninstall_forwarder_executable(spec.executable.install_dir(), Path::new("sudo"))
 }
 
 #[cfg(target_os = "macos")]
@@ -174,6 +185,13 @@ pub(super) fn install_privileged_forwarder_platform(
         spec.config.target_uid,
         spec.replace_existing,
     )?;
+    require_root_controlled(spec.executable.install_dir()).map_err(|error| {
+        LpmError::Script(format!(
+            "cannot install the privileged forwarder under {}: {error}",
+            spec.executable.install_dir().display()
+        ))
+    })?;
+    install_forwarder_executable(&spec.executable, Path::new("sudo"))?;
     let config_source = write_privileged_staging_file(
         spec,
         "proxy-forwarder.json",
@@ -220,7 +238,7 @@ pub(super) fn uninstall_privileged_forwarder_platform(
             .arg("-f")
             .arg(&spec.config_path),
     )?;
-    Ok(())
+    uninstall_forwarder_executable(spec.executable.install_dir(), Path::new("sudo"))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -583,7 +601,7 @@ pub(super) fn run_checked(command: &mut Command) -> Result<(), LpmError> {
     run_checked_output(command).map(|_| ())
 }
 
-fn run_checked_output(command: &mut Command) -> Result<std::process::Output, LpmError> {
+pub(super) fn run_checked_output(command: &mut Command) -> Result<std::process::Output, LpmError> {
     let output = command
         .stdin(std::process::Stdio::inherit())
         .output()
