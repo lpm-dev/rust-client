@@ -100,11 +100,15 @@ async fn auto_ack_with_full_capture_queue_returns_retryable_error() {
     );
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn auto_ack_persistence_deadline_returns_retryable_error() {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<CapturedWebhookEvent>(1);
     let forward = tokio::spawn(failed_forward(Some(tx)));
     let event = rx.recv().await.unwrap();
+    // Pause only once the forward has failed and waits for persistence. A clock
+    // paused from the start can jump past the forward's own request timeout
+    // before it connects, and the test server then waits for it forever.
+    tokio::time::pause();
     tokio::time::advance(std::time::Duration::from_secs(11)).await;
     assert_eq!(extract_response_data(&forward.await.unwrap()).0, 503);
     event.complete_persistence(Ok(()));
