@@ -4,14 +4,17 @@
 //! the installing user can change: that user, or anything running as them,
 //! would get root the next time the service started. Installation copies the
 //! running executable, or on macOS its whole signed app bundle, into a
-//! directory only root can write, strips every way the copy could stay
-//! writable (ACLs, setuid and setgid bits, group and other write), verifies
-//! the result, and only then lets the service run it.
+//! directory only root can change, strips every way the copy could stay
+//! writable (ACLs, setuid and setgid bits, group and other write), checks
+//! that it is the code that is running, and only then lets the service run it.
 
 #![cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use super::proxy_platform::{run_checked_inherited, run_checked_output};
+use super::proxy_platform::{
+    MV_ONTO_TARGET, path_from_command_output, run_checked_inherited, run_checked_output,
+    tee_as_root,
+};
 use lpm_common::LpmError;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -23,6 +26,10 @@ use std::process::Command;
 pub(super) struct ForwarderExecutable {
     /// What installation copies: a macOS app bundle or a plain executable.
     source: PathBuf,
+    /// Where the installing user reads a plain executable's bytes from. For
+    /// the running executable on Linux that is `/proc/self/exe`, the image
+    /// that is running, whatever its path holds by now.
+    read_from: PathBuf,
     /// Root-owned directory that holds the copy.
     install_dir: PathBuf,
     /// Name of the copy inside `install_dir`.
@@ -38,7 +45,13 @@ impl ForwarderExecutable {
     pub(super) fn for_running_executable(install_dir: PathBuf) -> Result<Self, LpmError> {
         let executable = std::env::current_exe().map_err(LpmError::Io)?;
         let executable = std::fs::canonicalize(&executable).map_err(LpmError::Io)?;
-        Ok(Self::plan(&executable, install_dir))
+        let plan = Self::plan(&executable, install_dir);
+        #[cfg(target_os = "linux")]
+        let plan = Self {
+            read_from: PathBuf::from("/proc/self/exe"),
+            ..plan
+        };
+        Ok(plan)
     }
 
     /// Describe an existing installation for removal. Only `install_dir` is
@@ -46,6 +59,7 @@ impl ForwarderExecutable {
     pub(super) fn for_removal(install_dir: PathBuf) -> Self {
         Self {
             source: PathBuf::new(),
+            read_from: PathBuf::new(),
             installed_executable: install_dir.clone(),
             install_dir,
             entry: OsString::new(),
@@ -76,6 +90,7 @@ impl ForwarderExecutable {
             let mut installed_executable = install_dir.join(&entry);
             installed_executable.push(inside_bundle);
             return Self {
+                read_from: bundle.clone(),
                 source: bundle,
                 install_dir,
                 entry,
@@ -88,6 +103,7 @@ impl ForwarderExecutable {
             .map_or_else(|| OsString::from("lpm"), |name| name.to_os_string());
         Self {
             source: executable.to_path_buf(),
+            read_from: executable.to_path_buf(),
             installed_executable: install_dir.join(&entry),
             install_dir,
             entry,
@@ -115,61 +131,52 @@ fn enclosing_app_bundle(executable: &Path) -> Option<PathBuf> {
         .then(|| bundle.to_path_buf())
 }
 
-/// Refuse a path that someone other than root could change.
-///
-/// `path`, if it exists, and every directory leading to it must be owned by
-/// root and not writable by group or others, both along the path as written
-/// and along its canonical form. A symlink on the way must itself be owned by
-/// root. Missing trailing components are skipped: installation creates them.
-#[cfg(unix)]
-pub(super) fn require_root_controlled(path: &Path) -> Result<(), LpmError> {
-    require_trusted_path(path, 0)
-}
-
-/// Like [`require_root_controlled`], also accepting `trusted_owner`, which is
-/// root in production and the test user in tests.
-#[cfg(unix)]
-fn require_trusted_path(path: &Path, trusted_owner: u32) -> Result<(), LpmError> {
-    use std::os::unix::fs::MetadataExt;
-
-    let inspect = |component: &Path| -> Result<(), LpmError> {
-        let metadata = std::fs::symlink_metadata(component).map_err(|error| {
-            LpmError::Script(format!("inspect {}: {error}", component.display()))
-        })?;
-        let owner = metadata.uid();
-        let mode = metadata.mode();
-        let trusted = owner == 0 || owner == trusted_owner;
-        if !trusted || (!metadata.file_type().is_symlink() && mode & 0o022 != 0) {
-            return Err(LpmError::Script(format!(
-                "{} must be owned by root and not writable by group or others (owner UID {owner}, mode {:o})",
-                component.display(),
-                mode & 0o7777
-            )));
-        }
-        Ok(())
-    };
-
-    let literal = path
+/// Why a user other than root, or `uid`, could change what `path` leads to,
+/// if one could: through any directory the kernel passes resolving it, or,
+/// while its last components don't exist yet, resolving the nearest
+/// ancestor that does.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn changeable_by_others(path: &Path, uid: u32) -> Option<String> {
+    let existing = path
         .ancestors()
         .find(|ancestor| std::fs::symlink_metadata(ancestor).is_ok())
         .unwrap_or_else(|| Path::new("/"));
-    for component in literal
-        .ancestors()
-        .filter(|component| !component.as_os_str().is_empty())
-    {
-        inspect(component)?;
+    match lpm_common::path_trust::first_changeable_directory(existing, uid) {
+        Ok(None) => None,
+        Ok(Some(found)) => Some(format!(
+            "users other than root can change {}: {}",
+            found.directory.display(),
+            found.reason
+        )),
+        Err(error) => Some(format!(
+            "{} could not be inspected: {error}",
+            existing.display()
+        )),
     }
-    let canonical = std::fs::canonicalize(literal).map_err(LpmError::Io)?;
-    for component in canonical.ancestors() {
-        inspect(component)?;
+}
+
+/// Whether only root can change the executable at `path`: the file it
+/// leads to and every directory on the way there. Only root could put a
+/// missing one back.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn root_controlled_executable(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    if changeable_by_others(path, 0).is_some() {
+        return false;
     }
-    Ok(())
+    let Ok(target) = std::fs::canonicalize(path) else {
+        return true;
+    };
+    std::fs::symlink_metadata(&target).is_ok_and(|metadata| {
+        metadata.is_file() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0
+    }) && matches!(has_extended_acl(&target), Ok(false))
 }
 
 /// What `lpm proxy status` should say about an installed privileged
 /// forwarder: it starts as root from a path a non-root user can replace
 /// (installs from earlier releases), or it runs an older lpm than this one.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn installed_forwarder_notice(config_path: &Path) -> Option<String> {
     #[derive(serde::Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -182,19 +189,26 @@ pub(super) fn installed_forwarder_notice(config_path: &Path) -> Option<String> {
     let bytes =
         lpm_common::read_file_capped(config_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES).ok()?;
     let installed: InstalledForwarder = serde_json::from_slice(&bytes).ok()?;
-    if require_root_controlled(&installed.binary_path).is_err() {
+    if !root_controlled_executable(&installed.binary_path) {
         return Some(format!(
             "the privileged forwarder starts as root from {}, which a non-root user can replace; run `lpm proxy install --privileged-ports` to install a root-owned copy",
             installed.binary_path.display()
         ));
     }
-    let current = env!("CARGO_PKG_VERSION");
-    match installed.lpm_version {
-        Some(version) if version != current => Some(format!(
-            "the privileged forwarder runs lpm {version}; run `lpm proxy install --privileged-ports` to update it to {current}"
-        )),
-        _ => None,
-    }
+    let version = installed.lpm_version?;
+    let running = env!("CARGO_PKG_VERSION");
+    let older = match (
+        lpm_semver::Version::parse(&version),
+        lpm_semver::Version::parse(running),
+    ) {
+        (Ok(installed), Ok(running)) => installed < running,
+        _ => true,
+    };
+    older.then(|| {
+        format!(
+            "the privileged forwarder runs lpm {version}; run `lpm proxy install --privileged-ports` to update it to {running}"
+        )
+    })
 }
 
 /// Copy the planned executable into its root-owned directory, replacing any
@@ -202,33 +216,61 @@ pub(super) fn installed_forwarder_notice(config_path: &Path) -> Option<String> {
 ///
 /// `privileged` runs each step with root rights (`sudo` in production). The
 /// copy is assembled in a root-only staging directory, stripped of ACLs,
-/// setuid and setgid bits, and group or other write access, verified, and
-/// only then moved to its final path.
+/// setuid and setgid bits, and group or other write access, checked to be
+/// the code that is running, and only then moved to its final path.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn install_forwarder_executable(
     executable: &ForwarderExecutable,
     privileged: &Path,
 ) -> Result<(), LpmError> {
-    install_forwarder_executable_trusting(executable, privileged, 0)
+    let checks = InstallChecks {
+        trusted_uid: 0,
+        #[cfg(target_os = "macos")]
+        code_requirement: running_code_requirement(executable.app_bundle)?,
+    };
+    install_checked(executable, privileged, &checks)
+}
+
+/// What installation trusts, and what it requires of the copy.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct InstallChecks {
+    /// Owner trusted besides root: root itself in production, the test user
+    /// in tests.
+    trusted_uid: u32,
+    /// What the copy's code signature must satisfy: the running executable's
+    /// code directory hash, so the copy is exactly the code that is running,
+    /// and for an app bundle LPM's release signature as well.
+    #[cfg(target_os = "macos")]
+    code_requirement: Option<String>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn install_forwarder_executable_trusting(
+fn install_checked(
     executable: &ForwarderExecutable,
     privileged: &Path,
-    trusted_owner: u32,
+    checks: &InstallChecks,
 ) -> Result<(), LpmError> {
     let install_dir = &executable.install_dir;
+    let refuse = |reason: String| {
+        LpmError::Script(format!(
+            "cannot install the privileged forwarder under {}: {reason}",
+            install_dir.display()
+        ))
+    };
+    if let Some(reason) = changeable_by_others(install_dir, checks.trusted_uid) {
+        return Err(refuse(reason));
+    }
     create_root_owned_directory(install_dir, privileged)?;
-    require_trusted_path(install_dir, trusted_owner)?;
+    if let Some(reason) = changeable_by_others(install_dir, checks.trusted_uid) {
+        return Err(refuse(reason));
+    }
 
-    let staging_template = install_dir.join(".staging.XXXXXX");
     let staging = run_checked_output(
         Command::new(privileged)
             .args(["mktemp", "-d"])
-            .arg(&staging_template),
+            .arg(install_dir.join(".staging.XXXXXX")),
     )?;
-    let staging = PathBuf::from(String::from_utf8_lossy(&staging.stdout).trim());
+    let staging = path_from_command_output(&staging.stdout);
     if staging.parent() != Some(install_dir.as_path()) {
         return Err(LpmError::Script(format!(
             "mktemp created {} outside {}",
@@ -237,7 +279,7 @@ fn install_forwarder_executable_trusting(
         )));
     }
 
-    let installed = install_staged_copy(executable, privileged, &staging, trusted_owner);
+    let installed = install_staged_copy(executable, privileged, &staging, checks);
     let cleanup = run_checked_inherited(Command::new(privileged).args(["rm", "-rf"]).arg(&staging));
     installed?;
     cleanup?;
@@ -245,14 +287,15 @@ fn install_forwarder_executable_trusting(
 }
 
 /// Create each missing directory of `install_dir` as root with mode 0755, so
-/// none inherits a permissive umask, and reset the final directory.
+/// none takes a permissive umask, then reset `install_dir`, which must be a
+/// directory itself and not a link to one.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn create_root_owned_directory(install_dir: &Path, privileged: &Path) -> Result<(), LpmError> {
     let missing: Vec<&Path> = install_dir
         .ancestors()
         .take_while(|ancestor| std::fs::symlink_metadata(ancestor).is_err())
         .collect();
-    for directory in missing.into_iter().rev() {
+    for directory in missing.iter().rev() {
         run_checked_inherited(
             Command::new(privileged)
                 .args(["mkdir", "-m", "0755"])
@@ -264,6 +307,15 @@ fn create_root_owned_directory(install_dir: &Path, privileged: &Path) -> Result<
                 .arg(directory),
         )?;
     }
+    let is_directory = std::fs::symlink_metadata(install_dir)
+        .map_err(LpmError::Io)?
+        .is_dir();
+    if !is_directory {
+        return Err(LpmError::Script(format!(
+            "{} must be a directory, not a link or a file",
+            install_dir.display()
+        )));
+    }
     run_checked_inherited(
         Command::new(privileged)
             .args(["chown", "0:0"])
@@ -273,7 +325,17 @@ fn create_root_owned_directory(install_dir: &Path, privileged: &Path) -> Result<
         Command::new(privileged)
             .args(["chmod", "0755"])
             .arg(install_dir),
-    )
+    )?;
+    // New directories take their parent's inheritable ACL entries, and
+    // staging would take them from `install_dir` in turn.
+    #[cfg(target_os = "macos")]
+    run_checked_inherited(
+        Command::new(privileged)
+            .args(["chmod", "-N"])
+            .arg(install_dir)
+            .args(missing.iter().skip(1)),
+    )?;
+    Ok(())
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -281,7 +343,7 @@ fn install_staged_copy(
     executable: &ForwarderExecutable,
     privileged: &Path,
     staging: &Path,
-    trusted_owner: u32,
+    checks: &InstallChecks,
 ) -> Result<(), LpmError> {
     let staged = staging.join(&executable.entry);
     if executable.app_bundle {
@@ -294,25 +356,28 @@ fn install_staged_copy(
                 .arg(&staged),
         )?;
     } else {
+        tee_as_root(privileged, open_executable(&executable.read_from)?, &staged)?;
         run_checked_inherited(
             Command::new(privileged)
-                .args(["install", "-m", "0755"])
-                .arg(&executable.source)
+                .args(["chmod", "0755"])
                 .arg(&staged),
         )?;
     }
+    require_directories_and_files(privileged, staging)?;
     // Copies keep the source's explicit ACLs on macOS, and those survive both
     // chown and chmod; a user-granted write ACL would leave the copy writable.
     #[cfg(target_os = "macos")]
     run_checked_inherited(Command::new(privileged).args(["chmod", "-RN"]).arg(staging))?;
+    // Clearing setuid and setgid before the copy becomes root's means no
+    // setuid-root file ever exists, even inside staging.
     run_checked_inherited(
         Command::new(privileged)
-            .args(["chown", "-R", "0:0"])
+            .args(["chmod", "-R", "u-s,g-s,go-w"])
             .arg(staging),
     )?;
     run_checked_inherited(
         Command::new(privileged)
-            .args(["chmod", "-R", "u-s,g-s,go-w"])
+            .args(["chown", "-R", "0:0"])
             .arg(staging),
     )?;
     // Let the installing user read, but not change, the staged copy to verify it.
@@ -321,19 +386,59 @@ fn install_staged_copy(
             .args(["chmod", "0755"])
             .arg(staging),
     )?;
-    verify_staged_copy(&staged, trusted_owner)?;
+    verify_staged_copy(&staged, checks.trusted_uid)?;
     #[cfg(target_os = "macos")]
-    if executable.app_bundle {
-        verify_macos_bundle_signature(&staged, privileged)?;
+    if let Some(requirement) = &checks.code_requirement {
+        verify_code_requirement(&staged, requirement)?;
     }
     swap_into_place(executable, privileged, &staged)
+}
+
+/// Open the plain executable to copy as the installing user, so the copy
+/// holds nothing that user could not read.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_executable(path: &Path) -> Result<std::fs::File, LpmError> {
+    let file = std::fs::File::open(path)
+        .map_err(|error| LpmError::Script(format!("open {}: {error}", path.display())))?;
+    if !file.metadata().map_err(LpmError::Io)?.is_file() {
+        return Err(LpmError::Script(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+/// Refuse a staged copy that holds anything but directories and regular
+/// files, checked as root before any step that changes metadata throughout
+/// it: `chmod -RN` follows symlinks, so a link in a bundle would strip the
+/// ACL of whatever it points to.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn require_directories_and_files(privileged: &Path, staging: &Path) -> Result<(), LpmError> {
+    let found = run_checked_output(
+        Command::new(privileged)
+            .arg("find")
+            .arg(staging)
+            .args(["!", "-type", "d", "!", "-type", "f"]),
+    )?;
+    match found
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .find(|line| !line.is_empty())
+    {
+        None => Ok(()),
+        Some(entry) => Err(LpmError::Script(format!(
+            "the forwarder executable copy holds {}, which is neither a directory nor a regular file",
+            path_from_command_output(entry).display()
+        ))),
+    }
 }
 
 /// Check every entry of the staged copy: directories and regular files only,
 /// owned by root, no group or other write, no setuid or setgid, and on macOS
 /// no ACL.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn verify_staged_copy(staged: &Path, trusted_owner: u32) -> Result<(), LpmError> {
+fn verify_staged_copy(staged: &Path, trusted_uid: u32) -> Result<(), LpmError> {
     use std::os::unix::fs::MetadataExt;
 
     let mut pending = vec![staged.to_path_buf()];
@@ -345,7 +450,7 @@ fn verify_staged_copy(staged: &Path, trusted_owner: u32) -> Result<(), LpmError>
         let mode = metadata.mode();
         let kind_allowed = metadata.is_dir() || metadata.is_file();
         if !kind_allowed
-            || (owner != 0 && owner != trusted_owner)
+            || (owner != 0 && owner != trusted_uid)
             || mode & 0o6022 != 0
             || has_extended_acl(&path)?
         {
@@ -366,63 +471,92 @@ fn verify_staged_copy(staged: &Path, trusted_owner: u32) -> Result<(), LpmError>
 
 #[cfg(target_os = "macos")]
 fn has_extended_acl(path: &Path) -> Result<bool, LpmError> {
-    use std::os::unix::ffi::OsStrExt;
-
-    const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
-    const ACL_FIRST_ENTRY: libc::c_int = 0;
-    unsafe extern "C" {
-        fn acl_get_link_np(path: *const libc::c_char, kind: libc::c_int) -> *mut libc::c_void;
-        fn acl_get_entry(
-            acl: *mut libc::c_void,
-            entry_id: libc::c_int,
-            entry: *mut *mut libc::c_void,
-        ) -> libc::c_int;
-        fn acl_free(object: *mut libc::c_void) -> libc::c_int;
-    }
-
-    let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| LpmError::Script(format!("path contains a NUL byte: {}", path.display())))?;
-    // SAFETY: `path_c` is a valid NUL-terminated path for the duration of the call.
-    let acl = unsafe { acl_get_link_np(path_c.as_ptr(), ACL_TYPE_EXTENDED) };
-    if acl.is_null() {
-        let error = std::io::Error::last_os_error();
-        return match error.raw_os_error() {
-            Some(libc::ENOENT) => Ok(false),
-            _ => Err(LpmError::Script(format!(
-                "read the ACL of {}: {error}",
-                path.display()
-            ))),
-        };
-    }
-    let mut entry = std::ptr::null_mut();
-    // SAFETY: `acl` is a live ACL returned above and `entry` is valid storage.
-    let has_entry = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) } == 0;
-    // SAFETY: `acl` came from `acl_get_link_np` and is freed exactly once.
-    unsafe { acl_free(acl) };
-    Ok(has_entry)
+    lpm_common::macos_acl::has_extended_acl_at(path)
+        .map_err(|error| LpmError::Script(format!("read the ACL of {}: {error}", path.display())))
 }
 
-/// `install -m` copies neither ACLs nor extended attributes on Linux.
+/// A Linux ACL grants no more than the mode's group bits, which the checks
+/// read already.
 #[cfg(target_os = "linux")]
 fn has_extended_acl(_path: &Path) -> Result<bool, LpmError> {
     Ok(false)
 }
 
-/// Require the staged bundle to carry LPM's own Developer ID signature, not
-/// merely any valid one.
+/// The designated requirement of LPM's release bundles: LPM's bundle
+/// identifier, signed with LPM's Developer ID Application certificate, whose
+/// leaf and intermediate carry Apple's Developer ID extensions.
 #[cfg(target_os = "macos")]
-fn verify_macos_bundle_signature(staged: &Path, privileged: &Path) -> Result<(), LpmError> {
-    let requirement = format!(
-        r#"=anchor apple generic and identifier "{}" and certificate leaf[subject.OU] = "{}""#,
-        crate::commands::self_update::MACOS_EXPECTED_BUNDLE_ID,
+fn lpm_release_requirement() -> String {
+    format!(
+        r#"anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "{}" and identifier "{}""#,
         crate::commands::self_update::MACOS_EXPECTED_TEAM_ID,
-    );
-    run_checked_inherited(
-        Command::new(privileged)
-            .args(["/usr/bin/codesign", "--verify", "--strict"])
+        crate::commands::self_update::MACOS_EXPECTED_BUNDLE_ID,
+    )
+}
+
+/// What a copy must satisfy to be the code that is running: the running
+/// executable's code directory hash, and for an app bundle LPM's release
+/// signature too. None for an unsigned build, which only Intel Macs run.
+#[cfg(target_os = "macos")]
+fn running_code_requirement(app_bundle: bool) -> Result<Option<String>, LpmError> {
+    match (running_cdhash(), app_bundle) {
+        (Some(cdhash), true) => Ok(Some(format!(
+            r#"={} and cdhash H"{cdhash}""#,
+            lpm_release_requirement()
+        ))),
+        (Some(cdhash), false) => Ok(Some(format!(r#"=cdhash H"{cdhash}""#))),
+        (None, true) => Err(LpmError::Script(
+            "the running lpm app bundle has no code signature".into(),
+        )),
+        (None, false) => Ok(None),
+    }
+}
+
+/// The code directory hash the kernel validated this process's executable
+/// against when it started, which no later change to the file can alter.
+#[cfg(target_os = "macos")]
+fn running_cdhash() -> Option<String> {
+    const CS_OPS_CDHASH: libc::c_uint = 5;
+    unsafe extern "C" {
+        fn csops(
+            pid: libc::pid_t,
+            ops: libc::c_uint,
+            useraddr: *mut libc::c_void,
+            usersize: libc::size_t,
+        ) -> libc::c_int;
+    }
+
+    let mut cdhash = [0u8; 20];
+    // SAFETY: csops writes at most `cdhash.len()` bytes into `cdhash`, which
+    // outlives the call.
+    let status = unsafe {
+        csops(
+            libc::getpid(),
+            CS_OPS_CDHASH,
+            cdhash.as_mut_ptr().cast(),
+            cdhash.len(),
+        )
+    };
+    (status == 0).then(|| hex::encode(cdhash))
+}
+
+/// Require the staged copy's code signature to satisfy `requirement`. This
+/// runs as the installing user: checking reads the copy, it changes nothing.
+#[cfg(target_os = "macos")]
+fn verify_code_requirement(staged: &Path, requirement: &str) -> Result<(), LpmError> {
+    run_checked_output(
+        Command::new("/usr/bin/codesign")
+            .args(["--verify", "--strict"])
             .arg(format!("--test-requirement={requirement}"))
             .arg(staged),
     )
+    .map(drop)
+    .map_err(|error| {
+        LpmError::Script(format!(
+            "the staged forwarder executable {} does not carry the code signature of the lpm that is running: {error}",
+            staged.display()
+        ))
+    })
 }
 
 /// Move the verified copy to its final path. A plain executable replaces the
@@ -438,7 +572,7 @@ fn swap_into_place(
     if !executable.app_bundle {
         return run_checked_inherited(
             Command::new(privileged)
-                .args(["mv", "-f"])
+                .args(["mv", "-f", MV_ONTO_TARGET])
                 .arg(staged)
                 .arg(&destination),
         );
@@ -511,11 +645,23 @@ pub(super) fn uninstall_forwarder_executable(
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
+    use crate::commands::proxy::tests::fake_privileged_runner;
     use std::os::unix::fs::PermissionsExt;
 
     fn current_uid() -> u32 {
-        // SAFETY: `geteuid` only reads the process credentials.
-        unsafe { libc::geteuid() }
+        lpm_common::current_uid()
+    }
+
+    fn checks() -> InstallChecks {
+        InstallChecks {
+            trusted_uid: current_uid(),
+            #[cfg(target_os = "macos")]
+            code_requirement: None,
+        }
+    }
+
+    fn install(plan: &ForwarderExecutable, privileged: &Path) -> Result<(), LpmError> {
+        install_checked(plan, privileged, &checks())
     }
 
     #[test]
@@ -567,6 +713,7 @@ mod tests {
 
         assert!(!plan.app_bundle);
         assert_eq!(plan.source, Path::new("/home/dev/.lpm/bin/lpm"));
+        assert_eq!(plan.read_from, Path::new("/home/dev/.lpm/bin/lpm"));
         assert_eq!(
             plan.installed_executable(),
             Path::new("/opt/lpm/proxy-forwarder/lpm")
@@ -589,27 +736,40 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn trusted_path_check_rejects_directories_others_can_write() {
-        let dir = tempfile::tempdir().unwrap();
-        for mode in [0o775, 0o757] {
-            let directory = dir.path().join(format!("mode-{mode:o}"));
-            std::fs::create_dir(&directory).unwrap();
-            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(mode)).unwrap();
+    fn the_running_executable_is_copied_from_its_running_image_on_linux() {
+        let plan =
+            ForwarderExecutable::for_running_executable(PathBuf::from("/opt/lpm/proxy-forwarder"))
+                .unwrap();
+        let running = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
 
-            let error = require_trusted_path(&directory.join("forwarder"), current_uid())
-                .expect_err("a group or world writable directory is not trusted");
-            assert!(
-                error.to_string().contains("must be owned by root"),
-                "{error}"
-            );
-        }
+        assert_eq!(plan.read_from, Path::new("/proc/self/exe"));
+        assert_eq!(plan.source, running);
+        assert_eq!(
+            plan.installed_executable(),
+            Path::new("/opt/lpm/proxy-forwarder").join(running.file_name().unwrap())
+        );
+    }
+
+    #[test]
+    fn path_check_rejects_a_directory_anyone_can_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o757)).unwrap();
+
+        let reason = changeable_by_others(&shared.join("forwarder"), current_uid())
+            .expect("a world-writable directory is not trusted");
+        assert!(reason.contains("can change"), "{reason}");
 
         let private = dir.path().join("private");
         std::fs::create_dir(&private).unwrap();
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755)).unwrap();
-        require_trusted_path(&private.join("forwarder"), current_uid())
-            .expect("a 0755 directory of the trusted owner is accepted");
+        assert_eq!(
+            changeable_by_others(&private.join("forwarder"), current_uid()),
+            None
+        );
     }
 
     #[test]
@@ -619,13 +779,55 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
 
-        let error = require_root_controlled(&dir.path().join("forwarder"))
-            .expect_err("a user-owned temporary directory is not root-controlled");
+        let reason = changeable_by_others(&dir.path().join("forwarder"), 0)
+            .expect("a user-owned temporary directory is not root-controlled");
 
+        assert!(reason.contains("can change"), "{reason}");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn add_acl(path: &Path, entry: &str) {
         assert!(
-            error.to_string().contains("must be owned by root"),
-            "{error}"
+            std::process::Command::new("chmod")
+                .args(["+a", entry])
+                .arg(path)
+                .status()
+                .unwrap()
+                .success()
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn path_check_rejects_a_directory_whose_acl_lets_others_change_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        add_acl(
+            &shared,
+            "everyone allow add_file,add_subdirectory,delete_child",
+        );
+
+        let reason = changeable_by_others(&shared.join("forwarder"), current_uid())
+            .expect("an ACL that lets others add entries makes the directory untrusted");
+        assert!(reason.contains("access control list"), "{reason}");
+
+        let guarded = dir.path().join("guarded");
+        std::fs::create_dir(&guarded).unwrap();
+        add_acl(&guarded, "everyone deny delete");
+        assert_eq!(
+            changeable_by_others(&guarded.join("forwarder"), current_uid()),
+            None,
+            "an ACL that only denies grants nothing"
+        );
+    }
+
+    fn write_forwarder_config(config: &Path, binary: &Path, version: Option<&str>) {
+        let mut value = serde_json::json!({"targetUid": 501, "binaryPath": binary});
+        if let Some(version) = version {
+            value["lpmVersion"] = version.into();
+        }
+        std::fs::write(config, value.to_string()).unwrap();
     }
 
     #[test]
@@ -637,23 +839,33 @@ mod tests {
         let config = dir.path().join("proxy-forwarder.json");
         let user_executable = dir.path().join("lpm");
         std::fs::write(&user_executable, "build").unwrap();
-        let write_config = |binary: &Path, version: Option<&str>| {
-            let mut value = serde_json::json!({"targetUid": 501, "binaryPath": binary});
-            if let Some(version) = version {
-                value["lpmVersion"] = version.into();
-            }
-            std::fs::write(&config, value.to_string()).unwrap();
-        };
 
-        write_config(&user_executable, None);
-        let notice = installed_forwarder_notice(&config).expect("a user-writable executable");
-        assert!(notice.contains("a non-root user can replace"), "{notice}");
+        for replaceable in [user_executable, dir.path().join("deleted-lpm")] {
+            write_forwarder_config(&config, &replaceable, None);
+            let notice = installed_forwarder_notice(&config).expect("a user-writable executable");
+            assert!(notice.contains("a non-root user can replace"), "{notice}");
+        }
 
-        write_config(Path::new("/bin/sh"), Some("0.1.0"));
+        write_forwarder_config(
+            &config,
+            Path::new("/bin/lpm-forwarder-that-is-gone"),
+            Some(env!("CARGO_PKG_VERSION")),
+        );
+        assert_eq!(installed_forwarder_notice(&config), None);
+
+        write_forwarder_config(&config, Path::new("/bin/sh"), Some("0.1.0"));
         let notice = installed_forwarder_notice(&config).expect("an outdated forwarder");
         assert!(notice.contains("runs lpm 0.1.0"), "{notice}");
 
-        write_config(Path::new("/bin/sh"), Some(env!("CARGO_PKG_VERSION")));
+        write_forwarder_config(&config, Path::new("/bin/sh"), Some("not a version"));
+        let notice = installed_forwarder_notice(&config).expect("an unreadable version");
+        assert!(notice.contains("runs lpm not a version"), "{notice}");
+
+        write_forwarder_config(
+            &config,
+            Path::new("/bin/sh"),
+            Some(env!("CARGO_PKG_VERSION")),
+        );
         assert_eq!(installed_forwarder_notice(&config), None);
 
         assert_eq!(
@@ -662,27 +874,13 @@ mod tests {
         );
     }
 
-    /// Stands in for `sudo`: runs each step as the current user, skipping
-    /// steps that need root or a signed bundle plus any listed in `skip`.
-    fn fake_privileged_runner(directory: &Path, skip: &str) -> PathBuf {
-        let path = directory.join("privileged");
-        std::fs::write(
-            &path,
-            format!(
-                "#!/bin/sh\ncase \"$1\" in chown|/usr/bin/codesign{skip}) exit 0 ;; esac\n\
-                 if [ \"$1\" = mv ] && [ -n \"$FAIL_MV_FROM_STAGING\" ]; then\n\
-                   case \"$2\" in */.staging.*) exit 1 ;; esac\n\
-                 fi\n\
-                 exec \"$@\"\n"
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        path
-    }
+    #[test]
+    fn status_notice_does_not_recommend_downgrading_a_newer_forwarder() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("proxy-forwarder.json");
+        write_forwarder_config(&config, Path::new("/bin/sh"), Some("999.0.0"));
 
-    fn install(plan: &ForwarderExecutable, privileged: &Path) -> Result<(), LpmError> {
-        install_forwarder_executable_trusting(plan, privileged, current_uid())
+        assert_eq!(installed_forwarder_notice(&config), None);
     }
 
     #[test]
@@ -709,11 +907,10 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(entries, vec![OsString::from("lpm")]);
-        let install_dir_mode = std::fs::metadata(&install_dir)
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(install_dir_mode & 0o777, 0o755);
+        for (path, expected) in [(&install_dir, 0o755), (&plan.installed_executable, 0o755)] {
+            let mode = std::fs::metadata(path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o7777, expected, "{}", path.display());
+        }
     }
 
     #[test]
@@ -724,14 +921,7 @@ mod tests {
         std::fs::write(&source, "build").unwrap();
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o6775)).unwrap();
         #[cfg(target_os = "macos")]
-        assert!(
-            std::process::Command::new("chmod")
-                .args(["+a", "everyone allow write"])
-                .arg(&source)
-                .status()
-                .unwrap()
-                .success()
-        );
+        add_acl(&source, "everyone allow write");
         let plan =
             ForwarderExecutable::plan_with(&source, dir.path().join("root/forwarder"), false);
 
@@ -743,6 +933,71 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o7777, 0o755, "{mode:o}");
         assert!(!has_extended_acl(plan.installed_executable()).unwrap());
+    }
+
+    #[test]
+    fn install_copies_the_executable_it_opened_even_if_its_path_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lpm");
+        std::fs::write(&source, "the build that is running").unwrap();
+        let replace_source = format!(
+            "if [ \"$1\" = tee ]; then printf replaced > '{0}.new' && mv '{0}.new' '{0}'; fi\n",
+            source.display()
+        );
+        let privileged = fake_privileged_runner(dir.path(), &replace_source);
+        let plan =
+            ForwarderExecutable::plan_with(&source, dir.path().join("root/forwarder"), false);
+
+        install(&plan, &privileged).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "replaced");
+        assert_eq!(
+            std::fs::read_to_string(plan.installed_executable()).unwrap(),
+            "the build that is running"
+        );
+    }
+
+    #[test]
+    fn install_refuses_an_install_directory_that_is_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let privileged = fake_privileged_runner(dir.path(), "");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keep"), "unrelated").unwrap();
+        let link = dir.path().join("forwarder");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        let source = dir.path().join("lpm");
+        std::fs::write(&source, "build").unwrap();
+        let plan = ForwarderExecutable::plan_with(&source, link, false);
+
+        let error =
+            install(&plan, &privileged).expect_err("a symlinked install directory is refused");
+
+        assert!(error.to_string().contains("must be a directory"), "{error}");
+        assert!(elsewhere.join("keep").exists());
+        assert!(!elsewhere.join("lpm").exists());
+    }
+
+    #[test]
+    fn install_refuses_an_install_directory_under_one_others_can_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let privileged = fake_privileged_runner(dir.path(), "");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o757)).unwrap();
+        let source = dir.path().join("lpm");
+        std::fs::write(&source, "build").unwrap();
+        let plan = ForwarderExecutable::plan_with(&source, shared.join("root/forwarder"), false);
+
+        let error = install(&plan, &privileged).expect_err("an untrusted parent is refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("cannot install the privileged forwarder under"),
+            "{error}"
+        );
+        assert!(!shared.join("root").exists());
     }
 
     #[test]
@@ -785,10 +1040,44 @@ mod tests {
         let bundle = directory.join(format!("{marker}/LPM CLI.app"));
         std::fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
         std::fs::create_dir_all(bundle.join("Contents/_CodeSignature")).unwrap();
-        std::fs::write(bundle.join("Contents/MacOS/lpm-rs"), marker).unwrap();
+        std::fs::write(
+            bundle.join("Contents/Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>CFBundleExecutable</key><string>lpm-rs</string><key>CFBundleIdentifier</key><string>dev.lpm.cli</string></dict></plist>
+"#,
+        )
+        .unwrap();
+        let executable = bundle.join("Contents/MacOS/lpm-rs");
+        std::fs::write(&executable, format!("#!/bin/sh\necho {marker}\n")).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(bundle.join("Contents/embedded.provisionprofile"), "profile").unwrap();
         std::fs::write(bundle.join("Contents/_CodeSignature/CodeResources"), "seal").unwrap();
-        bundle.join("Contents/MacOS/lpm-rs")
+        executable
+    }
+
+    /// Sign `bundle` ad hoc as `dev.lpm.cli` and return its code directory hash.
+    #[cfg(target_os = "macos")]
+    fn sign_ad_hoc(bundle: &Path) -> String {
+        let signed = std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-", "--identifier", "dev.lpm.cli"])
+            .arg(bundle)
+            .output()
+            .unwrap();
+        assert!(
+            signed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&signed.stderr)
+        );
+        let details = std::process::Command::new("/usr/bin/codesign")
+            .args(["-d", "-vvv"])
+            .arg(bundle)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&details.stderr)
+            .lines()
+            .find_map(|line| line.strip_prefix("CDHash="))
+            .expect("a signed bundle has a code directory hash")
+            .to_string()
     }
 
     #[cfg(target_os = "macos")]
@@ -814,7 +1103,7 @@ mod tests {
         }
         assert_eq!(
             std::fs::read_to_string(plan.installed_executable()).unwrap(),
-            "first"
+            "#!/bin/sh\necho first\n"
         );
     }
 
@@ -823,7 +1112,8 @@ mod tests {
     fn install_refuses_a_copy_that_was_not_hardened() {
         let dir = tempfile::tempdir().unwrap();
         // A runner whose chmod does nothing leaves the setuid and write bits that ditto keeps.
-        let privileged = fake_privileged_runner(dir.path(), "|chmod");
+        let privileged =
+            fake_privileged_runner(dir.path(), "if [ \"$1\" = chmod ]; then exit 0; fi\n");
         let executable = fake_bundle(dir.path(), "unhardened");
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o4777)).unwrap();
         let plan =
@@ -842,27 +1132,146 @@ mod tests {
     #[test]
     fn a_bundle_that_cannot_move_into_place_restores_the_earlier_bundle() {
         let dir = tempfile::tempdir().unwrap();
-        let privileged = fake_privileged_runner(dir.path(), "");
         let install_dir = dir.path().join("root/Forwarder");
         let first = ForwarderExecutable::plan_with(
             &fake_bundle(dir.path(), "first"),
             install_dir.clone(),
             true,
         );
-        install(&first, &privileged).unwrap();
+        install(&first, &fake_privileged_runner(dir.path(), "")).unwrap();
         let second =
             ForwarderExecutable::plan_with(&fake_bundle(dir.path(), "second"), install_dir, true);
+        let failing_move = fake_privileged_runner(
+            &dir.path().join("failing"),
+            "if [ \"$1\" = mv ]; then case \"$2\" in */.staging.*) exit 1 ;; esac; fi\n",
+        );
 
-        // SAFETY: nextest runs each test in its own process, so no other thread reads it.
-        unsafe { std::env::set_var("FAIL_MV_FROM_STAGING", "1") };
-        let result = install(&second, &privileged);
-        // SAFETY: as above.
-        unsafe { std::env::remove_var("FAIL_MV_FROM_STAGING") };
+        install(&second, &failing_move).expect_err("the failed move must be reported");
 
-        result.expect_err("the failed move must be reported");
         assert_eq!(
             std::fs::read_to_string(first.installed_executable()).unwrap(),
-            "first"
+            "#!/bin/sh\necho first\n"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn install_leaves_the_targets_of_symlinks_in_the_bundle_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let privileged = fake_privileged_runner(dir.path(), "");
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, "not part of lpm").unwrap();
+        add_acl(&outside, "everyone deny read");
+        let executable = fake_bundle(dir.path(), "linked");
+        let bundle = enclosing_app_bundle(&executable).unwrap();
+        std::os::unix::fs::symlink(&outside, bundle.join("Contents/outside")).unwrap();
+        let plan =
+            ForwarderExecutable::plan_with(&executable, dir.path().join("root/Forwarder"), true);
+
+        let error = install(&plan, &privileged).expect_err("a bundle with a symlink is refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("neither a directory nor a regular file"),
+            "{error}"
+        );
+        assert!(has_extended_acl(&outside).unwrap());
+        assert!(!plan.installed_executable().exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn install_strips_acls_that_new_directories_inherit() {
+        let dir = tempfile::tempdir().unwrap();
+        let privileged = fake_privileged_runner(dir.path(), "");
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        add_acl(
+            &shared,
+            "everyone deny delete,file_inherit,directory_inherit,only_inherit",
+        );
+        let source = dir.path().join("lpm");
+        std::fs::write(&source, "build").unwrap();
+        let plan = ForwarderExecutable::plan_with(&source, shared.join("root/forwarder"), false);
+
+        install(&plan, &privileged).unwrap();
+
+        for path in [
+            shared.join("root"),
+            shared.join("root/forwarder"),
+            plan.installed_executable().to_path_buf(),
+        ] {
+            assert!(!has_extended_acl(&path).unwrap(), "{}", path.display());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn install_requires_lpms_release_signature_on_a_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let privileged = fake_privileged_runner(dir.path(), "");
+        let executable = fake_bundle(dir.path(), "ad-hoc");
+        let cdhash = sign_ad_hoc(&enclosing_app_bundle(&executable).unwrap());
+        let plan =
+            ForwarderExecutable::plan_with(&executable, dir.path().join("root/Forwarder"), true);
+        let with_requirement = |requirement: String| InstallChecks {
+            code_requirement: Some(requirement),
+            ..checks()
+        };
+
+        let error = install_checked(
+            &plan,
+            &privileged,
+            &with_requirement(format!("={}", lpm_release_requirement())),
+        )
+        .expect_err("an ad hoc signature is not LPM's release signature");
+        assert!(error.to_string().contains("code signature"), "{error}");
+        assert!(!plan.installed_executable().exists());
+
+        install_checked(
+            &plan,
+            &privileged,
+            &with_requirement(format!(r#"=cdhash H"{cdhash}""#)),
+        )
+        .expect("the copy keeps the signature of the bundle it came from");
+        assert!(plan.installed_executable().is_file());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn install_refuses_a_copy_that_is_not_the_running_executable() {
+        let Some(requirement) = running_code_requirement(false).unwrap() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let privileged = fake_privileged_runner(dir.path(), "");
+        let source = dir.path().join("lpm");
+        std::fs::write(&source, "#!/bin/sh\necho a different build\n").unwrap();
+        let plan =
+            ForwarderExecutable::plan_with(&source, dir.path().join("root/forwarder"), false);
+        let running = InstallChecks {
+            code_requirement: Some(requirement),
+            ..checks()
+        };
+
+        let error = install_checked(&plan, &privileged, &running)
+            .expect_err("a file other than the running executable is refused");
+
+        assert!(error.to_string().contains("code signature"), "{error}");
+        assert!(!plan.installed_executable().exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_copy_of_the_running_executable_satisfies_its_code_requirement() {
+        let Some(requirement) = running_code_requirement(false).unwrap() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("lpm-rs");
+        std::fs::copy(std::env::current_exe().unwrap(), &copy).unwrap();
+
+        verify_code_requirement(&copy, &requirement).unwrap();
     }
 }

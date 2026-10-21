@@ -587,3 +587,96 @@ fn write_forwarder_config(path: &Path, target_uid: u32) {
     .unwrap();
     std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
 }
+
+/// Stands in for `sudo`: runs each step as the current user after the shell
+/// `prelude`, skipping `chown`, which needs root.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn fake_privileged_runner(directory: &Path, prelude: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(directory).unwrap();
+    let path = directory.join("privileged");
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\nif [ \"$1\" = chown ]; then exit 0; fi\n{prelude}exec \"$@\"\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn write_root_file_replaces_the_destination_with_its_mode_and_leaves_nothing_else() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let privileged = fake_privileged_runner(dir.path(), "");
+    let destination = dir.path().join("etc/lpm/proxy-forwarder.json");
+
+    write_root_file(&privileged, b"first", &destination, "0644").unwrap();
+    write_root_file(&privileged, b"second", &destination, "0600").unwrap();
+
+    assert_eq!(std::fs::read_to_string(&destination).unwrap(), "second");
+    let mode = std::fs::metadata(&destination)
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o7777, 0o600);
+    let entries: Vec<_> = std::fs::read_dir(destination.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        entries,
+        vec![std::ffi::OsString::from("proxy-forwarder.json")]
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn write_root_file_replaces_a_link_at_the_destination_instead_of_writing_through_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let privileged = fake_privileged_runner(dir.path(), "");
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let services = dir.path().join("services");
+    std::fs::create_dir(&services).unwrap();
+    let to_directory = services.join("forwarder.service");
+    std::os::unix::fs::symlink(&elsewhere, &to_directory).unwrap();
+    let unrelated = elsewhere.join("unrelated");
+    std::fs::write(&unrelated, "unrelated").unwrap();
+    let to_file = services.join("forwarder.json");
+    std::os::unix::fs::symlink(&unrelated, &to_file).unwrap();
+
+    write_root_file(&privileged, b"unit", &to_directory, "0644").unwrap();
+    write_root_file(&privileged, b"config", &to_file, "0644").unwrap();
+
+    for (path, contents) in [(&to_directory, "unit"), (&to_file, "config")] {
+        assert!(std::fs::symlink_metadata(path).unwrap().is_file());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
+    }
+    assert_eq!(std::fs::read_to_string(&unrelated).unwrap(), "unrelated");
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 1);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn write_root_file_that_cannot_move_into_place_keeps_the_earlier_file_and_cleans_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let privileged = fake_privileged_runner(dir.path(), "if [ \"$1\" = mv ]; then exit 1; fi\n");
+    let destination = dir.path().join("etc/proxy-forwarder.json");
+    std::fs::create_dir(destination.parent().unwrap()).unwrap();
+    std::fs::write(&destination, "earlier").unwrap();
+
+    write_root_file(&privileged, b"later", &destination, "0644")
+        .expect_err("the failed move must be reported");
+
+    assert_eq!(std::fs::read_to_string(&destination).unwrap(), "earlier");
+    assert_eq!(
+        std::fs::read_dir(destination.parent().unwrap())
+            .unwrap()
+            .count(),
+        1
+    );
+}
