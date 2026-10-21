@@ -16,10 +16,12 @@
 use super::proxy_platform::run_checked_inherited;
 #[cfg(target_os = "macos")]
 use super::proxy_platform::run_checked_output;
+#[cfg(target_os = "macos")]
+use super::root_fs::stream_as_root;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::root_fs::{
-    MV_ONTO_TARGET, changeable_by_others, create_missing_directories, open_for_copy,
-    private_root_directory, tee_as_root,
+    changeable_by_others, create_missing_directories, open_for_copy, private_root_directory,
+    rename_onto, tee_as_root,
 };
 use lpm_common::LpmError;
 use std::ffi::OsString;
@@ -209,6 +211,8 @@ pub(super) fn install_forwarder_executable(
         trusted_uid: 0,
         #[cfg(target_os = "macos")]
         code_requirement: running_code_requirement(executable.app_bundle)?,
+        #[cfg(target_os = "macos")]
+        bundle: BundlePolicy::lpm_release(),
     };
     install_checked(executable, privileged, &checks)
 }
@@ -224,6 +228,9 @@ struct InstallChecks {
     /// and for an app bundle LPM's release signature as well.
     #[cfg(target_os = "macos")]
     code_requirement: Option<String>,
+    /// What an app bundle may hold.
+    #[cfg(target_os = "macos")]
+    bundle: BundlePolicy,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -299,7 +306,13 @@ fn install_staged_copy(
 ) -> Result<(), LpmError> {
     let staged = staging.join(&executable.entry);
     if executable.app_bundle {
-        copy_bundle_as_root(privileged, &executable.source, &staged)?;
+        #[cfg(target_os = "macos")]
+        copy_bundle_as_root(privileged, executable, &staged, &checks.bundle)?;
+        #[cfg(not(target_os = "macos"))]
+        return Err(LpmError::Script(format!(
+            "{} is an app bundle, which only macOS installs",
+            executable.source.display()
+        )));
     } else {
         tee_as_root(privileged, open_for_copy(&executable.read_from)?, &staged)?;
         run_checked_inherited(
@@ -322,59 +335,131 @@ fn install_staged_copy(
     swap_into_place(executable, privileged, &staged)
 }
 
-/// Most entries a bundle may hold; LPM's holds a dozen.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-const MAX_BUNDLE_ENTRIES: usize = 4096;
+/// What an app bundle may hold to be copied: the directories and files
+/// LPM's release bundle has, so nothing its code signature leaves unsealed,
+/// such as a `.DS_Store`, reaches the root-owned copy, within limits on
+/// their number and size.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+struct BundlePolicy {
+    name: &'static str,
+    /// Relative to the bundle, which is the empty path.
+    directories: std::collections::HashSet<PathBuf>,
+    required_files: std::collections::HashSet<PathBuf>,
+    optional_files: std::collections::HashSet<PathBuf>,
+    max_entries: usize,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+}
 
-/// Recreate the bundle at `source` as `staged`, as root: its directories
-/// with mode 0755, and its files filled through `tee` from handles the
+#[cfg(target_os = "macos")]
+impl BundlePolicy {
+    /// The inventory and limits self-update holds release bundles to.
+    fn lpm_release() -> Self {
+        use crate::commands::self_update as release;
+
+        let relative = |path: &'static str| {
+            Path::new(path)
+                .strip_prefix(release::MACOS_APP_NAME)
+                .expect("release bundle paths start with its name")
+                .to_path_buf()
+        };
+        Self {
+            name: release::MACOS_APP_NAME,
+            directories: release::MACOS_ALLOWED_BUNDLE_DIRECTORIES
+                .into_iter()
+                .map(relative)
+                .collect(),
+            required_files: release::MACOS_REQUIRED_BUNDLE_FILES
+                .into_iter()
+                .map(relative)
+                .collect(),
+            optional_files: release::MACOS_OPTIONAL_BUNDLE_FILES
+                .into_iter()
+                .map(relative)
+                .collect(),
+            max_entries: release::MACOS_BUNDLE_MAX_ENTRIES,
+            max_file_bytes: release::MACOS_BUNDLE_MAX_ENTRY_BYTES,
+            max_total_bytes: release::MACOS_BUNDLE_MAX_EXTRACTED_BYTES,
+        }
+    }
+}
+
+/// Recreate the planned app bundle as `staged`, as root: its directories
+/// with mode 0755, and its files streamed to `tee` from handles the
 /// installing user opens, executables with mode 0755 and the rest 0644.
-/// Anything but directories and regular files is refused. Root reads nothing
-/// at a path the user controls, so whatever `source` becomes, the copy holds
-/// only what that user could read, and its signature decides whether it is
-/// LPM.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn copy_bundle_as_root(privileged: &Path, source: &Path, staged: &Path) -> Result<(), LpmError> {
+/// Root reads nothing at a path the user controls, so whatever the bundle
+/// path has become, the copy holds only what that user could read, and its
+/// signature decides whether it is LPM. Anything `policy` does not allow is
+/// refused before root writes a byte; a file that grows past its limit while
+/// it is copied, during the copy.
+#[cfg(target_os = "macos")]
+fn copy_bundle_as_root(
+    privileged: &Path,
+    executable: &ForwarderExecutable,
+    staged: &Path,
+    policy: &BundlePolicy,
+) -> Result<(), LpmError> {
     use std::os::unix::fs::PermissionsExt;
 
-    if !std::fs::symlink_metadata(source)
-        .map_err(LpmError::Io)?
-        .is_dir()
+    let source = &executable.source;
+    let not_lpm = |what: &dyn std::fmt::Display| {
+        LpmError::Script(format!(
+            "{what} is not part of LPM's app bundle, so it is not copied for the privileged forwarder"
+        ))
+    };
+    if executable.entry != policy.name
+        || !std::fs::symlink_metadata(source)
+            .map_err(LpmError::Io)?
+            .is_dir()
     {
-        return Err(LpmError::Script(format!(
-            "{} is not an app bundle directory",
-            source.display()
-        )));
+        return Err(not_lpm(&source.display()));
     }
     let mut directories = vec![PathBuf::new()];
     let mut executables = Vec::new();
     let mut others = Vec::new();
+    let mut entries = 0_usize;
     let mut pending = vec![PathBuf::new()];
     while let Some(directory) = pending.pop() {
         for entry in std::fs::read_dir(source.join(&directory)).map_err(LpmError::Io)? {
             let entry = entry.map_err(LpmError::Io)?;
-            let relative = directory.join(entry.file_name());
-            if directories.len() + executables.len() + others.len() >= MAX_BUNDLE_ENTRIES {
+            entries += 1;
+            if entries > policy.max_entries {
                 return Err(LpmError::Script(format!(
-                    "{} holds more than {MAX_BUNDLE_ENTRIES} entries",
-                    source.display()
+                    "{} holds more than the {} entries LPM's app bundle may",
+                    source.display(),
+                    policy.max_entries
                 )));
             }
+            let relative = directory.join(entry.file_name());
             let metadata = entry.metadata().map_err(LpmError::Io)?;
-            if metadata.is_dir() {
+            if metadata.is_dir() && policy.directories.contains(&relative) {
                 directories.push(relative.clone());
                 pending.push(relative);
-            } else if !metadata.is_file() {
-                return Err(LpmError::Script(format!(
-                    "{} is neither a directory nor a regular file",
-                    source.join(relative).display()
-                )));
-            } else if metadata.permissions().mode() & 0o111 != 0 {
-                executables.push(relative);
+            } else if metadata.is_file()
+                && (policy.required_files.contains(&relative)
+                    || policy.optional_files.contains(&relative))
+            {
+                if metadata.permissions().mode() & 0o111 != 0 {
+                    executables.push(relative);
+                } else {
+                    others.push(relative);
+                }
             } else {
-                others.push(relative);
+                return Err(not_lpm(&source.join(relative).display()));
             }
         }
+    }
+    if let Some(missing) = policy
+        .required_files
+        .iter()
+        .find(|required| !executables.contains(required) && !others.contains(required))
+    {
+        return Err(LpmError::Script(format!(
+            "{} lacks {}, so it is not LPM's app bundle",
+            source.display(),
+            missing.display()
+        )));
     }
 
     run_checked_inherited(
@@ -382,12 +467,23 @@ fn copy_bundle_as_root(privileged: &Path, source: &Path, staged: &Path) -> Resul
             .args(["mkdir", "-m", "0755"])
             .args(directories.iter().map(|relative| staged.join(relative))),
     )?;
+    let mut total = 0_u64;
     for relative in executables.iter().chain(&others) {
-        tee_as_root(
+        let path = source.join(relative);
+        let limit = policy.max_file_bytes.min(policy.max_total_bytes - total);
+        let Some(copied) = stream_as_root(
             privileged,
-            open_for_copy(&source.join(relative))?,
+            &mut open_for_copy(&path)?,
             &staged.join(relative),
-        )?;
+            limit,
+        )?
+        else {
+            return Err(LpmError::Script(format!(
+                "{} is larger than LPM's app bundle may be",
+                path.display()
+            )));
+        };
+        total += copied;
     }
     for (mode, files) in [("0755", &executables), ("0644", &others)] {
         if !files.is_empty() {
@@ -538,12 +634,7 @@ fn swap_into_place(
 ) -> Result<(), LpmError> {
     let destination = executable.install_dir.join(&executable.entry);
     if !executable.app_bundle {
-        return run_checked_inherited(
-            Command::new(privileged)
-                .args(["mv", "-f", MV_ONTO_TARGET])
-                .arg(staged)
-                .arg(&destination),
-        );
+        return rename_onto(privileged, staged, &destination);
     }
     let mut previous_name = OsString::from(".previous.");
     previous_name.push(&executable.entry);
@@ -625,6 +716,8 @@ mod tests {
             trusted_uid: current_uid(),
             #[cfg(target_os = "macos")]
             code_requirement: None,
+            #[cfg(target_os = "macos")]
+            bundle: BundlePolicy::lpm_release(),
         }
     }
 
@@ -991,6 +1084,27 @@ mod tests {
     }
 
     #[test]
+    fn install_refuses_a_directory_where_the_copy_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let privileged = fake_privileged_runner(dir.path(), "");
+        let source = dir.path().join("lpm");
+        std::fs::write(&source, "build").unwrap();
+        let install_dir = dir.path().join("root/forwarder");
+        std::fs::create_dir_all(install_dir.join("lpm")).unwrap();
+        let plan = ForwarderExecutable::plan_with(&source, install_dir, false);
+
+        let error = install(&plan, &privileged).expect_err("a directory is not replaced");
+
+        assert!(error.to_string().contains("is a directory"), "{error}");
+        assert_eq!(
+            std::fs::read_dir(plan.installed_executable())
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
     fn uninstall_removes_the_copy_and_its_directory() {
         let dir = tempfile::tempdir().unwrap();
         let privileged = fake_privileged_runner(dir.path(), "");
@@ -1021,8 +1135,16 @@ mod tests {
         std::fs::write(&executable, format!("#!/bin/sh\necho {marker}\n")).unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::write(bundle.join("Contents/embedded.provisionprofile"), "profile").unwrap();
+        std::fs::write(bundle.join("Contents/CodeResources"), "legacy seal").unwrap();
         std::fs::write(bundle.join("Contents/_CodeSignature/CodeResources"), "seal").unwrap();
         executable
+    }
+
+    #[cfg(target_os = "macos")]
+    fn bundle_checks(adjust: impl FnOnce(&mut BundlePolicy)) -> InstallChecks {
+        let mut checks = checks();
+        adjust(&mut checks.bundle);
+        checks
     }
 
     /// Sign `bundle` ad hoc as `dev.lpm.cli` and return its code directory hash.
@@ -1147,11 +1269,83 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("neither a directory nor a regular file"),
+                .contains("is not part of LPM's app bundle"),
             "{error}"
         );
         assert!(has_extended_acl(&outside).unwrap());
         assert!(!plan.installed_executable().exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn install_copies_only_what_lpms_app_bundle_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("privileged.log");
+        let privileged = fake_privileged_runner(
+            dir.path(),
+            &format!("printf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        );
+        let refused = |plan: &ForwarderExecutable| {
+            let error = install(plan, &privileged).expect_err("the bundle must be refused");
+            assert!(!plan.installed_executable().exists());
+            assert!(
+                !std::fs::read_to_string(&log)
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|step| step.starts_with("tee ")),
+                "nothing is copied before the bundle is refused"
+            );
+            error.to_string()
+        };
+
+        let executable = fake_bundle(dir.path(), "finder-metadata");
+        let bundle = enclosing_app_bundle(&executable).unwrap();
+        std::fs::create_dir(bundle.join("Contents/Resources")).unwrap();
+        std::fs::write(bundle.join("Contents/Resources/.DS_Store"), "unsealed").unwrap();
+        let plan =
+            ForwarderExecutable::plan_with(&executable, dir.path().join("root/Forwarder"), true);
+        assert!(refused(&plan).contains("is not part of LPM's app bundle"));
+
+        let executable = fake_bundle(dir.path(), "incomplete");
+        let bundle = enclosing_app_bundle(&executable).unwrap();
+        std::fs::remove_file(bundle.join("Contents/embedded.provisionprofile")).unwrap();
+        let plan =
+            ForwarderExecutable::plan_with(&executable, dir.path().join("root/Forwarder"), true);
+        assert!(refused(&plan).contains("lacks Contents/embedded.provisionprofile"));
+
+        let renamed = dir.path().join("renamed/Other.app/Contents/MacOS/lpm-rs");
+        std::fs::create_dir_all(renamed.parent().unwrap()).unwrap();
+        std::fs::write(&renamed, "build").unwrap();
+        let plan =
+            ForwarderExecutable::plan_with(&renamed, dir.path().join("root/Forwarder"), true);
+        assert!(refused(&plan).contains("is not part of LPM's app bundle"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn install_refuses_a_bundle_larger_than_lpms_may_be() {
+        let dir = tempfile::tempdir().unwrap();
+        let privileged = fake_privileged_runner(dir.path(), "");
+        let plan = ForwarderExecutable::plan_with(
+            &fake_bundle(dir.path(), "large"),
+            dir.path().join("root/Forwarder"),
+            true,
+        );
+
+        for checks in [
+            bundle_checks(|policy| policy.max_file_bytes = 8),
+            bundle_checks(|policy| policy.max_total_bytes = 40),
+            bundle_checks(|policy| policy.max_entries = 5),
+        ] {
+            let error = install_checked(&plan, &privileged, &checks)
+                .expect_err("a bundle over its limits is refused");
+            assert!(
+                error.to_string().contains("LPM's app bundle may"),
+                "{error}"
+            );
+            assert!(!plan.installed_executable().exists());
+        }
+        install_checked(&plan, &privileged, &checks()).unwrap();
     }
 
     #[cfg(target_os = "macos")]
@@ -1189,9 +1383,15 @@ mod tests {
         let cdhash = sign_ad_hoc(&enclosing_app_bundle(&executable).unwrap());
         let plan =
             ForwarderExecutable::plan_with(&executable, dir.path().join("root/Forwarder"), true);
+        // A script's ad hoc signature lives in files a Mach-O keeps inside itself.
         let with_requirement = |requirement: String| InstallChecks {
             code_requirement: Some(requirement),
-            ..checks()
+            ..bundle_checks(|policy| {
+                policy.optional_files.extend(
+                    ["CodeDirectory", "CodeRequirements", "CodeSignature"]
+                        .map(|name| Path::new("Contents/_CodeSignature").join(name)),
+                );
+            })
         };
 
         let error = install_checked(

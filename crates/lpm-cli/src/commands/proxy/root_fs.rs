@@ -17,9 +17,9 @@ use std::process::{Command, Stdio};
 /// The `mv` flag that renames onto a target that is a link to a directory,
 /// replacing the link, instead of moving into the directory it points to.
 #[cfg(target_os = "linux")]
-pub(super) const MV_ONTO_TARGET: &str = "-T";
+const MV_ONTO_TARGET: &str = "-T";
 #[cfg(target_os = "macos")]
-pub(super) const MV_ONTO_TARGET: &str = "-h";
+const MV_ONTO_TARGET: &str = "-h";
 
 /// Why a user other than root, or `uid`, could change what `path` leads to,
 /// if one could: through any directory the kernel passes resolving it, or,
@@ -30,50 +30,31 @@ pub(super) fn changeable_by_others(path: &Path, uid: u32) -> Option<String> {
         .ancestors()
         .find(|ancestor| std::fs::symlink_metadata(ancestor).is_ok())
         .unwrap_or_else(|| Path::new("/"));
-    let unreadable = |error: std::io::Error| {
-        Some(format!(
+    // On a volume that ignores ownership, as macOS mounts external drives by
+    // default, every user owns every file, whatever owner and mode it shows.
+    #[cfg(target_os = "macos")]
+    let found =
+        lpm_common::path_trust::first_changeable_directory_with(existing, uid, |directory| {
+            Ok(
+                lpm_common::macos_acl::ignores_ownership_at(directory)?.then_some(
+                    "it is on a volume that ignores ownership, where every user owns every file",
+                ),
+            )
+        });
+    #[cfg(not(target_os = "macos"))]
+    let found = lpm_common::path_trust::first_changeable_directory(existing, uid);
+    match found {
+        Ok(None) => None,
+        Ok(Some(found)) => Some(format!(
+            "users other than root can change {}: {}",
+            found.directory.display(),
+            found.reason
+        )),
+        Err(error) => Some(format!(
             "{} could not be inspected: {error}",
             existing.display()
-        ))
-    };
-    match lpm_common::path_trust::first_changeable_directory(existing, uid) {
-        Ok(None) => {}
-        Ok(Some(found)) => {
-            return Some(format!(
-                "users other than root can change {}: {}",
-                found.directory.display(),
-                found.reason
-            ));
-        }
-        Err(error) => return unreadable(error),
+        )),
     }
-    #[cfg(target_os = "macos")]
-    match volume_ignoring_ownership(existing) {
-        Ok(None) => {}
-        Ok(Some(directory)) => {
-            return Some(format!(
-                "{} is on a volume that ignores ownership, where every user owns every file",
-                directory.display()
-            ));
-        }
-        Err(error) => return unreadable(error),
-    }
-    None
-}
-
-/// The first place resolving `path` passes through that lies on a volume
-/// ignoring ownership, as macOS mounts external drives by default. Each
-/// prefix of `path` is looked up as the kernel resolves it, and so is each
-/// directory leading to where it ends up.
-#[cfg(target_os = "macos")]
-fn volume_ignoring_ownership(path: &Path) -> std::io::Result<Option<PathBuf>> {
-    let canonical = std::fs::canonicalize(path)?;
-    for place in path.ancestors().chain(canonical.ancestors()) {
-        if !place.as_os_str().is_empty() && lpm_common::macos_acl::ignores_ownership_at(place)? {
-            return Ok(Some(place.to_path_buf()));
-        }
-    }
-    Ok(None)
 }
 
 /// Create the missing directories of `directory` as root, with mode 0755
@@ -181,8 +162,8 @@ pub(super) fn write_root_file(
     prefix.push(name);
     let private = private_root_directory(privileged, parent, &prefix)?;
     let temporary = private.join(name);
-    let written = pipe_as_root(privileged, contents, &temporary)
-        .and_then(|()| {
+    let written = stream_as_root(privileged, &mut &contents[..], &temporary, u64::MAX)
+        .and_then(|_| {
             run_checked_inherited(
                 Command::new(privileged)
                     .arg("chmod")
@@ -190,21 +171,40 @@ pub(super) fn write_root_file(
                     .arg(&temporary),
             )
         })
-        .and_then(|()| {
-            run_checked_inherited(
-                Command::new(privileged)
-                    .args(["mv", "-f", MV_ONTO_TARGET])
-                    .arg(&temporary)
-                    .arg(destination),
-            )
-        });
+        .and_then(|()| rename_onto(privileged, &temporary, destination));
     let cleanup = run_checked_inherited(Command::new(privileged).args(["rm", "-rf"]).arg(&private));
     written?;
     cleanup
 }
 
-/// Write `contents` to `destination` as root through `tee`'s standard input.
-fn pipe_as_root(privileged: &Path, contents: &[u8], destination: &Path) -> Result<(), LpmError> {
+/// Rename `from` onto `to` as root, replacing a file or a link there. A
+/// directory at `to` is refused, since BSD `mv` would move `from` into it.
+pub(super) fn rename_onto(privileged: &Path, from: &Path, to: &Path) -> Result<(), LpmError> {
+    if std::fs::symlink_metadata(to).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(LpmError::Script(format!(
+            "{} is a directory, not a file",
+            to.display()
+        )));
+    }
+    run_checked_inherited(
+        Command::new(privileged)
+            .args(["mv", "-f", MV_ONTO_TARGET])
+            .arg(from)
+            .arg(to),
+    )
+}
+
+/// Write what `source` holds to `destination` as root, passing it through
+/// `tee`'s standard input. Returns how many bytes that was, or None when
+/// `source` held more than `limit`, of which no more than `limit` reached
+/// `destination`. Counting the bytes as they pass, rather than trusting a
+/// size read beforehand, holds even if `source` grows meanwhile.
+pub(super) fn stream_as_root(
+    privileged: &Path,
+    source: &mut impl std::io::Read,
+    destination: &Path,
+    limit: u64,
+) -> Result<Option<u64>, LpmError> {
     use std::io::Write as _;
 
     let mut command = Command::new(privileged);
@@ -214,14 +214,28 @@ fn pipe_as_root(privileged: &Path, contents: &[u8], destination: &Path) -> Resul
         .stdin(Stdio::piped())
         .stdout(Stdio::null());
     let mut child = command.spawn().map_err(LpmError::Io)?;
-    let written = child
-        .stdin
-        .take()
-        .expect("tee's standard input is piped")
-        .write_all(contents);
+    let mut stdin = child.stdin.take().expect("tee's standard input is piped");
+    let mut buffer = vec![0_u8; 128 * 1024];
+    let mut copied = 0_u64;
+    let streamed = loop {
+        let read = match source.read(&mut buffer) {
+            Ok(0) => break Ok(Some(copied)),
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => break Err(error),
+        };
+        copied += read as u64;
+        if copied > limit {
+            break Ok(None);
+        }
+        if let Err(error) = stdin.write_all(&buffer[..read]) {
+            break Err(error);
+        }
+    };
+    drop(stdin);
     let status = child.wait().map_err(LpmError::Io)?;
     require_success(&command, status)?;
-    written.map_err(LpmError::Io)
+    streamed.map_err(LpmError::Io)
 }
 
 /// Copy what `source` holds to `destination` as root through `tee`'s
@@ -382,8 +396,18 @@ mod tests {
         );
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(attached.path(), &link).unwrap();
+        // A link that only passes through the volume on its way back.
+        let trusted = dir.path().join("trusted");
+        std::fs::create_dir(&trusted).unwrap();
+        std::os::unix::fs::symlink(&trusted, attached.path().join("back")).unwrap();
+        let round_trip = dir.path().join("round-trip");
+        std::os::unix::fs::symlink(attached.path().join("back"), &round_trip).unwrap();
 
-        for path in [attached.path().join("forwarder"), link.join("forwarder")] {
+        for path in [
+            attached.path().join("forwarder"),
+            link.join("forwarder"),
+            round_trip.join("forwarder"),
+        ] {
             let reason = changeable_by_others(&path, current_uid())
                 .expect("a volume that ignores ownership is not trusted");
             assert!(reason.contains("ignores ownership"), "{reason}");
@@ -473,6 +497,41 @@ mod tests {
             assert!(error.to_string().contains("cannot write"), "{error}");
         }
         assert!(entries_of(&shared).is_empty());
+    }
+
+    #[test]
+    fn write_root_file_refuses_a_directory_at_the_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let privileged = fake_privileged_runner(dir.path(), "");
+        let destination = dir.path().join("etc/proxy-forwarder.json");
+        std::fs::create_dir_all(&destination).unwrap();
+
+        let error = write_root_file(&privileged, current_uid(), b"config", &destination, "0644")
+            .expect_err("a directory is not replaced");
+
+        assert!(error.to_string().contains("is a directory"), "{error}");
+        assert!(entries_of(&destination).is_empty());
+        assert_eq!(
+            entries_of(destination.parent().unwrap()),
+            vec![OsString::from("proxy-forwarder.json")]
+        );
+    }
+
+    #[test]
+    fn stream_as_root_writes_no_more_than_its_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let privileged = fake_privileged_runner(dir.path(), "");
+        let destination = dir.path().join("copy");
+
+        let copied =
+            stream_as_root(&privileged, &mut &b"twelve bytes"[..], &destination, 12).unwrap();
+        assert_eq!(copied, Some(12));
+        assert_eq!(std::fs::read(&destination).unwrap(), b"twelve bytes");
+
+        let over = vec![7_u8; 300 * 1024];
+        let copied = stream_as_root(&privileged, &mut &over[..], &destination, 200 * 1024).unwrap();
+        assert_eq!(copied, None);
+        assert!(std::fs::metadata(&destination).unwrap().len() <= 200 * 1024);
     }
 
     #[test]
