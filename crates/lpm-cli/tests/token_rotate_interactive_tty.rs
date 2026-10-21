@@ -63,6 +63,7 @@ mod tty {
         project: &std::path::Path,
         lpm_home: &std::path::Path,
         registry_url: &str,
+        response: &[u8],
     ) -> (ExitStatus, String) {
         let mut master_fd = -1;
         let mut slave_fd = -1;
@@ -141,9 +142,7 @@ mod tty {
             }
 
             if prompt_seen && !response_sent && terminal_echo_is_disabled(&master) {
-                master
-                    .write_all(format!("{OTP}\r").as_bytes())
-                    .expect("write OTP response");
+                master.write_all(response).expect("write OTP response");
                 master.flush().expect("flush OTP response");
                 response_sent = true;
             }
@@ -201,8 +200,13 @@ mod tty {
             .mount(&server)
             .await;
 
-        let (status, transcript) =
-            run_token_rotate_in_pty(project.path(), lpm_home.path(), &server.uri());
+        let response = format!("{OTP}\r");
+        let (status, transcript) = run_token_rotate_in_pty(
+            project.path(),
+            lpm_home.path(),
+            &server.uri(),
+            response.as_bytes(),
+        );
         let transcript = common::strip_ansi(&transcript);
 
         assert!(status.success(), "token rotation failed:\n{transcript}");
@@ -222,5 +226,38 @@ mod tty {
                 .and_then(|value| value.to_str().ok()),
             Some(OTP)
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn token_rotate_otp_prompt_cancelled_with_ctrl_c_exits_with_interrupt_status() {
+        let project = TempDir::new().expect("create project");
+        let lpm_home = TempDir::new().expect("create LPM home");
+        std::fs::write(
+            project.path().join("package.json"),
+            r#"{"name":"token-rotate-tty","version":"1.0.0"}"#,
+        )
+        .expect("write package.json");
+
+        let server = wiremock::MockServer::start().await;
+        common::seed_lpm_token(lpm_home.path(), &server.uri(), "old-session-token");
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/token/rotate"))
+            .respond_with(OtpChallengeResponder)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (status, transcript) =
+            run_token_rotate_in_pty(project.path(), lpm_home.path(), &server.uri(), b"\x03");
+        let transcript = common::strip_ansi(&transcript);
+
+        assert_eq!(
+            status.code(),
+            Some(130),
+            "a cancelled OTP prompt must exit with the interrupt status:\n{transcript}"
+        );
+        assert!(transcript.contains("Operation cancelled."), "{transcript}");
+        assert!(!transcript.contains("OTP prompt failed"), "{transcript}");
+        assert!(!transcript.contains("session token rotated successfully"));
     }
 }

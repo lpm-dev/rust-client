@@ -1,4 +1,5 @@
 use crate::commands::web_auth;
+use crate::prompt::PromptResultExt as _;
 use crate::{auth, install_ui};
 use lpm_common::LpmError;
 use std::io::IsTerminal;
@@ -195,7 +196,7 @@ pub fn run_custom(
             )))
             .mask('*')
             .interact()
-            .map_err(|e| LpmError::Registry(e.to_string()))?
+            .map_prompt_err(|e| LpmError::Registry(e.to_string()))?
         }
     };
 

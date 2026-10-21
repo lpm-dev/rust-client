@@ -1,4 +1,5 @@
 use super::prelude::*;
+use crate::prompt::PromptResultExt as _;
 
 enum PushTarget {
     Personal,
@@ -90,7 +91,7 @@ pub(super) async fn vars_push(
         let confirm = cliclack::confirm("Continue?")
             .initial_value(false)
             .interact()
-            .map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?;
+            .map_prompt_err(|e| LpmError::Script(format!("prompt failed: {e}")))?;
         if !confirm {
             output::info("cancelled");
             return Ok(());

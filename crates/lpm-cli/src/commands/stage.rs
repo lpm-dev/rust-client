@@ -1,5 +1,6 @@
 use crate::commands::{npm_auth, npm_stage, publish, publish_common, publish_npm};
 use crate::install_ui;
+use crate::prompt::PromptResultExt as _;
 use lpm_common::LpmError;
 use lpm_runner::lpm_json::{self, NpmPublishConfig};
 use std::path::Path;
@@ -178,7 +179,7 @@ async fn publish_current_project_locked(
             )))
             .initial_value(true)
             .interact()
-            .map_err(|e| LpmError::Registry(e.to_string()))?;
+            .map_prompt_err(|e| LpmError::Registry(e.to_string()))?;
             if !confirm {
                 install_ui::skipped("Stage cancelled");
                 return Ok(());

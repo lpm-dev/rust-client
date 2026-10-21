@@ -27,6 +27,7 @@
 //! `BindingDrift` path at install time.
 
 use crate::install_ui;
+use crate::prompt::PromptResultExt as _;
 use crate::trust_snapshot::{self, SnapshotEntry, TrustSnapshot};
 use clap::Subcommand;
 use lpm_common::LpmError;
@@ -622,7 +623,7 @@ async fn run_prune(
         stale.len()
     ))
     .interact()
-    .map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?;
+    .map_prompt_err(|e| LpmError::Script(format!("prompt failed: {e}")))?;
     if !confirmed {
         install_ui::warn("Nothing pruned");
         return Ok(());

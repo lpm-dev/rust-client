@@ -8,6 +8,7 @@ use crate::commands::publish_common::{
 };
 use crate::commands::web_auth;
 use crate::output;
+use crate::prompt::PromptResultExt as _;
 use lpm_common::LpmError;
 use lpm_runner::lpm_json::NpmPublishConfig;
 use serde::de::{DeserializeSeed as _, IgnoredAny, MapAccess, Visitor};
@@ -1132,7 +1133,7 @@ fn prompt_npm_otp() -> Result<String, LpmError> {
             }
         })
         .interact()
-        .map_err(|e| LpmError::Registry(e.to_string()))?;
+        .map_prompt_err(|e| LpmError::Registry(e.to_string()))?;
     Ok(code)
 }
 

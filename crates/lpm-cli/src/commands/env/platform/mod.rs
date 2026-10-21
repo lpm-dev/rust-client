@@ -4,6 +4,7 @@ mod github_actions;
 mod railway;
 
 use super::prelude::*;
+use crate::prompt::PromptResultExt as _;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::StreamExt;
 use rand::RngCore;
@@ -1928,7 +1929,7 @@ pub(super) async fn vars_connect(
     } else {
         cliclack::password(format!("Paste {display_name} API token"))
             .interact()
-            .map_err(|error| LpmError::Script(format!("prompt failed: {error}")))?
+            .map_prompt_err(|error| LpmError::Script(format!("prompt failed: {error}")))?
     };
     if platform_token.is_empty() {
         return Err(LpmError::Script("--token cannot be empty".into()));
@@ -2367,7 +2368,7 @@ pub(super) async fn vars_platform_push(
         ))
         .initial_value(false)
         .interact()
-        .map_err(|error| LpmError::Script(format!("prompt failed: {error}")))?;
+        .map_prompt_err(|error| LpmError::Script(format!("prompt failed: {error}")))?;
         if !confirmed {
             output::info("cancelled");
             return Ok(());
@@ -2835,7 +2836,7 @@ pub(super) async fn vars_platform_pull(
         )))
         .initial_value(true)
         .interact()
-        .map_err(|error| LpmError::Script(format!("prompt failed: {error}")))?;
+        .map_prompt_err(|error| LpmError::Script(format!("prompt failed: {error}")))?;
         if !confirmed {
             output::info("cancelled");
             return Ok(());

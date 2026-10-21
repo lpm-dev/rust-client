@@ -4,6 +4,7 @@ use crate::commands::publish_common::{
 use crate::commands::publish_npm::NPM_REGISTRY_URL;
 use crate::commands::web_auth;
 use crate::output;
+use crate::prompt::PromptResultExt as _;
 use flate2::read::GzDecoder;
 use lpm_common::LpmError;
 use lpm_runner::lpm_json::NpmPublishConfig;
@@ -839,7 +840,7 @@ fn is_otp_required(headers: &reqwest::header::HeaderMap) -> bool {
 fn prompt_npm_otp() -> Result<String, LpmError> {
     cliclack::input("Enter npm one-time password")
         .interact()
-        .map_err(|e| LpmError::Registry(e.to_string()))
+        .map_prompt_err(|e| LpmError::Registry(e.to_string()))
 }
 
 async fn response_json_or_empty(

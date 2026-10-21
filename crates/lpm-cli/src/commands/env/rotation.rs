@@ -1,4 +1,5 @@
 use super::prelude::*;
+use crate::prompt::PromptResultExt as _;
 
 pub(super) async fn env_rotate_key(
     client: &lpm_registry::RegistryClient,
@@ -1150,7 +1151,7 @@ pub(super) async fn env_rotate_sharing_key(
     let typed: String =
         cliclack::input("Type ROTATE (uppercase) to confirm. Any other input cancels.")
             .interact()
-            .map_err(|e| LpmError::Script(format!("confirmation prompt failed: {e}")))?;
+            .map_prompt_err(|e| LpmError::Script(format!("confirmation prompt failed: {e}")))?;
     if typed != "ROTATE" {
         return Err(LpmError::Script(
             "rotation cancelled — no server-side or local state changed.".into(),
