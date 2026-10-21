@@ -1,8 +1,12 @@
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use super::forwarder_executable::{install_forwarder_executable, uninstall_forwarder_executable};
 use super::proxy_service::{PrivilegedForwarderSpec, ProxyServiceSpec};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::proxy_service::{
     reject_conflicting_privileged_forwarder_owner, reject_removing_foreign_privileged_forwarder,
 };
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use super::root_fs::write_root_file;
 use lpm_common::LpmError;
 use std::path::Path;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -115,23 +119,23 @@ pub(super) fn install_privileged_forwarder_platform(
         spec.config.target_uid,
         spec.replace_existing,
     )?;
-    let config_source = write_privileged_staging_file(
-        spec,
-        "proxy-forwarder.json",
-        &serde_json::to_string_pretty(&spec.config)
-            .map_err(|err| LpmError::Script(err.to_string()))?,
+    let sudo = Path::new("sudo");
+    install_forwarder_executable(&spec.executable, sudo)?;
+    write_root_file(
+        sudo,
+        0,
+        privileged_forwarder_config_json(spec)?.as_bytes(),
+        &spec.config_path,
+        "0644",
     )?;
-    let unit_source = write_privileged_staging_file(
-        spec,
-        "proxy-forwarder.service",
-        &render_linux_forwarder_systemd_unit(spec),
+    write_root_file(
+        sudo,
+        0,
+        render_linux_forwarder_systemd_unit(spec).as_bytes(),
+        &spec.service_path,
+        "0644",
     )?;
-    install_root_file(&config_source, &spec.config_path, "0644")?;
-    install_root_file(&unit_source, &spec.service_path, "0644")?;
-    install_linux_forwarder_unit(Path::new("sudo"), &linux_systemd_unit_name(spec.label))?;
-    let _ = std::fs::remove_file(config_source);
-    let _ = std::fs::remove_file(unit_source);
-    Ok(())
+    install_linux_forwarder_unit(sudo, &linux_systemd_unit_name(spec.label))
 }
 
 #[cfg(target_os = "linux")]
@@ -162,7 +166,7 @@ pub(super) fn uninstall_privileged_forwarder_platform(
             .arg(&spec.config_path),
     )?;
     run_checked_inherited(Command::new("sudo").args(["systemctl", "daemon-reload"]))?;
-    Ok(())
+    uninstall_forwarder_executable(spec.executable.install_dir(), Path::new("sudo"))
 }
 
 #[cfg(target_os = "macos")]
@@ -174,19 +178,22 @@ pub(super) fn install_privileged_forwarder_platform(
         spec.config.target_uid,
         spec.replace_existing,
     )?;
-    let config_source = write_privileged_staging_file(
-        spec,
-        "proxy-forwarder.json",
-        &serde_json::to_string_pretty(&spec.config)
-            .map_err(|err| LpmError::Script(err.to_string()))?,
+    let sudo = Path::new("sudo");
+    install_forwarder_executable(&spec.executable, sudo)?;
+    write_root_file(
+        sudo,
+        0,
+        privileged_forwarder_config_json(spec)?.as_bytes(),
+        &spec.config_path,
+        "0644",
     )?;
-    let plist_source = write_privileged_staging_file(
-        spec,
-        "proxy-forwarder.plist",
-        &render_macos_forwarder_launch_daemon_plist(spec),
+    write_root_file(
+        sudo,
+        0,
+        render_macos_forwarder_launch_daemon_plist(spec).as_bytes(),
+        &spec.service_path,
+        "0644",
     )?;
-    install_root_file(&config_source, &spec.config_path, "0644")?;
-    install_root_file(&plist_source, &spec.service_path, "0644")?;
     let target = macos_system_launchctl_target(spec.label);
     run_macos_bootout(Command::new("sudo").args(["launchctl", "bootout", &target]))?;
     run_checked_inherited(
@@ -195,10 +202,7 @@ pub(super) fn install_privileged_forwarder_platform(
             .arg(&spec.service_path),
     )?;
     run_checked_inherited(Command::new("sudo").args(["launchctl", "enable", &target]))?;
-    run_checked_inherited(Command::new("sudo").args(["launchctl", "kickstart", "-k", &target]))?;
-    let _ = std::fs::remove_file(config_source);
-    let _ = std::fs::remove_file(plist_source);
-    Ok(())
+    run_checked_inherited(Command::new("sudo").args(["launchctl", "kickstart", "-k", &target]))
 }
 
 #[cfg(target_os = "macos")]
@@ -220,7 +224,7 @@ pub(super) fn uninstall_privileged_forwarder_platform(
             .arg("-f")
             .arg(&spec.config_path),
     )?;
-    Ok(())
+    uninstall_forwarder_executable(spec.executable.install_dir(), Path::new("sudo"))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -242,41 +246,8 @@ pub(super) fn uninstall_privileged_forwarder_platform(
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(super) fn write_privileged_staging_file(
-    spec: &PrivilegedForwarderSpec,
-    file_name: &str,
-    contents: &str,
-) -> Result<PathBuf, LpmError> {
-    let lpm_home = spec.config.state_path.parent().ok_or_else(|| {
-        LpmError::Script(format!(
-            "proxy state path has no parent: {}",
-            spec.config.state_path.display()
-        ))
-    })?;
-    let staging_dir = lpm_home.join("services").join("proxy");
-    std::fs::create_dir_all(&staging_dir).map_err(LpmError::Io)?;
-    let path = staging_dir.join(file_name);
-    std::fs::write(&path, contents).map_err(LpmError::Io)?;
-    Ok(path)
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(super) fn install_root_file(
-    source: &Path,
-    destination: &Path,
-    mode: &str,
-) -> Result<(), LpmError> {
-    if let Some(parent) = destination.parent() {
-        run_checked_inherited(Command::new("sudo").arg("mkdir").arg("-p").arg(parent))?;
-    }
-    run_checked_inherited(
-        Command::new("sudo")
-            .arg("install")
-            .arg("-m")
-            .arg(mode)
-            .arg(source)
-            .arg(destination),
-    )
+fn privileged_forwarder_config_json(spec: &PrivilegedForwarderSpec) -> Result<String, LpmError> {
+    serde_json::to_string_pretty(&spec.config).map_err(|err| LpmError::Script(err.to_string()))
 }
 
 #[cfg(target_os = "macos")]
@@ -583,7 +554,7 @@ pub(super) fn run_checked(command: &mut Command) -> Result<(), LpmError> {
     run_checked_output(command).map(|_| ())
 }
 
-fn run_checked_output(command: &mut Command) -> Result<std::process::Output, LpmError> {
+pub(super) fn run_checked_output(command: &mut Command) -> Result<std::process::Output, LpmError> {
     let output = command
         .stdin(std::process::Stdio::inherit())
         .output()
@@ -608,10 +579,22 @@ fn run_checked_output(command: &mut Command) -> Result<std::process::Output, Lpm
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn run_checked_inherited(command: &mut Command) -> Result<(), LpmError> {
-    let status = command
-        .stdout(std::process::Stdio::from(std::io::stderr()))
-        .status()
-        .map_err(LpmError::Io)?;
+    run_checked_status(command.stdout(std::process::Stdio::from(std::io::stderr())))
+}
+
+/// Run `command` with the standard streams it was given, failing unless it
+/// succeeds.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn run_checked_status(command: &mut Command) -> Result<(), LpmError> {
+    let status = command.status().map_err(LpmError::Io)?;
+    require_success(command, status)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn require_success(
+    command: &Command,
+    status: std::process::ExitStatus,
+) -> Result<(), LpmError> {
     if status.success() {
         return Ok(());
     }

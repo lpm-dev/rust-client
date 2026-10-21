@@ -552,6 +552,10 @@ fn sample_forwarder_spec() -> PrivilegedForwarderSpec {
     PrivilegedForwarderSpec {
         label: "dev.lpm.proxy.forwarder",
         exe: PathBuf::from("/tmp/LPM Bin/lpm-rs"),
+        executable: super::forwarder_executable::ForwarderExecutable::plan(
+            Path::new("/home/dev/.lpm/bin/lpm-rs"),
+            PathBuf::from("/tmp/LPM Bin"),
+        ),
         start_args: vec![
             "proxy".to_string(),
             "forwarder".to_string(),
@@ -582,4 +586,21 @@ fn write_forwarder_config(path: &Path, target_uid: u32) {
     )
     .unwrap();
     std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+}
+
+/// Stands in for `sudo`: runs each step as the current user after the shell
+/// `prelude`, skipping `chown`, which needs root.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn fake_privileged_runner(directory: &Path, prelude: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::create_dir_all(directory).unwrap();
+    let path = directory.join("privileged");
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\nif [ \"$1\" = chown ]; then exit 0; fi\n{prelude}exec \"$@\"\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    path
 }

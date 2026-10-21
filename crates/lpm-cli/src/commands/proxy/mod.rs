@@ -1,5 +1,8 @@
+mod forwarder_executable;
 mod proxy_platform;
 mod proxy_service;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod root_fs;
 
 #[cfg(test)]
 mod tests;
@@ -235,6 +238,10 @@ async fn run_status(json_output: bool) -> Result<(), LpmError> {
     }
 
     render_status_human(&status);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Some(notice) = proxy_service::installed_forwarder_notice() {
+        install_ui::warn_untrusted(&notice);
+    }
     Ok(())
 }
 

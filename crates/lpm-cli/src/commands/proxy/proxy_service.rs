@@ -1,3 +1,4 @@
+use super::forwarder_executable::ForwarderExecutable;
 use super::listener_args;
 use super::proxy_platform::{
     install_privileged_forwarder_platform, install_proxy_service_platform,
@@ -195,7 +196,9 @@ impl ProxyServiceSpec {
 #[cfg_attr(windows, allow(dead_code))]
 pub(super) struct PrivilegedForwarderSpec {
     pub(super) label: &'static str,
+    /// Root-owned copy of lpm that the service runs; see [`ForwarderExecutable`].
     pub(super) exe: PathBuf,
+    pub(super) executable: ForwarderExecutable,
     pub(super) start_args: Vec<String>,
     pub(super) config_path: PathBuf,
     pub(super) service_path: PathBuf,
@@ -263,7 +266,10 @@ impl PrivilegedForwarderSpec {
                     "--forwarder-config".to_string(),
                     config_path.display().to_string(),
                 ];
-                let exe = std::env::current_exe().map_err(LpmError::Io)?;
+                let executable = ForwarderExecutable::for_running_executable(
+                    privileged_forwarder_executable_dir(),
+                )?;
+                let exe = executable.installed_executable().to_path_buf();
                 let config = PrivilegedForwarderConfig::new(
                     target_uid,
                     root.proxy_state(),
@@ -273,6 +279,7 @@ impl PrivilegedForwarderSpec {
                 Ok(Self {
                     label: "dev.lpm.proxy.forwarder",
                     exe,
+                    executable,
                     start_args,
                     config_path,
                     service_path,
@@ -314,9 +321,13 @@ impl PrivilegedForwarderSpec {
                     "--forwarder-config".to_string(),
                     config_path.display().to_string(),
                 ];
+                let executable =
+                    ForwarderExecutable::for_removal(privileged_forwarder_executable_dir());
+                let exe = executable.installed_executable().to_path_buf();
                 Ok(Self {
                     label: "dev.lpm.proxy.forwarder",
-                    exe: std::env::current_exe().map_err(LpmError::Io)?,
+                    exe: exe.clone(),
+                    executable,
                     start_args,
                     config_path,
                     service_path,
@@ -326,8 +337,9 @@ impl PrivilegedForwarderSpec {
                     config: PrivilegedForwarderConfig {
                         target_uid: current_effective_uid(),
                         state_path: root.proxy_state(),
-                        binary_path: std::env::current_exe().map_err(LpmError::Io)?,
+                        binary_path: exe,
                         rules: Vec::new(),
+                        lpm_version: None,
                     },
                     replace_existing: false,
                 })
@@ -343,6 +355,10 @@ pub(super) struct PrivilegedForwarderConfig {
     pub(super) state_path: PathBuf,
     pub(super) binary_path: PathBuf,
     pub(super) rules: Vec<PrivilegedForwarderRuleConfig>,
+    /// Version of the root-owned lpm copy the forwarder runs, which stays put
+    /// when the user's own lpm updates. Absent in configs from earlier releases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) lpm_version: Option<String>,
 }
 
 impl PrivilegedForwarderConfig {
@@ -377,6 +393,7 @@ impl PrivilegedForwarderConfig {
             state_path,
             binary_path,
             rules,
+            lpm_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         })
     }
 }
@@ -579,6 +596,22 @@ fn privileged_forwarder_config_path() -> PathBuf {
     PathBuf::from("/Library/Application Support/LPM/proxy-forwarder.json")
 }
 
+/// A warning `lpm proxy status` shows about the installed privileged forwarder.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn installed_forwarder_notice() -> Option<String> {
+    super::forwarder_executable::installed_forwarder_notice(&privileged_forwarder_config_path())
+}
+
+#[cfg(target_os = "linux")]
+fn privileged_forwarder_executable_dir() -> PathBuf {
+    PathBuf::from("/opt/lpm/proxy-forwarder")
+}
+
+#[cfg(target_os = "macos")]
+fn privileged_forwarder_executable_dir() -> PathBuf {
+    PathBuf::from("/Library/Application Support/LPM/Forwarder")
+}
+
 #[cfg(target_os = "linux")]
 fn privileged_forwarder_service_path(label: &str) -> PathBuf {
     PathBuf::from("/etc/systemd/system").join(super::proxy_platform::linux_systemd_unit_name(label))
@@ -660,6 +693,7 @@ fn privileged_forwarder_json(spec: &PrivilegedForwarderSpec) -> serde_json::Valu
         "service": spec.label,
         "servicePath": spec.service_path,
         "configPath": spec.config_path,
+        "executable": spec.exe,
         "args": spec.start_args,
         "targetUid": spec.config.target_uid,
         "statePath": spec.config.state_path,

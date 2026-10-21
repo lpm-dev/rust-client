@@ -45,6 +45,23 @@ pub fn ignores_ownership(handle: impl AsFd) -> io::Result<bool> {
     Ok(flags & libc::MNT_IGNORE_OWNERSHIP as u32 != 0)
 }
 
+/// Like [`ignores_ownership`], for the volume holding what `path` leads to,
+/// found without opening it, so it needs no read access and never waits on
+/// a FIFO.
+pub fn ignores_ownership_at(path: &Path) -> io::Result<bool> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let mut volume = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: statfs reads a NUL-terminated path that outlives the call and
+    // fills `volume`.
+    if unsafe { libc::statfs(path.as_ptr(), volume.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: statfs succeeded, so it filled `volume`.
+    let flags = unsafe { volume.assume_init() }.f_flags;
+    Ok(flags & libc::MNT_IGNORE_OWNERSHIP as u32 != 0)
+}
+
 /// Whether the open file or directory has extended ACL entries.
 pub fn has_extended_acl(handle: impl AsFd) -> io::Result<bool> {
     let file_descriptor = handle.as_fd().as_raw_fd();
@@ -201,6 +218,7 @@ mod tests {
         let handle = std::fs::File::open(directory.path()).unwrap();
 
         assert!(!ignores_ownership(&handle).unwrap());
+        assert!(!ignores_ownership_at(directory.path()).unwrap());
     }
 
     #[test]
@@ -217,8 +235,17 @@ mod tests {
         );
 
         let handle = std::fs::File::open(attached.path()).unwrap();
+        let unreadable = attached.path().join("unreadable");
+        std::fs::create_dir(&unreadable).unwrap();
+        std::fs::set_permissions(
+            &unreadable,
+            std::os::unix::fs::PermissionsExt::from_mode(0o111),
+        )
+        .unwrap();
 
         assert!(ignores_ownership(&handle).unwrap());
+        assert!(ignores_ownership_at(attached.path()).unwrap());
+        assert!(ignores_ownership_at(&unreadable).unwrap());
     }
 
     fn add_entry(path: &std::path::Path, entry: &str) {

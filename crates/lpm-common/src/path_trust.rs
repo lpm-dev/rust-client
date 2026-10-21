@@ -29,6 +29,27 @@ const MAX_LINKS: usize = 40;
 /// root owns, which only they may move. A link is followed, and its target
 /// resolved the same way. None when every directory consulted is safe.
 pub fn first_changeable_directory(path: &Path, uid: u32) -> io::Result<Option<Changeable>> {
+    first_changeable_directory_with(path, uid, |_| Ok(None))
+}
+
+/// Like [`first_changeable_directory`], also asking `also` about each
+/// directory resolving `path` passes through, the ones a link leads through
+/// on the way included: a reason it gives makes that directory changeable.
+pub fn first_changeable_directory_with(
+    path: &Path,
+    uid: u32,
+    mut also: impl FnMut(&Path) -> io::Result<Option<&'static str>>,
+) -> io::Result<Option<Changeable>> {
+    let mut check =
+        |directory: &Path, metadata: &std::fs::Metadata| -> io::Result<Option<Changeable>> {
+            if let Some(found) = changeable(directory, metadata, uid)? {
+                return Ok(Some(found));
+            }
+            Ok(also(directory)?.map(|reason| Changeable {
+                directory: directory.to_path_buf(),
+                reason,
+            }))
+        };
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -37,7 +58,7 @@ pub fn first_changeable_directory(path: &Path, uid: u32) -> io::Result<Option<Ch
     let mut pending: Vec<std::ffi::OsString> = Vec::new();
     push_components(&mut pending, &absolute);
     let mut current = PathBuf::from("/");
-    if let Some(found) = changeable(&current, &std::fs::metadata(&current)?, uid)? {
+    if let Some(found) = check(&current, &std::fs::metadata(&current)?)? {
         return Ok(Some(found));
     }
     let mut links = 0;
@@ -74,7 +95,7 @@ pub fn first_changeable_directory(path: &Path, uid: u32) -> io::Result<Option<Ch
         }
         current = next;
         if entry.is_dir()
-            && let Some(found) = changeable(&current, &entry, uid)?
+            && let Some(found) = check(&current, &entry)?
         {
             return Ok(Some(found));
         }
@@ -478,6 +499,31 @@ mod tests {
 
         let found = first_changeable_directory(&link, me()).unwrap().unwrap();
         assert_eq!(found.directory, open.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn an_extra_check_sees_each_directory_a_link_leads_through() {
+        let directory = tempfile::tempdir().unwrap();
+        let safe = directory.path().join("safe");
+        let passed = directory.path().join("passed");
+        for path in [&safe, &passed] {
+            std::fs::create_dir(path).unwrap();
+            set_mode(path, 0o755);
+        }
+        std::os::unix::fs::symlink(&safe, passed.join("back")).unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(passed.join("back"), &link).unwrap();
+        let passed = passed.canonicalize().unwrap();
+
+        let found = first_changeable_directory_with(&link, me(), |seen| {
+            Ok((seen == passed).then_some("flagged"))
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(found.directory, passed);
+        assert_eq!(found.reason, "flagged");
+        assert_eq!(first_changeable_directory(&link, me()).unwrap(), None);
     }
 
     #[test]

@@ -2199,25 +2199,25 @@ struct StandaloneAssets {
 }
 
 #[cfg(any(target_os = "macos", test))]
-const MACOS_APP_NAME: &str = "LPM CLI.app";
+pub(crate) const MACOS_APP_NAME: &str = "LPM CLI.app";
 #[cfg(any(target_os = "macos", test))]
 const MACOS_INTERNAL_EXECUTABLE: &str = "Contents/MacOS/lpm-rs";
 #[cfg(any(target_os = "macos", test))]
-const MACOS_BUNDLE_MAX_ENTRIES: usize = 64;
+pub(crate) const MACOS_BUNDLE_MAX_ENTRIES: usize = 64;
 #[cfg(any(target_os = "macos", test))]
-const MACOS_BUNDLE_MAX_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const MACOS_BUNDLE_MAX_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(any(target_os = "macos", test))]
-const MACOS_BUNDLE_MAX_EXTRACTED_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MACOS_BUNDLE_MAX_EXTRACTED_BYTES: u64 = 512 * 1024 * 1024;
 #[cfg(target_os = "macos")]
-const MACOS_EXPECTED_TEAM_ID: &str = "823S8YKMRW";
+pub(crate) const MACOS_EXPECTED_TEAM_ID: &str = "823S8YKMRW";
 #[cfg(target_os = "macos")]
-const MACOS_EXPECTED_BUNDLE_ID: &str = "dev.lpm.cli";
+pub(crate) const MACOS_EXPECTED_BUNDLE_ID: &str = "dev.lpm.cli";
 #[cfg(target_os = "macos")]
 const MACOS_EXPECTED_ACCESS_GROUP: &str = "823S8YKMRW.dev.lpm.vault.shared";
 #[cfg(target_os = "macos")]
 const MACOS_EXPECTED_PROFILE_ACCESS_GROUP: &str = "823S8YKMRW.*";
 #[cfg(any(target_os = "macos", test))]
-const MACOS_REQUIRED_BUNDLE_FILES: [&str; 5] = [
+pub(crate) const MACOS_REQUIRED_BUNDLE_FILES: [&str; 5] = [
     "LPM CLI.app/Contents/Info.plist",
     "LPM CLI.app/Contents/CodeResources",
     "LPM CLI.app/Contents/embedded.provisionprofile",
@@ -2227,9 +2227,10 @@ const MACOS_REQUIRED_BUNDLE_FILES: [&str; 5] = [
 // Icon resources were added after the first signed app release. Code-signature
 // validation still requires any resource sealed by the downloaded app.
 #[cfg(any(target_os = "macos", test))]
-const MACOS_OPTIONAL_BUNDLE_FILES: [&str; 1] = ["LPM CLI.app/Contents/Resources/LPMCLI.icns"];
+pub(crate) const MACOS_OPTIONAL_BUNDLE_FILES: [&str; 1] =
+    ["LPM CLI.app/Contents/Resources/LPMCLI.icns"];
 #[cfg(any(target_os = "macos", test))]
-const MACOS_ALLOWED_BUNDLE_DIRECTORIES: [&str; 5] = [
+pub(crate) const MACOS_ALLOWED_BUNDLE_DIRECTORIES: [&str; 5] = [
     "LPM CLI.app",
     "LPM CLI.app/Contents",
     "LPM CLI.app/Contents/MacOS",
