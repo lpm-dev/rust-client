@@ -1995,7 +1995,7 @@ jobs:
       - release-metadata
     if: needs.finalize-promotion-release.result == 'success' && needs.release-metadata.outputs.mode == 'promote'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       actions: read
       contents: read
@@ -2082,6 +2082,13 @@ jobs:
           publish_package @lpm-registry/cli-linux-arm64
           publish_package @lpm-registry/cli-win32-x64
 
+      - name: Verify npm serves every platform package
+        run: >-
+          node npm/release/verify-registry-publication.mjs
+          --manifest "$PWD/release-candidate/npm-release-packages/release-packages.json"
+          --scope platforms
+          --tag "$NPM_TAG"
+
       - name: Publish exact wrapper tarball last
         env:
           GH_TOKEN: ${{ github.token }}
@@ -2109,6 +2116,13 @@ jobs:
               exit "$exit_code"
             fi
           fi
+
+      - name: Verify npm serves the wrapper package
+        run: >-
+          node npm/release/verify-registry-publication.mjs
+          --manifest "$PWD/release-candidate/npm-release-packages/release-packages.json"
+          --scope wrapper
+          --tag latest
 
       - name: Verify published wrapper install
         env:
@@ -2428,7 +2442,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' &&
       needs.release-metadata.outputs.mode == 'npm-publish-only'))
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     permissions:
       contents: read
       id-token: write
@@ -2557,6 +2571,13 @@ jobs:
           done
           publish_pkg @lpm-registry/cli-win32-x64
 
+      - name: Verify npm serves every platform package
+        run: >-
+          node npm/release/verify-registry-publication.mjs
+          --manifest npm-release-packages/release-packages.json
+          --scope platforms
+          --tag "$NPM_TAG"
+
   publish-npm-wrapper:
     name: Publish @lpm-registry/cli wrapper
     needs:
@@ -2573,7 +2594,7 @@ jobs:
       needs.release-metadata.outputs.mode == 'npm-publish-only' &&
       needs.publish-npm-platform.result == 'success'))
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     permissions:
       contents: read
       id-token: write
@@ -2664,6 +2685,13 @@ jobs:
           test "$actual" = "lpm $VERSION"
           "$PREFIX/node_modules/.bin/lpx" --help >/dev/null
 
+      - name: Verify npm serves every platform package before publishing the wrapper
+        run: >-
+          node npm/release/verify-registry-publication.mjs
+          --manifest npm-release-packages/release-packages.json
+          --scope platforms
+          --tag "$NPM_TAG"
+
       - name: Publish exact verified wrapper tarball
         env:
           EXPECTED_SOURCE_SHA: ${{ needs.release-metadata.outputs.mode == 'full' && github.sha || steps.source.outputs.source_sha }}
@@ -2696,6 +2724,13 @@ jobs:
               exit "$exit_code"
             fi
           fi
+
+      - name: Verify npm serves the wrapper package
+        run: >-
+          node npm/release/verify-registry-publication.mjs
+          --manifest npm-release-packages/release-packages.json
+          --scope wrapper
+          --tag "$NPM_TAG"
 
       - name: Verify published wrapper from npm
         run: |
