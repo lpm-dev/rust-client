@@ -542,6 +542,10 @@ fn has_extended_acl(path: &Path) -> Result<bool, LpmError> {
 /// A Linux ACL grants no more than the mode's group bits, which the checks
 /// read already.
 #[cfg(target_os = "linux")]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "keeps the signature of the fallible macOS check"
+)]
 fn has_extended_acl(_path: &Path) -> Result<bool, LpmError> {
     Ok(false)
 }
