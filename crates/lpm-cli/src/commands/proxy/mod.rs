@@ -1,6 +1,8 @@
 mod forwarder_executable;
 mod proxy_platform;
 mod proxy_service;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod root_fs;
 
 #[cfg(test)]
 mod tests;
