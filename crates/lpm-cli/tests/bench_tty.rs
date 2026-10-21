@@ -66,23 +66,33 @@ fn run_bench_terminal(args: &[&str], watch: bool) {
     let group = child.id() as i32;
     let mut transcript = Vec::new();
     let mut buffer = [0_u8; 4096];
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
+    let mut read_available = |transcript: &mut Vec<u8>| loop {
         match master.read(&mut buffer) {
+            Ok(0) => return,
             Ok(count) => transcript.extend_from_slice(&buffer[..count]),
             Err(error)
                 if error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.raw_os_error() == Some(libc::EIO) => {}
+                    || error.raw_os_error() == Some(libc::EIO) =>
+            {
+                return;
+            }
             Err(error) => panic!("terminal read failed: {error}"),
         }
+    };
+    // A loaded macOS runner can take seconds just to launch the debug binary, so the deadline
+    // only bounds a hung benchmark; the expected outcomes end the wait as soon as they occur.
+    let deadline = Instant::now() + BENCH_TERMINAL_TIMEOUT;
+    let outcome = loop {
+        read_available(&mut transcript);
         if let Some(status) = child.try_wait().unwrap() {
-            break Some(status);
+            read_available(&mut transcript);
+            break BenchOutcome::Exited(status);
         }
-        if watch && String::from_utf8_lossy(&transcript).contains("BENCH_WATCHING") {
-            break None;
+        if String::from_utf8_lossy(&transcript).contains("BENCH_WATCHING") {
+            break BenchOutcome::Watching;
         }
         if Instant::now() >= deadline {
-            break None;
+            break BenchOutcome::TimedOut;
         }
         std::thread::sleep(Duration::from_millis(10));
     };
@@ -92,18 +102,26 @@ fn run_bench_terminal(args: &[&str], watch: bool) {
     }
     let _ = child.wait();
     let transcript = String::from_utf8_lossy(&transcript);
-    if watch {
-        assert!(
-            status.is_none() && transcript.contains("BENCH_WATCHING"),
-            "explicit watch did not stay active: {transcript}"
-        );
-    } else {
-        assert!(
-            status.is_some_and(|status| status.success()),
-            "default benchmark entered watch mode: {transcript}"
-        );
-        assert!(transcript.contains("BENCH_FINISHED"));
+    match (watch, outcome) {
+        (true, BenchOutcome::Watching) => {}
+        (false, BenchOutcome::Exited(status)) if status.success() => {
+            assert!(transcript.contains("BENCH_FINISHED"), "{transcript}");
+        }
+        (true, outcome) => panic!("explicit watch did not stay active ({outcome:?}): {transcript}"),
+        (false, BenchOutcome::Watching) => {
+            panic!("default benchmark entered watch mode: {transcript}")
+        }
+        (false, outcome) => panic!("default benchmark did not finish ({outcome:?}): {transcript}"),
     }
+}
+
+const BENCH_TERMINAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Debug)]
+enum BenchOutcome {
+    Exited(std::process::ExitStatus),
+    Watching,
+    TimedOut,
 }
 
 #[test]

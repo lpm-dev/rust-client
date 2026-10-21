@@ -527,14 +527,9 @@ fn socket_addr_port(value: &serde_json::Value) -> u64 {
 fn proxy_start_status_stop_round_trips_foreground_control_daemon() {
     let _guard = proxy_daemon_test_guard();
     let (project, lpm_home) = isolated_dirs();
-    let mut child = common::lpm_command(project.path(), lpm_home.path(), None, &["proxy", "start"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn lpm proxy start");
+    let mut daemon = ProxyDaemonChild::spawn(project.path(), lpm_home.path(), &["proxy", "start"]);
 
-    wait_for_proxy_running(project.path(), lpm_home.path(), &mut child);
+    wait_for_proxy_running(project.path(), lpm_home.path(), &mut daemon);
 
     let (status, stdout, stderr) = common::run_lpm(
         project.path(),
@@ -548,17 +543,7 @@ fn proxy_start_status_stop_round_trips_foreground_control_daemon() {
     let json = common::parse_json_stdout(&stdout);
     assert_eq!(json["success"], true);
     assert_eq!(json["stopped"], true);
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().expect("poll proxy child") {
-            assert!(status.success(), "proxy child exited with {status}");
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let _ = child.kill();
-    panic!("proxy child did not exit after stop");
+    wait_for_proxy_child_exit(&mut daemon);
 }
 
 #[cfg(unix)]
@@ -567,19 +552,13 @@ fn proxy_start_http_port_routes_registered_host() {
     let _guard = proxy_daemon_test_guard();
     let (project, lpm_home) = isolated_dirs();
     let upstream_port = spawn_echo_upstream();
-    let mut child = common::lpm_command(
+    let mut daemon = ProxyDaemonChild::spawn(
         project.path(),
         lpm_home.path(),
-        None,
         &["proxy", "start", "--http-port", "0"],
-    )
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    .spawn()
-    .expect("spawn lpm proxy start");
+    );
 
-    let status = wait_for_proxy_running(project.path(), lpm_home.path(), &mut child);
+    let status = wait_for_proxy_running(project.path(), lpm_home.path(), &mut daemon);
     let http_addr = status["httpAddr"]
         .as_str()
         .expect("status should include bound HTTP address")
@@ -627,7 +606,7 @@ fn proxy_start_http_port_routes_registered_host() {
     assert_eq!(stderr, "");
     let json = common::parse_json_stdout(&stdout);
     assert_eq!(json["stopped"], true);
-    wait_for_proxy_child_exit(&mut child);
+    wait_for_proxy_child_exit(&mut daemon);
 }
 
 #[cfg(unix)]
@@ -640,14 +619,9 @@ fn proxy_start_uses_lpm_json_proxy_listener_defaults_without_explicit_flags() {
         r#"{"proxy":{"host":"app.localhost","port":0,"httpRedirect":false}}"#,
     )
     .expect("write lpm.json");
-    let mut child = common::lpm_command(project.path(), lpm_home.path(), None, &["proxy", "start"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn lpm proxy start");
+    let mut daemon = ProxyDaemonChild::spawn(project.path(), lpm_home.path(), &["proxy", "start"]);
 
-    let status = wait_for_proxy_running(project.path(), lpm_home.path(), &mut child);
+    let status = wait_for_proxy_running(project.path(), lpm_home.path(), &mut daemon);
 
     assert!(
         status["tlsAddr"].as_str().is_some(),
@@ -664,7 +638,7 @@ fn proxy_start_uses_lpm_json_proxy_listener_defaults_without_explicit_flags() {
     assert_eq!(stderr, "");
     let json = common::parse_json_stdout(&stdout);
     assert_eq!(json["stopped"], true);
-    wait_for_proxy_child_exit(&mut child);
+    wait_for_proxy_child_exit(&mut daemon);
 }
 
 #[cfg(unix)]
@@ -674,19 +648,13 @@ fn proxy_start_tls_port_routes_registered_host_with_project_cert() {
     let (project, lpm_home) = isolated_dirs();
     write_project_cert(project.path(), &["app.localhost"]);
     let upstream_port = spawn_echo_upstream();
-    let mut child = common::lpm_command(
+    let mut daemon = ProxyDaemonChild::spawn(
         project.path(),
         lpm_home.path(),
-        None,
         &["proxy", "start", "--tls-port", "0"],
-    )
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    .spawn()
-    .expect("spawn lpm proxy start");
+    );
 
-    let status = wait_for_proxy_running(project.path(), lpm_home.path(), &mut child);
+    let status = wait_for_proxy_running(project.path(), lpm_home.path(), &mut daemon);
     let tls_addr = status["tlsAddr"]
         .as_str()
         .expect("status should include bound HTTPS address")
@@ -744,7 +712,7 @@ fn proxy_start_tls_port_routes_registered_host_with_project_cert() {
     assert_eq!(stderr, "");
     let json = common::parse_json_stdout(&stdout);
     assert_eq!(json["stopped"], true);
-    wait_for_proxy_child_exit(&mut child);
+    wait_for_proxy_child_exit(&mut daemon);
 }
 
 #[cfg(unix)]
@@ -752,10 +720,9 @@ fn proxy_start_tls_port_routes_registered_host_with_project_cert() {
 fn proxy_start_http_redirect_port_redirects_registered_host_to_https_listener() {
     let _guard = proxy_daemon_test_guard();
     let (project, lpm_home) = isolated_dirs();
-    let mut child = common::lpm_command(
+    let mut daemon = ProxyDaemonChild::spawn(
         project.path(),
         lpm_home.path(),
-        None,
         &[
             "proxy",
             "start",
@@ -764,14 +731,9 @@ fn proxy_start_http_redirect_port_redirects_registered_host_to_https_listener() 
             "--http-redirect-port",
             "0",
         ],
-    )
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    .spawn()
-    .expect("spawn lpm proxy start");
+    );
 
-    let status = wait_for_proxy_running(project.path(), lpm_home.path(), &mut child);
+    let status = wait_for_proxy_running(project.path(), lpm_home.path(), &mut daemon);
     let redirect_addr = status["httpRedirectAddr"]
         .as_str()
         .expect("status should include bound HTTP redirect address")
@@ -833,19 +795,48 @@ fn proxy_start_http_redirect_port_redirects_registered_host_to_https_listener() 
     assert_eq!(stderr, "");
     let json = common::parse_json_stdout(&stdout);
     assert_eq!(json["stopped"], true);
-    wait_for_proxy_child_exit(&mut child);
+    wait_for_proxy_child_exit(&mut daemon);
+}
+
+/// A foreground `lpm proxy start` whose stderr is kept, so a daemon that exits
+/// early or fails to stop reports why.
+#[cfg(unix)]
+struct ProxyDaemonChild {
+    child: std::process::Child,
+    stderr: tempfile::NamedTempFile,
+}
+
+#[cfg(unix)]
+impl ProxyDaemonChild {
+    fn spawn(project: &std::path::Path, lpm_home: &std::path::Path, args: &[&str]) -> Self {
+        let stderr = tempfile::NamedTempFile::new().expect("create proxy stderr capture");
+        let child = common::lpm_command(project, lpm_home, None, args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr.reopen().expect("open proxy stderr capture"))
+            .spawn()
+            .expect("spawn lpm proxy start");
+        Self { child, stderr }
+    }
+
+    fn stderr(&self) -> String {
+        std::fs::read_to_string(self.stderr.path()).unwrap_or_default()
+    }
 }
 
 #[cfg(unix)]
 fn wait_for_proxy_running(
     project: &std::path::Path,
     lpm_home: &std::path::Path,
-    child: &mut std::process::Child,
+    daemon: &mut ProxyDaemonChild,
 ) -> serde_json::Value {
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().expect("poll proxy child") {
-            panic!("proxy child exited before status became running: {status}");
+        if let Some(status) = daemon.child.try_wait().expect("poll proxy child") {
+            panic!(
+                "proxy child exited before status became running: {status}\nstderr:\n{}",
+                daemon.stderr()
+            );
         }
 
         let (status, stdout, _) =
@@ -858,8 +849,11 @@ fn wait_for_proxy_running(
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let _ = child.kill();
-    panic!("proxy daemon did not become ready");
+    let _ = daemon.child.kill();
+    panic!(
+        "proxy daemon did not become ready\nstderr:\n{}",
+        daemon.stderr()
+    );
 }
 
 fn wait_for_proxy_running_without_child(
@@ -882,17 +876,24 @@ fn wait_for_proxy_running_without_child(
 }
 
 #[cfg(unix)]
-fn wait_for_proxy_child_exit(child: &mut std::process::Child) {
+fn wait_for_proxy_child_exit(daemon: &mut ProxyDaemonChild) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if let Some(status) = child.try_wait().expect("poll proxy child") {
-            assert!(status.success(), "proxy child exited with {status}");
+        if let Some(status) = daemon.child.try_wait().expect("poll proxy child") {
+            assert!(
+                status.success(),
+                "proxy child exited with {status}\nstderr:\n{}",
+                daemon.stderr()
+            );
             return;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let _ = child.kill();
-    panic!("proxy child did not exit after stop");
+    let _ = daemon.child.kill();
+    panic!(
+        "proxy child did not exit after stop\nstderr:\n{}",
+        daemon.stderr()
+    );
 }
 
 #[cfg(unix)]
@@ -1018,20 +1019,29 @@ fn privileged_service_redirects_to_the_public_https_port() {
         );
         assert!(status.success(), "{stderr}");
         let plan = common::parse_json_stdout(&stdout);
-        let args: Vec<&str> = plan["args"]
+        let mut args: Vec<&str> = plan["args"]
             .as_array()
             .unwrap()
             .iter()
             .map(|arg| arg.as_str().unwrap())
             .collect();
-        let mut child = common::lpm_command(project.path(), lpm_home.path(), None, &args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let _cleanup = ProxyDaemonCleanup::new(project.path().into(), lpm_home.path().into());
-        let status = wait_for_proxy_running(project.path(), lpm_home.path(), &mut child);
+        for flag in ["--tls-port", "--http-redirect-port"] {
+            let value = args.iter().position(|arg| *arg == flag).map_or_else(
+                || panic!("the service plan has no {flag}: {plan}"),
+                |index| index + 1,
+            );
+            let backend_port: u16 = args[value].parse().expect("numeric backend port");
+            assert!(
+                backend_port >= 1024,
+                "the service plan must bind an unprivileged {flag} backend: {plan}"
+            );
+            // The planned port was free only when the plan was made, and parallel tests
+            // probe the same ports by binding them, so the daemon binds an ephemeral one.
+            args[value] = "0";
+        }
+        let mut daemon = ProxyDaemonChild::spawn(project.path(), lpm_home.path(), &args);
+        let cleanup = ProxyDaemonCleanup::new(project.path().into(), lpm_home.path().into());
+        let status = wait_for_proxy_running(project.path(), lpm_home.path(), &mut daemon);
         assert_eq!(
             status["public_tls_addr"],
             format!("https://127.0.0.1:{public_port}")
@@ -1076,6 +1086,9 @@ fn privileged_service_redirects_to_the_public_https_port() {
             response.headers()["location"],
             format!("https://{authority}/login?next=/app")
         );
+        let (stopped, _, stop_stderr) = cleanup.stop();
+        assert!(stopped.success(), "{stop_stderr}");
+        wait_for_proxy_child_exit(&mut daemon);
     }
 }
 
