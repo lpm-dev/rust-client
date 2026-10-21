@@ -1,5 +1,6 @@
 use super::swift::extract_swift_metadata;
 use crate::commands::publish_common::{self, TarballFile};
+use crate::prompt::PromptResultExt as _;
 use crate::{install_ui, quality};
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
@@ -91,7 +92,8 @@ pub(super) async fn resolve_lpm_otp(
             }
         })
         .interact()
-        .map_err(|e| OtpFailure::Final(LpmError::Registry(e.to_string())))?;
+        .map_prompt_err(|e| LpmError::Registry(e.to_string()))
+        .map_err(OtpFailure::Final)?;
     Ok(Some(code))
 }
 

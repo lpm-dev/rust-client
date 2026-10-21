@@ -1,4 +1,5 @@
 use crate::install_ui;
+use crate::prompt::PromptResultExt as _;
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
 use secrecy::{ExposeSecret, SecretString};
@@ -188,7 +189,7 @@ fn prompt_otp() -> Result<OtpCode, LpmError> {
             }
         })
         .interact()
-        .map_err(|error| LpmError::Registry(format!("OTP prompt failed: {error}")))?;
+        .map_prompt_err(|error| LpmError::Registry(format!("OTP prompt failed: {error}")))?;
     OtpCode::parse(value)
 }
 

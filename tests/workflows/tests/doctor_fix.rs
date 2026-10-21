@@ -572,7 +572,7 @@ fn doctor_all_fix_keeps_formatter_output_out_of_the_json_document() {
         marker.display(),
         marker.display()
     );
-    seed_verified_plugin_with_binary(&project, "biome", "2.5.9", formatter.as_bytes());
+    seed_verified_plugin_with_binary(&project, "biome", "2.6.2", formatter.as_bytes());
 
     let output = lpm_doctor_offline(&project)
         .env("LPM_PLUGIN_GITHUB_API_BASE", "http://127.0.0.1:1")
@@ -775,7 +775,7 @@ fn doctor_human_summary_reports_failed_repairs() {
     let project = TempProject::empty(r#"{"name":"doctor-fix-failure","version":"1.0.0"}"#);
     seed_healthy_hoisted_install(&project);
     seed_minimal_lockfile(&project);
-    seed_verified_plugin_with_binary(&project, "biome", "2.5.9", b"#!/bin/sh\nif [ \"$3\" = \"--write\" ]; then echo 'failed repair' >&2; exit 9; fi\necho 'Formatter would have printed fixture.js' >&2\nexit 1\n");
+    seed_verified_plugin_with_binary(&project, "biome", "2.6.2", b"#!/bin/sh\nif [ \"$3\" = \"--write\" ]; then echo 'failed repair' >&2; exit 9; fi\necho 'Formatter would have printed fixture.js' >&2\nexit 1\n");
     let output = lpm_doctor_offline(&project)
         .env("LPM_PLUGIN_GITHUB_API_BASE", "http://127.0.0.1:1")
         .args(["doctor", "--all", "--yes"])
@@ -808,15 +808,15 @@ async fn doctor_failed_plugin_repairs_identify_each_target() {
     for (name, version, route, tag) in [
         (
             "biome",
-            "2.5.9",
+            "2.6.2",
             "/repos/biomejs/biome/releases",
             "@biomejs/biome@99.0.0",
         ),
         (
             "oxlint",
-            "1.79.0",
+            "1.89.0",
             "/repos/oxc-project/oxc/releases",
-            "apps_v99.0.0",
+            "oxlint_v99.0.0",
         ),
     ] {
         seed_verified_plugin_with_binary(&project, name, version, b"#!/bin/sh\nexit 0\n");
@@ -865,7 +865,7 @@ async fn doctor_failed_plugin_repairs_identify_each_target() {
 fn doctor_does_not_substitute_an_installed_tool_for_an_unavailable_pin() {
     let project = TempProject::empty(r#"{"name":"doctor-pins","version":"1.0.0"}"#);
     project.write_file("lpm.json", r#"{"tools":{"biome":"2.5.8"}}"#);
-    seed_verified_plugin_with_binary(&project, "biome", "2.5.9", b"#!/bin/sh\nexit 0\n");
+    seed_verified_plugin_with_binary(&project, "biome", "2.6.2", b"#!/bin/sh\nexit 0\n");
     let output = lpm_doctor_offline(&project)
         .env("LPM_PLUGIN_GITHUB_API_BASE", "http://127.0.0.1:1")
         .args(["doctor", "--all", "--json"])

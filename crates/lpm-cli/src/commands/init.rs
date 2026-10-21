@@ -1,6 +1,7 @@
 use crate::cli::InitPackageTargetCli;
 use crate::install_ui;
 use crate::manifest_tx::ManifestTransaction;
+use crate::prompt::PromptResultExt as _;
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::RegistryClient;
 use std::io::{IsTerminal, Write};
@@ -256,7 +257,7 @@ fn resolve_init_target(options: &InitOptions<'_>) -> Result<InitPackageTarget, L
         .item("npm", "npm-compatible package", "publish target: npm")
         .initial_value("lpm")
         .interact()
-        .map_err(|e| LpmError::Registry(e.to_string()))?;
+        .map_prompt_err(|e| LpmError::Registry(e.to_string()))?;
 
     match choice {
         "lpm" => Ok(InitPackageTarget::Lpm),
@@ -364,7 +365,7 @@ fn prompt_string(
     }
     prompt
         .interact()
-        .map_err(|e| LpmError::Registry(e.to_string()))
+        .map_prompt_err(|e| LpmError::Registry(e.to_string()))
 }
 
 fn validate_lpm_owner(owner: &str) -> Result<(), LpmError> {

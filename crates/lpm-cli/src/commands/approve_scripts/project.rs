@@ -1,4 +1,5 @@
 use super::prelude::*;
+use crate::prompt::PromptResultExt as _;
 
 #[cfg(test)]
 thread_local! {
@@ -405,7 +406,7 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
             };
             cliclack::confirm(prompt)
                 .interact()
-                .map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?
+                .map_prompt_err(|e| LpmError::Script(format!("prompt failed: {e}")))?
         } else {
             true
         };
@@ -723,7 +724,7 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
                     .item(InteractiveChoice::Quit, "Quit", "abort without writing")
                     .initial_value(InteractiveChoice::KeepOld)
                     .interact()
-                    .map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?
+                    .map_prompt_err(|e| LpmError::Script(format!("prompt failed: {e}")))?
             } else {
                 // First-time review: original labels.
                 cliclack::select(prompt)
@@ -733,7 +734,7 @@ async fn run_under_store_lock(context: RunContext<'_>) -> Result<(), LpmError> {
                     .item(InteractiveChoice::Quit, "Quit", "abort without writing")
                     .initial_value(InteractiveChoice::Approve)
                     .interact()
-                    .map_err(|e| LpmError::Script(format!("prompt failed: {e}")))?
+                    .map_prompt_err(|e| LpmError::Script(format!("prompt failed: {e}")))?
             };
             match choice.decision() {
                 Some(d) => {

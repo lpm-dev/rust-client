@@ -315,6 +315,20 @@ fn hold_inherited_pipes_for_deadline_helper() {
     }
 }
 
+/// Read a request head before answering. Closing a socket with unread request
+/// bytes sends a reset, which can reach the client before it reads the response.
+async fn read_request_head(socket: &mut tokio::net::TcpStream) {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut head = Vec::with_capacity(1024);
+    let mut chunk = [0_u8; 1024];
+    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = socket.read(&mut chunk).await.unwrap();
+        assert_ne!(read, 0, "the client closed before sending its request");
+        head.extend_from_slice(&chunk[..read]);
+    }
+}
+
 async fn finish_bounded_tunnel_workflow(
     output_task: tokio::task::JoinHandle<std::process::Output>,
     mut relay_task: tokio::task::JoinHandle<()>,
@@ -1206,6 +1220,7 @@ fn plan_required_relay() -> (String, tokio::task::JoinHandle<bool>) {
             .await
             .expect("no connect reached the relay")
             .unwrap();
+        read_request_head(&mut socket).await;
         let body = r#"{"error":"Tunnels need a Pro plan. Upgrade at https://lpm.dev/pricing","code":"plan_required"}"#;
         tokio::io::AsyncWriteExt::write_all(&mut socket, format!("HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
         drop(socket);
@@ -1293,6 +1308,7 @@ async fn tunnel_json_reports_a_retry_before_a_successful_reconnection() {
     let relay_task = tokio::spawn(async move {
         tokio::time::timeout(Duration::from_secs(12), async {
             let (mut socket, _) = relay.accept().await.unwrap();
+            read_request_head(&mut socket).await;
             let body = r#"{"error":"Unable to initialize tunnel usage","code":"usage_unavailable"}"#;
             tokio::io::AsyncWriteExt::write_all(&mut socket, format!("HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             drop(socket);

@@ -1,4 +1,5 @@
 use super::*;
+use crate::prompt::PromptResultExt as _;
 
 #[derive(Clone, Copy)]
 pub(super) struct SwiftInstallOptions<'a> {
@@ -193,7 +194,7 @@ fn select_spm_target(targets: &[String], yes: bool) -> Result<String, LpmError> 
             }
             selection
                 .interact()
-                .map_err(|error| LpmError::Registry(format!("prompt failed: {error}")))
+                .map_prompt_err(|error| LpmError::Registry(format!("prompt failed: {error}")))
         }
     }
 }

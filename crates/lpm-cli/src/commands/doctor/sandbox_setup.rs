@@ -36,6 +36,7 @@ pub fn run(
     }
     #[cfg(windows)]
     {
+        use crate::prompt::PromptResultExt as _;
         use lpm_sandbox::helper_appcontainer::setup;
         use std::io::IsTerminal;
         let cwd = std::env::current_dir().map_err(LpmError::Io)?;
@@ -101,7 +102,7 @@ pub fn run(
                     "Apply these sandbox permissions?"
                 })
                 .interact()
-                .map_err(LpmError::Io)?
+                .map_prompt_err(LpmError::Io)?
                 {
                     return Ok(());
                 }

@@ -4,6 +4,7 @@ use crate::commands::publish_common::{
 use crate::commands::publish_npm::NPM_REGISTRY_URL;
 use crate::commands::web_auth;
 use crate::output;
+use crate::prompt::PromptResultExt as _;
 use flate2::read::GzDecoder;
 use lpm_common::LpmError;
 use lpm_runner::lpm_json::NpmPublishConfig;
@@ -839,7 +840,7 @@ fn is_otp_required(headers: &reqwest::header::HeaderMap) -> bool {
 fn prompt_npm_otp() -> Result<String, LpmError> {
     cliclack::input("Enter npm one-time password")
         .interact()
-        .map_err(|e| LpmError::Registry(e.to_string()))
+        .map_prompt_err(|e| LpmError::Registry(e.to_string()))
 }
 
 async fn response_json_or_empty(
@@ -1335,12 +1336,21 @@ mod tests {
 
     #[tokio::test]
     async fn stage_download_rejects_an_oversized_declared_tarball_before_reading_it() {
-        use tokio::io::AsyncWriteExt as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
+            // Closing a socket with unread request bytes sends a reset, which can reach the
+            // client before it reads the response headers.
+            let mut request = Vec::with_capacity(1024);
+            let mut chunk = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0, "the client closed before sending its request");
+                request.extend_from_slice(&chunk[..read]);
+            }
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 lpm_registry::MAX_COMPRESSED_TARBALL_SIZE + 1

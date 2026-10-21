@@ -16,6 +16,7 @@
 //! then succeed; the failure must be loud so the operator wires a
 //! different credential flow (long-lived token, OIDC, etc.) instead.
 
+use crate::prompt::PromptResultExt as _;
 use lpm_vault::sync::{CliStepUpCredential, discover_cli_step_up_policy, mint_cli_step_up_proof};
 use std::io::IsTerminal;
 
@@ -59,7 +60,7 @@ pub async fn request_cli_step_up_proof(
             );
             let password: String = cliclack::password("Password")
                 .interact()
-                .map_err(|e| LpmError::Script(format!("password prompt failed: {e}")))?;
+                .map_prompt_err(|e| LpmError::Script(format!("password prompt failed: {e}")))?;
 
             crate::commands::env::auth::execute_sync_with_bearer(
                 client,
@@ -93,7 +94,7 @@ pub async fn request_cli_step_up_proof(
             );
             let password: String = cliclack::password("Password")
                 .interact()
-                .map_err(|e| LpmError::Script(format!("password prompt failed: {e}")))?;
+                .map_prompt_err(|e| LpmError::Script(format!("password prompt failed: {e}")))?;
             let code: String = cliclack::input("Authenticator code (6 digits)")
                 .validate(|input: &String| {
                     if input.chars().all(|c| c.is_ascii_digit()) && input.len() == 6 {
@@ -103,7 +104,7 @@ pub async fn request_cli_step_up_proof(
                     }
                 })
                 .interact()
-                .map_err(|e| LpmError::Script(format!("totp prompt failed: {e}")))?;
+                .map_prompt_err(|e| LpmError::Script(format!("totp prompt failed: {e}")))?;
 
             crate::commands::env::auth::execute_sync_with_bearer(
                 client,

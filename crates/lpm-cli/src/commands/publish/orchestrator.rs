@@ -30,6 +30,7 @@ use super::version_data::{build_publish_version_data, integrity_to_sha512_hex};
 use super::wait::{DEFAULT_PUBLICATION_WAIT_TIMEOUT, wait_for_lpm_publication_with_oidc};
 use crate::commands::skills::author;
 use crate::commands::{npm_auth, publish_common, publish_npm};
+use crate::prompt::PromptResultExt as _;
 use crate::{auth, install_ui, oidc, provenance, sigstore};
 use lpm_common::{LpmError, PackageName};
 use lpm_registry::{PublishPreflightVerdict, RegistryClient};
@@ -1635,7 +1636,7 @@ async fn execute_prepared_inner(
             let confirm = cliclack::confirm(prompt_msg)
                 .initial_value(true)
                 .interact()
-                .map_err(|e| LpmError::Registry(e.to_string()))?;
+                .map_prompt_err(|e| LpmError::Registry(e.to_string()))?;
 
             if !confirm {
                 install_ui::skipped("Publish cancelled");
