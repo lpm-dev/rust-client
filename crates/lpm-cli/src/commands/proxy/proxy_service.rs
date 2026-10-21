@@ -321,9 +321,8 @@ impl PrivilegedForwarderSpec {
                     "--forwarder-config".to_string(),
                     config_path.display().to_string(),
                 ];
-                let executable = ForwarderExecutable::for_running_executable(
-                    privileged_forwarder_executable_dir(),
-                )?;
+                let executable =
+                    ForwarderExecutable::for_removal(privileged_forwarder_executable_dir());
                 let exe = executable.installed_executable().to_path_buf();
                 Ok(Self {
                     label: "dev.lpm.proxy.forwarder",
@@ -340,6 +339,7 @@ impl PrivilegedForwarderSpec {
                         state_path: root.proxy_state(),
                         binary_path: exe,
                         rules: Vec::new(),
+                        lpm_version: None,
                     },
                     replace_existing: false,
                 })
@@ -355,6 +355,10 @@ pub(super) struct PrivilegedForwarderConfig {
     pub(super) state_path: PathBuf,
     pub(super) binary_path: PathBuf,
     pub(super) rules: Vec<PrivilegedForwarderRuleConfig>,
+    /// Version of the root-owned lpm copy the forwarder runs, which stays put
+    /// when the user's own lpm updates. Absent in configs from earlier releases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) lpm_version: Option<String>,
 }
 
 impl PrivilegedForwarderConfig {
@@ -389,6 +393,7 @@ impl PrivilegedForwarderConfig {
             state_path,
             binary_path,
             rules,
+            lpm_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         })
     }
 }
@@ -591,13 +596,10 @@ fn privileged_forwarder_config_path() -> PathBuf {
     PathBuf::from("/Library/Application Support/LPM/proxy-forwarder.json")
 }
 
-/// The executable an installed privileged forwarder runs, when a non-root
-/// user could replace it.
+/// A warning `lpm proxy status` shows about the installed privileged forwarder.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(super) fn replaceable_installed_forwarder_executable() -> Option<PathBuf> {
-    super::forwarder_executable::replaceable_forwarder_executable(
-        &privileged_forwarder_config_path(),
-    )
+pub(super) fn installed_forwarder_notice() -> Option<String> {
+    super::forwarder_executable::installed_forwarder_notice(&privileged_forwarder_config_path())
 }
 
 #[cfg(target_os = "linux")]
