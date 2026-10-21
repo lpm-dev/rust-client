@@ -184,20 +184,33 @@ async fn run_forwarder(config_path: &Path) -> Result<(), LpmError> {
         )));
     }
 
-    let mut handles = Vec::with_capacity(config.rules.len());
-    for rule_config in &config.rules {
-        let rule =
-            lpm_proxy::TcpForwarderRule::new(rule_config.listen_addr, rule_config.target_addr)
-                .map_err(|err| LpmError::Script(err.to_string()))?;
+    let mut listeners = Vec::with_capacity(config.rules.len());
+    for rule in &config.rules {
+        if !rule.listen_addr.ip().is_loopback() {
+            return Err(LpmError::Script(format!(
+                "forwarder listen address must be loopback, got {}",
+                rule.listen_addr
+            )));
+        }
+        let listener = tokio::net::TcpListener::bind(rule.listen_addr)
+            .await
+            .map_err(|err| {
+                LpmError::Script(format!("bind TCP forwarder on {}: {err}", rule.listen_addr))
+            })?;
+        listeners.push((rule.target, listener));
+    }
+    lpm_proxy::drop_root_privileges(config.target_uid)
+        .map_err(|err| LpmError::Script(err.to_string()))?;
+
+    let mut handles = Vec::with_capacity(listeners.len());
+    for (target, listener) in listeners {
         let guard = lpm_proxy::UnixForwarderGuard::new(
             config.state_path.clone(),
             config.target_uid,
-            rule_config.target_addr,
-        )
-        .map_err(|err| LpmError::Script(err.to_string()))?;
+            target,
+        );
         handles.push(
-            lpm_proxy::start_guarded_tcp_forwarder(rule, guard)
-                .await
+            lpm_proxy::start_guarded_tcp_forwarder(listener, guard)
                 .map_err(|err| LpmError::Script(err.to_string()))?,
         );
     }
@@ -257,16 +270,14 @@ async fn run_start(
         ));
     }
 
-    let mut listeners = Vec::with_capacity(3);
-    if let Some(port) = options.http_port {
-        listeners.push(format!("HTTP on 127.0.0.1:{port}"));
-    }
-    if let Some(port) = options.http_redirect_port {
-        listeners.push(format!("HTTP redirect on 127.0.0.1:{port}"));
-    }
-    if let Some(port) = options.tls_port {
-        listeners.push(format!("HTTPS on 127.0.0.1:{port}"));
-    }
+    let listeners: Vec<String> = [
+        ("HTTP", options.http_port),
+        ("HTTP redirect", options.http_redirect_port),
+        ("HTTPS", options.tls_port),
+    ]
+    .into_iter()
+    .filter_map(|(kind, port)| port.map(|port| listener_announcement(kind, port)))
+    .collect();
     let message = if listeners.is_empty() {
         "Starting local proxy control daemon".to_string()
     } else {
@@ -407,6 +418,15 @@ fn clear_standard_handle_inheritance() -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Describe a listener before it binds; port 0 asks the system for a free port.
+pub(super) fn listener_announcement(kind: &str, port: u16) -> String {
+    if port == 0 {
+        format!("{kind} on a free 127.0.0.1 port")
+    } else {
+        format!("{kind} on 127.0.0.1:{port}")
+    }
 }
 
 pub(super) fn listener_args(options: lpm_proxy::ProxyDaemonOptions) -> Vec<String> {

@@ -301,7 +301,11 @@ fn proxy_install_privileged_ports_dry_run_reports_forwarder_plan_with_clean_fds(
     let args = json["args"].as_array().unwrap();
     for flag in ["--tls-port", "--http-redirect-port"] {
         let offset = args.iter().position(|arg| arg == flag).unwrap();
-        assert!(args[offset + 1].as_str().unwrap().parse::<u16>().unwrap() >= 1024);
+        assert_eq!(
+            args[offset + 1],
+            "0",
+            "the user daemon must bind a free {flag} backend each time it starts: {json}"
+        );
     }
 
     let forwarder = &json["privilegedForwarder"];
@@ -324,13 +328,17 @@ fn proxy_install_privileged_ports_dry_run_reports_forwarder_plan_with_clean_fds(
         .find(|rule| rule["name"] == "https")
         .expect("https forwarder rule");
     assert_eq!(https["listenAddr"], "127.0.0.1:443");
-    assert!(socket_addr_port(&https["targetAddr"]) >= 1024);
     let redirect = rules
         .iter()
         .find(|rule| rule["name"] == "httpRedirect")
         .expect("redirect forwarder rule");
     assert_eq!(redirect["listenAddr"], "127.0.0.1:80");
-    assert!(socket_addr_port(&redirect["targetAddr"]) >= 1024);
+    for rule in rules {
+        assert!(
+            rule.get("targetAddr").is_none(),
+            "the forwarder follows the daemon's advertised listener instead of a fixed backend: {rule}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -364,7 +372,6 @@ fn proxy_install_privileged_ports_uses_low_external_ports_when_config_uses_high_
         .find(|rule| rule["name"] == "https")
         .expect("https forwarder rule");
     assert_eq!(https["listenAddr"], "127.0.0.1:443");
-    assert!(socket_addr_port(&https["targetAddr"]) >= 1024);
 }
 
 #[cfg(unix)]
@@ -1019,26 +1026,12 @@ fn privileged_service_redirects_to_the_public_https_port() {
         );
         assert!(status.success(), "{stderr}");
         let plan = common::parse_json_stdout(&stdout);
-        let mut args: Vec<&str> = plan["args"]
+        let args: Vec<&str> = plan["args"]
             .as_array()
             .unwrap()
             .iter()
             .map(|arg| arg.as_str().unwrap())
             .collect();
-        for flag in ["--tls-port", "--http-redirect-port"] {
-            let value = args.iter().position(|arg| *arg == flag).map_or_else(
-                || panic!("the service plan has no {flag}: {plan}"),
-                |index| index + 1,
-            );
-            let backend_port: u16 = args[value].parse().expect("numeric backend port");
-            assert!(
-                backend_port >= 1024,
-                "the service plan must bind an unprivileged {flag} backend: {plan}"
-            );
-            // The planned port was free only when the plan was made, and parallel tests
-            // probe the same ports by binding them, so the daemon binds an ephemeral one.
-            args[value] = "0";
-        }
         let mut daemon = ProxyDaemonChild::spawn(project.path(), lpm_home.path(), &args);
         let cleanup = ProxyDaemonCleanup::new(project.path().into(), lpm_home.path().into());
         let status = wait_for_proxy_running(project.path(), lpm_home.path(), &mut daemon);
@@ -1090,6 +1083,62 @@ fn privileged_service_redirects_to_the_public_https_port() {
         assert!(stopped.success(), "{stop_stderr}");
         wait_for_proxy_child_exit(&mut daemon);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn privileged_service_starts_when_another_program_holds_its_backend_ports() {
+    if running_as_root() {
+        return;
+    }
+    let _guard = proxy_daemon_test_guard();
+    let (project, lpm_home) = isolated_dirs();
+    let (status, stdout, stderr) = common::run_lpm_with_env(
+        project.path(),
+        lpm_home.path(),
+        None,
+        &[("LPM_PROXY_SERVICE_DRY_RUN", "1")],
+        &["--json", "proxy", "install", "--privileged-ports"],
+    );
+    assert!(status.success(), "{stderr}");
+    let plan = common::parse_json_stdout(&stdout);
+    let args: Vec<&str> = plan["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|arg| arg.as_str().unwrap())
+        .collect();
+
+    // Another program takes the planned backend ports, and the former defaults, after
+    // installation and before the service starts.
+    let mut held_ports: Vec<u16> = ["--tls-port", "--http-redirect-port"]
+        .into_iter()
+        .filter_map(|flag| {
+            let value = args.iter().position(|arg| *arg == flag)? + 1;
+            args.get(value)?.parse().ok()
+        })
+        .filter(|port| *port != 0)
+        .collect();
+    held_ports.extend([9443, 9080]);
+    let _held: Vec<std::net::TcpListener> = held_ports
+        .into_iter()
+        .filter_map(|port| std::net::TcpListener::bind(("127.0.0.1", port)).ok())
+        .collect();
+
+    let mut daemon = ProxyDaemonChild::spawn(project.path(), lpm_home.path(), &args);
+    let cleanup = ProxyDaemonCleanup::new(project.path().into(), lpm_home.path().into());
+    let status = wait_for_proxy_running(project.path(), lpm_home.path(), &mut daemon);
+
+    assert_eq!(status["public_tls_addr"], "https://127.0.0.1:443");
+    for listener in ["tlsAddr", "httpRedirectAddr"] {
+        assert!(
+            socket_addr_port(&status[listener]) >= 1024,
+            "the daemon must advertise an unprivileged {listener}: {status}"
+        );
+    }
+    let (stopped, _, stop_stderr) = cleanup.stop();
+    assert!(stopped.success(), "{stop_stderr}");
+    wait_for_proxy_child_exit(&mut daemon);
 }
 
 #[cfg(unix)]

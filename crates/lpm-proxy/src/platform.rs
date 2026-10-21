@@ -144,6 +144,91 @@ pub(crate) fn process_is_running(_pid: u32) -> bool {
     true
 }
 
+/// Give up root for good, becoming `uid` with its primary group and no
+/// supplementary groups.
+///
+/// The privileged forwarder calls this once its low ports are bound, so every
+/// connection it relays is opened by the user whose daemon receives it, never
+/// by root.
+#[cfg(unix)]
+pub fn drop_root_privileges(uid: u32) -> Result<(), ProxyError> {
+    if uid == 0 {
+        return Err(ProxyError::Forwarder(
+            "the privileged forwarder must not keep running as root".to_string(),
+        ));
+    }
+    let gid = primary_gid_of(uid)?;
+    let os_error = |call: &str| {
+        ProxyError::Forwarder(format!(
+            "{call} while dropping root for UID {uid}: {}",
+            std::io::Error::last_os_error()
+        ))
+    };
+    // SAFETY: `setgroups` reads exactly one group ID from a valid pointer.
+    if unsafe { libc::setgroups(1, &gid) } != 0 {
+        return Err(os_error("setgroups"));
+    }
+    // SAFETY: `setgid` and `setuid` take plain IDs and have no memory preconditions.
+    if unsafe { libc::setgid(gid) } != 0 {
+        return Err(os_error("setgid"));
+    }
+    // SAFETY: as above.
+    if unsafe { libc::setuid(uid) } != 0 {
+        return Err(os_error("setuid"));
+    }
+    // SAFETY: these calls only read the process credentials.
+    let dropped = unsafe {
+        libc::getuid() == uid
+            && libc::geteuid() == uid
+            && libc::getgid() == gid
+            && libc::getegid() == gid
+    };
+    // SAFETY: `setuid` takes a plain ID; success here would mean root was regainable.
+    if !dropped || unsafe { libc::setuid(0) } == 0 {
+        return Err(ProxyError::Forwarder(format!(
+            "the forwarder could still act as root after switching to UID {uid}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn primary_gid_of(uid: u32) -> Result<libc::gid_t, ProxyError> {
+    const MAX_PASSWD_BUFFER: usize = 1 << 20;
+    let mut buffer: Vec<libc::c_char> = vec![0; 1024];
+    loop {
+        let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: every pointer is valid for the call, and `buffer` outlives `entry`'s use.
+        let code = unsafe {
+            libc::getpwuid_r(
+                uid,
+                entry.as_mut_ptr(),
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut found,
+            )
+        };
+        if code == libc::ERANGE && buffer.len() < MAX_PASSWD_BUFFER {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        if code != 0 {
+            return Err(ProxyError::Forwarder(format!(
+                "look up the account for UID {uid}: {}",
+                std::io::Error::from_raw_os_error(code)
+            )));
+        }
+        if found.is_null() {
+            return Err(ProxyError::Forwarder(format!(
+                "no account exists for UID {uid}"
+            )));
+        }
+        // SAFETY: `getpwuid_r` initialized `entry` because it reported a match.
+        return Ok(unsafe { entry.assume_init() }.pw_gid);
+    }
+}
+
 #[cfg(unix)]
 pub(crate) fn read_forwarder_daemon_state(
     path: &Path,
@@ -154,7 +239,8 @@ pub(crate) fn read_forwarder_daemon_state(
 
     let mut file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        // O_NONBLOCK keeps a FIFO planted at the path from blocking the open.
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|err| {
             ProxyError::Forwarder(format!(
@@ -217,17 +303,39 @@ pub(crate) fn read_forwarder_daemon_state(
     })
 }
 
+/// Resolve the backend a guarded forwarder rule delivers to.
+///
+/// The address comes from the user daemon's own state, so the daemon can
+/// bind whichever port is free when it starts. It is accepted only while that
+/// daemon is alive and owned by `expected_uid`, and only as `127.0.0.1` on an
+/// unprivileged port, which is the only address the daemon binds.
 #[cfg(unix)]
 pub(crate) fn validate_forwarder_daemon_state(
     state: &ProxyDaemonState,
     expected_uid: u32,
-    expected_addr: SocketAddr,
+    target: ForwarderTarget,
     mut process_alive: impl FnMut(u32) -> bool,
     mut process_uid: impl FnMut(u32) -> Option<u32>,
-) -> Result<(), ProxyError> {
-    if !state_contains_listener_addr(state, expected_addr) {
+) -> Result<SocketAddr, ProxyError> {
+    let advertised = match target {
+        ForwarderTarget::Https => state.tls_addr.as_deref(),
+        ForwarderTarget::HttpRedirect => state.http_redirect_addr.as_deref(),
+    }
+    .ok_or_else(|| {
+        ProxyError::Forwarder(format!(
+            "guarded proxy state does not advertise an {target} listener"
+        ))
+    })?;
+    let backend_addr = parse_state_listener_addr(advertised).ok_or_else(|| {
+        ProxyError::Forwarder(format!(
+            "guarded proxy state advertises an unparseable {target} listener {advertised:?}"
+        ))
+    })?;
+    if backend_addr.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        || backend_addr.port() < 1024
+    {
         return Err(ProxyError::Forwarder(format!(
-            "guarded proxy state does not advertise backend listener {expected_addr}"
+            "guarded proxy state advertises {target} listener {backend_addr}; expected 127.0.0.1 with port >=1024"
         )));
     }
     if !process_alive(state.pid) {
@@ -237,7 +345,7 @@ pub(crate) fn validate_forwarder_daemon_state(
         )));
     }
     match process_uid(state.pid) {
-        Some(uid) if uid == expected_uid => Ok(()),
+        Some(uid) if uid == expected_uid => Ok(backend_addr),
         Some(uid) => Err(ProxyError::Forwarder(format!(
             "guarded proxy daemon PID {} is owned by UID {uid}, expected UID {expected_uid}",
             state.pid
@@ -247,21 +355,6 @@ pub(crate) fn validate_forwarder_daemon_state(
             state.pid
         ))),
     }
-}
-
-#[cfg(unix)]
-pub(crate) fn state_contains_listener_addr(
-    state: &ProxyDaemonState,
-    expected_addr: SocketAddr,
-) -> bool {
-    [
-        state.http_addr.as_deref(),
-        state.http_redirect_addr.as_deref(),
-        state.tls_addr.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .any(|addr| parse_state_listener_addr(addr) == Some(expected_addr))
 }
 
 #[cfg(unix)]

@@ -64,9 +64,12 @@ pub use paths::proxy_socket_path_from_env;
 pub use paths::{
     proxy_pipe_name_for_root, proxy_state_path_from_env, read_status, read_status_from_path,
 };
+#[cfg(unix)]
+pub use platform::drop_root_privileges;
 pub use registry::RouteRegistry;
 pub use tcp_forward::{
-    TcpForwarderHandle, TcpForwarderRule, start_tcp_forwarder, start_tcp_forwarder_on_listener,
+    ForwarderTarget, TcpForwarderHandle, TcpForwarderRule, start_tcp_forwarder,
+    start_tcp_forwarder_on_listener,
 };
 #[cfg(unix)]
 pub use tcp_forward::{UnixForwarderGuard, start_guarded_tcp_forwarder};
