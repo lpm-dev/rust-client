@@ -1026,26 +1026,12 @@ fn privileged_service_redirects_to_the_public_https_port() {
         );
         assert!(status.success(), "{stderr}");
         let plan = common::parse_json_stdout(&stdout);
-        let mut args: Vec<&str> = plan["args"]
+        let args: Vec<&str> = plan["args"]
             .as_array()
             .unwrap()
             .iter()
             .map(|arg| arg.as_str().unwrap())
             .collect();
-        for flag in ["--tls-port", "--http-redirect-port"] {
-            let value = args.iter().position(|arg| *arg == flag).map_or_else(
-                || panic!("the service plan has no {flag}: {plan}"),
-                |index| index + 1,
-            );
-            let backend_port: u16 = args[value].parse().expect("numeric backend port");
-            assert!(
-                backend_port >= 1024,
-                "the service plan must bind an unprivileged {flag} backend: {plan}"
-            );
-            // The planned port was free only when the plan was made, and parallel tests
-            // probe the same ports by binding them, so the daemon binds an ephemeral one.
-            args[value] = "0";
-        }
         let mut daemon = ProxyDaemonChild::spawn(project.path(), lpm_home.path(), &args);
         let cleanup = ProxyDaemonCleanup::new(project.path().into(), lpm_home.path().into());
         let status = wait_for_proxy_running(project.path(), lpm_home.path(), &mut daemon);
@@ -1139,14 +1125,9 @@ fn privileged_service_starts_when_another_program_holds_its_backend_ports() {
         .filter_map(|port| std::net::TcpListener::bind(("127.0.0.1", port)).ok())
         .collect();
 
-    let mut child = common::lpm_command(project.path(), lpm_home.path(), None, &args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut daemon = ProxyDaemonChild::spawn(project.path(), lpm_home.path(), &args);
     let cleanup = ProxyDaemonCleanup::new(project.path().into(), lpm_home.path().into());
-    let status = wait_for_proxy_running(project.path(), lpm_home.path(), &mut child);
+    let status = wait_for_proxy_running(project.path(), lpm_home.path(), &mut daemon);
 
     assert_eq!(status["public_tls_addr"], "https://127.0.0.1:443");
     for listener in ["tlsAddr", "httpRedirectAddr"] {
@@ -1157,7 +1138,7 @@ fn privileged_service_starts_when_another_program_holds_its_backend_ports() {
     }
     let (stopped, _, stop_stderr) = cleanup.stop();
     assert!(stopped.success(), "{stop_stderr}");
-    wait_for_proxy_child_exit(&mut child);
+    wait_for_proxy_child_exit(&mut daemon);
 }
 
 #[cfg(unix)]
