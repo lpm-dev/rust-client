@@ -9,7 +9,7 @@ import { parseArgs } from 'node:util';
 
 export const MANAGERS = ['lpm', 'bun', 'pnpm', 'npm', 'aube', 'nub', 'deno', 'vlt', 'upm', 'yarn', 'vite'];
 export const ROWS = ['echo', 'node', 'esbuild', 'tsx', 'lint', 'fmt'];
-export const DEPS = { esbuild: '0.28.2', tsx: '4.23.15', oxlint: '1.79.0', '@biomejs/biome': '2.5.9', react: 'file:./react-0.0.0.tgz' };
+export const DEPS = { esbuild: '0.28.2', tsx: '4.23.15', oxlint: '1.89.0', '@biomejs/biome': '2.6.2', react: 'file:./react-0.0.0.tgz' };
 const SCRIPT = fileURLToPath(import.meta.url);
 const write = (p, value) => { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, value); };
 const json = (p, value) => write(p, `${JSON.stringify(value, null, 2)}\n`);

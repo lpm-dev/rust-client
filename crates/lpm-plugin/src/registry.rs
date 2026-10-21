@@ -1,5 +1,16 @@
 //! Hardcoded plugin registry — defines available tools, download URLs, and platforms.
 
+use std::borrow::Cow;
+
+/// A GitHub release tag naming scheme that applies to versions at or above `since`.
+#[derive(Debug, Clone, Copy)]
+pub struct ReleaseTagScheme {
+    /// Lowest version released under this scheme.
+    pub since: &'static str,
+    /// Tag text before the version, e.g. `oxlint_v` in `oxlint_v1.89.0`.
+    pub prefix: &'static str,
+}
+
 /// A plugin definition.
 #[derive(Debug, Clone)]
 pub struct PluginDef {
@@ -9,8 +20,12 @@ pub struct PluginDef {
     pub binary_name: &'static str,
     /// Latest known version.
     pub latest_version: &'static str,
-    /// Download URL template. Placeholders: `{version}`, `{platform}`.
+    /// Download URL template. Placeholders: `{tag}` (the release tag, with `@`
+    /// percent-encoded) and `{platform}` (the asset name).
     pub url_template: &'static str,
+    /// Release tag schemes ordered by descending `since`. A version's release
+    /// tag uses the first scheme whose `since` is at or below it.
+    pub release_tags: &'static [ReleaseTagScheme],
     /// Map from LPM platform string to asset suffix in the release.
     pub platform_map: &'static [(&'static str, &'static str)],
     /// Whether the download is a tar.gz archive (true) or a direct binary (false).
@@ -19,6 +34,48 @@ pub struct PluginDef {
     ///
     /// Other versions require upstream verification data or an explicit unverified override.
     pub checksums: &'static [(&'static str, &'static str)],
+}
+
+impl PluginDef {
+    fn release_tag_prefix(&self, version: &str) -> &'static str {
+        self.release_tags
+            .iter()
+            .find(|scheme| crate::versions::compare_versions(version, scheme.since).is_ge())
+            .map_or("", |scheme| scheme.prefix)
+    }
+
+    /// The GitHub release tag that publishes `version`.
+    pub fn release_tag(&self, version: &str) -> String {
+        let prefix = self.release_tag_prefix(version);
+        let mut tag = String::with_capacity(prefix.len() + version.len());
+        tag.push_str(prefix);
+        tag.push_str(version);
+        tag
+    }
+
+    /// The version a release tag publishes, if the tag follows the scheme that
+    /// version belongs to. Tags from other release families in the same
+    /// repository, or under a scheme that does not cover their version, are
+    /// rejected so the download URL built from the version names that tag.
+    pub fn version_from_release_tag<'a>(&self, tag: &'a str) -> Option<&'a str> {
+        self.release_tags.iter().find_map(|scheme| {
+            tag.strip_prefix(scheme.prefix)
+                .filter(|version| self.release_tag_prefix(version) == scheme.prefix)
+        })
+    }
+
+    /// The download URL of `asset` in the release that publishes `version`.
+    pub fn asset_url(&self, version: &str, asset: &str) -> String {
+        let tag = self.release_tag(version);
+        let tag = if tag.contains('@') {
+            Cow::Owned(tag.replace('@', "%40"))
+        } else {
+            Cow::Borrowed(tag.as_str())
+        };
+        self.url_template
+            .replace("{tag}", &tag)
+            .replace("{platform}", asset)
+    }
 }
 
 /// Get a plugin definition by name.
@@ -51,13 +108,23 @@ pub fn resolve_checksum(def: &PluginDef, platform: &str) -> Option<&'static str>
 
 static PLUGINS: &[PluginDef] = &[
     // Oxlint: distributed as .tar.gz archives from oxc-project/oxc
-    // Tag format: apps_v{version}
+    // Tag format: oxlint_v{version} from 1.85.0, apps_v{version} before it
     // Asset: oxlint-{rust-target-triple}.tar.gz (contains oxlint binary inside)
     PluginDef {
         name: "oxlint",
         binary_name: "oxlint",
-        latest_version: "1.79.0",
-        url_template: "https://github.com/oxc-project/oxc/releases/download/apps_v{version}/{platform}",
+        latest_version: "1.89.0",
+        url_template: "https://github.com/oxc-project/oxc/releases/download/{tag}/{platform}",
+        release_tags: &[
+            ReleaseTagScheme {
+                since: "1.85.0",
+                prefix: "oxlint_v",
+            },
+            ReleaseTagScheme {
+                since: "0.0.0",
+                prefix: "apps_v",
+            },
+        ],
         platform_map: &[
             ("darwin-arm64", "oxlint-aarch64-apple-darwin.tar.gz"),
             ("darwin-x64", "oxlint-x86_64-apple-darwin.tar.gz"),
@@ -72,23 +139,23 @@ static PLUGINS: &[PluginDef] = &[
         checksums: &[
             (
                 "darwin-arm64",
-                "930e3656277ca6ad135fe7bda18e1f64886e0f8d0755df8b19cd6b499f12931b",
+                "fa4349f33b24221e2d303ace66de3dac2ff756eab48126b2cb58429ed36bccbc",
             ),
             (
                 "darwin-x64",
-                "debd377ff3e7929743c440c6f23546a99658f7b0271725718c45197ace49bc5a",
+                "198261cfb91c0f0387c55642ba5c2c4aa2c3cf9593188f86187c759f280bae88",
             ),
             (
                 "linux-x64",
-                "c7ddeff22c8d5ebd23648ff0917dd67a85178d86937acc3300ff4e974faaa042",
+                "88492c336807a34062fa540416fe75037c04bcce1ed77824e3db3aaec215949a",
             ),
             (
                 "linux-arm64",
-                "47ae11cb1745202e26652a633449065f85bb974b5404d932d673995f39e9a724",
+                "69b3680c38b21395d4ea509fbd1019fa011db0cd717dd7be2ede2575cb6f7915",
             ),
             (
                 "win-x64",
-                "bd706727f9fb5e5e343fe3ad8166dfd4755b6843673c7451eb40a58a7df384c8",
+                "50be9b3d180a48f2a33fb9ab6d92383c6464d38e4df347b08b1bce6b999c8c15",
             ),
         ],
     },
@@ -98,8 +165,12 @@ static PLUGINS: &[PluginDef] = &[
     PluginDef {
         name: "biome",
         binary_name: "biome",
-        latest_version: "2.5.9",
-        url_template: "https://github.com/biomejs/biome/releases/download/%40biomejs/biome%40{version}/{platform}",
+        latest_version: "2.6.2",
+        url_template: "https://github.com/biomejs/biome/releases/download/{tag}/{platform}",
+        release_tags: &[ReleaseTagScheme {
+            since: "0.0.0",
+            prefix: "@biomejs/biome@",
+        }],
         platform_map: &[
             ("darwin-arm64", "biome-darwin-arm64"),
             ("darwin-x64", "biome-darwin-x64"),
@@ -114,23 +185,23 @@ static PLUGINS: &[PluginDef] = &[
         checksums: &[
             (
                 "darwin-arm64",
-                "7d8b51dec857ffa8aa35ce5eaa3a4476cd62bed013adc2896bf43cac0a67a79b",
+                "be66b76dcb930b1e365bd36c4f5d8557c2dda70b31567f8bd15509e487753a69",
             ),
             (
                 "darwin-x64",
-                "df2b50ee283634cdd6f7570b7da06bc3c9cd7ec0590ecbbaf986c7590bef3289",
+                "9bba9be8c50bf2a58bc6de8023b599e57613588800bd843273e9ccaa4deba52c",
             ),
             (
                 "linux-x64",
-                "013eb5158b9e53235dbbf31255cb3b776fb9338b32fa6ff4a44ee1ceed65ee63",
+                "43c08f3454d375d38c6441939acc8a557702bc8459272dd513f4f7474a4ed352",
             ),
             (
                 "linux-arm64",
-                "bf593f7955e3a437fb8056b255142b50872baa3e81371cda2c3fce9239af1890",
+                "08536c586089e603dae610f73adc3ab95c0a0fdb00c029662c09456c42ea3ac8",
             ),
             (
                 "win-x64",
-                "f8474a0f9f457df176c10be3f0e82be890e8986ff2805d4a7f3c5a4cba5962ca",
+                "283639d771d82502b7498e87cee2e703f84aa040144b04ea1bcfc0ab942a9184",
             ),
         ],
     },
@@ -174,16 +245,72 @@ mod tests {
     }
 
     #[test]
-    fn oxlint_url_format() {
+    fn oxlint_release_urls_follow_the_tag_scheme_of_each_version() {
         let p = get_plugin("oxlint").unwrap();
-        let url = p
-            .url_template
-            .replace("{version}", "1.79.0")
-            .replace("{platform}", "oxlint-aarch64-apple-darwin.tar.gz");
+        let asset = "oxlint-aarch64-apple-darwin.tar.gz";
+        for (version, tag) in [
+            ("1.89.0", "oxlint_v1.89.0"),
+            ("1.85.0", "oxlint_v1.85.0"),
+            ("1.84.0", "apps_v1.84.0"),
+            ("1.57.0", "apps_v1.57.0"),
+        ] {
+            assert_eq!(p.release_tag(version), tag);
+            assert_eq!(
+                p.asset_url(version, asset),
+                format!("https://github.com/oxc-project/oxc/releases/download/{tag}/{asset}")
+            );
+        }
+    }
+
+    #[test]
+    fn biome_release_urls_percent_encode_the_scoped_tag() {
+        let p = get_plugin("biome").unwrap();
+
+        assert_eq!(p.release_tag("2.6.2"), "@biomejs/biome@2.6.2");
         assert_eq!(
-            url,
-            "https://github.com/oxc-project/oxc/releases/download/apps_v1.79.0/oxlint-aarch64-apple-darwin.tar.gz"
+            p.asset_url("2.6.2", "biome-darwin-arm64"),
+            "https://github.com/biomejs/biome/releases/download/%40biomejs/biome%402.6.2/biome-darwin-arm64"
         );
+    }
+
+    #[test]
+    fn release_tags_map_to_versions_only_under_the_scheme_that_covers_them() {
+        let oxlint = get_plugin("oxlint").unwrap();
+        assert_eq!(
+            oxlint.version_from_release_tag("oxlint_v1.89.0"),
+            Some("1.89.0")
+        );
+        assert_eq!(
+            oxlint.version_from_release_tag("apps_v1.84.0"),
+            Some("1.84.0")
+        );
+        assert_eq!(oxlint.version_from_release_tag("apps_v1.89.0"), None);
+        assert_eq!(oxlint.version_from_release_tag("oxlint_v1.27.0"), None);
+        assert_eq!(oxlint.version_from_release_tag("oxfmt_v0.74.0"), None);
+        assert_eq!(oxlint.version_from_release_tag("crates_v0.155.0"), None);
+
+        let biome = get_plugin("biome").unwrap();
+        assert_eq!(
+            biome.version_from_release_tag("@biomejs/biome@2.6.2"),
+            Some("2.6.2")
+        );
+        assert_eq!(
+            biome.version_from_release_tag("@biomejs/js-api@2.6.2"),
+            None
+        );
+    }
+
+    #[test]
+    fn every_plugin_round_trips_its_latest_version_through_its_release_tag() {
+        for plugin in list_plugins() {
+            let tag = plugin.release_tag(plugin.latest_version);
+            assert_eq!(
+                plugin.version_from_release_tag(&tag),
+                Some(plugin.latest_version),
+                "{}",
+                plugin.name
+            );
+        }
     }
 
     #[test]

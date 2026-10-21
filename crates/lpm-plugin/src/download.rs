@@ -82,10 +82,7 @@ pub async fn download_plugin(
         ))
     })?;
 
-    let url = def
-        .url_template
-        .replace("{version}", version)
-        .replace("{platform}", asset_name);
+    let url = def.asset_url(version, asset_name);
 
     tracing::debug!("downloading plugin {}@{} from {}", def.name, version, url);
 
@@ -990,7 +987,11 @@ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  asset.tar.gz";
             name: "testplug",
             binary_name: "testbin",
             latest_version: "1.0.0",
-            url_template: "https://example.test/{version}/{platform}",
+            url_template: "https://example.test/{tag}/{platform}",
+            release_tags: &[crate::registry::ReleaseTagScheme {
+                since: "0.0.0",
+                prefix: "",
+            }],
             platform_map: &[("test-arch", "asset.bin")],
             is_archive: false,
             checksums: &[(

@@ -19,6 +19,7 @@
 use crate::registry::PluginDef;
 use lpm_common::LpmError;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 const GITHUB_API_BASE_ENV: &str = "LPM_PLUGIN_GITHUB_API_BASE";
@@ -167,28 +168,6 @@ fn cache_path() -> Result<PathBuf, LpmError> {
     Ok(dir.join(".version-cache.json"))
 }
 
-/// Tag prefix configuration for GitHub repos that publish multiple tools.
-///
-/// Some repos (e.g., oxc-project/oxc) have multiple release types with different
-/// tag prefixes. We need to filter to the correct one.
-fn tag_prefix_for_plugin(def: &PluginDef) -> Option<&'static str> {
-    let url = def.url_template;
-    if let Some(start) = url.find("download/") {
-        let after_download = &url[start + "download/".len()..];
-        if let Some(end) = after_download.find("{version}") {
-            let prefix = &after_download[..end];
-            if !prefix.is_empty() {
-                return match prefix {
-                    "apps_v" => Some("apps_v"),
-                    "%40biomejs/biome%40" => Some("@biomejs/biome@"),
-                    _ => None,
-                };
-            }
-        }
-    }
-    None
-}
-
 /// Read a GitHub token from environment variables.
 ///
 /// Checks `GITHUB_TOKEN` first (standard), then `GH_TOKEN` (gh CLI convention).
@@ -258,8 +237,10 @@ fn check_rate_limit(resp: &reqwest::Response) -> Option<String> {
 /// [`approve_version`] only after a successful verified install of
 /// the returned version.
 ///
-/// For repos with multiple release types (e.g., oxc), fetches the release list
-/// and filters by tag prefix instead of using `/releases/latest`.
+/// Lists the repository's releases rather than asking for `/releases/latest`,
+/// because a repository can publish several tools (oxc releases oxlint, oxfmt,
+/// and crates), and keeps only tags that follow the plugin's release-tag
+/// scheme for their version.
 ///
 /// Supports `GITHUB_TOKEN` / `GH_TOKEN` env vars for authenticated requests
 /// (5000 req/hr vs 60 unauthenticated).
@@ -279,23 +260,29 @@ pub async fn peek_latest_from_github_with_client(
     def: &PluginDef,
     client: &reqwest::Client,
 ) -> Result<String, String> {
+    peek_latest_from_github_at(def, client, &github_api_base()).await
+}
+
+async fn peek_latest_from_github_at(
+    def: &PluginDef,
+    client: &reqwest::Client,
+    api_base: &str,
+) -> Result<String, String> {
     let (owner, repo) = parse_github_owner_repo(def)?;
-    let tag_prefix = tag_prefix_for_plugin(def);
 
     let mut best: Option<lpm_semver::Version> = None;
+    let mut url = String::with_capacity(api_base.len() + owner.len() + repo.len() + 48);
     for page in 1..=100 {
-        let url = if tag_prefix.is_some() {
-            let mut url = format!(
-                "{}/repos/{owner}/{repo}/releases?per_page=20",
-                github_api_base()
-            );
-            if page > 1 {
-                url.push_str(&format!("&page={page}"));
-            }
-            url
-        } else {
-            format!("{}/repos/{owner}/{repo}/releases/latest", github_api_base())
-        };
+        url.clear();
+        url.push_str(api_base);
+        url.push_str("/repos/");
+        url.push_str(&owner);
+        url.push('/');
+        url.push_str(&repo);
+        url.push_str("/releases?per_page=20");
+        if page > 1 {
+            write!(url, "&page={page}").expect("writing to a String cannot fail");
+        }
         let response = build_github_request(client, &url)
             .send()
             .await
@@ -308,29 +295,23 @@ pub async fn peek_latest_from_github_with_client(
         if !response.status().is_success() {
             return Err(format!("github API returned {}", response.status()));
         }
-        let more = tag_prefix.is_some()
-            && response
-                .headers()
-                .get("link")
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.contains("rel=\"next\""));
-        let releases = if tag_prefix.is_some() {
-            read_capped_github_json::<Vec<GithubRelease>>(response).await?
-        } else {
-            vec![read_capped_github_json::<GithubRelease>(response).await?]
-        };
+        let more = response
+            .headers()
+            .get("link")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("rel=\"next\""));
+        let releases = read_capped_github_json::<Vec<GithubRelease>>(response).await?;
         for release in releases {
-            if release.draft
-                || release.prerelease
-                || tag_prefix.is_some_and(|prefix| !release.tag_name.starts_with(prefix))
-            {
+            if release.draft || release.prerelease {
                 continue;
             }
-            let value = extract_version_from_tag(&release.tag_name);
-            if !is_semver_like(&value) {
+            let Some(value) = def.version_from_release_tag(&release.tag_name) else {
+                continue;
+            };
+            if !is_semver_like(value) {
                 continue;
             }
-            let Ok(version) = lpm_semver::Version::parse(&value) else {
+            let Ok(version) = lpm_semver::Version::parse(value) else {
                 continue;
             };
             if !version.is_prerelease() && best.as_ref().is_none_or(|current| version > *current) {
@@ -392,14 +373,10 @@ async fn release_asset_checksum_at(
     let (owner, repo) = parse_github_owner_repo(def)?;
     let name = crate::registry::resolve_platform_asset(def, platform)
         .ok_or("unsupported plugin platform")?;
-    let expected_url = def
-        .url_template
-        .replace("{version}", version)
-        .replace("{platform}", name);
-    if asset_url != expected_url {
+    if asset_url != def.asset_url(version, name) {
         return Err("release asset download URL does not match the plugin definition".into());
     }
-    let tag = format!("{}{version}", tag_prefix_for_plugin(def).unwrap_or("v"));
+    let tag = def.release_tag(version);
     let mut url = reqwest::Url::parse(api_base).map_err(|error| error.to_string())?;
     url.path_segments_mut()
         .map_err(|()| "invalid GitHub API base")?
@@ -485,27 +462,6 @@ fn parse_github_owner_repo(def: &PluginDef) -> Result<(String, String), String> 
     Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
-/// Extract a semver version from a git tag.
-///
-/// "v1.57.0" → "1.57.0"
-/// "apps_v1.57.0" → "1.57.0"
-/// "@biomejs/biome@2.4.8" → "2.4.8"
-fn extract_version_from_tag(tag: &str) -> String {
-    if let Some(idx) = tag.rfind('@')
-        && idx > 0
-    {
-        return tag[idx + 1..].to_string();
-    }
-
-    let stripped = tag
-        .strip_prefix("apps_v")
-        .or_else(|| tag.strip_prefix("cli_v"))
-        .or_else(|| tag.strip_prefix("v"))
-        .unwrap_or(tag);
-
-    stripped.to_string()
-}
-
 /// Check if a string looks like a semver version (MAJOR.MINOR.PATCH with optional pre-release).
 fn is_semver_like(s: &str) -> bool {
     let parts: Vec<&str> = s.splitn(2, '-').collect();
@@ -544,26 +500,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_version_simple() {
-        assert_eq!(extract_version_from_tag("v1.57.0"), "1.57.0");
-    }
-
-    #[test]
-    fn extract_version_apps_prefix() {
-        assert_eq!(extract_version_from_tag("apps_v1.57.0"), "1.57.0");
-    }
-
-    #[test]
-    fn extract_version_scoped() {
-        assert_eq!(extract_version_from_tag("@biomejs/biome@2.4.8"), "2.4.8");
-    }
-
-    #[test]
-    fn extract_version_no_prefix() {
-        assert_eq!(extract_version_from_tag("1.0.0"), "1.0.0");
-    }
-
-    #[test]
     fn semver_like_valid() {
         assert!(is_semver_like("1.57.0"));
         assert!(is_semver_like("2.4.8"));
@@ -577,18 +513,6 @@ mod tests {
         assert!(!is_semver_like(""));
         assert!(!is_semver_like("abc"));
         assert!(!is_semver_like("nightly-2024-01-01"));
-    }
-
-    #[test]
-    fn tag_prefix_oxlint() {
-        let def = crate::registry::get_plugin("oxlint").unwrap();
-        assert_eq!(tag_prefix_for_plugin(def), Some("apps_v"));
-    }
-
-    #[test]
-    fn tag_prefix_biome() {
-        let def = crate::registry::get_plugin("biome").unwrap();
-        assert_eq!(tag_prefix_for_plugin(def), Some("@biomejs/biome@"));
     }
 
     #[test]
@@ -852,11 +776,8 @@ mod tests {
             let version = "1.0.0";
             let platform = "darwin-arm64";
             let name = crate::registry::resolve_platform_asset(def, platform).unwrap();
-            let asset_url = def
-                .url_template
-                .replace("{version}", version)
-                .replace("{platform}", name);
-            let tag = format!("{}{version}", tag_prefix_for_plugin(def).unwrap());
+            let asset_url = def.asset_url(version, name);
+            let tag = def.release_tag(version);
             let (owner, repo) = parse_github_owner_repo(def).unwrap();
             let mut endpoint = reqwest::Url::parse("http://localhost/").unwrap();
             endpoint
@@ -926,6 +847,34 @@ mod tests {
             }
         }
     }
+    #[tokio::test]
+    async fn latest_oxlint_release_is_found_across_the_oxlint_and_apps_tag_schemes() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        let release =
+            |tag: &str| serde_json::json!({"tag_name": tag, "draft": false, "prerelease": false});
+        Mock::given(method("GET"))
+            .and(path("/repos/oxc-project/oxc/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                release("oxlint_v1.89.0"),
+                release("oxfmt_v0.74.0"),
+                release("crates_v0.155.0"),
+                release("apps_v1.84.0"),
+                release("apps_v1.89.1"),
+            ])))
+            .mount(&server)
+            .await;
+        let def = crate::registry::get_plugin("oxlint").unwrap();
+
+        let latest =
+            peek_latest_from_github_at(def, &github_client().unwrap(), &server.uri()).await;
+
+        assert_eq!(latest.unwrap(), "1.89.0");
+    }
+
     #[test]
     fn mixed_version_ordering_is_transitive() {
         for a in ["1.2.0", "1.10.0", "1.15x"] {
@@ -946,10 +895,7 @@ mod tests {
         let destination = MockServer::start().await;
         let def = crate::registry::get_plugin("oxlint").unwrap();
         let name = crate::registry::resolve_platform_asset(def, "darwin-arm64").unwrap();
-        let asset_url = def
-            .url_template
-            .replace("{version}", "1.0.0")
-            .replace("{platform}", name);
+        let asset_url = def.asset_url("1.0.0", name);
         Mock::given(method("GET"))
             .respond_with(
                 ResponseTemplate::new(302)
@@ -958,7 +904,7 @@ mod tests {
             .mount(&initial)
             .await;
         Mock::given(method("GET")).respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "tag_name":"apps_v1.0.0","draft":false,"assets":[{
+            "tag_name":def.release_tag("1.0.0"),"draft":false,"assets":[{
                 "name":name,"browser_download_url":asset_url,"digest":format!("sha256:{}", "a".repeat(64))
             }]
         }))).mount(&destination).await;
