@@ -178,13 +178,24 @@ pub(super) fn write_root_file(
 }
 
 /// Rename `from` onto `to` as root, replacing a file or a link there. A
-/// directory at `to` is refused, since BSD `mv` would move `from` into it.
+/// directory at `to` is refused, since BSD `mv` would move `from` into it,
+/// and so is a `to` this process cannot inspect, which could be one.
 pub(super) fn rename_onto(privileged: &Path, from: &Path, to: &Path) -> Result<(), LpmError> {
-    if std::fs::symlink_metadata(to).is_ok_and(|metadata| metadata.is_dir()) {
-        return Err(LpmError::Script(format!(
-            "{} is a directory, not a file",
-            to.display()
-        )));
+    match std::fs::symlink_metadata(to) {
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(LpmError::Script(format!(
+                "{} is a directory, not a file",
+                to.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(LpmError::Script(format!(
+                "inspect {}: {error}",
+                to.display()
+            )));
+        }
     }
     run_checked_inherited(
         Command::new(privileged)
@@ -532,6 +543,91 @@ mod tests {
         let copied = stream_as_root(&privileged, &mut &over[..], &destination, 200 * 1024).unwrap();
         assert_eq!(copied, None);
         assert!(std::fs::metadata(&destination).unwrap().len() <= 200 * 1024);
+    }
+
+    #[test]
+    fn rename_onto_refuses_a_destination_it_cannot_inspect() {
+        if current_uid() == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("privileged.log");
+        let privileged = fake_privileged_runner(
+            dir.path(),
+            &format!("printf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        );
+        let from = dir.path().join("staged");
+        std::fs::write(&from, "unit").unwrap();
+        let unsearchable = dir.path().join("LaunchDaemons");
+        std::fs::create_dir_all(unsearchable.join("forwarder.plist")).unwrap();
+        std::fs::set_permissions(&unsearchable, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let refused = rename_onto(&privileged, &from, &unsearchable.join("forwarder.plist"));
+
+        std::fs::set_permissions(&unsearchable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = refused.expect_err("an uninspectable destination is refused");
+        assert!(error.to_string().contains("inspect"), "{error}");
+        assert!(!log.exists(), "no privileged step runs");
+        assert!(entries_of(&unsearchable.join("forwarder.plist")).is_empty());
+    }
+
+    /// Hands out `data` a few bytes at a time, interrupted before every chunk.
+    struct Halting<'a> {
+        data: &'a [u8],
+        interrupt: bool,
+    }
+
+    impl std::io::Read for Halting<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.interrupt = !self.interrupt;
+            if self.interrupt {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            let count = self.data.len().min(buffer.len()).min(3);
+            buffer[..count].copy_from_slice(&self.data[..count]);
+            self.data = &self.data[count..];
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn stream_as_root_copies_through_short_and_interrupted_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let privileged = fake_privileged_runner(dir.path(), "");
+        let destination = dir.path().join("copy");
+        let data = b"a plist that arrives in pieces";
+
+        let copied = stream_as_root(
+            &privileged,
+            &mut Halting {
+                data,
+                interrupt: false,
+            },
+            &destination,
+            data.len() as u64,
+        )
+        .unwrap();
+
+        assert_eq!(copied, Some(data.len() as u64));
+        assert_eq!(std::fs::read(&destination).unwrap(), data);
+    }
+
+    #[test]
+    fn stream_as_root_reports_tee_failing_rather_than_the_broken_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let privileged =
+            fake_privileged_runner(dir.path(), "if [ \"$1\" = tee ]; then exit 3; fi\n");
+        let large = vec![1_u8; 4 * 1024 * 1024];
+
+        let error = stream_as_root(
+            &privileged,
+            &mut &large[..],
+            &dir.path().join("copy"),
+            u64::MAX,
+        )
+        .expect_err("a failing tee is reported");
+
+        assert!(error.to_string().contains("failed with"), "{error}");
     }
 
     #[test]
