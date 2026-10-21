@@ -388,6 +388,10 @@ const MAX_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
 /// empty entries to exhaust inodes.
 const MAX_ENTRY_COUNT: usize = 50_000;
 
+/// Max bytes in a ZIP symlink target, which ZIP stores as entry content
+/// rather than in a bounded header field. Matches Linux `PATH_MAX`.
+const MAX_ZIP_SYMLINK_TARGET_BYTES: usize = 4096;
+
 /// Extract a .tar.gz archive with path traversal protection and
 /// decompression-bomb caps.
 ///
@@ -487,21 +491,21 @@ fn ensure_runtime_archive_directory(root: &Path, path: &Path) -> Result<(), LpmE
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             Ok(_) => {
                 return Err(LpmError::Script(format!(
-                    "tarball entry traverses a non-directory path: {}",
+                    "runtime archive entry traverses a non-directory path: {}",
                     current.display()
                 )));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 std::fs::create_dir(&current).map_err(|error| {
                     LpmError::Script(format!(
-                        "failed to create tarball directory {}: {error}",
+                        "failed to create runtime archive directory {}: {error}",
                         current.display()
                     ))
                 })?;
             }
             Err(error) => {
                 return Err(LpmError::Script(format!(
-                    "failed to inspect tarball directory {}: {error}",
+                    "failed to inspect runtime archive directory {}: {error}",
                     current.display()
                 )));
             }
@@ -510,15 +514,32 @@ fn ensure_runtime_archive_directory(root: &Path, path: &Path) -> Result<(), LpmE
     Ok(())
 }
 
+/// Lexically bound a symlink target to the extraction root.
+///
+/// `..` is accepted only before every other component. Those leading `..`
+/// climb through the link's parents, which extraction guarantees are real
+/// directories, so the lexical depth matches what the kernel resolves. A
+/// `..` after a normal component could instead climb out of a directory
+/// symlink (`self -> .` then `self/../..`), which no lexical walk can model.
 fn validate_runtime_symlink_target(path: &Path, target: &Path) -> Result<(), LpmError> {
     let mut resolved_depth = path
         .parent()
         .map_or(0, |parent| parent.components().count());
+    let mut descended = false;
     for component in target.components() {
         match component {
             std::path::Component::CurDir => {}
             std::path::Component::Normal(_) => {
+                descended = true;
                 resolved_depth = resolved_depth.saturating_add(1);
+            }
+            std::path::Component::ParentDir if descended => {
+                return Err(LpmError::Script(format!(
+                    "runtime archive symlink target uses `..` after another component, \
+                     which can escape the extraction root through a linked directory: {} -> {}",
+                    path.display(),
+                    target.display()
+                )));
             }
             std::path::Component::ParentDir if resolved_depth > 0 => {
                 resolved_depth -= 1;
@@ -527,7 +548,7 @@ fn validate_runtime_symlink_target(path: &Path, target: &Path) -> Result<(), Lpm
             | std::path::Component::RootDir
             | std::path::Component::Prefix(_) => {
                 return Err(LpmError::Script(format!(
-                    "tarball symlink escapes the extraction root: {} -> {}",
+                    "runtime archive symlink escapes the extraction root: {} -> {}",
                     path.display(),
                     target.display()
                 )));
@@ -536,13 +557,13 @@ fn validate_runtime_symlink_target(path: &Path, target: &Path) -> Result<(), Lpm
     }
     if target.as_os_str().is_empty() {
         return Err(LpmError::Script(format!(
-            "tarball symlink has an empty target: {}",
+            "runtime archive symlink has an empty target: {}",
             path.display()
         )));
     }
     if resolved_depth > lpm_extractor::DEFAULT_MAX_ARCHIVE_PATH_DEPTH {
         return Err(LpmError::Script(format!(
-            "tarball symlink target exceeds the {}-component nesting limit: {} -> {}",
+            "runtime archive symlink target exceeds the {}-component nesting limit: {} -> {}",
             lpm_extractor::DEFAULT_MAX_ARCHIVE_PATH_DEPTH,
             path.display(),
             target.display()
@@ -601,53 +622,138 @@ fn validate_runtime_hard_link_target(
 fn replace_runtime_symlink(target: &Path, output: &Path) -> Result<(), LpmError> {
     use std::os::unix::fs::symlink;
 
-    replace_runtime_link(output, || symlink(target, output), "symlink")
+    replace_runtime_entry(output, || symlink(target, output), "symlink")
 }
 
 #[cfg(windows)]
 fn replace_runtime_symlink(target: &Path, output: &Path) -> Result<(), LpmError> {
     use std::os::windows::fs::symlink_file;
 
-    replace_runtime_link(output, || symlink_file(target, output), "symlink")
+    replace_runtime_entry(output, || symlink_file(target, output), "symlink")
 }
 
 fn replace_runtime_hard_link(target: &Path, output: &Path) -> Result<(), LpmError> {
-    replace_runtime_link(output, || std::fs::hard_link(target, output), "hard link")
+    replace_runtime_entry(output, || std::fs::hard_link(target, output), "hard link")
 }
 
-fn replace_runtime_link(
+/// Create an archive entry at `output`, replacing an existing non-directory
+/// (such as a symlink an earlier entry created) instead of following it.
+fn replace_runtime_entry<T>(
     output: &Path,
-    create: impl Fn() -> std::io::Result<()>,
+    create: impl Fn() -> std::io::Result<T>,
     label: &str,
-) -> Result<(), LpmError> {
+) -> Result<T, LpmError> {
     match create() {
-        Ok(()) => Ok(()),
+        Ok(created) => Ok(created),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             std::fs::remove_file(output).map_err(|error| {
                 LpmError::Script(format!(
-                    "failed to replace tarball {label} {}: {error}",
+                    "failed to replace runtime archive {label} {}: {error}",
                     output.display()
                 ))
             })?;
             create().map_err(|error| {
                 LpmError::Script(format!(
-                    "failed to create tarball {label} {}: {error}",
+                    "failed to create runtime archive {label} {}: {error}",
                     output.display()
                 ))
             })
         }
         Err(error) => Err(LpmError::Script(format!(
-            "failed to create tarball {label} {}: {error}",
+            "failed to create runtime archive {label} {}: {error}",
             output.display()
         ))),
     }
 }
 
+const UNIX_FILE_TYPE_MASK: u32 = 0o170000;
+const UNIX_REGULAR_FILE: u32 = 0o100000;
+const UNIX_DIRECTORY: u32 = 0o040000;
+const UNIX_SYMLINK: u32 = 0o120000;
+
+#[derive(Debug, Clone, Copy)]
+enum ZipEntryKind {
+    Directory,
+    File,
+    Symlink,
+}
+
+/// Classify a ZIP entry from its Unix file type, falling back to the name's
+/// trailing slash for archives that only record DOS attributes.
+fn zip_entry_kind(
+    unix_mode: Option<u32>,
+    named_as_directory: bool,
+    path: &Path,
+) -> Result<ZipEntryKind, LpmError> {
+    match unix_mode.map_or(0, |mode| mode & UNIX_FILE_TYPE_MASK) {
+        0 | UNIX_REGULAR_FILE if named_as_directory => Ok(ZipEntryKind::Directory),
+        0 | UNIX_REGULAR_FILE => Ok(ZipEntryKind::File),
+        UNIX_DIRECTORY => Ok(ZipEntryKind::Directory),
+        UNIX_SYMLINK if !named_as_directory => Ok(ZipEntryKind::Symlink),
+        file_type => Err(LpmError::Script(format!(
+            "unsupported zip entry type {file_type:o}: {}",
+            path.display()
+        ))),
+    }
+}
+
+fn read_zip_symlink_target(
+    entry: &mut impl std::io::Read,
+    path: &Path,
+) -> Result<std::path::PathBuf, LpmError> {
+    use std::io::Read;
+
+    let mut target = Vec::with_capacity(256);
+    entry
+        .take(MAX_ZIP_SYMLINK_TARGET_BYTES as u64 + 1)
+        .read_to_end(&mut target)
+        .map_err(|error| {
+            LpmError::Script(format!(
+                "failed to read zip symlink {}: {error}",
+                path.display()
+            ))
+        })?;
+    if target.len() > MAX_ZIP_SYMLINK_TARGET_BYTES {
+        return Err(LpmError::Script(format!(
+            "zip symlink target exceeds {MAX_ZIP_SYMLINK_TARGET_BYTES} bytes: {}",
+            path.display()
+        )));
+    }
+    let target = String::from_utf8(target).map_err(|_| {
+        LpmError::Script(format!(
+            "zip symlink target is not valid UTF-8: {}",
+            path.display()
+        ))
+    })?;
+    if target.contains('\0') {
+        return Err(LpmError::Script(format!(
+            "zip symlink target contains a NUL byte: {}",
+            path.display()
+        )));
+    }
+    Ok(std::path::PathBuf::from(target))
+}
+
+fn create_runtime_archive_file(output: &Path) -> Result<std::fs::File, LpmError> {
+    replace_runtime_entry(
+        output,
+        || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(output)
+        },
+        "file",
+    )
+}
+
 /// Extract a .zip archive with path traversal protection and
 /// decompression-bomb caps.
 ///
-/// Used for Windows Node.js distributions which are distributed as .zip files.
-/// Each entry is validated to ensure it does not escape the destination directory.
+/// Used for Bun distributions on every platform and Node.js on Windows.
+/// Entries go through the same directory, symlink, and replacement rules as
+/// [`extract_tarball`], so a symlink entry extracts as a symlink whose target
+/// stays inside `dest`.
 fn extract_zip(data: &[u8], dest: &Path) -> Result<(), LpmError> {
     use std::io::Cursor;
 
@@ -682,44 +788,44 @@ fn extract_zip(data: &[u8], dest: &Path) -> Result<(), LpmError> {
             )));
         }
 
-        let outpath = match file.enclosed_name() {
-            Some(path) => {
-                if path.components().count() > lpm_extractor::DEFAULT_MAX_ARCHIVE_PATH_DEPTH {
-                    return Err(LpmError::Script(format!(
-                        "ZIP entry exceeds the {}-component nesting limit: {}",
-                        lpm_extractor::DEFAULT_MAX_ARCHIVE_PATH_DEPTH,
-                        path.display()
-                    )));
-                }
-                dest.join(path)
-            }
-            None => {
-                // enclosed_name() returns None for entries with path traversal
-                return Err(LpmError::Script(format!(
-                    "path traversal detected in zip entry: {}",
-                    String::from_utf8_lossy(file.name_raw())
-                )));
-            }
+        // enclosed_name() returns None for entries with path traversal
+        let Some(path) = file.enclosed_name() else {
+            return Err(LpmError::Script(format!(
+                "path traversal detected in zip entry: {}",
+                String::from_utf8_lossy(file.name_raw())
+            )));
         };
+        if path.components().count() > lpm_extractor::DEFAULT_MAX_ARCHIVE_PATH_DEPTH {
+            return Err(LpmError::Script(format!(
+                "ZIP entry exceeds the {}-component nesting limit: {}",
+                lpm_extractor::DEFAULT_MAX_ARCHIVE_PATH_DEPTH,
+                path.display()
+            )));
+        }
+        let output = dest.join(&path);
 
-        if file.is_dir() {
-            std::fs::create_dir_all(&outpath)?;
-        } else {
-            if let Some(parent) = outpath.parent()
-                && !parent.exists()
-            {
-                std::fs::create_dir_all(parent)?;
+        match zip_entry_kind(file.unix_mode(), file.is_dir(), &path)? {
+            ZipEntryKind::Directory => ensure_runtime_archive_directory(dest, &path)?,
+            ZipEntryKind::Symlink => {
+                ensure_runtime_archive_parent(dest, &path)?;
+                let target = read_zip_symlink_target(&mut file, &path)?;
+                validate_runtime_symlink_target(&path, &target)?;
+                replace_runtime_symlink(&target, &output)?;
             }
-            let mut outfile = std::fs::File::create(&outpath)?;
-            std::io::copy(&mut file, &mut outfile)
-                .map_err(|e| LpmError::Script(format!("failed to extract zip entry: {e}")))?;
+            ZipEntryKind::File => {
+                ensure_runtime_archive_parent(dest, &path)?;
+                let mut outfile = create_runtime_archive_file(&output)?;
+                std::io::copy(&mut file, &mut outfile)
+                    .map_err(|e| LpmError::Script(format!("failed to extract zip entry: {e}")))?;
 
-            // Entry modes come from a downloaded archive: keep only its execute bits, as
-            // package extraction does, so no entry can be setuid or group/world-writable.
-            #[cfg(unix)]
-            if let Some(mode) = file.unix_mode() {
-                use std::os::unix::fs::PermissionsExt;
-                outfile.set_permissions(std::fs::Permissions::from_mode(0o644 | (mode & 0o111)))?;
+                // Entry modes come from a downloaded archive: keep only its execute bits, as
+                // package extraction does, so no entry can be setuid or group/world-writable.
+                #[cfg(unix)]
+                if let Some(mode) = file.unix_mode() {
+                    use std::os::unix::fs::PermissionsExt;
+                    outfile
+                        .set_permissions(std::fs::Permissions::from_mode(0o644 | (mode & 0o111)))?;
+                }
             }
         }
     }
@@ -1098,6 +1204,11 @@ mod tests {
 
     #[cfg(unix)]
     fn build_tar_gz_with_symlink(path: &str, target: &str) -> Vec<u8> {
+        build_tar_gz_with_symlinks(&[(path, target)])
+    }
+
+    #[cfg(unix)]
+    fn build_tar_gz_with_symlinks(links: &[(&str, &str)]) -> Vec<u8> {
         let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         let mut builder = tar::Builder::new(encoder);
 
@@ -1114,17 +1225,54 @@ mod tests {
             )
             .unwrap();
 
-        let mut link_header = tar::Header::new_gnu();
-        link_header.set_entry_type(tar::EntryType::Symlink);
-        link_header.set_size(0);
-        link_header.set_mode(0o777);
-        link_header.set_link_name(target).unwrap();
-        link_header.set_cksum();
-        builder
-            .append_data(&mut link_header, path, std::io::empty())
-            .unwrap();
+        for (path, target) in links {
+            let mut link_header = tar::Header::new_gnu();
+            link_header.set_entry_type(tar::EntryType::Symlink);
+            link_header.set_size(0);
+            link_header.set_mode(0o777);
+            link_header.set_link_name(target).unwrap();
+            link_header.set_cksum();
+            builder
+                .append_data(&mut link_header, path, std::io::empty())
+                .unwrap();
+        }
 
         builder.into_inner().unwrap().finish().unwrap()
+    }
+
+    enum ZipFixtureEntry<'a> {
+        File(&'a str, &'a [u8]),
+        Symlink(&'a str, &'a str),
+        Special(&'a str, u32),
+    }
+
+    fn build_zip(entries: &[ZipFixtureEntry<'_>]) -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for entry in entries {
+            match *entry {
+                ZipFixtureEntry::File(name, content) => {
+                    writer
+                        .start_file(name, zip::write::SimpleFileOptions::default())
+                        .unwrap();
+                    writer.write_all(content).unwrap();
+                }
+                ZipFixtureEntry::Symlink(name, target) => {
+                    writer
+                        .add_symlink(name, target, zip::write::SimpleFileOptions::default())
+                        .unwrap();
+                }
+                ZipFixtureEntry::Special(name, mode) => {
+                    writer
+                        .start_file(
+                            name,
+                            zip::write::SimpleFileOptions::default()
+                                .external_attributes(mode << 16),
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        writer.finish().unwrap().into_inner()
     }
 
     fn build_tar_gz_with_hard_link(path: &str, target: &str) -> Vec<u8> {
@@ -1478,6 +1626,185 @@ mod tests {
                 "{name} archived as {archived_mode:o} extracted as {mode:o}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_zip_preserves_safe_relative_runtime_symlinks() {
+        let archive = build_zip(&[
+            ZipFixtureEntry::File("bun-dist/lib/tool.js", b"runtime"),
+            ZipFixtureEntry::Symlink("bun-dist/bin/tool", "../lib/tool.js"),
+        ]);
+        let dest = TempDir::new().unwrap();
+
+        extract_zip(&archive, dest.path()).expect("safe runtime symlink should extract");
+
+        let link = dest.path().join("bun-dist/bin/tool");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a ZIP symlink entry must extract as a symlink, not a file holding its target"
+        );
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            std::path::Path::new("../lib/tool.js")
+        );
+        assert_eq!(std::fs::read(&link).unwrap(), b"runtime");
+    }
+
+    #[test]
+    fn extract_zip_rejects_runtime_symlink_targets_outside_the_root() {
+        let archive = build_zip(&[
+            ZipFixtureEntry::File("bun-dist/bin/bun", b"runtime"),
+            ZipFixtureEntry::Symlink("bun-dist/bin/tool", "../../../escape"),
+        ]);
+        let root = TempDir::new().unwrap();
+        let dest = root.path().join("runtime");
+        std::fs::create_dir(&dest).unwrap();
+
+        let error = extract_zip(&archive, &dest)
+            .expect_err("an out-of-root runtime symlink must be rejected");
+
+        assert!(
+            error.to_string().contains("escapes"),
+            "expected symlink escape error, got: {error}"
+        );
+        assert!(!dest.join("bun-dist/bin/tool").exists());
+    }
+
+    #[test]
+    fn extract_zip_rejects_symlink_targets_longer_than_the_target_limit() {
+        let target = "a/".repeat(MAX_ZIP_SYMLINK_TARGET_BYTES / 2 + 1);
+        let archive = build_zip(&[ZipFixtureEntry::Symlink("bun-dist/bin/tool", &target)]);
+        let dest = TempDir::new().unwrap();
+
+        let error = extract_zip(&archive, dest.path())
+            .expect_err("an oversized ZIP symlink target must be rejected");
+
+        assert!(
+            error.to_string().contains("symlink target exceeds"),
+            "expected symlink target size error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn extract_zip_rejects_device_and_fifo_entries() {
+        for (label, mode) in [
+            ("fifo", 0o010644),
+            ("character device", 0o020644),
+            ("block device", 0o060644),
+            ("socket", 0o140644),
+        ] {
+            let archive = build_zip(&[ZipFixtureEntry::Special("bun-dist/special", mode)]);
+            let dest = TempDir::new().unwrap();
+
+            let error = extract_zip(&archive, dest.path())
+                .expect_err("a non-file, non-directory, non-symlink ZIP entry must be rejected");
+
+            assert!(
+                error.to_string().contains("unsupported"),
+                "expected unsupported {label} entry error, got: {error}"
+            );
+            assert!(!dest.path().join("bun-dist/special").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_zip_rejects_a_preexisting_symlink_parent() {
+        use std::os::unix::fs::symlink;
+
+        let archive = build_zip(&[ZipFixtureEntry::File("bun-dist/bin/bun", b"runtime")]);
+        let root = TempDir::new().unwrap();
+        let dest = root.path().join("runtime");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&dest).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        symlink(&outside, dest.join("bun-dist")).unwrap();
+
+        let error = extract_zip(&archive, &dest)
+            .expect_err("a runtime entry through a symlink parent must be rejected");
+
+        assert!(
+            error.to_string().contains("non-directory"),
+            "expected symlink-parent error, got: {error}"
+        );
+        assert!(!outside.join("bin/bun").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_zip_rejects_entries_beneath_an_archived_directory_symlink() {
+        let archive = build_zip(&[
+            ZipFixtureEntry::File("bun-dist/real/keep", b"original"),
+            ZipFixtureEntry::Symlink("bun-dist/alias", "real"),
+            ZipFixtureEntry::File("bun-dist/alias/keep", b"replacement"),
+        ]);
+        let dest = TempDir::new().unwrap();
+
+        let error = extract_zip(&archive, dest.path())
+            .expect_err("an entry routed through an archived symlink must be rejected");
+
+        assert!(
+            error.to_string().contains("non-directory"),
+            "expected symlink-parent error, got: {error}"
+        );
+        assert_eq!(
+            std::fs::read(dest.path().join("bun-dist/real/keep")).unwrap(),
+            b"original"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_zip_replaces_an_archived_symlink_instead_of_writing_through_it() {
+        // ZIP readers collapse identical raw names, so the later entry reaches the same
+        // output path through an interior `.` component instead.
+        let archive = build_zip(&[
+            ZipFixtureEntry::File("bun-dist/real", b"original"),
+            ZipFixtureEntry::Symlink("bun-dist/link", "real"),
+            ZipFixtureEntry::File("bun-dist/./link", b"replacement"),
+        ]);
+        let dest = TempDir::new().unwrap();
+
+        extract_zip(&archive, dest.path()).expect("a later file entry should replace the link");
+
+        let link = dest.path().join("bun-dist/link");
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().is_file(),
+            "the later file entry must replace the symlink itself"
+        );
+        assert_eq!(std::fs::read(&link).unwrap(), b"replacement");
+        assert_eq!(
+            std::fs::read(dest.path().join("bun-dist/real")).unwrap(),
+            b"original",
+            "writing a file entry must never follow an extracted symlink"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extract_tarball_rejects_symlink_targets_that_climb_back_out_through_another_symlink() {
+        // `self` resolves to `node-v22/bin`, so `self/../../..` lands one level above the
+        // extraction root even though a purely lexical walk of the target stays inside it.
+        let archive = build_tar_gz_with_symlinks(&[
+            ("node-v22/bin/self", "."),
+            ("node-v22/bin/escape", "self/../../.."),
+        ]);
+        let root = TempDir::new().unwrap();
+        let dest = root.path().join("runtime");
+        std::fs::create_dir(&dest).unwrap();
+
+        let error = extract_tarball(&archive, &dest)
+            .expect_err("a symlink target that climbs after descending must be rejected");
+
+        assert!(
+            error.to_string().contains("`..` after another component"),
+            "expected climb-after-descend error, got: {error}"
+        );
+        assert!(std::fs::symlink_metadata(dest.join("node-v22/bin/escape")).is_err());
     }
 
     #[test]

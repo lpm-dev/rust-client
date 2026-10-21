@@ -56,9 +56,7 @@ export async function verifyPublishedPackage({
 }) {
   assertPlainObject(releaseManifest, "release manifest");
   const version = parseReleaseVersion(releaseManifest.version);
-  if (expectedTag !== "latest" && expectedTag !== "nightly") {
-    throw new Error(`The npm dist-tag is not supported: ${format(expectedTag)}`);
-  }
+  assertSupportedDistTag(expectedTag);
   assertLowerHex(expectedSourceSha, 40, "release source SHA");
   const defaultSourceRef = expectedTag === "latest" ? `refs/tags/v${version}` : "refs/heads/main";
   const sourceRef = expectedSourceRef ?? defaultSourceRef;
@@ -75,38 +73,11 @@ export async function verifyPublishedPackage({
   ) {
     throw new Error("The release source run ID is not valid");
   }
-  if (!Array.isArray(releaseManifest.packages)) {
-    throw new Error("The release manifest packages value must be an array");
-  }
 
-  const records = releaseManifest.packages.filter(record => record?.name === packageName);
-  if (records.length !== 1) {
-    throw new Error(`The release manifest must contain one record for ${packageName}`);
-  }
-  const record = records[0];
-  assertPlainObject(record, `release record for ${packageName}`);
-  if (record.version !== version) {
-    throw new Error(`The release record version does not match for ${packageName}`);
-  }
-  assertLowerHex(record.shasum, 40, `SHA-1 shasum for ${packageName}`);
-  assertLowerHex(record.sha256, 64, `SHA-256 digest for ${packageName}`);
+  const { record } = releasePackageRecord(releaseManifest, packageName);
   const expectedSha512 = integritySha512Hex(record.integrity, packageName);
   await verifyTarballImpl({ tarballPath, record, packageName });
-
-  const encodedPackage = encodeURIComponent(packageName);
-  const packument = await registryJson(
-    fetchImpl,
-    `${REGISTRY_ORIGIN}/${encodedPackage}`,
-    PACKUMENT_LIMIT,
-    `npm package metadata for ${packageName}`,
-  );
-  validateRegistryVersion({
-    packument,
-    packageName,
-    version,
-    expectedTag,
-    record,
-  });
+  await verifyRegistryVersion({ packageName, version, expectedTag, record, fetchImpl });
 
   const attestations = await verifySignaturesImpl({ packageName, version });
   const sourceRun = validateAttestations({
@@ -130,6 +101,59 @@ export async function verifyPublishedPackage({
   }
 
   return Object.freeze({ packageName, version, tag: expectedTag });
+}
+
+/**
+ * Select the single release-manifest record for `packageName` after checking
+ * that its version matches the release and its digests are well formed.
+ */
+export function releasePackageRecord(releaseManifest, packageName) {
+  assertPlainObject(releaseManifest, "release manifest");
+  const version = parseReleaseVersion(releaseManifest.version);
+  if (!Array.isArray(releaseManifest.packages)) {
+    throw new Error("The release manifest packages value must be an array");
+  }
+
+  const records = releaseManifest.packages.filter(record => record?.name === packageName);
+  if (records.length !== 1) {
+    throw new Error(`The release manifest must contain one record for ${packageName}`);
+  }
+  const record = records[0];
+  assertPlainObject(record, `release record for ${packageName}`);
+  if (record.version !== version) {
+    throw new Error(`The release record version does not match for ${packageName}`);
+  }
+  assertLowerHex(record.shasum, 40, `SHA-1 shasum for ${packageName}`);
+  assertLowerHex(record.sha256, 64, `SHA-256 digest for ${packageName}`);
+  integritySha512Hex(record.integrity, packageName);
+  return Object.freeze({ version, record });
+}
+
+/**
+ * Check that the npm registry serves `packageName@version` with the release
+ * record's exact digests, SLSA provenance, and `expectedTag` selecting it.
+ */
+export async function verifyRegistryVersion({
+  packageName,
+  version,
+  expectedTag,
+  record,
+  fetchImpl = fetch,
+}) {
+  assertSupportedDistTag(expectedTag);
+  const packument = await registryJson(
+    fetchImpl,
+    `${REGISTRY_ORIGIN}/${encodeURIComponent(packageName)}`,
+    PACKUMENT_LIMIT,
+    `npm package metadata for ${packageName}`,
+  );
+  validateRegistryVersion({ packument, packageName, version, expectedTag, record });
+}
+
+export function assertSupportedDistTag(expectedTag) {
+  if (expectedTag !== "latest" && expectedTag !== "nightly") {
+    throw new Error(`The npm dist-tag is not supported: ${format(expectedTag)}`);
+  }
 }
 
 export async function verifyGitHubSourceRun({
