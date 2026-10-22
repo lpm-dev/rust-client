@@ -171,7 +171,8 @@ fn refuse_git_stub() -> Result<(), GitProbeError> {
 
 /// Why the `git` that `path`, a `PATH` value, finds first can't run: it is
 /// `/usr/bin/git`, and the developer directory `selected` names holds no
-/// git for it to run.
+/// git for it to run. Without a `PATH`, spawning searches macOS's default,
+/// `/usr/bin:/bin`, and so does this.
 #[cfg(target_os = "macos")]
 fn git_stub_without_tools(
     path: Option<&std::ffi::OsStr>,
@@ -179,7 +180,7 @@ fn git_stub_without_tools(
 ) -> Option<String> {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let git = std::env::split_paths(path?)
+    let git = std::env::split_paths(path.unwrap_or(std::ffi::OsStr::new("/usr/bin:/bin")))
         .map(|directory| directory.join("git"))
         .find(|candidate| {
             std::fs::metadata(candidate).is_ok_and(|metadata| {
@@ -1440,7 +1441,12 @@ mod tests {
             git_stub_without_tools(Some(empty.path().as_os_str()), || None),
             None
         );
-        assert_eq!(git_stub_without_tools(None, || None), None);
+        // Without PATH, spawning searches the default path, /usr/bin first.
+        assert!(git_stub_without_tools(None, || None).is_some());
+        assert_eq!(
+            git_stub_without_tools(None, || Some(tools.path().to_path_buf())),
+            None
+        );
     }
 
     #[cfg(unix)]

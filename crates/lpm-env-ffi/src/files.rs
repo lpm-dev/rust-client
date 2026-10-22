@@ -68,8 +68,9 @@ fn shown(path: &Path) -> String {
 }
 
 /// Describe the LPM home at `home` for the user whose home directory is
-/// `user_home`: whether it is that user's default home, `~/.lpm`, and the
-/// suffix the CLI appends to its credential-store service names there.
+/// `user_home`: where it is once links are followed, whether it is that
+/// user's default home, `~/.lpm`, and the suffix the CLI appends to its
+/// credential-store service names there.
 /// # Safety
 /// Both pointers must reference readable bytes for their lengths during the call.
 #[unsafe(no_mangle)]
@@ -90,13 +91,18 @@ pub unsafe extern "C" fn lpm_env_describe_home(
         #[serde(rename_all = "camelCase")]
         struct Output {
             abi_version: u32,
+            identity: String,
             is_default: bool,
             scope: Option<String>,
         }
         let root = lpm_common::LpmRoot::from_dir(home);
+        let Some(identity) = root.identity().to_str().map(str::to_owned) else {
+            return failure(2, "env.invalid_utf8");
+        };
         let scope = root.credential_scope_for(&user_home);
         json(&Output {
             abi_version: ABI_VERSION,
+            identity,
             is_default: scope.is_none(),
             scope,
         })
@@ -243,19 +249,6 @@ pub unsafe extern "C" fn lpm_env_open_project_state(
         return failure(2, "env.invalid_input");
     }
     catch_unwind(AssertUnwindSafe(|| {
-        let state_display = lpm_common::project_state_dir(&display);
-        if lpm_common::LpmRoot::from_dir(&state_display).identity()
-            == lpm_common::LpmRoot::from_dir(home).identity()
-        {
-            return refusal(
-                "env.project_state_is_home",
-                format!(
-                    "{} is LPM's own home, so no project can keep its state there",
-                    state_display.display()
-                ),
-                None,
-            );
-        }
         // SAFETY: The caller keeps `project` open for this call; only a
         // duplicate of it is owned here.
         let duplicate = match unsafe { BorrowedFd::borrow_raw(project) }.try_clone_to_owned() {
@@ -269,6 +262,16 @@ pub unsafe extern "C" fn lpm_env_open_project_state(
             }
         };
         let root = cap_std::fs::Dir::from_std_file(std::fs::File::from(duplicate));
+        if state_is_home(&root, &home) {
+            return refusal(
+                "env.project_state_is_home",
+                format!(
+                    "{} is LPM's own home, so no project can keep its state there",
+                    lpm_common::project_state_dir(&display).display()
+                ),
+                None,
+            );
+        }
         match lpm_common::ensure_project_state_dir_in(&root, &display) {
             Ok(directory) => {
                 let descriptor = directory.into_std_file().into_raw_fd();
@@ -292,6 +295,35 @@ pub unsafe extern "C" fn lpm_env_open_project_state(
         }
     }))
     .unwrap_or_else(|_| failure(3, "env.engine_panic"))
+}
+
+/// Whether `home`, an LPM home, is the `.lpm` of `project`, the open
+/// directory, decided from the directory itself rather than a path to it,
+/// which a link could have taken elsewhere since: the home's folder is
+/// `project`, and the home is its `.lpm`, or would be once created.
+#[cfg(unix)]
+fn state_is_home(project: &cap_std::fs::Dir, home: &Path) -> bool {
+    use cap_std::fs::MetadataExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let identity = lpm_common::LpmRoot::from_dir(home).identity();
+    let (Some(folder), Some(name)) = (identity.parent(), identity.file_name()) else {
+        return false;
+    };
+    let (Ok(open), Ok(folder)) = (project.dir_metadata(), std::fs::metadata(folder)) else {
+        return false;
+    };
+    if (open.dev(), open.ino()) != (folder.dev(), folder.ino()) {
+        return false;
+    }
+    match (
+        std::fs::symlink_metadata(&identity),
+        project.symlink_metadata(lpm_common::PROJECT_STATE_DIR),
+    ) {
+        (Ok(home), Ok(state)) => (home.dev(), home.ino()) == (state.dev(), state.ino()),
+        (Err(_), _) => lpm_common::is_project_state_name(name),
+        (Ok(_), Err(_)) => false,
+    }
 }
 
 #[cfg(unix)]
@@ -348,6 +380,20 @@ pub unsafe extern "C" fn lpm_env_prepare_secret_file(
             IgnoreFile::ProjectGitignore,
             IgnoreFailure::Refuse,
         ) {
+            Ok((ignore, warnings)) if refuses_unverified(&ignore, &path) => refusal(
+                "env.secret_unverified",
+                format!(
+                    "{}, and a repository holds it, so git could already track it",
+                    warnings.first().map_or_else(
+                        || format!("git could not check {}", path.display()),
+                        |warning| warning.clone()
+                    )
+                ),
+                Some(Detail {
+                    path: shown(&path),
+                    untrack: None,
+                }),
+            ),
             Ok((ignore, warnings)) => {
                 let kind = match ignore {
                     SecretIgnore::OutsideProject => "outsideProject",
@@ -389,6 +435,18 @@ pub unsafe extern "C" fn lpm_env_prepare_secret_file(
         }
     }))
     .unwrap_or_else(|_| failure(3, "env.engine_panic"))
+}
+
+/// Whether a file of secrets git couldn't check must not be written: where
+/// a repository holds it, as only git can say whether that repository
+/// tracks it, and a tracked file would take its secrets into the next
+/// commit. With `IgnoreFailure::Refuse`, an unverified file is one git
+/// couldn't be run for.
+fn refuses_unverified(ignore: &lpm_common::project_secret::SecretIgnore, path: &Path) -> bool {
+    matches!(
+        ignore,
+        lpm_common::project_secret::SecretIgnore::Unverified { .. }
+    ) && lpm_common::project_git::repository_marker_above(path.parent().unwrap_or(path))
 }
 
 #[cfg(all(test, unix))]
@@ -457,10 +515,20 @@ mod tests {
         project: &Path,
         home: &Path,
     ) -> (u32, serde_json::Value, Option<std::os::fd::OwnedFd>) {
+        open_state_shown_as(project, project, home)
+    }
+
+    /// Opens the state directory of the folder open at `project`, which the
+    /// call is told is at `display`.
+    fn open_state_shown_as(
+        project: &Path,
+        display: &Path,
+        home: &Path,
+    ) -> (u32, serde_json::Value, Option<std::os::fd::OwnedFd>) {
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
         let directory = std::fs::File::open(project).unwrap();
-        let (display, home) = (text(project), text(home));
+        let (display, home) = (text(display), text(home));
         let mut state = -1;
         // SAFETY: The directory and strings stay live, and `state` writable, for the call.
         let result = unsafe {
@@ -524,6 +592,17 @@ mod tests {
             lpm_common::LpmRoot::from_dir(&other)
                 .credential_scope_for(user.path())
                 .unwrap()
+        );
+
+        // A home reached through a linked folder is described where it is.
+        let real = user.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, user.path().join("alias")).unwrap();
+        let (status, output) = describe(text(&user.path().join("alias/lpm-home")), user_home);
+        assert_eq!(status, 0);
+        assert_eq!(
+            output["identity"],
+            text(&std::fs::canonicalize(&real).unwrap().join("lpm-home"))
         );
 
         for (home, user_home) in [
@@ -654,6 +733,49 @@ mod tests {
         );
         assert_eq!(output["code"], "env.project_state_is_home");
         assert!(!home.join(".gitignore").exists());
+
+        // The folder that is open decides, whatever path it is shown as, as a
+        // link can be repointed between opening the folder and the call.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let (status, output, state) = open_state_shown_as(user.path(), elsewhere.path(), &home);
+        assert_eq!(status, 5, "{output}");
+        assert_eq!(output["code"], "env.project_state_is_home");
+        assert!(state.is_none());
+        assert!(!home.join(".gitignore").exists());
+        let (status, _, _) = open_state_shown_as(elsewhere.path(), user.path(), &home);
+        assert_eq!(
+            status, 0,
+            "another folder shown as the home directory keeps its state"
+        );
+        assert!(elsewhere.path().join(".lpm/.gitignore").exists());
+    }
+
+    #[test]
+    fn a_secret_file_git_could_not_check_is_refused_where_a_repository_holds_it() {
+        use lpm_common::project_secret::SecretIgnore;
+
+        let outside = tempfile::tempdir().unwrap();
+        let repository = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repository.path().join(".git")).unwrap();
+        std::fs::create_dir_all(repository.path().join("config")).unwrap();
+        let unverified = SecretIgnore::Unverified { added: None };
+
+        assert!(refuses_unverified(
+            &unverified,
+            &repository.path().join("config/.env")
+        ));
+        assert!(refuses_unverified(
+            &unverified,
+            &repository.path().join(".env")
+        ));
+        assert!(!refuses_unverified(
+            &unverified,
+            &outside.path().join(".env")
+        ));
+        assert!(!refuses_unverified(
+            &SecretIgnore::Added { files: Vec::new() },
+            &repository.path().join(".env")
+        ));
     }
 
     #[test]
