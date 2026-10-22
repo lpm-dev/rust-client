@@ -188,8 +188,13 @@ impl LpmRoot {
 
     /// Whether this is the user's default root, `~/.lpm`, by identity.
     pub fn is_default(&self) -> bool {
-        dirs::home_dir()
-            .is_some_and(|home| canonical_identity(&home.join(".lpm")) == self.identity())
+        dirs::home_dir().is_some_and(|home| self.is_default_for(&home))
+    }
+
+    /// Whether this is the default root, `.lpm`, of the user whose home
+    /// directory is `user_home`, by identity.
+    pub fn is_default_for(&self, user_home: &Path) -> bool {
+        canonical_identity(&user_home.join(".lpm")) == self.identity()
     }
 
     /// `service` as this root names it in the OS credential store. The
@@ -206,13 +211,24 @@ impl LpmRoot {
         if self.is_default() {
             return None;
         }
+        Some(self.identity_digest())
+    }
+
+    /// [`Self::credential_scope`] for the user whose home directory is
+    /// `user_home`, for a process that doesn't take it from the environment.
+    pub fn credential_scope_for(&self, user_home: &Path) -> Option<String> {
+        (!self.is_default_for(user_home)).then(|| self.identity_digest())
+    }
+
+    fn identity_digest(&self) -> String {
         use sha2::Digest as _;
+        use std::fmt::Write as _;
         let digest = sha2::Sha256::digest(self.identity().as_os_str().as_encoded_bytes());
         let mut scope = String::with_capacity(16);
         for byte in &digest[..8] {
-            scope.push_str(&format!("{byte:02x}"));
+            let _ = write!(scope, "{byte:02x}");
         }
-        Some(scope)
+        scope
     }
 
     // ─── Store ──────────────────────────────────────────────────────
@@ -1957,6 +1973,41 @@ mod tests {
             assert!(default.is_default());
             assert_eq!(default.credential_service("dev.lpm.vault"), "dev.lpm.vault");
         }
+    }
+
+    #[test]
+    fn a_given_user_home_decides_the_default_root_and_its_scope() {
+        let tmp = TempDir::new().unwrap();
+        let user_home = tmp.path().join("user");
+        std::fs::create_dir(&user_home).unwrap();
+        let default = LpmRoot::from_dir(user_home.join(".lpm"));
+        let other = LpmRoot::from_dir(tmp.path().join("other"));
+
+        assert!(default.is_default_for(&user_home));
+        assert_eq!(default.credential_scope_for(&user_home), None);
+        assert!(!other.is_default_for(&user_home));
+        let scope = other.credential_scope_for(&user_home).unwrap();
+        assert_eq!(scope.len(), 16);
+        assert!(scope.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            other.credential_service("dev.lpm.vault"),
+            format!("dev.lpm.vault:{scope}"),
+            "the scope matches the one the environment's root gets"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_reached_through_a_link_is_the_default_root() {
+        let tmp = TempDir::new().unwrap();
+        let user_home = tmp.path().join("user");
+        std::fs::create_dir_all(user_home.join(".lpm")).unwrap();
+        std::os::unix::fs::symlink(&user_home, tmp.path().join("linked")).unwrap();
+
+        let linked = LpmRoot::from_dir(tmp.path().join("linked/.lpm"));
+
+        assert!(linked.is_default_for(&user_home));
+        assert_eq!(linked.credential_scope_for(&user_home), None);
     }
 
     #[test]

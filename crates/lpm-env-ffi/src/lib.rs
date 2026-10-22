@@ -1,5 +1,7 @@
-//! Bounded C ABI for the bundled native schema engine and GitHub Actions secret
-//! sealing. No process environment access.
+//! Bounded C ABI for the bundled native schema engine, GitHub Actions secret
+//! sealing, and the LPM home and project files an app shares with the CLI.
+//! Only writing a file of secrets reads the process environment, for the
+//! `git` it runs.
 
 use lpm_env_source::{ReplacedGroups, ReplacedRules, SchemaSnapshot, SourceLocation};
 use serde::ser::SerializeStruct;
@@ -9,6 +11,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+
+mod files;
 
 const ABI_VERSION: u32 = 1;
 const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;

@@ -12,6 +12,27 @@ spec.loader.exec_module(exporter)
 
 
 HEADER = '#ifndef LPM_ENV_H\n#define LPM_ENV_H\n#define LPM_ENV_ABI_VERSION 7\n#endif\n'
+MANIFESTS = {
+    'Cargo.toml': '[workspace.dependencies]\nlpm-env = { path = "crates/lpm-env" }\nlpm-env-source = { path = "crates/lpm-env-source" }\n',
+    'crates/lpm-env/Cargo.toml': '[dependencies]\n',
+    'crates/lpm-env-source/Cargo.toml': '[dependencies]\nlpm-env.workspace = true\n',
+    'crates/lpm-env-ffi/Cargo.toml': '[dependencies]\nlpm-env-source.workspace = true\n',
+}
+
+
+def write_sources(root, marker='original'):
+    """An engine source tree: manifests the exporter walks, sources holding marker, and the header."""
+    for name, text in MANIFESTS.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    for name in ['Cargo.lock', 'scripts/export-env-engine.py', 'crates/lpm-env/src/lib.rs', 'crates/lpm-env-source/src/lib.rs']:
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(marker)
+    header = root / 'crates/lpm-env-ffi/include/lpm_env.h'
+    header.parent.mkdir(parents=True, exist_ok=True)
+    header.write_text(HEADER if marker == 'original' else HEADER + marker)
 
 
 class EngineExportTests(unittest.TestCase):
@@ -27,6 +48,32 @@ class EngineExportTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'LPM_ENV_ABI_VERSION'):
                     exporter.header_abi_version(root)
 
+    def test_provenance_covers_every_workspace_crate_the_engine_builds_from(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_sources(root)
+            manifests = {
+                'Cargo.toml': MANIFESTS['Cargo.toml'] + 'common = { path = "crates/lpm-common", package = "lpm-common" }\nunused = { path = "crates/unused" }\nserde = "1"\n',
+                'crates/lpm-env-ffi/Cargo.toml': '[dependencies]\nlpm-env-source.workspace = true\nserde.workspace = true\n[target.\'cfg(unix)\'.dependencies]\ncommon = { workspace = true, features = ["extra"] }\n',
+                'crates/lpm-common/Cargo.toml': '[build-dependencies]\nhelper = { path = "../lpm-build-helper" }\n',
+                'crates/lpm-build-helper/Cargo.toml': '[dependencies]\n',
+                'crates/unused/Cargo.toml': '[dependencies]\n',
+            }
+            for name, text in manifests.items():
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text)
+            (root / 'crates/lpm-build-helper/src').mkdir()
+            (root / 'crates/lpm-build-helper/src/lib.rs').write_text('helper')
+
+            self.assertEqual(exporter.engine_crates(root), [Path('crates') / name for name in ['lpm-build-helper', 'lpm-common', 'lpm-env', 'lpm-env-ffi', 'lpm-env-source']])
+            self.assertIn('crates/lpm-build-helper/src/lib.rs', exporter.source_hashes(root))
+            self.assertNotIn('crates/unused/Cargo.toml', exporter.source_hashes(root))
+
+            (root / 'crates/lpm-build-helper/Cargo.toml').write_text('[dependencies]\noutside = { path = "../../../elsewhere" }\n')
+            with self.assertRaisesRegex(RuntimeError, 'outside the repository: outside'):
+                exporter.engine_crates(root)
+
     def test_archive_hashing_streams_without_reading_the_complete_file(self):
         import hashlib
         with tempfile.TemporaryDirectory() as temporary:
@@ -40,19 +87,11 @@ class EngineExportTests(unittest.TestCase):
         for state in ('modified', 'staged', 'untracked', 'unrelated'):
             with self.subTest(state=state), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary) / 'source'
-                root.mkdir()
-                files = ['Cargo.toml', 'Cargo.lock', 'scripts/export-env-engine.py', 'crates/lpm-env/src/lib.rs']
-                for name in files:
-                    path = root / name
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_text('original')
-                header = root / 'crates/lpm-env-ffi/include/lpm_env.h'
-                header.parent.mkdir(parents=True)
-                header.write_text(HEADER)
+                write_sources(root)
                 subprocess.run(['git', 'init', '-q', str(root)], check=True)
                 subprocess.run(['git', '-C', str(root), 'add', '.'], check=True)
                 subprocess.run(['git', '-C', str(root), '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'fixture'], check=True)
-                changed = root / ('notes.txt' if state == 'unrelated' else 'crates/lpm-env/src/new.rs' if state == 'untracked' else files[-1])
+                changed = root / ('notes.txt' if state == 'unrelated' else 'crates/lpm-env/src/new.rs' if state == 'untracked' else 'crates/lpm-env/src/lib.rs')
                 changed.write_text('changed')
                 if state == 'staged': subprocess.run(['git', '-C', str(root), 'add', '.'], check=True)
                 real_run = subprocess.run
@@ -67,11 +106,7 @@ class EngineExportTests(unittest.TestCase):
     def scenario(self, failure):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / 'source'
-            root.mkdir()
-            for name in ['Cargo.toml', 'Cargo.lock', 'scripts/export-env-engine.py', 'crates/lpm-env/src/lib.rs', 'crates/lpm-env-source/src/lib.rs', 'crates/lpm-env-ffi/include/lpm_env.h']:
-                path = root / name
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(HEADER if name.endswith('lpm_env.h') else 'original')
+            write_sources(root)
             output = Path(temporary) / 'engine'
             (output / 'LPMEnv.xcframework').mkdir(parents=True)
             (output / 'LPMEnv.xcframework/old').write_bytes(b'old bundle')
@@ -112,7 +147,7 @@ class EngineExportTests(unittest.TestCase):
                     (artifact / 'library').write_bytes(b'new bundle')
 
             def read(args, **kwargs):
-                if args[:2] == ['git', 'show']: return b'original'
+                if args[:2] == ['git', 'show']: return (root / args[2].split(':', 1)[1]).read_bytes()
                 if args[0] == 'rustc':
                     return '/pinned/rust-1.94\n' if '--print' in args else 'host: aarch64-apple-darwin\n'
                 return paths if args[1] == 'ls-files' else 'a' * 40 + '\n'
@@ -197,10 +232,7 @@ module.export(root, target, output)
             sources = []
             for marker in ['A', 'B']:
                 root = parent / marker
-                for name in ['Cargo.toml', 'Cargo.lock', 'scripts/export-env-engine.py', 'crates/lpm-env/src/lib.rs', 'crates/lpm-env-source/src/lib.rs', 'crates/lpm-env-ffi/include/lpm_env.h']:
-                    path = root / name
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_text(HEADER + marker if name.endswith('lpm_env.h') else marker)
+                write_sources(root, marker)
                 sources.append(root)
             signal = parent / 'first-slice-built'
             target = parent / 'shared-target'

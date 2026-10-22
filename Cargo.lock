@@ -3549,10 +3549,13 @@ dependencies = [
 name = "lpm-env-ffi"
 version = "0.81.0"
 dependencies = [
+ "cap-std",
  "crypto_box",
  "hex",
+ "lpm-common",
  "lpm-env",
  "lpm-env-source",
+ "lpm-workspace",
  "serde",
  "serde_json",
  "tempfile",

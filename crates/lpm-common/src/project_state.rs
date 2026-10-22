@@ -297,6 +297,13 @@ impl LpmHomeExposed {
             "give it a .gitignore that ignores everything (`*`), or point LPM_HOME at a directory of its own"
         }
     }
+
+    /// Whether the home is a repository's root, which only another home
+    /// keeps out of git.
+    #[must_use]
+    pub fn at_repository_root(&self) -> bool {
+        self.at_repository_root
+    }
 }
 
 impl std::fmt::Display for LpmHomeExposed {
@@ -312,11 +319,16 @@ impl std::fmt::Display for LpmHomeExposed {
 /// reason when a repository is around a home it can't keep out, where
 /// secrets must not be written; elsewhere what it can't do is logged.
 pub fn keep_lpm_home_ignored(root: &Path) -> Result<(), String> {
+    keep_lpm_home_out_of_git(root).map_err(|exposed| exposed.reason)
+}
+
+/// [`keep_lpm_home_ignored`], failing with what keeps the home in git, for
+/// a caller that tells its user how to fix it.
+pub fn keep_lpm_home_out_of_git(root: &Path) -> Result<(), LpmHomeExposed> {
     match cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority()) {
         Ok(directory) => keep_open_lpm_home_ignored(&directory, root),
         Err(error) => lpm_home_left_in_git(root, &error, false),
     }
-    .map_err(|exposed| exposed.reason)
 }
 
 /// [`keep_lpm_home_ignored`] for an LPM home a caller opened itself, at
@@ -710,6 +722,11 @@ mod tests {
         std::fs::write(home.join(".gitignore"), "node_modules/\n").unwrap();
         let reason = keep_lpm_home_ignored(&home).unwrap_err();
         assert!(reason.contains("doesn't ignore everything"), "{reason}");
+        let exposed = keep_lpm_home_out_of_git(&home).unwrap_err();
+        assert_eq!(exposed.to_string(), reason);
+        assert!(!exposed.at_repository_root());
+        let at_root = keep_lpm_home_out_of_git(repository.path()).unwrap_err();
+        assert!(at_root.at_repository_root(), "{at_root}");
 
         std::fs::remove_file(home.join(".gitignore")).unwrap();
         keep_lpm_home_ignored(&home).unwrap();

@@ -125,6 +125,8 @@ impl std::fmt::Display for GitProbeError {
 
 /// Runs a [`hardened_git_command`] in `dir` to completion, with no input.
 pub fn run_git(dir: &Path, args: &[&str]) -> Result<std::process::Output, GitProbeError> {
+    #[cfg(target_os = "macos")]
+    refuse_git_stub()?;
     probe_command(dir, args)
         .output()
         .map_err(|error| spawn_failure(dir, &error))
@@ -138,7 +140,81 @@ pub(crate) fn git_lists_any(
     args: &[&str],
     wanted: impl FnMut(&[u8]) -> bool,
 ) -> Result<bool, GitProbeError> {
+    #[cfg(target_os = "macos")]
+    refuse_git_stub()?;
     first_record_matching(dir, probe_command(dir, args), wanted)
+}
+
+/// Fails as though git were missing where the `git` on `PATH` is macOS's
+/// `/usr/bin/git` with no developer tools selected: that stub opens the
+/// Command Line Tools installer, as an app that asks git looks to the user
+/// to have done, and then fails.
+#[cfg(target_os = "macos")]
+fn refuse_git_stub() -> Result<(), GitProbeError> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // Only finding the tools is kept: they can be installed while an app
+    // that asks git keeps running.
+    static TOOLS_FOUND: AtomicBool = AtomicBool::new(false);
+    if TOOLS_FOUND.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let path = std::env::var_os("PATH");
+    match git_stub_without_tools(path.as_deref(), selected_developer_directory) {
+        Some(reason) => Err(GitProbeError::GitMissing(reason)),
+        None => {
+            TOOLS_FOUND.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+}
+
+/// Why the `git` that `path`, a `PATH` value, finds first can't run: it is
+/// `/usr/bin/git`, and the developer directory `selected` names holds no
+/// git for it to run.
+#[cfg(target_os = "macos")]
+fn git_stub_without_tools(
+    path: Option<&std::ffi::OsStr>,
+    selected: impl FnOnce() -> Option<PathBuf>,
+) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let git = std::env::split_paths(path?)
+        .map(|directory| directory.join("git"))
+        .find(|candidate| {
+            std::fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })?;
+    if std::fs::canonicalize(&git).ok()? != Path::new("/usr/bin/git") {
+        return None;
+    }
+    if selected().is_some_and(|developer| developer.join("usr/bin/git").is_file()) {
+        return None;
+    }
+    Some(
+        "macOS's git needs the Command Line Tools, which aren't installed; install them with \
+         `xcode-select --install`"
+            .to_owned(),
+    )
+}
+
+/// The developer directory `/usr/bin/git` runs git from, as `xcode-select`
+/// reports it without offering to install one.
+#[cfg(target_os = "macos")]
+fn selected_developer_directory() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let output = std::process::Command::new("/usr/bin/xcode-select")
+        .arg("-p")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| PathBuf::from(std::ffi::OsStr::from_bytes(output.stdout.trim_ascii_end())))
 }
 
 fn first_record_matching(
@@ -301,6 +377,9 @@ pub fn tracked_entries_in_any_repository(
 /// an entry with conflicts, which has no stage 0, and past `limit` bytes.
 pub fn indexed_blob(root: &Path, entry: &str, limit: usize) -> std::io::Result<Vec<u8>> {
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    #[cfg(target_os = "macos")]
+    refuse_git_stub()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::NotFound, error.to_string()))?;
     let object = format!(":0:{entry}");
     let mut command = probe_command(root, &["cat-file", "blob", &object]);
     let output = crate::process_output::output_capped(&mut command, TIMEOUT, limit)?;
@@ -1326,6 +1405,43 @@ pub fn shell_word(word: &str) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_s_git_stub_counts_as_missing_git_until_developer_tools_are_selected() {
+        let first = tempfile::tempdir().unwrap();
+        let tools = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tools.path().join("usr/bin")).unwrap();
+        std::fs::write(tools.path().join("usr/bin/git"), "").unwrap();
+        // A directory ahead of `/usr/bin` whose `git` leads to the stub.
+        std::os::unix::fs::symlink("/usr/bin/git", first.path().join("git")).unwrap();
+        let path = std::env::join_paths([first.path(), Path::new("/usr/bin")]).unwrap();
+        let path = Some(path.as_os_str());
+
+        let missing = git_stub_without_tools(path, || None).unwrap();
+        assert!(missing.contains("xcode-select --install"), "{missing}");
+        let empty = tempfile::tempdir().unwrap();
+        assert!(git_stub_without_tools(path, || Some(empty.path().to_path_buf())).is_some());
+        assert_eq!(
+            git_stub_without_tools(path, || Some(tools.path().to_path_buf())),
+            None
+        );
+
+        // A git of its own ahead of the stub runs without developer tools,
+        // and a PATH without git leaves spawning to report it missing.
+        let own = tempfile::tempdir().unwrap();
+        let git = own.path().join("git");
+        std::fs::write(&git, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&git, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let ahead = std::env::join_paths([own.path(), Path::new("/usr/bin")]).unwrap();
+        assert_eq!(git_stub_without_tools(Some(&ahead), || None), None);
+        assert_eq!(
+            git_stub_without_tools(Some(empty.path().as_os_str()), || None),
+            None
+        );
+        assert_eq!(git_stub_without_tools(None, || None), None);
+    }
 
     #[cfg(unix)]
     #[test]

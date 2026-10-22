@@ -31,9 +31,6 @@ open = { workspace = true }
 shlex = { workspace = true }
 unicode-normalization = "0.1"
 
-[target.'cfg(not(windows))'.dependencies]
-sha2 = { workspace = true, features = ["asm"] }
-
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -51,6 +48,11 @@ windows-sys = { version = "0.60", features = [
 ] }
 
 [features]
+# SHA-256 in C and assembly, for the CLI's hashing; not for Windows, whose
+# toolchain doesn't build it. Off where a build must come out byte for byte the
+# same on every machine, as the vault app's engine must: that object code
+# follows the local C compiler.
+asm-sha2 = ["sha2/asm"]
 # Test helpers other crates' tests use: macOS disk images.
 test-support = []
 

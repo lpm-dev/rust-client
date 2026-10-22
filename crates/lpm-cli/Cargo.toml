@@ -205,6 +205,9 @@ windows-sys = { version = "0.60", features = [
 [target.'cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))'.dependencies]
 keyring = { workspace = true }
 
+[target.'cfg(not(windows))'.dependencies]
+lpm-common = { workspace = true, features = ["asm-sha2"] }
+
 [features]
 # Build GNU Linux release artifacts without host DBus/OpenSSL dependencies.
 portable-linux = ["keyring/vendored"]
