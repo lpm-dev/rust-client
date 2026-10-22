@@ -18,7 +18,8 @@ typedef struct {
 
 uint32_t lpm_env_abi_version(void);
 /* Input and folder pointers must reference valid UTF-8 byte ranges during the call.
- * status: 0=resolved, 1=invalid schema/source, 2=invalid input, 3=panic, 4=output limit.
+ * status: 0=resolved, 1=invalid schema/source, 2=invalid input, 3=panic, 4=output limit,
+ * 5=refused (the LPM home and project files).
  * Every returned result must be released exactly once, including failures.
  * The result and snapshot cannot be used after release. */
 /* Validate a flat schema without filesystem access. Authored imports require resolve. */
@@ -51,6 +52,55 @@ LPMEnvResult lpm_env_check(const uint8_t *schema, size_t schema_length,
  * status: 0=sealed, 2=invalid input, 3=failure or panic. */
 LPMEnvResult lpm_env_seal_box(const uint8_t *public_key, size_t public_key_length,
                             const uint8_t *plaintext, size_t plaintext_length);
+/* The LPM home and project files, kept as the CLI keeps them. Every path is an
+ * absolute UTF-8 path of at most 32 KiB.
+ * Status 5 refuses with {code, message} and, for a secret file, path and, where
+ * git tracks it, untrack: the commands that untrack it, each quoted in backticks. */
+/* Where the LPM home at `home` is once links are followed, whether it is the
+ * default home (`.lpm` in `user_home`), and the suffix the CLI appends to its
+ * credential-store service names there: {identity, isDefault, scope}, scope null
+ * for the default home, else 16 hex digits, used as "<service>:<scope>". identity
+ * is canonical as far as the path exists, with the rest appended.
+ * status: 0=described, 2=invalid input, 3=panic. */
+LPMEnvResult lpm_env_describe_home(const uint8_t *home, size_t home_length,
+                                 const uint8_t *user_home, size_t user_home_length);
+/* Create the LPM home owner-only where it is missing and keep it out of git with
+ * a .gitignore that ignores everything, as the CLI does before it writes login or
+ * env state there. Output {exposed}: null, or {reason, atRepositoryRoot} where a
+ * git repository around the home could commit what it holds, so nothing secret
+ * may be written there; only another home keeps a repository's root out.
+ * status: 0=prepared, 2=invalid input, 3=panic, 5=could not create the home. */
+LPMEnvResult lpm_env_prepare_home(const uint8_t *home, size_t home_length);
+/* The project the CLI's env commands act on for `folder`: the nearest directory at
+ * or above it with a package.json or lpm.json, stopping before `user_home`, else
+ * `folder`. Output {root, isProject, stateIsHome}; stateIsHome means the project's
+ * .lpm is the LPM home at `home`, where project state must not be kept.
+ * status: 0=found, 2=invalid input, 3=panic. */
+LPMEnvResult lpm_env_project_root(const uint8_t *folder, size_t folder_length,
+                                const uint8_t *user_home, size_t user_home_length,
+                                const uint8_t *home, size_t home_length);
+/* Open the .lpm of the open project directory `project`, at `display`, as the CLI
+ * does: created owner-only where missing, never through a link, kept from group
+ * and other access and from inherited macOS access lists where the user owns it,
+ * and with a .gitignore that ignores everything. A project whose .lpm would be the
+ * LPM home at `home` is refused. On success *state receives a new descriptor for
+ * .lpm that the caller closes. status: 0=opened, 2=invalid input, 3=panic,
+ * 5=refused: code env.project_state_is_home, env.project_state_link (.lpm is a
+ * link or not a directory), or env.project_state. */
+LPMEnvResult lpm_env_open_project_state(int32_t project, const uint8_t *display,
+                                      size_t display_length, const uint8_t *home,
+                                      size_t home_length, int32_t *state);
+/* Ready `path` for a file of secrets that the caller then writes, as `lpm env
+ * export` readies one for the project at `project`: git is made to ignore it, by a
+ * rule in the .gitignore of the project or of the repository that holds it, and a
+ * file git tracks is refused, as is one git can't be run for where a repository
+ * holds it. Runs git. Output {ignore: {kind, files}, warnings}, kind one of
+ * outsideProject, alreadyIgnored, added, noRepository, unverified (git can't run
+ * and no repository holds it), failed. status: 0=ready, 2=invalid input,
+ * 3=panic, 5=refused: code env.secret_tracked, env.secret_unverified,
+ * env.secret_ignore, or env.secret_write. */
+LPMEnvResult lpm_env_prepare_secret_file(const uint8_t *project, size_t project_length,
+                                       const uint8_t *path, size_t path_length);
 /* Release only the output buffer after decoding; the snapshot stays live.
  * Exclusively borrow result. Clears data/length; repeated calls are harmless.
  * A matching lpm_env_release is still required for the result. */

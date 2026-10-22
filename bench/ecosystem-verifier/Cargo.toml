@@ -19,6 +19,9 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 thiserror = { workspace = true }
 
+[target.'cfg(not(windows))'.dependencies]
+lpm-common = { workspace = true, features = ["asm-sha2"] }
+
 [dev-dependencies]
 tempfile = "3"
 

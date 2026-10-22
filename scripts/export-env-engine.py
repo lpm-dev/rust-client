@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import tomllib
 
 
 def file_hash(path):
@@ -19,11 +20,36 @@ def file_hash(path):
     return digest.hexdigest()
 
 
+def engine_crates(root):
+    """The workspace crates the engine builds from, relative to root: lpm-env-ffi and every path dependency it reaches, build and target-specific ones included."""
+    shared = tomllib.loads((root / 'Cargo.toml').read_text()).get('workspace', {}).get('dependencies', {})
+    found = set()
+    pending = [Path('crates/lpm-env-ffi')]
+    while pending:
+        crate = pending.pop()
+        if crate in found:
+            continue
+        found.add(crate)
+        manifest = tomllib.loads((root / crate / 'Cargo.toml').read_text())
+        for table in [manifest, *manifest.get('target', {}).values()]:
+            for kind in ['dependencies', 'build-dependencies']:
+                for name, spec in table.get(kind, {}).items():
+                    base = crate
+                    if isinstance(spec, dict) and spec.get('workspace'):
+                        spec, base = shared.get(name), Path()
+                    if isinstance(spec, dict) and 'path' in spec:
+                        path = Path(os.path.normpath(base / spec['path']))
+                        if path.is_absolute() or path.parts[:1] == ('..',):
+                            raise RuntimeError('Engine dependency outside the repository: ' + name)
+                        pending.append(path)
+    return sorted(found)
+
+
 def source_hashes(root):
     inputs = [root / 'Cargo.toml', root / 'Cargo.lock', root / 'scripts/export-env-engine.py']
     inputs += [path for path in [root / '.cargo/config.toml', root / 'rust-toolchain.toml'] if path.is_file()]
-    for crate in ['lpm-env', 'lpm-env-source', 'lpm-env-ffi']:
-        inputs += sorted(path for path in (root / 'crates' / crate).rglob('*') if path.is_file())
+    for crate in engine_crates(root):
+        inputs += sorted(path for path in (root / crate).rglob('*') if path.is_file())
     return {str(path.relative_to(root)): file_hash(path) for path in inputs}
 
 
