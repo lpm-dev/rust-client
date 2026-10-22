@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+lpm-env-backup = { path = "../crates/lpm-env-backup" }
 lpm-extractor = { path = "../crates/lpm-extractor" }
 lpm-migrate = { path = "../crates/lpm-migrate" }
 lpm-semver = { path = "../crates/lpm-semver" }
@@ -39,6 +40,27 @@ bench = false
 [[bin]]
 name = "foreign_lockfile_parsers"
 path = "fuzz_targets/foreign_lockfile_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "env_backup_payload"
+path = "fuzz_targets/env_backup_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "env_backup_header"
+path = "fuzz_targets/env_backup_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "env_backup_passphrase"
+path = "fuzz_targets/env_backup_passphrase.rs"
 test = false
 doc = false
 bench = false

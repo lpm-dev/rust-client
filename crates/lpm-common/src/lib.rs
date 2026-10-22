@@ -40,6 +40,7 @@ pub mod project_glob;
 pub mod project_secret;
 pub mod project_state;
 pub mod provenance;
+pub mod stored_env;
 pub mod symlink;
 pub mod terminal;
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]

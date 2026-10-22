@@ -33,6 +33,7 @@ members = [
     "crates/lpm-env-codegen",
     "crates/lpm-env-source",
     "crates/lpm-env-ffi",
+    "crates/lpm-env-backup",
     "crates/lpm-env-wasm",
     "crates/lpm-global",
     "crates/lpm-audit-corpus",
@@ -84,6 +85,7 @@ lpm-migrate = { path = "crates/lpm-migrate" }
 lpm-env = { path = "crates/lpm-env" }
 lpm-env-codegen = { path = "crates/lpm-env-codegen" }
 lpm-env-source = { path = "crates/lpm-env-source" }
+lpm-env-backup = { path = "crates/lpm-env-backup" }
 lpm-global = { path = "crates/lpm-global" }
 
 # Async runtime
@@ -233,4 +235,17 @@ needless_collect = "deny"
 unnecessary_wraps = "deny"
 
 [profile.dev.package.scrypt]
+opt-level = 3
+
+# Backup tests derive keys and encrypt and wipe 64 MiB payloads.
+[profile.dev.package.lpm-env-backup]
+opt-level = 3
+
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.chacha20]
+opt-level = 3
+
+[profile.dev.package.poly1305]
 opt-level = 3

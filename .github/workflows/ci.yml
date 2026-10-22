@@ -604,6 +604,15 @@ jobs:
       - name: Foreign lockfile parser fuzz smoke
         run: cargo +nightly fuzz run foreign_lockfile_parsers -- -runs=2000
 
+      - name: Env backup payload fuzz smoke
+        run: cargo +nightly fuzz run env_backup_payload -- -runs=2000
+
+      - name: Env backup header fuzz smoke
+        run: cargo +nightly fuzz run env_backup_header -- -runs=2000
+
+      - name: Env backup passphrase fuzz smoke
+        run: cargo +nightly fuzz run env_backup_passphrase -- -runs=2000
+
   windows-platform-backends:
     name: Windows platform backend runtime checks
     runs-on: windows-latest

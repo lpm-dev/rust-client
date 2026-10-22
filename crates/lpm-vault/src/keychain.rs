@@ -6,6 +6,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use lpm_common::stored_env::{is_safe_vault_id, is_valid_environment_name, is_valid_org_slug};
+
 use crate::macos_keychain::{
     delete as delete_keychain_password, read_string as try_read_keychain_password,
     with_keychain_transaction as with_raw_keychain_transaction,
@@ -961,18 +963,6 @@ fn is_canonical_transaction_id(value: &str) -> bool {
     is_valid_project_storage_id(value) && value.bytes().all(|byte| !byte.is_ascii_uppercase())
 }
 
-fn is_valid_org_slug(value: &str) -> bool {
-    let Some(first) = value.bytes().next() else {
-        return false;
-    };
-    value.len() <= 120
-        && first.is_ascii_alphanumeric()
-        && value
-            .bytes()
-            .skip(1)
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-}
-
 #[cfg(test)]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct EnvironmentsWrapper {
@@ -1741,30 +1731,11 @@ fn are_valid_environment_summaries(summaries: &[ProjectEnvironmentSummary]) -> b
             .all(|summary| is_valid_environment_name(&summary.name))
 }
 
-fn is_valid_environment_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name != "__index__"
-        && !name.contains("..")
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-}
-
 fn validate_vault_id(vault_id: &str) -> Result<(), String> {
-    let invalid = vault_id.is_empty()
-        || vault_id.len() > 128
-        || matches!(vault_id, "." | "..")
-        || vault_id.starts_with('~')
-        || vault_id.starts_with("__")
-        || vault_id.contains("..")
-        || vault_id
-            .chars()
-            .any(|character| character.is_control() || matches!(character, '/' | '\\' | ':'));
-    if invalid {
-        Err("vault ID is not safe for protected storage".to_owned())
-    } else {
+    if is_safe_vault_id(vault_id) {
         Ok(())
+    } else {
+        Err("vault ID is not safe for protected storage".to_owned())
     }
 }
 
