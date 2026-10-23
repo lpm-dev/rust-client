@@ -674,7 +674,8 @@ jobs:
           cargo check --locked -p lpm-vault
 
       - name: Windows fallback vault store tests
-        run: cargo test --locked -p lpm-vault --lib fallback::
+        run: |
+          cargo test --locked -p lpm-vault --lib fallback::
 
       - name: Windows port backend tests
         run: cargo test --locked -p lpm-runner ports::tests
