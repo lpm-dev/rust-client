@@ -1104,6 +1104,18 @@ fn set_test_binary_executable(path: &Path) {
 #[cfg(not(unix))]
 fn set_test_binary_executable(_path: &Path) {}
 
+/// The file the CLI's fallback store keeps `vault_id` in, under the LPM home
+/// at `home`: a digest of the ID, as crates/lpm-vault names it.
+pub fn fallback_vault_file(home: &Path, vault_id: &str) -> PathBuf {
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    digest.update(b"lpm-vault-file\0");
+    digest.update(vault_id.as_bytes());
+    home.join(".lpm/vaults")
+        .join(format!("{}.vault", hex::encode(digest.finalize())))
+}
+
 pub fn write_repeated_file(
     path: &Path,
     prefix: &[u8],

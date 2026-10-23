@@ -1,6 +1,7 @@
 //! Encrypted vault blobs for non-macOS platforms.
 //!
-//! Linux and Windows keep vault files at `~/.lpm/vaults/{vault-id}.enc`.
+//! Linux and Windows keep vault files in `~/.lpm/vaults`, each named by a
+//! digest of its vault ID; earlier versions named them `{vault-id}.enc`.
 //! The encryption key is protected by the OS secure store when available,
 //! with a random file-backed key used when the native store is unavailable.
 
@@ -118,8 +119,49 @@ fn force_file_data_key() -> bool {
     lpm_common::acceptance::env_flag_enabled("LPM_FORCE_FILE_VAULT")
 }
 
-fn vault_file_name(vault_id: &str) -> String {
-    format!("{vault_id}.enc")
+/// A vault's file name: a digest of its ID, so every ID names a file that's
+/// valid and distinct on every platform. Vault IDs come from user-editable
+/// lpm.json, and Windows compares names without case and reserves some
+/// (`CON`, `NUL`, …), so `{vault-id}.enc` could collide or not open at all.
+/// Digest names are lowercase hex, so they stay distinct without case too and
+/// open directly.
+pub(crate) fn vault_file_name(vault_id: &str) -> String {
+    use sha2::Digest as _;
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"lpm-vault-file\0");
+    digest.update(vault_id.as_bytes());
+    format!("{}.vault", hex::encode(digest.finalize()))
+}
+
+/// The name a vault's file had before it was named by digest, when an entry is
+/// named that exactly. A case-insensitive file system would open the legacy
+/// file of a vault whose ID differs only in case, and an entry can't have a
+/// name the platform reserves.
+fn existing_legacy_vault_file_name(
+    vaults: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+) -> Result<Option<String>, String> {
+    let legacy = format!("{vault_id}.enc");
+    Ok(vaults
+        .contains_entry_named_exactly(&legacy)?
+        .then_some(legacy))
+}
+
+/// The vault's encrypted file and the name it's under, if it has one.
+fn read_vault_content(
+    vaults: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+) -> Result<Option<(String, Vec<u8>)>, String> {
+    let current = vault_file_name(vault_id);
+    if let Some(content) = vaults.read_owner_only_file(&current, "encrypted vault")? {
+        return Ok(Some((current, content)));
+    }
+    let Some(legacy) = existing_legacy_vault_file_name(vaults, vault_id)? else {
+        return Ok(None);
+    };
+    Ok(vaults
+        .read_owner_only_file(&legacy, "encrypted vault")?
+        .map(|content| (legacy, content)))
 }
 
 fn local_vault_associated_data(vault_id: &str) -> Result<Vec<u8>, String> {
@@ -399,7 +441,11 @@ fn vault_files_exist(directory: &crate::storage_transaction::VaultStorageDirecto
     let Ok(vaults) = directory.open_or_create_directory("vaults") else {
         return false;
     };
-    vaults.contains_file_with_extension("enc").unwrap_or(false)
+    ["vault", "enc"].iter().any(|extension| {
+        vaults
+            .contains_file_with_extension(extension)
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(test)]
@@ -543,8 +589,7 @@ fn read_vault_file_env_unlocked(
     default_fallback: bool,
 ) -> Result<Option<SecretMap>, String> {
     let vaults = directory.open_or_create_directory("vaults")?;
-    let name = vault_file_name(vault_id);
-    let Some(content) = vaults.read_owner_only_file(&name, "encrypted vault")? else {
+    let Some((name, content)) = read_vault_content(&vaults, vault_id)? else {
         return Ok(None);
     };
     let encoded = std::str::from_utf8(&content).map_err(|_| {
@@ -597,8 +642,7 @@ pub(crate) fn read_all_environments_with_digest_unlocked(
     use sha2::Digest as _;
 
     let vaults = directory.open_or_create_directory("vaults")?;
-    let name = vault_file_name(vault_id);
-    let Some(content) = vaults.read_owner_only_file(&name, "encrypted vault")? else {
+    let Some((name, content)) = read_vault_content(&vaults, vault_id)? else {
         return Ok((None, None));
     };
     let digest = sha2::Sha256::digest(&content).into();
@@ -625,8 +669,15 @@ pub(crate) fn vault_payload_digest_unlocked(
     vault_id: &str,
 ) -> Result<Option<[u8; 32]>, String> {
     let vaults = directory.open_or_create_directory("vaults")?;
-    let name = vault_file_name(vault_id);
-    vaults.sha256_owner_only_file(&name, "encrypted vault")
+    if let Some(digest) =
+        vaults.sha256_owner_only_file(&vault_file_name(vault_id), "encrypted vault")?
+    {
+        return Ok(Some(digest));
+    }
+    match existing_legacy_vault_file_name(&vaults, vault_id)? {
+        Some(legacy) => vaults.sha256_owner_only_file(&legacy, "encrypted vault"),
+        None => Ok(None),
+    }
 }
 
 /// Write vault secrets to encrypted file (specific environment).
@@ -653,7 +704,19 @@ pub(crate) fn write_all_environments_unlocked(
         &vault_file_name(vault_id),
         encrypted.as_bytes(),
         "encrypted vault",
-    )
+    )?;
+    remove_legacy_vault_file(&vaults, vault_id)
+}
+
+/// Removes the vault's legacy file, when an entry is named that exactly.
+fn remove_legacy_vault_file(
+    vaults: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+) -> Result<(), String> {
+    if let Some(legacy) = existing_legacy_vault_file_name(vaults, vault_id)? {
+        vaults.remove_file(&legacy, "encrypted vault")?;
+    }
+    Ok(())
 }
 
 pub(crate) fn mutate_vault_file_env<T>(
@@ -693,7 +756,7 @@ pub fn delete_vault_file(vault_id: &str) -> Result<(), String> {
     crate::storage_transaction::with_vault_transaction(|directory| {
         let vaults = directory.open_or_create_directory("vaults")?;
         vaults.remove_file(&vault_file_name(vault_id), "encrypted vault")?;
-        Ok(())
+        remove_legacy_vault_file(&vaults, vault_id)
     })
 }
 
@@ -897,6 +960,188 @@ mod tests {
                 .expect("concurrent vault should exist");
 
             assert_eq!(stored.len(), workers);
+        });
+    }
+
+    fn secrets(value: &str) -> SecretMap {
+        HashMap::from([("TOKEN".to_owned(), value.to_owned())])
+    }
+
+    fn force_file_vault() {
+        unsafe {
+            std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
+        }
+    }
+
+    #[test]
+    fn vaults_whose_ids_differ_only_in_case_keep_their_own_files() {
+        with_temp_vault_home(|_| {
+            force_file_vault();
+            write_vault_file("shared-vault", &secrets("lower")).expect("write lower");
+            write_vault_file("SHARED-VAULT", &secrets("upper")).expect("write upper");
+
+            let lower = read_vault_file_env("shared-vault", "default").expect("read lower");
+            let upper = read_vault_file_env("SHARED-VAULT", "default").expect("read upper");
+
+            assert_eq!(lower, Some(secrets("lower")));
+            assert_eq!(upper, Some(secrets("upper")));
+        });
+    }
+
+    #[test]
+    fn every_vault_id_names_a_file_valid_and_distinct_on_every_platform() {
+        let ids = [
+            "vault", "VAULT", "Vault", "CON", "con", "a?b", "trail.", "LPT1.txt", "x y ",
+        ];
+        let names: Vec<String> = ids.iter().map(|id| vault_file_name(id)).collect();
+        for name in &names {
+            let (stem, extension) = name.split_once('.').expect("an extension");
+            assert_eq!(extension, "vault", "{name}");
+            assert_eq!(stem.len(), 64, "{name}");
+            assert!(
+                stem.bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "{name}"
+            );
+        }
+        let distinct: std::collections::HashSet<String> =
+            names.iter().map(|name| name.to_ascii_lowercase()).collect();
+        assert_eq!(distinct.len(), ids.len());
+    }
+
+    #[test]
+    fn a_vault_under_its_legacy_name_is_read_and_moved_on_the_next_write() {
+        with_temp_vault_home(|_| {
+            force_file_vault();
+            write_vault_file("old-vault", &secrets("before")).expect("write");
+            let content = read_encrypted_vault("old-vault");
+            with_storage_directory(|directory| {
+                let vaults = directory.open_or_create_directory("vaults")?;
+                vaults.write_owner_only_file("old-vault.enc", &content, "encrypted vault")?;
+                vaults.remove_file(&vault_file_name("old-vault"), "encrypted vault")?;
+                Ok(())
+            });
+
+            let read = read_vault_file_env("old-vault", "default").expect("read legacy");
+            assert_eq!(read, Some(secrets("before")));
+
+            write_vault_file("old-vault", &secrets("after")).expect("write again");
+            let (current, legacy) = with_storage_directory(|directory| {
+                let vaults = directory.open_or_create_directory("vaults")?;
+                Ok((
+                    vaults
+                        .read_owner_only_file(&vault_file_name("old-vault"), "encrypted vault")?,
+                    vaults.read_owner_only_file("old-vault.enc", "encrypted vault")?,
+                ))
+            });
+            assert!(current.is_some());
+            assert!(legacy.is_none(), "the legacy file is removed once moved");
+            assert_eq!(
+                read_vault_file_env("old-vault", "default").expect("read moved"),
+                Some(secrets("after"))
+            );
+        });
+    }
+
+    #[test]
+    fn a_legacy_file_counts_only_under_its_exact_name() {
+        with_temp_vault_home(|_| {
+            force_file_vault();
+            write_vault_file("Other-Vault", &secrets("theirs")).expect("write");
+            let content = read_encrypted_vault("Other-Vault");
+            with_storage_directory(|directory| {
+                let vaults = directory.open_or_create_directory("vaults")?;
+                vaults.write_owner_only_file("Other-Vault.enc", &content, "encrypted vault")?;
+                vaults.remove_file(&vault_file_name("Other-Vault"), "encrypted vault")?;
+                Ok(())
+            });
+
+            // A case-insensitive file system opens Other-Vault.enc for this name too.
+            assert_eq!(
+                read_vault_file_env("other-vault", "default").expect("read"),
+                None
+            );
+            write_vault_file("other-vault", &secrets("mine")).expect("write mine");
+            assert_eq!(
+                read_vault_file_env("Other-Vault", "default").expect("read theirs"),
+                Some(secrets("theirs"))
+            );
+            assert_eq!(
+                read_vault_file_env("other-vault", "default").expect("read mine"),
+                Some(secrets("mine"))
+            );
+            delete_vault_file("other-vault").expect("delete mine");
+            assert_eq!(
+                read_vault_file_env("Other-Vault", "default").expect("read theirs again"),
+                Some(secrets("theirs"))
+            );
+        });
+    }
+
+    #[test]
+    fn deleting_a_vault_removes_its_legacy_file_too() {
+        with_temp_vault_home(|_| {
+            force_file_vault();
+            write_vault_file("gone-vault", &secrets("value")).expect("write");
+            let content = read_encrypted_vault("gone-vault");
+            with_storage_directory(|directory| {
+                let vaults = directory.open_or_create_directory("vaults")?;
+                vaults.write_owner_only_file("gone-vault.enc", &content, "encrypted vault")
+            });
+            delete_vault_file("gone-vault").expect("delete");
+            assert_eq!(
+                read_vault_file_env("gone-vault", "default").expect("read"),
+                None
+            );
+        });
+    }
+
+    #[test]
+    fn vaults_whose_ids_windows_cannot_name_as_files_are_stored() {
+        with_temp_vault_home(|_| {
+            force_file_vault();
+            for id in ["CON", "nul", "a?b", "trail.", "x y ", "LPT1.txt"] {
+                write_vault_file(id, &secrets(id)).expect(id);
+            }
+            for id in ["CON", "nul", "a?b", "trail.", "x y ", "LPT1.txt"] {
+                assert_eq!(
+                    read_vault_file_env(id, "default").expect(id),
+                    Some(secrets(id)),
+                    "{id}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn a_vault_under_its_digest_name_is_read_and_written_without_listing_the_directory() {
+        use crate::storage_transaction::ENTRY_LISTINGS;
+
+        with_temp_vault_home(|_| {
+            force_file_vault();
+            write_vault_file("listed-vault", &secrets("value")).expect("write");
+            ENTRY_LISTINGS.with(|listings| listings.set(0));
+
+            read_vault_file_env("listed-vault", "default").expect("read");
+            write_vault_file("listed-vault", &secrets("again")).expect("write again");
+            with_storage_directory(|directory| {
+                vault_payload_digest_unlocked(directory, "listed-vault")
+            });
+            assert_eq!(ENTRY_LISTINGS.with(std::cell::Cell::get), 0);
+
+            let content = read_encrypted_vault("listed-vault");
+            with_storage_directory(|directory| {
+                let vaults = directory.open_or_create_directory("vaults")?;
+                vaults.write_owner_only_file("listed-vault.enc", &content, "encrypted vault")?;
+                vaults.remove_file(&vault_file_name("listed-vault"), "encrypted vault")?;
+                Ok(())
+            });
+            read_vault_file_env("listed-vault", "default").expect("read legacy");
+            assert_eq!(
+                ENTRY_LISTINGS.with(std::cell::Cell::get),
+                1,
+                "a legacy file is matched by its exact name"
+            );
         });
     }
 

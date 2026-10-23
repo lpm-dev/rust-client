@@ -419,10 +419,10 @@ pub(crate) enum SyncVersionTarget<'a> {
 /// If lpm.json doesn't exist, creates a minimal one with just the vault field.
 ///
 /// Existing IDs are validated by [`is_safe_vault_id`] before being
-/// returned. The file-fallback vault backend joins the ID into a
-/// `~/.lpm/vaults/{id}.enc` path, so an unvalidated `../` or absolute
-/// path in `lpm.json["vault"]` from a malicious cloned repo would let
-/// `lpm env` modify `.enc` files outside the vaults directory.
+/// returned. `lpm.json["vault"]` can come from a malicious cloned repo,
+/// and the ID names the project's secure-store items and, under its legacy
+/// `~/.lpm/vaults/{id}.enc` name, a fallback vault file, so a `../` or
+/// absolute path must never reach them.
 pub fn get_or_create_vault_id(project_dir: &Path) -> Result<String, String> {
     lpm_common::update_lpm_json(project_dir, |root, _| {
         if let Some(value) = root.get("vault").filter(|value| !value.is_null()) {

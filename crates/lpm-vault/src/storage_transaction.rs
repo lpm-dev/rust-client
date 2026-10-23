@@ -11,6 +11,12 @@ use lpm_common::macos_acl;
 const TRANSACTION_LOCK_NAME: &str = ".vault-keychain.lock";
 
 #[cfg(test)]
+thread_local! {
+    /// How often this thread has listed a directory to match an entry's exact name.
+    pub(crate) static ENTRY_LISTINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 static FORCE_DIRECTORY_SYNC_FAILURE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -497,6 +503,38 @@ impl VaultStorageDirectory {
 
     pub(crate) fn display_path(&self, name: &str) -> PathBuf {
         self.display.join(name)
+    }
+
+    /// Whether an entry is named exactly `name`, byte for byte. A
+    /// case-insensitive file system opens `name` for an entry that differs
+    /// from it only in case; this tells them apart. The directory is listed
+    /// only when something opens under `name`.
+    pub(crate) fn contains_entry_named_exactly(&self, name: &str) -> Result<bool, String> {
+        validate_name(OsStr::new(name))?;
+        match self.directory.symlink_metadata(name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Ok(_) | Err(_) => {}
+        }
+        #[cfg(test)]
+        ENTRY_LISTINGS.with(|listings| listings.set(listings.get() + 1));
+        let entries = self.directory.entries().map_err(|error| {
+            format!(
+                "failed to inspect protected directory {}: {error}",
+                self.display.display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "failed to inspect an entry in {}: {error}",
+                    self.display.display()
+                )
+            })?;
+            if entry.file_name() == OsStr::new(name) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub(crate) fn contains_file_with_extension(&self, extension: &str) -> Result<bool, String> {
