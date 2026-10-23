@@ -3,13 +3,18 @@
 import argparse
 import fcntl
 import hashlib
+import html
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
 import tomllib
+
+NOTICES = 'THIRD_PARTY_NOTICES.html'
+LICENSE_FILE_PREFIXES = ('LICENSE', 'LICENCE', 'COPYING', 'COPYRIGHT', 'NOTICE', 'UNLICENSE')
 
 
 def file_hash(path):
@@ -62,6 +67,96 @@ def header_abi_version(root):
     raise RuntimeError('lpm_env.h does not define LPM_ENV_ABI_VERSION')
 
 
+def linked_packages(metadata_by_target):
+    """The registry packages linked into lpm-env-ffi for any of the targets: those its
+    normal dependencies reach, without proc macros, which only run while compiling."""
+    linked = {}
+    for metadata in metadata_by_target:
+        packages = {package['id']: package for package in metadata['packages']}
+        nodes = {node['id']: node for node in metadata['resolve']['nodes']}
+        pending = [next(package['id'] for package in metadata['packages'] if package['name'] == 'lpm-env-ffi' and package['source'] is None)]
+        reached = set()
+        while pending:
+            node = pending.pop()
+            if node in reached:
+                continue
+            reached.add(node)
+            for dependency in nodes[node]['deps']:
+                package = packages[dependency['pkg']]
+                normal = any(kind['kind'] is None for kind in dependency['dep_kinds'])
+                if normal and not any('proc-macro' in target['kind'] for target in package['targets']):
+                    pending.append(dependency['pkg'])
+        for node in reached:
+            package = packages[node]
+            if package['source'] is not None:
+                linked[(package['name'], package['version'])] = package
+    return [linked[key] for key in sorted(linked)]
+
+
+def normalized(data):
+    text = data.decode('utf-8', errors='replace').replace('\r\n', '\n').replace('\r', '\n')
+    return '\n'.join(line.rstrip() for line in text.split('\n')).strip('\n')
+
+
+def is_apache_license(text):
+    return re.match(r'\s*Apache License\s+Version 2\.0', text) is not None
+
+
+def license_texts(package, mit_text):
+    """The license, copyright and notice files a package ships. A package that may
+    be used under MIT alone leaves out its Apache License text when it ships an MIT
+    one. One that ships none and offers MIT gets the MIT text in its authors' name;
+    any other fails, to be reviewed."""
+    directory = Path(package['manifest_path']).parent
+    paths = {path for path in directory.iterdir() if path.is_file() and path.name.upper().startswith(LICENSE_FILE_PREFIXES)}
+    if package.get('license_file'):
+        paths.add(directory / package['license_file'])
+    texts = [normalized(path.read_bytes()) for path in sorted(paths, key=lambda path: path.name)]
+    expression = package.get('license') or ''
+    terms = set(re.findall(r'[A-Za-z0-9.+-]+', expression)) - {'OR', 'AND', 'WITH'}
+    mit_alone = 'MIT' in terms and 'AND' not in expression.split()
+    if mit_alone and any('Permission is hereby granted' in text for text in texts):
+        texts = [text for text in texts if not is_apache_license(text)]
+    if texts:
+        return texts
+    if 'MIT' in terms:
+        holders = ', '.join(package.get('authors') or []) or 'the ' + package['name'] + ' authors'
+        return [normalized(mit_text.replace('<year> <copyright holders>', holders).encode())]
+    raise RuntimeError(package['name'] + ' ' + package['version'] + ' ships no license text; review its license and add its notice')
+
+
+def third_party_notices(packages, mit_text, data_notices, std_notice):
+    """One HTML document of the notices for everything the engine links: each crate
+    with the license texts it ships, each distinct text written once, the data
+    files' notices, and the Rust standard library's own notices."""
+    body = re.search(r'<body>(.*)</body>', std_notice, re.DOTALL | re.IGNORECASE)
+    if body is None:
+        raise RuntimeError('The Rust standard library notices have no body')
+    numbers = {}
+    items = []
+    for package in packages:
+        texts = [numbers.setdefault(text, len(numbers) + 1) for text in license_texts(package, mit_text)]
+        name, version = html.escape(package['name']), html.escape(package['version'])
+        items.append(
+            '<li><b>' + name + '</b> ' + version + ', ' + html.escape(package.get('license') or 'see its texts')
+            + ', source https://crates.io/crates/' + name + '/' + version
+            + ', texts ' + ', '.join('<a href="#text-' + str(number) + '">' + str(number) + '</a>' for number in texts) + '</li>')
+    parts = [
+        '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="UTF-8">\n<title>Third-party notices for the LPM env engine</title>\n</head>\n<body>',
+        '<h1>Third-party notices for the LPM env engine</h1>',
+        '<h2>Rust crates</h2>',
+        '<ul>\n' + '\n'.join(items) + '\n</ul>',
+        '<h2>Crate license texts</h2>',
+    ]
+    for text, number in numbers.items():
+        parts.append('<h3 id="text-' + str(number) + '">' + str(number) + '</h3>\n<pre>' + html.escape(text) + '</pre>')
+    if data_notices:
+        parts.append('<h2>Data</h2>')
+        parts += ['<pre>' + html.escape(normalized(text)) + '</pre>' for text in data_notices]
+    parts += ['<h2>The Rust standard library</h2>', body.group(1).strip(), '</body>\n</html>\n']
+    return '\n'.join(parts)
+
+
 def export(root, target_dir, output):
     target_dir = target_dir.resolve() / 'env-engine-export'
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -75,7 +170,7 @@ def export_locked(root, target_dir, output):
     output = output.resolve()
     target_dir.mkdir(parents=True, exist_ok=True)
     output.parent.mkdir(parents=True, exist_ok=True)
-    if output.exists() and any(path.name not in {'LPMEnv.xcframework', 'provenance.json'} for path in output.iterdir()):
+    if output.exists() and any(path.name not in {'LPMEnv.xcframework', 'provenance.json', NOTICES} for path in output.iterdir()):
         raise RuntimeError('Output contains files outside the engine bundle')
     revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
     recorded_sources = source_hashes(root)
@@ -126,7 +221,16 @@ def export_locked(root, target_dir, output):
         subprocess.run([str(objcopy), '--strip-debug', '--enable-deterministic-archives', '--remove-section=__LLVM,__bitcode', '--remove-section=__LLVM,__cmdline', str(library)], env=env, check=True)
         subprocess.run(['xcodebuild', '-create-xcframework', '-library', str(library), '-headers', str(frozen / 'crates/lpm-env-ffi/include'), '-output', str(artifact)], env=env, check=True)
         files = {str(path.relative_to(staging)): file_hash(path) for path in artifact.rglob('*') if path.is_file()}
-        provenance = dict(abiVersion=abi_version, toolchain='1.94.0', targets=targets, repository='https://github.com/lpm-dev/rust-client', revision=revision, sources=sources, artifacts=files)
+        metadata = [json.loads(subprocess.check_output(['cargo', '+1.94.0', 'metadata', '--locked', '--offline', '--format-version', '1', '--filter-platform', target], cwd=frozen, env=env)) for target in targets]
+        licenses = Path(sysroot) / 'share/doc/rust'
+        notices = third_party_notices(
+            linked_packages(metadata),
+            (licenses / 'licenses/MIT.txt').read_text(),
+            [path.read_bytes() for path in sorted((frozen / 'crates/lpm-env-ffi/include').glob('*NOTICE*'))],
+            (licenses / 'COPYRIGHT-library.html').read_text(),
+        )
+        (staging / NOTICES).write_text(notices)
+        provenance = dict(abiVersion=abi_version, toolchain='1.94.0', targets=targets, repository='https://github.com/lpm-dev/rust-client', revision=revision, sources=sources, artifacts=files, notices=file_hash(staging / NOTICES))
         (staging / 'provenance.json').write_text(json.dumps(provenance, indent=2, sort_keys=True) + '\n')
         if source_hashes(root) != sources or subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip() != revision:
             raise RuntimeError('Engine sources changed during export')
