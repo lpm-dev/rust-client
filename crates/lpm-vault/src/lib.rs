@@ -1548,7 +1548,7 @@ mod tests {
             let vault_id = vault_id::read_vault_id(project.path()).unwrap();
             assert!(
                 root.join("vaults")
-                    .join(format!("{vault_id}.enc"))
+                    .join(fallback::vault_file_name(&vault_id))
                     .is_file()
             );
             assert!(!home.join(".lpm").exists(), "nothing lands in $HOME/.lpm");
