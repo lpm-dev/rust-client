@@ -23,7 +23,7 @@ test("release verification reruns every release-critical CI policy gate", () => 
     /cargo fmt --check/,
     /EmbarkStudios\/cargo-deny-action@[0-9a-f]{40}/,
     /command-arguments: --hide-inclusion-graph advisories bans licenses/,
-    /grep -r 'fancy-regex' crates\/\*\/Cargo\.toml/,
+    /python3 scripts\/check-fancy-regex-dependents\.py/,
     /sh tests\/install-sh\/run\.sh/,
     /bash bench\/test-audit-install-args\.sh/,
     /bash bench\/test-local-install\.sh/,
