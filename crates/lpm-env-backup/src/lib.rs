@@ -29,7 +29,7 @@
 //! program installs [`WipingAllocator`], as the LPM env engine does.
 
 mod container;
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 mod freed_memory_probe;
 pub mod passphrase;
 pub mod payload;
@@ -144,6 +144,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(miri))]
     fn checking_or_opening_a_backup_leaves_no_secret_in_freed_memory() {
         use crate::freed_memory_probe::{MARKER, watch};
         let secret = std::str::from_utf8(MARKER).expect("ASCII");
@@ -199,6 +200,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(miri))]
     fn zxcvbn_frees_copies_of_a_passphrase_that_the_wiping_allocator_zeroes() {
         use crate::freed_memory_probe::{MARKER, watch_wiping};
         let passphrase = Passphrase::new(MARKER).expect("passphrase");

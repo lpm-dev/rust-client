@@ -8,6 +8,7 @@ thread_local! {
     static LARGE_ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
     static ALLOCATED_BYTES: Cell<usize> = const { Cell::new(0) };
     static MAX_ALLOCATION: Cell<usize> = const { Cell::new(0) };
+    static LARGEST_REALLOCATION: Cell<usize> = const { Cell::new(0) };
 }
 fn record_allocation(size: usize) {
     if PROBE_ENABLED.try_with(Cell::get).unwrap_or(false) {
@@ -32,6 +33,9 @@ unsafe impl std::alloc::GlobalAlloc for ProbeAllocator {
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
         record_allocation(size);
+        if PROBE_ENABLED.try_with(Cell::get).unwrap_or(false) {
+            LARGEST_REALLOCATION.with(|value| value.set(value.get().max(layout.size())));
+        }
         // SAFETY: Forward the caller's unchanged allocator contract to System.
         unsafe { std::alloc::System.realloc(ptr, layout, size) }
     }
@@ -566,6 +570,27 @@ fn oversized_effective_enums_reject_before_copying_declarations() {
         "oversized schemas must reject before cloning enum storage"
     );
     assert_eq!(result.unwrap_err().diagnostic.code, "env.output_budget");
+}
+
+#[test]
+fn bounded_json_writes_its_output_once_into_an_allocation_exactly_its_size() {
+    let value: Vec<String> = (0..200_000).map(|index| format!("value-{index}")).collect();
+    let expected = serde_json::to_vec(&value).unwrap();
+    LARGEST_REALLOCATION.with(|value| value.set(0));
+    let (bytes, allocated, _) = allocation_probe(|| bounded_json(&value, 8 * 1024 * 1024).unwrap());
+    assert_eq!(bytes, expected);
+    assert_eq!(bytes.capacity(), bytes.len());
+    // Only the short list of chunks grows; no buffer of output is resized.
+    let largest_reallocation = LARGEST_REALLOCATION.with(Cell::get);
+    assert!(
+        largest_reallocation < 4096,
+        "a {largest_reallocation}-byte buffer was resized"
+    );
+    assert!(
+        allocated < 2 * bytes.len() + 64 * 1024,
+        "allocated {allocated} bytes for {} bytes of output",
+        bytes.len()
+    );
 }
 
 #[test]

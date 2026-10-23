@@ -52,8 +52,8 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 
 use lpm_common::stored_env::{
-    is_canonical_registry_url, is_safe_vault_id, is_valid_environment_name, is_valid_org_slug,
-    is_valid_variable_name,
+    MAX_ENVIRONMENT_NAME_BYTES, MAX_ORG_SLUG_BYTES, MAX_VAULT_ID_BYTES, is_canonical_registry_url,
+    is_safe_vault_id, is_valid_environment_name, is_valid_org_slug, is_valid_variable_name,
 };
 
 /// The most projects a backup holds.
@@ -75,6 +75,32 @@ const MAX_LABEL_BYTES: usize = 64;
 const MAX_DEVICE_NAME_BYTES: usize = 256;
 const MAX_REGISTRY_BYTES: usize = 2048;
 const MAX_PRINCIPAL_BYTES: usize = 256;
+
+/// The most bytes an object's keys decode to, and what a longer key fails as.
+#[derive(Clone, Copy)]
+struct KeyLimit {
+    bytes: usize,
+    too_long: PayloadErrorKind,
+}
+
+/// Longer than any field name the format has, so a longer key can't be one.
+const FIELD_NAMES: KeyLimit = KeyLimit {
+    bytes: 64,
+    too_long: PayloadErrorKind::Structure,
+};
+const ENVIRONMENT_NAMES: KeyLimit = KeyLimit {
+    bytes: MAX_ENVIRONMENT_NAME_BYTES,
+    too_long: PayloadErrorKind::EnvironmentName,
+};
+/// A variable's name is stored with its project, which must fit the store.
+const VARIABLE_NAMES: KeyLimit = KeyLimit {
+    bytes: MAX_PROJECT_BYTES,
+    too_long: PayloadErrorKind::ProjectTooLarge,
+};
+const APP_KEYS: KeyLimit = KeyLimit {
+    bytes: MAX_APP_KEY_BYTES,
+    too_long: PayloadErrorKind::App,
+};
 
 /// Why a payload isn't a valid backup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,7 +188,7 @@ fn first(seen: &mut bool, reader: &Reader<'_>, at: usize) -> Result<(), PayloadE
 fn read_backup(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
     let (mut created_at, mut producer, mut device_name, mut projects, mut app) =
         (false, false, false, false, false);
-    reader.object(|reader, key, at| match &*key {
+    reader.object(FIELD_NAMES, |reader, key, at| match &*key {
         "createdAt" => {
             first(&mut created_at, reader, at)?;
             let value_at = reader.at;
@@ -180,7 +206,10 @@ fn read_backup(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
             reader
                 .optional(|reader| {
                     let name_at = reader.at;
-                    if is_label(&reader.text_value()?, MAX_DEVICE_NAME_BYTES) {
+                    if reader
+                        .text_value(MAX_DEVICE_NAME_BYTES)?
+                        .is_some_and(|name| is_label(&name, MAX_DEVICE_NAME_BYTES))
+                    {
                         Ok(())
                     } else {
                         Err(reader.error_at(PayloadErrorKind::DeviceName, name_at))
@@ -196,16 +225,21 @@ fn read_backup(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
             first(&mut app, reader, at)?;
             reader
                 .optional(|reader| {
-                    if reader.peek() != Some(b'{') {
-                        return Err(reader.error(PayloadErrorKind::App));
-                    }
+                    reader.skip_whitespace();
+                    let value_at = reader.at;
+                    let object = reader.peek() == Some(b'{');
                     let mut keys = 0;
                     reader
                         .app_value(1, &mut keys)
                         .map_err(|error| match error.kind {
                             PayloadErrorKind::Syntax => error,
                             _ => reader.error_at(PayloadErrorKind::App, error.offset),
-                        })
+                        })?;
+                    if object {
+                        Ok(())
+                    } else {
+                        Err(reader.error_at(PayloadErrorKind::App, value_at))
+                    }
                 })
                 .map(|_| ())
         }
@@ -220,7 +254,7 @@ fn read_backup(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
 
 fn read_producer(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
     let (mut name, mut version) = (false, false);
-    reader.object(|reader, key, at| {
+    reader.object(FIELD_NAMES, |reader, key, at| {
         let seen = match &*key {
             "name" => &mut name,
             "version" => &mut version,
@@ -228,7 +262,10 @@ fn read_producer(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
         };
         first(seen, reader, at)?;
         let label_at = reader.at;
-        if is_label(&reader.text_value()?, MAX_LABEL_BYTES) {
+        if reader
+            .text_value(MAX_LABEL_BYTES)?
+            .is_some_and(|label| is_label(&label, MAX_LABEL_BYTES))
+        {
             Ok(())
         } else {
             Err(reader.error_at(PayloadErrorKind::Producer, label_at))
@@ -297,30 +334,39 @@ fn read_project<'a>(reader: &mut Reader<'a>) -> Result<(Cow<'a, str>, usize), Pa
     let mut folder: Option<Option<Cow<'a, str>>> = None;
     let (mut hidden, mut cli_access, mut sync) = (false, false, false);
     let mut environments = None;
-    reader.object(|reader, key, at| {
+    // A name or folder too long for the index record fails once the project's
+    // read, as one that makes the record too long does.
+    let mut oversized = false;
+    let mut stored_text = |reader: &mut Reader<'a>| {
+        Ok(reader.text_value(MAX_PROJECT_BYTES)?.unwrap_or_else(|| {
+            oversized = true;
+            Cow::Borrowed("")
+        }))
+    };
+    reader.object(FIELD_NAMES, |reader, key, at| {
         match &*key {
             "vaultId" => {
                 if vault_id.is_some() {
                     return Err(reader.error_at(PayloadErrorKind::Structure, at));
                 }
                 let id_at = reader.at;
-                let id = reader.text_value()?;
-                if !is_safe_vault_id(&id) {
-                    return Err(reader.error_at(PayloadErrorKind::VaultId, id_at));
-                }
+                let id = reader
+                    .text_value(MAX_VAULT_ID_BYTES)?
+                    .filter(|id| is_safe_vault_id(id))
+                    .ok_or_else(|| reader.error_at(PayloadErrorKind::VaultId, id_at))?;
                 vault_id = Some(id);
             }
             "name" => {
                 if name.is_some() {
                     return Err(reader.error_at(PayloadErrorKind::Structure, at));
                 }
-                name = Some(reader.text_value()?);
+                name = Some(stored_text(reader)?);
             }
             "folder" => {
                 if folder.is_some() {
                     return Err(reader.error_at(PayloadErrorKind::Structure, at));
                 }
-                folder = Some(reader.optional(Reader::text_value)?);
+                folder = Some(reader.optional(&mut stored_text)?);
             }
             "hidden" => {
                 first(&mut hidden, reader, at)?;
@@ -354,7 +400,7 @@ fn read_project<'a>(reader: &mut Reader<'a>) -> Result<(Cow<'a, str>, usize), Pa
         + quoted_len(&name)
         + quoted_len(folder.flatten().as_deref().unwrap_or_default())
         + summary_bytes;
-    if index_record_bytes > MAX_PROJECT_BYTES {
+    if oversized || index_record_bytes > MAX_PROJECT_BYTES {
         return Err(reader.error_at(PayloadErrorKind::ProjectTooLarge, project_at));
     }
     Ok((vault_id, index_record_bytes))
@@ -366,8 +412,8 @@ fn read_sync(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
     let mut registry = None;
     let mut scope = None;
     let mut principal = None;
-    let mut org_slug: Option<Option<Cow<'_, str>>> = None;
-    reader.object(|reader, key, at| {
+    let mut org_slug = None;
+    reader.object(FIELD_NAMES, |reader, key, at| {
         let repeated = match &*key {
             "registry" => registry.is_some(),
             "scope" => scope.is_some(),
@@ -379,25 +425,24 @@ fn read_sync(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
             return Err(reader.error_at(PayloadErrorKind::Structure, at));
         }
         match &*key {
-            "registry" => registry = Some(reader.text_value()?),
+            "registry" => registry = Some(reader.text_value(MAX_REGISTRY_BYTES)?),
             "scope" => scope = Some(reader.one_of(&["personal", "organization"])?),
-            "principalId" => principal = Some(reader.text_value()?),
-            _ => org_slug = Some(reader.optional(Reader::text_value)?),
+            "principalId" => principal = Some(reader.text_value(MAX_PRINCIPAL_BYTES)?),
+            _ => org_slug = Some(reader.optional(|reader| reader.text_value(MAX_ORG_SLUG_BYTES))?),
         }
         Ok(())
     })?;
     let (Some(registry), Some(scope), Some(principal)) = (registry, scope, principal) else {
         return Err(reader.error(PayloadErrorKind::Structure));
     };
-    let org_slug = org_slug.flatten();
-    let org_matches_scope = if scope == 0 {
-        org_slug.is_none()
-    } else {
-        org_slug.as_deref().is_some_and(is_valid_org_slug)
+    let org_matches_scope = match org_slug.flatten() {
+        None => scope == 0,
+        Some(slug) => scope == 1 && slug.as_deref().is_some_and(is_valid_org_slug),
     };
-    if registry.len() <= MAX_REGISTRY_BYTES
-        && is_canonical_registry_url(&registry)
-        && is_label(&principal, MAX_PRINCIPAL_BYTES)
+    if registry.as_deref().is_some_and(is_canonical_registry_url)
+        && principal
+            .as_deref()
+            .is_some_and(|principal| is_label(principal, MAX_PRINCIPAL_BYTES))
         && org_matches_scope
     {
         Ok(())
@@ -418,7 +463,7 @@ fn read_environments(reader: &mut Reader<'_>) -> Result<(usize, usize), PayloadE
     let mut names = HashSet::new();
     let mut stored_bytes = STORED_ENVELOPE_BYTES;
     let mut summary_bytes = 0;
-    reader.object(|reader, name, at| {
+    reader.object(ENVIRONMENT_NAMES, |reader, name, at| {
         if !is_valid_environment_name(&name) {
             return Err(reader.error_at(PayloadErrorKind::EnvironmentName, at));
         }
@@ -449,7 +494,7 @@ fn read_environments(reader: &mut Reader<'_>) -> Result<(usize, usize), PayloadE
 fn read_variables(reader: &mut Reader<'_>) -> Result<(usize, usize), PayloadError> {
     let mut names = HashSet::new();
     let mut stored_bytes = 2;
-    reader.object(|reader, name, at| {
+    reader.object(VARIABLE_NAMES, |reader, name, at| {
         if !is_valid_variable_name(&name) {
             return Err(reader.error_at(PayloadErrorKind::VariableName, at));
         }
@@ -539,9 +584,11 @@ impl<'a> Reader<'a> {
     }
 
     /// Reads an object, giving `member` each key, decoded, and where it
-    /// starts, with the reader at its value, which `member` must read.
+    /// starts, with the reader at its value, which `member` must read. A key
+    /// over `keys`' limit fails before it's decoded.
     fn object(
         &mut self,
+        keys: KeyLimit,
         mut member: impl FnMut(&mut Self, Cow<'a, str>, usize) -> Result<(), PayloadError>,
     ) -> Result<(), PayloadError> {
         if !self.take(b'{') {
@@ -556,7 +603,9 @@ impl<'a> Reader<'a> {
             if self.peek() != Some(b'"') {
                 return Err(self.error(PayloadErrorKind::Syntax));
             }
-            let key = self.text_value()?;
+            let Some(key) = self.text_value(keys.bytes)? else {
+                return Err(self.error_at(keys.too_long, key_at));
+            };
             self.expect(b':')?;
             member(self, key, key_at)?;
             if self.take(b'}') {
@@ -673,23 +722,28 @@ impl<'a> Reader<'a> {
             .ok_or_else(|| self.error_at(PayloadErrorKind::Structure, at))
     }
 
-    /// A string, decoded: only keys, names and labels are read this way. One
-    /// without escapes is borrowed; one with them is walked again to decode.
-    fn text_value(&mut self) -> Result<Cow<'a, str>, PayloadError> {
+    /// A string, decoded, or `None` when it decodes to more than
+    /// `max_bytes`: only keys, names and labels are read this way. One
+    /// without escapes is borrowed; one with them is walked again to decode,
+    /// once its decoded length is known to fit.
+    fn text_value(&mut self, max_bytes: usize) -> Result<Option<Cow<'a, str>>, PayloadError> {
         self.skip_whitespace();
         let opening = self.at;
-        let mut escapes = Escapes(false);
-        let (start, end) = self.string_span(&mut escapes, PayloadErrorKind::Structure)?;
-        if !escapes.0 {
-            return Ok(Cow::Borrowed(&self.text[start..end]));
+        let mut length = DecodedLength::default();
+        let (start, end) = self.string_span(&mut length, PayloadErrorKind::Structure)?;
+        if length.bytes > max_bytes {
+            return Ok(None);
         }
-        let mut decoded = Decoded(String::with_capacity(end - start));
+        if !length.escaped {
+            return Ok(Some(Cow::Borrowed(&self.text[start..end])));
+        }
+        let mut decoded = Decoded(String::with_capacity(length.bytes));
         Reader {
             text: self.text,
             at: opening,
         }
         .string_span(&mut decoded, PayloadErrorKind::Structure)?;
-        Ok(Cow::Owned(decoded.0))
+        Ok(Some(Cow::Owned(decoded.0)))
     }
 
     /// A value: a string, measured as the CLI stores it, never copied.
@@ -794,9 +848,9 @@ impl<'a> Reader<'a> {
             Some(b'{' | b'[') if depth > MAX_APP_DEPTH => Err(self.error(PayloadErrorKind::App)),
             Some(b'{') => {
                 let mut seen = HashSet::new();
-                self.object(|reader, key, at| {
+                self.object(APP_KEYS, |reader, key, at| {
                     *keys += 1;
-                    if *keys > MAX_APP_KEYS || key.len() > MAX_APP_KEY_BYTES || !seen.insert(key) {
+                    if *keys > MAX_APP_KEYS || !seen.insert(key) {
                         return Err(reader.error_at(PayloadErrorKind::App, at));
                     }
                     reader.app_value(depth + 1, keys)
@@ -829,12 +883,21 @@ trait Sink<'a> {
 /// Checks a string without keeping any of it.
 impl Sink<'_> for () {}
 
-/// Whether a string has escapes.
-struct Escapes(bool);
+/// A string's length decoded, and whether it has escapes.
+#[derive(Default)]
+struct DecodedLength {
+    bytes: usize,
+    escaped: bool,
+}
 
-impl Sink<'_> for Escapes {
-    fn escaped(&mut self, _character: char) {
-        self.0 = true;
+impl Sink<'_> for DecodedLength {
+    fn run(&mut self, run: &str) {
+        self.bytes += run.len();
+    }
+
+    fn escaped(&mut self, character: char) {
+        self.bytes += character.len_utf8();
+        self.escaped = true;
     }
 }
 
@@ -1472,6 +1535,110 @@ mod tests {
                 (error.kind, error.offset),
                 (PayloadErrorKind::Syntax, head.len() + offset),
                 "{app}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_is_a_syntax_error_when_no_json_value_follows_and_an_app_error_when_one_isnt_an_object() {
+        let head = r#"{"createdAt":0,"producer":{"name":"a","version":"1"},"projects":[],"app":"#;
+        for (app, kind, offset) in [
+            ("@}", PayloadErrorKind::Syntax, 0),
+            (" @}", PayloadErrorKind::Syntax, 1),
+            ("}", PayloadErrorKind::Syntax, 0),
+            ("", PayloadErrorKind::Syntax, 0),
+            ("tru}", PayloadErrorKind::Syntax, 0),
+            ("[1 2]}", PayloadErrorKind::Syntax, 3),
+            ("[1]}", PayloadErrorKind::App, 0),
+            (" [1]}", PayloadErrorKind::App, 1),
+            (r#""x"}"#, PayloadErrorKind::App, 0),
+            ("1}", PayloadErrorKind::App, 0),
+            ("true}", PayloadErrorKind::App, 0),
+        ] {
+            let payload = format!("{head}{app}");
+            let error = validate(payload.as_bytes()).expect_err(app);
+            assert_eq!(
+                (error.kind, error.offset),
+                (kind, head.len() + offset),
+                "{app:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(not(miri))]
+    fn a_string_over_its_limit_is_refused_before_it_is_decoded() {
+        use crate::freed_memory_probe::largest_allocation;
+        use PayloadErrorKind::*;
+        // Each escape is six bytes that decode to one.
+        let long = "\\u0061".repeat(120_000);
+        let head = r#"{"createdAt":0,"producer":{"name":"a","version":"1"},"projects":"#;
+        let project = |vault_id: &str, name: &str, fields: &str| {
+            format!(
+                r#"{head}[{{"vaultId":"{vault_id}","name":"{name}","hidden":false,"cliAccess":"automatic",{fields}}}]}}"#
+            )
+        };
+        let sync = |registry: &str, principal: &str, org: &str| {
+            project(
+                "v",
+                "n",
+                &format!(
+                    r#""environments":{{}},"sync":{{"registry":"{registry}","scope":"organization","principalId":"{principal}","orgSlug":"{org}"}}"#
+                ),
+            )
+        };
+        let cases = [
+            (format!(r#"{{"{long}":0}}"#), Structure),
+            (
+                format!(
+                    r#"{{"createdAt":0,"producer":{{"name":"{long}","version":"1"}},"projects":[]}}"#
+                ),
+                Producer,
+            ),
+            (
+                format!(
+                    r#"{{"createdAt":0,"producer":{{"name":"a","version":"1"}},"deviceName":"{long}","projects":[]}}"#
+                ),
+                DeviceName,
+            ),
+            (format!(r#"{head}[],"app":{{"{long}":0}}}}"#), App),
+            (project(&long, "n", r#""environments":{}"#), VaultId),
+            (project("v", &long, r#""environments":{}"#), ProjectTooLarge),
+            (
+                project(
+                    "v",
+                    "n",
+                    &format!(r#""folder":"{long}","environments":{{}}"#),
+                ),
+                ProjectTooLarge,
+            ),
+            (
+                project("v", "n", &format!(r#""environments":{{"{long}":{{}}}}"#)),
+                EnvironmentName,
+            ),
+            (
+                project(
+                    "v",
+                    "n",
+                    &format!(r#""environments":{{"default":{{"{long}":""}}}}"#),
+                ),
+                ProjectTooLarge,
+            ),
+            (sync(&long, "u", "acme"), Sync),
+            (sync("https://lpm.dev", &long, "acme"), Sync),
+            (sync("https://lpm.dev", "u", &long), Sync),
+        ];
+        assert_eq!(
+            validate(sync("https://lpm.dev", "u", "acme").as_bytes()),
+            Ok(())
+        );
+        for (payload, expected) in cases {
+            let mut result = Ok(());
+            let largest = largest_allocation(|| result = validate(payload.as_bytes()));
+            assert_eq!(result.map_err(|error| error.kind), Err(expected));
+            assert!(
+                largest < 64 * 1024,
+                "{expected:?} allocated {largest} bytes before refusing"
             );
         }
     }

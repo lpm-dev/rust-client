@@ -351,24 +351,47 @@ pub fn declaration_code(kind: &ValidationErrorKind) -> &'static str {
 }
 
 /// Enforce output size while writing, before an unbounded allocation can occur.
+/// The output is written once into chunks that are never resized, then copied
+/// once into an allocation exactly its size. Growing a buffer copies it under
+/// an allocator that wipes what it frees, as the env engine's does, and a
+/// buffer left larger than its output keeps the difference until it's freed.
 pub fn bounded_json<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, SourceError> {
+    const FIRST_CHUNK: usize = 4096;
+    const LARGEST_CHUNK: usize = 64 * 1024;
     struct Output {
-        bytes: Vec<u8>,
+        chunks: Vec<Vec<u8>>,
+        length: usize,
         limit: usize,
     }
     impl std::io::Write for Output {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            if bytes.len() > self.limit.saturating_sub(self.length) {
                 return Err(std::io::Error::other("bounded JSON output exceeded"));
             }
-            let needed = self.bytes.len() + bytes.len();
-            if needed > self.bytes.capacity() {
-                let capacity = needed
-                    .max(self.bytes.capacity().saturating_mul(2))
-                    .min(self.limit);
-                self.bytes.reserve_exact(capacity - self.bytes.len());
+            let mut rest = bytes;
+            while !rest.is_empty() {
+                let room = self
+                    .chunks
+                    .last()
+                    .map_or(0, |chunk| chunk.capacity() - chunk.len());
+                if room == 0 {
+                    // Chunks double up to the largest, so a small output
+                    // takes one small chunk, and none passes the limit.
+                    let size = self.chunks.last().map_or(FIRST_CHUNK, |chunk| {
+                        chunk.capacity().saturating_mul(2).min(LARGEST_CHUNK)
+                    });
+                    self.chunks
+                        .push(Vec::with_capacity(size.min(self.limit - self.length)));
+                    continue;
+                }
+                let (now, later) = rest.split_at(room.min(rest.len()));
+                self.chunks
+                    .last_mut()
+                    .expect("the last chunk has room")
+                    .extend_from_slice(now);
+                self.length += now.len();
+                rest = later;
             }
-            self.bytes.extend_from_slice(bytes);
             Ok(bytes.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -376,13 +399,23 @@ pub fn bounded_json<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, So
         }
     }
     let mut output = Output {
-        bytes: Vec::with_capacity(limit.min(4096)),
+        chunks: Vec::new(),
+        length: 0,
         limit,
     };
     serde_json::to_writer(&mut output, value).map_err(|_| {
         SourceError::new("env.output_budget", "serialize", "lpm.json", "/envSchema")
     })?;
-    Ok(output.bytes)
+    if let [chunk] = output.chunks.as_slice()
+        && chunk.len() == chunk.capacity()
+    {
+        return Ok(output.chunks.pop().expect("one chunk"));
+    }
+    let mut bytes = Vec::with_capacity(output.length);
+    for chunk in output.chunks {
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]

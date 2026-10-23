@@ -1,13 +1,20 @@
 //! The names the CLI and the LPM Vault app accept for the env projects they
 //! keep in the credential store.
 
+/// The longest vault ID.
+pub const MAX_VAULT_ID_BYTES: usize = 128;
+/// The longest environment name.
+pub const MAX_ENVIRONMENT_NAME_BYTES: usize = 64;
+/// The longest organization slug.
+pub const MAX_ORG_SLUG_BYTES: usize = 120;
+
 /// Whether `id` can name a vault in protected storage and in fallback stores
 /// that normalize paths their own way: 1 to 128 bytes, without a path
 /// separator, colon, control character or `..`, not `.`, and not starting
 /// with `~` or with `__`, which the store's own records use.
 pub fn is_safe_vault_id(id: &str) -> bool {
     !id.is_empty()
-        && id.len() <= 128
+        && id.len() <= MAX_VAULT_ID_BYTES
         && !id.starts_with("__")
         && !id.starts_with('~')
         && id != "."
@@ -21,7 +28,7 @@ pub fn is_safe_vault_id(id: &str) -> bool {
 /// digits, `-`, `_` or `.`, without `..`, and not `__index__`.
 pub fn is_valid_environment_name(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= 64
+        && name.len() <= MAX_ENVIRONMENT_NAME_BYTES
         && name != "__index__"
         && !name.contains("..")
         && name
@@ -43,7 +50,7 @@ pub fn is_valid_variable_name(name: &str) -> bool {
 /// ASCII letters, digits, `-` or `_`, starting with a letter or digit.
 pub fn is_valid_org_slug(slug: &str) -> bool {
     let mut bytes = slug.bytes();
-    slug.len() <= 120
+    slug.len() <= MAX_ORG_SLUG_BYTES
         && bytes
             .next()
             .is_some_and(|first| first.is_ascii_alphanumeric())
