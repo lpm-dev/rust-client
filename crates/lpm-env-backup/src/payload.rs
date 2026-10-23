@@ -1997,6 +1997,26 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(miri))]
+    fn skipping_a_non_object_app_holds_a_bit_per_level_it_nests() {
+        use crate::freed_memory_probe::largest_allocation;
+        let head = r#"{"createdAt":0,"producer":{"name":"a","version":"1"},"projects":[],"app":"#;
+        let depth = 1_000_000;
+        let nested = format!("{head}{}{}}}", "[".repeat(depth), "]".repeat(depth));
+        let mut result = Ok(());
+        let largest = largest_allocation(|| result = validate(nested.as_bytes()));
+        assert_eq!(
+            result.map_err(|error| error.kind),
+            Err(PayloadErrorKind::App)
+        );
+        // An eighth of a byte per level, doubled while the stack grows.
+        assert!(
+            largest <= depth / 4,
+            "{largest} bytes held for {depth} levels"
+        );
+    }
+
+    #[test]
     fn the_app_section_is_held_to_a_key_budget_however_its_keys_are_spread() {
         let with_app = |app: &str| {
             format!(
