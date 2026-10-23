@@ -169,11 +169,25 @@ fn seal_with(
     Ok(std::mem::take(&mut *file))
 }
 
-/// Decrypts a backup file and returns its payload, which the caller checks.
-pub(crate) fn open(
-    file: &[u8],
-    passphrase: &Passphrase,
-) -> Result<Zeroizing<Vec<u8>>, ContainerError> {
+/// Where the payload starts in a backup's plaintext, after its length.
+pub const PAYLOAD_OFFSET: usize = LENGTH_PREFIX_LEN;
+
+/// A backup's decrypted plaintext, in an allocation exactly its length, and
+/// the length of the payload at [`PAYLOAD_OFFSET`] in it.
+pub(crate) struct Plaintext {
+    pub(crate) bytes: Zeroizing<Vec<u8>>,
+    pub(crate) payload_len: usize,
+}
+
+impl Plaintext {
+    pub(crate) fn payload(&self) -> &[u8] {
+        &self.bytes[PAYLOAD_OFFSET..PAYLOAD_OFFSET + self.payload_len]
+    }
+}
+
+/// Decrypts a backup file and returns its plaintext, whose payload the
+/// caller checks.
+pub(crate) fn open(file: &[u8], passphrase: &Passphrase) -> Result<Plaintext, ContainerError> {
     let header = Header::decode(file)?;
     let key = derive_key(passphrase, &header.salt)?;
     let (ciphertext, tag) = file[HEADER_LEN..].split_at(file.len() - HEADER_LEN - TAG_LEN);
@@ -200,9 +214,11 @@ pub(crate) fn open(
     {
         return Err(ContainerError::InvalidPlaintext);
     }
-    plaintext.copy_within(LENGTH_PREFIX_LEN..LENGTH_PREFIX_LEN + payload_len, 0);
-    plaintext.truncate(payload_len);
-    Ok(plaintext)
+    debug_assert_eq!(plaintext.len(), plaintext.capacity());
+    Ok(Plaintext {
+        bytes: plaintext,
+        payload_len,
+    })
 }
 
 fn cipher(key: &[u8; 32]) -> XChaCha20Poly1305 {
@@ -213,6 +229,8 @@ fn derive_key(
     passphrase: &Passphrase,
     salt: &[u8; SALT_LEN],
 ) -> Result<Zeroizing<[u8; 32]>, ContainerError> {
+    #[cfg(test)]
+    tests::DERIVATIONS.with(|count| count.set(count.get() + 1));
     let params = kdf_params();
     let _permit = KDF_PERMIT
         .lock()
@@ -253,6 +271,11 @@ pub(crate) mod tests {
 
     thread_local! {
         static CHEAP_KDF: Cell<bool> = const { Cell::new(true) };
+        pub(super) static DERIVATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn derivations() -> usize {
+        DERIVATIONS.with(Cell::get)
     }
 
     /// Unit tests derive keys at a tiny cost unless they ask for profile 1,
@@ -277,7 +300,7 @@ pub(crate) mod tests {
             hex(&Sha256::digest(&file)),
             "d0cbac7a16fba56bbad5e785311737ac0039c9d2499e992c6bd3541f72950d8b"
         );
-        assert_eq!(open(&file, &passphrase).expect("open").as_slice(), payload);
+        assert_eq!(open(&file, &passphrase).expect("open").payload(), payload);
         let key = derive_key(&passphrase, &header.salt).expect("key");
         assert_eq!(
             hex(key.as_ref()),
@@ -307,10 +330,7 @@ pub(crate) mod tests {
                 format_version: FORMAT_VERSION
             })
         );
-        assert_eq!(
-            open(&file, &passphrase()).expect("open").as_slice(),
-            payload
-        );
+        assert_eq!(open(&file, &passphrase()).expect("open").payload(), payload);
     }
 
     #[test]
@@ -326,7 +346,7 @@ pub(crate) mod tests {
         assert_eq!(small.len(), exact.len());
         assert_eq!(over.len(), small.len() + PADDING_UNIT);
         assert_eq!(
-            open(&exact, &passphrase).expect("open").len(),
+            open(&exact, &passphrase).expect("open").payload().len(),
             PADDING_UNIT - 8
         );
     }
@@ -386,6 +406,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn opening_a_structurally_bad_file_never_derives_a_key() {
+        let file = seal(b"{}", &passphrase()).expect("seal");
+        let before = derivations();
+        for bytes in [
+            Vec::new(),
+            b"PK\x03\x04 a zip".to_vec(),
+            file[..HEADER_LEN - 1].to_vec(),
+            file[..file.len() - 1].to_vec(),
+            [file.as_slice(), b"\0"].concat(),
+            with_byte(&file, 12, 1),
+            with_byte(&file, 9, 2),
+            vec![0_u8; MAX_FILE_BYTES + 1],
+        ] {
+            assert!(open(&bytes, &passphrase()).is_err());
+        }
+        assert_eq!(derivations(), before);
+        assert!(open(&file, &passphrase()).is_ok());
+        assert_eq!(derivations(), before + 1);
+    }
+
+    #[test]
     fn a_later_version_profile_or_cipher_reads_as_a_newer_format() {
         let file = seal(b"{}", &passphrase()).expect("seal");
         for (index, value, format_version) in [(9, 2, 2), (10, 2, 1), (11, 2, 1)] {
@@ -412,7 +453,7 @@ pub(crate) mod tests {
         let file = seal(&payload, &passphrase()).expect("seal");
         assert!(file.len() <= MAX_FILE_BYTES);
         assert_eq!(
-            open(&file, &passphrase()).expect("open").len(),
+            open(&file, &passphrase()).expect("open").payload().len(),
             MAX_PAYLOAD_BYTES
         );
     }

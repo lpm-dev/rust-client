@@ -137,17 +137,11 @@ jobs:
           arguments: --all-features
           command-arguments: --hide-inclusion-graph advisories bans licenses
 
-      # Security: fancy-regex uses backtracking which is vulnerable to ReDoS.
-      # All regex in lpm-security scans untrusted input (npm package source code).
-      # The `regex` crate guarantees linear-time matching (Thompson NFA).
-      # If fancy-regex appears as a dependency, it MUST be reviewed.
-      - name: Reject fancy-regex (ReDoS prevention)
-        run: |
-          if grep -r 'fancy-regex' crates/*/Cargo.toml; then
-            echo "::error::fancy-regex found in Cargo.toml dependencies. The regex crate (linear-time) must be used for scanning untrusted input."
-            exit 1
-          fi
-          echo "✓ No fancy-regex dependencies found"
+      # Security: fancy-regex backtracks, so a pattern it runs on untrusted input can
+      # take exponential time; the `regex` crate guarantees linear-time matching.
+      # Every crate that reaches fancy-regex, directly or not, must be reviewed.
+      - name: Reject unreviewed fancy-regex dependents (ReDoS prevention)
+        run: python3 scripts/check-fancy-regex-dependents.py
 
       - name: install.sh smoke tests
         run: sh tests/install-sh/run.sh

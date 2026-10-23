@@ -6,7 +6,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use lpm_common::stored_env::{is_safe_vault_id, is_valid_environment_name, is_valid_org_slug};
+use lpm_common::stored_env::{
+    is_canonical_registry_url, is_safe_vault_id, is_valid_environment_name, is_valid_org_slug,
+};
 
 use crate::macos_keychain::{
     delete as delete_keychain_password, read_string as try_read_keychain_password,
@@ -898,23 +900,6 @@ fn is_valid_current_sync_binding(binding: &CurrentSyncBinding) -> bool {
         && binding.principal_id.len() <= 256
         && !binding.principal_id.chars().any(char::is_control)
         && is_canonical_registry_url(&binding.registry_url)
-}
-
-fn is_canonical_registry_url(value: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(value) else {
-        return false;
-    };
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none_or(str::is_empty)
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return false;
-    }
-    let canonical_path = url.path().trim_end_matches('/');
-    format!("{}{canonical_path}", url.origin().ascii_serialization()) == value
 }
 
 fn decode_account_vault_id(encoded: &str) -> Result<String, String> {

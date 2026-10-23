@@ -22,35 +22,51 @@
 //! ```
 //!
 //! `deviceName`, `folder`, `sync` and `app` may be absent or null; `orgSlug`
-//! goes with the `organization` scope only. `app` is an object the app that
-//! wrote the backup owns; it's checked here only as JSON. Every other object
-//! refuses unknown and repeated fields.
+//! goes with the `organization` scope only. Every object refuses unknown and
+//! repeated fields. `createdAt` is a plain unsigned integer, `cliAccess` and
+//! `scope` are written exactly as shown, without escapes, and each value is a
+//! string.
 //!
-//! Values are read once, in place, to check them and measure them, and never
-//! copied. Errors carry a code and a position, never the text they're about.
+//! Names, folders and vault IDs are kept as the CLI stores them, which can be
+//! any text, including direction controls: show them isolated, with controls
+//! made visible. The labels this format defines (the producer, `deviceName`
+//! and `principalId`) refuse controls and direction controls. Restorers whose
+//! store names files after vault IDs, as the CLI's file store does on Windows,
+//! must map them to names that are valid and distinct there. A project's
+//! environments as the CLI stores them, and the index record that lists them
+//! with the project's name and folder, must each fit the credential store's
+//! limit on one item. Registries are written as the CLI's sync bindings hold
+//! them.
+//!
+//! `app` is an object the app that wrote the backup owns. Here it's only
+//! checked as JSON whose objects repeat no key, nested at most
+//! [`MAX_APP_DEPTH`] deep, whose numbers are finite doubles. Its reader must
+//! refuse what it doesn't know.
+//!
+//! The reader never copies a value, nor any string where an object, list,
+//! number or flag belongs: it measures them where they lie. It decodes only
+//! keys, names and labels. Errors carry a code and a byte offset, never text.
 
 use std::borrow::Cow;
 use std::collections::HashSet;
-use std::fmt;
 
 use lpm_common::stored_env::{
-    is_safe_vault_id, is_valid_environment_name, is_valid_org_slug, is_valid_variable_name,
+    is_canonical_registry_url, is_safe_vault_id, is_valid_environment_name, is_valid_org_slug,
+    is_valid_variable_name,
 };
-use serde::Deserialize;
-use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
-use serde_json::value::RawValue;
 
 /// The most projects a backup holds.
 pub const MAX_PROJECTS: usize = 10_000;
-/// The most a project's environments take as the CLI stores them, as
-/// `{"environments":{…}}`: the credential store's limit on one item.
+/// The credential store's limit on one item, which a project's environments
+/// as the CLI stores them (`{"environments":{…}}`) and its index record must
+/// each fit.
 pub const MAX_PROJECT_BYTES: usize = 100 * 1024;
+/// The most objects and lists nested in `app`, counting `app` itself.
+pub const MAX_APP_DEPTH: usize = 32;
 /// The latest `createdAt`: the last second of 9999.
 const MAX_CREATED_AT: u64 = 253_402_300_799;
 const MAX_LABEL_BYTES: usize = 64;
 const MAX_DEVICE_NAME_BYTES: usize = 256;
-const MAX_PROJECT_NAME_UTF16: usize = 200;
-const MAX_FOLDER_BYTES: usize = 4096;
 const MAX_REGISTRY_BYTES: usize = 2048;
 const MAX_PRINCIPAL_BYTES: usize = 256;
 
@@ -58,15 +74,16 @@ const MAX_PRINCIPAL_BYTES: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PayloadError {
     pub kind: PayloadErrorKind,
-    /// The 1-based line and column the JSON reader had reached.
-    pub position: Option<(usize, usize)>,
+    /// The byte offset in the payload where the problem was found.
+    pub offset: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadErrorKind {
-    /// Not JSON, or not one JSON object.
+    /// Not UTF-8 JSON.
     Syntax,
-    /// A field is missing, unknown, repeated, or of the wrong type.
+    /// A field is missing, unknown or repeated, or a value is of the wrong
+    /// type or spelling.
     Structure,
     CreatedAt,
     Producer,
@@ -74,18 +91,17 @@ pub enum PayloadErrorKind {
     TooManyProjects,
     VaultId,
     DuplicateVaultId,
-    ProjectName,
-    Folder,
     EnvironmentName,
     DuplicateEnvironment,
     VariableName,
     DuplicateVariable,
     /// A value that isn't a string.
     Value,
-    /// A project's environments over [`MAX_PROJECT_BYTES`].
+    /// A project's environments, or its index record, over [`MAX_PROJECT_BYTES`].
     ProjectTooLarge,
     Sync,
-    /// `app` isn't an object.
+    /// `app` isn't an object, repeats a key, nests too deep or holds a number
+    /// out of range.
     App,
 }
 
@@ -100,8 +116,6 @@ impl PayloadErrorKind {
             Self::TooManyProjects => "too_many_projects",
             Self::VaultId => "vault_id",
             Self::DuplicateVaultId => "duplicate_vault_id",
-            Self::ProjectName => "project_name",
-            Self::Folder => "folder",
             Self::EnvironmentName => "environment_name",
             Self::DuplicateEnvironment => "duplicate_environment",
             Self::VariableName => "variable_name",
@@ -112,479 +126,721 @@ impl PayloadErrorKind {
             Self::App => "app",
         }
     }
-
-    const ALL: [Self; 18] = [
-        Self::Syntax,
-        Self::Structure,
-        Self::CreatedAt,
-        Self::Producer,
-        Self::DeviceName,
-        Self::TooManyProjects,
-        Self::VaultId,
-        Self::DuplicateVaultId,
-        Self::ProjectName,
-        Self::Folder,
-        Self::EnvironmentName,
-        Self::DuplicateEnvironment,
-        Self::VariableName,
-        Self::DuplicateVariable,
-        Self::Value,
-        Self::ProjectTooLarge,
-        Self::Sync,
-        Self::App,
-    ];
-}
-
-/// The message a check gives serde: a marker and the code, which
-/// [`PayloadError::from_json`] finds again. It never holds the text it's
-/// about, as serde's own type errors would.
-struct Rejection(PayloadErrorKind);
-
-const REJECTION_MARKER: &str = "lpm-env-backup:";
-
-impl fmt::Display for Rejection {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{REJECTION_MARKER}{}", self.0.code())
-    }
-}
-
-fn reject<E: de::Error>(kind: PayloadErrorKind) -> E {
-    E::custom(Rejection(kind))
-}
-
-impl PayloadError {
-    fn whole(kind: PayloadErrorKind) -> Self {
-        Self {
-            kind,
-            position: None,
-        }
-    }
-
-    fn from_json(error: &serde_json::Error) -> Self {
-        let message = error.to_string();
-        let kind = message
-            .strip_prefix(REJECTION_MARKER)
-            .and_then(|rest| {
-                let code = rest.split(' ').next().unwrap_or_default();
-                PayloadErrorKind::ALL
-                    .into_iter()
-                    .find(|kind| kind.code() == code)
-            })
-            .unwrap_or(match error.classify() {
-                serde_json::error::Category::Data => PayloadErrorKind::Structure,
-                _ => PayloadErrorKind::Syntax,
-            });
-        Self {
-            kind,
-            position: (error.line() > 0).then(|| (error.line(), error.column())),
-        }
-    }
 }
 
 /// Checks that `payload` is a valid version 1 backup.
 pub fn validate(payload: &[u8]) -> Result<(), PayloadError> {
-    let backup: Backup<'_> =
-        serde_json::from_slice(payload).map_err(|error| PayloadError::from_json(&error))?;
-    backup.check()
+    let text = std::str::from_utf8(payload).map_err(|error| PayloadError {
+        kind: PayloadErrorKind::Syntax,
+        offset: error.valid_up_to(),
+    })?;
+    let mut reader = Reader { text, at: 0 };
+    read_backup(&mut reader)?;
+    reader.skip_whitespace();
+    if reader.at == text.len() {
+        Ok(())
+    } else {
+        Err(reader.error(PayloadErrorKind::Syntax))
+    }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Backup<'a> {
-    created_at: u64,
-    #[serde(borrow)]
-    producer: Producer<'a>,
-    #[serde(borrow, default)]
-    device_name: Option<Cow<'a, str>>,
-    #[serde(rename = "projects")]
-    _projects: Projects,
-    #[serde(borrow, default)]
-    app: Option<&'a RawValue>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Producer<'a> {
-    #[serde(borrow)]
-    name: Cow<'a, str>,
-    #[serde(borrow)]
-    version: Cow<'a, str>,
-}
-
-impl Backup<'_> {
-    fn check(&self) -> Result<(), PayloadError> {
-        if self.created_at > MAX_CREATED_AT {
-            return Err(PayloadError::whole(PayloadErrorKind::CreatedAt));
-        }
-        if !is_label(&self.producer.name, MAX_LABEL_BYTES)
-            || !is_label(&self.producer.version, MAX_LABEL_BYTES)
-        {
-            return Err(PayloadError::whole(PayloadErrorKind::Producer));
-        }
-        if self
-            .device_name
-            .as_deref()
-            .is_some_and(|name| !is_label(name, MAX_DEVICE_NAME_BYTES))
-        {
-            return Err(PayloadError::whole(PayloadErrorKind::DeviceName));
-        }
-        if self.app.is_some_and(|app| !app.get().starts_with('{')) {
-            return Err(PayloadError::whole(PayloadErrorKind::App));
-        }
+/// Marks a field read, refusing it the second time.
+fn first(seen: &mut bool, reader: &Reader<'_>, at: usize) -> Result<(), PayloadError> {
+    if std::mem::replace(seen, true) {
+        Err(reader.error_at(PayloadErrorKind::Structure, at))
+    } else {
         Ok(())
     }
 }
 
-/// Text shown to people: non-empty, bounded, and without control characters.
-fn is_label(text: &str, max_bytes: usize) -> bool {
-    !text.is_empty() && text.len() <= max_bytes && !text.chars().any(char::is_control)
-}
-
-/// The projects, checked as they're read so a payload can't make the reader
-/// hold more than [`MAX_PROJECTS`] of them, with each vault ID once.
-struct Projects;
-
-impl<'de> Deserialize<'de> for Projects {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_seq(ProjectsVisitor)
-    }
-}
-
-struct ProjectsVisitor;
-
-impl<'de> Visitor<'de> for ProjectsVisitor {
-    type Value = Projects;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a list of projects")
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, mut projects: A) -> Result<Projects, A::Error> {
-        let mut vault_ids = HashSet::new();
-        while let Some(project) = projects.next_element::<Project<'de>>()? {
-            if vault_ids.len() == MAX_PROJECTS {
-                return Err(reject(PayloadErrorKind::TooManyProjects));
+fn read_backup(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
+    let (mut created_at, mut producer, mut device_name, mut projects, mut app) =
+        (false, false, false, false, false);
+    reader.object(|reader, key, at| match &*key {
+        "createdAt" => {
+            first(&mut created_at, reader, at)?;
+            let value_at = reader.at;
+            if reader.unsigned()? > MAX_CREATED_AT {
+                return Err(reader.error_at(PayloadErrorKind::CreatedAt, value_at));
             }
-            project.check()?;
-            if !vault_ids.insert(project.vault_id) {
-                return Err(reject(PayloadErrorKind::DuplicateVaultId));
-            }
+            Ok(())
         }
-        Ok(Projects)
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Project<'a> {
-    #[serde(borrow)]
-    vault_id: Cow<'a, str>,
-    #[serde(borrow)]
-    name: Cow<'a, str>,
-    #[serde(borrow, default)]
-    folder: Option<Cow<'a, str>>,
-    #[serde(rename = "hidden")]
-    _hidden: bool,
-    #[serde(rename = "cliAccess")]
-    _cli_access: CliAccess,
-    environments: Environments,
-    #[serde(borrow, default)]
-    sync: Option<Sync<'a>>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum CliAccess {
-    Automatic,
-    RequireApproval,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Sync<'a> {
-    #[serde(borrow)]
-    registry: Cow<'a, str>,
-    scope: SyncScope,
-    #[serde(borrow)]
-    principal_id: Cow<'a, str>,
-    #[serde(borrow, default)]
-    org_slug: Option<Cow<'a, str>>,
-}
-
-#[derive(Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-enum SyncScope {
-    Personal,
-    Organization,
-}
-
-impl Project<'_> {
-    fn check<E: de::Error>(&self) -> Result<(), E> {
-        if !is_safe_vault_id(&self.vault_id) {
-            return Err(reject(PayloadErrorKind::VaultId));
+        "producer" => {
+            first(&mut producer, reader, at)?;
+            read_producer(reader)
         }
-        if self.name.is_empty()
-            || self.name.encode_utf16().count() > MAX_PROJECT_NAME_UTF16
-            || self.name.chars().any(char::is_control)
-        {
-            return Err(reject(PayloadErrorKind::ProjectName));
+        "deviceName" => {
+            first(&mut device_name, reader, at)?;
+            reader
+                .optional(|reader| {
+                    let name_at = reader.at;
+                    if is_label(&reader.text_value()?, MAX_DEVICE_NAME_BYTES) {
+                        Ok(())
+                    } else {
+                        Err(reader.error_at(PayloadErrorKind::DeviceName, name_at))
+                    }
+                })
+                .map(|_| ())
         }
-        if self.folder.as_deref().is_some_and(|folder| {
-            !folder.starts_with('/')
-                || folder.len() > MAX_FOLDER_BYTES
-                || folder.chars().any(char::is_control)
-        }) {
-            return Err(reject(PayloadErrorKind::Folder));
+        "projects" => {
+            first(&mut projects, reader, at)?;
+            read_projects(reader)
         }
-        if self.environments.stored_bytes > MAX_PROJECT_BYTES {
-            return Err(reject(PayloadErrorKind::ProjectTooLarge));
+        "app" => {
+            first(&mut app, reader, at)?;
+            reader
+                .optional(|reader| {
+                    if reader.peek() != Some(b'{') {
+                        return Err(reader.error(PayloadErrorKind::App));
+                    }
+                    reader
+                        .app_value(1)
+                        .map_err(|error| reader.error_at(PayloadErrorKind::App, error.offset))
+                })
+                .map(|_| ())
         }
-        if self.sync.as_ref().is_some_and(|sync| !sync.is_valid()) {
-            return Err(reject(PayloadErrorKind::Sync));
-        }
+        _ => Err(reader.error_at(PayloadErrorKind::Structure, at)),
+    })?;
+    if created_at && producer && projects {
         Ok(())
+    } else {
+        Err(reader.error(PayloadErrorKind::Structure))
     }
 }
 
-impl Sync<'_> {
-    fn is_valid(&self) -> bool {
-        let registry = &self.registry;
-        let after_scheme = registry
-            .strip_prefix("https://")
-            .or_else(|| registry.strip_prefix("http://"));
-        let well_formed_registry = registry.len() <= MAX_REGISTRY_BYTES
-            && after_scheme.is_some_and(|rest| {
-                !rest.is_empty()
-                    && !rest.starts_with('/')
-                    && !rest.ends_with('/')
-                    && !rest.chars().any(|character| {
-                        character.is_control()
-                            || character.is_whitespace()
-                            || matches!(character, '?' | '#' | '@' | '\\')
-                    })
-            });
-        let org_matches_scope = match self.scope {
-            SyncScope::Personal => self.org_slug.is_none(),
-            SyncScope::Organization => self.org_slug.as_deref().is_some_and(is_valid_org_slug),
+fn read_producer(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
+    let (mut name, mut version) = (false, false);
+    reader.object(|reader, key, at| {
+        let seen = match &*key {
+            "name" => &mut name,
+            "version" => &mut version,
+            _ => return Err(reader.error_at(PayloadErrorKind::Structure, at)),
         };
-        well_formed_registry
-            && is_label(&self.principal_id, MAX_PRINCIPAL_BYTES)
-            && org_matches_scope
+        first(seen, reader, at)?;
+        let label_at = reader.at;
+        if is_label(&reader.text_value()?, MAX_LABEL_BYTES) {
+            Ok(())
+        } else {
+            Err(reader.error_at(PayloadErrorKind::Producer, label_at))
+        }
+    })?;
+    if name && version {
+        Ok(())
+    } else {
+        Err(reader.error(PayloadErrorKind::Structure))
     }
 }
 
-/// A project's environments, read for their names and for the size the CLI
-/// stores them at, without keeping a value.
-struct Environments {
-    stored_bytes: usize,
+/// Text people are shown that this format defines: non-empty, bounded, and
+/// without controls or direction controls.
+fn is_label(text: &str, max_bytes: usize) -> bool {
+    !text.is_empty()
+        && text.len() <= max_bytes
+        && !text
+            .chars()
+            .any(|character| character.is_control() || is_direction_control(character))
+}
+
+/// The characters that change the direction text runs in, which could make a
+/// label read as something else.
+fn is_direction_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{61C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// The projects, checked as they're read, each vault ID once, so a payload
+/// can't make the reader hold more than [`MAX_PROJECTS`] of them.
+fn read_projects(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
+    let mut vault_ids = HashSet::new();
+    reader.list(|reader| {
+        reader.skip_whitespace();
+        let at = reader.at;
+        if vault_ids.len() == MAX_PROJECTS {
+            return Err(reader.error_at(PayloadErrorKind::TooManyProjects, at));
+        }
+        let (vault_id, _) = read_project(reader)?;
+        if vault_ids.insert(vault_id) {
+            Ok(())
+        } else {
+            Err(reader.error_at(PayloadErrorKind::DuplicateVaultId, at))
+        }
+    })
+}
+
+/// The CLI's index record for a project, around its strings and summaries:
+/// `{"schemaVersion":3,"storageId":"…","id":…,"name":…,"path":…,
+/// "discoveryShard":…,"environmentSummaries":[…]}`, with the longest storage
+/// ID and shard number.
+const INDEX_RECORD_BYTES: usize = r#"{"schemaVersion":3,"storageId":"00000000-0000-4000-8000-000000000000","id":,"name":,"path":,"discoveryShard":1023,"environmentSummaries":[]}"#.len();
+/// One environment's summary in the index record, around its name and count.
+const INDEX_SUMMARY_BYTES: usize = r#"{"name":,"keyCount":}"#.len();
+
+/// Reads one project and returns its vault ID and the most its index record
+/// takes.
+fn read_project<'a>(reader: &mut Reader<'a>) -> Result<(Cow<'a, str>, usize), PayloadError> {
+    reader.skip_whitespace();
+    let project_at = reader.at;
+    let mut vault_id = None;
+    let mut name = None;
+    let mut folder: Option<Option<Cow<'a, str>>> = None;
+    let (mut hidden, mut cli_access, mut sync) = (false, false, false);
+    let mut environments = None;
+    reader.object(|reader, key, at| {
+        match &*key {
+            "vaultId" => {
+                if vault_id.is_some() {
+                    return Err(reader.error_at(PayloadErrorKind::Structure, at));
+                }
+                let id_at = reader.at;
+                let id = reader.text_value()?;
+                if !is_safe_vault_id(&id) {
+                    return Err(reader.error_at(PayloadErrorKind::VaultId, id_at));
+                }
+                vault_id = Some(id);
+            }
+            "name" => {
+                if name.is_some() {
+                    return Err(reader.error_at(PayloadErrorKind::Structure, at));
+                }
+                name = Some(reader.text_value()?);
+            }
+            "folder" => {
+                if folder.is_some() {
+                    return Err(reader.error_at(PayloadErrorKind::Structure, at));
+                }
+                folder = Some(reader.optional(Reader::text_value)?);
+            }
+            "hidden" => {
+                first(&mut hidden, reader, at)?;
+                reader.flag()?;
+            }
+            "cliAccess" => {
+                first(&mut cli_access, reader, at)?;
+                reader.one_of(&["automatic", "requireApproval"])?;
+            }
+            "environments" => {
+                if environments.is_some() {
+                    return Err(reader.error_at(PayloadErrorKind::Structure, at));
+                }
+                environments = Some(read_environments(reader)?.1);
+            }
+            "sync" => {
+                first(&mut sync, reader, at)?;
+                reader.optional(read_sync)?;
+            }
+            _ => return Err(reader.error_at(PayloadErrorKind::Structure, at)),
+        }
+        Ok(())
+    })?;
+    let (Some(vault_id), Some(name), true, true, Some(summary_bytes)) =
+        (vault_id, name, hidden, cli_access, environments)
+    else {
+        return Err(reader.error(PayloadErrorKind::Structure));
+    };
+    let index_record_bytes = INDEX_RECORD_BYTES
+        + quoted_len(&vault_id)
+        + quoted_len(&name)
+        + quoted_len(folder.flatten().as_deref().unwrap_or_default())
+        + summary_bytes;
+    if index_record_bytes > MAX_PROJECT_BYTES {
+        return Err(reader.error_at(PayloadErrorKind::ProjectTooLarge, project_at));
+    }
+    Ok((vault_id, index_record_bytes))
+}
+
+fn read_sync(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
+    reader.skip_whitespace();
+    let sync_at = reader.at;
+    let mut registry = None;
+    let mut scope = None;
+    let mut principal = None;
+    let mut org_slug: Option<Option<Cow<'_, str>>> = None;
+    reader.object(|reader, key, at| {
+        let repeated = match &*key {
+            "registry" => registry.is_some(),
+            "scope" => scope.is_some(),
+            "principalId" => principal.is_some(),
+            "orgSlug" => org_slug.is_some(),
+            _ => true,
+        };
+        if repeated {
+            return Err(reader.error_at(PayloadErrorKind::Structure, at));
+        }
+        match &*key {
+            "registry" => registry = Some(reader.text_value()?),
+            "scope" => scope = Some(reader.one_of(&["personal", "organization"])?),
+            "principalId" => principal = Some(reader.text_value()?),
+            _ => org_slug = Some(reader.optional(Reader::text_value)?),
+        }
+        Ok(())
+    })?;
+    let (Some(registry), Some(scope), Some(principal)) = (registry, scope, principal) else {
+        return Err(reader.error(PayloadErrorKind::Structure));
+    };
+    let org_slug = org_slug.flatten();
+    let org_matches_scope = if scope == 0 {
+        org_slug.is_none()
+    } else {
+        org_slug.as_deref().is_some_and(is_valid_org_slug)
+    };
+    if registry.len() <= MAX_REGISTRY_BYTES
+        && is_canonical_registry_url(&registry)
+        && is_label(&principal, MAX_PRINCIPAL_BYTES)
+        && org_matches_scope
+    {
+        Ok(())
+    } else {
+        Err(reader.error_at(PayloadErrorKind::Sync, sync_at))
+    }
 }
 
 /// `{"environments":{}}`, around the entries.
 const STORED_ENVELOPE_BYTES: usize = r#"{"environments":{}}"#.len();
 
-// The visitors below read with `deserialize_any`, so a value of the wrong
-// type reaches them: serde_json's own message for it would quote the text.
-impl<'de> Deserialize<'de> for Environments {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(EnvironmentsVisitor)
-    }
+/// A project's environments: the bytes they take as the CLI stores them, and
+/// the bytes their comma-separated summaries take in its index record.
+fn read_environments(reader: &mut Reader<'_>) -> Result<(usize, usize), PayloadError> {
+    let mut names = HashSet::new();
+    let mut stored_bytes = STORED_ENVELOPE_BYTES;
+    let mut summary_bytes = 0;
+    reader.object(|reader, name, at| {
+        if !is_valid_environment_name(&name) {
+            return Err(reader.error_at(PayloadErrorKind::EnvironmentName, at));
+        }
+        let (count, variables) = read_variables(reader)?;
+        let separator = usize::from(!names.is_empty());
+        stored_bytes += separator + quoted_len(&name) + 1 + variables;
+        summary_bytes +=
+            separator + INDEX_SUMMARY_BYTES + quoted_len(&name) + decimal_digits(count);
+        if stored_bytes > MAX_PROJECT_BYTES || summary_bytes > MAX_PROJECT_BYTES {
+            return Err(reader.error_at(PayloadErrorKind::ProjectTooLarge, at));
+        }
+        if names.insert(name) {
+            Ok(())
+        } else {
+            Err(reader.error_at(PayloadErrorKind::DuplicateEnvironment, at))
+        }
+    })?;
+    Ok((stored_bytes, summary_bytes))
 }
 
-/// Fails every JSON type a visitor doesn't take, without describing the
-/// value, which serde's default messages would quote.
-macro_rules! refuse_other_types {
-    ($kind:expr) => {
-        fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
-            Err(reject($kind))
+/// One environment's variables: how many, and the bytes `{…}` takes stored.
+fn read_variables(reader: &mut Reader<'_>) -> Result<(usize, usize), PayloadError> {
+    let mut names = HashSet::new();
+    let mut stored_bytes = 2;
+    reader.object(|reader, name, at| {
+        if !is_valid_variable_name(&name) {
+            return Err(reader.error_at(PayloadErrorKind::VariableName, at));
         }
-        fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
-            Err(reject($kind))
+        let value = reader.measured_value()?;
+        stored_bytes += usize::from(!names.is_empty()) + quoted_len(&name) + 1 + value;
+        if stored_bytes > MAX_PROJECT_BYTES {
+            return Err(reader.error_at(PayloadErrorKind::ProjectTooLarge, at));
         }
-        fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
-            Err(reject($kind))
+        if names.insert(name) {
+            Ok(())
+        } else {
+            Err(reader.error_at(PayloadErrorKind::DuplicateVariable, at))
         }
-        fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
-            Err(reject($kind))
-        }
-        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-            Err(reject($kind))
-        }
-        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-            Err(reject($kind))
-        }
-    };
+    })?;
+    Ok((names.len(), stored_bytes))
 }
 
-macro_rules! refuse_strings_and_lists {
-    ($kind:expr) => {
-        fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
-            Err(reject($kind))
-        }
-        fn visit_seq<A: SeqAccess<'de>>(self, _: A) -> Result<Self::Value, A::Error> {
-            Err(reject($kind))
-        }
-    };
-}
-
-struct EnvironmentsVisitor;
-
-impl<'de> Visitor<'de> for EnvironmentsVisitor {
-    type Value = Environments;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("environments")
-    }
-
-    refuse_other_types!(PayloadErrorKind::Structure);
-    refuse_strings_and_lists!(PayloadErrorKind::Structure);
-
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Environments, A::Error> {
-        let mut names = HashSet::new();
-        let mut stored_bytes = STORED_ENVELOPE_BYTES;
-        while let Some(Name(name)) =
-            map.next_key_seed(NameSeed(PayloadErrorKind::EnvironmentName))?
-        {
-            if !is_valid_environment_name(&name) {
-                return Err(reject(PayloadErrorKind::EnvironmentName));
-            }
-            let variables = map.next_value_seed(VariablesSeed)?;
-            stored_bytes += usize::from(!names.is_empty()) + quoted_len(&name) + 1 + variables;
-            if stored_bytes > MAX_PROJECT_BYTES {
-                return Err(reject(PayloadErrorKind::ProjectTooLarge));
-            }
-            if !names.insert(name) {
-                return Err(reject(PayloadErrorKind::DuplicateEnvironment));
-            }
-        }
-        Ok(Environments { stored_bytes })
-    }
-}
-
-/// One environment's variables; reads as the bytes `{…}` takes when stored.
-struct VariablesSeed;
-
-impl<'de> DeserializeSeed<'de> for VariablesSeed {
-    type Value = usize;
-
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<usize, D::Error> {
-        deserializer.deserialize_any(VariablesVisitor)
-    }
-}
-
-struct VariablesVisitor;
-
-impl<'de> Visitor<'de> for VariablesVisitor {
-    type Value = usize;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("variables")
-    }
-
-    refuse_other_types!(PayloadErrorKind::Structure);
-    refuse_strings_and_lists!(PayloadErrorKind::Structure);
-
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<usize, A::Error> {
-        let mut names = HashSet::new();
-        let mut stored_bytes = 2;
-        while let Some(Name(name)) = map.next_key_seed(NameSeed(PayloadErrorKind::VariableName))? {
-            if !is_valid_variable_name(&name) {
-                return Err(reject(PayloadErrorKind::VariableName));
-            }
-            let value = map.next_value_seed(ValueSeed)?;
-            stored_bytes += usize::from(!names.is_empty()) + quoted_len(&name) + 1 + value;
-            if stored_bytes > MAX_PROJECT_BYTES {
-                return Err(reject(PayloadErrorKind::ProjectTooLarge));
-            }
-            if !names.insert(name) {
-                return Err(reject(PayloadErrorKind::DuplicateVariable));
-            }
-        }
-        Ok(stored_bytes)
-    }
-}
-
-/// A value; reads as its length quoted as the CLI stores it, so it's
-/// measured where it lies and never copied.
-struct ValueSeed;
-
-impl<'de> DeserializeSeed<'de> for ValueSeed {
-    type Value = usize;
-
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<usize, D::Error> {
-        deserializer.deserialize_any(ValueVisitor)
-    }
-}
-
-struct ValueVisitor;
-
-impl<'de> Visitor<'de> for ValueVisitor {
-    type Value = usize;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a string value")
-    }
-
-    refuse_other_types!(PayloadErrorKind::Value);
-
-    fn visit_str<E: de::Error>(self, value: &str) -> Result<usize, E> {
-        Ok(quoted_len(value))
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, _: A) -> Result<usize, A::Error> {
-        Err(reject(PayloadErrorKind::Value))
-    }
-
-    fn visit_map<A: MapAccess<'de>>(self, _: A) -> Result<usize, A::Error> {
-        Err(reject(PayloadErrorKind::Value))
-    }
-}
-
-/// A map key, borrowed from the payload where it has no escapes.
-struct Name<'de>(Cow<'de, str>);
-
-struct NameSeed(PayloadErrorKind);
-
-impl<'de> DeserializeSeed<'de> for NameSeed {
-    type Value = Name<'de>;
-
-    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Name<'de>, D::Error> {
-        deserializer.deserialize_str(NameVisitor(self.0))
-    }
-}
-
-struct NameVisitor(PayloadErrorKind);
-
-impl<'de> Visitor<'de> for NameVisitor {
-    type Value = Name<'de>;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a name")
-    }
-
-    fn visit_borrowed_str<E: de::Error>(self, name: &'de str) -> Result<Name<'de>, E> {
-        Ok(Name(Cow::Borrowed(name)))
-    }
-
-    fn visit_str<E: de::Error>(self, name: &str) -> Result<Name<'de>, E> {
-        Ok(Name(Cow::Owned(name.to_owned())))
-    }
-
-    fn visit_bytes<E: de::Error>(self, _: &[u8]) -> Result<Name<'de>, E> {
-        Err(reject(self.0))
-    }
+fn decimal_digits(value: usize) -> usize {
+    value.checked_ilog10().map_or(1, |log| log as usize + 1)
 }
 
 /// The length of `text` as serde_json writes it in quotes, which is how the
 /// CLI stores values.
 fn quoted_len(text: &str) -> usize {
-    2 + text
-        .bytes()
-        .map(|byte| match byte {
-            b'"' | b'\\' | b'\x08' | b'\x0c' | b'\n' | b'\r' | b'\t' => 2,
-            0x00..=0x1f => 6,
-            _ => 1,
-        })
-        .sum::<usize>()
+    2 + text.chars().map(escaped_len).sum::<usize>()
+}
+
+/// What `character` takes inside quotes as serde_json writes it.
+fn escaped_len(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+        '\0'..='\u{1f}' => 6,
+        _ => character.len_utf8(),
+    }
+}
+
+/// A strict JSON reader over the payload that reads only the shapes this
+/// format has, and skips what it reads without copying it.
+struct Reader<'a> {
+    text: &'a str,
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn error(&self, kind: PayloadErrorKind) -> PayloadError {
+        self.error_at(kind, self.at)
+    }
+
+    fn error_at(&self, kind: PayloadErrorKind, offset: usize) -> PayloadError {
+        PayloadError { kind, offset }
+    }
+
+    /// What reading the wrong token as `kind` fails as: `kind`, unless the
+    /// input ends or the next byte starts no JSON value at all.
+    fn mismatch(&mut self, kind: PayloadErrorKind) -> PayloadError {
+        match self.peek() {
+            Some(b'{' | b'[' | b'"' | b't' | b'f' | b'n' | b'-' | b'0'..=b'9') => self.error(kind),
+            _ => self.error(PayloadErrorKind::Syntax),
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        let bytes = self.text.as_bytes();
+        while matches!(bytes.get(self.at), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.at += 1;
+        }
+    }
+
+    /// The next token's first byte, after whitespace.
+    fn peek(&mut self) -> Option<u8> {
+        self.skip_whitespace();
+        self.text.as_bytes().get(self.at).copied()
+    }
+
+    fn take(&mut self, byte: u8) -> bool {
+        let taken = self.peek() == Some(byte);
+        self.at += usize::from(taken);
+        taken
+    }
+
+    fn expect(&mut self, byte: u8) -> Result<(), PayloadError> {
+        if self.take(byte) {
+            Ok(())
+        } else {
+            Err(self.error(PayloadErrorKind::Syntax))
+        }
+    }
+
+    /// Reads an object, giving `member` each key, decoded, and where it
+    /// starts, with the reader at its value, which `member` must read.
+    fn object(
+        &mut self,
+        mut member: impl FnMut(&mut Self, Cow<'a, str>, usize) -> Result<(), PayloadError>,
+    ) -> Result<(), PayloadError> {
+        if !self.take(b'{') {
+            return Err(self.mismatch(PayloadErrorKind::Structure));
+        }
+        if self.take(b'}') {
+            return Ok(());
+        }
+        loop {
+            self.skip_whitespace();
+            let key_at = self.at;
+            if self.peek() != Some(b'"') {
+                return Err(self.error(PayloadErrorKind::Syntax));
+            }
+            let key = self.text_value()?;
+            self.expect(b':')?;
+            member(self, key, key_at)?;
+            if self.take(b'}') {
+                return Ok(());
+            }
+            self.expect(b',')?;
+        }
+    }
+
+    /// Reads a list, with `element` reading each element.
+    fn list(
+        &mut self,
+        mut element: impl FnMut(&mut Self) -> Result<(), PayloadError>,
+    ) -> Result<(), PayloadError> {
+        if !self.take(b'[') {
+            return Err(self.mismatch(PayloadErrorKind::Structure));
+        }
+        if self.take(b']') {
+            return Ok(());
+        }
+        loop {
+            element(self)?;
+            if self.take(b']') {
+                return Ok(());
+            }
+            self.expect(b',')?;
+        }
+    }
+
+    /// `None` for `null`, else what `read` reads.
+    fn optional<T>(
+        &mut self,
+        read: impl FnOnce(&mut Self) -> Result<T, PayloadError>,
+    ) -> Result<Option<T>, PayloadError> {
+        if self.peek() == Some(b'n') {
+            self.word("null").map(|()| None)
+        } else {
+            read(self).map(Some)
+        }
+    }
+
+    fn word(&mut self, word: &str) -> Result<(), PayloadError> {
+        if self.text[self.at..].starts_with(word) {
+            self.at += word.len();
+            Ok(())
+        } else {
+            Err(self.error(PayloadErrorKind::Syntax))
+        }
+    }
+
+    fn flag(&mut self) -> Result<bool, PayloadError> {
+        match self.peek() {
+            Some(b't') => self.word("true").map(|()| true),
+            Some(b'f') => self.word("false").map(|()| false),
+            _ => Err(self.mismatch(PayloadErrorKind::Structure)),
+        }
+    }
+
+    /// A number with no sign, fraction or exponent.
+    fn unsigned(&mut self) -> Result<u64, PayloadError> {
+        if !matches!(self.peek(), Some(b'0'..=b'9')) {
+            return Err(self.mismatch(PayloadErrorKind::Structure));
+        }
+        let at = self.at;
+        let token = self.number_token()?;
+        token
+            .parse()
+            .map_err(|_| self.error_at(PayloadErrorKind::Structure, at))
+    }
+
+    /// A JSON number's text, as RFC 8259 writes them.
+    fn number_token(&mut self) -> Result<&'a str, PayloadError> {
+        self.skip_whitespace();
+        let start = self.at;
+        let bytes = self.text.as_bytes();
+        let digits = |at: &mut usize| {
+            let first = *at;
+            while matches!(bytes.get(*at), Some(b'0'..=b'9')) {
+                *at += 1;
+            }
+            *at > first
+        };
+        let mut at = start + usize::from(bytes.get(start) == Some(&b'-'));
+        let integer = at;
+        if !digits(&mut at) || (bytes[integer] == b'0' && at > integer + 1) {
+            return Err(self.error_at(PayloadErrorKind::Syntax, start));
+        }
+        if bytes.get(at) == Some(&b'.') {
+            at += 1;
+            if !digits(&mut at) {
+                return Err(self.error_at(PayloadErrorKind::Syntax, at));
+            }
+        }
+        if matches!(bytes.get(at), Some(b'e' | b'E')) {
+            at += 1;
+            at += usize::from(matches!(bytes.get(at), Some(b'+' | b'-')));
+            if !digits(&mut at) {
+                return Err(self.error_at(PayloadErrorKind::Syntax, at));
+            }
+        }
+        self.at = at;
+        Ok(&self.text[start..at])
+    }
+
+    /// The index of `names`' string the value is, written without escapes.
+    fn one_of(&mut self, names: &[&str]) -> Result<usize, PayloadError> {
+        self.skip_whitespace();
+        let at = self.at;
+        let (start, end) = self.string_span(&mut (), PayloadErrorKind::Structure)?;
+        let raw = &self.text[start..end];
+        names
+            .iter()
+            .position(|name| *name == raw)
+            .ok_or_else(|| self.error_at(PayloadErrorKind::Structure, at))
+    }
+
+    /// A string, decoded: only keys, names and labels are read this way. One
+    /// without escapes is borrowed; one with them is walked again to decode.
+    fn text_value(&mut self) -> Result<Cow<'a, str>, PayloadError> {
+        self.skip_whitespace();
+        let opening = self.at;
+        let mut escapes = Escapes(false);
+        let (start, end) = self.string_span(&mut escapes, PayloadErrorKind::Structure)?;
+        if !escapes.0 {
+            return Ok(Cow::Borrowed(&self.text[start..end]));
+        }
+        let mut decoded = Decoded(String::with_capacity(end - start));
+        Reader {
+            text: self.text,
+            at: opening,
+        }
+        .string_span(&mut decoded, PayloadErrorKind::Structure)?;
+        Ok(Cow::Owned(decoded.0))
+    }
+
+    /// A value: a string, measured as the CLI stores it, never copied.
+    fn measured_value(&mut self) -> Result<usize, PayloadError> {
+        let mut measured = Measured(2);
+        self.string_span(&mut measured, PayloadErrorKind::Value)?;
+        Ok(measured.0)
+    }
+
+    /// Walks the string at the reader, giving `sink` each stretch without
+    /// escapes and each escaped character, and returns where its text starts
+    /// and ends. Anything but a string fails as `not_string`, before any of
+    /// it is read.
+    fn string_span(
+        &mut self,
+        sink: &mut impl Sink<'a>,
+        not_string: PayloadErrorKind,
+    ) -> Result<(usize, usize), PayloadError> {
+        if self.peek() != Some(b'"') {
+            return Err(self.mismatch(not_string));
+        }
+        let bytes = self.text.as_bytes();
+        let start = self.at + 1;
+        let mut stretch = start;
+        let mut at = start;
+        loop {
+            match bytes.get(at) {
+                None => return Err(self.error_at(PayloadErrorKind::Syntax, at)),
+                Some(b'"') => {
+                    if stretch < at {
+                        sink.run(&self.text[stretch..at]);
+                    }
+                    self.at = at + 1;
+                    return Ok((start, at));
+                }
+                Some(b'\\') => {
+                    if stretch < at {
+                        sink.run(&self.text[stretch..at]);
+                    }
+                    let (character, length) = self.escape(at)?;
+                    sink.escaped(character);
+                    at += length;
+                    stretch = at;
+                }
+                Some(0x00..=0x1f) => return Err(self.error_at(PayloadErrorKind::Syntax, at)),
+                Some(_) => at += 1,
+            }
+        }
+    }
+
+    /// The character the escape at `at` stands for, and its length.
+    fn escape(&self, at: usize) -> Result<(char, usize), PayloadError> {
+        let bytes = self.text.as_bytes();
+        let invalid = || self.error_at(PayloadErrorKind::Syntax, at);
+        let hex = |from: usize| -> Option<u32> {
+            let digits = self.text.get(from..from + 4)?;
+            if !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return None;
+            }
+            u32::from_str_radix(digits, 16).ok()
+        };
+        let simple = match bytes.get(at + 1) {
+            Some(b'"') => '"',
+            Some(b'\\') => '\\',
+            Some(b'/') => '/',
+            Some(b'b') => '\u{8}',
+            Some(b'f') => '\u{c}',
+            Some(b'n') => '\n',
+            Some(b'r') => '\r',
+            Some(b't') => '\t',
+            Some(b'u') => {
+                let unit = hex(at + 2).ok_or_else(invalid)?;
+                return match unit {
+                    0xD800..=0xDBFF => {
+                        let low = (bytes.get(at + 6..at + 8) == Some(b"\\u"))
+                            .then(|| hex(at + 8))
+                            .flatten()
+                            .filter(|low| (0xDC00..=0xDFFF).contains(low))
+                            .ok_or_else(invalid)?;
+                        let scalar = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+                        char::from_u32(scalar)
+                            .map(|character| (character, 12))
+                            .ok_or_else(invalid)
+                    }
+                    0xDC00..=0xDFFF => Err(invalid()),
+                    _ => char::from_u32(unit)
+                        .map(|character| (character, 6))
+                        .ok_or_else(invalid),
+                };
+            }
+            _ => return Err(invalid()),
+        };
+        Ok((simple, 2))
+    }
+
+    /// Any JSON value inside `app`, `depth` containers deep: objects with no
+    /// repeated key, nested at most [`MAX_APP_DEPTH`] deep, and finite numbers.
+    /// Strings are walked, not decoded, except for keys.
+    fn app_value(&mut self, depth: usize) -> Result<(), PayloadError> {
+        match self.peek() {
+            Some(b'{' | b'[') if depth > MAX_APP_DEPTH => Err(self.error(PayloadErrorKind::App)),
+            Some(b'{') => {
+                let mut keys = HashSet::new();
+                self.object(|reader, key, at| {
+                    if !keys.insert(key) {
+                        return Err(reader.error_at(PayloadErrorKind::App, at));
+                    }
+                    reader.app_value(depth + 1)
+                })
+            }
+            Some(b'[') => self.list(|reader| reader.app_value(depth + 1)),
+            Some(b'"') => self.string_span(&mut (), PayloadErrorKind::App).map(|_| ()),
+            Some(b't' | b'f') => self.flag().map(|_| ()),
+            Some(b'n') => self.word("null"),
+            Some(b'-' | b'0'..=b'9') => {
+                let at = self.at;
+                let token = self.number_token()?;
+                if token.parse::<f64>().is_ok_and(f64::is_finite) {
+                    Ok(())
+                } else {
+                    Err(self.error_at(PayloadErrorKind::App, at))
+                }
+            }
+            _ => Err(self.error(PayloadErrorKind::Syntax)),
+        }
+    }
+}
+
+/// What a string's walk gives its parts to.
+trait Sink<'a> {
+    fn run(&mut self, _run: &'a str) {}
+    fn escaped(&mut self, _character: char) {}
+}
+
+/// Checks a string without keeping any of it.
+impl Sink<'_> for () {}
+
+/// Whether a string has escapes.
+struct Escapes(bool);
+
+impl Sink<'_> for Escapes {
+    fn escaped(&mut self, _character: char) {
+        self.0 = true;
+    }
+}
+
+/// A string's text, decoded.
+struct Decoded(String);
+
+impl<'a> Sink<'a> for Decoded {
+    fn run(&mut self, run: &'a str) {
+        self.0.push_str(run);
+    }
+
+    fn escaped(&mut self, character: char) {
+        self.0.push(character);
+    }
+}
+
+/// A string's length as serde_json writes it, from 2 for its quotes.
+struct Measured(usize);
+
+impl Sink<'_> for Measured {
+    fn run(&mut self, run: &str) {
+        self.0 += run.len();
+    }
+
+    fn escaped(&mut self, character: char) {
+        self.0 += escaped_len(character);
+    }
 }
 
 #[cfg(test)]
@@ -676,7 +932,7 @@ mod tests {
     fn not_json_or_trailing_text_is_a_syntax_error_with_its_position() {
         let error = validate(b"{\"createdAt\":").expect_err("truncated");
         assert_eq!(error.kind, PayloadErrorKind::Syntax);
-        assert_eq!(error.position, Some((1, 13)));
+        assert_eq!(error.offset, 13);
         let trailing = [serde_json::to_vec(&valid()).unwrap(), b" {}".to_vec()].concat();
         assert_eq!(
             validate(&trailing).err().map(|error| error.kind),
@@ -721,15 +977,6 @@ mod tests {
         for (path, value, expected) in [
             ("vaultId", json!("../escape"), PayloadErrorKind::VaultId),
             ("vaultId", json!("__index__"), PayloadErrorKind::VaultId),
-            ("name", json!(""), PayloadErrorKind::ProjectName),
-            ("name", json!("tab\tname"), PayloadErrorKind::ProjectName),
-            (
-                "name",
-                json!("n".repeat(201)),
-                PayloadErrorKind::ProjectName,
-            ),
-            ("folder", json!("relative/path"), PayloadErrorKind::Folder),
-            ("folder", json!("/new\nline"), PayloadErrorKind::Folder),
         ] {
             let mut payload = valid();
             payload["projects"][0][path] = value;
@@ -777,12 +1024,21 @@ mod tests {
             "preview.eu-1": {"C": ""}
         });
         let stored = serde_json::to_string(&json!({"environments": environments})).unwrap();
-        let encoded = serde_json::to_vec(&environments).unwrap();
-        let measured =
-            Environments::deserialize(&mut serde_json::Deserializer::from_slice(&encoded))
-                .unwrap()
-                .stored_bytes;
-        assert_eq!(measured, stored.len());
+        let encoded = serde_json::to_string(&environments).unwrap();
+        // Escapes the CLI wouldn't write are measured as the text they stand for.
+        let respelled = encoded
+            .replace('é', "\\u00e9")
+            .replace('🚀', "\\ud83d\\ude80")
+            .replace('/', "\\/");
+        assert_ne!(respelled, encoded);
+        for text in [encoded.as_str(), respelled.as_str()] {
+            let mut reader = Reader { text, at: 0 };
+            assert_eq!(
+                read_environments(&mut reader).unwrap().0,
+                stored.len(),
+                "{text}"
+            );
+        }
     }
 
     #[test]
@@ -872,15 +1128,285 @@ mod tests {
     }
 
     #[test]
-    fn every_error_code_is_distinct_and_found_again_from_its_message() {
-        let codes: HashSet<_> = PayloadErrorKind::ALL
-            .iter()
-            .map(|kind| kind.code())
-            .collect();
-        assert_eq!(codes.len(), PayloadErrorKind::ALL.len());
-        for kind in PayloadErrorKind::ALL {
-            let error = <serde_json::Error as de::Error>::custom(Rejection(kind));
-            assert_eq!(PayloadError::from_json(&error).kind, kind);
+    fn objects_and_enum_values_have_only_their_documented_spelling() {
+        let positional = br#"[0,["lpm","1"],null,[],null]"#;
+        assert_eq!(
+            validate(positional).err().map(|error| error.kind),
+            Some(PayloadErrorKind::Structure)
+        );
+        let positional_producer = br#"{"createdAt":0,"producer":["lpm","1"],"projects":[]}"#;
+        assert_eq!(
+            validate(positional_producer).err().map(|error| error.kind),
+            Some(PayloadErrorKind::Structure)
+        );
+        for (path, value) in [
+            (
+                "projects",
+                json!([["v", "n", null, false, "automatic", {}, null]]),
+            ),
+            (
+                "projects",
+                json!([{"vaultId": "v", "name": "n", "hidden": false,
+                "cliAccess": {"automatic": null}, "environments": {}}]),
+            ),
+            (
+                "projects",
+                json!([{"vaultId": "v", "name": "n", "hidden": false,
+                "cliAccess": "automatic", "environments": {},
+                "sync": ["https://lpm.dev", "personal", "u", null]}]),
+            ),
+            (
+                "projects",
+                json!([{"vaultId": "v", "name": "n", "hidden": false,
+                "cliAccess": "automatic", "environments": {},
+                "sync": {"registry": "https://lpm.dev", "scope": {"personal": null}, "principalId": "u"}}]),
+            ),
+        ] {
+            let mut payload = valid();
+            payload[path] = value.clone();
+            assert_eq!(kind(&payload), Some(PayloadErrorKind::Structure), "{value}");
         }
+    }
+
+    #[test]
+    fn names_and_folders_the_cli_stores_are_kept_as_they_are() {
+        for name in [
+            "n".repeat(201),
+            "tab\tname".to_owned(),
+            " padded ".to_owned(),
+        ] {
+            let mut payload = valid();
+            payload["projects"][0]["name"] = json!(name);
+            assert_eq!(check(&payload), Ok(()), "{name:?}");
+        }
+        for folder in [
+            "/Users/me/a\nb",
+            "/Users/me/tab\there",
+            "C:\\Users\\me\\project",
+            "relative/path",
+        ] {
+            let mut payload = valid();
+            payload["projects"][0]["folder"] = json!(folder);
+            assert_eq!(check(&payload), Ok(()), "{folder:?}");
+        }
+    }
+
+    #[test]
+    fn a_project_whose_index_record_would_pass_the_store_limit_is_refused() {
+        let many: serde_json::Map<String, serde_json::Value> = (0..4000)
+            .map(|index| (format!("e{index:04}"), json!({})))
+            .collect();
+        let mut payload = valid();
+        payload["projects"][0]["environments"] = serde_json::Value::Object(many);
+        assert_eq!(kind(&payload), Some(PayloadErrorKind::ProjectTooLarge));
+        let fits: serde_json::Map<String, serde_json::Value> = (0..2000)
+            .map(|index| (format!("e{index:04}"), json!({})))
+            .collect();
+        payload["projects"][0]["environments"] = serde_json::Value::Object(fits);
+        assert_eq!(check(&payload), Ok(()));
+    }
+
+    #[test]
+    fn the_index_record_is_measured_as_the_cli_writes_it() {
+        let project = json!({
+            "vaultId": "550e8400-e29b-41d4-a716-446655440000", "name": "demo \"api\" ✓",
+            "folder": "/Users/me/a\nb", "hidden": false, "cliAccess": "automatic",
+            "environments": {"default": {"A": "1", "B": "2"}, "staging": {}, "preview.eu": {"C": ""}}
+        });
+        let text = serde_json::to_string(&project).unwrap();
+        let (_, index_record_bytes) = read_project(&mut Reader { text: &text, at: 0 }).unwrap();
+        let record = json!({
+            "schemaVersion": 3,
+            "storageId": "00000000-0000-4000-8000-000000000000",
+            "id": project["vaultId"], "name": project["name"], "path": project["folder"],
+            "discoveryShard": 1023,
+            "environmentSummaries": [
+                {"name": "default", "keyCount": 2}, {"name": "staging", "keyCount": 0},
+                {"name": "preview.eu", "keyCount": 1}
+            ]
+        });
+        assert_eq!(
+            index_record_bytes,
+            serde_json::to_string(&record).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn registries_must_be_canonical_urls_as_the_cli_stores_them() {
+        for registry in [
+            "https://:",
+            "https://[",
+            "https://lpm.dev:bad",
+            "https://LPM.dev",
+            "https://lpm.dev:443",
+            "https://lpm.dev/registry/",
+            "https://lpm.dev/a b",
+            "https://lpm.dev#x",
+        ] {
+            let mut payload = valid();
+            payload["projects"][0]["sync"]["registry"] = json!(registry);
+            assert_eq!(kind(&payload), Some(PayloadErrorKind::Sync), "{registry}");
+        }
+        for registry in [
+            "https://lpm.dev",
+            "http://localhost:3000",
+            "http://localhost:3000/registry",
+            "https://[::1]:8443",
+        ] {
+            let mut payload = valid();
+            payload["projects"][0]["sync"]["registry"] = json!(registry);
+            assert_eq!(check(&payload), Ok(()), "{registry}");
+        }
+    }
+
+    const DIRECTION_CONTROLS: [char; 12] = [
+        '\u{61C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
+        '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+    ];
+
+    #[test]
+    fn labels_the_format_defines_refuse_direction_controls() {
+        for control in DIRECTION_CONTROLS {
+            let text = format!("safe{control}txt");
+            let mut producer = valid();
+            producer["producer"]["name"] = json!(text);
+            assert_eq!(
+                kind(&producer),
+                Some(PayloadErrorKind::Producer),
+                "{control:?}"
+            );
+            let mut version = valid();
+            version["producer"]["version"] = json!(text);
+            assert_eq!(
+                kind(&version),
+                Some(PayloadErrorKind::Producer),
+                "{control:?}"
+            );
+            let mut device = valid();
+            device["deviceName"] = json!(text);
+            assert_eq!(
+                kind(&device),
+                Some(PayloadErrorKind::DeviceName),
+                "{control:?}"
+            );
+            let mut principal = valid();
+            principal["projects"][0]["sync"]["principalId"] = json!(text);
+            assert_eq!(
+                kind(&principal),
+                Some(PayloadErrorKind::Sync),
+                "{control:?}"
+            );
+            let mut registry = valid();
+            registry["projects"][0]["sync"]["registry"] = json!(format!("https://lpm.dev/{text}"));
+            assert_eq!(kind(&registry), Some(PayloadErrorKind::Sync), "{control:?}");
+        }
+        let mut emoji = valid();
+        emoji["deviceName"] = json!("Studio \u{2764}\u{FE0F} \u{1F468}\u{200D}\u{1F4BB}");
+        assert_eq!(check(&emoji), Ok(()));
+    }
+
+    #[test]
+    fn stored_names_folders_and_vault_ids_keep_direction_controls() {
+        let mut payload = valid();
+        payload["projects"][0]["name"] = json!("safe\u{202E}txt");
+        payload["projects"][0]["folder"] = json!("/Users/me/\u{2067}x\u{2069}");
+        payload["projects"][0]["vaultId"] = json!("vault\u{202E}id");
+        assert_eq!(check(&payload), Ok(()));
+    }
+
+    #[test]
+    fn the_app_section_refuses_repeated_keys_deep_nesting_and_numbers_out_of_range() {
+        let with_app = |app: &str| {
+            format!(
+                r#"{{"createdAt":0,"producer":{{"name":"a","version":"1"}},"projects":[],"app":{app}}}"#
+            )
+        };
+        let app_kind = |app: &str| {
+            validate(with_app(app).as_bytes())
+                .err()
+                .map(|error| error.kind)
+        };
+        for app in [
+            r#"{"settings":1,"settings":2}"#,
+            r#"{"a":{"b":1,"b":2}}"#,
+            r#"{"n":1e400}"#,
+            r#"{"n":-1e400}"#,
+            r#"{"s":"\ud800"}"#,
+        ] {
+            assert_eq!(app_kind(app), Some(PayloadErrorKind::App), "{app}");
+        }
+        let nested = |depth: usize| format!("{}{}", "[".repeat(depth - 1), "]".repeat(depth - 1));
+        let deepest = format!(r#"{{"x":{}}}"#, nested(MAX_APP_DEPTH));
+        assert_eq!(app_kind(&deepest), None);
+        let too_deep = format!(r#"{{"x":{}}}"#, nested(MAX_APP_DEPTH + 1));
+        assert_eq!(app_kind(&too_deep), Some(PayloadErrorKind::App));
+        let ordinary = r#"{"settings":{"appearance":"dark","n":12345678901234567890,"f":-0.5e3},"list":[true,null,"s"]}"#;
+        assert_eq!(app_kind(ordinary), None);
+    }
+
+    #[test]
+    fn the_reader_accepts_exactly_the_json_serde_json_does() {
+        let corpus = [
+            r#"{}"#,
+            r#" { "a" : [ 1 , 2 ] , "b" : { } } "#,
+            r#"{"a":-0,"b":0.5e-3,"c":1E+2,"d":12345678901234567890,"e":-1.25E-7}"#,
+            r#"{"a":true,"b":false,"c":null}"#,
+            r#"{"a":"é🚀\/\b\f\n\r\t\"\\"}"#,
+            "{\"a\":\"\u{7f}\u{e9}\"}",
+            r#"{"a":01}"#,
+            r#"{"a":1.}"#,
+            r#"{"a":.5}"#,
+            r#"{"a":+1}"#,
+            r#"{"a":1e}"#,
+            r#"{"a":-}"#,
+            r#"{"a":"\x"}"#,
+            r#"{"a":"\u12"}"#,
+            r#"{"a":"\ud800A"}"#,
+            r#"{"a":"\udc00"}"#,
+            r#"{"a":[1,]}"#,
+            r#"{"a":1,}"#,
+            r#"{a:1}"#,
+            r#"{"a":tru}"#,
+            r#"{"a":nul}"#,
+            r#"{"a":"x"#,
+            "{\"a\":\"raw\ttab\"}",
+            r#"{"a":Infinity}"#,
+            r#"{"a":NaN}"#,
+            r#"{"a" 1}"#,
+            r#"{"a":1 "b":2}"#,
+            "{\"a\":1}\u{feff}",
+        ];
+        for app in corpus {
+            let payload = format!(
+                r#"{{"createdAt":0,"producer":{{"name":"a","version":"1"}},"projects":[],"app":{app}}}"#
+            );
+            let serde_accepts = serde_json::from_str::<serde_json::Value>(&payload).is_ok();
+            assert_eq!(validate(payload.as_bytes()).is_ok(), serde_accepts, "{app}");
+        }
+    }
+
+    #[test]
+    fn every_error_code_is_distinct() {
+        use PayloadErrorKind::*;
+        let kinds = [
+            Syntax,
+            Structure,
+            CreatedAt,
+            Producer,
+            DeviceName,
+            TooManyProjects,
+            VaultId,
+            DuplicateVaultId,
+            EnvironmentName,
+            DuplicateEnvironment,
+            VariableName,
+            DuplicateVariable,
+            Value,
+            ProjectTooLarge,
+            Sync,
+            App,
+        ];
+        let codes: HashSet<_> = kinds.iter().map(|kind| kind.code()).collect();
+        assert_eq!(codes.len(), kinds.len());
     }
 }

@@ -3520,6 +3520,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-normalization",
+ "url",
  "urlencoding",
  "windows-sys 0.60.2",
 ]
@@ -3573,7 +3574,6 @@ dependencies = [
  "chacha20poly1305",
  "getrandom 0.3.4",
  "lpm-common",
- "serde",
  "serde_json",
  "sha2 0.10.9",
  "unicode-normalization",

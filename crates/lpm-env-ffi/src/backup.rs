@@ -13,12 +13,6 @@ use crate::{ABI_VERSION, LPMEnvResult, failure, result};
 
 const REFUSED: u32 = 5;
 
-/// A result holding a copy of `secret` in a buffer of exactly its length,
-/// so release wipes all of it and no larger allocation is left behind.
-fn secret_result(secret: &[u8]) -> LPMEnvResult {
-    result(0, Box::<[u8]>::from(secret).into_vec(), None)
-}
-
 fn refusal(code: &str, details: Value) -> LPMEnvResult {
     let mut output = json!({ "abiVersion": ABI_VERSION, "code": code });
     if let (Some(output), Value::Object(details)) = (output.as_object_mut(), details) {
@@ -41,12 +35,10 @@ fn passphrase_refusal(error: PassphraseError) -> LPMEnvResult {
 }
 
 fn payload_refusal(error: PayloadError) -> LPMEnvResult {
-    let mut details = json!({ "reason": error.kind.code() });
-    if let Some((line, column)) = error.position {
-        details["line"] = json!(line);
-        details["column"] = json!(column);
-    }
-    refusal("backup.invalid_contents", details)
+    refusal(
+        "backup.invalid_contents",
+        json!({ "reason": error.kind.code(), "offset": error.offset }),
+    )
 }
 
 fn container_refusal(error: ContainerError) -> LPMEnvResult {
@@ -68,13 +60,15 @@ fn container_refusal(error: ContainerError) -> LPMEnvResult {
 }
 
 /// A borrowed range, or `None` for a null pointer with a nonzero length.
+/// Callers refuse lengths over their limits first, which keeps every length
+/// here far below `isize::MAX`.
 ///
 /// # Safety
 /// A non-null pointer must reference `length` readable bytes for the call.
 unsafe fn bytes<'a>(pointer: *const u8, length: usize) -> Option<&'a [u8]> {
     if length == 0 {
         Some(&[])
-    } else if pointer.is_null() {
+    } else if pointer.is_null() || length > isize::MAX as usize {
         None
     } else {
         // SAFETY: The caller supplies a live readable range of `length` bytes.
@@ -89,7 +83,10 @@ pub unsafe extern "C" fn lpm_env_backup_check_passphrase(
     passphrase: *const u8,
     length: usize,
 ) -> LPMEnvResult {
-    // SAFETY: Forwarded from this function's contract.
+    if length > MAX_INPUT_BYTES {
+        return passphrase_refusal(PassphraseError::TooLong);
+    }
+    // SAFETY: Forwarded from this function's contract; the length is bounded above.
     let Some(raw) = (unsafe { bytes(passphrase, length) }) else {
         return failure(2, "env.invalid_input");
     };
@@ -112,7 +109,8 @@ pub unsafe extern "C" fn lpm_env_backup_check_passphrase(
 #[unsafe(no_mangle)]
 pub extern "C" fn lpm_env_backup_generate_passphrase() -> LPMEnvResult {
     catch_unwind(AssertUnwindSafe(|| match passphrase::generate() {
-        Ok(phrase) => secret_result(phrase.as_bytes()),
+        // A buffer of exactly the phrase's length, so release wipes all of it.
+        Ok(phrase) => result(0, Box::<[u8]>::from(phrase.as_bytes()).into_vec(), None),
         Err(_) => failure(3, "backup.random_failed"),
     }))
     .unwrap_or_else(|_| failure(3, "env.engine_panic"))
@@ -127,15 +125,18 @@ pub unsafe extern "C" fn lpm_env_backup_seal(
     passphrase: *const u8,
     passphrase_length: usize,
 ) -> LPMEnvResult {
-    // SAFETY: Forwarded from this function's contract.
+    if payload_length > MAX_PAYLOAD_BYTES {
+        return refusal("backup.too_large", Value::Null);
+    }
+    if passphrase_length > MAX_INPUT_BYTES {
+        return passphrase_refusal(PassphraseError::TooLong);
+    }
+    // SAFETY: Forwarded from this function's contract; the lengths are bounded above.
     let (Some(payload), Some(raw)) = (unsafe { bytes(payload, payload_length) }, unsafe {
         bytes(passphrase, passphrase_length)
     }) else {
         return failure(2, "env.invalid_input");
     };
-    if payload.len() > MAX_PAYLOAD_BYTES {
-        return refusal("backup.too_large", Value::Null);
-    }
     catch_unwind(AssertUnwindSafe(|| {
         let passphrase = match Passphrase::new(raw) {
             Ok(passphrase) => passphrase,
@@ -158,7 +159,10 @@ pub unsafe extern "C" fn lpm_env_backup_seal(
 /// The pointer must reference `length` readable bytes during the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lpm_env_backup_inspect(file: *const u8, length: usize) -> LPMEnvResult {
-    // SAFETY: Forwarded from this function's contract.
+    if length > MAX_FILE_BYTES {
+        return refusal("backup.too_large", Value::Null);
+    }
+    // SAFETY: Forwarded from this function's contract; the length is bounded above.
     let Some(file) = (unsafe { bytes(file, length) }) else {
         return failure(2, "env.invalid_input");
     };
@@ -173,25 +177,31 @@ pub unsafe extern "C" fn lpm_env_backup_inspect(file: *const u8, length: usize) 
 }
 
 /// # Safety
-/// Each pointer must reference its length in readable bytes during the call.
+/// Each pointer must reference its length in readable bytes during the call,
+/// and both out-pointers must be writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lpm_env_backup_open(
     file: *const u8,
     file_length: usize,
     passphrase: *const u8,
     passphrase_length: usize,
+    payload_offset: *mut usize,
+    payload_length: *mut usize,
 ) -> LPMEnvResult {
-    // SAFETY: Forwarded from this function's contract.
+    if file_length > MAX_FILE_BYTES {
+        return refusal("backup.too_large", Value::Null);
+    }
+    if passphrase_length > MAX_INPUT_BYTES {
+        return passphrase_refusal(PassphraseError::TooLong);
+    }
+    // SAFETY: Forwarded from this function's contract; the lengths are bounded above.
     let (Some(file), Some(raw)) = (unsafe { bytes(file, file_length) }, unsafe {
         bytes(passphrase, passphrase_length)
     }) else {
         return failure(2, "env.invalid_input");
     };
-    if file.len() > MAX_FILE_BYTES {
-        return refusal("backup.too_large", Value::Null);
-    }
-    if raw.len() > MAX_INPUT_BYTES {
-        return passphrase_refusal(PassphraseError::TooLong);
+    if payload_offset.is_null() || payload_length.is_null() {
+        return failure(2, "env.invalid_input");
     }
     catch_unwind(AssertUnwindSafe(|| {
         if let Err(error) = lpm_env_backup::inspect(file) {
@@ -202,7 +212,19 @@ pub unsafe extern "C" fn lpm_env_backup_open(
             Err(error) => return passphrase_refusal(error),
         };
         match lpm_env_backup::open(file, &passphrase) {
-            Ok(payload) => secret_result(&payload),
+            Ok(opened) => {
+                // The plaintext's allocation is exactly its length, so it
+                // becomes the output without a copy, and release wipes it.
+                let (mut plaintext, range) = opened.into_plaintext();
+                let plaintext = std::mem::take(&mut *plaintext);
+                debug_assert_eq!(plaintext.len(), plaintext.capacity());
+                // SAFETY: The caller supplies writable out-pointers, checked non-null above.
+                unsafe {
+                    payload_offset.write(range.start);
+                    payload_length.write(range.len());
+                }
+                result(0, plaintext, None)
+            }
             Err(OpenError::Container(error)) => container_refusal(error),
             Err(OpenError::Payload(error)) => payload_refusal(error),
         }
@@ -263,16 +285,21 @@ mod tests {
         })
     }
 
-    fn open(file: &[u8], passphrase: &[u8]) -> Owned {
-        // SAFETY: Both slices stay live for the synchronous call.
-        Owned(unsafe {
+    /// The result, and the payload's offset and length in its output.
+    fn open(file: &[u8], passphrase: &[u8]) -> (Owned, usize, usize) {
+        let (mut offset, mut length) = (usize::MAX, usize::MAX);
+        // SAFETY: Both slices and both out-values stay live for the synchronous call.
+        let result = Owned(unsafe {
             lpm_env_backup_open(
                 file.as_ptr(),
                 file.len(),
                 passphrase.as_ptr(),
                 passphrase.len(),
+                &mut offset,
+                &mut length,
             )
-        })
+        });
+        (result, offset, length)
     }
 
     fn inspect(file: &[u8]) -> Owned {
@@ -291,12 +318,32 @@ mod tests {
         assert_eq!(sealed.status(), 0);
         let file = sealed.data().to_vec();
         assert_eq!(&file[..12], b"LPMBKUP\0\0\x01\x01\x01");
-        let opened = open(&file, PASSPHRASE);
+        let (opened, offset, length) = open(&file, PASSPHRASE);
         assert_eq!(opened.status(), 0);
-        assert_eq!(opened.data(), PAYLOAD);
-        let wrong = open(&file, b"harbor velvet ninety cactus orbit maples");
+        assert_eq!(&opened.data()[offset..offset + length], PAYLOAD);
+        let (wrong, ..) = open(&file, b"harbor velvet ninety cactus orbit maples");
         assert_eq!(wrong.status(), REFUSED);
         assert_eq!(wrong.json()["code"], "backup.wrong_passphrase");
+    }
+
+    #[test]
+    fn opening_hands_over_the_plaintext_without_copying_its_payload() {
+        let file = seal(PAYLOAD, PASSPHRASE).data().to_vec();
+        let (opened, offset, length) = open(&file, PASSPHRASE);
+        assert_eq!(opened.status(), 0);
+        assert_eq!(
+            (offset, length),
+            (lpm_env_backup::PAYLOAD_OFFSET, PAYLOAD.len())
+        );
+        // The output is the whole plaintext: the payload's length, the
+        // payload and its zero padding, exactly as large as the ciphertext.
+        assert_eq!(opened.data().len(), file.len() - 80 - 16);
+        assert_eq!(opened.data()[..8], (PAYLOAD.len() as u64).to_be_bytes());
+        assert!(
+            opened.data()[offset + length..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
     }
 
     #[test]
@@ -316,7 +363,7 @@ mod tests {
             let refused = inspect(&bytes);
             assert_eq!(refused.status(), REFUSED);
             assert_eq!(refused.json()["code"], code);
-            let opened = open(&bytes, PASSPHRASE);
+            let (opened, ..) = open(&bytes, PASSPHRASE);
             assert_eq!(
                 opened.json()["code"],
                 code,
@@ -338,7 +385,7 @@ mod tests {
         let output = invalid.json();
         assert_eq!(output["code"], "backup.invalid_contents");
         assert_eq!(output["reason"], "structure");
-        assert!(output["line"].as_u64().is_some() && output["column"].as_u64().is_some());
+        assert!(output["offset"].as_u64().is_some());
         assert!(!String::from_utf8_lossy(invalid.data()).contains("sk_live"));
 
         for (passphrase, code) in [
@@ -393,11 +440,76 @@ mod tests {
             "lpm_env_backup_seal(const uint8_t *payload, size_t payload_length,",
             "lpm_env_backup_inspect(const uint8_t *file, size_t length);",
             "lpm_env_backup_open(const uint8_t *file, size_t file_length,",
+            "size_t *payload_offset, size_t *payload_length);",
         ] {
-            assert!(
-                header.contains(&format!("LPMEnvResult {function}")),
-                "{function}"
-            );
+            assert!(header.contains(function), "{function}");
+        }
+    }
+
+    #[test]
+    fn the_wordlists_attribution_ships_beside_the_header() {
+        let notice = include_str!("../include/WORDLIST_NOTICE.md");
+        for credit in [
+            "EFF Large Wordlist for Passphrases",
+            "Electronic Frontier Foundation",
+            "https://www.eff.org/dice",
+            "https://creativecommons.org/licenses/by/3.0/us/",
+        ] {
+            assert!(notice.contains(credit), "{credit}");
+        }
+    }
+
+    #[test]
+    fn lengths_past_the_limits_are_refused_before_anything_is_read() {
+        let byte = [0_u8];
+        let pointer = byte.as_ptr();
+        // SAFETY: Each length is over its limit, so nothing behind the pointer is read.
+        let results = unsafe {
+            [
+                (
+                    lpm_env_backup_check_passphrase(pointer, usize::MAX),
+                    "backup.passphrase_too_long",
+                ),
+                (
+                    lpm_env_backup_inspect(pointer, usize::MAX),
+                    "backup.too_large",
+                ),
+                (
+                    lpm_env_backup_seal(pointer, usize::MAX, PASSPHRASE.as_ptr(), PASSPHRASE.len()),
+                    "backup.too_large",
+                ),
+                (
+                    lpm_env_backup_seal(PAYLOAD.as_ptr(), PAYLOAD.len(), pointer, usize::MAX),
+                    "backup.passphrase_too_long",
+                ),
+                (
+                    lpm_env_backup_open(
+                        pointer,
+                        usize::MAX,
+                        PASSPHRASE.as_ptr(),
+                        PASSPHRASE.len(),
+                        &mut 0,
+                        &mut 0,
+                    ),
+                    "backup.too_large",
+                ),
+                (
+                    lpm_env_backup_open(
+                        PAYLOAD.as_ptr(),
+                        PAYLOAD.len(),
+                        pointer,
+                        usize::MAX,
+                        &mut 0,
+                        &mut 0,
+                    ),
+                    "backup.passphrase_too_long",
+                ),
+            ]
+        };
+        for (result, code) in results {
+            let owned = Owned(result);
+            assert_eq!(owned.status(), REFUSED);
+            assert_eq!(owned.json()["code"], code);
         }
     }
 
@@ -409,7 +521,30 @@ mod tests {
                 lpm_env_backup_check_passphrase(std::ptr::null(), 1),
                 lpm_env_backup_inspect(std::ptr::null(), 1),
                 lpm_env_backup_seal(std::ptr::null(), 1, PASSPHRASE.as_ptr(), PASSPHRASE.len()),
-                lpm_env_backup_open(PAYLOAD.as_ptr(), PAYLOAD.len(), std::ptr::null(), 1),
+                lpm_env_backup_open(
+                    PAYLOAD.as_ptr(),
+                    PAYLOAD.len(),
+                    std::ptr::null(),
+                    1,
+                    &mut 0,
+                    &mut 0,
+                ),
+                lpm_env_backup_open(
+                    PAYLOAD.as_ptr(),
+                    PAYLOAD.len(),
+                    PASSPHRASE.as_ptr(),
+                    PASSPHRASE.len(),
+                    std::ptr::null_mut(),
+                    &mut 0,
+                ),
+                lpm_env_backup_open(
+                    PAYLOAD.as_ptr(),
+                    PAYLOAD.len(),
+                    PASSPHRASE.as_ptr(),
+                    PASSPHRASE.len(),
+                    &mut 0,
+                    std::ptr::null_mut(),
+                ),
             ]
         };
         for result in results {

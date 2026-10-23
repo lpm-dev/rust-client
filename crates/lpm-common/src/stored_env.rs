@@ -50,6 +50,26 @@ pub fn is_valid_org_slug(slug: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+/// Whether `value` is a registry URL as stored sync bindings hold it: an
+/// `http` or `https` URL with a host and no credentials, query or fragment,
+/// written as its origin and its path without trailing slashes.
+pub fn is_canonical_registry_url(value: &str) -> bool {
+    let Ok(url) = url::Url::parse(value) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none_or(str::is_empty)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    let canonical_path = url.path().trim_end_matches('/');
+    format!("{}{canonical_path}", url.origin().ascii_serialization()) == value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,6 +112,36 @@ mod tests {
         }
         for name in ["", "__index__", "a..b", "a b", "a/b", "é", &"e".repeat(65)] {
             assert!(!is_valid_environment_name(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn registry_urls_must_be_written_canonically() {
+        for url in [
+            "https://lpm.dev",
+            "http://localhost:3000",
+            "http://localhost:3000/registry",
+            "https://[::1]:8443",
+        ] {
+            assert!(is_canonical_registry_url(url), "{url}");
+        }
+        for url in [
+            "",
+            "lpm.dev",
+            "ftp://lpm.dev",
+            "https://:",
+            "https://[",
+            "https://lpm.dev:bad",
+            "https://LPM.dev",
+            "https://lpm.dev:443",
+            "https://lpm.dev/",
+            "https://lpm.dev/a/",
+            "https://user@lpm.dev",
+            "https://lpm.dev?x",
+            "https://lpm.dev#x",
+            "https://lpm.dev/a b",
+        ] {
+            assert!(!is_canonical_registry_url(url), "{url:?}");
         }
     }
 

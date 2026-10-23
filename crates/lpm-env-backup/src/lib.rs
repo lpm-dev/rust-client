@@ -22,16 +22,25 @@
 //! shows little about what it holds. Files are at most 64 MiB. A file
 //! whose header can't be a readable backup fails before the key is derived.
 //!
-//! [`payload`] describes what a version 1 payload holds.
+//! [`payload`] describes what a version 1 payload holds. [`open`] returns the
+//! whole plaintext, so a caller can hand the payload on without copying it.
+//! The key derivation's memory, the key and every plaintext buffer are wiped
+//! when freed; the copies zxcvbn makes of a passphrase aren't, which the LPM
+//! env engine covers by wiping all memory it frees.
 
 mod container;
+#[cfg(test)]
+mod freed_memory_probe;
 pub mod passphrase;
 pub mod payload;
+
+use std::ops::Range;
 
 use zeroize::Zeroizing;
 
 pub use container::{
-    ContainerError, FORMAT_VERSION, FileInfo, MAX_FILE_BYTES, MAX_PAYLOAD_BYTES, inspect,
+    ContainerError, FORMAT_VERSION, FileInfo, MAX_FILE_BYTES, MAX_PAYLOAD_BYTES, PAYLOAD_OFFSET,
+    inspect,
 };
 pub use passphrase::{GenerateError, Passphrase, PassphraseError, Strength};
 pub use payload::{PayloadError, PayloadErrorKind};
@@ -67,12 +76,29 @@ pub fn seal(payload: &[u8], passphrase: &Passphrase) -> Result<Vec<u8>, SealErro
     container::seal(payload, passphrase).map_err(SealError::Container)
 }
 
-/// Decrypts a backup file and checks its payload, which it returns. The
-/// passphrase's strength isn't checked again.
-pub fn open(file: &[u8], passphrase: &Passphrase) -> Result<Zeroizing<Vec<u8>>, OpenError> {
-    let payload = container::open(file, passphrase).map_err(OpenError::Container)?;
-    payload::validate(&payload).map_err(OpenError::Payload)?;
-    Ok(payload)
+/// A backup's checked payload, inside its decrypted plaintext, which is wiped
+/// when dropped.
+pub struct OpenedBackup(container::Plaintext);
+
+impl OpenedBackup {
+    pub fn payload(&self) -> &[u8] {
+        self.0.payload()
+    }
+
+    /// The whole plaintext, in an allocation exactly its length, and where
+    /// the payload is in it, for a caller that releases it later.
+    pub fn into_plaintext(self) -> (Zeroizing<Vec<u8>>, Range<usize>) {
+        let range = PAYLOAD_OFFSET..PAYLOAD_OFFSET + self.0.payload_len;
+        (self.0.bytes, range)
+    }
+}
+
+/// Decrypts a backup file and checks its payload. The passphrase's strength
+/// isn't checked again.
+pub fn open(file: &[u8], passphrase: &Passphrase) -> Result<OpenedBackup, OpenError> {
+    let plaintext = container::open(file, passphrase).map_err(OpenError::Container)?;
+    payload::validate(plaintext.payload()).map_err(OpenError::Payload)?;
+    Ok(OpenedBackup(plaintext))
 }
 
 #[cfg(test)]
@@ -92,7 +118,7 @@ mod tests {
             inspect(&file).expect("inspect").format_version,
             FORMAT_VERSION
         );
-        assert_eq!(open(&file, &strong()).expect("open").as_slice(), PAYLOAD);
+        assert_eq!(open(&file, &strong()).expect("open").payload(), PAYLOAD);
     }
 
     #[test]
@@ -108,6 +134,72 @@ mod tests {
     fn sealing_refuses_an_invalid_payload() {
         assert!(matches!(
             seal(b"{}", &strong()),
+            Err(SealError::Payload(PayloadError {
+                kind: PayloadErrorKind::Structure,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn checking_or_opening_a_backup_leaves_no_secret_in_freed_memory() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        let secret = std::str::from_utf8(MARKER).expect("ASCII");
+        let head = r#"{"createdAt":0,"producer":{"name":"a","version":"1"},"projects":"#;
+        let with_project = |fields: &str| {
+            format!(
+                r#"{head}[{{"vaultId":"v","name":"n","hidden":false,"cliAccess":"automatic",{fields}}}]}}"#
+            )
+        };
+        // Escapes would make a decoding parser copy the string to decode it.
+        let value = format!(r#"{secret}\n\"quoted\"A"#);
+        let cases: Vec<String> = vec![
+            with_project(&format!(
+                r#""environments":{{"default":{{"A":"{value}","B":"{secret}"}}}}"#
+            )),
+            with_project(&format!(r#""environments":{{"default":"{value}"}}"#)),
+            with_project(&format!(
+                r#""environments":{{"default":{{"A":["{value}"]}}}}"#
+            )),
+            with_project(&format!(r#""environments":{{}},"sync":"{value}""#)),
+            with_project(&format!(
+                r#""environments":{{}},"sync":{{"registry":"https://lpm.dev","scope":"{value}","principalId":"u"}}"#
+            )),
+            format!(
+                r#"{{"createdAt":"{value}","producer":{{"name":"a","version":"1"}},"projects":[]}}"#
+            ),
+            format!(r#"{{"createdAt":0,"producer":"{value}","projects":[]}}"#),
+            format!(r#"{head}"{value}"}}"#),
+            format!(r#"{head}["{value}"]}}"#),
+            format!(
+                r#"{head}[{{"vaultId":"v","name":"n","hidden":"{value}","cliAccess":"automatic","environments":{{}}}}]}}"#
+            ),
+            format!(
+                r#"{head}[{{"vaultId":"v","name":"n","hidden":false,"cliAccess":"{value}","environments":{{}}}}]}}"#
+            ),
+        ];
+        assert_eq!(payload::validate(cases[0].as_bytes()), Ok(()));
+        for (index, case) in cases.iter().enumerate() {
+            let mut result = Ok(());
+            let leaked = watch(|| result = payload::validate(case.as_bytes()));
+            assert!(!leaked, "case {index} left the secret in freed memory");
+            assert!(
+                index == 0 || result.is_err_and(|error| error.kind != PayloadErrorKind::Syntax),
+                "case {index} must be read, then refused: {result:?}"
+            );
+        }
+        let file = seal(cases[0].as_bytes(), &strong()).expect("seal");
+        let leaked = watch(|| {
+            let opened = open(&file, &strong()).expect("open");
+            drop(opened);
+        });
+        assert!(!leaked, "opening left the secret in freed memory");
+    }
+
+    #[test]
+    fn sealing_refuses_a_payload_written_as_positional_lists() {
+        assert!(matches!(
+            seal(br#"[0,["lpm","1"],null,[],null]"#, &strong()),
             Err(SealError::Payload(PayloadError {
                 kind: PayloadErrorKind::Structure,
                 ..

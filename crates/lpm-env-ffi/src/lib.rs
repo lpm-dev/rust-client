@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 mod backup;
 mod files;
+mod wiping_allocator;
 
 const ABI_VERSION: u32 = 1;
 const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;

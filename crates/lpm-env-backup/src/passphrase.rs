@@ -68,8 +68,10 @@ impl Passphrase {
         self.0.as_bytes()
     }
 
-    /// zxcvbn's estimate of this passphrase. zxcvbn keeps copies of what it
-    /// reads that aren't wiped, as does any text field it was typed into.
+    /// zxcvbn's estimate of this passphrase, which reads at most its first
+    /// 100 characters and can take a quarter of a second for symbol-heavy
+    /// text. zxcvbn makes copies of what it reads that it doesn't wipe; the
+    /// LPM env engine wipes all memory it frees.
     pub fn strength(&self) -> Strength {
         let guesses_log10 = zxcvbn::zxcvbn(&self.0, &[]).guesses_log10();
         Strength {

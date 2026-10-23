@@ -114,13 +114,19 @@ LPMEnvResult lpm_env_prepare_secret_file(const uint8_t *project, size_t project_
  *   backup.passphrase_weak {guessesLog10};
  *   backup.too_large; backup.not_a_backup; backup.newer_format {formatVersion};
  *   backup.damaged; backup.wrong_passphrase (or the file was changed);
- *   backup.invalid_contents {reason, line?, column?}, never quoting the contents.
+ *   backup.invalid_contents {reason, offset?}, never quoting the contents; offset
+ *   is the payload byte where the problem was found.
  * Status 3 is a panic, backup.random_failed, or backup.out_of_memory.
- * A pointer may be null only when its length is 0. Every output buffer is zeroed
- * when released. */
+ * A pointer may be null only when its length is 0; a length over its limit is
+ * refused before the pointer is read. Every output buffer is zeroed when released,
+ * and the engine zeroes all memory it frees.
+ * The format records no platform logins or sync keys. */
 /* zxcvbn's estimate for a passphrase, of at most its first 100 characters:
  * {acceptable, guessesLog10, minimumGuessesLog10}; acceptable means a backup can be
- * sealed with it. status: 0=checked, 2=invalid input, 3=panic, 5=refused. */
+ * sealed with it. The first call loads zxcvbn's dictionaries; an estimate can then
+ * take a quarter of a second for symbol-heavy text, so run it off the main thread
+ * and keep only the latest. Only the first 100 characters, once normalized, count.
+ * status: 0=checked, 2=invalid input, 3=panic, 5=refused. */
 LPMEnvResult lpm_env_backup_check_passphrase(const uint8_t *passphrase, size_t length);
 /* Six words drawn uniformly from the EFF large wordlist, separated by spaces, as
  * UTF-8 bytes (not JSON); always acceptable. status: 0=generated, 3=failure. */
@@ -133,11 +139,14 @@ LPMEnvResult lpm_env_backup_seal(const uint8_t *payload, size_t payload_length,
 /* Read a file's header without the passphrase: {formatVersion}.
  * status: 0=a backup this engine reads, 2=invalid input, 3=panic, 5=refused. */
 LPMEnvResult lpm_env_backup_inspect(const uint8_t *file, size_t length);
-/* Decrypt a backup file and check its payload, the output. The file's header is
- * checked before the key is derived, and strength isn't checked again.
+/* Decrypt a backup file and check its payload. The output is the whole decrypted
+ * plaintext, so the payload isn't copied: on success *payload_offset and
+ * *payload_length say where the payload is in it. The file's header is checked
+ * before the key is derived, and strength isn't checked again.
  * status: 0=opened, 2=invalid input, 3=failure, 5=refused. */
 LPMEnvResult lpm_env_backup_open(const uint8_t *file, size_t file_length,
-                               const uint8_t *passphrase, size_t passphrase_length);
+                               const uint8_t *passphrase, size_t passphrase_length,
+                               size_t *payload_offset, size_t *payload_length);
 /* Release only the output buffer after decoding; the snapshot stays live.
  * Exclusively borrow result. Clears data/length; repeated calls are harmless.
  * A matching lpm_env_release is still required for the result. */
