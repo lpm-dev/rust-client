@@ -1,16 +1,24 @@
-//! The engine's allocator: the system's, except that every block is zeroed
-//! before it's freed. The engine holds env values, decrypted backups and
-//! passphrases, and its dependencies (serde_json's scratch buffers, zxcvbn's
-//! copies of what it scores) free memory holding them without wiping it.
-//! Resizing always moves a block, so growing a large buffer step by step
-//! briefly holds both copies; the engine sizes its large buffers exactly.
+//! An allocator for programs that hold backups and passphrases: the
+//! system's, except that every block is zeroed before it's freed. This crate
+//! wipes its own buffers, but dependencies don't: zxcvbn frees the copies it
+//! makes of a passphrase it scores, and serde_json its scratch buffers,
+//! without wiping them. A program only gets that guarantee by installing
+//! this as its global allocator:
+//!
+//! ```ignore
+//! #[global_allocator]
+//! static ALLOCATOR: lpm_env_backup::WipingAllocator = lpm_env_backup::WipingAllocator;
+//! ```
+//!
+//! Growing a block always moves it, since the system allocator could move it
+//! and free the old copy unwiped, so growing a large buffer step by step
+//! briefly holds both copies. Shrinking wipes the freed end and keeps the
+//! block where it is.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 
-struct WipingAllocator;
-
-#[global_allocator]
-static ALLOCATOR: WipingAllocator = WipingAllocator;
+/// The system allocator, zeroing every block before it's freed.
+pub struct WipingAllocator;
 
 // SAFETY: Blocks come from `System` and go back to it with the layouts they
 // were allocated with; wiping writes only the bytes a block owns.
@@ -44,7 +52,7 @@ unsafe impl GlobalAlloc for WipingAllocator {
 ///
 /// # Safety
 /// `block` must be a live allocation of `layout`.
-unsafe fn release(block: *mut u8, layout: Layout, free: impl FnOnce(*mut u8, Layout)) {
+pub(crate) unsafe fn release(block: *mut u8, layout: Layout, free: impl FnOnce(*mut u8, Layout)) {
     // SAFETY: Guaranteed by the caller.
     let bytes = unsafe { std::slice::from_raw_parts_mut(block, layout.size()) };
     // Words wipe a large block, such as key derivation's 256 MiB, about eight
@@ -57,20 +65,30 @@ unsafe fn release(block: *mut u8, layout: Layout, free: impl FnOnce(*mut u8, Lay
     free(block, layout);
 }
 
-/// Moves `block` into a new allocation of `new_size` bytes and releases the
-/// old one wiped. Resizing in place through the system allocator could move
-/// the block and free the old copy unwiped.
+/// Resizes `block` to `new_size` bytes. Shrinking wipes the bytes it gives
+/// up and keeps the block, which the system frees whatever size it's told.
+/// Growing moves it into a new allocation and releases the old one wiped:
+/// growing in place through the system allocator could move the block and
+/// free the old copy unwiped.
 ///
 /// # Safety
 /// `block` must be a live allocation of `layout`, and `new_size` must be
 /// nonzero and, rounded up to the alignment, at most `isize::MAX`.
-unsafe fn reallocate(
+pub(crate) unsafe fn reallocate(
     block: *mut u8,
     layout: Layout,
     new_size: usize,
     allocate: impl FnOnce(Layout) -> *mut u8,
     free: impl FnOnce(*mut u8, Layout),
 ) -> *mut u8 {
+    if new_size <= layout.size() {
+        // SAFETY: The bytes from `new_size` to the old size lie inside the block.
+        let freed = unsafe {
+            std::slice::from_raw_parts_mut(block.add(new_size), layout.size() - new_size)
+        };
+        zeroize::Zeroize::zeroize(freed);
+        return block;
+    }
     // SAFETY: The caller guarantees the size and alignment are valid.
     let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
     let moved = allocate(new_layout);
@@ -141,30 +159,50 @@ mod tests {
     }
 
     #[test]
-    fn growing_or_shrinking_moves_the_data_and_zeroes_the_old_block() {
-        for (size, new_size) in [(64, 4096), (4096, 64)] {
-            let (block, layout) = filled(size);
-            // SAFETY: The block is a live allocation of `layout`, and the new size is valid.
-            let moved = unsafe {
-                reallocate(
-                    block,
-                    layout,
-                    new_size,
-                    |layout| System.alloc(layout),
-                    |old, layout| {
-                        assert_zeroed(old, layout);
-                        System.dealloc(old, layout);
-                    },
-                )
-            };
-            assert_ne!(moved, block);
-            let kept = size.min(new_size);
-            // SAFETY: The moved block holds `new_size` bytes, `kept` of them copied.
-            let copied = unsafe { std::slice::from_raw_parts(moved, kept) };
-            assert!(copied.iter().all(|byte| *byte == 0xA5));
-            // SAFETY: Freed once, with the layout it was allocated with.
-            unsafe { System.dealloc(moved, Layout::from_size_align(new_size, 8).expect("layout")) };
-        }
+    fn growing_moves_the_data_and_zeroes_the_old_block() {
+        let (block, layout) = filled(64);
+        // SAFETY: The block is a live allocation of `layout`, and the new size is valid.
+        let moved = unsafe {
+            reallocate(
+                block,
+                layout,
+                4096,
+                |layout| System.alloc(layout),
+                |old, layout| {
+                    assert_zeroed(old, layout);
+                    System.dealloc(old, layout);
+                },
+            )
+        };
+        assert_ne!(moved, block);
+        // SAFETY: The moved block holds 4096 bytes, the first 64 copied.
+        let copied = unsafe { std::slice::from_raw_parts(moved, 64) };
+        assert!(copied.iter().all(|byte| *byte == 0xA5));
+        // SAFETY: Freed once, with the layout it was allocated with.
+        unsafe { System.dealloc(moved, Layout::from_size_align(4096, 8).expect("layout")) };
+    }
+
+    #[test]
+    fn shrinking_keeps_the_block_and_zeroes_what_it_gives_up() {
+        let (block, layout) = filled(4096);
+        // SAFETY: The block is a live allocation of `layout`.
+        let kept = unsafe {
+            reallocate(
+                block,
+                layout,
+                100,
+                |_| panic!("moved"),
+                |_, _| panic!("freed"),
+            )
+        };
+        assert_eq!(kept, block);
+        // SAFETY: The block is still live with all 4096 bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(block, 4096) };
+        assert!(bytes[..100].iter().all(|byte| *byte == 0xA5));
+        assert!(bytes[100..].iter().all(|byte| *byte == 0));
+        // The system frees the block whatever size it's told.
+        // SAFETY: Freed once, as the 100-byte block it now is.
+        unsafe { System.dealloc(block, Layout::from_size_align(100, 8).expect("layout")) };
     }
 
     #[test]

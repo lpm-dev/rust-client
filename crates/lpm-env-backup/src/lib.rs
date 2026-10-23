@@ -25,14 +25,15 @@
 //! [`payload`] describes what a version 1 payload holds. [`open`] returns the
 //! whole plaintext, so a caller can hand the payload on without copying it.
 //! The key derivation's memory, the key and every plaintext buffer are wiped
-//! when freed; the copies zxcvbn makes of a passphrase aren't, which the LPM
-//! env engine covers by wiping all memory it frees.
+//! when freed; the copies zxcvbn makes of a passphrase aren't, unless the
+//! program installs [`WipingAllocator`], as the LPM env engine does.
 
 mod container;
 #[cfg(test)]
 mod freed_memory_probe;
 pub mod passphrase;
 pub mod payload;
+pub mod wiping_allocator;
 
 use std::ops::Range;
 
@@ -44,6 +45,7 @@ pub use container::{
 };
 pub use passphrase::{GenerateError, Passphrase, PassphraseError, Strength};
 pub use payload::{PayloadError, PayloadErrorKind};
+pub use wiping_allocator::WipingAllocator;
 
 /// Why a backup couldn't be sealed.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -152,7 +154,7 @@ mod tests {
             )
         };
         // Escapes would make a decoding parser copy the string to decode it.
-        let value = format!(r#"{secret}\n\"quoted\"A"#);
+        let value = format!(r#"{secret}\n\"quoted\"\u0041"#);
         let cases: Vec<String> = vec![
             with_project(&format!(
                 r#""environments":{{"default":{{"A":"{value}","B":"{secret}"}}}}"#
@@ -194,6 +196,17 @@ mod tests {
             drop(opened);
         });
         assert!(!leaked, "opening left the secret in freed memory");
+    }
+
+    #[test]
+    fn zxcvbn_frees_copies_of_a_passphrase_that_the_wiping_allocator_zeroes() {
+        use crate::freed_memory_probe::{MARKER, watch_wiping};
+        let passphrase = Passphrase::new(MARKER).expect("passphrase");
+        let (held, left) = watch_wiping(|| {
+            let _ = passphrase.strength();
+        });
+        assert!(held, "zxcvbn frees blocks holding the passphrase");
+        assert!(!left, "none of them still holds it once wiped");
     }
 
     #[test]

@@ -951,6 +951,7 @@ dependencies = [
  "lpm-extractor",
  "lpm-migrate",
  "lpm-semver",
+ "serde",
  "serde_json",
 ]
 

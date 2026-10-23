@@ -40,8 +40,9 @@
 //!
 //! `app` is an object the app that wrote the backup owns. Here it's only
 //! checked as JSON whose objects repeat no key, nested at most
-//! [`MAX_APP_DEPTH`] deep, whose numbers are finite doubles. Its reader must
-//! refuse what it doesn't know.
+//! [`MAX_APP_DEPTH`] deep, with at most [`MAX_APP_KEYS`] keys between them of
+//! at most [`MAX_APP_KEY_BYTES`] each, whose numbers are finite doubles. Its
+//! reader must refuse what it doesn't know.
 //!
 //! The reader never copies a value, nor any string where an object, list,
 //! number or flag belongs: it measures them where they lie. It decodes only
@@ -63,6 +64,11 @@ pub const MAX_PROJECTS: usize = 10_000;
 pub const MAX_PROJECT_BYTES: usize = 100 * 1024;
 /// The most objects and lists nested in `app`, counting `app` itself.
 pub const MAX_APP_DEPTH: usize = 32;
+/// The most keys `app`'s objects have between them, which bounds the memory
+/// that refusing repeated keys holds.
+pub const MAX_APP_KEYS: usize = 1_000_000;
+/// The longest key in `app`, decoded.
+pub const MAX_APP_KEY_BYTES: usize = 256;
 /// The latest `createdAt`: the last second of 9999.
 const MAX_CREATED_AT: u64 = 253_402_300_799;
 const MAX_LABEL_BYTES: usize = 64;
@@ -100,8 +106,8 @@ pub enum PayloadErrorKind {
     /// A project's environments, or its index record, over [`MAX_PROJECT_BYTES`].
     ProjectTooLarge,
     Sync,
-    /// `app` isn't an object, repeats a key, nests too deep or holds a number
-    /// out of range.
+    /// `app` isn't an object, repeats a key, nests too deep, has too many or
+    /// too long keys, or holds a number out of range.
     App,
 }
 
@@ -193,9 +199,13 @@ fn read_backup(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
                     if reader.peek() != Some(b'{') {
                         return Err(reader.error(PayloadErrorKind::App));
                     }
+                    let mut keys = 0;
                     reader
-                        .app_value(1)
-                        .map_err(|error| reader.error_at(PayloadErrorKind::App, error.offset))
+                        .app_value(1, &mut keys)
+                        .map_err(|error| match error.kind {
+                            PayloadErrorKind::Syntax => error,
+                            _ => reader.error_at(PayloadErrorKind::App, error.offset),
+                        })
                 })
                 .map(|_| ())
         }
@@ -398,6 +408,9 @@ fn read_sync(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
 
 /// `{"environments":{}}`, around the entries.
 const STORED_ENVELOPE_BYTES: usize = r#"{"environments":{}}"#.len();
+/// The CLI stores a project without environments with an empty `default`,
+/// which its index record then summarizes.
+const EMPTY_STORED_BYTES: usize = r#"{"environments":{"default":{}}}"#.len();
 
 /// A project's environments: the bytes they take as the CLI stores them, and
 /// the bytes their comma-separated summaries take in its index record.
@@ -423,6 +436,12 @@ fn read_environments(reader: &mut Reader<'_>) -> Result<(usize, usize), PayloadE
             Err(reader.error_at(PayloadErrorKind::DuplicateEnvironment, at))
         }
     })?;
+    if names.is_empty() {
+        return Ok((
+            EMPTY_STORED_BYTES,
+            INDEX_SUMMARY_BYTES + quoted_len("default") + decimal_digits(0),
+        ));
+    }
     Ok((stored_bytes, summary_bytes))
 }
 
@@ -767,21 +786,23 @@ impl<'a> Reader<'a> {
     }
 
     /// Any JSON value inside `app`, `depth` containers deep: objects with no
-    /// repeated key, nested at most [`MAX_APP_DEPTH`] deep, and finite numbers.
-    /// Strings are walked, not decoded, except for keys.
-    fn app_value(&mut self, depth: usize) -> Result<(), PayloadError> {
+    /// repeated key, nested at most [`MAX_APP_DEPTH`] deep, with at most
+    /// [`MAX_APP_KEYS`] keys between them, counted in `keys`, and finite
+    /// numbers. Strings are walked, not decoded, except for keys.
+    fn app_value(&mut self, depth: usize, keys: &mut usize) -> Result<(), PayloadError> {
         match self.peek() {
             Some(b'{' | b'[') if depth > MAX_APP_DEPTH => Err(self.error(PayloadErrorKind::App)),
             Some(b'{') => {
-                let mut keys = HashSet::new();
+                let mut seen = HashSet::new();
                 self.object(|reader, key, at| {
-                    if !keys.insert(key) {
+                    *keys += 1;
+                    if *keys > MAX_APP_KEYS || key.len() > MAX_APP_KEY_BYTES || !seen.insert(key) {
                         return Err(reader.error_at(PayloadErrorKind::App, at));
                     }
-                    reader.app_value(depth + 1)
+                    reader.app_value(depth + 1, keys)
                 })
             }
-            Some(b'[') => self.list(|reader| reader.app_value(depth + 1)),
+            Some(b'[') => self.list(|reader| reader.app_value(depth + 1, keys)),
             Some(b'"') => self.string_span(&mut (), PayloadErrorKind::App).map(|_| ()),
             Some(b't' | b'f') => self.flag().map(|_| ()),
             Some(b'n') => self.word("null"),
@@ -1328,13 +1349,16 @@ mod tests {
         };
         for app in [
             r#"{"settings":1,"settings":2}"#,
-            r#"{"a":{"b":1,"b":2}}"#,
+            r#"{"a":{"b":1,"\u0062":2}}"#,
             r#"{"n":1e400}"#,
             r#"{"n":-1e400}"#,
-            r#"{"s":"\ud800"}"#,
         ] {
             assert_eq!(app_kind(app), Some(PayloadErrorKind::App), "{app}");
         }
+        assert_eq!(
+            app_kind(r#"{"s":"\ud800"}"#),
+            Some(PayloadErrorKind::Syntax)
+        );
         let nested = |depth: usize| format!("{}{}", "[".repeat(depth - 1), "]".repeat(depth - 1));
         let deepest = format!(r#"{{"x":{}}}"#, nested(MAX_APP_DEPTH));
         assert_eq!(app_kind(&deepest), None);
@@ -1351,7 +1375,7 @@ mod tests {
             r#" { "a" : [ 1 , 2 ] , "b" : { } } "#,
             r#"{"a":-0,"b":0.5e-3,"c":1E+2,"d":12345678901234567890,"e":-1.25E-7}"#,
             r#"{"a":true,"b":false,"c":null}"#,
-            r#"{"a":"é🚀\/\b\f\n\r\t\"\\"}"#,
+            r#"{"a":"\u00e9\ud83d\ude80\/\b\f\n\r\t\"\\"}"#,
             "{\"a\":\"\u{7f}\u{e9}\"}",
             r#"{"a":01}"#,
             r#"{"a":1.}"#,
@@ -1361,7 +1385,7 @@ mod tests {
             r#"{"a":-}"#,
             r#"{"a":"\x"}"#,
             r#"{"a":"\u12"}"#,
-            r#"{"a":"\ud800A"}"#,
+            r#"{"a":"\ud800\u0041"}"#,
             r#"{"a":"\udc00"}"#,
             r#"{"a":[1,]}"#,
             r#"{"a":1,}"#,
@@ -1383,6 +1407,107 @@ mod tests {
             let serde_accepts = serde_json::from_str::<serde_json::Value>(&payload).is_ok();
             assert_eq!(validate(payload.as_bytes()).is_ok(), serde_accepts, "{app}");
         }
+    }
+
+    #[test]
+    fn empty_environments_are_measured_as_the_cli_stores_its_default_one() {
+        let mut reader = Reader { text: "{}", at: 0 };
+        let (stored, summaries) = read_environments(&mut reader).unwrap();
+        assert_eq!(stored, r#"{"environments":{"default":{}}}"#.len());
+        assert_eq!(summaries, r#"{"name":"default","keyCount":0}"#.len());
+
+        let fixed = r#"{"schemaVersion":3,"storageId":"00000000-0000-4000-8000-000000000000","id":"v","name":"","path":"","discoveryShard":1023,"environmentSummaries":[{"name":"default","keyCount":0}]}"#.len();
+        let project = |name_len: usize| {
+            json!({
+                "createdAt": 0, "producer": {"name": "a", "version": "1"},
+                "projects": [{
+                    "vaultId": "v", "name": "n".repeat(name_len), "hidden": false,
+                    "cliAccess": "automatic", "environments": {}
+                }]
+            })
+        };
+        assert_eq!(check(&project(MAX_PROJECT_BYTES - fixed)), Ok(()));
+        assert_eq!(
+            kind(&project(MAX_PROJECT_BYTES - fixed + 1)),
+            Some(PayloadErrorKind::ProjectTooLarge)
+        );
+    }
+
+    #[test]
+    fn numbers_that_round_to_the_largest_double_are_finite() {
+        for number in [
+            "1.7976931348623158e308",
+            "-1.7976931348623158e308",
+            "17976931348623158e292",
+        ] {
+            let payload = format!(
+                r#"{{"createdAt":0,"producer":{{"name":"a","version":"1"}},"projects":[],"app":{{"n":{number}}}}}"#
+            );
+            assert_eq!(validate(payload.as_bytes()), Ok(()), "{number}");
+            assert!(serde_json::from_str::<serde::de::IgnoredAny>(&payload).is_ok());
+        }
+        for number in ["1.7976931348623159e308", "1e309", "-1e309"] {
+            let payload = format!(
+                r#"{{"createdAt":0,"producer":{{"name":"a","version":"1"}},"projects":[],"app":{{"n":{number}}}}}"#
+            );
+            let error = validate(payload.as_bytes()).expect_err(number);
+            assert_eq!(error.kind, PayloadErrorKind::App, "{number}");
+        }
+    }
+
+    #[test]
+    fn malformed_json_inside_app_is_a_syntax_error_at_its_offset() {
+        let head = r#"{"createdAt":0,"producer":{"name":"a","version":"1"},"projects":[],"app":"#;
+        for (app, offset) in [
+            (r#"{"x":}"#, 5),
+            (r#"{"x":1,}"#, 7),
+            (r#"{"x":"\x"}"#, 6),
+            (r#"{"x":[1 2]}"#, 8),
+            (r#"{"x":tru}"#, 5),
+            (r#"{"x":"#, 5),
+        ] {
+            let payload = format!("{head}{app}}}");
+            let error = validate(payload.as_bytes()).expect_err(app);
+            assert_eq!(
+                (error.kind, error.offset),
+                (PayloadErrorKind::Syntax, head.len() + offset),
+                "{app}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_app_section_is_held_to_a_key_budget_however_its_keys_are_spread() {
+        let with_app = |app: &str| {
+            format!(
+                r#"{{"createdAt":0,"producer":{{"name":"a","version":"1"}},"projects":[],"app":{app}}}"#
+            )
+        };
+        let wide = |count: usize| {
+            let members: Vec<String> = (0..count).map(|key| format!(r#""{key}":0"#)).collect();
+            format!("{{{}}}", members.join(","))
+        };
+        // `app` is itself an object, so its own keys count.
+        assert_eq!(validate(with_app(&wide(MAX_APP_KEYS)).as_bytes()), Ok(()));
+        let over = validate(with_app(&wide(MAX_APP_KEYS + 1)).as_bytes()).expect_err("over");
+        assert_eq!(over.kind, PayloadErrorKind::App);
+        let half = wide(MAX_APP_KEYS / 2);
+        let spread = format!(r#"{{"a":{half},"b":{half}}}"#);
+        assert_eq!(
+            validate(with_app(&spread).as_bytes())
+                .err()
+                .map(|error| error.kind),
+            Some(PayloadErrorKind::App)
+        );
+        let longest = format!(r#"{{"{}":0}}"#, "k".repeat(MAX_APP_KEY_BYTES));
+        assert_eq!(validate(with_app(&longest).as_bytes()), Ok(()));
+        let too_long = format!(r#"{{"{}":0}}"#, "k".repeat(MAX_APP_KEY_BYTES + 1));
+        assert_eq!(
+            validate(with_app(&too_long).as_bytes())
+                .err()
+                .map(|error| error.kind),
+            Some(PayloadErrorKind::App)
+        );
     }
 
     #[test]

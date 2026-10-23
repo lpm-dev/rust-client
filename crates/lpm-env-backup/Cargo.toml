@@ -17,6 +17,7 @@ zeroize = { version = "1", features = ["std"] }
 zxcvbn = { version = "3.1", default-features = false }
 
 [dev-dependencies]
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 

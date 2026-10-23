@@ -15,7 +15,11 @@ use std::sync::Arc;
 
 mod backup;
 mod files;
-mod wiping_allocator;
+
+/// The engine holds env values, decrypted backups and passphrases, so all
+/// memory it frees is wiped first, including what its dependencies free.
+#[global_allocator]
+static ALLOCATOR: lpm_env_backup::WipingAllocator = lpm_env_backup::WipingAllocator;
 
 const ABI_VERSION: u32 = 1;
 const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
