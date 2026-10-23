@@ -1,5 +1,6 @@
 //! Bounded C ABI for the bundled native schema engine, GitHub Actions secret
-//! sealing, and the LPM home and project files an app shares with the CLI.
+//! sealing, the LPM home and project files an app shares with the CLI, and
+//! passphrase-protected backup files.
 //! Only writing a file of secrets reads the process environment, for the
 //! `git` it runs.
 
@@ -12,7 +13,13 @@ use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
+mod backup;
 mod files;
+
+/// The engine holds env values, decrypted backups and passphrases, so all
+/// memory it frees is wiped first, including what its dependencies free.
+#[global_allocator]
+static ALLOCATOR: lpm_env_backup::WipingAllocator = lpm_env_backup::WipingAllocator;
 
 const ABI_VERSION: u32 = 1;
 const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
@@ -581,15 +588,20 @@ pub unsafe extern "C" fn lpm_env_clear_output(result: *mut LPMEnvResult) {
     let result = unsafe { &mut *result };
     if !result.data.is_null() {
         // SAFETY: The pointer and length are the unchanged boxed slice returned by this ABI.
-        drop(unsafe {
-            Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                result.data,
-                result.length,
-            ))
-        });
+        unsafe { wipe_output(result.data, result.length) };
         result.data = std::ptr::null_mut();
         result.length = 0;
     }
+}
+
+/// Frees an output buffer after zeroing it, since some outputs hold secrets.
+///
+/// # Safety
+/// `data` and `length` must be an unchanged boxed slice this ABI returned.
+unsafe fn wipe_output(data: *mut u8, length: usize) {
+    // SAFETY: Guaranteed by the caller.
+    let mut output = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(data, length)) };
+    zeroize::Zeroize::zeroize(&mut *output);
 }
 
 /// # Safety
@@ -599,12 +611,7 @@ pub unsafe extern "C" fn lpm_env_release(result: LPMEnvResult) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         if !result.data.is_null() {
             // SAFETY: The pointer and length are the unchanged boxed slice returned by this ABI.
-            drop(unsafe {
-                Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                    result.data,
-                    result.length,
-                ))
-            });
+            unsafe { wipe_output(result.data, result.length) };
         }
         if !result.snapshot.is_null() {
             // SAFETY: This ownership was transferred by one successful resolve call.

@@ -473,33 +473,7 @@ pub fn read_vault_id(project_dir: &Path) -> Option<String> {
     Some(raw.to_string())
 }
 
-/// Validate that a `vault` field from `lpm.json` is safe to join into
-/// a filesystem path. Rejects empty strings, path separators (`/` and
-/// `\\`), `..`/`.` components, null bytes, anything starting with `~`,
-/// and absolute Windows drive letters. Standard UUIDs and slug-shaped
-/// IDs (alnum + `-` + `_`) pass.
-pub fn is_safe_vault_id(id: &str) -> bool {
-    if id.is_empty() || id.len() > 128 || id.starts_with("__") {
-        return false;
-    }
-    if id == "." || id == ".." {
-        return false;
-    }
-    if id.starts_with('~') {
-        return false;
-    }
-    for c in id.chars() {
-        if c.is_control() || matches!(c, '/' | '\\' | ':' | '\0') {
-            return false;
-        }
-    }
-    // Reject `..` even outside a path component. This keeps IDs portable
-    // across fallback stores that can apply different path normalization.
-    if id.contains("..") {
-        return false;
-    }
-    true
-}
+pub use lpm_common::stored_env::is_safe_vault_id;
 
 /// Read the last known personal cloud vault version from `lpm.json`.
 pub fn read_personal_sync_version(project_dir: &Path) -> Option<i32> {

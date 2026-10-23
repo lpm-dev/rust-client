@@ -1,0 +1,25 @@
+[package]
+name = "lpm-env-backup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Passphrase-encrypted backup files of env projects, shared by the LPM CLI and the LPM Vault app"
+
+[dependencies]
+argon2 = { version = "0.5.3", default-features = false, features = ["zeroize"] }
+chacha20poly1305 = { version = "0.10.1", default-features = false }
+getrandom = "0.3"
+lpm-common.workspace = true
+unicode-normalization = "0.1"
+zeroize = { version = "1", features = ["std"] }
+zxcvbn = { version = "3.1", default-features = false }
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

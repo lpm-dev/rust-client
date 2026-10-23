@@ -137,17 +137,11 @@ jobs:
           arguments: --all-features
           command-arguments: --hide-inclusion-graph advisories bans licenses
 
-      # Security: fancy-regex uses backtracking which is vulnerable to ReDoS.
-      # All regex in lpm-security scans untrusted input (npm package source code).
-      # The `regex` crate guarantees linear-time matching (Thompson NFA).
-      # If fancy-regex appears as a dependency, it MUST be reviewed.
-      - name: Reject fancy-regex (ReDoS prevention)
-        run: |
-          if grep -r 'fancy-regex' crates/*/Cargo.toml; then
-            echo "::error::fancy-regex found in Cargo.toml dependencies. The regex crate (linear-time) must be used for scanning untrusted input."
-            exit 1
-          fi
-          echo "✓ No fancy-regex dependencies found"
+      # Security: fancy-regex backtracks, so a pattern it runs on untrusted input can
+      # take exponential time; the `regex` crate guarantees linear-time matching.
+      # Every crate that reaches fancy-regex, directly or not, must be reviewed.
+      - name: Reject unreviewed fancy-regex dependents (ReDoS prevention)
+        run: python3 scripts/check-fancy-regex-dependents.py
 
       - name: install.sh smoke tests
         run: sh tests/install-sh/run.sh
@@ -603,6 +597,46 @@ jobs:
 
       - name: Foreign lockfile parser fuzz smoke
         run: cargo +nightly fuzz run foreign_lockfile_parsers -- -runs=2000
+
+      - name: Env backup payload fuzz smoke
+        run: cargo +nightly fuzz run env_backup_payload -- -runs=2000
+
+      - name: Env backup header fuzz smoke
+        run: cargo +nightly fuzz run env_backup_header -- -runs=2000
+
+      - name: Env backup passphrase fuzz smoke
+        run: cargo +nightly fuzz run env_backup_passphrase -- -runs=2000
+
+  wiping-allocator-miri:
+    name: Wiping allocator under Miri
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Install Rust nightly with Miri
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: nightly
+          components: miri, rust-src
+
+      - name: Cache cargo
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-miri-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-miri-
+
+      # The env engine installs this allocator for the whole process, so its
+      # wiping and resizing, and the engine releasing results through it,
+      # must be defined behavior.
+      - name: Wiping allocator and engine result release
+        run: |
+          cargo +nightly miri test --locked -p lpm-env-backup --lib wiping_allocator::
+          cargo +nightly miri test --locked -p lpm-env-backup --test global_wiping_allocator
+          cargo +nightly miri test --locked -p lpm-env-ffi backup::tests::null_pointers_with_a_length_are_invalid_input -- --exact
 
   windows-platform-backends:
     name: Windows platform backend runtime checks

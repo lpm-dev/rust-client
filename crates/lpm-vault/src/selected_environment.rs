@@ -5,6 +5,8 @@ use std::fmt;
 use serde::de::{DeserializeSeed, Deserializer, Error as _, MapAccess, Visitor};
 
 use crate::{EnvironmentMap, SecretMap};
+pub(crate) use lpm_common::stored_env::is_valid_environment_name;
+use lpm_common::stored_env::is_valid_variable_name;
 use lpm_env::{DEFAULT_ENVIRONMENT, reads_default_environment};
 
 #[derive(serde::Deserialize)]
@@ -100,27 +102,6 @@ pub(crate) fn serialize(environments: &EnvironmentMap) -> Result<String, String>
     }
     serde_json::to_string(&BorrowedPayload { environments })
         .map_err(|error| format!("failed to serialize environments: {error}"))
-}
-
-pub(crate) fn is_valid_environment_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 64
-        && name != "__index__"
-        && !name.contains("..")
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-}
-
-fn is_valid_variable_name(name: &str) -> bool {
-    let Some(first) = name.bytes().next() else {
-        return false;
-    };
-    (first.is_ascii_alphabetic() || first == b'_')
-        && name
-            .bytes()
-            .skip(1)
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 pub(crate) fn parse(

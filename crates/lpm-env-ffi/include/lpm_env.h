@@ -7,6 +7,8 @@
 #define LPM_ENV_INPUT_LIMIT (2 * 1024 * 1024)
 #define LPM_ENV_OUTPUT_LIMIT (8 * 1024 * 1024)
 #define LPM_ENV_SEAL_INPUT_LIMIT (64 * 1024)
+#define LPM_ENV_BACKUP_FILE_LIMIT (64 * 1024 * 1024)
+#define LPM_ENV_BACKUP_PASSPHRASE_LIMIT (4 * 1024)
 
 typedef struct LPMEnvSnapshot LPMEnvSnapshot;
 typedef struct {
@@ -101,6 +103,50 @@ LPMEnvResult lpm_env_open_project_state(int32_t project, const uint8_t *display,
  * env.secret_ignore, or env.secret_write. */
 LPMEnvResult lpm_env_prepare_secret_file(const uint8_t *project, size_t project_length,
                                        const uint8_t *path, size_t path_length);
+/* Backup files: env projects in one file protected by a passphrase, in the
+ * lpm-env-backup format the CLI shares. Passphrases are UTF-8 of at most
+ * LPM_ENV_BACKUP_PASSPHRASE_LIMIT bytes, used in Unicode NFC (at most 1 KiB) and
+ * otherwise exactly as typed. A file is at most LPM_ENV_BACKUP_FILE_LIMIT bytes.
+ * Sealing and opening derive a key with Argon2id over 256 MiB of memory, one
+ * derivation at a time, so call them off the main thread.
+ * Status 5 refuses with {code} and, where noted, more fields:
+ *   backup.passphrase_empty, backup.passphrase_not_utf8, backup.passphrase_too_long;
+ *   backup.passphrase_weak {guessesLog10};
+ *   backup.too_large; backup.not_a_backup; backup.newer_format {formatVersion};
+ *   backup.damaged; backup.wrong_passphrase (or the file was changed);
+ *   backup.invalid_contents {reason, offset?}, never quoting the contents; offset
+ *   is the payload byte where the problem was found.
+ * Status 3 is a panic, backup.random_failed, or backup.out_of_memory.
+ * A pointer may be null only when its length is 0; a length over its limit is
+ * refused before the pointer is read. Every output buffer is zeroed when released,
+ * and the engine zeroes all memory it frees.
+ * The format records no platform logins or sync keys. */
+/* zxcvbn's estimate for a passphrase, of at most its first 100 characters:
+ * {acceptable, guessesLog10, minimumGuessesLog10}; acceptable means a backup can be
+ * sealed with it. The first call loads zxcvbn's dictionaries; an estimate can then
+ * take a quarter of a second for symbol-heavy text, so run it off the main thread
+ * and keep only the latest. Only the first 100 characters, once normalized, count.
+ * status: 0=checked, 2=invalid input, 3=panic, 5=refused. */
+LPMEnvResult lpm_env_backup_check_passphrase(const uint8_t *passphrase, size_t length);
+/* Six words drawn uniformly from the EFF large wordlist, separated by spaces, as
+ * UTF-8 bytes (not JSON); always acceptable. status: 0=generated, 3=failure. */
+LPMEnvResult lpm_env_backup_generate_passphrase(void);
+/* Check a payload (described in lpm-env-backup's payload module) and the
+ * passphrase's strength, then encrypt the payload into a backup file, the output.
+ * status: 0=sealed, 2=invalid input, 3=failure, 5=refused. */
+LPMEnvResult lpm_env_backup_seal(const uint8_t *payload, size_t payload_length,
+                               const uint8_t *passphrase, size_t passphrase_length);
+/* Read a file's header without the passphrase: {formatVersion}.
+ * status: 0=a backup this engine reads, 2=invalid input, 3=panic, 5=refused. */
+LPMEnvResult lpm_env_backup_inspect(const uint8_t *file, size_t length);
+/* Decrypt a backup file and check its payload. The output is the whole decrypted
+ * plaintext, so the payload isn't copied: on success *payload_offset and
+ * *payload_length say where the payload is in it. The file's header is checked
+ * before the key is derived, and strength isn't checked again.
+ * status: 0=opened, 2=invalid input, 3=failure, 5=refused. */
+LPMEnvResult lpm_env_backup_open(const uint8_t *file, size_t file_length,
+                               const uint8_t *passphrase, size_t passphrase_length,
+                               size_t *payload_offset, size_t *payload_length);
 /* Release only the output buffer after decoding; the snapshot stays live.
  * Exclusively borrow result. Clears data/length; repeated calls are harmless.
  * A matching lpm_env_release is still required for the result. */

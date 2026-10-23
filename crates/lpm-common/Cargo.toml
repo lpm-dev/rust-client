@@ -30,6 +30,7 @@ smallvec = "1"
 open = { workspace = true }
 shlex = { workspace = true }
 unicode-normalization = "0.1"
+url = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

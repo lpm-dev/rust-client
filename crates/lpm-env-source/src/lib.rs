@@ -351,38 +351,86 @@ pub fn declaration_code(kind: &ValidationErrorKind) -> &'static str {
 }
 
 /// Enforce output size while writing, before an unbounded allocation can occur.
+/// The output is written once into chunks that are never resized, then copied
+/// once into an allocation exactly its size. Growing a buffer copies it under
+/// an allocator that wipes what it frees, as the env engine's does, and a
+/// buffer left larger than its output keeps the difference until it's freed.
 pub fn bounded_json<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, SourceError> {
+    const FIRST_CHUNK: usize = 4096;
+    const LARGEST_CHUNK: usize = 64 * 1024;
     struct Output {
-        bytes: Vec<u8>,
+        /// The chunks written so far, each full.
+        full: Vec<Vec<u8>>,
+        /// The chunk being written, never grown past its capacity.
+        current: Vec<u8>,
+        length: usize,
         limit: usize,
     }
+    impl Output {
+        /// Writes `bytes` across as many new chunks as they need. Chunks
+        /// double up to the largest, so a small output takes one small
+        /// chunk, and none passes the limit.
+        #[cold]
+        fn spill(&mut self, mut bytes: &[u8]) {
+            loop {
+                let room = self.current.capacity() - self.current.len();
+                let (now, later) = bytes.split_at(room.min(bytes.len()));
+                self.current.extend_from_slice(now);
+                self.length += now.len();
+                bytes = later;
+                if bytes.is_empty() {
+                    return;
+                }
+                let size = match self.current.capacity() {
+                    0 => FIRST_CHUNK,
+                    capacity => capacity.saturating_mul(2).min(LARGEST_CHUNK),
+                };
+                let next = Vec::with_capacity(size.min(self.limit - self.length));
+                let written = std::mem::replace(&mut self.current, next);
+                if !written.is_empty() {
+                    self.full.push(written);
+                }
+            }
+        }
+    }
     impl std::io::Write for Output {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+        fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            if bytes.len() > self.limit - self.length {
                 return Err(std::io::Error::other("bounded JSON output exceeded"));
             }
-            let needed = self.bytes.len() + bytes.len();
-            if needed > self.bytes.capacity() {
-                let capacity = needed
-                    .max(self.bytes.capacity().saturating_mul(2))
-                    .min(self.limit);
-                self.bytes.reserve_exact(capacity - self.bytes.len());
+            if bytes.len() <= self.current.capacity() - self.current.len() {
+                self.current.extend_from_slice(bytes);
+                self.length += bytes.len();
+            } else {
+                self.spill(bytes);
             }
-            self.bytes.extend_from_slice(bytes);
-            Ok(bytes.len())
+            Ok(())
+        }
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.write_all(bytes).map(|()| bytes.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
     let mut output = Output {
-        bytes: Vec::with_capacity(limit.min(4096)),
+        full: Vec::new(),
+        current: Vec::new(),
+        length: 0,
         limit,
     };
     serde_json::to_writer(&mut output, value).map_err(|_| {
         SourceError::new("env.output_budget", "serialize", "lpm.json", "/envSchema")
     })?;
-    Ok(output.bytes)
+    if output.full.is_empty() && output.current.len() == output.current.capacity() {
+        return Ok(output.current);
+    }
+    let mut bytes = Vec::with_capacity(output.length);
+    for chunk in output.full {
+        bytes.extend_from_slice(&chunk);
+    }
+    bytes.extend_from_slice(&output.current);
+    Ok(bytes)
 }
 
 #[cfg(test)]

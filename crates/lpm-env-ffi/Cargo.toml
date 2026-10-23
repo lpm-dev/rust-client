@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Versioned static C ABI for authoritative native env schema validation, GitHub Actions secret sealing, and the LPM home and project files the CLI keeps"
+description = "Versioned static C ABI for authoritative native env schema validation, GitHub Actions secret sealing, the LPM home and project files the CLI keeps, and env backup files"
 
 [lib]
 crate-type = ["staticlib"]
@@ -15,12 +15,14 @@ cap-std = "4.0.2"
 crypto_box.workspace = true
 lpm-common.workspace = true
 lpm-env.workspace = true
+lpm-env-backup.workspace = true
 lpm-env-source.workspace = true
 lpm-workspace.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
 x25519-dalek.workspace = true
+zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3"
