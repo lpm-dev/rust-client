@@ -104,6 +104,15 @@ export async function verifyPublishedPackage({
 }
 
 /**
+ * npm lists the release version with an identity or digest the release
+ * manifest does not have. npm never changes a published version, so waiting
+ * for registry propagation cannot resolve this.
+ */
+export class PublishedVersionMismatchError extends Error {
+  name = "PublishedVersionMismatchError";
+}
+
+/**
  * Select the single release-manifest record for `packageName` after checking
  * that its version matches the release and its digests are well formed.
  */
@@ -424,16 +433,25 @@ function trustedNpmCliPath() {
 function validateRegistryVersion({ packument, packageName, version, expectedTag, record }) {
   assertPlainObject(packument, `npm package metadata for ${packageName}`);
   const versionMetadata = packument.versions?.[version];
+  if (versionMetadata === undefined) {
+    throw new Error(`The npm package metadata does not list ${packageName}@${version}`);
+  }
   assertPlainObject(versionMetadata, `npm version metadata for ${packageName}@${version}`);
   assertPlainObject(versionMetadata.dist, `npm distribution metadata for ${packageName}@${version}`);
   if (versionMetadata.name !== packageName || versionMetadata.version !== version) {
-    throw new Error(`The npm version identity does not match for ${packageName}@${version}`);
+    throw new PublishedVersionMismatchError(
+      `The npm version identity does not match for ${packageName}@${version}`,
+    );
   }
   if (versionMetadata.dist.shasum !== record.shasum) {
-    throw new Error(`The published SHA-1 shasum does not match for ${packageName}@${version}`);
+    throw new PublishedVersionMismatchError(
+      `The published SHA-1 shasum does not match for ${packageName}@${version}`,
+    );
   }
   if (versionMetadata.dist.integrity !== record.integrity) {
-    throw new Error(`The published SHA-512 integrity does not match for ${packageName}@${version}`);
+    throw new PublishedVersionMismatchError(
+      `The published SHA-512 integrity does not match for ${packageName}@${version}`,
+    );
   }
   if (packument["dist-tags"]?.[expectedTag] !== version) {
     throw new Error(`The npm ${expectedTag} dist-tag does not select ${packageName}@${version}`);

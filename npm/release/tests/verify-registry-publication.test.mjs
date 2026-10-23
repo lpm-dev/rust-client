@@ -8,12 +8,14 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  PROPAGATION_TIMEOUT_MS,
   PUBLICATION_SCOPES,
   verifyRegistryPublications,
 } from "../verify-registry-publication.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const VERSION = "0.81.0";
+const PREVIOUS_VERSION = "0.80.0";
 const WRAPPER = "@lpm-registry/cli";
 const PROVENANCE_PREDICATE = "https://slsa.dev/provenance/v1";
 const PLATFORMS = [
@@ -24,6 +26,12 @@ const PLATFORMS = [
   "@lpm-registry/cli-linux-x64-musl",
   "@lpm-registry/cli-win32-x64",
 ];
+const NPM_PUBLISH_JOBS = Object.freeze([
+  "publish-promotion-platform",
+  "publish-npm-platform",
+  "publish-npm-wrapper",
+]);
+const NON_WAITING_STEP_MINUTES = 15;
 
 test("the platform scope covers all six platform packages and nothing else", () => {
   assert.deepEqual([...PUBLICATION_SCOPES.platforms].sort(), PLATFORMS);
@@ -66,6 +74,39 @@ test("registry publication waits for a package that is still propagating", async
   assert.match(registry.logs[0], /cli-win32-x64@0\.81\.0 is not verifiable on npm yet \(attempt 1\)/);
 });
 
+test("registry publication outlasts the thirteen minutes npm has taken to list a published version", async () => {
+  const listedAt = 13 * 60_000;
+  const registry = fakeRegistry(releaseManifest(), {
+    listedAfterMs: { "@lpm-registry/cli-win32-x64": listedAt },
+  });
+
+  await verifyRegistryPublications({
+    releaseManifest: registry.manifest,
+    scope: "platforms",
+    expectedTag: "nightly",
+    ...registry.options,
+  });
+
+  assert.ok(registry.clock() >= listedAt);
+});
+
+test("registry publication names the version npm has not listed yet", async () => {
+  const registry = fakeRegistry(releaseManifest(), {
+    listedAfterMs: { "@lpm-registry/cli-win32-x64": Infinity },
+  });
+
+  await assert.rejects(
+    verifyRegistryPublications({
+      releaseManifest: registry.manifest,
+      scope: "platforms",
+      expectedTag: "nightly",
+      ...registry.options,
+      timeoutMs: 60_000,
+    }),
+    /cli-win32-x64: The npm package metadata does not list @lpm-registry\/cli-win32-x64@0\.81\.0$/,
+  );
+});
+
 test("registry publication names every platform package npm never serves", async () => {
   const registry = fakeRegistry(releaseManifest(), {
     missing: ["@lpm-registry/cli-darwin-x64", "@lpm-registry/cli-linux-x64-musl"],
@@ -90,21 +131,48 @@ test("registry publication names every platform package npm never serves", async
   assert.ok(registry.clock() >= 60_000, "missing packages are retried for the whole window");
 });
 
-test("registry publication rejects a published tarball whose integrity differs", async () => {
-  const registry = fakeRegistry(releaseManifest(), {
-    integrityOverride: { "@lpm-registry/cli-linux-arm64": integrity("tampered") },
-  });
+test("registry publication fails without retrying when npm lists the version with other contents", async () => {
+  const tampered = "@lpm-registry/cli-linux-arm64";
+  const cases = [
+    [
+      metadata => {
+        metadata.dist.integrity = integrity("tampered");
+      },
+      "The published SHA-512 integrity does not match",
+    ],
+    [
+      metadata => {
+        metadata.dist.shasum = "0".repeat(40);
+      },
+      "The published SHA-1 shasum does not match",
+    ],
+    [
+      metadata => {
+        metadata.name = "@lpm-registry/cli-linux-x64";
+      },
+      "The npm version identity does not match",
+    ],
+  ];
 
-  await assert.rejects(
-    verifyRegistryPublications({
-      releaseManifest: registry.manifest,
-      scope: "platforms",
-      expectedTag: "latest",
-      ...registry.options,
-      timeoutMs: 1_000,
-    }),
-    /cli-linux-arm64: The published SHA-512 integrity does not match/,
-  );
+  for (const [tamper, message] of cases) {
+    const registry = fakeRegistry(releaseManifest(), { tamperVersion: { [tampered]: tamper } });
+
+    await assert.rejects(
+      verifyRegistryPublications({
+        releaseManifest: registry.manifest,
+        scope: "platforms",
+        expectedTag: "latest",
+        ...registry.options,
+      }),
+      error => {
+        assert.match(error.message, /npm did not serve 1 of 6 package\(s\)/);
+        assert.ok(error.message.includes(`cli-linux-arm64: ${message}`), error.message);
+        return true;
+      },
+    );
+    assert.equal(registry.requestsFor(tampered), 1, message);
+    assert.deepEqual(registry.sleeps, [], message);
+  }
 });
 
 test("registry publication rejects a dist-tag that still selects the previous version", async () => {
@@ -122,6 +190,7 @@ test("registry publication rejects a dist-tag that still selects the previous ve
     }),
     /@lpm-registry\/cli: The npm latest dist-tag does not select @lpm-registry\/cli@0\.81\.0/,
   );
+  assert.ok(registry.sleeps.length > 0, "a dist-tag that has not moved yet is retried");
 });
 
 test("the wrapper scope checks only the wrapper package", async () => {
@@ -216,16 +285,6 @@ test("the registry publication CLI requires a manifest, scope, and dist-tag", ()
 });
 
 test("every npm publish job verifies on the registry each package it publishes", () => {
-  const workflow = fs
-    .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
-    .replaceAll("\r\n", "\n");
-  const jobSource = (job, nextJob) => {
-    const start = workflow.indexOf(`\n  ${job}:\n`);
-    const end = workflow.indexOf(`\n  ${nextJob}:\n`, start + 1);
-    assert.notEqual(start, -1, `missing ${job} job`);
-    assert.notEqual(end, -1, `missing ${nextJob} job after ${job}`);
-    return workflow.slice(start, end);
-  };
   const verification = scope =>
     new RegExp(
       `node npm/release/verify-registry-publication\\.mjs\\n\\s+--manifest [^\\n]+\\n\\s+--scope ${scope}\\n`,
@@ -241,34 +300,64 @@ test("every npm publish job verifies on the registry each package it publishes",
       previous = index;
     }
   };
-  const timeout = source => Number(source.match(/^ {4}timeout-minutes:\s*(\d+)\s*$/m)?.[1]);
 
-  const promotion = jobSource("publish-promotion-platform", "finalize-promotion-release");
-  assertOrdered(promotion, "publish-promotion-platform", [
+  assertOrdered(workflowJob("publish-promotion-platform"), "publish-promotion-platform", [
     "publish_package @lpm-registry/cli-win32-x64",
     verification("platforms"),
     "- name: Publish exact wrapper tarball last",
     verification("wrapper"),
     "bash scripts/ci/verify-published-wrapper.sh",
   ]);
-  assert.ok(timeout(promotion) >= 45);
-
-  const platform = jobSource("publish-npm-platform", "publish-npm-wrapper");
-  assertOrdered(platform, "publish-npm-platform", [
+  assertOrdered(workflowJob("publish-npm-platform"), "publish-npm-platform", [
     "publish_pkg @lpm-registry/cli-win32-x64",
     verification("platforms"),
   ]);
-  assert.ok(timeout(platform) >= 25);
-
-  const wrapper = jobSource("publish-npm-wrapper", "update-homebrew");
-  assertOrdered(wrapper, "publish-npm-wrapper", [
+  assertOrdered(workflowJob("publish-npm-wrapper"), "publish-npm-wrapper", [
     verification("platforms"),
     "- name: Publish exact verified wrapper tarball",
     verification("wrapper"),
     "bash scripts/ci/verify-published-wrapper.sh",
   ]);
-  assert.ok(timeout(wrapper) >= 45);
 });
+
+test("every npm publish job outlasts the worst case of every registry wait it runs", () => {
+  const verifierMinutes = PROPAGATION_TIMEOUT_MS / 60_000;
+  const wrapperSmokeMinutes =
+    Number(
+      fs
+        .readFileSync(path.join(repoRoot, "scripts/ci/verify-published-wrapper.sh"), "utf8")
+        .match(/^propagation_timeout_seconds=(\d+)$/m)?.[1],
+    ) / 60;
+  assert.ok(wrapperSmokeMinutes > 0, "verify-published-wrapper.sh has no propagation window");
+
+  for (const job of NPM_PUBLISH_JOBS) {
+    const source = workflowJob(job);
+    const count = pattern => source.match(pattern)?.length ?? 0;
+    const verifications = count(/node npm\/release\/verify-registry-publication\.mjs\n/g);
+    const wrapperSmokes = count(/bash scripts\/ci\/verify-published-wrapper\.sh /g);
+    const requiredMinutes =
+      verifications * verifierMinutes +
+      wrapperSmokes * wrapperSmokeMinutes +
+      NON_WAITING_STEP_MINUTES;
+    const timeoutMinutes = Number(source.match(/^ {4}timeout-minutes:\s*(\d+)\s*$/m)?.[1]);
+
+    assert.ok(
+      timeoutMinutes >= requiredMinutes,
+      `${job} allows ${timeoutMinutes} minutes, but ${verifications} registry verification(s) and ` +
+        `${wrapperSmokes} wrapper smoke(s) can wait ${requiredMinutes} minutes before reporting`,
+    );
+  }
+});
+
+function workflowJob(job) {
+  const workflow = fs
+    .readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8")
+    .replaceAll("\r\n", "\n");
+  const start = workflow.indexOf(`\n  ${job}:\n`);
+  assert.notEqual(start, -1, `missing ${job} job`);
+  const next = workflow.slice(start + 1).search(/\n {2}[a-z][a-z0-9-]*:\n/);
+  return next === -1 ? workflow.slice(start) : workflow.slice(start, start + 1 + next);
+}
 
 function releaseManifest() {
   return {
@@ -294,9 +383,22 @@ function integrity(seed) {
   return `sha512-${crypto.createHash("sha512").update(seed).digest("base64")}`;
 }
 
+function packumentResponse(packument) {
+  return new Response(JSON.stringify(packument), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
 function fakeRegistry(
   manifest,
-  { visibleAfterRequests = {}, missing = [], integrityOverride = {}, distTagOverride = {} } = {},
+  {
+    visibleAfterRequests = {},
+    listedAfterMs = {},
+    missing = [],
+    tamperVersion = {},
+    distTagOverride = {},
+  } = {},
 ) {
   let clock = 0;
   const requests = [];
@@ -315,25 +417,29 @@ function fakeRegistry(
     ) {
       return new Response("not found", { status: 404 });
     }
-    const tag = distTagOverride[name] ?? VERSION;
-    return new Response(
-      JSON.stringify({
+    if (clock < (listedAfterMs[name] ?? 0)) {
+      return packumentResponse({
         name,
-        "dist-tags": { latest: tag, nightly: tag },
-        versions: {
-          [VERSION]: {
-            name,
-            version: VERSION,
-            dist: {
-              shasum: record.shasum,
-              integrity: integrityOverride[name] ?? record.integrity,
-              attestations: { provenance: { predicateType: PROVENANCE_PREDICATE } },
-            },
-          },
-        },
-      }),
-      { status: 200, headers: { "content-type": "application/json" } },
-    );
+        "dist-tags": { latest: PREVIOUS_VERSION, nightly: PREVIOUS_VERSION },
+        versions: { [PREVIOUS_VERSION]: { name, version: PREVIOUS_VERSION } },
+      });
+    }
+    const tag = distTagOverride[name] ?? VERSION;
+    const versionMetadata = {
+      name,
+      version: VERSION,
+      dist: {
+        shasum: record.shasum,
+        integrity: record.integrity,
+        attestations: { provenance: { predicateType: PROVENANCE_PREDICATE } },
+      },
+    };
+    tamperVersion[name]?.(versionMetadata);
+    return packumentResponse({
+      name,
+      "dist-tags": { latest: tag, nightly: tag },
+      versions: { [VERSION]: versionMetadata },
+    });
   };
   return {
     manifest,
