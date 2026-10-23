@@ -359,62 +359,77 @@ pub fn bounded_json<T: Serialize>(value: &T, limit: usize) -> Result<Vec<u8>, So
     const FIRST_CHUNK: usize = 4096;
     const LARGEST_CHUNK: usize = 64 * 1024;
     struct Output {
-        chunks: Vec<Vec<u8>>,
+        /// The chunks written so far, each full.
+        full: Vec<Vec<u8>>,
+        /// The chunk being written, never grown past its capacity.
+        current: Vec<u8>,
         length: usize,
         limit: usize,
     }
+    impl Output {
+        /// Writes `bytes` across as many new chunks as they need. Chunks
+        /// double up to the largest, so a small output takes one small
+        /// chunk, and none passes the limit.
+        #[cold]
+        fn spill(&mut self, mut bytes: &[u8]) {
+            loop {
+                let room = self.current.capacity() - self.current.len();
+                let (now, later) = bytes.split_at(room.min(bytes.len()));
+                self.current.extend_from_slice(now);
+                self.length += now.len();
+                bytes = later;
+                if bytes.is_empty() {
+                    return;
+                }
+                let size = match self.current.capacity() {
+                    0 => FIRST_CHUNK,
+                    capacity => capacity.saturating_mul(2).min(LARGEST_CHUNK),
+                };
+                let next = Vec::with_capacity(size.min(self.limit - self.length));
+                let written = std::mem::replace(&mut self.current, next);
+                if !written.is_empty() {
+                    self.full.push(written);
+                }
+            }
+        }
+    }
     impl std::io::Write for Output {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if bytes.len() > self.limit.saturating_sub(self.length) {
+        fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            if bytes.len() > self.limit - self.length {
                 return Err(std::io::Error::other("bounded JSON output exceeded"));
             }
-            let mut rest = bytes;
-            while !rest.is_empty() {
-                let room = self
-                    .chunks
-                    .last()
-                    .map_or(0, |chunk| chunk.capacity() - chunk.len());
-                if room == 0 {
-                    // Chunks double up to the largest, so a small output
-                    // takes one small chunk, and none passes the limit.
-                    let size = self.chunks.last().map_or(FIRST_CHUNK, |chunk| {
-                        chunk.capacity().saturating_mul(2).min(LARGEST_CHUNK)
-                    });
-                    self.chunks
-                        .push(Vec::with_capacity(size.min(self.limit - self.length)));
-                    continue;
-                }
-                let (now, later) = rest.split_at(room.min(rest.len()));
-                self.chunks
-                    .last_mut()
-                    .expect("the last chunk has room")
-                    .extend_from_slice(now);
-                self.length += now.len();
-                rest = later;
+            if bytes.len() <= self.current.capacity() - self.current.len() {
+                self.current.extend_from_slice(bytes);
+                self.length += bytes.len();
+            } else {
+                self.spill(bytes);
             }
-            Ok(bytes.len())
+            Ok(())
+        }
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.write_all(bytes).map(|()| bytes.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
     let mut output = Output {
-        chunks: Vec::new(),
+        full: Vec::new(),
+        current: Vec::new(),
         length: 0,
         limit,
     };
     serde_json::to_writer(&mut output, value).map_err(|_| {
         SourceError::new("env.output_budget", "serialize", "lpm.json", "/envSchema")
     })?;
-    if let [chunk] = output.chunks.as_slice()
-        && chunk.len() == chunk.capacity()
-    {
-        return Ok(output.chunks.pop().expect("one chunk"));
+    if output.full.is_empty() && output.current.len() == output.current.capacity() {
+        return Ok(output.current);
     }
     let mut bytes = Vec::with_capacity(output.length);
-    for chunk in output.chunks {
+    for chunk in output.full {
         bytes.extend_from_slice(&chunk);
     }
+    bytes.extend_from_slice(&output.current);
     Ok(bytes)
 }
 

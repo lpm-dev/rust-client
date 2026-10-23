@@ -74,14 +74,21 @@ unsafe impl GlobalAlloc for Probe {
         if new_size == layout.size() {
             return block;
         }
+        // A resize that fails keeps the block, so it's scanned only once
+        // the new one is given.
         unsafe {
-            scan(block, layout.size(), &FOUND);
             if wiping() {
                 return crate::wiping_allocator::reallocate(
                     block,
                     layout,
                     new_size,
-                    |layout| System.alloc_zeroed(layout),
+                    |new_layout| {
+                        let moved = System.alloc_zeroed(new_layout);
+                        if !moved.is_null() {
+                            scan(block, layout.size(), &FOUND);
+                        }
+                        moved
+                    },
                     |block, layout| {
                         scan(block, layout.size(), &FOUND_AFTER_WIPING);
                         System.dealloc(block, layout);
@@ -93,6 +100,7 @@ unsafe impl GlobalAlloc for Probe {
             if moved.is_null() {
                 return moved;
             }
+            scan(block, layout.size(), &FOUND);
             std::ptr::copy_nonoverlapping(block, moved, layout.size().min(new_size));
             System.dealloc(block, layout);
             moved
@@ -338,6 +346,44 @@ fn resizing_while_wiping_reports_only_blocks_freed_or_moved_with_the_marker() {
     unsafe { std::alloc::dealloc(block, layout) };
 }
 
+#[test]
+fn a_resize_that_fails_frees_and_moves_nothing() {
+    let layout = Layout::from_size_align(MARKER.len() * 2, 1).expect("layout");
+    // SAFETY: The layout is nonzero.
+    let block = unsafe { std::alloc::alloc_zeroed(layout) };
+    assert!(!block.is_null());
+    // SAFETY: The block holds twice the marker's length.
+    unsafe { block.copy_from_nonoverlapping(MARKER.as_ptr(), MARKER.len()) };
+    for wiping in [false, true] {
+        let watched = watch_freeing(wiping, || {
+            // SAFETY: The block is a live allocation of `layout`, and the
+            // new size, aligned to 1, doesn't overflow `isize`.
+            let resized = unsafe { std::alloc::realloc(block, layout, isize::MAX as usize) };
+            assert!(resized.is_null(), "no block that large is given");
+        });
+        assert!(
+            !watched.held && !watched.left,
+            "a block a failed resize keeps isn't counted as freed, wiping: {wiping}"
+        );
+        // SAFETY: A failed resize leaves the block live.
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(block, MARKER.len()) },
+            MARKER
+        );
+    }
+    // SAFETY: Freed once, with its layout.
+    unsafe { std::alloc::dealloc(block, layout) };
+}
+
+#[test]
+fn a_panic_while_watching_leaves_the_thread_unwatched() {
+    for wiping in [false, true] {
+        let unwound = std::panic::catch_unwind(|| watch_freeing(wiping, || panic!("watched")));
+        assert!(unwound.is_err());
+        assert!(!watched() && !self::wiping(), "wiping: {wiping}");
+    }
+}
+
 /// Runs `body` while watching freed and moved blocks, and says whether any
 /// of them still held the marker. Inputs holding it must outlive the call.
 pub(crate) fn watch(body: impl FnOnce()) -> bool {
@@ -362,6 +408,24 @@ struct Watched {
     largest: usize,
 }
 
+/// This thread's watch, which ends when it's dropped, even by a panic.
+struct Watching;
+
+impl Watching {
+    fn start(wiping: bool) -> Self {
+        WIPING.set(wiping);
+        WATCHED.set(true);
+        Self
+    }
+}
+
+impl Drop for Watching {
+    fn drop(&mut self) {
+        WATCHED.set(false);
+        WIPING.set(false);
+    }
+}
+
 fn watch_freeing(wiping: bool, body: impl FnOnce()) -> Watched {
     let _only = WATCH
         .lock()
@@ -369,11 +433,9 @@ fn watch_freeing(wiping: bool, body: impl FnOnce()) -> Watched {
     FOUND.store(false, Ordering::Relaxed);
     FOUND_AFTER_WIPING.store(false, Ordering::Relaxed);
     LARGEST.store(0, Ordering::Relaxed);
-    WIPING.set(wiping);
-    WATCHED.set(true);
+    let watching = Watching::start(wiping);
     body();
-    WATCHED.set(false);
-    WIPING.set(false);
+    drop(watching);
     Watched {
         held: FOUND.load(Ordering::Relaxed),
         left: FOUND_AFTER_WIPING.load(Ordering::Relaxed),

@@ -54,6 +54,7 @@ use std::collections::HashSet;
 use lpm_common::stored_env::{
     MAX_ENVIRONMENT_NAME_BYTES, MAX_ORG_SLUG_BYTES, MAX_VAULT_ID_BYTES, is_canonical_registry_url,
     is_safe_vault_id, is_valid_environment_name, is_valid_org_slug, is_valid_variable_name,
+    is_variable_name_byte,
 };
 
 /// The most projects a backup holds.
@@ -76,31 +77,8 @@ const MAX_DEVICE_NAME_BYTES: usize = 256;
 const MAX_REGISTRY_BYTES: usize = 2048;
 const MAX_PRINCIPAL_BYTES: usize = 256;
 
-/// The most bytes an object's keys decode to, and what a longer key fails as.
-#[derive(Clone, Copy)]
-struct KeyLimit {
-    bytes: usize,
-    too_long: PayloadErrorKind,
-}
-
 /// Longer than any field name the format has, so a longer key can't be one.
-const FIELD_NAMES: KeyLimit = KeyLimit {
-    bytes: 64,
-    too_long: PayloadErrorKind::Structure,
-};
-const ENVIRONMENT_NAMES: KeyLimit = KeyLimit {
-    bytes: MAX_ENVIRONMENT_NAME_BYTES,
-    too_long: PayloadErrorKind::EnvironmentName,
-};
-/// A variable's name is stored with its project, which must fit the store.
-const VARIABLE_NAMES: KeyLimit = KeyLimit {
-    bytes: MAX_PROJECT_BYTES,
-    too_long: PayloadErrorKind::ProjectTooLarge,
-};
-const APP_KEYS: KeyLimit = KeyLimit {
-    bytes: MAX_APP_KEY_BYTES,
-    too_long: PayloadErrorKind::App,
-};
+const MAX_FIELD_NAME_BYTES: usize = 64;
 
 /// Why a payload isn't a valid backup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,62 +166,46 @@ fn first(seen: &mut bool, reader: &Reader<'_>, at: usize) -> Result<(), PayloadE
 fn read_backup(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
     let (mut created_at, mut producer, mut device_name, mut projects, mut app) =
         (false, false, false, false, false);
-    reader.object(FIELD_NAMES, |reader, key, at| match &*key {
-        "createdAt" => {
-            first(&mut created_at, reader, at)?;
-            let value_at = reader.at;
-            if reader.unsigned()? > MAX_CREATED_AT {
-                return Err(reader.error_at(PayloadErrorKind::CreatedAt, value_at));
+    reader.object(MAX_FIELD_NAME_BYTES, |reader, key, at| {
+        match key.as_deref() {
+            Some("createdAt") => {
+                first(&mut created_at, reader, at)?;
+                let value_at = reader.at;
+                if reader.unsigned()? > MAX_CREATED_AT {
+                    return Err(reader.error_at(PayloadErrorKind::CreatedAt, value_at));
+                }
+                Ok(())
             }
-            Ok(())
+            Some("producer") => {
+                first(&mut producer, reader, at)?;
+                read_producer(reader)
+            }
+            Some("deviceName") => {
+                first(&mut device_name, reader, at)?;
+                reader
+                    .optional(|reader| {
+                        let name_at = reader.at;
+                        if reader
+                            .text_value(MAX_DEVICE_NAME_BYTES)?
+                            .is_some_and(|name| is_label(&name, MAX_DEVICE_NAME_BYTES))
+                        {
+                            Ok(())
+                        } else {
+                            Err(reader.error_at(PayloadErrorKind::DeviceName, name_at))
+                        }
+                    })
+                    .map(|_| ())
+            }
+            Some("projects") => {
+                first(&mut projects, reader, at)?;
+                read_projects(reader)
+            }
+            Some("app") => {
+                first(&mut app, reader, at)?;
+                reader.optional(read_app).map(|_| ())
+            }
+            _ => Err(reader.error_at(PayloadErrorKind::Structure, at)),
         }
-        "producer" => {
-            first(&mut producer, reader, at)?;
-            read_producer(reader)
-        }
-        "deviceName" => {
-            first(&mut device_name, reader, at)?;
-            reader
-                .optional(|reader| {
-                    let name_at = reader.at;
-                    if reader
-                        .text_value(MAX_DEVICE_NAME_BYTES)?
-                        .is_some_and(|name| is_label(&name, MAX_DEVICE_NAME_BYTES))
-                    {
-                        Ok(())
-                    } else {
-                        Err(reader.error_at(PayloadErrorKind::DeviceName, name_at))
-                    }
-                })
-                .map(|_| ())
-        }
-        "projects" => {
-            first(&mut projects, reader, at)?;
-            read_projects(reader)
-        }
-        "app" => {
-            first(&mut app, reader, at)?;
-            reader
-                .optional(|reader| {
-                    reader.skip_whitespace();
-                    let value_at = reader.at;
-                    let object = reader.peek() == Some(b'{');
-                    let mut keys = 0;
-                    reader
-                        .app_value(1, &mut keys)
-                        .map_err(|error| match error.kind {
-                            PayloadErrorKind::Syntax => error,
-                            _ => reader.error_at(PayloadErrorKind::App, error.offset),
-                        })?;
-                    if object {
-                        Ok(())
-                    } else {
-                        Err(reader.error_at(PayloadErrorKind::App, value_at))
-                    }
-                })
-                .map(|_| ())
-        }
-        _ => Err(reader.error_at(PayloadErrorKind::Structure, at)),
     })?;
     if created_at && producer && projects {
         Ok(())
@@ -252,12 +214,35 @@ fn read_backup(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
     }
 }
 
+/// `app`, which fails as [`PayloadErrorKind::App`] where it breaks the
+/// section's rules once it's known to be JSON up to there: an object where
+/// it breaks one, and anything else at its start, once it's read through.
+fn read_app(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
+    reader.skip_whitespace();
+    let value_at = reader.at;
+    if reader.peek() == Some(b'{') {
+        let mut keys = 0;
+        return reader
+            .app_value(1, &mut keys)
+            .map_err(|error| match error.kind {
+                PayloadErrorKind::Syntax => error,
+                _ => reader.error_at(PayloadErrorKind::App, error.offset),
+            });
+    }
+    reader.skip_value()?;
+    if matches!(reader.peek(), Some(b',' | b'}')) {
+        Err(reader.error_at(PayloadErrorKind::App, value_at))
+    } else {
+        Err(reader.error(PayloadErrorKind::Syntax))
+    }
+}
+
 fn read_producer(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
     let (mut name, mut version) = (false, false);
-    reader.object(FIELD_NAMES, |reader, key, at| {
-        let seen = match &*key {
-            "name" => &mut name,
-            "version" => &mut version,
+    reader.object(MAX_FIELD_NAME_BYTES, |reader, key, at| {
+        let seen = match key.as_deref() {
+            Some("name") => &mut name,
+            Some("version") => &mut version,
             _ => return Err(reader.error_at(PayloadErrorKind::Structure, at)),
         };
         first(seen, reader, at)?;
@@ -343,9 +328,9 @@ fn read_project<'a>(reader: &mut Reader<'a>) -> Result<(Cow<'a, str>, usize), Pa
             Cow::Borrowed("")
         }))
     };
-    reader.object(FIELD_NAMES, |reader, key, at| {
-        match &*key {
-            "vaultId" => {
+    reader.object(MAX_FIELD_NAME_BYTES, |reader, key, at| {
+        match key.as_deref() {
+            Some("vaultId") => {
                 if vault_id.is_some() {
                     return Err(reader.error_at(PayloadErrorKind::Structure, at));
                 }
@@ -356,33 +341,33 @@ fn read_project<'a>(reader: &mut Reader<'a>) -> Result<(Cow<'a, str>, usize), Pa
                     .ok_or_else(|| reader.error_at(PayloadErrorKind::VaultId, id_at))?;
                 vault_id = Some(id);
             }
-            "name" => {
+            Some("name") => {
                 if name.is_some() {
                     return Err(reader.error_at(PayloadErrorKind::Structure, at));
                 }
                 name = Some(stored_text(reader)?);
             }
-            "folder" => {
+            Some("folder") => {
                 if folder.is_some() {
                     return Err(reader.error_at(PayloadErrorKind::Structure, at));
                 }
                 folder = Some(reader.optional(&mut stored_text)?);
             }
-            "hidden" => {
+            Some("hidden") => {
                 first(&mut hidden, reader, at)?;
                 reader.flag()?;
             }
-            "cliAccess" => {
+            Some("cliAccess") => {
                 first(&mut cli_access, reader, at)?;
                 reader.one_of(&["automatic", "requireApproval"])?;
             }
-            "environments" => {
+            Some("environments") => {
                 if environments.is_some() {
                     return Err(reader.error_at(PayloadErrorKind::Structure, at));
                 }
                 environments = Some(read_environments(reader)?.1);
             }
-            "sync" => {
+            Some("sync") => {
                 first(&mut sync, reader, at)?;
                 reader.optional(read_sync)?;
             }
@@ -413,21 +398,21 @@ fn read_sync(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
     let mut scope = None;
     let mut principal = None;
     let mut org_slug = None;
-    reader.object(FIELD_NAMES, |reader, key, at| {
-        let repeated = match &*key {
-            "registry" => registry.is_some(),
-            "scope" => scope.is_some(),
-            "principalId" => principal.is_some(),
-            "orgSlug" => org_slug.is_some(),
+    reader.object(MAX_FIELD_NAME_BYTES, |reader, key, at| {
+        let repeated = match key.as_deref() {
+            Some("registry") => registry.is_some(),
+            Some("scope") => scope.is_some(),
+            Some("principalId") => principal.is_some(),
+            Some("orgSlug") => org_slug.is_some(),
             _ => true,
         };
         if repeated {
             return Err(reader.error_at(PayloadErrorKind::Structure, at));
         }
-        match &*key {
-            "registry" => registry = Some(reader.text_value(MAX_REGISTRY_BYTES)?),
-            "scope" => scope = Some(reader.one_of(&["personal", "organization"])?),
-            "principalId" => principal = Some(reader.text_value(MAX_PRINCIPAL_BYTES)?),
+        match key.as_deref() {
+            Some("registry") => registry = Some(reader.text_value(MAX_REGISTRY_BYTES)?),
+            Some("scope") => scope = Some(reader.one_of(&["personal", "organization"])?),
+            Some("principalId") => principal = Some(reader.text_value(MAX_PRINCIPAL_BYTES)?),
             _ => org_slug = Some(reader.optional(|reader| reader.text_value(MAX_ORG_SLUG_BYTES))?),
         }
         Ok(())
@@ -463,10 +448,10 @@ fn read_environments(reader: &mut Reader<'_>) -> Result<(usize, usize), PayloadE
     let mut names = HashSet::new();
     let mut stored_bytes = STORED_ENVELOPE_BYTES;
     let mut summary_bytes = 0;
-    reader.object(ENVIRONMENT_NAMES, |reader, name, at| {
-        if !is_valid_environment_name(&name) {
+    reader.object(MAX_ENVIRONMENT_NAME_BYTES, |reader, name, at| {
+        let Some(name) = name.filter(|name| is_valid_environment_name(name)) else {
             return Err(reader.error_at(PayloadErrorKind::EnvironmentName, at));
-        }
+        };
         let (count, variables) = read_variables(reader)?;
         let separator = usize::from(!names.is_empty());
         stored_bytes += separator + quoted_len(&name) + 1 + variables;
@@ -494,7 +479,16 @@ fn read_environments(reader: &mut Reader<'_>) -> Result<(usize, usize), PayloadE
 fn read_variables(reader: &mut Reader<'_>) -> Result<(usize, usize), PayloadError> {
     let mut names = HashSet::new();
     let mut stored_bytes = 2;
-    reader.object(VARIABLE_NAMES, |reader, name, at| {
+    reader.object(MAX_PROJECT_BYTES, |reader, name, at| {
+        let Some(name) = name else {
+            // No name this long fits the store, but it fails as a shorter
+            // one would: as a name first, then by its value.
+            if !reader.decodes_to_variable_name(at) {
+                return Err(reader.error_at(PayloadErrorKind::VariableName, at));
+            }
+            reader.measured_value()?;
+            return Err(reader.error_at(PayloadErrorKind::ProjectTooLarge, at));
+        };
         if !is_valid_variable_name(&name) {
             return Err(reader.error_at(PayloadErrorKind::VariableName, at));
         }
@@ -583,13 +577,14 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// Reads an object, giving `member` each key, decoded, and where it
-    /// starts, with the reader at its value, which `member` must read. A key
-    /// over `keys`' limit fails before it's decoded.
+    /// Reads an object, giving `member` each key and where it starts, with
+    /// the reader at its value, which `member` must read. A key is decoded
+    /// only when it decodes to at most `max_key_bytes`, and is `None`
+    /// otherwise, since none that long is valid there.
     fn object(
         &mut self,
-        keys: KeyLimit,
-        mut member: impl FnMut(&mut Self, Cow<'a, str>, usize) -> Result<(), PayloadError>,
+        max_key_bytes: usize,
+        mut member: impl FnMut(&mut Self, Option<Cow<'a, str>>, usize) -> Result<(), PayloadError>,
     ) -> Result<(), PayloadError> {
         if !self.take(b'{') {
             return Err(self.mismatch(PayloadErrorKind::Structure));
@@ -603,9 +598,7 @@ impl<'a> Reader<'a> {
             if self.peek() != Some(b'"') {
                 return Err(self.error(PayloadErrorKind::Syntax));
             }
-            let Some(key) = self.text_value(keys.bytes)? else {
-                return Err(self.error_at(keys.too_long, key_at));
-            };
+            let key = self.text_value(max_key_bytes)?;
             self.expect(b':')?;
             member(self, key, key_at)?;
             if self.take(b'}') {
@@ -746,6 +739,18 @@ impl<'a> Reader<'a> {
         Ok(Some(Cow::Owned(decoded.0)))
     }
 
+    /// Whether the string at `at`, already read, decodes to a variable name.
+    fn decodes_to_variable_name(&self, at: usize) -> bool {
+        let mut name = VariableNameShape::default();
+        Reader {
+            text: self.text,
+            at,
+        }
+        .string_span(&mut name, PayloadErrorKind::Syntax)
+        .is_ok()
+            && name.is_valid()
+    }
+
     /// A value: a string, measured as the CLI stores it, never copied.
     fn measured_value(&mut self) -> Result<usize, PayloadError> {
         let mut measured = Measured(2);
@@ -848,9 +853,9 @@ impl<'a> Reader<'a> {
             Some(b'{' | b'[') if depth > MAX_APP_DEPTH => Err(self.error(PayloadErrorKind::App)),
             Some(b'{') => {
                 let mut seen = HashSet::new();
-                self.object(APP_KEYS, |reader, key, at| {
+                self.object(MAX_APP_KEY_BYTES, |reader, key, at| {
                     *keys += 1;
-                    if *keys > MAX_APP_KEYS || !seen.insert(key) {
+                    if *keys > MAX_APP_KEYS || !key.is_some_and(|key| seen.insert(key)) {
                         return Err(reader.error_at(PayloadErrorKind::App, at));
                     }
                     reader.app_value(depth + 1, keys)
@@ -871,6 +876,108 @@ impl<'a> Reader<'a> {
             }
             _ => Err(self.error(PayloadErrorKind::Syntax)),
         }
+    }
+
+    /// Skips any JSON value, checking nothing but its syntax, without
+    /// recursing however deep it nests.
+    fn skip_value(&mut self) -> Result<(), PayloadError> {
+        let mut open = Containers::default();
+        loop {
+            match self.peek() {
+                Some(b'{') => {
+                    self.at += 1;
+                    if !self.take(b'}') {
+                        open.push(Container::Object);
+                        self.skip_key()?;
+                        continue;
+                    }
+                }
+                Some(b'[') => {
+                    self.at += 1;
+                    if !self.take(b']') {
+                        open.push(Container::List);
+                        continue;
+                    }
+                }
+                Some(b'"') => {
+                    self.string_span(&mut (), PayloadErrorKind::Syntax)?;
+                }
+                Some(b't') => self.word("true")?,
+                Some(b'f') => self.word("false")?,
+                Some(b'n') => self.word("null")?,
+                Some(b'-' | b'0'..=b'9') => {
+                    self.number_token()?;
+                }
+                _ => return Err(self.error(PayloadErrorKind::Syntax)),
+            }
+            loop {
+                let Some(container) = open.innermost() else {
+                    return Ok(());
+                };
+                let closer = match container {
+                    Container::Object => b'}',
+                    Container::List => b']',
+                };
+                if !self.take(closer) {
+                    self.expect(b',')?;
+                    if container == Container::Object {
+                        self.skip_key()?;
+                    }
+                    break;
+                }
+                open.pop();
+            }
+        }
+    }
+
+    /// Skips an object's key and the colon after it.
+    fn skip_key(&mut self) -> Result<(), PayloadError> {
+        if self.peek() != Some(b'"') {
+            return Err(self.error(PayloadErrorKind::Syntax));
+        }
+        self.string_span(&mut (), PayloadErrorKind::Syntax)?;
+        self.expect(b':')
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Container {
+    Object,
+    List,
+}
+
+/// The containers a skipped value is inside, innermost last, kept a bit
+/// each: a payload can nest one in each of its bytes.
+#[derive(Default)]
+struct Containers {
+    objects: Vec<u64>,
+    depth: usize,
+}
+
+impl Containers {
+    fn push(&mut self, container: Container) {
+        let (word, bit) = (self.depth / 64, self.depth % 64);
+        if word == self.objects.len() {
+            self.objects.push(0);
+        }
+        match container {
+            Container::Object => self.objects[word] |= 1 << bit,
+            Container::List => self.objects[word] &= !(1 << bit),
+        }
+        self.depth += 1;
+    }
+
+    fn innermost(&self) -> Option<Container> {
+        let top = self.depth.checked_sub(1)?;
+        Some(if self.objects[top / 64] >> (top % 64) & 1 == 1 {
+            Container::Object
+        } else {
+            Container::List
+        })
+    }
+
+    fn pop(&mut self) {
+        self.depth -= 1;
     }
 }
 
@@ -898,6 +1005,35 @@ impl Sink<'_> for DecodedLength {
     fn escaped(&mut self, character: char) {
         self.bytes += character.len_utf8();
         self.escaped = true;
+    }
+}
+
+/// Whether a string decodes to a variable name, judged as it's walked.
+#[derive(Default)]
+struct VariableNameShape {
+    started: bool,
+    invalid: bool,
+}
+
+impl VariableNameShape {
+    fn push(&mut self, byte: u8) {
+        self.invalid |= !is_variable_name_byte(byte, !self.started);
+        self.started = true;
+    }
+
+    fn is_valid(&self) -> bool {
+        self.started && !self.invalid
+    }
+}
+
+impl Sink<'_> for VariableNameShape {
+    fn run(&mut self, run: &str) {
+        run.bytes().for_each(|byte| self.push(byte));
+    }
+
+    fn escaped(&mut self, character: char) {
+        // Every character a name can hold is ASCII, so any other fails it.
+        self.push(u8::try_from(character).unwrap_or(u8::MAX));
     }
 }
 
@@ -1463,12 +1599,28 @@ mod tests {
             r#"{"a":1 "b":2}"#,
             "{\"a\":1}\u{feff}",
         ];
-        for app in corpus {
-            let payload = format!(
+        let with_app = |app: &str| {
+            format!(
                 r#"{{"createdAt":0,"producer":{{"name":"a","version":"1"}},"projects":[],"app":{app}}}"#
-            );
+            )
+        };
+        for app in corpus {
+            let payload = with_app(app);
             let serde_accepts = serde_json::from_str::<serde_json::Value>(&payload).is_ok();
             assert_eq!(validate(payload.as_bytes()).is_ok(), serde_accepts, "{app}");
+
+            let listed = with_app(&format!("[{app}]"));
+            let serde_accepts = serde_json::from_str::<serde_json::Value>(&listed).is_ok();
+            let expected = if serde_accepts {
+                PayloadErrorKind::App
+            } else {
+                PayloadErrorKind::Syntax
+            };
+            assert_eq!(
+                validate(listed.as_bytes()).err().map(|error| error.kind),
+                Some(expected),
+                "[{app}]"
+            );
         }
     }
 
@@ -1639,6 +1791,207 @@ mod tests {
             assert!(
                 largest < 64 * 1024,
                 "{expected:?} allocated {largest} bytes before refusing"
+            );
+        }
+    }
+
+    /// Where `needle` first starts in `haystack`.
+    fn offset_of(haystack: &str, needle: &str) -> usize {
+        haystack.find(needle).expect("the needle is in the payload")
+    }
+
+    /// `key` with its first character written as a `\u` escape.
+    fn escaping_first(key: &str) -> String {
+        let first = key.chars().next().expect("a key");
+        format!("\\u{:04x}{}", u32::from(first), &key[first.len_utf8()..])
+    }
+
+    #[test]
+    fn an_oversized_key_fails_as_it_would_have_once_decoded() {
+        let head = r#"{"createdAt":0,"producer":{"name":"a","version":"1"},"projects":[{"vaultId":"v","name":"n","hidden":false,"cliAccess":"automatic","environments":{"default":{"#;
+        let long =
+            |first: &str, last: &str| format!("{first}{}{last}", "a".repeat(MAX_PROJECT_BYTES - 1));
+        let variable = |key: &str, value: &str| format!(r#"{head}"{key}":{value}}}}}}}]}}"#);
+        for (key, value, kind, at_value) in [
+            (
+                long("1", "a"),
+                r#""v""#,
+                PayloadErrorKind::VariableName,
+                false,
+            ),
+            (
+                long("a", "-"),
+                r#""v""#,
+                PayloadErrorKind::VariableName,
+                false,
+            ),
+            (
+                long("a", r"é"),
+                r#""v""#,
+                PayloadErrorKind::VariableName,
+                false,
+            ),
+            (
+                long("a", r"\n"),
+                r#""v""#,
+                PayloadErrorKind::VariableName,
+                false,
+            ),
+            (long("a", "a"), "null", PayloadErrorKind::Value, true),
+            (long("a", "a"), "@", PayloadErrorKind::Syntax, true),
+            (
+                long("a", "a"),
+                r#""v""#,
+                PayloadErrorKind::ProjectTooLarge,
+                false,
+            ),
+            (
+                long("a", r"_"),
+                r#""v""#,
+                PayloadErrorKind::ProjectTooLarge,
+                false,
+            ),
+        ] {
+            for key in [escaping_first(&key), key] {
+                let payload = variable(&key, value);
+                let error = validate(payload.as_bytes()).expect_err(value);
+                let expected = if at_value {
+                    offset_of(&payload, &format!(":{value}")) + 1
+                } else {
+                    head.len()
+                };
+                assert_eq!(
+                    (error.kind, error.offset),
+                    (kind, expected),
+                    "{}…{} then {value}",
+                    &key[..6],
+                    &key[key.len() - 6..]
+                );
+            }
+        }
+        let unterminated = variable(&long("a", "a"), r#""v"#);
+        assert_eq!(
+            validate(unterminated.as_bytes())
+                .err()
+                .map(|error| error.kind),
+            Some(PayloadErrorKind::Syntax)
+        );
+
+        let app_head =
+            r#"{"createdAt":0,"producer":{"name":"a","version":"1"},"projects":[],"app":{"#;
+        let environment_head = &head[..head.len() - r#""default":{"#.len()];
+        for (head, key) in [
+            ("{", "a".repeat(65)),
+            (environment_head, "a".repeat(65)),
+            (head, long("a", "a")),
+            (app_head, "a".repeat(MAX_APP_KEY_BYTES + 1)),
+        ] {
+            for key in [escaping_first(&key), key] {
+                let payload = format!(r#"{head}"{key}" 0}}"#);
+                let error = validate(payload.as_bytes()).expect_err("missing colon");
+                assert_eq!(
+                    (error.kind, error.offset),
+                    (PayloadErrorKind::Syntax, head.len() + key.len() + 3),
+                    "{head}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_non_object_app_fails_at_its_start_unless_its_json_is_malformed() {
+        let head = r#"{"createdAt":0,"producer":{"name":"a","version":"1"},"projects":[],"app":"#;
+        let long_key = "k".repeat(MAX_APP_KEY_BYTES + 1);
+        let too_deep = format!(
+            "{}{}",
+            "[".repeat(MAX_APP_DEPTH + 1),
+            "]".repeat(MAX_APP_DEPTH + 1)
+        );
+        for app in [
+            r#"[ {"a":0,"a":1}]}"#.to_owned(),
+            format!(r#"[{{"{long_key}":0}}]}}"#),
+            format!("{too_deep}}}"),
+            "[1e400]}".to_owned(),
+            "1e400}".to_owned(),
+            r#""text" }"#.to_owned(),
+            "true}".to_owned(),
+            r#"[{"a":[{"b":{}},[]]}],"deviceName":null}"#.to_owned(),
+        ] {
+            let error = validate(format!("{head}{app}").as_bytes()).expect_err(&app);
+            assert_eq!(
+                (error.kind, error.offset),
+                (PayloadErrorKind::App, head.len()),
+                "{app}"
+            );
+        }
+        for (app, suffix) in [
+            ("trueX}", "X"),
+            ("falseX}", "X"),
+            ("1x}", "x"),
+            (r#""x"y}"#, "y"),
+            ("[{}]x}", "x"),
+            ("[1] z}", "z"),
+            ("[1,]}", "]}"),
+            ("[}", "}"),
+            (r#"[{"a" 1}]}"#, "1}"),
+            ("[{1:2}]}", "1:"),
+            (r#"[{"a":1,}]}"#, "}]"),
+            ("[", ""),
+        ] {
+            let payload = format!("{head}{app}");
+            let error = validate(payload.as_bytes()).expect_err(app);
+            let expected = if suffix.is_empty() {
+                payload.len()
+            } else {
+                head.len() + offset_of(app, suffix)
+            };
+            assert_eq!(
+                (error.kind, error.offset),
+                (PayloadErrorKind::Syntax, expected),
+                "{app}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_object_app_is_read_through_however_deep_it_nests() {
+        let head = r#"{"createdAt":0,"producer":{"name":"a","version":"1"},"projects":[],"app":"#;
+        let depth = 1_000_000;
+        let nested = format!("{head}{}{}}}", "[".repeat(depth), "]".repeat(depth));
+        let error = validate(nested.as_bytes()).expect_err("a list");
+        assert_eq!(
+            (error.kind, error.offset),
+            (PayloadErrorKind::App, head.len())
+        );
+        let mut unbalanced = nested.into_bytes();
+        let middle = head.len() + depth + depth / 2;
+        unbalanced[middle] = b'}';
+        let error = validate(&unbalanced).expect_err("unbalanced");
+        assert_eq!(
+            (error.kind, error.offset),
+            (PayloadErrorKind::Syntax, middle)
+        );
+
+        // Objects and lists alternate past several words of the stack that
+        // tracks them, so a closer of the wrong kind at any depth is caught.
+        let levels = 150;
+        let opening = r#"[{"k":"#.repeat(levels);
+        let closing = "}]".repeat(levels);
+        let mixed = format!("{head}{opening}0{closing}}}");
+        let error = validate(mixed.as_bytes()).expect_err("mixed");
+        assert_eq!(
+            (error.kind, error.offset),
+            (PayloadErrorKind::App, head.len())
+        );
+        for swapped in [0, 63, 64, 65, 127, 128, 2 * levels - 1] {
+            let mut wrong = mixed.clone().into_bytes();
+            let at = head.len() + opening.len() + 1 + swapped;
+            wrong[at] = if wrong[at] == b'}' { b']' } else { b'}' };
+            let error = validate(&wrong).expect_err("a wrong closer");
+            assert_eq!(
+                (error.kind, error.offset),
+                (PayloadErrorKind::Syntax, at),
+                "closer {swapped}"
             );
         }
     }

@@ -42,8 +42,19 @@ pub fn is_valid_variable_name(name: &str) -> bool {
     let mut bytes = name.bytes();
     bytes
         .next()
-        .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
-        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        .is_some_and(|first| is_variable_name_byte(first, true))
+        && bytes.all(|byte| is_variable_name_byte(byte, false))
+}
+
+/// Whether `byte` can be in a stored variable's name, and start it when
+/// `first`, for readers that judge a name without holding all of it.
+pub fn is_variable_name_byte(byte: u8, first: bool) -> bool {
+    byte == b'_'
+        || if first {
+            byte.is_ascii_alphabetic()
+        } else {
+            byte.is_ascii_alphanumeric()
+        }
 }
 
 /// Whether `slug` can name an organization in stored associations: 1 to 120

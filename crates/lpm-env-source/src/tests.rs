@@ -594,6 +594,30 @@ fn bounded_json_writes_its_output_once_into_an_allocation_exactly_its_size() {
 }
 
 #[test]
+fn bounded_json_matches_serde_json_where_chunks_fill_and_at_its_limit() {
+    // Where the first chunks fill: 4 KiB, then doubling to 64 KiB.
+    for boundary in [4096, 12_288, 61_440, 126_976, 192_512] {
+        for length in boundary - 2..=boundary + 2 {
+            // `[0,…,0]` written a byte at a time, with a `10` for even lengths.
+            let mut digits = vec![0u8; (length - 1) / 2];
+            if length % 2 == 0 {
+                digits[0] = 10;
+            }
+            let short_writes = serde_json::to_value(&digits).unwrap();
+            let one_long_write = serde_json::json!(["x".repeat(length - 4)]);
+            for value in [short_writes, one_long_write] {
+                let expected = serde_json::to_vec(&value).unwrap();
+                assert_eq!(expected.len(), length);
+                let bytes = bounded_json(&value, length).unwrap();
+                assert_eq!(bytes, expected, "{length}");
+                assert_eq!(bytes.capacity(), length);
+                assert!(bounded_json(&value, length - 1).is_err(), "{length}");
+            }
+        }
+    }
+}
+
+#[test]
 fn bounded_json_capacity_never_exceeds_its_output_budget() {
     let value = "x".repeat(1_300_000);
     let bytes = bounded_json(&value, MAX_SCHEMA_BYTES).unwrap();
