@@ -120,7 +120,8 @@ LPMEnvResult lpm_env_prepare_secret_file(const uint8_t *project, size_t project_
  * A pointer may be null only when its length is 0; a length over its limit is
  * refused before the pointer is read. Every output buffer is zeroed when released,
  * and the engine zeroes all memory it frees.
- * The format records no platform logins or sync keys. */
+ * The format records no platform logins; sync keys travel only through
+ * lpm_env_backup_open_split's records. */
 /* zxcvbn's estimate for a passphrase, of at most its first 100 characters:
  * {acceptable, guessesLog10, minimumGuessesLog10}; acceptable means a backup can be
  * sealed with it. The first call loads zxcvbn's dictionaries; an estimate can then
@@ -147,6 +148,25 @@ LPMEnvResult lpm_env_backup_inspect(const uint8_t *file, size_t length);
 LPMEnvResult lpm_env_backup_open(const uint8_t *file, size_t file_length,
                                const uint8_t *passphrase, size_t passphrase_length,
                                size_t *payload_offset, size_t *payload_length);
+/* Open as lpm_env_backup_open does, and take the payload's keys out of it, so
+ * keys never reach a JSON parser as text: *payload_offset and *payload_length say
+ * where the payload, without its keys member, is in the output, and *keys_offset
+ * and *keys_length where the keys' records are, right after it. Records follow
+ * one another, each a kind byte, then:
+ *   1 personal root key: account digest (32 bytes), key as 64 lowercase hex digits;
+ *   2 live sharing key, 3 pending sharing key: account digest (32 bytes), key as
+ *     44 standard base64 digits;
+ *   4 legacy wrapping key: key as 64 lowercase hex digits;
+ *   5 key floor: name digest (32 bytes), version as a big-endian uint32.
+ * Keys and floors are written as their stores keep them; an account digest's hex
+ * is its store account (sharing keys under "__x25519_private_key__." and its
+ * ".pending" form), and a floor's is its file name after
+ * ".env-project-key-floor-". With no keys, *keys_length is 0.
+ * status: 0=opened, 2=invalid input, 3=failure, 5=refused. */
+LPMEnvResult lpm_env_backup_open_split(const uint8_t *file, size_t file_length,
+                                     const uint8_t *passphrase, size_t passphrase_length,
+                                     size_t *payload_offset, size_t *payload_length,
+                                     size_t *keys_offset, size_t *keys_length);
 /* Release only the output buffer after decoding; the snapshot stays live.
  * Exclusively borrow result. Clears data/length; repeated calls are harmless.
  * A matching lpm_env_release is still required for the result. */

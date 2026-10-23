@@ -103,6 +103,46 @@ pub fn open(file: &[u8], passphrase: &Passphrase) -> Result<OpenedBackup, OpenEr
     Ok(OpenedBackup(plaintext))
 }
 
+/// A backup's checked payload without its `keys`, and the keys' records
+/// ([`payload::take_keys`]), inside its decrypted plaintext, which is wiped
+/// when dropped.
+pub struct SplitBackup {
+    bytes: Zeroizing<Vec<u8>>,
+    payload: Range<usize>,
+    keys: Range<usize>,
+}
+
+impl SplitBackup {
+    pub fn payload(&self) -> &[u8] {
+        &self.bytes[self.payload.clone()]
+    }
+
+    pub fn keys(&self) -> &[u8] {
+        &self.bytes[self.keys.clone()]
+    }
+
+    /// The whole plaintext, in an allocation exactly its length, and where
+    /// the payload and the keys' records are in it, for a caller that
+    /// releases it later.
+    pub fn into_plaintext(self) -> (Zeroizing<Vec<u8>>, Range<usize>, Range<usize>) {
+        (self.bytes, self.payload, self.keys)
+    }
+}
+
+/// Decrypts a backup file, checks its payload, and takes its `keys` out of
+/// it in place, so a reader of the payload never parses keys as text.
+pub fn open_split(file: &[u8], passphrase: &Passphrase) -> Result<SplitBackup, OpenError> {
+    let plaintext = container::open(file, passphrase).map_err(OpenError::Container)?;
+    let range = PAYLOAD_OFFSET..PAYLOAD_OFFSET + plaintext.payload_len;
+    let mut bytes = plaintext.bytes;
+    let (payload, keys) = payload::take_keys(&mut bytes, range).map_err(OpenError::Payload)?;
+    Ok(SplitBackup {
+        bytes,
+        payload,
+        keys,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,6 +161,28 @@ mod tests {
             FORMAT_VERSION
         );
         assert_eq!(open(&file, &strong()).expect("open").payload(), PAYLOAD);
+    }
+
+    const KEYED_PAYLOAD: &str = r#"{"createdAt":1761171075,"keys":{"wrappingKey":"b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"},"producer":{"name":"LPM Vault","version":"1.4.0"},"projects":[]}"#;
+
+    #[test]
+    fn opening_split_gives_the_payload_without_its_keys_and_their_records() {
+        let file = seal(KEYED_PAYLOAD.as_bytes(), &strong()).expect("seal");
+        let split = open_split(&file, &strong()).expect("open split");
+        assert_eq!(
+            split.payload(),
+            br#"{"createdAt":1761171075,"producer":{"name":"LPM Vault","version":"1.4.0"},"projects":[]}"#
+        );
+        let mut record = vec![4];
+        record.extend_from_slice(&[b'b', b'2'].repeat(32));
+        assert_eq!(split.keys(), record);
+        let (bytes, payload, keys) = split.into_plaintext();
+        assert_eq!(bytes.len(), bytes.capacity());
+        assert_eq!(keys.start, payload.end);
+
+        let plain = seal(PAYLOAD, &strong()).expect("seal");
+        let split = open_split(&plain, &strong()).expect("open split");
+        assert_eq!((split.payload(), split.keys()), (PAYLOAD, &[][..]));
     }
 
     #[test]
@@ -197,6 +259,19 @@ mod tests {
             drop(opened);
         });
         assert!(!leaked, "opening left the secret in freed memory");
+
+        let keyed = cases[0].replacen(
+            r#"{"createdAt""#,
+            r#"{"keys":{"wrappingKey":"b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"},"createdAt""#,
+            1,
+        );
+        let file = seal(keyed.as_bytes(), &strong()).expect("seal");
+        let leaked = watch(|| {
+            let split = open_split(&file, &strong()).expect("open split");
+            assert!(!split.keys().is_empty());
+            drop(split);
+        });
+        assert!(!leaked, "opening split left the secret in freed memory");
     }
 
     #[test]

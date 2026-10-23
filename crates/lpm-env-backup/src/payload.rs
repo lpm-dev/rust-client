@@ -17,11 +17,17 @@
 //!     "environments": {"default": {"DATABASE_URL": "postgres://…"}},
 //!     "sync": {"registry": "https://lpm.dev", "scope": "personal", "principalId": "…"}
 //!   }],
-//!   "app": {}
+//!   "app": {},
+//!   "keys": {
+//!     "personalRoots": [{"account": "<64 hex>", "key": "<64 hex>"}],
+//!     "sharingKeys": [{"account": "<64 hex>", "live": "<base64>", "pending": "<base64>"}],
+//!     "wrappingKey": "<64 hex>",
+//!     "keyFloors": [{"name": "<64 hex>", "version": 3}]
+//!   }
 //! }
 //! ```
 //!
-//! `deviceName`, `folder`, `sync` and `app` may be absent or null; `orgSlug`
+//! `deviceName`, `folder`, `sync`, `app` and `keys` may be absent or null; `orgSlug`
 //! goes with the `organization` scope only. Every object refuses unknown and
 //! repeated fields. `createdAt` is a plain unsigned integer, `cliAccess` and
 //! `scope` are written exactly as shown, without escapes, and each value is a
@@ -38,6 +44,14 @@
 //! limit on one item. Registries are written as the CLI's sync bindings hold
 //! them.
 //!
+//! `keys` holds the sync keys the credential stores held, as they keep them:
+//! personal root keys and the legacy wrapping key as 64 lowercase hex digits,
+//! sharing keys (live, pending or both) as standard base64 of 32 bytes, each
+//! under its store account's digest, and the personal key floors by their file
+//! names' digests. Every account and name appears once in its list, and each
+//! list holds at most [`MAX_KEY_ENTRIES`]. [`take_keys`] takes them out of a
+//! payload so a reader never parses them as text.
+//!
 //! `app` is an object the app that wrote the backup owns. Here it's only
 //! checked as JSON whose objects repeat no key, nested at most
 //! [`MAX_APP_DEPTH`] deep, with at most [`MAX_APP_KEYS`] keys between them of
@@ -50,6 +64,9 @@
 
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::ops::Range;
+
+use zeroize::{Zeroize, Zeroizing};
 
 use lpm_common::stored_env::{
     MAX_ENVIRONMENT_NAME_BYTES, MAX_ORG_SLUG_BYTES, MAX_VAULT_ID_BYTES, is_canonical_registry_url,
@@ -70,6 +87,8 @@ pub const MAX_APP_DEPTH: usize = 32;
 pub const MAX_APP_KEYS: usize = 1_000_000;
 /// The longest key in `app`, decoded.
 pub const MAX_APP_KEY_BYTES: usize = 256;
+/// The most entries each list in `keys` holds.
+pub const MAX_KEY_ENTRIES: usize = 64;
 /// The latest `createdAt`: the last second of 9999.
 const MAX_CREATED_AT: u64 = 253_402_300_799;
 const MAX_LABEL_BYTES: usize = 64;
@@ -113,6 +132,9 @@ pub enum PayloadErrorKind {
     /// `app` isn't an object, repeats a key, nests too deep, has too many or
     /// too long keys, or holds a number out of range.
     App,
+    /// `keys` holds a key, account, name or floor not written as the stores
+    /// keep it, repeats an account or name, or lists too many.
+    Keys,
 }
 
 impl PayloadErrorKind {
@@ -134,6 +156,7 @@ impl PayloadErrorKind {
             Self::ProjectTooLarge => "project_too_large",
             Self::Sync => "sync",
             Self::App => "app",
+            Self::Keys => "keys",
         }
     }
 }
@@ -144,13 +167,179 @@ pub fn validate(payload: &[u8]) -> Result<(), PayloadError> {
         kind: PayloadErrorKind::Syntax,
         offset: error.valid_up_to(),
     })?;
+    read_whole(text, &mut ()).map(|_| ())
+}
+
+/// Reads all of `text` as a backup, giving `keys` the spans of its keys, and
+/// returns where its `keys` member lies, when it has one.
+fn read_whole(text: &str, keys: &mut impl KeySpans) -> Result<Option<Range<usize>>, PayloadError> {
     let mut reader = Reader { text, at: 0 };
-    read_backup(&mut reader)?;
+    let member = read_backup(&mut reader, keys)?;
     reader.skip_whitespace();
     if reader.at == text.len() {
-        Ok(())
+        Ok(member)
     } else {
         Err(reader.error(PayloadErrorKind::Syntax))
+    }
+}
+
+/// Checks a payload as [`validate`] does and takes its `keys` out, in place:
+/// the payload is rewritten without that member, and the keys' records follow
+/// it in bytes the member took, every record being shorter than its text.
+/// The bytes the payload gave up beyond the records are zeroed. Returns where
+/// the payload and the records now lie in `buffer`; with no `keys`, the
+/// records are empty and the payload is as it was.
+///
+/// A record is its kind's byte, then:
+/// - 1, a personal root key: its account's 32-byte digest, then its 64 hex digits;
+/// - 2, a live sharing key, and 3, a pending one: its account's 32-byte digest,
+///   then its 44 base64 digits;
+/// - 4, the legacy wrapping key: its 64 hex digits;
+/// - 5, a key floor: its name's 32-byte digest, then its version as a
+///   big-endian u32.
+pub fn take_keys(
+    buffer: &mut [u8],
+    payload: Range<usize>,
+) -> Result<(Range<usize>, Range<usize>), PayloadError> {
+    let mut spans = Vec::new();
+    let member = {
+        let text = std::str::from_utf8(&buffer[payload.clone()]).map_err(|error| PayloadError {
+            kind: PayloadErrorKind::Syntax,
+            offset: error.valid_up_to(),
+        })?;
+        read_whole(text, &mut spans)?
+    };
+    let Some(member) = member else {
+        return Ok((payload.clone(), payload.end..payload.end));
+    };
+    let text = &buffer[payload.clone()];
+    let mut records = Zeroizing::new(Vec::with_capacity(
+        spans.iter().map(KeySpan::record_len).sum(),
+    ));
+    for span in &spans {
+        span.write_record(text, &mut records);
+    }
+    let cut = member_cut(text, member);
+    let (cut_start, cut_end) = (payload.start + cut.start, payload.start + cut.end);
+    if records.len() > cut.len() {
+        return Err(PayloadError {
+            kind: PayloadErrorKind::Keys,
+            offset: cut.start,
+        });
+    }
+    buffer.copy_within(cut_end..payload.end, cut_start);
+    let payload_end = payload.end - cut.len();
+    let keys = payload_end..payload_end + records.len();
+    buffer[keys.clone()].copy_from_slice(&records);
+    buffer[keys.end..payload.end].zeroize();
+    Ok((payload.start..payload_end, keys))
+}
+
+/// The bytes to cut to remove the member at `member` from the object it's
+/// in, with the comma that separates it from a neighbour, so the rest stays
+/// valid JSON.
+fn member_cut(text: &[u8], member: Range<usize>) -> Range<usize> {
+    let is_space = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\r');
+    let before = text[..member.start]
+        .iter()
+        .rposition(|byte| !is_space(byte))
+        .unwrap_or(0);
+    if text[before] == b',' {
+        return before..member.end;
+    }
+    let after = member.end
+        + text[member.end..]
+            .iter()
+            .position(|byte| !is_space(byte))
+            .unwrap_or(text.len() - member.end);
+    if text.get(after) == Some(&b',') {
+        member.start..after + 1
+    } else {
+        member.start..member.end
+    }
+}
+
+/// The kinds of key `keys` holds, as their records name them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyKind {
+    PersonalRoot = 1,
+    SharingLive = 2,
+    SharingPending = 3,
+    WrappingKey = 4,
+}
+
+const FLOOR_RECORD: u8 = 5;
+
+/// One of `keys`' entries, where its text lies in the payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum KeySpan {
+    Key {
+        kind: KeyKind,
+        account: Option<Range<usize>>,
+        value: Range<usize>,
+    },
+    Floor {
+        name: Range<usize>,
+        version: u32,
+    },
+}
+
+impl KeySpan {
+    fn record_len(&self) -> usize {
+        match self {
+            Self::Key { account, value, .. } => {
+                1 + account.as_ref().map_or(0, |_| 32) + value.len()
+            }
+            Self::Floor { .. } => 1 + 32 + 4,
+        }
+    }
+
+    fn write_record(&self, text: &[u8], record: &mut Vec<u8>) {
+        match self {
+            Self::Key {
+                kind,
+                account,
+                value,
+            } => {
+                record.push(*kind as u8);
+                if let Some(account) = account {
+                    record.extend_from_slice(&hex_digest(&text[account.clone()]));
+                }
+                record.extend_from_slice(&text[value.clone()]);
+            }
+            Self::Floor { name, version } => {
+                record.push(FLOOR_RECORD);
+                record.extend_from_slice(&hex_digest(&text[name.clone()]));
+                record.extend_from_slice(&version.to_be_bytes());
+            }
+        }
+    }
+}
+
+/// The 32 bytes 64 lowercase hex digits stand for.
+fn hex_digest(text: &[u8]) -> [u8; 32] {
+    let nibble = |digit: u8| {
+        if digit <= b'9' {
+            digit - b'0'
+        } else {
+            digit - b'a' + 10
+        }
+    };
+    std::array::from_fn(|index| nibble(text[index * 2]) << 4 | nibble(text[index * 2 + 1]))
+}
+
+/// What the reader gives the spans of `keys`' entries to.
+trait KeySpans {
+    fn found(&mut self, span: KeySpan);
+}
+
+impl KeySpans for () {
+    fn found(&mut self, _span: KeySpan) {}
+}
+
+impl KeySpans for Vec<KeySpan> {
+    fn found(&mut self, span: KeySpan) {
+        self.push(span);
     }
 }
 
@@ -163,9 +352,13 @@ fn first(seen: &mut bool, reader: &Reader<'_>, at: usize) -> Result<(), PayloadE
     }
 }
 
-fn read_backup(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
+fn read_backup(
+    reader: &mut Reader<'_>,
+    keys: &mut impl KeySpans,
+) -> Result<Option<Range<usize>>, PayloadError> {
     let (mut created_at, mut producer, mut device_name, mut projects, mut app) =
         (false, false, false, false, false);
+    let mut keys_member = None;
     reader.object(MAX_FIELD_NAME_BYTES, |reader, key, at| {
         match key.as_deref() {
             Some("createdAt") => {
@@ -204,14 +397,184 @@ fn read_backup(reader: &mut Reader<'_>) -> Result<(), PayloadError> {
                 first(&mut app, reader, at)?;
                 reader.optional(read_app).map(|_| ())
             }
+            Some("keys") => {
+                if keys_member.is_some() {
+                    return Err(reader.error_at(PayloadErrorKind::Structure, at));
+                }
+                reader.optional(|reader| read_keys(reader, keys))?;
+                keys_member = Some(at..reader.at);
+                Ok(())
+            }
             _ => Err(reader.error_at(PayloadErrorKind::Structure, at)),
         }
     })?;
     if created_at && producer && projects {
-        Ok(())
+        Ok(keys_member)
     } else {
         Err(reader.error(PayloadErrorKind::Structure))
     }
+}
+
+/// `keys`, giving `spans` where each entry lies.
+fn read_keys(reader: &mut Reader<'_>, spans: &mut impl KeySpans) -> Result<(), PayloadError> {
+    let (mut roots, mut sharing, mut wrapping, mut floors) = (false, false, false, false);
+    reader.object(MAX_FIELD_NAME_BYTES, |reader, key, at| {
+        match key.as_deref() {
+            Some("personalRoots") => {
+                first(&mut roots, reader, at)?;
+                read_key_list(reader, |reader, accounts, entry_at| {
+                    let (mut account, mut value) = (None, None);
+                    reader.object(MAX_FIELD_NAME_BYTES, |reader, key, at| {
+                        let slot = match key.as_deref() {
+                            Some("account") => &mut account,
+                            Some("key") => &mut value,
+                            _ => return Err(reader.error_at(PayloadErrorKind::Structure, at)),
+                        };
+                        once(slot, reader, at, Reader::hex_text)
+                    })?;
+                    let (Some(account), Some(value)) = (account, value) else {
+                        return Err(reader.error(PayloadErrorKind::Structure));
+                    };
+                    claim(accounts, reader, &account, entry_at)?;
+                    spans.found(KeySpan::Key {
+                        kind: KeyKind::PersonalRoot,
+                        account: Some(account),
+                        value,
+                    });
+                    Ok(())
+                })
+            }
+            Some("sharingKeys") => {
+                first(&mut sharing, reader, at)?;
+                read_key_list(reader, |reader, accounts, entry_at| {
+                    let (mut account, mut live, mut pending) = (None, None, None);
+                    reader.object(MAX_FIELD_NAME_BYTES, |reader, key, at| {
+                        match key.as_deref() {
+                            Some("account") => once(&mut account, reader, at, Reader::hex_text),
+                            Some("live") => once(&mut live, reader, at, Reader::base64_key),
+                            Some("pending") => once(&mut pending, reader, at, Reader::base64_key),
+                            _ => Err(reader.error_at(PayloadErrorKind::Structure, at)),
+                        }
+                    })?;
+                    let Some(account) = account else {
+                        return Err(reader.error(PayloadErrorKind::Structure));
+                    };
+                    if live.is_none() && pending.is_none() {
+                        return Err(reader.error_at(PayloadErrorKind::Keys, entry_at));
+                    }
+                    claim(accounts, reader, &account, entry_at)?;
+                    for (kind, value) in [
+                        (KeyKind::SharingLive, live),
+                        (KeyKind::SharingPending, pending),
+                    ] {
+                        if let Some(value) = value {
+                            spans.found(KeySpan::Key {
+                                kind,
+                                account: Some(account.clone()),
+                                value,
+                            });
+                        }
+                    }
+                    Ok(())
+                })
+            }
+            Some("wrappingKey") => {
+                first(&mut wrapping, reader, at)?;
+                let value = reader.hex_text()?;
+                spans.found(KeySpan::Key {
+                    kind: KeyKind::WrappingKey,
+                    account: None,
+                    value,
+                });
+                Ok(())
+            }
+            Some("keyFloors") => {
+                first(&mut floors, reader, at)?;
+                read_key_list(reader, |reader, names, entry_at| {
+                    let (mut name, mut version) = (None, None);
+                    reader.object(MAX_FIELD_NAME_BYTES, |reader, key, at| {
+                        match key.as_deref() {
+                            Some("name") => once(&mut name, reader, at, Reader::hex_text),
+                            Some("version") => once(&mut version, reader, at, Reader::key_version),
+                            _ => Err(reader.error_at(PayloadErrorKind::Structure, at)),
+                        }
+                    })?;
+                    let (Some(name), Some(version)) = (name, version) else {
+                        return Err(reader.error(PayloadErrorKind::Structure));
+                    };
+                    claim(names, reader, &name, entry_at)?;
+                    spans.found(KeySpan::Floor { name, version });
+                    Ok(())
+                })
+            }
+            _ => Err(reader.error_at(PayloadErrorKind::Structure, at)),
+        }
+    })
+}
+
+/// Reads a field of an entry in `keys` with `read`, refusing it the second time.
+fn once<'a, T>(
+    slot: &mut Option<T>,
+    reader: &mut Reader<'a>,
+    at: usize,
+    read: impl FnOnce(&mut Reader<'a>) -> Result<T, PayloadError>,
+) -> Result<(), PayloadError> {
+    if slot.is_some() {
+        return Err(reader.error_at(PayloadErrorKind::Structure, at));
+    }
+    *slot = Some(read(reader)?);
+    Ok(())
+}
+
+/// A list in `keys` of at most [`MAX_KEY_ENTRIES`] entries, with `entry`
+/// reading each from where it starts, given the accounts or names read so
+/// far.
+fn read_key_list<'a>(
+    reader: &mut Reader<'a>,
+    mut entry: impl FnMut(&mut Reader<'a>, &mut HashSet<&'a str>, usize) -> Result<(), PayloadError>,
+) -> Result<(), PayloadError> {
+    let mut names = HashSet::new();
+    let mut count = 0;
+    reader.list(|reader| {
+        reader.skip_whitespace();
+        let at = reader.at;
+        if count == MAX_KEY_ENTRIES {
+            return Err(reader.error_at(PayloadErrorKind::Keys, at));
+        }
+        count += 1;
+        entry(reader, &mut names, at)
+    })
+}
+
+/// Records the account or name at `span`, refusing one already in `names`.
+fn claim<'a>(
+    names: &mut HashSet<&'a str>,
+    reader: &Reader<'a>,
+    span: &Range<usize>,
+    entry_at: usize,
+) -> Result<(), PayloadError> {
+    if names.insert(&reader.text[span.clone()]) {
+        Ok(())
+    } else {
+        Err(reader.error_at(PayloadErrorKind::Keys, entry_at))
+    }
+}
+
+/// Standard base64 of 32 bytes as written with padding: 43 digits, the last
+/// one's two spare bits zero, then one `=`.
+fn is_canonical_base64_of_32_bytes(text: &[u8]) -> bool {
+    let digit = |byte: u8| match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    text.len() == 44
+        && text[43] == b'='
+        && text[..42].iter().all(|&byte| digit(byte).is_some())
+        && digit(text[42]).is_some_and(|value| value & 0b11 == 0)
 }
 
 /// `app`, which fails as [`PayloadErrorKind::App`] where it breaks the
@@ -751,6 +1114,44 @@ impl<'a> Reader<'a> {
             && name.is_valid()
     }
 
+    /// A key, account or name as the stores keep it: 64 lowercase hex
+    /// digits without escapes. Returns where its text lies, never copying it.
+    fn hex_text(&mut self) -> Result<Range<usize>, PayloadError> {
+        self.stored_text(|text| {
+            text.len() == 64
+                && text
+                    .iter()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        })
+    }
+
+    /// A sharing key as the stores keep it: standard base64 of 32 bytes
+    /// without escapes. Returns where its text lies, never copying it.
+    fn base64_key(&mut self) -> Result<Range<usize>, PayloadError> {
+        self.stored_text(is_canonical_base64_of_32_bytes)
+    }
+
+    fn stored_text(&mut self, valid: impl Fn(&[u8]) -> bool) -> Result<Range<usize>, PayloadError> {
+        self.skip_whitespace();
+        let at = self.at;
+        let mut length = DecodedLength::default();
+        let (start, end) = self.string_span(&mut length, PayloadErrorKind::Structure)?;
+        if length.escaped || !valid(&self.text.as_bytes()[start..end]) {
+            return Err(self.error_at(PayloadErrorKind::Keys, at));
+        }
+        Ok(start..end)
+    }
+
+    /// A personal key floor's version: 1 to 2^31 − 1.
+    fn key_version(&mut self) -> Result<u32, PayloadError> {
+        self.skip_whitespace();
+        let at = self.at;
+        u32::try_from(self.unsigned()?)
+            .ok()
+            .filter(|version| (1..=i32::MAX as u32).contains(version))
+            .ok_or_else(|| self.error_at(PayloadErrorKind::Keys, at))
+    }
+
     /// A value: a string, measured as the CLI stores it, never copied.
     fn measured_value(&mut self) -> Result<usize, PayloadError> {
         let mut measured = Measured(2);
@@ -1105,6 +1506,259 @@ mod tests {
 
     fn kind(value: &serde_json::Value) -> Option<PayloadErrorKind> {
         check(value).err().map(|error| error.kind)
+    }
+
+    const ROOT_ACCOUNT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const ROOT_KEY: &str = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1";
+    const SHARING_ACCOUNT: &str =
+        "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+    const LIVE_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const PENDING_KEY: &str = "//////////////////////////////////////////8=";
+    const WRAPPING_KEY: &str = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2";
+    const FLOOR_NAME: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    fn keys() -> serde_json::Value {
+        json!({
+            "personalRoots": [{"account": ROOT_ACCOUNT, "key": ROOT_KEY}],
+            "sharingKeys": [{"account": SHARING_ACCOUNT, "live": LIVE_KEY, "pending": PENDING_KEY}],
+            "wrappingKey": WRAPPING_KEY,
+            "keyFloors": [{"name": FLOOR_NAME, "version": 3}]
+        })
+    }
+
+    fn records() -> Vec<u8> {
+        let mut records = vec![1];
+        records.extend(hex_digest(ROOT_ACCOUNT.as_bytes()));
+        records.extend(ROOT_KEY.as_bytes());
+        records.push(2);
+        records.extend(hex_digest(SHARING_ACCOUNT.as_bytes()));
+        records.extend(LIVE_KEY.as_bytes());
+        records.push(3);
+        records.extend(hex_digest(SHARING_ACCOUNT.as_bytes()));
+        records.extend(PENDING_KEY.as_bytes());
+        records.push(4);
+        records.extend(WRAPPING_KEY.as_bytes());
+        records.push(5);
+        records.extend(hex_digest(FLOOR_NAME.as_bytes()));
+        records.extend(3u32.to_be_bytes());
+        records
+    }
+
+    #[test]
+    fn keys_are_carried_as_the_stores_keep_them() {
+        let mut payload = valid();
+        payload["keys"] = keys();
+        assert_eq!(check(&payload), Ok(()));
+        payload["keys"] = serde_json::Value::Null;
+        assert_eq!(check(&payload), Ok(()));
+        payload["keys"] = json!({"personalRoots": [], "sharingKeys": [], "keyFloors": []});
+        assert_eq!(check(&payload), Ok(()));
+        payload["keys"] =
+            json!({"sharingKeys": [{"account": SHARING_ACCOUNT, "pending": PENDING_KEY}]});
+        assert_eq!(
+            check(&payload),
+            Ok(()),
+            "a pending key alone is a state the stores hold"
+        );
+    }
+
+    #[test]
+    fn keys_written_otherwise_than_the_stores_keep_them_are_refused() {
+        use PayloadErrorKind::{Keys, Structure};
+        let root = |account: &str, key: serde_json::Value| json!({"personalRoots": [{"account": account, "key": key}]});
+        let sharing = |entry: serde_json::Value| json!({"sharingKeys": [entry]});
+        let floor = |version: serde_json::Value| json!({"keyFloors": [{"name": FLOOR_NAME, "version": version}]});
+        let many: Vec<_> = (0..=MAX_KEY_ENTRIES)
+            .map(|index| json!({"name": format!("{index:064x}"), "version": 1}))
+            .collect();
+        for (case, keys, expected) in [
+            (
+                "uppercase hex",
+                root(ROOT_ACCOUNT, json!(ROOT_KEY.to_uppercase())),
+                Keys,
+            ),
+            ("short hex", root(ROOT_ACCOUNT, json!(&ROOT_KEY[1..])), Keys),
+            (
+                "short account",
+                root(&ROOT_ACCOUNT[1..], json!(ROOT_KEY)),
+                Keys,
+            ),
+            ("number key", root(ROOT_ACCOUNT, json!(1)), Structure),
+            (
+                "unpadded base64",
+                sharing(json!({"account": SHARING_ACCOUNT, "live": &LIVE_KEY[..43]})),
+                Keys,
+            ),
+            (
+                "spare bits set",
+                sharing(
+                    json!({"account": SHARING_ACCOUNT, "live": format!("{}B=", &LIVE_KEY[..42])}),
+                ),
+                Keys,
+            ),
+            (
+                "url-safe base64",
+                sharing(json!({"account": SHARING_ACCOUNT, "live": PENDING_KEY.replace('/', "_")})),
+                Keys,
+            ),
+            (
+                "no slot",
+                sharing(json!({"account": SHARING_ACCOUNT})),
+                Keys,
+            ),
+            ("no account", sharing(json!({"live": LIVE_KEY})), Structure),
+            (
+                "unknown field",
+                sharing(json!({"account": SHARING_ACCOUNT, "live": LIVE_KEY, "x": 1})),
+                Structure,
+            ),
+            ("floor zero", floor(json!(0)), Keys),
+            ("floor too high", floor(json!(1u64 << 31)), Keys),
+            ("too many", json!({"keyFloors": many}), Keys),
+            ("unknown list", json!({"orgKeys": []}), Structure),
+        ] {
+            let mut payload = valid();
+            payload["keys"] = keys;
+            assert_eq!(kind(&payload), Some(expected), "{case}");
+        }
+
+        let head = r#"{"createdAt":0,"producer":{"name":"a","version":"1"},"projects":[],"keys":{"personalRoots":["#;
+        let entry = format!(r#"{{"account":"{ROOT_ACCOUNT}","key":"{ROOT_KEY}"}}"#);
+        let repeated = format!("{head}{entry},{entry}]}}}}");
+        let error = validate(repeated.as_bytes()).expect_err("a repeated account");
+        assert_eq!(
+            (error.kind, error.offset),
+            (Keys, head.len() + entry.len() + 1)
+        );
+        let escaped = format!(
+            r#"{head}{{"account":"{ROOT_ACCOUNT}","key":"\u0061{}"}}]}}}}"#,
+            &ROOT_KEY[1..]
+        );
+        let error = validate(escaped.as_bytes()).expect_err("an escaped key");
+        assert_eq!(
+            (error.kind, error.offset),
+            (Keys, offset_of(&escaped, r#""\u0061"#))
+        );
+        let twice = r#"{"createdAt":0,"producer":{"name":"a","version":"1"},"projects":[],"keys":null,"keys":null}"#;
+        let error = validate(twice.as_bytes()).expect_err("a repeated keys member");
+        assert_eq!(
+            (error.kind, error.offset),
+            (Structure, offset_of(twice, r#""keys":null}"#))
+        );
+    }
+
+    /// `payload` with its keys taken out: the payload, the records, and the
+    /// whole buffer after it.
+    fn taken(payload: &str) -> (String, Vec<u8>, Vec<u8>) {
+        let mut buffer = format!("--{payload}--").into_bytes();
+        let range = 2..2 + payload.len();
+        let (payload, keys) = take_keys(&mut buffer, range.clone()).expect("take keys");
+        assert_eq!(payload.start, range.start);
+        assert_eq!(keys.start, payload.end);
+        assert!(keys.end <= range.end);
+        assert_eq!(&buffer[range.end..], b"--");
+        (
+            String::from_utf8(buffer[payload].to_vec()).expect("text"),
+            buffer[keys.clone()].to_vec(),
+            buffer[keys.end..range.end].to_vec(),
+        )
+    }
+
+    #[test]
+    fn taking_keys_out_leaves_a_valid_payload_and_their_records() {
+        let expected = valid();
+        for (first, pretty) in [(true, false), (false, false), (true, true), (false, true)] {
+            let mut ordered = serde_json::Map::new();
+            if first {
+                ordered.insert("keys".into(), keys());
+            }
+            for (field, value) in expected.as_object().expect("object") {
+                ordered.insert(field.clone(), value.clone());
+            }
+            if !first {
+                ordered.insert("keys".into(), keys());
+            }
+            let value = serde_json::Value::Object(ordered);
+            let text = if pretty {
+                serde_json::to_string_pretty(&value)
+            } else {
+                serde_json::to_string(&value)
+            }
+            .expect("encode");
+            let (payload, records, rest) = taken(&text);
+            assert_eq!(
+                validate(payload.as_bytes()),
+                Ok(()),
+                "first: {first}, pretty: {pretty}"
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&payload).expect("json"),
+                expected
+            );
+            assert_eq!(records, super::tests::records());
+            assert!(
+                rest.iter().all(|&byte| byte == 0),
+                "the bytes given up are zeroed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_payload_without_keys_is_left_as_it_was_and_null_keys_are_cut() {
+        let text = serde_json::to_string(&valid()).expect("encode");
+        let (payload, records, rest) = taken(&text);
+        assert_eq!((payload, records, rest), (text, Vec::new(), Vec::new()));
+
+        let mut with_null = valid();
+        with_null["keys"] = serde_json::Value::Null;
+        let (payload, records, _) = taken(&serde_json::to_string(&with_null).expect("encode"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&payload).expect("json"),
+            valid()
+        );
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn the_tightest_keys_still_fit_their_records() {
+        let head = r#"{"createdAt":0,"producer":{"name":"a","version":"1"},"projects":[],"keys":"#;
+        for keys in [
+            format!(r#"{{"personalRoots":[{{"account":"{ROOT_ACCOUNT}","key":"{ROOT_KEY}"}}]}}"#),
+            format!(r#"{{"sharingKeys":[{{"account":"{SHARING_ACCOUNT}","live":"{LIVE_KEY}"}}]}}"#),
+            format!(
+                r#"{{"sharingKeys":[{{"account":"{SHARING_ACCOUNT}","live":"{LIVE_KEY}","pending":"{PENDING_KEY}"}}]}}"#
+            ),
+            format!(r#"{{"wrappingKey":"{WRAPPING_KEY}"}}"#),
+            format!(r#"{{"keyFloors":[{{"name":"{FLOOR_NAME}","version":1}}]}}"#),
+        ] {
+            let text = format!("{head}{keys}}}");
+            let (payload, records, _) = taken(&text);
+            assert_eq!(validate(payload.as_bytes()), Ok(()), "{keys}");
+            assert!(!records.is_empty(), "{keys}");
+        }
+    }
+
+    #[test]
+    fn no_key_text_is_left_outside_its_records() {
+        let mut payload = valid();
+        payload["keys"] = keys();
+        let text = serde_json::to_string(&payload).expect("encode");
+        let mut buffer = text.clone().into_bytes();
+        let (payload, records) = take_keys(&mut buffer, 0..text.len()).expect("take keys");
+        for secret in [ROOT_KEY, LIVE_KEY, PENDING_KEY, WRAPPING_KEY] {
+            let found: Vec<_> = buffer
+                .windows(secret.len())
+                .enumerate()
+                .filter(|(_, window)| *window == secret.as_bytes())
+                .map(|(at, _)| at)
+                .collect();
+            assert_eq!(found.len(), 1, "{secret} appears once");
+            assert!(
+                records.contains(&found[0]),
+                "{secret} is only in the records"
+            );
+            assert!(!payload.contains(&found[0]));
+        }
     }
 
     #[test]
@@ -2070,6 +2724,7 @@ mod tests {
             ProjectTooLarge,
             Sync,
             App,
+            Keys,
         ];
         let codes: HashSet<_> = kinds.iter().map(|kind| kind.code()).collect();
         assert_eq!(codes.len(), kinds.len());
