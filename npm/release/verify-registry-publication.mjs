@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import { PLATFORM_PACKAGES } from "./release-artifacts.mjs";
 import {
+  PublishedVersionMismatchError,
   assertSupportedDistTag,
   readManifest,
   releasePackageRecord,
@@ -11,7 +12,9 @@ import {
 } from "./verify-published-package.mjs";
 
 const WRAPPER_PACKAGE = "@lpm-registry/cli";
-const PROPAGATION_TIMEOUT_MS = 600_000;
+// npm acknowledges a publish before it lists the version, and has taken over
+// twelve minutes to list a large platform tarball.
+export const PROPAGATION_TIMEOUT_MS = 30 * 60_000;
 const INITIAL_RETRY_DELAY_MS = 5_000;
 const MAX_RETRY_DELAY_MS = 30_000;
 const ARGUMENT_NAMES = Object.freeze(["manifest", "scope", "tag"]);
@@ -28,7 +31,9 @@ export const PUBLICATION_SCOPES = Object.freeze({
  *
  * Every package is checked concurrently, and a failure names each package that
  * never became verifiable together with its last error, so one run reports the
- * whole set of missing or mismatched publications.
+ * whole set of missing or mismatched publications. A package npm already lists
+ * with a different identity or digest fails at once instead of being retried,
+ * because npm never changes a published version.
  */
 export async function verifyRegistryPublications({
   releaseManifest,
@@ -93,6 +98,7 @@ async function verifyBeforeDeadline({ deadline, log, now, sleep, verify, label }
       await verify();
       return null;
     } catch (error) {
+      if (error instanceof PublishedVersionMismatchError) return error;
       const remaining = deadline - now();
       if (remaining <= 0) return error;
       log(`${label} is not verifiable on npm yet (attempt ${attempt}): ${describe(error)}`);
