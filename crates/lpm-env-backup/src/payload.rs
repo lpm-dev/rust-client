@@ -30,9 +30,9 @@
 //! Names, folders and vault IDs are kept as the CLI stores them, which can be
 //! any text, including direction controls: show them isolated, with controls
 //! made visible. The labels this format defines (the producer, `deviceName`
-//! and `principalId`) refuse controls and direction controls. Restorers whose
-//! store names files after vault IDs, as the CLI's file store does on Windows,
-//! must map them to names that are valid and distinct there. A project's
+//! and `principalId`) refuse controls and direction controls. A restorer
+//! whose store names files after vault IDs must map them to names that are
+//! valid and distinct there. A project's
 //! environments as the CLI stores them, and the index record that lists them
 //! with the project's name and folder, must each fit the credential store's
 //! limit on one item. Registries are written as the CLI's sync bindings hold
