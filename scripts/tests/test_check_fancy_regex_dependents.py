@@ -30,11 +30,13 @@ REVIEWED_GRAPH = [
 
 
 class CheckFancyRegexDependentsTests(unittest.TestCase):
-    def run_check(self, packages):
+    def run_check(self, packages, built=()):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'Cargo.lock'
             path.write_text(lockfile(packages))
-            with patch('sys.argv', ['check', '--lockfile', str(path)]), patch('builtins.print'):
+            is_built = lambda name, version, root: (name, version) in built
+            with patch('sys.argv', ['check', '--lockfile', str(path)]), patch('builtins.print'), \
+                    patch.object(check, 'is_built', is_built):
                 return check.main()
 
     def test_dependents_include_versioned_and_unversioned_references(self):
@@ -54,6 +56,22 @@ class CheckFancyRegexDependentsTests(unittest.TestCase):
 
     def test_a_reviewed_dependent_that_is_gone_fails(self):
         self.assertEqual(self.run_check([entry for entry in REVIEWED_GRAPH if entry[0] != 'termwiz']), 1)
+
+    def test_a_dependent_reviewed_as_never_built_that_is_now_built_fails(self):
+        self.assertEqual(self.run_check(REVIEWED_GRAPH, built={('termwiz', '0.23.3')}), 1)
+
+    def test_only_dependents_reviewed_as_never_built_are_checked_with_cargo_tree(self):
+        asked = []
+        def is_built(name, version, root):
+            asked.append(name)
+            return False
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'Cargo.lock'
+            path.write_text(lockfile(REVIEWED_GRAPH))
+            with patch('sys.argv', ['check', '--lockfile', str(path)]), patch('builtins.print'), \
+                    patch.object(check, 'is_built', is_built):
+                self.assertEqual(check.main(), 0)
+        self.assertEqual(asked, ['termwiz'])
 
     def test_the_repository_lockfile_matches_the_reviewed_list(self):
         with patch('sys.argv', ['check']), patch('builtins.print'):
