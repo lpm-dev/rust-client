@@ -330,7 +330,7 @@ pub(super) async fn env_pair(
                 }
                 let scope = lpm_vault::sync::SharingKeyScope::new(&registry_url, &expected_principal_id)?;
                 let local = lpm_vault::sync::resolve_local_public_key_state(&scope)?;
-                if current.public_key_b64.as_deref() != Some(local.public_key_b64.as_str()) {
+                if current.public_key_b64() != Some(local.public_key_b64.as_str()) {
                     return Err("this device does not have the registered organization sharing key; run `lpm env pull --org <organization>` on your trusted device before pairing".into());
                 }
                 Ok(local.private_key)

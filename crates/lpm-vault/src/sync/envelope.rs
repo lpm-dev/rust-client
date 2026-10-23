@@ -493,10 +493,7 @@ pub(super) fn parse_sharing_key_response(
         }
         "stepUpRequired" => {
             let data: StepUpRequiredData = parse_data(envelope.data)?;
-            if !matches!(
-                data.required_scope.as_str(),
-                "vault:public-key:set" | "vault:public-key:rotate"
-            ) {
+            if !super::public_key::is_sharing_key_step_up_scope(&data.required_scope) {
                 return Err("sharing-key envelope has an invalid step-up scope".into());
             }
             response.message = Some("Sharing-key write requires step-up authorization".into());

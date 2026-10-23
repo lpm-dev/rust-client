@@ -191,8 +191,9 @@ pub use public_key::{
     create_pending_x25519_keypair, discard_pending_x25519_keypair, get_my_public_key,
     get_my_public_key_state, get_org_member_key_access, get_org_member_keys,
     promote_pending_x25519_keypair, read_pending_x25519_keypair, resolve_local_public_key_state,
-    resolve_public_key_state_from_member_access, start_sharing_key_rotation,
-    try_acquire_sharing_key_rotation_lock, upload_public_key, upload_public_key_for_org,
+    resolve_public_key_state_from_member_access, sharing_key_step_up_scope,
+    start_sharing_key_rotation, try_acquire_sharing_key_rotation_lock, upload_public_key,
+    upload_public_key_for_org,
 };
 pub use step_up::{
     CLI_STEP_UP_HEADER_NAME, CliStepUpCredential, CliStepUpPolicy, discover_cli_step_up_policy,

@@ -55,7 +55,7 @@ fn run_case(name: &str, isolated: bool, tampered: bool, accepted: bool) {
             if accepted {
                 let state = result.expect("isolated signed response must verify");
                 assert_eq!(state.principal_id, "acceptance-principal");
-                assert_eq!(state.public_key_b64, None);
+                assert_eq!(state.public_key_b64(), None);
                 #[cfg(any(debug_assertions, feature = "acceptance-test-hooks"))]
                 for address in [
                     "https://lpm.dev",

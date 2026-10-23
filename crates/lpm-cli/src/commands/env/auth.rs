@@ -311,7 +311,7 @@ mod tests {
                     lpm_vault::sync::mint_cli_step_up_proof(
                         &registry_url,
                         &auth_token,
-                        "vault:public-key:set",
+                        &format!("vault:public-key:set:{}", "a".repeat(64)),
                         &lpm_vault::sync::CliStepUpCredential::Password {
                             password: "wrong-password",
                         },

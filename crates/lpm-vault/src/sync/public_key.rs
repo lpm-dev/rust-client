@@ -106,9 +106,9 @@ pub struct UploadPublicKeyResponse {
 /// Upload the user's X25519 public key to the server.
 ///
 /// `step_up_proof` carries the CLI step-up JWT in the
-/// `X-LPM-Step-Up-Proof` header. The server requires a proof minted
-/// with audience `vault:public-key:set` for first-set, or
-/// `vault:public-key:rotate` for rotation; an idempotent same-key
+/// `X-LPM-Step-Up-Proof` header. The server requires a proof minted for
+/// the scope [`sharing_key_step_up_scope`] names, which binds the new key
+/// and the key it replaces; an idempotent same-key
 /// repost does not require a proof and is reported back as
 /// `status: "unchanged"`.
 ///
@@ -134,7 +134,7 @@ pub async fn upload_public_key(
     let authoritative =
         get_my_public_key_state_with_client(client, registry_url, auth_token).await?;
     if authoritative.principal_id != expected_principal_id
-        || authoritative.public_key_b64.as_deref() != Some(public_key_b64)
+        || authoritative.public_key_b64() != Some(public_key_b64)
     {
         return Err("server did not confirm the uploaded sharing key".into());
     }
@@ -254,14 +254,83 @@ pub async fn get_my_public_key(
     Ok(
         get_my_public_key_state_with_client(client, registry_url, auth_token)
             .await?
-            .public_key_b64,
+            .public_key_b64()
+            .map(str::to_owned),
     )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MyPublicKeyState {
     pub principal_id: String,
-    pub public_key_b64: Option<String>,
+    /// The account's current sharing key, as lpm.dev signed it, when it has one.
+    pub key: Option<ValidatedSharingKey>,
+}
+
+impl MyPublicKeyState {
+    /// The account's current sharing public key, in canonical base64.
+    pub fn public_key_b64(&self) -> Option<&str> {
+        self.key
+            .as_ref()
+            .map(ValidatedSharingKey::encoded_public_key)
+    }
+
+    /// The step-up scope lpm.dev requires to make `new_public_key_b64` this
+    /// account's sharing key, from the key it has now.
+    pub fn step_up_scope_to_install(&self, new_public_key_b64: &str) -> Result<String, String> {
+        sharing_key_step_up_scope(self.key.as_ref(), new_public_key_b64)
+    }
+}
+
+/// The step-up scope lpm.dev requires to make `new_public_key_b64` an
+/// account's sharing key: `vault:public-key:set:<new fingerprint>` when it has
+/// none, or `vault:public-key:rotate:<version>:<fingerprint>:<new fingerprint>`
+/// naming the key it replaces. A proof for it can't install another key, or
+/// replace a key that changed after it was minted.
+pub fn sharing_key_step_up_scope(
+    current: Option<&ValidatedSharingKey>,
+    new_public_key_b64: &str,
+) -> Result<String, String> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(new_public_key_b64)
+        .map_err(|_| "the new sharing key isn't valid base64".to_owned())?;
+    let new_public_key: [u8; 32] = decoded
+        .try_into()
+        .map_err(|_| "the new sharing key isn't 32 bytes".to_owned())?;
+    let new = public_key_fingerprint(&new_public_key);
+    Ok(match current {
+        None => format!("vault:public-key:set:{new}"),
+        Some(current) => format!(
+            "vault:public-key:rotate:{}:{}:{new}",
+            current.version(),
+            current.fingerprint()
+        ),
+    })
+}
+
+/// Whether `scope` is a sharing-key step-up scope as lpm.dev names one (see
+/// [`sharing_key_step_up_scope`]).
+pub(super) fn is_sharing_key_step_up_scope(scope: &str) -> bool {
+    let is_fingerprint = |part: &str| {
+        part.len() == 64
+            && part
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    if let Some(new) = scope.strip_prefix("vault:public-key:set:") {
+        return is_fingerprint(new);
+    }
+    let Some(rotation) = scope.strip_prefix("vault:public-key:rotate:") else {
+        return false;
+    };
+    let mut parts = rotation.split(':');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(version), Some(current), Some(new), None)
+            if (1..=10).contains(&version.len())
+                && version.bytes().all(|byte| byte.is_ascii_digit())
+                && is_fingerprint(current)
+                && is_fingerprint(new)
+    )
 }
 
 pub async fn get_my_public_key_state(
@@ -306,12 +375,9 @@ async fn get_my_public_key_state_with_client(
             ),
         ));
     }
-    let public_key_b64 = envelope
-        .sharing_key
-        .map(|key| key.encoded_public_key().to_owned());
     Ok(MyPublicKeyState {
         principal_id: envelope.principal_id,
-        public_key_b64,
+        key: envelope.sharing_key,
     })
 }
 
@@ -430,7 +496,7 @@ pub enum PublicKeyRegistrationState {
     /// check.
     Matches(LocalPublicKeyState),
     /// Server has no key for this user. Caller must acquire a CLI
-    /// step-up proof (`vault:public-key:set` scope) and call
+    /// step-up proof for [`sharing_key_step_up_scope`]`(None, …)` and call
     /// `upload_public_key(..., Some(proof))` to register before
     /// proceeding.
     NeedsInitialSet(LocalPublicKeyState),
@@ -439,8 +505,8 @@ pub enum PublicKeyRegistrationState {
     /// vector the server hardening exists to close. The CLI command layer
     /// surfaces this state by refusing the operation and instructing
     /// the user to run the explicit rotation flow (`lpm env
-    /// rotate-sharing-key`), which acquires a `vault:public-key:rotate`
-    /// proof.
+    /// rotate-sharing-key`), which acquires a rotation proof naming the
+    /// key it replaces.
     RotationRequired {
         local: LocalPublicKeyState,
         server_public_key_b64: String,
@@ -454,7 +520,7 @@ pub enum PublicKeyRegistrationState {
 ///
 ///   - `Matches` — same key on both sides; caller can no-op.
 ///   - `NeedsInitialSet` — no key on server; caller can register the
-///     local key with a `vault:public-key:set` proof.
+///     local key with a first-key proof ([`sharing_key_step_up_scope`]).
 ///   - `RotationRequired` — different key on server; caller MUST refuse
 ///     to silently upload (the prior `ensure_public_key` path overwrote
 ///     here, which is the security bug this state prevents).
@@ -470,14 +536,14 @@ pub async fn classify_public_key_state(
     let scope = SharingKeyScope::new(registry_url, &server.principal_id)?;
     let local = resolve_local_public_key_state(&scope)?;
 
-    match server.public_key_b64 {
+    match server.public_key_b64() {
         None => Ok(PublicKeyRegistrationState::NeedsInitialSet(local)),
         Some(server) if server == local.public_key_b64 => {
             Ok(PublicKeyRegistrationState::Matches(local))
         }
         Some(server) => Ok(PublicKeyRegistrationState::RotationRequired {
+            server_public_key_b64: server.to_owned(),
             local,
-            server_public_key_b64: server,
         }),
     }
 }
@@ -574,7 +640,7 @@ where
     }
     let mut discarded_pending = false;
     if let Some(pending) = read_pending_x25519_keypair(&scope).map_err(Local)? {
-        if current.public_key_b64.as_deref() == Some(&pending.public_key_b64) {
+        if current.public_key_b64() == Some(&pending.public_key_b64) {
             promote_pending_x25519_keypair(&scope).map_err(Local)?;
             return Ok(SharingKeyRotationStart::Resumed);
         }
@@ -601,8 +667,8 @@ where
 ///
 ///   1. Generate a fresh keypair and persist it to the pending slot
 ///      WITHOUT touching the live slot.
-///   2. Upload the pending public key with a `vault:public-key:rotate`
-///      step-up proof.
+///   2. Upload the pending public key with a step-up proof naming it and
+///      the key it replaces ([`sharing_key_step_up_scope`]).
 ///   3. On HTTP success, atomically promote the pending slot into the
 ///      live slot.
 ///   4. On restart (or any future invocation), if the pending slot
@@ -1047,6 +1113,91 @@ mod tests {
         let private_key = [byte.wrapping_add(1); 32];
         base64::engine::general_purpose::STANDARD
             .encode(crate::crypto::x25519_public_from_private(&private_key))
+    }
+
+    /// `public_key_b64` as lpm.dev would sign it at `version`.
+    fn signed_key(public_key_b64: &str, version: i32) -> ValidatedSharingKey {
+        let raw: [u8; 32] = base64::engine::general_purpose::STANDARD
+            .decode(public_key_b64)
+            .expect("base64")
+            .try_into()
+            .expect("32 bytes");
+        ValidatedSharingKey::from_authenticated(
+            public_key_b64.to_owned(),
+            version,
+            public_key_fingerprint(&raw),
+        )
+        .expect("a signed key")
+    }
+
+    #[test]
+    fn sharing_key_scopes_name_the_new_key_and_the_key_it_replaces() {
+        let current = signed_key(&test_public_key(1), 3);
+        let new = test_public_key(2);
+        let new_fingerprint = public_key_fingerprint(
+            &base64::engine::general_purpose::STANDARD
+                .decode(&new)
+                .expect("base64")
+                .try_into()
+                .expect("32 bytes"),
+        );
+        let set = sharing_key_step_up_scope(None, &new).expect("set scope");
+        let rotate = sharing_key_step_up_scope(Some(&current), &new).expect("rotate scope");
+        assert_eq!(set, format!("vault:public-key:set:{new_fingerprint}"));
+        assert_eq!(
+            rotate,
+            format!(
+                "vault:public-key:rotate:3:{}:{new_fingerprint}",
+                current.fingerprint()
+            )
+        );
+        let state = MyPublicKeyState {
+            principal_id: "caller".into(),
+            key: Some(current),
+        };
+        assert_eq!(state.step_up_scope_to_install(&new).expect("scope"), rotate);
+        assert!(sharing_key_step_up_scope(None, "not base64!").is_err());
+        assert!(sharing_key_step_up_scope(None, "AAAA").is_err());
+
+        for scope in [&set, &rotate] {
+            assert!(is_sharing_key_step_up_scope(scope), "{scope}");
+        }
+        for scope in [
+            "vault:public-key:set".to_owned(),
+            "vault:public-key:rotate".to_owned(),
+            set.to_uppercase(),
+            format!("{set}0"),
+            format!("vault:public-key:rotate:{new_fingerprint}:{new_fingerprint}"),
+            format!("vault:public-key:rotate::{new_fingerprint}:{new_fingerprint}"),
+            format!("vault:public-key:rotate:12345678901:{new_fingerprint}:{new_fingerprint}"),
+            format!("{rotate}:extra"),
+        ] {
+            assert!(!is_sharing_key_step_up_scope(&scope), "{scope}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_step_up_envelope_naming_no_key_is_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/users/me/public-key"))
+            .respond_with(signed_envelope_response(
+                403,
+                "sharingKey.write",
+                "stepUpRequired",
+                account_binding("caller"),
+                serde_json::json!({ "requiredScope": "vault:public-key:set" }),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let error = upload_public_key(&server.uri(), "token", "caller", &test_public_key(3), None)
+            .await
+            .expect_err("an unbound scope");
+        assert!(
+            error.to_string().contains("invalid step-up scope"),
+            "{error}"
+        );
     }
 
     fn account_binding(principal_id: &str) -> serde_json::Value {
@@ -1592,7 +1743,10 @@ mod tests {
                 "sharingKey.write",
                 "stepUpRequired",
                 account_binding("caller"),
-                serde_json::json!({ "requiredScope": "vault:public-key:set" }),
+                serde_json::json!({
+                    "requiredScope": sharing_key_step_up_scope(None, &test_public_key(3))
+                        .expect("scope")
+                }),
             ))
             .expect(1)
             .mount(&server)
@@ -1964,11 +2118,11 @@ mod tests {
         let reads = std::cell::RefCell::new(vec![
             MyPublicKeyState {
                 principal_id: "caller".into(),
-                public_key_b64: Some(pending.public_key_b64.clone()),
+                key: Some(signed_key(&pending.public_key_b64, 2)),
             },
             MyPublicKeyState {
                 principal_id: "caller".into(),
-                public_key_b64: Some("the key before the rotation".into()),
+                key: Some(signed_key(&test_public_key(9), 1)),
             },
         ]);
         let start = start_sharing_key_rotation("https://registry.example", || {
@@ -2006,11 +2160,11 @@ mod tests {
         let reads = std::cell::RefCell::new(vec![
             MyPublicKeyState {
                 principal_id: "someone else".into(),
-                public_key_b64: None,
+                key: None,
             },
             MyPublicKeyState {
                 principal_id: "caller".into(),
-                public_key_b64: None,
+                key: None,
             },
         ]);
         let start = start_sharing_key_rotation("https://registry.example", || {
