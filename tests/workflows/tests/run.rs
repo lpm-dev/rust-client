@@ -8,7 +8,10 @@ mod support;
 use std::sync::{Arc, Mutex};
 use support::auth_state::{SessionSeed, seed_sessions};
 use support::mock_registry::MockRegistry;
-use support::{TempProject, lpm, lpm_spawnable, lpm_spawnable_from_path, write_repeated_file};
+use support::{
+    TempProject, fallback_vault_file, lpm, lpm_spawnable, lpm_spawnable_from_path,
+    write_repeated_file,
+};
 use wiremock::matchers::{header, method, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -55,10 +58,7 @@ fn run_stops_before_lifecycle_hooks_when_linked_env_secrets_cannot_be_read() {
         String::from_utf8_lossy(&seed.stderr)
     );
     std::fs::write(
-        project
-            .home()
-            .join(".lpm/vaults")
-            .join(format!("{project_id}.enc")),
+        fallback_vault_file(project.home(), project_id),
         "invalid-encrypted-fixture",
     )
     .expect("make the isolated env record unreadable");
@@ -113,7 +113,7 @@ fn env_denial_emits_one_failed_json_envelope() {
                 .success()
         );
         std::fs::write(
-            project.home().join(".lpm/vaults/json-denied.enc"),
+            fallback_vault_file(project.home(), "json-denied"),
             "invalid-encrypted-fixture",
         )
         .unwrap();
@@ -141,7 +141,7 @@ fn late_env_denial_during_cache_publication_never_reports_success() {
             r#"{"name":"cache-env-denial","scripts":{"build":"node build.js"}}"#,
         );
         project.write_file("lpm.json", r#"{"vault":"cache-denied","tasks":{"build":{"cache":true,"cacheEnv":[],"inputs":["build.js"],"outputs":["dist/**"]}}}"#);
-        let record = project.home().join(".lpm/vaults/cache-denied.enc");
+        let record = fallback_vault_file(project.home(), "cache-denied");
         project.write_file("build.js", &format!("const fs=require('fs');fs.mkdirSync('dist',{{recursive:true}});fs.writeFileSync('dist/result','ok');fs.writeFileSync({},'invalid-encrypted-fixture');",serde_json::to_string(&record.to_string_lossy()).unwrap()));
         assert!(
             lpm(&project)
@@ -198,7 +198,7 @@ fn workspace_env_denial_stops_later_members_even_with_no_bail() {
             String::from_utf8_lossy(&seed.stderr)
         );
         std::fs::write(
-            project.home().join(".lpm/vaults/workspace-denied.enc"),
+            fallback_vault_file(project.home(), "workspace-denied"),
             "invalid-encrypted-fixture",
         )
         .unwrap();
@@ -242,7 +242,7 @@ fn watch_exits_without_hooks_when_linked_env_retrieval_is_denied() {
             .unwrap();
         assert!(seed.status.success());
         std::fs::write(
-            project.home().join(".lpm/vaults/watch-denied.enc"),
+            fallback_vault_file(project.home(), "watch-denied"),
             "invalid-encrypted-fixture",
         )
         .unwrap();

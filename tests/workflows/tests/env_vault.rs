@@ -630,7 +630,7 @@ fn write_file_backed_vault(home: &std::path::Path, vault_id: &str, payload: serd
         BASE64.encode(encrypted)
     );
 
-    write_private_file(&vaults_dir.join(format!("{vault_id}.enc")), encoded);
+    write_private_file(&support::fallback_vault_file(home, vault_id), encoded);
 }
 
 fn parse_clean_json_stdout(output: &std::process::Output) -> serde_json::Value {
@@ -986,7 +986,7 @@ fn doctor_json_reports_unavailable_vault_storage_when_blob_has_no_key_source() {
     let vaults_dir = project.home().join(".lpm").join("vaults");
     std::fs::create_dir_all(&vaults_dir).expect("failed to create vaults dir");
     std::fs::write(
-        vaults_dir.join("missing-key.enc"),
+        support::fallback_vault_file(project.home(), "missing-key"),
         "not decrypted during status",
     )
     .expect("failed to seed vault blob");
@@ -1949,11 +1949,7 @@ async fn env_pull_rejects_a_different_bound_account_before_local_overwrite() {
             }
         }),
     );
-    let vault_path = project
-        .home()
-        .join(".lpm")
-        .join("vaults")
-        .join(format!("{vault_id}.enc"));
+    let vault_path = support::fallback_vault_file(project.home(), vault_id);
     let before_vault = std::fs::read(&vault_path).expect("read local vault before pull");
     let before_manifest = project.read_file("lpm.json");
 
@@ -2023,7 +2019,7 @@ async fn env_pull_rejects_semantically_invalid_lpm_json_before_network_or_local_
             }
         }),
     );
-    let vault_path = project.home().join(".lpm/vaults/vault-invalid-pull.enc");
+    let vault_path = support::fallback_vault_file(project.home(), "vault-invalid-pull");
     let original_vault = std::fs::read(&vault_path).expect("read original local vault");
 
     let output = lpm(&project)
