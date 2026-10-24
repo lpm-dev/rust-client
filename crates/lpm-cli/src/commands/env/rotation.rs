@@ -836,7 +836,9 @@ async fn register_missing_sharing_key_for_org(
          before continuing with `{op_label}`. You'll be prompted to confirm your \
          password (and authenticator code, if enrolled) to authorize the write."
     ));
-    let proof = crate::step_up::request_cli_step_up_proof(client, "vault:public-key:set").await?;
+    let step_up_scope = lpm_vault::sync::sharing_key_step_up_scope(None, &local.public_key_b64)
+        .map_err(LpmError::Script)?;
+    let proof = crate::step_up::request_cli_step_up_proof(client, &step_up_scope).await?;
     let (refreshed_access, refreshed_registry_url) =
         super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
             let public_key = local.public_key_b64.clone();
@@ -1150,14 +1152,22 @@ pub(super) async fn env_rotate_sharing_key(
         ));
     }
 
-    // Acquire the step-up proof BEFORE generating the pending
-    // key — a credential refusal must not leave a stale pending file
-    // on disk.
-    let proof =
-        crate::step_up::request_cli_step_up_proof(client, "vault:public-key:rotate").await?;
-
+    // The proof names the new key, so the pending key comes first. A refused
+    // or cancelled confirmation discards it; this run holds the rotation
+    // lock, so no other run can be relying on it.
     let pending =
         lpm_vault::sync::create_pending_x25519_keypair(&key_scope).map_err(LpmError::Script)?;
+    let step_up_scope = server_key
+        .step_up_scope_to_install(&pending.public_key_b64)
+        .map_err(LpmError::Script)?;
+    let proof = match crate::step_up::request_cli_step_up_proof(client, &step_up_scope).await {
+        Ok(proof) => proof,
+        Err(error) => {
+            lpm_vault::sync::discard_pending_x25519_keypair(&key_scope)
+                .map_err(LpmError::Script)?;
+            return Err(error);
+        }
+    };
     let expected_registry_url = registry_url.clone();
     let expected_principal_id = server_key.principal_id.clone();
 

@@ -6,9 +6,13 @@
 //! WS3 + WS4 server gates require a step-up proof for routes through
 //! this helper:
 //!
-//!   - `lpm env rotate-sharing-key` → `vault:public-key:rotate`
+//!   - `lpm env rotate-sharing-key` →
+//!     `vault:public-key:rotate:<version>:<fingerprint>:<new fingerprint>`
 //!   - `lpm env share` / `lpm env pull --org` first-time registration
-//!     → `vault:public-key:set`
+//!     → `vault:public-key:set:<new fingerprint>`
+//!
+//!   Sharing-key scopes name the new key and the key it replaces
+//!   (`lpm_vault::sync::sharing_key_step_up_scope`).
 //!   - (future) force-push gates → `vault:force-push:*`
 //!
 //! Always refuses non-interactive callers: a CI environment piping

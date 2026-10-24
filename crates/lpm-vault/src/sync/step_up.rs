@@ -247,7 +247,7 @@ mod tests {
         let proof = mint_cli_step_up_proof(
             &server.uri(),
             "token",
-            "vault:public-key:set",
+            "vault:public-key:set:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &CliStepUpCredential::Password {
                 password: "hunter2",
             },
@@ -258,7 +258,7 @@ mod tests {
 
         let body = captured.lock().unwrap()[0].clone();
         assert!(body.contains("\"method\":\"password\""));
-        assert!(body.contains("\"scope\":\"vault:public-key:set\""));
+        assert!(body.contains("\"scope\":\"vault:public-key:set:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""));
         assert!(body.contains("\"password\":\"hunter2\""));
         assert!(
             !body.contains("totpCode"),
@@ -299,7 +299,7 @@ mod tests {
         let proof = mint_cli_step_up_proof(
             &server.uri(),
             "token",
-            "vault:public-key:rotate",
+            "vault:public-key:rotate:1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &CliStepUpCredential::Totp {
                 password: "hunter2",
                 code: "123456",
@@ -311,7 +311,7 @@ mod tests {
 
         let body = captured.lock().unwrap()[0].clone();
         assert!(body.contains("\"method\":\"totp\""));
-        assert!(body.contains("\"scope\":\"vault:public-key:rotate\""));
+        assert!(body.contains("\"scope\":\"vault:public-key:rotate:1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\""));
         assert!(body.contains("\"password\":\"hunter2\""));
         assert!(body.contains("\"totpCode\":\"123456\""));
     }
@@ -333,7 +333,7 @@ mod tests {
         let err = mint_cli_step_up_proof(
             &server.uri(),
             "token",
-            "vault:public-key:set",
+            "vault:public-key:set:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &CliStepUpCredential::Password { password: "wrong" },
         )
         .await
