@@ -18,6 +18,7 @@ use aes_gcm::{
     aead::{AeadInPlace, generic_array::GenericArray},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use elliptic_curve::Generate;
 use hkdf::Hkdf;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -642,10 +643,7 @@ pub struct P256PairingKeyExchange {
 impl P256PairingKeyExchange {
     /// Create a fresh exchange bound to the browser's uncompressed SEC1 key.
     pub fn new(browser_public_key_b64: &str) -> Result<Self, String> {
-        Self::from_secret(
-            browser_public_key_b64,
-            p256::SecretKey::random(&mut rand::thread_rng()),
-        )
+        Self::from_secret(browser_public_key_b64, p256::SecretKey::generate())
     }
 
     pub fn new_for_protocol(
@@ -654,7 +652,7 @@ impl P256PairingKeyExchange {
     ) -> Result<Self, String> {
         Self::from_secret_for_protocol(
             browser_public_key_b64,
-            p256::SecretKey::random(&mut rand::thread_rng()),
+            p256::SecretKey::generate(),
             protocol_version,
         )
     }
@@ -671,7 +669,7 @@ impl P256PairingKeyExchange {
         ephemeral_secret: p256::SecretKey,
         protocol_version: u8,
     ) -> Result<Self, String> {
-        use elliptic_curve::sec1::ToEncodedPoint;
+        use elliptic_curve::sec1::ToSec1Point;
         let (encryption_info, sas_info): (&'static [u8], &'static [u8]) = match protocol_version {
             3 => (PAIRING_ENCRYPTION_INFO, PAIRING_SAS_INFO),
             4 => (b"lpm-dashboard-pair-org-v4", b"lpm-pair-org-sas-v4"),
@@ -689,7 +687,7 @@ impl P256PairingKeyExchange {
             .map_err(|e| format!("invalid browser P-256 public key: {e}"))?;
         let ephemeral_public_bytes = ephemeral_secret
             .public_key()
-            .to_encoded_point(false)
+            .to_sec1_point(false)
             .as_bytes()
             .to_vec();
         let ephemeral_public_key_b64 = BASE64.encode(&ephemeral_public_bytes);
@@ -1356,10 +1354,10 @@ mod tests {
         let wrapping_key = generate_aes_key();
 
         // Simulate browser: generate a P-256 keypair, encode public as uncompressed SEC1
-        let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
+        let browser_secret = P256SecretKey::generate();
         let browser_public = browser_secret.public_key();
-        use elliptic_curve::sec1::ToEncodedPoint;
-        let browser_pub_b64 = BASE64.encode(browser_public.to_encoded_point(false).as_bytes());
+        use elliptic_curve::sec1::ToSec1Point;
+        let browser_pub_b64 = BASE64.encode(browser_public.to_sec1_point(false).as_bytes());
 
         let exchange = P256PairingKeyExchange::new(&browser_pub_b64).unwrap();
         let encrypted = exchange.wrap_key(&wrapping_key).unwrap();
@@ -1382,10 +1380,10 @@ mod tests {
         let wrapping_key = generate_aes_key();
 
         // Browser generates keypair
-        let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
+        let browser_secret = P256SecretKey::generate();
         let browser_public = browser_secret.public_key();
-        use elliptic_curve::sec1::ToEncodedPoint;
-        let browser_pub_b64 = BASE64.encode(browser_public.to_encoded_point(false).as_bytes());
+        use elliptic_curve::sec1::ToSec1Point;
+        let browser_pub_b64 = BASE64.encode(browser_public.to_sec1_point(false).as_bytes());
 
         // CLI wraps
         let exchange = P256PairingKeyExchange::new(&browser_pub_b64).unwrap();
@@ -1413,14 +1411,10 @@ mod tests {
         use p256::SecretKey as P256SecretKey;
 
         let wrapping_key = generate_aes_key();
-        let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
-        use elliptic_curve::sec1::ToEncodedPoint;
-        let browser_pub_b64 = BASE64.encode(
-            browser_secret
-                .public_key()
-                .to_encoded_point(false)
-                .as_bytes(),
-        );
+        let browser_secret = P256SecretKey::generate();
+        use elliptic_curve::sec1::ToSec1Point;
+        let browser_pub_b64 =
+            BASE64.encode(browser_secret.public_key().to_sec1_point(false).as_bytes());
 
         let exchange_a = P256PairingKeyExchange::new(&browser_pub_b64).unwrap();
         let exchange_b = P256PairingKeyExchange::new(&browser_pub_b64).unwrap();
@@ -1434,7 +1428,7 @@ mod tests {
 
     #[test]
     fn protocol_v3_pairing_sas_is_eight_grouped_digits() {
-        use elliptic_curve::sec1::ToEncodedPoint;
+        use elliptic_curve::sec1::ToSec1Point;
         use p256::SecretKey as P256SecretKey;
 
         for _ in 0..200 {
@@ -1448,13 +1442,9 @@ mod tests {
                         .unwrap()
                 })
                 .collect();
-            let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
-            let browser_public = BASE64.encode(
-                browser_secret
-                    .public_key()
-                    .to_encoded_point(false)
-                    .as_bytes(),
-            );
+            let browser_secret = P256SecretKey::generate();
+            let browser_public =
+                BASE64.encode(browser_secret.public_key().to_sec1_point(false).as_bytes());
             let exchange = P256PairingKeyExchange::new(&browser_public).unwrap();
             let out = exchange.short_authentication_string(&code);
             assert_eq!(
@@ -1474,15 +1464,11 @@ mod tests {
 
     #[test]
     fn protocol_v3_pairing_sas_is_deterministic_for_same_exchange() {
-        use elliptic_curve::sec1::ToEncodedPoint;
+        use elliptic_curve::sec1::ToSec1Point;
         use p256::SecretKey as P256SecretKey;
-        let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
-        let browser_public = BASE64.encode(
-            browser_secret
-                .public_key()
-                .to_encoded_point(false)
-                .as_bytes(),
-        );
+        let browser_secret = P256SecretKey::generate();
+        let browser_public =
+            BASE64.encode(browser_secret.public_key().to_sec1_point(false).as_bytes());
         let exchange = P256PairingKeyExchange::new(&browser_public).unwrap();
         let a = exchange.short_authentication_string("ABC123");
         let b = exchange.short_authentication_string("ABC123");
@@ -1587,15 +1573,11 @@ mod tests {
 
     #[test]
     fn protocol_v3_pairing_sas_changes_with_cli_ephemeral_secret() {
-        use elliptic_curve::sec1::ToEncodedPoint;
+        use elliptic_curve::sec1::ToSec1Point;
         use p256::SecretKey as P256SecretKey;
-        let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
-        let browser_public = BASE64.encode(
-            browser_secret
-                .public_key()
-                .to_encoded_point(false)
-                .as_bytes(),
-        );
+        let browser_secret = P256SecretKey::generate();
+        let browser_public =
+            BASE64.encode(browser_secret.public_key().to_sec1_point(false).as_bytes());
         let a = P256PairingKeyExchange::new(&browser_public)
             .unwrap()
             .short_authentication_string("ABC123");
@@ -1607,15 +1589,11 @@ mod tests {
 
     #[test]
     fn protocol_v3_pairing_sas_changes_when_code_changes() {
-        use elliptic_curve::sec1::ToEncodedPoint;
+        use elliptic_curve::sec1::ToSec1Point;
         use p256::SecretKey as P256SecretKey;
-        let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
-        let browser_public = BASE64.encode(
-            browser_secret
-                .public_key()
-                .to_encoded_point(false)
-                .as_bytes(),
-        );
+        let browser_secret = P256SecretKey::generate();
+        let browser_public =
+            BASE64.encode(browser_secret.public_key().to_sec1_point(false).as_bytes());
         let exchange = P256PairingKeyExchange::new(&browser_public).unwrap();
         assert_ne!(
             exchange.short_authentication_string("ABC123"),

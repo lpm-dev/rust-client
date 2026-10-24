@@ -53,6 +53,7 @@ use self::bundle::{
 #[cfg(test)]
 use self::chain::{
     OID_ECDSA_WITH_SHA256, OID_ECDSA_WITH_SHA384, enforce_issuer_constraints, oid_components_match,
+    verify_ecdsa_p256_sha256, verify_ecdsa_p384_sha384,
 };
 #[cfg(test)]
 use self::inclusion::{rfc6962_hash_children, rfc6962_leaf_hash, rfc6962_verify_inclusion};

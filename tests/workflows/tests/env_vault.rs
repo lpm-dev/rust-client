@@ -1322,18 +1322,14 @@ async fn env_unpair_does_not_replay_or_refresh_after_a_server_error() {
 
 #[tokio::test]
 async fn env_pair_uppercases_code_and_approves_browser_pairing() {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::{Generate, sec1::ToSec1Point};
 
     let project = TempProject::empty(r#"{"name":"vault-pair-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
-    let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
-    let browser_public_key = BASE64.encode(
-        browser_secret
-            .public_key()
-            .to_encoded_point(false)
-            .as_bytes(),
-    );
+    let browser_secret = P256SecretKey::generate();
+    let browser_public_key =
+        BASE64.encode(browser_secret.public_key().to_sec1_point(false).as_bytes());
     mock.with_current_principal("session-access-token", "account-1", 1)
         .await;
     mock.with_pairing_session("ABC123", "session-access-token", &browser_public_key)
@@ -1380,18 +1376,14 @@ async fn env_pair_uppercases_code_and_approves_browser_pairing() {
 
 #[tokio::test]
 async fn env_pair_stage_retry_remains_bound_to_the_principal_captured_before_refresh() {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::{Generate, sec1::ToSec1Point};
 
     let project =
         TempProject::empty(r#"{"name":"env-pair-stage-account-switch","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
-    let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
-    let browser_public_key = BASE64.encode(
-        browser_secret
-            .public_key()
-            .to_encoded_point(false)
-            .as_bytes(),
-    );
+    let browser_secret = P256SecretKey::generate();
+    let browser_public_key =
+        BASE64.encode(browser_secret.public_key().to_sec1_point(false).as_bytes());
 
     seed_sessions(
         project.home(),
@@ -1444,18 +1436,14 @@ async fn env_pair_stage_retry_remains_bound_to_the_principal_captured_before_ref
 
 #[tokio::test]
 async fn env_pair_approval_retry_remains_bound_to_the_principal_captured_before_refresh() {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::{Generate, sec1::ToSec1Point};
 
     let project =
         TempProject::empty(r#"{"name":"env-pair-approval-account-switch","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
-    let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
-    let browser_public_key = BASE64.encode(
-        browser_secret
-            .public_key()
-            .to_encoded_point(false)
-            .as_bytes(),
-    );
+    let browser_secret = P256SecretKey::generate();
+    let browser_public_key =
+        BASE64.encode(browser_secret.public_key().to_sec1_point(false).as_bytes());
 
     seed_sessions(
         project.home(),
@@ -1513,7 +1501,7 @@ async fn env_pair_approval_retry_remains_bound_to_the_principal_captured_before_
 
 #[tokio::test]
 async fn env_pair_refuses_when_stdin_is_not_a_tty_and_yes_flag_absent() {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::{Generate, sec1::ToSec1Point};
 
     // The headline H1 phishing payload — "run this command from a tutorial /
     // pipe / heredoc" — relies on the CLI completing the wrap with no human
@@ -1525,13 +1513,9 @@ async fn env_pair_refuses_when_stdin_is_not_a_tty_and_yes_flag_absent() {
     let project = TempProject::empty(r#"{"name":"vault-pair-non-tty-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
-    let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
-    let browser_public_key = BASE64.encode(
-        browser_secret
-            .public_key()
-            .to_encoded_point(false)
-            .as_bytes(),
-    );
+    let browser_secret = P256SecretKey::generate();
+    let browser_public_key =
+        BASE64.encode(browser_secret.public_key().to_sec1_point(false).as_bytes());
     mock.with_current_principal("session-access-token", "account-1", 0)
         .await;
     mock.with_pairing_session_call_count("NOTTY1", "session-access-token", &browser_public_key, 0)
@@ -1571,18 +1555,14 @@ async fn env_pair_refuses_when_stdin_is_not_a_tty_and_yes_flag_absent() {
 
 #[tokio::test]
 async fn env_pair_with_yes_prints_browser_key_fingerprint_and_match_number_before_approving() {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::{Generate, sec1::ToSec1Point};
 
     let project = TempProject::empty(r#"{"name":"vault-pair-meta-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
-    let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
-    let browser_public_key = BASE64.encode(
-        browser_secret
-            .public_key()
-            .to_encoded_point(false)
-            .as_bytes(),
-    );
+    let browser_secret = P256SecretKey::generate();
+    let browser_public_key =
+        BASE64.encode(browser_secret.public_key().to_sec1_point(false).as_bytes());
 
     mock.with_current_principal("session-access-token", "account-1", 1)
         .await;
@@ -2045,19 +2025,15 @@ async fn env_pull_rejects_semantically_invalid_lpm_json_before_network_or_local_
 
 #[tokio::test]
 async fn env_pair_refresh_only_session_then_unpair_reuses_normalized_session() {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::{Generate, sec1::ToSec1Point};
 
     let project =
         TempProject::empty(r#"{"name":"vault-pair-refresh-chain-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
-    let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
-    let browser_public_key = BASE64.encode(
-        browser_secret
-            .public_key()
-            .to_encoded_point(false)
-            .as_bytes(),
-    );
+    let browser_secret = P256SecretKey::generate();
+    let browser_public_key =
+        BASE64.encode(browser_secret.public_key().to_sec1_point(false).as_bytes());
 
     mock.with_refresh_expected(
         "refresh-seed-token",
@@ -2128,18 +2104,14 @@ async fn env_pair_refresh_only_session_then_unpair_reuses_normalized_session() {
 
 #[tokio::test]
 async fn env_pair_then_logout_revoke_revokes_pairings_and_blocks_future_pairing_commands() {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::{Generate, sec1::ToSec1Point};
 
     let project = TempProject::empty(r#"{"name":"vault-pair-logout-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
-    let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
-    let browser_public_key = BASE64.encode(
-        browser_secret
-            .public_key()
-            .to_encoded_point(false)
-            .as_bytes(),
-    );
+    let browser_secret = P256SecretKey::generate();
+    let browser_public_key =
+        BASE64.encode(browser_secret.public_key().to_sec1_point(false).as_bytes());
     mock.with_current_principal("session-access-token", "account-1", 2)
         .await;
     mock.with_pairing_session("PAIR01", "session-access-token", &browser_public_key)
@@ -2243,19 +2215,15 @@ async fn env_pair_then_logout_revoke_revokes_pairings_and_blocks_future_pairing_
 #[tokio::test]
 async fn env_pair_refresh_only_session_then_logout_revoke_revokes_pairings_and_blocks_future_pairing_commands()
  {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::{Generate, sec1::ToSec1Point};
 
     let project =
         TempProject::empty(r#"{"name":"vault-pair-refresh-logout-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
-    let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
-    let browser_public_key = BASE64.encode(
-        browser_secret
-            .public_key()
-            .to_encoded_point(false)
-            .as_bytes(),
-    );
+    let browser_secret = P256SecretKey::generate();
+    let browser_public_key =
+        BASE64.encode(browser_secret.public_key().to_sec1_point(false).as_bytes());
 
     mock.with_refresh_expected(
         "refresh-seed-token",
@@ -2356,20 +2324,16 @@ async fn env_pair_refresh_only_session_then_logout_revoke_revokes_pairings_and_b
 #[tokio::test]
 async fn env_pair_unpair_then_logout_revoke_on_refresh_backed_session_keeps_normalized_state_and_blocks_future_vault_commands()
  {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::{Generate, sec1::ToSec1Point};
 
     let project = TempProject::empty(
         r#"{"name":"vault-pair-unpair-logout-refresh-chain-test","version":"1.0.0"}"#,
     );
     let mock = MockRegistry::start().await;
 
-    let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
-    let browser_public_key = BASE64.encode(
-        browser_secret
-            .public_key()
-            .to_encoded_point(false)
-            .as_bytes(),
-    );
+    let browser_secret = P256SecretKey::generate();
+    let browser_public_key =
+        BASE64.encode(browser_secret.public_key().to_sec1_point(false).as_bytes());
 
     mock.with_refresh_expected(
         "refresh-seed-token",
@@ -2502,20 +2466,16 @@ async fn env_pair_unpair_then_logout_revoke_on_refresh_backed_session_keeps_norm
 #[tokio::test]
 async fn env_pair_unpair_then_logout_all_revoke_on_refresh_backed_session_clears_auth_state_and_blocks_future_vault_commands()
  {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::{Generate, sec1::ToSec1Point};
 
     let project = TempProject::empty(
         r#"{"name":"vault-pair-unpair-logout-all-refresh-chain-test","version":"1.0.0"}"#,
     );
     let mock = MockRegistry::start().await;
 
-    let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
-    let browser_public_key = BASE64.encode(
-        browser_secret
-            .public_key()
-            .to_encoded_point(false)
-            .as_bytes(),
-    );
+    let browser_secret = P256SecretKey::generate();
+    let browser_public_key =
+        BASE64.encode(browser_secret.public_key().to_sec1_point(false).as_bytes());
 
     mock.with_refresh_expected(
         "refresh-seed-token",
@@ -3612,18 +3572,14 @@ async fn env_pair_surfaces_expired_code_error() {
 
 #[tokio::test]
 async fn env_pair_rejects_non_pending_session_status() {
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::{Generate, sec1::ToSec1Point};
 
     let project = TempProject::empty(r#"{"name":"vault-pair-status-test","version":"1.0.0"}"#);
     let mock = MockRegistry::start().await;
 
-    let browser_secret = P256SecretKey::random(&mut rand::thread_rng());
-    let browser_public_key = BASE64.encode(
-        browser_secret
-            .public_key()
-            .to_encoded_point(false)
-            .as_bytes(),
-    );
+    let browser_secret = P256SecretKey::generate();
+    let browser_public_key =
+        BASE64.encode(browser_secret.public_key().to_sec1_point(false).as_bytes());
     mock.with_current_principal("session-access-token", "account-1", 1)
         .await;
     mock.with_pairing_session_status(

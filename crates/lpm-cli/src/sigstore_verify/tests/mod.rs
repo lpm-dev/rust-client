@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use ecdsa::signature::Signer;
 use ecdsa::signature::hazmat::PrehashSigner;
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+use p256::elliptic_curve::Generate;
 use p256::pkcs8::DecodePrivateKey;
 use rcgen::{CertificateParams, KeyPair, PKCS_ECDSA_P256_SHA256};
 use sha2::{Digest, Sha256};
@@ -1047,7 +1048,7 @@ use p256::pkcs8::EncodePublicKey;
 /// would carry. Centralised so every SET test starts from the
 /// same shape.
 fn p256_rekor_signing_key() -> (SigningKey, Vec<u8>, Vec<u8>) {
-    let signing_key = SigningKey::random(&mut rand::thread_rng());
+    let signing_key = SigningKey::generate();
     let verifying_key = VerifyingKey::from(&signing_key);
     let spki_der = verifying_key
         .to_public_key_der()
@@ -1144,6 +1145,77 @@ fn verifies_valid_rekor_set_returns_parsed_integrated_time() {
         returned_time, expected,
         "verify_rekor_set must return the parsed integratedTime as the at_time anchor"
     );
+}
+
+/// Rekor, Fulcio and the CT logs sign with Go's `crypto/ecdsa`, which doesn't
+/// normalize S, so about half of their signatures carry a high S. Returns
+/// `signature` in that form.
+fn with_high_s<C>(signature: ecdsa::Signature<C>) -> ecdsa::Signature<C>
+where
+    C: ecdsa::EcdsaCurve + p256::elliptic_curve::CurveArithmetic,
+    ecdsa::SignatureSize<C>: p256::elliptic_curve::array::ArraySize,
+{
+    use p256::elliptic_curve::ff::PrimeField;
+    use p256::elliptic_curve::scalar::IsHigh;
+    let (r, s) = signature.split_scalars();
+    let s = if bool::from(s.is_high()) { *s } else { -*s };
+    let high = ecdsa::Signature::<C>::from_scalars(r.to_repr(), s.to_repr()).unwrap();
+    assert!(bool::from(high.s().is_high()));
+    high
+}
+
+#[test]
+fn verifies_rekor_set_with_a_high_s() {
+    let (signing_key, spki_der, log_id_bytes) = p256_rekor_signing_key();
+    let log_id_hex = hex::encode(&log_id_bytes);
+    let integrated_time = 1700000000_i64;
+    let mut tlog =
+        synth_tlog_entry_with_set(&signing_key, &log_id_hex, 42, integrated_time, "Zm9vYmFy");
+    let promise = tlog.inclusion_promise.as_mut().unwrap();
+    let signature = Signature::from_der(
+        &BASE64
+            .decode(&promise.signed_entry_timestamp)
+            .expect("SET is base64"),
+    )
+    .expect("SET is DER");
+    promise.signed_entry_timestamp = BASE64.encode(with_high_s(signature).to_der().as_bytes());
+    let key = rekor_key_active_around(log_id_bytes, spki_der, integrated_time);
+
+    verify_rekor_set(
+        &tlog,
+        std::slice::from_ref(&key),
+        RekorInclusionProofPolicy::RequireSet,
+    )
+    .expect("a SET with a high S must verify");
+}
+
+#[test]
+fn verifies_cert_signatures_with_a_high_s() {
+    let tbs: &[u8] = b"tbsCertificate";
+
+    let p256_key = SigningKey::generate();
+    let p256_spki = VerifyingKey::from(&p256_key).to_public_key_der().unwrap();
+    let p256_signature: Signature = p256_key.sign(tbs);
+    verify_ecdsa_p256_sha256(
+        p256_spki.as_bytes(),
+        tbs,
+        with_high_s(p256_signature).to_der().as_bytes(),
+        "leaf",
+    )
+    .expect("a P-256 cert signature with a high S must verify");
+
+    let p384_key = p384::ecdsa::SigningKey::generate();
+    let p384_spki = p384::ecdsa::VerifyingKey::from(&p384_key)
+        .to_public_key_der()
+        .unwrap();
+    let p384_signature: p384::ecdsa::Signature = p384_key.sign(tbs);
+    verify_ecdsa_p384_sha384(
+        p384_spki.as_bytes(),
+        tbs,
+        with_high_s(p384_signature).to_der().as_bytes(),
+        "root",
+    )
+    .expect("a P-384 cert signature with a high S must verify");
 }
 
 #[test]
@@ -2624,7 +2696,7 @@ fn issuer_spki_from_cert(issuer_cert: &rcgen::Certificate) -> Vec<u8> {
 /// Synth a CT log keypair + the matching CtLogKey active around
 /// `at_year`. Returns (signing_key, ct_log_key).
 fn synth_ct_log_key(at_year: i32) -> (SigningKey, CtLogKey) {
-    let signing_key = SigningKey::random(&mut rand::thread_rng());
+    let signing_key = SigningKey::generate();
     let verifying_key = VerifyingKey::from(&signing_key);
     let spki_der = verifying_key
         .to_public_key_der()
@@ -2798,7 +2870,7 @@ fn rejects_sct_with_forged_signature_under_pinned_key() {
     let issuer_spki = issuer_spki_from_cert(&issuer.cert);
     let (_, ct_log_key) = synth_ct_log_key(2025);
     // Different key signs — the pinned `ct_log_key` will reject.
-    let forge_key = SigningKey::random(&mut rand::thread_rng());
+    let forge_key = SigningKey::generate();
     let forge_sig: Signature = forge_key.sign(b"anything");
     let serialized = encode_serialized_sct(
         &ct_log_key.log_id,
@@ -2833,7 +2905,7 @@ fn rejects_sct_with_unsupported_signature_algorithm() {
     let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let issuer_spki = issuer_spki_from_cert(&issuer.cert);
     let (_, ct_log_key) = synth_ct_log_key(2025);
-    let dummy_sig: Signature = SigningKey::random(&mut rand::thread_rng()).sign(&[0u8; 32]);
+    let dummy_sig: Signature = SigningKey::generate().sign(&[0u8; 32]);
     let serialized = encode_serialized_sct(
         &ct_log_key.log_id,
         1_700_000_000_000,

@@ -159,13 +159,13 @@ dirs = "6"
 fd-lock = "4"
 cap-fs-ext = "4.0.2"
 secrecy = "0.10"
-p256 = { version = "0.13", features = ["ecdsa", "ecdh", "pem"] }
+p256 = { version = "0.14", features = ["ecdsa", "ecdh", "pem"] }
 # p384 for Fulcio root chain verification: Sigstore's Fulcio roots are
 # ECDSA P-384 with SHA-384, while leaf certs are P-256 (per the
 # profile). Verification covers both link types.
-p384 = { version = "0.13", features = ["ecdsa", "pem"] }
-elliptic-curve = { version = "0.13", features = ["sec1"] }
-ecdsa = { version = "0.16", features = ["signing", "verifying", "der"] }
+p384 = { version = "0.14", features = ["ecdsa", "pem"] }
+elliptic-curve = { version = "0.14", features = ["sec1"] }
+ecdsa = { version = "0.17", features = ["algorithm", "der"] }
 
 # Interactive prompts & terminal UI
 cliclack = "0.5"

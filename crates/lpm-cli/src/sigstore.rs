@@ -15,6 +15,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use ecdsa::signature::Signer;
 use lpm_common::LpmError;
 use p256::ecdsa::{SigningKey, VerifyingKey};
+use p256::elliptic_curve::Generate;
 use p256::pkcs8::EncodePublicKey;
 
 /// Fulcio public instance (v2 API).
@@ -511,7 +512,7 @@ pub async fn sign_and_record_with_endpoints(
     endpoints: &SigstoreEndpoints,
 ) -> Result<SigstoreBundle, LpmError> {
     // Step 1: Generate ephemeral ECDSA P-256 keypair
-    let signing_key = SigningKey::random(&mut rand::thread_rng());
+    let signing_key = SigningKey::generate();
     let verifying_key = VerifyingKey::from(&signing_key);
 
     // Encode public key as PEM (SPKI format) for Fulcio v2
