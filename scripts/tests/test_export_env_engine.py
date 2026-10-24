@@ -151,9 +151,18 @@ class EngineExportTests(unittest.TestCase):
                     if failure == 'canonical':
                         self.assertEqual(kwargs['cwd'], kwargs['cwd'].resolve())
                     if failure == 'remap-spaces':
+                        # macOS's temporary directory is reached through the /var symlink; Linux's isn't.
+                        homes = dict.fromkeys([str(cargo_home.resolve()), str(cargo_home)])
+                        self.assertEqual(kwargs['env']['CARGO_ENCODED_RUSTFLAGS'].split('\x1f'), [
+                            '--remap-path-prefix=' + str(kwargs['cwd']) + '=/lpm-rust-client',
+                            *['--remap-path-prefix=' + home + '=/lpm-cargo' for home in homes],
+                        ])
+                    if failure == 'cargo-home-alias':
+                        self.assertEqual(kwargs['env']['CARGO_HOME'], str(cargo_home))
                         self.assertEqual(kwargs['env']['CARGO_ENCODED_RUSTFLAGS'].split('\x1f'), [
                             '--remap-path-prefix=' + str(kwargs['cwd']) + '=/lpm-rust-client',
                             '--remap-path-prefix=' + str(cargo_home.resolve()) + '=/lpm-cargo',
+                            '--remap-path-prefix=' + str(cargo_home) + '=/lpm-cargo',
                         ])
                     builds.append(kwargs['cwd'])
                     self.assertNotEqual(kwargs['cwd'], root)
@@ -161,7 +170,7 @@ class EngineExportTests(unittest.TestCase):
                     if failure == 'mutation' and len(builds) == 1:
                         (root / 'crates/lpm-env/src/lib.rs').write_text('changed')
                 if args[0] == 'lipo':
-                    if failure in {'packaging', 'canonical', 'remap-spaces'}:
+                    if failure in {'packaging', 'canonical', 'remap-spaces', 'cargo-home-alias'}:
                         raise subprocess.CalledProcessError(1, args)
                     Path(args[-1]).write_bytes(b'library')
                 if failure == 'environment' and args[0] in {'lipo', 'xcrun', 'xcodebuild'}:
@@ -194,6 +203,10 @@ class EngineExportTests(unittest.TestCase):
             alias = Path(temporary) / 'frozen-alias'
             alias.symlink_to(real, target_is_directory=True)
             cargo_home = Path(temporary) / 'cargo home with spaces'
+            if failure == 'cargo-home-alias':
+                (Path(temporary) / 'cargo-real').mkdir()
+                cargo_home = Path(temporary) / 'cargo-alias'
+                cargo_home.symlink_to(Path(temporary) / 'cargo-real', target_is_directory=True)
 
             @contextlib.contextmanager
             def temporary_directory(**options):
@@ -210,6 +223,46 @@ class EngineExportTests(unittest.TestCase):
             self.assertEqual((output / 'LPMEnv.xcframework/old').read_bytes(), b'old bundle')
             self.assertEqual((output / 'provenance.json').read_bytes(), b'old provenance')
 
+    def test_notices_read_metadata_with_a_cargo_cache_holding_only_what_the_engine_build_fetched(self):
+        """A clean runner's cache holds what building lpm-env-ffi fetched, while `cargo metadata`
+        resolves every workspace package, which it can't fetch offline."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / 'source'
+            write_sources(root)
+            output = Path(temporary) / 'engine'
+            paths = b'\0'.join(str(path.relative_to(root)).encode() for path in root.rglob('*') if path.is_file()) + b'\0'
+            sysroot = fake_sysroot(Path(temporary) / 'sysroot')
+            cache = set()
+
+            def command(args, **kwargs):
+                if args[0] == 'cargo':
+                    cache.add('engine dependencies')
+                    library = Path(kwargs['env']['CARGO_TARGET_DIR']) / args[-1] / 'release/liblpm_env_ffi.a'
+                    library.parent.mkdir(parents=True, exist_ok=True)
+                    library.write_bytes(b'library')
+                elif args[0] == 'lipo':
+                    Path(args[-1]).write_bytes(b'library')
+                elif args[0] == 'xcodebuild':
+                    artifact = Path(args[-1])
+                    artifact.mkdir()
+                    (artifact / 'library').write_bytes(b'bundle')
+
+            def read(args, **kwargs):
+                if args[:2] == ['git', 'show']: return (root / args[2].split(':', 1)[1]).read_bytes()
+                if args[0] == 'rustc':
+                    return str(sysroot) + '\n' if '--print' in args else 'host: aarch64-apple-darwin\n'
+                if args[:3] == ['cargo', '+1.94.0', 'metadata']:
+                    if 'workspace dependencies' not in cache:
+                        if '--offline' in args:
+                            raise subprocess.CalledProcessError(101, args, stderr=b'attempting to make an HTTP request, but --offline was specified')
+                        cache.add('workspace dependencies')
+                    return ENGINE_METADATA
+                return paths if args[1] == 'ls-files' else 'a' * 40 + '\n'
+
+            with patch.object(exporter.subprocess, 'run', side_effect=command), patch.object(exporter.subprocess, 'check_output', side_effect=read):
+                exporter.export(root, Path(temporary) / 'target', output)
+            self.assertIn('The Rust standard library', (output / exporter.NOTICES).read_text())
+
     def test_concurrent_source_changes_reject_publication(self):
         self.scenario('mutation')
 
@@ -224,6 +277,9 @@ class EngineExportTests(unittest.TestCase):
 
     def test_remapping_keeps_paths_with_spaces_in_single_compiler_arguments(self):
         self.scenario('remap-spaces')
+
+    def test_remapping_covers_a_cargo_home_reached_through_a_symlink_as_cargo_names_it(self):
+        self.scenario('cargo-home-alias')
 
     def test_archive_stripping_uses_the_pinned_rust_llvm_tools(self):
         self.scenario('pinned-strip')

@@ -202,8 +202,12 @@ def export_locked(root, target_dir, output):
         env = {key: value for key, value in os.environ.items() if key in {
             'PATH', 'HOME', 'TMPDIR', 'CARGO_HOME', 'RUSTUP_HOME', 'DEVELOPER_DIR', 'SDKROOT',
         }}
-        cargo_home = Path(env.get('CARGO_HOME', str(Path.home() / '.cargo'))).resolve()
-        flags = ['--remap-path-prefix=' + str(frozen) + '=/lpm-rust-client', '--remap-path-prefix=' + str(cargo_home) + '=/lpm-cargo']
+        cargo_home = Path(env.get('CARGO_HOME', str(Path.home() / '.cargo')))
+        if not cargo_home.is_absolute():
+            cargo_home = frozen / cargo_home
+        # Cargo names sources under its home as given, which a symlink, such as macOS's /tmp, keeps apart from the resolved path.
+        homes = dict.fromkeys([str(cargo_home.resolve()), str(cargo_home)])
+        flags = ['--remap-path-prefix=' + str(frozen) + '=/lpm-rust-client'] + ['--remap-path-prefix=' + home + '=/lpm-cargo' for home in homes]
         env.update(CARGO_TARGET_DIR=str(target_dir), CARGO_INCREMENTAL='0', ZERO_AR_DATE='1', CARGO_ENCODED_RUSTFLAGS='\x1f'.join(flags))
         for target in targets:
             if shutil.disk_usage(target_dir).free < 10 * 1024**3:
@@ -221,7 +225,8 @@ def export_locked(root, target_dir, output):
         subprocess.run([str(objcopy), '--strip-debug', '--enable-deterministic-archives', '--remove-section=__LLVM,__bitcode', '--remove-section=__LLVM,__cmdline', str(library)], env=env, check=True)
         subprocess.run(['xcodebuild', '-create-xcframework', '-library', str(library), '-headers', str(frozen / 'crates/lpm-env-ffi/include'), '-output', str(artifact)], env=env, check=True)
         files = {str(path.relative_to(staging)): file_hash(path) for path in artifact.rglob('*') if path.is_file()}
-        metadata = [json.loads(subprocess.check_output(['cargo', '+1.94.0', 'metadata', '--locked', '--offline', '--format-version', '1', '--filter-platform', target], cwd=frozen, env=env)) for target in targets]
+        # Not offline: metadata resolves every workspace package, beyond what building lpm-env-ffi fetched.
+        metadata = [json.loads(subprocess.check_output(['cargo', '+1.94.0', 'metadata', '--locked', '--format-version', '1', '--filter-platform', target], cwd=frozen, env=env)) for target in targets]
         licenses = Path(sysroot) / 'share/doc/rust'
         notices = third_party_notices(
             linked_packages(metadata),
