@@ -515,6 +515,80 @@ fn local_public_key_state(private_key: [u8; 32]) -> LocalPublicKeyState {
     }
 }
 
+/// What starting a sharing-key rotation found, holding the scope's rotation
+/// lock.
+pub enum SharingKeyRotationStart {
+    /// An earlier run uploaded its pending key and stopped before promoting
+    /// it. It's live now, which completes that rotation.
+    Resumed,
+    /// Ready to rotate, holding the scope's rotation lock until this is
+    /// dropped, with lpm.dev's current key. `discarded_pending` says a pending
+    /// key an earlier run never uploaded was thrown away.
+    Ready {
+        scope: SharingKeyScope,
+        lock: SharingKeyRotationLock,
+        current: MyPublicKeyState,
+        discarded_pending: bool,
+    },
+}
+
+/// Why starting a sharing-key rotation failed: reading lpm.dev's key, or this
+/// device's own stores and lock.
+#[derive(Debug)]
+pub enum SharingKeyRotationStartError<E> {
+    Read(E),
+    Local(String),
+}
+
+/// Starts a sharing-key rotation on `registry_url`. `read_current` reads
+/// lpm.dev's key for the signed-in principal. The first read only names the
+/// scope whose rotation lock is taken; lpm.dev is read again under the lock,
+/// for the same principal, and a pending key an interrupted run left is
+/// settled against that read, which no other rotation can change meanwhile:
+/// promoted when lpm.dev holds it, discarded when not.
+pub async fn start_sharing_key_rotation<E, F, Fut>(
+    registry_url: &str,
+    mut read_current: F,
+) -> Result<SharingKeyRotationStart, SharingKeyRotationStartError<E>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<MyPublicKeyState, E>>,
+{
+    use SharingKeyRotationStartError::{Local, Read};
+    let discovered = read_current().await.map_err(Read)?;
+    let scope = SharingKeyScope::new(registry_url, &discovered.principal_id).map_err(Local)?;
+    let lock = try_acquire_sharing_key_rotation_lock(&scope)
+        .map_err(Local)?
+        .ok_or_else(|| {
+            Local(
+                "another sharing-key rotation is already running; wait for it to finish before retrying"
+                    .to_owned(),
+            )
+        })?;
+    let current = read_current().await.map_err(Read)?;
+    if current.principal_id != discovered.principal_id {
+        return Err(Local(
+            "the signed-in account changed while the sharing-key rotation started; run it again"
+                .to_owned(),
+        ));
+    }
+    let mut discarded_pending = false;
+    if let Some(pending) = read_pending_x25519_keypair(&scope).map_err(Local)? {
+        if current.public_key_b64.as_deref() == Some(&pending.public_key_b64) {
+            promote_pending_x25519_keypair(&scope).map_err(Local)?;
+            return Ok(SharingKeyRotationStart::Resumed);
+        }
+        discard_pending_x25519_keypair(&scope).map_err(Local)?;
+        discarded_pending = true;
+    }
+    Ok(SharingKeyRotationStart::Ready {
+        scope,
+        lock,
+        current,
+        discarded_pending,
+    })
+}
+
 /// Pending sharing-keypair lifecycle helpers used by the
 /// `rotate-sharing-key` flow.
 ///
@@ -1875,6 +1949,76 @@ mod tests {
             .await
             .expect_err("server 500 must propagate, not be misclassified");
         assert!(err.to_string().contains("500"), "got: {err}");
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn a_pending_key_is_judged_against_the_key_lpm_dev_holds_once_the_rotation_lock_is() {
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+        let scope =
+            SharingKeyScope::new("https://registry.example", "caller").expect("sharing key scope");
+        let pending = create_pending_x25519_keypair(&scope).expect("create pending");
+        // Another run uploaded the pending key between this run's first read
+        // and taking the lock, then stopped before promoting it.
+        let reads = std::cell::RefCell::new(vec![
+            MyPublicKeyState {
+                principal_id: "caller".into(),
+                public_key_b64: Some(pending.public_key_b64.clone()),
+            },
+            MyPublicKeyState {
+                principal_id: "caller".into(),
+                public_key_b64: Some("the key before the rotation".into()),
+            },
+        ]);
+        let start = start_sharing_key_rotation("https://registry.example", || {
+            let read = reads.borrow_mut().pop().expect("a read");
+            async move { Ok::<_, String>(read) }
+        })
+        .await
+        .expect("start");
+        assert!(
+            matches!(start, SharingKeyRotationStart::Resumed),
+            "lpm.dev holds the pending key, so the rotation is complete"
+        );
+        assert!(
+            reads.borrow().is_empty(),
+            "lpm.dev is read again under the lock"
+        );
+        assert_eq!(
+            resolve_local_public_key_state(&scope)
+                .expect("live key")
+                .public_key_b64,
+            pending.public_key_b64
+        );
+        assert!(
+            read_pending_x25519_keypair(&scope)
+                .expect("read pending")
+                .is_none()
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn starting_a_rotation_refuses_an_account_that_changed_before_the_lock() {
+        let _guard = env_lock_guard();
+        let _isolated = IsolatedVaultKeyEnv::new();
+        let reads = std::cell::RefCell::new(vec![
+            MyPublicKeyState {
+                principal_id: "someone else".into(),
+                public_key_b64: None,
+            },
+            MyPublicKeyState {
+                principal_id: "caller".into(),
+                public_key_b64: None,
+            },
+        ]);
+        let start = start_sharing_key_rotation("https://registry.example", || {
+            let read = reads.borrow_mut().pop().expect("a read");
+            async move { Ok::<_, String>(read) }
+        })
+        .await;
+        assert!(matches!(start, Err(SharingKeyRotationStartError::Local(_))));
     }
 
     #[cfg(debug_assertions)]

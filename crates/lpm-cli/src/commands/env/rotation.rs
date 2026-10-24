@@ -1078,33 +1078,19 @@ pub(super) async fn env_rotate_sharing_key(
         ));
     }
 
-    let (server_key, registry_url) =
+    let registry_url = client.base_url().to_owned();
+    let start = lpm_vault::sync::start_sharing_key_rotation(&registry_url, || {
         super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| async move {
-            let state =
-                lpm_vault::sync::get_my_public_key_state(&registry_url, &auth_token).await?;
-            Ok((state, registry_url))
+            lpm_vault::sync::get_my_public_key_state(&registry_url, &auth_token).await
         })
-        .await?;
-    let key_scope = lpm_vault::sync::SharingKeyScope::new(&registry_url, &server_key.principal_id)
-        .map_err(LpmError::Script)?;
-    let _rotation_lock = lpm_vault::sync::try_acquire_sharing_key_rotation_lock(&key_scope)
-		.map_err(LpmError::Script)?
-        .ok_or_else(|| {
-            LpmError::Script(
-                "another `lpm env rotate-sharing-key` command is already running; wait for it to finish before retrying"
-                    .into(),
-            )
-        })?;
-
-    // Crash recovery — if a pending key exists and matches the server,
-    // the previous run committed the server side but didn't promote
-    // locally. Promote and return; no second rotation needed.
-    if let Some(pending) =
-        lpm_vault::sync::read_pending_x25519_keypair(&key_scope).map_err(LpmError::Script)?
-    {
-        if server_key.public_key_b64.as_deref() == Some(&pending.public_key_b64) {
-            lpm_vault::sync::promote_pending_x25519_keypair(&key_scope)
-                .map_err(LpmError::Script)?;
+    })
+    .await
+    .map_err(|error| match error {
+        lpm_vault::sync::SharingKeyRotationStartError::Read(error) => error,
+        lpm_vault::sync::SharingKeyRotationStartError::Local(message) => LpmError::Script(message),
+    })?;
+    let (key_scope, _rotation_lock, server_key) = match start {
+        lpm_vault::sync::SharingKeyRotationStart::Resumed => {
             if json_output {
                 println!(
                     "{}",
@@ -1121,15 +1107,21 @@ pub(super) async fn env_rotate_sharing_key(
             }
             return Ok(());
         }
-        // Pending exists but doesn't match server — last attempt failed
-        // before the server committed. Discard the orphan so the next
-        // step can re-generate.
-        output::warn(
-            "found a stale pending sharing-key from a prior failed rotation. Discarding it \
-             and starting fresh.",
-        );
-        lpm_vault::sync::discard_pending_x25519_keypair(&key_scope).map_err(LpmError::Script)?;
-    }
+        lpm_vault::sync::SharingKeyRotationStart::Ready {
+            scope,
+            lock,
+            current,
+            discarded_pending,
+        } => {
+            if discarded_pending {
+                output::warn(
+                    "found a stale pending sharing-key from a prior failed rotation. Discarded it \
+                     and starting fresh.",
+                );
+            }
+            (scope, lock, current)
+        }
+    };
 
     // Show blast radius. We can't precompute it locally (we don't know
     // which orgs the user belongs to without a server roundtrip we'd
