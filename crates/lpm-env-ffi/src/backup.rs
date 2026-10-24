@@ -176,6 +176,56 @@ pub unsafe extern "C" fn lpm_env_backup_inspect(file: *const u8, length: usize) 
     .unwrap_or_else(|_| failure(3, "env.engine_panic"))
 }
 
+/// The file and raw passphrase an open call was given, or the result that
+/// refuses them.
+///
+/// # Safety
+/// Each pointer must reference its length in readable bytes during the call.
+unsafe fn open_inputs<'a>(
+    file: *const u8,
+    file_length: usize,
+    passphrase: *const u8,
+    passphrase_length: usize,
+) -> Result<(&'a [u8], &'a [u8]), LPMEnvResult> {
+    if file_length > MAX_FILE_BYTES {
+        return Err(refusal("backup.too_large", Value::Null));
+    }
+    if passphrase_length > MAX_INPUT_BYTES {
+        return Err(passphrase_refusal(PassphraseError::TooLong));
+    }
+    // SAFETY: Forwarded from this function's contract; the lengths are bounded above.
+    match (unsafe { bytes(file, file_length) }, unsafe {
+        bytes(passphrase, passphrase_length)
+    }) {
+        (Some(file), Some(raw)) => Ok((file, raw)),
+        _ => Err(failure(2, "env.invalid_input")),
+    }
+}
+
+/// Opens `file` with `open` once its header reads as a backup and `raw` as a
+/// passphrase, turning a panic into a failure.
+fn opening(
+    file: &[u8],
+    raw: &[u8],
+    open: impl FnOnce(&[u8], &Passphrase) -> Result<LPMEnvResult, OpenError>,
+) -> LPMEnvResult {
+    catch_unwind(AssertUnwindSafe(|| {
+        if let Err(error) = lpm_env_backup::inspect(file) {
+            return container_refusal(error);
+        }
+        let passphrase = match Passphrase::new(raw) {
+            Ok(passphrase) => passphrase,
+            Err(error) => return passphrase_refusal(error),
+        };
+        match open(file, &passphrase) {
+            Ok(result) => result,
+            Err(OpenError::Container(error)) => container_refusal(error),
+            Err(OpenError::Payload(error)) => payload_refusal(error),
+        }
+    }))
+    .unwrap_or_else(|_| failure(3, "env.engine_panic"))
+}
+
 /// # Safety
 /// Each pointer must reference its length in readable bytes during the call,
 /// and both out-pointers must be writable.
@@ -188,52 +238,78 @@ pub unsafe extern "C" fn lpm_env_backup_open(
     payload_offset: *mut usize,
     payload_length: *mut usize,
 ) -> LPMEnvResult {
-    if file_length > MAX_FILE_BYTES {
-        return refusal("backup.too_large", Value::Null);
-    }
-    if passphrase_length > MAX_INPUT_BYTES {
-        return passphrase_refusal(PassphraseError::TooLong);
-    }
-    // SAFETY: Forwarded from this function's contract; the lengths are bounded above.
-    let (Some(file), Some(raw)) = (unsafe { bytes(file, file_length) }, unsafe {
-        bytes(passphrase, passphrase_length)
-    }) else {
-        return failure(2, "env.invalid_input");
+    // SAFETY: Forwarded from this function's contract.
+    let (file, raw) = match unsafe { open_inputs(file, file_length, passphrase, passphrase_length) }
+    {
+        Ok(inputs) => inputs,
+        Err(refused) => return refused,
     };
     if payload_offset.is_null() || payload_length.is_null() {
         return failure(2, "env.invalid_input");
     }
-    catch_unwind(AssertUnwindSafe(|| {
-        if let Err(error) = lpm_env_backup::inspect(file) {
-            return container_refusal(error);
+    opening(file, raw, |file, passphrase| {
+        let opened = lpm_env_backup::open(file, passphrase)?;
+        // The plaintext's allocation is exactly its length, so it becomes
+        // the output without a copy, and release wipes it.
+        let (mut plaintext, range) = opened.into_plaintext();
+        let plaintext = std::mem::take(&mut *plaintext);
+        debug_assert_eq!(plaintext.len(), plaintext.capacity());
+        // SAFETY: The caller supplies writable out-pointers, checked non-null above.
+        unsafe {
+            payload_offset.write(range.start);
+            payload_length.write(range.len());
         }
-        let passphrase = match Passphrase::new(raw) {
-            Ok(passphrase) => passphrase,
-            Err(error) => return passphrase_refusal(error),
-        };
-        match lpm_env_backup::open(file, &passphrase) {
-            Ok(opened) => {
-                // The plaintext's allocation is exactly its length, so it
-                // becomes the output without a copy, and release wipes it.
-                let (mut plaintext, range) = opened.into_plaintext();
-                let plaintext = std::mem::take(&mut *plaintext);
-                debug_assert_eq!(plaintext.len(), plaintext.capacity());
-                // SAFETY: The caller supplies writable out-pointers, checked non-null above.
-                unsafe {
-                    payload_offset.write(range.start);
-                    payload_length.write(range.len());
-                }
-                result(0, plaintext, None)
-            }
-            Err(OpenError::Container(error)) => container_refusal(error),
-            Err(OpenError::Payload(error)) => payload_refusal(error),
+        Ok(result(0, plaintext, None))
+    })
+}
+
+/// # Safety
+/// Each pointer must reference its length in readable bytes during the call,
+/// and all four out-pointers must be writable.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn lpm_env_backup_open_split(
+    file: *const u8,
+    file_length: usize,
+    passphrase: *const u8,
+    passphrase_length: usize,
+    payload_offset: *mut usize,
+    payload_length: *mut usize,
+    keys_offset: *mut usize,
+    keys_length: *mut usize,
+) -> LPMEnvResult {
+    // SAFETY: Forwarded from this function's contract.
+    let (file, raw) = match unsafe { open_inputs(file, file_length, passphrase, passphrase_length) }
+    {
+        Ok(inputs) => inputs,
+        Err(refused) => return refused,
+    };
+    if [payload_offset, payload_length, keys_offset, keys_length]
+        .iter()
+        .any(|out| out.is_null())
+    {
+        return failure(2, "env.invalid_input");
+    }
+    opening(file, raw, |file, passphrase| {
+        let split = lpm_env_backup::open_split(file, passphrase)?;
+        let (mut plaintext, payload, keys) = split.into_plaintext();
+        let plaintext = std::mem::take(&mut *plaintext);
+        debug_assert_eq!(plaintext.len(), plaintext.capacity());
+        // SAFETY: The caller supplies writable out-pointers, checked non-null above.
+        unsafe {
+            payload_offset.write(payload.start);
+            payload_length.write(payload.len());
+            keys_offset.write(keys.start);
+            keys_length.write(keys.len());
         }
-    }))
-    .unwrap_or_else(|_| failure(3, "env.engine_panic"))
+        Ok(result(0, plaintext, None))
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
+
     use super::*;
     use crate::lpm_env_release;
 
@@ -300,6 +376,76 @@ mod tests {
             )
         });
         (result, offset, length)
+    }
+
+    /// The result, and the payload's and the keys' ranges in its output.
+    fn open_split(file: &[u8], passphrase: &[u8]) -> (Owned, Range<usize>, Range<usize>) {
+        let (mut payload_offset, mut payload_length) = (usize::MAX, usize::MAX);
+        let (mut keys_offset, mut keys_length) = (usize::MAX, usize::MAX);
+        // SAFETY: Both slices and all out-values stay live for the synchronous call.
+        let result = Owned(unsafe {
+            lpm_env_backup_open_split(
+                file.as_ptr(),
+                file.len(),
+                passphrase.as_ptr(),
+                passphrase.len(),
+                &mut payload_offset,
+                &mut payload_length,
+                &mut keys_offset,
+                &mut keys_length,
+            )
+        });
+        (
+            result,
+            payload_offset..payload_offset.wrapping_add(payload_length),
+            keys_offset..keys_offset.wrapping_add(keys_length),
+        )
+    }
+
+    #[test]
+    fn opening_split_hands_over_the_payload_without_its_keys_and_their_records() {
+        let keyed = br#"{"keys":{"personalRoots":[{"account":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","key":"a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"}]},"createdAt":1761171075,"producer":{"name":"LPM Vault","version":"1.4.0"},"projects":[]}"#;
+        let sealed = seal(keyed, PASSPHRASE);
+        assert_eq!(sealed.status(), 0);
+        let file = sealed.data().to_vec();
+        let (opened, payload, keys) = open_split(&file, PASSPHRASE);
+        assert_eq!(opened.status(), 0);
+        assert_eq!(
+            &opened.data()[payload.clone()],
+            br#"{"createdAt":1761171075,"producer":{"name":"LPM Vault","version":"1.4.0"},"projects":[]}"#
+        );
+        assert_eq!(keys.start, payload.end);
+        let record = &opened.data()[keys];
+        assert_eq!(record.len(), 1 + 32 + 64);
+        assert_eq!(record[0], 1);
+        assert_eq!(
+            record[1..33],
+            [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef].repeat(4)
+        );
+        assert_eq!(&record[33..], [b'a', b'1'].repeat(32));
+
+        let plain = seal(PAYLOAD, PASSPHRASE).data().to_vec();
+        let (opened, payload, keys) = open_split(&plain, PASSPHRASE);
+        assert_eq!(&opened.data()[payload], PAYLOAD);
+        assert!(keys.is_empty());
+
+        let (wrong, ..) = open_split(&file, b"harbor velvet ninety cactus orbit maples");
+        assert_eq!(wrong.json()["code"], "backup.wrong_passphrase");
+        let mut unused = 0;
+        // SAFETY: The file stays live; a null out-pointer is refused before anything is read.
+        let refused = Owned(unsafe {
+            lpm_env_backup_open_split(
+                file.as_ptr(),
+                file.len(),
+                PASSPHRASE.as_ptr(),
+                PASSPHRASE.len(),
+                &mut unused,
+                &mut unused,
+                std::ptr::null_mut(),
+                &mut unused,
+            )
+        });
+        assert_eq!(refused.status(), 2);
     }
 
     fn inspect(file: &[u8]) -> Owned {
@@ -441,6 +587,8 @@ mod tests {
             "lpm_env_backup_inspect(const uint8_t *file, size_t length);",
             "lpm_env_backup_open(const uint8_t *file, size_t file_length,",
             "size_t *payload_offset, size_t *payload_length);",
+            "lpm_env_backup_open_split(const uint8_t *file, size_t file_length,",
+            "size_t *keys_offset, size_t *keys_length);",
         ] {
             assert!(header.contains(function), "{function}");
         }
