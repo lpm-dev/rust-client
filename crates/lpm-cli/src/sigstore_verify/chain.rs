@@ -394,7 +394,7 @@ fn verify_ecdsa_signature_by_oid(
     }
 }
 
-fn verify_ecdsa_p256_sha256(
+pub(super) fn verify_ecdsa_p256_sha256(
     spki_der: &[u8],
     tbs_bytes: &[u8],
     sig_bytes: &[u8],
@@ -424,7 +424,7 @@ fn verify_ecdsa_p256_sha256(
     })
 }
 
-fn verify_ecdsa_p384_sha384(
+pub(super) fn verify_ecdsa_p384_sha384(
     spki_der: &[u8],
     tbs_bytes: &[u8],
     sig_bytes: &[u8],

@@ -3,7 +3,10 @@
 mod support;
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use p256::{SecretKey, elliptic_curve::sec1::ToEncodedPoint};
+use p256::{
+    SecretKey,
+    elliptic_curve::{Generate, sec1::ToSec1Point},
+};
 use sha2::{Digest, Sha256};
 use std::sync::{
     Arc,
@@ -59,13 +62,9 @@ async fn organization_pairing(key_matches: bool, account_changes: bool) {
                 .insert_header(lpm_vault::signature::SIGNATURE_HEADER, signature.as_str())
                 .set_body_string(body)
         }).expect(2).mount(registry.server()).await;
-    let browser_private = SecretKey::random(&mut rand::thread_rng());
-    let browser_public = BASE64.encode(
-        browser_private
-            .public_key()
-            .to_encoded_point(false)
-            .as_bytes(),
-    );
+    let browser_private = SecretKey::generate();
+    let browser_public =
+        BASE64.encode(browser_private.public_key().to_sec1_point(false).as_bytes());
     Mock::given(method("GET"))
         .and(path("/api/vault/pair/ORG123"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "status": "pending", "protocolVersion": 4, "browserPublicKey": browser_public })))
