@@ -57,9 +57,9 @@ const CHANGED_OUTSIDE: &str = "changed outside LPM while LPM was changing it";
 
 #[cfg(test)]
 thread_local! {
-    /// Fail the next commit right after its journal is written, as a crash
-    /// would leave it.
-    pub(crate) static CRASH_AFTER_JOURNAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Fail the next commit once its journal is written and that many of its
+    /// changes are applied, as a crash would leave it.
+    pub(crate) static CRASH_AFTER_CHANGES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     /// How often this thread ran recovery.
     pub(crate) static RECOVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -570,6 +570,16 @@ impl<'directory> FileCompanion<'directory> {
         let mut companion_folder = self.vaults.open_existing_directory(&folder_name)?;
         let (mut sync_vaults, mut sync_folder) = (false, false);
         for (index, operation) in journal.operations.iter().enumerate() {
+            #[cfg(test)]
+            if replay == Replay::Commit
+                && index > 0
+                && CRASH_AFTER_CHANGES.with(|crash| crash.get()) == Some(index)
+            {
+                CRASH_AFTER_CHANGES.with(|crash| crash.set(None));
+                return Err(RecoveryError::Failed(
+                    "simulated crash between changes".to_owned(),
+                ));
+            }
             let (folder, entry, account) =
                 match operation.physical(vault_id).map_err(RecoveryError::Stuck)? {
                     PhysicalTarget::Values { name } => {
@@ -633,6 +643,15 @@ impl<'directory> FileCompanion<'directory> {
                     folder.remove_file_unsynced(&entry, "a journaled deletion")?;
                 }
             }
+        }
+        #[cfg(test)]
+        if replay == Replay::Commit
+            && CRASH_AFTER_CHANGES.with(|crash| crash.get()) == Some(journal.operations.len())
+        {
+            CRASH_AFTER_CHANGES.with(|crash| crash.set(None));
+            return Err(RecoveryError::Failed(
+                "simulated crash after the last change".to_owned(),
+            ));
         }
         if let Some(folder) = companion_folder.take()
             && folder.is_empty()?
@@ -796,7 +815,8 @@ impl<'directory> FileCompanion<'directory> {
             .write_owner_only_file(&journal_name(vault_id), &encoded, "env file journal")?;
         let applied = (|| {
             #[cfg(test)]
-            if CRASH_AFTER_JOURNAL.with(|crash| crash.replace(false)) {
+            if CRASH_AFTER_CHANGES.with(|crash| crash.get()) == Some(0) {
+                CRASH_AFTER_CHANGES.with(|crash| crash.set(None));
                 return Err("simulated crash after the env file journal".to_owned());
             }
             self.replay(vault_id, &journal, stage.as_ref(), Replay::Commit)

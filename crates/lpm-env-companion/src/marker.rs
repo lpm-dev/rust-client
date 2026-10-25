@@ -353,7 +353,7 @@ where
 
 /// A JSON object read into a map, refusing a repeated key instead of keeping
 /// the last value.
-pub struct UniqueMapVisitor<V>(pub std::marker::PhantomData<V>);
+pub(crate) struct UniqueMapVisitor<V>(pub(crate) std::marker::PhantomData<V>);
 
 impl<'de, V: Deserialize<'de>> Visitor<'de> for UniqueMapVisitor<V> {
     type Value = BTreeMap<String, V>;

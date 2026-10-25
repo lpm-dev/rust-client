@@ -10,6 +10,7 @@
 
 pub mod account;
 pub mod assessment;
+pub mod budgets;
 pub mod gate;
 pub mod graph;
 pub mod invariants;

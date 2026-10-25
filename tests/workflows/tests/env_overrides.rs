@@ -134,6 +134,37 @@ fn tasks_and_parallel_runs_say_once_that_overrides_apply() {
 }
 
 #[test]
+fn a_file_run_directly_applies_a_personal_override_and_says_so_once() {
+    let (project, vault_id) = project_with_team_value(r#"{"show":"node show.cjs"}"#);
+    seed(
+        &project,
+        &vault_id,
+        Some(OVERRIDES_MARKER),
+        Some(&overrides_record(
+            &vault_id,
+            "default",
+            r#""API_URL":"mine""#,
+            "",
+        )),
+    );
+
+    let output = lpm(&project).args(["show.cjs"]).output().unwrap();
+
+    let stderr = stderr(&output);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stdout(&output).contains("API_URL=mine"),
+        "{}",
+        stdout(&output)
+    );
+    assert_eq!(
+        stderr.matches("1 personal override on").count(),
+        1,
+        "{stderr}"
+    );
+}
+
+#[test]
 fn unset_removes_the_team_value_from_the_run() {
     let (project, vault_id) = project_with_team_value(r#"{"show":"node show.cjs"}"#);
     seed(

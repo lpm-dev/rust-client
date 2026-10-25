@@ -590,29 +590,41 @@ fn recovery_syncs_the_folder_of_a_change_that_reached_its_target_before_the_cras
 }
 
 #[test]
-fn an_interrupted_deletion_never_leaves_values_without_their_companion_data() {
-    with_temp_vault_home(|home| {
-        force_file_vault();
-        seed_values();
-        commit(vec![
-            write(marker_account(), marker_with_overrides()),
-            write(record("overrides", None), overrides(r#""A":"1""#)),
-        ]);
-        CRASH_AFTER_JOURNAL.with(|crash| crash.set(true));
+fn a_deletion_interrupted_at_any_step_never_leaves_values_without_their_companion_data() {
+    // The first transaction deletes the digest and legacy values files, the
+    // overrides record and the marker: a crash can come before or after any.
+    for applied in 0..=4 {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            seed_values();
+            let vaults = vaults_path(home);
+            std::fs::copy(
+                vaults.join(crate::fallback::vault_file_name(VAULT)),
+                vaults.join(format!("{VAULT}.enc")),
+            )
+            .expect("seed a legacy copy");
+            set_owner_only(&vaults.join(format!("{VAULT}.enc")));
+            commit(vec![
+                write(marker_account(), marker_with_overrides()),
+                write(record("overrides", None), overrides(r#""A":"1""#)),
+            ]);
+            CRASH_AFTER_CHANGES.with(|crash| crash.set(Some(applied)));
 
-        crate::fallback::delete_vault_file(VAULT).expect_err("the simulated crash");
+            crate::fallback::delete_vault_file(VAULT).expect_err("the simulated crash");
 
-        assert_eq!(
-            crate::try_get_all_env_for_vault_id(VAULT, "default").expect("recovered read"),
-            HashMap::new(),
-            "recovery finishes the deletion with the values"
-        );
-        assert!(
-            !vaults_path(home)
-                .join(companion_folder_name(VAULT))
-                .exists()
-        );
-    });
+            assert_eq!(
+                crate::try_get_all_env_for_vault_id(VAULT, "default").expect("recovered read"),
+                HashMap::new(),
+                "after {applied} changes, recovery finishes the deletion with the values"
+            );
+            assert!(
+                !vaults.join(companion_folder_name(VAULT)).exists(),
+                "{applied}"
+            );
+            assert!(!vaults.join(format!("{VAULT}.enc")).exists(), "{applied}");
+            assert!(!journal_path(home, VAULT).exists(), "{applied}");
+        });
+    }
 }
 
 #[test]
@@ -857,4 +869,28 @@ fn a_healthy_project_has_nothing_to_review() {
         assert!(reviewed.problems.is_empty(), "{reviewed:?}");
         assert!(repair(&reviewed).expect("nothing to run").is_empty());
     });
+}
+
+#[test]
+fn every_file_journal_fixture_validates_as_recorded() {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Fixture {
+        vault_id: String,
+        cases: Vec<Case>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Case {
+        name: String,
+        text: String,
+        valid: bool,
+    }
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../../../../lpm-env-companion/tests/fixtures/file-journals.json"
+    ))
+    .expect("the file journal fixture decodes");
+    for case in fixture.cases {
+        let parsed = FileJournal::parse(case.text.as_bytes(), &fixture.vault_id);
+        assert_eq!(parsed.is_ok(), case.valid, "{}: {parsed:?}", case.name);
+    }
 }

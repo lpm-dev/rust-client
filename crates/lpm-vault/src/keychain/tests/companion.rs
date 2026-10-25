@@ -919,3 +919,141 @@ fn damaged_access_is_reviewed_with_no_repair_here() {
         []
     );
 }
+
+#[test]
+fn every_journal_fixture_recovers_as_recorded() {
+    use base64::Engine as _;
+    use std::collections::BTreeMap;
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Fixture {
+        journal_account: String,
+        cases: Vec<Case>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Case {
+        name: String,
+        before: BTreeMap<String, String>,
+        journal: serde_json::Value,
+        outcome: String,
+        #[serde(default)]
+        after: BTreeMap<String, String>,
+        #[serde(default)]
+        refusal: Option<String>,
+    }
+    let decode = |value: &str| {
+        base64::engine::general_purpose::STANDARD
+            .decode(value)
+            .expect("fixture bytes are base64")
+    };
+    let fixture: Fixture = serde_json::from_str(include_str!(
+        "../../../../lpm-env-companion/tests/fixtures/journals.json"
+    ))
+    .expect("the journal fixture decodes");
+    assert_eq!(fixture.journal_account, TRANSACTION_MARKER_ACCOUNT);
+    for case in fixture.cases {
+        let mut storage = MemoryProjectStorage::default();
+        for (account, value) in &case.before {
+            storage.values.insert(account.clone(), decode(value));
+        }
+        storage.values.insert(
+            TRANSACTION_MARKER_ACCOUNT,
+            serde_json::to_vec(&case.journal).expect("encode the journal"),
+        );
+
+        let result = recover_project_transaction(&mut storage);
+
+        match case.outcome.as_str() {
+            "recovers" => {
+                result.unwrap_or_else(|error| panic!("{}: {error}", case.name));
+                let left: BTreeMap<String, Vec<u8>> = storage
+                    .values
+                    .keys()
+                    .map(|account| {
+                        (
+                            account.to_owned(),
+                            storage
+                                .values
+                                .get_bytes(account)
+                                .unwrap_or_default()
+                                .to_vec(),
+                        )
+                    })
+                    .collect();
+                let expected: BTreeMap<String, Vec<u8>> = case
+                    .after
+                    .iter()
+                    .map(|(account, value)| (account.clone(), decode(value)))
+                    .collect();
+                assert_eq!(left, expected, "{}", case.name);
+            }
+            "refuses" => {
+                let error = result.map(|_| ()).expect_err(&case.name);
+                let refusal = case.refusal.as_deref().unwrap_or_default();
+                assert!(error.contains(refusal), "{}: {error}", case.name);
+                assert!(
+                    storage.values.contains_key(TRANSACTION_MARKER_ACCOUNT),
+                    "{}",
+                    case.name
+                );
+            }
+            other => panic!("{}: unknown outcome {other}", case.name),
+        }
+    }
+}
+
+#[test]
+fn a_deletion_that_fails_after_any_mutation_finishes_on_the_next_one() {
+    let storage = || {
+        let mut storage = storage_with_values();
+        storage.values.insert(
+            marker_account(VAULT),
+            marker(
+                &format!(
+                    r#"{OVERRIDES_FEATURE},"future":{{"version":1,"ifUnsupported":"ignore","kinds":["future-log"],"state":"active"}}"#
+                ),
+                "active",
+            ),
+        );
+        storage.values.insert(
+            record_account("overrides", VAULT, None),
+            overrides_record(r#""A":"1""#),
+        );
+        for part in 0..40 {
+            storage.values.insert(
+                record_account("future-log", VAULT, Some(part)),
+                vec![part as u8; 64],
+            );
+        }
+        storage.mutation_attempts = 0;
+        storage
+    };
+    let mut uninterrupted = storage();
+    delete_vault_with_storage(&mut uninterrupted, VAULT).expect("delete the project");
+    let mutations = uninterrupted.mutation_attempts;
+    assert!(mutations > 0);
+
+    for failure_point in 1..=mutations {
+        let mut storage = storage();
+        storage.fail_once_at_mutation = Some(failure_point);
+        let _ = delete_vault_with_storage(&mut storage, VAULT);
+        assert!(storage.injected_failure, "{failure_point}");
+        storage.fail_once_at_mutation = None;
+
+        delete_vault_with_storage(&mut storage, VAULT)
+            .unwrap_or_else(|error| panic!("{failure_point}: {error}"));
+
+        assert!(!storage.values.contains_key(VAULT), "{failure_point}");
+        assert!(
+            !storage.values.keys().any(|account| {
+                crate::companion::account::is_in_companion_namespace(account)
+                    || account.starts_with(TRANSACTION_STAGE_PREFIX)
+                    || account == TRANSACTION_MARKER_ACCOUNT
+            }),
+            "{failure_point}: {:?}",
+            storage.values.keys().collect::<Vec<_>>()
+        );
+    }
+}

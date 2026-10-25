@@ -1,0 +1,86 @@
+{
+  "schemaVersion": 1,
+  "vaultId": "proj",
+  "cases": [
+    {
+      "name": "a deletion of one of the project's records",
+      "text": "{\"schemaVersion\":1,\"transactionId\":\"0123456789abcdef0123456789abcdef\",\"operations\":[{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:overrides:cHJvag\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null}]}",
+      "valid": true
+    },
+    {
+      "name": "a deletion of both of the project's values files",
+      "text": "{\"schemaVersion\":1,\"transactionId\":\"0123456789abcdef0123456789abcdef\",\"operations\":[{\"action\":\"delete\",\"target\":\"proj\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null,\"valuesFile\":\"digest\"},{\"action\":\"delete\",\"target\":\"proj\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null,\"valuesFile\":\"legacy\"}]}",
+      "valid": true
+    },
+    {
+      "name": "a replacement with its after-state",
+      "text": "{\"schemaVersion\":1,\"transactionId\":\"0123456789abcdef0123456789abcdef\",\"operations\":[{\"action\":\"replace\",\"target\":\"__vault_companion_v1__:overrides:cHJvag\",\"before\":null,\"after\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}]}",
+      "valid": true
+    },
+    {
+      "name": "a values file outside the folder",
+      "text": "{\"schemaVersion\":1,\"transactionId\":\"0123456789abcdef0123456789abcdef\",\"operations\":[{\"action\":\"delete\",\"target\":\"../escape\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null,\"valuesFile\":\"legacy\"}]}",
+      "valid": false
+    },
+    {
+      "name": "another project's record",
+      "text": "{\"schemaVersion\":1,\"transactionId\":\"0123456789abcdef0123456789abcdef\",\"operations\":[{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:overrides:b3RoZXI\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null}]}",
+      "valid": false
+    },
+    {
+      "name": "another project's values",
+      "text": "{\"schemaVersion\":1,\"transactionId\":\"0123456789abcdef0123456789abcdef\",\"operations\":[{\"action\":\"delete\",\"target\":\"other\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null,\"valuesFile\":\"digest\"}]}",
+      "valid": false
+    },
+    {
+      "name": "an account outside the companion namespace",
+      "text": "{\"schemaVersion\":1,\"transactionId\":\"0123456789abcdef0123456789abcdef\",\"operations\":[{\"action\":\"delete\",\"target\":\"__vault_project_index_marker__\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null}]}",
+      "valid": false
+    },
+    {
+      "name": "a digest that isn't lowercase hex",
+      "text": "{\"schemaVersion\":1,\"transactionId\":\"0123456789abcdef0123456789abcdef\",\"operations\":[{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:overrides:cHJvag\",\"before\":\"XYZ\",\"after\":null}]}",
+      "valid": false
+    },
+    {
+      "name": "a replacement without an after-state",
+      "text": "{\"schemaVersion\":1,\"transactionId\":\"0123456789abcdef0123456789abcdef\",\"operations\":[{\"action\":\"replace\",\"target\":\"__vault_companion_v1__:overrides:cHJvag\",\"before\":null,\"after\":null}]}",
+      "valid": false
+    },
+    {
+      "name": "the same file twice",
+      "text": "{\"schemaVersion\":1,\"transactionId\":\"0123456789abcdef0123456789abcdef\",\"operations\":[{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:overrides:cHJvag\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:overrides:cHJvag\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null}]}",
+      "valid": false
+    },
+    {
+      "name": "more operations than a transaction holds",
+      "text": "{\"schemaVersion\":1,\"transactionId\":\"0123456789abcdef0123456789abcdef\",\"operations\":[{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:000\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:001\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:002\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:003\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:004\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:005\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:006\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:007\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:008\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:009\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:00a\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:00b\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:00c\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:00d\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:00e\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:00f\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:010\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:011\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:012\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:013\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:014\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:015\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:016\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:017\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:018\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:019\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:01a\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:01b\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:01c\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:01d\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:01e\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:01f\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null},{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:future-log:cHJvag:020\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null}]}",
+      "valid": false
+    },
+    {
+      "name": "no operations",
+      "text": "{\"schemaVersion\":1,\"transactionId\":\"0123456789abcdef0123456789abcdef\",\"operations\":[]}",
+      "valid": false
+    },
+    {
+      "name": "an unknown field",
+      "text": "{\"schemaVersion\":1,\"transactionId\":\"0123456789abcdef0123456789abcdef\",\"operations\":[{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:overrides:cHJvag\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null}],\"note\":\"hi\"}",
+      "valid": false
+    },
+    {
+      "name": "an unknown schema version",
+      "text": "{\"schemaVersion\":2,\"transactionId\":\"0123456789abcdef0123456789abcdef\",\"operations\":[{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:overrides:cHJvag\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null}]}",
+      "valid": false
+    },
+    {
+      "name": "a transaction ID that isn't 32 lowercase hex digits",
+      "text": "{\"schemaVersion\":1,\"transactionId\":\"ABC\",\"operations\":[{\"action\":\"delete\",\"target\":\"__vault_companion_v1__:overrides:cHJvag\",\"before\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"after\":null}]}",
+      "valid": false
+    },
+    {
+      "name": "a repeated key",
+      "text": "{\"schemaVersion\":1,\"schemaVersion\":1,\"transactionId\":\"0123456789abcdef0123456789abcdef\",\"operations\":[]}",
+      "valid": false
+    }
+  ]
+}
