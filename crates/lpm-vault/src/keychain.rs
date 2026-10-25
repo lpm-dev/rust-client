@@ -582,83 +582,17 @@ fn check_companion_invariants(
     changes: &[(&str, Option<&[u8]>)],
     full: bool,
 ) -> Result<(), String> {
-    type Changes<'value> = Vec<(CompanionAccount, Option<&'value [u8]>)>;
-    let mut by_vault: HashMap<String, Changes<'_>> = HashMap::new();
-    for (account, value) in changes {
-        let parsed = CompanionAccount::parse(account)
-            .ok_or_else(|| "vault transaction companion account is invalid".to_owned())?;
-        by_vault
-            .entry(parsed.vault_id().to_owned())
-            .or_default()
-            .push((parsed, *value));
-    }
-    let inventory = if full {
+    let names = if full {
         Some(storage.account_names()?)
     } else {
         None
     };
-    for (vault_id, vault_changes) in by_vault {
-        let marker_change = vault_changes
-            .iter()
-            .find(|(account, _)| matches!(account, CompanionAccount::Marker { .. }));
-        let post_marker = match marker_change {
-            Some((_, Some(bytes))) => Some(Marker::parse(&vault_id, bytes).map_err(|error| {
-                format!("vault transaction feature marker is invalid: {error}")
-            })?),
-            Some((_, None)) => None,
-            None => storage
-                .read(&crate::companion::account::marker_account(&vault_id))?
-                .map(|bytes| {
-                    Marker::parse(&vault_id, &bytes).map_err(|error| {
-                        format!("the feature marker of {vault_id} is invalid: {error}")
-                    })
-                })
-                .transpose()?,
-        };
-        let listed = |account: &CompanionAccount| match (account, &post_marker) {
-            (CompanionAccount::Marker { .. }, _) => true,
-            (CompanionAccount::Record { kind, .. }, Some(marker)) => {
-                marker.lists_kind(kind) || marker.restore_lists_kind(kind)
-            }
-            (CompanionAccount::Staged { kind, .. }, Some(marker)) => {
-                marker.restore_lists_kind(kind)
-            }
-            (_, None) => false,
-        };
-        for (account, value) in &vault_changes {
-            if value.is_some() && !listed(account) {
-                return Err(format!(
-                    "vault transaction writes {} without a feature that lists it",
-                    account.name()
-                ));
-            }
-        }
-        if let Some(inventory) = &inventory {
-            let deleted: HashSet<&CompanionAccount> = vault_changes
-                .iter()
-                .filter(|(_, value)| value.is_none())
-                .map(|(account, _)| account)
-                .collect();
-            for name in inventory {
-                let Some(account) = CompanionAccount::parse(name) else {
-                    continue;
-                };
-                if account.vault_id() != vault_id
-                    || matches!(account, CompanionAccount::Marker { .. })
-                    || deleted.contains(&account)
-                {
-                    continue;
-                }
-                if !listed(&account) {
-                    return Err(format!(
-                        "vault transaction would leave {} without a feature that lists it",
-                        account.name()
-                    ));
-                }
-            }
-        }
-    }
-    Ok(())
+    crate::companion::invariants::check_transaction(
+        changes,
+        |vault_id| storage.read(&crate::companion::account::marker_account(vault_id)),
+        names.as_deref(),
+    )
+    .map_err(|refusal| refusal.describe("vault transaction"))
 }
 
 fn recover_project_transaction(
@@ -1552,7 +1486,7 @@ pub(crate) fn read_for_run_unlocked(
     default_fallback: bool,
 ) -> Result<(Option<SecretMap>, crate::PersonalOverrides), String> {
     let read = companion_gate::read_for_run(&mut KeychainProjectStorage, vault_id)?;
-    let overrides = crate::companion::evaluate_overrides(
+    let overrides = crate::companion::overrides::evaluate(
         &read.gate,
         vault_id,
         env,
@@ -1587,7 +1521,7 @@ pub(crate) fn read_all_for_run_unlocked(
     String,
 > {
     let read = companion_gate::read_for_run(&mut KeychainProjectStorage, vault_id)?;
-    let overrides = crate::companion::evaluate_all_overrides(
+    let overrides = crate::companion::overrides::evaluate_all(
         &read.gate,
         vault_id,
         read.overrides_record.as_deref(),
@@ -1983,48 +1917,61 @@ fn delete_vault_with_storage_after_recovery(
 
 /// Delete a project with companion records: the first transaction
 /// removes the values item, the project's metadata, the shared key and the
-/// single records, and leaves a `deleting` marker that lists every kind
-/// still present. Later batches remove the rest, the marker last.
+/// single records, and either the marker or, when records remain, leaves a
+/// `deleting` marker that later transactions finish.
 fn delete_project_with_companion_records(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
     project_mutations: Option<Vec<ProjectStorageMutation>>,
     marker_bytes: Option<Vec<u8>>,
-    mut inventory: Vec<CompanionAccount>,
+    inventory: Vec<CompanionAccount>,
 ) -> Result<(), String> {
-    use crate::companion::lifecycle::MAX_TRANSACTION_OPERATIONS;
+    use crate::companion::lifecycle::{FoundMarker, MarkerChange, Plan, PlannedChange};
 
-    let current = marker_bytes.and_then(|bytes| Marker::parse(vault_id, &bytes).ok());
-    let deleting = crate::companion::deleting_marker(vault_id, current.as_ref(), &inventory);
+    let current = marker_bytes
+        .as_deref()
+        .map(|bytes| Marker::parse(vault_id, bytes).ok());
+    let found = match &current {
+        None => FoundMarker::Absent,
+        Some(None) => FoundMarker::Invalid,
+        Some(Some(marker)) => FoundMarker::Valid(marker),
+    };
     let mut mutations =
         project_mutations.unwrap_or_else(|| vec![ProjectStorageMutation::delete(vault_id)]);
-    inventory.sort_by_key(|account| {
-        (
-            account.kind() != Some(crate::companion::graph::SHARED_KEY_KIND),
-            account.part().is_some(),
-        )
-    });
-    let room = MAX_TRANSACTION_OPERATIONS.saturating_sub(mutations.len() + 1);
-    let first = inventory
-        .iter()
-        .take_while(|account| account.part().is_none())
-        .take(room)
-        .count();
-    let remaining = inventory.split_off(first);
-    mutations.extend(
-        inventory
-            .iter()
-            .map(|account| ProjectStorageMutation::delete(account.name())),
-    );
-    mutations.push(ProjectStorageMutation::write(
-        crate::companion::account::marker_account(vault_id),
-        deleting.encode().map_err(|error| error.to_string())?,
-    ));
+    let plan =
+        crate::companion::lifecycle::plan_deletion(vault_id, found, inventory, mutations.len())?;
+    let mut transactions = plan.transactions.into_iter();
+    if let Some(first) = transactions.next() {
+        for change in first.changes {
+            match change {
+                PlannedChange::Delete(account) => {
+                    mutations.push(ProjectStorageMutation::delete(account.name()));
+                }
+                PlannedChange::Move { .. } => {
+                    return Err("a deletion plan moved a record".to_owned());
+                }
+            }
+        }
+        let marker_account = crate::companion::account::marker_account(vault_id);
+        match first.marker {
+            Some(MarkerChange::Write(marker)) => mutations.push(ProjectStorageMutation::write(
+                marker_account,
+                marker.encode().map_err(|error| error.to_string())?,
+            )),
+            Some(MarkerChange::Delete) => {
+                mutations.push(ProjectStorageMutation::delete(marker_account));
+            }
+            None => {}
+        }
+    }
     apply_project_transaction_after_recovery(storage, mutations)?;
-    crate::companion::lifecycle::resume(
+    crate::companion::lifecycle::execute(
         &mut companion_gate::KeychainCompanion(&mut *storage),
-        deleting,
-        remaining,
+        Plan {
+            vault_id: plan.vault_id,
+            transactions: transactions.collect(),
+            result: None,
+        },
     )?;
     crate::companion::remember(vault_id, &ProjectGate::Plain);
     Ok(())

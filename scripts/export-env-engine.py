@@ -16,7 +16,7 @@ import tomllib
 NOTICES = 'THIRD_PARTY_NOTICES.html'
 # The companion storage contract both clients test against, shipped with the
 # engine so the app reads the fixtures of the revision it links.
-FIXTURES = Path('crates/lpm-vault/tests/fixtures/companion')
+FIXTURES = Path('crates/lpm-env-companion/tests/fixtures')
 BUNDLED_FIXTURES = Path('fixtures/companion')
 LICENSE_FILE_PREFIXES = ('LICENSE', 'LICENCE', 'COPYING', 'COPYRIGHT', 'NOTICE', 'UNLICENSE')
 

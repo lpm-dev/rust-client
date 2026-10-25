@@ -2,23 +2,23 @@
 //! minimum policy, the access class of every kind, and which versions this
 //! client supports.
 
-use super::marker::Level;
+use crate::marker::Level;
 
 /// The kind every key-dependent feature shares.
-pub(crate) const SHARED_KEY_KIND: &str = "key";
+pub const SHARED_KEY_KIND: &str = "key";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct KnownFeature {
-    pub(crate) name: &'static str,
+pub struct KnownFeature {
+    pub name: &'static str,
     /// Every kind the feature lists, in the order its marker entry lists them.
-    pub(crate) kinds: &'static [&'static str],
+    pub kinds: &'static [&'static str],
     /// Kinds that must exist while the feature is active.
-    pub(crate) required: &'static [&'static str],
-    pub(crate) minimum: Level,
-    pub(crate) supported_versions: &'static [u16],
+    pub required: &'static [&'static str],
+    pub minimum: Level,
+    pub supported_versions: &'static [u16],
 }
 
-pub(crate) const OVERRIDES: KnownFeature = KnownFeature {
+pub const OVERRIDES: KnownFeature = KnownFeature {
     name: "overrides",
     kinds: &["overrides"],
     required: &["overrides"],
@@ -52,13 +52,13 @@ const DETAILS: KnownFeature = KnownFeature {
 
 const KNOWN_FEATURES: [KnownFeature; 4] = [OVERRIDES, HISTORY, RELEASES, DETAILS];
 
-pub(crate) fn known_feature(name: &str) -> Option<&'static KnownFeature> {
+pub fn known_feature(name: &str) -> Option<&'static KnownFeature> {
     KNOWN_FEATURES.iter().find(|feature| feature.name == name)
 }
 
 /// The known feature that alone may list `kind`, or `None` for `key`, which
 /// any feature may list, and for kinds no known feature owns.
-pub(crate) fn reserved_owner(kind: &str) -> Option<&'static str> {
+pub fn reserved_owner(kind: &str) -> Option<&'static str> {
     if kind == SHARED_KEY_KIND {
         return None;
     }
@@ -68,9 +68,8 @@ pub(crate) fn reserved_owner(kind: &str) -> Option<&'static str> {
         .map(|feature| feature.name)
 }
 
-#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AccessClass {
+pub enum AccessClass {
     /// Readable without CLI approval: the marker and ciphertext parts.
     Open,
     /// The same CLI approval as the project's values item.
@@ -80,8 +79,7 @@ pub(crate) enum AccessClass {
 /// A record's access class. Every kind follows values, unknown kinds
 /// included, except the parts of `history` and `releases`, which are
 /// ciphertext under `key`.
-#[cfg(target_os = "macos")]
-pub(crate) fn record_access_class(kind: &str, part: Option<u16>) -> AccessClass {
+pub fn record_access_class(kind: &str, part: Option<u16>) -> AccessClass {
     if part.is_some() && matches!(kind, "history" | "releases") {
         AccessClass::Open
     } else {
@@ -104,7 +102,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
     fn only_history_and_release_parts_are_open() {
         assert_eq!(record_access_class("history", Some(0)), AccessClass::Open);
         assert_eq!(record_access_class("releases", Some(7)), AccessClass::Open);

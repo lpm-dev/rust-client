@@ -3666,15 +3666,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "lpm-env-companion"
+version = "0.81.0"
+dependencies = [
+ "base64 0.22.1",
+ "lpm-common",
+ "lpm-env",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "lpm-env-ffi"
 version = "0.81.0"
 dependencies = [
+ "base64 0.22.1",
  "cap-std",
  "crypto_box",
  "hex",
  "lpm-common",
  "lpm-env",
  "lpm-env-backup",
+ "lpm-env-companion",
  "lpm-env-source",
  "lpm-workspace",
  "serde",
@@ -4266,6 +4279,7 @@ dependencies = [
  "libc",
  "lpm-common",
  "lpm-env",
+ "lpm-env-companion",
  "lpm-http",
  "objc2-local-authentication",
  "p256",

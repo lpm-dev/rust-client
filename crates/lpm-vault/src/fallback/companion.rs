@@ -20,7 +20,7 @@
 //! There's no `preparing` journal: stages found without a journal were never
 //! committed, and recovery deletes them.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
 use aes_gcm::aead::{AeadInPlace, generic_array::GenericArray};
 use aes_gcm::{Aes256Gcm, KeyInit};
@@ -29,12 +29,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::companion::account::CompanionAccount;
 use crate::companion::gate::{Operation, ProjectGate};
+use crate::companion::invariants::check_transaction;
 use crate::companion::lifecycle::{
-    LifecycleStore, MAX_TRANSACTION_OPERATIONS, MAX_TRANSACTION_PAYLOAD_BYTES, Mutation,
+    FoundMarker, LifecycleStore, MAX_TRANSACTION_OPERATIONS, MAX_TRANSACTION_PAYLOAD_BYTES,
+    Mutation,
 };
 use crate::companion::marker::{MAX_RECORD_BYTES, Marker};
 use crate::companion::overrides::{OVERRIDES_KIND, PersonalOverrides};
-use crate::companion::{CompanionBackend, damaged, evaluate_overrides};
+use crate::companion::{CompanionBackend, damaged};
 use crate::storage_transaction::VaultStorageDirectory;
 
 const VAULTS_FOLDER: &str = "vaults";
@@ -419,35 +421,20 @@ impl<'directory> FileCompanion<'directory> {
 
     /// I1, I2 and I5 for the marker each touched project is left with.
     fn check_journal_invariants(&self, journal: &FileJournal) -> Result<(), String> {
-        let mut projects: BTreeMap<String, Vec<(CompanionAccount, FileAction)>> = BTreeMap::new();
-        for operation in &journal.operations {
+        let stage = self.vaults.open_existing_directory(STAGE_FOLDER)?;
+        let key = self.data_key()?;
+        let mut targets: Vec<(&str, Option<Vec<u8>>)> = Vec::new();
+        let mut vaults = BTreeSet::new();
+        for (index, operation) in journal.operations.iter().enumerate() {
             if operation.values_file.is_some() {
                 continue;
             }
             let account = CompanionAccount::parse(&operation.target).ok_or_else(|| {
                 "the env file journal names an invalid companion record".to_owned()
             })?;
-            projects
-                .entry(account.vault_id().to_owned())
-                .or_default()
-                .push((account, operation.action));
-        }
-        let stage = self.vaults.open_existing_directory(STAGE_FOLDER)?;
-        for (vault_id, changes) in projects {
-            let marker_index = journal.operations.iter().position(|operation| {
-                operation.values_file.is_none()
-                    && matches!(
-                        CompanionAccount::parse(&operation.target),
-                        Some(CompanionAccount::Marker { vault_id: ref id }) if *id == vault_id
-                    )
-            });
-            let key = self.data_key()?;
-            let marker_account = CompanionAccount::Marker {
-                vault_id: vault_id.clone(),
-            };
-            let post_marker = match marker_index {
-                Some(index) if journal.operations[index].action == FileAction::Delete => None,
-                Some(index) => {
+            let value = match (&account, operation.action) {
+                (_, FileAction::Delete) => None,
+                (CompanionAccount::Marker { vault_id }, FileAction::Replace) => {
                     let name = stage_name(&journal.transaction_id, index);
                     let sealed = match stage
                         .as_ref()
@@ -457,7 +444,7 @@ impl<'directory> FileCompanion<'directory> {
                     {
                         Some(sealed) => sealed,
                         None => self
-                            .folder(&vault_id)?
+                            .folder(vault_id)?
                             .map(|folder| self.read_sealed(&folder, MARKER_ENTRY))
                             .transpose()?
                             .flatten()
@@ -465,46 +452,43 @@ impl<'directory> FileCompanion<'directory> {
                                 "the env file journal lost a marker it wrote".to_owned()
                             })?,
                     };
-                    Some(parse_marker(
-                        &vault_id,
-                        &open(&key, &marker_account, &sealed)?,
-                    )?)
+                    Some(open(&key, &account, &sealed)?)
                 }
-                None => self.read_marker(&vault_id, &key)?,
+                (_, FileAction::Replace) => Some(Vec::new()),
             };
-            let listed = |account: &CompanionAccount| match (account, &post_marker) {
-                (CompanionAccount::Marker { .. }, _) => true,
-                (CompanionAccount::Record { kind, .. }, Some(marker)) => {
-                    marker.lists_kind(kind) || marker.restore_lists_kind(kind)
-                }
-                (CompanionAccount::Staged { kind, .. }, Some(marker)) => {
-                    marker.restore_lists_kind(kind)
-                }
-                (_, None) => false,
-            };
-            let deleted: HashSet<&CompanionAccount> = changes
-                .iter()
-                .filter(|(_, action)| *action == FileAction::Delete)
-                .map(|(account, _)| account)
-                .collect();
-            for (account, action) in &changes {
-                if *action == FileAction::Replace && !listed(account) {
-                    return Err(format!(
-                        "the env file journal writes {} without a feature that lists it",
-                        account.name()
-                    ));
-                }
-            }
-            for account in self.inventory_of(&vault_id)? {
-                if !deleted.contains(&account) && !listed(&account) {
-                    return Err(format!(
-                        "the env file journal would leave {} without a feature that lists it",
-                        account.name()
-                    ));
-                }
-            }
+            vaults.insert(account.vault_id().to_owned());
+            targets.push((operation.target.as_str(), value));
         }
-        Ok(())
+        let mut names = Vec::new();
+        for vault_id in &vaults {
+            names.extend(
+                self.inventory_of(vault_id)?
+                    .iter()
+                    .map(CompanionAccount::name),
+            );
+        }
+        let changes: Vec<(&str, Option<&[u8]>)> = targets
+            .iter()
+            .map(|(target, value)| (*target, value.as_deref()))
+            .collect();
+        check_transaction(
+            &changes,
+            |vault_id| self.read_marker_bytes(vault_id, &key),
+            Some(&names),
+        )
+        .map_err(|refusal| refusal.describe("the env file journal"))
+    }
+
+    fn read_marker_bytes(&self, vault_id: &str, key: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
+        let Some(folder) = self.folder(vault_id)? else {
+            return Ok(None);
+        };
+        let account = CompanionAccount::Marker {
+            vault_id: vault_id.to_owned(),
+        };
+        self.read_sealed(&folder, MARKER_ENTRY)?
+            .map(|sealed| open(key, &account, &sealed))
+            .transpose()
     }
 
     fn read_marker(&self, vault_id: &str, key: &[u8; 32]) -> Result<Option<Marker>, String> {
@@ -759,7 +743,8 @@ pub(crate) fn read_overrides_unlocked(
     environment: &str,
 ) -> Result<PersonalOverrides, String> {
     let (gate, record) = read_overrides_record_unlocked(directory, vault_id)?;
-    evaluate_overrides(&gate, vault_id, environment, record.as_deref()).map_err(damaged)
+    crate::companion::overrides::evaluate(&gate, vault_id, environment, record.as_deref())
+        .map_err(damaged)
 }
 
 /// Remove every companion record of `vault_id` through the deletion protocol.
@@ -770,17 +755,13 @@ pub(crate) fn delete_project_unlocked(
     let gate = authorize_unlocked(directory, vault_id, Operation::Maintenance)?;
     let mut companion = FileCompanion::open(directory)?;
     let inventory = companion.inventory(vault_id)?;
-    if inventory.is_empty() && matches!(gate, ProjectGate::Plain) {
-        return Ok(());
-    }
-    let deleting = crate::companion::deleting_marker(vault_id, gate.marker(), &inventory);
-    companion.commit(vec![Mutation::Write {
-        account: CompanionAccount::Marker {
-            vault_id: vault_id.to_owned(),
-        },
-        value: deleting.encode().map_err(|error| error.to_string())?,
-    }])?;
-    crate::companion::lifecycle::resume(&mut companion, deleting, inventory)?;
+    let found = match &gate {
+        ProjectGate::Plain => FoundMarker::Absent,
+        ProjectGate::Damaged(_) => FoundMarker::Invalid,
+        ProjectGate::Marked(marker) => FoundMarker::Valid(marker),
+    };
+    let plan = crate::companion::lifecycle::plan_deletion(vault_id, found, inventory, 0)?;
+    crate::companion::lifecycle::execute(&mut companion, plan)?;
     crate::companion::remember(vault_id, &ProjectGate::Plain);
     Ok(())
 }

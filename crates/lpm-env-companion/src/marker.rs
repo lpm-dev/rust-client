@@ -8,11 +8,11 @@ use std::fmt;
 use serde::de::{Error as _, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use super::account::{is_valid_identifier, is_valid_kind};
-use super::graph::{self, SHARED_KEY_KIND};
+use crate::account::{is_valid_identifier, is_valid_kind};
+use crate::graph::{self, SHARED_KEY_KIND};
 
-pub(crate) const MARKER_SCHEMA_VERSION: u8 = 1;
-pub(crate) const MAX_RECORD_BYTES: usize = 100 * 1024;
+pub const MARKER_SCHEMA_VERSION: u8 = 1;
+pub const MAX_RECORD_BYTES: usize = 100 * 1024;
 const MAX_FEATURES: usize = 16;
 const MAX_KINDS_PER_FEATURE: usize = 8;
 
@@ -20,7 +20,7 @@ const MAX_KINDS_PER_FEATURE: usize = 8;
 /// to least permissive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum Level {
+pub enum Level {
     Ignore,
     ReadOnly,
     Refuse,
@@ -28,7 +28,7 @@ pub(crate) enum Level {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum ProjectState {
+pub enum ProjectState {
     Active,
     Deleting,
     Discarding,
@@ -37,51 +37,51 @@ pub(crate) enum ProjectState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum FeatureState {
+pub enum FeatureState {
     Active,
     Removing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) enum RestorePhase {
+pub enum RestorePhase {
     Staging,
     Activating,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct FeatureEntry {
-    pub(crate) version: u16,
-    pub(crate) if_unsupported: Level,
-    pub(crate) kinds: Vec<String>,
-    pub(crate) state: FeatureState,
+pub struct FeatureEntry {
+    pub version: u16,
+    pub if_unsupported: Level,
+    pub kinds: Vec<String>,
+    pub state: FeatureState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct Restore {
-    pub(crate) phase: RestorePhase,
-    pub(crate) replaces: Vec<String>,
+pub struct Restore {
+    pub phase: RestorePhase,
+    pub replaces: Vec<String>,
     #[serde(deserialize_with = "unique_features")]
-    pub(crate) features: BTreeMap<String, FeatureEntry>,
+    pub features: BTreeMap<String, FeatureEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct Marker {
-    pub(crate) schema_version: u8,
-    pub(crate) vault_id: String,
-    pub(crate) state: ProjectState,
+pub struct Marker {
+    pub schema_version: u8,
+    pub vault_id: String,
+    pub state: ProjectState,
     #[serde(deserialize_with = "unique_features")]
-    pub(crate) features: BTreeMap<String, FeatureEntry>,
+    pub features: BTreeMap<String, FeatureEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) restore: Option<Restore>,
+    pub restore: Option<Restore>,
 }
 
 /// Why a marker can't be used; any of these makes its project damaged.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InvalidMarker(pub(crate) String);
+pub struct InvalidMarker(pub String);
 
 impl fmt::Display for InvalidMarker {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -94,7 +94,7 @@ fn invalid(reason: impl Into<String>) -> InvalidMarker {
 }
 
 impl Marker {
-    pub(crate) fn empty(vault_id: &str, state: ProjectState) -> Self {
+    pub fn empty(vault_id: &str, state: ProjectState) -> Self {
         Self {
             schema_version: MARKER_SCHEMA_VERSION,
             vault_id: vault_id.to_owned(),
@@ -105,7 +105,7 @@ impl Marker {
     }
 
     /// Parse and validate the marker stored for `vault_id`.
-    pub(crate) fn parse(vault_id: &str, bytes: &[u8]) -> Result<Self, InvalidMarker> {
+    pub fn parse(vault_id: &str, bytes: &[u8]) -> Result<Self, InvalidMarker> {
         if bytes.len() > MAX_RECORD_BYTES {
             return Err(invalid("the feature marker is too large"));
         }
@@ -118,7 +118,7 @@ impl Marker {
         Ok(marker)
     }
 
-    pub(crate) fn encode(&self) -> Result<Vec<u8>, InvalidMarker> {
+    pub fn encode(&self) -> Result<Vec<u8>, InvalidMarker> {
         self.validate()?;
         let encoded = serde_json::to_vec(self)
             .map_err(|error| invalid(format!("the feature marker can't be encoded: {error}")))?;
@@ -128,7 +128,7 @@ impl Marker {
         Ok(encoded)
     }
 
-    pub(crate) fn validate(&self) -> Result<(), InvalidMarker> {
+    pub fn validate(&self) -> Result<(), InvalidMarker> {
         if self.schema_version != MARKER_SCHEMA_VERSION {
             return Err(invalid("the feature marker's schema version is unknown"));
         }
@@ -193,10 +193,7 @@ impl Marker {
 
     /// The features a restore leaves: the project's own without the replaced
     /// ones, plus the restored ones.
-    pub(crate) fn post_restore_features(
-        &self,
-        restore: &Restore,
-    ) -> BTreeMap<String, FeatureEntry> {
+    pub fn post_restore_features(&self, restore: &Restore) -> BTreeMap<String, FeatureEntry> {
         let mut features = self.features.clone();
         for name in &restore.replaces {
             features.remove(name);
@@ -212,13 +209,13 @@ impl Marker {
 
     /// Whether some feature entry lists `kind`, or, during a restore, some
     /// restored feature does, for staged records.
-    pub(crate) fn lists_kind(&self, kind: &str) -> bool {
+    pub fn lists_kind(&self, kind: &str) -> bool {
         self.features
             .values()
             .any(|entry| entry.kinds.iter().any(|listed| listed == kind))
     }
 
-    pub(crate) fn restore_lists_kind(&self, kind: &str) -> bool {
+    pub fn restore_lists_kind(&self, kind: &str) -> bool {
         self.restore.as_ref().is_some_and(|restore| {
             restore
                 .features
@@ -229,7 +226,7 @@ impl Marker {
 
     /// The project's level: the strictest contribution of its features whose
     /// version this client doesn't support.
-    pub(crate) fn level(&self) -> Level {
+    pub fn level(&self) -> Level {
         self.features
             .iter()
             .filter_map(|(name, entry)| unsupported_contribution(name, entry))
@@ -238,7 +235,7 @@ impl Marker {
     }
 
     /// The first feature, by name, that contributes the project's level.
-    pub(crate) fn strictest_unsupported(&self) -> Option<(&str, &FeatureEntry)> {
+    pub fn strictest_unsupported(&self) -> Option<(&str, &FeatureEntry)> {
         let level = self.level();
         self.features
             .iter()
@@ -246,7 +243,7 @@ impl Marker {
             .map(|(name, entry)| (name.as_str(), entry))
     }
 
-    pub(crate) fn feature(&self, name: &str) -> Option<&FeatureEntry> {
+    pub fn feature(&self, name: &str) -> Option<&FeatureEntry> {
         self.features.get(name)
     }
 }
@@ -261,7 +258,7 @@ fn unsupported_contribution(name: &str, entry: &FeatureEntry) -> Option<Level> {
     }
 }
 
-pub(crate) fn is_supported(name: &str, version: u16) -> bool {
+pub fn is_supported(name: &str, version: u16) -> bool {
     graph::known_feature(name).is_some_and(|known| known.supported_versions.contains(&version))
 }
 
@@ -335,7 +332,7 @@ where
 
 /// A JSON object read into a map, refusing a repeated key instead of keeping
 /// the last value.
-pub(crate) struct UniqueMapVisitor<V>(pub(crate) std::marker::PhantomData<V>);
+pub struct UniqueMapVisitor<V>(pub std::marker::PhantomData<V>);
 
 impl<'de, V: Deserialize<'de>> Visitor<'de> for UniqueMapVisitor<V> {
     type Value = BTreeMap<String, V>;

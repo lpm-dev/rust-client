@@ -13,9 +13,10 @@ use std::fmt;
 use lpm_common::stored_env::{is_valid_environment_name, is_valid_variable_name};
 use serde::{Deserialize, Deserializer};
 
-use super::marker::{MAX_RECORD_BYTES, UniqueMapVisitor};
+use crate::gate::{Damage, ProjectGate};
+use crate::marker::{FeatureState, MAX_RECORD_BYTES, UniqueMapVisitor};
 
-pub(crate) const OVERRIDES_KIND: &str = "overrides";
+pub const OVERRIDES_KIND: &str = "overrides";
 
 /// The overrides of the selected environment.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -38,7 +39,7 @@ impl PersonalOverrides {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct InvalidOverrides(pub(crate) String);
+pub struct InvalidOverrides(pub String);
 
 impl fmt::Display for InvalidOverrides {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -86,7 +87,7 @@ where
 /// Validate the whole record stored for `vault_id`, then keep only
 /// `environment`'s overrides. `version` is the marker's version for the
 /// feature, which the record must repeat.
-pub(crate) fn parse_selected(
+pub fn parse_selected(
     bytes: &[u8],
     vault_id: &str,
     version: u16,
@@ -96,7 +97,7 @@ pub(crate) fn parse_selected(
 }
 
 /// Validate the whole record and keep every environment's overrides.
-pub(crate) fn parse_all(
+pub fn parse_all(
     bytes: &[u8],
     vault_id: &str,
     version: u16,
@@ -115,6 +116,55 @@ pub(crate) fn parse_all(
             )
         })
         .collect())
+}
+
+/// The selected environment's personal overrides, from the overrides record
+/// an Apply read always reads, found or not, so a missing marker can't hide
+/// a record and a missing record can't pass for no overrides.
+pub fn evaluate(
+    gate: &ProjectGate,
+    vault_id: &str,
+    environment: &str,
+    record: Option<&[u8]>,
+) -> Result<PersonalOverrides, Damage> {
+    evaluate_with(gate, record, |bytes, version| {
+        parse_selected(bytes, vault_id, version, environment)
+    })
+}
+
+/// Every environment's personal overrides, under the same rules as
+/// [`evaluate`].
+pub fn evaluate_all(
+    gate: &ProjectGate,
+    vault_id: &str,
+    record: Option<&[u8]>,
+) -> Result<BTreeMap<String, PersonalOverrides>, Damage> {
+    evaluate_with(gate, record, |bytes, version| {
+        parse_all(bytes, vault_id, version)
+    })
+}
+
+fn evaluate_with<T: Default>(
+    gate: &ProjectGate,
+    record: Option<&[u8]>,
+    parse: impl FnOnce(&[u8], u16) -> Result<T, InvalidOverrides>,
+) -> Result<T, Damage> {
+    let entry = gate
+        .marker()
+        .and_then(|marker| marker.feature(OVERRIDES_KIND))
+        .filter(|entry| entry.state == FeatureState::Active);
+    let kind = || OVERRIDES_KIND.to_owned();
+    match (entry, record) {
+        (None, None) => Ok(T::default()),
+        (None, Some(_)) => Err(Damage::UnlistedRecord { kind: kind() }),
+        (Some(_), None) => Err(Damage::MissingRecord { kind: kind() }),
+        (Some(entry), Some(bytes)) => {
+            parse(bytes, entry.version).map_err(|error| Damage::InvalidRecord {
+                kind: kind(),
+                reason: error.to_string(),
+            })
+        }
+    }
 }
 
 fn parse_record(
@@ -273,6 +323,51 @@ mod tests {
         );
         assert!(
             parse_selected_with_case_policy(json.as_bytes(), "proj", 1, "staging", true).is_err()
+        );
+    }
+
+    #[test]
+    fn overrides_are_damaged_when_the_marker_and_the_record_disagree() {
+        use crate::marker::{FeatureEntry, Level, Marker, ProjectState};
+
+        let plain = ProjectGate::Plain;
+        assert_eq!(
+            evaluate(&plain, "proj", "default", None),
+            Ok(PersonalOverrides::default())
+        );
+        assert_eq!(
+            evaluate(&plain, "proj", "default", Some(b"{}")),
+            Err(Damage::UnlistedRecord {
+                kind: "overrides".to_owned()
+            })
+        );
+        let mut marker = Marker::empty("proj", ProjectState::Active);
+        marker.features.insert(
+            "overrides".to_owned(),
+            FeatureEntry {
+                version: 1,
+                if_unsupported: Level::Refuse,
+                kinds: vec!["overrides".to_owned()],
+                state: FeatureState::Active,
+            },
+        );
+        let marked = ProjectGate::Marked(marker);
+        assert_eq!(
+            evaluate(&marked, "proj", "default", None),
+            Err(Damage::MissingRecord {
+                kind: "overrides".to_owned()
+            })
+        );
+        assert!(matches!(
+            evaluate_all(&marked, "proj", Some(b"[]")),
+            Err(Damage::InvalidRecord { .. })
+        ));
+        let record = br#"{"schemaVersion":1,"vaultId":"proj","environments":{"default":{"set":{"A":"1"},"unset":[]}}}"#;
+        let overrides = evaluate(&marked, "proj", "default", Some(record)).expect("valid");
+        assert_eq!(overrides.set["A"], "1");
+        assert_eq!(
+            evaluate_all(&marked, "proj", Some(record)).expect("valid")["default"],
+            overrides
         );
     }
 

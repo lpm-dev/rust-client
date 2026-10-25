@@ -324,6 +324,48 @@ fn recovery_fails_closed_when_a_companion_entry_changed_outside_the_journal() {
 }
 
 #[test]
+fn recovery_replays_over_a_stray_record_it_doesnt_touch() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        commit(vec![
+            write(
+                marker_account(),
+                br#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"overrides":{"version":1,"ifUnsupported":"refuse","kinds":["overrides"],"state":"active"},"future":{"version":1,"ifUnsupported":"ignore","kinds":["future-kind"],"state":"active"}}}"#.to_vec(),
+            ),
+            write(record("overrides", None), overrides(r#""A":"1""#)),
+            write(record("future-kind", None), b"stray".to_vec()),
+        ]);
+        commit(vec![write(marker_account(), marker_with_overrides())]);
+        let folder = vaults_path(home).join(companion_folder_name(VAULT));
+        let overrides_entry = folder.join(entry_name(&record("overrides", None)));
+        let journal = FileJournal {
+            schema_version: FILE_JOURNAL_SCHEMA_VERSION,
+            transaction_id: "0123456789abcdef0123456789abcdec".to_owned(),
+            operations: vec![FileOperation {
+                action: FileAction::Delete,
+                target: record("overrides", None).name(),
+                values_file: None,
+                before: digest_of(&overrides_entry),
+                after: None,
+            }],
+        };
+        write_journal(home, &journal);
+
+        with_vault_transaction(|directory| FileCompanion::open(directory)?.recover())
+            .expect("damage the journal didn't cause doesn't block");
+
+        assert!(!overrides_entry.exists());
+        assert!(
+            folder
+                .join(entry_name(&record("future-kind", None)))
+                .exists()
+        );
+        assert!(!vaults_path(home).join(JOURNAL).exists());
+    });
+}
+
+#[test]
 fn stages_without_a_journal_are_swept() {
     with_temp_vault_home(|home| {
         force_file_vault();

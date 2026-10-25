@@ -1,6 +1,6 @@
 //! Bounded C ABI for the bundled native schema engine, GitHub Actions secret
-//! sealing, the LPM home and project files an app shares with the CLI, and
-//! passphrase-protected backup files.
+//! sealing, the LPM home and project files an app shares with the CLI,
+//! passphrase-protected backup files, and the companion storage contract.
 //! Only writing a file of secrets reads the process environment, for the
 //! `git` it runs.
 
@@ -14,6 +14,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 mod backup;
+mod companion;
 mod files;
 
 /// The engine holds env values, decrypted backups and passphrases, so all

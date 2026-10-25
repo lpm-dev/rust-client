@@ -167,6 +167,65 @@ LPMEnvResult lpm_env_backup_open_split(const uint8_t *file, size_t file_length,
                                      const uint8_t *passphrase, size_t passphrase_length,
                                      size_t *payload_offset, size_t *payload_length,
                                      size_t *keys_offset, size_t *keys_length);
+/* Companion storage: records kept next to an env project's values item in the
+ * shared credential store, with a feature marker, decided exactly as the CLI
+ * decides them. Nothing here reads or writes a store. Each function takes one
+ * UTF-8 JSON request of at most LPM_ENV_INPUT_LIMIT bytes; stored bytes travel
+ * as standard base64 strings, and account names as text. Status 2 is invalid
+ * input {code}: companion.invalid_input, or as noted. Status 3 is a panic.
+ * Status 5 refuses with {code: "companion.refused", message}. */
+/* Describe account names. Input {names: [name]}. Output {accounts: [one per name:
+ * null outside the companion namespace; {valid: false} for a name in it spelled
+ * any other way than its one spelling; else {valid: true, role: "marker" |
+ * "record" | "staged", vaultId, kind, part, access: "open" | "followsValues"},
+ * kind and part null where they don't apply]}. status: 0=described. */
+LPMEnvResult lpm_env_companion_accounts(const uint8_t *input, size_t input_length);
+/* Spell account names. Input {accounts: [{role, vaultId, kind?, part?}]}, a
+ * marker without kind or part, a record or staged record with a kind. Output
+ * {names: [name]}, in order. status: 0=spelled, 2=companion.invalid_account. */
+LPMEnvResult lpm_env_companion_account_names(const uint8_t *input, size_t input_length);
+/* What one project's state allows, from what the caller saw of it in one lock
+ * scope. Input {vaultId, marker: bytes | null (absent), inventory?: [names] from a
+ * names-only listing in the same scope (other projects' names are ignored),
+ * overrides?: {bytes: bytes | null} when the overrides record was read, found or
+ * not, accessDamage?: why access was found damaged}. Output {marker: "absent" |
+ * "invalid" | "valid", state, restorePhase, needsResume, level: "ignore" |
+ * "readOnly" | "refuse" (null unless valid), unsupported: {feature, version,
+ * level} | null, features: [{name, version, ifUnsupported, kinds, state,
+ * supported}], damage: [{code: "invalidMarker" | "missingRecord" |
+ * "invalidRecord" | "unlistedRecord" | "access", kind?, reason?, repair:
+ * {action: "discardProject" | "removeFeature" | "removeUnlisted", feature?} |
+ * null}], allows: {readExcludingOverrides, readApplyingOverrides, write}}.
+ * Maintenance is always allowed; with needsResume nothing else is until a
+ * resume plan has run. Reasons never quote record contents. status: 0=assessed. */
+LPMEnvResult lpm_env_companion_assess(const uint8_t *input, size_t input_length);
+/* Plan a lifecycle operation as transactions to commit in order, each
+ * atomically. Input {action, vaultId, marker: bytes | null, inventory: [names]
+ * from a names-only listing in the same lock scope, ownOperations?, feature?}:
+ *   resume: finish an interrupted step of a valid marker;
+ *   delete: the project's records, with ownOperations of the caller's own (its
+ *     values item and metadata) committed in the first transaction;
+ *   discard: every record, keeping the values;
+ *   removeFeature: one feature of a valid marker and the records only it lists;
+ *   removeUnlisted: the records a valid marker doesn't list.
+ * Output {transactions: [{deletes: [name], moves: [{staged, live}],
+ * writesMarker: bytes | null, deletesMarker}], result: the marker left, bytes |
+ * null, notice: {kind: "deletion" | "discard" | "restoreUndone" | "restore" |
+ * "featureRemoval", features} | null (resume only)}. A move writes the staged
+ * record's bytes to live and deletes staged. Each transaction holds at most 32
+ * operations and, with records of at most 100 KiB, 1 MiB of writes.
+ * status: 0=planned, 5=refused. */
+LPMEnvResult lpm_env_companion_plan(const uint8_t *input, size_t input_length);
+/* Check one transaction before committing it, or when its committed journal is
+ * replayed. Input {changes: [{account, bytes: bytes | null (a deletion)}],
+ * markers: {vaultId: bytes | null}, names?: [names]}. Only a marker's bytes are
+ * read, so other writes may send "". markers holds each touched project's marker
+ * as the store holds it now; names, a names-only listing, adds the check that a
+ * transaction changing a marker leaves no record it listed without a feature,
+ * made while the old marker is still stored. Accounts outside the companion
+ * namespace are skipped. status: 0=passes, 2=companion.missing_marker,
+ * 5=refused. */
+LPMEnvResult lpm_env_companion_check_transaction(const uint8_t *input, size_t input_length);
 /* Release only the output buffer after decoding; the snapshot stays live.
  * Exclusively borrow result. Clears data/length; repeated calls are harmless.
  * A matching lpm_env_release is still required for the result. */

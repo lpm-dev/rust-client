@@ -13,15 +13,15 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use lpm_common::stored_env::is_safe_vault_id;
 
-pub(crate) const MARKER_PREFIX: &str = "__vault_features_v1__:";
-pub(crate) const RECORD_PREFIX: &str = "__vault_companion_v1__:";
-pub(crate) const STAGED_PREFIX: &str = "__vault_staged_v1__:";
-pub(crate) const MAX_ACCOUNT_BYTES: usize = 512;
+pub const MARKER_PREFIX: &str = "__vault_features_v1__:";
+pub const RECORD_PREFIX: &str = "__vault_companion_v1__:";
+pub const STAGED_PREFIX: &str = "__vault_staged_v1__:";
+pub const MAX_ACCOUNT_BYTES: usize = 512;
 const MAX_IDENTIFIER_BYTES: usize = 32;
 const MAX_PART: u16 = 0xfff;
 
 /// A feature or kind name: `[a-z][a-z0-9-]{0,31}`.
-pub(crate) fn is_valid_identifier(name: &str) -> bool {
+pub fn is_valid_identifier(name: &str) -> bool {
     let bytes = name.as_bytes();
     !bytes.is_empty()
         && bytes.len() <= MAX_IDENTIFIER_BYTES
@@ -33,12 +33,12 @@ pub(crate) fn is_valid_identifier(name: &str) -> bool {
 
 /// A record kind: an identifier other than `features`, which names the
 /// marker's entry in the file store.
-pub(crate) fn is_valid_kind(kind: &str) -> bool {
+pub fn is_valid_kind(kind: &str) -> bool {
     kind != "features" && is_valid_identifier(kind)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) enum CompanionAccount {
+pub enum CompanionAccount {
     Marker {
         vault_id: String,
     },
@@ -57,7 +57,7 @@ pub(crate) enum CompanionAccount {
 impl CompanionAccount {
     /// The account's meaning, when `account` is spelled exactly as this
     /// namespace spells it.
-    pub(crate) fn parse(account: &str) -> Option<Self> {
+    pub fn parse(account: &str) -> Option<Self> {
         if account.len() > MAX_ACCOUNT_BYTES {
             return None;
         }
@@ -83,7 +83,7 @@ impl CompanionAccount {
         })
     }
 
-    pub(crate) fn vault_id(&self) -> &str {
+    pub fn vault_id(&self) -> &str {
         match self {
             Self::Marker { vault_id }
             | Self::Record { vault_id, .. }
@@ -92,21 +92,21 @@ impl CompanionAccount {
     }
 
     /// The record's kind, or `None` for the marker.
-    pub(crate) fn kind(&self) -> Option<&str> {
+    pub fn kind(&self) -> Option<&str> {
         match self {
             Self::Marker { .. } => None,
             Self::Record { kind, .. } | Self::Staged { kind, .. } => Some(kind),
         }
     }
 
-    pub(crate) fn part(&self) -> Option<u16> {
+    pub fn part(&self) -> Option<u16> {
         match self {
             Self::Marker { .. } => None,
             Self::Record { part, .. } | Self::Staged { part, .. } => *part,
         }
     }
 
-    pub(crate) fn name(&self) -> String {
+    pub fn name(&self) -> String {
         match self {
             Self::Marker { vault_id } => marker_account(vault_id),
             Self::Record {
@@ -123,7 +123,7 @@ impl CompanionAccount {
     }
 
     /// The live record a staged record becomes when a restore activates.
-    pub(crate) fn activated(&self) -> Option<Self> {
+    pub fn activated(&self) -> Option<Self> {
         match self {
             Self::Staged {
                 kind,
@@ -140,18 +140,17 @@ impl CompanionAccount {
 }
 
 /// Whether `account` is in the companion namespace, valid or not.
-#[cfg(target_os = "macos")]
-pub(crate) fn is_in_companion_namespace(account: &str) -> bool {
+pub fn is_in_companion_namespace(account: &str) -> bool {
     account.starts_with(MARKER_PREFIX)
         || account.starts_with(RECORD_PREFIX)
         || account.starts_with(STAGED_PREFIX)
 }
 
-pub(crate) fn encode_vault_id(vault_id: &str) -> String {
+pub fn encode_vault_id(vault_id: &str) -> String {
     URL_SAFE_NO_PAD.encode(vault_id.as_bytes())
 }
 
-pub(crate) fn marker_account(vault_id: &str) -> String {
+pub fn marker_account(vault_id: &str) -> String {
     let encoded = encode_vault_id(vault_id);
     let mut account = String::with_capacity(MARKER_PREFIX.len() + encoded.len());
     account.push_str(MARKER_PREFIX);
@@ -159,11 +158,11 @@ pub(crate) fn marker_account(vault_id: &str) -> String {
     account
 }
 
-pub(crate) fn record_account(kind: &str, vault_id: &str, part: Option<u16>) -> String {
+pub fn record_account(kind: &str, vault_id: &str, part: Option<u16>) -> String {
     prefixed_record_account(RECORD_PREFIX, kind, vault_id, part)
 }
 
-pub(crate) fn staged_account(kind: &str, vault_id: &str, part: Option<u16>) -> String {
+pub fn staged_account(kind: &str, vault_id: &str, part: Option<u16>) -> String {
     prefixed_record_account(STAGED_PREFIX, kind, vault_id, part)
 }
 

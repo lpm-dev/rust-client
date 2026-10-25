@@ -3,11 +3,11 @@
 
 use std::fmt;
 
-use super::marker::{FeatureEntry, InvalidMarker, Level, Marker};
+use crate::marker::{FeatureEntry, InvalidMarker, Level, Marker};
 
 /// What an operation does with a project's values and companion records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Operation {
+pub enum Operation {
     /// Reads values to run, show or send them, without personal overrides.
     ReadExcludingOverrides,
     /// Reads values together with personal overrides, to run or show them.
@@ -20,7 +20,7 @@ pub(crate) enum Operation {
 
 /// What a damaged project lacks or holds that it shouldn't.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Damage {
+pub enum Damage {
     InvalidMarker(String),
     MissingRecord {
         kind: String,
@@ -34,7 +34,6 @@ pub(crate) enum Damage {
     },
     /// Approval attributes that contradict each other, which only the macOS
     /// Keychain has.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Access(String),
 }
 
@@ -45,7 +44,7 @@ impl Damage {
         matches!(
             self,
             Self::MissingRecord { kind } | Self::InvalidRecord { kind, .. } | Self::UnlistedRecord { kind }
-                if kind == super::overrides::OVERRIDES_KIND
+                if kind == crate::overrides::OVERRIDES_KIND
         )
     }
 }
@@ -74,7 +73,7 @@ impl From<InvalidMarker> for Damage {
 
 /// Why the gate stopped an operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum GateError {
+pub enum GateError {
     Unsupported {
         feature: String,
         version: u16,
@@ -130,7 +129,7 @@ fn feature_description(feature: &str) -> String {
 
 /// What the gate knows about one project inside one lock scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ProjectGate {
+pub enum ProjectGate {
     /// No marker: the project has no companion data a client must understand.
     Plain,
     Marked(Marker),
@@ -138,7 +137,7 @@ pub(crate) enum ProjectGate {
 }
 
 impl ProjectGate {
-    pub(crate) fn marker(&self) -> Option<&Marker> {
+    pub fn marker(&self) -> Option<&Marker> {
         match self {
             Self::Marked(marker) => Some(marker),
             Self::Plain | Self::Damaged(_) => None,
@@ -146,7 +145,7 @@ impl ProjectGate {
     }
 
     /// Apply the operation matrix.
-    pub(crate) fn authorize(&self, operation: Operation) -> Result<(), GateError> {
+    pub fn authorize(&self, operation: Operation) -> Result<(), GateError> {
         if operation == Operation::Maintenance {
             return Ok(());
         }
@@ -184,8 +183,8 @@ impl ProjectGate {
 
 #[cfg(test)]
 mod tests {
-    use super::super::marker::{FeatureState, ProjectState};
     use super::*;
+    use crate::marker::{FeatureState, ProjectState};
 
     fn marked(name: &str, version: u16, level: Level, kinds: &[&str]) -> ProjectGate {
         let mut marker = Marker::empty("proj", ProjectState::Active);

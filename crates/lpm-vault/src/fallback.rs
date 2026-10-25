@@ -692,7 +692,7 @@ pub(crate) fn read_all_run_environments_unlocked(
     String,
 > {
     let (gate, record) = companion::read_overrides_record_unlocked(directory, vault_id)?;
-    let overrides = crate::companion::evaluate_all_overrides(&gate, vault_id, record.as_deref())
+    let overrides = crate::companion::overrides::evaluate_all(&gate, vault_id, record.as_deref())
         .map_err(crate::companion::damaged)?;
     let values = read_all_environments_unlocked(directory, vault_id)?;
     Ok((values, overrides))

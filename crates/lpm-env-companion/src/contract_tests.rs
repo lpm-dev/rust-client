@@ -2,12 +2,11 @@
 
 use serde::Deserialize;
 
-use super::account::CompanionAccount;
-#[cfg(target_os = "macos")]
-use super::graph::{AccessClass, record_access_class};
-use super::lifecycle::needs_resume;
-use super::marker::{Level, Marker};
-use super::overrides::parse_selected;
+use crate::account::CompanionAccount;
+use crate::graph::{AccessClass, record_access_class};
+use crate::lifecycle::needs_resume;
+use crate::marker::{Level, Marker};
+use crate::overrides::parse_selected;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,7 +29,7 @@ struct MarkerCase {
 #[test]
 fn every_marker_fixture_validates_and_levels_as_recorded() {
     let fixture: Fixture<MarkerCase> =
-        serde_json::from_str(include_str!("../../tests/fixtures/companion/markers.json"))
+        serde_json::from_str(include_str!("../tests/fixtures/markers.json"))
             .expect("marker fixtures decode");
     assert_eq!(fixture.schema_version, 1);
     for case in fixture.cases {
@@ -64,14 +63,13 @@ struct AccountCase {
     vault_id: Option<String>,
     kind: Option<String>,
     part: Option<u16>,
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     access_class: Option<String>,
 }
 
 #[test]
 fn every_account_fixture_parses_as_recorded() {
     let fixture: Fixture<AccountCase> =
-        serde_json::from_str(include_str!("../../tests/fixtures/companion/accounts.json"))
+        serde_json::from_str(include_str!("../tests/fixtures/accounts.json"))
             .expect("account fixtures decode");
     for case in fixture.cases {
         let parsed = CompanionAccount::parse(&case.account);
@@ -98,7 +96,6 @@ fn every_account_fixture_parses_as_recorded() {
         );
         assert_eq!(case.kind.as_deref(), parsed.kind(), "{}", case.account);
         assert_eq!(case.part, parsed.part(), "{}", case.account);
-        #[cfg(target_os = "macos")]
         if let Some(kind) = parsed.kind() {
             let class = match record_access_class(kind, parsed.part()) {
                 AccessClass::Open => "open",
@@ -132,10 +129,9 @@ struct OverridesCase {
 
 #[test]
 fn every_overrides_fixture_validates_and_selects_as_recorded() {
-    let fixture: Fixture<OverridesCase> = serde_json::from_str(include_str!(
-        "../../tests/fixtures/companion/overrides.json"
-    ))
-    .expect("overrides fixtures decode");
+    let fixture: Fixture<OverridesCase> =
+        serde_json::from_str(include_str!("../tests/fixtures/overrides.json"))
+            .expect("overrides fixtures decode");
     for case in fixture.cases {
         let parsed = parse_selected(
             case.json.as_bytes(),

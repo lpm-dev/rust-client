@@ -11,7 +11,7 @@ fn run_read(storage: &mut MemoryProjectStorage) -> Result<companion_gate::RunRea
 
 fn run_overrides(storage: &mut MemoryProjectStorage) -> Result<crate::PersonalOverrides, String> {
     let read = run_read(storage)?;
-    crate::companion::evaluate_overrides(
+    crate::companion::overrides::evaluate(
         &read.gate,
         VAULT,
         "default",
@@ -139,6 +139,65 @@ fn committed_recovery_refuses_to_leave_records_without_their_marker() {
 
     assert!(error.contains("would leave"), "{error}");
     assert!(storage.values.contains_key(&marker_account(VAULT)));
+}
+
+#[test]
+fn committed_recovery_replays_over_a_stray_record_it_doesnt_touch() {
+    let mut storage = MemoryProjectStorage::default();
+    storage
+        .values
+        .insert(marker_account(VAULT), marker(OVERRIDES_FEATURE, "active"));
+    let stray = record_account("future-kind", VAULT, None);
+    storage.values.insert(stray.clone(), b"stray".to_vec());
+    let overrides = record_account("overrides", VAULT, None);
+    let record = overrides_record(r#""A":"1""#);
+    committed_journal(&mut storage, &[(&overrides, Some(record.as_bytes()))]);
+
+    recover_project_transaction(&mut storage).expect("damage it didn't cause doesn't block");
+
+    assert_eq!(storage.values.get(&overrides), Some(record.as_str()));
+    assert!(storage.values.contains_key(&stray));
+    assert!(!storage.values.contains_key(TRANSACTION_MARKER_ACCOUNT));
+}
+
+#[test]
+fn committed_recovery_finishes_a_marker_deletion_it_already_replayed() {
+    let mut storage = MemoryProjectStorage::default();
+    let overrides = record_account("overrides", VAULT, None);
+    storage
+        .values
+        .insert(overrides.clone(), overrides_record(r#""A":"1""#));
+    committed_journal(&mut storage, &[(&marker_account(VAULT), None)]);
+
+    recover_project_transaction(&mut storage)
+        .expect("refusing can't bring back a marker that's gone");
+
+    assert!(!storage.values.contains_key(TRANSACTION_MARKER_ACCOUNT));
+    assert!(storage.values.contains_key(&overrides));
+}
+
+#[test]
+fn committed_recovery_deletes_a_marker_over_strays_it_didnt_list() {
+    let mut storage = MemoryProjectStorage::default();
+    storage
+        .values
+        .insert(marker_account(VAULT), marker(OVERRIDES_FEATURE, "active"));
+    let overrides = record_account("overrides", VAULT, None);
+    storage
+        .values
+        .insert(overrides.clone(), overrides_record(r#""A":"1""#));
+    let stray = record_account("future-kind", VAULT, None);
+    storage.values.insert(stray.clone(), b"stray".to_vec());
+    committed_journal(
+        &mut storage,
+        &[(&overrides, None), (&marker_account(VAULT), None)],
+    );
+
+    recover_project_transaction(&mut storage).expect("the stray was unlisted before");
+
+    assert!(!storage.values.contains_key(&marker_account(VAULT)));
+    assert!(!storage.values.contains_key(&overrides));
+    assert!(storage.values.contains_key(&stray));
 }
 
 #[test]
@@ -319,6 +378,61 @@ fn deleting_a_project_removes_its_companion_records_with_the_key_first() {
         storage.deletes.get(&record_account("key", VAULT, None)),
         Some(&1)
     );
+}
+
+#[test]
+fn deleting_a_project_whose_records_fit_one_transaction_writes_no_deleting_marker() {
+    let mut storage = storage_with_values();
+    storage
+        .values
+        .insert(marker_account(VAULT), marker(OVERRIDES_FEATURE, "active"));
+    storage.values.insert(
+        record_account("overrides", VAULT, None),
+        overrides_record(r#""A":"1""#),
+    );
+    storage.writes.clear();
+
+    delete_vault_with_storage(&mut storage, VAULT).expect("delete the project");
+
+    assert!(!storage.values.contains_key(VAULT));
+    assert!(!storage.values.contains_key(&marker_account(VAULT)));
+    assert!(
+        !storage
+            .values
+            .contains_key(&record_account("overrides", VAULT, None))
+    );
+    assert_eq!(storage.writes.get(&marker_account(VAULT)), None);
+}
+
+#[test]
+fn deleting_a_project_with_parts_and_no_valid_marker_finishes() {
+    for marker_value in [None, Some(r#"{"schemaVersion":1}"#)] {
+        let mut storage = storage_with_values();
+        if let Some(marker_value) = marker_value {
+            storage.values.insert(marker_account(VAULT), marker_value);
+        }
+        storage
+            .values
+            .insert(record_account("future-kind", VAULT, None), b"x".to_vec());
+        for part in 0..40 {
+            storage.values.insert(
+                record_account("future-log", VAULT, Some(part)),
+                vec![part as u8; 64],
+            );
+        }
+
+        delete_vault_with_storage(&mut storage, VAULT).expect("delete the project");
+
+        assert!(!storage.values.contains_key(VAULT));
+        assert!(
+            !storage
+                .values
+                .keys()
+                .any(|account| crate::companion::account::is_in_companion_namespace(account)),
+            "{marker_value:?}: {:?}",
+            storage.values.keys().collect::<Vec<_>>()
+        );
+    }
 }
 
 #[test]

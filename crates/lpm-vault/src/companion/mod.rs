@@ -6,14 +6,9 @@
 //! reads the project's marker inside its lock, finishes any interrupted
 //! lifecycle step, and applies the operation matrix before touching values.
 
-pub(crate) mod account;
-#[cfg(test)]
-mod contract_tests;
-pub(crate) mod gate;
-pub(crate) mod graph;
-pub(crate) mod lifecycle;
-pub(crate) mod marker;
-pub(crate) mod overrides;
+pub(crate) use lpm_env_companion::{
+    account, gate, graph, invariants, lifecycle, marker, overrides,
+};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -21,8 +16,7 @@ use std::collections::HashMap;
 use account::CompanionAccount;
 use gate::{Damage, Operation, ProjectGate};
 use lifecycle::LifecycleStore;
-use marker::{FeatureState, Marker};
-use overrides::{OVERRIDES_KIND, PersonalOverrides};
+use marker::{FeatureState, Marker, ProjectState, RestorePhase};
 
 /// A store of one platform's companion records.
 pub(crate) trait CompanionBackend: LifecycleStore {
@@ -103,13 +97,13 @@ pub(crate) fn open_project(
         Some(bytes) => match Marker::parse(vault_id, &bytes) {
             Err(error) => ProjectGate::Damaged(error.into()),
             Ok(marker) if lifecycle::needs_resume(&marker) => {
-                let interrupted = interrupted_step(&marker);
+                let notice = resume_notice(&marker);
                 let inventory = backend.inventory(vault_id)?;
                 let gate = match lifecycle::resume(backend, marker, inventory)? {
                     Some(marker) => ProjectGate::Marked(marker),
                     None => ProjectGate::Plain,
                 };
-                tracing::warn!("{interrupted} of env project {vault_id}'s newer data");
+                tracing::warn!("{notice}");
                 gate
             }
             Ok(marker) => ProjectGate::Marked(marker),
@@ -119,26 +113,27 @@ pub(crate) fn open_project(
     Ok(gate)
 }
 
-/// How the notice after a resume describes what it finished.
-fn interrupted_step(marker: &Marker) -> String {
+/// What the notice after a resume says it finished or undid.
+fn resume_notice(marker: &Marker) -> String {
+    let project = format!("env project {}'s newer data", marker.vault_id);
     match (
         marker.state,
         marker.restore.as_ref().map(|restore| restore.phase),
     ) {
-        (marker::ProjectState::Deleting, _) => "finished an interrupted deletion".to_owned(),
-        (marker::ProjectState::Discarding, _) => "finished an interrupted discard".to_owned(),
-        (marker::ProjectState::Restoring, Some(marker::RestorePhase::Staging)) => {
-            "undid an interrupted restore; run the restore again".to_owned()
+        (ProjectState::Deleting, _) => format!("finished an interrupted deletion of {project}"),
+        (ProjectState::Discarding, _) => format!("finished an interrupted discard of {project}"),
+        (ProjectState::Restoring, Some(RestorePhase::Staging)) => {
+            format!("undid an interrupted restore of {project}; run the restore again")
         }
-        (marker::ProjectState::Restoring, _) => "finished an interrupted restore".to_owned(),
-        (marker::ProjectState::Active, _) => {
+        (ProjectState::Restoring, _) => format!("finished an interrupted restore of {project}"),
+        (ProjectState::Active, _) => {
             let removing: Vec<&str> = marker
                 .features
                 .iter()
                 .filter(|(_, entry)| entry.state == FeatureState::Removing)
                 .map(|(name, _)| name.as_str())
                 .collect();
-            format!("finished removing {}", removing.join(", "))
+            format!("finished removing {} from {project}", removing.join(", "))
         }
     }
 }
@@ -155,106 +150,9 @@ pub(crate) fn authorize(
     Ok(gate)
 }
 
-/// The selected environment's personal overrides, from the overrides record
-/// an Apply read always reads, found or not, so a missing marker can't hide
-/// a record and a missing record can't pass for no overrides.
-pub(crate) fn evaluate_overrides(
-    gate: &ProjectGate,
-    vault_id: &str,
-    environment: &str,
-    record: Option<&[u8]>,
-) -> Result<PersonalOverrides, Damage> {
-    let entry = gate
-        .marker()
-        .and_then(|marker| marker.feature(OVERRIDES_KIND))
-        .filter(|entry| entry.state == FeatureState::Active);
-    match (entry, record) {
-        (None, None) => Ok(PersonalOverrides::default()),
-        (None, Some(_)) => Err(Damage::UnlistedRecord {
-            kind: OVERRIDES_KIND.to_owned(),
-        }),
-        (Some(_), None) => Err(Damage::MissingRecord {
-            kind: OVERRIDES_KIND.to_owned(),
-        }),
-        (Some(entry), Some(bytes)) => {
-            overrides::parse_selected(bytes, vault_id, entry.version, environment).map_err(
-                |error| Damage::InvalidRecord {
-                    kind: OVERRIDES_KIND.to_owned(),
-                    reason: error.to_string(),
-                },
-            )
-        }
-    }
-}
-
-/// Every environment's personal overrides, under the same rules as
-/// [`evaluate_overrides`].
-pub(crate) fn evaluate_all_overrides(
-    gate: &ProjectGate,
-    vault_id: &str,
-    record: Option<&[u8]>,
-) -> Result<std::collections::BTreeMap<String, PersonalOverrides>, Damage> {
-    let entry = gate
-        .marker()
-        .and_then(|marker| marker.feature(OVERRIDES_KIND))
-        .filter(|entry| entry.state == FeatureState::Active);
-    match (entry, record) {
-        (None, None) => Ok(std::collections::BTreeMap::new()),
-        (None, Some(_)) => Err(Damage::UnlistedRecord {
-            kind: OVERRIDES_KIND.to_owned(),
-        }),
-        (Some(_), None) => Err(Damage::MissingRecord {
-            kind: OVERRIDES_KIND.to_owned(),
-        }),
-        (Some(entry), Some(bytes)) => {
-            overrides::parse_all(bytes, vault_id, entry.version).map_err(|error| {
-                Damage::InvalidRecord {
-                    kind: OVERRIDES_KIND.to_owned(),
-                    reason: error.to_string(),
-                }
-            })
-        }
-    }
-}
-
 /// Fail an Apply read on damage it found, in the gate's own words.
 pub(crate) fn damaged(damage: Damage) -> String {
     gate::GateError::Damaged(damage).to_string()
-}
-
-/// Where a deletion's first transaction leaves the marker: `deleting`, and
-/// listing every kind the inventory found, so every record left for later
-/// batches still belongs to a feature.
-pub(crate) fn deleting_marker(
-    vault_id: &str,
-    current: Option<&Marker>,
-    inventory: &[CompanionAccount],
-) -> Marker {
-    let mut marker = current
-        .cloned()
-        .unwrap_or_else(|| Marker::empty(vault_id, marker::ProjectState::Active));
-    marker.state = marker::ProjectState::Deleting;
-    marker.restore = None;
-    for account in inventory {
-        let Some(kind) = account.kind() else {
-            continue;
-        };
-        if marker.lists_kind(kind) {
-            continue;
-        }
-        let owner = graph::reserved_owner(kind).unwrap_or(kind).to_owned();
-        let entry = marker
-            .features
-            .entry(owner)
-            .or_insert_with(|| marker::FeatureEntry {
-                version: u16::MAX,
-                if_unsupported: marker::Level::Refuse,
-                kinds: Vec::new(),
-                state: FeatureState::Active,
-            });
-        entry.kinds.push(kind.to_owned());
-    }
-    marker
 }
 
 #[cfg(test)]
@@ -262,86 +160,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn overrides_are_damaged_when_the_marker_and_the_record_disagree() {
-        let mut marker = Marker::empty("proj", marker::ProjectState::Active);
-        let plain = ProjectGate::Plain;
+    fn resume_notices_name_the_project_in_one_sentence() {
+        let mut marker = Marker::empty("proj", ProjectState::Deleting);
         assert_eq!(
-            evaluate_overrides(&plain, "proj", "default", None),
-            Ok(PersonalOverrides::default())
+            resume_notice(&marker),
+            "finished an interrupted deletion of env project proj's newer data"
         );
-        assert_eq!(
-            evaluate_overrides(&plain, "proj", "default", Some(b"{}")),
-            Err(Damage::UnlistedRecord {
-                kind: "overrides".to_owned()
-            })
-        );
-        marker.features.insert(
-            "overrides".to_owned(),
-            marker::FeatureEntry {
-                version: 1,
-                if_unsupported: marker::Level::Refuse,
-                kinds: vec!["overrides".to_owned()],
-                state: FeatureState::Active,
-            },
-        );
-        let marked = ProjectGate::Marked(marker);
-        assert_eq!(
-            evaluate_overrides(&marked, "proj", "default", None),
-            Err(Damage::MissingRecord {
-                kind: "overrides".to_owned()
-            })
-        );
-        let record = br#"{"schemaVersion":1,"vaultId":"proj","environments":{"default":{"set":{"A":"1"},"unset":[]}}}"#;
-        let overrides =
-            evaluate_overrides(&marked, "proj", "default", Some(record)).expect("valid");
-        assert_eq!(overrides.set["A"], "1");
-    }
-
-    #[test]
-    fn a_deleting_marker_lists_every_kind_found_including_unlisted_ones() {
-        let inventory = [
-            CompanionAccount::Record {
-                kind: "overrides".to_owned(),
-                vault_id: "proj".to_owned(),
-                part: None,
-            },
-            CompanionAccount::Record {
-                kind: "future-log".to_owned(),
-                vault_id: "proj".to_owned(),
-                part: Some(3),
-            },
-            CompanionAccount::Record {
-                kind: "key".to_owned(),
-                vault_id: "proj".to_owned(),
-                part: None,
-            },
-        ];
-        let marker = deleting_marker("proj", None, &inventory);
-        marker.validate().expect("the deleting marker validates");
-        assert_eq!(marker.state, marker::ProjectState::Deleting);
-        for account in &inventory {
-            assert!(marker.lists_kind(account.kind().unwrap()));
-        }
-    }
-
-    #[test]
-    fn resume_notices_say_what_was_finished_or_undone() {
-        let mut marker = Marker::empty("proj", marker::ProjectState::Deleting);
-        assert_eq!(
-            interrupted_step(&marker),
-            "finished an interrupted deletion"
-        );
-        marker.state = marker::ProjectState::Restoring;
+        marker.state = ProjectState::Restoring;
         marker.restore = Some(marker::Restore {
-            phase: marker::RestorePhase::Staging,
+            phase: RestorePhase::Staging,
             replaces: Vec::new(),
             features: std::collections::BTreeMap::new(),
         });
         assert_eq!(
-            interrupted_step(&marker),
-            "undid an interrupted restore; run the restore again"
+            resume_notice(&marker),
+            "undid an interrupted restore of env project proj's newer data; run the restore again"
         );
-        let mut removing = Marker::empty("proj", marker::ProjectState::Active);
+        let mut removing = Marker::empty("proj", ProjectState::Active);
         removing.features.insert(
             "overrides".to_owned(),
             marker::FeatureEntry {
@@ -351,7 +186,10 @@ mod tests {
                 state: FeatureState::Removing,
             },
         );
-        assert_eq!(interrupted_step(&removing), "finished removing overrides");
+        assert_eq!(
+            resume_notice(&removing),
+            "finished removing overrides from env project proj's newer data"
+        );
     }
 
     #[test]
