@@ -516,3 +516,62 @@ fn one_lock_scope_reads_a_project_marker_once() {
 
     assert_eq!(storage.reads.get(&marker_account(VAULT)), Some(&1));
 }
+
+#[test]
+fn a_healthy_apply_read_reads_the_marker_values_and_overrides_once_each_and_never_probes() {
+    let mut storage = storage_with_values();
+    storage
+        .values
+        .insert(marker_account(VAULT), marker(OVERRIDES_FEATURE, "active"));
+    storage.values.insert(
+        record_account("overrides", VAULT, None),
+        overrides_record(r#""A":"1""#),
+    );
+    storage.reads.clear();
+
+    run_overrides(&mut storage).expect("apply read");
+
+    let reads = |account: &str| storage.reads.get(account).copied().unwrap_or(0);
+    assert_eq!(reads(&marker_account(VAULT)), 1);
+    assert_eq!(reads(VAULT), 1);
+    assert_eq!(reads(&record_account("overrides", VAULT, None)), 1);
+    assert_eq!(storage.reads.values().sum::<usize>(), 3);
+    assert!(storage.probes.is_empty());
+    assert_eq!(storage.listings, 0);
+}
+
+#[test]
+fn an_apply_read_without_overrides_still_reads_their_account_once() {
+    let mut storage = storage_with_values();
+    storage.reads.clear();
+
+    run_overrides(&mut storage).expect("apply read");
+
+    assert_eq!(
+        storage
+            .reads
+            .get(&record_account("overrides", VAULT, None))
+            .copied(),
+        Some(1)
+    );
+    assert_eq!(storage.reads.values().sum::<usize>(), 3);
+}
+
+#[test]
+fn a_values_write_adds_one_marker_read_and_no_probe_or_listing() {
+    let mut storage = storage_with_values();
+    storage.reads.clear();
+
+    save_vault_data_with_storage(
+        &mut storage,
+        VAULT,
+        "Project",
+        "/project",
+        r#"{"environments":{"default":{"TOKEN":"changed"}}}"#,
+    )
+    .expect("write values");
+
+    assert_eq!(storage.reads.get(&marker_account(VAULT)).copied(), Some(1));
+    assert!(storage.probes.is_empty());
+    assert_eq!(storage.listings, 0);
+}

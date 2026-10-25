@@ -1981,7 +1981,7 @@ fn delete_vault_with_storage_after_recovery(
     delete_project_with_companion_records(storage, vault_id, mutations, marker_bytes, inventory)
 }
 
-/// Delete a project with companion records [R3]: the first transaction
+/// Delete a project with companion records: the first transaction
 /// removes the values item, the project's metadata, the shared key and the
 /// single records, and leaves a `deleting` marker that lists every kind
 /// still present. Later batches remove the rest, the marker last.

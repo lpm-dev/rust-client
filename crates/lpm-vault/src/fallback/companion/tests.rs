@@ -415,3 +415,23 @@ fn deleting_a_project_removes_its_companion_folder() {
         );
     });
 }
+
+#[test]
+fn a_clean_values_write_syncs_one_folder_and_stages_nothing() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        DIRECTORY_SYNCS.with(|syncs| syncs.borrow_mut().clear());
+        crate::fallback::DATA_KEY_LOADS.with(|loads| loads.set(0));
+
+        seed_values();
+
+        let syncs = DIRECTORY_SYNCS.with(|syncs| syncs.borrow().clone());
+        assert_eq!(syncs, [vaults_path(home)]);
+        assert!(!vaults_path(home).join(STAGE_FOLDER).exists());
+        assert_eq!(
+            crate::fallback::DATA_KEY_LOADS.with(std::cell::Cell::get),
+            1
+        );
+    });
+}
