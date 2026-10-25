@@ -193,7 +193,7 @@ mod policy_tests {
     #[test]
     fn every_stripped_runtime_hook_is_one_project_env_cant_set() {
         for hook in STRIPPED_INHERITED_RUNTIME_HOOKS {
-            assert!(lpm_env::env_var_runs_code(hook), "{hook}");
+            assert!(lpm_env::is_denied_env_var(hook), "{hook}");
             assert!(inherited_env_is_stripped(hook), "{hook}");
         }
     }

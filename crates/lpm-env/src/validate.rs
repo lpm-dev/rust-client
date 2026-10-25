@@ -117,6 +117,9 @@ impl std::fmt::Display for ValidationError {
             }
             ValidationErrorKind::Missing => {
                 write!(f, "{}: missing (required)", key)?;
+                if crate::is_denied_env_var(&self.key) {
+                    write!(f, "; LPM never passes a project's value for it")?;
+                }
                 if let Some(desc) = &self.description {
                     write!(f, " — {}", TerminalSafe(desc))?;
                 }
@@ -1049,6 +1052,24 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].key, "DATABASE_URL");
         assert_eq!(errors[0].kind, ValidationErrorKind::Missing);
+    }
+
+    #[test]
+    fn a_required_name_lpm_never_passes_says_why_it_is_missing() {
+        let missing = |key: &str, description: Option<&str>| ValidationError {
+            key: key.into(),
+            kind: ValidationErrorKind::Missing,
+            description: description.map(Into::into),
+            is_secret: false,
+        };
+        assert_eq!(
+            missing("CLASSPATH", Some("Java classpath")).to_string(),
+            "CLASSPATH: missing (required); LPM never passes a project's value for it — Java classpath"
+        );
+        assert_eq!(
+            missing("DATABASE_URL", None).to_string(),
+            "DATABASE_URL: missing (required)"
+        );
     }
 
     #[test]

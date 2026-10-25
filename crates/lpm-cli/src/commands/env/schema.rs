@@ -266,7 +266,7 @@ pub(super) fn vars_check(
     let all_envs = check_environments(env_input, lpm_config.as_ref(), || {
         lpm_vault::try_get_all_environments(project_dir).map_err(LpmError::Script)
     })?;
-    let mut results: Vec<(String, usize, Vec<lpm_env::ValidationError>)> =
+    let mut results: Vec<(String, usize, Vec<lpm_env::ValidationError>, Vec<String>)> =
         Vec::with_capacity(all_envs.len());
     let mut all_valid = true;
     let validator = lpm_env::EnvValidator::new(schema);
@@ -285,40 +285,45 @@ pub(super) fn vars_check(
                     description: None,
                     is_secret: false,
                 }],
+                Vec::new(),
             ));
             continue;
         }
-        let mut env_vars = lpm_runner::dotenv::load_project_env_unvalidated_for_resolved(
-            project_dir,
-            environment,
-            lpm_config.as_ref(),
-        )?;
-        lpm_runner::dotenv::merge_configured_service_env(
-            &mut env_vars,
-            lpm_config.as_ref(),
-            scope.service.as_deref(),
-        )?;
-        let errors = lpm_runner::dotenv::evaluate_project_env(
-            &mut env_vars,
-            Some(&validator),
-            lpm_env::EvalContext {
-                environment: &environment.canonical,
-                stage: scope.stage.unwrap_or_default(),
-                service: scope.service.as_deref(),
-            },
-        )?;
+        let (errors, ignored) = lpm_runner::dotenv::collect_ignored_env_names(|| {
+            let mut env_vars = lpm_runner::dotenv::load_project_env_unvalidated_for_resolved(
+                project_dir,
+                environment,
+                lpm_config.as_ref(),
+            )?;
+            lpm_runner::dotenv::merge_configured_service_env(
+                &mut env_vars,
+                lpm_config.as_ref(),
+                scope.service.as_deref(),
+            )?;
+            lpm_runner::dotenv::evaluate_project_env(
+                &mut env_vars,
+                Some(&validator),
+                lpm_env::EvalContext {
+                    environment: &environment.canonical,
+                    stage: scope.stage.unwrap_or_default(),
+                    service: scope.service.as_deref(),
+                },
+            )
+        });
+        let errors = errors?;
         all_valid &= errors.is_empty();
-        results.push((environment.canonical.clone(), schema.len(), errors));
+        results.push((environment.canonical.clone(), schema.len(), errors, ignored));
     }
 
     if json_output {
         let json_results: Vec<serde_json::Value> = results
             .iter()
-            .map(|(name, total, errors)| {
+            .map(|(name, total, errors, ignored)| {
                 serde_json::json!({
                     "environment": name,
                     "total": total,
                     "valid": valid_variable_count(schema, errors),
+                    "ignored": ignored,
                     "errors": errors.iter().map(|e| {
                         let mut diagnostic = serde_json::json!({"key": e.key, "error": e.to_string()});
                         if let lpm_env::ValidationErrorKind::GroupViolation { group, mode } = &e.kind {
@@ -345,7 +350,7 @@ pub(super) fn vars_check(
     }
 
     println!();
-    for (name, total, errors) in &results {
+    for (name, total, errors, ignored) in &results {
         let valid = valid_variable_count(schema, errors);
         if errors.is_empty() {
             println!(
@@ -372,6 +377,12 @@ pub(super) fn vars_check(
             for error in errors {
                 println!("    {}", install_ui::red(&error.to_string()));
             }
+        }
+        if !ignored.is_empty() {
+            println!(
+                "    {}",
+                install_ui::yellow(&lpm_runner::dotenv::ignored_env_note(ignored))
+            );
         }
     }
     println!();

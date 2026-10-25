@@ -2591,14 +2591,17 @@ fn team_values_that_run_code_never_reach_a_script_but_the_shells_own_do() {
     let project = TempProject::empty(r#"{"scripts":{"show":"node show.cjs"}}"#);
     project.write_file(
         "show.cjs",
-        "for (const name of ['CLASSPATH', 'GIT_CONFIG_KEY_0', 'NPM_CONFIG_USERCONFIG', 'TEAM_VALUE']) console.log(`${name}=${process.env[name]}`)",
+        "for (const name of ['CLASSPATH', 'CORECLR_PROFILER_PATH_64', 'DOTNET_GCName', 'GIT_CONFIG_KEY_0', 'NPM_CONFIG_USERCONFIG', 'YARN_YARN_PATH', 'TEAM_VALUE']) console.log(`${name}=${process.env[name]}`)",
     );
     lpm(&project)
         .args([
             "env",
             "set",
             "CLASSPATH=evil.jar",
+            "CORECLR_PROFILER_PATH_64=./evil.so",
+            "DOTNET_GCName=evil.so",
             "GIT_CONFIG_KEY_0=core.sshCommand",
+            "YARN_YARN_PATH=./evil.cjs",
             "TEAM_VALUE=kept",
         ])
         .assert()
@@ -2618,16 +2621,137 @@ fn team_values_that_run_code_never_reach_a_script_but_the_shells_own_do() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in [
         "CLASSPATH=undefined",
+        "CORECLR_PROFILER_PATH_64=undefined",
+        "DOTNET_GCName=undefined",
         "GIT_CONFIG_KEY_0=undefined",
         "NPM_CONFIG_USERCONFIG=/ci/.npmrc",
+        "YARN_YARN_PATH=undefined",
         "TEAM_VALUE=kept",
     ] {
         assert!(stdout.contains(line), "{line} in {stdout}");
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("ignored CLASSPATH and GIT_CONFIG_KEY_0 from project env: LPM never passes them to processes"),
+        stderr.contains("ignored CLASSPATH, CORECLR_PROFILER_PATH_64, DOTNET_GCName, GIT_CONFIG_KEY_0 and YARN_YARN_PATH from project env: LPM never passes a project's value for them to processes"),
         "{stderr}"
+    );
+}
+
+#[test]
+fn one_command_warns_once_about_the_team_values_it_ignores() {
+    let project = TempProject::empty(
+        r#"{"scripts":{"build":"node build.js","first":"node -e 0","second":"node -e 0"}}"#,
+    );
+    project.write_file(
+        "build.js",
+        "require('node:fs').mkdirSync('dist',{recursive:true}); require('node:fs').writeFileSync('dist/out','ok');\n",
+    );
+    project.write_file(
+        "lpm.json",
+        r#"{"tasks":{"build":{"cache":true,"inputs":["build.js"],"outputs":["dist/**"]}}}"#,
+    );
+    lpm(&project)
+        .args(["env", "set", "CLASSPATH=evil.jar"])
+        .assert()
+        .success();
+
+    for args in [
+        &["run", "build"][..],
+        &["run", "first", "second", "--parallel"][..],
+    ] {
+        let output = lpm(&project).args(args).output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        assert_eq!(
+            stderr.matches("ignored CLASSPATH from project env").count(),
+            1,
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn env_set_says_when_lpm_never_passes_a_stored_value() {
+    let project = TempProject::empty(r#"{"name":"stored-denied"}"#);
+    let output = lpm(&project)
+        .args(["env", "set", "CLASSPATH=evil.jar", "TEAM_VALUE=kept"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        shown.contains("LPM never passes a project's value for CLASSPATH to processes"),
+        "{shown}"
+    );
+    assert!(!shown.contains("value for TEAM_VALUE"), "{shown}");
+
+    let output = lpm(&project)
+        .args(["env", "set", "ZDOTDIR=./evil", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json = parse_json_stdout(&output, "env set");
+    assert_eq!(json["stored"], serde_json::json!(["ZDOTDIR"]));
+    assert_eq!(json["ignored"], serde_json::json!(["ZDOTDIR"]));
+}
+
+#[test]
+fn env_check_lists_the_values_lpm_ignores_and_why_a_rule_for_one_fails() {
+    let project = TempProject::empty(r#"{"name":"check-denied"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"envSchema":{"vars":{"CLASSPATH":{"required":true},"TEAM_VALUE":{"required":true}}}}"#,
+    );
+    lpm(&project)
+        .args([
+            "env",
+            "set",
+            "CLASSPATH=evil.jar",
+            "ZDOTDIR=./evil",
+            "TEAM_VALUE=kept",
+        ])
+        .assert()
+        .success();
+
+    let output = lpm(&project).args(["env", "check"]).output().unwrap();
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("ignored CLASSPATH and ZDOTDIR: LPM never passes a project's value for them to processes"),
+        "{stdout}"
+    );
+    assert!(
+        stdout
+            .contains("CLASSPATH: missing (required); LPM never passes a project's value for it\n"),
+        "{stdout}"
+    );
+    assert!(!stderr.contains("from project env"), "{stderr}");
+
+    let output = lpm(&project)
+        .args(["env", "check", "--json"])
+        .output()
+        .unwrap();
+    let json = parse_json_stdout(&output, "env check");
+    assert_eq!(
+        json["environments"][0]["ignored"],
+        serde_json::json!(["CLASSPATH", "ZDOTDIR"])
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("from project env"));
+
+    let output = lpm(&project)
+        .args(["env", "check"])
+        .env("CLASSPATH", "/opt/app.jar")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 

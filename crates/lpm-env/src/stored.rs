@@ -7,10 +7,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 pub const DEFAULT_ENVIRONMENT: &str = "default";
 
 /// Names that make a process run code it wasn't asked to run: libraries the
-/// dynamic linker preloads, interpreter options and startup files, module
-/// search paths a runtime loads code from, and the helpers Git, SSH, Cargo
-/// and npm execute. Build settings a project deliberately hands its own
-/// toolchain, such as `CC`, `RUSTFLAGS` or `JAVA_HOME`, aren't among them.
+/// dynamic linker preloads, interpreter options and startup files, the module
+/// search paths, profilers and libraries a runtime loads, and the helpers and
+/// configuration files Git, SSH, Cargo, npm and Yarn execute. Build settings a
+/// project deliberately hands its own toolchain, such as `CC`, `RUSTFLAGS` or
+/// `JAVA_HOME`, aren't among them.
+///
+/// .NET reads each runtime setting as `DOTNET_<name>`, falling back to
+/// `CORECLR_<name>` for profilers and `COMPlus_<name>` otherwise, so every
+/// spelling is listed.
 const CODE_RUNNING_ENV_VARS: &[&str] = &[
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
@@ -35,8 +40,29 @@ const CODE_RUNNING_ENV_VARS: &[&str] = &[
     "JDK_JAVA_OPTIONS",
     "CLASSPATH",
     "DOTNET_STARTUP_HOOKS",
+    "DOTNET_ADDITIONAL_DEPS",
+    "DOTNET_SHARED_STORE",
+    "DOTNET_ENABLE_PROFILING",
+    "DOTNET_PROFILER",
+    "DOTNET_PROFILER_PATH",
     "CORECLR_ENABLE_PROFILING",
+    "CORECLR_PROFILER",
+    "CORECLR_PROFILER_PATH",
     "COR_ENABLE_PROFILING",
+    "COR_PROFILER",
+    "COR_PROFILER_PATH",
+    "DOTNET_ENABLE_NOTIFICATION_PROFILERS",
+    "DOTNET_NOTIFICATION_PROFILERS",
+    "CORECLR_ENABLE_NOTIFICATION_PROFILERS",
+    "CORECLR_NOTIFICATION_PROFILERS",
+    "DOTNET_GCNAME",
+    "DOTNET_GCPATH",
+    "COMPLUS_GCNAME",
+    "COMPLUS_GCPATH",
+    "DOTNET_JITNAME",
+    "COMPLUS_JITNAME",
+    "DOTNET_ALTJITNAME",
+    "COMPLUS_ALTJITNAME",
     "PHPRC",
     "PHP_INI_SCAN_DIR",
     "LUA_INIT",
@@ -52,6 +78,7 @@ const CODE_RUNNING_ENV_VARS: &[&str] = &[
     "SSH_ASKPASS",
     "GIT_EXEC_PATH",
     "GIT_EXTERNAL_DIFF",
+    "GIT_TEMPLATE_DIR",
     "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_SYSTEM",
     "GIT_CONFIG_COUNT",
@@ -63,18 +90,29 @@ const CODE_RUNNING_ENV_VARS: &[&str] = &[
     "NPM_CONFIG_GLOBALCONFIG",
     "NPM_CONFIG_USERCONFIG",
     "NPM_CONFIG_SCRIPT_SHELL",
+    "NPM_CONFIG_SHELL",
+    "NPM_CONFIG_GIT",
+    "NPM_CONFIG_NODE_GYP",
     "NPM_CONFIG_NODE_OPTIONS",
+    "YARN_YARN_PATH",
+    "YARN_RC_FILENAME",
 ];
 
-/// Numbered and versioned forms of the names above, such as
-/// `GIT_CONFIG_KEY_0` and `LUA_PATH_5_4`. `GIT_CONFIG_NOSYSTEM` and the
-/// other Git settings that run nothing don't share these prefixes.
+/// Numbered, versioned and per-architecture forms of the names above, such
+/// as `GIT_CONFIG_KEY_0`, `LUA_PATH_5_4` and `CORECLR_PROFILER_PATH_64`.
+/// `GIT_CONFIG_NOSYSTEM` and the other Git settings that run nothing don't
+/// share these prefixes.
 const CODE_RUNNING_ENV_PREFIXES: &[&str] = &[
     "GIT_CONFIG_KEY_",
     "GIT_CONFIG_VALUE_",
     "LUA_INIT_",
     "LUA_PATH_",
     "LUA_CPATH_",
+    "DOTNET_PROFILER_PATH_",
+    "CORECLR_PROFILER_PATH_",
+    "COR_PROFILER_PATH_",
+    "DOTNET_NOTIFICATION_PROFILERS_",
+    "CORECLR_NOTIFICATION_PROFILERS_",
 ];
 
 /// Names that describe the process's own environment, which project env
@@ -93,8 +131,10 @@ pub fn is_denied_env_var(key: &str) -> bool {
 }
 
 /// Whether `key` makes a process run code it wasn't asked to run, compared
-/// without case.
-pub fn env_var_runs_code(key: &str) -> bool {
+/// without ASCII case. Windows compares environment names with an uppercase
+/// table that leaves lookalikes such as `ſ` and `ı` distinct from `S` and `I`,
+/// so no other folding can reach a process under a denied name.
+fn env_var_runs_code(key: &str) -> bool {
     let key = key.as_bytes();
     CODE_RUNNING_ENV_VARS
         .iter()
@@ -300,6 +340,38 @@ mod tests {
         "LUA_PATH_5_4",
         "LUA_CPATH",
         "LUA_CPATH_5_3",
+        "DOTNET_ADDITIONAL_DEPS",
+        "DOTNET_SHARED_STORE",
+        "DOTNET_ENABLE_PROFILING",
+        "DOTNET_PROFILER",
+        "DOTNET_PROFILER_PATH",
+        "DOTNET_PROFILER_PATH_64",
+        "CORECLR_PROFILER",
+        "CORECLR_PROFILER_PATH",
+        "CORECLR_PROFILER_PATH_ARM64",
+        "COR_PROFILER",
+        "COR_PROFILER_PATH",
+        "COR_PROFILER_PATH_32",
+        "DOTNET_ENABLE_NOTIFICATION_PROFILERS",
+        "DOTNET_NOTIFICATION_PROFILERS",
+        "DOTNET_NOTIFICATION_PROFILERS_ARM64",
+        "CORECLR_ENABLE_NOTIFICATION_PROFILERS",
+        "CORECLR_NOTIFICATION_PROFILERS",
+        "CORECLR_NOTIFICATION_PROFILERS_64",
+        "DOTNET_GCName",
+        "DOTNET_GCPath",
+        "COMPlus_GCName",
+        "COMPlus_GCPath",
+        "DOTNET_JitName",
+        "COMPlus_JitName",
+        "DOTNET_AltJitName",
+        "COMPlus_AltJitName",
+        "NPM_CONFIG_NODE_GYP",
+        "NPM_CONFIG_GIT",
+        "NPM_CONFIG_SHELL",
+        "GIT_TEMPLATE_DIR",
+        "YARN_YARN_PATH",
+        "YARN_RC_FILENAME",
     ];
 
     #[test]
@@ -339,6 +411,12 @@ mod tests {
             "SSH_AUTH_SOCK",
             "CLASSPATH_PREFIX",
             "LUA_VERSION",
+            "DOTNET_ROOT",
+            "DOTNET_ENVIRONMENT",
+            "DOTNET_CLI_TELEMETRY_OPTOUT",
+            "DOTNET_gcServer",
+            "YARN_ENABLE_IMMUTABLE_INSTALLS",
+            "NPM_CONFIG_GIT_TAG_VERSION",
         ] {
             assert!(!is_denied_env_var(name), "{name}");
         }
