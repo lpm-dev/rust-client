@@ -5,9 +5,11 @@
 //! the app's listing also sees records no feature lists and required
 //! records that are missing.
 
+use std::collections::HashSet;
+
 use crate::account::CompanionAccount;
 use crate::gate::{Damage, GateError, Operation, ProjectGate};
-use crate::graph::known_feature;
+use crate::graph::{OVERRIDES, known_feature};
 use crate::invariants::is_listed;
 use crate::lifecycle::needs_resume;
 use crate::marker::{FeatureState, Marker};
@@ -23,7 +25,7 @@ pub struct Observed<'a> {
     pub inventory: Option<&'a [CompanionAccount]>,
     /// The overrides record when the client read it, found or not.
     pub overrides: Option<Option<&'a [u8]>>,
-    /// Why the client found the project's access damaged (R2), if it did.
+    /// Why the client found the project's access damaged, if it did.
     pub access: Option<&'a str>,
 }
 
@@ -56,8 +58,9 @@ pub fn assess(vault_id: &str, observed: Observed<'_>) -> Assessment {
         },
     };
     let mut damage = Vec::new();
+    let mut seen = HashSet::new();
     let mut found = |found: Damage| {
-        if !damage.contains(&found) {
+        if seen.insert(found.clone()) {
             damage.push(found);
         }
     };
@@ -107,7 +110,12 @@ pub fn assess(vault_id: &str, observed: Observed<'_>) -> Assessment {
                 }
             }
         }
-        if let Some(record) = observed.overrides
+        let overrides_are_supported = gate
+            .marker()
+            .and_then(|marker| marker.feature(overrides::OVERRIDES_KIND))
+            .is_none_or(|entry| OVERRIDES.supported_versions.contains(&entry.version));
+        if overrides_are_supported
+            && let Some(record) = observed.overrides
             && let Err(damaged) = overrides::evaluate_all(&gate, vault_id, record)
         {
             found(damaged);
@@ -181,6 +189,32 @@ mod tests {
             kind: kind.to_owned(),
             vault_id: "proj".to_owned(),
             part,
+        }
+    }
+
+    #[test]
+    fn overrides_of_a_version_this_client_doesnt_support_are_never_judged() {
+        let marker = br#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"overrides":{"version":2,"ifUnsupported":"refuse","kinds":["overrides"],"state":"active"}}}"#;
+        let inventory = [record("overrides", None)];
+        for overrides in [
+            Some(&br#"{"schemaVersion":2,"vaultId":"proj","layers":[]}"#[..]),
+            None,
+        ] {
+            let assessment = assess(
+                "proj",
+                Observed {
+                    marker: Some(marker),
+                    inventory: Some(&inventory),
+                    overrides: Some(overrides),
+                    access: None,
+                },
+            );
+            assert!(assessment.damage.is_empty(), "{:?}", assessment.damage);
+            assert!(
+                assessment
+                    .authorize(Operation::ReadApplyingOverrides)
+                    .is_err()
+            );
         }
     }
 

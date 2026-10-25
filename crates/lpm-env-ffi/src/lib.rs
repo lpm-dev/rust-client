@@ -991,7 +991,7 @@ mod tests {
     #[test]
     fn root_definition_errors_name_the_declaration_and_never_echo_literals() {
         let dir = tempfile::tempdir().unwrap();
-        let unknown = "This field isn't one this LPM CLI knows. Check its spelling, or update the LPM CLI if a newer version wrote it.";
+        let unknown = "This field isn't one this version of LPM knows. Check its spelling, or update LPM if a newer version wrote it.";
         for (input, code, pointer, message) in [
             (
                 r#"{"vars":{"PORT":{"rnage":"PRIVATE"}}}"#,

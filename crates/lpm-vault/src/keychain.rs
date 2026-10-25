@@ -444,7 +444,7 @@ fn apply_project_transaction_after_recovery(
         .map(|mutation| (mutation.account(), mutation.value()))
         .collect();
     if !companion_changes.is_empty() {
-        check_companion_invariants(storage, &companion_changes, false)?;
+        check_companion_invariants(storage, &companion_changes)?;
     }
 
     let mut journal = TransactionJournal {
@@ -553,11 +553,23 @@ fn verified_values_access(
     written_in_transaction: bool,
 ) -> Result<CliAccess, String> {
     let marker = crate::companion::account::marker_account(vault_id);
-    match storage.probe(vault_id, &[PROJECT_INDEX_MARKER_ACCOUNT, &marker]) {
-        // A weak item that claims approval passes approval on, not its weakness.
+    let open = [PROJECT_INDEX_MARKER_ACCOUNT, marker.as_str()];
+    match storage.probe(vault_id, &open) {
+        // A weak item that claims approval gets the approval it claims, and
+        // passes approval on, never its weakness.
         ProbeOutcome::Automatic => match storage.claimed_access(vault_id)? {
             Some(ClaimedAccess::Automatic) | None => Ok(CliAccess::Automatic),
-            Some(ClaimedAccess::RequireApproval | ClaimedAccess::Contradictory) => {
+            Some(ClaimedAccess::RequireApproval) => {
+                storage.require_approval(vault_id, &open)?;
+                tracing::warn!(
+                    "this env project's values claimed CLI approval that the macOS Keychain wasn't enforcing; LPM now requires it, as they claimed"
+                );
+                Ok(CliAccess::RequireApproval)
+            }
+            Some(ClaimedAccess::Contradictory) => {
+                tracing::warn!(
+                    "this env project's values have approval attributes that contradict each other, so its newer data is stored with approval; switch the project's CLI approval in LPM Vault to set it again"
+                );
                 Ok(CliAccess::RequireApproval)
             }
         },
@@ -573,24 +585,40 @@ fn verified_values_access(
     }
 }
 
-/// Check I1 and I5 for the companion records a transaction writes: each kind
-/// is listed by the marker the transaction leaves. With `full`, also check
-/// the project's other records against that marker, from a names-only
-/// inventory: recovery does this, since it can't trust who wrote the journal.
+/// Check a transaction's companion changes as both its commit and its
+/// recovery do: each record it writes is listed by the marker it leaves
+/// (I1, I5), and a marker change leaves no record the old marker listed
+/// without a feature (I2). The service is listed only for that, once.
 fn check_companion_invariants(
     storage: &mut impl ProjectStorage,
     changes: &[(&str, Option<&[u8]>)],
-    full: bool,
 ) -> Result<(), String> {
-    let names = if full {
-        Some(storage.account_names()?)
-    } else {
-        None
-    };
+    let storage = std::cell::RefCell::new(storage);
+    let mut names: Option<Vec<String>> = None;
     crate::companion::invariants::check_transaction(
         changes,
-        |vault_id| storage.read(&crate::companion::account::marker_account(vault_id)),
-        names.as_deref(),
+        |vault_id| {
+            storage
+                .borrow_mut()
+                .read(&crate::companion::account::marker_account(vault_id))
+        },
+        |vault_id| {
+            let names = match &mut names {
+                Some(names) => names,
+                None => names.insert(storage.borrow_mut().account_names()?),
+            };
+            Ok(names
+                .iter()
+                .filter_map(|name| crate::companion::account::CompanionAccount::parse(name))
+                .filter(|account| {
+                    account.vault_id() == vault_id
+                        && !matches!(
+                            account,
+                            crate::companion::account::CompanionAccount::Marker { .. }
+                        )
+                })
+                .collect())
+        },
     )
     .map_err(|refusal| refusal.describe("vault transaction"))
 }
@@ -723,21 +751,26 @@ fn roll_forward_persisted_project_transaction(
     storage: &mut impl ProjectStorage,
     journal: &TransactionJournal,
 ) -> Result<(), String> {
-    check_persisted_companion_invariants(storage, journal)?;
-    for operation in &journal.operations {
+    let mut checked_markers = check_persisted_companion_invariants(storage, journal)?;
+    for (index, operation) in journal.operations.iter().enumerate() {
         match operation.action.as_str() {
             "write" => {
                 let stage = operation
                     .staged_account
                     .as_deref()
                     .ok_or_else(|| "vault transaction stage is missing".to_owned())?;
-                if let Some(value) = read_validated_stage(storage, operation, stage)? {
+                let value = match checked_markers.remove(&index) {
+                    Some(CheckedMarker::Staged(value)) => Some(value),
+                    Some(CheckedMarker::Applied) => None,
+                    None => read_validated_stage(storage, operation, stage)?,
+                };
+                if let Some(value) = value {
                     storage.write_verified_with_access_from(
                         &operation.target_account,
                         &value,
                         stage,
                     )?;
-                } else {
+                } else if !journal_marker_was_checked(operation) {
                     read_validated_applied_target(storage, operation)?;
                 }
             }
@@ -789,25 +822,46 @@ fn read_validated_applied_target(
     Ok(target)
 }
 
+/// A marker write the invariant check already validated, by the index of
+/// its journal operation, so replay reads it no more.
+enum CheckedMarker {
+    /// The stage's bytes, still to be written.
+    Staged(Vec<u8>),
+    /// The target already holds the journal's bytes.
+    Applied,
+}
+
+fn journal_marker_was_checked(operation: &TransactionJournalOperation) -> bool {
+    operation
+        .target_account
+        .starts_with(crate::companion::account::MARKER_PREFIX)
+}
+
 /// The invariant check needs only the marker each project is left with and
-/// the names of the records written, so record bodies aren't held.
+/// the names of the records written, so record bodies aren't held. Returns
+/// the marker writes it validated.
 fn check_persisted_companion_invariants(
     storage: &mut impl ProjectStorage,
     journal: &TransactionJournal,
-) -> Result<(), String> {
+) -> Result<HashMap<usize, CheckedMarker>, String> {
+    let mut checked = HashMap::new();
     let mut changes: Vec<(&str, Option<Vec<u8>>)> = Vec::new();
-    for operation in &journal.operations {
+    for (index, operation) in journal.operations.iter().enumerate() {
         let account = operation.target_account.as_str();
         if !crate::companion::account::is_in_companion_namespace(account) {
             continue;
         }
         let value = match (operation.action.as_str(), &operation.staged_account) {
-            ("write", Some(stage))
-                if account.starts_with(crate::companion::account::MARKER_PREFIX) =>
-            {
+            ("write", Some(stage)) if journal_marker_was_checked(operation) => {
                 Some(match read_validated_stage(storage, operation, stage)? {
-                    Some(value) => value,
-                    None => read_validated_applied_target(storage, operation)?,
+                    Some(value) => {
+                        checked.insert(index, CheckedMarker::Staged(value.clone()));
+                        value
+                    }
+                    None => {
+                        checked.insert(index, CheckedMarker::Applied);
+                        read_validated_applied_target(storage, operation)?
+                    }
                 })
             }
             ("write", _) => Some(Vec::new()),
@@ -816,13 +870,14 @@ fn check_persisted_companion_invariants(
         changes.push((account, value));
     }
     if changes.is_empty() {
-        return Ok(());
+        return Ok(checked);
     }
     let changes: Vec<(&str, Option<&[u8]>)> = changes
         .iter()
         .map(|(account, value)| (*account, value.as_deref()))
         .collect();
-    check_companion_invariants(storage, &changes, true)
+    check_companion_invariants(storage, &changes)?;
+    Ok(checked)
 }
 
 fn finish_project_transaction(
@@ -1470,12 +1525,6 @@ fn delete_vault_unlocked(vault_id: &str) -> Result<(), String> {
     delete_vault_with_storage_after_recovery(&mut KeychainProjectStorage, vault_id)
 }
 
-pub fn list_vaults() -> Result<Vec<IndexEntry>, String> {
-    with_keychain_transaction(|| {
-        list_vaults_with_storage_after_recovery(&mut KeychainProjectStorage)
-    })
-}
-
 /// The selected environment's values and personal overrides, read together
 /// inside one lock on this thread, so one approval covers both. With
 /// `default_fallback`, an environment without values of its own reads
@@ -1641,6 +1690,7 @@ fn list_vaults_with_storage(storage: &mut impl ProjectStorage) -> Result<Vec<Ind
     list_vaults_with_storage_after_recovery(storage)
 }
 
+#[cfg(test)]
 fn list_vaults_with_storage_after_recovery(
     storage: &mut impl ProjectStorage,
 ) -> Result<Vec<IndexEntry>, String> {
@@ -1926,7 +1976,7 @@ fn delete_project_with_companion_records(
     marker_bytes: Option<Vec<u8>>,
     inventory: Vec<CompanionAccount>,
 ) -> Result<(), String> {
-    use crate::companion::lifecycle::{FoundMarker, MarkerChange, Plan, PlannedChange};
+    use crate::companion::lifecycle::{FoundMarker, Plan};
 
     let current = marker_bytes
         .as_deref()
@@ -1942,27 +1992,12 @@ fn delete_project_with_companion_records(
         crate::companion::lifecycle::plan_deletion(vault_id, found, inventory, mutations.len())?;
     let mut transactions = plan.transactions.into_iter();
     if let Some(first) = transactions.next() {
-        for change in first.changes {
-            match change {
-                PlannedChange::Delete(account) => {
-                    mutations.push(ProjectStorageMutation::delete(account.name()));
-                }
-                PlannedChange::Move { .. } => {
-                    return Err("a deletion plan moved a record".to_owned());
-                }
-            }
-        }
-        let marker_account = crate::companion::account::marker_account(vault_id);
-        match first.marker {
-            Some(MarkerChange::Write(marker)) => mutations.push(ProjectStorageMutation::write(
-                marker_account,
-                marker.encode().map_err(|error| error.to_string())?,
-            )),
-            Some(MarkerChange::Delete) => {
-                mutations.push(ProjectStorageMutation::delete(marker_account));
-            }
-            None => {}
-        }
+        mutations.extend(
+            first
+                .into_deletions(vault_id)?
+                .into_iter()
+                .map(companion_gate::storage_mutation),
+        );
     }
     apply_project_transaction_after_recovery(storage, mutations)?;
     crate::companion::lifecycle::execute(

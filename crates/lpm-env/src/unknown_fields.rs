@@ -6,11 +6,13 @@
 //! every node comes from the same declarations as the parser. Maps of
 //! variable or group names are values, never checked as fields. For an
 //! untagged union, a key is unknown only if no alternative defines it; the
-//! typed parser still rejects invalid combinations.
+//! typed parser still rejects invalid combinations. A key written twice is
+//! checked in each copy, since the typed parser may have stopped at either.
 
 use std::sync::OnceLock;
 
-use serde_json::{Map, Value};
+use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde_json::Value;
 
 /// A field no node of its kind defines, at `parent`, the path segments of
 /// the object holding it, in document order.
@@ -42,20 +44,84 @@ fn generated<T: schemars::JsonSchema>() -> Value {
 }
 
 fn first_unknown_field(document: &[u8], schema: &Value) -> Option<UnknownField> {
-    let value: Value = serde_json::from_slice(document).ok()?;
+    let node: Node = serde_json::from_slice(document).ok()?;
     let mut parent = Vec::new();
-    walk(&value, schema, schema, &mut parent)
+    walk(&node, schema, schema, &mut parent)
+}
+
+/// A document's shape as written: every entry of an object, a repeated key
+/// in each place it appears, and no scalar values.
+enum Node {
+    Object(Vec<(String, Node)>),
+    Array(Vec<Node>),
+    Scalar,
+}
+
+impl<'de> Deserialize<'de> for Node {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct NodeVisitor;
+
+        impl<'de> Visitor<'de> for NodeVisitor {
+            type Value = Node;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON value")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Node, A::Error> {
+                let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
+                while let Some(entry) = map.next_entry::<String, Node>()? {
+                    entries.push(entry);
+                }
+                Ok(Node::Object(entries))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut items: A) -> Result<Node, A::Error> {
+                let mut nodes = Vec::with_capacity(items.size_hint().unwrap_or(0));
+                while let Some(node) = items.next_element()? {
+                    nodes.push(node);
+                }
+                Ok(Node::Array(nodes))
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Node, E> {
+                Ok(Node::Scalar)
+            }
+
+            fn visit_i64<E>(self, _: i64) -> Result<Node, E> {
+                Ok(Node::Scalar)
+            }
+
+            fn visit_u64<E>(self, _: u64) -> Result<Node, E> {
+                Ok(Node::Scalar)
+            }
+
+            fn visit_f64<E>(self, _: f64) -> Result<Node, E> {
+                Ok(Node::Scalar)
+            }
+
+            fn visit_str<E>(self, _: &str) -> Result<Node, E> {
+                Ok(Node::Scalar)
+            }
+
+            fn visit_unit<E>(self) -> Result<Node, E> {
+                Ok(Node::Scalar)
+            }
+        }
+
+        deserializer.deserialize_any(NodeVisitor)
+    }
 }
 
 fn walk(
-    value: &Value,
+    value: &Node,
     schema: &Value,
     root: &Value,
     parent: &mut Vec<String>,
 ) -> Option<UnknownField> {
     match value {
-        Value::Object(map) => walk_object(map, schema, root, parent),
-        Value::Array(items) => {
+        Node::Object(entries) => walk_object(entries, schema, root, parent),
+        Node::Array(items) => {
             let item_schemas: Vec<&Value> = alternatives(schema, root)
                 .into_iter()
                 .filter_map(|alternative| alternative.get("items"))
@@ -73,12 +139,12 @@ fn walk(
             }
             None
         }
-        _ => None,
+        Node::Scalar => None,
     }
 }
 
 fn walk_object(
-    map: &Map<String, Value>,
+    entries: &[(String, Node)],
     schema: &Value,
     root: &Value,
     parent: &mut Vec<String>,
@@ -90,7 +156,7 @@ fn walk_object(
     if objects.is_empty() {
         return None;
     }
-    for (key, child) in map {
+    for (key, child) in entries {
         let mut child_schemas = Vec::with_capacity(objects.len());
         let mut open = false;
         for object in &objects {
@@ -126,7 +192,7 @@ fn walk_object(
 /// An unknown field inside `value` only when every schema that could
 /// describe it reports one, so a union alternative that accepts it wins.
 fn unknown_under_all(
-    value: &Value,
+    value: &Node,
     schemas: &[&Value],
     root: &Value,
     parent: &mut Vec<String>,
@@ -266,6 +332,18 @@ mod tests {
         assert_eq!(
             definition(r#"{"vars":{},"rotationPolicy":{}}"#),
             Some((Vec::new(), "rotationPolicy".to_owned()))
+        );
+    }
+
+    #[test]
+    fn an_unknown_field_in_any_copy_of_a_repeated_key_is_found() {
+        assert_eq!(
+            definition(r#"{"vars":{"A":{"requird":true},"A":{"required":true}}}"#),
+            Some((path(&["vars", "A"]), "requird".to_owned()))
+        );
+        assert_eq!(
+            definition(r#"{"vars":{"A":{}},"vars":{"B":{"zeta":1}}}"#),
+            Some((path(&["vars", "B"]), "zeta".to_owned()))
         );
     }
 

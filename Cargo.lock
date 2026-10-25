@@ -3671,7 +3671,6 @@ version = "0.81.0"
 dependencies = [
  "base64 0.22.1",
  "lpm-common",
- "lpm-env",
  "serde",
  "serde_json",
 ]
@@ -4294,6 +4293,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "urlencoding",
  "windows-sys 0.60.2",
  "wiremock",

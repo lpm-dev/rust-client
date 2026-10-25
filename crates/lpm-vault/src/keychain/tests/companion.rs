@@ -581,7 +581,7 @@ fn restored_records_that_follow_values_take_the_values_verified_approval() {
 }
 
 #[test]
-fn values_that_claim_approval_without_it_pass_approval_on_not_their_weakness() {
+fn values_that_claim_approval_without_it_get_it_before_their_records_are_staged() {
     let mut storage = storage_with_values();
     activating_restore(&mut storage);
     storage
@@ -591,6 +591,40 @@ fn values_that_claim_approval_without_it_pass_approval_on_not_their_weakness() {
     companion_gate::authorize(&mut storage, VAULT, Operation::Maintenance)
         .expect("the restore finishes");
 
+    assert!(
+        storage.protected.contains(VAULT),
+        "the values get the approval they claim"
+    );
+    assert!(
+        storage
+            .protected
+            .contains(&record_account("overrides", VAULT, None))
+    );
+}
+
+#[test]
+fn values_whose_approval_attributes_contradict_each_other_are_reported() {
+    let mut storage = storage_with_values();
+    activating_restore(&mut storage);
+    storage
+        .claims
+        .insert(VAULT.to_owned(), ClaimedAccess::Contradictory);
+
+    let warnings = crate::test_tracing::warnings(|| {
+        companion_gate::authorize(&mut storage, VAULT, Operation::Maintenance)
+            .expect("the restore finishes");
+    });
+
+    assert!(
+        warnings.contains(
+            "this env project's values have approval attributes that contradict each other"
+        ),
+        "{warnings}"
+    );
+    assert!(
+        !storage.protected.contains(VAULT),
+        "an unclear claim isn't enforced"
+    );
     assert!(
         storage
             .protected
@@ -688,4 +722,52 @@ fn a_values_write_adds_one_marker_read_and_no_probe_or_listing() {
     assert_eq!(storage.reads.get(&marker_account(VAULT)).copied(), Some(1));
     assert!(storage.probes.is_empty());
     assert_eq!(storage.listings, 0);
+}
+
+#[test]
+fn a_commit_refuses_to_leave_records_without_their_marker() {
+    let mut storage = storage_with_values();
+    storage
+        .values
+        .insert(marker_account(VAULT), marker(OVERRIDES_FEATURE, "active"));
+    storage.values.insert(
+        record_account("overrides", VAULT, None),
+        overrides_record(r#""A":"1""#),
+    );
+
+    let error = apply_project_transaction(
+        &mut storage,
+        vec![ProjectStorageMutation::delete(marker_account(VAULT))],
+    )
+    .expect_err("a commit is checked as recovery would check it");
+
+    assert!(error.contains("would leave"), "{error}");
+    assert!(storage.values.contains_key(&marker_account(VAULT)));
+    assert!(!storage.values.contains_key(TRANSACTION_MARKER_ACCOUNT));
+}
+
+#[test]
+fn committed_recovery_reads_a_staged_marker_no_more_than_a_staged_record() {
+    let mut storage = MemoryProjectStorage::default();
+    let marker = marker(OVERRIDES_FEATURE, "active");
+    let overrides = overrides_record(r#""A":"1""#);
+    committed_journal(
+        &mut storage,
+        &[
+            (&marker_account(VAULT), Some(marker.as_bytes())),
+            (
+                &record_account("overrides", VAULT, None),
+                Some(overrides.as_bytes()),
+            ),
+        ],
+    );
+    let stage = |index| transaction_stage_account("00000000-0000-4000-8000-0000000000aa", index);
+
+    recover_project_transaction(&mut storage).expect("a committed journal recovers");
+
+    assert_eq!(
+        storage.reads.get(&stage(0)),
+        storage.reads.get(&stage(1)),
+        "each stage is read for its bytes, then to confirm it's gone"
+    );
 }

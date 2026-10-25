@@ -83,12 +83,18 @@
       "valid": false
     },
     {
-      "name": "denied variable name",
+      "name": "a name LPM never passes to a process stays valid; the runner drops it",
       "vaultId": "proj",
       "version": 1,
-      "environment": "default",
-      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"staging\":{\"set\":{\"NODE_OPTIONS\":\"--inspect\"},\"unset\":[]}}}",
-      "valid": false
+      "environment": "staging",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"staging\":{\"set\":{\"NODE_OPTIONS\":\"--inspect\"},\"unset\":[\"CLASSPATH\"]}}}",
+      "valid": true,
+      "set": {
+        "NODE_OPTIONS": "--inspect"
+      },
+      "unset": [
+        "CLASSPATH"
+      ]
     },
     {
       "name": "NUL in a value",

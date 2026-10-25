@@ -21,6 +21,25 @@ unsafe extern "C" {
     static kSecUseOperationPrompt: CFStringRef;
 }
 
+/// The reason the approval prompt gives for reading `account`: a values
+/// item is named by its vault ID, a companion record by what it holds.
+fn operation_prompt(account: &str) -> String {
+    use crate::companion::account::CompanionAccount;
+    match CompanionAccount::parse(account) {
+        Some(record) => {
+            let holds = match record.kind() {
+                Some(crate::companion::overrides::OVERRIDES_KIND) => "personal overrides",
+                _ => "newer data",
+            };
+            format!(
+                "Allow LPM CLI to access env project {}'s {holds}",
+                record.vault_id()
+            )
+        }
+        None => format!("Allow LPM CLI to access env project {account}"),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CliAccess {
     Automatic,
@@ -249,10 +268,24 @@ impl SecurityFrameworkBackend {
 
     /// An item's CLI approval as its attributes claim it: the approval marker
     /// with an access control, or no marker (or an empty one, which the app
-    /// writes when approval is off). Any other combination is contradictory.
+    /// writes when approval is off), in the one accessibility class LPM
+    /// writes. Any other combination is contradictory.
     fn classify(
         attributes: &CFDictionary<CFString, CFType>,
     ) -> Result<CliAccess, KeychainStorageError> {
+        let accessible = unsafe { CFString::wrap_under_get_rule(kSecAttrAccessible) };
+        if let Some(class) = attributes.find(&accessible) {
+            let class = class
+                .downcast::<CFString>()
+                .ok_or(KeychainStorageError::VerificationFailed)?;
+            if class
+                != unsafe {
+                    CFString::wrap_under_get_rule(kSecAttrAccessibleWhenUnlockedThisDeviceOnly)
+                }
+            {
+                return Err(KeychainStorageError::VerificationFailed);
+            }
+        }
         let generic = unsafe { CFString::wrap_under_get_rule(kSecAttrGeneric) };
         let Some(marker) = attributes.find(&generic) else {
             return Ok(CliAccess::Automatic);
@@ -292,8 +325,7 @@ impl SecurityFrameworkBackend {
         ));
         pairs.push((
             unsafe { CFString::wrap_under_get_rule(kSecUseOperationPrompt) },
-            CFString::from(format!("Allow LPM CLI to access env project {account}").as_str())
-                .into_CFType(),
+            CFString::from(operation_prompt(account).as_str()).into_CFType(),
         ));
         for key in [unsafe { kSecReturnData }, unsafe { kSecReturnAttributes }] {
             pairs.push((
@@ -470,8 +502,7 @@ impl SecurityFrameworkBackend {
         ));
         pairs.push((
             unsafe { CFString::wrap_under_get_rule(kSecUseOperationPrompt) },
-            CFString::from(format!("Allow LPM CLI to access env project {account}").as_str())
-                .into_CFType(),
+            CFString::from(operation_prompt(account).as_str()).into_CFType(),
         ));
         pairs.push((
             unsafe { CFString::wrap_under_get_rule(kSecReturnData) },
@@ -734,6 +765,96 @@ pub(crate) fn delete(service: &str, account: &str) -> Result<KeychainDeleteOutco
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_prompts_say_what_they_read() {
+        assert_eq!(
+            operation_prompt("8c1f0d2e-6a35-4c1b-9f3e-2d7b5a1c9e40"),
+            "Allow LPM CLI to access env project 8c1f0d2e-6a35-4c1b-9f3e-2d7b5a1c9e40"
+        );
+        assert_eq!(
+            operation_prompt(&crate::companion::account::record_account(
+                "overrides",
+                "8c1f0d2e-6a35-4c1b-9f3e-2d7b5a1c9e40",
+                None
+            )),
+            "Allow LPM CLI to access env project 8c1f0d2e-6a35-4c1b-9f3e-2d7b5a1c9e40's personal overrides"
+        );
+        assert_eq!(
+            operation_prompt(&crate::companion::account::record_account(
+                "future-log",
+                "proj",
+                Some(3)
+            )),
+            "Allow LPM CLI to access env project proj's newer data"
+        );
+    }
+
+    #[test]
+    fn access_claims_classify_as_the_shared_fixture_records() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            cases: Vec<Case>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Case {
+            name: String,
+            marker: Option<String>,
+            access_control: bool,
+            accessible: Option<String>,
+            claim: String,
+        }
+        let fixture: Fixture = serde_json::from_str(include_str!(
+            "../../lpm-env-companion/tests/fixtures/access-claims.json"
+        ))
+        .expect("the access fixture decodes");
+        for case in fixture.cases {
+            let mut pairs: Vec<(CFString, CFType)> = Vec::new();
+            if let Some(marker) = &case.marker {
+                pairs.push((
+                    unsafe { CFString::wrap_under_get_rule(kSecAttrGeneric) },
+                    CFData::from_buffer(marker.as_bytes()).into_CFType(),
+                ));
+            }
+            if case.access_control {
+                let control = SecAccessControl::create_with_protection(
+                    Some(security_framework::access_control::ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
+                    0,
+                )
+                .expect("an access control");
+                pairs.push((
+                    unsafe { CFString::wrap_under_get_rule(kSecAttrAccessControl) },
+                    control.into_CFType(),
+                ));
+            }
+            if let Some(class) = &case.accessible {
+                let class = match class.as_str() {
+                    "whenUnlockedThisDeviceOnly" => unsafe {
+                        kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+                    },
+                    "whenUnlocked" => unsafe {
+                        security_framework_sys::access_control::kSecAttrAccessibleWhenUnlocked
+                    },
+                    "afterFirstUnlock" => unsafe {
+                        security_framework_sys::access_control::kSecAttrAccessibleAfterFirstUnlock
+                    },
+                    other => panic!("{}: unknown class {other}", case.name),
+                };
+                pairs.push((
+                    unsafe { CFString::wrap_under_get_rule(kSecAttrAccessible) },
+                    unsafe { CFString::wrap_under_get_rule(class) }.into_CFType(),
+                ));
+            }
+            let attributes = CFDictionary::from_CFType_pairs(&pairs);
+            let claim = match SecurityFrameworkBackend::claim(&attributes) {
+                ClaimedAccess::Automatic => "automatic",
+                ClaimedAccess::RequireApproval => "requireApproval",
+                ClaimedAccess::Contradictory => "contradictory",
+            };
+            assert_eq!(claim, case.claim, "{}", case.name);
+        }
+    }
 
     #[test]
     #[ignore = "requires a signed macOS test bundle with the shared Keychain entitlement"]

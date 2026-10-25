@@ -570,7 +570,7 @@ pub fn unknown_field_error(source: &str, unknown: &lpm_env::UnknownField) -> Sou
     let mut error = SourceError::new("env.unknown_field", "parse", source, &pointer);
     error.diagnostic.field = Some(field);
     error.diagnostic.message = Some(
-        "This field isn't one this LPM CLI knows. Check its spelling, or update the LPM CLI if a newer version wrote it.",
+        "This field isn't one this version of LPM knows. Check its spelling, or update LPM if a newer version wrote it.",
     );
     error
 }

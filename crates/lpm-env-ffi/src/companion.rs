@@ -16,11 +16,11 @@ use lpm_env_companion::gate::{Damage, Operation, ProjectGate};
 use lpm_env_companion::graph::{AccessClass, record_access_class};
 use lpm_env_companion::invariants::{Refusal, check_transaction};
 use lpm_env_companion::lifecycle::{
-    FoundMarker, MarkerChange, Plan, PlannedChange, needs_resume, plan_deletion, plan_discard,
+    FoundMarker, MarkerChange, Plan, PlannedChange, Resumed, plan_deletion, plan_discard,
     plan_feature_removal, plan_resume, plan_unlisted_removal,
 };
 use lpm_env_companion::marker::{
-    FeatureEntry, FeatureState, Level, Marker, ProjectState, RestorePhase, is_supported,
+    FeatureEntry, Level, Marker, ProjectState, RestorePhase, is_supported,
 };
 use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -541,25 +541,27 @@ pub unsafe extern "C" fn lpm_env_companion_plan(input: *const u8, length: usize)
         })
     }
     fn resume_notice(marker: &Marker) -> Option<Notice> {
-        let kind = match (
-            marker.state,
-            marker.restore.as_ref().map(|restore| restore.phase),
-        ) {
-            (ProjectState::Deleting, _) => "deletion",
-            (ProjectState::Discarding, _) => "discard",
-            (ProjectState::Restoring, Some(RestorePhase::Staging)) => "restoreUndone",
-            (ProjectState::Restoring, _) => "restore",
-            (ProjectState::Active, _) if needs_resume(marker) => "featureRemoval",
-            (ProjectState::Active, _) => return None,
-        };
-        Some(Notice {
-            kind,
-            features: marker
-                .features
-                .iter()
-                .filter(|(_, entry)| entry.state == FeatureState::Removing)
-                .map(|(name, _)| name.clone())
-                .collect(),
+        Some(match Resumed::of(marker)? {
+            Resumed::Deletion => Notice {
+                kind: "deletion",
+                features: Vec::new(),
+            },
+            Resumed::Discard => Notice {
+                kind: "discard",
+                features: Vec::new(),
+            },
+            Resumed::RestoreUndone => Notice {
+                kind: "restoreUndone",
+                features: Vec::new(),
+            },
+            Resumed::Restore => Notice {
+                kind: "restore",
+                features: Vec::new(),
+            },
+            Resumed::FeatureRemoval(features) => Notice {
+                kind: "featureRemoval",
+                features,
+            },
         })
     }
     // SAFETY: Forwarded from this function's contract.
@@ -641,6 +643,7 @@ pub unsafe extern "C" fn lpm_env_companion_check_transaction(
         abi_version: u32,
     }
     const MISSING_MARKER: &str = "companion.missing_marker";
+    const MISSING_NAMES: &str = "companion.missing_names";
     // SAFETY: Forwarded from this function's contract.
     unsafe {
         respond(input, length, |request: Request| {
@@ -658,10 +661,17 @@ pub unsafe extern "C" fn lpm_env_companion_check_transaction(
                 Some(marker) => Ok(marker.as_ref().map(|bytes| bytes.0.clone())),
                 None => Err(MISSING_MARKER.to_owned()),
             };
-            match check_transaction(&changes, live, request.names.as_deref()) {
+            let inventory = |vault_id: &str| match &request.names {
+                Some(names) => Ok(project_inventory(vault_id, names)),
+                None => Err(MISSING_NAMES.to_owned()),
+            };
+            match check_transaction(&changes, live, inventory) {
                 Ok(()) => json(&Output {
                     abi_version: ABI_VERSION,
                 }),
+                Err(Refusal::Storage(missing)) if missing == MISSING_NAMES => {
+                    failure(2, MISSING_NAMES)
+                }
                 Err(Refusal::Storage(_)) => failure(2, MISSING_MARKER),
                 Err(refused) => refusal("companion.refused", refused.describe("vault transaction")),
             }

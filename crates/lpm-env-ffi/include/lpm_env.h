@@ -196,15 +196,19 @@ LPMEnvResult lpm_env_companion_account_names(const uint8_t *input, size_t input_
  * "invalidRecord" | "unlistedRecord" | "access", kind?, reason?, repair:
  * {action: "discardProject" | "removeFeature" | "removeUnlisted", feature?} |
  * null}], allows: {readExcludingOverrides, readApplyingOverrides, write}}.
- * Maintenance is always allowed; with needsResume nothing else is until a
- * resume plan has run. Reasons never quote record contents. status: 0=assessed. */
+ * allows applies the operation matrix to the marker and to every damage listed,
+ * so damage only a listing finds counts when inventory is given. Maintenance is
+ * always allowed; with needsResume nothing else is until a resume plan has run.
+ * An overrides feature of a version this engine doesn't support is never judged
+ * as damage. Reasons never quote record contents. status: 0=assessed. */
 LPMEnvResult lpm_env_companion_assess(const uint8_t *input, size_t input_length);
 /* Plan a lifecycle operation as transactions to commit in order, each
  * atomically. Input {action, vaultId, marker: bytes | null, inventory: [names]
  * from a names-only listing in the same lock scope, ownOperations?, feature?}:
  *   resume: finish an interrupted step of a valid marker;
- *   delete: the project's records, with ownOperations of the caller's own (its
- *     values item and metadata) committed in the first transaction;
+ *   delete: the project's records, with ownOperations (at most 31) of the
+ *     caller's own, its values item and metadata, committed in the first
+ *     transaction;
  *   discard: every record, keeping the values;
  *   removeFeature: one feature of a valid marker and the records only it lists;
  *   removeUnlisted: the records a valid marker doesn't list.
@@ -216,14 +220,16 @@ LPMEnvResult lpm_env_companion_assess(const uint8_t *input, size_t input_length)
  * operations and, with records of at most 100 KiB, 1 MiB of writes.
  * status: 0=planned, 5=refused. */
 LPMEnvResult lpm_env_companion_plan(const uint8_t *input, size_t input_length);
-/* Check one transaction before committing it, or when its committed journal is
- * replayed. Input {changes: [{account, bytes: bytes | null (a deletion)}],
+/* Check one transaction before committing it, and again when its committed
+ * journal is replayed: both apply the same rules, so a journal a commit accepts
+ * always replays. Input {changes: [{account, bytes: bytes | null (a deletion)}],
  * markers: {vaultId: bytes | null}, names?: [names]}. Only a marker's bytes are
  * read, so other writes may send "". markers holds each touched project's marker
- * as the store holds it now; names, a names-only listing, adds the check that a
- * transaction changing a marker leaves no record it listed without a feature,
- * made while the old marker is still stored. Accounts outside the companion
- * namespace are skipped. status: 0=passes, 2=companion.missing_marker,
+ * as the store holds it now; a project whose changes only delete records needs
+ * none. names, a names-only listing, is needed when a transaction changes a
+ * marker the store still holds, which must leave no record that marker listed
+ * without a feature. Accounts outside the companion namespace are skipped.
+ * status: 0=passes, 2=companion.missing_marker or companion.missing_names,
  * 5=refused. */
 LPMEnvResult lpm_env_companion_check_transaction(const uint8_t *input, size_t input_length);
 /* Release only the output buffer after decoding; the snapshot stays live.

@@ -8,19 +8,21 @@
 //! sealed with AES-256-GCM under the data key, bound to its logical account
 //! and vault ID.
 //!
-//! Changes that touch several files go through a journal, `vaults/.journal`,
-//! with stages in `vaults/.stage/`:
+//! Changes that touch several of a project's files go through its journal,
+//! `vaults/<vault digest>.journal`, with stages in
+//! `vaults/<vault digest>.stage/`, so an interrupted change holds up only its
+//! own project:
 //!
-//! 1. Write every stage, each file synced, then sync `.stage/` once.
+//! 1. Write every stage, each file synced, then sync the stage folder once.
 //! 2. Write the journal, `committed`, atomically.
 //! 3. Rename each stage over its target, or delete the target.
 //! 4. Sync each changed folder once.
-//! 5. Delete the journal, sync `vaults/`, and remove `.stage/`.
+//! 5. Delete the journal, sync `vaults/`, and remove the stage folder.
 //!
 //! There's no `preparing` journal: stages found without a journal were never
 //! committed, and recovery deletes them.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 use aes_gcm::aead::{AeadInPlace, generic_array::GenericArray};
 use aes_gcm::{Aes256Gcm, KeyInit};
@@ -28,35 +30,61 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::companion::account::CompanionAccount;
-use crate::companion::gate::{Operation, ProjectGate};
+use crate::companion::gate::{Damage, GateError, Operation, ProjectGate};
 use crate::companion::invariants::check_transaction;
 use crate::companion::lifecycle::{
     FoundMarker, LifecycleStore, MAX_TRANSACTION_OPERATIONS, MAX_TRANSACTION_PAYLOAD_BYTES,
-    Mutation,
+    Mutation, Plan,
 };
-use crate::companion::marker::{MAX_RECORD_BYTES, Marker};
+use crate::companion::marker::MAX_RECORD_BYTES;
 use crate::companion::overrides::{OVERRIDES_KIND, PersonalOverrides};
 use crate::companion::{CompanionBackend, damaged};
 use crate::storage_transaction::VaultStorageDirectory;
 
 const VAULTS_FOLDER: &str = "vaults";
-const JOURNAL: &str = ".journal";
-const STAGE_FOLDER: &str = ".stage";
 const MARKER_ENTRY: &str = "features";
 const RECORD_ENTRY_PREFIX: &str = "record.";
 const STAGED_ENTRY_PREFIX: &str = "staged.";
 const ENTRY_AAD_DOMAIN: &[u8] = b"lpm-vault-companion\x01";
 const NONCE_BYTES: usize = 12;
 const TAG_BYTES: usize = 16;
+/// The largest sealed entry: a record at its limit with its nonce and tag.
+const MAX_SEALED_ENTRY_BYTES: u64 = (MAX_RECORD_BYTES + NONCE_BYTES + TAG_BYTES) as u64;
 const FILE_JOURNAL_SCHEMA_VERSION: u8 = 1;
 const MAX_FILE_JOURNAL_BYTES: usize = 64 * 1024;
+const CHANGED_OUTSIDE: &str = "it changed outside LPM while LPM was changing it";
+
+#[cfg(test)]
+thread_local! {
+    /// Fail the next commit right after its journal is written, as a crash
+    /// would leave it.
+    pub(crate) static CRASH_AFTER_JOURNAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// How often this thread ran recovery.
+    pub(crate) static RECOVERIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The digest that names a project's values file, companion folder, journal
+/// and stage folder.
+fn vault_digest(vault_id: &str) -> String {
+    let mut name = super::vault_file_name(vault_id);
+    if let Some(digest) = name.strip_suffix(".vault") {
+        name.truncate(digest.len());
+    }
+    name
+}
 
 /// A project's companion folder: the digest that names its values file, with
 /// a `.companion` extension.
 pub(crate) fn companion_folder_name(vault_id: &str) -> String {
-    let values = super::vault_file_name(vault_id);
-    let digest = values.strip_suffix(".vault").unwrap_or(&values);
-    format!("{digest}.companion")
+    format!("{}.companion", vault_digest(vault_id))
+}
+
+fn journal_name(vault_id: &str) -> String {
+    format!("{}.journal", vault_digest(vault_id))
+}
+
+fn stage_folder_name(vault_id: &str) -> String {
+    format!("{}.stage", vault_digest(vault_id))
 }
 
 fn entry_name(account: &CompanionAccount) -> String {
@@ -136,7 +164,13 @@ fn seal(key: &[u8; 32], account: &CompanionAccount, plaintext: &[u8]) -> Result<
     Ok(sealed)
 }
 
-fn open(key: &[u8; 32], account: &CompanionAccount, sealed: &[u8]) -> Result<Vec<u8>, String> {
+/// Authenticate and decrypt `sealed` in place, so the plaintext reuses its
+/// allocation.
+fn open(
+    key: &[u8; 32],
+    account: &CompanionAccount,
+    mut sealed: Vec<u8>,
+) -> Result<Vec<u8>, String> {
     if sealed.len() < NONCE_BYTES + TAG_BYTES {
         return Err(format!(
             "companion entry {} is truncated",
@@ -145,14 +179,14 @@ fn open(key: &[u8; 32], account: &CompanionAccount, sealed: &[u8]) -> Result<Vec
     }
     let cipher =
         Aes256Gcm::new_from_slice(key).map_err(|error| format!("cipher init error: {error}"))?;
-    let (nonce, rest) = sealed.split_at(NONCE_BYTES);
-    let (ciphertext, tag) = rest.split_at(rest.len() - TAG_BYTES);
-    let mut plaintext = ciphertext.to_vec();
+    let tag_start = sealed.len() - TAG_BYTES;
+    let (head, tag) = sealed.split_at_mut(tag_start);
+    let (nonce, ciphertext) = head.split_at_mut(NONCE_BYTES);
     cipher
         .decrypt_in_place_detached(
             GenericArray::from_slice(nonce),
             &entry_associated_data(account)?,
-            &mut plaintext,
+            ciphertext,
             GenericArray::from_slice(tag),
         )
         .map_err(|_| {
@@ -161,7 +195,9 @@ fn open(key: &[u8; 32], account: &CompanionAccount, sealed: &[u8]) -> Result<Vec
                 entry_name(account)
             )
         })?;
-    Ok(plaintext)
+    sealed.truncate(tag_start);
+    sealed.drain(..NONCE_BYTES);
+    Ok(sealed)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -184,6 +220,15 @@ enum ValuesFile {
     Digest,
     /// `<vault id>.enc`, the name before files were named by digest.
     Legacy,
+}
+
+impl ValuesFile {
+    fn name(self, vault_id: &str) -> String {
+        match self {
+            Self::Digest => super::vault_file_name(vault_id),
+            Self::Legacy => format!("{vault_id}.enc"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,31 +255,39 @@ struct FileJournal {
 
 /// Where an operation's target lives, derived from its logical name only.
 enum PhysicalTarget {
-    Values { name: String },
-    Companion { folder: String, entry: String },
+    Values {
+        name: String,
+    },
+    Companion {
+        account: CompanionAccount,
+        entry: String,
+    },
 }
 
 impl FileOperation {
-    fn physical(&self) -> Result<PhysicalTarget, String> {
+    /// The operation's target, which must be one of `vault_id`'s files.
+    fn physical(&self, vault_id: &str) -> Result<PhysicalTarget, String> {
         match self.values_file {
             Some(file) => {
-                if !lpm_common::stored_env::is_safe_vault_id(&self.target) {
-                    return Err("the env file journal names an invalid env project".to_owned());
+                if self.target != vault_id {
+                    return Err(
+                        "this env project's file journal names another project's values".to_owned(),
+                    );
                 }
                 Ok(PhysicalTarget::Values {
-                    name: match file {
-                        ValuesFile::Digest => super::vault_file_name(&self.target),
-                        ValuesFile::Legacy => format!("{}.enc", self.target),
-                    },
+                    name: file.name(vault_id),
                 })
             }
             None => {
-                let account = CompanionAccount::parse(&self.target).ok_or_else(|| {
-                    "the env file journal names an invalid companion record".to_owned()
-                })?;
+                let account = CompanionAccount::parse(&self.target)
+                    .filter(|account| account.vault_id() == vault_id)
+                    .ok_or_else(|| {
+                        "this env project's file journal names a record that isn't one of its own"
+                            .to_owned()
+                    })?;
                 Ok(PhysicalTarget::Companion {
-                    folder: companion_folder_name(account.vault_id()),
                     entry: entry_name(&account),
+                    account,
                 })
             }
         }
@@ -253,33 +306,36 @@ fn is_hex_digest(value: &str) -> bool {
 }
 
 impl FileJournal {
-    fn parse(bytes: &[u8]) -> Result<Self, String> {
+    fn parse(bytes: &[u8], vault_id: &str) -> Result<Self, String> {
         if bytes.len() > MAX_FILE_JOURNAL_BYTES {
-            return Err("the env file journal is too large".to_owned());
+            return Err("this env project's file journal is too large".to_owned());
         }
-        let journal: Self = serde_json::from_slice(bytes)
-            .map_err(|error| format!("the env file journal is malformed: {error}"))?;
-        journal.validate()?;
+        let journal: Self = serde_json::from_slice(bytes).map_err(|error| {
+            format!(
+                "this env project's file journal is malformed: {}",
+                crate::companion::marker::describe_json_error(&error)
+            )
+        })?;
+        journal.validate(vault_id)?;
         Ok(journal)
     }
 
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&self, vault_id: &str) -> Result<(), String> {
         if self.schema_version != FILE_JOURNAL_SCHEMA_VERSION
             || !is_transaction_id(&self.transaction_id)
             || self.operations.is_empty()
             || self.operations.len() > MAX_TRANSACTION_OPERATIONS
         {
-            return Err("the env file journal is invalid".to_owned());
+            return Err("this env project's file journal is invalid".to_owned());
         }
-        let mut targets = HashSet::with_capacity(self.operations.len());
+        let mut targets = BTreeSet::new();
         for operation in &self.operations {
-            let physical = operation.physical()?;
-            let key = match physical {
+            let key = match operation.physical(vault_id)? {
                 PhysicalTarget::Values { name } => name,
-                PhysicalTarget::Companion { folder, entry } => format!("{folder}/{entry}"),
+                PhysicalTarget::Companion { entry, .. } => format!("/{entry}"),
             };
             if !targets.insert(key) {
-                return Err("the env file journal names a target twice".to_owned());
+                return Err("this env project's file journal names a file twice".to_owned());
             }
             if operation
                 .before
@@ -294,7 +350,7 @@ impl FileJournal {
                     FileAction::Delete => operation.after.is_some(),
                 }
             {
-                return Err("the env file journal has an invalid operation".to_owned());
+                return Err("this env project's file journal has an invalid change".to_owned());
             }
         }
         Ok(())
@@ -312,6 +368,22 @@ fn new_transaction_id() -> String {
     let mut bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
+}
+
+/// One change of a file-store transaction.
+enum FileChange {
+    Companion(Mutation),
+    /// Delete one of the project's values files, as a deletion's first
+    /// transaction does with the shared key and the single records.
+    DeleteValues(ValuesFile),
+}
+
+/// Who applies a journal: the commit that wrote it, which knows every target
+/// is in its before-state, or recovery, which checks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Replay {
+    Commit,
+    Recovery,
 }
 
 /// The file store's companion records, for one operation inside the lock.
@@ -343,103 +415,59 @@ impl<'directory> FileCompanion<'directory> {
         folder: &VaultStorageDirectory,
         entry: &str,
     ) -> Result<Option<Vec<u8>>, String> {
-        folder.read_owner_only_file(entry, "companion entry")
+        folder.read_owner_only_file_capped(entry, "companion entry", MAX_SEALED_ENTRY_BYTES)
     }
 
-    /// Recover an interrupted journal: replay it when it's committed, and
-    /// remove stages no journal covers. Runs before every file-store
-    /// operation that reads companion records.
-    pub(crate) fn recover(&mut self) -> Result<(), String> {
-        let Some(bytes) = self
-            .vaults
-            .read_owner_only_file(JOURNAL, "env file journal")?
+    /// Recover `vault_id`'s interrupted journal: replay it when it's
+    /// committed, and remove stages no journal covers. Runs before the first
+    /// operation on the project in each lock.
+    pub(crate) fn recover(&mut self, vault_id: &str) -> Result<(), String> {
+        #[cfg(test)]
+        RECOVERIES.with(|recoveries| recoveries.set(recoveries.get() + 1));
+        let Some(bytes) = self.vaults.read_owner_only_file_capped(
+            &journal_name(vault_id),
+            "env file journal",
+            MAX_FILE_JOURNAL_BYTES as u64,
+        )?
         else {
-            return self.remove_stage_folder();
+            return self.remove_stage_folder(vault_id);
         };
-        let journal = FileJournal::parse(&bytes)?;
-        self.check_journal_invariants(&journal)?;
-        let stage = self.vaults.open_existing_directory(STAGE_FOLDER)?;
-        let mut changed = BTreeSet::new();
-        for (index, operation) in journal.operations.iter().enumerate() {
-            let companion_folder = match operation.physical()? {
-                PhysicalTarget::Values { .. } => None,
-                PhysicalTarget::Companion { folder, .. } => {
-                    Some(self.vaults.open_or_create_directory(&folder)?)
-                }
-            };
-            let (folder, entry) = match (&companion_folder, operation.physical()?) {
-                (Some(folder), PhysicalTarget::Companion { entry, .. }) => (folder, entry),
-                (_, PhysicalTarget::Values { name }) => (&self.vaults, name),
-                (None, PhysicalTarget::Companion { .. }) => {
-                    return Err("a companion folder is missing".to_owned());
-                }
-            };
-            let current = folder
-                .sha256_owner_only_file(&entry, "env file journal target")?
-                .map(hex::encode);
-            if current == operation.after {
-                continue;
-            }
-            if current != operation.before {
-                if operation.values_file.is_some() {
-                    // An older CLI rewrote these values after the crash; its
-                    // write wins, as it would right after a finished transaction.
-                    continue;
-                }
-                return Err(crate::companion::gate::GateError::Damaged(
-                    crate::companion::gate::Damage::InvalidRecord {
-                        kind: entry,
-                        reason: "it changed outside the transaction that was writing it".to_owned(),
-                    },
-                )
-                .to_string());
-            }
-            match operation.action {
-                FileAction::Replace => {
-                    let stage = stage.as_ref().ok_or_else(|| {
-                        "the env file journal lost the stage of a change it hadn't applied"
-                            .to_owned()
-                    })?;
-                    let name = stage_name(&journal.transaction_id, index);
-                    let digest = stage
-                        .sha256_owner_only_file(&name, "env file journal stage")?
-                        .map(hex::encode);
-                    if digest != operation.after {
-                        return Err("an env file journal stage doesn't match its digest".to_owned());
-                    }
-                    stage.rename_to(&name, folder, &entry, "a journaled change")?;
-                }
-                FileAction::Delete => {
-                    folder.remove_file_unsynced(&entry, "a journaled deletion")?;
-                }
-            }
-            changed.insert(operation_folder_key(operation)?);
-        }
+        let journal = FileJournal::parse(&bytes, vault_id)?;
+        let stage = self
+            .vaults
+            .open_existing_directory(&stage_folder_name(vault_id))?;
+        self.check_journal_invariants(vault_id, &journal, stage.as_ref())?;
+        self.replay(vault_id, &journal, stage.as_ref(), Replay::Recovery)?;
         drop(stage);
-        self.sync_folders(&changed)?;
-        self.finish()
+        self.finish(vault_id)
     }
 
-    /// I1, I2 and I5 for the marker each touched project is left with.
-    fn check_journal_invariants(&self, journal: &FileJournal) -> Result<(), String> {
-        let stage = self.vaults.open_existing_directory(STAGE_FOLDER)?;
+    /// I1, I2 and I5 for the marker the journal leaves, as its commit
+    /// checked them.
+    fn check_journal_invariants(
+        &self,
+        vault_id: &str,
+        journal: &FileJournal,
+        stage: Option<&VaultStorageDirectory>,
+    ) -> Result<(), String> {
         let key = self.data_key()?;
-        let mut targets: Vec<(&str, Option<Vec<u8>>)> = Vec::new();
-        let mut vaults = BTreeSet::new();
+        let mut changes: Vec<(String, Option<Vec<u8>>)> = Vec::new();
         for (index, operation) in journal.operations.iter().enumerate() {
-            if operation.values_file.is_some() {
+            let PhysicalTarget::Companion { account, .. } = operation.physical(vault_id)? else {
                 continue;
-            }
-            let account = CompanionAccount::parse(&operation.target).ok_or_else(|| {
-                "the env file journal names an invalid companion record".to_owned()
-            })?;
+            };
             let value = match (&account, operation.action) {
                 (_, FileAction::Delete) => None,
-                (CompanionAccount::Marker { vault_id }, FileAction::Replace) => {
+                (CompanionAccount::Marker { .. }, FileAction::Replace) => {
                     let name = stage_name(&journal.transaction_id, index);
                     let sealed = match stage
-                        .as_ref()
-                        .map(|stage| stage.read_owner_only_file(&name, "env file journal stage"))
+                        .map(|stage| {
+                            stage.read_owner_only_file_capped(
+                                &name,
+                                "env file journal stage",
+                                MAX_SEALED_ENTRY_BYTES,
+                            )
+                        })
                         .transpose()?
                         .flatten()
                     {
@@ -450,34 +478,36 @@ impl<'directory> FileCompanion<'directory> {
                             .transpose()?
                             .flatten()
                             .ok_or_else(|| {
-                                "the env file journal lost a marker it wrote".to_owned()
+                                "this env project's file journal lost a feature marker it wrote"
+                                    .to_owned()
                             })?,
                     };
-                    Some(open(&key, &account, &sealed)?)
+                    Some(open(&key, &account, sealed)?)
                 }
                 (_, FileAction::Replace) => Some(Vec::new()),
             };
-            vaults.insert(account.vault_id().to_owned());
-            targets.push((operation.target.as_str(), value));
+            changes.push((operation.target.clone(), value));
         }
-        let mut names = Vec::new();
-        for vault_id in &vaults {
-            names.extend(
-                self.inventory_of(vault_id)?
-                    .iter()
-                    .map(CompanionAccount::name),
-            );
-        }
-        let changes: Vec<(&str, Option<&[u8]>)> = targets
+        self.check_changes(&changes, &key)
+            .map_err(|refusal| refusal.describe("this env project's file journal"))
+    }
+
+    /// The commit-time and recovery-time invariant check, over the names
+    /// and marker bytes of a transaction's companion changes.
+    fn check_changes(
+        &self,
+        changes: &[(String, Option<Vec<u8>>)],
+        key: &[u8; 32],
+    ) -> Result<(), crate::companion::invariants::Refusal> {
+        let changes: Vec<(&str, Option<&[u8]>)> = changes
             .iter()
-            .map(|(target, value)| (*target, value.as_deref()))
+            .map(|(account, value)| (account.as_str(), value.as_deref()))
             .collect();
         check_transaction(
             &changes,
-            |vault_id| self.read_marker_bytes(vault_id, &key),
-            Some(&names),
+            |vault_id| self.read_marker_bytes(vault_id, key),
+            |vault_id| self.listed_records(vault_id),
         )
-        .map_err(|refusal| refusal.describe("the env file journal"))
     }
 
     fn read_marker_bytes(&self, vault_id: &str, key: &[u8; 32]) -> Result<Option<Vec<u8>>, String> {
@@ -488,55 +518,289 @@ impl<'directory> FileCompanion<'directory> {
             vault_id: vault_id.to_owned(),
         };
         self.read_sealed(&folder, MARKER_ENTRY)?
-            .map(|sealed| open(key, &account, &sealed))
+            .map(|sealed| open(key, &account, sealed))
             .transpose()
     }
 
-    fn read_marker(&self, vault_id: &str, key: &[u8; 32]) -> Result<Option<Marker>, String> {
-        let Some(folder) = self.folder(vault_id)? else {
-            return Ok(None);
-        };
-        let account = CompanionAccount::Marker {
-            vault_id: vault_id.to_owned(),
-        };
-        self.read_sealed(&folder, MARKER_ENTRY)?
-            .map(|sealed| parse_marker(vault_id, &open(key, &account, &sealed)?))
-            .transpose()
-    }
-
-    fn sync_folders(&self, changed: &BTreeSet<String>) -> Result<(), String> {
-        for key in changed {
-            if key.is_empty() {
-                self.vaults.sync("env files")?;
-            } else if let Some(folder) = self.vaults.open_existing_directory(key)? {
-                folder.sync("companion records")?;
+    /// Apply `journal` in order, then sync every folder it touched: each
+    /// target's folder whether this replay or the one before a crash changed
+    /// it, and `vaults/` for values files and for companion folders it
+    /// created or emptied.
+    fn replay(
+        &self,
+        vault_id: &str,
+        journal: &FileJournal,
+        stage: Option<&VaultStorageDirectory>,
+        replay: Replay,
+    ) -> Result<(), String> {
+        let folder_name = companion_folder_name(vault_id);
+        let mut companion_folder = self.vaults.open_existing_directory(&folder_name)?;
+        let (mut sync_vaults, mut sync_folder) = (false, false);
+        for (index, operation) in journal.operations.iter().enumerate() {
+            let (folder, entry, account) = match operation.physical(vault_id)? {
+                PhysicalTarget::Values { name } => {
+                    sync_vaults = true;
+                    (&self.vaults, name, None)
+                }
+                PhysicalTarget::Companion { account, entry } => {
+                    sync_folder = true;
+                    if companion_folder.is_none() {
+                        if operation.action == FileAction::Delete {
+                            sync_vaults = true;
+                            continue;
+                        }
+                        companion_folder =
+                            Some(self.vaults.open_or_create_directory(&folder_name)?);
+                        sync_vaults = true;
+                    }
+                    let Some(folder) = companion_folder.as_ref() else {
+                        unreachable!("the companion folder was just opened");
+                    };
+                    (folder, entry, Some(account))
+                }
+            };
+            if replay == Replay::Recovery {
+                let current = folder
+                    .sha256_owner_only_file(&entry, "env file journal target")?
+                    .map(hex::encode);
+                if current == operation.after {
+                    continue;
+                }
+                if current != operation.before {
+                    let Some(account) = account else {
+                        // An older CLI rewrote these values after the crash; its
+                        // write wins, as it would right after a finished transaction.
+                        continue;
+                    };
+                    return Err(GateError::Damaged(changed_outside(&account)).to_string());
+                }
             }
+            match operation.action {
+                FileAction::Replace => {
+                    let stage = stage.ok_or_else(|| {
+                        "this env project's file journal lost the stage of a change it hadn't applied"
+                            .to_owned()
+                    })?;
+                    let name = stage_name(&journal.transaction_id, index);
+                    if replay == Replay::Recovery
+                        && stage
+                            .sha256_owner_only_file(&name, "env file journal stage")?
+                            .map(hex::encode)
+                            != operation.after
+                    {
+                        return Err(
+                            "a stage of this env project's file journal doesn't match its digest"
+                                .to_owned(),
+                        );
+                    }
+                    stage.rename_to(&name, folder, &entry, "a journaled change")?;
+                }
+                FileAction::Delete => {
+                    folder.remove_file_unsynced(&entry, "a journaled deletion")?;
+                }
+            }
+        }
+        if let Some(folder) = companion_folder.take()
+            && folder.is_empty()?
+        {
+            drop(folder);
+            sync_folder = false;
+            sync_vaults |= self
+                .vaults
+                .remove_empty_directory(&folder_name, "a companion folder")?;
+        }
+        if sync_folder && let Some(folder) = self.vaults.open_existing_directory(&folder_name)? {
+            folder.sync("companion records")?;
+        }
+        if sync_vaults {
+            self.vaults.sync("env files")?;
         }
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<(), String> {
-        self.vaults.remove_file(JOURNAL, "env file journal")?;
-        self.remove_stage_folder()
+    /// Commit `changes` to `vault_id`'s files as one crash-atomic
+    /// transaction. Companion changes are checked as recovery checks them,
+    /// unless `checked` is false, which only seeds damage for tests.
+    fn commit_changes(
+        &mut self,
+        vault_id: &str,
+        changes: Vec<FileChange>,
+        checked: bool,
+    ) -> Result<(), String> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        if changes.len() > MAX_TRANSACTION_OPERATIONS {
+            return Err("an env file transaction has too many changes".to_owned());
+        }
+        if let [FileChange::DeleteValues(file)] = changes[..] {
+            self.vaults
+                .remove_file(&file.name(vault_id), "encrypted vault")?;
+            return Ok(());
+        }
+        let payload: usize = changes
+            .iter()
+            .map(|change| match change {
+                FileChange::Companion(mutation) => mutation.payload_bytes(),
+                FileChange::DeleteValues(_) => 0,
+            })
+            .sum();
+        if payload > MAX_TRANSACTION_PAYLOAD_BYTES {
+            return Err("an env file transaction writes too many bytes".to_owned());
+        }
+        let key = self.data_key()?;
+        if checked {
+            let companion: Vec<(String, Option<Vec<u8>>)> = changes
+                .iter()
+                .filter_map(|change| match change {
+                    FileChange::Companion(Mutation::Write { account, value }) => Some((
+                        account.name(),
+                        Some(match account {
+                            CompanionAccount::Marker { .. } => value.clone(),
+                            _ => Vec::new(),
+                        }),
+                    )),
+                    FileChange::Companion(Mutation::Delete { account }) => {
+                        Some((account.name(), None))
+                    }
+                    FileChange::DeleteValues(_) => None,
+                })
+                .collect();
+            self.check_changes(&companion, &key)
+                .map_err(|refusal| refusal.describe("an env file transaction"))?;
+        }
+
+        let transaction_id = new_transaction_id();
+        let folder = self.folder(vault_id)?;
+        let mut stage = None;
+        let mut operations = Vec::with_capacity(changes.len());
+        for (index, change) in changes.iter().enumerate() {
+            let operation = match change {
+                FileChange::DeleteValues(file) => FileOperation {
+                    action: FileAction::Delete,
+                    target: vault_id.to_owned(),
+                    values_file: Some(*file),
+                    before: self
+                        .vaults
+                        .sha256_owner_only_file(&file.name(vault_id), "encrypted vault")?
+                        .map(hex::encode),
+                    after: None,
+                },
+                FileChange::Companion(mutation) => {
+                    let (account, value) = match mutation {
+                        Mutation::Write { account, value } => (account, Some(value)),
+                        Mutation::Delete { account } => (account, None),
+                    };
+                    if account.vault_id() != vault_id {
+                        return Err(
+                            "an env file transaction may change only one env project".to_owned()
+                        );
+                    }
+                    if value.is_some_and(|value| value.len() > MAX_RECORD_BYTES) {
+                        return Err("a companion record exceeds its size limit".to_owned());
+                    }
+                    let before = folder
+                        .as_ref()
+                        .map(|folder| {
+                            folder.sha256_owner_only_file(&entry_name(account), "companion entry")
+                        })
+                        .transpose()?
+                        .flatten()
+                        .map(hex::encode);
+                    let after = match value {
+                        Some(value) => {
+                            let sealed = seal(&key, account, value)?;
+                            if stage.is_none() {
+                                stage = Some(
+                                    self.vaults
+                                        .open_or_create_directory(&stage_folder_name(vault_id))?,
+                                );
+                            }
+                            let Some(stage) = stage.as_ref() else {
+                                unreachable!("the stage folder was just opened");
+                            };
+                            stage.write_owner_only_file_unsynced(
+                                &stage_name(&transaction_id, index),
+                                &sealed,
+                                "env file journal stage",
+                            )?;
+                            Some(sha256_hex(&sealed))
+                        }
+                        None => None,
+                    };
+                    FileOperation {
+                        action: if after.is_some() {
+                            FileAction::Replace
+                        } else {
+                            FileAction::Delete
+                        },
+                        target: account.name(),
+                        values_file: None,
+                        before,
+                        after,
+                    }
+                }
+            };
+            operations.push(operation);
+        }
+        drop(folder);
+        if let Some(stage) = stage.as_ref() {
+            stage.sync("env file journal stages")?;
+        }
+        let journal = FileJournal {
+            schema_version: FILE_JOURNAL_SCHEMA_VERSION,
+            transaction_id,
+            operations,
+        };
+        journal.validate(vault_id)?;
+        let encoded = serde_json::to_vec(&journal)
+            .map_err(|error| format!("failed to encode the env file journal: {error}"))?;
+        if encoded.len() > MAX_FILE_JOURNAL_BYTES {
+            return Err("the env file journal is too large".to_owned());
+        }
+        self.vaults
+            .write_owner_only_file(&journal_name(vault_id), &encoded, "env file journal")?;
+        let applied = (|| {
+            #[cfg(test)]
+            if CRASH_AFTER_JOURNAL.with(|crash| crash.replace(false)) {
+                return Err("simulated crash after the env file journal".to_owned());
+            }
+            self.replay(vault_id, &journal, stage.as_ref(), Replay::Commit)?;
+            drop(stage);
+            self.finish(vault_id)
+        })();
+        if applied.is_err() {
+            crate::companion::forget(vault_id);
+        }
+        applied
+    }
+
+    fn finish(&mut self, vault_id: &str) -> Result<(), String> {
+        self.vaults
+            .remove_file(&journal_name(vault_id), "env file journal")?;
+        self.remove_stage_folder(vault_id)
     }
 
     /// Windows refuses to remove a folder while any handle to it is open, so
     /// callers drop theirs first.
-    fn remove_stage_folder(&self) -> Result<(), String> {
-        if !self.vaults.entry_exists(STAGE_FOLDER)? {
+    fn remove_stage_folder(&self, vault_id: &str) -> Result<(), String> {
+        let name = stage_folder_name(vault_id);
+        if !self.vaults.entry_exists(&name)? {
             return Ok(());
         }
         {
-            let stage = self.vaults.open_or_create_directory(STAGE_FOLDER)?;
-            for name in stage.entry_names()? {
-                stage.remove_file_unsynced(&name, "a stale env file journal stage")?;
+            let stage = self.vaults.open_or_create_directory(&name)?;
+            for entry in stage.entry_names()? {
+                stage.remove_file_unsynced(&entry, "a stale env file journal stage")?;
             }
         }
         self.vaults
-            .remove_empty_directory(STAGE_FOLDER, "env file journal stages")?;
+            .remove_empty_directory(&name, "env file journal stages")?;
         Ok(())
     }
 
+    /// `vault_id`'s companion and staged records, failing on an entry whose
+    /// name LPM doesn't write, which the gate reports as damage.
     fn inventory_of(&self, vault_id: &str) -> Result<Vec<CompanionAccount>, String> {
         let Some(folder) = self.folder(vault_id)? else {
             return Ok(Vec::new());
@@ -547,29 +811,41 @@ impl<'directory> FileCompanion<'directory> {
                 Some(CompanionAccount::Marker { .. }) => {}
                 Some(account) => accounts.push(account),
                 None => {
-                    return Err(crate::companion::gate::GateError::Damaged(
-                        crate::companion::gate::Damage::InvalidRecord {
-                            kind: name,
-                            reason: "its name isn't one LPM writes".to_owned(),
-                        },
-                    )
+                    return Err(GateError::Damaged(Damage::InvalidRecord {
+                        kind: name,
+                        reason: "its name isn't one LPM writes".to_owned(),
+                    })
                     .to_string());
                 }
             }
         }
         Ok(accounts)
     }
+
+    /// `vault_id`'s companion and staged records, skipping entries no
+    /// marker can list, for the invariant check.
+    fn listed_records(&self, vault_id: &str) -> Result<Vec<CompanionAccount>, String> {
+        let Some(folder) = self.folder(vault_id)? else {
+            return Ok(Vec::new());
+        };
+        Ok(folder
+            .entry_names()?
+            .iter()
+            .filter_map(|name| parse_entry_name(vault_id, name))
+            .filter(|account| !matches!(account, CompanionAccount::Marker { .. }))
+            .collect())
+    }
 }
 
-fn operation_folder_key(operation: &FileOperation) -> Result<String, String> {
-    Ok(match operation.physical()? {
-        PhysicalTarget::Values { .. } => String::new(),
-        PhysicalTarget::Companion { folder, .. } => folder,
-    })
-}
-
-fn parse_marker(vault_id: &str, bytes: &[u8]) -> Result<Marker, String> {
-    Marker::parse(vault_id, bytes).map_err(|error| error.to_string())
+/// A companion entry a journal was changing that something else changed.
+fn changed_outside(account: &CompanionAccount) -> Damage {
+    match account.kind() {
+        Some(kind) => Damage::InvalidRecord {
+            kind: kind.to_owned(),
+            reason: CHANGED_OUTSIDE.to_owned(),
+        },
+        None => Damage::InvalidMarker(format!("the feature marker is invalid: {CHANGED_OUTSIDE}")),
+    }
 }
 
 impl LifecycleStore for FileCompanion<'_> {
@@ -581,131 +857,21 @@ impl LifecycleStore for FileCompanion<'_> {
             return Ok(None);
         };
         let key = self.data_key()?;
-        open(&key, account, &sealed).map(Some)
+        open(&key, account, sealed).map(Some)
     }
 
     fn commit(&mut self, mutations: Vec<Mutation>) -> Result<(), String> {
-        if mutations.is_empty() {
+        let Some(vault_id) = mutations
+            .first()
+            .map(|mutation| mutation.account().vault_id().to_owned())
+        else {
             return Ok(());
-        }
-        if mutations.len() > MAX_TRANSACTION_OPERATIONS {
-            return Err("an env file transaction has too many operations".to_owned());
-        }
-        let payload: usize = mutations
-            .iter()
-            .map(|mutation| match mutation {
-                Mutation::Write { value, .. } => value.len(),
-                Mutation::Delete { .. } => 0,
-            })
-            .sum();
-        if payload > MAX_TRANSACTION_PAYLOAD_BYTES {
-            return Err("an env file transaction writes too many bytes".to_owned());
-        }
-        let key = self.data_key()?;
-        let transaction_id = new_transaction_id();
-        let stage = self.vaults.open_or_create_directory(STAGE_FOLDER)?;
-        let mut operations = Vec::with_capacity(mutations.len());
-        let mut staged_any = false;
-        for (index, mutation) in mutations.iter().enumerate() {
-            let (account, value) = match mutation {
-                Mutation::Write { account, value } => (account, Some(value)),
-                Mutation::Delete { account } => (account, None),
-            };
-            if value.is_some_and(|value| value.len() > MAX_RECORD_BYTES) {
-                return Err("a companion record exceeds its size limit".to_owned());
-            }
-            let before = self
-                .folder(account.vault_id())?
-                .map(|folder| {
-                    folder.sha256_owner_only_file(&entry_name(account), "companion entry")
-                })
-                .transpose()?
-                .flatten()
-                .map(hex::encode);
-            let after = match value {
-                Some(value) => {
-                    let sealed = seal(&key, account, value)?;
-                    stage.write_owner_only_file_unsynced(
-                        &stage_name(&transaction_id, index),
-                        &sealed,
-                        "env file journal stage",
-                    )?;
-                    staged_any = true;
-                    Some(sha256_hex(&sealed))
-                }
-                None => None,
-            };
-            operations.push(FileOperation {
-                action: if after.is_some() {
-                    FileAction::Replace
-                } else {
-                    FileAction::Delete
-                },
-                target: account.name(),
-                values_file: None,
-                before,
-                after,
-            });
-        }
-        if staged_any {
-            stage.sync("env file journal stages")?;
-        }
-        let journal = FileJournal {
-            schema_version: FILE_JOURNAL_SCHEMA_VERSION,
-            transaction_id,
-            operations,
         };
-        journal.validate()?;
-        let encoded = serde_json::to_vec(&journal)
-            .map_err(|error| format!("failed to encode the env file journal: {error}"))?;
-        if encoded.len() > MAX_FILE_JOURNAL_BYTES {
-            return Err("the env file journal is too large".to_owned());
-        }
-        self.vaults
-            .write_owner_only_file(JOURNAL, &encoded, "env file journal")?;
-
-        let mut changed = BTreeSet::new();
-        let mut created_folder = false;
-        for (index, operation) in journal.operations.iter().enumerate() {
-            let PhysicalTarget::Companion { folder, entry } = operation.physical()? else {
-                return Err("an env file transaction may only change companion records".to_owned());
-            };
-            match operation.action {
-                FileAction::Replace => {
-                    created_folder |= !self.vaults.entry_exists(&folder)?;
-                    let directory = self.vaults.open_or_create_directory(&folder)?;
-                    stage.rename_to(
-                        &stage_name(&journal.transaction_id, index),
-                        &directory,
-                        &entry,
-                        "a companion record",
-                    )?;
-                }
-                FileAction::Delete => {
-                    if let Some(directory) = self.vaults.open_existing_directory(&folder)? {
-                        directory.remove_file_unsynced(&entry, "a companion record")?;
-                    }
-                }
-            }
-            changed.insert(folder);
-        }
-        let mut removed_folder = false;
-        for folder in &changed {
-            if let Some(directory) = self.vaults.open_existing_directory(folder)?
-                && directory.entry_names()?.is_empty()
-            {
-                drop(directory);
-                removed_folder |= self
-                    .vaults
-                    .remove_empty_directory(folder, "a companion folder")?;
-            }
-        }
-        if created_folder || removed_folder {
-            changed.insert(String::new());
-        }
-        drop(stage);
-        self.sync_folders(&changed)?;
-        self.finish()
+        self.commit_changes(
+            &vault_id,
+            mutations.into_iter().map(FileChange::Companion).collect(),
+            true,
+        )
     }
 }
 
@@ -715,14 +881,17 @@ impl CompanionBackend for FileCompanion<'_> {
     }
 }
 
-/// Recover the file journal, then authorize `operation` on `vault_id`.
+/// Recover `vault_id`'s file journal, unless this lock already opened the
+/// project, then authorize `operation` on it.
 pub(crate) fn authorize_unlocked(
     directory: &VaultStorageDirectory,
     vault_id: &str,
     operation: Operation,
 ) -> Result<ProjectGate, String> {
     let mut companion = FileCompanion::open(directory)?;
-    companion.recover()?;
+    if !crate::companion::is_open(vault_id) {
+        companion.recover(vault_id)?;
+    }
     crate::companion::authorize(&mut companion, vault_id, operation)
 }
 
@@ -753,23 +922,70 @@ pub(crate) fn read_overrides_unlocked(
         .map_err(damaged)
 }
 
-/// Remove every companion record of `vault_id` through the deletion protocol.
+/// Delete `vault_id`'s values files and every companion record through the
+/// deletion protocol. Its first transaction deletes the values with the
+/// shared key and the single records, so no crash leaves values that run
+/// without the records that change how they run.
 pub(crate) fn delete_project_unlocked(
     directory: &VaultStorageDirectory,
     vault_id: &str,
 ) -> Result<(), String> {
     let gate = authorize_unlocked(directory, vault_id, Operation::Maintenance)?;
     let mut companion = FileCompanion::open(directory)?;
-    let inventory = companion.inventory(vault_id)?;
+    let mut values = Vec::with_capacity(2);
+    if companion
+        .vaults
+        .entry_exists(&ValuesFile::Digest.name(vault_id))?
+    {
+        values.push(ValuesFile::Digest);
+    }
+    if super::existing_legacy_vault_file_name(&companion.vaults, vault_id)?.is_some() {
+        values.push(ValuesFile::Legacy);
+    }
+    let inventory = companion.inventory_of(vault_id)?;
     let found = match &gate {
         ProjectGate::Plain => FoundMarker::Absent,
         ProjectGate::Damaged(_) => FoundMarker::Invalid,
         ProjectGate::Marked(marker) => FoundMarker::Valid(marker),
     };
-    let plan = crate::companion::lifecycle::plan_deletion(vault_id, found, inventory, 0)?;
-    crate::companion::lifecycle::execute(&mut companion, plan)?;
+    let plan =
+        crate::companion::lifecycle::plan_deletion(vault_id, found, inventory, values.len())?;
+    let mut transactions = plan.transactions.into_iter();
+    let mut first: Vec<FileChange> = values.into_iter().map(FileChange::DeleteValues).collect();
+    if let Some(transaction) = transactions.next() {
+        first.extend(
+            transaction
+                .into_deletions(vault_id)?
+                .into_iter()
+                .map(FileChange::Companion),
+        );
+    }
+    companion.commit_changes(vault_id, first, true)?;
+    crate::companion::lifecycle::execute(
+        &mut companion,
+        Plan {
+            vault_id: plan.vault_id,
+            transactions: transactions.collect(),
+            result: None,
+        },
+    )?;
     crate::companion::remember(vault_id, &ProjectGate::Plain);
     Ok(())
+}
+
+/// Write `mutations` without the invariant check, as only damaged data
+/// would be stored, for tests that read it.
+#[cfg(any(test, feature = "acceptance-test-hooks"))]
+pub(crate) fn commit_unchecked(
+    directory: &VaultStorageDirectory,
+    vault_id: &str,
+    mutations: Vec<Mutation>,
+) -> Result<(), String> {
+    FileCompanion::open(directory)?.commit_changes(
+        vault_id,
+        mutations.into_iter().map(FileChange::Companion).collect(),
+        false,
+    )
 }
 
 /// How many projects have companion folders, for storage status.

@@ -93,6 +93,23 @@ fn invalid(reason: impl Into<String>) -> InvalidMarker {
     InvalidMarker(reason.into())
 }
 
+/// What's wrong with JSON that didn't parse and where, without the input:
+/// serde quotes unknown names and unexpected values as they are, control
+/// characters and record values included.
+pub fn describe_json_error(error: &serde_json::Error) -> String {
+    let problem = match error.classify() {
+        serde_json::error::Category::Syntax | serde_json::error::Category::Eof => "invalid JSON",
+        serde_json::error::Category::Data | serde_json::error::Category::Io => {
+            "an unexpected field or value"
+        }
+    };
+    format!(
+        "{problem} at line {}, column {}",
+        error.line(),
+        error.column()
+    )
+}
+
 impl Marker {
     pub fn empty(vault_id: &str, state: ProjectState) -> Self {
         Self {
@@ -109,8 +126,12 @@ impl Marker {
         if bytes.len() > MAX_RECORD_BYTES {
             return Err(invalid("the feature marker is too large"));
         }
-        let marker: Self = serde_json::from_slice(bytes)
-            .map_err(|error| invalid(format!("the feature marker is malformed: {error}")))?;
+        let marker: Self = serde_json::from_slice(bytes).map_err(|error| {
+            invalid(format!(
+                "the feature marker is malformed: {}",
+                describe_json_error(&error)
+            ))
+        })?;
         if marker.vault_id != vault_id {
             return Err(invalid("the feature marker names another env project"));
         }
@@ -207,14 +228,14 @@ impl Marker {
         features
     }
 
-    /// Whether some feature entry lists `kind`, or, during a restore, some
-    /// restored feature does, for staged records.
+    /// Whether some feature entry lists `kind`.
     pub fn lists_kind(&self, kind: &str) -> bool {
         self.features
             .values()
             .any(|entry| entry.kinds.iter().any(|listed| listed == kind))
     }
 
+    /// Whether the restore in progress lists `kind`, for its staged records.
     pub fn restore_lists_kind(&self, kind: &str) -> bool {
         self.restore.as_ref().is_some_and(|restore| {
             restore
@@ -360,6 +381,16 @@ impl<'de, V: Deserialize<'de>> Visitor<'de> for UniqueMapVisitor<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_malformed_marker_is_described_without_its_contents() {
+        let marker =
+            br#"{"schemaVersion":1,"vaultId":"proj","state":"\u001b[31mgone","features":{}}"#;
+        let error = Marker::parse("proj", marker).expect_err("an unknown state");
+        assert!(!error.0.contains('\x1b'), "{error}");
+        assert!(!error.0.contains("gone"), "{error}");
+        assert!(error.0.contains("line 1"), "{error}");
+    }
 
     fn entry(version: u16, level: Level, kinds: &[&str]) -> FeatureEntry {
         FeatureEntry {

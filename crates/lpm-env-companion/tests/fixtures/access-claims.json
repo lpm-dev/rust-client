@@ -5,31 +5,57 @@
       "name": "Rust automatic: no access control, no marker",
       "marker": null,
       "accessControl": false,
+      "accessible": "whenUnlockedThisDeviceOnly",
       "claim": "automatic"
     },
     {
       "name": "Swift approval off: empty-flags access control and an empty marker",
       "marker": "",
       "accessControl": true,
+      "accessible": "whenUnlockedThisDeviceOnly",
       "claim": "automatic"
     },
     {
       "name": "protected: the approval marker and an access control",
       "marker": "lpm-cli-access:require-approval:v1",
       "accessControl": true,
+      "accessible": "whenUnlockedThisDeviceOnly",
       "claim": "requireApproval"
     },
     {
       "name": "approval marker without an access control",
       "marker": "lpm-cli-access:require-approval:v1",
       "accessControl": false,
+      "accessible": "whenUnlockedThisDeviceOnly",
       "claim": "contradictory"
     },
     {
       "name": "an unknown marker",
       "marker": "lpm-cli-access:require-approval:v2",
       "accessControl": true,
+      "accessible": "whenUnlockedThisDeviceOnly",
       "claim": "contradictory"
+    },
+    {
+      "name": "readable while the Mac is locked: automatic attributes in another class",
+      "marker": null,
+      "accessControl": false,
+      "accessible": "afterFirstUnlock",
+      "claim": "contradictory"
+    },
+    {
+      "name": "a class that can leave this Mac, with the approval marker and an access control",
+      "marker": "lpm-cli-access:require-approval:v1",
+      "accessControl": true,
+      "accessible": "whenUnlocked",
+      "claim": "contradictory"
+    },
+    {
+      "name": "no class reported: judged by its other attributes",
+      "marker": null,
+      "accessControl": false,
+      "accessible": null,
+      "claim": "automatic"
     }
   ]
 }

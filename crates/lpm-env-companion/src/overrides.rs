@@ -14,7 +14,7 @@ use lpm_common::stored_env::{is_valid_environment_name, is_valid_variable_name};
 use serde::{Deserialize, Deserializer};
 
 use crate::gate::{Damage, ProjectGate};
-use crate::marker::{FeatureState, MAX_RECORD_BYTES, UniqueMapVisitor};
+use crate::marker::{FeatureState, MAX_RECORD_BYTES, UniqueMapVisitor, describe_json_error};
 
 pub const OVERRIDES_KIND: &str = "overrides";
 
@@ -120,7 +120,9 @@ pub fn parse_all(
 
 /// The selected environment's personal overrides, from the overrides record
 /// an Apply read always reads, found or not, so a missing marker can't hide
-/// a record and a missing record can't pass for no overrides.
+/// a record and a missing record can't pass for no overrides. The gate must
+/// have allowed the Apply read, which it never does for a version this
+/// client doesn't support.
 pub fn evaluate(
     gate: &ProjectGate,
     vault_id: &str,
@@ -176,8 +178,12 @@ fn parse_record(
     if bytes.len() > MAX_RECORD_BYTES {
         return Err(invalid("the personal overrides are too large"));
     }
-    let record: OverridesRecord = serde_json::from_slice(bytes)
-        .map_err(|error| invalid(format!("the personal overrides are malformed: {error}")))?;
+    let record: OverridesRecord = serde_json::from_slice(bytes).map_err(|error| {
+        invalid(format!(
+            "the personal overrides are malformed: {}",
+            describe_json_error(&error)
+        ))
+    })?;
     if record.schema_version != version {
         return Err(invalid(
             "the personal overrides' version differs from the feature marker's",
@@ -257,14 +263,12 @@ fn validate_environment(
     Ok(())
 }
 
+/// A name LPM never passes to a process stays valid here: the runner drops
+/// it when it composes the environment, so widening that list never turns a
+/// stored record into damage.
 fn validate_key(key: &str) -> Result<(), InvalidOverrides> {
     if !is_valid_variable_name(key) {
         return Err(invalid("the personal overrides name an invalid variable"));
-    }
-    if lpm_env::is_denied_env_var(key) {
-        return Err(invalid(format!(
-            "the personal overrides name {key}, which LPM never passes to a process"
-        )));
     }
     Ok(())
 }
@@ -303,7 +307,6 @@ mod tests {
             r#"{"schemaVersion":1,"vaultId":"proj","environments":{"staging":{"set":{"A":"1"}}}}"#,
             r#"{"schemaVersion":1,"vaultId":"proj","environments":{"bad name":{"set":{"A":"1"},"unset":[]}}}"#,
             r#"{"schemaVersion":1,"vaultId":"proj","environments":{"staging":{"set":{"1A":"1"},"unset":[]}}}"#,
-            r#"{"schemaVersion":1,"vaultId":"proj","environments":{"staging":{"set":{"NODE_OPTIONS":"--inspect"},"unset":[]}}}"#,
             r#"{"schemaVersion":1,"vaultId":"proj","environments":{"staging":{"set":{"A":"x\u0000y"},"unset":[]}}}"#,
             r#"{"schemaVersion":1,"vaultId":"proj","environments":{"staging":{"set":{"A":"1"},"unset":["A"]}}}"#,
             r#"{"schemaVersion":1,"vaultId":"proj","environments":{"staging":{"set":{},"unset":["A","A"]}}}"#,
@@ -313,6 +316,22 @@ mod tests {
         for json in invalid_records {
             assert!(parse(json, "development").is_err(), "{json}");
         }
+    }
+
+    #[test]
+    fn a_name_lpm_never_passes_keeps_the_record_valid() {
+        let json = r#"{"schemaVersion":1,"vaultId":"proj","environments":{"staging":{"set":{"NODE_OPTIONS":"--inspect","A":"1"},"unset":["CLASSPATH"]}}}"#;
+        let staging = parse(json, "staging").expect("a later deny list can't damage a record");
+        assert_eq!(staging.set["NODE_OPTIONS"], "--inspect");
+        assert_eq!(staging.unset, ["CLASSPATH"]);
+    }
+
+    #[test]
+    fn a_malformed_record_is_described_without_its_contents() {
+        let json = r#"{"schemaVersion":1,"vaultId":"proj","environments":{"staging":{"set":{"A":4815162342},"unset":[]}}}"#;
+        let error = parse(json, "staging").expect_err("a value must be a string");
+        assert!(!error.0.contains("4815162342"), "{error}");
+        assert!(error.0.contains("line 1"), "{error}");
     }
 
     #[test]

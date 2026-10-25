@@ -123,17 +123,20 @@ pub fn check_written<'account>(
 /// account names with the bytes each writes, or `None` for a deletion, and
 /// only a marker's bytes are read, so other writes may pass empty bytes.
 /// Accounts outside the companion namespace are skipped. `live_marker`
-/// reads a touched project's marker as the store holds it now.
+/// reads a touched project's marker as the store holds it now, and
+/// `inventory` lists a project's companion and staged records by name;
+/// each runs only for a project whose check needs it.
 ///
-/// With `names`, a names-only listing of the store, a transaction that
-/// changes a marker is also checked for records it would leave without a
-/// feature. That needs the marker from before the transaction, so it's
-/// checked only while the store still holds it: when recovery finds the
-/// marker's change already replayed, refusing would undo nothing.
+/// Commits and recovery check the same rules, so recovery replays every
+/// journal a commit accepted. A transaction that changes a marker is also
+/// checked for records it would leave without a feature. That needs the
+/// marker from before the transaction, so it's checked only while the store
+/// still holds it: when recovery finds the marker's change already
+/// replayed, refusing would undo nothing.
 pub fn check_transaction(
     changes: &[(&str, Option<&[u8]>)],
     mut live_marker: impl FnMut(&str) -> Result<Option<Vec<u8>>, String>,
-    names: Option<&[String]>,
+    mut inventory: impl FnMut(&str) -> Result<Vec<CompanionAccount>, String>,
 ) -> Result<(), Refusal> {
     type Changes<'value> = Vec<(CompanionAccount, Option<&'value [u8]>)>;
     let mut by_vault: BTreeMap<String, Changes<'_>> = BTreeMap::new();
@@ -152,19 +155,25 @@ pub fn check_transaction(
             .iter()
             .find(|(account, _)| matches!(account, CompanionAccount::Marker { .. }))
             .map(|(_, value)| *value);
-        let live = match (marker_change, names) {
-            (Some(_), None) => None,
-            _ => Some(live_marker(vault_id).map_err(Refusal::Storage)?),
-        };
-        let post_marker = match (marker_change, &live) {
-            (Some(Some(bytes)), _) => Some(
+        let mut written = vault_changes
+            .iter()
+            .filter(|(account, value)| {
+                value.is_some() && !matches!(account, CompanionAccount::Marker { .. })
+            })
+            .map(|(account, _)| account)
+            .peekable();
+        if marker_change.is_none() && written.peek().is_none() {
+            continue;
+        }
+        let live = live_marker(vault_id).map_err(Refusal::Storage)?;
+        let post_marker = match marker_change {
+            Some(Some(bytes)) => Some(
                 Marker::parse(vault_id, bytes)
                     .map_err(|error| Refusal::InvalidMarker(error.to_string()))?,
             ),
-            (Some(None), _) => None,
-            (None, live) => live
-                .as_ref()
-                .and_then(Option::as_deref)
+            Some(None) => None,
+            None => live
+                .as_deref()
                 .map(|bytes| {
                     Marker::parse(vault_id, bytes).map_err(|error| Refusal::InvalidLiveMarker {
                         vault_id: vault_id.clone(),
@@ -173,34 +182,29 @@ pub fn check_transaction(
                 })
                 .transpose()?,
         };
-        let written = vault_changes
-            .iter()
-            .filter(|(_, value)| value.is_some())
-            .map(|(account, _)| account);
         check_written(post_marker.as_ref(), written).map_err(Refusal::Unlisted)?;
 
-        let before = match (marker_change, live.as_ref().and_then(Option::as_deref)) {
-            (Some(Some(after)), Some(live)) if live != after => Some(live),
-            (Some(None), Some(live)) => Some(live),
-            _ => None,
+        let before = match (marker_change, live.as_deref()) {
+            (Some(Some(after)), Some(live)) if live != after => live,
+            (Some(None), Some(live)) => live,
+            _ => continue,
         };
-        if let (Some(names), Some(before)) = (names, before) {
-            let before = Marker::parse(vault_id, before).ok();
-            let deleted: HashSet<&CompanionAccount> = vault_changes
-                .iter()
-                .filter(|(_, value)| value.is_none())
-                .map(|(account, _)| account)
-                .collect();
-            let orphan = names
-                .iter()
-                .filter_map(|name| CompanionAccount::parse(name))
-                .filter(|account| account.vault_id() == vault_id && !deleted.contains(account))
-                .find(|account| {
-                    is_listed(before.as_ref(), account) && !is_listed(post_marker.as_ref(), account)
-                });
-            if let Some(account) = orphan {
-                return Err(Refusal::Orphans(account));
-            }
+        let before = Marker::parse(vault_id, before).ok();
+        let deleted: HashSet<&CompanionAccount> = vault_changes
+            .iter()
+            .filter(|(_, value)| value.is_none())
+            .map(|(account, _)| account)
+            .collect();
+        let orphan = inventory(vault_id)
+            .map_err(Refusal::Storage)?
+            .into_iter()
+            .find(|account| {
+                !deleted.contains(account)
+                    && is_listed(before.as_ref(), account)
+                    && !is_listed(post_marker.as_ref(), account)
+            });
+        if let Some(account) = orphan {
+            return Err(Refusal::Orphans(account));
         }
     }
     Ok(())
@@ -288,7 +292,11 @@ mod tests {
             (overrides.as_str(), Some(&b"{}"[..])),
         ];
         assert_eq!(
-            check_transaction(&changes, |_| panic!("the marker changes"), None),
+            check_transaction(
+                &changes,
+                |_| Ok(None),
+                |_| panic!("no marker to orphan from")
+            ),
             Ok(())
         );
     }
@@ -302,15 +310,19 @@ mod tests {
             Ok(Some(OVERRIDES_MARKER.as_bytes().to_vec()))
         };
         assert_eq!(
-            check_transaction(&[(overrides.as_str(), Some(&b"{}"[..]))], live, None),
+            check_transaction(
+                &[(overrides.as_str(), Some(&b"{}"[..]))],
+                live,
+                no_inventory
+            ),
             Ok(())
         );
         assert_eq!(
-            check_transaction(&[(notes.as_str(), Some(&b"x"[..]))], live, None),
+            check_transaction(&[(notes.as_str(), Some(&b"x"[..]))], live, no_inventory),
             Err(Refusal::Unlisted(Unlisted(record("notes"))))
         );
         assert_eq!(
-            check_transaction(&[(notes.as_str(), None)], live, None),
+            check_transaction(&[(notes.as_str(), None)], live, no_inventory),
             Ok(()),
             "deleting an unlisted record repairs it"
         );
@@ -318,59 +330,82 @@ mod tests {
             check_transaction(
                 &[(overrides.as_str(), Some(&b"{}"[..]))],
                 |_| Ok(Some(b"not a marker".to_vec())),
-                None
+                no_inventory
             ),
             Err(Refusal::InvalidLiveMarker { .. })
         ));
         assert_eq!(
-            check_transaction(&[("__vault_companion_v1__:Bad:cHJvag", None)], live, None),
+            check_transaction(
+                &[("__vault_companion_v1__:Bad:cHJvag", None)],
+                live,
+                no_inventory
+            ),
             Err(Refusal::InvalidAccount)
         );
     }
 
+    fn no_inventory(_: &str) -> Result<Vec<CompanionAccount>, String> {
+        panic!("no marker changes, so nothing can be orphaned")
+    }
+
     #[test]
-    fn recovery_refuses_orphaning_listed_records_only_while_the_old_marker_is_there() {
+    fn orphaning_listed_records_is_refused_only_while_the_old_marker_is_there() {
         let marker = crate::account::marker_account("proj");
         let overrides = crate::account::record_account("overrides", "proj", None);
-        let stray = crate::account::record_account("future-kind", "proj", None);
-        let names = [marker.clone(), overrides.clone(), stray];
+        let inventory = |vault_id: &str| {
+            assert_eq!(vault_id, "proj");
+            Ok(vec![record("overrides"), record("future-kind")])
+        };
         let live = |_: &str| Ok(Some(OVERRIDES_MARKER.as_bytes().to_vec()));
         let deletes_marker = [(marker.as_str(), None)];
         assert_eq!(
-            check_transaction(&deletes_marker, live, Some(&names)),
+            check_transaction(&deletes_marker, live, inventory),
             Err(Refusal::Orphans(record("overrides")))
         );
         assert_eq!(
-            check_transaction(&deletes_marker, |_| Ok(None), Some(&names)),
+            check_transaction(&deletes_marker, |_| Ok(None), |_| panic!("nothing listed")),
             Ok(()),
             "the deletion was replayed already"
         );
         let deletes_with_records = [(marker.as_str(), None), (overrides.as_str(), None)];
         assert_eq!(
-            check_transaction(&deletes_with_records, live, Some(&names)),
+            check_transaction(&deletes_with_records, live, inventory),
             Ok(()),
             "the stray was unlisted before"
         );
         let empty = r#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{}}"#;
         let drops_feature = [(marker.as_str(), Some(empty.as_bytes()))];
         assert_eq!(
-            check_transaction(&drops_feature, live, Some(&names)),
+            check_transaction(&drops_feature, live, inventory),
             Err(Refusal::Orphans(record("overrides")))
         );
         assert_eq!(
             check_transaction(
                 &drops_feature,
                 |_| Ok(Some(empty.as_bytes().to_vec())),
-                Some(&names)
+                |_| panic!("the marker was replayed already")
             ),
             Ok(()),
             "the marker was replayed already"
         );
+    }
+
+    #[test]
+    fn a_transaction_that_only_deletes_records_reads_nothing() {
+        let overrides = crate::account::record_account("overrides", "proj", None);
+        let mut reads = 0;
         assert_eq!(
-            check_transaction(&deletes_marker, live, None),
-            Ok(()),
-            "commits are planned from the inventory"
+            check_transaction(
+                &[(overrides.as_str(), None)],
+                |_| {
+                    reads += 1;
+                    Ok(None)
+                },
+                no_inventory
+            ),
+            Ok(())
         );
+        assert_eq!(reads, 0);
     }
 
     #[test]

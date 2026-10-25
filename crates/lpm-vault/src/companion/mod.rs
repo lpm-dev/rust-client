@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use account::CompanionAccount;
 use gate::{Damage, Operation, ProjectGate};
 use lifecycle::LifecycleStore;
-use marker::{FeatureState, Marker, ProjectState, RestorePhase};
+use marker::Marker;
 
 /// A store of one platform's companion records.
 pub(crate) trait CompanionBackend: LifecycleStore {
@@ -71,6 +71,26 @@ fn remembered(vault_id: &str) -> Option<ProjectGate> {
     })
 }
 
+/// Whether this lock scope already opened `vault_id`, so its interrupted
+/// changes are finished.
+pub(crate) fn is_open(vault_id: &str) -> bool {
+    LOCK_SCOPE.with_borrow(|scope| {
+        scope
+            .as_ref()
+            .is_some_and(|gates| gates.contains_key(vault_id))
+    })
+}
+
+/// Make the next operation on `vault_id` in this lock scope open it again,
+/// after a change failed partway and may have left a journal.
+pub(crate) fn forget(vault_id: &str) {
+    LOCK_SCOPE.with_borrow_mut(|scope| {
+        if let Some(gates) = scope.as_mut() {
+            gates.remove(vault_id);
+        }
+    });
+}
+
 /// Replace what this lock scope knows about `vault_id`, after a change to its
 /// marker or records.
 pub(crate) fn remember(vault_id: &str, gate: &ProjectGate) {
@@ -103,7 +123,9 @@ pub(crate) fn open_project(
                     Some(marker) => ProjectGate::Marked(marker),
                     None => ProjectGate::Plain,
                 };
-                tracing::warn!("{notice}");
+                if let Some(notice) = notice {
+                    tracing::warn!("{notice}");
+                }
                 gate
             }
             Ok(marker) => ProjectGate::Marked(marker),
@@ -113,29 +135,32 @@ pub(crate) fn open_project(
     Ok(gate)
 }
 
-/// What the notice after a resume says it finished or undid.
-fn resume_notice(marker: &Marker) -> String {
-    let project = format!("env project {}'s newer data", marker.vault_id);
-    match (
-        marker.state,
-        marker.restore.as_ref().map(|restore| restore.phase),
-    ) {
-        (ProjectState::Deleting, _) => format!("finished an interrupted deletion of {project}"),
-        (ProjectState::Discarding, _) => format!("finished an interrupted discard of {project}"),
-        (ProjectState::Restoring, Some(RestorePhase::Staging)) => {
-            format!("undid an interrupted restore of {project}; run the restore again")
+/// What the notice after a resume says it finished or undid. The project is
+/// the one the operation reads, so it's "this env project".
+fn resume_notice(marker: &Marker) -> Option<String> {
+    const UNFINISHED: &str = "which an earlier run left unfinished";
+    Some(match lifecycle::Resumed::of(marker)? {
+        lifecycle::Resumed::Deletion => {
+            format!("finished deleting this env project's newer data, {UNFINISHED}")
         }
-        (ProjectState::Restoring, _) => format!("finished an interrupted restore of {project}"),
-        (ProjectState::Active, _) => {
-            let removing: Vec<&str> = marker
-                .features
+        lifecycle::Resumed::Discard => {
+            format!("finished discarding this env project's newer data, {UNFINISHED}")
+        }
+        lifecycle::Resumed::RestoreUndone => "undid a restore of this env project's newer data that an earlier run left unfinished; run the restore again".to_owned(),
+        lifecycle::Resumed::Restore => {
+            format!("finished restoring this env project's newer data, {UNFINISHED}")
+        }
+        lifecycle::Resumed::FeatureRemoval(features) => {
+            let features: Vec<String> = features
                 .iter()
-                .filter(|(_, entry)| entry.state == FeatureState::Removing)
-                .map(|(name, _)| name.as_str())
+                .map(|feature| gate::feature_description(feature))
                 .collect();
-            format!("finished removing {} from {project}", removing.join(", "))
+            format!(
+                "finished removing {} from this env project's newer data, {UNFINISHED}",
+                features.join(" and ")
+            )
         }
-    }
+    })
 }
 
 /// [`open_project`], then the operation matrix.
@@ -158,13 +183,16 @@ pub(crate) fn damaged(damage: Damage) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use marker::{FeatureState, ProjectState, RestorePhase};
 
     #[test]
     fn resume_notices_name_the_project_in_one_sentence() {
         let mut marker = Marker::empty("proj", ProjectState::Deleting);
         assert_eq!(
-            resume_notice(&marker),
-            "finished an interrupted deletion of env project proj's newer data"
+            resume_notice(&marker).as_deref(),
+            Some(
+                "finished deleting this env project's newer data, which an earlier run left unfinished"
+            )
         );
         marker.state = ProjectState::Restoring;
         marker.restore = Some(marker::Restore {
@@ -173,8 +201,10 @@ mod tests {
             features: std::collections::BTreeMap::new(),
         });
         assert_eq!(
-            resume_notice(&marker),
-            "undid an interrupted restore of env project proj's newer data; run the restore again"
+            resume_notice(&marker).as_deref(),
+            Some(
+                "undid a restore of this env project's newer data that an earlier run left unfinished; run the restore again"
+            )
         );
         let mut removing = Marker::empty("proj", ProjectState::Active);
         removing.features.insert(
@@ -187,8 +217,10 @@ mod tests {
             },
         );
         assert_eq!(
-            resume_notice(&removing),
-            "finished removing overrides from env project proj's newer data"
+            resume_notice(&removing).as_deref(),
+            Some(
+                "finished removing personal overrides from this env project's newer data, which an earlier run left unfinished"
+            )
         );
     }
 

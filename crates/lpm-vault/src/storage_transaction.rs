@@ -22,6 +22,8 @@ thread_local! {
     pub(crate) static DIRECTORY_SYNCS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
     /// How many files this thread synced through the unsynced-directory writer.
     pub(crate) static FILE_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many directory entries this thread's listings returned.
+    pub(crate) static ENTRIES_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -314,6 +316,17 @@ impl VaultStorageDirectory {
         name: &str,
         label: &str,
     ) -> Result<Option<Vec<u8>>, String> {
+        self.read_owner_only_file_capped(name, label, lpm_common::STATE_FILE_SIZE_CAP_BYTES)
+    }
+
+    /// [`Self::read_owner_only_file`] for a file that may hold at most
+    /// `limit` bytes, refused by its size before any is read.
+    pub(crate) fn read_owner_only_file_capped(
+        &self,
+        name: &str,
+        label: &str,
+        limit: u64,
+    ) -> Result<Option<Vec<u8>>, String> {
         validate_name(OsStr::new(name))?;
         let mut options = OpenOptions::new();
         options.read(true).follow(FollowSymlinks::No).nonblock(true);
@@ -332,12 +345,8 @@ impl VaultStorageDirectory {
         };
         self.validate_regular_file(&file, OsStr::new(name), true)?;
         let path = self.display.join(name);
-        let (data, _) = lpm_common::read_file_capped_from_open_file(
-            file.into_std(),
-            &path,
-            lpm_common::STATE_FILE_SIZE_CAP_BYTES,
-        )
-        .map_err(|error| format!("failed to read {label}: {error}"))?;
+        let (data, _) = lpm_common::read_file_capped_from_open_file(file.into_std(), &path, limit)
+            .map_err(|error| format!("failed to read {label}: {error}"))?;
         Ok(Some(data))
     }
 
@@ -534,9 +543,33 @@ impl VaultStorageDirectory {
                     self.display.display()
                 )
             })?;
+            #[cfg(test)]
+            ENTRIES_VISITED.with(|visited| visited.set(visited.get() + 1));
             names.push(name);
         }
         Ok(names)
+    }
+
+    /// Whether the directory has no entries, read from its first entry only.
+    pub(crate) fn is_empty(&self) -> Result<bool, String> {
+        let mut entries = self.directory.entries().map_err(|error| {
+            format!(
+                "failed to inspect protected directory {}: {error}",
+                self.display.display()
+            )
+        })?;
+        match entries.next() {
+            None => Ok(true),
+            Some(Ok(_)) => {
+                #[cfg(test)]
+                ENTRIES_VISITED.with(|visited| visited.set(visited.get() + 1));
+                Ok(false)
+            }
+            Some(Err(error)) => Err(format!(
+                "failed to inspect an entry in {}: {error}",
+                self.display.display()
+            )),
+        }
     }
 
     /// Remove the empty child directory `name`, without syncing this one.

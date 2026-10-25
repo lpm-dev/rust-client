@@ -832,14 +832,11 @@ fn write_vault_file_env_unlocked(
     write_all_environments_unlocked(directory, vault_id, &environments)
 }
 
-/// Delete encrypted vault file, and every companion record through the
+/// Delete the encrypted vault files and every companion record through the
 /// deletion protocol.
 pub fn delete_vault_file(vault_id: &str) -> Result<(), String> {
     crate::storage_transaction::with_vault_transaction(|directory| {
-        companion::delete_project_unlocked(directory, vault_id)?;
-        let vaults = directory.open_or_create_directory("vaults")?;
-        vaults.remove_file(&vault_file_name(vault_id), "encrypted vault")?;
-        remove_legacy_vault_file(&vaults, vault_id)
+        companion::delete_project_unlocked(directory, vault_id)
     })
 }
 

@@ -19,7 +19,7 @@ pub enum Operation {
 }
 
 /// What a damaged project lacks or holds that it shouldn't.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Damage {
     InvalidMarker(String),
     MissingRecord {
@@ -117,7 +117,7 @@ impl fmt::Display for GateError {
 
 /// How messages name a feature. Feature names follow the identifier grammar,
 /// so an unknown one is safe to show quoted.
-fn feature_description(feature: &str) -> String {
+pub fn feature_description(feature: &str) -> String {
     match feature {
         "overrides" => "personal overrides".to_owned(),
         "history" => "local history".to_owned(),

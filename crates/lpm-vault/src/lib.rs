@@ -43,6 +43,9 @@ mod macos_keychain;
 #[cfg(test)]
 pub(crate) mod test_env_lock;
 
+#[cfg(test)]
+pub(crate) mod test_tracing;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -57,7 +60,7 @@ pub mod acceptance {
     use std::path::Path;
 
     use crate::companion::account::CompanionAccount;
-    use crate::companion::lifecycle::{LifecycleStore as _, Mutation};
+    use crate::companion::lifecycle::Mutation;
 
     /// Store `marker` and `overrides`, as JSON, as `vault_id`'s feature marker
     /// and personal overrides in the file store of the LPM home at
@@ -71,7 +74,6 @@ pub mod acceptance {
     ) -> Result<(), String> {
         crate::storage_transaction::with_vault_transaction_at(lpm_home, |directory| {
             crate::fallback::use_file_data_key_in_scope(directory)?;
-            let mut companion = crate::fallback::companion::FileCompanion::open(directory)?;
             let mut mutations = Vec::with_capacity(2);
             if let Some(marker) = marker {
                 mutations.push(Mutation::Write {
@@ -91,7 +93,7 @@ pub mod acceptance {
                     value: overrides.as_bytes().to_vec(),
                 });
             }
-            companion.commit(mutations)
+            crate::fallback::companion::commit_unchecked(directory, vault_id, mutations)
         })
     }
 }

@@ -10,7 +10,6 @@ description = "The companion storage contract the LPM CLI and the LPM Vault app 
 [dependencies]
 base64 = { workspace = true }
 lpm-common = { workspace = true }
-lpm-env = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

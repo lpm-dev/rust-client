@@ -9,7 +9,9 @@
 //! transaction stays within [`MAX_TRANSACTION_OPERATIONS`] operations and
 //! [`MAX_TRANSACTION_PAYLOAD_BYTES`] of written bytes, counting a move as
 //! the largest record a store accepts, since a names-only inventory doesn't
-//! say how large a record is.
+//! say how large a record is. [`execute`] knows each record's size once it
+//! reads it, so it commits a step's changes in as few transactions as their
+//! actual sizes allow.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -34,6 +36,12 @@ pub enum Mutation {
 }
 
 impl Mutation {
+    pub fn account(&self) -> &CompanionAccount {
+        match self {
+            Self::Write { account, .. } | Self::Delete { account } => account,
+        }
+    }
+
     pub fn payload_bytes(&self) -> usize {
         match self {
             Self::Write { value, .. } => value.len(),
@@ -92,12 +100,83 @@ pub struct Transaction {
     pub marker: Option<MarkerChange>,
 }
 
+impl Transaction {
+    /// The mutations of a transaction that moves nothing, such as a
+    /// deletion's first, which a client commits beside its own changes.
+    pub fn into_deletions(self, vault_id: &str) -> Result<Vec<Mutation>, String> {
+        let mut mutations = Vec::with_capacity(self.changes.len() + 1);
+        for change in self.changes {
+            match change {
+                PlannedChange::Delete(account) => mutations.push(Mutation::Delete { account }),
+                PlannedChange::Move { .. } => {
+                    return Err(
+                        "a transaction a client commits beside its own moves a record".to_owned(),
+                    );
+                }
+            }
+        }
+        let marker = CompanionAccount::Marker {
+            vault_id: vault_id.to_owned(),
+        };
+        match self.marker {
+            Some(MarkerChange::Write(next)) => mutations.push(Mutation::Write {
+                account: marker,
+                value: next.encode().map_err(|error| error.to_string())?,
+            }),
+            Some(MarkerChange::Delete) => mutations.push(Mutation::Delete { account: marker }),
+            None => {}
+        }
+        Ok(mutations)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
     pub vault_id: String,
     pub transactions: Vec<Transaction>,
     /// The marker the project is left with, or `None` when it's gone.
     pub result: Option<Marker>,
+}
+
+/// What finishing a marker's interrupted step does, for the notice a client
+/// shows once it's done.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resumed {
+    Deletion,
+    Discard,
+    /// A restore interrupted while staging, rolled back, so the person runs
+    /// it again.
+    RestoreUndone,
+    Restore,
+    /// The features marked `removing`, by name.
+    FeatureRemoval(Vec<String>),
+}
+
+impl Resumed {
+    /// What resuming `marker` finishes or undoes, or `None` when it
+    /// describes nothing to finish.
+    pub fn of(marker: &Marker) -> Option<Self> {
+        Some(match marker.state {
+            ProjectState::Deleting => Self::Deletion,
+            ProjectState::Discarding => Self::Discard,
+            ProjectState::Restoring => match marker.restore.as_ref().map(|restore| restore.phase) {
+                Some(RestorePhase::Staging) => Self::RestoreUndone,
+                _ => Self::Restore,
+            },
+            ProjectState::Active => {
+                let removing: Vec<String> = marker
+                    .features
+                    .iter()
+                    .filter(|(_, entry)| entry.state == FeatureState::Removing)
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                if removing.is_empty() {
+                    return None;
+                }
+                Self::FeatureRemoval(removing)
+            }
+        })
+    }
 }
 
 /// Whether `marker` describes work a client must finish before anything else.
@@ -123,7 +202,9 @@ pub fn plan_resume(
     };
     loop {
         let step = match marker.state {
-            ProjectState::Deleting | ProjectState::Discarding => remove_everything(&inventory),
+            ProjectState::Deleting | ProjectState::Discarding => {
+                remove_everything(std::mem::take(&mut inventory))
+            }
             ProjectState::Restoring => {
                 let phase = marker
                     .restore
@@ -169,49 +250,89 @@ pub fn plan_resume(
     }
 }
 
-/// Commit every transaction of `plan`, reading each staged record a move
-/// needs just before its transaction, and return the marker it leaves.
+/// Commit every transaction of `plan` and return the marker it leaves.
+/// Each staged record a move needs is read just before the transaction that
+/// moves it. A step's planned transactions are joined wherever their records'
+/// actual sizes fit one transaction, and each marker change ends a commit, so
+/// the next step plans on the marker it leaves.
 pub fn execute(store: &mut impl LifecycleStore, plan: Plan) -> Result<Option<Marker>, String> {
     let marker_account = CompanionAccount::Marker {
         vault_id: plan.vault_id,
     };
+    let mut batch = Batch::default();
     for transaction in plan.transactions {
-        let mut mutations = Vec::with_capacity(
-            transaction
-                .changes
-                .iter()
-                .map(PlannedChange::operations)
-                .sum::<usize>()
-                + 1,
-        );
         for change in transaction.changes {
             match change {
-                PlannedChange::Delete(account) => mutations.push(Mutation::Delete { account }),
+                PlannedChange::Delete(account) => {
+                    batch.add(store, [Mutation::Delete { account }])?;
+                }
                 PlannedChange::Move { staged, live } => {
                     let value = store.read(&staged)?.ok_or_else(|| {
                         "a restore lost a staged record before it was activated".to_owned()
                     })?;
-                    mutations.push(Mutation::Write {
-                        account: live,
-                        value,
-                    });
-                    mutations.push(Mutation::Delete { account: staged });
+                    batch.add(
+                        store,
+                        [
+                            Mutation::Write {
+                                account: live,
+                                value,
+                            },
+                            Mutation::Delete { account: staged },
+                        ],
+                    )?;
                 }
             }
         }
-        match transaction.marker {
-            Some(MarkerChange::Write(marker)) => mutations.push(Mutation::Write {
+        let marker = match transaction.marker {
+            Some(MarkerChange::Write(marker)) => Mutation::Write {
                 account: marker_account.clone(),
                 value: marker.encode().map_err(|error| error.to_string())?,
-            }),
-            Some(MarkerChange::Delete) => mutations.push(Mutation::Delete {
+            },
+            Some(MarkerChange::Delete) => Mutation::Delete {
                 account: marker_account.clone(),
-            }),
-            None => {}
-        }
-        store.commit(mutations)?;
+            },
+            None => continue,
+        };
+        batch.add(store, [marker])?;
+        batch.commit(store)?;
     }
+    batch.commit(store)?;
     Ok(plan.result)
+}
+
+/// Mutations [`execute`] gathers into one transaction.
+#[derive(Default)]
+struct Batch {
+    mutations: Vec<Mutation>,
+    payload: usize,
+}
+
+impl Batch {
+    /// Add `mutations`, which must commit together, after committing what the
+    /// batch holds when they wouldn't fit beside it.
+    fn add<const N: usize>(
+        &mut self,
+        store: &mut impl LifecycleStore,
+        mutations: [Mutation; N],
+    ) -> Result<(), String> {
+        let payload: usize = mutations.iter().map(Mutation::payload_bytes).sum();
+        if self.mutations.len() + N > MAX_TRANSACTION_OPERATIONS
+            || self.payload + payload > MAX_TRANSACTION_PAYLOAD_BYTES
+        {
+            self.commit(store)?;
+        }
+        self.mutations.extend(mutations);
+        self.payload += payload;
+        Ok(())
+    }
+
+    fn commit(&mut self, store: &mut impl LifecycleStore) -> Result<(), String> {
+        if self.mutations.is_empty() {
+            return Ok(());
+        }
+        self.payload = 0;
+        store.commit(std::mem::take(&mut self.mutations))
+    }
 }
 
 /// [`plan_resume`], then [`execute`].
@@ -234,10 +355,11 @@ pub enum FoundMarker<'marker> {
 /// Plan deleting `vault_id`'s companion records with its project, given a
 /// names-only inventory taken after any resume. The first transaction
 /// leaves room for `own_operations` of the client's own, which it commits
-/// with it: deleting the values item and the project's metadata. It deletes
-/// the shared key first, then as many single records as fit, and then
-/// either deletes the marker, when nothing is left, or writes a `deleting`
-/// marker that later transactions finish.
+/// with it: deleting the values item and the project's metadata. When
+/// everything fits, that transaction deletes every record and the marker.
+/// Otherwise it deletes the shared key first, then as many single records as
+/// fit, and writes a `deleting` marker that later transactions finish. Fails
+/// when `own_operations` leave no room for that marker.
 pub fn plan_deletion(
     vault_id: &str,
     found: FoundMarker<'_>,
@@ -326,44 +448,51 @@ fn plan_removal(
     mut inventory: Vec<CompanionAccount>,
     own_operations: usize,
 ) -> Result<Plan, String> {
+    let room = MAX_TRANSACTION_OPERATIONS
+        .checked_sub(own_operations)
+        .filter(|room| *room > 0)
+        .ok_or_else(|| {
+            "a deletion's own changes leave no room in its first transaction".to_owned()
+        })?;
     inventory.sort_by_key(deletion_order);
-    let room = MAX_TRANSACTION_OPERATIONS.saturating_sub(own_operations + 1);
+    let mut plan = Plan {
+        vault_id: vault_id.to_owned(),
+        transactions: Vec::new(),
+        result: None,
+    };
+    let marker = (found != FoundMarker::Absent).then_some(MarkerChange::Delete);
+    if inventory.len() + usize::from(marker.is_some()) <= room {
+        if marker.is_some() || !inventory.is_empty() {
+            plan.transactions.push(Transaction {
+                changes: inventory.into_iter().map(PlannedChange::Delete).collect(),
+                marker,
+            });
+        }
+        return Ok(plan);
+    }
     let first = inventory
         .iter()
-        .take_while(|account| account.part().is_none())
-        .take(room)
+        .take_while(|account| deletion_order(account).0 < PART_RANK)
+        .take(room - 1)
         .count();
     let rest = inventory.split_off(first);
-    let first: Vec<PlannedChange> = inventory.into_iter().map(PlannedChange::Delete).collect();
-    if rest.is_empty() {
-        let marker = (found != FoundMarker::Absent).then_some(MarkerChange::Delete);
-        return Ok(Plan {
-            vault_id: vault_id.to_owned(),
-            transactions: if marker.is_none() && first.is_empty() {
-                Vec::new()
-            } else {
-                vec![Transaction {
-                    changes: first,
-                    marker,
-                }]
-            },
-            result: None,
-        });
-    }
     let mut marker = match found {
         FoundMarker::Valid(current) => current.clone(),
         FoundMarker::Absent | FoundMarker::Invalid => Marker::empty(vault_id, state),
     };
     marker.state = state;
     marker.restore = None;
-    let mut plan = plan_resume(marker.clone(), rest)?;
-    plan.transactions.insert(
-        0,
-        Transaction {
-            changes: first,
-            marker: Some(MarkerChange::Write(marker)),
+    plan.transactions.push(Transaction {
+        changes: inventory.into_iter().map(PlannedChange::Delete).collect(),
+        marker: Some(MarkerChange::Write(marker)),
+    });
+    pack(
+        Step {
+            changes: rest.into_iter().map(PlannedChange::Delete).collect(),
+            marker: MarkerChange::Delete,
         },
-    );
+        &mut plan.transactions,
+    )?;
     Ok(plan)
 }
 
@@ -430,12 +559,16 @@ fn pack_changes(
     Ok(())
 }
 
-/// Deletions in key-first order: the shared key, then single records, then parts.
+/// The rank [`deletion_order`] gives parts of every kind but the shared key.
+const PART_RANK: u8 = 2;
+
+/// Deletions in key-first order: every shared key record, then single
+/// records, then parts.
 fn deletion_order(account: &CompanionAccount) -> (u8, Option<u16>) {
     let rank = match (account.kind(), account.part()) {
         (Some(SHARED_KEY_KIND), _) => 0,
         (_, None) => 1,
-        (_, Some(_)) => 2,
+        (_, Some(_)) => PART_RANK,
     };
     (rank, account.part())
 }
@@ -455,9 +588,9 @@ fn ending(next: Marker, leaves_records: bool) -> MarkerChange {
     }
 }
 
-fn remove_everything(inventory: &[CompanionAccount]) -> Step {
+fn remove_everything(inventory: Vec<CompanionAccount>) -> Step {
     Step {
-        changes: deletions(inventory.to_vec()),
+        changes: deletions(inventory),
         marker: MarkerChange::Delete,
     }
 }
@@ -917,6 +1050,62 @@ mod tests {
     }
 
     #[test]
+    fn a_deletion_that_fits_takes_one_transaction_even_with_parts() {
+        let store = history_store(2);
+        let current = store.marker().expect("marker");
+        let inventory = store.inventory();
+        let records = inventory.len();
+        let plan =
+            plan_deletion("proj", FoundMarker::Valid(&current), inventory, 4).expect("a plan");
+        assert_eq!(plan.transactions.len(), 1);
+        assert_eq!(plan.transactions[0].changes.len(), records);
+        assert_eq!(plan.transactions[0].marker, Some(MarkerChange::Delete));
+        assert_eq!(
+            plan.transactions[0].changes.first(),
+            Some(&PlannedChange::Delete(record("key", None)))
+        );
+    }
+
+    #[test]
+    fn a_deletion_shreds_every_key_record_first_even_one_in_parts() {
+        let mut store = history_store(40);
+        for part in 0..2 {
+            store
+                .records
+                .insert(record("key", Some(part)), b"key-part".to_vec());
+        }
+        let current = store.marker().expect("marker");
+        let plan = plan_deletion("proj", FoundMarker::Valid(&current), store.inventory(), 1)
+            .expect("a plan");
+        assert_eq!(
+            plan.transactions[0].changes[..4],
+            [
+                PlannedChange::Delete(record("key", None)),
+                PlannedChange::Delete(record("key", Some(0))),
+                PlannedChange::Delete(record("key", Some(1))),
+                PlannedChange::Delete(record("history-head", None)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_deletion_refuses_own_operations_that_leave_no_room_for_its_marker() {
+        let store = history_store(40);
+        let current = store.marker().expect("marker");
+        for own in [MAX_TRANSACTION_OPERATIONS, usize::MAX] {
+            assert!(
+                plan_deletion("proj", FoundMarker::Valid(&current), store.inventory(), own)
+                    .is_err(),
+                "{own}"
+            );
+        }
+        let own = MAX_TRANSACTION_OPERATIONS - 1;
+        let plan = plan_deletion("proj", FoundMarker::Valid(&current), store.inventory(), own)
+            .expect("a plan");
+        assert_eq!(first_with_own(&plan, own).len(), MAX_TRANSACTION_OPERATIONS);
+    }
+
+    #[test]
     fn a_deletion_without_a_marker_writes_none_unless_records_outlast_the_first_transaction() {
         let single = vec![record("future-kind", None)];
         let plan = plan_deletion("proj", FoundMarker::Absent, single.clone(), 1).expect("a plan");
@@ -943,9 +1132,11 @@ mod tests {
             }]
         );
         let mut with_parts = single;
-        with_parts.push(record("future-log", Some(3)));
+        with_parts.extend(
+            (0..MAX_TRANSACTION_OPERATIONS as u16).map(|part| record("future-log", Some(part))),
+        );
         let plan = plan_deletion("proj", FoundMarker::Invalid, with_parts, 1).expect("a plan");
-        assert_eq!(plan.transactions.len(), 2);
+        assert_eq!(plan.transactions.len(), 3);
         let Some(MarkerChange::Write(deleting)) = &plan.transactions[0].marker else {
             panic!("a deleting marker first");
         };
@@ -953,12 +1144,20 @@ mod tests {
         assert!(deleting.features.is_empty());
         deleting.validate().expect("the deleting marker validates");
         assert_eq!(
-            plan.transactions[1],
-            Transaction {
-                changes: vec![PlannedChange::Delete(record("future-log", Some(3)))],
-                marker: Some(MarkerChange::Delete),
-            }
+            plan.transactions[0].changes,
+            [PlannedChange::Delete(record("future-kind", None))]
         );
+        let later = plan.transactions[1..]
+            .iter()
+            .map(|transaction| transaction.changes.len())
+            .sum::<usize>();
+        assert_eq!(later, MAX_TRANSACTION_OPERATIONS);
+        assert!(
+            plan.transactions[1..2]
+                .iter()
+                .all(|transaction| transaction.marker.is_none())
+        );
+        assert_eq!(plan.transactions[2].marker, Some(MarkerChange::Delete));
     }
 
     #[test]
@@ -1240,6 +1439,22 @@ mod tests {
             .count();
         assert_eq!(marker_changes, 2, "one marker change per activation step");
         assert!(plan.transactions.last().unwrap().marker.is_some());
+    }
+
+    #[test]
+    fn an_activation_commits_its_moves_by_their_actual_size() {
+        let (mut store, _) = restoring_store(RestorePhase::Activating, 0);
+        for part in 0..11 {
+            store
+                .records
+                .insert(staged("history", Some(part)), b"tiny".to_vec());
+        }
+        let marker = store.marker().expect("marker");
+        let plan = plan_resume(marker, store.inventory()).expect("a plan");
+        assert_eq!(plan.transactions.len(), 3, "sized for the largest records");
+        execute(&mut store, plan).expect("activation finishes");
+        assert_eq!(store.transactions.len(), 2, "one commit per step");
+        assert!(store.marker().is_some_and(|marker| !needs_resume(&marker)));
     }
 
     #[test]

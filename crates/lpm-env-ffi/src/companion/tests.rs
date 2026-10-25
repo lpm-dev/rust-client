@@ -355,6 +355,24 @@ fn a_deletion_plan_leaves_room_for_the_callers_own_changes() {
 }
 
 #[test]
+fn a_deletion_plan_refuses_own_changes_that_leave_no_room() {
+    for own in [json!(32), json!(u64::MAX)] {
+        let (status, refused) = call(
+            lpm_env_companion_plan,
+            &json!({
+                "action": "delete",
+                "vaultId": "proj",
+                "marker": base64(OVERRIDES_MARKER.as_bytes()),
+                "inventory": [record_name("overrides", None)],
+                "ownOperations": own,
+            }),
+        );
+        assert_ne!(status, 0, "{own}");
+        assert_eq!(refused["code"], "companion.refused", "{own}");
+    }
+}
+
+#[test]
 fn feature_and_unlisted_removals_need_a_valid_marker() {
     let inventory = json!([record_name("overrides", None), record_name("notes", None)]);
     let (status, removal) = call(
@@ -408,10 +426,16 @@ fn a_transaction_check_refuses_unlisted_writes_and_needs_each_live_marker() {
                 { "account": record_name("overrides", None), "bytes": "" },
                 { "account": "proj", "bytes": base64(b"{}") },
             ],
-            "markers": {},
+            "markers": { "proj": null },
         }),
     );
     assert_eq!(status, 0);
+
+    let (status, deletion) = call(
+        lpm_env_companion_check_transaction,
+        &json!({ "changes": [{ "account": record_name("overrides", None), "bytes": null }], "markers": {} }),
+    );
+    assert_eq!(status, 0, "deleting records reads no marker: {deletion}");
 
     let (status, refused) = call(
         lpm_env_companion_check_transaction,
@@ -445,6 +469,16 @@ fn a_transaction_check_refuses_unlisted_writes_and_needs_each_live_marker() {
     );
     assert_eq!(status, 5);
     assert!(orphans["message"].as_str().unwrap().contains("would leave"));
+
+    let (status, missing) = call(
+        lpm_env_companion_check_transaction,
+        &json!({
+            "changes": [{ "account": marker, "bytes": null }],
+            "markers": { "proj": base64(OVERRIDES_MARKER.as_bytes()) },
+        }),
+    );
+    assert_eq!(status, 2);
+    assert_eq!(missing["code"], "companion.missing_names");
 }
 
 #[test]
