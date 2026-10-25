@@ -415,6 +415,7 @@ impl<'directory> FileCompanion<'directory> {
             }
             changed.insert(operation_folder_key(operation)?);
         }
+        drop(stage);
         self.sync_folders(&changed)?;
         self.finish()
     }
@@ -519,13 +520,17 @@ impl<'directory> FileCompanion<'directory> {
         self.remove_stage_folder()
     }
 
+    /// Windows refuses to remove a folder while any handle to it is open, so
+    /// callers drop theirs first.
     fn remove_stage_folder(&self) -> Result<(), String> {
         if !self.vaults.entry_exists(STAGE_FOLDER)? {
             return Ok(());
         }
-        let stage = self.vaults.open_or_create_directory(STAGE_FOLDER)?;
-        for name in stage.entry_names()? {
-            stage.remove_file_unsynced(&name, "a stale env file journal stage")?;
+        {
+            let stage = self.vaults.open_or_create_directory(STAGE_FOLDER)?;
+            for name in stage.entry_names()? {
+                stage.remove_file_unsynced(&name, "a stale env file journal stage")?;
+            }
         }
         self.vaults
             .remove_empty_directory(STAGE_FOLDER, "env file journal stages")?;
@@ -698,6 +703,7 @@ impl LifecycleStore for FileCompanion<'_> {
         if created_folder || removed_folder {
             changed.insert(String::new());
         }
+        drop(stage);
         self.sync_folders(&changed)?;
         self.finish()
     }

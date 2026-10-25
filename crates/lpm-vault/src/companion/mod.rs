@@ -6,9 +6,9 @@
 //! reads the project's marker inside its lock, finishes any interrupted
 //! lifecycle step, and applies the operation matrix before touching values.
 
-pub(crate) use lpm_env_companion::{
-    account, gate, graph, invariants, lifecycle, marker, overrides,
-};
+#[cfg(target_os = "macos")]
+pub(crate) use lpm_env_companion::graph;
+pub(crate) use lpm_env_companion::{account, gate, invariants, lifecycle, marker, overrides};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
