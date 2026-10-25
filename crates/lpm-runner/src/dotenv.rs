@@ -835,19 +835,31 @@ fn contained_env_file_path(project_dir: &Path, file_path: &str) -> Result<PathBu
 }
 
 pub(crate) fn remove_dangerous_env_vars(vars: &mut HashMap<String, String>, source: &str) {
-    let denied_keys: Vec<String> = vars
+    let mut denied: Vec<String> = vars
         .keys()
         .filter(|key| is_denied_env_var(key))
         .cloned()
         .collect();
-
-    for denied in denied_keys {
-        if vars.remove(&denied).is_some() {
-            tracing::warn!(
-                "ignored dangerous env var '{denied}' from {source} — this variable cannot be set via LPM project env"
-            );
-        }
+    if denied.is_empty() {
+        return;
     }
+    for key in &denied {
+        vars.remove(key);
+    }
+    denied.sort_unstable();
+    tracing::warn!("{}", ignored_env_warning(&denied, source));
+}
+
+/// One warning for every key `source` set that LPM never passes to a
+/// process, `keys` in order.
+fn ignored_env_warning(keys: &[String], source: &str) -> String {
+    let named = match keys {
+        [] => String::new(),
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    };
+    let pronoun = if keys.len() == 1 { "it" } else { "them" };
+    format!("ignored {named} from {source}: LPM never passes {pronoun} to processes")
 }
 
 /// Merge a single `.env` file into an existing map (overwriting existing keys).
@@ -1171,6 +1183,40 @@ mod tests {
             vars.get("NORMAL_VAR").unwrap(),
             "ok",
             "normal vars should pass through"
+        );
+    }
+
+    #[test]
+    fn code_running_env_vars_are_filtered_from_dotenv() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".env"),
+            "JAVA_TOOL_OPTIONS=-javaagent:evil.jar\ngit_config_key_0=core.sshCommand\nGIT_CONFIG_VALUE_0=./evil\nNPM_CONFIG_USERCONFIG=./evil-npmrc\nZDOTDIR=./evil\nGIT_CONFIG_NOSYSTEM=1\nJAVA_HOME=/opt/java",
+        )
+        .unwrap();
+
+        let vars = load_env_files(dir.path(), None).unwrap();
+        let mut kept: Vec<&str> = vars.keys().map(String::as_str).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, ["GIT_CONFIG_NOSYSTEM", "JAVA_HOME"]);
+    }
+
+    #[test]
+    fn one_warning_names_every_ignored_key_of_a_source_in_order() {
+        assert_eq!(
+            ignored_env_warning(&["CLASSPATH".to_owned()], ".env file"),
+            "ignored CLASSPATH from .env file: LPM never passes it to processes"
+        );
+        assert_eq!(
+            ignored_env_warning(
+                &[
+                    "CLASSPATH".to_owned(),
+                    "GIT_ASKPASS".to_owned(),
+                    "ZDOTDIR".to_owned()
+                ],
+                "project env"
+            ),
+            "ignored CLASSPATH, GIT_ASKPASS and ZDOTDIR from project env: LPM never passes them to processes"
         );
     }
 

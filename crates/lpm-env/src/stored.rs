@@ -6,7 +6,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 /// The environment whose stored values an environment without values of its own uses.
 pub const DEFAULT_ENVIRONMENT: &str = "default";
 
-const DENIED_ENV_VARS: &[&str] = &[
+/// Names that make a process run code it wasn't asked to run: libraries the
+/// dynamic linker preloads, interpreter options and startup files, module
+/// search paths a runtime loads code from, and the helpers Git, SSH, Cargo
+/// and npm execute. Build settings a project deliberately hands its own
+/// toolchain, such as `CC`, `RUSTFLAGS` or `JAVA_HOME`, aren't among them.
+const CODE_RUNNING_ENV_VARS: &[&str] = &[
     "LD_PRELOAD",
     "LD_LIBRARY_PATH",
     "LD_AUDIT",
@@ -15,31 +20,88 @@ const DENIED_ENV_VARS: &[&str] = &[
     "DYLD_FRAMEWORK_PATH",
     "DYLD_FALLBACK_LIBRARY_PATH",
     "NODE_OPTIONS",
+    "NODE_PATH",
     "PYTHONPATH",
     "PYTHONSTARTUP",
-    "GIT_SSH_COMMAND",
-    "BASH_ENV",
-    "ENV",
+    "PYTHONHOME",
+    "PYTHONUSERBASE",
     "PERL5OPT",
     "PERL5LIB",
+    "PERLLIB",
     "RUBYOPT",
     "RUBYLIB",
-    "PATH",
-    "HOME",
-    "LPM_HOME",
-    "USER",
-    "SHELL",
-    "TERM",
+    "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+    "CLASSPATH",
+    "DOTNET_STARTUP_HOOKS",
+    "CORECLR_ENABLE_PROFILING",
+    "COR_ENABLE_PROFILING",
+    "PHPRC",
+    "PHP_INI_SCAN_DIR",
+    "LUA_INIT",
+    "LUA_PATH",
+    "LUA_CPATH",
+    "BASH_ENV",
+    "ENV",
+    "ZDOTDIR",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_PROXY_COMMAND",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "GIT_EXEC_PATH",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    "NPM_CONFIG_GLOBALCONFIG",
+    "NPM_CONFIG_USERCONFIG",
+    "NPM_CONFIG_SCRIPT_SHELL",
+    "NPM_CONFIG_NODE_OPTIONS",
 ];
+
+/// Numbered and versioned forms of the names above, such as
+/// `GIT_CONFIG_KEY_0` and `LUA_PATH_5_4`. `GIT_CONFIG_NOSYSTEM` and the
+/// other Git settings that run nothing don't share these prefixes.
+const CODE_RUNNING_ENV_PREFIXES: &[&str] = &[
+    "GIT_CONFIG_KEY_",
+    "GIT_CONFIG_VALUE_",
+    "LUA_INIT_",
+    "LUA_PATH_",
+    "LUA_CPATH_",
+];
+
+/// Names that describe the process's own environment, which project env
+/// never replaces.
+const PROCESS_ENV_VARS: &[&str] = &["PATH", "HOME", "LPM_HOME", "USER", "SHELL", "TERM"];
 
 /// Whether LPM refuses to pass `key` to a process from project env, compared
 /// without case. The runner drops these variables whatever their source and
 /// never fills them from schema defaults.
 #[inline]
 pub fn is_denied_env_var(key: &str) -> bool {
-    DENIED_ENV_VARS
+    env_var_runs_code(key)
+        || PROCESS_ENV_VARS
+            .iter()
+            .any(|name| key.eq_ignore_ascii_case(name))
+}
+
+/// Whether `key` makes a process run code it wasn't asked to run, compared
+/// without case.
+pub fn env_var_runs_code(key: &str) -> bool {
+    let key = key.as_bytes();
+    CODE_RUNNING_ENV_VARS
         .iter()
-        .any(|denied| key.eq_ignore_ascii_case(denied))
+        .any(|name| key.eq_ignore_ascii_case(name.as_bytes()))
+        || CODE_RUNNING_ENV_PREFIXES.iter().any(|prefix| {
+            key.len() > prefix.len() && key[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+        })
 }
 
 /// Whether reading `environment` uses the [`DEFAULT_ENVIRONMENT`]'s stored
@@ -192,6 +254,111 @@ mod tests {
         assert!(is_denied_env_var("Path"));
         assert!(!is_denied_env_var("NODE_ENV"));
         assert!(!is_denied_env_var("DATABASE_URL"));
+    }
+
+    /// Names that make a process run code it wasn't asked to run, beyond
+    /// the dynamic linker's: interpreter options and startup files, module
+    /// search paths, and the helpers Git, SSH, Cargo and npm execute.
+    const CODE_RUNNING: &[&str] = &[
+        "JAVA_TOOL_OPTIONS",
+        "_JAVA_OPTIONS",
+        "JDK_JAVA_OPTIONS",
+        "CLASSPATH",
+        "NODE_PATH",
+        "PYTHONHOME",
+        "PYTHONUSERBASE",
+        "PERLLIB",
+        "GIT_SSH",
+        "GIT_PROXY_COMMAND",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "GIT_EXEC_PATH",
+        "GIT_EXTERNAL_DIFF",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_12",
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        "NPM_CONFIG_GLOBALCONFIG",
+        "NPM_CONFIG_USERCONFIG",
+        "NPM_CONFIG_SCRIPT_SHELL",
+        "NPM_CONFIG_NODE_OPTIONS",
+        "ZDOTDIR",
+        "DOTNET_STARTUP_HOOKS",
+        "CORECLR_ENABLE_PROFILING",
+        "COR_ENABLE_PROFILING",
+        "PHPRC",
+        "PHP_INI_SCAN_DIR",
+        "LUA_INIT",
+        "LUA_INIT_5_4",
+        "LUA_PATH",
+        "LUA_PATH_5_4",
+        "LUA_CPATH",
+        "LUA_CPATH_5_3",
+    ];
+
+    #[test]
+    fn names_that_make_a_process_run_other_code_are_denied_in_any_case() {
+        for name in CODE_RUNNING {
+            assert!(is_denied_env_var(name), "{name}");
+            assert!(is_denied_env_var(&name.to_ascii_lowercase()), "{name}");
+        }
+    }
+
+    #[test]
+    fn names_ordinary_projects_set_stay_usable() {
+        for name in [
+            "JAVA_HOME",
+            "CARGO_HOME",
+            "GEM_HOME",
+            "GEM_PATH",
+            "RUSTFLAGS",
+            "GOFLAGS",
+            "CC",
+            "CXX",
+            "AR",
+            "LD",
+            "NPM_CONFIG_REGISTRY",
+            "NPM_CONFIG_CACHE",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "NODE_EXTRA_CA_CERTS",
+            "GIT_EDITOR",
+            "GIT_SEQUENCE_EDITOR",
+            "PAGER",
+            "GIT_PAGER",
+            "TMPDIR",
+            "TEMP",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_SSH_VARIANT",
+            "SSH_AUTH_SOCK",
+            "CLASSPATH_PREFIX",
+            "LUA_VERSION",
+        ] {
+            assert!(!is_denied_env_var(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_stored_code_running_name_is_ignored_and_never_satisfies_a_rule() {
+        let schema: crate::EnvSchema =
+            serde_json::from_str(r#"{"vars":{"CLASSPATH":{"required":true}}}"#).unwrap();
+        let validator = EnvValidator::new(&schema);
+        let stored = environments(&[(
+            "default",
+            &[
+                ("CLASSPATH", "evil.jar"),
+                ("GIT_CONFIG_KEY_0", "core.sshCommand"),
+            ],
+        )]);
+        let check = check_stored_values(&validator, "default", &stored).unwrap();
+        assert_eq!(check.ignored, ["CLASSPATH", "GIT_CONFIG_KEY_0"]);
+        assert_eq!(codes(&check), [("CLASSPATH", "missing")]);
     }
 
     fn environments(

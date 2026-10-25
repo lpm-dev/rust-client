@@ -2587,6 +2587,51 @@ fn denied_process_hooks_cannot_satisfy_requirements_through_defaults() {
 }
 
 #[test]
+fn team_values_that_run_code_never_reach_a_script_but_the_shells_own_do() {
+    let project = TempProject::empty(r#"{"scripts":{"show":"node show.cjs"}}"#);
+    project.write_file(
+        "show.cjs",
+        "for (const name of ['CLASSPATH', 'GIT_CONFIG_KEY_0', 'NPM_CONFIG_USERCONFIG', 'TEAM_VALUE']) console.log(`${name}=${process.env[name]}`)",
+    );
+    lpm(&project)
+        .args([
+            "env",
+            "set",
+            "CLASSPATH=evil.jar",
+            "GIT_CONFIG_KEY_0=core.sshCommand",
+            "TEAM_VALUE=kept",
+        ])
+        .assert()
+        .success();
+
+    let output = lpm(&project)
+        .args(["run", "show", "--no-cache"])
+        .env("NPM_CONFIG_USERCONFIG", "/ci/.npmrc")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in [
+        "CLASSPATH=undefined",
+        "GIT_CONFIG_KEY_0=undefined",
+        "NPM_CONFIG_USERCONFIG=/ci/.npmrc",
+        "TEAM_VALUE=kept",
+    ] {
+        assert!(stdout.contains(line), "{line} in {stdout}");
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ignored CLASSPATH and GIT_CONFIG_KEY_0 from project env: LPM never passes them to processes"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn scoped_env_commands_merge_configured_service_overlays() {
     let project = TempProject::empty(r#"{"name":"service-overlays"}"#);
     project.write_file("lpm.json",r#"{"services":{"api":{"command":"node server.js","env":{"SERVICE_VALUE":"configured"}}},"envSchema":{"vars":{"SERVICE_VALUE":{"requiredIn":[{"service":["api"]}],"enum":["configured"]}}}}"#);

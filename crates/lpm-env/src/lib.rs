@@ -43,8 +43,8 @@ pub use schema::{
 };
 pub use scopes::{EnvStage, EvalContext, ScopeSelector, ScopedDefault};
 pub use stored::{
-    DEFAULT_ENVIRONMENT, StoredValuesCheck, check_stored_values, is_denied_env_var,
-    reads_default_environment,
+    DEFAULT_ENVIRONMENT, StoredValuesCheck, check_stored_values, env_var_runs_code,
+    is_denied_env_var, reads_default_environment,
 };
 pub use validate::{EnvValidator, ValidationError, ValidationErrorKind, validate, validate_schema};
 
