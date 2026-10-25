@@ -51,6 +51,51 @@ pub type EnvironmentMap = HashMap<String, SecretMap>;
 
 pub use companion::overrides::PersonalOverrides;
 
+/// Hooks for acceptance tests that seed data a separate `lpm` process reads.
+#[cfg(feature = "acceptance-test-hooks")]
+pub mod acceptance {
+    use std::path::Path;
+
+    use crate::companion::account::CompanionAccount;
+    use crate::companion::lifecycle::{LifecycleStore as _, Mutation};
+
+    /// Store `marker` and `overrides`, as JSON, as `vault_id`'s feature marker
+    /// and personal overrides in the file store of the LPM home at
+    /// `lpm_home`, sealed with that home's file-fallback key. Either may be
+    /// `None` to leave the record out, as damaged data would.
+    pub fn store_file_companion_records(
+        lpm_home: &Path,
+        vault_id: &str,
+        marker: Option<&str>,
+        overrides: Option<&str>,
+    ) -> Result<(), String> {
+        crate::storage_transaction::with_vault_transaction_at(lpm_home, |directory| {
+            crate::fallback::use_file_data_key_in_scope(directory)?;
+            let mut companion = crate::fallback::companion::FileCompanion::open(directory)?;
+            let mut mutations = Vec::with_capacity(2);
+            if let Some(marker) = marker {
+                mutations.push(Mutation::Write {
+                    account: CompanionAccount::Marker {
+                        vault_id: vault_id.to_owned(),
+                    },
+                    value: marker.as_bytes().to_vec(),
+                });
+            }
+            if let Some(overrides) = overrides {
+                mutations.push(Mutation::Write {
+                    account: CompanionAccount::Record {
+                        kind: crate::companion::overrides::OVERRIDES_KIND.to_owned(),
+                        vault_id: vault_id.to_owned(),
+                        part: None,
+                    },
+                    value: overrides.as_bytes().to_vec(),
+                });
+            }
+            companion.commit(mutations)
+        })
+    }
+}
+
 /// What running a project reads: the selected environment's values and its
 /// personal overrides on this machine.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -244,6 +289,45 @@ pub fn try_get_run_environment_for_vault_id(
             overrides,
         })
     })
+}
+
+/// Every environment's values and personal overrides, read together in one
+/// lock, for a view of what each environment would run with.
+pub fn try_get_all_run_environments_for_vault_id(
+    vault_id: &str,
+) -> Result<(EnvironmentMap, HashMap<String, PersonalOverrides>), String> {
+    validate_explicit_vault_id(vault_id)?;
+    with_project_vault_transaction(|directory| {
+        let (values, overrides) = read_all_run_environments_unlocked(directory, vault_id)?;
+        Ok((values.unwrap_or_default(), overrides.into_iter().collect()))
+    })
+}
+
+type AllRunEnvironments = (
+    Option<EnvironmentMap>,
+    std::collections::BTreeMap<String, PersonalOverrides>,
+);
+
+fn read_all_run_environments_unlocked(
+    directory: &storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+) -> Result<AllRunEnvironments, String> {
+    if force_file_vault_backend() {
+        return fallback::read_all_run_environments_unlocked(directory, vault_id);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let (values, overrides) = keychain::read_all_for_run_unlocked(vault_id)?;
+        let values = match values {
+            Some(values) => Some(values),
+            None => fallback::read_all_environments_unlocked(directory, vault_id)?,
+        };
+        Ok((values, overrides))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        fallback::read_all_run_environments_unlocked(directory, vault_id)
+    }
 }
 
 fn read_run_environment_unlocked(

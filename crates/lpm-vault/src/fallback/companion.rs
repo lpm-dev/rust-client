@@ -736,13 +736,12 @@ pub(crate) fn authorize_unlocked(
     crate::companion::authorize(&mut companion, vault_id, operation)
 }
 
-/// The selected environment's personal overrides, read in the caller's lock
-/// after the Apply gate.
-pub(crate) fn read_overrides_unlocked(
+/// The personal overrides record, read in the caller's lock after the Apply
+/// gate, with the gate that decides what it means.
+pub(crate) fn read_overrides_record_unlocked(
     directory: &VaultStorageDirectory,
     vault_id: &str,
-    environment: &str,
-) -> Result<PersonalOverrides, String> {
+) -> Result<(ProjectGate, Option<Vec<u8>>), String> {
     let gate = authorize_unlocked(directory, vault_id, Operation::ReadApplyingOverrides)?;
     let mut companion = FileCompanion::open(directory)?;
     let record = companion.read(&CompanionAccount::Record {
@@ -750,6 +749,16 @@ pub(crate) fn read_overrides_unlocked(
         vault_id: vault_id.to_owned(),
         part: None,
     })?;
+    Ok((gate, record))
+}
+
+/// The selected environment's personal overrides.
+pub(crate) fn read_overrides_unlocked(
+    directory: &VaultStorageDirectory,
+    vault_id: &str,
+    environment: &str,
+) -> Result<PersonalOverrides, String> {
+    let (gate, record) = read_overrides_record_unlocked(directory, vault_id)?;
     evaluate_overrides(&gate, vault_id, environment, record.as_deref()).map_err(damaged)
 }
 

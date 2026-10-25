@@ -43,6 +43,10 @@ pub(crate) struct VaultStorageDirectory {
 impl VaultStorageDirectory {
     fn open_lpm() -> Result<Self, String> {
         let root = crate::lpm_root_dir().ok_or_else(|| "no home directory".to_owned())?;
+        Self::open_root(&root)
+    }
+
+    fn open_root(root: &Path) -> Result<Self, String> {
         let (Some(parent_path), Some(name)) = (root.parent(), root.file_name()) else {
             return Err(format!(
                 "the LPM home must name a directory: {}",
@@ -762,11 +766,32 @@ pub(crate) fn with_vault_transaction<T>(
     with_vault_transaction_before_lock(|| Ok(()), operation)
 }
 
+/// [`with_vault_transaction`] for the LPM home at `root`, for acceptance
+/// tests that seed a home another process uses.
+#[cfg(feature = "acceptance-test-hooks")]
+pub(crate) fn with_vault_transaction_at<T>(
+    root: &Path,
+    operation: impl FnOnce(&VaultStorageDirectory) -> Result<T, String>,
+) -> Result<T, String> {
+    with_directory_transaction(
+        VaultStorageDirectory::open_root(root)?,
+        || Ok(()),
+        operation,
+    )
+}
+
 fn with_vault_transaction_before_lock<T>(
     before_lock: impl FnOnce() -> Result<(), String>,
     operation: impl FnOnce(&VaultStorageDirectory) -> Result<T, String>,
 ) -> Result<T, String> {
-    let directory = VaultStorageDirectory::open_lpm()?;
+    with_directory_transaction(VaultStorageDirectory::open_lpm()?, before_lock, operation)
+}
+
+fn with_directory_transaction<T>(
+    directory: VaultStorageDirectory,
+    before_lock: impl FnOnce() -> Result<(), String>,
+    operation: impl FnOnce(&VaultStorageDirectory) -> Result<T, String>,
+) -> Result<T, String> {
     let lock_file = directory.open_lock(TRANSACTION_LOCK_NAME, "vault transaction lock")?;
     let verification_file = lock_file
         .try_clone()

@@ -151,6 +151,7 @@ pub(super) struct RecoveryContext<'a> {
     pub(super) service_runtime_hints: &'a HashMap<String, crate::bin_path::ManagedRuntimeHint>,
     pub(super) service_envs: &'a HashMap<String, HashMap<String, String>>,
     pub(super) env_validator: Option<&'a lpm_env::EnvValidator<'a>>,
+    pub(super) personal_overrides: &'a crate::dotenv::PersonalOverrides,
     pub(super) env_name: &'a str,
     pub(super) validate_env_schema: bool,
     pub(super) port_map: &'a ServicePortMap,
@@ -809,6 +810,7 @@ fn start_restart_service(
         },
         &service_path.value,
         context.validate_env_schema,
+        context.personal_overrides,
     ) {
         let error = sanitize_terminal_inline(&error.to_string()).into_owned();
         if let Some(state) = states.get_mut(name) {
@@ -1272,6 +1274,7 @@ mod tests {
                 service_runtime_hints: &HashMap::new(),
                 service_envs: &HashMap::new(),
                 env_validator: None,
+                personal_overrides: &crate::dotenv::PersonalOverrides::default(),
                 env_name: "default",
                 validate_env_schema: false,
                 port_map: &ServicePortMap::new(),

@@ -2634,16 +2634,29 @@ fn project_loaders_preserve_the_implicit_default_file_cascade() {
         r#"{"envSchema":{"vars":{"CASCADE_VALUE":{"enum":["local"]}}}}"#,
     );
     let config = lpm_runner::lpm_json::read_lpm_json(project.path()).unwrap();
+    let apply = lpm_runner::dotenv::OverridePolicy::Apply;
     for values in [
-        lpm_runner::dotenv::load_project_env_with_schema_validation(project.path(), None, true),
-        lpm_runner::dotenv::load_project_env_with_config(project.path(), None, config.as_ref()),
+        lpm_runner::dotenv::load_project_env_with_schema_validation(
+            project.path(),
+            None,
+            true,
+            apply,
+        ),
+        lpm_runner::dotenv::load_project_env_with_config(
+            project.path(),
+            None,
+            config.as_ref(),
+            apply,
+        ),
         lpm_runner::dotenv::load_project_env_with_config_and_context(
             project.path(),
             None,
             config.as_ref(),
             Default::default(),
             None,
-        ),
+            apply,
+        )
+        .map(|composed| composed.vars),
     ] {
         assert_eq!(values.unwrap()["CASCADE_VALUE"], "local");
     }
@@ -2656,16 +2669,29 @@ fn project_loaders_honor_the_configured_default_file_and_scope() {
     project.write_file("config/default.env", "CASCADE_VALUE=configured\n");
     project.write_file("lpm.json", r#"{"env":{"default":"config/default.env"},"envSchema":{"vars":{"CASCADE_VALUE":{"requiredIn":[{"environment":["default"]}],"enum":["configured"]}}}}"#);
     let config = lpm_runner::lpm_json::read_lpm_json(project.path()).unwrap();
+    let apply = lpm_runner::dotenv::OverridePolicy::Apply;
     for values in [
-        lpm_runner::dotenv::load_project_env_with_schema_validation(project.path(), None, true),
-        lpm_runner::dotenv::load_project_env_with_config(project.path(), None, config.as_ref()),
+        lpm_runner::dotenv::load_project_env_with_schema_validation(
+            project.path(),
+            None,
+            true,
+            apply,
+        ),
+        lpm_runner::dotenv::load_project_env_with_config(
+            project.path(),
+            None,
+            config.as_ref(),
+            apply,
+        ),
         lpm_runner::dotenv::load_project_env_with_config_and_context(
             project.path(),
             None,
             config.as_ref(),
             Default::default(),
             None,
-        ),
+            apply,
+        )
+        .map(|composed| composed.vars),
     ] {
         assert_eq!(values.unwrap()["CASCADE_VALUE"], "configured");
     }

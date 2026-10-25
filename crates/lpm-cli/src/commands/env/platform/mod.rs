@@ -2229,6 +2229,7 @@ pub(super) async fn vars_platform_push(
             project_dir,
             &resolved_env,
             config.as_ref(),
+            lpm_runner::dotenv::OverridePolicy::Exclude,
         )?,
     );
     let local = client.prepare_local(
@@ -2563,6 +2564,7 @@ pub(super) async fn vars_platform_status(
                 project_dir,
                 &resolved,
                 config.as_ref().ok().and_then(Option::as_ref),
+                lpm_runner::dotenv::OverridePolicy::Exclude,
             )
             .map_err(|error| error.to_string())
         }) {

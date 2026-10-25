@@ -396,11 +396,12 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
     let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
     let environments = config.as_ref().and_then(|c| c.environments.as_ref());
     let schema = config.as_ref().and_then(|c| c.env_schema.as_ref());
-    let vault_envs = match vault_id.as_deref() {
-        Some(vault_id) => {
-            lpm_vault::try_get_all_environments_for_vault_id(vault_id).map_err(LpmError::Script)?
-        }
-        None => HashMap::new(),
+    // Status is what each environment would run with on this Mac, so it
+    // includes the personal overrides.
+    let (vault_envs, overrides_by_env) = match vault_id.as_deref() {
+        Some(vault_id) => lpm_vault::try_get_all_run_environments_for_vault_id(vault_id)
+            .map_err(LpmError::Script)?,
+        None => (HashMap::new(), HashMap::new()),
     };
     let all_envs = lpm_env::resolver::list_all(env_map, environments, &vault_envs);
 
@@ -425,6 +426,7 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
         schema_error: Option<String>,
         alias: Option<String>,
         source: lpm_env::EnvSource,
+        override_count: usize,
     }
 
     let validator = schema.map(lpm_env::EnvValidator::new);
@@ -436,6 +438,12 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
         let env_specific = vault_envs.get(&env.canonical);
         let effective_vars = effective_schema_vars(&env.canonical, &vault_envs);
         let var_count = env_specific.map_or(0, |v| v.len());
+        let storage_environment = if env.implicit_default {
+            "default"
+        } else {
+            env.storage_key.as_str()
+        };
+        let overrides = overrides_by_env.get(storage_environment);
 
         let mut schema_error = None;
         let schema_status = if let (Some(schema), Some(validator)) = (schema, &validator) {
@@ -455,6 +463,9 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
                 )?;
                 if let Some(stored) = effective_vars {
                     lpm_runner::dotenv::merge_stored_project_env(&mut values, stored)?;
+                }
+                if let Some(overrides) = overrides {
+                    lpm_runner::dotenv::apply_personal_overrides(&mut values, overrides);
                 }
                 let errors = lpm_runner::dotenv::evaluate_project_env(
                     &mut values,
@@ -485,6 +496,7 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
             schema_error,
             alias: env.alias.clone(),
             source: env.source.clone(),
+            override_count: overrides.map_or(0, lpm_vault::PersonalOverrides::len),
         });
     }
 
@@ -504,6 +516,9 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
                 }
                 if let Some(error) = &r.schema_error {
                     obj["schemaError"] = serde_json::json!(error);
+                }
+                if r.override_count > 0 {
+                    obj["personalOverrides"] = serde_json::json!(r.override_count);
                 }
                 obj
             })
@@ -574,7 +589,17 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
         };
         let updated_str = install_ui::dim(&format!("{updated_raw:<updated_width$}"));
 
-        let source_indicator = install_ui::TerminalLine::new("");
+        let source_indicator = match row.override_count {
+            0 => install_ui::TerminalLine::new(""),
+            1 => install_ui::terminal_line!(
+                " {}",
+                install_ui::dim("· 1 personal override on this Mac")
+            ),
+            count => install_ui::terminal_line!(
+                " {}",
+                install_ui::dim(&format!("· {count} personal overrides on this Mac"))
+            ),
+        };
 
         let var_count = install_ui::dim(&format!("{:>9}", row.var_count));
 

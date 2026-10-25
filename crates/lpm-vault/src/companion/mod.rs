@@ -160,6 +160,36 @@ pub(crate) fn evaluate_overrides(
     }
 }
 
+/// Every environment's personal overrides, under the same rules as
+/// [`evaluate_overrides`].
+pub(crate) fn evaluate_all_overrides(
+    gate: &ProjectGate,
+    vault_id: &str,
+    record: Option<&[u8]>,
+) -> Result<std::collections::BTreeMap<String, PersonalOverrides>, Damage> {
+    let entry = gate
+        .marker()
+        .and_then(|marker| marker.feature(OVERRIDES_KIND))
+        .filter(|entry| entry.state == FeatureState::Active);
+    match (entry, record) {
+        (None, None) => Ok(std::collections::BTreeMap::new()),
+        (None, Some(_)) => Err(Damage::UnlistedRecord {
+            kind: OVERRIDES_KIND.to_owned(),
+        }),
+        (Some(_), None) => Err(Damage::MissingRecord {
+            kind: OVERRIDES_KIND.to_owned(),
+        }),
+        (Some(entry), Some(bytes)) => {
+            overrides::parse_all(bytes, vault_id, entry.version).map_err(|error| {
+                Damage::InvalidRecord {
+                    kind: OVERRIDES_KIND.to_owned(),
+                    reason: error.to_string(),
+                }
+            })
+        }
+    }
+}
+
 /// Fail an Apply read on damage it found, in the gate's own words.
 pub(crate) fn damaged(damage: Damage) -> String {
     gate::GateError::Damaged(damage).to_string()

@@ -27,7 +27,9 @@ pub(super) fn emit_project_env_for_ci(
         config.as_ref(),
         lpm_env::EnvStage::Ci,
         None,
-    )?;
+        lpm_runner::dotenv::OverridePolicy::Exclude,
+    )?
+    .vars;
     let secret_keys: HashSet<String> = config
         .as_ref()
         .and_then(|config| config.env_schema.as_ref())

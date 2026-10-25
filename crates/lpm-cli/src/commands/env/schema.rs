@@ -184,14 +184,25 @@ fn format_print_env(
     format: lpm_env::PrintFormat,
     scope: &super::arguments::Scope,
 ) -> Result<String, LpmError> {
-    // Use the unified loader (handles inheritance, vault, schema validation + defaults)
-    let mut env_vars = lpm_runner::dotenv::load_project_env_with_config_and_context(
+    // Use the unified loader (handles inheritance, vault, overrides, schema validation + defaults)
+    let composed = lpm_runner::dotenv::load_project_env_with_config_and_context(
         project_dir,
         resolved_mode,
         config,
         scope.stage.unwrap_or_default(),
         scope.service.as_deref(),
+        lpm_runner::dotenv::OverridePolicy::Apply,
     )?;
+    // Every format is machine-readable, so overridden keys are reported on
+    // stderr, never marked in the output.
+    if let Some(notice) = lpm_runner::dotenv::personal_override_notice(
+        composed.overrides.len(),
+        resolved_mode.unwrap_or("default"),
+    ) {
+        eprintln!("lpm: {notice}");
+        lpm_runner::dotenv::log_personal_override_names(&composed.overrides);
+    }
+    let mut env_vars = composed.vars;
     let schema = config.and_then(|c| c.env_schema.as_ref());
 
     // Collect secret keys for masking
@@ -266,8 +277,12 @@ pub(super) fn vars_check(
     let all_envs = check_environments(env_input, lpm_config.as_ref(), || {
         lpm_vault::try_get_all_environments(project_dir).map_err(LpmError::Script)
     })?;
-    let mut results: Vec<(String, usize, Vec<lpm_env::ValidationError>)> =
-        Vec::with_capacity(all_envs.len());
+    let mut results: Vec<(
+        String,
+        usize,
+        Vec<lpm_env::ValidationError>,
+        std::collections::HashSet<String>,
+    )> = Vec::with_capacity(all_envs.len());
     let mut all_valid = true;
     let validator = lpm_env::EnvValidator::new(schema);
     for environment in &all_envs {
@@ -285,21 +300,19 @@ pub(super) fn vars_check(
                     description: None,
                     is_secret: false,
                 }],
+                std::collections::HashSet::new(),
             ));
             continue;
         }
-        let mut env_vars = lpm_runner::dotenv::load_project_env_unvalidated_for_resolved(
+        let mut composed = lpm_runner::dotenv::load_project_env_layers_for_resolved(
             project_dir,
             environment,
             lpm_config.as_ref(),
-        )?;
-        lpm_runner::dotenv::merge_configured_service_env(
-            &mut env_vars,
-            lpm_config.as_ref(),
-            scope.service.as_deref(),
-        )?;
+            lpm_runner::dotenv::OverridePolicy::Apply,
+        )?
+        .compose(lpm_config.as_ref(), scope.service.as_deref())?;
         let errors = lpm_runner::dotenv::evaluate_project_env(
-            &mut env_vars,
+            &mut composed.vars,
             Some(&validator),
             lpm_env::EvalContext {
                 environment: &environment.canonical,
@@ -307,14 +320,30 @@ pub(super) fn vars_check(
                 service: scope.service.as_deref(),
             },
         )?;
+        let from_overrides = errors
+            .iter()
+            .filter(|error| {
+                lpm_runner::dotenv::is_caused_by_personal_override(
+                    &error.key,
+                    &composed.vars,
+                    &composed.overrides,
+                )
+            })
+            .map(|error| error.key.clone())
+            .collect();
         all_valid &= errors.is_empty();
-        results.push((environment.canonical.clone(), schema.len(), errors));
+        results.push((
+            environment.canonical.clone(),
+            schema.len(),
+            errors,
+            from_overrides,
+        ));
     }
 
     if json_output {
         let json_results: Vec<serde_json::Value> = results
             .iter()
-            .map(|(name, total, errors)| {
+            .map(|(name, total, errors, from_overrides)| {
                 serde_json::json!({
                     "environment": name,
                     "total": total,
@@ -324,6 +353,9 @@ pub(super) fn vars_check(
                         if let lpm_env::ValidationErrorKind::GroupViolation { group, mode } = &e.kind {
                             diagnostic["group"] = serde_json::json!(group);
                             diagnostic["mode"] = serde_json::json!(mode);
+                        }
+                        if from_overrides.contains(&e.key) {
+                            diagnostic["personalOverride"] = serde_json::json!(true);
                         }
                         diagnostic
                     }).collect::<Vec<_>>(),
@@ -345,7 +377,7 @@ pub(super) fn vars_check(
     }
 
     println!();
-    for (name, total, errors) in &results {
+    for (name, total, errors, from_overrides) in &results {
         let valid = valid_variable_count(schema, errors);
         if errors.is_empty() {
             println!(
@@ -370,7 +402,15 @@ pub(super) fn vars_check(
                 )
             );
             for error in errors {
-                println!("    {}", install_ui::red(&error.to_string()));
+                if from_overrides.contains(&error.key) {
+                    println!(
+                        "    {} {}",
+                        install_ui::red(&error.to_string()),
+                        install_ui::dim("(from a personal override on this Mac)")
+                    );
+                } else {
+                    println!("    {}", install_ui::red(&error.to_string()));
+                }
             }
         }
     }

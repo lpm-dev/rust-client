@@ -5,6 +5,21 @@ use super::*;
 use crate::companion::account::{marker_account, record_account, staged_account};
 use crate::companion::gate::Operation;
 
+fn run_read(storage: &mut MemoryProjectStorage) -> Result<companion_gate::RunRead, String> {
+    companion_gate::read_for_run(storage, VAULT)
+}
+
+fn run_overrides(storage: &mut MemoryProjectStorage) -> Result<crate::PersonalOverrides, String> {
+    let read = run_read(storage)?;
+    crate::companion::evaluate_overrides(
+        &read.gate,
+        VAULT,
+        "default",
+        read.overrides_record.as_deref(),
+    )
+    .map_err(crate::companion::damaged)
+}
+
 const VAULT: &str = "proj";
 const VALUES: &str = r#"{"environments":{"default":{"TOKEN":"team"}}}"#;
 
@@ -209,7 +224,7 @@ fn read_only_features_allow_reads_and_refuse_writes() {
     assert!(
         companion_gate::authorize(&mut storage, VAULT, Operation::ReadExcludingOverrides).is_ok()
     );
-    assert!(companion_gate::read_for_run(&mut storage, VAULT, "default").is_ok());
+    assert!(run_overrides(&mut storage).is_ok());
     let error = companion_gate::authorize(&mut storage, VAULT, Operation::Write)
         .expect_err("read-only refuses writes");
     assert!(error.contains("can only read"), "{error}");
@@ -314,9 +329,7 @@ fn applying_overrides_reads_the_record_even_without_a_marker() {
         overrides_record(r#""A":"1""#),
     );
 
-    let error = companion_gate::read_for_run(&mut storage, VAULT, "default")
-        .err()
-        .expect("markerless overrides are damage");
+    let error = run_overrides(&mut storage).expect_err("markerless overrides are damage");
 
     assert!(error.contains("belongs to no feature"), "{error}");
     assert!(
@@ -331,9 +344,7 @@ fn applying_overrides_fails_when_the_marker_lists_a_missing_record() {
         .values
         .insert(marker_account(VAULT), marker(OVERRIDES_FEATURE, "active"));
 
-    let error = companion_gate::read_for_run(&mut storage, VAULT, "default")
-        .err()
-        .expect("a missing required record is damage");
+    let error = run_overrides(&mut storage).expect_err("a missing required record is damage");
 
     assert!(error.contains(r#"missing record "overrides""#), "{error}");
 }
@@ -349,10 +360,11 @@ fn applying_overrides_returns_the_selected_environment_with_the_values() {
         overrides_record(r#""TOKEN":"mine""#),
     );
 
-    let read = companion_gate::read_for_run(&mut storage, VAULT, "default").expect("apply read");
+    let values = run_read(&mut storage).expect("apply read").values;
+    let overrides = run_overrides(&mut storage).expect("apply read");
 
-    assert_eq!(read.values.as_deref(), Some(VALUES.as_bytes()));
-    assert_eq!(read.overrides.set["TOKEN"], "mine");
+    assert_eq!(values.as_deref(), Some(VALUES.as_bytes()));
+    assert_eq!(overrides.set["TOKEN"], "mine");
 }
 
 #[test]
@@ -370,7 +382,7 @@ fn weaker_overrides_under_approved_values_are_strengthened_before_use() {
         .insert(VAULT.to_owned(), ClaimedAccess::RequireApproval);
     storage.protected.insert(VAULT.to_owned());
 
-    companion_gate::read_for_run(&mut storage, VAULT, "default").expect("apply read");
+    run_overrides(&mut storage).expect("apply read");
 
     assert_eq!(storage.approvals_required, std::slice::from_ref(&overrides));
     assert!(storage.protected.contains(&overrides));
@@ -392,9 +404,7 @@ fn an_unavailable_keychain_returns_no_override_bytes_and_records_nothing() {
     storage.protected.insert(VAULT.to_owned());
     storage.keychain_unavailable = true;
 
-    let error = companion_gate::read_for_run(&mut storage, VAULT, "default")
-        .err()
-        .expect("an inconclusive probe fails");
+    let error = run_overrides(&mut storage).expect_err("an inconclusive probe fails");
 
     assert!(error.contains("retry once the Mac is unlocked"), "{error}");
     assert!(storage.approvals_required.is_empty());
@@ -414,9 +424,8 @@ fn contradictory_override_approval_is_damage() {
         .claims
         .insert(overrides, ClaimedAccess::Contradictory);
 
-    let error = companion_gate::read_for_run(&mut storage, VAULT, "default")
-        .err()
-        .expect("contradictory approval attributes are damage");
+    let error =
+        run_overrides(&mut storage).expect_err("contradictory approval attributes are damage");
 
     assert!(error.contains("contradict"), "{error}");
 }

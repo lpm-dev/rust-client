@@ -1551,9 +1551,16 @@ pub(crate) fn read_for_run_unlocked(
     env: &str,
     default_fallback: bool,
 ) -> Result<(Option<SecretMap>, crate::PersonalOverrides), String> {
-    let read = companion_gate::read_for_run(&mut KeychainProjectStorage, vault_id, env)?;
+    let read = companion_gate::read_for_run(&mut KeychainProjectStorage, vault_id)?;
+    let overrides = crate::companion::evaluate_overrides(
+        &read.gate,
+        vault_id,
+        env,
+        read.overrides_record.as_deref(),
+    )
+    .map_err(crate::companion::damaged)?;
     let Some(bytes) = read.values else {
-        return Ok((None, read.overrides));
+        return Ok((None, overrides));
     };
     let json = String::from_utf8(bytes)
         .map_err(|_| "vault keychain data is not valid UTF-8".to_owned())?;
@@ -1565,7 +1572,37 @@ pub(crate) fn read_for_run_unlocked(
     let values = parsed
         .map(crate::selected_environment::SelectedVaultPayload::into_selected)
         .map_err(|error| format!("vault keychain data is not valid JSON: {error}"))?;
-    Ok((values, read.overrides))
+    Ok((values, overrides))
+}
+
+/// Every environment's values and personal overrides, read together inside
+/// one lock on this thread.
+pub(crate) fn read_all_for_run_unlocked(
+    vault_id: &str,
+) -> Result<
+    (
+        Option<EnvironmentMap>,
+        std::collections::BTreeMap<String, crate::PersonalOverrides>,
+    ),
+    String,
+> {
+    let read = companion_gate::read_for_run(&mut KeychainProjectStorage, vault_id)?;
+    let overrides = crate::companion::evaluate_all_overrides(
+        &read.gate,
+        vault_id,
+        read.overrides_record.as_deref(),
+    )
+    .map_err(crate::companion::damaged)?;
+    let values = read
+        .values
+        .map(|bytes| {
+            let json = String::from_utf8(bytes)
+                .map_err(|_| "vault keychain data is not valid UTF-8".to_owned())?;
+            crate::selected_environment::parse_all(&json)
+                .map_err(|error| format!("vault keychain data is not valid JSON: {error}"))
+        })
+        .transpose()?;
+    Ok((values, overrides))
 }
 
 /// Authorize `operation` on `vault_id` against its Keychain feature marker,

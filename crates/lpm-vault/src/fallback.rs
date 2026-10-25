@@ -335,6 +335,17 @@ pub(crate) fn forget_scoped_data_key() {
     SCOPED_DATA_KEY.with(|key| key.set(None));
 }
 
+/// Use the file-fallback key for the rest of this lock, as a process running
+/// with `LPM_FORCE_FILE_VAULT` would.
+#[cfg(feature = "acceptance-test-hooks")]
+pub(crate) fn use_file_data_key_in_scope(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+) -> Result<(), String> {
+    let key = get_or_create_file_data_key(directory)?;
+    SCOPED_DATA_KEY.with(|scoped| scoped.set(Some(key)));
+    Ok(())
+}
+
 fn load_data_key_with_store_unlocked(
     directory: &crate::storage_transaction::VaultStorageDirectory,
     store: &dyn NativeDataKeyStore,
@@ -666,6 +677,24 @@ pub(crate) fn read_run_environment_unlocked(
 ) -> Result<(Option<SecretMap>, crate::PersonalOverrides), String> {
     let overrides = companion::read_overrides_unlocked(directory, vault_id, env)?;
     let values = read_vault_file_env_unlocked(directory, vault_id, env, default_fallback)?;
+    Ok((values, overrides))
+}
+
+/// Every environment's values and personal overrides, in the caller's lock.
+pub(crate) fn read_all_run_environments_unlocked(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+) -> Result<
+    (
+        Option<EnvironmentMap>,
+        std::collections::BTreeMap<String, crate::PersonalOverrides>,
+    ),
+    String,
+> {
+    let (gate, record) = companion::read_overrides_record_unlocked(directory, vault_id)?;
+    let overrides = crate::companion::evaluate_all_overrides(&gate, vault_id, record.as_deref())
+        .map_err(crate::companion::damaged)?;
+    let values = read_all_environments_unlocked(directory, vault_id)?;
     Ok((values, overrides))
 }
 

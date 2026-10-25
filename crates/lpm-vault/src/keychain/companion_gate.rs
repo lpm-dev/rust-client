@@ -5,8 +5,8 @@
 use crate::companion::account::{CompanionAccount, marker_account, record_account};
 use crate::companion::gate::{Damage, Operation, ProjectGate};
 use crate::companion::lifecycle::{LifecycleStore, Mutation};
-use crate::companion::overrides::{OVERRIDES_KIND, PersonalOverrides};
-use crate::companion::{CompanionBackend, damaged, evaluate_overrides};
+use crate::companion::overrides::OVERRIDES_KIND;
+use crate::companion::{CompanionBackend, damaged};
 use crate::macos_keychain::{ClaimedAccess, ProbeOutcome};
 
 use super::{
@@ -59,18 +59,18 @@ pub(super) fn authorize(
     crate::companion::authorize(&mut KeychainCompanion(storage), vault_id, operation)
 }
 
-/// The values item's bytes and the selected environment's personal
-/// overrides, read in one lock scope on one thread, so one approval covers
-/// both.
+/// The values item's bytes and the personal overrides record, read in one
+/// lock scope on one thread, so one approval covers both, with the gate that
+/// decides what the record means.
 pub(super) struct RunRead {
     pub(super) values: Option<Vec<u8>>,
-    pub(super) overrides: PersonalOverrides,
+    pub(super) gate: ProjectGate,
+    pub(super) overrides_record: Option<Vec<u8>>,
 }
 
 pub(super) fn read_for_run(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
-    environment: &str,
 ) -> Result<RunRead, String> {
     let gate = authorize(storage, vault_id, Operation::ReadApplyingOverrides)?;
     let (values, values_access) = match storage.read_with_access(vault_id)? {
@@ -99,9 +99,11 @@ pub(super) fn read_for_run(
         }
         None => None,
     };
-    let overrides =
-        evaluate_overrides(&gate, vault_id, environment, record.as_deref()).map_err(damaged)?;
-    Ok(RunRead { values, overrides })
+    Ok(RunRead {
+        values,
+        gate,
+        overrides_record: record,
+    })
 }
 
 /// A record that follows values but claims no approval while the values item

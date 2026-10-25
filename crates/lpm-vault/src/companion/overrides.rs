@@ -95,17 +95,38 @@ pub(crate) fn parse_selected(
     parse_selected_with_case_policy(bytes, vault_id, version, environment, cfg!(windows))
 }
 
-fn parse_selected_with_case_policy(
+/// Validate the whole record and keep every environment's overrides.
+pub(crate) fn parse_all(
     bytes: &[u8],
     vault_id: &str,
     version: u16,
-    environment: &str,
+) -> Result<BTreeMap<String, PersonalOverrides>, InvalidOverrides> {
+    let record = parse_record(bytes, vault_id, version, cfg!(windows))?;
+    Ok(record
+        .environments
+        .into_iter()
+        .map(|(name, entry)| {
+            (
+                name,
+                PersonalOverrides {
+                    set: entry.set.into_iter().collect(),
+                    unset: entry.unset,
+                },
+            )
+        })
+        .collect())
+}
+
+fn parse_record(
+    bytes: &[u8],
+    vault_id: &str,
+    version: u16,
     case_insensitive: bool,
-) -> Result<PersonalOverrides, InvalidOverrides> {
+) -> Result<OverridesRecord, InvalidOverrides> {
     if bytes.len() > MAX_RECORD_BYTES {
         return Err(invalid("the personal overrides are too large"));
     }
-    let mut record: OverridesRecord = serde_json::from_slice(bytes)
+    let record: OverridesRecord = serde_json::from_slice(bytes)
         .map_err(|error| invalid(format!("the personal overrides are malformed: {error}")))?;
     if record.schema_version != version {
         return Err(invalid(
@@ -118,6 +139,17 @@ fn parse_selected_with_case_policy(
     for (name, entry) in &record.environments {
         validate_environment(name, entry, case_insensitive)?;
     }
+    Ok(record)
+}
+
+fn parse_selected_with_case_policy(
+    bytes: &[u8],
+    vault_id: &str,
+    version: u16,
+    environment: &str,
+    case_insensitive: bool,
+) -> Result<PersonalOverrides, InvalidOverrides> {
+    let mut record = parse_record(bytes, vault_id, version, case_insensitive)?;
     Ok(record
         .environments
         .remove(environment)
