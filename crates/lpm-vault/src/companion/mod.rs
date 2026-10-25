@@ -103,17 +103,44 @@ pub(crate) fn open_project(
         Some(bytes) => match Marker::parse(vault_id, &bytes) {
             Err(error) => ProjectGate::Damaged(error.into()),
             Ok(marker) if lifecycle::needs_resume(&marker) => {
+                let interrupted = interrupted_step(&marker);
                 let inventory = backend.inventory(vault_id)?;
-                match lifecycle::resume(backend, marker, inventory)? {
+                let gate = match lifecycle::resume(backend, marker, inventory)? {
                     Some(marker) => ProjectGate::Marked(marker),
                     None => ProjectGate::Plain,
-                }
+                };
+                tracing::warn!("{interrupted} of env project {vault_id}'s newer data");
+                gate
             }
             Ok(marker) => ProjectGate::Marked(marker),
         },
     };
     remember(vault_id, &gate);
     Ok(gate)
+}
+
+/// How the notice after a resume describes what it finished.
+fn interrupted_step(marker: &Marker) -> String {
+    match (
+        marker.state,
+        marker.restore.as_ref().map(|restore| restore.phase),
+    ) {
+        (marker::ProjectState::Deleting, _) => "finished an interrupted deletion".to_owned(),
+        (marker::ProjectState::Discarding, _) => "finished an interrupted discard".to_owned(),
+        (marker::ProjectState::Restoring, Some(marker::RestorePhase::Staging)) => {
+            "undid an interrupted restore; run the restore again".to_owned()
+        }
+        (marker::ProjectState::Restoring, _) => "finished an interrupted restore".to_owned(),
+        (marker::ProjectState::Active, _) => {
+            let removing: Vec<&str> = marker
+                .features
+                .iter()
+                .filter(|(_, entry)| entry.state == FeatureState::Removing)
+                .map(|(name, _)| name.as_str())
+                .collect();
+            format!("finished removing {}", removing.join(", "))
+        }
+    }
 }
 
 /// [`open_project`], then the operation matrix.
@@ -295,6 +322,36 @@ mod tests {
         for account in &inventory {
             assert!(marker.lists_kind(account.kind().unwrap()));
         }
+    }
+
+    #[test]
+    fn resume_notices_say_what_was_finished_or_undone() {
+        let mut marker = Marker::empty("proj", marker::ProjectState::Deleting);
+        assert_eq!(
+            interrupted_step(&marker),
+            "finished an interrupted deletion"
+        );
+        marker.state = marker::ProjectState::Restoring;
+        marker.restore = Some(marker::Restore {
+            phase: marker::RestorePhase::Staging,
+            replaces: Vec::new(),
+            features: std::collections::BTreeMap::new(),
+        });
+        assert_eq!(
+            interrupted_step(&marker),
+            "undid an interrupted restore; run the restore again"
+        );
+        let mut removing = Marker::empty("proj", marker::ProjectState::Active);
+        removing.features.insert(
+            "overrides".to_owned(),
+            marker::FeatureEntry {
+                version: 1,
+                if_unsupported: marker::Level::Refuse,
+                kinds: vec!["overrides".to_owned()],
+                state: FeatureState::Removing,
+            },
+        );
+        assert_eq!(interrupted_step(&removing), "finished removing overrides");
     }
 
     #[test]

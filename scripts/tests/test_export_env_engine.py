@@ -65,6 +65,9 @@ def write_sources(root, marker='original'):
     header = root / 'crates/lpm-env-ffi/include/lpm_env.h'
     header.parent.mkdir(parents=True, exist_ok=True)
     header.write_text(HEADER if marker == 'original' else HEADER + marker)
+    fixture = root / exporter.FIXTURES / 'markers.json'
+    fixture.parent.mkdir(parents=True, exist_ok=True)
+    fixture.write_text('{"marker": "' + marker + '"}\n')
 
 
 class EngineExportTests(unittest.TestCase):
@@ -406,6 +409,10 @@ module.export(root, target, output)
                 notices = parent / name / exporter.NOTICES
                 self.assertEqual(provenance['notices'], exporter.file_hash(notices))
                 self.assertIn('Copyright notices for The Rust Standard Library', notices.read_text())
+                bundled = parent / name / 'fixtures/companion/markers.json'
+                self.assertEqual(bundled.read_text(), '{"marker": "' + name[-1] + '"}\n')
+                self.assertEqual(provenance['fixtures'], {'fixtures/companion/markers.json': exporter.file_hash(bundled)})
+                self.assertIn(str(exporter.FIXTURES / 'markers.json'), provenance['sources'])
 
 
 if __name__ == '__main__':

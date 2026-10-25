@@ -796,6 +796,92 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a signed macOS test bundle with the shared Keychain entitlement"]
+    fn native_probe_tells_protected_items_from_automatic_and_unavailable_ones() {
+        assert_eq!(std::env::var("LPM_RUN_KEYCHAIN_TESTS").as_deref(), Ok("1"));
+        let service = format!("dev.lpm.companion-probe.fixture.{}", rand::random::<u128>());
+        struct FixtureCleanup<'a>(&'a str);
+        impl Drop for FixtureCleanup<'_> {
+            fn drop(&mut self) {
+                for account in ["open", "automatic", "protected", "contradictory"] {
+                    let _ = delete(self.0, account);
+                }
+            }
+        }
+        let _cleanup = FixtureCleanup(&service);
+        SecurityFrameworkBackend::add(&service, "open", b"open").expect("open item");
+        SecurityFrameworkBackend::add(&service, "automatic", b"synthetic-fixture")
+            .expect("automatic item");
+        SecurityFrameworkBackend::write_with_access(
+            &service,
+            "protected",
+            b"synthetic-fixture",
+            CliAccess::RequireApproval,
+        )
+        .expect("protected item");
+
+        assert_eq!(
+            probe(&service, "automatic", &["open"]),
+            ProbeOutcome::Automatic
+        );
+        assert_eq!(
+            probe(&service, "protected", &["open"]),
+            ProbeOutcome::Protected
+        );
+        assert_eq!(
+            probe(&service, "protected", &["missing"]),
+            ProbeOutcome::Inconclusive,
+            "a refusal counts as protection only when an open item reads"
+        );
+        assert_eq!(probe(&service, "missing", &["open"]), ProbeOutcome::Absent);
+        assert_eq!(
+            claimed_access(&service, "protected").expect("attributes"),
+            Some(ClaimedAccess::RequireApproval)
+        );
+        assert_eq!(
+            claimed_access(&service, "automatic").expect("attributes"),
+            Some(ClaimedAccess::Automatic)
+        );
+
+        let query = CFDictionary::from_CFType_pairs(&SecurityFrameworkBackend::identity_pairs(
+            &service,
+            "automatic",
+        ));
+        let marker_only = CFDictionary::from_CFType_pairs(&[(
+            unsafe { CFString::wrap_under_get_rule(kSecAttrGeneric) },
+            CFData::from_buffer(APPROVAL_MARKER).into_CFType(),
+        )]);
+        assert_eq!(
+            unsafe {
+                SecItemUpdate(
+                    query.as_concrete_TypeRef(),
+                    marker_only.as_concrete_TypeRef(),
+                )
+            },
+            0
+        );
+        assert_eq!(
+            claimed_access(&service, "automatic").expect("attributes"),
+            Some(ClaimedAccess::Contradictory),
+            "an approval marker without an access control contradicts itself"
+        );
+        assert_eq!(
+            probe(&service, "automatic", &["open"]),
+            ProbeOutcome::Automatic,
+            "the probe reports what the item does, not what it claims"
+        );
+        require_approval(&service, "automatic", &["open"]).expect("strengthen");
+        assert_eq!(
+            probe(&service, "automatic", &["open"]),
+            ProbeOutcome::Protected
+        );
+        let names = account_names(&service).expect("listing");
+        for account in ["open", "automatic", "protected"] {
+            assert!(names.iter().any(|name| name == account), "{names:?}");
+        }
+    }
+
+    #[test]
     fn interaction_not_allowed_explains_how_to_unlock_the_data_protection_keychain() {
         let error = SecurityFrameworkBackend::map_error(
             "add",
