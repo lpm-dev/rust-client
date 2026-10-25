@@ -901,3 +901,51 @@ fn nested_overrides_retain_the_original_variable_declaration() {
     assert_eq!(result.declaring_origins["VALUE"].source, "base.json");
     assert_eq!(result.declaring_origins["VALUE"].pointer, "/vars/VALUE");
 }
+
+#[test]
+fn unknown_fields_name_the_field_and_where_it_is_in_the_file_that_holds_it() {
+    let error = decode_definition(
+        br#"{"vars":{"API_URL":{"format":"url","rotateEvery":"30d"}}}"#,
+        "lpm.json",
+    )
+    .unwrap_err();
+    assert_eq!(error.diagnostic.code, "env.unknown_field");
+    assert_eq!(
+        error.diagnostic.pointer,
+        "/envSchema/vars/API_URL/rotateEvery"
+    );
+    assert_eq!(error.diagnostic.field.as_deref(), Some("rotateEvery"));
+    assert_eq!(
+        error.to_string(),
+        "envSchema field \"rotateEvery\" at lpm.json/envSchema/vars/API_URL isn't one this LPM CLI knows. Check its spelling, or update the LPM CLI if a newer version wrote it."
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("base.json"),
+        r#"{"vars":{"A":{"required":true,"futureRule":"private-fixture-value"}}}"#,
+    )
+    .unwrap();
+    let error = resolve(&dir, serde_json::json!({"extends":["base.json"]})).unwrap_err();
+    assert_eq!(error.diagnostic.code, "env.unknown_field");
+    assert_eq!(error.diagnostic.source, "base.json");
+    assert_eq!(error.diagnostic.pointer, "/vars/A/futureRule");
+    assert!(
+        !serde_json::to_string(&error.diagnostic)
+            .unwrap()
+            .contains("private-fixture-value")
+    );
+}
+
+#[test]
+fn unknown_field_names_are_escaped_before_they_are_shown() {
+    let error =
+        decode_definition(br#"{"vars":{"A":{"x\u202e\u001b[2J":true}}}"#, "lpm.json").unwrap_err();
+    assert_eq!(error.diagnostic.code, "env.unknown_field");
+    let shown = error.to_string();
+    assert!(
+        !shown.contains('\u{202e}') && !shown.contains('\u{1b}'),
+        "{shown}"
+    );
+    assert!(shown.contains("\\u{202e}"), "{shown}");
+}

@@ -3096,6 +3096,42 @@ fn env_schema_json_reports_import_provenance_without_reading_values() {
 }
 
 #[test]
+fn env_schema_unknown_fields_name_the_field_in_the_file_that_holds_it() {
+    let project = TempProject::empty(r#"{"name":"fragment-unknown-field"}"#);
+    project.write_file("lpm.json", r#"{"envSchema":{"extends":["base.json"]}}"#);
+    project.write_file(
+        "base.json",
+        r#"{"vars":{"VALUE":{"required":true,"rotateEvery":"private-fixture-value"}}}"#,
+    );
+    let output = lpm(&project)
+        .args(["env", "schema", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let value = parse_json_stdout(&output, "unknown field diagnostic");
+    let diagnostic = &value["diagnostics"][0];
+    assert_eq!(diagnostic["code"], "env.unknown_field");
+    assert_eq!(diagnostic["source"], "base.json");
+    assert_eq!(diagnostic["pointer"], "/vars/VALUE/rotateEvery");
+    assert_eq!(diagnostic["field"], "rotateEvery");
+    assert!(!value.to_string().contains("private-fixture-value"));
+
+    project.write_file(
+        "lpm.json",
+        r#"{"envSchema":{"vars":{"VALUE":{"format":"url","rotateEvery":"30d"}}}}"#,
+    );
+    let checked = lpm(&project).args(["env", "check"]).output().unwrap();
+    assert!(!checked.status.success());
+    assert!(
+        String::from_utf8_lossy(&checked.stderr).contains(
+            "envSchema field \"rotateEvery\" at lpm.json/envSchema/vars/VALUE isn't one this LPM CLI knows."
+        ),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+}
+
+#[test]
 fn env_schema_fragment_type_errors_report_safe_field_locations() {
     let project = TempProject::empty(r#"{"name":"fragment-types"}"#);
     project.write_file("lpm.json", r#"{"envSchema":{"extends":["base.json"]}}"#);

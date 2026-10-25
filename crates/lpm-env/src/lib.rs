@@ -30,6 +30,7 @@ pub mod resolver;
 mod schema;
 mod scopes;
 mod stored;
+mod unknown_fields;
 mod validate;
 
 pub use example::generate as generate_env_example;
@@ -45,6 +46,9 @@ pub use scopes::{EnvStage, EvalContext, ScopeSelector, ScopedDefault};
 pub use stored::{
     DEFAULT_ENVIRONMENT, StoredValuesCheck, check_stored_values, is_denied_env_var,
     reads_default_environment,
+};
+pub use unknown_fields::{
+    UnknownField, first_unknown_definition_field, first_unknown_schema_field,
 };
 pub use validate::{EnvValidator, ValidationError, ValidationErrorKind, validate, validate_schema};
 

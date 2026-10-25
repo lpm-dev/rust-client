@@ -902,7 +902,10 @@ pub fn resolve_schema_definition(
         .map_err(|_| SourceError::new("env.root_unreadable", "read", "lpm.json", "/envSchema"))?;
     let projection: Projection = serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))
         .map_err(|_| {
-            SourceError::new("env.invalid_definition", "parse", "lpm.json", "/envSchema")
+            unknown_env_schema_field_in(&content).map_or_else(
+                || SourceError::new("env.invalid_definition", "parse", "lpm.json", "/envSchema"),
+                |unknown| lpm_env_source::unknown_field_error("lpm.json", &unknown),
+            )
         })?;
     let definition = projection.schema.ok_or_else(|| {
         SourceError::new("env.schema_missing", "definition", "lpm.json", "/envSchema")
@@ -931,6 +934,20 @@ pub fn parse_lpm_json_with_root(
     parse_lpm_json_inner(content, None, Some(root)).map_err(|error| error.to_string())
 }
 
+/// The first field of `envSchema` this version doesn't know, read again only
+/// after the typed parse failed.
+fn unknown_env_schema_field_in(content: &str) -> Option<lpm_env::UnknownField> {
+    let value: serde_json::Value =
+        serde_json::from_str(lpm_common::strip_utf8_bom_str(content)).ok()?;
+    let schema = serde_json::to_vec(value.get("envSchema")?).ok()?;
+    lpm_env::first_unknown_definition_field(&schema)
+}
+
+fn unknown_env_schema_field(content: &str) -> Option<String> {
+    unknown_env_schema_field_in(content)
+        .map(|unknown| lpm_env_source::unknown_field_error("lpm.json", &unknown).to_string())
+}
+
 fn parse_lpm_json_inner(
     content: &str,
     project_dir: Option<&Path>,
@@ -943,6 +960,9 @@ fn parse_lpm_json_inner(
             let path = failure.path().to_string();
             let error = failure.inner();
             if path == "envSchema" || path.starts_with("envSchema.") {
+                if let Some(message) = unknown_env_schema_field(content) {
+                    return message;
+                }
                 let safe_path: String = path.chars().flat_map(char::escape_default).collect();
                 return format!("invalid lpm.json data at {safe_path} (line {}, column {}): check envSchema field names and value types", error.line(), error.column());
             }
@@ -1259,6 +1279,22 @@ pub fn extract_mode_from_env_path(env_path: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn an_unknown_env_schema_field_reads_as_a_typo_or_a_newer_field() {
+        let error = parse_lpm_json(
+            r#"{"envSchema":{"vars":{"API_URL":{"format":"url","rotateEvery":"30d"}}}}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "envSchema field \"rotateEvery\" at lpm.json/envSchema/vars/API_URL isn't one this LPM CLI knows. Check its spelling, or update the LPM CLI if a newer version wrote it."
+        );
+        let type_error =
+            parse_lpm_json(r#"{"envSchema":{"vars":{"API_URL":{"required":"yes"}}}}"#).unwrap_err();
+        assert!(type_error.contains("check envSchema field names and value types"));
+    }
 
     #[test]
     fn bom_prefixed_configuration_preserves_service_validation() {
