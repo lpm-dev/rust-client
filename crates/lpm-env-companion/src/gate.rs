@@ -101,6 +101,17 @@ impl fmt::Display for GateError {
                 "This env project uses {} v{version}, which this LPM CLI doesn't support. Update the LPM CLI: lpm self-update",
                 feature_description(feature)
             ),
+            Self::Damaged(Damage::Access(reason)) => {
+                write!(
+                    formatter,
+                    "This env project's CLI approval is damaged: {reason}."
+                )?;
+                if cfg!(target_os = "macos") {
+                    formatter
+                        .write_str(" Switch its CLI approval in LPM Vault to set it again.")?;
+                }
+                Ok(())
+            }
             Self::Damaged(damage) => {
                 write!(
                     formatter,
@@ -282,6 +293,21 @@ mod tests {
                 .to_string(),
             "This env project uses local history v2, which this LPM CLI can only read. Update the LPM CLI to change it: lpm self-update"
         );
+    }
+
+    #[test]
+    fn damaged_access_names_the_approval_not_the_newer_data() {
+        let message = GateError::Damaged(Damage::Access(
+            "the values' approval attributes contradict each other".to_owned(),
+        ))
+        .to_string();
+        assert!(
+            message.starts_with(
+                "This env project's CLI approval is damaged: the values' approval attributes contradict each other."
+            ),
+            "{message}"
+        );
+        assert!(!message.contains("newer data"), "{message}");
     }
 
     #[test]

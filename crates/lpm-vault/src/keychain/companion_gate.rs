@@ -56,7 +56,11 @@ pub(super) fn authorize(
     vault_id: &str,
     operation: Operation,
 ) -> Result<ProjectGate, String> {
-    crate::companion::authorize(&mut KeychainCompanion(storage), vault_id, operation)
+    crate::companion::authorize(
+        &mut KeychainCompanion(&mut super::ListedStorage::new(storage)),
+        vault_id,
+        operation,
+    )
 }
 
 /// The values item's bytes and the personal overrides record, read in one
@@ -68,17 +72,40 @@ pub(super) struct RunRead {
     pub(super) overrides_record: Option<Vec<u8>>,
 }
 
+/// The values item's bytes with the approval they claim, read in one call.
+/// Approval attributes that contradict each other damage the project's
+/// access, which refuses every read.
+fn read_values(
+    storage: &mut impl ProjectStorage,
+    vault_id: &str,
+) -> Result<Option<(Vec<u8>, ClaimedAccess)>, String> {
+    match storage.read_with_access(vault_id)? {
+        Some((_, ClaimedAccess::Contradictory)) => Err(damaged(Damage::Access(
+            "the values' approval attributes contradict each other".to_owned(),
+        ))),
+        read => Ok(read),
+    }
+}
+
+/// The values item's payload for a read that excludes personal overrides.
+pub(super) fn read_values_excluding_overrides(
+    storage: &mut impl ProjectStorage,
+    vault_id: &str,
+) -> Result<Option<String>, String> {
+    authorize(storage, vault_id, Operation::ReadExcludingOverrides)?;
+    read_values(storage, vault_id)?
+        .map(|(bytes, _)| {
+            String::from_utf8(bytes).map_err(|_| "vault keychain data is not UTF-8".to_owned())
+        })
+        .transpose()
+}
+
 pub(super) fn read_for_run(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
 ) -> Result<RunRead, String> {
     let gate = authorize(storage, vault_id, Operation::ReadApplyingOverrides)?;
-    let (values, values_access) = match storage.read_with_access(vault_id)? {
-        Some((_, ClaimedAccess::Contradictory)) => {
-            return Err(damaged(Damage::Access(
-                "the values' approval attributes contradict each other".to_owned(),
-            )));
-        }
+    let (values, values_access) = match read_values(storage, vault_id)? {
         Some((bytes, access)) => (Some(bytes), Some(access)),
         None => (None, None),
     };

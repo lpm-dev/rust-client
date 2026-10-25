@@ -771,3 +771,77 @@ fn committed_recovery_reads_a_staged_marker_no_more_than_a_staged_record() {
         "each stage is read for its bytes, then to confirm it's gone"
     );
 }
+
+#[test]
+fn a_transaction_writes_no_more_than_its_payload_limit() {
+    let mut storage = storage_with_values();
+    let marker = marker(
+        r#""future":{"version":1,"ifUnsupported":"ignore","kinds":["future-log"],"state":"active"}"#,
+        "active",
+    );
+    let mut mutations = vec![ProjectStorageMutation::write(
+        marker_account(VAULT),
+        marker.into_bytes(),
+    )];
+    mutations.extend((0..11).map(|part| {
+        ProjectStorageMutation::write(
+            record_account("future-log", VAULT, Some(part)),
+            vec![b'x'; 100 * 1024],
+        )
+    }));
+
+    let error = apply_project_transaction(&mut storage, mutations)
+        .expect_err("1,126,400 bytes is too many");
+
+    assert!(error.contains("too many bytes"), "{error}");
+    assert!(!storage.values.contains_key(&marker_account(VAULT)));
+    assert!(!storage.values.contains_key(TRANSACTION_MARKER_ACCOUNT));
+}
+
+#[test]
+fn every_read_refuses_values_whose_approval_contradicts_itself() {
+    let mut storage = storage_with_values();
+    storage
+        .claims
+        .insert(VAULT.to_owned(), ClaimedAccess::Contradictory);
+
+    for error in [
+        companion_gate::read_values_excluding_overrides(&mut storage, VAULT)
+            .map(|_| ())
+            .expect_err("an Exclude read"),
+        run_read(&mut storage)
+            .map(|_| ())
+            .expect_err("an Apply read"),
+    ] {
+        assert!(error.contains("CLI approval is damaged"), "{error}");
+    }
+}
+
+#[test]
+fn deleting_a_project_lists_the_service_once_however_many_transactions_it_takes() {
+    let mut storage = storage_with_values();
+    storage.values.insert(
+        marker_account(VAULT),
+        marker(
+            r#""future":{"version":1,"ifUnsupported":"ignore","kinds":["future-log"],"state":"active"}"#,
+            "active",
+        ),
+    );
+    for part in 0..80 {
+        storage.values.insert(
+            record_account("future-log", VAULT, Some(part)),
+            vec![part as u8; 64],
+        );
+    }
+    storage.listings = 0;
+
+    delete_vault_with_storage(&mut storage, VAULT).expect("delete the project");
+
+    assert!(
+        !storage
+            .values
+            .keys()
+            .any(|account| crate::companion::account::is_in_companion_namespace(account))
+    );
+    assert_eq!(storage.listings, 1);
+}

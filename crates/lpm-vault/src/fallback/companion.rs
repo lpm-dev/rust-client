@@ -943,11 +943,7 @@ pub(crate) fn delete_project_unlocked(
         values.push(ValuesFile::Legacy);
     }
     let inventory = companion.inventory_of(vault_id)?;
-    let found = match &gate {
-        ProjectGate::Plain => FoundMarker::Absent,
-        ProjectGate::Damaged(_) => FoundMarker::Invalid,
-        ProjectGate::Marked(marker) => FoundMarker::Valid(marker),
-    };
+    let found = FoundMarker::of(&gate);
     let plan =
         crate::companion::lifecycle::plan_deletion(vault_id, found, inventory, values.len())?;
     let mut transactions = plan.transactions.into_iter();

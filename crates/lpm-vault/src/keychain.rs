@@ -289,6 +289,112 @@ trait ProjectStorage {
     }
 }
 
+/// A project storage that lists the service once and keeps that listing
+/// current through the writes and deletions it makes, for the several
+/// transactions of one lifecycle operation inside one lock.
+struct ListedStorage<'storage, S: ProjectStorage> {
+    storage: &'storage mut S,
+    names: Option<HashSet<String>>,
+}
+
+impl<'storage, S: ProjectStorage> ListedStorage<'storage, S> {
+    fn new(storage: &'storage mut S) -> Self {
+        Self {
+            storage,
+            names: None,
+        }
+    }
+
+    fn wrote(&mut self, account: &str) {
+        if let Some(names) = self.names.as_mut() {
+            names.insert(account.to_owned());
+        }
+    }
+}
+
+impl<S: ProjectStorage> ProjectStorage for ListedStorage<'_, S> {
+    fn read(&mut self, account: &str) -> Result<Option<Vec<u8>>, String> {
+        self.storage.read(account)
+    }
+
+    fn write(&mut self, account: &str, value: &[u8]) -> Result<(), String> {
+        let written = self.storage.write(account, value);
+        self.wrote(account);
+        written
+    }
+
+    fn delete(&mut self, account: &str) -> Result<bool, String> {
+        let deleted = self.storage.delete(account);
+        if deleted.is_ok()
+            && let Some(names) = self.names.as_mut()
+        {
+            names.remove(account);
+        }
+        deleted
+    }
+
+    fn account_names(&mut self) -> Result<Vec<String>, String> {
+        let names = match &mut self.names {
+            Some(names) => names,
+            None => self
+                .names
+                .insert(self.storage.account_names()?.into_iter().collect()),
+        };
+        Ok(names.iter().cloned().collect())
+    }
+
+    fn read_with_access(
+        &mut self,
+        account: &str,
+    ) -> Result<Option<(Vec<u8>, ClaimedAccess)>, String> {
+        self.storage.read_with_access(account)
+    }
+
+    fn claimed_access(&mut self, account: &str) -> Result<Option<ClaimedAccess>, String> {
+        self.storage.claimed_access(account)
+    }
+
+    fn probe(&mut self, account: &str, open_accounts: &[&str]) -> ProbeOutcome {
+        self.storage.probe(account, open_accounts)
+    }
+
+    fn require_approval(&mut self, account: &str, open_accounts: &[&str]) -> Result<(), String> {
+        self.storage.require_approval(account, open_accounts)
+    }
+
+    fn write_verified(&mut self, account: &str, value: &[u8]) -> Result<(), String> {
+        let written = self.storage.write_verified(account, value);
+        self.wrote(account);
+        written
+    }
+
+    fn write_verified_with_access_from(
+        &mut self,
+        account: &str,
+        value: &[u8],
+        source: &str,
+    ) -> Result<(), String> {
+        let written = self
+            .storage
+            .write_verified_with_access_from(account, value, source);
+        self.wrote(account);
+        written
+    }
+
+    fn write_verified_with_access(
+        &mut self,
+        account: &str,
+        value: &[u8],
+        access: CliAccess,
+    ) -> Result<(), String> {
+        let written = self
+            .storage
+            .write_verified_with_access(account, value, access);
+        self.wrote(account);
+        written
+    }
+}
+
 fn read_text(storage: &mut impl ProjectStorage, account: &str) -> Result<Option<String>, String> {
     storage
         .read(account)?
@@ -392,6 +498,15 @@ fn apply_project_transaction_after_recovery(
     }
     if mutations.len() > MAX_TRANSACTION_OPERATIONS {
         return Err("vault transaction contains too many operations".to_owned());
+    }
+    if mutations
+        .iter()
+        .filter_map(ProjectStorageMutation::value)
+        .map(<[u8]>::len)
+        .sum::<usize>()
+        > crate::companion::lifecycle::MAX_TRANSACTION_PAYLOAD_BYTES
+    {
+        return Err("vault transaction writes too many bytes".to_owned());
     }
     let transaction_id = generate_project_storage_id();
     let mut targets = HashSet::with_capacity(mutations.len());
@@ -1272,12 +1387,9 @@ fn try_read_vault_env_unlocked_with_fallback(
     env: &str,
     default_fallback: bool,
 ) -> Result<Option<SecretMap>, String> {
-    companion_gate::authorize(
-        &mut KeychainProjectStorage,
-        vault_id,
-        Operation::ReadExcludingOverrides,
-    )?;
-    let Some(json) = try_read_keychain_password(&service(), vault_id)? else {
+    let Some(json) =
+        companion_gate::read_values_excluding_overrides(&mut KeychainProjectStorage, vault_id)?
+    else {
         return Ok(None);
     };
 
@@ -1311,12 +1423,9 @@ pub(crate) fn try_read_all_environments_with_digest_unlocked(
 ) -> Result<(Option<EnvironmentMap>, Option<[u8; 32]>), String> {
     use sha2::Digest as _;
 
-    companion_gate::authorize(
-        &mut KeychainProjectStorage,
-        vault_id,
-        Operation::ReadExcludingOverrides,
-    )?;
-    let Some(json) = try_read_keychain_password(&service(), vault_id)? else {
+    let Some(json) =
+        companion_gate::read_values_excluding_overrides(&mut KeychainProjectStorage, vault_id)?
+    else {
         return Ok((None, None));
     };
     let digest = sha2::Sha256::digest(json.as_bytes()).into();
@@ -1329,12 +1438,7 @@ pub(crate) fn try_read_all_environments_with_digest_unlocked(
 pub(crate) fn vault_payload_digest_unlocked(vault_id: &str) -> Result<Option<[u8; 32]>, String> {
     use sha2::Digest as _;
 
-    companion_gate::authorize(
-        &mut KeychainProjectStorage,
-        vault_id,
-        Operation::ReadExcludingOverrides,
-    )?;
-    try_read_keychain_password(&service(), vault_id)
+    companion_gate::read_values_excluding_overrides(&mut KeychainProjectStorage, vault_id)
         .map(|json| json.map(|json| sha2::Sha256::digest(json.as_bytes()).into()))
 }
 
@@ -1952,17 +2056,21 @@ fn delete_vault_with_storage_after_recovery(
     vault_id: &str,
 ) -> Result<(), String> {
     validate_vault_id(vault_id)?;
-    companion_gate::authorize(storage, vault_id, Operation::Maintenance)?;
+    let storage = &mut ListedStorage::new(storage);
+    let gate = crate::companion::authorize(
+        &mut companion_gate::KeychainCompanion(&mut *storage),
+        vault_id,
+        Operation::Maintenance,
+    )?;
     let inventory = companion_gate::KeychainCompanion(&mut *storage).inventory(vault_id)?;
-    let marker_bytes = storage.read(&crate::companion::account::marker_account(vault_id))?;
     let mutations = project_deletion_mutations(storage, vault_id)?;
-    if inventory.is_empty() && marker_bytes.is_none() {
+    if inventory.is_empty() && gate == ProjectGate::Plain {
         return match mutations {
             Some(mutations) => apply_project_transaction_after_recovery(storage, mutations),
             None => storage.delete(vault_id).map(|_| ()),
         };
     }
-    delete_project_with_companion_records(storage, vault_id, mutations, marker_bytes, inventory)
+    delete_project_with_companion_records(storage, vault_id, mutations, &gate, inventory)
 }
 
 /// Delete a project with companion records: the first transaction
@@ -1973,19 +2081,12 @@ fn delete_project_with_companion_records(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
     project_mutations: Option<Vec<ProjectStorageMutation>>,
-    marker_bytes: Option<Vec<u8>>,
+    gate: &ProjectGate,
     inventory: Vec<CompanionAccount>,
 ) -> Result<(), String> {
     use crate::companion::lifecycle::{FoundMarker, Plan};
 
-    let current = marker_bytes
-        .as_deref()
-        .map(|bytes| Marker::parse(vault_id, bytes).ok());
-    let found = match &current {
-        None => FoundMarker::Absent,
-        Some(None) => FoundMarker::Invalid,
-        Some(Some(marker)) => FoundMarker::Valid(marker),
-    };
+    let found = FoundMarker::of(gate);
     let mut mutations =
         project_mutations.unwrap_or_else(|| vec![ProjectStorageMutation::delete(vault_id)]);
     let plan =

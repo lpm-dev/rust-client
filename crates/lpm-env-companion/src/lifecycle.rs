@@ -352,6 +352,17 @@ pub enum FoundMarker<'marker> {
     Valid(&'marker Marker),
 }
 
+impl<'marker> FoundMarker<'marker> {
+    /// What `gate` found at the marker account.
+    pub fn of(gate: &'marker crate::gate::ProjectGate) -> Self {
+        match gate {
+            crate::gate::ProjectGate::Plain => Self::Absent,
+            crate::gate::ProjectGate::Damaged(_) => Self::Invalid,
+            crate::gate::ProjectGate::Marked(marker) => Self::Valid(marker),
+        }
+    }
+}
+
 /// Plan deleting `vault_id`'s companion records with its project, given a
 /// names-only inventory taken after any resume. The first transaction
 /// leaves room for `own_operations` of the client's own, which it commits
