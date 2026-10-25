@@ -22,9 +22,19 @@ pub(crate) enum Operation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Damage {
     InvalidMarker(String),
-    MissingRecord { kind: String },
-    InvalidRecord { kind: String, reason: String },
-    UnlistedRecord { kind: String },
+    MissingRecord {
+        kind: String,
+    },
+    InvalidRecord {
+        kind: String,
+        reason: String,
+    },
+    UnlistedRecord {
+        kind: String,
+    },
+    /// Approval attributes that contradict each other, which only the macOS
+    /// Keychain has.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Access(String),
 }
 

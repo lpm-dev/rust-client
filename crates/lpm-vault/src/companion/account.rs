@@ -140,6 +140,7 @@ impl CompanionAccount {
 }
 
 /// Whether `account` is in the companion namespace, valid or not.
+#[cfg(target_os = "macos")]
 pub(crate) fn is_in_companion_namespace(account: &str) -> bool {
     account.starts_with(MARKER_PREFIX)
         || account.starts_with(RECORD_PREFIX)

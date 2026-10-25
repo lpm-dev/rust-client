@@ -68,6 +68,7 @@ pub(crate) fn reserved_owner(kind: &str) -> Option<&'static str> {
         .map(|feature| feature.name)
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AccessClass {
     /// Readable without CLI approval: the marker and ciphertext parts.
@@ -79,6 +80,7 @@ pub(crate) enum AccessClass {
 /// A record's access class. Every kind follows values, unknown kinds
 /// included, except the parts of `history` and `releases`, which are
 /// ciphertext under `key`.
+#[cfg(target_os = "macos")]
 pub(crate) fn record_access_class(kind: &str, part: Option<u16>) -> AccessClass {
     if part.is_some() && matches!(kind, "history" | "releases") {
         AccessClass::Open
@@ -102,6 +104,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn only_history_and_release_parts_are_open() {
         assert_eq!(record_access_class("history", Some(0)), AccessClass::Open);
         assert_eq!(record_access_class("releases", Some(7)), AccessClass::Open);

@@ -3,6 +3,7 @@
 use serde::Deserialize;
 
 use super::account::CompanionAccount;
+#[cfg(target_os = "macos")]
 use super::graph::{AccessClass, record_access_class};
 use super::lifecycle::needs_resume;
 use super::marker::{Level, Marker};
@@ -63,6 +64,7 @@ struct AccountCase {
     vault_id: Option<String>,
     kind: Option<String>,
     part: Option<u16>,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     access_class: Option<String>,
 }
 
@@ -96,6 +98,7 @@ fn every_account_fixture_parses_as_recorded() {
         );
         assert_eq!(case.kind.as_deref(), parsed.kind(), "{}", case.account);
         assert_eq!(case.part, parsed.part(), "{}", case.account);
+        #[cfg(target_os = "macos")]
         if let Some(kind) = parsed.kind() {
             let class = match record_access_class(kind, parsed.part()) {
                 AccessClass::Open => "open",
