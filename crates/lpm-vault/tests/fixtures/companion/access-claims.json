@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "name": "Rust automatic: no access control, no marker",
+      "marker": null,
+      "accessControl": false,
+      "claim": "automatic"
+    },
+    {
+      "name": "Swift approval off: empty-flags access control and an empty marker",
+      "marker": "",
+      "accessControl": true,
+      "claim": "automatic"
+    },
+    {
+      "name": "protected: the approval marker and an access control",
+      "marker": "lpm-cli-access:require-approval:v1",
+      "accessControl": true,
+      "claim": "requireApproval"
+    },
+    {
+      "name": "approval marker without an access control",
+      "marker": "lpm-cli-access:require-approval:v1",
+      "accessControl": false,
+      "claim": "contradictory"
+    },
+    {
+      "name": "an unknown marker",
+      "marker": "lpm-cli-access:require-approval:v2",
+      "accessControl": true,
+      "claim": "contradictory"
+    }
+  ]
+}

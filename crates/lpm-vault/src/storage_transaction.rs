@@ -17,6 +17,19 @@ thread_local! {
 }
 
 #[cfg(test)]
+thread_local! {
+    /// Every directory this thread synced, in order.
+    pub(crate) static DIRECTORY_SYNCS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// How many files this thread synced through the unsynced-directory writer.
+    pub(crate) static FILE_SYNCS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_file_sync() {
+    FILE_SYNCS.with(|syncs| syncs.set(syncs.get() + 1));
+}
+
+#[cfg(test)]
 static FORCE_DIRECTORY_SYNC_FAILURE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -407,6 +420,131 @@ impl VaultStorageDirectory {
         self.write_owner_only_file(name, contents, label)
     }
 
+    /// [`Self::write_owner_only_file`] without syncing the directory, for a
+    /// caller that syncs it once after several changes.
+    pub(crate) fn write_owner_only_file_unsynced(
+        &self,
+        name: &str,
+        contents: &[u8],
+        label: &str,
+    ) -> Result<(), String> {
+        self.refuse_if_exposed()?;
+        validate_name(OsStr::new(name))?;
+        validate_contents_size(contents, label)?;
+        #[cfg(test)]
+        record_file_sync();
+        lpm_common::write_file_atomic_in_dir_with(
+            &self.directory,
+            OsStr::new(name),
+            |file| -> std::io::Result<()> {
+                #[cfg(unix)]
+                {
+                    use cap_std::fs::{Permissions, PermissionsExt as _};
+                    #[cfg(target_os = "macos")]
+                    macos_acl::clear_extended_acl(&*file)?;
+                    file.set_permissions(Permissions::from_mode(0o600))?;
+                }
+                file.write_all(contents)?;
+                file.sync_all()
+            },
+        )
+        .map_err(|error| format!("failed to write {label}: {error}"))
+    }
+
+    /// Persist the directory's entries, after changes that didn't.
+    pub(crate) fn sync(&self, label: &str) -> Result<(), String> {
+        self.sync_directory(label)
+    }
+
+    /// Rename `from` here over `to` in `destination`, without syncing either
+    /// directory.
+    pub(crate) fn rename_to(
+        &self,
+        from: &str,
+        destination: &Self,
+        to: &str,
+        label: &str,
+    ) -> Result<(), String> {
+        destination.refuse_if_exposed()?;
+        validate_name(OsStr::new(from))?;
+        validate_name(OsStr::new(to))?;
+        self.directory
+            .rename(from, &destination.directory, to)
+            .map_err(|error| format!("failed to move {label} into place: {error}"))
+    }
+
+    /// Remove `name` without syncing the directory. Returns whether it existed.
+    pub(crate) fn remove_file_unsynced(&self, name: &str, label: &str) -> Result<bool, String> {
+        validate_name(OsStr::new(name))?;
+        match self.directory.remove_file(name) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!("failed to remove {label}: {error}")),
+        }
+    }
+
+    /// The child directory `name`, when one exists; never creates it.
+    pub(crate) fn open_existing_directory(&self, name: &str) -> Result<Option<Self>, String> {
+        validate_name(OsStr::new(name))?;
+        match self.directory.symlink_metadata(name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(_) | Err(_) => {}
+        }
+        self.open_or_create_directory(name).map(Some)
+    }
+
+    /// Whether an entry named `name` exists, without listing the directory.
+    pub(crate) fn entry_exists(&self, name: &str) -> Result<bool, String> {
+        validate_name(OsStr::new(name))?;
+        match self.directory.symlink_metadata(name) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!(
+                "failed to inspect {}: {error}",
+                self.display.join(name).display()
+            )),
+        }
+    }
+
+    /// Every entry's name, which must be UTF-8.
+    pub(crate) fn entry_names(&self) -> Result<Vec<String>, String> {
+        #[cfg(test)]
+        ENTRY_LISTINGS.with(|listings| listings.set(listings.get() + 1));
+        let entries = self.directory.entries().map_err(|error| {
+            format!(
+                "failed to inspect protected directory {}: {error}",
+                self.display.display()
+            )
+        })?;
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "failed to inspect an entry in {}: {error}",
+                    self.display.display()
+                )
+            })?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                format!(
+                    "protected directory {} has an entry whose name isn't UTF-8",
+                    self.display.display()
+                )
+            })?;
+            names.push(name);
+        }
+        Ok(names)
+    }
+
+    /// Remove the empty child directory `name`, without syncing this one.
+    pub(crate) fn remove_empty_directory(&self, name: &str, label: &str) -> Result<bool, String> {
+        validate_name(OsStr::new(name))?;
+        match self.directory.remove_dir(name) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!("failed to remove {label}: {error}")),
+        }
+    }
+
     fn sync_after_mutation(&self, label: &str, operation: &str) -> Result<(), String> {
         self.sync_directory(label).map_err(|error| {
             format!(
@@ -416,6 +554,8 @@ impl VaultStorageDirectory {
     }
 
     fn sync_directory(&self, label: &str) -> Result<(), String> {
+        #[cfg(test)]
+        DIRECTORY_SYNCS.with(|syncs| syncs.borrow_mut().push(self.display.clone()));
         #[cfg(test)]
         if FORCE_DIRECTORY_SYNC_FAILURE.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(format!(
@@ -652,7 +792,31 @@ fn with_vault_transaction_before_lock<T>(
         OsStr::new(TRANSACTION_LOCK_NAME),
         "vault transaction lock",
     )?;
+    let _scope = LockScope::enter();
     operation(&directory)
+}
+
+/// What one held vault lock remembers, forgotten when it's released: each
+/// project's feature marker state, and the file store's data key, so an
+/// operation loads that key once.
+struct LockScope {
+    companion: crate::companion::LockScope,
+}
+
+impl LockScope {
+    fn enter() -> Self {
+        Self {
+            companion: crate::companion::LockScope::enter(),
+        }
+    }
+}
+
+impl Drop for LockScope {
+    fn drop(&mut self) {
+        if self.companion.is_outermost() {
+            crate::fallback::forget_scoped_data_key();
+        }
+    }
 }
 
 pub(crate) fn try_acquire_named_lock(

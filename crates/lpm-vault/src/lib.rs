@@ -24,6 +24,7 @@
 //! let secrets = lpm_vault::try_get_all(&project_dir)?;
 //! ```
 
+mod companion;
 pub mod crypto;
 mod fallback;
 mod selected_environment;
@@ -47,6 +48,39 @@ use std::path::{Path, PathBuf};
 
 pub type SecretMap = HashMap<String, String>;
 pub type EnvironmentMap = HashMap<String, SecretMap>;
+
+pub use companion::overrides::PersonalOverrides;
+
+/// What running a project reads: the selected environment's values and its
+/// personal overrides on this machine.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunEnvironment {
+    pub values: HashMap<String, String>,
+    pub overrides: PersonalOverrides,
+}
+
+/// Authorize `operation` on `vault_id` against the feature marker of the
+/// store that holds its companion records, finishing any interrupted
+/// lifecycle step first. On macOS that's the Keychain, even when the values
+/// themselves come from a file left by an earlier version.
+pub(crate) fn authorize_companion(
+    directory: &storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+    operation: companion::gate::Operation,
+) -> Result<(), String> {
+    if force_file_vault_backend() {
+        return fallback::companion::authorize_unlocked(directory, vault_id, operation).map(|_| ());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = directory;
+        keychain::authorize_unlocked(vault_id, operation)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        fallback::companion::authorize_unlocked(directory, vault_id, operation).map(|_| ())
+    }
+}
 
 fn with_project_vault_transaction<T>(
     operation: impl FnOnce(&storage_transaction::VaultStorageDirectory) -> Result<T, String>,
@@ -176,6 +210,75 @@ pub fn try_get_all_environments_for_vault_id(
     with_project_vault_transaction(|directory| {
         Ok(read_all_environments_unlocked(directory, vault_id)?.unwrap_or_default())
     })
+}
+
+/// The values and personal overrides to run a project with, read together
+/// in one lock, so a single approval covers both. `env` names the selected
+/// environment; without one, `default` is read. An environment without values
+/// of its own reads `default`'s values, but only its own overrides.
+pub fn try_get_run_environment(
+    project_dir: &Path,
+    env: Option<&str>,
+) -> Result<RunEnvironment, String> {
+    let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
+        return Ok(RunEnvironment::default());
+    };
+    try_get_run_environment_for_vault_id(&vault_id, env)
+}
+
+/// [`try_get_run_environment`] for an explicit vault ID.
+pub fn try_get_run_environment_for_vault_id(
+    vault_id: &str,
+    env: Option<&str>,
+) -> Result<RunEnvironment, String> {
+    validate_explicit_vault_id(vault_id)?;
+    let (environment, default_fallback) = match env {
+        Some(env) => (env, true),
+        None => (lpm_env::DEFAULT_ENVIRONMENT, false),
+    };
+    with_project_vault_transaction(|directory| {
+        let (values, overrides) =
+            read_run_environment_unlocked(directory, vault_id, environment, default_fallback)?;
+        Ok(RunEnvironment {
+            values: values.unwrap_or_default(),
+            overrides,
+        })
+    })
+}
+
+fn read_run_environment_unlocked(
+    directory: &storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+    environment: &str,
+    default_fallback: bool,
+) -> Result<(Option<SecretMap>, PersonalOverrides), String> {
+    if force_file_vault_backend() {
+        return fallback::read_run_environment_unlocked(
+            directory,
+            vault_id,
+            environment,
+            default_fallback,
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let (values, overrides) =
+            keychain::read_for_run_unlocked(vault_id, environment, default_fallback)?;
+        let values = match values {
+            Some(values) => Some(values),
+            None => fallback::read_vault_file_env_unlocked(
+                directory,
+                vault_id,
+                environment,
+                default_fallback,
+            )?,
+        };
+        Ok((values, overrides))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        fallback::read_run_environment_unlocked(directory, vault_id, environment, default_fallback)
+    }
 }
 
 /// Get all vault secrets for a specific environment.

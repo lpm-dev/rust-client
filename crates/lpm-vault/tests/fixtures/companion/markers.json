@@ -1,0 +1,241 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "name": "no features",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{}}",
+      "valid": true,
+      "level": "ignore",
+      "needsResume": false
+    },
+    {
+      "name": "supported overrides",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "valid": true,
+      "level": "ignore",
+      "needsResume": false
+    },
+    {
+      "name": "unsupported overrides refuse whatever the marker says",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"ignore\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "valid": true,
+      "level": "refuse",
+      "needsResume": false
+    },
+    {
+      "name": "unsupported overrides version may add a kind",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":2,\"ifUnsupported\":\"ignore\",\"kinds\":[\"overrides\",\"overrides-index\"],\"state\":\"active\"}}}",
+      "valid": true,
+      "level": "refuse",
+      "needsResume": false
+    },
+    {
+      "name": "history ignored by this client",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"history\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-head\",\"history\",\"key\"],\"state\":\"active\"}}}",
+      "valid": true,
+      "level": "ignore",
+      "needsResume": false
+    },
+    {
+      "name": "history and releases share key; strictest level wins",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"history\":{\"version\":1,\"ifUnsupported\":\"readOnly\",\"kinds\":[\"history-head\",\"history\",\"key\"],\"state\":\"active\"},\"releases\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"releases-head\",\"releases\",\"key\"],\"state\":\"active\"}}}",
+      "valid": true,
+      "level": "readOnly",
+      "needsResume": false
+    },
+    {
+      "name": "unknown feature declares its level",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"future\":{\"version\":3,\"ifUnsupported\":\"refuse\",\"kinds\":[\"future-log\"],\"state\":\"active\"}}}",
+      "valid": true,
+      "level": "refuse",
+      "needsResume": false
+    },
+    {
+      "name": "unknown feature may share key",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"future\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"future-log\",\"key\"],\"state\":\"active\"},\"history\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-head\",\"history\",\"key\"],\"state\":\"active\"}}}",
+      "valid": true,
+      "level": "ignore",
+      "needsResume": false
+    },
+    {
+      "name": "a removing feature needs resume",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"removing\"}}}",
+      "valid": true,
+      "level": "ignore",
+      "needsResume": true
+    },
+    {
+      "name": "deleting",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"deleting\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "valid": true,
+      "level": "ignore",
+      "needsResume": true
+    },
+    {
+      "name": "discarding",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"discarding\",\"features\":{\"future\":{\"version\":65535,\"ifUnsupported\":\"refuse\",\"kinds\":[\"future-log\"],\"state\":\"active\"}}}",
+      "valid": true,
+      "level": "refuse",
+      "needsResume": true
+    },
+    {
+      "name": "restoring while staging",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"restoring\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}},\"restore\":{\"phase\":\"staging\",\"replaces\":[\"overrides\"],\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}}",
+      "valid": true,
+      "level": "ignore",
+      "needsResume": true
+    },
+    {
+      "name": "restoring after replaced records are gone",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"restoring\",\"features\":{},\"restore\":{\"phase\":\"activating\",\"replaces\":[],\"features\":{\"history\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-head\",\"history\",\"key\"],\"state\":\"active\"}}}}",
+      "valid": true,
+      "level": "ignore",
+      "needsResume": true
+    },
+    {
+      "name": "unknown top-level field",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{},\"extra\":1}",
+      "valid": false
+    },
+    {
+      "name": "repeated top-level key",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{}}",
+      "valid": false
+    },
+    {
+      "name": "repeated feature",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"},\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "valid": false
+    },
+    {
+      "name": "another project's marker",
+      "vaultId": "other",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{}}",
+      "valid": false
+    },
+    {
+      "name": "unknown schema version",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{}}",
+      "valid": false
+    },
+    {
+      "name": "unknown project state",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"paused\",\"features\":{}}",
+      "valid": false
+    },
+    {
+      "name": "feature name outside the grammar",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"Over\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"thing\"],\"state\":\"active\"}}}",
+      "valid": false
+    },
+    {
+      "name": "feature name with a terminal escape",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"a\\u001b[31m\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"thing\"],\"state\":\"active\"}}}",
+      "valid": false
+    },
+    {
+      "name": "kind named features",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"future\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"features\"],\"state\":\"active\"}}}",
+      "valid": false
+    },
+    {
+      "name": "unknown feature claims a reserved kind",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"future\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "valid": false
+    },
+    {
+      "name": "two features list one kind",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"alpha\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"shared\"],\"state\":\"active\"},\"beta\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"shared\"],\"state\":\"active\"}}}",
+      "valid": false
+    },
+    {
+      "name": "supported version with an extra kind",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\",\"extra\"],\"state\":\"active\"}}}",
+      "valid": false
+    },
+    {
+      "name": "version zero",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"overrides\":{\"version\":0,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}",
+      "valid": false
+    },
+    {
+      "name": "no kinds",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"future\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[],\"state\":\"active\"}}}",
+      "valid": false
+    },
+    {
+      "name": "a kind listed twice",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"future\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"a\",\"a\"],\"state\":\"active\"}}}",
+      "valid": false
+    },
+    {
+      "name": "restore outside the restoring state",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{},\"restore\":{\"phase\":\"staging\",\"replaces\":[],\"features\":{\"history\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-head\",\"history\",\"key\"],\"state\":\"active\"}}}}",
+      "valid": false
+    },
+    {
+      "name": "restoring without a restore",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"restoring\",\"features\":{}}",
+      "valid": false
+    },
+    {
+      "name": "restore of an existing feature without replacing it",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"restoring\",\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}},\"restore\":{\"phase\":\"staging\",\"replaces\":[],\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}}",
+      "valid": false
+    },
+    {
+      "name": "restore replaces a feature the project lacks",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"restoring\",\"features\":{},\"restore\":{\"phase\":\"staging\",\"replaces\":[\"overrides\"],\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"active\"}}}}",
+      "valid": false
+    },
+    {
+      "name": "restored feature not active",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"restoring\",\"features\":{},\"restore\":{\"phase\":\"staging\",\"replaces\":[],\"features\":{\"overrides\":{\"version\":1,\"ifUnsupported\":\"refuse\",\"kinds\":[\"overrides\"],\"state\":\"removing\"}}}}",
+      "valid": false
+    },
+    {
+      "name": "restoring key without replacing every key-dependent feature",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"restoring\",\"features\":{\"releases\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"releases-head\",\"releases\",\"key\"],\"state\":\"active\"}},\"restore\":{\"phase\":\"staging\",\"replaces\":[],\"features\":{\"history\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-head\",\"history\",\"key\"],\"state\":\"active\"}}}}",
+      "valid": false
+    },
+    {
+      "name": "restore with an unknown phase",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"restoring\",\"features\":{},\"restore\":{\"phase\":\"done\",\"replaces\":[],\"features\":{\"history\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-head\",\"history\",\"key\"],\"state\":\"active\"}}}}",
+      "valid": false
+    }
+  ]
+}
