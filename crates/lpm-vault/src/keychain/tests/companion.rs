@@ -845,3 +845,77 @@ fn deleting_a_project_lists_the_service_once_however_many_transactions_it_takes(
     );
     assert_eq!(storage.listings, 1);
 }
+
+#[test]
+fn a_missing_record_is_reviewed_and_repaired_by_removing_its_feature() {
+    use crate::companion::repair::CompanionRepair;
+    let mut storage = storage_with_values();
+    storage
+        .values
+        .insert(marker_account(VAULT), marker(OVERRIDES_FEATURE, "active"));
+
+    let review = review_companion_data_with_storage(&mut storage, VAULT).expect("a review");
+    assert_eq!(review.problems.len(), 1);
+    assert_eq!(
+        review.problems[0].description,
+        "missing record \"overrides\""
+    );
+    assert_eq!(
+        review.problems[0].repair,
+        Some(CompanionRepair::RemoveFeature("overrides".to_owned()))
+    );
+
+    let repaired =
+        repair_companion_data_with_storage(&mut storage, VAULT, &review).expect("the repair");
+
+    assert_eq!(
+        repaired,
+        [CompanionRepair::RemoveFeature("overrides".to_owned())]
+    );
+    assert!(!storage.values.contains_key(&marker_account(VAULT)));
+    assert!(
+        review_companion_data_with_storage(&mut storage, VAULT)
+            .expect("a review")
+            .problems
+            .is_empty()
+    );
+    run_overrides(&mut storage).expect("overrides apply again");
+}
+
+#[test]
+fn a_repair_refuses_a_project_that_changed_since_its_review() {
+    let mut storage = storage_with_values();
+    storage
+        .values
+        .insert(marker_account(VAULT), marker(OVERRIDES_FEATURE, "active"));
+    let review = review_companion_data_with_storage(&mut storage, VAULT).expect("a review");
+    let overrides = record_account("overrides", VAULT, None);
+    storage
+        .values
+        .insert(overrides.clone(), overrides_record(r#""A":"1""#));
+
+    let error = repair_companion_data_with_storage(&mut storage, VAULT, &review)
+        .expect_err("the reviewed damage is gone");
+
+    assert!(error.contains("changed since you reviewed it"), "{error}");
+    assert!(storage.values.contains_key(&overrides));
+    assert!(storage.values.contains_key(&marker_account(VAULT)));
+}
+
+#[test]
+fn damaged_access_is_reviewed_with_no_repair_here() {
+    let mut storage = storage_with_values();
+    storage
+        .claims
+        .insert(VAULT.to_owned(), ClaimedAccess::Contradictory);
+
+    let review = review_companion_data_with_storage(&mut storage, VAULT).expect("a review");
+
+    assert_eq!(review.problems.len(), 1);
+    assert_eq!(review.problems[0].repair, None);
+    assert!(review.repairs().is_empty());
+    assert_eq!(
+        repair_companion_data_with_storage(&mut storage, VAULT, &review).expect("nothing to run"),
+        []
+    );
+}

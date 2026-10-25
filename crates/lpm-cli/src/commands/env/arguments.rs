@@ -127,6 +127,13 @@ pub(super) enum LocalAction {
         #[arg(long)]
         force: bool,
     },
+    /// Show what's damaged in this project's newer data, such as its personal
+    /// overrides, and repair it.
+    Repair {
+        /// Repair without asking first.
+        #[arg(long)]
+        yes: bool,
+    },
     Ls,
     Log,
     Unpair,
@@ -160,6 +167,7 @@ pub(super) fn parse(args: &[&str], json_output: bool) -> Result<Option<LocalActi
                 | "schema"
                 | "generate"
                 | "init"
+                | "repair"
                 | "ls"
                 | "copy"
                 | "cp"

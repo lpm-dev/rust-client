@@ -158,7 +158,7 @@ impl Assessment {
         let marker = self.gate.marker();
         match damage {
             Damage::Access(_) => None,
-            Damage::InvalidMarker(_) => Some(Repair::DiscardProject),
+            Damage::InvalidMarker(_) | Damage::Unfinished(_) => Some(Repair::DiscardProject),
             Damage::UnlistedRecord { .. } if marker.is_none() => Some(Repair::DiscardProject),
             Damage::UnlistedRecord { .. } => Some(Repair::RemoveUnlisted),
             Damage::MissingRecord { kind } | Damage::InvalidRecord { kind, .. } => Some(

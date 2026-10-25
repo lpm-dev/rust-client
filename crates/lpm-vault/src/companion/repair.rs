@@ -1,0 +1,215 @@
+//! Reviewing and repairing a project's damaged companion data from the CLI,
+//! which is the only client on Linux, Windows and Macs without LPM Vault.
+//! The engine decides what's damaged and how each damage is repaired; a
+//! repair runs only against the state the person reviewed.
+
+use super::CompanionBackend;
+use super::account::CompanionAccount;
+use super::assessment::{Observed, Repair, assess};
+use super::lifecycle::{FoundMarker, execute, plan_discard};
+use super::marker::Marker;
+use super::overrides::OVERRIDES_KIND;
+
+/// What's damaged in a project's newer data, and how each problem is
+/// repaired, in the order the engine found them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompanionReview {
+    pub problems: Vec<CompanionProblem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompanionProblem {
+    /// What's damaged, without any record's contents.
+    pub description: String,
+    /// The repair, or `None` when only switching the project's CLI approval
+    /// in LPM Vault sets it right.
+    pub repair: Option<CompanionRepair>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CompanionRepair {
+    /// Delete every companion record of the project. Its values stay.
+    DiscardProject,
+    /// Remove one feature and the records only it lists.
+    RemoveFeature(String),
+    /// Delete the records no feature lists.
+    RemoveUnlisted,
+}
+
+impl CompanionRepair {
+    /// What the repair does, as an instruction.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::DiscardProject => {
+                "discard this env project's newer data; its values stay".to_owned()
+            }
+            Self::RemoveFeature(feature) => format!(
+                "remove {} and the records only it uses",
+                super::gate::feature_description(feature)
+            ),
+            Self::RemoveUnlisted => "delete the records no feature lists".to_owned(),
+        }
+    }
+}
+
+impl From<Repair> for CompanionRepair {
+    fn from(repair: Repair) -> Self {
+        match repair {
+            Repair::DiscardProject => Self::DiscardProject,
+            Repair::RemoveFeature(feature) => Self::RemoveFeature(feature),
+            Repair::RemoveUnlisted => Self::RemoveUnlisted,
+        }
+    }
+}
+
+impl CompanionReview {
+    /// A review of one problem that only discarding the newer data repairs,
+    /// such as an interrupted change that can't be finished.
+    pub(crate) fn discard(description: String) -> Self {
+        Self {
+            problems: vec![CompanionProblem {
+                description,
+                repair: Some(CompanionRepair::DiscardProject),
+            }],
+        }
+    }
+
+    /// The distinct repairs to run, a project-wide discard alone when one
+    /// is needed, since it removes everything the others would.
+    pub fn repairs(&self) -> Vec<CompanionRepair> {
+        let mut repairs: Vec<CompanionRepair> = self
+            .problems
+            .iter()
+            .filter_map(|problem| problem.repair.clone())
+            .collect();
+        repairs.sort_unstable();
+        repairs.dedup();
+        if repairs.contains(&CompanionRepair::DiscardProject) {
+            repairs.retain(|repair| *repair == CompanionRepair::DiscardProject);
+        }
+        repairs
+    }
+}
+
+pub(crate) const CHANGED_SINCE_REVIEW: &str =
+    "this env project's newer data changed since you reviewed it; run lpm env repair again";
+
+fn marker_account(vault_id: &str) -> CompanionAccount {
+    CompanionAccount::Marker {
+        vault_id: vault_id.to_owned(),
+    }
+}
+
+/// Review `vault_id`'s companion data as the engine judges it, after its
+/// interrupted steps were finished. `access` is why the store found the
+/// project's access damaged, if it did.
+pub(crate) fn review(
+    backend: &mut impl CompanionBackend,
+    vault_id: &str,
+    access: Option<&str>,
+) -> Result<CompanionReview, String> {
+    let marker = backend.read(&marker_account(vault_id))?;
+    let inventory = backend.inventory(vault_id)?;
+    let overrides = backend.read(&CompanionAccount::Record {
+        kind: OVERRIDES_KIND.to_owned(),
+        vault_id: vault_id.to_owned(),
+        part: None,
+    })?;
+    let assessment = assess(
+        vault_id,
+        Observed {
+            marker: marker.as_deref(),
+            inventory: Some(&inventory),
+            overrides: Some(overrides.as_deref()),
+            access,
+        },
+    );
+    Ok(CompanionReview {
+        problems: assessment
+            .every_damage()
+            .map(|damage| CompanionProblem {
+                description: damage.to_string(),
+                repair: assessment.repair(damage).map(CompanionRepair::from),
+            })
+            .collect(),
+    })
+}
+
+/// Run every repair `reviewed` lists, after checking `vault_id` still shows
+/// exactly that damage. Returns the repairs it ran.
+pub(crate) fn repair(
+    backend: &mut impl CompanionBackend,
+    vault_id: &str,
+    access: Option<&str>,
+    reviewed: &CompanionReview,
+) -> Result<Vec<CompanionRepair>, String> {
+    if review(backend, vault_id, access)? != *reviewed {
+        return Err(CHANGED_SINCE_REVIEW.to_owned());
+    }
+    let repairs = reviewed.repairs();
+    for repair in &repairs {
+        let marker = backend
+            .read(&marker_account(vault_id))?
+            .map(|bytes| Marker::parse(vault_id, &bytes));
+        let inventory = backend.inventory(vault_id)?;
+        let valid = || match &marker {
+            Some(Ok(marker)) => Ok(marker),
+            _ => Err(CHANGED_SINCE_REVIEW.to_owned()),
+        };
+        let plan = match repair {
+            CompanionRepair::DiscardProject => {
+                let found = match &marker {
+                    None => FoundMarker::Absent,
+                    Some(Err(_)) => FoundMarker::Invalid,
+                    Some(Ok(marker)) => FoundMarker::Valid(marker),
+                };
+                plan_discard(vault_id, found, inventory)?
+            }
+            CompanionRepair::RemoveFeature(feature) => {
+                super::lifecycle::plan_feature_removal(valid()?, feature, inventory)?
+            }
+            CompanionRepair::RemoveUnlisted => {
+                super::lifecycle::plan_unlisted_removal(valid()?, inventory)?
+            }
+        };
+        execute(backend, plan)?;
+    }
+    super::forget(vault_id);
+    Ok(repairs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn problem(repair: Option<CompanionRepair>) -> CompanionProblem {
+        CompanionProblem {
+            description: String::new(),
+            repair,
+        }
+    }
+
+    #[test]
+    fn a_discard_supersedes_every_other_repair_and_repairs_run_once() {
+        let review = CompanionReview {
+            problems: vec![
+                problem(Some(CompanionRepair::RemoveUnlisted)),
+                problem(Some(CompanionRepair::RemoveFeature("overrides".to_owned()))),
+                problem(Some(CompanionRepair::RemoveUnlisted)),
+                problem(None),
+            ],
+        };
+        assert_eq!(
+            review.repairs(),
+            [
+                CompanionRepair::RemoveFeature("overrides".to_owned()),
+                CompanionRepair::RemoveUnlisted
+            ]
+        );
+        let mut discarding = review;
+        discarding
+            .problems
+            .push(problem(Some(CompanionRepair::DiscardProject)));
+        assert_eq!(discarding.repairs(), [CompanionRepair::DiscardProject]);
+    }
+}

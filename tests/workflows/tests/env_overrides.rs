@@ -98,6 +98,42 @@ fn run_applies_a_personal_override_and_reports_only_its_count() {
 }
 
 #[test]
+fn tasks_and_parallel_runs_say_once_that_overrides_apply() {
+    let (project, vault_id) =
+        project_with_team_value(r#"{"show":"node show.cjs","again":"node show.cjs"}"#);
+    seed(
+        &project,
+        &vault_id,
+        Some(OVERRIDES_MARKER),
+        Some(&overrides_record(
+            &vault_id,
+            "default",
+            r#""API_URL":"mine""#,
+            r#""NOT_IN_THE_PROJECT""#,
+        )),
+    );
+    extend_lpm_json(
+        &project,
+        serde_json::json!({"tasks": {"show": {"cache": true, "inputs": ["show.cjs"], "outputs": []}}}),
+    );
+
+    for args in [
+        &["run", "show"][..],
+        &["run", "show", "again", "--parallel", "--no-cache"][..],
+    ] {
+        let output = lpm(&project).args(args).output().unwrap();
+        let stderr = stderr(&output);
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        assert!(stdout(&output).contains("API_URL=mine"), "{args:?}");
+        assert_eq!(
+            stderr.matches("1 personal override on").count(),
+            1,
+            "{args:?}: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn unset_removes_the_team_value_from_the_run() {
     let (project, vault_id) = project_with_team_value(r#"{"show":"node show.cjs"}"#);
     seed(
@@ -199,11 +235,72 @@ fn a_marker_listing_missing_overrides_stops_runs() {
         .unwrap();
 
     assert!(!run.status.success());
+    let message = stderr(&run);
     assert!(
-        stderr(&run).contains(r#"missing record "overrides""#),
-        "{}",
-        stderr(&run)
+        message.contains(r#"missing record "overrides""#),
+        "{message}"
     );
+    assert!(message.contains("lpm env repair"), "{message}");
+    assert!(
+        !message.contains("Environment validation failed"),
+        "{message}"
+    );
+    assert!(!message.contains("--no-env-check"), "{message}");
+}
+
+#[test]
+fn env_repair_reviews_then_repairs_a_damaged_feature() {
+    let (project, vault_id) = project_with_team_value(r#"{"show":"node show.cjs"}"#);
+    seed(&project, &vault_id, Some(OVERRIDES_MARKER), None);
+
+    let review = lpm(&project)
+        .args(["env", "repair", "--json"])
+        .output()
+        .unwrap();
+    assert!(!review.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&review.stdout).expect("JSON");
+    assert_eq!(
+        json["problems"],
+        serde_json::json!([{
+            "damage": "missing record \"overrides\"",
+            "repair": {"action": "removeFeature", "feature": "overrides"},
+        }])
+    );
+    assert_eq!(json["repaired"], serde_json::json!([]));
+
+    let unattended = lpm(&project).args(["env", "repair"]).output().unwrap();
+    assert!(!unattended.status.success());
+    assert!(
+        stderr(&unattended).contains("lpm env repair --yes"),
+        "{}",
+        stderr(&unattended)
+    );
+
+    let repair = lpm(&project)
+        .args(["env", "repair", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert!(repair.status.success(), "{}", stderr(&repair));
+    let json: serde_json::Value = serde_json::from_slice(&repair.stdout).expect("JSON");
+    assert_eq!(
+        json["repaired"],
+        serde_json::json!([{"action": "removeFeature", "feature": "overrides"}])
+    );
+
+    let run = lpm(&project)
+        .args(["run", "show", "--no-cache"])
+        .output()
+        .unwrap();
+    assert!(run.status.success(), "{}", stderr(&run));
+    assert!(stdout(&run).contains("API_URL=team"), "{}", stdout(&run));
+
+    let healthy = lpm(&project)
+        .args(["env", "repair", "--json"])
+        .output()
+        .unwrap();
+    assert!(healthy.status.success(), "{}", stderr(&healthy));
+    let json: serde_json::Value = serde_json::from_slice(&healthy.stdout).expect("JSON");
+    assert_eq!(json["problems"], serde_json::json!([]));
 }
 
 #[test]

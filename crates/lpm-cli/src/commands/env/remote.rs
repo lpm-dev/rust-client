@@ -159,8 +159,8 @@ pub(super) async fn env_share(
         ));
     }
 
-    let all_envs =
-        lpm_vault::try_get_all_environments_for_vault_id(&vault_id).map_err(LpmError::Script)?;
+    let all_envs = lpm_vault::try_get_all_environments_for_vault_id(&vault_id)
+        .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
     let environment_count = all_envs.len();
     let total_keys: usize = all_envs.values().map(|e| e.len()).sum();
     if all_envs.is_empty() {
@@ -520,7 +520,7 @@ pub(super) async fn vars_diff(
         let resolved_b = lpm_env::resolver::resolve(args[1], env_map, environments);
         let local_environments = match vault_id.as_deref() {
             Some(vault_id) => lpm_vault::try_get_all_environments_for_vault_id(vault_id)
-                .map_err(LpmError::Script)?,
+                .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?,
             None => HashMap::new(),
         };
         let (a, b) = take_local_diff_pair(
@@ -541,7 +541,7 @@ pub(super) async fn vars_diff(
             .as_deref()
             .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
         let local = lpm_vault::try_get_all_env_for_vault_id(vault_id, &resolved.storage_key)
-            .map_err(LpmError::Script)?;
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
         let canonical = resolved.canonical.clone();
         let expected_principal_id = manifest
             .vault
@@ -577,7 +577,7 @@ pub(super) async fn vars_diff(
             .as_deref()
             .ok_or_else(|| LpmError::Script("no vault configured".into()))?;
         let local = lpm_vault::try_get_all_env_for_vault_id(vault_id, "default")
-            .map_err(LpmError::Script)?;
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
         let expected_principal_id = manifest
             .vault
             .personal_expected_principal_for_registry(client.base_url())

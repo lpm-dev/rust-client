@@ -53,6 +53,7 @@ pub type SecretMap = HashMap<String, String>;
 pub type EnvironmentMap = HashMap<String, SecretMap>;
 
 pub use companion::overrides::PersonalOverrides;
+pub use companion::repair::{CompanionProblem, CompanionRepair, CompanionReview};
 
 /// Hooks for acceptance tests that seed data a separate `lpm` process reads.
 #[cfg(feature = "acceptance-test-hooks")]
@@ -96,6 +97,49 @@ pub mod acceptance {
             crate::fallback::companion::commit_unchecked(directory, vault_id, mutations)
         })
     }
+}
+
+/// Whether `message` is an env project's refusal of an operation, by a
+/// feature this client doesn't support or by damage, rather than a storage
+/// failure. Refusals say what the person can do.
+pub fn is_env_project_refusal(message: &str) -> bool {
+    companion::gate::GateError::describes(message)
+}
+
+/// What's damaged in the newer data of the env project at `project_dir`,
+/// after any interrupted step was finished, or `None` when the directory has
+/// no env project.
+pub fn review_companion_data(project_dir: &Path) -> Result<Option<CompanionReview>, String> {
+    let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
+        return Ok(None);
+    };
+    #[cfg(target_os = "macos")]
+    if !force_file_vault_backend() {
+        return keychain::review_companion_data(&vault_id).map(Some);
+    }
+    storage_transaction::with_vault_transaction(|directory| {
+        fallback::companion::review_companion_data_unlocked(directory, &vault_id)
+    })
+    .map(Some)
+}
+
+/// Run every repair `reviewed` lists for the env project at `project_dir`,
+/// after checking it still shows exactly that damage. Returns the repairs
+/// it ran.
+pub fn repair_companion_data(
+    project_dir: &Path,
+    reviewed: &CompanionReview,
+) -> Result<Vec<CompanionRepair>, String> {
+    let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
+        return Err("this directory has no env project".to_owned());
+    };
+    #[cfg(target_os = "macos")]
+    if !force_file_vault_backend() {
+        return keychain::repair_companion_data(&vault_id, reviewed);
+    }
+    storage_transaction::with_vault_transaction(|directory| {
+        fallback::companion::repair_companion_data_unlocked(directory, &vault_id, reviewed)
+    })
 }
 
 /// What running a project reads: the selected environment's values and its

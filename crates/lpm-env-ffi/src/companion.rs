@@ -365,6 +365,7 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
             }
             Damage::UnlistedRecord { kind } => ("unlistedRecord", Some(kind.as_str()), None),
             Damage::Access(reason) => ("access", None, Some(reason.as_str())),
+            Damage::Unfinished(reason) => ("unfinishedChange", None, Some(reason.as_str())),
         };
         DamageOutput {
             code,

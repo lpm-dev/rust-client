@@ -59,8 +59,8 @@ pub(super) async fn vars_push(
         .map(str::to_owned)
         .ok_or_else(|| LpmError::Script("no vault configured. Run `lpm env set` first".into()))?;
 
-    let all_envs =
-        lpm_vault::try_get_all_environments_for_vault_id(&vault_id).map_err(LpmError::Script)?;
+    let all_envs = lpm_vault::try_get_all_environments_for_vault_id(&vault_id)
+        .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
     let environment_count = all_envs.len();
     let total_keys: usize = all_envs.values().map(|e| e.len()).sum();
     if all_envs.is_empty() {

@@ -2849,9 +2849,11 @@ pub(super) async fn vars_platform_pull(
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect::<Vec<_>>();
     if env_name == "default" {
-        lpm_vault::set(project_dir, &pairs).map_err(LpmError::Script)?;
+        lpm_vault::set(project_dir, &pairs)
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
     } else {
-        lpm_vault::set_env(project_dir, env_name, &pairs).map_err(LpmError::Script)?;
+        lpm_vault::set_env(project_dir, env_name, &pairs)
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
     }
     let audit = record_platform_audit_with_recovery(
         registry_client,

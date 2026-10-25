@@ -157,7 +157,7 @@ pub(super) fn vars_init(
         }
     }
     let snapshot = lpm_vault::capture_environment_initialization_snapshot(vault_id.as_deref())
-        .map_err(LpmError::Script)?;
+        .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
 
     // Build the list of environments to process
     let all_envs = lpm_env::resolver::list_all_from_vault_names(
@@ -396,11 +396,11 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
     let env_map = config.as_ref().map_or(&empty_env_map, |c| &c.env);
     let environments = config.as_ref().and_then(|c| c.environments.as_ref());
     let schema = config.as_ref().and_then(|c| c.env_schema.as_ref());
-    // Status is what each environment would run with on this Mac, so it
+    // Status is what each environment would run with on this machine, so it
     // includes the personal overrides.
     let (vault_envs, overrides_by_env) = match vault_id.as_deref() {
         Some(vault_id) => lpm_vault::try_get_all_run_environments_for_vault_id(vault_id)
-            .map_err(LpmError::Script)?,
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?,
         None => (HashMap::new(), HashMap::new()),
     };
     let all_envs = lpm_env::resolver::list_all(env_map, environments, &vault_envs);
@@ -445,9 +445,28 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
         };
         let overrides = overrides_by_env.get(storage_environment);
 
+        let mode = (!env.implicit_default).then_some(env.storage_key.as_str());
+        let mut composed = (|| -> Result<lpm_runner::dotenv::ChildEnv, LpmError> {
+            let mut values = lpm_runner::dotenv::load_project_env_files_with_config(
+                project_dir,
+                mode,
+                env.file_path.as_deref(),
+                config.as_ref(),
+            )?;
+            if let Some(stored) = effective_vars {
+                lpm_runner::dotenv::merge_stored_project_env(&mut values, stored)?;
+            }
+            Ok(lpm_runner::dotenv::compose_with_overrides(
+                values, overrides,
+            ))
+        })();
+        let override_count = composed.as_ref().map_or_else(
+            |_| overrides.map_or(0, lpm_vault::PersonalOverrides::len),
+            lpm_runner::dotenv::ChildEnv::override_count,
+        );
+
         let mut schema_error = None;
         let schema_status = if let (Some(schema), Some(validator)) = (schema, &validator) {
-            let mode = (!env.implicit_default).then_some(env.storage_key.as_str());
             let evaluation = (|| -> Result<usize, LpmError> {
                 lpm_env::resolver::validate_env_name(&env.canonical).map_err(|_| {
                     LpmError::EnvValidation(lpm_env::resolver::invalid_identity_message(
@@ -455,20 +474,10 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
                         env.alias.as_deref(),
                     ))
                 })?;
-                let mut values = lpm_runner::dotenv::load_project_env_files_with_config(
-                    project_dir,
-                    mode,
-                    env.file_path.as_deref(),
-                    config.as_ref(),
-                )?;
-                if let Some(stored) = effective_vars {
-                    lpm_runner::dotenv::merge_stored_project_env(&mut values, stored)?;
-                }
-                if let Some(overrides) = overrides {
-                    lpm_runner::dotenv::apply_personal_overrides(&mut values, overrides);
-                }
-                let errors = lpm_runner::dotenv::evaluate_project_env(
-                    &mut values,
+                let composed = composed
+                    .as_mut()
+                    .map_err(|error| LpmError::EnvValidation(error.to_string()))?;
+                let errors = composed.evaluate(
                     Some(validator),
                     lpm_env::EvalContext {
                         environment: &env.canonical,
@@ -496,7 +505,7 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
             schema_error,
             alias: env.alias.clone(),
             source: env.source.clone(),
-            override_count: overrides.map_or(0, lpm_vault::PersonalOverrides::len),
+            override_count,
         });
     }
 
@@ -591,13 +600,12 @@ pub(super) fn vars_ls(project_dir: &std::path::Path, json_output: bool) -> Resul
 
         let source_indicator = match row.override_count {
             0 => install_ui::TerminalLine::new(""),
-            1 => install_ui::terminal_line!(
-                " {}",
-                install_ui::dim("· 1 personal override on this Mac")
-            ),
             count => install_ui::terminal_line!(
                 " {}",
-                install_ui::dim(&format!("· {count} personal overrides on this Mac"))
+                install_ui::dim(&format!(
+                    "· {}",
+                    lpm_runner::dotenv::personal_overrides_here(count)
+                ))
             ),
         };
 

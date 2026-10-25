@@ -371,8 +371,12 @@ fn recovery_replays_over_a_stray_record_it_doesnt_touch() {
         };
         write_journal(home, &journal);
 
-        with_vault_transaction(|directory| FileCompanion::open(directory)?.recover(VAULT))
-            .expect("damage the journal didn't cause doesn't block");
+        with_vault_transaction(|directory| {
+            FileCompanion::open(directory)?
+                .recover(VAULT)
+                .map_err(RecoveryError::into_message)
+        })
+        .expect("damage the journal didn't cause doesn't block");
 
         assert!(!overrides_entry.exists());
         assert!(
@@ -709,5 +713,148 @@ fn one_run_read_recovers_once() {
         crate::try_get_run_environment_for_vault_id(VAULT, None).expect("run read");
 
         assert_eq!(RECOVERIES.with(std::cell::Cell::get), 1);
+    });
+}
+
+fn review() -> CompanionReview {
+    with_vault_transaction(|directory| review_companion_data_unlocked(directory, VAULT))
+        .expect("a review")
+}
+
+fn repair(reviewed: &CompanionReview) -> Result<Vec<CompanionRepair>, String> {
+    with_vault_transaction(|directory| repair_companion_data_unlocked(directory, VAULT, reviewed))
+}
+
+fn assert_discarded_with_values_kept(home: &std::path::Path) {
+    assert!(!journal_path(home, VAULT).exists());
+    assert!(!vaults_path(home).join(stage_folder_name(VAULT)).exists());
+    assert!(
+        !vaults_path(home)
+            .join(companion_folder_name(VAULT))
+            .exists()
+    );
+    assert_eq!(
+        crate::try_get_run_environment_for_vault_id(VAULT, None)
+            .expect("the project runs again")
+            .values["TOKEN"],
+        "team"
+    );
+}
+
+#[test]
+fn an_interrupted_change_that_cant_be_finished_is_repaired_by_a_discard() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        commit(vec![
+            write(marker_account(), marker_with_overrides()),
+            write(record("overrides", None), overrides(r#""A":"1""#)),
+        ]);
+        write_journal(
+            home,
+            &FileJournal {
+                schema_version: FILE_JOURNAL_SCHEMA_VERSION,
+                transaction_id: "0123456789abcdef0123456789abcde2".to_owned(),
+                operations: vec![FileOperation {
+                    action: FileAction::Delete,
+                    target: record("overrides", None).name(),
+                    values_file: None,
+                    before: Some("0".repeat(64)),
+                    after: None,
+                }],
+            },
+        );
+        let error = crate::try_get_run_environment_for_vault_id(VAULT, None)
+            .expect_err("the stuck project fails closed");
+        assert!(
+            error.contains("an interrupted change can't be finished"),
+            "{error}"
+        );
+        assert!(error.contains("lpm env repair"), "{error}");
+
+        let reviewed = review();
+        assert_eq!(reviewed.repairs(), [CompanionRepair::DiscardProject]);
+        assert!(
+            reviewed.problems[0]
+                .description
+                .contains("record \"overrides\" changed outside LPM"),
+            "{reviewed:?}"
+        );
+
+        assert_eq!(
+            repair(&reviewed).expect("the discard"),
+            [CompanionRepair::DiscardProject]
+        );
+        assert_discarded_with_values_kept(home);
+    });
+}
+
+#[test]
+fn files_lpm_doesnt_write_and_an_unreadable_marker_are_repaired_by_a_discard() {
+    for damage in ["stray", "unreadable marker"] {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            seed_values();
+            commit(vec![
+                write(marker_account(), marker_with_overrides()),
+                write(record("overrides", None), overrides(r#""A":"1""#)),
+            ]);
+            let folder = vaults_path(home).join(companion_folder_name(VAULT));
+            let path = match damage {
+                "stray" => folder.join("notes.txt"),
+                _ => folder.join(MARKER_ENTRY),
+            };
+            std::fs::write(&path, b"not sealed by LPM").expect("damage the folder");
+            set_owner_only(&path);
+
+            let reviewed = review();
+            assert_eq!(
+                reviewed.repairs(),
+                [CompanionRepair::DiscardProject],
+                "{damage}"
+            );
+            repair(&reviewed).expect("the discard");
+            assert_discarded_with_values_kept(home);
+        });
+    }
+}
+
+#[test]
+fn an_invalid_marker_is_repaired_by_a_discard() {
+    with_temp_vault_home(|home| {
+        force_file_vault();
+        seed_values();
+        commit(vec![
+            write(marker_account(), marker_with_overrides()),
+            write(record("overrides", None), overrides(r#""A":"1""#)),
+        ]);
+        with_vault_transaction(|directory| {
+            commit_unchecked(
+                directory,
+                VAULT,
+                vec![write(marker_account(), b"{}".to_vec())],
+            )
+        })
+        .expect("seed an invalid marker");
+
+        let reviewed = review();
+        assert_eq!(reviewed.repairs(), [CompanionRepair::DiscardProject]);
+        repair(&reviewed).expect("the discard");
+        assert_discarded_with_values_kept(home);
+    });
+}
+
+#[test]
+fn a_healthy_project_has_nothing_to_review() {
+    with_temp_vault_home(|_| {
+        force_file_vault();
+        seed_values();
+        commit(vec![
+            write(marker_account(), marker_with_overrides()),
+            write(record("overrides", None), overrides(r#""A":"1""#)),
+        ]);
+        let reviewed = review();
+        assert!(reviewed.problems.is_empty(), "{reviewed:?}");
+        assert!(repair(&reviewed).expect("nothing to run").is_empty());
     });
 }

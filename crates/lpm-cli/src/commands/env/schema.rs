@@ -195,14 +195,8 @@ fn format_print_env(
     )?;
     // Every format is machine-readable, so overridden keys are reported on
     // stderr, never marked in the output.
-    if let Some(notice) = lpm_runner::dotenv::personal_override_notice(
-        composed.overrides.len(),
-        resolved_mode.unwrap_or("default"),
-    ) {
-        eprintln!("lpm: {notice}");
-        lpm_runner::dotenv::log_personal_override_names(&composed.overrides);
-    }
-    let mut env_vars = composed.vars;
+    lpm_runner::dotenv::announce_personal_overrides(&composed, resolved_mode.unwrap_or("default"));
+    let mut env_vars = composed.into_vars();
     let schema = config.and_then(|c| c.env_schema.as_ref());
 
     // Collect secret keys for masking
@@ -275,7 +269,8 @@ pub(super) fn vars_check(
     // This produces a consistent, deduplicated list from config + vault,
     // with legacy vault keys surfaced separately (never collapsed).
     let all_envs = check_environments(env_input, lpm_config.as_ref(), || {
-        lpm_vault::try_get_all_environments(project_dir).map_err(LpmError::Script)
+        lpm_vault::try_get_all_environments(project_dir)
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))
     })?;
     let mut results: Vec<(
         String,
@@ -311,8 +306,7 @@ pub(super) fn vars_check(
             lpm_runner::dotenv::OverridePolicy::Apply,
         )?
         .compose(lpm_config.as_ref(), scope.service.as_deref())?;
-        let errors = lpm_runner::dotenv::evaluate_project_env(
-            &mut composed.vars,
+        let errors = composed.evaluate(
             Some(&validator),
             lpm_env::EvalContext {
                 environment: &environment.canonical,
@@ -322,13 +316,7 @@ pub(super) fn vars_check(
         )?;
         let from_overrides = errors
             .iter()
-            .filter(|error| {
-                lpm_runner::dotenv::is_caused_by_personal_override(
-                    &error.key,
-                    &composed.vars,
-                    &composed.overrides,
-                )
-            })
+            .filter(|error| composed.caused_by_override(error))
             .map(|error| error.key.clone())
             .collect();
         all_valid &= errors.is_empty();
@@ -406,7 +394,10 @@ pub(super) fn vars_check(
                     println!(
                         "    {} {}",
                         install_ui::red(&error.to_string()),
-                        install_ui::dim("(from a personal override on this Mac)")
+                        install_ui::dim(&format!(
+                            "(from a personal override on {})",
+                            lpm_runner::dotenv::THIS_MACHINE
+                        ))
                     );
                 } else {
                     println!("    {}", install_ui::red(&error.to_string()));
@@ -456,7 +447,8 @@ pub(super) fn vars_validate(
         })
         .collect();
 
-    let secrets = lpm_vault::try_get_all(project_dir).map_err(LpmError::Script)?;
+    let secrets = lpm_vault::try_get_all(project_dir)
+        .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
 
     let mut present = Vec::new();
     let mut missing = Vec::new();

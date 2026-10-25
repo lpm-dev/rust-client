@@ -1351,13 +1351,13 @@ pub fn run_services_with_config(
     for (name, service) in active_services.iter() {
         let mut env = loaded.layers.compose_service(&service.env)?;
         if let Some(peer_env) = cross_env.get(name) {
-            crate::dotenv::merge_project_env(&mut env, peer_env)?;
+            env.merge_runtime(peer_env)?;
         }
         if let Some(port) = port_map.get(name) {
-            crate::dotenv::insert_project_env(&mut env, "PORT".to_string(), port.to_string());
+            env.insert_runtime("PORT".to_string(), port.to_string());
         }
         for (key, value) in &options.extra_envs {
-            crate::dotenv::insert_project_env(&mut env, key.clone(), value.clone());
+            env.insert_runtime(key.clone(), value.clone());
         }
         let runtime_hint = options
             .service_runtime_hints
@@ -1374,7 +1374,6 @@ pub fn run_services_with_config(
             },
             &service_path.value,
             validate_schema,
-            loaded.layers.overrides(),
         )
         .map_err(|error| LpmError::EnvValidation(format!("service '{name}': {error}")))?;
         service_paths.insert(name.clone(), service_path);
@@ -1510,7 +1509,7 @@ pub fn run_services_with_config(
                 cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
                 isolate_service_process_tree(&mut cmd);
                 crate::shell::strip_inherited_env_hooks(&mut cmd);
-                cmd.envs(env);
+                cmd.envs(env.vars());
 
                 let mut child = spawn_service_command_with(
                     &mut cmd,
@@ -1748,7 +1747,6 @@ pub fn run_services_with_config(
             service_runtime_hints: &options.service_runtime_hints,
             service_envs: &service_envs,
             env_validator: validator.as_ref(),
-            personal_overrides: loaded.layers.overrides(),
             env_name: loaded.env_name.as_deref().unwrap_or("default"),
             validate_env_schema: validate_schema,
             port_map: &port_map,

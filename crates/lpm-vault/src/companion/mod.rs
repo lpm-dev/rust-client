@@ -8,7 +8,11 @@
 
 #[cfg(target_os = "macos")]
 pub(crate) use lpm_env_companion::graph;
-pub(crate) use lpm_env_companion::{account, gate, invariants, lifecycle, marker, overrides};
+pub(crate) use lpm_env_companion::{
+    account, assessment, gate, invariants, lifecycle, marker, overrides,
+};
+
+pub(crate) mod repair;
 
 use std::cell::RefCell;
 use std::collections::HashMap;

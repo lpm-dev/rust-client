@@ -54,8 +54,8 @@ pub fn hidden_script_direct_invocation_allowed() -> bool {
     std::env::var_os(LPM_SCRIPT_CHILD_ENV).is_some()
 }
 
-fn mark_script_child_env(env_vars: &mut HashMap<String, String>) {
-    dotenv::insert_project_env(env_vars, LPM_SCRIPT_CHILD_ENV.to_string(), "1".to_string());
+fn mark_script_child_env(env_vars: &mut dotenv::ChildEnv) {
+    env_vars.insert_runtime(LPM_SCRIPT_CHILD_ENV.to_string(), "1".to_string());
 }
 
 /// Escape a runtime argument so the platform shell treats it as data.
@@ -334,10 +334,10 @@ pub fn run_script_with_envs_and_config(
     print_env_context(&loaded);
     let mut env_vars = loaded.layers.take_child_env()?;
     for (key, value) in extra_envs {
-        dotenv::insert_project_env(&mut env_vars, key.clone(), value.clone());
+        env_vars.insert_runtime(key.clone(), value.clone());
     }
     mark_script_child_env(&mut env_vars);
-    context.apply(&mut env_vars, script_name, &script_cmd);
+    env_vars.apply_npm_context(&context, script_name, &script_cmd);
     let pre_command = hooks::find_pre_hook(&scripts, script_name);
     if pre_command.is_some() {
         dotenv::validate_child_env(
@@ -346,21 +346,19 @@ pub fn run_script_with_envs_and_config(
             eval_context,
             &path,
             validate_schema,
-            loaded.layers.overrides(),
         )?;
     }
 
     // Run pre-hook if it exists
     if let Some(pre_cmd) = pre_command {
         let pre_name = hooks::pre_hook_name(script_name);
-        context.apply(&mut env_vars, &pre_name, pre_cmd);
+        env_vars.apply_npm_context(&context, &pre_name, pre_cmd);
         dotenv::validate_child_env(
             &mut env_vars,
             validator.as_ref(),
             eval_context,
             &path,
             validate_schema,
-            loaded.layers.overrides(),
         )?;
         tracing::debug!("running pre-hook: {pre_name}");
 
@@ -368,7 +366,7 @@ pub fn run_script_with_envs_and_config(
             command: pre_cmd,
             cwd: project_dir,
             path: &path,
-            envs: &env_vars,
+            envs: env_vars.vars(),
         })?;
 
         if !status.success() {
@@ -381,14 +379,13 @@ pub fn run_script_with_envs_and_config(
         }
     }
 
-    context.apply(&mut env_vars, script_name, &script_cmd);
+    env_vars.apply_npm_context(&context, script_name, &script_cmd);
     dotenv::validate_child_env(
         &mut env_vars,
         validator.as_ref(),
         eval_context,
         &path,
         validate_schema,
-        loaded.layers.overrides(),
     )?;
     let full_cmd = assemble_shell_command(&script_cmd, extra_args, project_dir, &path)?;
 
@@ -397,7 +394,7 @@ pub fn run_script_with_envs_and_config(
         command: &full_cmd,
         cwd: project_dir,
         path: &path,
-        envs: &env_vars,
+        envs: env_vars.vars(),
     })?;
 
     if !status.success() {
@@ -407,14 +404,13 @@ pub fn run_script_with_envs_and_config(
     // Run post-hook if it exists
     if let Some(post_cmd) = hooks::find_post_hook(&scripts, script_name) {
         let post_name = hooks::post_hook_name(script_name);
-        context.apply(&mut env_vars, &post_name, post_cmd);
+        env_vars.apply_npm_context(&context, &post_name, post_cmd);
         dotenv::validate_child_env(
             &mut env_vars,
             validator.as_ref(),
             eval_context,
             &path,
             validate_schema,
-            loaded.layers.overrides(),
         )?;
         tracing::debug!("running post-hook: {post_name}");
 
@@ -422,7 +418,7 @@ pub fn run_script_with_envs_and_config(
             command: post_cmd,
             cwd: project_dir,
             path: &path,
-            envs: &env_vars,
+            envs: env_vars.vars(),
         })?;
 
         if !status.success() {
@@ -508,10 +504,10 @@ pub fn run_dev_script_with_envs_and_config(
     };
     let mut env_vars = loaded.layers.take_child_env()?;
     for (key, value) in extra_envs {
-        dotenv::insert_project_env(&mut env_vars, key.clone(), value.clone());
+        env_vars.insert_runtime(key.clone(), value.clone());
     }
     mark_script_child_env(&mut env_vars);
-    context.apply(&mut env_vars, "dev", &script_cmd);
+    env_vars.apply_npm_context(&context, "dev", &script_cmd);
     let pre_command = hooks::find_pre_hook(&scripts, "dev");
     if pre_command.is_some() {
         dotenv::validate_child_env(
@@ -520,26 +516,24 @@ pub fn run_dev_script_with_envs_and_config(
             eval_context,
             &path,
             validate_schema,
-            loaded.layers.overrides(),
         )?;
     }
 
     if let Some(pre_cmd) = pre_command {
-        context.apply(&mut env_vars, "predev", pre_cmd);
+        env_vars.apply_npm_context(&context, "predev", pre_cmd);
         dotenv::validate_child_env(
             &mut env_vars,
             validator.as_ref(),
             eval_context,
             &path,
             validate_schema,
-            loaded.layers.overrides(),
         )?;
         let status = shell::spawn_shell_cancellable(
             &ShellCommand {
                 command: pre_cmd,
                 cwd: project_dir,
                 path: &path,
-                envs: &env_vars,
+                envs: env_vars.vars(),
             },
             &endpoint_options.stop_requested,
         )?;
@@ -556,14 +550,13 @@ pub fn run_dev_script_with_envs_and_config(
         }
     }
 
-    context.apply(&mut env_vars, "dev", &script_cmd);
+    env_vars.apply_npm_context(&context, "dev", &script_cmd);
     dotenv::validate_child_env(
         &mut env_vars,
         validator.as_ref(),
         eval_context,
         &path,
         validate_schema,
-        loaded.layers.overrides(),
     )?;
     let full_cmd = assemble_shell_command(&script_cmd, extra_args, project_dir, &path)?;
     let status = shell::spawn_shell_with_endpoint(
@@ -571,7 +564,7 @@ pub fn run_dev_script_with_envs_and_config(
             command: &full_cmd,
             cwd: project_dir,
             path: &path,
-            envs: &env_vars,
+            envs: env_vars.vars(),
         },
         endpoint_options.requested_port,
         Arc::clone(&endpoint_options.stop_requested),
@@ -589,21 +582,20 @@ pub fn run_dev_script_with_envs_and_config(
     }
 
     if let Some(post_cmd) = hooks::find_post_hook(&scripts, "dev") {
-        context.apply(&mut env_vars, "postdev", post_cmd);
+        env_vars.apply_npm_context(&context, "postdev", post_cmd);
         dotenv::validate_child_env(
             &mut env_vars,
             validator.as_ref(),
             eval_context,
             &path,
             validate_schema,
-            loaded.layers.overrides(),
         )?;
         let status = shell::spawn_shell_cancellable(
             &ShellCommand {
                 command: post_cmd,
                 cwd: project_dir,
                 path: &path,
-                envs: &env_vars,
+                envs: env_vars.vars(),
             },
             &endpoint_options.stop_requested,
         )?;
@@ -829,17 +821,20 @@ fn run_script_with_output_at_path_and_config(
         service: None,
     };
     let mut environment = loaded.layers.take_child_env()?;
+    dotenv::announce_personal_overrides(
+        &environment,
+        loaded.env_name.as_deref().unwrap_or("default"),
+    );
     mark_script_child_env(&mut environment);
     let pre_command = hooks::find_pre_hook(&scripts, script_name);
     if pre_command.is_some() {
-        context.apply(&mut environment, script_name, &command);
+        environment.apply_npm_context(&context, script_name, &command);
         dotenv::validate_child_env(
             &mut environment,
             validator.as_ref(),
             eval_context,
             path,
             validate_schema,
-            loaded.layers.overrides(),
         )?;
     }
     let pre_name = hooks::pre_hook_name(script_name);
@@ -860,14 +855,13 @@ fn run_script_with_output_at_path_and_config(
         let Some(declared_command) = declared_command else {
             continue;
         };
-        context.apply(&mut environment, phase, declared_command);
+        environment.apply_npm_context(&context, phase, declared_command);
         dotenv::validate_child_env(
             &mut environment,
             validator.as_ref(),
             eval_context,
             path,
             validate_schema,
-            loaded.layers.overrides(),
         )?;
         let full_command;
         let command = if phase == script_name {
@@ -880,7 +874,7 @@ fn run_script_with_output_at_path_and_config(
             command,
             cwd: project_dir,
             path,
-            envs: &environment,
+            envs: environment.vars(),
         }) {
             Ok(captured) => captured,
             Err(LpmError::ExitCode(code)) => {
@@ -1021,12 +1015,13 @@ fn run_command_buffered_named_with_config(
         service: None,
     };
     let mut env_vars = loaded.layers.take_child_env()?;
+    dotenv::announce_personal_overrides(&env_vars, loaded.env_name.as_deref().unwrap_or("default"));
     for (key, value) in extra_envs {
-        dotenv::insert_project_env(&mut env_vars, key.clone(), value.clone());
+        env_vars.insert_runtime(key.clone(), value.clone());
     }
     if !task_name.is_empty() {
-        NpmScriptContext::load(project_dir, &std::env::current_dir()?)?.apply(
-            &mut env_vars,
+        env_vars.apply_npm_context(
+            &NpmScriptContext::load(project_dir, &std::env::current_dir()?)?,
             task_name,
             command,
         );
@@ -1038,7 +1033,6 @@ fn run_command_buffered_named_with_config(
         eval_context,
         &path,
         validate_schema,
-        loaded.layers.overrides(),
     )?;
 
     let full_cmd = assemble_shell_command(command, extra_args, project_dir, &path)?;
@@ -1047,7 +1041,7 @@ fn run_command_buffered_named_with_config(
         command: &full_cmd,
         cwd: project_dir,
         path: &path,
-        envs: &env_vars,
+        envs: env_vars.vars(),
     })?;
 
     if !captured.status.success() {
@@ -1195,9 +1189,10 @@ fn run_command_prefixed_named_with_config(
         service: None,
     };
     let mut env_vars = loaded.layers.take_child_env()?;
+    dotenv::announce_personal_overrides(&env_vars, loaded.env_name.as_deref().unwrap_or("default"));
     if !task_name.is_empty() {
-        NpmScriptContext::load(project_dir, &std::env::current_dir()?)?.apply(
-            &mut env_vars,
+        env_vars.apply_npm_context(
+            &NpmScriptContext::load(project_dir, &std::env::current_dir()?)?,
             task_name,
             command,
         );
@@ -1209,7 +1204,6 @@ fn run_command_prefixed_named_with_config(
         eval_context,
         &path,
         validate_schema,
-        loaded.layers.overrides(),
     )?;
 
     let full_cmd = assemble_shell_command(command, extra_args, project_dir, &path)?;
@@ -1219,7 +1213,7 @@ fn run_command_prefixed_named_with_config(
             command: &full_cmd,
             cwd: project_dir,
             path: &path,
-            envs: &env_vars,
+            envs: env_vars.vars(),
         },
         prefix,
         color,
@@ -1358,12 +1352,13 @@ fn run_command_named_with_envs_and_config(
         service: None,
     };
     let mut env_vars = loaded.layers.take_child_env()?;
+    dotenv::announce_personal_overrides(&env_vars, loaded.env_name.as_deref().unwrap_or("default"));
     for (key, value) in extra_envs {
-        dotenv::insert_project_env(&mut env_vars, key.clone(), value.clone());
+        env_vars.insert_runtime(key.clone(), value.clone());
     }
     if !task_name.is_empty() {
-        NpmScriptContext::load(project_dir, &std::env::current_dir()?)?.apply(
-            &mut env_vars,
+        env_vars.apply_npm_context(
+            &NpmScriptContext::load(project_dir, &std::env::current_dir()?)?,
             task_name,
             command,
         );
@@ -1375,7 +1370,6 @@ fn run_command_named_with_envs_and_config(
         eval_context,
         &path,
         validate_schema,
-        loaded.layers.overrides(),
     )?;
 
     let full_cmd = assemble_shell_command(command, extra_args, project_dir, &path)?;
@@ -1384,7 +1378,7 @@ fn run_command_named_with_envs_and_config(
         command: &full_cmd,
         cwd: project_dir,
         path: &path,
-        envs: &env_vars,
+        envs: env_vars.vars(),
     })?;
 
     if !status.success() {
@@ -1536,19 +1530,13 @@ fn build_configured_local_bin_command(
         dotenv::resolve_project_environment(None, config.as_ref())?
     };
 
-    let composed = dotenv::load_project_env_unvalidated_for_resolved(
+    let mut env_vars = dotenv::load_project_env_unvalidated_for_resolved(
         project_dir,
         &resolved,
         config.as_ref(),
         dotenv::OverridePolicy::Apply,
     )?;
-    let mut env_vars = composed.vars;
-    if let Some(notice) =
-        dotenv::personal_override_notice(composed.overrides.len(), &resolved.canonical)
-    {
-        eprintln!("lpm: {notice}");
-        dotenv::log_personal_override_names(&composed.overrides);
-    }
+    dotenv::announce_personal_overrides(&env_vars, &resolved.canonical);
     let validator = config
         .as_ref()
         .filter(|_| !no_env_check)
@@ -1564,8 +1552,8 @@ fn build_configured_local_bin_command(
         },
         &path,
         !no_env_check,
-        &composed.overrides,
     )?;
+    let env_vars = env_vars.into_vars();
 
     let mut command = Command::new(&bin_path);
     shell::strip_inherited_env_hooks(&mut command);
@@ -1840,9 +1828,10 @@ fn run_command_captured_named_with_config(
         service: None,
     };
     let mut env_vars = loaded.layers.take_child_env()?;
+    dotenv::announce_personal_overrides(&env_vars, loaded.env_name.as_deref().unwrap_or("default"));
     if !task_name.is_empty() {
-        NpmScriptContext::load(project_dir, &std::env::current_dir()?)?.apply(
-            &mut env_vars,
+        env_vars.apply_npm_context(
+            &NpmScriptContext::load(project_dir, &std::env::current_dir()?)?,
             task_name,
             command,
         );
@@ -1854,7 +1843,6 @@ fn run_command_captured_named_with_config(
         eval_context,
         &path,
         validate_schema,
-        loaded.layers.overrides(),
     )?;
 
     let full_cmd = assemble_shell_command(command, extra_args, project_dir, &path)?;
@@ -1864,7 +1852,7 @@ fn run_command_captured_named_with_config(
             command: &full_cmd,
             cwd: project_dir,
             path: &path,
-            envs: &env_vars,
+            envs: env_vars.vars(),
         },
         reserve_stdout,
     )?;

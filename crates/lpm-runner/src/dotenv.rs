@@ -14,8 +14,22 @@ use crate::lpm_json;
 use lpm_common::{BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, LpmError, read_text_file_capped};
 use lpm_env::{EnvName, is_denied_env_var};
 pub use lpm_vault::PersonalOverrides;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
+
+/// The error an env store failure becomes: an env project's refusal as
+/// itself, so its message and next step stand alone, anything else as
+/// `other`.
+pub fn vault_error(other: fn(String) -> LpmError) -> impl Fn(String) -> LpmError {
+    move |message| {
+        if lpm_vault::is_env_project_refusal(&message) {
+            LpmError::EnvProjectRefused(message)
+        } else {
+            other(message)
+        }
+    }
+}
 
 /// Whether a load applies this machine's personal overrides. Every entry
 /// point takes one explicitly: running, showing and checking a project
@@ -91,25 +105,22 @@ fn load_project_env_from_snapshot(
     policy: OverridePolicy,
 ) -> Result<HashMap<String, String>, LpmError> {
     let resolved = resolve_project_environment(env_name, config)?;
-    let composed = load_project_env_layers_for_resolved(project_dir, &resolved, config, policy)?
+    let mut child = load_project_env_layers_for_resolved(project_dir, &resolved, config, policy)?
         .compose(None, None)?;
-    let mut vars = composed.vars;
     if validate_schema {
         let validator = config
             .and_then(|config| config.env_schema.as_ref())
             .map(lpm_env::EnvValidator::new);
-        let errors = evaluate_project_env(
-            &mut vars,
+        validate_project_env_with_plan(
+            &mut child,
             validator.as_ref(),
             lpm_env::EvalContext {
                 environment: &resolved.canonical,
                 ..Default::default()
             },
         )?;
-        validation_result(errors, &vars, &composed.overrides)?;
-        remove_dangerous_env_vars(&mut vars, "project env");
     }
-    Ok(vars)
+    Ok(child.into_vars())
 }
 
 /// Load and validate a scoped environment from one configuration snapshot.
@@ -120,16 +131,15 @@ pub fn load_project_env_with_config_and_context(
     stage: lpm_env::EnvStage,
     service: Option<&str>,
     policy: OverridePolicy,
-) -> Result<ComposedProjectEnv, LpmError> {
+) -> Result<ChildEnv, LpmError> {
     let resolved = resolve_project_environment(env_name, config)?;
-    let mut composed =
-        load_project_env_layers_for_resolved(project_dir, &resolved, config, policy)?
-            .compose(config, service)?;
+    let mut child = load_project_env_layers_for_resolved(project_dir, &resolved, config, policy)?
+        .compose(config, service)?;
     let validator = config
         .and_then(|config| config.env_schema.as_ref())
         .map(lpm_env::EnvValidator::new);
-    let errors = evaluate_project_env(
-        &mut composed.vars,
+    validate_project_env_with_plan(
+        &mut child,
         validator.as_ref(),
         lpm_env::EvalContext {
             environment: &resolved.canonical,
@@ -137,9 +147,7 @@ pub fn load_project_env_with_config_and_context(
             service,
         },
     )?;
-    validation_result(errors, &composed.vars, &composed.overrides)?;
-    remove_dangerous_env_vars(&mut composed.vars, "project env");
-    Ok(composed)
+    Ok(child)
 }
 
 /// Load a previously resolved identity without interpreting its canonical name as an alias.
@@ -149,23 +157,20 @@ pub fn load_project_env_for_resolved_with_config(
     config: Option<&lpm_json::LpmJsonConfig>,
     policy: OverridePolicy,
 ) -> Result<HashMap<String, String>, LpmError> {
-    let composed = load_project_env_layers_for_resolved(project_dir, resolved, config, policy)?
+    let mut child = load_project_env_layers_for_resolved(project_dir, resolved, config, policy)?
         .compose(None, None)?;
-    let mut vars = composed.vars;
     let validator = config
         .and_then(|config| config.env_schema.as_ref())
         .map(lpm_env::EnvValidator::new);
-    let errors = evaluate_project_env(
-        &mut vars,
+    validate_project_env_with_plan(
+        &mut child,
         validator.as_ref(),
         lpm_env::EvalContext {
             environment: &resolved.canonical,
             ..Default::default()
         },
     )?;
-    validation_result(errors, &vars, &composed.overrides)?;
-    remove_dangerous_env_vars(&mut vars, "project env");
-    Ok(vars)
+    Ok(child.into_vars())
 }
 
 /// Layers 1 and 2 of a project's environment, with layer 4, the personal
@@ -174,32 +179,217 @@ pub fn load_project_env_for_resolved_with_config(
 pub struct ProjectEnvLayers {
     vars: HashMap<String, String>,
     overrides: PersonalOverrides,
-    overrides_applied: bool,
+    /// The child environment, once layer 4 was applied to the layers.
+    composed: Option<ChildEnv>,
     vault_count: usize,
 }
 
-/// A project's environment through layer 4, with the overrides it applied,
-/// which validation needs to attribute failures to them.
-#[derive(Debug, Default)]
-pub struct ComposedProjectEnv {
-    pub vars: HashMap<String, String>,
-    pub overrides: PersonalOverrides,
+/// What the personal overrides decided for one name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Decision {
+    Set(String),
+    Unset,
+}
+
+/// The names whose value the personal overrides still decide, compared as
+/// the host compares names. A later layer that writes a name takes it back,
+/// so a validation failure names an override only while it's the value's
+/// final origin.
+#[derive(Debug, Clone, Default)]
+pub struct OverrideOrigins {
+    decided: HashMap<String, Decision>,
+    case_insensitive: bool,
+}
+
+impl OverrideOrigins {
+    fn of(overrides: &PersonalOverrides, case_insensitive: bool) -> Self {
+        let mut origins = Self {
+            decided: HashMap::with_capacity(overrides.len()),
+            case_insensitive,
+        };
+        for (name, value) in &overrides.set {
+            if !is_denied_env_var(name) {
+                let key = origins.key(name);
+                origins.decided.insert(key, Decision::Set(value.clone()));
+            }
+        }
+        for name in &overrides.unset {
+            if !is_denied_env_var(name) {
+                let key = origins.key(name);
+                origins.decided.insert(key, Decision::Unset);
+            }
+        }
+        origins
+    }
+
+    /// Override names are validated ASCII, so where the host ignores case
+    /// they compare by ASCII case.
+    fn key(&self, name: &str) -> String {
+        if self.case_insensitive {
+            name.to_ascii_uppercase()
+        } else {
+            name.to_owned()
+        }
+    }
+
+    /// A later layer wrote `name`.
+    fn release(&mut self, name: &str) {
+        if !self.decided.is_empty() {
+            let key = self.key(name);
+            self.decided.remove(&key);
+        }
+    }
+
+    /// Whether a personal override caused `error` in `vars`: it still decides
+    /// the value the schema judged, or its `unset` left the value missing.
+    pub fn caused(&self, error: &lpm_env::ValidationError, vars: &HashMap<String, String>) -> bool {
+        let Some(decision) = self.decided.get(&self.key(&error.key)) else {
+            return false;
+        };
+        let value = vars.get(&error.key).or_else(|| {
+            self.case_insensitive
+                .then(|| {
+                    vars.iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(&error.key))
+                        .map(|(_, value)| value)
+                })
+                .flatten()
+        });
+        match decision {
+            Decision::Set(set) => value == Some(set),
+            Decision::Unset => {
+                error.kind == lpm_env::ValidationErrorKind::Missing && value.is_none()
+            }
+        }
+    }
+}
+
+/// A child's environment through layer 4, with what the personal overrides
+/// still decide. Its later layers write through it, so each write takes the
+/// name back from the overrides.
+#[derive(Debug, Clone, Default)]
+pub struct ChildEnv {
+    vars: HashMap<String, String>,
+    overrides: PersonalOverrides,
+    origins: OverrideOrigins,
+    /// How many of the overrides changed the environment at layer 4.
+    applied: usize,
+}
+
+impl ChildEnv {
+    /// An environment no personal override shaped.
+    pub fn plain(vars: HashMap<String, String>) -> Self {
+        Self {
+            vars,
+            ..Self::default()
+        }
+    }
+
+    pub fn vars(&self) -> &HashMap<String, String> {
+        &self.vars
+    }
+
+    pub fn into_vars(self) -> HashMap<String, String> {
+        self.vars
+    }
+
+    /// How many personal overrides changed this environment.
+    pub fn override_count(&self) -> usize {
+        self.applied
+    }
+
+    pub fn overrides(&self) -> &PersonalOverrides {
+        &self.overrides
+    }
+
+    /// Layer 5: one of LPM's runtime values.
+    pub fn insert_runtime(&mut self, key: String, value: String) {
+        self.origins.release(&key);
+        insert_project_env(&mut self.vars, key, value);
+    }
+
+    /// Layer 5: values LPM computes for the child, such as a peer service's
+    /// address.
+    pub(crate) fn merge_runtime(
+        &mut self,
+        values: &HashMap<String, String>,
+    ) -> Result<(), LpmError> {
+        for key in values.keys() {
+            self.origins.release(key);
+        }
+        merge_project_env(&mut self.vars, values)
+    }
+
+    /// Layer 5: the npm lifecycle values of `phase`.
+    pub fn apply_npm_context(
+        &mut self,
+        context: &crate::npm_context::NpmScriptContext,
+        phase: &str,
+        command: &str,
+    ) {
+        for key in crate::npm_context::KEYS {
+            self.origins.release(key);
+        }
+        context.apply(&mut self.vars, phase, command);
+    }
+
+    /// The schema's verdict on this environment, which the schema may
+    /// complete with inherited values and defaults. A value it changes no
+    /// longer matches the override that set it, so it's never attributed.
+    pub fn evaluate(
+        &mut self,
+        validator: Option<&lpm_env::EnvValidator<'_>>,
+        context: lpm_env::EvalContext<'_>,
+    ) -> Result<Vec<lpm_env::ValidationError>, LpmError> {
+        evaluate_project_env(&mut self.vars, validator, context)
+    }
+
+    /// Whether a personal override caused `error`.
+    pub fn caused_by_override(&self, error: &lpm_env::ValidationError) -> bool {
+        self.origins.caused(error, &self.vars)
+    }
+
+    /// Steps 6–8 for a child: remove dangerous names from layers 1–5, insert
+    /// the trusted values, such as the exec plan's controlled `NODE_OPTIONS`,
+    /// and `PATH`, then evaluate the schema. Trusted values come after the
+    /// filter, so they're never filtered and never overridable.
+    fn validate(
+        &mut self,
+        validator: Option<&lpm_env::EnvValidator<'_>>,
+        context: lpm_env::EvalContext<'_>,
+        path: &str,
+        trusted: &[(String, String)],
+    ) -> Result<(), LpmError> {
+        remove_dangerous_env_vars(&mut self.vars, "child env");
+        for (key, value) in trusted {
+            self.insert_runtime(key.clone(), value.clone());
+        }
+        self.insert_runtime("PATH".into(), path.into());
+        let errors = self.evaluate(validator, context)?;
+        validation_result(errors, self)
+    }
 }
 
 impl ProjectEnvLayers {
-    /// Layers a caller already composed, kept with the overrides they applied.
-    pub(crate) fn already_composed(composed: ComposedProjectEnv, vault_count: usize) -> Self {
+    /// Layers whose child environment a caller already composed and
+    /// validated, kept with the overrides they applied.
+    pub(crate) fn already_composed(child: ChildEnv, vault_count: usize) -> Self {
         Self {
-            vars: composed.vars,
-            overrides: composed.overrides,
-            overrides_applied: true,
+            vars: HashMap::new(),
+            overrides: child.overrides.clone(),
+            composed: Some(child),
             vault_count,
         }
     }
 
-    /// How many names the personal overrides set or unset.
+    /// How many personal overrides change this environment: each `set`, and
+    /// each `unset` of a name the project has. Names LPM never passes to a
+    /// process count for neither.
     pub fn override_count(&self) -> usize {
-        self.overrides.len()
+        match &self.composed {
+            Some(child) => child.applied,
+            None => effective_overrides(&self.vars, &self.overrides, cfg!(windows)),
+        }
     }
 
     pub fn overrides(&self) -> &PersonalOverrides {
@@ -210,19 +400,23 @@ impl ProjectEnvLayers {
         self.vault_count
     }
 
-    /// The environment of a child without service values, layers 1, 2 and 4,
-    /// moved out. The overrides stay, for attributing validation failures.
-    pub(crate) fn take_child_env(&mut self) -> Result<HashMap<String, String>, LpmError> {
-        let vault_count = self.vault_count;
-        let composed = std::mem::take(self).compose(None, None)?;
-        *self = Self::already_composed(
-            ComposedProjectEnv {
-                vars: HashMap::new(),
-                overrides: composed.overrides,
-            },
-            vault_count,
-        );
-        Ok(composed.vars)
+    /// The environment of a child without service values, layers 1, 2 and 4.
+    pub(crate) fn take_child_env(&mut self) -> Result<ChildEnv, LpmError> {
+        match self.composed.take() {
+            Some(child) => Ok(child),
+            None => {
+                let layers = std::mem::take(self);
+                let overrides = layers.overrides.clone();
+                let vault_count = layers.vault_count;
+                let child = layers.compose(None, None)?;
+                *self = Self {
+                    overrides,
+                    vault_count,
+                    ..Self::default()
+                };
+                Ok(child)
+            }
+        }
     }
 
     /// Layers 3 and 4: `service`'s static values, then the personal
@@ -231,22 +425,18 @@ impl ProjectEnvLayers {
         self,
         config: Option<&lpm_json::LpmJsonConfig>,
         service: Option<&str>,
-    ) -> Result<ComposedProjectEnv, LpmError> {
-        let mut vars = self.vars;
-        if self.overrides_applied {
+    ) -> Result<ChildEnv, LpmError> {
+        if let Some(child) = self.composed {
             if service.is_some() {
                 return Err(LpmError::EnvValidation(
                     "service values can't follow personal overrides".to_owned(),
                 ));
             }
-        } else {
-            merge_configured_service_env(&mut vars, config, service)?;
-            apply_personal_overrides(&mut vars, &self.overrides);
+            return Ok(child);
         }
-        Ok(ComposedProjectEnv {
-            vars,
-            overrides: self.overrides,
-        })
+        let mut vars = self.vars;
+        merge_configured_service_env(&mut vars, config, service)?;
+        Ok(apply_layer_four(vars, &self.overrides))
     }
 
     /// [`Self::compose`] for one of several children that share the layers,
@@ -254,8 +444,8 @@ impl ProjectEnvLayers {
     pub(crate) fn compose_service(
         &self,
         service_env: &HashMap<String, String>,
-    ) -> Result<HashMap<String, String>, LpmError> {
-        if self.overrides_applied {
+    ) -> Result<ChildEnv, LpmError> {
+        if self.composed.is_some() {
             return Err(LpmError::EnvValidation(
                 "service values can't follow personal overrides".to_owned(),
             ));
@@ -263,9 +453,62 @@ impl ProjectEnvLayers {
         let mut vars = self.vars.clone();
         merge_project_env(&mut vars, service_env)?;
         remove_dangerous_env_vars(&mut vars, "service env");
-        apply_personal_overrides(&mut vars, &self.overrides);
-        Ok(vars)
+        Ok(apply_layer_four(vars, &self.overrides))
     }
+}
+
+/// Layer 4 over layers a caller read itself, such as `env ls`, which reads
+/// every environment's stored values in one load.
+pub fn compose_with_overrides(
+    vars: HashMap<String, String>,
+    overrides: Option<&PersonalOverrides>,
+) -> ChildEnv {
+    match overrides {
+        Some(overrides) => apply_layer_four(vars, overrides),
+        None => ChildEnv::plain(vars),
+    }
+}
+
+fn apply_layer_four(mut vars: HashMap<String, String>, overrides: &PersonalOverrides) -> ChildEnv {
+    let applied = effective_overrides(&vars, overrides, cfg!(windows));
+    apply_personal_overrides(&mut vars, overrides);
+    ChildEnv {
+        vars,
+        overrides: overrides.clone(),
+        origins: OverrideOrigins::of(overrides, cfg!(windows)),
+        applied,
+    }
+}
+
+/// How many of `overrides` change `vars`, the environment before layer 4.
+fn effective_overrides(
+    vars: &HashMap<String, String>,
+    overrides: &PersonalOverrides,
+    case_insensitive: bool,
+) -> usize {
+    let set = overrides
+        .set
+        .keys()
+        .filter(|name| !is_denied_env_var(name))
+        .count();
+    let mut unset = overrides
+        .unset
+        .iter()
+        .filter(|name| !is_denied_env_var(name))
+        .peekable();
+    if unset.peek().is_none() {
+        return set;
+    }
+    let removed = if case_insensitive {
+        let present: HashSet<CaselessAscii<'_>> =
+            vars.keys().map(|name| CaselessAscii(name)).collect();
+        unset
+            .filter(|name| present.contains(&CaselessAscii(name)))
+            .count()
+    } else {
+        unset.filter(|name| vars.contains_key(*name)).count()
+    };
+    set + removed
 }
 
 /// Layer 4: set and unset this machine's personal overrides, in one pass
@@ -312,15 +555,14 @@ fn apply_overrides_with_case_policy(
             .chain(&overrides.unset)
             .map(|name| CaselessAscii(name))
             .collect();
-        let mut host_names: Option<Vec<EnvName>> = None;
+        let mut host_names: Option<std::collections::BTreeSet<EnvName>> = None;
         vars.retain(|existing, _| {
             if existing.is_ascii() {
                 return !names.contains(&CaselessAscii(existing));
             }
             let host_names = host_names
                 .get_or_insert_with(|| names.iter().map(|name| EnvName::new(name.0)).collect());
-            let existing = EnvName::new(existing);
-            !host_names.contains(&existing)
+            !host_names.contains(&EnvName::new(existing))
         });
     } else {
         for name in &overrides.unset {
@@ -335,17 +577,63 @@ fn apply_overrides_with_case_policy(
     );
 }
 
+/// The machine personal overrides belong to, as LPM names it.
+pub const THIS_MACHINE: &str = if cfg!(target_os = "macos") {
+    "this Mac"
+} else {
+    "this computer"
+};
+
+/// "1 personal override on this Mac", or the count of several.
+pub fn personal_overrides_here(count: usize) -> String {
+    if count == 1 {
+        format!("1 personal override on {THIS_MACHINE}")
+    } else {
+        format!("{count} personal overrides on {THIS_MACHINE}")
+    }
+}
+
 /// The line `lpm` prints once per command when personal overrides apply:
 /// a count only, so the names stay out of shared terminals and logs.
 pub fn personal_override_notice(count: usize, environment: &str) -> Option<String> {
     (count > 0).then(|| {
         format!(
-            "{count} personal override{} on this Mac appl{} to {}",
-            if count == 1 { "" } else { "s" },
+            "{} appl{} to {}",
+            personal_overrides_here(count),
             if count == 1 { "ies" } else { "y" },
             lpm_common::sanitize_terminal_inline(environment)
         )
     })
+}
+
+static ANNOUNCED_OVERRIDES: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Print the personal-override notice of `child`'s `environment` once per
+/// process, however many tasks, cache checks and services of one command
+/// load it, and log the names at debug level.
+pub fn announce_personal_overrides(child: &ChildEnv, environment: &str) {
+    let Some(notice) = personal_override_notice(child.override_count(), environment) else {
+        return;
+    };
+    let first = ANNOUNCED_OVERRIDES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(notice.clone());
+    if first {
+        eprintln!("lpm: {notice}");
+        log_personal_override_names(child.overrides());
+    }
+}
+
+/// Record the notice of `count` overrides to `environment` as shown, by a
+/// line that says so itself.
+pub(crate) fn personal_overrides_shown(count: usize, environment: &str) {
+    if let Some(notice) = personal_override_notice(count, environment) {
+        ANNOUNCED_OVERRIDES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(notice);
+    }
 }
 
 /// Log the overridden names at debug level, which `--verbose` shows.
@@ -382,50 +670,34 @@ pub fn resolve_stored_project_environment(
 }
 
 /// Steps 6–8 for a child: remove dangerous names from layers 1–5, insert the
-/// trusted `PATH`, then evaluate the schema. `overrides` are the personal
-/// overrides layer 4 applied, for attributing failures to them.
+/// trusted `PATH`, then evaluate the schema.
 pub(crate) fn validate_child_env(
-    vars: &mut HashMap<String, String>,
+    child: &mut ChildEnv,
     validator: Option<&lpm_env::EnvValidator<'_>>,
     context: lpm_env::EvalContext<'_>,
     path: &str,
     validate_schema: bool,
-    overrides: &PersonalOverrides,
 ) -> Result<(), LpmError> {
-    validate_child_env_with_trusted(
-        vars,
-        validator,
-        context,
-        path,
-        validate_schema,
-        &[],
-        overrides,
-    )
+    validate_child_env_with_trusted(child, validator, context, path, validate_schema, &[])
 }
 
 /// [`validate_child_env`] with code-owned trusted values, such as the exec
 /// plan's controlled `NODE_OPTIONS`, inserted after the filter and before
 /// `PATH`, so they're never filtered and never overridable.
 pub(crate) fn validate_child_env_with_trusted(
-    vars: &mut HashMap<String, String>,
+    child: &mut ChildEnv,
     validator: Option<&lpm_env::EnvValidator<'_>>,
     context: lpm_env::EvalContext<'_>,
     path: &str,
     validate_schema: bool,
     trusted: &[(String, String)],
-    overrides: &PersonalOverrides,
 ) -> Result<(), LpmError> {
-    remove_dangerous_env_vars(vars, "child env");
-    for (key, value) in trusted {
-        insert_project_env(vars, key.clone(), value.clone());
-    }
-    insert_project_env(vars, "PATH".into(), path.into());
-    let errors = evaluate_project_env(
-        vars,
+    child.validate(
         if validate_schema { validator } else { None },
         context,
-    )?;
-    validation_result(errors, vars, overrides)
+        path,
+        trusted,
+    )
 }
 
 /// Apply the configured static service values before scoped CLI evaluation.
@@ -494,7 +766,7 @@ pub(crate) fn load_project_env_layers(
         }
         .map(|values| (values, PersonalOverrides::default())),
     })
-    .map_err(LpmError::EnvValidation)?;
+    .map_err(vault_error(LpmError::EnvValidation))?;
 
     let vault_count = vault_vars.len();
     if vault_count > 0 {
@@ -507,7 +779,7 @@ pub(crate) fn load_project_env_layers(
     Ok(ProjectEnvLayers {
         vars: loaded,
         overrides,
-        overrides_applied: false,
+        composed: None,
         vault_count,
     })
 }
@@ -587,7 +859,7 @@ pub fn load_project_env_unvalidated_with_config(
     env_name: Option<&str>,
     config: Option<&lpm_json::LpmJsonConfig>,
     policy: OverridePolicy,
-) -> Result<ComposedProjectEnv, LpmError> {
+) -> Result<ChildEnv, LpmError> {
     let resolved = resolve_project_environment(env_name, config)?;
     load_project_env_layers_for_resolved(project_dir, &resolved, config, policy)?
         .compose(None, None)
@@ -600,7 +872,7 @@ pub fn load_project_env_unvalidated_for_resolved(
     resolved: &lpm_env::ResolvedEnv,
     config: Option<&lpm_json::LpmJsonConfig>,
     policy: OverridePolicy,
-) -> Result<ComposedProjectEnv, LpmError> {
+) -> Result<ChildEnv, LpmError> {
     load_project_env_layers_for_resolved(project_dir, resolved, config, policy)?.compose(None, None)
 }
 
@@ -652,7 +924,10 @@ fn validate_project_env_with_case_policy(
         lpm_env::EvalContext::default(),
         case_insensitive,
     )?;
-    validation_result(errors, vars, &PersonalOverrides::default())?;
+    let child = ChildEnv::plain(std::mem::take(vars));
+    let result = validation_result(errors, &child);
+    *vars = child.into_vars();
+    result?;
     remove_dangerous_env_vars(vars, "project env");
     Ok(())
 }
@@ -743,25 +1018,22 @@ fn evaluate_project_env_with_case_policy(
 }
 
 pub(crate) fn validate_project_env_with_plan(
-    vars: &mut HashMap<String, String>,
+    child: &mut ChildEnv,
     validator: Option<&lpm_env::EnvValidator<'_>>,
     context: lpm_env::EvalContext<'_>,
-    overrides: &PersonalOverrides,
 ) -> Result<(), LpmError> {
-    let errors = evaluate_project_env(vars, validator, context)?;
-    validation_result(errors, vars, overrides)?;
-    remove_dangerous_env_vars(vars, "project env");
+    let errors = child.evaluate(validator, context)?;
+    validation_result(errors, child)?;
+    remove_dangerous_env_vars(&mut child.vars, "project env");
     Ok(())
 }
 
 /// Fail with every validation error, saying which ones a personal override
-/// caused: the override is the key's final origin, or its `unset` left the
-/// key missing. A later layer that replaced the override takes the blame
-/// back. Messages never include values.
+/// caused: the override is the value's final origin, or its `unset` left the
+/// value missing. Messages never include values.
 fn validation_result(
     errors: Vec<lpm_env::ValidationError>,
-    vars: &HashMap<String, String>,
-    overrides: &PersonalOverrides,
+    child: &ChildEnv,
 ) -> Result<(), LpmError> {
     if errors.is_empty() {
         return Ok(());
@@ -770,8 +1042,8 @@ fn validation_result(
         errors
             .iter()
             .map(|error| {
-                if is_caused_by_personal_override(&error.key, vars, overrides) {
-                    format!("  {error} (from a personal override on this Mac)")
+                if child.caused_by_override(error) {
+                    format!("  {error} (from a personal override on {THIS_MACHINE})")
                 } else {
                     format!("  {error}")
                 }
@@ -779,19 +1051,6 @@ fn validation_result(
             .collect::<Vec<_>>()
             .join("\n"),
     ))
-}
-
-/// Whether a personal override caused `key`'s validation failure: the
-/// override is its final origin, or its `unset` left it missing.
-pub fn is_caused_by_personal_override(
-    key: &str,
-    vars: &HashMap<String, String>,
-    overrides: &PersonalOverrides,
-) -> bool {
-    match overrides.set.get(key) {
-        Some(value) => vars.get(key) == Some(value),
-        None => overrides.unset.iter().any(|name| name == key) && !vars.contains_key(key),
-    }
 }
 
 pub(crate) fn merge_project_env(

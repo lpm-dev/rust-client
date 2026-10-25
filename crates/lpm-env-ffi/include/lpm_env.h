@@ -193,7 +193,8 @@ LPMEnvResult lpm_env_companion_account_names(const uint8_t *input, size_t input_
  * "readOnly" | "refuse" (null unless valid), unsupported: {feature, version,
  * level} | null, features: [{name, version, ifUnsupported, kinds, state,
  * supported}], damage: [{code: "invalidMarker" | "missingRecord" |
- * "invalidRecord" | "unlistedRecord" | "access", kind?, reason?, repair:
+ * "invalidRecord" | "unlistedRecord" | "access" | "unfinishedChange", kind?,
+ * reason?, repair:
  * {action: "discardProject" | "removeFeature" | "removeUnlisted", feature?} |
  * null}], allows: {readExcludingOverrides, readApplyingOverrides, write}}.
  * allows applies the operation matrix to the marker and to every damage listed,

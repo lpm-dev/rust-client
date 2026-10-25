@@ -1621,6 +1621,71 @@ fn save_validated_vault_data_with_storage_after_recovery(
     create_project_records(storage, project_name, project_path, payload, state)
 }
 
+/// What's damaged in `vault_id`'s newer data in the Keychain.
+pub(crate) fn review_companion_data(
+    vault_id: &str,
+) -> Result<crate::companion::repair::CompanionReview, String> {
+    with_keychain_transaction(|| {
+        review_companion_data_with_storage(&mut KeychainProjectStorage, vault_id)
+    })
+}
+
+/// Repair what `reviewed` lists in the Keychain.
+pub(crate) fn repair_companion_data(
+    vault_id: &str,
+    reviewed: &crate::companion::repair::CompanionReview,
+) -> Result<Vec<crate::companion::repair::CompanionRepair>, String> {
+    with_keychain_transaction(|| {
+        repair_companion_data_with_storage(&mut KeychainProjectStorage, vault_id, reviewed)
+    })
+}
+
+/// Finish `vault_id`'s interrupted step, then report why its access is
+/// damaged, if it is.
+fn open_for_repair(
+    storage: &mut impl ProjectStorage,
+    vault_id: &str,
+) -> Result<Option<&'static str>, String> {
+    validate_vault_id(vault_id)?;
+    crate::companion::authorize(
+        &mut companion_gate::KeychainCompanion(&mut *storage),
+        vault_id,
+        Operation::Maintenance,
+    )?;
+    Ok(
+        (storage.claimed_access(vault_id)? == Some(ClaimedAccess::Contradictory))
+            .then_some(companion_gate::CONTRADICTORY_VALUES),
+    )
+}
+
+fn review_companion_data_with_storage(
+    storage: &mut impl ProjectStorage,
+    vault_id: &str,
+) -> Result<crate::companion::repair::CompanionReview, String> {
+    let storage = &mut ListedStorage::new(storage);
+    let access = open_for_repair(storage, vault_id)?;
+    crate::companion::repair::review(
+        &mut companion_gate::KeychainCompanion(storage),
+        vault_id,
+        access,
+    )
+}
+
+fn repair_companion_data_with_storage(
+    storage: &mut impl ProjectStorage,
+    vault_id: &str,
+    reviewed: &crate::companion::repair::CompanionReview,
+) -> Result<Vec<crate::companion::repair::CompanionRepair>, String> {
+    let storage = &mut ListedStorage::new(storage);
+    let access = open_for_repair(storage, vault_id)?;
+    crate::companion::repair::repair(
+        &mut companion_gate::KeychainCompanion(storage),
+        vault_id,
+        access,
+        reviewed,
+    )
+}
+
 pub fn delete_vault(vault_id: &str) -> Result<(), String> {
     with_keychain_transaction(|| delete_vault_unlocked(vault_id))
 }

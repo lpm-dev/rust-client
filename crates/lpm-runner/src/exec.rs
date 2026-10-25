@@ -251,19 +251,13 @@ pub fn execute_exec_plan_with_config_and_signals(
     signals: &crate::execution::ExecutionSignals,
 ) -> Result<(), LpmError> {
     let resolved = dotenv::resolve_project_environment(plan.env_mode.as_deref(), config)?;
-    let composed = dotenv::load_project_env_unvalidated_with_config(
+    let mut env_vars = dotenv::load_project_env_unvalidated_with_config(
         project_dir,
         plan.env_mode.as_deref(),
         config,
         dotenv::OverridePolicy::Apply,
     )?;
-    let mut env_vars = composed.vars;
-    if let Some(notice) =
-        dotenv::personal_override_notice(composed.overrides.len(), &resolved.canonical)
-    {
-        eprintln!("lpm: {notice}");
-        dotenv::log_personal_override_names(&composed.overrides);
-    }
+    dotenv::announce_personal_overrides(&env_vars, &resolved.canonical);
     let validator = config
         .filter(|_| !plan.no_env_check)
         .and_then(|config| config.env_schema.as_ref())
@@ -278,8 +272,8 @@ pub fn execute_exec_plan_with_config_and_signals(
         &plan.command.path,
         !plan.no_env_check,
         &plan.command.env_overrides,
-        &composed.overrides,
     )?;
+    let env_vars = env_vars.into_vars();
 
     let mut command = Command::new(&plan.command.program);
     command

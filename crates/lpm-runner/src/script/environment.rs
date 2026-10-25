@@ -38,10 +38,15 @@ pub(super) fn print_env_context(loaded: &LoadedEnv) {
     let override_count = loaded.layers.override_count();
     let override_str = match override_count {
         0 => String::new(),
-        1 => "1 personal override on this Mac".to_owned(),
-        count => format!("{count} personal overrides on this Mac"),
+        count => dotenv::personal_overrides_here(count),
     };
-    dotenv::log_personal_override_names(loaded.layers.overrides());
+    if override_count > 0 {
+        dotenv::personal_overrides_shown(
+            override_count,
+            loaded.env_name.as_deref().unwrap_or("default"),
+        );
+        dotenv::log_personal_override_names(loaded.layers.overrides());
+    }
 
     // Build parts and join with " · "
     let mut parts = Vec::new();
@@ -82,13 +87,9 @@ pub(crate) struct LoadedEnv {
 
 impl LoadedEnv {
     /// The environment of a child without service values: layers 1, 2 and 4,
-    /// moved out. The overrides stay for attributing validation failures.
-    pub(crate) fn take_child_env(&mut self) -> Result<HashMap<String, String>, LpmError> {
+    /// moved out with what the personal overrides decide in it.
+    pub(crate) fn take_child_env(&mut self) -> Result<dotenv::ChildEnv, LpmError> {
         self.layers.take_child_env()
-    }
-
-    pub(crate) fn overrides(&self) -> &dotenv::PersonalOverrides {
-        self.layers.overrides()
     }
 }
 
@@ -194,18 +195,17 @@ pub(crate) fn resolve_and_load_env_with_schema_validation(
             .and_then(|config| config.env_schema.as_ref())
             .map(lpm_env::EnvValidator::new);
         let vault_count = layers.vault_count();
-        let mut composed = layers.compose(None, None)?;
+        let mut child = layers.compose(None, None)?;
         dotenv::validate_project_env_with_plan(
-            &mut composed.vars,
+            &mut child,
             validator.as_ref(),
             lpm_env::EvalContext {
                 environment: env_name.unwrap_or("default"),
                 stage: lpm_env::EnvStage::for_script(script_name),
                 service: None,
             },
-            &composed.overrides,
         )?;
-        layers = dotenv::ProjectEnvLayers::already_composed(composed, vault_count);
+        layers = dotenv::ProjectEnvLayers::already_composed(child, vault_count);
     }
 
     Ok(LoadedEnv {
@@ -227,7 +227,9 @@ pub fn load_script_env(
     explicit_mode: Option<&str>,
     policy: dotenv::OverridePolicy,
 ) -> Result<HashMap<String, String>, LpmError> {
-    resolve_and_load_env(project_dir, script_name, explicit_mode, policy)?.take_child_env()
+    resolve_and_load_env(project_dir, script_name, explicit_mode, policy)?
+        .take_child_env()
+        .map(dotenv::ChildEnv::into_vars)
 }
 
 /// Load a script environment using a configuration that the caller already parsed.
@@ -240,6 +242,7 @@ pub fn load_script_env_with_config(
 ) -> Result<HashMap<String, String>, LpmError> {
     resolve_and_load_env_with_config(project_dir, script_name, explicit_mode, config, policy)?
         .take_child_env()
+        .map(dotenv::ChildEnv::into_vars)
 }
 
 /// Load the validated final script environment for task-cache fingerprinting.
@@ -266,7 +269,7 @@ pub fn load_script_child_env_with_config(
     )?;
     let mut vars = loaded.take_child_env()?;
     mark_script_child_env(&mut vars);
-    context.apply(&mut vars, script_name, command);
+    vars.apply_npm_context(context, script_name, command);
     let validate_schema = !should_skip_env_validation();
     let validator = config
         .filter(|_| validate_schema)
@@ -282,9 +285,8 @@ pub fn load_script_child_env_with_config(
         },
         path,
         validate_schema,
-        loaded.overrides(),
     )?;
-    Ok(vars)
+    Ok(vars.into_vars())
 }
 
 #[cfg(test)]

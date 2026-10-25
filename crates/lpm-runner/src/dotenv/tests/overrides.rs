@@ -20,8 +20,17 @@ fn layers(vars: &[(&str, &str)], overrides: PersonalOverrides) -> ProjectEnvLaye
     ProjectEnvLayers {
         vars: map(vars),
         overrides,
-        overrides_applied: false,
+        composed: None,
         vault_count: 0,
+    }
+}
+
+fn error(key: &str, kind: lpm_env::ValidationErrorKind) -> lpm_env::ValidationError {
+    lpm_env::ValidationError {
+        key: key.to_owned(),
+        kind,
+        description: None,
+        is_secret: false,
     }
 }
 
@@ -49,12 +58,12 @@ fn overrides_beat_team_and_service_values_and_lose_to_runtime_values() {
             ("FROM_SERVICE", "service"),
         ]))
         .expect("compose");
-    insert_project_env(&mut env, "PORT".to_owned(), "5173".to_owned());
+    env.insert_runtime("PORT".to_owned(), "5173".to_owned());
 
-    assert_eq!(env["API_URL"], "mine");
-    assert_eq!(env["SERVICE_ONLY"], "mine");
-    assert_eq!(env["FROM_SERVICE"], "service");
-    assert_eq!(env["PORT"], "5173", "runtime values beat overrides");
+    assert_eq!(env.vars()["API_URL"], "mine");
+    assert_eq!(env.vars()["SERVICE_ONLY"], "mine");
+    assert_eq!(env.vars()["FROM_SERVICE"], "service");
+    assert_eq!(env.vars()["PORT"], "5173", "runtime values beat overrides");
 }
 
 #[test]
@@ -97,13 +106,10 @@ fn non_ascii_names_use_the_hosts_own_comparison() {
 
 #[test]
 fn composed_layers_refuse_service_values_after_the_overrides() {
-    let composed = ProjectEnvLayers::already_composed(
-        ComposedProjectEnv {
-            vars: map(&[("A", "1")]),
-            overrides: overrides(&[("A", "1")], &[]),
-        },
-        0,
-    );
+    let child = layers(&[("A", "0")], overrides(&[("A", "1")], &[]))
+        .compose(None, None)
+        .expect("compose");
+    let composed = ProjectEnvLayers::already_composed(child, 0);
 
     assert!(composed.compose(None, Some("api")).is_err());
 }
@@ -116,49 +122,105 @@ fn validation_failures_name_an_override_only_while_it_is_the_final_origin() {
     .expect("schema");
     let validator = config.env_schema.as_ref().map(lpm_env::EnvValidator::new);
     let personal = overrides(&[("API_URL", "not a url")], &["TOKEN"]);
+    let validate = |mut child: ChildEnv| {
+        validate_child_env(
+            &mut child,
+            validator.as_ref(),
+            lpm_env::EvalContext::default(),
+            "/usr/bin",
+            true,
+        )
+        .expect_err("both keys fail")
+        .to_string()
+    };
+    let attributed = format!("(from a personal override on {THIS_MACHINE})");
 
-    let mut vars = map(&[("API_URL", "not a url")]);
-    let error = validate_child_env(
-        &mut vars,
-        validator.as_ref(),
-        lpm_env::EvalContext::default(),
-        "/usr/bin",
-        true,
-        &personal,
-    )
-    .expect_err("both keys fail");
-    let message = error.to_string();
-    assert_eq!(
-        message
-            .matches("(from a personal override on this Mac)")
-            .count(),
-        2,
-        "{message}"
+    let child = layers(&[("TOKEN", "team")], personal.clone())
+        .compose(None, None)
+        .expect("compose");
+    let message = validate(child);
+    assert_eq!(message.matches(&attributed).count(), 2, "{message}");
+
+    let mut replaced = layers(&[("TOKEN", "team")], personal)
+        .compose(None, None)
+        .expect("compose");
+    replaced.insert_runtime("API_URL".to_owned(), "not a url".to_owned());
+    replaced.insert_runtime("TOKEN".to_owned(), String::new());
+    let message = validate(replaced);
+    assert!(
+        !message.contains("personal override"),
+        "a later layer's value is its own, even when it equals the override's: {message}"
     );
+}
 
-    let mut replaced = map(&[("API_URL", "still not a url"), ("TOKEN", "")]);
-    let error = validate_child_env(
-        &mut replaced,
-        validator.as_ref(),
-        lpm_env::EvalContext::default(),
-        "/usr/bin",
-        true,
-        &personal,
-    )
-    .expect_err("a later layer's value still fails");
-    assert!(!error.to_string().contains("personal override"), "{error}");
+#[test]
+fn an_unset_is_blamed_only_for_the_value_it_left_missing() {
+    let origins = OverrideOrigins::of(&overrides(&[], &["PORT"]), false);
+    let empty = HashMap::new();
+    assert!(origins.caused(
+        &error("PORT", lpm_env::ValidationErrorKind::Missing),
+        &empty
+    ));
+    let invalid = error(
+        "PORT",
+        lpm_env::ValidationErrorKind::ConstraintViolation { constraint: "port" },
+    );
+    assert!(
+        !origins.caused(&invalid, &empty),
+        "an invalid value came from somewhere the unset didn't"
+    );
+}
+
+#[test]
+fn an_override_is_found_under_the_declared_spelling_where_the_host_ignores_case() {
+    let origins = OverrideOrigins::of(&overrides(&[("api_url", "not a url")], &[]), true);
+    let invalid = error(
+        "API_URL",
+        lpm_env::ValidationErrorKind::ConstraintViolation { constraint: "url" },
+    );
+    assert!(origins.caused(&invalid, &map(&[("API_URL", "not a url")])));
+    assert!(
+        !OverrideOrigins::of(&overrides(&[("api_url", "not a url")], &[]), false)
+            .caused(&invalid, &map(&[("API_URL", "not a url")]))
+    );
+}
+
+#[test]
+fn the_count_includes_only_overrides_that_change_the_environment() {
+    let layers = layers(
+        &[("SENTRY_DSN", "team")],
+        overrides(
+            &[("API_URL", "mine"), ("NODE_OPTIONS", "--inspect")],
+            &["SENTRY_DSN", "NOT_IN_THE_PROJECT", "CLASSPATH"],
+        ),
+    );
+    assert_eq!(layers.override_count(), 2);
+    let child = layers.compose(None, None).expect("compose");
+    assert_eq!(child.override_count(), 2);
 }
 
 #[test]
 fn the_notice_counts_overrides_without_naming_them() {
     assert_eq!(personal_override_notice(0, "development"), None);
     assert_eq!(
-        personal_override_notice(1, "development").as_deref(),
-        Some("1 personal override on this Mac applies to development")
+        personal_override_notice(1, "development"),
+        Some(format!(
+            "1 personal override on {THIS_MACHINE} applies to development"
+        ))
     );
     assert_eq!(
-        personal_override_notice(2, "dev\u{1b}[31m").as_deref(),
-        Some("2 personal overrides on this Mac apply to dev"),
+        personal_override_notice(2, "dev\u{1b}[31m"),
+        Some(format!(
+            "2 personal overrides on {THIS_MACHINE} apply to dev"
+        )),
         "terminal controls never reach the notice"
+    );
+    assert_eq!(
+        THIS_MACHINE,
+        if cfg!(target_os = "macos") {
+            "this Mac"
+        } else {
+            "this computer"
+        }
     );
 }

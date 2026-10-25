@@ -2656,7 +2656,7 @@ fn project_loaders_preserve_the_implicit_default_file_cascade() {
             None,
             apply,
         )
-        .map(|composed| composed.vars),
+        .map(lpm_runner::dotenv::ChildEnv::into_vars),
     ] {
         assert_eq!(values.unwrap()["CASCADE_VALUE"], "local");
     }
@@ -2691,7 +2691,7 @@ fn project_loaders_honor_the_configured_default_file_and_scope() {
             None,
             apply,
         )
-        .map(|composed| composed.vars),
+        .map(lpm_runner::dotenv::ChildEnv::into_vars),
     ] {
         assert_eq!(values.unwrap()["CASCADE_VALUE"], "configured");
     }

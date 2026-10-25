@@ -4,7 +4,7 @@ use lpm_common::LpmError;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-const KEYS: [&str; 6] = [
+pub(crate) const KEYS: [&str; 6] = [
     "npm_lifecycle_event",
     "npm_lifecycle_script",
     "npm_package_name",

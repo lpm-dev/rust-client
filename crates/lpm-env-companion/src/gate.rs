@@ -35,6 +35,9 @@ pub enum Damage {
     /// Approval attributes that contradict each other, which only the macOS
     /// Keychain has.
     Access(String),
+    /// An interrupted change whose journal or files are in a state no LPM
+    /// client leaves them in, so it can't be finished or undone.
+    Unfinished(String),
 }
 
 impl Damage {
@@ -61,6 +64,12 @@ impl fmt::Display for Damage {
                 write!(formatter, "record \"{kind}\" belongs to no feature")
             }
             Self::Access(reason) => write!(formatter, "{reason}"),
+            Self::Unfinished(reason) => {
+                write!(
+                    formatter,
+                    "an interrupted change can't be finished: {reason}"
+                )
+            }
         }
     }
 }
@@ -80,6 +89,17 @@ pub enum GateError {
         level: Level,
     },
     Damaged(Damage),
+}
+
+/// How every [`GateError`] message begins, so a client whose storage layer
+/// passes errors as text can tell a refusal from a storage failure.
+const MESSAGE_PREFIX: &str = "This env project";
+
+impl GateError {
+    /// Whether `message` is a [`GateError`]'s.
+    pub fn describes(message: &str) -> bool {
+        message.starts_with(MESSAGE_PREFIX)
+    }
 }
 
 impl fmt::Display for GateError {
@@ -118,9 +138,10 @@ impl fmt::Display for GateError {
                     "This env project's newer data is damaged ({damage})."
                 )?;
                 if cfg!(target_os = "macos") {
-                    formatter.write_str(" Open it in LPM Vault to repair it.")?;
+                    formatter.write_str(" Repair it in LPM Vault, or with: lpm env repair")
+                } else {
+                    formatter.write_str(" Repair it: lpm env repair")
                 }
-                Ok(())
             }
         }
     }
@@ -293,6 +314,41 @@ mod tests {
                 .to_string(),
             "This env project uses local history v2, which this LPM CLI can only read. Update the LPM CLI to change it: lpm self-update"
         );
+    }
+
+    #[test]
+    fn every_refusal_is_recognized_by_its_message() {
+        let refusals = [
+            GateError::Unsupported {
+                feature: "overrides".to_owned(),
+                version: 2,
+                level: Level::Refuse,
+            },
+            GateError::Unsupported {
+                feature: "history".to_owned(),
+                version: 2,
+                level: Level::ReadOnly,
+            },
+            GateError::Damaged(Damage::InvalidMarker("x".to_owned())),
+            GateError::Damaged(Damage::MissingRecord {
+                kind: "overrides".to_owned(),
+            }),
+            GateError::Damaged(Damage::InvalidRecord {
+                kind: "overrides".to_owned(),
+                reason: "x".to_owned(),
+            }),
+            GateError::Damaged(Damage::UnlistedRecord {
+                kind: "notes".to_owned(),
+            }),
+            GateError::Damaged(Damage::Access("x".to_owned())),
+            GateError::Damaged(Damage::Unfinished("x".to_owned())),
+        ];
+        for refusal in refusals {
+            assert!(GateError::describes(&refusal.to_string()), "{refusal:?}");
+        }
+        assert!(!GateError::describes(
+            "failed to read companion entry: denied"
+        ));
     }
 
     #[test]

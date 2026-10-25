@@ -72,6 +72,11 @@ pub(super) struct RunRead {
     pub(super) overrides_record: Option<Vec<u8>>,
 }
 
+/// Why the values item damages a project's access, when its approval
+/// attributes contradict each other.
+pub(super) const CONTRADICTORY_VALUES: &str =
+    "the values' approval attributes contradict each other";
+
 /// The values item's bytes with the approval they claim, read in one call.
 /// Approval attributes that contradict each other damage the project's
 /// access, which refuses every read.
@@ -80,9 +85,9 @@ fn read_values(
     vault_id: &str,
 ) -> Result<Option<(Vec<u8>, ClaimedAccess)>, String> {
     match storage.read_with_access(vault_id)? {
-        Some((_, ClaimedAccess::Contradictory)) => Err(damaged(Damage::Access(
-            "the values' approval attributes contradict each other".to_owned(),
-        ))),
+        Some((_, ClaimedAccess::Contradictory)) => {
+            Err(damaged(Damage::Access(CONTRADICTORY_VALUES.to_owned())))
+        }
         read => Ok(read),
     }
 }

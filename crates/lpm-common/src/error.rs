@@ -641,6 +641,12 @@ pub enum LpmError {
     )]
     EnvValidation(String),
 
+    /// An env project's newer data stopped the operation: a feature this
+    /// client doesn't support, or damage. The message says what to do.
+    #[error("{0}")]
+    #[diagnostic(code(lpm::env_project_refused))]
+    EnvProjectRefused(String),
+
     #[error("environment generation failed:\n{reason}")]
     #[diagnostic(code(lpm::env_generation), help("{help}"))]
     EnvGeneration { reason: String, help: &'static str },
@@ -866,6 +872,7 @@ impl LpmError {
                 "catalog_entry_invalid_recursive_definition"
             }
             LpmError::EnvValidation(_) => "env_validation",
+            LpmError::EnvProjectRefused(_) => "env_project_refused",
             LpmError::EnvGeneration { .. } => "env_generation",
             LpmError::EngineMismatch { .. } | LpmError::RunEngineMismatch { .. } => {
                 "engine_mismatch"

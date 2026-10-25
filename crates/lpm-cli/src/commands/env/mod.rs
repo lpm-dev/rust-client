@@ -13,6 +13,7 @@ mod platform;
 mod pull;
 mod push;
 mod remote;
+mod repair;
 mod response;
 mod rotation;
 mod schema;
@@ -161,6 +162,7 @@ pub async fn run(
                 )
             }
             LocalAction::Init { force } => inventory::vars_init(project_dir, force, json_output),
+            LocalAction::Repair { yes } => repair::env_repair(project_dir, yes, json_output),
             LocalAction::Ls => inventory::vars_ls(project_dir, json_output),
             LocalAction::Log => remote::env_log(client, project_dir, json_output).await,
             LocalAction::Unpair => pairing::env_unpair(client, json_output).await,
