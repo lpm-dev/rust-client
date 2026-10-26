@@ -250,7 +250,7 @@ pub(crate) fn planting(
                 staged(vault_id, OVERRIDES_KIND),
                 vec![b'x'; 101 * 1024],
             )],
-            "Planted a restore whose staged record is over the 100 KiB a record may hold, so it can't be finished. Reads refuse with the reason. LPM Vault shows the unfinished change and why; deleting the project still works.".to_owned(),
+            "Planted a restore whose staged record is over the 100 KiB a record may hold, so it can never be finished. Reads refuse with the reason; lpm env repair and LPM Vault's Repair… discard the newer data and keep the values, and deleting the project still works.".to_owned(),
         ),
         State::ContradictoryRecord => {
             let overrides = record(vault_id, OVERRIDES_KIND, None);
