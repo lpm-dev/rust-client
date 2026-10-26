@@ -7,6 +7,7 @@
 
 mod support;
 
+use lpm_runner::dotenv::personal_overrides_here;
 use support::{TempProject, lpm};
 
 const OVERRIDES_MARKER: &str = r#"{"schemaVersion":1,"vaultId":"VAULT_ID","state":"active","features":{"overrides":{"version":1,"ifUnsupported":"refuse","kinds":["overrides"],"state":"active"}}}"#;
@@ -87,10 +88,7 @@ fn run_applies_a_personal_override_and_reports_only_its_count() {
         stdout(&output)
     );
     let stderr = stderr(&output);
-    assert!(
-        stderr.contains("1 personal override on this Mac"),
-        "{stderr}"
-    );
+    assert!(stderr.contains(&personal_overrides_here(1)), "{stderr}");
     assert!(
         !stderr.contains("API_URL"),
         "names stay out by default: {stderr}"
@@ -240,7 +238,11 @@ fn print_applies_overrides_but_ci_emission_excludes_them() {
     let printed_json: serde_json::Value =
         serde_json::from_slice(&printed.stdout).expect("print emits one JSON document");
     assert_eq!(printed_json["API_URL"], "mine");
-    assert!(stderr(&printed).contains("1 personal override on this Mac"));
+    assert!(
+        stderr(&printed).contains(&personal_overrides_here(1)),
+        "{}",
+        stderr(&printed)
+    );
 
     let ci = lpm(&project)
         .args(["env", "print", "--ci"])
