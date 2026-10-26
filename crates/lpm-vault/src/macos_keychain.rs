@@ -372,11 +372,10 @@ impl SecurityFrameworkBackend {
         service: &str,
         account: &str,
     ) -> Result<Option<ClaimedAccess>, KeychainStorageError> {
+        // Attributes need no authentication, but a context that forbids
+        // interaction makes the Keychain refuse an item that demands user
+        // presence even for them, so attribute queries pass none.
         let mut pairs = Self::identity_pairs(service, account);
-        pairs.push((
-            unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationContext) },
-            non_interactive_context(),
-        ));
         pairs.push((
             unsafe { CFString::wrap_under_get_rule(kSecReturnAttributes) },
             CFBoolean::from(true).into_CFType(),
@@ -403,15 +402,12 @@ impl SecurityFrameworkBackend {
     }
 
     /// The account names of every item in `service`, from attributes alone,
-    /// without authentication UI.
+    /// which never ask for authentication. Like [`Self::claimed_access`], it
+    /// passes no authentication context.
     fn account_names(service: &str) -> Result<Vec<String>, KeychainStorageError> {
         let mut pairs = Self::identity_pairs(service, "");
         let account_key = unsafe { CFString::wrap_under_get_rule(kSecAttrAccount) };
         pairs.retain(|(key, _)| key != &account_key);
-        pairs.push((
-            unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationContext) },
-            non_interactive_context(),
-        ));
         pairs.push((
             unsafe { CFString::wrap_under_get_rule(kSecReturnAttributes) },
             CFBoolean::from(true).into_CFType(),
@@ -983,8 +979,8 @@ mod tests {
         );
         assert_eq!(
             claimed_access(&service, "automatic").expect("attributes"),
-            Some(ClaimedAccess::Contradictory),
-            "an approval marker without an access control contradicts itself"
+            Some(ClaimedAccess::RequireApproval),
+            "every Data Protection item reports an access control, so an approval marker over one that asks for nothing claims approval"
         );
         assert_eq!(
             probe(&service, "automatic", &["open"]),
@@ -996,8 +992,33 @@ mod tests {
             probe(&service, "automatic", &["open"]),
             ProbeOutcome::Protected
         );
-        let names = account_names(&service).expect("listing");
-        for account in ["open", "automatic", "protected"] {
+        SecurityFrameworkBackend::add(&service, "contradictory", b"synthetic-fixture")
+            .expect("contradictory item");
+        let unknown_policy = CFDictionary::from_CFType_pairs(&[(
+            unsafe { CFString::wrap_under_get_rule(kSecAttrGeneric) },
+            CFData::from_buffer(b"lpm-cli-access:require-approval:v2").into_CFType(),
+        )]);
+        let query = CFDictionary::from_CFType_pairs(&SecurityFrameworkBackend::identity_pairs(
+            &service,
+            "contradictory",
+        ));
+        assert_eq!(
+            unsafe {
+                SecItemUpdate(
+                    query.as_concrete_TypeRef(),
+                    unknown_policy.as_concrete_TypeRef(),
+                )
+            },
+            0
+        );
+        assert_eq!(
+            claimed_access(&service, "contradictory").expect("attributes"),
+            Some(ClaimedAccess::Contradictory),
+            "a policy LPM doesn't know contradicts itself"
+        );
+        let names = account_names(&service)
+            .expect("items that demand user presence never stop the listing");
+        for account in ["open", "automatic", "protected", "contradictory"] {
             assert!(names.iter().any(|name| name == account), "{names:?}");
         }
     }
