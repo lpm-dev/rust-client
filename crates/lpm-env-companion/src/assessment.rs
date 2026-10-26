@@ -3,7 +3,8 @@
 //! the project's records, the overrides record and the access it verified.
 //! The CLI sees only the marker and, on Apply reads, the overrides record;
 //! the app's listing also sees records no feature lists and required
-//! records that are missing.
+//! records that are missing. Either may find, resuming, that an interrupted
+//! step can never be finished.
 
 use std::collections::HashSet;
 
@@ -27,6 +28,9 @@ pub struct Observed<'a> {
     pub overrides: Option<Option<&'a [u8]>>,
     /// Why the client found the project's access damaged, if it did.
     pub access: Option<&'a str>,
+    /// Why the project's interrupted step can never be finished, when the
+    /// client's resume found it can't.
+    pub unfinished: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +68,9 @@ pub fn assess(vault_id: &str, observed: Observed<'_>) -> Assessment {
             damage.push(found);
         }
     };
+    if let Some(reason) = observed.unfinished {
+        found(Damage::Unfinished(reason.to_owned()));
+    }
     let records_are_read = match &gate {
         ProjectGate::Plain => true,
         ProjectGate::Marked(marker) => !needs_resume(marker),
@@ -224,6 +231,7 @@ mod tests {
                     inventory: Some(&inventory),
                     overrides: Some(overrides),
                     access: None,
+                    unfinished: None,
                 },
             );
             assert!(assessment.damage.is_empty(), "{:?}", assessment.damage);
@@ -245,6 +253,7 @@ mod tests {
                 inventory: Some(&inventory),
                 overrides: Some(Some(RECORD)),
                 access: None,
+                unfinished: None,
             },
         );
         assert!(assessment.damage.is_empty());
@@ -481,5 +490,37 @@ mod tests {
             },
         );
         assert_eq!(access.repairs(), [], "damaged access has no repair here");
+    }
+
+    #[test]
+    fn an_interrupted_step_that_can_never_finish_is_damage_a_discard_repairs() {
+        let deleting = std::str::from_utf8(OVERRIDES_MARKER).unwrap().replace(
+            r#""state":"active","features""#,
+            r#""state":"deleting","features""#,
+        );
+        let assessment = assess(
+            "proj",
+            Observed {
+                marker: Some(deleting.as_bytes()),
+                inventory: Some(&[record("overrides", None)]),
+                access: Some("contradicts"),
+                unfinished: Some("a restore lost a staged record before it was activated"),
+                ..Observed::default()
+            },
+        );
+        assert!(assessment.needs_resume());
+        assert_eq!(
+            assessment.damage,
+            [
+                Damage::Unfinished(
+                    "a restore lost a staged record before it was activated".to_owned()
+                ),
+                Damage::Access("contradicts".to_owned()),
+            ],
+            "what can't be finished comes first"
+        );
+        assert_eq!(assessment.repairs(), [Repair::DiscardProject]);
+        assert_eq!(assessment.authorize(Operation::Maintenance), Ok(()));
+        assert!(assessment.authorize(Operation::Write).is_err());
     }
 }

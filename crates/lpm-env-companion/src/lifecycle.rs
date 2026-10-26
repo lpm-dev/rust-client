@@ -259,6 +259,21 @@ pub fn execute(store: &mut impl LifecycleStore, plan: Plan) -> Result<Option<Mar
     run(store, plan).map_err(ResumeError::into_message)
 }
 
+/// Whether a move can activate `staged`, given the length of the record
+/// stored there, `None` when it's missing. A staged record that's lost, or
+/// larger than a record may be, can never be moved, so the step that moves
+/// it can never be finished.
+pub fn check_move(staged: &CompanionAccount, length: Option<usize>) -> Result<(), String> {
+    match length {
+        None => Err("a restore lost a staged record before it was activated".to_owned()),
+        Some(length) if length > MAX_RECORD_BYTES => Err(format!(
+            "a restore's staged {} record holds {length} bytes, more than the {MAX_RECORD_BYTES} a record may",
+            staged.kind().unwrap_or("record"),
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
 /// Why an interrupted step wasn't finished.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeError {
@@ -292,22 +307,10 @@ fn run(store: &mut impl LifecycleStore, plan: Plan) -> Result<Option<Marker>, Re
                         .map_err(ResumeError::Storage)?;
                 }
                 PlannedChange::Move { staged, live } => {
-                    let value = store
-                        .read(&staged)
-                        .map_err(ResumeError::Storage)?
-                        .ok_or_else(|| {
-                            ResumeError::Unfinishable(
-                                "a restore lost a staged record before it was activated".to_owned(),
-                            )
-                        })?;
-                    if value.len() > crate::marker::MAX_RECORD_BYTES {
-                        return Err(ResumeError::Unfinishable(format!(
-                            "a restore's staged {} record holds {} bytes, more than the {} a record may",
-                            staged.kind().unwrap_or("record"),
-                            value.len(),
-                            crate::marker::MAX_RECORD_BYTES
-                        )));
-                    }
+                    let value = store.read(&staged).map_err(ResumeError::Storage)?;
+                    check_move(&staged, value.as_ref().map(Vec::len))
+                        .map_err(ResumeError::Unfinishable)?;
+                    let value = value.unwrap_or_default();
                     batch
                         .add(
                             store,
@@ -1410,20 +1413,47 @@ mod tests {
     }
 
     #[test]
-    fn a_restore_whose_staged_record_is_over_the_limit_can_never_finish() {
-        let (mut store, _) = restoring_store(RestorePhase::Activating, 0);
-        store.records.insert(
-            staged("overrides", None),
-            vec![b'x'; crate::marker::MAX_RECORD_BYTES + 1],
+    fn a_staged_record_moves_only_when_it_is_there_and_within_the_record_limit() {
+        let account = staged("overrides", None);
+        assert_eq!(check_move(&account, Some(MAX_RECORD_BYTES)), Ok(()));
+        assert_eq!(
+            check_move(&account, None),
+            Err("a restore lost a staged record before it was activated".to_owned())
         );
+        assert_eq!(
+            check_move(&account, Some(MAX_RECORD_BYTES + 1)),
+            Err(format!(
+                "a restore's staged overrides record holds {} bytes, more than the {MAX_RECORD_BYTES} a record may",
+                MAX_RECORD_BYTES + 1
+            ))
+        );
+    }
+
+    #[test]
+    fn a_restore_whose_staged_record_is_lost_or_over_the_limit_can_never_finish() {
+        let (mut store, _) = restoring_store(RestorePhase::Activating, 0);
+        store
+            .records
+            .insert(staged("overrides", None), vec![b'x'; MAX_RECORD_BYTES + 1]);
         let marker = store.marker().expect("marker");
         let inventory = store.inventory();
-        match resume(&mut store, marker, inventory) {
-            Err(ResumeError::Unfinishable(reason)) => {
-                assert!(reason.contains("overrides"), "{reason}");
-            }
-            other => panic!("expected a step that can't be finished, got {other:?}"),
-        }
+        assert_eq!(
+            resume(&mut store, marker, inventory),
+            Err(ResumeError::Unfinishable(
+                check_move(&staged("overrides", None), Some(MAX_RECORD_BYTES + 1)).unwrap_err()
+            ))
+        );
+
+        let (mut store, _) = restoring_store(RestorePhase::Activating, 0);
+        let marker = store.marker().expect("marker");
+        let inventory = store.inventory();
+        store.records.remove(&staged("overrides", None));
+        assert_eq!(
+            resume(&mut store, marker, inventory),
+            Err(ResumeError::Unfinishable(
+                "a restore lost a staged record before it was activated".to_owned()
+            ))
+        );
 
         let (mut store, _) = restoring_store(RestorePhase::Activating, 0);
         store.crash_after = Some(0);

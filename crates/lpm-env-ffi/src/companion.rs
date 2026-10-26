@@ -16,8 +16,8 @@ use lpm_env_companion::gate::{Damage, Operation, ProjectGate};
 use lpm_env_companion::graph::{AccessClass, record_access_class};
 use lpm_env_companion::invariants::{Refusal, check_transaction};
 use lpm_env_companion::lifecycle::{
-    FoundMarker, MarkerChange, Plan, PlannedChange, Resumed, plan_deletion, plan_discard,
-    plan_feature_removal, plan_resume, plan_unlisted_removal,
+    FoundMarker, MarkerChange, Plan, PlannedChange, Resumed, check_move, plan_deletion,
+    plan_discard, plan_feature_removal, plan_resume, plan_unlisted_removal,
 };
 use lpm_env_companion::marker::{
     FeatureEntry, Level, Marker, ProjectState, RestorePhase, is_supported,
@@ -302,6 +302,8 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
         overrides: Option<Read>,
         #[serde(default)]
         access_damage: Option<String>,
+        #[serde(default)]
+        unfinished: Option<String>,
     }
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -411,6 +413,7 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
                         .as_ref()
                         .map(|read| read.bytes.as_ref().map(|bytes| bytes.0.as_slice())),
                     access: request.access_damage.as_deref(),
+                    unfinished: request.unfinished.as_deref(),
                 },
             );
             let marker = assessment.gate.marker();
@@ -620,6 +623,44 @@ pub unsafe extern "C" fn lpm_env_companion_plan(input: *const u8, length: usize)
                 Ok(output) => json(&output),
                 Err(message) => refusal("companion.refused", message),
             }
+        })
+    }
+}
+
+/// Check the staged record a resume plan's move activates, just after
+/// reading it, the way the CLI checks its own: a move whose record is lost or
+/// larger than a record may be can never be made.
+/// # Safety
+/// The pointer must reference readable bytes for its length during the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lpm_env_companion_check_move(
+    input: *const u8,
+    length: usize,
+) -> LPMEnvResult {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Request {
+        staged: String,
+        length: Option<usize>,
+    }
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Output {
+        abi_version: u32,
+        unfinishable: Option<String>,
+    }
+    // SAFETY: Forwarded from this function's contract.
+    unsafe {
+        respond(input, length, |request: Request| {
+            let Some(staged @ CompanionAccount::Staged { .. }) =
+                CompanionAccount::parse(&request.staged)
+            else {
+                return failure(2, "companion.invalid_input");
+            };
+            json(&Output {
+                abi_version: ABI_VERSION,
+                unfinishable: check_move(&staged, request.length).err(),
+            })
         })
     }
 }

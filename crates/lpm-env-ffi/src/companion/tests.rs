@@ -339,6 +339,68 @@ fn an_interrupted_step_allows_nothing_until_it_is_resumed() {
 }
 
 #[test]
+fn a_step_that_can_never_finish_is_damage_a_discard_repairs() {
+    let deleting = OVERRIDES_MARKER.replace(
+        r#""state":"active","features""#,
+        r#""state":"deleting","features""#,
+    );
+    let reason = "a restore lost a staged record before it was activated";
+    let (status, output) = call(
+        lpm_env_companion_assess,
+        &json!({ "vaultId": "proj", "marker": base64(deleting.as_bytes()), "unfinished": reason }),
+    );
+    assert_eq!(status, 0);
+    assert_eq!(output["needsResume"], true);
+    assert_eq!(
+        output["damage"],
+        json!([{ "code": "unfinishedChange", "reason": reason, "repair": { "action": "discardProject" } }])
+    );
+    assert_eq!(output["repairs"], json!([{ "action": "discardProject" }]));
+}
+
+#[test]
+fn a_move_is_checked_against_its_staged_record_as_the_cli_checks_it() {
+    let staged = lpm_env_companion::account::staged_account("overrides", "proj", None);
+    let check = |length: Value| {
+        call(
+            lpm_env_companion_check_move,
+            &json!({ "staged": staged, "length": length }),
+        )
+    };
+    assert_eq!(
+        check(json!(100 * 1024)),
+        (
+            0,
+            json!({ "abiVersion": ABI_VERSION, "unfinishable": null })
+        )
+    );
+    for (length, expected) in [
+        (Value::Null, None),
+        (json!(100 * 1024 + 1), Some(100 * 1024 + 1)),
+    ] {
+        let (status, output) = check(length);
+        assert_eq!(status, 0);
+        let account = CompanionAccount::parse(&staged).unwrap();
+        assert_eq!(
+            output["unfinishable"],
+            lpm_env_companion::lifecycle::check_move(&account, expected).unwrap_err()
+        );
+    }
+    for staged in [
+        record_name("overrides", None),
+        marker_name("proj"),
+        "plain".to_owned(),
+    ] {
+        let (status, output) = call(
+            lpm_env_companion_check_move,
+            &json!({ "staged": staged, "length": 1 }),
+        );
+        assert_eq!(status, 2, "{staged}");
+        assert_eq!(output["code"], "companion.invalid_input");
+    }
+}
+
+#[test]
 fn a_deletion_plan_leaves_room_for_the_callers_own_changes() {
     let (status, plan) = call(
         lpm_env_companion_plan,
@@ -528,6 +590,7 @@ fn the_header_declares_every_companion_function_and_the_input_limit() {
         "lpm_env_companion_assess(const uint8_t *input, size_t input_length);",
         "lpm_env_companion_plan(const uint8_t *input, size_t input_length);",
         "lpm_env_companion_check_transaction(const uint8_t *input, size_t input_length);",
+        "lpm_env_companion_check_move(const uint8_t *input, size_t input_length);",
     ] {
         assert!(header.contains(function), "{function}");
     }

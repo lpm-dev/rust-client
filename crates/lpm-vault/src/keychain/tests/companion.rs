@@ -1153,6 +1153,23 @@ fn a_restore_that_can_never_finish_is_damage_only_a_discard_repairs() {
     );
 
     let review = review_companion_data_with_storage(&mut storage, VAULT).expect("review");
+    let reason = crate::companion::lifecycle::check_move(
+        &crate::companion::account::CompanionAccount::parse(&staged_account(
+            "overrides",
+            VAULT,
+            None,
+        ))
+        .expect("staged"),
+        Some(crate::companion::marker::MAX_RECORD_BYTES + 1),
+    )
+    .expect_err("too large");
+    assert_eq!(
+        review.problems,
+        [crate::companion::repair::CompanionProblem {
+            description: crate::companion::gate::Damage::Unfinished(reason).to_string(),
+            repair: Some(crate::companion::repair::CompanionRepair::DiscardProject),
+        }]
+    );
     assert_eq!(
         review.repairs(),
         [crate::companion::repair::CompanionRepair::DiscardProject]

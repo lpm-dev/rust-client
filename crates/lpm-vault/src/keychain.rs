@@ -1640,22 +1640,24 @@ pub(crate) fn repair_companion_data(
     })
 }
 
-/// Finish `vault_id`'s interrupted step, then report why its access is
-/// damaged, if it is.
+/// Finish `vault_id`'s interrupted step if it can be finished, then report
+/// why its access is damaged, if it is, and why the step can never be
+/// finished, if it can't.
 fn open_for_repair(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
-) -> Result<Option<&'static str>, String> {
+) -> Result<(Option<&'static str>, Option<String>), String> {
     validate_vault_id(vault_id)?;
-    crate::companion::authorize(
+    let unfinished = match crate::companion::open_project_or_unfinished(
         &mut companion_gate::KeychainCompanion(&mut *storage),
         vault_id,
-        Operation::Maintenance,
-    )?;
-    Ok(
-        (storage.claimed_access(vault_id)? == Some(ClaimedAccess::Contradictory))
-            .then_some(companion_gate::CONTRADICTORY_VALUES),
-    )
+    )? {
+        crate::companion::Opened::Unfinished(reason) => Some(reason),
+        crate::companion::Opened::Gate(_) => None,
+    };
+    let access = (storage.claimed_access(vault_id)? == Some(ClaimedAccess::Contradictory))
+        .then_some(companion_gate::CONTRADICTORY_VALUES);
+    Ok((access, unfinished))
 }
 
 fn review_companion_data_with_storage(
@@ -1663,16 +1665,12 @@ fn review_companion_data_with_storage(
     vault_id: &str,
 ) -> Result<crate::companion::repair::CompanionReview, String> {
     let storage = &mut ListedStorage::new(storage);
-    if let Some(reason) = unfinished_step(storage, vault_id)? {
-        return Ok(crate::companion::repair::CompanionReview::discard(
-            crate::companion::gate::Damage::Unfinished(reason).to_string(),
-        ));
-    }
-    let access = open_for_repair(storage, vault_id)?;
+    let (access, unfinished) = open_for_repair(storage, vault_id)?;
     crate::companion::repair::review(
         &mut companion_gate::KeychainCompanion(storage),
         vault_id,
         access,
+        unfinished.as_deref(),
     )
 }
 
@@ -1682,41 +1680,13 @@ fn repair_companion_data_with_storage(
     reviewed: &crate::companion::repair::CompanionReview,
 ) -> Result<Vec<crate::companion::repair::CompanionRepair>, String> {
     let storage = &mut ListedStorage::new(storage);
-    if let Some(reason) = unfinished_step(storage, vault_id)? {
-        let review = crate::companion::repair::CompanionReview::discard(
-            crate::companion::gate::Damage::Unfinished(reason).to_string(),
-        );
-        if review != *reviewed {
-            return Err(crate::companion::repair::CHANGED_SINCE_REVIEW.to_owned());
-        }
-        return crate::companion::repair::discard(
-            &mut companion_gate::KeychainCompanion(storage),
-            vault_id,
-        );
-    }
-    let access = open_for_repair(storage, vault_id)?;
+    let (access, unfinished) = open_for_repair(storage, vault_id)?;
     crate::companion::repair::repair(
         &mut companion_gate::KeychainCompanion(storage),
         vault_id,
         access,
+        unfinished.as_deref(),
         reviewed,
-    )
-}
-
-/// Why `vault_id`'s interrupted step can never be finished, if it can't.
-fn unfinished_step(
-    storage: &mut impl ProjectStorage,
-    vault_id: &str,
-) -> Result<Option<String>, String> {
-    validate_vault_id(vault_id)?;
-    Ok(
-        match crate::companion::open_project_or_unfinished(
-            &mut companion_gate::KeychainCompanion(&mut *storage),
-            vault_id,
-        )? {
-            crate::companion::Opened::Unfinished(reason) => Some(reason),
-            crate::companion::Opened::Gate(_) => None,
-        },
     )
 }
 

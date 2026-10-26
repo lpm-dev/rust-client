@@ -188,7 +188,8 @@ LPMEnvResult lpm_env_companion_account_names(const uint8_t *input, size_t input_
  * scope. Input {vaultId, marker: bytes | null (absent), inventory?: [names] from a
  * names-only listing in the same scope (other projects' names are ignored),
  * overrides?: {bytes: bytes | null} when the overrides record was read, found or
- * not, accessDamage?: why access was found damaged}. Output {marker: "absent" |
+ * not, accessDamage?: why access was found damaged, unfinished?: why a resume
+ * found the interrupted step can never be finished}. Output {marker: "absent" |
  * "invalid" | "valid", state, restorePhase, needsResume, level: "ignore" |
  * "readOnly" | "refuse" (null unless valid), unsupported: {feature, version,
  * level} | null, features: [{name, version, ifUnsupported, kinds, state,
@@ -220,10 +221,16 @@ LPMEnvResult lpm_env_companion_assess(const uint8_t *input, size_t input_length)
  * writesMarker: bytes | null, deletesMarker}], result: the marker left, bytes |
  * null, notice: {kind: "deletion" | "discard" | "restoreUndone" | "restore" |
  * "featureRemoval", features} | null (resume only)}. A move writes the staged
- * record's bytes to live and deletes staged. Each transaction holds at most 32
- * operations and, with records of at most 100 KiB, 1 MiB of writes.
+ * record's bytes to live and deletes staged, once lpm_env_companion_check_move
+ * admits them. Each transaction holds at most 32 operations and, with records
+ * of at most 100 KiB, 1 MiB of writes. A refused resume can never be finished.
  * status: 0=planned, 5=refused. */
 LPMEnvResult lpm_env_companion_plan(const uint8_t *input, size_t input_length);
+/* Check the staged record a move activates, just after reading it. Input
+ * {staged: a staged record's name, length: its byte count | null (missing)}.
+ * Output {unfinishable: why the move, and so the step that makes it, can never
+ * be finished | null}. status: 0=checked. */
+LPMEnvResult lpm_env_companion_check_move(const uint8_t *input, size_t input_length);
 /* Check one transaction before committing it, and again when its committed
  * journal is replayed: both apply the same rules, so a journal a commit accepts
  * always replays. Input {changes: [{account, bytes: bytes | null (a deletion)}],

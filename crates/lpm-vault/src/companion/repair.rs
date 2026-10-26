@@ -95,26 +95,32 @@ fn marker_account(vault_id: &str) -> CompanionAccount {
 
 /// Review `vault_id`'s companion data as the engine judges it, after its
 /// interrupted steps were finished. `access` is why the store found the
-/// project's access damaged, if it did.
+/// project's access damaged, if it did, and `unfinished` why its interrupted
+/// step can never be finished, if it can't; its records aren't read then.
 pub(crate) fn review(
     backend: &mut impl CompanionBackend,
     vault_id: &str,
     access: Option<&str>,
+    unfinished: Option<&str>,
 ) -> Result<CompanionReview, String> {
     let marker = backend.read(&marker_account(vault_id))?;
     let inventory = backend.inventory(vault_id)?;
-    let overrides = backend.read(&CompanionAccount::Record {
-        kind: OVERRIDES_KIND.to_owned(),
-        vault_id: vault_id.to_owned(),
-        part: None,
-    })?;
+    let overrides = match unfinished {
+        Some(_) => None,
+        None => Some(backend.read(&CompanionAccount::Record {
+            kind: OVERRIDES_KIND.to_owned(),
+            vault_id: vault_id.to_owned(),
+            part: None,
+        })?),
+    };
     let assessment = assess(
         vault_id,
         Observed {
             marker: marker.as_deref(),
             inventory: Some(&inventory),
-            overrides: Some(overrides.as_deref()),
+            overrides: overrides.as_ref().map(Option::as_deref),
             access,
+            unfinished,
         },
     );
     Ok(CompanionReview {
@@ -133,36 +139,17 @@ pub(crate) fn review(
     })
 }
 
-/// Discard `vault_id`'s companion data as its marker stands, without
-/// finishing the interrupted step it may describe, as a step that can never
-/// be finished needs.
-pub(crate) fn discard(
-    backend: &mut impl CompanionBackend,
-    vault_id: &str,
-) -> Result<Vec<CompanionRepair>, String> {
-    let marker = backend
-        .read(&marker_account(vault_id))?
-        .map(|bytes| Marker::parse(vault_id, &bytes));
-    let found = match &marker {
-        None => FoundMarker::Absent,
-        Some(Err(_)) => FoundMarker::Invalid,
-        Some(Ok(marker)) => FoundMarker::Valid(marker),
-    };
-    let inventory = backend.inventory(vault_id)?;
-    execute(backend, plan_discard(vault_id, found, inventory)?)?;
-    super::forget(vault_id);
-    Ok(vec![CompanionRepair::DiscardProject])
-}
-
 /// Run every repair `reviewed` lists, after checking `vault_id` still shows
-/// exactly that damage. Returns the repairs it ran.
+/// exactly that damage. Returns the repairs it ran. A discard runs on the
+/// marker as it stands, so it never needs the interrupted step finished.
 pub(crate) fn repair(
     backend: &mut impl CompanionBackend,
     vault_id: &str,
     access: Option<&str>,
+    unfinished: Option<&str>,
     reviewed: &CompanionReview,
 ) -> Result<Vec<CompanionRepair>, String> {
-    if review(backend, vault_id, access)? != *reviewed {
+    if review(backend, vault_id, access, unfinished)? != *reviewed {
         return Err(CHANGED_SINCE_REVIEW.to_owned());
     }
     let repairs = reviewed.repairs().to_vec();

@@ -1071,7 +1071,7 @@ pub(crate) fn review_companion_data_unlocked(
         }
     }
     crate::companion::authorize(&mut companion, vault_id, Operation::Maintenance)?;
-    crate::companion::repair::review(&mut companion, vault_id, None)
+    crate::companion::repair::review(&mut companion, vault_id, None, None)
 }
 
 /// Run what `reviewed` lists on the file store, after checking `vault_id`
@@ -1089,7 +1089,7 @@ pub(crate) fn repair_companion_data_unlocked(
         companion.discard_project(vault_id)?;
         return Ok(vec![CompanionRepair::DiscardProject]);
     }
-    crate::companion::repair::repair(&mut companion, vault_id, None, reviewed)
+    crate::companion::repair::repair(&mut companion, vault_id, None, None, reviewed)
 }
 
 /// The file store's records with commits that skip the invariant check, for
