@@ -9,6 +9,7 @@ expression: envelope
       "environment": "default",
       "total": 1,
       "valid": 0,
+      "ignored": [],
       "errors": [
         {
           "key": "REQUIRED",

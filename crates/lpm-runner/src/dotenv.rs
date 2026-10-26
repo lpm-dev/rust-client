@@ -14,6 +14,7 @@ use crate::lpm_json;
 use lpm_common::{BoundedReadError, CONFIG_FILE_SIZE_CAP_BYTES, LpmError, read_text_file_capped};
 use lpm_env::{EnvName, is_denied_env_var};
 pub use lpm_vault::PersonalOverrides;
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -1355,19 +1356,91 @@ fn contained_env_file_path(project_dir: &Path, file_path: &str) -> Result<PathBu
     Ok(canonical_path)
 }
 
+thread_local! {
+    static COLLECTED_IGNORED_NAMES: RefCell<Option<BTreeSet<String>>> = const { RefCell::new(None) };
+}
+
+/// Runs `action` and returns, with its result, the names of every value it
+/// dropped as [denied](is_denied_env_var), in order. The loaders report these
+/// to the caller instead of warning about them.
+pub fn collect_ignored_env_names<T>(action: impl FnOnce() -> T) -> (T, Vec<String>) {
+    struct Restore(Option<BTreeSet<String>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            COLLECTED_IGNORED_NAMES.with_borrow_mut(|names| *names = previous);
+        }
+    }
+    let _restore = Restore(COLLECTED_IGNORED_NAMES.replace(Some(BTreeSet::new())));
+    let result = action();
+    let names = COLLECTED_IGNORED_NAMES
+        .with_borrow_mut(Option::take)
+        .unwrap_or_default();
+    (result, names.into_iter().collect())
+}
+
 pub(crate) fn remove_dangerous_env_vars(vars: &mut HashMap<String, String>, source: &str) {
-    let denied_keys: Vec<String> = vars
+    let mut denied: Vec<String> = vars
         .keys()
         .filter(|key| is_denied_env_var(key))
         .cloned()
         .collect();
-
-    for denied in denied_keys {
-        if vars.remove(&denied).is_some() {
-            tracing::warn!(
-                "ignored dangerous env var '{denied}' from {source} — this variable cannot be set via LPM project env"
-            );
+    if denied.is_empty() {
+        return;
+    }
+    for key in &denied {
+        vars.remove(key);
+    }
+    let Some(mut denied) = COLLECTED_IGNORED_NAMES.with_borrow_mut(|collected| match collected {
+        Some(collected) => {
+            collected.extend(denied.drain(..));
+            None
         }
+        None => Some(denied),
+    }) else {
+        return;
+    };
+    denied.sort_unstable();
+    warn_ignored_once(&denied, source);
+}
+
+/// Warns that LPM ignored `keys` from `source` unless this process already
+/// has, since one command loads the same project env for every task and
+/// cache check it runs. Returns whether it warned.
+fn warn_ignored_once(keys: &[String], source: &str) -> bool {
+    static WARNED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+    let warning = format!(
+        "{} from {source}{}",
+        ignored_names(keys),
+        never_passed(keys)
+    );
+    let mut warned = WARNED.lock().unwrap_or_else(PoisonError::into_inner);
+    if warned.contains(&warning) {
+        return false;
+    }
+    tracing::warn!("{warning}");
+    warned.insert(warning);
+    true
+}
+
+/// Says that LPM ignored `keys`, which must be in order, and why.
+pub fn ignored_env_note(keys: &[String]) -> String {
+    format!("{}{}", ignored_names(keys), never_passed(keys))
+}
+
+fn ignored_names(keys: &[String]) -> String {
+    match keys {
+        [] => "ignored".to_owned(),
+        [only] => format!("ignored {only}"),
+        [rest @ .., last] => format!("ignored {} and {last}", rest.join(", ")),
+    }
+}
+
+fn never_passed(keys: &[String]) -> &'static str {
+    if keys.len() == 1 {
+        ": LPM never passes a project's value for it to processes"
+    } else {
+        ": LPM never passes a project's value for them to processes"
     }
 }
 
@@ -1395,15 +1468,24 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn project_hook_filter_matches_windows_process_names() {
-        for alias in ["node_options", "NODE_OPTıONS", "NODE_OPTIONſ"] {
+        // Command keeps one entry per name as Windows compares them, so the
+        // lookalikes reach a process as names of their own.
+        for (alias, reaches_node_options) in [
+            ("node_options", true),
+            ("NODE_OPTıONS", false),
+            ("NODE_OPTIONſ", false),
+        ] {
             let mut command = std::process::Command::new("unused");
             command.env("NODE_OPTIONS", "first").env(alias, "last");
-            if command.get_envs().count() == 1 {
-                let mut vars =
-                    HashMap::from([(alias.to_string(), "--require=untrusted.cjs".to_string())]);
-                remove_dangerous_env_vars(&mut vars, "regression fixture");
-                assert!(vars.is_empty(), "Windows hook alias survived: {alias}");
-            }
+            assert_eq!(
+                command.get_envs().count() == 1,
+                reaches_node_options,
+                "{alias}"
+            );
+            let mut vars =
+                HashMap::from([(alias.to_string(), "--require=untrusted.cjs".to_string())]);
+            remove_dangerous_env_vars(&mut vars, "regression fixture");
+            assert_eq!(vars.is_empty(), reaches_node_options, "{alias}");
         }
     }
 
@@ -1695,6 +1777,72 @@ mod tests {
             "ok",
             "normal vars should pass through"
         );
+    }
+
+    #[test]
+    fn code_running_env_vars_are_filtered_from_dotenv() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(".env"),
+            "JAVA_TOOL_OPTIONS=-javaagent:evil.jar\ngit_config_key_0=core.sshCommand\nGIT_CONFIG_VALUE_0=./evil\nNPM_CONFIG_USERCONFIG=./evil-npmrc\nZDOTDIR=./evil\nCORECLR_PROFILER_PATH_64=./evil.dll\nLPM_TEST_ORDINARY_BUILD_SETTING=kept",
+        )
+        .unwrap();
+
+        let vars = load_env_files(dir.path(), None).unwrap();
+        let kept: Vec<&str> = vars.keys().map(String::as_str).collect();
+        assert_eq!(kept, ["LPM_TEST_ORDINARY_BUILD_SETTING"]);
+    }
+
+    #[test]
+    fn one_note_names_every_ignored_key_in_order() {
+        assert_eq!(
+            ignored_env_note(&["CLASSPATH".to_owned()]),
+            "ignored CLASSPATH: LPM never passes a project's value for it to processes"
+        );
+        assert_eq!(
+            ignored_env_note(&[
+                "CLASSPATH".to_owned(),
+                "GIT_ASKPASS".to_owned(),
+                "ZDOTDIR".to_owned()
+            ]),
+            "ignored CLASSPATH, GIT_ASKPASS and ZDOTDIR: LPM never passes a project's value for them to processes"
+        );
+    }
+
+    #[test]
+    fn a_process_warns_about_the_same_ignored_keys_from_a_source_once() {
+        let keys = ["CLASSPATH".to_owned()];
+        assert!(warn_ignored_once(&keys, "a source only this test uses"));
+        assert!(!warn_ignored_once(&keys, "a source only this test uses"));
+        assert!(warn_ignored_once(
+            &keys,
+            "another source only this test uses"
+        ));
+    }
+
+    #[test]
+    fn collected_ignored_keys_are_reported_instead_of_warned_about() {
+        let mut vars = HashMap::from([
+            ("CLASSPATH".to_owned(), "evil.jar".to_owned()),
+            ("ZDOTDIR".to_owned(), "./evil".to_owned()),
+            ("TEAM_VALUE".to_owned(), "kept".to_owned()),
+        ]);
+        let ((), ignored) = collect_ignored_env_names(|| {
+            remove_dangerous_env_vars(&mut vars, "a collected source");
+            remove_dangerous_env_vars(
+                &mut HashMap::from([("CLASSPATH".to_owned(), "again.jar".to_owned())]),
+                "a collected source",
+            );
+        });
+        assert_eq!(ignored, ["CLASSPATH", "ZDOTDIR"]);
+        assert_eq!(vars.keys().collect::<Vec<_>>(), ["TEAM_VALUE"]);
+        assert!(warn_ignored_once(
+            &["CLASSPATH".to_owned(), "ZDOTDIR".to_owned()],
+            "a collected source"
+        ));
+
+        let ((), ignored) = collect_ignored_env_names(|| ());
+        assert!(ignored.is_empty());
     }
 
     #[test]

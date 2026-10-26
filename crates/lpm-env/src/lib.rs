@@ -44,8 +44,8 @@ pub use schema::{
 };
 pub use scopes::{EnvStage, EvalContext, ScopeSelector, ScopedDefault};
 pub use stored::{
-    DEFAULT_ENVIRONMENT, StoredValuesCheck, check_stored_values, is_denied_env_var,
-    reads_default_environment,
+    DEFAULT_ENVIRONMENT, INHERITED_RUNTIME_HOOKS, StoredValuesCheck, check_stored_values,
+    is_denied_env_var, is_never_passed, reads_default_environment,
 };
 pub use unknown_fields::{
     UnknownField, first_unknown_definition_field, first_unknown_schema_field,

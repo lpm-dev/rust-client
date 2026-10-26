@@ -272,21 +272,23 @@ pub(super) fn vars_check(
         lpm_vault::try_get_all_environments(project_dir)
             .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))
     })?;
-    let mut results: Vec<(
-        String,
-        usize,
-        Vec<lpm_env::ValidationError>,
-        std::collections::HashSet<String>,
-    )> = Vec::with_capacity(all_envs.len());
+    struct Checked {
+        name: String,
+        total: usize,
+        errors: Vec<lpm_env::ValidationError>,
+        from_overrides: std::collections::HashSet<String>,
+        ignored: Vec<String>,
+    }
+    let mut results: Vec<Checked> = Vec::with_capacity(all_envs.len());
     let mut all_valid = true;
     let validator = lpm_env::EnvValidator::new(schema);
     for environment in &all_envs {
         if lpm_env::resolver::validate_env_name(&environment.canonical).is_err() {
             all_valid = false;
-            results.push((
-                environment.canonical.clone(),
-                schema.len(),
-                vec![lpm_env::ValidationError {
+            results.push(Checked {
+                name: environment.canonical.clone(),
+                total: schema.len(),
+                errors: vec![lpm_env::ValidationError {
                     key: "env.name".into(),
                     kind: lpm_env::ValidationErrorKind::InvalidEnvironmentName {
                         canonical: environment.canonical.clone(),
@@ -295,47 +297,54 @@ pub(super) fn vars_check(
                     description: None,
                     is_secret: false,
                 }],
-                std::collections::HashSet::new(),
-            ));
+                from_overrides: std::collections::HashSet::new(),
+                ignored: Vec::new(),
+            });
             continue;
         }
-        let mut composed = lpm_runner::dotenv::load_project_env_layers_for_resolved(
-            project_dir,
-            environment,
-            lpm_config.as_ref(),
-            lpm_runner::dotenv::OverridePolicy::Apply,
-        )?
-        .compose(lpm_config.as_ref(), scope.service.as_deref())?;
-        let errors = composed.evaluate(
-            Some(&validator),
-            lpm_env::EvalContext {
-                environment: &environment.canonical,
-                stage: scope.stage.unwrap_or_default(),
-                service: scope.service.as_deref(),
-            },
-        )?;
-        let from_overrides = errors
-            .iter()
-            .filter(|error| composed.caused_by_override(error))
-            .map(|error| error.key.clone())
-            .collect();
+        let (checked, ignored) = lpm_runner::dotenv::collect_ignored_env_names(|| {
+            let mut composed = lpm_runner::dotenv::load_project_env_layers_for_resolved(
+                project_dir,
+                environment,
+                lpm_config.as_ref(),
+                lpm_runner::dotenv::OverridePolicy::Apply,
+            )?
+            .compose(lpm_config.as_ref(), scope.service.as_deref())?;
+            let errors = composed.evaluate(
+                Some(&validator),
+                lpm_env::EvalContext {
+                    environment: &environment.canonical,
+                    stage: scope.stage.unwrap_or_default(),
+                    service: scope.service.as_deref(),
+                },
+            )?;
+            let from_overrides = errors
+                .iter()
+                .filter(|error| composed.caused_by_override(error))
+                .map(|error| error.key.clone())
+                .collect();
+            Ok::<_, LpmError>((errors, from_overrides))
+        });
+        let (errors, from_overrides) = checked?;
         all_valid &= errors.is_empty();
-        results.push((
-            environment.canonical.clone(),
-            schema.len(),
+        results.push(Checked {
+            name: environment.canonical.clone(),
+            total: schema.len(),
             errors,
             from_overrides,
-        ));
+            ignored,
+        });
     }
 
     if json_output {
         let json_results: Vec<serde_json::Value> = results
             .iter()
-            .map(|(name, total, errors, from_overrides)| {
+            .map(|Checked { name, total, errors, from_overrides, ignored }| {
                 serde_json::json!({
                     "environment": name,
                     "total": total,
                     "valid": valid_variable_count(schema, errors),
+                    "ignored": ignored,
                     "errors": errors.iter().map(|e| {
                         let mut diagnostic = serde_json::json!({"key": e.key, "error": e.to_string()});
                         if let lpm_env::ValidationErrorKind::GroupViolation { group, mode } = &e.kind {
@@ -365,7 +374,14 @@ pub(super) fn vars_check(
     }
 
     println!();
-    for (name, total, errors, from_overrides) in &results {
+    for Checked {
+        name,
+        total,
+        errors,
+        from_overrides,
+        ignored,
+    } in &results
+    {
         let valid = valid_variable_count(schema, errors);
         if errors.is_empty() {
             println!(
@@ -403,6 +419,12 @@ pub(super) fn vars_check(
                     println!("    {}", install_ui::red(&error.to_string()));
                 }
             }
+        }
+        if !ignored.is_empty() {
+            println!(
+                "    {}",
+                install_ui::yellow(&lpm_runner::dotenv::ignored_env_note(ignored))
+            );
         }
     }
     println!();
