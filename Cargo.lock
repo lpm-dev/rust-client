@@ -3572,6 +3572,7 @@ dependencies = [
  "getrandom 0.3.4",
  "glob",
  "libc",
+ "lpm-env",
  "miette",
  "open",
  "serde",

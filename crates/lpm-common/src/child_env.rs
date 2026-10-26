@@ -14,11 +14,10 @@ use std::process::Command;
 /// `HOME`, `USER`, `LANG`, `PATH`, etc. Instead each entry is removed
 /// explicitly.
 ///
-/// Credential carriers + dynamic-linker hijacks live in one list;
+/// Credential carriers and runtime hooks are listed by name;
 /// suffix-shaped patterns (`*_SECRET`, `*_TOKEN`, etc.) get
 /// stripped programmatically via `STRIPPED_INHERITED_ENV_SUFFIXES`.
-const STRIPPED_INHERITED_ENV_PATTERNS: &[&str] = &[
-    // Credential carriers
+const STRIPPED_INHERITED_CREDENTIALS: &[&str] = &[
     "LPM_TOKEN",
     "NPM_TOKEN",
     "NODE_AUTH_TOKEN",
@@ -30,24 +29,6 @@ const STRIPPED_INHERITED_ENV_PATTERNS: &[&str] = &[
     "AWS_SESSION_TOKEN",
     "AZURE_CLIENT_SECRET",
     "LPM_KEY_PASSPHRASE",
-    // Runtime-hijack carriers
-    "LD_PRELOAD",
-    "LD_LIBRARY_PATH",
-    "LD_AUDIT",
-    "DYLD_INSERT_LIBRARIES",
-    "DYLD_LIBRARY_PATH",
-    "DYLD_FRAMEWORK_PATH",
-    "DYLD_FALLBACK_LIBRARY_PATH",
-    "NODE_OPTIONS",
-    "PYTHONPATH",
-    "PYTHONSTARTUP",
-    "GIT_SSH_COMMAND",
-    "BASH_ENV",
-    "ENV",
-    "PERL5OPT",
-    "PERL5LIB",
-    "RUBYOPT",
-    "RUBYLIB",
 ];
 
 const STRIPPED_INHERITED_ENV_SUFFIXES: &[&str] = &[
@@ -69,8 +50,9 @@ pub fn inherited_env_is_stripped(name: &str) -> bool {
 /// ends in a credential suffix.
 pub fn inherited_env_key_is_stripped(name: &OsStr) -> bool {
     let upper = name.as_encoded_bytes().to_ascii_uppercase();
-    STRIPPED_INHERITED_ENV_PATTERNS
+    STRIPPED_INHERITED_CREDENTIALS
         .iter()
+        .chain(lpm_env::INHERITED_RUNTIME_HOOKS)
         .any(|pattern| upper == pattern.as_bytes())
         || STRIPPED_INHERITED_ENV_SUFFIXES
             .iter()
@@ -87,7 +69,10 @@ pub fn inherited_env_key_is_stripped(name: &OsStr) -> bool {
 /// `ShellCommand.envs`, since those are project-controlled and
 /// already gated by the project's `.env` policy.
 pub fn strip_inherited_env_hooks(cmd: &mut Command) {
-    for &pattern in STRIPPED_INHERITED_ENV_PATTERNS {
+    for &pattern in STRIPPED_INHERITED_CREDENTIALS
+        .iter()
+        .chain(lpm_env::INHERITED_RUNTIME_HOOKS)
+    {
         cmd.env_remove(pattern);
     }
     for (key, _value) in std::env::vars_os() {
@@ -172,6 +157,19 @@ mod windows_tests {
                     "Windows secret alias survived"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn every_stripped_runtime_hook_is_one_project_env_cant_set() {
+        for hook in lpm_env::INHERITED_RUNTIME_HOOKS {
+            assert!(lpm_env::is_denied_env_var(hook), "{hook}");
+            assert!(inherited_env_is_stripped(hook), "{hook}");
         }
     }
 }

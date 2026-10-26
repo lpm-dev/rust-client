@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Shared types, errors, and constants for the LPM Rust client"
 
 [dependencies]
+lpm-env = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

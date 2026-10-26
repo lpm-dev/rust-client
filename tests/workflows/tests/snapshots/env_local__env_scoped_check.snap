@@ -10,6 +10,7 @@ expression: "parse_json_stdout(&output, \"scoped check\")"
       "environment": "production",
       "total": 1,
       "valid": 0,
+      "ignored": [],
       "errors": [
         {
           "key": "VALUE",

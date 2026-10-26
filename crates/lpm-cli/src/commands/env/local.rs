@@ -35,9 +35,14 @@ pub(super) fn env_set(
 
     if json_output {
         let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
+        let ignored: Vec<&str> = keys
+            .iter()
+            .copied()
+            .filter(|key| lpm_env::is_denied_env_var(key))
+            .collect();
         println!(
             "{}",
-            serde_json::json!({"success": true, "stored": keys, "env": env_label})
+            serde_json::json!({"success": true, "stored": keys, "ignored": ignored, "env": env_label})
         );
     } else {
         for (key, _) in &pairs {
@@ -46,6 +51,12 @@ pub(super) fn env_set(
                 install_ui::bold(key),
                 env_label,
             ));
+            if lpm_env::is_denied_env_var(key) {
+                output::warn_line(install_ui::terminal_line!(
+                    "LPM never passes a project's value for {} to processes",
+                    install_ui::bold(key),
+                ));
+            }
         }
     }
     Ok(())
