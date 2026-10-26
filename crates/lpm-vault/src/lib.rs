@@ -52,6 +52,8 @@ use std::path::{Path, PathBuf};
 pub type SecretMap = HashMap<String, String>;
 pub type EnvironmentMap = HashMap<String, SecretMap>;
 
+#[cfg(debug_assertions)]
+pub use companion::debug_states::DebugCompanionState;
 pub use companion::overrides::PersonalOverrides;
 pub use companion::repair::{CompanionProblem, CompanionRepair, CompanionReview};
 
@@ -139,6 +141,33 @@ pub fn repair_companion_data(
     }
     storage_transaction::with_vault_transaction(|directory| {
         fallback::companion::repair_companion_data_unlocked(directory, &vault_id, reviewed)
+    })
+}
+
+/// Plant `state` for the env project at `project_dir`, straight into the
+/// store that holds it, past the gate, for trying LPM and LPM Vault against
+/// the same data by hand. Returns what was planted and what each client
+/// should show. Debug builds only; on macOS the binary must be signed for
+/// the shared Keychain group.
+#[cfg(debug_assertions)]
+pub fn plant_debug_companion_state(
+    project_dir: &Path,
+    state: &DebugCompanionState,
+) -> Result<String, String> {
+    let Some(vault_id) = vault_id::read_vault_id(project_dir) else {
+        return Err("this directory has no env project".to_owned());
+    };
+    #[cfg(target_os = "macos")]
+    if !force_file_vault_backend() {
+        return keychain::plant_debug_companion_state(&vault_id, state);
+    }
+    if state.needs_keychain() {
+        return Err(
+            "this state needs the macOS Keychain, which only LPM Vault reads it from".to_owned(),
+        );
+    }
+    storage_transaction::with_vault_transaction(|directory| {
+        fallback::companion::plant_debug_companion_state(directory, &vault_id, state)
     })
 }
 

@@ -1190,6 +1190,32 @@ pub(crate) fn commit_unchecked(
     )
 }
 
+/// Plant `state` for `vault_id` in the file store, past the gate and the
+/// transaction check. Debug builds only.
+#[cfg(debug_assertions)]
+pub(crate) fn plant_debug_companion_state(
+    directory: &VaultStorageDirectory,
+    vault_id: &str,
+    state: &crate::companion::debug_states::DebugCompanionState,
+) -> Result<String, String> {
+    let mut companion = FileCompanion::open(directory)?;
+    let existing = companion.inventory_of(vault_id)?;
+    let planting = crate::companion::debug_states::planting(vault_id, state, existing);
+    if !planting.claims.is_empty() || planting.orphans.is_some() {
+        return Err("only the macOS Keychain holds approval claims and orphans".to_owned());
+    }
+    companion.commit_changes(
+        vault_id,
+        planting
+            .one_transaction()
+            .into_iter()
+            .map(FileChange::Companion)
+            .collect(),
+        false,
+    )?;
+    Ok(planting.description)
+}
+
 /// How many projects have companion folders, for storage status.
 pub(crate) fn companion_folder_count(directory: &VaultStorageDirectory) -> Result<usize, String> {
     let Some(vaults) = directory.open_existing_directory(VAULTS_FOLDER)? else {

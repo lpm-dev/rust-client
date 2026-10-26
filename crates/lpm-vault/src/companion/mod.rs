@@ -12,6 +12,8 @@ pub(crate) use lpm_env_companion::{
     account, assessment, gate, invariants, lifecycle, marker, overrides,
 };
 
+#[cfg(debug_assertions)]
+pub(crate) mod debug_states;
 pub(crate) mod repair;
 
 use std::cell::RefCell;

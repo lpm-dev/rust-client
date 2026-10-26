@@ -1058,6 +1058,82 @@ fn a_deletion_that_fails_after_any_mutation_finishes_on_the_next_one() {
     }
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn a_planted_state_leaves_no_claim_of_the_state_before() {
+    use crate::companion::debug_states::{DebugCompanionState, PlantedClaim};
+    let mut storage = storage_with_values();
+    let claim = |storage: &mut MemoryProjectStorage, account: &str, planted: PlantedClaim| {
+        let claimed = match planted {
+            PlantedClaim::UnknownPolicy => ClaimedAccess::Contradictory,
+            PlantedClaim::ApprovalNotEnforced => ClaimedAccess::RequireApproval,
+            PlantedClaim::ApprovalOff => ClaimedAccess::Automatic,
+        };
+        storage.claims.insert(account.to_owned(), claimed);
+        Ok(())
+    };
+    let overrides = record_account("overrides", VAULT, None);
+
+    plant_debug_companion_state_with_storage(
+        &mut storage,
+        VAULT,
+        &DebugCompanionState::ContradictoryRecord,
+        claim,
+    )
+    .expect("plant");
+    assert_eq!(
+        storage.claims.get(&overrides),
+        Some(&ClaimedAccess::Contradictory)
+    );
+
+    plant_debug_companion_state_with_storage(
+        &mut storage,
+        VAULT,
+        &DebugCompanionState::WeakValues,
+        claim,
+    )
+    .expect("plant");
+    assert_ne!(
+        storage.claims.get(&overrides),
+        Some(&ClaimedAccess::Contradictory),
+        "the record the state rewrites keeps no claim of the state before"
+    );
+    assert_eq!(
+        storage.claims.get(VAULT),
+        Some(&ClaimedAccess::RequireApproval)
+    );
+
+    plant_debug_companion_state_with_storage(
+        &mut storage,
+        VAULT,
+        &DebugCompanionState::Clear,
+        claim,
+    )
+    .expect("plant");
+    assert_eq!(
+        storage.claims.get(VAULT),
+        Some(&ClaimedAccess::Automatic),
+        "clear undoes an approval claim the Keychain doesn't enforce"
+    );
+
+    storage
+        .claims
+        .insert(VAULT.to_owned(), ClaimedAccess::RequireApproval);
+    storage.protected.insert(VAULT.to_owned());
+    plant_debug_companion_state_with_storage(
+        &mut storage,
+        VAULT,
+        &DebugCompanionState::Clear,
+        claim,
+    )
+    .expect("plant");
+    assert_eq!(
+        storage.claims.get(VAULT),
+        Some(&ClaimedAccess::RequireApproval),
+        "clear keeps approval the Keychain enforces"
+    );
+}
+
 #[test]
 fn a_restore_that_can_never_finish_is_damage_only_a_discard_repairs() {
     let mut storage = storage_with_values();

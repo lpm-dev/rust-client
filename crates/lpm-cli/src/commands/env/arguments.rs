@@ -134,6 +134,24 @@ pub(super) enum LocalAction {
         #[arg(long)]
         yes: bool,
     },
+    /// Plant a companion storage state for this project, for trying LPM and
+    /// LPM Vault against the same data by hand. Debug builds only.
+    #[cfg(debug_assertions)]
+    #[command(name = "debug-companion", hide = true)]
+    DebugCompanion {
+        /// overrides, missing-record, invalid-marker, unlisted-records,
+        /// newer-version, read-only, interrupted-deletion, stuck-restore,
+        /// contradictory-record, orphans or clear.
+        state: String,
+        #[command(flatten)]
+        environment: Environment,
+        /// A personal override to plant, for the overrides state.
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        set: Vec<String>,
+        /// A name the overrides state unsets.
+        #[arg(long = "unset", value_name = "NAME")]
+        unset: Vec<String>,
+    },
     Ls,
     Log,
     Unpair,
@@ -151,31 +169,34 @@ pub(super) enum LocalAction {
 }
 
 pub(super) fn parse(args: &[&str], json_output: bool) -> Result<Option<LocalAction>, LpmError> {
-    if !matches!(
-        args.first().copied(),
-        Some(
-            "set"
-                | "get"
-                | "list"
-                | "delete"
-                | "import"
-                | "export"
-                | "print"
-                | "example"
-                | "check"
-                | "validate"
-                | "schema"
-                | "generate"
-                | "init"
-                | "repair"
-                | "ls"
-                | "copy"
-                | "cp"
-                | "log"
-                | "unpair"
-                | "diff"
+    let debug_only = cfg!(debug_assertions) && args.first() == Some(&"debug-companion");
+    if !debug_only
+        && !matches!(
+            args.first().copied(),
+            Some(
+                "set"
+                    | "get"
+                    | "list"
+                    | "delete"
+                    | "import"
+                    | "export"
+                    | "print"
+                    | "example"
+                    | "check"
+                    | "validate"
+                    | "schema"
+                    | "generate"
+                    | "init"
+                    | "repair"
+                    | "ls"
+                    | "copy"
+                    | "cp"
+                    | "log"
+                    | "unpair"
+                    | "diff"
+            )
         )
-    ) {
+    {
         return Ok(None);
     }
     LocalCommand::try_parse_from(std::iter::once("lpm env").chain(args.iter().copied()))

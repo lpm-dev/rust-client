@@ -750,6 +750,44 @@ pub(crate) enum KeychainDeleteOutcome {
     NotFound,
 }
 
+/// Leave `claim` on `account`'s attributes, past what its access control
+/// enforces. Debug builds only, for planting those states by hand.
+#[cfg(debug_assertions)]
+pub(crate) fn plant_approval_claim(
+    service: &str,
+    account: &str,
+    claim: crate::companion::debug_states::PlantedClaim,
+) -> Result<(), String> {
+    use crate::companion::debug_states::PlantedClaim;
+    let policy: &[u8] = match claim {
+        PlantedClaim::UnknownPolicy => b"lpm-cli-access:require-approval:v2",
+        PlantedClaim::ApprovalNotEnforced => APPROVAL_MARKER,
+        PlantedClaim::ApprovalOff => b"",
+    };
+    let mut pairs = SecurityFrameworkBackend::identity_pairs(service, account);
+    pairs.push((
+        unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationContext) },
+        authentication_context(),
+    ));
+    let query = CFDictionary::from_CFType_pairs(&pairs);
+    let attributes = CFDictionary::from_CFType_pairs(&[(
+        unsafe { CFString::wrap_under_get_rule(kSecAttrGeneric) },
+        CFData::from_buffer(policy).into_CFType(),
+    )]);
+    // SAFETY: Both dictionaries are live CoreFoundation objects for the call.
+    let status = unsafe {
+        SecItemUpdate(
+            query.as_concrete_TypeRef(),
+            attributes.as_concrete_TypeRef(),
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(SecurityFrameworkBackend::map_status("claim approval", status).to_string())
+    }
+}
+
 pub(crate) fn delete(service: &str, account: &str) -> Result<KeychainDeleteOutcome, String> {
     match delete_generic_password_options(SecurityFrameworkBackend::options(service, account)) {
         Ok(()) => Ok(KeychainDeleteOutcome::Deleted),

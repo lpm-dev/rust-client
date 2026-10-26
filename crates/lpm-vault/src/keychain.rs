@@ -1720,6 +1720,112 @@ fn unfinished_step(
     )
 }
 
+/// Plant `state` for `vault_id` in the Keychain, past the gate and the
+/// transaction check, once any pending journal is recovered.
+#[cfg(debug_assertions)]
+pub(crate) fn plant_debug_companion_state(
+    vault_id: &str,
+    state: &crate::companion::debug_states::DebugCompanionState,
+) -> Result<String, String> {
+    validate_vault_id(vault_id)?;
+    with_keychain_transaction(|| {
+        plant_debug_companion_state_with_storage(
+            &mut KeychainProjectStorage,
+            vault_id,
+            state,
+            |_, account, claim| {
+                crate::macos_keychain::plant_approval_claim(&service(), account, claim)
+            },
+        )
+    })
+}
+
+/// [`plant_debug_companion_state`] on `storage`, `claim` leaving an
+/// approval claim on an item. Records that follow values take the values
+/// item's approval as they're written.
+#[cfg(debug_assertions)]
+fn plant_debug_companion_state_with_storage<S: ProjectStorage>(
+    storage: &mut S,
+    vault_id: &str,
+    state: &crate::companion::debug_states::DebugCompanionState,
+    mut claim: impl FnMut(
+        &mut S,
+        &str,
+        crate::companion::debug_states::PlantedClaim,
+    ) -> Result<(), String>,
+) -> Result<String, String> {
+    use crate::companion::lifecycle::Mutation;
+    recover_project_transaction(storage)?;
+    let names = storage.account_names()?;
+    let existing = names
+        .iter()
+        .filter_map(|name| CompanionAccount::parse(name))
+        .filter(|account| {
+            account.vault_id() == vault_id && !matches!(account, CompanionAccount::Marker { .. })
+        })
+        .collect();
+    let planting = crate::companion::debug_states::planting(vault_id, state, existing);
+    if planting
+        .claims
+        .iter()
+        .any(|(account, _)| account == vault_id)
+        && storage.claimed_access(vault_id)? != Some(ClaimedAccess::Automatic)
+    {
+        return Err("turn this project's CLI approval off first".to_owned());
+    }
+    let apply = |storage: &mut S, owner: &str, mutations: Vec<Mutation>| -> Result<(), String> {
+        for mutation in mutations {
+            match mutation {
+                Mutation::Write { account, value } => {
+                    let name = account.name();
+                    if matches!(account, CompanionAccount::Marker { .. }) {
+                        storage.write_verified(&name, &value)?;
+                    } else {
+                        storage.write_verified_with_access_from(&name, &value, owner)?;
+                    }
+                }
+                Mutation::Delete { account } => {
+                    storage.delete(&account.name())?;
+                }
+            }
+        }
+        Ok(())
+    };
+    // A Keychain write keeps an item's attributes, so every account goes
+    // first and no claim of the state before survives.
+    for account in &planting.clear {
+        storage.delete(&account.name())?;
+    }
+    apply(
+        storage,
+        vault_id,
+        planting
+            .writes
+            .into_iter()
+            .map(|(account, value)| Mutation::Write { account, value })
+            .collect(),
+    )?;
+    if let Some((orphan, mutations)) = planting.orphans {
+        apply(storage, &orphan, mutations)?;
+    }
+    for (account, planted) in &planting.claims {
+        claim(storage, account, *planted)?;
+    }
+    if matches!(
+        state,
+        crate::companion::debug_states::DebugCompanionState::Clear
+    ) && storage.claimed_access(vault_id)? == Some(ClaimedAccess::RequireApproval)
+        && storage.probe(vault_id, &[PROJECT_INDEX_MARKER_ACCOUNT]) == ProbeOutcome::Automatic
+    {
+        claim(
+            storage,
+            vault_id,
+            crate::companion::debug_states::PlantedClaim::ApprovalOff,
+        )?;
+    }
+    Ok(planting.description)
+}
+
 pub fn delete_vault(vault_id: &str) -> Result<(), String> {
     with_keychain_transaction(|| delete_vault_unlocked(vault_id))
 }

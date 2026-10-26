@@ -493,3 +493,70 @@ fn check_attributes_a_failure_to_the_override_that_caused_it() {
     assert_eq!(error["key"], "API_URL");
     assert_eq!(error["personalOverride"], true);
 }
+
+/// What `lpm run show` prints and reports after `lpm env debug-companion`
+/// planted `state`.
+fn run_after_planting(project: &TempProject, state: &[&str]) -> (String, String) {
+    let planted = lpm(project)
+        .args(["env", "debug-companion"])
+        .args(state)
+        .output()
+        .unwrap();
+    assert!(planted.status.success(), "{state:?}: {}", stderr(&planted));
+    let run = lpm(project)
+        .args(["run", "show", "--no-cache"])
+        .output()
+        .unwrap();
+    (stdout(&run), stderr(&run))
+}
+
+#[test]
+fn planted_companion_states_reach_the_cli_as_described() {
+    let (project, _) = project_with_team_value(r#"{"show":"node show.cjs"}"#);
+
+    let (out, err) = run_after_planting(&project, &["overrides", "--set", "API_URL=mine"]);
+    assert!(out.contains("API_URL=mine"), "{out}");
+    assert!(err.contains("1 personal override"), "{err}");
+
+    let (_, err) = run_after_planting(&project, &["missing-record"]);
+    assert!(err.contains("missing record \"overrides\""), "{err}");
+    let repaired = lpm(&project)
+        .args(["env", "repair", "--yes"])
+        .output()
+        .unwrap();
+    assert!(repaired.status.success(), "{}", stderr(&repaired));
+
+    let (_, err) = run_after_planting(&project, &["newer-version"]);
+    assert!(err.contains("lpm self-update"), "{err}");
+
+    let (out, err) = run_after_planting(&project, &["interrupted-deletion"]);
+    assert!(out.contains("API_URL=team"), "{out}");
+    assert!(err.contains("finished deleting"), "{err}");
+
+    let (out, err) = run_after_planting(&project, &["clear"]);
+    assert!(out.contains("API_URL=team"), "{out}");
+    assert!(!err.contains("personal override"), "{err}");
+
+    for keychain_only in [
+        "contradictory-record",
+        "weak-values",
+        "orphans",
+        "stuck-restore",
+    ] {
+        let refused = lpm(&project)
+            .args(["env", "debug-companion", keychain_only])
+            .output()
+            .unwrap();
+        assert!(!refused.status.success(), "{keychain_only}");
+        assert!(
+            stderr(&refused).contains("macOS Keychain"),
+            "{}",
+            stderr(&refused)
+        );
+    }
+    let help = lpm(&project).args(["env", "--help"]).output().unwrap();
+    assert!(
+        !stdout(&help).contains("debug-companion") && !stderr(&help).contains("debug-companion"),
+        "the command stays out of help"
+    );
+}
