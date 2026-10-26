@@ -216,7 +216,7 @@ pub(crate) fn planting(
                 record(vault_id, OVERRIDES_KIND, None),
                 br#"{"schemaVersion":2}"#.to_vec(),
             )],
-            "Planted personal overrides v2. lpm refuses to read, run or write the project and asks for lpm self-update. LPM Vault hides its values and offers Check for Updates…; rename, hide, approval and delete still work.".to_owned(),
+            "Planted personal overrides v2. lpm refuses to read, run or write the project and asks for lpm self-update. LPM Vault hides its values and offers Check for Updates…; rename, approval and delete still work.".to_owned(),
         ),
         State::ReadOnly => (
             Some(marker(
