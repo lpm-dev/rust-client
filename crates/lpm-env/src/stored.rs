@@ -119,6 +119,39 @@ const CODE_RUNNING_ENV_PREFIXES: &[&str] = &[
 /// never replaces.
 const PROCESS_ENV_VARS: &[&str] = &["PATH", "HOME", "LPM_HOME", "USER", "SHELL", "TERM"];
 
+/// Runtime hooks LPM also removes from the environment a process inherits,
+/// even when the person's own shell set them, so no value for one reaches a
+/// child. Each is also a name project env can't set. Tool settings such as
+/// `NPM_CONFIG_USERCONFIG` or `RUSTC_WRAPPER` stay inherited: CI and
+/// toolchains set them on purpose.
+pub const INHERITED_RUNTIME_HOOKS: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+    "NODE_OPTIONS",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "GIT_SSH_COMMAND",
+    "BASH_ENV",
+    "ENV",
+    "PERL5OPT",
+    "PERL5LIB",
+    "RUBYOPT",
+    "RUBYLIB",
+];
+
+/// Whether no value for `key` reaches a process, from project env or from
+/// the shell LPM was started from, compared without ASCII case.
+pub fn is_never_passed(key: &str) -> bool {
+    INHERITED_RUNTIME_HOOKS
+        .iter()
+        .any(|name| key.eq_ignore_ascii_case(name))
+}
+
 /// Whether LPM refuses to pass `key` to a process from project env, compared
 /// without case. The runner drops these variables whatever their source and
 /// never fills them from schema defaults.

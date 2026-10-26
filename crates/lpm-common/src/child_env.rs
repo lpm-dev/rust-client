@@ -31,31 +31,6 @@ const STRIPPED_INHERITED_CREDENTIALS: &[&str] = &[
     "LPM_KEY_PASSPHRASE",
 ];
 
-/// Runtime hooks stripped even when the person's own shell set them. Every
-/// one is also a name project env can't set, so dropping a project value
-/// never lets an inherited one through. Tool settings such as
-/// `NPM_CONFIG_USERCONFIG` or `RUSTC_WRAPPER` stay inherited: CI and
-/// toolchains set them on purpose.
-const STRIPPED_INHERITED_RUNTIME_HOOKS: &[&str] = &[
-    "LD_PRELOAD",
-    "LD_LIBRARY_PATH",
-    "LD_AUDIT",
-    "DYLD_INSERT_LIBRARIES",
-    "DYLD_LIBRARY_PATH",
-    "DYLD_FRAMEWORK_PATH",
-    "DYLD_FALLBACK_LIBRARY_PATH",
-    "NODE_OPTIONS",
-    "PYTHONPATH",
-    "PYTHONSTARTUP",
-    "GIT_SSH_COMMAND",
-    "BASH_ENV",
-    "ENV",
-    "PERL5OPT",
-    "PERL5LIB",
-    "RUBYOPT",
-    "RUBYLIB",
-];
-
 const STRIPPED_INHERITED_ENV_SUFFIXES: &[&str] = &[
     "_SECRET",
     "_PASSWORD",
@@ -77,7 +52,7 @@ pub fn inherited_env_key_is_stripped(name: &OsStr) -> bool {
     let upper = name.as_encoded_bytes().to_ascii_uppercase();
     STRIPPED_INHERITED_CREDENTIALS
         .iter()
-        .chain(STRIPPED_INHERITED_RUNTIME_HOOKS)
+        .chain(lpm_env::INHERITED_RUNTIME_HOOKS)
         .any(|pattern| upper == pattern.as_bytes())
         || STRIPPED_INHERITED_ENV_SUFFIXES
             .iter()
@@ -96,7 +71,7 @@ pub fn inherited_env_key_is_stripped(name: &OsStr) -> bool {
 pub fn strip_inherited_env_hooks(cmd: &mut Command) {
     for &pattern in STRIPPED_INHERITED_CREDENTIALS
         .iter()
-        .chain(STRIPPED_INHERITED_RUNTIME_HOOKS)
+        .chain(lpm_env::INHERITED_RUNTIME_HOOKS)
     {
         cmd.env_remove(pattern);
     }
@@ -192,7 +167,7 @@ mod policy_tests {
 
     #[test]
     fn every_stripped_runtime_hook_is_one_project_env_cant_set() {
-        for hook in STRIPPED_INHERITED_RUNTIME_HOOKS {
+        for hook in lpm_env::INHERITED_RUNTIME_HOOKS {
             assert!(lpm_env::is_denied_env_var(hook), "{hook}");
             assert!(inherited_env_is_stripped(hook), "{hook}");
         }

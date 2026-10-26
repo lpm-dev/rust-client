@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Shared types, errors, and constants for the LPM Rust client"
 
 [dependencies]
+lpm-env = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -58,7 +59,6 @@ asm-sha2 = ["sha2/asm"]
 test-support = []
 
 [dev-dependencies]
-lpm-env = { workspace = true }
 static_assertions = "1"
 tempfile = "3"
 

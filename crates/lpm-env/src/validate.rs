@@ -117,7 +117,12 @@ impl std::fmt::Display for ValidationError {
             }
             ValidationErrorKind::Missing => {
                 write!(f, "{}: missing (required)", key)?;
-                if crate::is_denied_env_var(&self.key) {
+                if crate::is_never_passed(&self.key) {
+                    write!(
+                        f,
+                        "; LPM never passes a value for it to a process, not even the shell's"
+                    )?;
+                } else if crate::is_denied_env_var(&self.key) {
                     write!(f, "; LPM never passes a project's value for it")?;
                 }
                 if let Some(desc) = &self.description {
@@ -1065,6 +1070,11 @@ mod tests {
         assert_eq!(
             missing("CLASSPATH", Some("Java classpath")).to_string(),
             "CLASSPATH: missing (required); LPM never passes a project's value for it — Java classpath"
+        );
+        assert_eq!(
+            missing("node_options", None).to_string(),
+            "node_options: missing (required); LPM never passes a value for it to a process, not even the shell's",
+            "a hook LPM strips from the shell too can't be set there either"
         );
         assert_eq!(
             missing("DATABASE_URL", None).to_string(),
