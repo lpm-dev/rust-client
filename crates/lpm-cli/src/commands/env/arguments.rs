@@ -141,7 +141,7 @@ pub(super) enum LocalAction {
     DebugCompanion {
         /// overrides, missing-record, invalid-marker, unlisted-records,
         /// newer-version, read-only, interrupted-deletion, stuck-restore,
-        /// contradictory-record, orphans or clear.
+        /// contradictory-record, weak-values, orphans or clear.
         state: String,
         #[command(flatten)]
         environment: Environment,
@@ -226,4 +226,27 @@ fn print_format(value: &str) -> Result<lpm_env::PrintFormat, String> {
             lpm_env::PrintFormat::all_names()
         )
     })
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use clap::CommandFactory;
+
+    #[test]
+    fn debug_companion_help_names_every_state() {
+        let command = super::LocalCommand::command();
+        let help = command
+            .find_subcommand("debug-companion")
+            .and_then(|debug| {
+                debug
+                    .get_arguments()
+                    .find(|argument| argument.get_id() == "state")
+            })
+            .and_then(|state| state.get_help())
+            .expect("the state argument's help")
+            .to_string();
+        for name in lpm_vault::DebugCompanionState::NAMES {
+            assert!(help.contains(name), "{name} is missing from: {help}");
+        }
+    }
 }
