@@ -1057,3 +1057,44 @@ fn a_deletion_that_fails_after_any_mutation_finishes_on_the_next_one() {
         );
     }
 }
+
+#[test]
+fn a_restore_that_can_never_finish_is_damage_only_a_discard_repairs() {
+    let mut storage = storage_with_values();
+    activating_restore(&mut storage);
+    storage.values.insert(
+        staged_account("overrides", VAULT, None),
+        "x".repeat(crate::companion::marker::MAX_RECORD_BYTES + 1),
+    );
+
+    let refused = run_read(&mut storage)
+        .map(|_| ())
+        .expect_err("a step that can't finish refuses");
+    assert!(crate::is_env_project_refusal(&refused), "{refused}");
+    assert!(
+        refused.contains("an interrupted change can't be finished"),
+        "{refused}"
+    );
+
+    let review = review_companion_data_with_storage(&mut storage, VAULT).expect("review");
+    assert_eq!(
+        review.repairs(),
+        [crate::companion::repair::CompanionRepair::DiscardProject]
+    );
+    assert_eq!(
+        repair_companion_data_with_storage(&mut storage, VAULT, &review).expect("repair"),
+        [crate::companion::repair::CompanionRepair::DiscardProject]
+    );
+    assert!(
+        !storage
+            .values
+            .keys()
+            .any(|account| account.starts_with("__vault_companion")
+                || account.starts_with("__vault_features")
+                || account.starts_with("__vault_staged")),
+        "every record goes"
+    );
+    assert_eq!(storage.values.get(VAULT), Some(VALUES), "the values stay");
+    crate::companion::forget(VAULT);
+    assert!(run_read(&mut storage).is_ok(), "the project reads again");
+}

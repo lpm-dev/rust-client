@@ -105,13 +105,33 @@ pub(crate) fn remember(vault_id: &str, gate: &ProjectGate) {
     });
 }
 
-/// Read `vault_id`'s marker, finishing any lifecycle step it describes.
+/// Read `vault_id`'s marker, finishing any lifecycle step it describes. A
+/// step that can never be finished refuses as damage only a discard repairs.
 pub(crate) fn open_project(
     backend: &mut impl CompanionBackend,
     vault_id: &str,
 ) -> Result<ProjectGate, String> {
+    match open_project_or_unfinished(backend, vault_id)? {
+        Opened::Gate(gate) => Ok(gate),
+        Opened::Unfinished(reason) => Err(damaged(Damage::Unfinished(reason))),
+    }
+}
+
+/// What opening a project found.
+pub(crate) enum Opened {
+    Gate(ProjectGate),
+    /// An interrupted step that can never be finished, and why.
+    Unfinished(String),
+}
+
+/// [`open_project`], telling a step that can never be finished apart from
+/// a store that failed.
+pub(crate) fn open_project_or_unfinished(
+    backend: &mut impl CompanionBackend,
+    vault_id: &str,
+) -> Result<Opened, String> {
     if let Some(gate) = remembered(vault_id) {
-        return Ok(gate);
+        return Ok(Opened::Gate(gate));
     }
     let marker_account = CompanionAccount::Marker {
         vault_id: vault_id.to_owned(),
@@ -123,9 +143,13 @@ pub(crate) fn open_project(
             Ok(marker) if lifecycle::needs_resume(&marker) => {
                 let notice = resume_notice(&marker);
                 let inventory = backend.inventory(vault_id)?;
-                let gate = match lifecycle::resume(backend, marker, inventory)? {
-                    Some(marker) => ProjectGate::Marked(marker),
-                    None => ProjectGate::Plain,
+                let gate = match lifecycle::resume(backend, marker, inventory) {
+                    Ok(Some(marker)) => ProjectGate::Marked(marker),
+                    Ok(None) => ProjectGate::Plain,
+                    Err(lifecycle::ResumeError::Unfinishable(reason)) => {
+                        return Ok(Opened::Unfinished(reason));
+                    }
+                    Err(lifecycle::ResumeError::Storage(error)) => return Err(error),
                 };
                 if let Some(notice) = notice {
                     tracing::warn!("{notice}");
@@ -136,7 +160,7 @@ pub(crate) fn open_project(
         },
     };
     remember(vault_id, &gate);
-    Ok(gate)
+    Ok(Opened::Gate(gate))
 }
 
 /// What the notice after a resume says it finished or undid. The project is

@@ -133,6 +133,27 @@ pub(crate) fn review(
     })
 }
 
+/// Discard `vault_id`'s companion data as its marker stands, without
+/// finishing the interrupted step it may describe, as a step that can never
+/// be finished needs.
+pub(crate) fn discard(
+    backend: &mut impl CompanionBackend,
+    vault_id: &str,
+) -> Result<Vec<CompanionRepair>, String> {
+    let marker = backend
+        .read(&marker_account(vault_id))?
+        .map(|bytes| Marker::parse(vault_id, &bytes));
+    let found = match &marker {
+        None => FoundMarker::Absent,
+        Some(Err(_)) => FoundMarker::Invalid,
+        Some(Ok(marker)) => FoundMarker::Valid(marker),
+    };
+    let inventory = backend.inventory(vault_id)?;
+    execute(backend, plan_discard(vault_id, found, inventory)?)?;
+    super::forget(vault_id);
+    Ok(vec![CompanionRepair::DiscardProject])
+}
+
 /// Run every repair `reviewed` lists, after checking `vault_id` still shows
 /// exactly that damage. Returns the repairs it ran.
 pub(crate) fn repair(

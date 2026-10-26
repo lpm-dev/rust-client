@@ -256,6 +256,29 @@ pub fn plan_resume(
 /// actual sizes fit one transaction, and each marker change ends a commit, so
 /// the next step plans on the marker it leaves.
 pub fn execute(store: &mut impl LifecycleStore, plan: Plan) -> Result<Option<Marker>, String> {
+    run(store, plan).map_err(ResumeError::into_message)
+}
+
+/// Why an interrupted step wasn't finished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeError {
+    /// It can never be finished as it stands: its plan is refused, or a
+    /// staged record it moves is missing or larger than a record may be.
+    /// Only discarding the project's newer data gets past it.
+    Unfinishable(String),
+    /// The store failed; trying again may finish it.
+    Storage(String),
+}
+
+impl ResumeError {
+    pub fn into_message(self) -> String {
+        match self {
+            Self::Unfinishable(reason) | Self::Storage(reason) => reason,
+        }
+    }
+}
+
+fn run(store: &mut impl LifecycleStore, plan: Plan) -> Result<Option<Marker>, ResumeError> {
     let marker_account = CompanionAccount::Marker {
         vault_id: plan.vault_id,
     };
@@ -264,39 +287,58 @@ pub fn execute(store: &mut impl LifecycleStore, plan: Plan) -> Result<Option<Mar
         for change in transaction.changes {
             match change {
                 PlannedChange::Delete(account) => {
-                    batch.add(store, [Mutation::Delete { account }])?;
+                    batch
+                        .add(store, [Mutation::Delete { account }])
+                        .map_err(ResumeError::Storage)?;
                 }
                 PlannedChange::Move { staged, live } => {
-                    let value = store.read(&staged)?.ok_or_else(|| {
-                        "a restore lost a staged record before it was activated".to_owned()
-                    })?;
-                    batch.add(
-                        store,
-                        [
-                            Mutation::Write {
-                                account: live,
-                                value,
-                            },
-                            Mutation::Delete { account: staged },
-                        ],
-                    )?;
+                    let value = store
+                        .read(&staged)
+                        .map_err(ResumeError::Storage)?
+                        .ok_or_else(|| {
+                            ResumeError::Unfinishable(
+                                "a restore lost a staged record before it was activated".to_owned(),
+                            )
+                        })?;
+                    if value.len() > crate::marker::MAX_RECORD_BYTES {
+                        return Err(ResumeError::Unfinishable(format!(
+                            "a restore's staged {} record holds {} bytes, more than the {} a record may",
+                            staged.kind().unwrap_or("record"),
+                            value.len(),
+                            crate::marker::MAX_RECORD_BYTES
+                        )));
+                    }
+                    batch
+                        .add(
+                            store,
+                            [
+                                Mutation::Write {
+                                    account: live,
+                                    value,
+                                },
+                                Mutation::Delete { account: staged },
+                            ],
+                        )
+                        .map_err(ResumeError::Storage)?;
                 }
             }
         }
         let marker = match transaction.marker {
             Some(MarkerChange::Write(marker)) => Mutation::Write {
                 account: marker_account.clone(),
-                value: marker.encode().map_err(|error| error.to_string())?,
+                value: marker
+                    .encode()
+                    .map_err(|error| ResumeError::Unfinishable(error.to_string()))?,
             },
             Some(MarkerChange::Delete) => Mutation::Delete {
                 account: marker_account.clone(),
             },
             None => continue,
         };
-        batch.add(store, [marker])?;
-        batch.commit(store)?;
+        batch.add(store, [marker]).map_err(ResumeError::Storage)?;
+        batch.commit(store).map_err(ResumeError::Storage)?;
     }
-    batch.commit(store)?;
+    batch.commit(store).map_err(ResumeError::Storage)?;
     Ok(plan.result)
 }
 
@@ -340,8 +382,11 @@ pub fn resume(
     store: &mut impl LifecycleStore,
     marker: Marker,
     inventory: Vec<CompanionAccount>,
-) -> Result<Option<Marker>, String> {
-    execute(store, plan_resume(marker, inventory)?)
+) -> Result<Option<Marker>, ResumeError> {
+    run(
+        store,
+        plan_resume(marker, inventory).map_err(ResumeError::Unfinishable)?,
+    )
 }
 
 /// What a client found at a project's marker account.
@@ -1362,6 +1407,35 @@ mod tests {
                 .insert(staged("history", Some(part)), vec![b'n'; 100 * 1024]);
         }
         (store, before)
+    }
+
+    #[test]
+    fn a_restore_whose_staged_record_is_over_the_limit_can_never_finish() {
+        let (mut store, _) = restoring_store(RestorePhase::Activating, 0);
+        store.records.insert(
+            staged("overrides", None),
+            vec![b'x'; crate::marker::MAX_RECORD_BYTES + 1],
+        );
+        let marker = store.marker().expect("marker");
+        let inventory = store.inventory();
+        match resume(&mut store, marker, inventory) {
+            Err(ResumeError::Unfinishable(reason)) => {
+                assert!(reason.contains("overrides"), "{reason}");
+            }
+            other => panic!("expected a step that can't be finished, got {other:?}"),
+        }
+
+        let (mut store, _) = restoring_store(RestorePhase::Activating, 0);
+        store.crash_after = Some(0);
+        let marker = store.marker().expect("marker");
+        let inventory = store.inventory();
+        assert!(
+            matches!(
+                resume(&mut store, marker, inventory),
+                Err(ResumeError::Storage(_))
+            ),
+            "a store that fails may finish it next time"
+        );
     }
 
     #[test]
