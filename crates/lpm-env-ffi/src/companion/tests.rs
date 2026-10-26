@@ -248,6 +248,10 @@ fn damage_carries_its_repair_and_only_damaged_overrides_still_allow_excluding_re
         json!([{ "code": "missingRecord", "kind": "overrides", "repair": { "action": "removeFeature", "feature": "overrides" } }])
     );
     assert_eq!(
+        missing["repairs"],
+        json!([{ "action": "removeFeature", "feature": "overrides" }])
+    );
+    assert_eq!(
         missing["allows"],
         json!({ "readExcludingOverrides": true, "readApplyingOverrides": false, "write": false })
     );
@@ -260,6 +264,10 @@ fn damage_carries_its_repair_and_only_damaged_overrides_still_allow_excluding_re
     assert_eq!(
         markerless["damage"],
         json!([{ "code": "unlistedRecord", "kind": "overrides", "repair": { "action": "discardProject" } }])
+    );
+    assert_eq!(
+        markerless["repairs"],
+        json!([{ "action": "discardProject" }])
     );
 
     let (_, invalid_record) = call(
@@ -281,6 +289,7 @@ fn damage_carries_its_repair_and_only_damaged_overrides_still_allow_excluding_re
         access["damage"],
         json!([{ "code": "access", "reason": "contradictory approval", "repair": null }])
     );
+    assert_eq!(access["repairs"], json!([]));
     assert_eq!(access["allows"]["readExcludingOverrides"], false);
 }
 

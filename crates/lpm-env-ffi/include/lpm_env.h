@@ -196,7 +196,10 @@ LPMEnvResult lpm_env_companion_account_names(const uint8_t *input, size_t input_
  * "invalidRecord" | "unlistedRecord" | "access" | "unfinishedChange", kind?,
  * reason?, repair:
  * {action: "discardProject" | "removeFeature" | "removeUnlisted", feature?} |
- * null}], allows: {readExcludingOverrides, readApplyingOverrides, write}}.
+ * null}], repairs: [{action, feature?}], allows: {readExcludingOverrides,
+ * readApplyingOverrides, write}}. repairs lists what sets every damage right,
+ * each once in the order found: a discardProject alone when any damage needs
+ * one, none for damaged access.
  * allows applies the operation matrix to the marker and to every damage listed,
  * so damage only a listing finds counts when inventory is given. Maintenance is
  * always allowed; with needsResume nothing else is until a resume plan has run.

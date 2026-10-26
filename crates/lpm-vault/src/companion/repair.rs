@@ -15,6 +15,8 @@ use super::overrides::OVERRIDES_KIND;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompanionReview {
     pub problems: Vec<CompanionProblem>,
+    /// The repairs that set every problem right, as the engine decides them.
+    repairs: Vec<CompanionRepair>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,7 +28,7 @@ pub struct CompanionProblem {
     pub repair: Option<CompanionRepair>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompanionRepair {
     /// Delete every companion record of the project. Its values stay.
     DiscardProject,
@@ -71,23 +73,14 @@ impl CompanionReview {
                 description,
                 repair: Some(CompanionRepair::DiscardProject),
             }],
+            repairs: vec![CompanionRepair::DiscardProject],
         }
     }
 
     /// The distinct repairs to run, a project-wide discard alone when one
     /// is needed, since it removes everything the others would.
-    pub fn repairs(&self) -> Vec<CompanionRepair> {
-        let mut repairs: Vec<CompanionRepair> = self
-            .problems
-            .iter()
-            .filter_map(|problem| problem.repair.clone())
-            .collect();
-        repairs.sort_unstable();
-        repairs.dedup();
-        if repairs.contains(&CompanionRepair::DiscardProject) {
-            repairs.retain(|repair| *repair == CompanionRepair::DiscardProject);
-        }
-        repairs
+    pub fn repairs(&self) -> &[CompanionRepair] {
+        &self.repairs
     }
 }
 
@@ -132,6 +125,11 @@ pub(crate) fn review(
                 repair: assessment.repair(damage).map(CompanionRepair::from),
             })
             .collect(),
+        repairs: assessment
+            .repairs()
+            .into_iter()
+            .map(CompanionRepair::from)
+            .collect(),
     })
 }
 
@@ -146,7 +144,7 @@ pub(crate) fn repair(
     if review(backend, vault_id, access)? != *reviewed {
         return Err(CHANGED_SINCE_REVIEW.to_owned());
     }
-    let repairs = reviewed.repairs();
+    let repairs = reviewed.repairs().to_vec();
     for repair in &repairs {
         let marker = backend
             .read(&marker_account(vault_id))?
@@ -176,40 +174,4 @@ pub(crate) fn repair(
     }
     super::forget(vault_id);
     Ok(repairs)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn problem(repair: Option<CompanionRepair>) -> CompanionProblem {
-        CompanionProblem {
-            description: String::new(),
-            repair,
-        }
-    }
-
-    #[test]
-    fn a_discard_supersedes_every_other_repair_and_repairs_run_once() {
-        let review = CompanionReview {
-            problems: vec![
-                problem(Some(CompanionRepair::RemoveUnlisted)),
-                problem(Some(CompanionRepair::RemoveFeature("overrides".to_owned()))),
-                problem(Some(CompanionRepair::RemoveUnlisted)),
-                problem(None),
-            ],
-        };
-        assert_eq!(
-            review.repairs(),
-            [
-                CompanionRepair::RemoveFeature("overrides".to_owned()),
-                CompanionRepair::RemoveUnlisted
-            ]
-        );
-        let mut discarding = review;
-        discarding
-            .problems
-            .push(problem(Some(CompanionRepair::DiscardProject)));
-        assert_eq!(discarding.repairs(), [CompanionRepair::DiscardProject]);
-    }
 }

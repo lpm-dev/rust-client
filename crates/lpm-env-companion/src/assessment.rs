@@ -152,6 +152,23 @@ impl Assessment {
         .chain(&self.damage)
     }
 
+    /// The repairs that set every damage right, each once, in the order
+    /// their damage was found: a project-wide discard alone when any damage
+    /// needs one, since it removes everything the others would. Damaged
+    /// access has none.
+    pub fn repairs(&self) -> Vec<Repair> {
+        let mut repairs = Vec::new();
+        for repair in self.every_damage().filter_map(|damage| self.repair(damage)) {
+            if repair == Repair::DiscardProject {
+                return vec![Repair::DiscardProject];
+            }
+            if !repairs.contains(&repair) {
+                repairs.push(repair);
+            }
+        }
+        repairs
+    }
+
     /// The repair for `damage`, or `None` for damaged access, which the
     /// app's reconcile fixes.
     pub fn repair(&self, damage: &Damage) -> Option<Repair> {
@@ -419,5 +436,50 @@ mod tests {
             assessment.authorize(Operation::ReadExcludingOverrides),
             Err(GateError::Unsupported { .. })
         ));
+    }
+    #[test]
+    fn repairs_run_once_each_and_a_discard_supersedes_the_others() {
+        let marker = br#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"overrides":{"version":1,"ifUnsupported":"refuse","kinds":["overrides"],"state":"active"},"history":{"version":1,"ifUnsupported":"ignore","kinds":["history-head","history","key"],"state":"active"}}}"#;
+        let inventory = [
+            record("notes", None),
+            record("history", Some(0)),
+            record("future-log", Some(0)),
+        ];
+        let assessment = assess(
+            "proj",
+            Observed {
+                marker: Some(marker),
+                inventory: Some(&inventory),
+                ..Observed::default()
+            },
+        );
+        assert_eq!(
+            assessment.repairs(),
+            [
+                Repair::RemoveUnlisted,
+                Repair::RemoveFeature("overrides".to_owned()),
+            ],
+            "two unlisted kinds need one removal"
+        );
+
+        let invalid = assess(
+            "proj",
+            Observed {
+                marker: Some(b"{}"),
+                inventory: Some(&inventory),
+                ..Observed::default()
+            },
+        );
+        assert_eq!(invalid.repairs(), [Repair::DiscardProject]);
+        let access = assess(
+            "proj",
+            Observed {
+                marker: Some(OVERRIDES_MARKER),
+                inventory: Some(&[record("overrides", None)]),
+                access: Some("contradicts"),
+                ..Observed::default()
+            },
+        );
+        assert_eq!(access.repairs(), [], "damaged access has no repair here");
     }
 }

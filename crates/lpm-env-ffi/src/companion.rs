@@ -351,7 +351,24 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
         unsupported: Option<Unsupported<'assessment>>,
         features: Vec<FeatureOutput<'assessment>>,
         damage: Vec<DamageOutput<'assessment>>,
+        repairs: Vec<RepairOutput>,
         allows: Allows,
+    }
+    fn repair_output(repair: Repair) -> RepairOutput {
+        match repair {
+            Repair::DiscardProject => RepairOutput {
+                action: "discardProject",
+                feature: None,
+            },
+            Repair::RemoveFeature(feature) => RepairOutput {
+                action: "removeFeature",
+                feature: Some(feature),
+            },
+            Repair::RemoveUnlisted => RepairOutput {
+                action: "removeUnlisted",
+                feature: None,
+            },
+        }
     }
     fn damage_output<'damage>(
         assessment: &Assessment,
@@ -371,20 +388,7 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
             code,
             kind,
             reason,
-            repair: assessment.repair(damage).map(|repair| match repair {
-                Repair::DiscardProject => RepairOutput {
-                    action: "discardProject",
-                    feature: None,
-                },
-                Repair::RemoveFeature(feature) => RepairOutput {
-                    action: "removeFeature",
-                    feature: Some(feature),
-                },
-                Repair::RemoveUnlisted => RepairOutput {
-                    action: "removeUnlisted",
-                    feature: None,
-                },
-            }),
+            repair: assessment.repair(damage).map(repair_output),
         }
     }
     // SAFETY: Forwarded from this function's contract.
@@ -437,6 +441,11 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
                 damage: assessment
                     .every_damage()
                     .map(|damage| damage_output(&assessment, damage))
+                    .collect(),
+                repairs: assessment
+                    .repairs()
+                    .into_iter()
+                    .map(repair_output)
                     .collect(),
                 allows: Allows {
                     read_excluding_overrides: allows(Operation::ReadExcludingOverrides),
