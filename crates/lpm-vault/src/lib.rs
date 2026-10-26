@@ -559,12 +559,23 @@ impl EnvironmentInitializationSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvironmentFileInitializationResult {
     pub file_present: bool,
     pub file_variable_count: usize,
     pub imported_count: Option<usize>,
     pub created_empty: bool,
+    /// Each imported value that holds characters that are hard to see, by key.
+    pub characters: Vec<(String, lpm_env::ValueCharacters)>,
+}
+
+/// What importing a .env file wrote.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct EnvFileImport {
+    /// How many values were written.
+    pub count: usize,
+    /// Each written value that holds characters that are hard to see, by key.
+    pub characters: Vec<(String, lpm_env::ValueCharacters)>,
 }
 
 #[cfg(test)]
@@ -784,6 +795,7 @@ fn initialize_environments_from_files_inner(
                 imported_count: (source.file_present && source.initialization.import_if_present)
                     .then_some(0),
                 created_empty: false,
+                characters: Vec::new(),
             })
             .collect());
     }
@@ -834,11 +846,12 @@ fn initialize_environments_from_files_inner(
                     file_variable_count: 0,
                     imported_count: None,
                     created_empty: initialization.create_if_missing,
+                    characters: Vec::new(),
                 });
                 continue;
             }
 
-            let imported_count = match source.secrets {
+            let (imported_count, characters) = match source.secrets {
                 Some(secrets) => {
                     let vault =
                         load_environment_initialization_vault(&mut state, project_dir, directory)?;
@@ -846,26 +859,21 @@ fn initialize_environments_from_files_inner(
                         .environments
                         .entry(initialization.environment.clone())
                         .or_default();
-                    let mut imported = 0;
-                    for (key, value) in secrets {
-                        if overwrite || !target.contains_key(&key) {
-                            target.insert(key, value);
-                            imported += 1;
-                        }
-                    }
-                    if imported > 0 {
+                    let imported = merge_imported_secrets(target, secrets, overwrite);
+                    if imported.count > 0 {
                         vault.changed = true;
                     }
-                    Some(imported)
+                    (Some(imported.count), imported.characters)
                 }
-                None if initialization.import_if_present => Some(0),
-                None => None,
+                None if initialization.import_if_present => (Some(0), Vec::new()),
+                None => (None, Vec::new()),
             };
             results.push(EnvironmentFileInitializationResult {
                 file_present: true,
                 file_variable_count: source.file_variable_count,
                 imported_count,
                 created_empty: false,
+                characters,
             });
         }
 
@@ -1327,21 +1335,19 @@ pub fn delete_env(project_dir: &Path, env: &str, keys: &[&str]) -> Result<(), St
     })
 }
 
-/// Import secrets from a .env file into the vault.
-///
-/// Returns the number of imported secrets.
+/// Import secrets from a .env file into the vault, as they're written there.
 pub fn import_env_file(
     project_dir: &Path,
     env_path: &Path,
     overwrite: bool,
-) -> Result<usize, String> {
+) -> Result<EnvFileImport, String> {
     let content =
         lpm_common::read_text_file_capped(env_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
             .map_err(|e| format!("failed to read {}: {e}", env_path.display()))?;
 
     let parsed = parse_env_content(&content);
     if parsed.is_empty() {
-        return Ok(0);
+        return Ok(EnvFileImport::default());
     }
 
     let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
@@ -1363,22 +1369,21 @@ pub fn import_env_file(
     Ok(imported)
 }
 
-/// Import secrets from a .env file into a specific environment.
-///
-/// Returns the number of imported secrets.
+/// Import secrets from a .env file into a specific environment, as they're
+/// written there.
 pub fn import_env_file_to_env(
     project_dir: &Path,
     env: &str,
     env_path: &Path,
     overwrite: bool,
-) -> Result<usize, String> {
+) -> Result<EnvFileImport, String> {
     let content =
         lpm_common::read_text_file_capped(env_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
             .map_err(|e| format!("failed to read {}: {e}", env_path.display()))?;
 
     let parsed = parse_env_content(&content);
     if parsed.is_empty() {
-        return Ok(0);
+        return Ok(EnvFileImport::default());
     }
 
     let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
@@ -1613,26 +1618,37 @@ fn parse_env_value(value: &str, lines: &mut std::str::Lines<'_>) -> String {
     value.trim().to_string()
 }
 
+/// Writes each parsed value unless its key is there and `overwrite` is off,
+/// noting what each written value holds that's hard to see.
 fn merge_imported_secrets(
     secrets: &mut HashMap<String, String>,
     parsed: HashMap<String, String>,
     overwrite: bool,
-) -> usize {
-    let mut imported = 0;
+) -> EnvFileImport {
+    use std::collections::hash_map::Entry;
+    let mut import = EnvFileImport::default();
     for (key, value) in parsed {
-        match secrets.entry(key) {
-            std::collections::hash_map::Entry::Occupied(mut entry) if overwrite => {
+        let key = match secrets.entry(key) {
+            Entry::Occupied(mut entry) if overwrite => {
+                let found = lpm_env::check_value_characters(&value);
                 entry.insert(value);
-                imported += 1;
+                found.map(|found| (entry.key().clone(), found))
             }
-            std::collections::hash_map::Entry::Vacant(entry) => {
+            Entry::Vacant(entry) => {
+                let found = lpm_env::check_value_characters(&value);
+                let key = found.map(|found| (entry.key().clone(), found));
                 entry.insert(value);
-                imported += 1;
+                key
             }
-            std::collections::hash_map::Entry::Occupied(_) => {}
-        }
+            Entry::Occupied(_) => continue,
+        };
+        import.count += 1;
+        import.characters.extend(key);
     }
-    imported
+    import
+        .characters
+        .sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    import
 }
 
 /// Decode a dotenv value after its opening double quote, consuming continuation lines.
@@ -1894,7 +1910,7 @@ KEY3=no-quotes"#;
         let parsed = HashMap::from([(key, value)]);
         let mut secrets = HashMap::new();
 
-        assert_eq!(merge_imported_secrets(&mut secrets, parsed, false), 1);
+        assert_eq!(merge_imported_secrets(&mut secrets, parsed, false).count, 1);
         let (stored_key, stored_value) = secrets
             .get_key_value("TRANSFERRED_KEY")
             .expect("imported secret");
@@ -2030,7 +2046,7 @@ KEY3=no-quotes"#;
             std::fs::write(&env_file, "DB=localhost\nPORT=3000\n").unwrap();
 
             let imported = import_env_file(dir.path(), &env_file, false).unwrap();
-            assert_eq!(imported, 2);
+            assert_eq!(imported.count, 2);
 
             let (content, exported) = export_env_content(dir.path()).unwrap().unwrap();
             assert_eq!(exported, 2);
@@ -2054,7 +2070,7 @@ KEY3=no-quotes"#;
             .unwrap();
 
             let imported = import_env_file(dir.path(), &env_file, false).unwrap();
-            assert_eq!(imported, 2);
+            assert_eq!(imported.count, 2);
 
             let secrets = try_get_all(dir.path()).expect("read vault");
             assert_eq!(
@@ -2603,11 +2619,48 @@ KEY3=no-quotes"#;
             std::fs::write(&env_file, "KEY=overwritten\nNEW=added").unwrap();
 
             let imported = import_env_file(dir.path(), &env_file, false).unwrap();
-            assert_eq!(imported, 1);
+            assert_eq!(imported.count, 1);
 
             let secrets = try_get_all(dir.path()).expect("read vault");
             assert_eq!(secrets["KEY"], "original");
             assert_eq!(secrets["NEW"], "added");
+
+            cleanup_vault(dir.path());
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn import_reports_hidden_characters_only_in_the_values_it_writes() {
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
+
+            set(dir.path(), &[("KEPT", "original")]).unwrap();
+
+            let env_file = dir.path().join(".env.test");
+            std::fs::write(
+                &env_file,
+                "KEPT=\u{200B}skipped\nNEW=\"added\u{A0}value\"\nCLEAN=value\nZERO=\u{FEFF}token",
+            )
+            .unwrap();
+
+            let imported = import_env_file(dir.path(), &env_file, false).unwrap();
+            assert_eq!(imported.count, 3);
+            let keys: Vec<&str> = imported
+                .characters
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect();
+            assert_eq!(keys, ["NEW", "ZERO"]);
+            assert_eq!(
+                imported.characters[0].1.characters[0].describe(),
+                "\\u{a0} NO-BREAK SPACE at character 6"
+            );
+            let secrets = try_get_all(dir.path()).expect("read vault");
+            assert_eq!(
+                secrets["NEW"], "added\u{A0}value",
+                "values are stored as given"
+            );
 
             cleanup_vault(dir.path());
         });
@@ -2625,7 +2678,7 @@ KEY3=no-quotes"#;
             std::fs::write(&env_file, "KEY=overwritten").unwrap();
 
             let imported = import_env_file(dir.path(), &env_file, true).unwrap();
-            assert_eq!(imported, 1);
+            assert_eq!(imported.count, 1);
 
             let secrets = try_get_all(dir.path()).expect("read vault");
             assert_eq!(secrets["KEY"], "overwritten");
@@ -3137,7 +3190,7 @@ KEY3=no-quotes"#;
                     .map(|index| (format!("KEY_{index}"), value.clone()))
                     .collect();
                 let mut secrets = HashMap::new();
-                let imported = merge_imported_secrets(&mut secrets, parsed, false);
+                let imported = merge_imported_secrets(&mut secrets, parsed, false).count;
                 imported + secrets.values().map(String::len).sum::<usize>()
             }
             "digest" => with_forced_file_vault_backend(|| {

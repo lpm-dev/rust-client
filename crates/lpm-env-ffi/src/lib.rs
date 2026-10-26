@@ -1,6 +1,7 @@
-//! Bounded C ABI for the bundled native schema engine, GitHub Actions secret
-//! sealing, the LPM home and project files an app shares with the CLI,
-//! passphrase-protected backup files, and the companion storage contract.
+//! Bounded C ABI for the bundled native schema engine, the characters in env
+//! values that are hard to see, GitHub Actions secret sealing, the LPM home
+//! and project files an app shares with the CLI, passphrase-protected backup
+//! files, and the companion storage contract.
 //! Only writing a file of secrets reads the process environment, for the
 //! `git` it runs.
 
@@ -14,6 +15,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 mod backup;
+mod characters;
 mod companion;
 mod files;
 
@@ -56,6 +58,23 @@ fn result(status: u32, bytes: Vec<u8>, snapshot: Option<Arc<SchemaSnapshot>>) ->
         snapshot: snapshot.map_or(std::ptr::null_mut(), |snapshot| {
             Box::into_raw(Box::new(snapshot)).cast()
         }),
+    }
+}
+
+/// A borrowed range, or `None` for a null pointer with a nonzero length.
+/// Callers refuse lengths over their limits first, which keeps every length
+/// here far below `isize::MAX`.
+///
+/// # Safety
+/// A non-null pointer must reference `length` readable bytes for the call.
+pub(crate) unsafe fn bytes<'a>(pointer: *const u8, length: usize) -> Option<&'a [u8]> {
+    if length == 0 {
+        Some(&[])
+    } else if pointer.is_null() || length > isize::MAX as usize {
+        None
+    } else {
+        // SAFETY: The caller supplies a live readable range of `length` bytes.
+        Some(unsafe { std::slice::from_raw_parts(pointer, length) })
     }
 }
 

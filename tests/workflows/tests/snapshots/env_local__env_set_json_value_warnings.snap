@@ -1,0 +1,50 @@
+---
+source: tests/workflows/tests/env_local.rs
+expression: envelope
+---
+{
+  "success": true,
+  "stored": [
+    "TOKEN",
+    "TOKEN",
+    "PLAIN"
+  ],
+  "ignored": [],
+  "env": "default",
+  "value_warnings": [
+    {
+      "key": "TOKEN",
+      "characters": [
+        {
+          "kind": "direction",
+          "code_point": "U+202E",
+          "escape": "\\u{202e}",
+          "name": "RIGHT-TO-LEFT OVERRIDE",
+          "group": null,
+          "count": 1,
+          "runs": [
+            {
+              "position": 8,
+              "count": 1
+            }
+          ]
+        },
+        {
+          "kind": "trailing_whitespace",
+          "code_point": "U+000A",
+          "escape": "\\n",
+          "name": "LINE FEED",
+          "group": null,
+          "count": 1,
+          "runs": [
+            {
+              "position": 14,
+              "count": 1
+            }
+          ]
+        }
+      ],
+      "more": 0
+    }
+  ]
+}

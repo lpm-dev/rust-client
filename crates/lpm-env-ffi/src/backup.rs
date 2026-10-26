@@ -9,7 +9,7 @@ use lpm_env_backup::{
 };
 use serde_json::{Value, json};
 
-use crate::{ABI_VERSION, LPMEnvResult, failure, result};
+use crate::{ABI_VERSION, LPMEnvResult, bytes, failure, result};
 
 const REFUSED: u32 = 5;
 
@@ -56,23 +56,6 @@ fn container_refusal(error: ContainerError) -> LPMEnvResult {
         }
         ContainerError::OutOfMemory => failure(3, "backup.out_of_memory"),
         ContainerError::Random => failure(3, "backup.random_failed"),
-    }
-}
-
-/// A borrowed range, or `None` for a null pointer with a nonzero length.
-/// Callers refuse lengths over their limits first, which keeps every length
-/// here far below `isize::MAX`.
-///
-/// # Safety
-/// A non-null pointer must reference `length` readable bytes for the call.
-unsafe fn bytes<'a>(pointer: *const u8, length: usize) -> Option<&'a [u8]> {
-    if length == 0 {
-        Some(&[])
-    } else if pointer.is_null() || length > isize::MAX as usize {
-        None
-    } else {
-        // SAFETY: The caller supplies a live readable range of `length` bytes.
-        Some(unsafe { std::slice::from_raw_parts(pointer, length) })
     }
 }
 

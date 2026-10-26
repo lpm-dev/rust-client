@@ -1,0 +1,68 @@
+---
+source: tests/workflows/tests/env_local.rs
+expression: envelope
+---
+{
+  "success": true,
+  "environments": [
+    {
+      "environment": "default",
+      "total": 2,
+      "valid": 2,
+      "ignored": [],
+      "value_warnings": [
+        {
+          "key": "EXTRA",
+          "characters": [
+            {
+              "kind": "leading_whitespace",
+              "code_point": "U+0009",
+              "escape": "\\t",
+              "name": "CHARACTER TABULATION",
+              "group": null,
+              "count": 1,
+              "runs": [
+                {
+                  "position": 1,
+                  "count": 1
+                }
+              ]
+            }
+          ],
+          "more": 0,
+          "personal_override": false
+        },
+        {
+          "key": "TOKEN",
+          "characters": [
+            {
+              "kind": "invisible",
+              "code_point": "U+200D",
+              "escape": "\\u{200d}",
+              "name": "ZERO WIDTH JOINER",
+              "group": null,
+              "count": 1,
+              "runs": [
+                {
+                  "position": 8,
+                  "count": 1
+                }
+              ]
+            }
+          ],
+          "more": 0,
+          "personal_override": false
+        }
+      ],
+      "errors": []
+    },
+    {
+      "environment": "staging",
+      "total": 2,
+      "valid": 2,
+      "ignored": [],
+      "value_warnings": [],
+      "errors": []
+    }
+  ]
+}

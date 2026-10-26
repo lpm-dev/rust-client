@@ -17,6 +17,8 @@ struct InitActionResult {
     file_exists: bool,
     file_variable_count: usize,
     outcome: Option<InitActionOutcome>,
+    /// Each imported value that holds characters that are hard to see, by key.
+    characters: Vec<(String, lpm_env::ValueCharacters)>,
 }
 
 #[derive(serde::Serialize)]
@@ -122,6 +124,7 @@ fn perform_init_actions(
                             .created_empty
                             .then_some(InitActionOutcome::CreatedEmpty)
                     }),
+                characters: result.characters,
             })
             .collect()
     })
@@ -284,6 +287,7 @@ pub(super) fn vars_init(
                     "environment": action.canonical,
                     "action": "imported",
                     "count": count,
+                    "value_warnings": super::characters::json_list(&result.characters),
                 })),
                 Some(InitActionOutcome::CreatedEmpty) => Some(serde_json::json!({
                     "environment": action.canonical,
@@ -318,6 +322,9 @@ pub(super) fn vars_init(
                 install_ui::cyan(&action.file_path),
                 &action.canonical,
             ));
+            for (key, found) in &result.characters {
+                super::characters::warn_stored(key, found);
+            }
             imported_count += 1;
         } else if result.file_exists && action.vault_exists {
             println!(

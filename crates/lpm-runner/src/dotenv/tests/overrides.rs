@@ -22,6 +22,7 @@ fn layers(vars: &[(&str, &str)], overrides: PersonalOverrides) -> ProjectEnvLaye
         overrides,
         composed: None,
         vault_count: 0,
+        vault_values: map(vars),
     }
 }
 
@@ -256,5 +257,32 @@ fn the_notice_counts_overrides_without_naming_them() {
         } else {
             "this computer"
         }
+    );
+}
+
+#[test]
+fn stored_value_characters_lists_vault_values_then_personal_overrides_by_key() {
+    let checked = layers(
+        &[("B_KEY", "b\u{200B}"), ("A_KEY", " a"), ("CLEAN", "value")],
+        overrides(&[("B_KEY", "mine\u{A0}"), ("CLEAN", "fine")], &["A_KEY"]),
+    )
+    .stored_value_characters();
+    let listed: Vec<(&str, bool, &str)> = checked
+        .iter()
+        .map(|stored| {
+            (
+                stored.key.as_str(),
+                stored.personal_override,
+                stored.characters.characters[0].character.name(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("A_KEY", false, "SPACE"),
+            ("B_KEY", false, "ZERO WIDTH SPACE"),
+            ("B_KEY", true, "NO-BREAK SPACE"),
+        ]
     );
 }

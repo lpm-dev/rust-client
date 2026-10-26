@@ -14,6 +14,9 @@ schemars = { workspace = true }
 tracing = { workspace = true }
 regex-automata = { workspace = true }
 url = "2"
+# The Unicode properties `url` already links, for the emoji and script
+# context that decides which characters in a value are text.
+icu_properties = { version = "2.2", default-features = false, features = ["compiled_data"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = ["Win32_Globalization"] }

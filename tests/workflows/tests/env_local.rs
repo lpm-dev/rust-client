@@ -3418,3 +3418,214 @@ fn invalid_env_values_include_action_specific_json_help_hints() {
         }
     }
 }
+
+// ─── characters that are hard to see ──────────────────────────────────
+
+#[test]
+fn env_set_stores_a_value_with_hidden_characters_as_given_and_warns_on_stderr() {
+    let project = TempProject::empty(r#"{"name":"env-hidden-set","version":"1.0.0"}"#);
+    let value = "sk_\u{200B}fixture\u{A0}token ";
+
+    let set = lpm(&project)
+        .args([
+            "env",
+            "set",
+            &format!("TOKEN={value}"),
+            "PLAIN=fixture-only",
+        ])
+        .output()
+        .expect("failed to run lpm env set");
+    assert!(
+        set.status.success(),
+        "{}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let stderr = strip_ansi(&String::from_utf8_lossy(&set.stderr));
+    assert!(
+        stderr.contains("TOKEN has characters that are hard to see; it was stored as given"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("\\u{200b} ZERO WIDTH SPACE at character 4"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("\\u{a0} NO-BREAK SPACE at character 12"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("\\u{20} SPACE at the end"), "{stderr}");
+    assert!(!stderr.contains("PLAIN has characters"), "{stderr}");
+    assert!(
+        !stderr.contains("fixture"),
+        "warnings never show the value:\n{stderr}"
+    );
+
+    let get = lpm(&project)
+        .args(["env", "get", "TOKEN", "--reveal"])
+        .output()
+        .expect("failed to run lpm env get");
+    assert_eq!(
+        String::from_utf8_lossy(&get.stdout),
+        format!("{value}\n"),
+        "the value is stored exactly as given"
+    );
+}
+
+#[test]
+fn env_set_json_lists_value_warnings_without_the_value() {
+    let project = TempProject::empty(r#"{"name":"env-hidden-set-json","version":"1.0.0"}"#);
+
+    let set = lpm(&project)
+        .args([
+            "--json",
+            "env",
+            "set",
+            "TOKEN=\u{FEFF}fixture\u{E0068}\u{E0069}",
+            "TOKEN=fixture\u{202E}value\n",
+            "PLAIN=fixture-only",
+        ])
+        .output()
+        .expect("failed to run lpm env set --json");
+    assert!(set.status.success(), "warnings never fail a set");
+    let envelope = parse_json_stdout(&set, "env set --json");
+    assert!(!envelope.to_string().contains("fixture"));
+    insta::assert_json_snapshot!("env_set_json_value_warnings", envelope);
+}
+
+#[test]
+fn env_import_warns_only_about_the_values_it_stored() {
+    let project = TempProject::empty(r#"{"name":"env-hidden-import","version":"1.0.0"}"#);
+    lpm(&project)
+        .args(["env", "set", "KEPT=original"])
+        .assert()
+        .success();
+    write_dotenv(
+        &project,
+        ".env",
+        "KEPT=\u{200B}not-imported\nNEW=\"fixture\u{3000}value\"\nCRLF=\"line one\\r\\nline two\"\nCLEAN=fixture-only\n",
+    );
+
+    let json = lpm(&project)
+        .args(["--json", "env", "import", ".env"])
+        .output()
+        .expect("failed to run lpm env import --json");
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let envelope = parse_json_stdout(&json, "env import --json");
+    assert_eq!(envelope["imported"], 3);
+    assert!(!envelope.to_string().contains("fixture"));
+    insta::assert_json_snapshot!("env_import_json_value_warnings", envelope);
+
+    let human = lpm(&project)
+        .args(["env", "import", ".env", "--overwrite"])
+        .output()
+        .expect("failed to run lpm env import");
+    assert!(human.status.success());
+    let stderr = strip_ansi(&String::from_utf8_lossy(&human.stderr));
+    assert!(
+        stderr.contains("KEPT has characters that are hard to see"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("\\u{200b} ZERO WIDTH SPACE at character 1"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("\\u{3000} IDEOGRAPHIC SPACE at character 8"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("\\r CARRIAGE RETURN at character 9"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("CLEAN has"), "{stderr}");
+}
+
+#[test]
+fn env_init_reports_hidden_characters_in_the_values_it_imports() {
+    let project = TempProject::empty(r#"{"name":"env-hidden-init","version":"1.0.0"}"#);
+    write_dotenv(
+        &project,
+        ".env",
+        "TOKEN=fixture\u{2060}value\nPLAIN=fixture-only\n",
+    );
+
+    let out = lpm(&project)
+        .args(["--json", "env", "init"])
+        .output()
+        .expect("failed to run lpm env init --json");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let envelope = parse_json_stdout(&out, "env init --json");
+    let action = &envelope["actions"][0];
+    assert_eq!(action["action"], "imported");
+    assert!(!envelope.to_string().contains("fixture"));
+    insta::assert_json_snapshot!("env_init_json_value_warnings", action);
+}
+
+#[test]
+fn env_check_reports_hidden_characters_as_warnings_not_failures() {
+    let project = TempProject::empty(r#"{"name":"env-hidden-check","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        r#"{"envSchema":{"vars":{"API_URL":{"format":"url"},"TOKEN":{"required":true}}}}"#,
+    );
+    lpm(&project)
+        .args([
+            "env",
+            "set",
+            "API_URL=https://example.com",
+            "TOKEN=fixture\u{200D}token",
+            "EXTRA=\tfixture",
+        ])
+        .assert()
+        .success();
+    lpm(&project)
+        .args(["env", "set", "--env=staging", "TOKEN=fixture-only"])
+        .assert()
+        .success();
+
+    let json = lpm(&project)
+        .args(["--json", "env", "check"])
+        .output()
+        .expect("failed to run lpm env check --json");
+    assert!(
+        json.status.success(),
+        "hidden characters never fail a check:\n{}",
+        String::from_utf8_lossy(&json.stdout)
+    );
+    let envelope = parse_json_stdout(&json, "env check --json");
+    assert_eq!(envelope["success"], true);
+    assert!(!envelope.to_string().contains("fixture"));
+    insta::assert_json_snapshot!("env_check_json_value_warnings", envelope);
+
+    let human = lpm(&project)
+        .args(["env", "check", "--env=default"])
+        .output()
+        .expect("failed to run lpm env check");
+    assert!(human.status.success());
+    let stdout = strip_ansi(&String::from_utf8_lossy(&human.stdout));
+    assert!(
+        stdout.contains("TOKEN has characters that are hard to see"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\\u{200d} ZERO WIDTH JOINER at character 8"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("EXTRA has characters that are hard to see"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\\t CHARACTER TABULATION at the start"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("fixture"), "{stdout}");
+}

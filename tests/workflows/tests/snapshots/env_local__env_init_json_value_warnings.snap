@@ -1,0 +1,31 @@
+---
+source: tests/workflows/tests/env_local.rs
+expression: action
+---
+{
+  "environment": "default",
+  "action": "imported",
+  "count": 2,
+  "value_warnings": [
+    {
+      "key": "TOKEN",
+      "characters": [
+        {
+          "kind": "invisible",
+          "code_point": "U+2060",
+          "escape": "\\u{2060}",
+          "name": "WORD JOINER",
+          "group": null,
+          "count": 1,
+          "runs": [
+            {
+              "position": 8,
+              "count": 1
+            }
+          ]
+        }
+      ],
+      "more": 0
+    }
+  ]
+}

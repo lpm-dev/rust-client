@@ -183,6 +183,17 @@ pub struct ProjectEnvLayers {
     /// The child environment, once layer 4 was applied to the layers.
     composed: Option<ChildEnv>,
     vault_count: usize,
+    /// The values read from the vault, before the files' values were merged under them.
+    vault_values: HashMap<String, String>,
+}
+
+/// A value read from storage that holds characters that are hard to see.
+#[derive(Debug)]
+pub struct StoredValueCharacters {
+    pub key: String,
+    /// The value is a personal override on this machine, not the project's.
+    pub personal_override: bool,
+    pub characters: lpm_env::ValueCharacters,
 }
 
 /// What the personal overrides decided for one name.
@@ -404,7 +415,33 @@ impl ProjectEnvLayers {
             overrides: child.overrides.clone(),
             composed: Some(child),
             vault_count,
+            vault_values: HashMap::new(),
         }
+    }
+
+    /// What the values this environment reads from storage hold that's hard
+    /// to see: its values in the vault, or the default environment's when it
+    /// has none, then its personal overrides on this machine, each by key.
+    pub fn stored_value_characters(&self) -> Vec<StoredValueCharacters> {
+        fn checked<'a>(
+            values: impl Iterator<Item = (&'a String, &'a String)>,
+            personal_override: bool,
+        ) -> Vec<StoredValueCharacters> {
+            let mut found: Vec<StoredValueCharacters> = values
+                .filter_map(|(key, value)| {
+                    lpm_env::check_value_characters(value).map(|characters| StoredValueCharacters {
+                        key: key.clone(),
+                        personal_override,
+                        characters,
+                    })
+                })
+                .collect();
+            found.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+            found
+        }
+        let mut found = checked(self.vault_values.iter(), false);
+        found.extend(checked(self.overrides.set.iter(), true));
+        found
     }
 
     /// How many personal overrides change this environment: each `set` of a
@@ -776,6 +813,7 @@ pub(crate) fn load_project_env_layers(
         overrides,
         composed: None,
         vault_count,
+        vault_values: vault_vars,
     })
 }
 

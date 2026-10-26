@@ -1,0 +1,53 @@
+---
+source: tests/workflows/tests/env_local.rs
+expression: envelope
+---
+{
+  "success": true,
+  "imported": 3,
+  "from": ".env",
+  "env": "default",
+  "warnings": [],
+  "value_warnings": [
+    {
+      "key": "CRLF",
+      "characters": [
+        {
+          "kind": "line_break",
+          "code_point": "U+000D",
+          "escape": "\\r",
+          "name": "CARRIAGE RETURN",
+          "group": null,
+          "count": 1,
+          "runs": [
+            {
+              "position": 9,
+              "count": 1
+            }
+          ]
+        }
+      ],
+      "more": 0
+    },
+    {
+      "key": "NEW",
+      "characters": [
+        {
+          "kind": "space",
+          "code_point": "U+3000",
+          "escape": "\\u{3000}",
+          "name": "IDEOGRAPHIC SPACE",
+          "group": null,
+          "count": 1,
+          "runs": [
+            {
+              "position": 8,
+              "count": 1
+            }
+          ]
+        }
+      ],
+      "more": 0
+    }
+  ]
+}

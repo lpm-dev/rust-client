@@ -10,6 +10,7 @@ expression: envelope
       "total": 1,
       "valid": 0,
       "ignored": [],
+      "value_warnings": [],
       "errors": [
         {
           "key": "REQUIRED",

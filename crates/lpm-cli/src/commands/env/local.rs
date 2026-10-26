@@ -35,6 +35,7 @@ pub(super) fn env_set(
         }
     }
 
+    let stored = stored_values(&pairs);
     if json_output {
         let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
         let ignored: Vec<&str> = keys
@@ -42,12 +43,25 @@ pub(super) fn env_set(
             .copied()
             .filter(|key| lpm_env::is_denied_env_var(key))
             .collect();
+        let value_warnings: Vec<serde_json::Value> = stored
+            .iter()
+            .filter_map(|(key, value)| {
+                lpm_env::check_value_characters(value)
+                    .map(|found| super::characters::json(key, &found))
+            })
+            .collect();
         println!(
             "{}",
-            serde_json::json!({"success": true, "stored": keys, "ignored": ignored, "env": env_label})
+            serde_json::json!({
+                "success": true,
+                "stored": keys,
+                "ignored": ignored,
+                "env": env_label,
+                "value_warnings": value_warnings,
+            })
         );
     } else {
-        for (key, _) in &pairs {
+        for (key, value) in &stored {
             output::success_line(install_ui::terminal_line!(
                 "stored {} ({})",
                 install_ui::bold(key),
@@ -59,9 +73,25 @@ pub(super) fn env_set(
                     install_ui::bold(key),
                 ));
             }
+            if let Some(found) = lpm_env::check_value_characters(value) {
+                super::characters::warn_stored(key, &found);
+            }
         }
     }
     Ok(())
+}
+
+/// Each key once, with the value it was stored with: its last assignment.
+fn stored_values<'a>(pairs: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    let mut seen = std::collections::HashSet::with_capacity(pairs.len());
+    let mut stored: Vec<(&str, &str)> = pairs
+        .iter()
+        .rev()
+        .filter(|(key, _)| seen.insert(*key))
+        .copied()
+        .collect();
+    stored.reverse();
+    stored
 }
 
 pub(super) fn env_get(
@@ -168,12 +198,13 @@ pub(super) fn env_import(
     let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
     let env_label = resolved_env.as_deref().unwrap_or("default");
 
-    let count = match &resolved_env {
+    let imported = match &resolved_env {
         Some(env) => lpm_vault::import_env_file_to_env(project_dir, env, &path, overwrite)
             .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?,
         None => lpm_vault::import_env_file(project_dir, &path, overwrite)
             .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?,
     };
+    let count = imported.count;
     let warnings = keep_env_source_ignored(project_dir, &path)?;
 
     if json_output {
@@ -185,6 +216,7 @@ pub(super) fn env_import(
                 "from": file,
                 "env": env_label,
                 "warnings": warnings,
+                "value_warnings": super::characters::json_list(&imported.characters),
             })
         );
     } else {
@@ -196,6 +228,9 @@ pub(super) fn env_import(
             install_ui::cyan(file),
             env_label,
         ));
+        for (key, found) in &imported.characters {
+            super::characters::warn_stored(key, found);
+        }
     }
     Ok(())
 }

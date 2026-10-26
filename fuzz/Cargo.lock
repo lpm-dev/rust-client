@@ -923,6 +923,7 @@ dependencies = [
 name = "lpm-env"
 version = "0.81.0"
 dependencies = [
+ "icu_properties",
  "regex-automata",
  "schemars",
  "serde",

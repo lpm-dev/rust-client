@@ -2,6 +2,7 @@
 
 mod arguments;
 pub(crate) mod auth;
+mod characters;
 mod ci;
 #[cfg(debug_assertions)]
 mod debug_companion;
@@ -223,6 +224,7 @@ mod tests {
     const PRODUCTION_SOURCES: &[&str] = &[
         include_str!("mod.rs"),
         include_str!("auth.rs"),
+        include_str!("characters.rs"),
         include_str!("inventory.rs"),
         include_str!("local.rs"),
         include_str!("oidc.rs"),

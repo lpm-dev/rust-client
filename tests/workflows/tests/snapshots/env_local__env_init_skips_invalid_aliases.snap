@@ -28,7 +28,8 @@ expression: value
     {
       "environment": "unit",
       "action": "imported",
-      "count": 1
+      "count": 1,
+      "value_warnings": []
     }
   ],
   "skipped": [
