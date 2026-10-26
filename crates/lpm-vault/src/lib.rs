@@ -43,7 +43,7 @@ mod macos_keychain;
 #[cfg(test)]
 pub(crate) mod test_env_lock;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) mod test_tracing;
 
 use std::collections::HashMap;
