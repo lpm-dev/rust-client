@@ -3,7 +3,7 @@
 mod graph;
 mod read;
 
-pub use graph::decode_definition;
+pub use graph::{decode_definition, unknown_field_error};
 
 use lpm_env::{EnvSchema, EnvSchemaDefinition, ValidationErrorKind};
 use serde::Serialize;
@@ -28,6 +28,10 @@ pub struct SchemaDiagnostic {
     pub source: String,
     pub pointer: String,
     pub key: Option<String>,
+    /// For `env.unknown_field`, the unknown field's name, escaped like a
+    /// pointer segment so it's safe to show.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<&'static str>,
     #[serde(rename = "relatedSources", skip_serializing_if = "Vec::is_empty")]
@@ -42,6 +46,20 @@ pub struct SourceError {
 
 impl std::fmt::Display for SourceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(field) = &self.diagnostic.field {
+            let pointer = &self.diagnostic.pointer;
+            let parent = pointer
+                .strip_suffix(field.as_str())
+                .and_then(|parent| parent.strip_suffix('/'))
+                .unwrap_or(pointer);
+            return write!(
+                f,
+                "envSchema field \"{}\" at {}{} isn't one this LPM CLI knows. Check its spelling, or update the LPM CLI if a newer version wrote it.",
+                DiagnosticText(field),
+                DiagnosticText(&self.diagnostic.source),
+                DiagnosticText(if parent.is_empty() { "/" } else { parent })
+            );
+        }
         write!(
             f,
             "{} at {}{}",
@@ -111,6 +129,7 @@ impl SourceError {
                     pointer.into()
                 },
                 key: None,
+                field: None,
                 message: None,
                 related_sources: Vec::new(),
             }),

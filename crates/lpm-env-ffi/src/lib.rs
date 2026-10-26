@@ -1,6 +1,6 @@
 //! Bounded C ABI for the bundled native schema engine, GitHub Actions secret
-//! sealing, the LPM home and project files an app shares with the CLI, and
-//! passphrase-protected backup files.
+//! sealing, the LPM home and project files an app shares with the CLI,
+//! passphrase-protected backup files, and the companion storage contract.
 //! Only writing a file of secrets reads the process environment, for the
 //! `git` it runs.
 
@@ -14,6 +14,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
 mod backup;
+mod companion;
 mod files;
 
 /// The engine holds env values, decrypted backups and passphrases, so all
@@ -173,6 +174,15 @@ impl<V, T: Serialize, F: Fn(&V) -> T> Serialize for Entries<'_, V, F> {
     }
 }
 
+/// A flat schema that doesn't decode: a field this version doesn't know, as
+/// a located diagnostic, or else an invalid definition.
+fn flat_definition_failure(bytes: &[u8]) -> LPMEnvResult {
+    match lpm_env::first_unknown_schema_field(bytes) {
+        Some(unknown) => diagnostic(&lpm_env_source::unknown_field_error("", &unknown)),
+        None => failure(1, "env.invalid_definition"),
+    }
+}
+
 fn diagnostic(error: &lpm_env_source::SourceError) -> LPMEnvResult {
     match lpm_env_source::bounded_json(&error.diagnostic, 4096) {
         Ok(bytes) => result(1, bytes, None),
@@ -201,7 +211,7 @@ pub unsafe extern "C" fn lpm_env_validate(input: *const u8, length: usize) -> LP
         }
         let schema = match serde_json::from_slice::<lpm_env::EnvSchema>(bytes) {
             Ok(schema) => schema,
-            Err(_) => return failure(1, "env.invalid_definition"),
+            Err(_) => return flat_definition_failure(bytes),
         };
         if let Some(error) = lpm_env::validate_schema(&schema).first() {
             return failure(1, lpm_env_source::declaration_code(&error.kind));
@@ -447,7 +457,7 @@ pub unsafe extern "C" fn lpm_env_check(
             return failure(2, "env.invalid_utf8");
         }
         let Ok(schema) = serde_json::from_slice::<lpm_env::EnvSchema>(schema) else {
-            return failure(1, "env.invalid_definition");
+            return flat_definition_failure(schema);
         };
         let Ok(input) = serde_json::from_slice::<CheckInput>(input) else {
             return failure(2, "env.invalid_input");
@@ -981,21 +991,25 @@ mod tests {
     #[test]
     fn root_definition_errors_name_the_declaration_and_never_echo_literals() {
         let dir = tempfile::tempdir().unwrap();
-        for (input, pointer, message) in [
+        let unknown = "This field isn't one this version of LPM knows. Check its spelling, or update LPM if a newer version wrote it.";
+        for (input, code, pointer, message) in [
             (
                 r#"{"vars":{"PORT":{"rnage":"PRIVATE"}}}"#,
+                "env.unknown_field",
                 "/envSchema/vars/PORT/rnage",
-                "Invalid schema definition. Check the field name and value type at this location.",
+                unknown,
             ),
             (
                 r#"{"vars":{"PORT":{"required":"PRIVATE"}}}"#,
+                "env.invalid_definition",
                 "/envSchema/vars/PORT/required",
                 "Invalid schema definition. Check the field name and value type at this location.",
             ),
             (
                 r#"{"varz":{}}"#,
+                "env.unknown_field",
                 "/envSchema/varz",
-                "Invalid schema definition. Check the field name and value type at this location.",
+                unknown,
             ),
         ] {
             let result = resolve(input.as_bytes(), dir.path().to_str().unwrap());
@@ -1005,12 +1019,27 @@ mod tests {
             unsafe {
                 lpm_env_release(result);
             }
-            assert_eq!(diagnostic["code"], "env.invalid_definition", "{input}");
+            assert_eq!(diagnostic["code"], code, "{input}");
             assert_eq!(diagnostic["source"], "lpm.json", "{input}");
             assert_eq!(diagnostic["pointer"], pointer, "{input}");
             assert_eq!(diagnostic["message"], message, "{input}");
             assert!(!diagnostic.to_string().contains("PRIVATE"), "{input}");
         }
+    }
+
+    #[test]
+    fn flat_unknown_fields_are_located_and_their_names_escaped() {
+        let schema = br#"{"vars":{"A":{"rotate\u001b[31mEvery":"PRIVATE"}}}"#;
+        // SAFETY: The slice stays live for this synchronous call.
+        let result = unsafe { lpm_env_validate(schema.as_ptr(), schema.len()) };
+        assert_eq!(result.status, 1);
+        let diagnostic = output(&result);
+        // SAFETY: This is the sole release of the returned result.
+        unsafe { lpm_env_release(result) };
+        assert_eq!(diagnostic["code"], "env.unknown_field");
+        assert_eq!(diagnostic["pointer"], "/vars/A/rotate\\u{1b}[31mEvery");
+        assert_eq!(diagnostic["field"], "rotate\\u{1b}[31mEvery");
+        assert!(!diagnostic.to_string().contains("PRIVATE"));
     }
 
     fn check(schema: &[u8], input: &[u8]) -> (u32, serde_json::Value) {
@@ -1256,11 +1285,15 @@ mod tests {
         for (schema, code) in [
             (
                 br#"{"vars":{"A":{"rnage":"1"}}}"#.as_slice(),
-                "env.invalid_definition",
+                "env.unknown_field",
             ),
             (br#"{"vars":{"A":{"pattern":"["}}}"#, "env.invalid_pattern"),
             (
                 br#"{"extends":["base.json"],"vars":{}}"#,
+                "env.unknown_field",
+            ),
+            (
+                br#"{"vars":{"A":{"required":"yes"}}}"#,
                 "env.invalid_definition",
             ),
         ] {

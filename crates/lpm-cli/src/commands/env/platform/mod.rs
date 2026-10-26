@@ -2229,6 +2229,7 @@ pub(super) async fn vars_platform_push(
             project_dir,
             &resolved_env,
             config.as_ref(),
+            lpm_runner::dotenv::OverridePolicy::Exclude,
         )?,
     );
     let local = client.prepare_local(
@@ -2563,6 +2564,7 @@ pub(super) async fn vars_platform_status(
                 project_dir,
                 &resolved,
                 config.as_ref().ok().and_then(Option::as_ref),
+                lpm_runner::dotenv::OverridePolicy::Exclude,
             )
             .map_err(|error| error.to_string())
         }) {
@@ -2847,9 +2849,11 @@ pub(super) async fn vars_platform_pull(
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect::<Vec<_>>();
     if env_name == "default" {
-        lpm_vault::set(project_dir, &pairs).map_err(LpmError::Script)?;
+        lpm_vault::set(project_dir, &pairs)
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
     } else {
-        lpm_vault::set_env(project_dir, env_name, &pairs).map_err(LpmError::Script)?;
+        lpm_vault::set_env(project_dir, env_name, &pairs)
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
     }
     let audit = record_platform_audit_with_recovery(
         registry_client,

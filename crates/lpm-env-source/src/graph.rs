@@ -509,6 +509,11 @@ impl Graph {
 pub fn decode_definition(bytes: &[u8], source: &str) -> Result<EnvSchemaDefinition, SourceError> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let definition = serde_path_to_error::deserialize(&mut deserializer).map_err(|failure| {
+        if failure.inner().classify() == serde_json::error::Category::Data
+            && let Some(unknown) = lpm_env::first_unknown_definition_field(bytes)
+        {
+            return unknown_field_error(source, &unknown);
+        }
         let mut pointer = String::with_capacity(64);
         if source == "lpm.json" {
             pointer.push_str("/envSchema");
@@ -544,6 +549,30 @@ pub fn decode_definition(bytes: &[u8], source: &str) -> Result<EnvSchemaDefiniti
         error
     })?;
     Ok(definition)
+}
+
+/// The diagnostic for a field no node of its kind defines: a typo, or a
+/// field a newer version wrote. Its pointer includes the field, and the
+/// field's name is escaped like any authored pointer segment.
+pub fn unknown_field_error(source: &str, unknown: &lpm_env::UnknownField) -> SourceError {
+    let mut pointer = String::with_capacity(64);
+    if source == "lpm.json" {
+        pointer.push_str("/envSchema");
+    }
+    for segment in &unknown.parent {
+        pointer.push('/');
+        push_pointer_segment(&mut pointer, segment);
+    }
+    let mut field = String::with_capacity(unknown.name.len());
+    push_pointer_segment(&mut field, &unknown.name);
+    pointer.push('/');
+    pointer.push_str(&field);
+    let mut error = SourceError::new("env.unknown_field", "parse", source, &pointer);
+    error.diagnostic.field = Some(field);
+    error.diagnostic.message = Some(
+        "This field isn't one this version of LPM knows. Check its spelling, or update LPM if a newer version wrote it.",
+    );
+    error
 }
 
 fn strip_bom(bytes: &[u8]) -> &[u8] {

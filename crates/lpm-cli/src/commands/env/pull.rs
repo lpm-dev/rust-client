@@ -101,7 +101,7 @@ pub(super) async fn vars_pull(
         }
 
         let baseline_environments = lpm_vault::try_get_all_environments_for_vault_id(&vault_id)
-            .map_err(LpmError::Script)?;
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
         let expected_principal_id = manifest
             .vault
             .org_sync_principal_for_registry(org_slug, client.base_url())
@@ -171,8 +171,8 @@ pub(super) async fn vars_pull(
     }
 
     let project_name = manifest.vault.project_name(project_dir);
-    let baseline_environments =
-        lpm_vault::try_get_all_environments_for_vault_id(&vault_id).map_err(LpmError::Script)?;
+    let baseline_environments = lpm_vault::try_get_all_environments_for_vault_id(&vault_id)
+        .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
     let local_key_count = baseline_environments
         .values()
         .map(|env| env.len())

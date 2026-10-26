@@ -25,15 +25,28 @@ pub(super) fn print_env_context(loaded: &LoadedEnv) {
         _ => String::new(),
     };
 
-    let vault_str = if loaded.vault_count > 0 {
+    let vault_count = loaded.layers.vault_count();
+    let vault_str = if vault_count > 0 {
         format!(
             "{} env secret{}",
-            loaded.vault_count,
-            if loaded.vault_count == 1 { "" } else { "s" }
+            vault_count,
+            if vault_count == 1 { "" } else { "s" }
         )
     } else {
         String::new()
     };
+    let override_count = loaded.layers.override_count();
+    let override_str = match override_count {
+        0 => String::new(),
+        count => dotenv::personal_overrides_here(count),
+    };
+    if override_count > 0 {
+        dotenv::personal_overrides_shown(
+            override_count,
+            loaded.env_name.as_deref().unwrap_or("default"),
+        );
+        dotenv::log_personal_override_names(loaded.layers.overrides());
+    }
 
     // Build parts and join with " · "
     let mut parts = Vec::new();
@@ -42,6 +55,9 @@ pub(super) fn print_env_context(loaded: &LoadedEnv) {
     }
     if !vault_str.is_empty() {
         parts.push(vault_str);
+    }
+    if !override_str.is_empty() {
+        parts.push(override_str);
     }
 
     if parts.is_empty() {
@@ -58,8 +74,8 @@ pub(super) fn print_env_context(loaded: &LoadedEnv) {
 
 /// Result of environment resolution + loading, including display metadata.
 pub(crate) struct LoadedEnv {
-    /// The loaded environment variables to inject into the child process.
-    pub(crate) vars: HashMap<String, String>,
+    /// Layers 1, 2 and 4 of the environment to inject into the child.
+    pub(crate) layers: dotenv::ProjectEnvLayers,
     /// The canonical environment name (e.g., "development", "production").
     /// `None` if no env was resolved (just .env + .env.local).
     pub(crate) env_name: Option<String>,
@@ -67,8 +83,14 @@ pub(crate) struct LoadedEnv {
     alias: Option<String>,
     /// How the env was determined.
     source: &'static str,
-    /// Number of env secrets loaded for this env.
-    vault_count: usize,
+}
+
+impl LoadedEnv {
+    /// The environment of a child without service values: layers 1, 2 and 4,
+    /// moved out with what the personal overrides decide in it.
+    pub(crate) fn take_child_env(&mut self) -> Result<dotenv::ChildEnv, LpmError> {
+        self.layers.take_child_env()
+    }
 }
 
 /// Resolve the env mode and load environment variables.
@@ -85,9 +107,16 @@ pub(super) fn resolve_and_load_env(
     project_dir: &Path,
     script_name: &str,
     explicit_mode: Option<&str>,
+    policy: dotenv::OverridePolicy,
 ) -> Result<LoadedEnv, LpmError> {
     let config = lpm_json::read_lpm_json(project_dir).map_err(LpmError::EnvValidation)?;
-    resolve_and_load_env_with_config(project_dir, script_name, explicit_mode, config.as_ref())
+    resolve_and_load_env_with_config(
+        project_dir,
+        script_name,
+        explicit_mode,
+        config.as_ref(),
+        policy,
+    )
 }
 
 pub(super) fn resolve_and_load_env_with_config(
@@ -95,6 +124,7 @@ pub(super) fn resolve_and_load_env_with_config(
     script_name: &str,
     explicit_mode: Option<&str>,
     config: Option<&lpm_json::LpmJsonConfig>,
+    policy: dotenv::OverridePolicy,
 ) -> Result<LoadedEnv, LpmError> {
     resolve_and_load_env_with_schema_validation(
         project_dir,
@@ -102,6 +132,7 @@ pub(super) fn resolve_and_load_env_with_config(
         explicit_mode,
         config,
         !should_skip_env_validation(),
+        policy,
     )
 }
 
@@ -111,6 +142,7 @@ pub(crate) fn resolve_and_load_env_with_schema_validation(
     explicit_mode: Option<&str>,
     config: Option<&lpm_json::LpmJsonConfig>,
     validate_schema: bool,
+    policy: dotenv::OverridePolicy,
 ) -> Result<LoadedEnv, LpmError> {
     // Determine the canonical env name via the resolver.
     // Priority: 1. explicit --env flag  2. lpm.json script mapping  3. None
@@ -156,19 +188,16 @@ pub(crate) fn resolve_and_load_env_with_schema_validation(
     let env_name = resolved.as_ref().map(|env| env.canonical.as_str());
     let load_mode = resolved.as_ref().and_then(dotenv::resolved_load_mode);
     let file_path = resolved.as_ref().and_then(|env| env.file_path.as_deref());
-    let mut loaded = dotenv::load_project_env_details_with_config_and_schema_validation(
-        project_dir,
-        load_mode,
-        file_path,
-        config,
-        false,
-    )?;
+    let mut layers =
+        dotenv::load_project_env_layers(project_dir, load_mode, file_path, config, policy)?;
     if validate_schema {
         let validator = config
             .and_then(|config| config.env_schema.as_ref())
             .map(lpm_env::EnvValidator::new);
+        let vault_count = layers.vault_count();
+        let mut child = layers.compose(None, None)?;
         dotenv::validate_project_env_with_plan(
-            &mut loaded.vars,
+            &mut child,
             validator.as_ref(),
             lpm_env::EvalContext {
                 environment: env_name.unwrap_or("default"),
@@ -176,14 +205,14 @@ pub(crate) fn resolve_and_load_env_with_schema_validation(
                 service: None,
             },
         )?;
+        layers = dotenv::ProjectEnvLayers::already_composed(child, vault_count);
     }
 
     Ok(LoadedEnv {
-        vars: loaded.vars,
+        layers,
         env_name: env_name.map(str::to_string),
         alias: resolved.and_then(|env| env.alias),
         source,
-        vault_count: loaded.vault_count,
     })
 }
 
@@ -196,8 +225,11 @@ pub fn load_script_env(
     project_dir: &Path,
     script_name: &str,
     explicit_mode: Option<&str>,
+    policy: dotenv::OverridePolicy,
 ) -> Result<HashMap<String, String>, LpmError> {
-    Ok(resolve_and_load_env(project_dir, script_name, explicit_mode)?.vars)
+    resolve_and_load_env(project_dir, script_name, explicit_mode, policy)?
+        .take_child_env()
+        .map(dotenv::ChildEnv::into_vars)
 }
 
 /// Load a script environment using a configuration that the caller already parsed.
@@ -206,11 +238,17 @@ pub fn load_script_env_with_config(
     script_name: &str,
     explicit_mode: Option<&str>,
     config: Option<&lpm_json::LpmJsonConfig>,
+    policy: dotenv::OverridePolicy,
 ) -> Result<HashMap<String, String>, LpmError> {
-    Ok(resolve_and_load_env_with_config(project_dir, script_name, explicit_mode, config)?.vars)
+    resolve_and_load_env_with_config(project_dir, script_name, explicit_mode, config, policy)?
+        .take_child_env()
+        .map(dotenv::ChildEnv::into_vars)
 }
 
 /// Load the validated final script environment for task-cache fingerprinting.
+/// A change to the effective environment, personal overrides included under
+/// [`dotenv::OverridePolicy::Apply`], changes the result.
+#[allow(clippy::too_many_arguments)]
 pub fn load_script_child_env_with_config(
     project_dir: &Path,
     script_name: &str,
@@ -219,17 +257,19 @@ pub fn load_script_child_env_with_config(
     path: &str,
     command: &str,
     context: &NpmScriptContext,
+    policy: dotenv::OverridePolicy,
 ) -> Result<HashMap<String, String>, LpmError> {
-    let loaded = resolve_and_load_env_with_schema_validation(
+    let mut loaded = resolve_and_load_env_with_schema_validation(
         project_dir,
         script_name,
         explicit_mode,
         config,
         false,
+        policy,
     )?;
-    let mut vars = loaded.vars;
+    let mut vars = loaded.take_child_env()?;
     mark_script_child_env(&mut vars);
-    context.apply(&mut vars, script_name, command);
+    vars.apply_npm_context(context, script_name, command);
     let validate_schema = !should_skip_env_validation();
     let validator = config
         .filter(|_| validate_schema)
@@ -246,7 +286,7 @@ pub fn load_script_child_env_with_config(
         path,
         validate_schema,
     )?;
-    Ok(vars)
+    Ok(vars.into_vars())
 }
 
 #[cfg(test)]
@@ -270,7 +310,14 @@ mod tests {
         .unwrap();
         let config = lpm_json::parse_lpm_json(r#"{"env":{"dev":"config/dev.env"}}"#).unwrap();
 
-        let loaded = load_script_env_with_config(dir.path(), "dev", None, Some(&config)).unwrap();
+        let loaded = load_script_env_with_config(
+            dir.path(),
+            "dev",
+            None,
+            Some(&config),
+            dotenv::OverridePolicy::Exclude,
+        )
+        .unwrap();
 
         assert_eq!(
             loaded.get("LPM_EXACT_ENV_MAPPING_TEST").map(String::as_str),

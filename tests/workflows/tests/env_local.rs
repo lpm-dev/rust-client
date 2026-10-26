@@ -2803,16 +2803,29 @@ fn project_loaders_preserve_the_implicit_default_file_cascade() {
         r#"{"envSchema":{"vars":{"CASCADE_VALUE":{"enum":["local"]}}}}"#,
     );
     let config = lpm_runner::lpm_json::read_lpm_json(project.path()).unwrap();
+    let apply = lpm_runner::dotenv::OverridePolicy::Apply;
     for values in [
-        lpm_runner::dotenv::load_project_env_with_schema_validation(project.path(), None, true),
-        lpm_runner::dotenv::load_project_env_with_config(project.path(), None, config.as_ref()),
+        lpm_runner::dotenv::load_project_env_with_schema_validation(
+            project.path(),
+            None,
+            true,
+            apply,
+        ),
+        lpm_runner::dotenv::load_project_env_with_config(
+            project.path(),
+            None,
+            config.as_ref(),
+            apply,
+        ),
         lpm_runner::dotenv::load_project_env_with_config_and_context(
             project.path(),
             None,
             config.as_ref(),
             Default::default(),
             None,
-        ),
+            apply,
+        )
+        .map(lpm_runner::dotenv::ChildEnv::into_vars),
     ] {
         assert_eq!(values.unwrap()["CASCADE_VALUE"], "local");
     }
@@ -2825,16 +2838,29 @@ fn project_loaders_honor_the_configured_default_file_and_scope() {
     project.write_file("config/default.env", "CASCADE_VALUE=configured\n");
     project.write_file("lpm.json", r#"{"env":{"default":"config/default.env"},"envSchema":{"vars":{"CASCADE_VALUE":{"requiredIn":[{"environment":["default"]}],"enum":["configured"]}}}}"#);
     let config = lpm_runner::lpm_json::read_lpm_json(project.path()).unwrap();
+    let apply = lpm_runner::dotenv::OverridePolicy::Apply;
     for values in [
-        lpm_runner::dotenv::load_project_env_with_schema_validation(project.path(), None, true),
-        lpm_runner::dotenv::load_project_env_with_config(project.path(), None, config.as_ref()),
+        lpm_runner::dotenv::load_project_env_with_schema_validation(
+            project.path(),
+            None,
+            true,
+            apply,
+        ),
+        lpm_runner::dotenv::load_project_env_with_config(
+            project.path(),
+            None,
+            config.as_ref(),
+            apply,
+        ),
         lpm_runner::dotenv::load_project_env_with_config_and_context(
             project.path(),
             None,
             config.as_ref(),
             Default::default(),
             None,
-        ),
+            apply,
+        )
+        .map(lpm_runner::dotenv::ChildEnv::into_vars),
     ] {
         assert_eq!(values.unwrap()["CASCADE_VALUE"], "configured");
     }
@@ -3236,6 +3262,42 @@ fn env_schema_json_reports_import_provenance_without_reading_values() {
     );
     assert_eq!(value["dependencies"], serde_json::json!(["base.json"]));
     insta::assert_json_snapshot!("env_schema_definition_json", value, {".fingerprint" => "[fingerprint]"});
+}
+
+#[test]
+fn env_schema_unknown_fields_name_the_field_in_the_file_that_holds_it() {
+    let project = TempProject::empty(r#"{"name":"fragment-unknown-field"}"#);
+    project.write_file("lpm.json", r#"{"envSchema":{"extends":["base.json"]}}"#);
+    project.write_file(
+        "base.json",
+        r#"{"vars":{"VALUE":{"required":true,"rotateEvery":"private-fixture-value"}}}"#,
+    );
+    let output = lpm(&project)
+        .args(["env", "schema", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let value = parse_json_stdout(&output, "unknown field diagnostic");
+    let diagnostic = &value["diagnostics"][0];
+    assert_eq!(diagnostic["code"], "env.unknown_field");
+    assert_eq!(diagnostic["source"], "base.json");
+    assert_eq!(diagnostic["pointer"], "/vars/VALUE/rotateEvery");
+    assert_eq!(diagnostic["field"], "rotateEvery");
+    assert!(!value.to_string().contains("private-fixture-value"));
+
+    project.write_file(
+        "lpm.json",
+        r#"{"envSchema":{"vars":{"VALUE":{"format":"url","rotateEvery":"30d"}}}}"#,
+    );
+    let checked = lpm(&project).args(["env", "check"]).output().unwrap();
+    assert!(!checked.status.success());
+    assert!(
+        String::from_utf8_lossy(&checked.stderr).contains(
+            "envSchema field \"rotateEvery\" at lpm.json/envSchema/vars/VALUE isn't one this LPM CLI knows."
+        ),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
 }
 
 #[test]

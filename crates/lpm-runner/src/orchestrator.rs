@@ -1338,6 +1338,7 @@ pub fn run_services_with_config(
         options.env_mode.as_deref(),
         config,
         false,
+        crate::dotenv::OverridePolicy::Apply,
     )?;
     let validate_schema = !crate::script::should_skip_env_validation();
     let validator = config
@@ -1348,17 +1349,15 @@ pub fn run_services_with_config(
 
     let mut service_envs = HashMap::with_capacity(active_services.len());
     for (name, service) in active_services.iter() {
-        let mut env = loaded.vars.clone();
-        crate::dotenv::merge_project_env(&mut env, &service.env)?;
-        crate::dotenv::remove_dangerous_env_vars(&mut env, "service env");
+        let mut env = loaded.layers.compose_service(&service.env)?;
         if let Some(peer_env) = cross_env.get(name) {
-            crate::dotenv::merge_project_env(&mut env, peer_env)?;
+            env.merge_runtime(peer_env)?;
         }
         if let Some(port) = port_map.get(name) {
-            crate::dotenv::insert_project_env(&mut env, "PORT".to_string(), port.to_string());
+            env.insert_runtime("PORT".to_string(), port.to_string());
         }
         for (key, value) in &options.extra_envs {
-            crate::dotenv::insert_project_env(&mut env, key.clone(), value.clone());
+            env.insert_runtime(key.clone(), value.clone());
         }
         let runtime_hint = options
             .service_runtime_hints
@@ -1391,6 +1390,13 @@ pub fn run_services_with_config(
 
     // Print startup banner with port reassignment info
     eprintln!();
+    if let Some(notice) = crate::dotenv::personal_override_notice(
+        loaded.layers.override_count(),
+        loaded.env_name.as_deref().unwrap_or("default"),
+    ) {
+        eprintln!("  {}", lpm_common::color::Painted::dimmed(&notice));
+        crate::dotenv::log_personal_override_names(loaded.layers.overrides());
+    }
     for name in &service_names {
         let config = &active_services[name];
         let color = color_map[name];
@@ -1503,7 +1509,7 @@ pub fn run_services_with_config(
                 cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
                 isolate_service_process_tree(&mut cmd);
                 crate::shell::strip_inherited_env_hooks(&mut cmd);
-                cmd.envs(env);
+                cmd.envs(env.vars());
 
                 let mut child = spawn_service_command_with(
                     &mut cmd,

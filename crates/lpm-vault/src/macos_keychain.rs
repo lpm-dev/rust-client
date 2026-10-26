@@ -8,8 +8,8 @@ use security_framework::passwords::{PasswordOptions, delete_generic_password_opt
 use security_framework_sys::access_control::kSecAttrAccessibleWhenUnlockedThisDeviceOnly;
 use security_framework_sys::item::{
     kSecAttrAccessGroup, kSecAttrAccount, kSecAttrService, kSecAttrSynchronizable, kSecClass,
-    kSecClassGenericPassword, kSecReturnAttributes, kSecReturnData, kSecUseAuthenticationContext,
-    kSecUseDataProtectionKeychain, kSecValueData,
+    kSecClassGenericPassword, kSecMatchLimit, kSecMatchLimitAll, kSecReturnAttributes,
+    kSecReturnData, kSecUseAuthenticationContext, kSecUseDataProtectionKeychain, kSecValueData,
 };
 use security_framework_sys::keychain_item::{SecItemAdd, SecItemCopyMatching, SecItemUpdate};
 
@@ -21,10 +21,39 @@ unsafe extern "C" {
     static kSecUseOperationPrompt: CFStringRef;
 }
 
+/// The reason the approval prompt gives for reading `account`: a values
+/// item is named by its vault ID, a companion record by what it holds.
+fn operation_prompt(account: &str) -> String {
+    use crate::companion::account::CompanionAccount;
+    match CompanionAccount::parse(account) {
+        Some(record) => {
+            let holds = match record.kind() {
+                Some(crate::companion::overrides::OVERRIDES_KIND) => "personal overrides",
+                _ => "newer data",
+            };
+            format!(
+                "Allow LPM CLI to access env project {}'s {holds}",
+                record.vault_id()
+            )
+        }
+        None => format!("Allow LPM CLI to access env project {account}"),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CliAccess {
     Automatic,
     RequireApproval,
+}
+
+/// The CLI approval an item's attributes claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaimedAccess {
+    Automatic,
+    RequireApproval,
+    /// A marker other than the approval marker, or the approval marker
+    /// without an access control.
+    Contradictory,
 }
 
 const APPROVAL_MARKER: &[u8] = b"lpm-cli-access:require-approval:v1";
@@ -45,6 +74,34 @@ fn authentication_context() -> CFType {
             })
             .clone()
     })
+}
+
+/// A context that never shows authentication UI and never reuses an earlier
+/// authentication, so a read through it shows whether an item demands user
+/// presence. It's never installed as the thread's context.
+fn non_interactive_context() -> CFType {
+    // SAFETY: `wrap_under_get_rule` retains the LAContext before its owning reference is released.
+    let context = unsafe { objc2_local_authentication::LAContext::new() };
+    unsafe {
+        context.setInteractionNotAllowed(true);
+        context.setTouchIDAuthenticationAllowableReuseDuration(0.0);
+    }
+    let pointer = std::ptr::from_ref(&*context).cast::<std::ffi::c_void>();
+    unsafe { CFType::wrap_under_get_rule(pointer) }
+}
+
+/// What reading an item without authentication UI showed about its access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeOutcome {
+    /// The item read without user presence.
+    Automatic,
+    /// The item demanded user presence while an open item in the same
+    /// Keychain read.
+    Protected,
+    Absent,
+    /// The Keychain may be unavailable, such as while the Mac is locked, so
+    /// nothing about the item's access can be concluded.
+    Inconclusive,
 }
 
 pub(crate) const SHARED_ACCESS_GROUP: &str = "823S8YKMRW.dev.lpm.vault.shared";
@@ -206,6 +263,29 @@ impl SecurityFrameworkBackend {
         // SAFETY: The successful downcast established the dictionary's type; keys and values come from Security.framework.
         let attributes: CFDictionary<CFString, CFType> =
             unsafe { CFDictionary::wrap_under_get_rule(attributes.as_concrete_TypeRef()) };
+        Self::classify(&attributes)
+    }
+
+    /// An item's CLI approval as its attributes claim it: the approval marker
+    /// with an access control, or no marker (or an empty one, which the app
+    /// writes when approval is off), in the one accessibility class LPM
+    /// writes. Any other combination is contradictory.
+    fn classify(
+        attributes: &CFDictionary<CFString, CFType>,
+    ) -> Result<CliAccess, KeychainStorageError> {
+        let accessible = unsafe { CFString::wrap_under_get_rule(kSecAttrAccessible) };
+        if let Some(class) = attributes.find(&accessible) {
+            let class = class
+                .downcast::<CFString>()
+                .ok_or(KeychainStorageError::VerificationFailed)?;
+            if class
+                != unsafe {
+                    CFString::wrap_under_get_rule(kSecAttrAccessibleWhenUnlockedThisDeviceOnly)
+                }
+            {
+                return Err(KeychainStorageError::VerificationFailed);
+            }
+        }
         let generic = unsafe { CFString::wrap_under_get_rule(kSecAttrGeneric) };
         let Some(marker) = attributes.find(&generic) else {
             return Ok(CliAccess::Automatic);
@@ -232,6 +312,180 @@ impl SecurityFrameworkBackend {
         Self::read_with_context(service, account, authentication_context())
     }
 
+    /// Read an item's data and the approval its attributes claim, in one
+    /// Security.framework call, so they describe the same item.
+    fn read_with_access(
+        service: &str,
+        account: &str,
+    ) -> Result<Option<(Vec<u8>, ClaimedAccess)>, KeychainStorageError> {
+        let mut pairs = Self::identity_pairs(service, account);
+        pairs.push((
+            unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationContext) },
+            authentication_context(),
+        ));
+        pairs.push((
+            unsafe { CFString::wrap_under_get_rule(kSecUseOperationPrompt) },
+            CFString::from(operation_prompt(account).as_str()).into_CFType(),
+        ));
+        for key in [unsafe { kSecReturnData }, unsafe { kSecReturnAttributes }] {
+            pairs.push((
+                unsafe { CFString::wrap_under_get_rule(key) },
+                CFBoolean::from(true).into_CFType(),
+            ));
+        }
+        let query = CFDictionary::from_CFType_pairs(&pairs);
+        let mut result: CFTypeRef = std::ptr::null();
+        let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &mut result) };
+        if status == ERR_SEC_ITEM_NOT_FOUND {
+            return Ok(None);
+        }
+        if status != 0 {
+            return Err(Self::map_status("read", status));
+        }
+        if result.is_null() {
+            return Err(KeychainStorageError::VerificationFailed);
+        }
+        let attributes = unsafe { CFType::wrap_under_create_rule(result) }
+            .downcast_into::<CFDictionary>()
+            .ok_or(KeychainStorageError::VerificationFailed)?;
+        // SAFETY: The successful downcast established the dictionary's type; keys and values come from Security.framework.
+        let attributes: CFDictionary<CFString, CFType> =
+            unsafe { CFDictionary::wrap_under_get_rule(attributes.as_concrete_TypeRef()) };
+        let data_key = unsafe { CFString::wrap_under_get_rule(kSecValueData) };
+        let data = attributes
+            .find(&data_key)
+            .and_then(|value| value.downcast::<CFData>())
+            .ok_or(KeychainStorageError::VerificationFailed)?;
+        Ok(Some((data.bytes().to_vec(), Self::claim(&attributes))))
+    }
+
+    fn claim(attributes: &CFDictionary<CFString, CFType>) -> ClaimedAccess {
+        match Self::classify(attributes) {
+            Ok(CliAccess::Automatic) => ClaimedAccess::Automatic,
+            Ok(CliAccess::RequireApproval) => ClaimedAccess::RequireApproval,
+            Err(_) => ClaimedAccess::Contradictory,
+        }
+    }
+
+    /// The approval `account`'s attributes claim, or `None` when it's absent.
+    fn claimed_access(
+        service: &str,
+        account: &str,
+    ) -> Result<Option<ClaimedAccess>, KeychainStorageError> {
+        // Attributes need no authentication, but a context that forbids
+        // interaction makes the Keychain refuse an item that demands user
+        // presence even for them, so attribute queries pass none.
+        let mut pairs = Self::identity_pairs(service, account);
+        pairs.push((
+            unsafe { CFString::wrap_under_get_rule(kSecReturnAttributes) },
+            CFBoolean::from(true).into_CFType(),
+        ));
+        let query = CFDictionary::from_CFType_pairs(&pairs);
+        let mut result: CFTypeRef = std::ptr::null();
+        let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &mut result) };
+        if status == ERR_SEC_ITEM_NOT_FOUND {
+            return Ok(None);
+        }
+        if status != 0 {
+            return Err(Self::map_status("read env access policy", status));
+        }
+        if result.is_null() {
+            return Err(KeychainStorageError::VerificationFailed);
+        }
+        let attributes = unsafe { CFType::wrap_under_create_rule(result) }
+            .downcast_into::<CFDictionary>()
+            .ok_or(KeychainStorageError::VerificationFailed)?;
+        // SAFETY: The successful downcast established the dictionary's type; keys and values come from Security.framework.
+        let attributes: CFDictionary<CFString, CFType> =
+            unsafe { CFDictionary::wrap_under_get_rule(attributes.as_concrete_TypeRef()) };
+        Ok(Some(Self::claim(&attributes)))
+    }
+
+    /// The account names of every item in `service`, from attributes alone,
+    /// which never ask for authentication. Like [`Self::claimed_access`], it
+    /// passes no authentication context.
+    fn account_names(service: &str) -> Result<Vec<String>, KeychainStorageError> {
+        let mut pairs = Self::identity_pairs(service, "");
+        let account_key = unsafe { CFString::wrap_under_get_rule(kSecAttrAccount) };
+        pairs.retain(|(key, _)| key != &account_key);
+        pairs.push((
+            unsafe { CFString::wrap_under_get_rule(kSecReturnAttributes) },
+            CFBoolean::from(true).into_CFType(),
+        ));
+        pairs.push((
+            unsafe { CFString::wrap_under_get_rule(kSecMatchLimit) },
+            unsafe { CFString::wrap_under_get_rule(kSecMatchLimitAll) }.into_CFType(),
+        ));
+        let query = CFDictionary::from_CFType_pairs(&pairs);
+        let mut result: CFTypeRef = std::ptr::null();
+        let status = unsafe { SecItemCopyMatching(query.as_concrete_TypeRef(), &mut result) };
+        if status == ERR_SEC_ITEM_NOT_FOUND {
+            return Ok(Vec::new());
+        }
+        if status != 0 {
+            return Err(Self::map_status("list", status));
+        }
+        if result.is_null() {
+            return Err(KeychainStorageError::VerificationFailed);
+        }
+        let items = unsafe { CFType::wrap_under_create_rule(result) }
+            .downcast_into::<core_foundation::array::CFArray>()
+            .ok_or(KeychainStorageError::VerificationFailed)?;
+        let mut names = Vec::with_capacity(usize::try_from(items.len()).unwrap_or_default());
+        for item in items.iter() {
+            // SAFETY: Security.framework returns an array of attribute dictionaries.
+            let attributes: CFDictionary<CFString, CFType> =
+                unsafe { CFDictionary::wrap_under_get_rule((*item).cast()) };
+            let account = attributes
+                .find(&account_key)
+                .and_then(|value| value.downcast::<CFString>())
+                .ok_or(KeychainStorageError::VerificationFailed)?;
+            names.push(account.to_string());
+        }
+        Ok(names)
+    }
+
+    fn probe(service: &str, account: &str, open_accounts: &[&str]) -> ProbeOutcome {
+        let context = non_interactive_context();
+        match Self::read_with_context(service, account, context.clone()) {
+            Ok(Some(_)) => ProbeOutcome::Automatic,
+            Ok(None) => ProbeOutcome::Absent,
+            Err(KeychainStorageError::InteractionNotAllowed) => {
+                let keychain_is_available = open_accounts.iter().any(|open| {
+                    matches!(
+                        Self::read_with_context(service, open, context.clone()),
+                        Ok(Some(_))
+                    )
+                });
+                if keychain_is_available {
+                    ProbeOutcome::Protected
+                } else {
+                    ProbeOutcome::Inconclusive
+                }
+            }
+            Err(_) => ProbeOutcome::Inconclusive,
+        }
+    }
+
+    /// Give an existing item CLI approval, keeping its data.
+    fn require_approval(service: &str, account: &str) -> Result<(), KeychainStorageError> {
+        let mut pairs = Self::identity_pairs(service, account);
+        pairs.push((
+            unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationContext) },
+            authentication_context(),
+        ));
+        let query = CFDictionary::from_CFType_pairs(&pairs);
+        let update =
+            CFDictionary::from_CFType_pairs(&Self::access_pairs(CliAccess::RequireApproval)?);
+        let status =
+            unsafe { SecItemUpdate(query.as_concrete_TypeRef(), update.as_concrete_TypeRef()) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(Self::map_status("require env approval", status))
+        }
+    }
+
     fn read_with_context(
         service: &str,
         account: &str,
@@ -244,8 +498,7 @@ impl SecurityFrameworkBackend {
         ));
         pairs.push((
             unsafe { CFString::wrap_under_get_rule(kSecUseOperationPrompt) },
-            CFString::from(format!("Allow LPM CLI to access env project {account}").as_str())
-                .into_CFType(),
+            CFString::from(operation_prompt(account).as_str()).into_CFType(),
         ));
         pairs.push((
             unsafe { CFString::wrap_under_get_rule(kSecReturnData) },
@@ -350,24 +603,96 @@ impl SecurityFrameworkBackend {
     }
 }
 
-pub(crate) fn write_string_with_access_from(
+/// Write `value` to `account` with the CLI approval `source` claims, then
+/// verify it reads back.
+pub(crate) fn write_bytes_with_access_from(
     service: &str,
     account: &str,
-    value: &str,
+    value: &[u8],
     source: &str,
 ) -> Result<(), String> {
-    if !crate::vault_id::is_safe_vault_id(account) && !crate::vault_id::is_safe_vault_id(source) {
-        return write_string(service, account, value);
-    }
     let result = (|| {
         let access = SecurityFrameworkBackend::cli_access(service, source)?;
-        SecurityFrameworkBackend::write_with_access(service, account, value.as_bytes(), access)?;
-        match SecurityFrameworkBackend::read(service, account)? {
-            Some(stored) if stored == value.as_bytes() => Ok(()),
-            _ => Err(KeychainStorageError::VerificationFailed),
-        }
+        SecurityFrameworkBackend::write_with_access(service, account, value, access)?;
+        verify_stored(service, account, value)
     })();
     result.map_err(|error| error.to_string())
+}
+
+/// Write `value` to `account` with `access` when the item is created; an
+/// existing item keeps its own access unless `access` requires approval.
+pub(crate) fn write_bytes_with_access(
+    service: &str,
+    account: &str,
+    value: &[u8],
+    access: CliAccess,
+) -> Result<(), String> {
+    SecurityFrameworkBackend::write_with_access(service, account, value, access)
+        .and_then(|()| verify_stored(service, account, value))
+        .map_err(|error| error.to_string())
+}
+
+fn verify_stored(service: &str, account: &str, value: &[u8]) -> Result<(), KeychainStorageError> {
+    match SecurityFrameworkBackend::read(service, account)? {
+        Some(stored) if stored == value => Ok(()),
+        _ => Err(KeychainStorageError::VerificationFailed),
+    }
+}
+
+pub(crate) fn read_bytes(service: &str, account: &str) -> Result<Option<Vec<u8>>, String> {
+    SecurityFrameworkBackend::read(service, account).map_err(|error| error.to_string())
+}
+
+pub(crate) fn read_bytes_with_access(
+    service: &str,
+    account: &str,
+) -> Result<Option<(Vec<u8>, ClaimedAccess)>, String> {
+    SecurityFrameworkBackend::read_with_access(service, account).map_err(|error| error.to_string())
+}
+
+pub(crate) fn claimed_access(
+    service: &str,
+    account: &str,
+) -> Result<Option<ClaimedAccess>, String> {
+    SecurityFrameworkBackend::claimed_access(service, account).map_err(|error| error.to_string())
+}
+
+pub(crate) fn write_bytes(service: &str, account: &str, value: &[u8]) -> Result<(), String> {
+    SecurityFrameworkBackend::write(service, account, value)
+        .and_then(|()| verify_stored(service, account, value))
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn account_names(service: &str) -> Result<Vec<String>, String> {
+    SecurityFrameworkBackend::account_names(service).map_err(|error| error.to_string())
+}
+
+/// Read `account` without authentication UI to learn whether it demands user
+/// presence. `open_accounts` are items without approval in the same service;
+/// one of them must read for a refusal to count as protection.
+pub(crate) fn probe(service: &str, account: &str, open_accounts: &[&str]) -> ProbeOutcome {
+    SecurityFrameworkBackend::probe(service, account, open_accounts)
+}
+
+/// Give `account` CLI approval, then confirm by probing that it demands user
+/// presence.
+pub(crate) fn require_approval(
+    service: &str,
+    account: &str,
+    open_accounts: &[&str],
+) -> Result<(), String> {
+    SecurityFrameworkBackend::require_approval(service, account)
+        .map_err(|error| error.to_string())?;
+    match probe(service, account, open_accounts) {
+        ProbeOutcome::Protected => Ok(()),
+        ProbeOutcome::Inconclusive => Err(
+            "the macOS Keychain is unavailable, so env approval couldn't be confirmed; retry once the Mac is unlocked"
+                .to_owned(),
+        ),
+        ProbeOutcome::Automatic | ProbeOutcome::Absent => {
+            Err(format!("env approval couldn't be confirmed for {account}"))
+        }
+    }
 }
 
 pub(crate) fn read_string(service: &str, account: &str) -> Result<Option<String>, String> {
@@ -382,14 +707,7 @@ pub(crate) fn read_string(service: &str, account: &str) -> Result<Option<String>
 }
 
 pub(crate) fn write_string(service: &str, account: &str, value: &str) -> Result<(), String> {
-    SecurityFrameworkBackend::write(service, account, value.as_bytes())
-        .and_then(
-            |()| match SecurityFrameworkBackend::read(service, account)? {
-                Some(stored) if stored == value.as_bytes() => Ok(()),
-                _ => Err(KeychainStorageError::VerificationFailed),
-            },
-        )
-        .map_err(|error| error.to_string())
+    write_bytes(service, account, value.as_bytes())
 }
 
 pub(crate) fn get_or_insert_string(
@@ -432,6 +750,44 @@ pub(crate) enum KeychainDeleteOutcome {
     NotFound,
 }
 
+/// Leave `claim` on `account`'s attributes, past what its access control
+/// enforces. Debug builds only, for planting those states by hand.
+#[cfg(debug_assertions)]
+pub(crate) fn plant_approval_claim(
+    service: &str,
+    account: &str,
+    claim: crate::companion::debug_states::PlantedClaim,
+) -> Result<(), String> {
+    use crate::companion::debug_states::PlantedClaim;
+    let policy: &[u8] = match claim {
+        PlantedClaim::UnknownPolicy => b"lpm-cli-access:require-approval:v2",
+        PlantedClaim::ApprovalNotEnforced => APPROVAL_MARKER,
+        PlantedClaim::ApprovalOff => b"",
+    };
+    let mut pairs = SecurityFrameworkBackend::identity_pairs(service, account);
+    pairs.push((
+        unsafe { CFString::wrap_under_get_rule(kSecUseAuthenticationContext) },
+        authentication_context(),
+    ));
+    let query = CFDictionary::from_CFType_pairs(&pairs);
+    let attributes = CFDictionary::from_CFType_pairs(&[(
+        unsafe { CFString::wrap_under_get_rule(kSecAttrGeneric) },
+        CFData::from_buffer(policy).into_CFType(),
+    )]);
+    // SAFETY: Both dictionaries are live CoreFoundation objects for the call.
+    let status = unsafe {
+        SecItemUpdate(
+            query.as_concrete_TypeRef(),
+            attributes.as_concrete_TypeRef(),
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(SecurityFrameworkBackend::map_status("claim approval", status).to_string())
+    }
+}
+
 pub(crate) fn delete(service: &str, account: &str) -> Result<KeychainDeleteOutcome, String> {
     match delete_generic_password_options(SecurityFrameworkBackend::options(service, account)) {
         Ok(()) => Ok(KeychainDeleteOutcome::Deleted),
@@ -443,6 +799,96 @@ pub(crate) fn delete(service: &str, account: &str) -> Result<KeychainDeleteOutco
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_prompts_say_what_they_read() {
+        assert_eq!(
+            operation_prompt("8c1f0d2e-6a35-4c1b-9f3e-2d7b5a1c9e40"),
+            "Allow LPM CLI to access env project 8c1f0d2e-6a35-4c1b-9f3e-2d7b5a1c9e40"
+        );
+        assert_eq!(
+            operation_prompt(&crate::companion::account::record_account(
+                "overrides",
+                "8c1f0d2e-6a35-4c1b-9f3e-2d7b5a1c9e40",
+                None
+            )),
+            "Allow LPM CLI to access env project 8c1f0d2e-6a35-4c1b-9f3e-2d7b5a1c9e40's personal overrides"
+        );
+        assert_eq!(
+            operation_prompt(&crate::companion::account::record_account(
+                "future-log",
+                "proj",
+                Some(3)
+            )),
+            "Allow LPM CLI to access env project proj's newer data"
+        );
+    }
+
+    #[test]
+    fn access_claims_classify_as_the_shared_fixture_records() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            cases: Vec<Case>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Case {
+            name: String,
+            marker: Option<String>,
+            access_control: bool,
+            accessible: Option<String>,
+            claim: String,
+        }
+        let fixture: Fixture = serde_json::from_str(include_str!(
+            "../../lpm-env-companion/tests/fixtures/access-claims.json"
+        ))
+        .expect("the access fixture decodes");
+        for case in fixture.cases {
+            let mut pairs: Vec<(CFString, CFType)> = Vec::new();
+            if let Some(marker) = &case.marker {
+                pairs.push((
+                    unsafe { CFString::wrap_under_get_rule(kSecAttrGeneric) },
+                    CFData::from_buffer(marker.as_bytes()).into_CFType(),
+                ));
+            }
+            if case.access_control {
+                let control = SecAccessControl::create_with_protection(
+                    Some(security_framework::access_control::ProtectionMode::AccessibleWhenUnlockedThisDeviceOnly),
+                    0,
+                )
+                .expect("an access control");
+                pairs.push((
+                    unsafe { CFString::wrap_under_get_rule(kSecAttrAccessControl) },
+                    control.into_CFType(),
+                ));
+            }
+            if let Some(class) = &case.accessible {
+                let class = match class.as_str() {
+                    "whenUnlockedThisDeviceOnly" => unsafe {
+                        kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+                    },
+                    "whenUnlocked" => unsafe {
+                        security_framework_sys::access_control::kSecAttrAccessibleWhenUnlocked
+                    },
+                    "afterFirstUnlock" => unsafe {
+                        security_framework_sys::access_control::kSecAttrAccessibleAfterFirstUnlock
+                    },
+                    other => panic!("{}: unknown class {other}", case.name),
+                };
+                pairs.push((
+                    unsafe { CFString::wrap_under_get_rule(kSecAttrAccessible) },
+                    unsafe { CFString::wrap_under_get_rule(class) }.into_CFType(),
+                ));
+            }
+            let attributes = CFDictionary::from_CFType_pairs(&pairs);
+            let claim = match SecurityFrameworkBackend::claim(&attributes) {
+                ClaimedAccess::Automatic => "automatic",
+                ClaimedAccess::RequireApproval => "requireApproval",
+                ClaimedAccess::Contradictory => "contradictory",
+            };
+            assert_eq!(claim, case.claim, "{}", case.name);
+        }
+    }
 
     #[test]
     #[ignore = "requires a signed macOS test bundle with the shared Keychain entitlement"]
@@ -502,6 +948,117 @@ mod tests {
             SecurityFrameworkBackend::read_with_context(&service, "stage", blocked_context()),
             Err(KeychainStorageError::InteractionNotAllowed)
         ));
+    }
+
+    #[test]
+    #[ignore = "requires a signed macOS test bundle with the shared Keychain entitlement"]
+    fn native_probe_tells_protected_items_from_automatic_and_unavailable_ones() {
+        assert_eq!(std::env::var("LPM_RUN_KEYCHAIN_TESTS").as_deref(), Ok("1"));
+        let service = format!("dev.lpm.companion-probe.fixture.{}", rand::random::<u128>());
+        struct FixtureCleanup<'a>(&'a str);
+        impl Drop for FixtureCleanup<'_> {
+            fn drop(&mut self) {
+                for account in ["open", "automatic", "protected", "contradictory"] {
+                    let _ = delete(self.0, account);
+                }
+            }
+        }
+        let _cleanup = FixtureCleanup(&service);
+        SecurityFrameworkBackend::add(&service, "open", b"open").expect("open item");
+        SecurityFrameworkBackend::add(&service, "automatic", b"synthetic-fixture")
+            .expect("automatic item");
+        SecurityFrameworkBackend::write_with_access(
+            &service,
+            "protected",
+            b"synthetic-fixture",
+            CliAccess::RequireApproval,
+        )
+        .expect("protected item");
+
+        assert_eq!(
+            probe(&service, "automatic", &["open"]),
+            ProbeOutcome::Automatic
+        );
+        assert_eq!(
+            probe(&service, "protected", &["open"]),
+            ProbeOutcome::Protected
+        );
+        assert_eq!(
+            probe(&service, "protected", &["missing"]),
+            ProbeOutcome::Inconclusive,
+            "a refusal counts as protection only when an open item reads"
+        );
+        assert_eq!(probe(&service, "missing", &["open"]), ProbeOutcome::Absent);
+        assert_eq!(
+            claimed_access(&service, "protected").expect("attributes"),
+            Some(ClaimedAccess::RequireApproval)
+        );
+        assert_eq!(
+            claimed_access(&service, "automatic").expect("attributes"),
+            Some(ClaimedAccess::Automatic)
+        );
+
+        let query = CFDictionary::from_CFType_pairs(&SecurityFrameworkBackend::identity_pairs(
+            &service,
+            "automatic",
+        ));
+        let marker_only = CFDictionary::from_CFType_pairs(&[(
+            unsafe { CFString::wrap_under_get_rule(kSecAttrGeneric) },
+            CFData::from_buffer(APPROVAL_MARKER).into_CFType(),
+        )]);
+        assert_eq!(
+            unsafe {
+                SecItemUpdate(
+                    query.as_concrete_TypeRef(),
+                    marker_only.as_concrete_TypeRef(),
+                )
+            },
+            0
+        );
+        assert_eq!(
+            claimed_access(&service, "automatic").expect("attributes"),
+            Some(ClaimedAccess::RequireApproval),
+            "every Data Protection item reports an access control, so an approval marker over one that asks for nothing claims approval"
+        );
+        assert_eq!(
+            probe(&service, "automatic", &["open"]),
+            ProbeOutcome::Automatic,
+            "the probe reports what the item does, not what it claims"
+        );
+        require_approval(&service, "automatic", &["open"]).expect("strengthen");
+        assert_eq!(
+            probe(&service, "automatic", &["open"]),
+            ProbeOutcome::Protected
+        );
+        SecurityFrameworkBackend::add(&service, "contradictory", b"synthetic-fixture")
+            .expect("contradictory item");
+        let unknown_policy = CFDictionary::from_CFType_pairs(&[(
+            unsafe { CFString::wrap_under_get_rule(kSecAttrGeneric) },
+            CFData::from_buffer(b"lpm-cli-access:require-approval:v2").into_CFType(),
+        )]);
+        let query = CFDictionary::from_CFType_pairs(&SecurityFrameworkBackend::identity_pairs(
+            &service,
+            "contradictory",
+        ));
+        assert_eq!(
+            unsafe {
+                SecItemUpdate(
+                    query.as_concrete_TypeRef(),
+                    unknown_policy.as_concrete_TypeRef(),
+                )
+            },
+            0
+        );
+        assert_eq!(
+            claimed_access(&service, "contradictory").expect("attributes"),
+            Some(ClaimedAccess::Contradictory),
+            "a policy LPM doesn't know contradicts itself"
+        );
+        let names = account_names(&service)
+            .expect("items that demand user presence never stop the listing");
+        for account in ["open", "automatic", "protected", "contradictory"] {
+            assert!(names.iter().any(|name| name == account), "{names:?}");
+        }
     }
 
     #[test]

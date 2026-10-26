@@ -17,6 +17,10 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rand::RngCore;
 use std::collections::HashMap;
 
+pub(crate) mod companion;
+
+use crate::companion::gate::Operation;
+
 const NATIVE_DATA_KEY_SERVICE: &str = "dev.lpm.vault-local-key";
 const NATIVE_DATA_KEY_ACCOUNT: &str = "data-key";
 const FALLBACK_KEY_FILE: &str = ".vault-fallback-key";
@@ -315,7 +319,48 @@ fn native_unavailable_without_file_key(error: String) -> String {
     )
 }
 
+thread_local! {
+    /// The data key the vault lock this thread holds already loaded, so an
+    /// operation loads it once for its values and companion records alike.
+    static SCOPED_DATA_KEY: std::cell::Cell<Option<DataKey>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static DATA_KEY_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Forget the data key when the vault lock is released.
+pub(crate) fn forget_scoped_data_key() {
+    SCOPED_DATA_KEY.with(|key| key.set(None));
+}
+
+/// Use the file-fallback key for the rest of this lock, as a process running
+/// with `LPM_FORCE_FILE_VAULT` would.
+#[cfg(feature = "acceptance-test-hooks")]
+pub(crate) fn use_file_data_key_in_scope(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+) -> Result<(), String> {
+    let key = get_or_create_file_data_key(directory)?;
+    SCOPED_DATA_KEY.with(|scoped| scoped.set(Some(key)));
+    Ok(())
+}
+
 fn load_data_key_with_store_unlocked(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    store: &dyn NativeDataKeyStore,
+) -> Result<DataKey, String> {
+    if let Some(key) = SCOPED_DATA_KEY.with(std::cell::Cell::get) {
+        return Ok(key);
+    }
+    #[cfg(test)]
+    DATA_KEY_LOADS.with(|loads| loads.set(loads.get() + 1));
+    let key = load_data_key_from_store_unlocked(directory, store)?;
+    SCOPED_DATA_KEY.with(|scoped| scoped.set(Some(key)));
+    Ok(key)
+}
+
+fn load_data_key_from_store_unlocked(
     directory: &crate::storage_transaction::VaultStorageDirectory,
     store: &dyn NativeDataKeyStore,
 ) -> Result<DataKey, String> {
@@ -441,7 +486,7 @@ fn vault_files_exist(directory: &crate::storage_transaction::VaultStorageDirecto
     let Ok(vaults) = directory.open_or_create_directory("vaults") else {
         return false;
     };
-    ["vault", "enc"].iter().any(|extension| {
+    ["vault", "enc", "companion"].iter().any(|extension| {
         vaults
             .contains_file_with_extension(extension)
             .unwrap_or(false)
@@ -582,12 +627,13 @@ pub(crate) fn read_vault_file_env_with_default_fallback(
     })
 }
 
-fn read_vault_file_env_unlocked(
+pub(crate) fn read_vault_file_env_unlocked(
     directory: &crate::storage_transaction::VaultStorageDirectory,
     vault_id: &str,
     env: &str,
     default_fallback: bool,
 ) -> Result<Option<SecretMap>, String> {
+    crate::authorize_companion(directory, vault_id, Operation::ReadExcludingOverrides)?;
     let vaults = directory.open_or_create_directory("vaults")?;
     let Some((name, content)) = read_vault_content(&vaults, vault_id)? else {
         return Ok(None);
@@ -620,6 +666,38 @@ fn take_environment(mut environments: EnvironmentMap, env: &str) -> Option<Secre
     environments.remove(env)
 }
 
+/// The selected environment's values and its personal overrides, in the
+/// caller's lock. The overrides are always `env`'s own, even when the values
+/// fall back to `default`'s.
+pub(crate) fn read_run_environment_unlocked(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+    env: &str,
+    default_fallback: bool,
+) -> Result<(Option<SecretMap>, crate::PersonalOverrides), String> {
+    let overrides = companion::read_overrides_unlocked(directory, vault_id, env)?;
+    let values = read_vault_file_env_unlocked(directory, vault_id, env, default_fallback)?;
+    Ok((values, overrides))
+}
+
+/// Every environment's values and personal overrides, in the caller's lock.
+pub(crate) fn read_all_run_environments_unlocked(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+) -> Result<
+    (
+        Option<EnvironmentMap>,
+        std::collections::BTreeMap<String, crate::PersonalOverrides>,
+    ),
+    String,
+> {
+    let (gate, record) = companion::read_overrides_record_unlocked(directory, vault_id)?;
+    let overrides = crate::companion::overrides::evaluate_all(&gate, vault_id, record.as_deref())
+        .map_err(crate::companion::damaged)?;
+    let values = read_all_environments_unlocked(directory, vault_id)?;
+    Ok((values, overrides))
+}
+
 /// Read all environments from encrypted file.
 pub fn read_all_environments(vault_id: &str) -> Result<Option<EnvironmentMap>, String> {
     crate::storage_transaction::with_vault_transaction(|directory| {
@@ -641,6 +719,7 @@ pub(crate) fn read_all_environments_with_digest_unlocked(
 ) -> Result<(Option<EnvironmentMap>, Option<[u8; 32]>), String> {
     use sha2::Digest as _;
 
+    crate::authorize_companion(directory, vault_id, Operation::ReadExcludingOverrides)?;
     let vaults = directory.open_or_create_directory("vaults")?;
     let Some((name, content)) = read_vault_content(&vaults, vault_id)? else {
         return Ok((None, None));
@@ -668,6 +747,7 @@ pub(crate) fn vault_payload_digest_unlocked(
     directory: &crate::storage_transaction::VaultStorageDirectory,
     vault_id: &str,
 ) -> Result<Option<[u8; 32]>, String> {
+    crate::authorize_companion(directory, vault_id, Operation::ReadExcludingOverrides)?;
     let vaults = directory.open_or_create_directory("vaults")?;
     if let Some(digest) =
         vaults.sha256_owner_only_file(&vault_file_name(vault_id), "encrypted vault")?
@@ -696,6 +776,7 @@ pub(crate) fn write_all_environments_unlocked(
     vault_id: &str,
     environments: &EnvironmentMap,
 ) -> Result<(), String> {
+    crate::authorize_companion(directory, vault_id, Operation::Write)?;
     let json = crate::selected_environment::serialize(environments)?;
     let encrypted =
         encrypt_with_store_unlocked(directory, vault_id, &json, &KeyringNativeDataKeyStore)?;
@@ -751,12 +832,11 @@ fn write_vault_file_env_unlocked(
     write_all_environments_unlocked(directory, vault_id, &environments)
 }
 
-/// Delete encrypted vault file.
+/// Delete the encrypted vault files and every companion record through the
+/// deletion protocol.
 pub fn delete_vault_file(vault_id: &str) -> Result<(), String> {
     crate::storage_transaction::with_vault_transaction(|directory| {
-        let vaults = directory.open_or_create_directory("vaults")?;
-        vaults.remove_file(&vault_file_name(vault_id), "encrypted vault")?;
-        remove_legacy_vault_file(&vaults, vault_id)
+        companion::delete_project_unlocked(directory, vault_id)
     })
 }
 
@@ -823,7 +903,7 @@ mod tests {
         }
     }
 
-    fn with_temp_vault_home<T>(test: impl FnOnce(&Path) -> T) -> T {
+    pub(super) fn with_temp_vault_home<T>(test: impl FnOnce(&Path) -> T) -> T {
         let _lock = crate::test_env_lock::acquire_env_lock();
         let temp_home = tempfile::tempdir().expect("create temp HOME");
         let original_home = crate::test_env_lock::HomeEnvSnapshot::set(temp_home.path());
@@ -967,7 +1047,7 @@ mod tests {
         HashMap::from([("TOKEN".to_owned(), value.to_owned())])
     }
 
-    fn force_file_vault() {
+    pub(super) fn force_file_vault() {
         unsafe {
             std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
         }

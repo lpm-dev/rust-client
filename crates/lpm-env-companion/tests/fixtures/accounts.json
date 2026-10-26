@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "account": "__vault_features_v1__:cHJvai0x",
+      "valid": true,
+      "type": "marker",
+      "vaultId": "proj-1"
+    },
+    {
+      "account": "__vault_companion_v1__:overrides:cHJvai0x",
+      "valid": true,
+      "type": "record",
+      "vaultId": "proj-1",
+      "kind": "overrides",
+      "accessClass": "followsValues"
+    },
+    {
+      "account": "__vault_companion_v1__:history:cHJvai0x:00f",
+      "valid": true,
+      "type": "record",
+      "vaultId": "proj-1",
+      "kind": "history",
+      "part": 15,
+      "accessClass": "open"
+    },
+    {
+      "account": "__vault_companion_v1__:history-head:cHJvai0x",
+      "valid": true,
+      "type": "record",
+      "vaultId": "proj-1",
+      "kind": "history-head",
+      "accessClass": "followsValues"
+    },
+    {
+      "account": "__vault_companion_v1__:future-log:cHJvai0x:001",
+      "valid": true,
+      "type": "record",
+      "vaultId": "proj-1",
+      "kind": "future-log",
+      "part": 1,
+      "accessClass": "followsValues"
+    },
+    {
+      "account": "__vault_staged_v1__:key:cHJvai0x",
+      "valid": true,
+      "type": "staged",
+      "vaultId": "proj-1",
+      "kind": "key",
+      "accessClass": "followsValues"
+    },
+    {
+      "account": "__vault_features_v1__:cHJvai0x=",
+      "valid": false
+    },
+    {
+      "account": "__vault_features_v1__:cHJvai1",
+      "valid": false
+    },
+    {
+      "account": "__vault_companion_v1__:Overrides:cHJvai0x",
+      "valid": false
+    },
+    {
+      "account": "__vault_companion_v1__:features:cHJvai0x",
+      "valid": false
+    },
+    {
+      "account": "__vault_companion_v1__:history:cHJvai0x:0F",
+      "valid": false
+    },
+    {
+      "account": "__vault_companion_v1__:history:cHJvai0x:0f",
+      "valid": false
+    },
+    {
+      "account": "__vault_companion_v1__:history:cHJvai0x:1000",
+      "valid": false
+    },
+    {
+      "account": "__vault_companion_v1__:history",
+      "valid": false
+    },
+    {
+      "account": "__vault_features_v1__:X192YXVsdF9wcm9qZWN0X2luZGV4X21hcmtlcl9f",
+      "valid": false
+    }
+  ]
+}

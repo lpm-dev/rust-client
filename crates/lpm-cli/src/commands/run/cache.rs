@@ -329,6 +329,7 @@ fn build_task_context(
         &child_path,
         &command,
         &script_context,
+        lpm_runner::dotenv::OverridePolicy::Apply,
     )?;
 
     let inherited_env = lpm_runner::shell::inherited_child_env();

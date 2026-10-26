@@ -255,12 +255,14 @@ pub fn execute_exec_plan_with_config_and_signals(
         project_dir,
         plan.env_mode.as_deref(),
         config,
+        dotenv::OverridePolicy::Apply,
     )?;
+    dotenv::announce_personal_overrides(&env_vars, &resolved.canonical);
     let validator = config
         .filter(|_| !plan.no_env_check)
         .and_then(|config| config.env_schema.as_ref())
         .map(lpm_env::EnvValidator::new);
-    dotenv::validate_child_env_with_overrides(
+    dotenv::validate_child_env_with_trusted(
         &mut env_vars,
         validator.as_ref(),
         lpm_env::EvalContext {
@@ -271,6 +273,7 @@ pub fn execute_exec_plan_with_config_and_signals(
         !plan.no_env_check,
         &plan.command.env_overrides,
     )?;
+    let env_vars = env_vars.into_vars();
 
     let mut command = Command::new(&plan.command.program);
     command

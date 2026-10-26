@@ -1,0 +1,140 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "name": "selected environment kept",
+      "vaultId": "proj",
+      "version": 1,
+      "environment": "development",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"development\":{\"set\":{\"API_URL\":\"http://localhost:4000\",\"EMPTY\":\"\"},\"unset\":[\"SENTRY_DSN\"]},\"staging\":{\"set\":{\"API_URL\":\"https://staging\"},\"unset\":[]}}}",
+      "valid": true,
+      "set": {
+        "API_URL": "http://localhost:4000",
+        "EMPTY": ""
+      },
+      "unset": [
+        "SENTRY_DSN"
+      ]
+    },
+    {
+      "name": "other environment selects nothing",
+      "vaultId": "proj",
+      "version": 1,
+      "environment": "production",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"staging\":{\"set\":{\"A\":\"1\"},\"unset\":[]}}}",
+      "valid": true,
+      "set": {},
+      "unset": []
+    },
+    {
+      "name": "version differs from the marker",
+      "vaultId": "proj",
+      "version": 1,
+      "environment": "default",
+      "json": "{\"schemaVersion\":2,\"vaultId\":\"proj\",\"environments\":{}}",
+      "valid": false
+    },
+    {
+      "name": "another project's record",
+      "vaultId": "proj",
+      "version": 1,
+      "environment": "default",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"other\",\"environments\":{}}",
+      "valid": false
+    },
+    {
+      "name": "unknown field",
+      "vaultId": "proj",
+      "version": 1,
+      "environment": "default",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{},\"extra\":true}",
+      "valid": false
+    },
+    {
+      "name": "empty environment entry",
+      "vaultId": "proj",
+      "version": 1,
+      "environment": "default",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"staging\":{\"set\":{},\"unset\":[]}}}",
+      "valid": false
+    },
+    {
+      "name": "missing unset",
+      "vaultId": "proj",
+      "version": 1,
+      "environment": "default",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"staging\":{\"set\":{\"A\":\"1\"}}}}",
+      "valid": false
+    },
+    {
+      "name": "invalid environment name",
+      "vaultId": "proj",
+      "version": 1,
+      "environment": "default",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"bad name\":{\"set\":{\"A\":\"1\"},\"unset\":[]}}}",
+      "valid": false
+    },
+    {
+      "name": "invalid variable name",
+      "vaultId": "proj",
+      "version": 1,
+      "environment": "default",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"staging\":{\"set\":{\"1A\":\"1\"},\"unset\":[]}}}",
+      "valid": false
+    },
+    {
+      "name": "a name LPM never passes to a process stays valid; the runner drops it",
+      "vaultId": "proj",
+      "version": 1,
+      "environment": "staging",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"staging\":{\"set\":{\"NODE_OPTIONS\":\"--inspect\"},\"unset\":[\"CLASSPATH\"]}}}",
+      "valid": true,
+      "set": {
+        "NODE_OPTIONS": "--inspect"
+      },
+      "unset": [
+        "CLASSPATH"
+      ]
+    },
+    {
+      "name": "NUL in a value",
+      "vaultId": "proj",
+      "version": 1,
+      "environment": "default",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"staging\":{\"set\":{\"A\":\"x\\u0000y\"},\"unset\":[]}}}",
+      "valid": false
+    },
+    {
+      "name": "set and unset name one variable",
+      "vaultId": "proj",
+      "version": 1,
+      "environment": "default",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"staging\":{\"set\":{\"A\":\"1\"},\"unset\":[\"A\"]}}}",
+      "valid": false
+    },
+    {
+      "name": "unset repeats a name",
+      "vaultId": "proj",
+      "version": 1,
+      "environment": "default",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"staging\":{\"set\":{},\"unset\":[\"A\",\"A\"]}}}",
+      "valid": false
+    },
+    {
+      "name": "repeated variable",
+      "vaultId": "proj",
+      "version": 1,
+      "environment": "default",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"staging\":{\"set\":{\"A\":\"1\",\"A\":\"2\"},\"unset\":[]}}}",
+      "valid": false
+    },
+    {
+      "name": "repeated environment",
+      "vaultId": "proj",
+      "version": 1,
+      "environment": "default",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"environments\":{\"staging\":{\"set\":{\"A\":\"1\"},\"unset\":[]},\"staging\":{\"set\":{\"B\":\"1\"},\"unset\":[]}}}",
+      "valid": false
+    }
+  ]
+}

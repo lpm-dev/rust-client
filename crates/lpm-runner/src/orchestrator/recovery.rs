@@ -149,7 +149,7 @@ pub(super) struct RecoveryContext<'a> {
     pub(super) service_cwds: &'a HashMap<String, PathBuf>,
     pub(super) groups: &'a [Vec<String>],
     pub(super) service_runtime_hints: &'a HashMap<String, crate::bin_path::ManagedRuntimeHint>,
-    pub(super) service_envs: &'a HashMap<String, HashMap<String, String>>,
+    pub(super) service_envs: &'a HashMap<String, crate::dotenv::ChildEnv>,
     pub(super) env_validator: Option<&'a lpm_env::EnvValidator<'a>>,
     pub(super) env_name: &'a str,
     pub(super) validate_env_schema: bool,
@@ -843,7 +843,7 @@ fn start_restart_service(
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     super::isolate_service_process_tree(&mut command);
     crate::shell::strip_inherited_env_hooks(&mut command);
-    command.envs(&env);
+    command.envs(env.vars());
 
     let mut new_child = match super::spawn_service_command_with(
         &mut command,

@@ -127,6 +127,31 @@ pub(super) enum LocalAction {
         #[arg(long)]
         force: bool,
     },
+    /// Show what's damaged in this project's newer data, such as its personal
+    /// overrides, and repair it.
+    Repair {
+        /// Repair without asking first.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Plant a companion storage state for this project, for trying LPM and
+    /// LPM Vault against the same data by hand. Debug builds only.
+    #[cfg(debug_assertions)]
+    #[command(name = "debug-companion", hide = true)]
+    DebugCompanion {
+        /// overrides, missing-record, invalid-marker, unlisted-records,
+        /// newer-version, read-only, interrupted-deletion, stuck-restore,
+        /// contradictory-record, weak-values, orphans or clear.
+        state: String,
+        #[command(flatten)]
+        environment: Environment,
+        /// A personal override to plant, for the overrides state.
+        #[arg(long = "set", value_name = "NAME=VALUE")]
+        set: Vec<String>,
+        /// A name the overrides state unsets.
+        #[arg(long = "unset", value_name = "NAME")]
+        unset: Vec<String>,
+    },
     Ls,
     Log,
     Unpair,
@@ -144,30 +169,34 @@ pub(super) enum LocalAction {
 }
 
 pub(super) fn parse(args: &[&str], json_output: bool) -> Result<Option<LocalAction>, LpmError> {
-    if !matches!(
-        args.first().copied(),
-        Some(
-            "set"
-                | "get"
-                | "list"
-                | "delete"
-                | "import"
-                | "export"
-                | "print"
-                | "example"
-                | "check"
-                | "validate"
-                | "schema"
-                | "generate"
-                | "init"
-                | "ls"
-                | "copy"
-                | "cp"
-                | "log"
-                | "unpair"
-                | "diff"
+    let debug_only = cfg!(debug_assertions) && args.first() == Some(&"debug-companion");
+    if !debug_only
+        && !matches!(
+            args.first().copied(),
+            Some(
+                "set"
+                    | "get"
+                    | "list"
+                    | "delete"
+                    | "import"
+                    | "export"
+                    | "print"
+                    | "example"
+                    | "check"
+                    | "validate"
+                    | "schema"
+                    | "generate"
+                    | "init"
+                    | "repair"
+                    | "ls"
+                    | "copy"
+                    | "cp"
+                    | "log"
+                    | "unpair"
+                    | "diff"
+            )
         )
-    ) {
+    {
         return Ok(None);
     }
     LocalCommand::try_parse_from(std::iter::once("lpm env").chain(args.iter().copied()))
@@ -197,4 +226,27 @@ fn print_format(value: &str) -> Result<lpm_env::PrintFormat, String> {
             lpm_env::PrintFormat::all_names()
         )
     })
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use clap::CommandFactory;
+
+    #[test]
+    fn debug_companion_help_names_every_state() {
+        let command = super::LocalCommand::command();
+        let help = command
+            .find_subcommand("debug-companion")
+            .and_then(|debug| {
+                debug
+                    .get_arguments()
+                    .find(|argument| argument.get_id() == "state")
+            })
+            .and_then(|state| state.get_help())
+            .expect("the state argument's help")
+            .to_string();
+        for name in lpm_vault::DebugCompanionState::NAMES {
+            assert!(help.contains(name), "{name} is missing from: {help}");
+        }
+    }
 }

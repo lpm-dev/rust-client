@@ -14,6 +14,10 @@ import tempfile
 import tomllib
 
 NOTICES = 'THIRD_PARTY_NOTICES.html'
+# The companion storage contract both clients test against, shipped with the
+# engine so the app reads the fixtures of the revision it links.
+FIXTURES = Path('crates/lpm-env-companion/tests/fixtures')
+BUNDLED_FIXTURES = Path('fixtures/companion')
 LICENSE_FILE_PREFIXES = ('LICENSE', 'LICENCE', 'COPYING', 'COPYRIGHT', 'NOTICE', 'UNLICENSE')
 
 
@@ -50,11 +54,17 @@ def engine_crates(root):
     return sorted(found)
 
 
+def fixture_paths(root):
+    directory = root / FIXTURES
+    return sorted(path for path in directory.glob('*.json') if path.is_file()) if directory.is_dir() else []
+
+
 def source_hashes(root):
     inputs = [root / 'Cargo.toml', root / 'Cargo.lock', root / 'scripts/export-env-engine.py']
     inputs += [path for path in [root / '.cargo/config.toml', root / 'rust-toolchain.toml'] if path.is_file()]
     for crate in engine_crates(root):
         inputs += sorted(path for path in (root / crate).rglob('*') if path.is_file())
+    inputs += fixture_paths(root)
     return {str(path.relative_to(root)): file_hash(path) for path in inputs}
 
 
@@ -170,7 +180,7 @@ def export_locked(root, target_dir, output):
     output = output.resolve()
     target_dir.mkdir(parents=True, exist_ok=True)
     output.parent.mkdir(parents=True, exist_ok=True)
-    if output.exists() and any(path.name not in {'LPMEnv.xcframework', 'provenance.json', NOTICES} for path in output.iterdir()):
+    if output.exists() and any(path.name not in {'LPMEnv.xcframework', 'provenance.json', NOTICES, BUNDLED_FIXTURES.parts[0]} for path in output.iterdir()):
         raise RuntimeError('Output contains files outside the engine bundle')
     revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
     recorded_sources = source_hashes(root)
@@ -235,7 +245,13 @@ def export_locked(root, target_dir, output):
             (licenses / 'COPYRIGHT-library.html').read_text(),
         )
         (staging / NOTICES).write_text(notices)
-        provenance = dict(abiVersion=abi_version, toolchain='1.94.0', targets=targets, repository='https://github.com/lpm-dev/rust-client', revision=revision, sources=sources, artifacts=files, notices=file_hash(staging / NOTICES))
+        fixtures = {}
+        for fixture in fixture_paths(frozen):
+            bundled = staging / BUNDLED_FIXTURES / fixture.name
+            bundled.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(fixture, bundled)
+            fixtures[str(BUNDLED_FIXTURES / fixture.name)] = file_hash(bundled)
+        provenance = dict(abiVersion=abi_version, toolchain='1.94.0', targets=targets, repository='https://github.com/lpm-dev/rust-client', revision=revision, sources=sources, artifacts=files, notices=file_hash(staging / NOTICES), fixtures=fixtures)
         (staging / 'provenance.json').write_text(json.dumps(provenance, indent=2, sort_keys=True) + '\n')
         if source_hashes(root) != sources or subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip() != revision:
             raise RuntimeError('Engine sources changed during export')

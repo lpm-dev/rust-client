@@ -1,0 +1,17 @@
+[package]
+name = "lpm-env-companion"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The companion storage contract the LPM CLI and the LPM Vault app share: account names, the feature marker, the operation matrix, personal overrides and lifecycle plans"
+
+[dependencies]
+base64 = { workspace = true }
+lpm-common = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

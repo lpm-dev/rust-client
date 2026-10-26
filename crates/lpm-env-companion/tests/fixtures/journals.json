@@ -1,0 +1,164 @@
+{
+  "schemaVersion": 1,
+  "vaultId": "proj",
+  "journalAccount": "__vault_transaction_v3__",
+  "cases": [
+    {
+      "name": "a committed marker and a binary record are replayed byte for byte",
+      "before": {
+        "__vault_transaction_stage_v3__:00000000-0000-4000-8000-0000000000aa:0": "eyJzY2hlbWFWZXJzaW9uIjoxLCJ2YXVsdElkIjoicHJvaiIsInN0YXRlIjoiYWN0aXZlIiwiZmVhdHVyZXMiOnsiZnV0dXJlIjp7InZlcnNpb24iOjEsImlmVW5zdXBwb3J0ZWQiOiJpZ25vcmUiLCJraW5kcyI6WyJmdXR1cmUtbG9nIl0sInN0YXRlIjoiYWN0aXZlIn19fQ==",
+        "__vault_transaction_stage_v3__:00000000-0000-4000-8000-0000000000aa:1": "AP9MAP4="
+      },
+      "journal": {
+        "schemaVersion": 3,
+        "transactionId": "00000000-0000-4000-8000-0000000000aa",
+        "state": "committed",
+        "operations": [
+          {
+            "action": "write",
+            "targetAccount": "__vault_features_v1__:cHJvag",
+            "stagedAccount": "__vault_transaction_stage_v3__:00000000-0000-4000-8000-0000000000aa:0",
+            "operationSha256": "ffb0aeb9fd2c65cc7ad5a910f0f53942ba6b1d01e91d16dd8299eadf9654e7f4"
+          },
+          {
+            "action": "write",
+            "targetAccount": "__vault_companion_v1__:future-log:cHJvag:001",
+            "stagedAccount": "__vault_transaction_stage_v3__:00000000-0000-4000-8000-0000000000aa:1",
+            "operationSha256": "3786ff9a12e14269bf655390ad2d501e7c007a26855c39ae3e7545c053e2588f"
+          }
+        ]
+      },
+      "outcome": "recovers",
+      "after": {
+        "__vault_features_v1__:cHJvag": "eyJzY2hlbWFWZXJzaW9uIjoxLCJ2YXVsdElkIjoicHJvaiIsInN0YXRlIjoiYWN0aXZlIiwiZmVhdHVyZXMiOnsiZnV0dXJlIjp7InZlcnNpb24iOjEsImlmVW5zdXBwb3J0ZWQiOiJpZ25vcmUiLCJraW5kcyI6WyJmdXR1cmUtbG9nIl0sInN0YXRlIjoiYWN0aXZlIn19fQ==",
+        "__vault_companion_v1__:future-log:cHJvag:001": "AP9MAP4="
+      }
+    },
+    {
+      "name": "a committed write whose stage replay already consumed is finished",
+      "before": {
+        "__vault_features_v1__:cHJvag": "eyJzY2hlbWFWZXJzaW9uIjoxLCJ2YXVsdElkIjoicHJvaiIsInN0YXRlIjoiYWN0aXZlIiwiZmVhdHVyZXMiOnsib3ZlcnJpZGVzIjp7InZlcnNpb24iOjEsImlmVW5zdXBwb3J0ZWQiOiJyZWZ1c2UiLCJraW5kcyI6WyJvdmVycmlkZXMiXSwic3RhdGUiOiJhY3RpdmUifX19",
+        "__vault_companion_v1__:overrides:cHJvag": "eyJzY2hlbWFWZXJzaW9uIjoxLCJ2YXVsdElkIjoicHJvaiIsImVudmlyb25tZW50cyI6eyJkZWZhdWx0Ijp7InNldCI6eyJBIjoiMSJ9LCJ1bnNldCI6W119fX0="
+      },
+      "journal": {
+        "schemaVersion": 3,
+        "transactionId": "00000000-0000-4000-8000-0000000000aa",
+        "state": "committed",
+        "operations": [
+          {
+            "action": "write",
+            "targetAccount": "__vault_companion_v1__:overrides:cHJvag",
+            "stagedAccount": "__vault_transaction_stage_v3__:00000000-0000-4000-8000-0000000000aa:0",
+            "operationSha256": "8152ed244973b508f374625d01d5cc7ad867d0b9083b3fbb09daa12bab995cd9"
+          }
+        ]
+      },
+      "outcome": "recovers",
+      "after": {
+        "__vault_features_v1__:cHJvag": "eyJzY2hlbWFWZXJzaW9uIjoxLCJ2YXVsdElkIjoicHJvaiIsInN0YXRlIjoiYWN0aXZlIiwiZmVhdHVyZXMiOnsib3ZlcnJpZGVzIjp7InZlcnNpb24iOjEsImlmVW5zdXBwb3J0ZWQiOiJyZWZ1c2UiLCJraW5kcyI6WyJvdmVycmlkZXMiXSwic3RhdGUiOiJhY3RpdmUifX19",
+        "__vault_companion_v1__:overrides:cHJvag": "eyJzY2hlbWFWZXJzaW9uIjoxLCJ2YXVsdElkIjoicHJvaiIsImVudmlyb25tZW50cyI6eyJkZWZhdWx0Ijp7InNldCI6eyJBIjoiMSJ9LCJ1bnNldCI6W119fX0="
+      }
+    },
+    {
+      "name": "a committed replay leaves a stray record it doesn't touch",
+      "before": {
+        "__vault_features_v1__:cHJvag": "eyJzY2hlbWFWZXJzaW9uIjoxLCJ2YXVsdElkIjoicHJvaiIsInN0YXRlIjoiYWN0aXZlIiwiZmVhdHVyZXMiOnsib3ZlcnJpZGVzIjp7InZlcnNpb24iOjEsImlmVW5zdXBwb3J0ZWQiOiJyZWZ1c2UiLCJraW5kcyI6WyJvdmVycmlkZXMiXSwic3RhdGUiOiJhY3RpdmUifX19",
+        "__vault_companion_v1__:future-kind:cHJvag": "c3RyYXk=",
+        "__vault_transaction_stage_v3__:00000000-0000-4000-8000-0000000000aa:0": "eyJzY2hlbWFWZXJzaW9uIjoxLCJ2YXVsdElkIjoicHJvaiIsImVudmlyb25tZW50cyI6eyJkZWZhdWx0Ijp7InNldCI6eyJBIjoiMSJ9LCJ1bnNldCI6W119fX0="
+      },
+      "journal": {
+        "schemaVersion": 3,
+        "transactionId": "00000000-0000-4000-8000-0000000000aa",
+        "state": "committed",
+        "operations": [
+          {
+            "action": "write",
+            "targetAccount": "__vault_companion_v1__:overrides:cHJvag",
+            "stagedAccount": "__vault_transaction_stage_v3__:00000000-0000-4000-8000-0000000000aa:0",
+            "operationSha256": "8152ed244973b508f374625d01d5cc7ad867d0b9083b3fbb09daa12bab995cd9"
+          }
+        ]
+      },
+      "outcome": "recovers",
+      "after": {
+        "__vault_features_v1__:cHJvag": "eyJzY2hlbWFWZXJzaW9uIjoxLCJ2YXVsdElkIjoicHJvaiIsInN0YXRlIjoiYWN0aXZlIiwiZmVhdHVyZXMiOnsib3ZlcnJpZGVzIjp7InZlcnNpb24iOjEsImlmVW5zdXBwb3J0ZWQiOiJyZWZ1c2UiLCJraW5kcyI6WyJvdmVycmlkZXMiXSwic3RhdGUiOiJhY3RpdmUifX19",
+        "__vault_companion_v1__:future-kind:cHJvag": "c3RyYXk=",
+        "__vault_companion_v1__:overrides:cHJvag": "eyJzY2hlbWFWZXJzaW9uIjoxLCJ2YXVsdElkIjoicHJvaiIsImVudmlyb25tZW50cyI6eyJkZWZhdWx0Ijp7InNldCI6eyJBIjoiMSJ9LCJ1bnNldCI6W119fX0="
+      }
+    },
+    {
+      "name": "a committed write of a record no feature lists is refused",
+      "before": {
+        "__vault_transaction_stage_v3__:00000000-0000-4000-8000-0000000000aa:0": "b3JwaGFu"
+      },
+      "journal": {
+        "schemaVersion": 3,
+        "transactionId": "00000000-0000-4000-8000-0000000000aa",
+        "state": "committed",
+        "operations": [
+          {
+            "action": "write",
+            "targetAccount": "__vault_companion_v1__:future-log:cHJvag",
+            "stagedAccount": "__vault_transaction_stage_v3__:00000000-0000-4000-8000-0000000000aa:0",
+            "operationSha256": "0469d0010e7e79b0ca536b0d21213825701b47c1927290c9c21b8da03a0307e7"
+          }
+        ]
+      },
+      "outcome": "refuses",
+      "refusal": "without a feature that lists it"
+    },
+    {
+      "name": "a committed marker deletion that leaves listed records is refused",
+      "before": {
+        "__vault_features_v1__:cHJvag": "eyJzY2hlbWFWZXJzaW9uIjoxLCJ2YXVsdElkIjoicHJvaiIsInN0YXRlIjoiYWN0aXZlIiwiZmVhdHVyZXMiOnsib3ZlcnJpZGVzIjp7InZlcnNpb24iOjEsImlmVW5zdXBwb3J0ZWQiOiJyZWZ1c2UiLCJraW5kcyI6WyJvdmVycmlkZXMiXSwic3RhdGUiOiJhY3RpdmUifX19",
+        "__vault_companion_v1__:overrides:cHJvag": "eyJzY2hlbWFWZXJzaW9uIjoxLCJ2YXVsdElkIjoicHJvaiIsImVudmlyb25tZW50cyI6eyJkZWZhdWx0Ijp7InNldCI6eyJBIjoiMSJ9LCJ1bnNldCI6W119fX0="
+      },
+      "journal": {
+        "schemaVersion": 3,
+        "transactionId": "00000000-0000-4000-8000-0000000000aa",
+        "state": "committed",
+        "operations": [
+          {
+            "action": "delete",
+            "targetAccount": "__vault_features_v1__:cHJvag",
+            "operationSha256": "827d210ea249e2cd7125c1c8fe26489538e5f34826fe65a944798ea8d8c6c625"
+          }
+        ]
+      },
+      "outcome": "refuses",
+      "refusal": "would leave"
+    },
+    {
+      "name": "a preparing journal missing a stage is discarded, leaving the records untouched",
+      "before": {
+        "__vault_features_v1__:cHJvag": "eyJzY2hlbWFWZXJzaW9uIjoxLCJ2YXVsdElkIjoicHJvaiIsInN0YXRlIjoiYWN0aXZlIiwiZmVhdHVyZXMiOnsib3ZlcnJpZGVzIjp7InZlcnNpb24iOjEsImlmVW5zdXBwb3J0ZWQiOiJyZWZ1c2UiLCJraW5kcyI6WyJvdmVycmlkZXMiXSwic3RhdGUiOiJhY3RpdmUifX19",
+        "__vault_companion_v1__:overrides:cHJvag": "eyJzY2hlbWFWZXJzaW9uIjoxLCJ2YXVsdElkIjoicHJvaiIsImVudmlyb25tZW50cyI6eyJkZWZhdWx0Ijp7InNldCI6eyJBIjoiMSJ9LCJ1bnNldCI6W119fX0=",
+        "__vault_transaction_stage_v3__:00000000-0000-4000-8000-0000000000aa:0": "eyJjaGFuZ2VkIjp0cnVlfQ=="
+      },
+      "journal": {
+        "schemaVersion": 3,
+        "transactionId": "00000000-0000-4000-8000-0000000000aa",
+        "state": "preparing",
+        "operations": [
+          {
+            "action": "write",
+            "targetAccount": "__vault_companion_v1__:overrides:cHJvag",
+            "stagedAccount": "__vault_transaction_stage_v3__:00000000-0000-4000-8000-0000000000aa:0",
+            "operationSha256": "7d1f4344d19c5769e68b3e88f9a57e6b5296682bfa1aef7231442ede46dc141d"
+          },
+          {
+            "action": "write",
+            "targetAccount": "__vault_features_v1__:cHJvag",
+            "stagedAccount": "__vault_transaction_stage_v3__:00000000-0000-4000-8000-0000000000aa:1",
+            "operationSha256": "de61e23a0cfa2572bd114a3addbcb28a089bfb8e4100d3362c5a8d282a37bada"
+          }
+        ]
+      },
+      "outcome": "recovers",
+      "after": {
+        "__vault_features_v1__:cHJvag": "eyJzY2hlbWFWZXJzaW9uIjoxLCJ2YXVsdElkIjoicHJvaiIsInN0YXRlIjoiYWN0aXZlIiwiZmVhdHVyZXMiOnsib3ZlcnJpZGVzIjp7InZlcnNpb24iOjEsImlmVW5zdXBwb3J0ZWQiOiJyZWZ1c2UiLCJraW5kcyI6WyJvdmVycmlkZXMiXSwic3RhdGUiOiJhY3RpdmUifX19",
+        "__vault_companion_v1__:overrides:cHJvag": "eyJzY2hlbWFWZXJzaW9uIjoxLCJ2YXVsdElkIjoicHJvaiIsImVudmlyb25tZW50cyI6eyJkZWZhdWx0Ijp7InNldCI6eyJBIjoiMSJ9LCJ1bnNldCI6W119fX0="
+      }
+    }
+  ]
+}

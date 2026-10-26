@@ -34,6 +34,7 @@ members = [
     "crates/lpm-env-source",
     "crates/lpm-env-ffi",
     "crates/lpm-env-backup",
+    "crates/lpm-env-companion",
     "crates/lpm-env-wasm",
     "crates/lpm-global",
     "crates/lpm-audit-corpus",
@@ -86,6 +87,7 @@ lpm-env = { path = "crates/lpm-env" }
 lpm-env-codegen = { path = "crates/lpm-env-codegen" }
 lpm-env-source = { path = "crates/lpm-env-source" }
 lpm-env-backup = { path = "crates/lpm-env-backup" }
+lpm-env-companion = { path = "crates/lpm-env-companion" }
 lpm-global = { path = "crates/lpm-global" }
 
 # Async runtime
