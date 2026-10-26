@@ -202,24 +202,48 @@ pub struct OverrideOrigins {
 }
 
 impl OverrideOrigins {
-    fn of(overrides: &PersonalOverrides, case_insensitive: bool) -> Self {
+    /// The overrides that change `vars`, the environment before layer 4: a
+    /// `set` of a name it lacks or holds another value for, and an `unset` of
+    /// a name it has. Names LPM never passes to a process change nothing.
+    fn changing(
+        vars: &HashMap<String, String>,
+        overrides: &PersonalOverrides,
+        case_insensitive: bool,
+    ) -> Self {
         let mut origins = Self {
             decided: HashMap::with_capacity(overrides.len()),
             case_insensitive,
         };
+        if overrides.is_empty() {
+            return origins;
+        }
+        let caseless: Option<HashMap<CaselessAscii<'_>, &str>> = case_insensitive.then(|| {
+            vars.iter()
+                .map(|(name, value)| (CaselessAscii(name), value.as_str()))
+                .collect()
+        });
+        let current = |name: &str| match &caseless {
+            Some(caseless) => caseless.get(&CaselessAscii(name)).copied(),
+            None => vars.get(name).map(String::as_str),
+        };
         for (name, value) in &overrides.set {
-            if !is_denied_env_var(name) {
+            if !is_denied_env_var(name) && current(name) != Some(value.as_str()) {
                 let key = origins.key(name);
                 origins.decided.insert(key, Decision::Set(value.clone()));
             }
         }
         for name in &overrides.unset {
-            if !is_denied_env_var(name) {
+            if !is_denied_env_var(name) && current(name).is_some() {
                 let key = origins.key(name);
                 origins.decided.insert(key, Decision::Unset);
             }
         }
         origins
+    }
+
+    /// How many overrides change the environment.
+    fn len(&self) -> usize {
+        self.decided.len()
     }
 
     /// Override names are validated ASCII, so where the host ignores case
@@ -382,13 +406,13 @@ impl ProjectEnvLayers {
         }
     }
 
-    /// How many personal overrides change this environment: each `set`, and
-    /// each `unset` of a name the project has. Names LPM never passes to a
-    /// process count for neither.
+    /// How many personal overrides change this environment: each `set` of a
+    /// name the project lacks or holds another value for, and each `unset`
+    /// of a name it has. Names LPM never passes to a process count for neither.
     pub fn override_count(&self) -> usize {
         match &self.composed {
             Some(child) => child.applied,
-            None => effective_overrides(&self.vars, &self.overrides, cfg!(windows)),
+            None => OverrideOrigins::changing(&self.vars, &self.overrides, cfg!(windows)).len(),
         }
     }
 
@@ -470,45 +494,15 @@ pub fn compose_with_overrides(
 }
 
 fn apply_layer_four(mut vars: HashMap<String, String>, overrides: &PersonalOverrides) -> ChildEnv {
-    let applied = effective_overrides(&vars, overrides, cfg!(windows));
+    let origins = OverrideOrigins::changing(&vars, overrides, cfg!(windows));
+    let applied = origins.len();
     apply_personal_overrides(&mut vars, overrides);
     ChildEnv {
         vars,
         overrides: overrides.clone(),
-        origins: OverrideOrigins::of(overrides, cfg!(windows)),
+        origins,
         applied,
     }
-}
-
-/// How many of `overrides` change `vars`, the environment before layer 4.
-fn effective_overrides(
-    vars: &HashMap<String, String>,
-    overrides: &PersonalOverrides,
-    case_insensitive: bool,
-) -> usize {
-    let set = overrides
-        .set
-        .keys()
-        .filter(|name| !is_denied_env_var(name))
-        .count();
-    let mut unset = overrides
-        .unset
-        .iter()
-        .filter(|name| !is_denied_env_var(name))
-        .peekable();
-    if unset.peek().is_none() {
-        return set;
-    }
-    let removed = if case_insensitive {
-        let present: HashSet<CaselessAscii<'_>> =
-            vars.keys().map(|name| CaselessAscii(name)).collect();
-        unset
-            .filter(|name| present.contains(&CaselessAscii(name)))
-            .count()
-    } else {
-        unset.filter(|name| vars.contains_key(*name)).count()
-    };
-    set + removed
 }
 
 /// Layer 4: set and unset this machine's personal overrides, in one pass

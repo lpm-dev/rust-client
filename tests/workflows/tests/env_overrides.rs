@@ -98,6 +98,36 @@ fn run_applies_a_personal_override_and_reports_only_its_count() {
 }
 
 #[test]
+fn an_override_of_the_team_value_changes_nothing_and_goes_unannounced() {
+    let (project, vault_id) = project_with_team_value(r#"{"show":"node show.cjs"}"#);
+    seed(
+        &project,
+        &vault_id,
+        Some(OVERRIDES_MARKER),
+        Some(&overrides_record(
+            &vault_id,
+            "default",
+            r#""API_URL":"team""#,
+            "",
+        )),
+    );
+
+    let output = lpm(&project)
+        .args(["run", "show", "--no-cache"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("API_URL=team"),
+        "{}",
+        stdout(&output)
+    );
+    let stderr = stderr(&output);
+    assert!(!stderr.contains("personal override"), "{stderr}");
+}
+
+#[test]
 fn tasks_and_parallel_runs_say_once_that_overrides_apply() {
     let (project, vault_id) =
         project_with_team_value(r#"{"show":"node show.cjs","again":"node show.cjs"}"#);

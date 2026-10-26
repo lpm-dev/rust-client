@@ -155,7 +155,8 @@ fn validation_failures_name_an_override_only_while_it_is_the_final_origin() {
 
 #[test]
 fn an_unset_is_blamed_only_for_the_value_it_left_missing() {
-    let origins = OverrideOrigins::of(&overrides(&[], &["PORT"]), false);
+    let origins =
+        OverrideOrigins::changing(&map(&[("PORT", "8080")]), &overrides(&[], &["PORT"]), false);
     let empty = HashMap::new();
     assert!(origins.caused(
         &error("PORT", lpm_env::ValidationErrorKind::Missing),
@@ -173,30 +174,63 @@ fn an_unset_is_blamed_only_for_the_value_it_left_missing() {
 
 #[test]
 fn an_override_is_found_under_the_declared_spelling_where_the_host_ignores_case() {
-    let origins = OverrideOrigins::of(&overrides(&[("api_url", "not a url")], &[]), true);
+    let origins = OverrideOrigins::changing(
+        &HashMap::new(),
+        &overrides(&[("api_url", "not a url")], &[]),
+        true,
+    );
     let invalid = error(
         "API_URL",
         lpm_env::ValidationErrorKind::ConstraintViolation { constraint: "url" },
     );
     assert!(origins.caused(&invalid, &map(&[("API_URL", "not a url")])));
     assert!(
-        !OverrideOrigins::of(&overrides(&[("api_url", "not a url")], &[]), false)
-            .caused(&invalid, &map(&[("API_URL", "not a url")]))
+        !OverrideOrigins::changing(
+            &HashMap::new(),
+            &overrides(&[("api_url", "not a url")], &[]),
+            false
+        )
+        .caused(&invalid, &map(&[("API_URL", "not a url")]))
     );
 }
 
 #[test]
 fn the_count_includes_only_overrides_that_change_the_environment() {
     let layers = layers(
-        &[("SENTRY_DSN", "team")],
+        &[("SENTRY_DSN", "team"), ("REGION", "eu")],
         overrides(
-            &[("API_URL", "mine"), ("NODE_OPTIONS", "--inspect")],
+            &[
+                ("API_URL", "mine"),
+                ("NODE_OPTIONS", "--inspect"),
+                ("REGION", "eu"),
+            ],
             &["SENTRY_DSN", "NOT_IN_THE_PROJECT", "CLASSPATH"],
         ),
     );
-    assert_eq!(layers.override_count(), 2);
+    assert_eq!(
+        layers.override_count(),
+        2,
+        "a set of the value the project already has changes nothing"
+    );
     let child = layers.compose(None, None).expect("compose");
     assert_eq!(child.override_count(), 2);
+}
+
+#[test]
+fn an_override_of_the_value_the_project_has_is_never_blamed() {
+    let layers = layers(
+        &[("API_URL", "not a url")],
+        overrides(&[("API_URL", "not a url")], &[]),
+    );
+    let child = layers.compose(None, None).expect("compose");
+    let invalid = error(
+        "API_URL",
+        lpm_env::ValidationErrorKind::ConstraintViolation { constraint: "url" },
+    );
+    assert!(
+        !child.caused_by_override(&invalid),
+        "removing the override wouldn't change the value"
+    );
 }
 
 #[test]
