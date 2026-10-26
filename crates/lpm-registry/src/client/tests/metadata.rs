@@ -325,6 +325,49 @@ async fn npm_proxy_metadata_sends_bearer_when_token_is_available() {
 }
 
 #[tokio::test]
+async fn npm_proxy_metadata_decodes_each_compression_the_client_accepts() {
+    use std::io::Write;
+    use wiremock::matchers::{header_regex, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let npm_name = "compressed-proxy-metadata";
+    let body = test_metadata_json(npm_name).into_bytes();
+    let gzip = {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&body).unwrap();
+        encoder.finish().unwrap()
+    };
+    let brotli = {
+        let mut encoded = Vec::new();
+        brotli::BrotliCompress(&mut body.as_slice(), &mut encoded, &Default::default()).unwrap();
+        encoded
+    };
+    let zstd = zstd::encode_all(body.as_slice(), 0).unwrap();
+
+    for (encoding, encoded) in [("gzip", gzip), ("br", brotli), ("zstd", zstd)] {
+        let proxy_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/registry/{npm_name}")))
+            .and(header_regex("accept-encoding", &format!(r"\b{encoding}\b")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", encoding)
+                    .set_body_bytes(encoded),
+            )
+            .expect(1)
+            .mount(&proxy_server)
+            .await;
+
+        let (client, _tmp) = client_with_mock_server(&proxy_server.uri());
+        let metadata = client
+            .get_npm_package_metadata(npm_name)
+            .await
+            .unwrap_or_else(|error| panic!("{encoding} metadata: {error}"));
+        assert_eq!(metadata.name, npm_name, "{encoding}");
+    }
+}
+
+#[tokio::test]
 async fn npm_proxy_metadata_refreshes_rejected_stored_session_before_direct_fallback() {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
