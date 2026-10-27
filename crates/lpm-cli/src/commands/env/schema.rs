@@ -278,6 +278,7 @@ pub(super) fn vars_check(
         errors: Vec<lpm_env::ValidationError>,
         from_overrides: std::collections::HashSet<String>,
         ignored: Vec<String>,
+        characters: Vec<lpm_runner::dotenv::StoredValueCharacters>,
     }
     let mut results: Vec<Checked> = Vec::with_capacity(all_envs.len());
     let mut all_valid = true;
@@ -299,17 +300,19 @@ pub(super) fn vars_check(
                 }],
                 from_overrides: std::collections::HashSet::new(),
                 ignored: Vec::new(),
+                characters: Vec::new(),
             });
             continue;
         }
         let (checked, ignored) = lpm_runner::dotenv::collect_ignored_env_names(|| {
-            let mut composed = lpm_runner::dotenv::load_project_env_layers_for_resolved(
+            let layers = lpm_runner::dotenv::load_project_env_layers_for_resolved(
                 project_dir,
                 environment,
                 lpm_config.as_ref(),
                 lpm_runner::dotenv::OverridePolicy::Apply,
-            )?
-            .compose(lpm_config.as_ref(), scope.service.as_deref())?;
+            )?;
+            let characters = layers.stored_value_characters();
+            let mut composed = layers.compose(lpm_config.as_ref(), scope.service.as_deref())?;
             let errors = composed.evaluate(
                 Some(&validator),
                 lpm_env::EvalContext {
@@ -323,9 +326,9 @@ pub(super) fn vars_check(
                 .filter(|error| composed.caused_by_override(error))
                 .map(|error| error.key.clone())
                 .collect();
-            Ok::<_, LpmError>((errors, from_overrides))
+            Ok::<_, LpmError>((errors, from_overrides, characters))
         });
-        let (errors, from_overrides) = checked?;
+        let (errors, from_overrides, characters) = checked?;
         all_valid &= errors.is_empty();
         results.push(Checked {
             name: environment.canonical.clone(),
@@ -333,18 +336,28 @@ pub(super) fn vars_check(
             errors,
             from_overrides,
             ignored,
+            characters,
         });
     }
 
     if json_output {
         let json_results: Vec<serde_json::Value> = results
             .iter()
-            .map(|Checked { name, total, errors, from_overrides, ignored }| {
+            .map(|Checked { name, total, errors, from_overrides, ignored, characters }| {
+                let value_warnings: Vec<serde_json::Value> = characters
+                    .iter()
+                    .map(|stored| {
+                        let mut warning = super::characters::json(&stored.key, &stored.characters);
+                        warning["personal_override"] = serde_json::json!(stored.personal_override);
+                        warning
+                    })
+                    .collect();
                 serde_json::json!({
                     "environment": name,
                     "total": total,
                     "valid": valid_variable_count(schema, errors),
                     "ignored": ignored,
+                    "value_warnings": value_warnings,
                     "errors": errors.iter().map(|e| {
                         let mut diagnostic = serde_json::json!({"key": e.key, "error": e.to_string()});
                         if let lpm_env::ValidationErrorKind::GroupViolation { group, mode } = &e.kind {
@@ -380,6 +393,7 @@ pub(super) fn vars_check(
         errors,
         from_overrides,
         ignored,
+        characters,
     } in &results
     {
         let valid = valid_variable_count(schema, errors);
@@ -425,6 +439,21 @@ pub(super) fn vars_check(
                 "    {}",
                 install_ui::yellow(&lpm_runner::dotenv::ignored_env_note(ignored))
             );
+        }
+        for stored in characters {
+            let heading = if stored.personal_override {
+                format!(
+                    "{} (a personal override on {}) has characters that are hard to see",
+                    stored.key,
+                    lpm_runner::dotenv::THIS_MACHINE
+                )
+            } else {
+                format!("{} has characters that are hard to see", stored.key)
+            };
+            println!("    {}", install_ui::yellow(&heading));
+            for line in super::characters::lines(&stored.characters) {
+                println!("{}", install_ui::terminal_line!("      {}", line));
+            }
         }
     }
     println!();

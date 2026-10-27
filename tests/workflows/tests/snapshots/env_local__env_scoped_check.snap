@@ -1,6 +1,5 @@
 ---
 source: tests/workflows/tests/env_local.rs
-assertion_line: 2168
 expression: "parse_json_stdout(&output, \"scoped check\")"
 ---
 {
@@ -11,6 +10,7 @@ expression: "parse_json_stdout(&output, \"scoped check\")"
       "total": 1,
       "valid": 0,
       "ignored": [],
+      "value_warnings": [],
       "errors": [
         {
           "key": "VALUE",

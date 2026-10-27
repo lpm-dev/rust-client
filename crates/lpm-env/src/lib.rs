@@ -19,6 +19,7 @@
 //! }
 //! ```
 
+mod characters;
 mod constraints;
 mod definition;
 mod example;
@@ -33,6 +34,11 @@ mod stored;
 mod unknown_fields;
 mod validate;
 
+pub use characters::{
+    CharacterKind, CharacterRun, FoundCharacter, HiddenCharacter, MAX_LISTED_CHARACTERS,
+    MAX_LISTED_RUNS, ShownCharacters, ValueCharacters, check_value_characters,
+    remove_hidden_characters, show_hidden_characters, trim_ends,
+};
 pub use example::generate as generate_env_example;
 pub use inheritance::{EnvDefinition, EnvironmentsConfig, list_environments, resolve_chain};
 pub use names::{CasingConflict, EnvName, align_declared_casing};

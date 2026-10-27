@@ -46,6 +46,38 @@ uint32_t lpm_env_verify(const LPMEnvSnapshot *snapshot);
  * ignores case, 2=invalid input, 3=panic, 4=work or output limit. */
 LPMEnvResult lpm_env_check(const uint8_t *schema, size_t schema_length,
                          const uint8_t *input, size_t input_length);
+/* Characters in values that are hard to see or change how text reads, flagged
+ * exactly as the CLI flags them; no schema is needed. A value is never changed
+ * unless lpm_env_fix_characters is called for it. Kinds: "leading_whitespace",
+ * "trailing_whitespace", "invisible", "direction", "space", "line_break",
+ * "control". Positions count characters (Unicode scalar values) from 1. */
+/* Input: {"environments":{"<name>":{"<KEY>":"<value>"}}}, at most
+ * LPM_ENV_INPUT_LIMIT bytes. Output: {abiVersion, environments: {name: {KEY:
+ * {characters: [{kind, codePoint ("U+200B") | null, escape ("\u{200b}", "\t")
+ * | null, name, group: null | "tags" | "variation_selectors" | "unassigned",
+ * count, runs: [{position, count}]}], more, removable, trimmable}}}}: every
+ * environment given, with only its flagged values. A group stands for
+ * characters that can spell out hidden text, so they aren't told apart; its
+ * codePoint and escape are null. At most 8 characters are listed per value,
+ * more counts the others, and at most 8 runs per character, count counting
+ * all. removable: lpm_env_fix_characters with fix 1 changes the value;
+ * trimmable: with fix 2. Output never contains values.
+ * status: 0=checked, 2=invalid input, 3=panic, 4=output limit. */
+LPMEnvResult lpm_env_check_characters(const uint8_t *input, size_t input_length);
+/* One UTF-8 value with each flagged character written as its escape, for
+ * showing someone who sees the value: {abiVersion, text, marks: [[start,
+ * length]]}, each mark an escape's place in text in UTF-16 code units. The
+ * pointer may be null only when the length is 0; at most LPM_ENV_INPUT_LIMIT.
+ * status: 0=shown, 2=invalid input, 3=panic, 4=output limit. */
+LPMEnvResult lpm_env_show_characters(const uint8_t *value, size_t value_length);
+/* One UTF-8 value fixed as a person chose, output as UTF-8 (not JSON).
+ * fix 1 removes each flagged character other than whitespace at an end, makes
+ * a space other than U+0020 or a tab a plain space, a line break other than
+ * \n a \n, and drops the carriage return of each \r\n. fix 2 removes the
+ * whitespace flagged at either end, keeping a multiline value's single final
+ * line break. The pointer may be null only when the length is 0; at most
+ * LPM_ENV_INPUT_LIMIT. status: 0=fixed, 2=invalid input, 3=panic. */
+LPMEnvResult lpm_env_fix_characters(const uint8_t *value, size_t value_length, uint32_t fix);
 /* Encrypt plaintext as a libsodium sealed box (crypto_box_seal) to a 32-byte
  * Curve25519 public key, the form GitHub requires for an Actions secret. Output:
  * the ephemeral public key then the box, plaintext_length + 48 bytes. plaintext

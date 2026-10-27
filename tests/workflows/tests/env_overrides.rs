@@ -562,3 +562,50 @@ fn planted_companion_states_reach_the_cli_as_described() {
         "the command stays out of help"
     );
 }
+
+#[test]
+fn check_reports_hidden_characters_in_a_personal_override_as_one() {
+    let (project, vault_id) = project_with_team_value("{}");
+    extend_lpm_json(
+        &project,
+        serde_json::json!({"envSchema":{"vars":{"API_URL":{}}}}),
+    );
+    seed(
+        &project,
+        &vault_id,
+        Some(OVERRIDES_MARKER),
+        Some(&overrides_record(
+            &vault_id,
+            "default",
+            "\"API_URL\":\"mine\\u200b\"",
+            "",
+        )),
+    );
+
+    let json = lpm(&project)
+        .args(["env", "check", "--env=default", "--json"])
+        .output()
+        .unwrap();
+    assert!(json.status.success(), "{}", stdout(&json));
+    let checked: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("one JSON document");
+    let warning = &checked["environments"][0]["value_warnings"][0];
+    assert_eq!(warning["key"], "API_URL");
+    assert_eq!(warning["personal_override"], true);
+    assert_eq!(warning["characters"][0]["name"], "ZERO WIDTH SPACE");
+    assert_eq!(warning["characters"][0]["runs"][0]["position"], 5);
+
+    let human = lpm(&project)
+        .args(["env", "check", "--env=default"])
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    assert!(
+        stdout(&human).contains(&format!(
+            "API_URL (a personal override on {}) has characters that are hard to see",
+            lpm_runner::dotenv::THIS_MACHINE
+        )),
+        "{}",
+        stdout(&human)
+    );
+}

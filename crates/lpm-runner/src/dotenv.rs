@@ -183,6 +183,17 @@ pub struct ProjectEnvLayers {
     /// The child environment, once layer 4 was applied to the layers.
     composed: Option<ChildEnv>,
     vault_count: usize,
+    /// The values read from the vault, before the files' values were merged under them.
+    vault_values: HashMap<String, String>,
+}
+
+/// A value read from storage that holds characters that are hard to see.
+#[derive(Debug)]
+pub struct StoredValueCharacters {
+    pub key: String,
+    /// The value is a personal override on this machine, not the project's.
+    pub personal_override: bool,
+    pub characters: lpm_env::ValueCharacters,
 }
 
 /// What the personal overrides decided for one name.
@@ -404,7 +415,33 @@ impl ProjectEnvLayers {
             overrides: child.overrides.clone(),
             composed: Some(child),
             vault_count,
+            vault_values: HashMap::new(),
         }
+    }
+
+    /// What the values this environment reads from storage hold that's hard
+    /// to see: its values in the vault, or the default environment's when it
+    /// has none, then its personal overrides on this machine, each by key.
+    pub fn stored_value_characters(&self) -> Vec<StoredValueCharacters> {
+        fn checked<'a>(
+            values: impl Iterator<Item = (&'a String, &'a String)>,
+            personal_override: bool,
+        ) -> Vec<StoredValueCharacters> {
+            let mut found: Vec<StoredValueCharacters> = values
+                .filter_map(|(key, value)| {
+                    lpm_env::check_value_characters(value).map(|characters| StoredValueCharacters {
+                        key: key.clone(),
+                        personal_override,
+                        characters,
+                    })
+                })
+                .collect();
+            found.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+            found
+        }
+        let mut found = checked(self.vault_values.iter(), false);
+        found.extend(checked(self.overrides.set.iter(), true));
+        found
     }
 
     /// How many personal overrides change this environment: each `set` of a
@@ -776,6 +813,7 @@ pub(crate) fn load_project_env_layers(
         overrides,
         composed: None,
         vault_count,
+        vault_values: vault_vars,
     })
 }
 
@@ -1161,10 +1199,10 @@ fn parse_env_str_with_case_policy(
     let mut lines = content.lines();
 
     while let Some(line) = lines.next() {
-        let trimmed = line.trim();
+        let trimmed = line.trim_start_matches(lpm_vault::is_dotenv_blank);
 
         // Skip empty lines and comments
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        if lpm_vault::is_dotenv_blank_line(trimmed) || trimmed.starts_with('#') {
             continue;
         }
 
@@ -1177,7 +1215,7 @@ fn parse_env_str_with_case_policy(
             None => continue,
         };
 
-        let key = trimmed[..eq_pos].trim().to_string();
+        let key = lpm_vault::trim_dotenv_blanks(&trimmed[..eq_pos]).to_string();
         if key.is_empty() {
             continue;
         }
@@ -1185,13 +1223,13 @@ fn parse_env_str_with_case_policy(
             vars.remove(&previous);
         }
 
-        let raw_value = trimmed[eq_pos + 1..].trim();
+        let raw_value = trimmed[eq_pos + 1..].trim_start_matches(lpm_vault::is_dotenv_blank);
 
         if let Some(rest) = raw_value.strip_prefix('"') {
             let value = lpm_vault::parse_double_quoted_env_value(rest, &mut lines);
             vars.insert(key, value);
         } else {
-            let value = unquote(raw_value);
+            let value = unquote(lpm_vault::trim_dotenv_blanks(raw_value));
             vars.insert(key, value);
         }
     }
@@ -1623,6 +1661,42 @@ mod tests {
             parse_env_str("# This is a comment\n\nKEY=value\n  # Another comment\n\nOTHER=123");
         assert_eq!(vars.len(), 2);
         assert_eq!(vars.get("KEY").unwrap(), "value");
+    }
+
+    #[test]
+    fn parse_env_keeps_characters_that_look_blank_around_unquoted_values() {
+        let vars = parse_env_str(
+            "\u{feff}FIRST=one\n\t PADDED = two \t\r\nNBSP=three\u{a0}\nZWSP=\u{200b}four\nFEED=five\u{c}\n",
+        );
+        assert_eq!(vars["FIRST"], "one");
+        assert_eq!(vars["PADDED"], "two");
+        assert_eq!(vars["NBSP"], "three\u{a0}");
+        assert_eq!(vars["ZWSP"], "\u{200b}four");
+        assert_eq!(vars["FEED"], "five\u{c}");
+    }
+
+    #[test]
+    fn parse_env_keeps_blanks_inside_a_double_quoted_value_that_spans_lines() {
+        let vars = parse_env_str("DOUBLE=\"a  \nb\"\nAFTER=\"e\"  \nSINGLE='f '  \n");
+        assert_eq!(vars["DOUBLE"], "a  \nb");
+        assert_eq!(vars["AFTER"], "e");
+        assert_eq!(vars["SINGLE"], "f ");
+    }
+
+    #[test]
+    fn parse_env_keeps_a_carriage_return_that_ends_no_crlf() {
+        assert_eq!(parse_env_str("KEY=value\r")["KEY"], "value\r");
+        assert_eq!(parse_env_str("KEY=value\r\r\nNEXT=1\r\n")["KEY"], "value\r");
+        assert_eq!(parse_env_str("KEY=value\r\nNEXT=1\r\n")["KEY"], "value");
+    }
+
+    #[test]
+    fn a_file_reads_the_same_when_run_as_when_imported() {
+        let content = "A= one \nB=\u{a0}two\u{a0}\nC=\"three \"\n\u{3000}D=four\nE='five'\nF=\"six  \nseven\"\nG=eight\r";
+        assert_eq!(
+            parse_env_str(content),
+            lpm_vault::parse_env_content(content)
+        );
     }
 
     #[test]

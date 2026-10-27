@@ -284,9 +284,12 @@ fn is_valid_vault_key(name: &str) -> bool {
 }
 
 fn reject_invalid_keys<'a>(pairs: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
-    let bad: Vec<&str> = pairs
+    // A rejected key is shown with its hidden characters as escapes, since a
+    // no-break space or a zero-width space is often why it's rejected.
+    let bad: Vec<String> = pairs
         .into_iter()
         .filter(|k| !is_valid_vault_key(k))
+        .map(|k| lpm_env::show_hidden_characters(k).text)
         .collect();
     if bad.is_empty() {
         Ok(())
@@ -559,12 +562,23 @@ impl EnvironmentInitializationSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvironmentFileInitializationResult {
     pub file_present: bool,
     pub file_variable_count: usize,
     pub imported_count: Option<usize>,
     pub created_empty: bool,
+    /// Each imported value that holds characters that are hard to see, by key.
+    pub characters: Vec<(String, lpm_env::ValueCharacters)>,
+}
+
+/// What importing a .env file wrote.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct EnvFileImport {
+    /// How many values were written.
+    pub count: usize,
+    /// Each written value that holds characters that are hard to see, by key.
+    pub characters: Vec<(String, lpm_env::ValueCharacters)>,
 }
 
 #[cfg(test)]
@@ -784,6 +798,7 @@ fn initialize_environments_from_files_inner(
                 imported_count: (source.file_present && source.initialization.import_if_present)
                     .then_some(0),
                 created_empty: false,
+                characters: Vec::new(),
             })
             .collect());
     }
@@ -834,11 +849,12 @@ fn initialize_environments_from_files_inner(
                     file_variable_count: 0,
                     imported_count: None,
                     created_empty: initialization.create_if_missing,
+                    characters: Vec::new(),
                 });
                 continue;
             }
 
-            let imported_count = match source.secrets {
+            let (imported_count, characters) = match source.secrets {
                 Some(secrets) => {
                     let vault =
                         load_environment_initialization_vault(&mut state, project_dir, directory)?;
@@ -846,26 +862,21 @@ fn initialize_environments_from_files_inner(
                         .environments
                         .entry(initialization.environment.clone())
                         .or_default();
-                    let mut imported = 0;
-                    for (key, value) in secrets {
-                        if overwrite || !target.contains_key(&key) {
-                            target.insert(key, value);
-                            imported += 1;
-                        }
-                    }
-                    if imported > 0 {
+                    let imported = merge_imported_secrets(target, secrets, overwrite);
+                    if imported.count > 0 {
                         vault.changed = true;
                     }
-                    Some(imported)
+                    (Some(imported.count), imported.characters)
                 }
-                None if initialization.import_if_present => Some(0),
-                None => None,
+                None if initialization.import_if_present => (Some(0), Vec::new()),
+                None => (None, Vec::new()),
             };
             results.push(EnvironmentFileInitializationResult {
                 file_present: true,
                 file_variable_count: source.file_variable_count,
                 imported_count,
                 created_empty: false,
+                characters,
             });
         }
 
@@ -1327,21 +1338,19 @@ pub fn delete_env(project_dir: &Path, env: &str, keys: &[&str]) -> Result<(), St
     })
 }
 
-/// Import secrets from a .env file into the vault.
-///
-/// Returns the number of imported secrets.
+/// Import secrets from a .env file into the vault, as they're written there.
 pub fn import_env_file(
     project_dir: &Path,
     env_path: &Path,
     overwrite: bool,
-) -> Result<usize, String> {
+) -> Result<EnvFileImport, String> {
     let content =
         lpm_common::read_text_file_capped(env_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
             .map_err(|e| format!("failed to read {}: {e}", env_path.display()))?;
 
     let parsed = parse_env_content(&content);
     if parsed.is_empty() {
-        return Ok(0);
+        return Ok(EnvFileImport::default());
     }
 
     let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
@@ -1363,22 +1372,21 @@ pub fn import_env_file(
     Ok(imported)
 }
 
-/// Import secrets from a .env file into a specific environment.
-///
-/// Returns the number of imported secrets.
+/// Import secrets from a .env file into a specific environment, as they're
+/// written there.
 pub fn import_env_file_to_env(
     project_dir: &Path,
     env: &str,
     env_path: &Path,
     overwrite: bool,
-) -> Result<usize, String> {
+) -> Result<EnvFileImport, String> {
     let content =
         lpm_common::read_text_file_capped(env_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
             .map_err(|e| format!("failed to read {}: {e}", env_path.display()))?;
 
     let parsed = parse_env_content(&content);
     if parsed.is_empty() {
-        return Ok(0);
+        return Ok(EnvFileImport::default());
     }
 
     let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
@@ -1574,14 +1582,15 @@ fn write_all_environments(
 ///
 /// Public so callers like `vars init` can count variables before importing.
 pub fn parse_env_content(content: &str) -> HashMap<String, String> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let mut vars = HashMap::new();
     let mut lines = content.lines();
 
     while let Some(line) = lines.next() {
-        let line = line.trim();
+        let line = line.trim_start_matches(is_dotenv_blank);
 
         // Skip empty lines and comments
-        if line.is_empty() || line.starts_with('#') {
+        if is_dotenv_blank_line(line) || line.starts_with('#') {
             continue;
         }
 
@@ -1589,8 +1598,8 @@ pub fn parse_env_content(content: &str) -> HashMap<String, String> {
         let line = line.strip_prefix("export ").unwrap_or(line);
 
         if let Some((key, value)) = line.split_once('=') {
-            let key = key.trim().to_string();
-            let value = parse_env_value(value.trim_start(), &mut lines);
+            let key = trim_dotenv_blanks(key).to_string();
+            let value = parse_env_value(value.trim_start_matches(is_dotenv_blank), &mut lines);
 
             if !key.is_empty() {
                 vars.insert(key, value);
@@ -1610,29 +1619,61 @@ fn parse_env_value(value: &str, lines: &mut std::str::Lines<'_>) -> String {
         return parse_single_quoted_env_value(rest, lines);
     }
 
-    value.trim().to_string()
+    trim_dotenv_blanks(value).to_string()
 }
 
+/// Whether `character` is a blank of dotenv syntax, which separates a key and
+/// an unquoted value from what's around them: a space or a tab. Every other
+/// character, even one that looks blank such as a no-break space, belongs to
+/// the value, where the warnings about characters that are hard to see find
+/// it. LPM Vault's parser keeps the same rule.
+pub fn is_dotenv_blank(character: char) -> bool {
+    matches!(character, ' ' | '\t')
+}
+
+/// `text` without the spaces and tabs at either end. Only an unquoted value
+/// loses those at its end: in a quoted one they're part of the value, even
+/// before a line break inside it.
+pub fn trim_dotenv_blanks(text: &str) -> &str {
+    text.trim_matches(is_dotenv_blank)
+}
+
+/// Whether a line holds only spaces and tabs, or nothing.
+pub fn is_dotenv_blank_line(line: &str) -> bool {
+    line.chars().all(is_dotenv_blank)
+}
+
+/// Writes each parsed value unless its key is there and `overwrite` is off,
+/// noting what each written value holds that's hard to see.
 fn merge_imported_secrets(
     secrets: &mut HashMap<String, String>,
     parsed: HashMap<String, String>,
     overwrite: bool,
-) -> usize {
-    let mut imported = 0;
+) -> EnvFileImport {
+    use std::collections::hash_map::Entry;
+    let mut import = EnvFileImport::default();
     for (key, value) in parsed {
-        match secrets.entry(key) {
-            std::collections::hash_map::Entry::Occupied(mut entry) if overwrite => {
+        let key = match secrets.entry(key) {
+            Entry::Occupied(mut entry) if overwrite => {
+                let found = lpm_env::check_value_characters(&value);
                 entry.insert(value);
-                imported += 1;
+                found.map(|found| (entry.key().clone(), found))
             }
-            std::collections::hash_map::Entry::Vacant(entry) => {
+            Entry::Vacant(entry) => {
+                let found = lpm_env::check_value_characters(&value);
+                let key = found.map(|found| (entry.key().clone(), found));
                 entry.insert(value);
-                imported += 1;
+                key
             }
-            std::collections::hash_map::Entry::Occupied(_) => {}
-        }
+            Entry::Occupied(_) => continue,
+        };
+        import.count += 1;
+        import.characters.extend(key);
     }
-    imported
+    import
+        .characters
+        .sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    import
 }
 
 /// Decode a dotenv value after its opening double quote, consuming continuation lines.
@@ -1886,6 +1927,46 @@ KEY3=no-quotes"#;
     }
 
     #[test]
+    fn parse_env_trims_only_spaces_and_tabs_around_unquoted_values() {
+        let vars = parse_env_content(
+            "\u{feff}FIRST=one\n\t PADDED = two \t\r\nNBSP=three\u{a0}\nZWSP=\u{200b}four\u{200b}\nWIDE=\u{3000}five\u{3000}\nFEED=six\u{c}\n",
+        );
+        assert_eq!(
+            vars["FIRST"], "one",
+            "a byte order mark at the start is no part of the first key"
+        );
+        assert_eq!(vars["PADDED"], "two");
+        assert_eq!(vars["NBSP"], "three\u{a0}");
+        assert_eq!(vars["ZWSP"], "\u{200b}four\u{200b}");
+        assert_eq!(vars["WIDE"], "\u{3000}five\u{3000}");
+        assert_eq!(vars["FEED"], "six\u{c}");
+    }
+
+    #[test]
+    fn parse_env_keeps_blanks_inside_a_quoted_value_that_spans_lines() {
+        let vars = parse_env_content("DOUBLE=\"a  \nb\"\nSINGLE='c\t\nd'\nAFTER=\"e\"  \n");
+        assert_eq!(vars["DOUBLE"], "a  \nb");
+        assert_eq!(vars["SINGLE"], "c\t\nd");
+        assert_eq!(vars["AFTER"], "e");
+    }
+
+    #[test]
+    fn parse_env_keeps_a_carriage_return_that_ends_no_crlf() {
+        assert_eq!(parse_env_content("KEY=value\r")["KEY"], "value\r");
+        assert_eq!(
+            parse_env_content("KEY=value\r\r\nNEXT=1\r\n")["KEY"],
+            "value\r"
+        );
+        assert_eq!(parse_env_content("KEY=value\r\nNEXT=1\r\n")["KEY"], "value");
+    }
+
+    #[test]
+    fn parse_env_keeps_a_character_that_looks_blank_in_the_key() {
+        let vars = parse_env_content("\u{a0}KEY=value\n");
+        assert_eq!(vars.keys().collect::<Vec<_>>(), ["\u{a0}KEY"]);
+    }
+
+    #[test]
     fn imported_secrets_transfer_owned_key_and_value_allocations() {
         let key = "TRANSFERRED_KEY".to_owned();
         let value = "transferred-value".to_owned();
@@ -1894,7 +1975,7 @@ KEY3=no-quotes"#;
         let parsed = HashMap::from([(key, value)]);
         let mut secrets = HashMap::new();
 
-        assert_eq!(merge_imported_secrets(&mut secrets, parsed, false), 1);
+        assert_eq!(merge_imported_secrets(&mut secrets, parsed, false).count, 1);
         let (stored_key, stored_value) = secrets
             .get_key_value("TRANSFERRED_KEY")
             .expect("imported secret");
@@ -2030,7 +2111,7 @@ KEY3=no-quotes"#;
             std::fs::write(&env_file, "DB=localhost\nPORT=3000\n").unwrap();
 
             let imported = import_env_file(dir.path(), &env_file, false).unwrap();
-            assert_eq!(imported, 2);
+            assert_eq!(imported.count, 2);
 
             let (content, exported) = export_env_content(dir.path()).unwrap().unwrap();
             assert_eq!(exported, 2);
@@ -2054,7 +2135,7 @@ KEY3=no-quotes"#;
             .unwrap();
 
             let imported = import_env_file(dir.path(), &env_file, false).unwrap();
-            assert_eq!(imported, 2);
+            assert_eq!(imported.count, 2);
 
             let secrets = try_get_all(dir.path()).expect("read vault");
             assert_eq!(
@@ -2603,11 +2684,48 @@ KEY3=no-quotes"#;
             std::fs::write(&env_file, "KEY=overwritten\nNEW=added").unwrap();
 
             let imported = import_env_file(dir.path(), &env_file, false).unwrap();
-            assert_eq!(imported, 1);
+            assert_eq!(imported.count, 1);
 
             let secrets = try_get_all(dir.path()).expect("read vault");
             assert_eq!(secrets["KEY"], "original");
             assert_eq!(secrets["NEW"], "added");
+
+            cleanup_vault(dir.path());
+        });
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn import_reports_hidden_characters_only_in_the_values_it_writes() {
+        with_forced_file_vault_backend(|| {
+            let dir = tempfile::tempdir().unwrap();
+
+            set(dir.path(), &[("KEPT", "original")]).unwrap();
+
+            let env_file = dir.path().join(".env.test");
+            std::fs::write(
+                &env_file,
+                "KEPT=\u{200B}skipped\nNEW=\"added\u{A0}value\"\nCLEAN=value\nZERO=\u{FEFF}token",
+            )
+            .unwrap();
+
+            let imported = import_env_file(dir.path(), &env_file, false).unwrap();
+            assert_eq!(imported.count, 3);
+            let keys: Vec<&str> = imported
+                .characters
+                .iter()
+                .map(|(key, _)| key.as_str())
+                .collect();
+            assert_eq!(keys, ["NEW", "ZERO"]);
+            assert_eq!(
+                imported.characters[0].1.characters[0].describe(),
+                "\\u{a0} NO-BREAK SPACE at character 6"
+            );
+            let secrets = try_get_all(dir.path()).expect("read vault");
+            assert_eq!(
+                secrets["NEW"], "added\u{A0}value",
+                "values are stored as given"
+            );
 
             cleanup_vault(dir.path());
         });
@@ -2625,7 +2743,7 @@ KEY3=no-quotes"#;
             std::fs::write(&env_file, "KEY=overwritten").unwrap();
 
             let imported = import_env_file(dir.path(), &env_file, true).unwrap();
-            assert_eq!(imported, 1);
+            assert_eq!(imported.count, 1);
 
             let secrets = try_get_all(dir.path()).expect("read vault");
             assert_eq!(secrets["KEY"], "overwritten");
@@ -3137,7 +3255,7 @@ KEY3=no-quotes"#;
                     .map(|index| (format!("KEY_{index}"), value.clone()))
                     .collect();
                 let mut secrets = HashMap::new();
-                let imported = merge_imported_secrets(&mut secrets, parsed, false);
+                let imported = merge_imported_secrets(&mut secrets, parsed, false).count;
                 imported + secrets.values().map(String::len).sum::<usize>()
             }
             "digest" => with_forced_file_vault_backend(|| {
