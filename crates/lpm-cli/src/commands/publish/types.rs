@@ -1,6 +1,7 @@
 use crate::commands::publish_common::{NpmProvenanceAttachment, TarballFile, TarballHashes};
 use crate::oidc;
 use lpm_common::LpmError;
+use lpm_registry::{PublicationHold, PublicationStatusResponse};
 use lpm_runner::lpm_json;
 /// Target registries for a publish operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,11 +107,39 @@ impl LpmPublicationStatus {
     }
 }
 
+/// What one publication-status poll observed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PublicationSnapshot {
+    pub(super) status: LpmPublicationStatus,
+    pub(super) current_latest_version: Option<String>,
+    pub(super) hold: Option<PublicationHold>,
+}
+
+impl From<PublicationStatusResponse> for PublicationSnapshot {
+    fn from(response: PublicationStatusResponse) -> Self {
+        Self {
+            status: LpmPublicationStatus::from_registry_value(&response.status),
+            current_latest_version: response.current_latest_version,
+            hold: response.hold,
+        }
+    }
+}
+
+/// The Registry's account of a hold, or a stand-in where it gives none.
+pub(super) fn hold_explanation(hold: &PublicationHold) -> &str {
+    hold.message
+        .as_deref()
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .unwrap_or("LPM.dev Registry is holding it.")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicationWaitResult {
     pub success: bool,
     pub status: Option<LpmPublicationStatus>,
     pub current_latest_version: Option<String>,
+    pub hold: Option<PublicationHold>,
     pub error: Option<String>,
 }
 
@@ -120,7 +149,23 @@ impl PublicationWaitResult {
             success: true,
             status: Some(LpmPublicationStatus::Active),
             current_latest_version: None,
+            hold: None,
             error: None,
+        }
+    }
+
+    /// The Registry holds the version and only a new version gets past it.
+    pub(super) fn held(status: LpmPublicationStatus, hold: PublicationHold) -> Self {
+        let error = format!(
+            "Upload succeeded, but this version won't become available. {} Do not publish this version again.",
+            hold_explanation(&hold)
+        );
+        Self {
+            success: false,
+            status: Some(status),
+            current_latest_version: None,
+            hold: Some(hold),
+            error: Some(error),
         }
     }
 
@@ -141,21 +186,32 @@ impl PublicationWaitResult {
             success: false,
             status: Some(status),
             current_latest_version: None,
+            hold: None,
             error: Some(format!(
                 "Upload succeeded, but {message}. Do not publish this version again."
             )),
         }
     }
 
-    pub(super) fn timed_out(status: Option<LpmPublicationStatus>) -> Self {
+    /// The wait ended first; a hold the last poll saw says why.
+    pub(super) fn timed_out(
+        status: Option<LpmPublicationStatus>,
+        hold: Option<PublicationHold>,
+    ) -> Self {
+        let held = hold.as_ref().map_or_else(String::new, |hold| {
+            format!(
+                " The version isn't available yet. {}",
+                hold_explanation(hold)
+            )
+        });
         Self {
             success: false,
             status,
             current_latest_version: None,
-            error: Some(
-                "Upload succeeded, but waiting for LPM.dev Registry publication timed out. Do not publish this version again."
-                    .to_string(),
-            ),
+            error: Some(format!(
+                "Upload succeeded, but waiting for LPM.dev Registry publication timed out.{held} Do not publish this version again."
+            )),
+            hold,
         }
     }
 
@@ -164,10 +220,21 @@ impl PublicationWaitResult {
             success: false,
             status: None,
             current_latest_version: None,
+            hold: None,
             error: Some(format!(
                 "Upload succeeded, but LPM.dev Registry publication could not be checked: {error}. Do not publish this version again."
             )),
         }
+    }
+
+    /// Keeps what the last poll saw: its status, hold and latest version.
+    pub(super) fn with_last_snapshot(mut self, last: Option<PublicationSnapshot>) -> Self {
+        if let Some(last) = last {
+            self.status = Some(last.status);
+            self.hold = last.hold;
+            self.current_latest_version = last.current_latest_version;
+        }
+        self
     }
 
     pub(super) fn with_current_latest_version(

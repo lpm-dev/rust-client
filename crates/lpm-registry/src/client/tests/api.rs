@@ -419,6 +419,79 @@ async fn publication_status_sends_package_identity_and_publish_bearer() {
 
     assert_eq!(response.status, "pending_review");
     assert_eq!(response.current_latest_version.as_deref(), Some("1.1.0"));
+    assert_eq!(response.hold, None);
+}
+
+#[tokio::test]
+async fn publication_status_reads_a_hold_and_leaves_out_one_it_cant_read() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let cases = [
+        (
+            serde_json::json!({
+                "reason": "publication_intent_changed",
+                "message": "It was published for a distribution this package doesn't have.",
+                "final": true
+            }),
+            Some(PublicationHold {
+                reason: Some("publication_intent_changed".into()),
+                message: Some(
+                    "It was published for a distribution this package doesn't have.".into(),
+                ),
+                is_final: true,
+            }),
+        ),
+        (
+            serde_json::json!({ "reason": "release_cooldown", "message": "Soon." }),
+            Some(PublicationHold {
+                reason: Some("release_cooldown".into()),
+                message: Some("Soon.".into()),
+                is_final: false,
+            }),
+        ),
+        (
+            serde_json::json!({ "reason": "package_archived", "message": 5, "final": null }),
+            Some(PublicationHold {
+                reason: Some("package_archived".into()),
+                message: None,
+                is_final: false,
+            }),
+        ),
+        (
+            serde_json::json!({ "final": "yes" }),
+            Some(PublicationHold {
+                reason: None,
+                message: None,
+                is_final: false,
+            }),
+        ),
+        (serde_json::json!("held"), None),
+        (serde_json::Value::Null, None),
+    ];
+    for (hold, expected) in cases {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/package/publication-status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "@lpm.dev/owner.resolved",
+                "version": "1.2.3",
+                "status": "processing",
+                "reviewStatus": "approved",
+                "hold": hold
+            })))
+            .mount(&server)
+            .await;
+
+        let response = RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("publish-token")
+            .get_publication_status("@lpm.dev/owner.resolved", "1.2.3")
+            .await
+            .expect("a hold never fails the poll");
+
+        assert_eq!(response.hold, expected, "{hold}");
+    }
 }
 
 #[tokio::test]
