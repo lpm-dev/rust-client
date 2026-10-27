@@ -1199,7 +1199,7 @@ fn parse_env_str_with_case_policy(
     let mut lines = content.lines();
 
     while let Some(line) = lines.next() {
-        let trimmed = line.trim();
+        let trimmed = lpm_vault::dotenv_line(line);
 
         // Skip empty lines and comments
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -1215,7 +1215,7 @@ fn parse_env_str_with_case_policy(
             None => continue,
         };
 
-        let key = trimmed[..eq_pos].trim().to_string();
+        let key = lpm_vault::trim_dotenv_blanks(&trimmed[..eq_pos]).to_string();
         if key.is_empty() {
             continue;
         }
@@ -1223,7 +1223,7 @@ fn parse_env_str_with_case_policy(
             vars.remove(&previous);
         }
 
-        let raw_value = trimmed[eq_pos + 1..].trim();
+        let raw_value = lpm_vault::trim_dotenv_blanks(&trimmed[eq_pos + 1..]);
 
         if let Some(rest) = raw_value.strip_prefix('"') {
             let value = lpm_vault::parse_double_quoted_env_value(rest, &mut lines);
@@ -1661,6 +1661,27 @@ mod tests {
             parse_env_str("# This is a comment\n\nKEY=value\n  # Another comment\n\nOTHER=123");
         assert_eq!(vars.len(), 2);
         assert_eq!(vars.get("KEY").unwrap(), "value");
+    }
+
+    #[test]
+    fn parse_env_keeps_characters_that_look_blank_around_unquoted_values() {
+        let vars = parse_env_str(
+            "\u{feff}FIRST=one\n\t PADDED = two \t\r\nNBSP=three\u{a0}\nZWSP=\u{200b}four\nFEED=five\u{c}\n",
+        );
+        assert_eq!(vars["FIRST"], "one");
+        assert_eq!(vars["PADDED"], "two");
+        assert_eq!(vars["NBSP"], "three\u{a0}");
+        assert_eq!(vars["ZWSP"], "\u{200b}four");
+        assert_eq!(vars["FEED"], "five\u{c}");
+    }
+
+    #[test]
+    fn a_file_reads_the_same_when_run_as_when_imported() {
+        let content = "A= one \nB=\u{a0}two\u{a0}\nC=\"three \"\n\u{3000}D=four\nE='five'\n";
+        assert_eq!(
+            parse_env_str(content),
+            lpm_vault::parse_env_content(content)
+        );
     }
 
     #[test]

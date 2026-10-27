@@ -3629,3 +3629,122 @@ fn env_check_reports_hidden_characters_as_warnings_not_failures() {
     );
     assert!(!stdout.contains("fixture"), "{stdout}");
 }
+
+#[test]
+fn env_import_keeps_characters_that_look_blank_at_the_ends_of_unquoted_values() {
+    let project = TempProject::empty(r#"{"name":"env-blank-ends","version":"1.0.0"}"#);
+    write_dotenv(
+        &project,
+        ".env",
+        "\u{FEFF}FIRST=fixture-one\nTRAIL= fixture\u{A0}\t\nWIDE=\u{3000}fixture\n",
+    );
+
+    let import = lpm(&project)
+        .args(["env", "import", ".env"])
+        .output()
+        .expect("failed to run lpm env import");
+    assert!(
+        import.status.success(),
+        "{}",
+        String::from_utf8_lossy(&import.stderr)
+    );
+    let stderr = strip_ansi(&String::from_utf8_lossy(&import.stderr));
+    assert!(
+        stderr.contains("imported 3 secrets"),
+        "a byte order mark is no part of the first key:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("TRAIL has characters that are hard to see"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("\\u{a0} NO-BREAK SPACE at the end"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("\\u{3000} IDEOGRAPHIC SPACE at the start"),
+        "{stderr}"
+    );
+
+    for (key, expected) in [
+        ("FIRST", "fixture-one"),
+        ("TRAIL", "fixture\u{A0}"),
+        ("WIDE", "\u{3000}fixture"),
+    ] {
+        let get = lpm(&project)
+            .args(["env", "get", key, "--reveal"])
+            .output()
+            .expect("failed to run lpm env get");
+        assert_eq!(
+            String::from_utf8_lossy(&get.stdout),
+            format!("{expected}\n"),
+            "{key} keeps every character but the spaces and tabs around it"
+        );
+    }
+}
+
+#[test]
+fn env_import_refuses_a_key_that_is_not_a_valid_name_and_keeps_the_vault_readable() {
+    let project = TempProject::empty(r#"{"name":"env-invalid-import-key","version":"1.0.0"}"#);
+    lpm(&project)
+        .args(["env", "set", "KEPT=fixture-kept"])
+        .assert()
+        .success();
+    write_dotenv(&project, ".env", "\u{A0}PADDED=fixture\nGOOD=fixture-two\n");
+
+    let import = lpm(&project)
+        .args(["env", "import", ".env"])
+        .output()
+        .expect("failed to run lpm env import");
+    assert!(
+        !import.status.success(),
+        "an invalid key refuses the import"
+    );
+    let stderr = strip_ansi(&String::from_utf8_lossy(&import.stderr));
+    assert!(
+        stderr.contains(r#""\u{a0}PADDED""#),
+        "the key is named with its hidden character escaped:\n{stderr}"
+    );
+
+    let list = lpm(&project)
+        .args(["--json", "env", "list"])
+        .output()
+        .expect("failed to run lpm env list");
+    assert!(
+        list.status.success(),
+        "the vault stays readable:\n{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+    let listed = parse_json_stdout(&list, "env list --json");
+    assert_eq!(
+        listed,
+        serde_json::json!({"KEPT": "••••••••"}),
+        "nothing from the refused file was written"
+    );
+}
+
+#[test]
+fn env_init_refuses_a_key_that_is_not_a_valid_name_and_names_its_hidden_characters() {
+    let project = TempProject::empty(r#"{"name":"env-invalid-init-key","version":"1.0.0"}"#);
+    write_dotenv(&project, ".env", "GOOD=fixture\n\u{A0}BAD=fixture-two\n");
+
+    let init = lpm(&project)
+        .args(["env", "init"])
+        .output()
+        .expect("failed to run lpm env init");
+    assert!(!init.status.success(), "an invalid key refuses the init");
+    let stderr = strip_ansi(&String::from_utf8_lossy(&init.stderr));
+    assert!(
+        stderr.contains(r"rejected: \u{a0}BAD"),
+        "the key's hidden character is shown as an escape:\n{stderr}"
+    );
+    let list = lpm(&project)
+        .args(["--json", "env", "list"])
+        .output()
+        .expect("failed to run lpm env list");
+    assert!(
+        list.status.success(),
+        "the vault stays readable:\n{}",
+        String::from_utf8_lossy(&list.stderr)
+    );
+}

@@ -284,9 +284,12 @@ fn is_valid_vault_key(name: &str) -> bool {
 }
 
 fn reject_invalid_keys<'a>(pairs: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
-    let bad: Vec<&str> = pairs
+    // A rejected key is shown with its hidden characters as escapes, since a
+    // no-break space or a zero-width space is often why it's rejected.
+    let bad: Vec<String> = pairs
         .into_iter()
         .filter(|k| !is_valid_vault_key(k))
+        .map(|k| lpm_env::show_hidden_characters(k).text)
         .collect();
     if bad.is_empty() {
         Ok(())
@@ -1579,11 +1582,12 @@ fn write_all_environments(
 ///
 /// Public so callers like `vars init` can count variables before importing.
 pub fn parse_env_content(content: &str) -> HashMap<String, String> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let mut vars = HashMap::new();
     let mut lines = content.lines();
 
     while let Some(line) = lines.next() {
-        let line = line.trim();
+        let line = dotenv_line(line);
 
         // Skip empty lines and comments
         if line.is_empty() || line.starts_with('#') {
@@ -1594,8 +1598,8 @@ pub fn parse_env_content(content: &str) -> HashMap<String, String> {
         let line = line.strip_prefix("export ").unwrap_or(line);
 
         if let Some((key, value)) = line.split_once('=') {
-            let key = key.trim().to_string();
-            let value = parse_env_value(value.trim_start(), &mut lines);
+            let key = trim_dotenv_blanks(key).to_string();
+            let value = parse_env_value(value.trim_start_matches(is_dotenv_blank), &mut lines);
 
             if !key.is_empty() {
                 vars.insert(key, value);
@@ -1615,7 +1619,27 @@ fn parse_env_value(value: &str, lines: &mut std::str::Lines<'_>) -> String {
         return parse_single_quoted_env_value(rest, lines);
     }
 
-    value.trim().to_string()
+    trim_dotenv_blanks(value).to_string()
+}
+
+/// Whether `character` is a blank of dotenv syntax, which separates a key and
+/// an unquoted value from what's around them: a space or a tab. Every other
+/// character, even one that looks blank such as a no-break space, belongs to
+/// the value, where the warnings about characters that are hard to see find
+/// it. LPM Vault's parser keeps the same rule.
+pub fn is_dotenv_blank(character: char) -> bool {
+    matches!(character, ' ' | '\t')
+}
+
+/// `text` without the spaces and tabs at either end.
+pub fn trim_dotenv_blanks(text: &str) -> &str {
+    text.trim_matches(is_dotenv_blank)
+}
+
+/// One line of a dotenv file as its syntax reads it: without the carriage
+/// return of a `\r\n` ending, or the spaces and tabs at either end.
+pub fn dotenv_line(line: &str) -> &str {
+    trim_dotenv_blanks(line.strip_suffix('\r').unwrap_or(line))
 }
 
 /// Writes each parsed value unless its key is there and `overwrite` is off,
@@ -1899,6 +1923,28 @@ KEY3=no-quotes"#;
         let vars = parse_env_content("KEY=\"left\\\nright\"\n");
 
         assert_eq!(vars["KEY"], "left\\\nright");
+    }
+
+    #[test]
+    fn parse_env_trims_only_spaces_and_tabs_around_unquoted_values() {
+        let vars = parse_env_content(
+            "\u{feff}FIRST=one\n\t PADDED = two \t\r\nNBSP=three\u{a0}\nZWSP=\u{200b}four\u{200b}\nWIDE=\u{3000}five\u{3000}\nFEED=six\u{c}\n",
+        );
+        assert_eq!(
+            vars["FIRST"], "one",
+            "a byte order mark at the start is no part of the first key"
+        );
+        assert_eq!(vars["PADDED"], "two");
+        assert_eq!(vars["NBSP"], "three\u{a0}");
+        assert_eq!(vars["ZWSP"], "\u{200b}four\u{200b}");
+        assert_eq!(vars["WIDE"], "\u{3000}five\u{3000}");
+        assert_eq!(vars["FEED"], "six\u{c}");
+    }
+
+    #[test]
+    fn parse_env_keeps_a_character_that_looks_blank_in_the_key() {
+        let vars = parse_env_content("\u{a0}KEY=value\n");
+        assert_eq!(vars.keys().collect::<Vec<_>>(), ["\u{a0}KEY"]);
     }
 
     #[test]
