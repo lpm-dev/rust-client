@@ -75,6 +75,19 @@ jobs:
           tenant-id: ${{ secrets.WINDOWS_SIGNING_AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.WINDOWS_SIGNING_AZURE_SUBSCRIPTION_ID }}
 
+      # Some Windows runners start without PSGallery registered, and the signing
+      # action installs its PowerShell module from it whenever its cache misses.
+      - name: Register the PowerShell Gallery
+        shell: pwsh
+        run: |
+          if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+            Register-PSRepository -Default
+            # Registering runs nuget.exe, which can leave a failing exit code
+            # behind even though PSGallery is registered; the check below decides.
+            $global:LASTEXITCODE = 0
+          }
+          Get-PSRepository -Name PSGallery | Format-List Name, SourceLocation
+
       - name: Sign binaries
         uses: azure/artifact-signing-action@c0ae2c1d0c1847ab81ac0ab8521bee597cfedd30 # v2
         with:

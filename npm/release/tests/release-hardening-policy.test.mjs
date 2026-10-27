@@ -18,6 +18,20 @@ function jobSource(workflow, job, nextJob) {
   return workflow.slice(start, end);
 }
 
+function jobsOf(workflow) {
+  const jobs = workflow.slice(workflow.indexOf("\njobs:\n"));
+  const headers = [...jobs.matchAll(/^  ([A-Za-z0-9_-]+):\n/gm)];
+  return headers.map((header, index) => [
+    header[1],
+    jobs.slice(header.index, headers[index + 1]?.index ?? jobs.length),
+  ]);
+}
+
+function stepsOf(job) {
+  const start = job.indexOf("\n    steps:\n");
+  return start === -1 ? [] : job.slice(start).split("\n      - ").slice(1);
+}
+
 test("nightly and candidate construction survives the unused verification branch being skipped", () => {
   const workflow = read(".github/workflows/release.yml");
   const constructionJobs = [
@@ -181,6 +195,43 @@ test("macOS signing and ticket checks outlast transient Apple service failures",
   );
   assert.match(preflight, /bash scripts\/ci\/test-with-apple-service-retry\.sh/);
   assert.match(ci, /bash scripts\/ci\/test-with-apple-service-retry\.sh/);
+});
+
+test("Windows signing registers the PowerShell Gallery before the signing action installs from it", () => {
+  const signingJobs = [];
+  const workflows = fs
+    .readdirSync(path.join(repoRoot, ".github/workflows"))
+    .filter(name => /\.ya?ml$/.test(name))
+    .sort();
+  for (const file of workflows) {
+    for (const [job, source] of jobsOf(read(`.github/workflows/${file}`))) {
+      const steps = stepsOf(source);
+      const signing = steps.findIndex(step => /\buses: azure\/artifact-signing-action@/.test(step));
+      if (signing === -1) continue;
+      signingJobs.push(`${file}:${job}`);
+
+      const registration = steps.findIndex(step => /Register-PSRepository -Default/.test(step));
+      assert.ok(
+        registration !== -1 && registration < signing,
+        `${file}:${job} must register PSGallery before the signing action installs its module`,
+      );
+      const step = steps[registration];
+      assert.match(step, /\n        shell: pwsh\n/, `${file}:${job} must register PSGallery for pwsh`);
+      assert.doesNotMatch(
+        step,
+        /^        (if|continue-on-error):/m,
+        `${file}:${job} must always register PSGallery, and fail if it can't`,
+      );
+      assert.match(
+        step,
+        /if \(-not \(Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue\)\) \{\n\s+Register-PSRepository -Default\n(?:\s+#.*\n)*\s+\$global:LASTEXITCODE = 0\n\s+\}\n\s+Get-PSRepository -Name PSGallery \|/,
+        `${file}:${job} must register PSGallery only when it is missing, let the check after it decide the step's result, then confirm it is there`,
+      );
+    }
+  }
+  for (const job of ["release.yml:sign-windows", "windows-signing-smoke.yml:sign"]) {
+    assert.ok(signingJobs.includes(job), `expected ${job} to use the signing action`);
+  }
 });
 
 test("candidate smoke and sealing hard-enforce uploaded artifact digests", () => {
