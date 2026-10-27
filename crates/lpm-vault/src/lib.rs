@@ -1587,10 +1587,10 @@ pub fn parse_env_content(content: &str) -> HashMap<String, String> {
     let mut lines = content.lines();
 
     while let Some(line) = lines.next() {
-        let line = dotenv_line(line);
+        let line = line.trim_start_matches(is_dotenv_blank);
 
         // Skip empty lines and comments
-        if line.is_empty() || line.starts_with('#') {
+        if is_dotenv_blank_line(line) || line.starts_with('#') {
             continue;
         }
 
@@ -1631,15 +1631,16 @@ pub fn is_dotenv_blank(character: char) -> bool {
     matches!(character, ' ' | '\t')
 }
 
-/// `text` without the spaces and tabs at either end.
+/// `text` without the spaces and tabs at either end. Only an unquoted value
+/// loses those at its end: in a quoted one they're part of the value, even
+/// before a line break inside it.
 pub fn trim_dotenv_blanks(text: &str) -> &str {
     text.trim_matches(is_dotenv_blank)
 }
 
-/// One line of a dotenv file as its syntax reads it: without the carriage
-/// return of a `\r\n` ending, or the spaces and tabs at either end.
-pub fn dotenv_line(line: &str) -> &str {
-    trim_dotenv_blanks(line.strip_suffix('\r').unwrap_or(line))
+/// Whether a line holds only spaces and tabs, or nothing.
+pub fn is_dotenv_blank_line(line: &str) -> bool {
+    line.chars().all(is_dotenv_blank)
 }
 
 /// Writes each parsed value unless its key is there and `overwrite` is off,
@@ -1939,6 +1940,24 @@ KEY3=no-quotes"#;
         assert_eq!(vars["ZWSP"], "\u{200b}four\u{200b}");
         assert_eq!(vars["WIDE"], "\u{3000}five\u{3000}");
         assert_eq!(vars["FEED"], "six\u{c}");
+    }
+
+    #[test]
+    fn parse_env_keeps_blanks_inside_a_quoted_value_that_spans_lines() {
+        let vars = parse_env_content("DOUBLE=\"a  \nb\"\nSINGLE='c\t\nd'\nAFTER=\"e\"  \n");
+        assert_eq!(vars["DOUBLE"], "a  \nb");
+        assert_eq!(vars["SINGLE"], "c\t\nd");
+        assert_eq!(vars["AFTER"], "e");
+    }
+
+    #[test]
+    fn parse_env_keeps_a_carriage_return_that_ends_no_crlf() {
+        assert_eq!(parse_env_content("KEY=value\r")["KEY"], "value\r");
+        assert_eq!(
+            parse_env_content("KEY=value\r\r\nNEXT=1\r\n")["KEY"],
+            "value\r"
+        );
+        assert_eq!(parse_env_content("KEY=value\r\nNEXT=1\r\n")["KEY"], "value");
     }
 
     #[test]

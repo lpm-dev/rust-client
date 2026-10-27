@@ -1199,10 +1199,10 @@ fn parse_env_str_with_case_policy(
     let mut lines = content.lines();
 
     while let Some(line) = lines.next() {
-        let trimmed = lpm_vault::dotenv_line(line);
+        let trimmed = line.trim_start_matches(lpm_vault::is_dotenv_blank);
 
         // Skip empty lines and comments
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        if lpm_vault::is_dotenv_blank_line(trimmed) || trimmed.starts_with('#') {
             continue;
         }
 
@@ -1223,13 +1223,13 @@ fn parse_env_str_with_case_policy(
             vars.remove(&previous);
         }
 
-        let raw_value = lpm_vault::trim_dotenv_blanks(&trimmed[eq_pos + 1..]);
+        let raw_value = trimmed[eq_pos + 1..].trim_start_matches(lpm_vault::is_dotenv_blank);
 
         if let Some(rest) = raw_value.strip_prefix('"') {
             let value = lpm_vault::parse_double_quoted_env_value(rest, &mut lines);
             vars.insert(key, value);
         } else {
-            let value = unquote(raw_value);
+            let value = unquote(lpm_vault::trim_dotenv_blanks(raw_value));
             vars.insert(key, value);
         }
     }
@@ -1676,8 +1676,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_env_keeps_blanks_inside_a_double_quoted_value_that_spans_lines() {
+        let vars = parse_env_str("DOUBLE=\"a  \nb\"\nAFTER=\"e\"  \nSINGLE='f '  \n");
+        assert_eq!(vars["DOUBLE"], "a  \nb");
+        assert_eq!(vars["AFTER"], "e");
+        assert_eq!(vars["SINGLE"], "f ");
+    }
+
+    #[test]
+    fn parse_env_keeps_a_carriage_return_that_ends_no_crlf() {
+        assert_eq!(parse_env_str("KEY=value\r")["KEY"], "value\r");
+        assert_eq!(parse_env_str("KEY=value\r\r\nNEXT=1\r\n")["KEY"], "value\r");
+        assert_eq!(parse_env_str("KEY=value\r\nNEXT=1\r\n")["KEY"], "value");
+    }
+
+    #[test]
     fn a_file_reads_the_same_when_run_as_when_imported() {
-        let content = "A= one \nB=\u{a0}two\u{a0}\nC=\"three \"\n\u{3000}D=four\nE='five'\n";
+        let content = "A= one \nB=\u{a0}two\u{a0}\nC=\"three \"\n\u{3000}D=four\nE='five'\nF=\"six  \nseven\"\nG=eight\r";
         assert_eq!(
             parse_env_str(content),
             lpm_vault::parse_env_content(content)

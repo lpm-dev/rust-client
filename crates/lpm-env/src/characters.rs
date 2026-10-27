@@ -487,7 +487,9 @@ fn classify(
         '\u{FE0E}' | '\u{FE0F}' if context.previous.is_some_and(|base| EMOJI.contains(base)) => {
             return None;
         }
-        '\u{E0100}'..='\u{E01EF}'
+        // Ideographic variation sequences, and the standardized variants
+        // that stand for CJK compatibility ideographs, such as U+4FAE U+FE00.
+        '\u{E0100}'..='\u{E01EF}' | '\u{FE00}'..='\u{FE02}'
             if context
                 .previous
                 .is_some_and(|base| UNIFIED_IDEOGRAPHS.contains(base)) =>
@@ -1153,6 +1155,7 @@ mod tests {
             "שלום עולם",
             "你好，世界",
             "葛\u{E0100}城市",
+            "侮\u{FE00}辱",
             "こんにちは世界",
             "안녕하세요",
             "Привет, мир",
@@ -1214,6 +1217,23 @@ mod tests {
                 vec![(3, 3)]
             ),
             "selectors after the first can only be hiding data"
+        );
+        assert_eq!(
+            single("侮\u{FE00}\u{FE01}"),
+            (
+                CharacterKind::Invisible,
+                HiddenCharacter::VariationSelectors,
+                vec![(3, 1)]
+            ),
+            "one standardized selector after an ideograph is text; a second is not"
+        );
+        assert_eq!(
+            single("a\u{FE00}"),
+            (
+                CharacterKind::Invisible,
+                HiddenCharacter::VariationSelectors,
+                vec![(2, 1)]
+            )
         );
         assert_eq!(
             single("ᠠ\u{180B}\u{180C}"),
