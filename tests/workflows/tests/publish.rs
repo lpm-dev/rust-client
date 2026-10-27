@@ -3323,6 +3323,7 @@ async fn publish_wait_json_reports_upload_and_active_publication_states() {
             "success": true,
             "status": "active",
             "current_latest_version": "1.0.0",
+            "hold": null,
             "error": null
           },
           "duration_ms": 0

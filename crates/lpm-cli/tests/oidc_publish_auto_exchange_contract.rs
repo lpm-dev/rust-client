@@ -611,6 +611,122 @@ async fn publish_wait_uses_the_status_only_oidc_credential() {
     );
 }
 
+/// Mounts an OIDC publish whose upload succeeds and whose status polls
+/// answer `status_body`, expecting `polls` of them.
+async fn mount_held_publication(server: &MockServer, status_body: serde_json::Value, polls: u64) {
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/oidc"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "token": EXCHANGED_TOKEN,
+            "publicationStatusToken": PUBLICATION_STATUS_TOKEN,
+            "publicationStatusExpiresAt": "2099-08-11T12:00:00.000Z"
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/whoami"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "username": "owner",
+            "mfa_enabled": false
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex("/api/registry/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true,
+            "publicationStatus": "pending_review",
+            "currentLatestVersion": null
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/registry/-/package/publication-status"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(status_body))
+        .expect(polls)
+        .mount(server)
+        .await;
+}
+
+const FINAL_HOLD_MESSAGE: &str =
+    "It was published for a distribution this package doesn't have. Publish a new version.";
+
+fn final_hold_status() -> serde_json::Value {
+    serde_json::json!({
+        "name": PACKAGE_NAME,
+        "version": "0.1.0",
+        "status": "processing",
+        "reviewStatus": "approved",
+        "hold": {
+            "reason": "publication_intent_changed",
+            "message": FINAL_HOLD_MESSAGE,
+            "final": true
+        },
+        "currentLatestVersion": null
+    })
+}
+
+#[tokio::test]
+async fn publish_wait_stops_at_a_final_hold_and_reports_it_in_json() {
+    let server = MockServer::start().await;
+    mount_held_publication(&server, final_hold_status(), 1).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_minimal_project(tmp.path());
+
+    let output = spawn_publish(
+        tmp.path(),
+        &server.uri(),
+        &["--yes", "--wait", "--wait-timeout", "60", "--json"],
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a final hold fails the publish\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["success"], false);
+    let wait = &json["results"][0]["publication_wait"];
+    assert_eq!(
+        json["results"][0]["success"], true,
+        "the upload itself succeeded"
+    );
+    assert_eq!(wait["success"], false);
+    assert_eq!(wait["status"], "processing");
+    assert_eq!(wait["hold"]["reason"], "publication_intent_changed");
+    assert_eq!(wait["hold"]["final"], true);
+    assert_eq!(
+        wait["error"],
+        format!(
+            "Upload succeeded, but this version won't become available. {FINAL_HOLD_MESSAGE} Do not publish this version again."
+        )
+    );
+}
+
+#[tokio::test]
+async fn publish_wait_stops_at_a_final_hold_and_says_why() {
+    let server = MockServer::start().await;
+    mount_held_publication(&server, final_hold_status(), 1).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_minimal_project(tmp.path());
+
+    let output = spawn_publish(
+        tmp.path(),
+        &server.uri(),
+        &["--yes", "--wait", "--wait-timeout", "60"],
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr={stderr}");
+    assert!(
+        stderr.contains(&format!("won't become available. {FINAL_HOLD_MESSAGE}")),
+        "stderr={stderr}"
+    );
+}
+
 #[tokio::test]
 async fn publish_check_skips_oidc_exchange() {
     // `--check` is a local-validation surface. Even with LPM as target and

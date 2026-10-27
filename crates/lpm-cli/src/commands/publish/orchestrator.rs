@@ -24,6 +24,7 @@ use super::target::resolve_targets;
 use super::types::{
     LpmPublicationStatus, NpmTargetArtifact, NpmTargetArtifactInput, PublicationWaitResult,
     PublishProject, PublishQualityGateInput, PublishResult, PublishTarget, ResolvedProvenance,
+    hold_explanation,
 };
 use super::upload_lpm::{LpmPublishBody, OtpFailure, publish_to_lpm, resolve_lpm_otp};
 use super::version_data::{build_publish_version_data, integrity_to_sha512_hex};
@@ -2132,6 +2133,14 @@ async fn execute_prepared_inner(
                         &version,
                         timeout,
                         oidc_token_for_wait.as_ref(),
+                        |hold| {
+                            if !json_output {
+                                install_ui::warn_untrusted(&format!(
+                                    "{lpm_name}@{version} isn't available yet. {}",
+                                    hold_explanation(hold)
+                                ));
+                            }
+                        },
                     )
                     .await
                 }

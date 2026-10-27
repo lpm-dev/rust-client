@@ -1045,6 +1045,34 @@ pub struct PublicationStatusResponse {
     pub review_status: Option<String>,
     #[serde(default, rename = "currentLatestVersion")]
     pub current_latest_version: Option<String>,
+    /// Why a version that passed its review isn't available yet. A hold
+    /// this client can't read is left out rather than failing the poll.
+    #[serde(default, deserialize_with = "deserialize_publication_hold")]
+    pub hold: Option<PublicationHold>,
+}
+
+/// Why the Registry holds a version that passed its publication review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicationHold {
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// The hold and what the package's owner can do about it.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Only a new version gets past the hold: checking this one again can't
+    /// clear it.
+    #[serde(default, rename = "final")]
+    pub is_final: bool,
+}
+
+fn deserialize_publication_hold<'de, D>(
+    deserializer: D,
+) -> Result<Option<PublicationHold>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
