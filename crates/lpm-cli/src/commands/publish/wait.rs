@@ -60,8 +60,9 @@ pub(super) async fn wait_for_lpm_publication_with_oidc(
 
 /// Polls until the version is active, reaches a state further polls can't
 /// change, or `deadline` passes, a poll in flight included. Each hold is
-/// reported once as it appears or changes; one only a new version gets past
-/// ends the wait. A wait that runs out reports what the last poll saw.
+/// reported once as it appears or changes, again if it returns after
+/// clearing; one only a new version gets past ends the wait. A wait that
+/// runs out, or a poll that fails, reports what the last poll saw.
 pub(super) async fn poll_publication_snapshots<F, Fut>(
     mut fetch_snapshot: F,
     deadline: Instant,
@@ -77,9 +78,7 @@ where
         let snapshot = match tokio::time::timeout_at(deadline, fetch_snapshot()).await {
             Ok(Ok(snapshot)) => snapshot,
             Ok(Err(error)) => {
-                return PublicationWaitResult::request_failed(&error).with_current_latest_version(
-                    last.and_then(|last| last.current_latest_version),
-                );
+                return PublicationWaitResult::request_failed(&error).with_last_snapshot(last);
             }
             Err(_) => break,
         };
@@ -227,7 +226,11 @@ mod tests {
         let result = wait_for(fetch, Duration::from_secs(10), &mut Vec::new()).await;
 
         assert_eq!(*polls.lock().unwrap(), 4, "polls at 0, 3, 6 and 9 seconds");
-        assert!(started.elapsed() <= Duration::from_secs(10));
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(9),
+            "a poll that would land past the deadline isn't waited for"
+        );
         assert_eq!(result.status, Some(LpmPublicationStatus::PendingReview));
         assert_eq!(result.current_latest_version.as_deref(), Some("1.1.0"));
         assert_eq!(
@@ -290,6 +293,88 @@ mod tests {
             Some(
                 "Upload succeeded, but waiting for LPM.dev Registry publication timed out. The version isn't available yet. It becomes available when its release cooldown ends. Do not publish this version again."
             )
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stops_when_a_hold_becomes_one_only_a_new_version_gets_past() {
+        let rechecked = hold(
+            "dependency_rights_changed",
+            "One of its dependencies is private.",
+            false,
+        );
+        let final_hold = hold(
+            "dependency_rights_changed",
+            "One of its dependencies is private.",
+            true,
+        );
+        let (fetch, polls) = scripted(vec![
+            snapshot(LpmPublicationStatus::Processing, Some(rechecked.clone())),
+            snapshot(LpmPublicationStatus::Processing, Some(final_hold.clone())),
+        ]);
+        let mut reported = Vec::new();
+
+        let result = wait_for(fetch, Duration::from_secs(60), &mut reported).await;
+
+        assert_eq!(*polls.lock().unwrap(), 2);
+        assert_eq!(reported, vec![rechecked]);
+        assert_eq!(result.hold, Some(final_hold));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("won't become available"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reports_a_hold_again_when_it_returns_after_clearing() {
+        let archived = hold("package_archived", "The package is archived.", false);
+        let (fetch, _) = scripted(vec![
+            snapshot(LpmPublicationStatus::Processing, Some(archived.clone())),
+            snapshot(LpmPublicationStatus::Processing, None),
+            snapshot(LpmPublicationStatus::Processing, Some(archived.clone())),
+            snapshot(LpmPublicationStatus::Active, None),
+        ]);
+        let mut reported = Vec::new();
+
+        let result = wait_for(fetch, Duration::from_secs(60), &mut reported).await;
+
+        assert!(result.success);
+        assert_eq!(reported, vec![archived.clone(), archived]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_poll_keeps_what_the_last_one_saw() {
+        let archived = hold("package_archived", "The package is archived.", false);
+        let mut answered = false;
+        let fetch = || {
+            let first = !std::mem::replace(&mut answered, true);
+            let archived = archived.clone();
+            std::future::ready(if first {
+                Ok(snapshot(LpmPublicationStatus::Processing, Some(archived)))
+            } else {
+                Err(LpmError::Network("connection reset".into()))
+            })
+        };
+
+        let result = poll_publication_snapshots(
+            fetch,
+            Instant::now() + Duration::from_secs(60),
+            POLL,
+            |_| {},
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(result.status, Some(LpmPublicationStatus::Processing));
+        assert_eq!(result.hold, Some(archived));
+        assert_eq!(result.current_latest_version.as_deref(), Some("1.1.0"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("could not be checked"))
         );
     }
 

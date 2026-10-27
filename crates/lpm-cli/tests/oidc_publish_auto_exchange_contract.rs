@@ -612,8 +612,8 @@ async fn publish_wait_uses_the_status_only_oidc_credential() {
 }
 
 /// Mounts an OIDC publish whose upload succeeds and whose status polls
-/// answer `status_body`, expecting `polls` of them.
-async fn mount_held_publication(server: &MockServer, status_body: serde_json::Value, polls: u64) {
+/// answer `statuses` in order, one poll each.
+async fn mount_held_publication(server: &MockServer, statuses: &[serde_json::Value]) {
     Mock::given(method("POST"))
         .and(path("/api/registry/-/token/oidc"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -641,12 +641,15 @@ async fn mount_held_publication(server: &MockServer, status_body: serde_json::Va
         .expect(1)
         .mount(server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/api/registry/-/package/publication-status"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(status_body))
-        .expect(polls)
-        .mount(server)
-        .await;
+    for status in statuses {
+        Mock::given(method("GET"))
+            .and(path("/api/registry/-/package/publication-status"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(status))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(server)
+            .await;
+    }
 }
 
 const FINAL_HOLD_MESSAGE: &str =
@@ -670,7 +673,7 @@ fn final_hold_status() -> serde_json::Value {
 #[tokio::test]
 async fn publish_wait_stops_at_a_final_hold_and_reports_it_in_json() {
     let server = MockServer::start().await;
-    mount_held_publication(&server, final_hold_status(), 1).await;
+    mount_held_publication(&server, &[final_hold_status()]).await;
     let tmp = tempfile::tempdir().unwrap();
     write_minimal_project(tmp.path());
 
@@ -709,7 +712,7 @@ async fn publish_wait_stops_at_a_final_hold_and_reports_it_in_json() {
 #[tokio::test]
 async fn publish_wait_stops_at_a_final_hold_and_says_why() {
     let server = MockServer::start().await;
-    mount_held_publication(&server, final_hold_status(), 1).await;
+    mount_held_publication(&server, &[final_hold_status()]).await;
     let tmp = tempfile::tempdir().unwrap();
     write_minimal_project(tmp.path());
 
@@ -725,6 +728,76 @@ async fn publish_wait_stops_at_a_final_hold_and_says_why() {
         stderr.contains(&format!("won't become available. {FINAL_HOLD_MESSAGE}")),
         "stderr={stderr}"
     );
+}
+
+const RECHECKED_HOLD_MESSAGE: &str =
+    "The package is archived. Unarchive the package; the release is checked again automatically.";
+
+/// A hold a later check can clear, then the version available.
+fn rechecked_hold_then_active() -> [serde_json::Value; 2] {
+    let status = |status: &str, hold: serde_json::Value| {
+        serde_json::json!({
+            "name": PACKAGE_NAME,
+            "version": "0.1.0",
+            "status": status,
+            "reviewStatus": "approved",
+            "hold": hold,
+            "currentLatestVersion": null
+        })
+    };
+    [
+        status(
+            "processing",
+            serde_json::json!({
+                "reason": "package_archived",
+                "message": RECHECKED_HOLD_MESSAGE,
+                "final": false
+            }),
+        ),
+        status("active", serde_json::Value::Null),
+    ]
+}
+
+#[tokio::test]
+async fn publish_wait_says_once_why_a_version_isnt_available_yet() {
+    let server = MockServer::start().await;
+    mount_held_publication(&server, &rechecked_hold_then_active()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_minimal_project(tmp.path());
+
+    let output = spawn_publish(
+        tmp.path(),
+        &server.uri(),
+        &["--yes", "--wait", "--wait-timeout", "60"],
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr={stderr}");
+    let warning = format!("{PACKAGE_NAME}@0.1.0 isn't available yet. {RECHECKED_HOLD_MESSAGE}");
+    assert_eq!(stderr.matches(&warning).count(), 1, "stderr={stderr}");
+}
+
+#[tokio::test]
+async fn publish_wait_keeps_json_output_free_of_hold_warnings() {
+    let server = MockServer::start().await;
+    mount_held_publication(&server, &rechecked_hold_then_active()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_minimal_project(tmp.path());
+
+    let output = spawn_publish(
+        tmp.path(),
+        &server.uri(),
+        &["--yes", "--wait", "--wait-timeout", "60", "--json"],
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr={stderr}");
+    assert!(!stderr.contains("isn't available yet"), "stderr={stderr}");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let wait = &json["results"][0]["publication_wait"];
+    assert_eq!(wait["success"], true);
+    assert_eq!(wait["status"], "active");
+    assert_eq!(wait["hold"], serde_json::Value::Null);
 }
 
 #[tokio::test]

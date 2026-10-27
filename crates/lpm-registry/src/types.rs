@@ -1052,16 +1052,21 @@ pub struct PublicationStatusResponse {
 }
 
 /// Why the Registry holds a version that passed its publication review.
+/// Each field this client can't read is left out on its own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublicationHold {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_string")]
     pub reason: Option<String>,
     /// The hold and what the package's owner can do about it.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_lenient_string")]
     pub message: Option<String>,
-    /// Only a new version gets past the hold: checking this one again can't
+    /// Only a new version gets past the hold: no check of this one can
     /// clear it.
-    #[serde(default, rename = "final")]
+    #[serde(
+        default,
+        rename = "final",
+        deserialize_with = "deserialize_lenient_bool"
+    )]
     pub is_final: bool,
 }
 
@@ -1073,6 +1078,25 @@ where
 {
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
     Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
+
+fn deserialize_lenient_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| match value {
+        serde_json::Value::String(value) => Some(value),
+        _ => None,
+    }))
+}
+
+fn deserialize_lenient_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| value.as_bool()).unwrap_or(false))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -450,7 +450,22 @@ async fn publication_status_reads_a_hold_and_leaves_out_one_it_cant_read() {
                 is_final: false,
             }),
         ),
-        (serde_json::json!({ "final": "yes" }), None),
+        (
+            serde_json::json!({ "reason": "package_archived", "message": 5, "final": null }),
+            Some(PublicationHold {
+                reason: Some("package_archived".into()),
+                message: None,
+                is_final: false,
+            }),
+        ),
+        (
+            serde_json::json!({ "final": "yes" }),
+            Some(PublicationHold {
+                reason: None,
+                message: None,
+                is_final: false,
+            }),
+        ),
         (serde_json::json!("held"), None),
         (serde_json::Value::Null, None),
     ];

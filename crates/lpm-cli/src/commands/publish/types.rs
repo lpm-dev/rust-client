@@ -227,6 +227,16 @@ impl PublicationWaitResult {
         }
     }
 
+    /// Keeps what the last poll saw: its status, hold and latest version.
+    pub(super) fn with_last_snapshot(mut self, last: Option<PublicationSnapshot>) -> Self {
+        if let Some(last) = last {
+            self.status = Some(last.status);
+            self.hold = last.hold;
+            self.current_latest_version = last.current_latest_version;
+        }
+        self
+    }
+
     pub(super) fn with_current_latest_version(
         mut self,
         current_latest_version: Option<String>,

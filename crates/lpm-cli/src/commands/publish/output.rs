@@ -50,7 +50,11 @@ pub(super) fn publish_result_json(result: &PublishResult) -> serde_json::Value {
                 "success": wait.success,
                 "status": wait.status.as_ref().map(LpmPublicationStatus::as_str),
                 "current_latest_version": wait.current_latest_version.as_deref(),
-                "hold": wait.hold,
+                "hold": wait.hold.as_ref().map(|hold| serde_json::json!({
+                    "reason": hold.reason.as_deref(),
+                    "message": hold.message.as_deref(),
+                    "final": hold.is_final,
+                })),
                 "error": wait.error.as_deref(),
             }),
         );
