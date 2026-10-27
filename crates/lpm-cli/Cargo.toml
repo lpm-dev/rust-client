@@ -152,7 +152,7 @@ jsonschema = { version = "0.46", default-features = false }
 # Typed errors for the C1 Sigstore verifier (`sigstore_verify.rs`).
 # Matches the workspace-wide convention (`lpm_common::LpmError`).
 thiserror = { workspace = true }
-roxmltree = "=0.21.1"
+roxmltree = "=0.21.2"
 spdx = { version = "0.13.5", default-features = false }
 
 # Unix process group management (build.rs timeout kill)
