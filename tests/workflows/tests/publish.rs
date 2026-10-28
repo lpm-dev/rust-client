@@ -5220,3 +5220,41 @@ async fn publish_json_preserves_registry_skill_warnings() {
         "Agent Skills haven't changed since v1.0.0"
     );
 }
+
+#[test]
+fn a_mock_registry_drops_after_its_task_spends_its_cooperative_budget() {
+    let (dropped, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let registry = MockRegistry::start().await;
+                while tokio::task::coop::has_budget_remaining() {
+                    registry.server().received_requests().await;
+                }
+                drop(registry);
+            });
+        dropped.send(()).unwrap();
+    });
+
+    assert!(
+        received
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .is_ok(),
+        "a mock registry must drop after its task's cooperative budget is spent"
+    );
+}
+
+#[tokio::test]
+#[should_panic(expected = "Verifications failed")]
+async fn a_mock_registry_fails_its_test_when_a_mock_expectation_is_unmet() {
+    let registry = MockRegistry::start().await;
+    Mock::given(method("GET"))
+        .and(path("/never-requested"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(registry.server())
+        .await;
+}

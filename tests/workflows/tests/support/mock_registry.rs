@@ -348,8 +348,26 @@ pub fn signed_sync_response(
 /// Wraps `wiremock::MockServer` and provides ergonomic helpers for mounting
 /// common endpoint mocks. Pass `mock.url()` as `--registry` to the CLI.
 pub struct MockRegistry {
-    server: MockServer,
+    server: Option<MockServer>,
     tarball_integrities: Arc<Mutex<HashMap<(String, String), String>>>,
+}
+
+impl Drop for MockRegistry {
+    // `MockServer` checks its mocks' expectations as it drops, blocking on a
+    // tokio lock with `futures::executor::block_on`. Inside a tokio task whose
+    // cooperative budget is spent, tokio defers that lock's wake to the
+    // scheduler the blocked thread never returns to, so the drop runs on a
+    // thread of its own and only its panic comes back.
+    fn drop(&mut self) {
+        let Some(server) = self.server.take() else {
+            return;
+        };
+        if let Err(panic) = std::thread::spawn(move || drop(server)).join()
+            && !std::thread::panicking()
+        {
+            std::panic::resume_unwind(panic);
+        }
+    }
 }
 
 struct JsonResponseSequence {
@@ -760,7 +778,7 @@ impl MockRegistry {
             .mount(&server)
             .await;
         MockRegistry {
-            server,
+            server: Some(server),
             tarball_integrities: Arc::default(),
         }
     }
@@ -774,14 +792,14 @@ impl MockRegistry {
     /// [`MockRegistry::start`] (one less moving part to set up).
     pub fn from_server(server: MockServer) -> Self {
         MockRegistry {
-            server,
+            server: Some(server),
             tarball_integrities: Arc::default(),
         }
     }
 
     /// The base URL of the mock server (e.g., `http://127.0.0.1:PORT`).
     pub fn url(&self) -> String {
-        self.server.uri()
+        self.server().uri()
     }
 
     pub async fn with_package_skills_response(
@@ -794,7 +812,7 @@ impl MockRegistry {
             .and(query_param("name", name))
             .respond_with(ResponseTemplate::new(200).set_body_json(response))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -810,7 +828,7 @@ impl MockRegistry {
                 "skills": skills,
             })))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -844,7 +862,7 @@ impl MockRegistry {
                 "skills": skills,
             })))
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -867,7 +885,7 @@ impl MockRegistry {
             )
             .with_priority(1)
             .expect(1..)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -887,7 +905,7 @@ impl MockRegistry {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "packages": packages,
             })))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -898,7 +916,7 @@ impl MockRegistry {
             .and(path("/api/registry/quality"))
             .and(query_param("name", name))
             .respond_with(ResponseTemplate::new(200).set_body_json(report))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -938,7 +956,7 @@ impl MockRegistry {
                 bodies: Arc::new(Mutex::new(responses.into())),
             })
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -956,7 +974,7 @@ impl MockRegistry {
                 path: path_to_create,
             })
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -977,7 +995,7 @@ impl MockRegistry {
             .and(body_string_contains(format!("\"tokenId\":\"{token_id}\"")))
             .respond_with(ResponseTemplate::new(status).set_body_json(response))
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1002,7 +1020,7 @@ impl MockRegistry {
             .and(body_string_contains("\"self\":true"))
             .respond_with(ResponseTemplate::new(status).set_body_json(response))
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1021,7 +1039,7 @@ impl MockRegistry {
                 ResponseTemplate::new(status).set_body_json(serde_json::json!({ "error": error })),
             )
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1032,7 +1050,7 @@ impl MockRegistry {
             .and(body_string_contains("\"scope\":\"read\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(response))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1053,7 +1071,7 @@ impl MockRegistry {
                 expires_at: expires_at.to_string(),
             })
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1064,7 +1082,7 @@ impl MockRegistry {
             .and(body_string_contains("\"scope\":\"read\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(response))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1077,7 +1095,7 @@ impl MockRegistry {
                     .set_body_json(serde_json::json!({ "error": "replacement rejected" })),
             )
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1087,7 +1105,7 @@ impl MockRegistry {
             .and(path("/api/registry/-/token/replace-project"))
             .respond_with(ProjectTokenReplacementEchoError)
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1107,7 +1125,7 @@ impl MockRegistry {
                 expires_at: expires_at.to_string(),
             })
             .expect(2)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1127,7 +1145,7 @@ impl MockRegistry {
                 "tokenId": "33333333-3333-4333-8333-333333333333",
             })))
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1142,7 +1160,7 @@ impl MockRegistry {
                 failures_remaining: AtomicUsize::new(1),
             })
             .expect(2)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1156,7 +1174,7 @@ impl MockRegistry {
                 failures_remaining: AtomicUsize::new(1),
             })
             .expect(2)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1176,7 +1194,7 @@ impl MockRegistry {
                 "expiresAt": expires_at,
             })))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1188,7 +1206,7 @@ impl MockRegistry {
             .and(header("authorization", format!("Bearer {bearer_token}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(stats))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1207,7 +1225,7 @@ impl MockRegistry {
                     "status": if (200..300).contains(&status) { "ok" } else { "error" }
                 })),
             )
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1221,7 +1239,7 @@ impl MockRegistry {
                     .set_body_json(serde_json::json!({ "status": "ok" }))
                     .set_delay(delay),
             )
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1260,7 +1278,7 @@ impl MockRegistry {
                 }]
             })))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1309,7 +1327,7 @@ impl MockRegistry {
                 }]
             })))
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1321,7 +1339,7 @@ impl MockRegistry {
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(whoami_response(username, email)),
             )
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1339,7 +1357,7 @@ impl MockRegistry {
                 ResponseTemplate::new(200).set_body_json(whoami_response(username, email)),
             )
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1371,7 +1389,7 @@ impl MockRegistry {
                 },
                 "organizations": []
             })))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1388,7 +1406,7 @@ impl MockRegistry {
             .and(header("authorization", format!("Bearer {bearer_token}")))
             .respond_with(ResponseTemplate::new(status))
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1409,7 +1427,7 @@ impl MockRegistry {
                 "refreshToken": rotated_refresh_token,
                 "expiresAt": expires_at,
             })))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1432,7 +1450,7 @@ impl MockRegistry {
                 "expiresAt": expires_at,
             })))
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1459,7 +1477,7 @@ impl MockRegistry {
                 "expiresAt": expires_at,
             })))
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1477,7 +1495,7 @@ impl MockRegistry {
                 principal_id: principal_id.to_owned(),
             })
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1502,7 +1520,7 @@ impl MockRegistry {
             })))
             .respond_with(ResponseTemplate::new(status).set_body_json(response))
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1526,7 +1544,7 @@ impl MockRegistry {
                 "alreadyRevoked": false
             })))
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1547,7 +1565,7 @@ impl MockRegistry {
                 "browserPublicKey": browser_public_key,
             })))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1572,7 +1590,7 @@ impl MockRegistry {
                 "browserPublicKey": browser_public_key,
             })))
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1609,7 +1627,7 @@ impl MockRegistry {
             .and(header("authorization", format!("Bearer {bearer_token}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(body))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1635,7 +1653,7 @@ impl MockRegistry {
             .and(header("authorization", format!("Bearer {bearer_token}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(body))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1653,7 +1671,7 @@ impl MockRegistry {
             .and(header("authorization", format!("Bearer {bearer_token}")))
             .respond_with(ResponseTemplate::new(status_code).set_body_string(body))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1715,7 +1733,7 @@ impl MockRegistry {
                 }),
             )
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1745,7 +1763,7 @@ impl MockRegistry {
                 }),
             )
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1792,7 +1810,7 @@ impl MockRegistry {
                 "token": lpm_token,
             })))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1828,7 +1846,7 @@ impl MockRegistry {
             .and(body_json(expected_body))
             .respond_with(ResponseTemplate::new(status_code).set_body_json(body))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1848,7 +1866,7 @@ impl MockRegistry {
                 "value": runtime_token,
             })))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1867,7 +1885,7 @@ impl MockRegistry {
             .and(header("authorization", format!("Bearer {request_token}")))
             .respond_with(ResponseTemplate::new(status_code).set_body_json(body))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -1893,7 +1911,7 @@ impl MockRegistry {
             "vars": vars,
         })))
         .expect(1)
-        .mount(&self.server)
+        .mount(self.server())
         .await;
         self
     }
@@ -2007,7 +2025,7 @@ impl MockRegistry {
             .and(query_param_is_missing("versionOnly"))
             .respond_with(pull_response)
             .expect(1..=2)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
 
         Mock::given(method("GET"))
@@ -2020,7 +2038,7 @@ impl MockRegistry {
                 vault_id,
                 TestSyncScope::Personal,
             ))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
 
         let push_mock = Mock::given(method("POST"))
@@ -2034,7 +2052,7 @@ impl MockRegistry {
                         status,
                         message: error,
                     })
-                    .mount(&self.server)
+                    .mount(self.server())
                     .await;
             }
             None => {
@@ -2048,7 +2066,7 @@ impl MockRegistry {
                         vault_id,
                         TestSyncScope::Personal,
                     ))
-                    .mount(&self.server)
+                    .mount(self.server())
                     .await;
             }
         }
@@ -2078,7 +2096,7 @@ impl MockRegistry {
                 "id": principal_id,
             })))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
 
         // GET responder — looks up state, returns blob if present.
@@ -2094,7 +2112,7 @@ impl MockRegistry {
                 bearer_token: get_bearer,
                 principal_id: principal_owned.clone(),
             })
-            .mount(&self.server)
+            .mount(self.server())
             .await;
 
         // POST responder — captures body, bumps version, stores.
@@ -2107,7 +2125,7 @@ impl MockRegistry {
                 vault_id: vault_id_owned,
                 principal_id: principal_owned,
             })
-            .mount(&self.server)
+            .mount(self.server())
             .await;
 
         self
@@ -2168,7 +2186,7 @@ impl MockRegistry {
             "subject": format!("repo:{repo}"),
         })))
         .expect(1)
-        .mount(&self.server)
+        .mount(self.server())
         .await;
         self
     }
@@ -2210,7 +2228,7 @@ impl MockRegistry {
             "subject": format!("project:{project_id}"),
         })))
         .expect(1)
-        .mount(&self.server)
+        .mount(self.server())
         .await;
         self
     }
@@ -2230,7 +2248,7 @@ impl MockRegistry {
                 "policies": policies,
             })))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2261,7 +2279,7 @@ impl MockRegistry {
                 vault_id: vault_id.to_owned(),
             })
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2292,7 +2310,7 @@ impl MockRegistry {
                 vault_id: vault_id.to_owned(),
             })
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2326,7 +2344,7 @@ impl MockRegistry {
                 vault_id: vault_id.to_owned(),
             })
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2360,7 +2378,7 @@ impl MockRegistry {
                 vault_id: vault_id.to_owned(),
             })
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2392,7 +2410,7 @@ impl MockRegistry {
                 vault_id: vault_id.to_owned(),
             })
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2414,7 +2432,7 @@ impl MockRegistry {
                 vault_id: vault_id.to_owned(),
             })
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2437,7 +2455,7 @@ impl MockRegistry {
                 "full_name": repository,
             })))
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2463,7 +2481,7 @@ impl MockRegistry {
                 "variables": variables,
             })))
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         Mock::given(method("GET"))
             .and(path(format!(
@@ -2477,7 +2495,7 @@ impl MockRegistry {
                 "secrets": secrets,
             })))
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2511,7 +2529,7 @@ impl MockRegistry {
                 bodies: Arc::new(Mutex::new(variable_bodies)),
             })
             .expect(variable_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
 
         let secret_calls = secrets.len() as u64;
@@ -2535,7 +2553,7 @@ impl MockRegistry {
                 bodies: Arc::new(Mutex::new(secret_bodies)),
             })
             .expect(secret_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2569,7 +2587,7 @@ impl MockRegistry {
                 "key": base64::engine::general_purpose::STANDARD.encode([7u8; 32]),
             })))
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2591,7 +2609,7 @@ impl MockRegistry {
             .and(body_string_contains(format!("\"value\":\"{value}\"")))
             .respond_with(ResponseTemplate::new(201))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2613,7 +2631,7 @@ impl MockRegistry {
             .and(body_string_contains(format!("\"value\":\"{value}\"")))
             .respond_with(ResponseTemplate::new(204))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2632,7 +2650,7 @@ impl MockRegistry {
             .and(header("authorization", format!("Bearer {token}")))
             .respond_with(ResponseTemplate::new(204))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2654,7 +2672,7 @@ impl MockRegistry {
             .and(body_string_contains("\"key_id\":\"workflow-key\""))
             .respond_with(ResponseTemplate::new(204))
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2673,7 +2691,7 @@ impl MockRegistry {
             .and(header("authorization", format!("Bearer {token}")))
             .respond_with(ResponseTemplate::new(204))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2696,7 +2714,7 @@ impl MockRegistry {
                     .set_body_json(serde_json::json!({ "message": "workflow denied" })),
             )
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2725,7 +2743,7 @@ impl MockRegistry {
             vault_id: vault_id.to_owned(),
         })
         .expect(1)
-        .mount(&self.server)
+        .mount(self.server())
         .await;
         self
     }
@@ -2746,7 +2764,7 @@ impl MockRegistry {
                 "pagination": { "next": null },
             })))
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2763,7 +2781,7 @@ impl MockRegistry {
             .and(header("authorization", format!("Bearer {token}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(envs))
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2788,7 +2806,7 @@ impl MockRegistry {
                 "uuid": "updated-coolify-variable",
             })))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2819,7 +2837,7 @@ impl MockRegistry {
                 "data": { "variables": variables },
             })))
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2858,7 +2876,7 @@ impl MockRegistry {
                 bodies: Arc::new(Mutex::new(bodies)),
             })
             .expect(expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2891,7 +2909,7 @@ impl MockRegistry {
                 "data": { "variableCollectionUpsert": true },
             })))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2920,7 +2938,7 @@ impl MockRegistry {
                 }
             })))
             .expect(fixture.expected_calls)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2953,7 +2971,7 @@ impl MockRegistry {
                 }
             })))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2972,7 +2990,7 @@ impl MockRegistry {
                 "success": true,
             })))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -2995,7 +3013,7 @@ impl MockRegistry {
                 "error": message,
             })))
             .expect(1)
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -3038,7 +3056,7 @@ impl MockRegistry {
     /// Convenience: full tarball URL with the server origin prepended.
     /// Equivalent to `format!("{}{}", mock.url(), MockRegistry::tarball_path(name, version))`.
     pub fn tarball_url(&self, name: &str, version: &str) -> String {
-        format!("{}{}", self.server.uri(), Self::tarball_path(name, version))
+        format!("{}{}", self.url(), Self::tarball_path(name, version))
     }
 
     /// Serve `tarball_bytes` at registry.npmjs.org's tarball path and return
@@ -3059,7 +3077,7 @@ impl MockRegistry {
                     .set_body_bytes(tarball_bytes.to_vec())
                     .insert_header("content-type", "application/octet-stream"),
             )
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         format!("{}{tarball_path}", lpm_common::NPM_REGISTRY_URL)
     }
@@ -3195,13 +3213,13 @@ impl MockRegistry {
             .and(path(format!("/{name}")))
             .and(header("accept", "application/vnd.npm.install-v1+json"))
             .respond_with(ResponseTemplate::new(200).set_body_json(abbreviated))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         Mock::given(method("GET"))
             .and(path(format!("/{name}")))
             .and(header("accept", "application/json"))
             .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -3212,7 +3230,7 @@ impl MockRegistry {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "keys": [signer.key_json()],
             })))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -3228,13 +3246,13 @@ impl MockRegistry {
         Mock::given(method("GET"))
             .and(path(&metadata_path))
             .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         let npm_direct_path = format!("/{name}");
         Mock::given(method("GET"))
             .and(path(&npm_direct_path))
             .respond_with(ResponseTemplate::new(200).set_body_json(metadata))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
 
         let tarball_path = Self::tarball_path(name, version);
@@ -3246,7 +3264,7 @@ impl MockRegistry {
                     .set_body_bytes(tarball_bytes.to_vec())
                     .insert_header("content-type", "application/octet-stream"),
             )
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -3341,13 +3359,13 @@ impl MockRegistry {
         Mock::given(method("GET"))
             .and(path(&metadata_path))
             .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         let npm_direct_path = format!("/{name}");
         Mock::given(method("GET"))
             .and(path(&npm_direct_path))
             .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
 
         let tarball_path = Self::tarball_path(&name, &version);
@@ -3358,7 +3376,7 @@ impl MockRegistry {
                     .set_body_bytes(tarball_bytes)
                     .insert_header("content-type", "application/octet-stream"),
             )
-            .mount(&self.server)
+            .mount(self.server())
             .await;
 
         self.with_batch_metadata(vec![metadata]).await;
@@ -3409,13 +3427,13 @@ impl MockRegistry {
         Mock::given(method("GET"))
             .and(path(&metadata_path))
             .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         let npm_direct_path = format!("/{name}");
         Mock::given(method("GET"))
             .and(path(&npm_direct_path))
             .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
 
         // Mount tarball endpoint
@@ -3427,7 +3445,7 @@ impl MockRegistry {
                     .set_body_bytes(tarball_bytes.to_vec())
                     .insert_header("content-type", "application/octet-stream"),
             )
-            .mount(&self.server)
+            .mount(self.server())
             .await;
 
         self
@@ -3473,13 +3491,13 @@ impl MockRegistry {
         Mock::given(method("GET"))
             .and(path(&metadata_path))
             .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         let npm_direct_path = format!("/{name}");
         Mock::given(method("GET"))
             .and(path(&npm_direct_path))
             .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
 
         let tarball_path = Self::tarball_path(name, version);
@@ -3490,7 +3508,7 @@ impl MockRegistry {
                     .set_body_bytes(tarball_bytes.to_vec())
                     .insert_header("content-type", "application/octet-stream"),
             )
-            .mount(&self.server)
+            .mount(self.server())
             .await;
 
         self
@@ -3589,7 +3607,7 @@ impl MockRegistry {
             Mock::given(method("GET"))
                 .and(path(&tarball_path))
                 .respond_with(response)
-                .mount(&self.server)
+                .mount(self.server())
                 .await;
         }
 
@@ -3604,13 +3622,13 @@ impl MockRegistry {
         Mock::given(method("GET"))
             .and(path(&metadata_path))
             .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         let npm_direct_path = format!("/{name}");
         Mock::given(method("GET"))
             .and(path(&npm_direct_path))
             .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
 
         metadata
@@ -3631,13 +3649,13 @@ impl MockRegistry {
         Mock::given(method("GET"))
             .and(path(&metadata_path))
             .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         let npm_direct_path = format!("/{name}");
         Mock::given(method("GET"))
             .and(path(&npm_direct_path))
             .respond_with(ResponseTemplate::new(200).set_body_json(metadata.clone()))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
 
         for (version, tarball_bytes) in tarballs {
@@ -3650,7 +3668,7 @@ impl MockRegistry {
                         .set_body_bytes(tarball_bytes.clone())
                         .insert_header("content-type", "application/octet-stream"),
                 )
-                .mount(&self.server)
+                .mount(self.server())
                 .await;
         }
 
@@ -3667,7 +3685,7 @@ impl MockRegistry {
         Mock::given(method("GET"))
             .and(path(format!("/{name}")))
             .respond_with(ResponseTemplate::new(status).set_body_json(body))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -3709,7 +3727,7 @@ impl MockRegistry {
         Mock::given(method("POST"))
             .and(path("/api/registry/batch-metadata"))
             .respond_with(ResponseTemplate::new(200).set_body_raw(ndjson, "application/x-ndjson"))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -3722,7 +3740,7 @@ impl MockRegistry {
                 "success": true,
                 "message": "Package published"
             })))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -3735,7 +3753,7 @@ impl MockRegistry {
                 "error": "Unauthorized",
                 "message": "Authentication required"
             })))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -3777,7 +3795,7 @@ impl MockRegistry {
             Mock::given(method("GET"))
                 .and(path(format!("/v1/vulns/{id}")))
                 .respond_with(ResponseTemplate::new(200).set_body_json(advisory))
-                .mount(&self.server)
+                .mount(self.server())
                 .await;
         }
 
@@ -3786,7 +3804,7 @@ impl MockRegistry {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "results": results,
             })))
-            .mount(&self.server)
+            .mount(self.server())
             .await;
         self
     }
@@ -3806,7 +3824,9 @@ impl MockRegistry {
 
     /// Access the underlying `MockServer` for custom mock setups.
     pub fn server(&self) -> &MockServer {
-        &self.server
+        self.server
+            .as_ref()
+            .expect("a mock registry keeps its server until it drops")
     }
 }
 
