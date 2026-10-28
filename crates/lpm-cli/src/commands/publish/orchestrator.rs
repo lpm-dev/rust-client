@@ -26,7 +26,7 @@ use super::types::{
     PublishProject, PublishQualityGateInput, PublishResult, PublishTarget, ResolvedProvenance,
     hold_explanation,
 };
-use super::upload_lpm::{LpmPublishBody, OtpFailure, publish_to_lpm, resolve_lpm_otp};
+use super::upload_lpm::{LpmPublishBody, OtpFailure, lpm_second_factor, publish_to_lpm};
 use super::version_data::{build_publish_version_data, integrity_to_sha512_hex};
 use super::wait::{DEFAULT_PUBLICATION_WAIT_TIMEOUT, wait_for_lpm_publication_with_oidc};
 use crate::commands::skills::author;
@@ -1646,26 +1646,22 @@ async fn execute_prepared_inner(
         }
     }
 
-    // lpm.dev's second factor is settled before any target publishes too,
-    // so one `--json` can't ask for publishes none. A version lpm.dev
-    // already has needs none, and an account that can't be read yet is the
-    // LPM target's to read again.
+    // lpm.dev's second factor is checked before any target publishes too,
+    // so one `--json` that can't send one publishes none. The LPM target
+    // asks for a code itself, just before its publish request. A version
+    // lpm.dev already has needs none, and an account that can't be read yet
+    // is the LPM target's to read again.
     let mut lpm_dev_has_the_version = None;
-    let otp = if targets_lpm && targets.len() > 1 {
+    if targets_lpm && targets.len() > 1 {
         lpm_dev_has_the_version =
             refuse_before_any_publish_what_lpm_dev_refuses(client, lpm_source, &version).await?;
-        if lpm_dev_has_the_version.is_some() {
-            otp
-        } else {
-            match resolve_lpm_otp(client, otp.as_deref(), json_output, lpm_whoami_cache).await {
-                Ok(settled) => settled,
-                Err(OtpFailure::AccountUnread(_)) => otp,
-                Err(OtpFailure::Final(error)) => return Err(error),
-            }
+        if lpm_dev_has_the_version.is_none()
+            && let Err(OtpFailure::Final(error)) =
+                lpm_second_factor(client, otp.as_deref(), json_output, lpm_whoami_cache).await
+        {
+            return Err(error);
         }
-    } else {
-        otp
-    };
+    }
 
     let provenance_context = match provenance_request {
         ProvenanceRequest::File(_) => None,

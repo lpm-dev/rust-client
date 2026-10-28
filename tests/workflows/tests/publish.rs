@@ -337,6 +337,133 @@ async fn publish_uploads_a_tarball_whose_base64_would_be_past_lpm_dev_s_request_
     assert!(publish.body.len() < 64 * 1024, "{}", publish.body.len());
 }
 
+#[tokio::test]
+async fn publish_skips_the_upload_of_a_tarball_lpm_dev_has_stored_already() {
+    let mock = MockRegistry::start().await;
+    mock.with_publish_endpoint().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    let upload_id = "00000000-0000-4000-8000-0000000000aa";
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/package/uploads"))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": upload_id,
+            "uploadUrl": format!("{}{MOCK_TARBALL_UPLOAD_PREFIX}{upload_id}.tgz", mock.url()),
+            "uploadHeaders": { "content-type": "application/gzip", "if-none-match": "*" },
+            "expiresAt": "2099-01-01T00:00:00.000Z",
+            "stored": true,
+        })))
+        .mount(mock.server())
+        .await;
+    let project = TempProject::empty(
+        r#"{"name":"@lpm.dev/testuser.stored","version":"1.0.0","main":"index.js","license":"MIT"}"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
+        .output()
+        .expect("run publish");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path().starts_with(MOCK_TARBALL_UPLOAD_PREFIX))
+    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&lpm_publish_request(&requests).body).unwrap();
+    let attachment = payload["_attachments"]
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap();
+    assert_eq!(attachment["upload_id"], upload_id);
+}
+
+/// A registry that has no tarball uploads, as one older than them: its
+/// router answers the request to open one with 405.
+async fn without_tarball_uploads(mock: &MockRegistry) {
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/package/uploads"))
+        .respond_with(ResponseTemplate::new(405))
+        .mount(mock.server())
+        .await;
+}
+
+#[tokio::test]
+async fn publish_sends_the_tarball_inline_to_an_lpm_dev_registry_without_uploads() {
+    let mock = MockRegistry::start().await;
+    mock.with_publish_endpoint().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    without_tarball_uploads(&mock).await;
+    let project = TempProject::empty(
+        r#"{"name":"@lpm.dev/testuser.inline","version":"1.0.0","main":"index.js","license":"MIT"}"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
+        .output()
+        .expect("run publish");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = mock.server().received_requests().await.unwrap();
+    let tarball = extract_npm_upload_tarball(lpm_publish_request(&requests));
+    assert!(
+        uploaded_file_paths(&tarball)
+            .iter()
+            .any(|path| path.ends_with("index.js"))
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.url.path().starts_with(MOCK_TARBALL_UPLOAD_PREFIX))
+    );
+}
+
+#[tokio::test]
+async fn publish_refuses_a_tarball_too_large_inline_for_an_lpm_dev_registry_without_uploads() {
+    // 80 MiB of tarball is 107 MiB in base64, past what a request takes.
+    let mock = MockRegistry::start().await;
+    mock.with_publish_endpoint().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    without_tarball_uploads(&mock).await;
+    let project = TempProject::empty(
+        r#"{"name":"@lpm.dev/testuser.too-large-inline","version":"1.0.0","main":"index.js","license":"MIT"}"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+    std::fs::write(
+        project.path().join("blob.bin"),
+        incompressible(80 * 1024 * 1024),
+    )
+    .unwrap();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
+        .output()
+        .expect("run publish");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("doesn't take tarball uploads"), "{stderr}");
+    let requests = mock.server().received_requests().await.unwrap();
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.method.as_str() == "PUT")
+    );
+}
+
 /// A project publishing to lpm.dev and to an npm-compatible registry at
 /// `registry`.
 fn lpm_and_npm_project(name: &str, registry: &str) -> TempProject {

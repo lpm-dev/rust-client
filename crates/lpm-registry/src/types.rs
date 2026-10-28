@@ -1049,6 +1049,10 @@ pub struct PublishUpload {
     pub upload_headers: std::collections::BTreeMap<String, String>,
     #[serde(rename = "expiresAt")]
     pub expires_at: String,
+    /// The Registry has the tarball from an earlier try of the same publish
+    /// already, so it needn't be sent again.
+    #[serde(default)]
+    pub stored: bool,
 }
 
 impl std::fmt::Debug for PublishUpload {
@@ -1059,6 +1063,7 @@ impl std::fmt::Debug for PublishUpload {
             .field("upload_url", &"<redacted>")
             .field("upload_headers", &self.upload_headers)
             .field("expires_at", &self.expires_at)
+            .field("stored", &self.stored)
             .finish()
     }
 }

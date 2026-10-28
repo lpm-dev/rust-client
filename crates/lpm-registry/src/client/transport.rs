@@ -475,9 +475,8 @@ impl RegistryClient {
                 .map_err(|e| LpmError::Network(format!("failed to build request: {e}")))?;
             let headers = req.headers().clone();
 
-            match lpm_http::send_with_replayable_redirects(self.http.as_ref(), req, Some(payload))
-                .await
-            {
+            let transfer = super::http::TransferClientProvider(self.http.as_ref());
+            match lpm_http::send_with_replayable_redirects(&transfer, req, Some(payload)).await {
                 Ok(response) => {
                     let status = response.status().as_u16();
 
