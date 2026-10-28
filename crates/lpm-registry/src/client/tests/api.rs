@@ -1447,3 +1447,500 @@ async fn publish_package_returns_http_500_when_version_missing_after_500() {
         Err(LpmError::Http { status: 500, message }) if message == "publish boom"
     ));
 }
+
+fn opened_publish_upload(server_uri: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": "11111111-1111-4111-8111-111111111111",
+        "uploadUrl": format!("{server_uri}/storage/publish-uploads/upload.tgz?X-Amz-Signature=signed"),
+        "uploadHeaders": {
+            "content-type": "application/gzip",
+            "if-none-match": "*",
+        },
+        "expiresAt": "2099-01-01T00:00:00.000Z",
+    })
+}
+
+fn publish_upload(server_uri: &str) -> PublishUpload {
+    serde_json::from_value(opened_publish_upload(server_uri)).unwrap()
+}
+
+#[tokio::test]
+async fn create_publish_upload_sends_the_tarball_s_identity_with_the_bearer() {
+    use wiremock::matchers::{body_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/package/uploads"))
+        .and(header("authorization", "Bearer publish-token"))
+        .and(body_json(serde_json::json!({
+            "name": "@lpm.dev/owner.pkg",
+            "version": "1.2.3",
+            "size": 4096,
+            "integrity": "sha512-abc",
+        })))
+        .respond_with(
+            ResponseTemplate::new(201).set_body_json(opened_publish_upload(&server.uri())),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let upload = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("publish-token")
+        .create_publish_upload("@lpm.dev/owner.pkg", "1.2.3", 4096, "sha512-abc")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(upload.id, "11111111-1111-4111-8111-111111111111");
+    assert_eq!(
+        upload.upload_url,
+        format!(
+            "{}/storage/publish-uploads/upload.tgz?X-Amz-Signature=signed",
+            server.uri()
+        )
+    );
+    assert_eq!(upload.upload_headers["if-none-match"], "*");
+}
+
+#[tokio::test]
+async fn create_publish_upload_states_a_refusal_as_the_publish_would() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for (status, body, expected) in [
+        (
+            413,
+            serde_json::json!({
+                "error": "Tarball too large (100.01 MiB). Maximum single package size is 100 MiB.",
+                "code": "TARBALL_TOO_LARGE",
+            })
+            .to_string(),
+            "publish failed (413 Payload Too Large): Tarball too large (100.01 MiB). Maximum single package size is 100 MiB. [TARBALL_TOO_LARGE]",
+        ),
+        (
+            403,
+            serde_json::json!({
+                "error": "Version 1.2.3 already exists. You cannot overwrite versions.",
+                "code": "VERSION_EXISTS",
+            })
+            .to_string(),
+            "Version 1.2.3 already exists. Verify the existing release in the registry if an earlier publish was interrupted. To publish different contents, choose a new version.",
+        ),
+        (
+            409,
+            "upstream unavailable".to_string(),
+            "publish failed (409 Conflict): HTTP 409 Conflict",
+        ),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/package/uploads"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("publish-token")
+            .create_publish_upload("@lpm.dev/owner.pkg", "1.2.3", 1, "sha512-abc")
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!("registry error: {expected}"),
+            "{status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_publish_upload_answers_none_from_a_registry_without_uploads() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for (status, body) in [
+        (405, String::new()),
+        (404, serde_json::json!({ "error": "Not found" }).to_string()),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/package/uploads"))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let upload = RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("publish-token")
+            .create_publish_upload("@lpm.dev/owner.pkg", "1.2.3", 1, "sha512-abc")
+            .await
+            .unwrap();
+
+        assert!(upload.is_none(), "{status}");
+    }
+}
+
+#[tokio::test]
+async fn create_publish_upload_states_a_coded_404_as_a_refusal() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/package/uploads"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+            "error": "Organization not found",
+            "code": "ORG_NOT_FOUND",
+        })))
+        .mount(&server)
+        .await;
+
+    let error = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("publish-token")
+        .create_publish_upload("@lpm.dev/owner.pkg", "1.2.3", 1, "sha512-abc")
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "registry error: publish failed (404 Not Found): Organization not found [ORG_NOT_FOUND]"
+    );
+}
+
+#[tokio::test]
+async fn create_publish_upload_maps_401_to_auth_required() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/package/uploads"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("expired"))
+        .mount(&server)
+        .await;
+
+    let result = RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("publish-token")
+        .create_publish_upload("@lpm.dev/owner.pkg", "1.2.3", 1, "sha512-abc")
+        .await;
+
+    assert!(matches!(result, Err(LpmError::AuthRequired)), "{result:?}");
+}
+
+#[tokio::test]
+async fn upload_publish_tarball_sends_the_tarball_with_its_headers_and_no_bearer() {
+    use wiremock::matchers::{body_bytes, header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let tarball = Arc::new(b"tarball bytes for storage".to_vec());
+    Mock::given(method("PUT"))
+        .and(path("/storage/publish-uploads/upload.tgz"))
+        .and(query_param("X-Amz-Signature", "signed"))
+        .and(header("content-type", "application/gzip"))
+        .and(header("if-none-match", "*"))
+        .and(body_bytes(tarball.as_slice()))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    RegistryClient::new()
+        .with_base_url(server.uri())
+        .with_token("publish-token")
+        .upload_publish_tarball(&publish_upload(&server.uri()), &tarball)
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests[0].headers.get("authorization").is_none());
+    assert_eq!(
+        requests[0].headers.get("content-length").unwrap(),
+        &tarball.len().to_string()
+    );
+}
+
+#[tokio::test]
+async fn upload_publish_tarball_takes_a_412_as_an_earlier_try_s_upload() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(412).set_body_string(
+            "<Error><Code>PreconditionFailed</Code><Message>At least one of the pre-conditions you specified did not hold</Message></Error>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    RegistryClient::new()
+        .with_base_url(server.uri())
+        .upload_publish_tarball(&publish_upload(&server.uri()), &Arc::new(vec![1, 2, 3]))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn upload_publish_tarball_retries_a_storage_server_error() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    RegistryClient::new()
+        .with_base_url(server.uri())
+        .upload_publish_tarball(&publish_upload(&server.uri()), &Arc::new(vec![1, 2, 3]))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn upload_publish_tarball_states_storage_s_refusal_without_retrying() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(403).set_body_string(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>SignatureDoesNotMatch</Code><Message>The request signature we calculated does not match the signature you provided.</Message></Error>",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let error = RegistryClient::new()
+        .with_base_url(server.uri())
+        .upload_publish_tarball(&publish_upload(&server.uri()), &Arc::new(vec![1, 2, 3]))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            LpmError::Http { status: 403, message }
+                if message == "tarball upload failed: SignatureDoesNotMatch: The request signature we calculated does not match the signature you provided."
+        ),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn upload_publish_tarball_refuses_a_header_it_would_not_send() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let mut upload = publish_upload(&server.uri());
+    upload
+        .upload_headers
+        .insert("Authorization".into(), "Bearer leaked".into());
+
+    let error = RegistryClient::new()
+        .with_base_url(server.uri())
+        .upload_publish_tarball(&upload, &Arc::new(vec![1, 2, 3]))
+        .await
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("tarball upload header LPM doesn't send: Authorization"),
+        "{error}"
+    );
+}
+
+#[test]
+fn publish_upload_debug_leaves_out_its_presigned_url() {
+    let rendered = format!("{:?}", publish_upload("https://storage.example"));
+
+    assert!(!rendered.contains("X-Amz-Signature"), "{rendered}");
+    assert!(
+        rendered.contains("11111111-1111-4111-8111-111111111111"),
+        "{rendered}"
+    );
+}
+
+fn client_with_read_timeout(server_uri: &str, read_timeout: Duration) -> RegistryClient {
+    let mut client = RegistryClient::new()
+        .with_base_url(server_uri)
+        .with_token("publish-token");
+    client.http = HttpClients::from_default_client_set(
+        RegistryClient::build_http_client_set_with_tls_and_identity(
+            CONNECT_TIMEOUT,
+            read_timeout,
+            &crate::npmrc::TlsOverrides::default(),
+            None,
+        )
+        .unwrap(),
+    );
+    client
+}
+
+#[tokio::test]
+async fn upload_publish_tarball_waits_for_storage_longer_than_a_registry_read() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(800)))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    client_with_read_timeout(&server.uri(), Duration::from_millis(200))
+        .upload_publish_tarball(&publish_upload(&server.uri()), &Arc::new(vec![1, 2, 3]))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn publish_package_waits_for_the_registry_longer_than_a_metadata_read() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "success": true }))
+                .set_delay(Duration::from_millis(800)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let payload = replayable_json(&serde_json::json!({ "name": "@lpm.dev/owner.pkg" }));
+    let published = client_with_read_timeout(&server.uri(), Duration::from_millis(200))
+        .publish_package(
+            "@lpm.dev/owner.pkg",
+            "1.0.0",
+            "sha512-test",
+            &payload,
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(published["success"], true);
+}
+
+#[tokio::test]
+async fn a_failed_tarball_upload_leaves_out_its_presigned_query() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://{}/storage/upload.tgz?X-Amz-Credential=key&X-Amz-Signature=signed",
+        listener.local_addr().unwrap()
+    );
+    drop(listener);
+    let error = reqwest::Client::new().put(&url).send().await.unwrap_err();
+
+    let message = crate::client::api::tarball_upload_network_error(error).to_string();
+
+    assert!(message.contains("tarball upload failed: "), "{message}");
+    assert!(!message.contains("X-Amz"), "{message}");
+}
+
+#[tokio::test]
+async fn upload_publish_tarball_refuses_a_redirect_that_would_send_the_tarball_elsewhere() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let storage = MockServer::start().await;
+    let elsewhere = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("location", format!("{}/capture", elsewhere.uri())),
+        )
+        .expect(1)
+        .mount(&storage)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&elsewhere)
+        .await;
+
+    let error = RegistryClient::new()
+        .with_base_url(storage.uri())
+        .upload_publish_tarball(&publish_upload(&storage.uri()), &Arc::new(vec![1, 2, 3]))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(error, LpmError::Http { status: 307, .. }),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_tarball_upload_sends_its_body_in_pieces_that_each_count_as_progress() {
+    use futures::StreamExt as _;
+
+    let tarball = bytes::Bytes::from(vec![7_u8; 600 * 1024]);
+    let progress = crate::client::api::UploadProgress::new();
+    let pieces: Vec<_> =
+        crate::client::api::tarball_upload_chunks(tarball.clone(), Arc::clone(&progress))
+            .map(Result::unwrap)
+            .collect()
+            .await;
+
+    assert_eq!(
+        pieces.iter().map(bytes::Bytes::len).collect::<Vec<_>>(),
+        [256 * 1024, 256 * 1024, 88 * 1024]
+    );
+    assert_eq!(pieces.concat(), tarball);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_tarball_upload_stalls_only_after_its_limit_passes_without_progress() {
+    use futures::StreamExt as _;
+
+    let progress = crate::client::api::UploadProgress::new();
+    let mut pieces = Box::pin(crate::client::api::tarball_upload_chunks(
+        bytes::Bytes::from(vec![0_u8; 512 * 1024]),
+        Arc::clone(&progress),
+    ));
+    let limit = Duration::from_secs(60);
+
+    tokio::time::advance(Duration::from_secs(50)).await;
+    pieces.next().await;
+    let stalled = progress.stalled(limit);
+    tokio::pin!(stalled);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(59), &mut stalled)
+            .await
+            .is_err(),
+        "a piece taken 50 s in keeps the upload going until 110 s"
+    );
+    tokio::time::timeout(Duration::from_secs(2), &mut stalled)
+        .await
+        .expect("the upload stalls 60 s after its last piece");
+}

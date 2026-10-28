@@ -2,7 +2,7 @@ use super::{AvailableLpmPublishPreflight, read_package_json, workspace_project};
 use crate::support::assertions::assert_fault_injection_aborted;
 use crate::support::mock_registry::MockRegistry;
 use crate::support::{TempProject, lpm, lpm_with_registry};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, ResponseTemplate};
 
 fn change(project: &TempProject, mode: &str, bump: &str) -> std::process::Output {
@@ -642,6 +642,7 @@ async fn release_publish_ships_member_skills_without_rewriting_member_manifests(
         .mount(registry.server())
         .await;
     Mock::given(method("PUT"))
+        .and(path_regex("^/api/registry/"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_json(serde_json::json!({"success":true,"message":"Package published"})),

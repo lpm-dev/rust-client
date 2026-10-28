@@ -475,9 +475,8 @@ impl RegistryClient {
                 .map_err(|e| LpmError::Network(format!("failed to build request: {e}")))?;
             let headers = req.headers().clone();
 
-            match lpm_http::send_with_replayable_redirects(self.http.as_ref(), req, Some(payload))
-                .await
-            {
+            let transfer = super::http::TransferClientProvider(self.http.as_ref());
+            match lpm_http::send_with_replayable_redirects(&transfer, req, Some(payload)).await {
                 Ok(response) => {
                     let status = response.status().as_u16();
 
@@ -501,9 +500,7 @@ impl RegistryClient {
                                 })
                                 .is_some_and(|message| message == duplicate_message)
                             {
-                                return Err(LpmError::Registry(format!(
-                                    "Version {published_version} already exists. Verify the existing release in the registry if an earlier publish was interrupted. To publish different contents, choose a new version."
-                                )));
+                                return Err(version_exists_error(published_version));
                             }
                             return Err(forbidden_error_from_body(body));
                         }
@@ -927,6 +924,13 @@ impl RegistryClient {
         }
         reqwest::Url::parse(&format!("{}{rest}", transport.trim_end_matches('/'))).ok()
     }
+}
+
+/// A publish refused because the Registry has the version.
+pub(super) fn version_exists_error(version: &str) -> LpmError {
+    LpmError::Registry(format!(
+        "Version {version} already exists. Verify the existing release in the registry if an earlier publish was interrupted. To publish different contents, choose a new version."
+    ))
 }
 
 async fn read_publish_error_text(

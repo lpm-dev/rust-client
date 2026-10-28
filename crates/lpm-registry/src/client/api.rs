@@ -1,5 +1,150 @@
-use super::transport::{Answered, FailedResponse};
+use super::transport::{
+    Answered, FailedResponse, MAX_RETRIES, backoff_delay, version_exists_error,
+};
 use super::*;
+
+/// The longest a tarball upload may take: a minute, and ten seconds a MiB,
+/// about 100 KiB/s, up to half an hour.
+fn tarball_upload_timeout(size: usize) -> Duration {
+    let mebibytes = (size as u64).div_ceil(1024 * 1024);
+    Duration::from_secs((60 + mebibytes * 10).min(30 * 60))
+}
+
+/// Headers an upload URL may ask for: its content's type, a write-once
+/// condition, and storage's own. Never a credential or a framing header.
+fn tarball_upload_header_is_allowed(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == "content-type" || name == "if-none-match" || name.starts_with("x-amz-")
+}
+
+/// A tarball, shared with its publish, as a request body that isn't copied
+/// for each try.
+struct SharedTarball(Arc<Vec<u8>>);
+
+impl AsRef<[u8]> for SharedTarball {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// The longest a tarball upload may go without the connection taking any
+/// of its body or its answer arriving before it's given up as stalled.
+const TARBALL_UPLOAD_STALL: Duration = Duration::from_secs(60);
+
+/// The pieces a tarball upload sends its body in, each of which counts as
+/// progress when the connection takes it.
+const TARBALL_UPLOAD_CHUNK: usize = 256 * 1024;
+
+/// When a tarball upload last made progress.
+pub(super) struct UploadProgress {
+    started: tokio::time::Instant,
+    last_millis: std::sync::atomic::AtomicU64,
+}
+
+impl UploadProgress {
+    pub(super) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            started: tokio::time::Instant::now(),
+            last_millis: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    fn mark(&self) {
+        let millis = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_millis
+            .store(millis, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Resolves once `limit` passes without progress.
+    pub(super) async fn stalled(&self, limit: Duration) {
+        loop {
+            let last =
+                Duration::from_millis(self.last_millis.load(std::sync::atomic::Ordering::Relaxed));
+            let deadline = self.started + last + limit;
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep_until(deadline).await;
+        }
+    }
+}
+
+/// `tarball` as a request body in pieces, each marking `progress` as the
+/// connection takes it.
+pub(super) fn tarball_upload_chunks(
+    tarball: bytes::Bytes,
+    progress: Arc<UploadProgress>,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, std::convert::Infallible>> + Send + 'static {
+    let len = tarball.len();
+    futures::stream::iter((0..len).step_by(TARBALL_UPLOAD_CHUNK).map(move |start| {
+        progress.mark();
+        Ok(tarball.slice(start..(start + TARBALL_UPLOAD_CHUNK).min(len)))
+    }))
+}
+
+/// Whether `body` is one of the Registry's refusals, which name their
+/// `code`, rather than a server's answer for a route it doesn't have.
+fn is_coded_refusal(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .is_some_and(|json| json.get("code").is_some_and(serde_json::Value::is_string))
+}
+
+/// The error a refusal of a publish's upload is, as the publish's own would
+/// read: `VERSION_EXISTS` as the version existing, anything else with its
+/// status, message and code.
+fn publish_upload_refusal(status: u16, body: &str, version: &str) -> LpmError {
+    let json = serde_json::from_str::<serde_json::Value>(body).ok();
+    let text = |field: &str| {
+        json.as_ref()
+            .and_then(|json| json.get(field))
+            .and_then(serde_json::Value::as_str)
+    };
+    let code = text("code");
+    if code == Some("VERSION_EXISTS") {
+        return version_exists_error(version);
+    }
+    let status_text = reqwest::StatusCode::from_u16(status)
+        .map_or_else(|_| status.to_string(), |status| status.to_string());
+    let error = text("error").map_or_else(
+        || format!("HTTP {status_text}"),
+        |error| lpm_common::sanitize_terminal_inline(error).into_owned(),
+    );
+    LpmError::Registry(match code {
+        Some(code) => format!("publish failed ({status_text}): {error} [{code}]"),
+        None => format!("publish failed ({status_text}): {error}"),
+    })
+}
+
+/// The error a tarball upload that got no answer is, without its URL: a
+/// presigned URL's query is a credential for the upload.
+pub(super) fn tarball_upload_network_error(error: reqwest::Error) -> LpmError {
+    LpmError::Network(format!(
+        "tarball upload failed: {}",
+        lpm_http::error_chain(&error.without_url())
+    ))
+}
+
+/// The error storage's refusal of a tarball upload is, with the code and
+/// message of its XML error where it gives one.
+async fn tarball_upload_refusal(status: u16, response: reqwest::Response) -> LpmError {
+    let body = read_capped_error_text(response).await;
+    let element = |name: &str| {
+        let open = format!("<{name}>");
+        let start = body.find(&open)? + open.len();
+        let end = body[start..].find(&format!("</{name}>"))? + start;
+        Some(lpm_common::sanitize_terminal_inline(&body[start..end]).into_owned())
+    };
+    let detail = match (element("Code"), element("Message")) {
+        (Some(code), Some(message)) => format!(": {code}: {message}"),
+        (Some(code), None) => format!(": {code}"),
+        _ => String::new(),
+    };
+    LpmError::Http {
+        status,
+        message: format!("tarball upload failed{detail}"),
+    }
+}
 
 impl RegistryClient {
     // ─── Discovery Endpoints ────────────────────────────────────────
@@ -317,6 +462,139 @@ impl RegistryClient {
             )));
         }
         Ok(PublishPreflightVerdict::Accepted(response))
+    }
+
+    /// Opens an upload of the tarball a publish of `name@version` sends,
+    /// which the publish then names in place of the tarball, so a tarball
+    /// isn't bound by the Registry's limit on a request's body. The Registry
+    /// runs the publish preflight's checks with the tarball's `size` first.
+    /// A refusal is the error the publish would give; a timeout, a rate
+    /// limit, a server error or a network failure is retried first. None
+    /// from a Registry that takes no uploads, which answers 404 or 405
+    /// without a refusal's code.
+    ///
+    /// Calls: POST /api/registry/-/package/uploads
+    pub async fn create_publish_upload(
+        &self,
+        name: &str,
+        version: &str,
+        size: u64,
+        integrity: &str,
+    ) -> Result<Option<PublishUpload>, LpmError> {
+        let url = format!("{}/api/registry/-/package/uploads", self.base_url);
+        let body = serde_json::json!({
+            "name": name,
+            "version": version,
+            "size": size,
+            "integrity": integrity,
+        });
+        let answer = self
+            .execute_with_recovery(AuthPosture::AuthRequired, || async {
+                let mut request = self.http.for_url(&url).await?.post(&url).json(&body);
+                if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired)? {
+                    request = request.bearer_auth(bearer);
+                }
+                match self.send_with_retry_keeping_status(request).await? {
+                    Answered::Failed(FailedResponse { status: 401, .. }) => {
+                        Err(LpmError::AuthRequired)
+                    }
+                    answer => Ok(answer),
+                }
+            })
+            .await?;
+        let response = match answer {
+            Answered::Success(response) => response,
+            Answered::Failed(FailedResponse {
+                status: 404 | 405,
+                body,
+                ..
+            }) if !is_coded_refusal(&body) => return Ok(None),
+            Answered::Failed(FailedResponse { status, body, .. }) => {
+                return Err(publish_upload_refusal(status, &body, version));
+            }
+        };
+        let upload: PublishUpload =
+            parse_capped_api_json(response, "publish upload response").await?;
+        if upload.id.is_empty() {
+            return Err(LpmError::Registry(
+                "the Registry opened a tarball upload without an id".into(),
+            ));
+        }
+        Ok(Some(upload))
+    }
+
+    /// Sends a publish's tarball to the URL `upload` was given, with its
+    /// headers and no credential of the Registry's. The URL takes one write,
+    /// so storage answering that it has the tarball already (412) means an
+    /// earlier try stored it; the publish checks the bytes either way. A
+    /// timeout, a rate limit, a server error or a network failure is
+    /// retried.
+    pub async fn upload_publish_tarball(
+        &self,
+        upload: &PublishUpload,
+        tarball: &Arc<Vec<u8>>,
+    ) -> Result<(), LpmError> {
+        let url = reqwest::Url::parse(&upload.upload_url).map_err(|_| {
+            LpmError::Registry("the Registry gave a tarball upload URL that isn't valid".into())
+        })?;
+        self.validate_request_url(&url)?;
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in &upload.upload_headers {
+            let header = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .ok()
+                .filter(|_| tarball_upload_header_is_allowed(name))
+                .ok_or_else(|| {
+                    LpmError::Registry(format!(
+                        "the Registry asked for a tarball upload header LPM doesn't send: {}",
+                        lpm_common::sanitize_terminal_inline(name)
+                    ))
+                })?;
+            let value = reqwest::header::HeaderValue::from_str(value).map_err(|_| {
+                LpmError::Registry(format!(
+                    "the Registry gave a tarball upload header that isn't valid: {name}"
+                ))
+            })?;
+            headers.insert(header, value);
+        }
+        let client = self.http.for_transfer_url(url.as_str()).await?;
+        let timeout = tarball_upload_timeout(tarball.len());
+        let body = bytes::Bytes::from_owner(SharedTarball(Arc::clone(tarball)));
+
+        let mut last_error = None;
+        for attempt in 0..=MAX_RETRIES {
+            let progress = UploadProgress::new();
+            let request = client
+                .put(url.clone())
+                .headers(headers.clone())
+                .header(reqwest::header::CONTENT_LENGTH, body.len())
+                .timeout(timeout)
+                .body(reqwest::Body::wrap_stream(tarball_upload_chunks(
+                    body.clone(),
+                    Arc::clone(&progress),
+                )));
+            let sent = tokio::select! {
+                sent = request.send() => sent.map_err(tarball_upload_network_error),
+                () = progress.stalled(TARBALL_UPLOAD_STALL) => Err(LpmError::Network(format!(
+                    "tarball upload stalled: nothing was sent or answered for {} s",
+                    TARBALL_UPLOAD_STALL.as_secs()
+                ))),
+            };
+            match sent {
+                Ok(response) => match response.status().as_u16() {
+                    200..=299 | 412 => return Ok(()),
+                    status @ (408 | 429 | 500 | 502 | 503 | 504) => {
+                        last_error = Some(tarball_upload_refusal(status, response).await);
+                    }
+                    status => return Err(tarball_upload_refusal(status, response).await),
+                },
+                Err(error) => last_error = Some(error),
+            }
+            if attempt < MAX_RETRIES {
+                tokio::time::sleep(backoff_delay(attempt)).await;
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| LpmError::Network("tarball upload failed after retries".into())))
     }
 
     /// Read the current publication lifecycle state for an uploaded LPM version.

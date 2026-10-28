@@ -512,6 +512,7 @@ async fn first_publish_with_authored_skills_continues_after_missing_published_sk
         .expect(1)
         .mount(&server)
         .await;
+    mount_tarball_upload(&server).await;
     Mock::given(method("PUT"))
         .and(path_regex("/api/registry/.*"))
         .and(header("authorization", format!("Bearer {EXCHANGED_TOKEN}")))
@@ -566,6 +567,7 @@ async fn publish_wait_uses_the_status_only_oidc_credential() {
         .expect(1)
         .mount(&server)
         .await;
+    mount_tarball_upload(&server).await;
     Mock::given(method("PUT"))
         .and(path_regex("/api/registry/.*"))
         .and(header("authorization", format!("Bearer {EXCHANGED_TOKEN}")))
@@ -611,6 +613,36 @@ async fn publish_wait_uses_the_status_only_oidc_credential() {
     );
 }
 
+/// Mounts lpm.dev's tarball upload: the endpoint that opens one, with the
+/// exchanged credential, and the storage PUT its URL names on the same mock
+/// server.
+async fn mount_tarball_upload(server: &MockServer) {
+    let id = "00000000-0000-4000-8000-000000000001";
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/package/uploads"))
+        .and(header("authorization", format!("Bearer {EXCHANGED_TOKEN}")))
+        .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": id,
+            "uploadUrl": format!("{}/storage/publish-uploads/{id}.tgz", server.uri()),
+            "uploadHeaders": {
+                "content-type": "application/gzip",
+                "if-none-match": "*"
+            },
+            "expiresAt": "2099-01-01T00:00:00.000Z"
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path(format!("/storage/publish-uploads/{id}.tgz")))
+        .and(header("content-type", "application/gzip"))
+        .and(header("if-none-match", "*"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
 /// Mounts an OIDC publish whose upload succeeds and whose status polls
 /// answer `statuses` in order, one poll each.
 async fn mount_held_publication(server: &MockServer, statuses: &[serde_json::Value]) {
@@ -631,6 +663,7 @@ async fn mount_held_publication(server: &MockServer, statuses: &[serde_json::Val
         })))
         .mount(server)
         .await;
+    mount_tarball_upload(server).await;
     Mock::given(method("PUT"))
         .and(path_regex("/api/registry/.*"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

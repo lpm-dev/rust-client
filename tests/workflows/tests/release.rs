@@ -1,9 +1,10 @@
 mod release_contract;
 mod support;
 
-use base64::Engine as _;
 use support::assertions::{assert_fault_injection_aborted, parse_json_output};
-use support::mock_registry::{MockRegistry, make_tarball};
+use support::mock_registry::{
+    MockRegistry, lpm_published_tarball, make_tarball, mount_tarball_uploads,
+};
 use support::{
     LOCK_CONTENTION_MARKER_ENV, TempProject, lpm, lpm_spawnable, lpm_with_registry,
     wait_for_lock_contention,
@@ -410,21 +411,6 @@ async fn mount_lpm_metadata_versions(server: &MockServer, name: &str, versions: 
         .expect(1)
         .mount(server)
         .await;
-}
-
-fn extract_release_upload_tarball(request: &wiremock::Request) -> Vec<u8> {
-    let payload: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-    let attachment = payload["_attachments"]
-        .as_object()
-        .and_then(|attachments| attachments.values().next())
-        .expect("release publish payload must contain a tarball attachment");
-    base64::engine::general_purpose::STANDARD
-        .decode(
-            attachment["data"]
-                .as_str()
-                .expect("release tarball attachment must be base64 text"),
-        )
-        .expect("release tarball attachment must decode")
 }
 
 fn release_uploaded_file_paths(tarball_data: &[u8]) -> Vec<String> {
@@ -2972,6 +2958,7 @@ async fn release_publish_refuses_manifest_drift_after_remote_preflight() {
         })))
         .mount(&server)
         .await;
+    mount_tarball_uploads(&server).await;
     Mock::given(method("PUT"))
         .and(path_regex("/api/registry/.*"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3148,6 +3135,7 @@ async fn release_publish_refuses_workspace_dependency_drift_after_remote_preflig
         })))
         .mount(&server)
         .await;
+    mount_tarball_uploads(&server).await;
     Mock::given(method("PUT"))
         .and(path_regex("/api/registry/.*"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3222,6 +3210,7 @@ async fn release_publish_refuses_workspace_dependency_drift_between_member_uploa
         .mount(&server)
         .await;
     let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    mount_tarball_uploads(&server).await;
     Mock::given(method("PUT"))
         .and(path_regex("/api/registry/.*"))
         .respond_with(RewriteManifestAfterFirstPublish {
@@ -3291,6 +3280,7 @@ async fn release_publish_refuses_static_internal_range_drift_between_member_uplo
         .mount(&server)
         .await;
     let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    mount_tarball_uploads(&server).await;
     Mock::given(method("PUT"))
         .and(path_regex("/api/registry/.*"))
         .respond_with(RewriteManifestAfterFirstPublish {
@@ -3364,6 +3354,7 @@ async fn release_publish_refuses_duplicate_member_name_drift_between_uploads() {
         .mount(&server)
         .await;
     let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    mount_tarball_uploads(&server).await;
     Mock::given(method("PUT"))
         .and(path_regex("/api/registry/.*"))
         .respond_with(RewriteManifestAfterFirstPublish {
@@ -3444,6 +3435,7 @@ async fn release_publish_refuses_a_new_workspace_member_between_uploads() {
         .mount(&server)
         .await;
     let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    mount_tarball_uploads(&server).await;
     Mock::given(method("PUT"))
         .and(path_regex("/api/registry/.*"))
         .respond_with(RewriteManifestAfterFirstPublish {
@@ -3518,6 +3510,7 @@ async fn release_publish_refuses_catalog_drift_between_member_uploads() {
         .mount(&server)
         .await;
     let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    mount_tarball_uploads(&server).await;
     Mock::given(method("PUT"))
         .and(path_regex("/api/registry/.*"))
         .respond_with(RewriteManifestAfterFirstPublish {
@@ -3586,6 +3579,7 @@ async fn release_publish_reuses_one_lpm_whoami_for_shared_auth_members() {
         .expect(1)
         .mount(&server)
         .await;
+    mount_tarball_uploads(&server).await;
     Mock::given(method("PUT"))
         .and(path_regex("/api/registry/.*"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3649,6 +3643,7 @@ async fn release_publish_reports_completed_and_unattempted_packages_after_failur
         })))
         .mount(&server)
         .await;
+    mount_tarball_uploads(&server).await;
     Mock::given(method("PUT"))
         .and(path_regex("/api/registry/.*"))
         .respond_with(FailSecondPublish::default())
@@ -3758,6 +3753,7 @@ async fn release_publish_uses_each_members_publish_config_directory() {
         .expect(1)
         .mount(&server)
         .await;
+    mount_tarball_uploads(&server).await;
     Mock::given(method("PUT"))
         .and(path_regex("/api/registry/.*"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -3780,11 +3776,7 @@ async fn release_publish_uses_each_members_publish_config_directory() {
         String::from_utf8_lossy(&output.stderr),
     );
     let requests = server.received_requests().await.unwrap();
-    let upload = requests
-        .iter()
-        .find(|request| request.method.as_str() == "PUT")
-        .expect("release publish must upload the member");
-    let paths = release_uploaded_file_paths(&extract_release_upload_tarball(upload));
+    let paths = release_uploaded_file_paths(&lpm_published_tarball(&requests));
     assert!(paths.iter().any(|path| path == "package/projected.js"));
     assert!(
         !paths.iter().any(|path| path == "package/root-only.js"),
@@ -3932,6 +3924,7 @@ async fn release_publish_preserves_successful_upload_when_postpublish_fails() {
         .expect(1)
         .mount(&server)
         .await;
+    mount_tarball_uploads(&server).await;
     Mock::given(method("PUT"))
         .and(path_regex("/api/registry/.*"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -4000,6 +3993,7 @@ async fn release_publish_holds_the_exclusive_install_lock_through_upload() {
         .expect(1)
         .mount(&server)
         .await;
+    mount_tarball_uploads(&server).await;
     Mock::given(method("PUT"))
         .and(path_regex("/api/registry/.*"))
         .respond_with(

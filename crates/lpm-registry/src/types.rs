@@ -1035,6 +1035,39 @@ pub enum PublishPreflightVerdict {
     },
 }
 
+/// POST /api/registry/-/package/uploads: where a publish's tarball goes
+/// before the publish names it by `id`.
+#[derive(Clone, Deserialize)]
+pub struct PublishUpload {
+    pub id: String,
+    /// A presigned URL that takes one write of the tarball. It authorizes
+    /// that write, so it's left out of `Debug`.
+    #[serde(rename = "uploadUrl")]
+    pub upload_url: String,
+    /// The headers the upload sends, as they are.
+    #[serde(rename = "uploadHeaders")]
+    pub upload_headers: std::collections::BTreeMap<String, String>,
+    #[serde(rename = "expiresAt")]
+    pub expires_at: String,
+    /// The Registry has the tarball from an earlier try of the same publish
+    /// already, so it needn't be sent again.
+    #[serde(default)]
+    pub stored: bool,
+}
+
+impl std::fmt::Debug for PublishUpload {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PublishUpload")
+            .field("id", &self.id)
+            .field("upload_url", &"<redacted>")
+            .field("upload_headers", &self.upload_headers)
+            .field("expires_at", &self.expires_at)
+            .field("stored", &self.stored)
+            .finish()
+    }
+}
+
 /// GET /api/registry/-/package/publication-status
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicationStatusResponse {

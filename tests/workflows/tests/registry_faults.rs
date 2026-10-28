@@ -959,7 +959,9 @@ async fn concurrent_publish_allows_one_winner_for_the_same_package_version() {
         .expect("wiremock request log must be available");
     let put_count = requests
         .iter()
-        .filter(|request| request.method.as_str() == "PUT")
+        .filter(|request| {
+            request.method.as_str() == "PUT" && request.url.path().starts_with("/api/registry/")
+        })
         .count();
     assert_eq!(put_count, 2, "registry must observe both publish attempts");
 }

@@ -26,7 +26,7 @@ use super::types::{
     PublishProject, PublishQualityGateInput, PublishResult, PublishTarget, ResolvedProvenance,
     hold_explanation,
 };
-use super::upload_lpm::{LpmPublishBody, OtpFailure, publish_to_lpm, resolve_lpm_otp};
+use super::upload_lpm::{LpmPublishBody, OtpFailure, lpm_second_factor, publish_to_lpm};
 use super::version_data::{build_publish_version_data, integrity_to_sha512_hex};
 use super::wait::{DEFAULT_PUBLICATION_WAIT_TIMEOUT, wait_for_lpm_publication_with_oidc};
 use crate::commands::skills::author;
@@ -1646,26 +1646,22 @@ async fn execute_prepared_inner(
         }
     }
 
-    // lpm.dev's second factor is settled before any target publishes too,
-    // so one `--json` can't ask for publishes none. A version lpm.dev
-    // already has needs none, and an account that can't be read yet is the
-    // LPM target's to read again.
+    // lpm.dev's second factor is checked before any target publishes too,
+    // so one `--json` that can't send one publishes none. The LPM target
+    // asks for a code itself, just before its publish request. A version
+    // lpm.dev already has needs none, and an account that can't be read yet
+    // is the LPM target's to read again.
     let mut lpm_dev_has_the_version = None;
-    let otp = if targets_lpm && targets.len() > 1 {
+    if targets_lpm && targets.len() > 1 {
         lpm_dev_has_the_version =
             refuse_before_any_publish_what_lpm_dev_refuses(client, lpm_source, &version).await?;
-        if lpm_dev_has_the_version.is_some() {
-            otp
-        } else {
-            match resolve_lpm_otp(client, otp.as_deref(), json_output, lpm_whoami_cache).await {
-                Ok(settled) => settled,
-                Err(OtpFailure::AccountUnread(_)) => otp,
-                Err(OtpFailure::Final(error)) => return Err(error),
-            }
+        if lpm_dev_has_the_version.is_none()
+            && let Err(OtpFailure::Final(error)) =
+                lpm_second_factor(client, otp.as_deref(), json_output, lpm_whoami_cache).await
+        {
+            return Err(error);
         }
-    } else {
-        otp
-    };
+    }
 
     let provenance_context = match provenance_request {
         ProvenanceRequest::File(_) => None,
@@ -2801,8 +2797,15 @@ mod lpm_target_limit_tests {
     }
 
     fn parts(tarball_files: &[publish_common::TarballFile]) -> LpmPublishParts<'_> {
+        parts_with_readme(None, tarball_files)
+    }
+
+    fn parts_with_readme<'a>(
+        readme: Option<&'a str>,
+        tarball_files: &'a [publish_common::TarballFile],
+    ) -> LpmPublishParts<'a> {
         LpmPublishParts {
-            readme: None,
+            readme,
             tarball_files,
             quality_result: None,
             lpm_config: None,
@@ -2812,10 +2815,25 @@ mod lpm_target_limit_tests {
     }
 
     #[test]
-    fn refuses_a_request_its_file_list_takes_past_the_body_limit_though_its_tarball_is_within_its_own()
-     {
-        // 133.33 MiB of base64 for a tarball at its 100 MiB limit.
-        let tarball = Arc::new(vec![0_u8; 100 * MIB]);
+    fn measures_the_request_without_its_tarball_which_is_uploaded_apart() {
+        let version_data = serde_json::json!({ "name": "pkg", "version": "1.0.0" });
+        let (hashes, no_copies, names) = (hashes(), HashMap::new(), HashMap::new());
+        let length = |size: usize| {
+            let tarball = Arc::new(vec![0_u8; size]);
+            lpm_target_request(source(&tarball, &hashes, &version_data, &no_copies, &names))
+                .unwrap()
+                .len(&parts(&[]))
+                .unwrap()
+        };
+
+        // Only the tarball's length, in digits, is in the request.
+        assert_eq!(length(100 * MIB) - length(MIB), 2);
+        assert!(length(100 * MIB) < 4 * 1024, "{}", length(100 * MIB));
+    }
+
+    #[test]
+    fn refuses_a_request_its_metadata_takes_past_the_body_limit() {
+        let tarball = Arc::new(vec![0_u8; 16]);
         let version_data = serde_json::json!({ "name": "pkg", "version": "1.0.0" });
         let few: Vec<_> = (0..10)
             .map(|index| publish_common::TarballFile {
@@ -2825,7 +2843,7 @@ mod lpm_target_limit_tests {
             .collect();
         let many: Vec<_> = (0..100_000)
             .map(|index| publish_common::TarballFile {
-                path: format!("package/{}/{index}.js", "d".repeat(180)),
+                path: format!("package/{}/{index}.js", "d".repeat(1_100)),
                 size: 1,
             })
             .collect();
@@ -2845,32 +2863,33 @@ mod lpm_target_limit_tests {
 
     #[test]
     fn keeps_room_for_a_provenance_bundle_when_one_is_signed() {
+        let tarball = Arc::new(vec![0_u8; 16]);
         let version_data = serde_json::json!({ "name": "pkg", "version": "1.0.0" });
         let (hashes, no_copies, names) = (hashes(), HashMap::new(), HashMap::new());
         let files = [];
-        let length = |size: usize| {
-            let tarball = Arc::new(vec![0_u8; size]);
-            lpm_target_request(source(&tarball, &hashes, &version_data, &no_copies, &names))
+        let source = || source(&tarball, &hashes, &version_data, &no_copies, &names);
+        // An ASCII README adds a byte to the request for each of its own.
+        let length = |readme: &str| {
+            lpm_target_request(source())
                 .unwrap()
-                .len(&parts(&files))
+                .len(&parts_with_readme(Some(readme), &files))
                 .unwrap()
         };
-        // Whole groups of 3 bytes, which base64 writes as 4, so the request
-        // grows by exactly 4 bytes a group near the size it's sized for.
         let room = publish_common::MAX_LPM_REGISTRY_BODY_BYTES - PROVENANCE_BODY_RESERVE_BYTES;
-        let near = (room / 4 * 3) as usize;
-        let groups = (room as i64 - length(near) as i64).div_euclid(4);
-        let fits = (near as i64 + 3 * groups) as usize;
-        assert!(length(fits) <= room && room - length(fits) < 4);
-        let check = |size: usize, provenance: bool| {
-            let tarball = Arc::new(vec![0_u8; size]);
-            let source = source(&tarball, &hashes, &version_data, &no_copies, &names);
-            check_lpm_target_body(source, &parts(&files), provenance)
+        let fits = "a".repeat((room - length("")) as usize);
+        assert_eq!(length(&fits), room);
+        let past = format!("{fits}a");
+        let check = |readme: &str, provenance: bool| {
+            check_lpm_target_body(
+                source(),
+                &parts_with_readme(Some(readme), &files),
+                provenance,
+            )
         };
 
-        check(fits, true).unwrap();
-        check(fits + 3, false).unwrap();
-        let error = check(fits + 3, true).unwrap_err().to_string();
+        check(&fits, true).unwrap();
+        check(&past, false).unwrap();
+        let error = check(&past, true).unwrap_err().to_string();
         assert!(
             error.contains("publish request too large for the LPM registry")
                 && error.contains("less 1 MiB kept for its provenance bundle"),
