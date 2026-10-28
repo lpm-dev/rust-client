@@ -432,6 +432,95 @@ struct ProjectTokenRetirementSequence {
     failures_remaining: AtomicUsize,
 }
 
+/// Where a mock registry's tarball uploads go, standing in for storage.
+pub const MOCK_TARBALL_UPLOAD_PREFIX: &str = "/__storage/publish-uploads/";
+
+/// Answers `POST /api/registry/-/package/uploads` as lpm.dev does, with an
+/// upload URL on the mock server itself and a new UUID-shaped id each time.
+struct PublishUploadResponder {
+    base_url: String,
+    next: AtomicUsize,
+}
+
+impl Respond for PublishUploadResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let id = format!(
+            "00000000-0000-4000-8000-{:012x}",
+            self.next.fetch_add(1, Ordering::Relaxed)
+        );
+        ResponseTemplate::new(201).set_body_json(serde_json::json!({
+            "id": id,
+            "uploadUrl": format!(
+                "{}{MOCK_TARBALL_UPLOAD_PREFIX}{id}.tgz?X-Amz-Signature=mock",
+                self.base_url
+            ),
+            "uploadHeaders": {
+                "content-type": "application/gzip",
+                "if-none-match": "*",
+            },
+            "expiresAt": "2099-01-01T00:00:00.000Z",
+        }))
+    }
+}
+
+/// Mounts lpm.dev's tarball upload on `server`: the endpoint that opens an
+/// upload, and the storage PUT its URL names. Both answer at the lowest
+/// priority, so a test can answer either itself.
+pub async fn mount_tarball_uploads(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/package/uploads"))
+        .respond_with(PublishUploadResponder {
+            base_url: server.uri(),
+            next: AtomicUsize::new(1),
+        })
+        .with_priority(u8::MAX)
+        .mount(server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(format!("^{MOCK_TARBALL_UPLOAD_PREFIX}")))
+        .respond_with(ResponseTemplate::new(200))
+        .with_priority(u8::MAX)
+        .mount(server)
+        .await;
+}
+
+/// The LPM publish among `requests`: the PUT to a Registry package path.
+pub fn lpm_publish_request(requests: &[Request]) -> &Request {
+    requests
+        .iter()
+        .find(|request| {
+            request.method.as_str() == "PUT" && request.url.path().starts_with("/api/registry/")
+        })
+        .expect("publish must send one Registry PUT")
+}
+
+/// The tarball an LPM publish among `requests` sent: the body of the
+/// storage upload its attachment names, as the publish carries no tarball.
+pub fn lpm_published_tarball(requests: &[Request]) -> Vec<u8> {
+    let payload: serde_json::Value =
+        serde_json::from_slice(&lpm_publish_request(requests).body).expect("publish payload");
+    let attachment = payload["_attachments"]
+        .as_object()
+        .and_then(|attachments| attachments.values().next())
+        .expect("publish payload must contain one tarball attachment");
+    assert!(
+        attachment.get("data").is_none(),
+        "an LPM publish names its upload instead of carrying the tarball"
+    );
+    let upload_path = format!(
+        "{MOCK_TARBALL_UPLOAD_PREFIX}{}.tgz",
+        attachment["upload_id"]
+            .as_str()
+            .expect("the attachment names its upload")
+    );
+    requests
+        .iter()
+        .find(|request| request.method.as_str() == "PUT" && request.url.path() == upload_path)
+        .expect("the tarball must be uploaded before the publish")
+        .body
+        .clone()
+}
+
 struct PublishPreflightResponder;
 
 impl Respond for PublishPreflightResponder {
@@ -651,6 +740,7 @@ impl MockRegistry {
             .with_priority(u8::MAX)
             .mount(&server)
             .await;
+        mount_tarball_uploads(&server).await;
         Mock::given(method("POST"))
             .and(path("/api/registry/pool/install-report"))
             .respond_with(ResponseTemplate::new(200))

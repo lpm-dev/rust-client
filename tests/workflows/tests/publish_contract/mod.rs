@@ -214,7 +214,7 @@ async fn publish_bom_manifest_survives_target_rename_and_source_stays_unchanged(
         .iter()
         .find(|request| request.method.as_str() == "PUT")
         .unwrap();
-    let tarball = extract_lpm_upload_tarball(request);
+    let tarball = extract_npm_upload_tarball(request);
     assert_eq!(
         extract_uploaded_package_json(&tarball)["name"],
         "renamed-package"

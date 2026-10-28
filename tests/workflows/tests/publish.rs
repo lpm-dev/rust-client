@@ -11,7 +11,9 @@ use sha2::{Digest, Sha512};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use support::assertions::parse_json_output;
-use support::mock_registry::MockRegistry;
+use support::mock_registry::{
+    MOCK_TARBALL_UPLOAD_PREFIX, MockRegistry, lpm_publish_request, lpm_published_tarball,
+};
 use support::{TempProject, lpm, lpm_spawnable_with_registry, lpm_with_registry};
 use wiremock::matchers::{header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -65,10 +67,7 @@ async fn publish_retains_products_from_native_swift_manifest_inspection() {
         .assert()
         .success();
     let requests = mock.server().received_requests().await.unwrap();
-    let upload = requests
-        .iter()
-        .find(|request| request.method.as_str() == "PUT")
-        .unwrap();
+    let upload = lpm_publish_request(&requests);
     let payload: serde_json::Value = serde_json::from_slice(&upload.body).unwrap();
     assert_eq!(
         payload["versions"]["1.0.0"]["_swiftManifest"]["products"][0]["name"],
@@ -300,44 +299,42 @@ fn incompressible(bytes: usize) -> Vec<u8> {
         .collect()
 }
 
-#[test]
-fn publish_refuses_a_request_past_lpm_dev_s_limit_whose_tarball_is_within_its_own() {
-    // The tarball stays under 100 MiB. Its base64, package.json's long field
-    // and a README whose control characters JSON writes six bytes each, sent
-    // twice, take the request past 150 MiB.
-    let filler = "x".repeat(15 * 1024 * 1024);
-    let project = TempProject::empty(&format!(
-        r#"{{
-        "name": "@lpm.dev/testuser.too-big-request",
+#[tokio::test]
+async fn publish_uploads_a_tarball_whose_base64_would_be_past_lpm_dev_s_request_limit() {
+    // 96 MiB of tarball is 128 MiB in base64, past the 100 MiB lpm.dev takes
+    // in a request, so it goes to storage before the publish names it.
+    let mock = MockRegistry::start().await;
+    mock.with_publish_endpoint().await;
+    mock.with_whoami("testuser", "test@example.com").await;
+    let project = TempProject::empty(
+        r#"{
+        "name": "@lpm.dev/testuser.large-binary",
         "version": "1.0.0",
         "main": "index.js",
-        "license": "MIT",
-        "filler": "{filler}"
-    }}"#
-    ));
+        "license": "MIT"
+    }"#,
+    );
     project.write_file("index.js", "module.exports = {}");
-    project.write_file("README.md", &"\u{1}".repeat(1024 * 1024));
     std::fs::write(
         project.path().join("blob.bin"),
         incompressible(96 * 1024 * 1024),
     )
     .unwrap();
 
-    let output = lpm(&project)
-        .args(["publish", "--dry-run", "--yes", "--json"])
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["publish", "--yes", "--token", "test-token-123", "--lpm"])
         .output()
-        .expect("failed to run lpm publish --dry-run");
+        .expect("run publish");
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!output.status.success(), "{stdout}");
-    let envelope: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|error| panic!("publish --json must print JSON: {error}\n{stdout}"));
     assert!(
-        envelope["error"]
-            .as_str()
-            .is_some_and(|error| error.contains("publish request too large for the LPM registry")),
-        "{stdout}"
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    let requests = mock.server().received_requests().await.unwrap();
+    assert!(lpm_published_tarball(&requests).len() > 96 * 1024 * 1024);
+    let publish = lpm_publish_request(&requests);
+    assert!(publish.body.len() < 64 * 1024, "{}", publish.body.len());
 }
 
 /// A project publishing to lpm.dev and to an npm-compatible registry at
@@ -523,9 +520,10 @@ async fn publish_asks_for_lpm_dev_s_second_factor_before_any_target_publishes() 
 /// registry's.
 async fn uploads(mock: &MockRegistry) -> (usize, usize) {
     let requests = mock.server().received_requests().await.unwrap();
-    let puts = requests
-        .iter()
-        .filter(|request| request.method.as_str() == "PUT");
+    let puts = requests.iter().filter(|request| {
+        request.method.as_str() == "PUT"
+            && !request.url.path().starts_with(MOCK_TARBALL_UPLOAD_PREFIX)
+    });
     let lpm = puts
         .clone()
         .filter(|request| request.url.path().starts_with("/api/registry/"))
@@ -755,19 +753,7 @@ async fn publish_asks_lpm_dev_about_the_tarball_it_is_sent() {
         String::from_utf8_lossy(&published.stderr)
     );
     let requests = accepting.server().received_requests().await.unwrap();
-    let upload = requests
-        .iter()
-        .find(|request| request.method.as_str() == "PUT")
-        .expect("publish must upload");
-    let payload: serde_json::Value = serde_json::from_slice(&upload.body).unwrap();
-    let attachment = payload["_attachments"]
-        .as_object()
-        .and_then(|attachments| attachments.values().next())
-        .expect("the upload carries its tarball");
-    let uploaded = BASE64
-        .decode(attachment["data"].as_str().unwrap())
-        .unwrap()
-        .len() as u64;
+    let uploaded = lpm_published_tarball(&requests).len() as u64;
 
     assert!(uploaded > 0);
     assert_eq!(sizes, vec![uploaded, uploaded]);
@@ -2665,11 +2651,7 @@ async fn publish_preserves_authored_executable_bits_in_the_uploaded_tarball() {
         String::from_utf8_lossy(&output.stderr),
     );
     let requests = mock.server().received_requests().await.unwrap();
-    let upload = requests
-        .iter()
-        .find(|request| request.method.as_str() == "PUT")
-        .expect("publish must upload a tarball");
-    let tarball_data = extract_lpm_upload_tarball(upload);
+    let tarball_data = lpm_published_tarball(&requests);
     assert_eq!(
         extract_uploaded_file_mode(&tarball_data, "package/bin/mode-check") & 0o777,
         0o755,
@@ -2713,10 +2695,7 @@ async fn publish_quality_metadata_uses_the_detected_ecosystem() {
         String::from_utf8_lossy(&output.stderr),
     );
     let requests = mock.server().received_requests().await.unwrap();
-    let upload = requests
-        .iter()
-        .find(|request| request.method.as_str() == "PUT")
-        .expect("publish must upload package metadata");
+    let upload = lpm_publish_request(&requests);
     let payload: serde_json::Value = serde_json::from_slice(&upload.body).unwrap();
     assert_eq!(
         payload["versions"]["1.0.0"]["_qualityMeta"]["ecosystem"],
@@ -2750,11 +2729,7 @@ async fn publish_applies_nested_npmignore_without_a_root_ignore_file() {
 
     assert!(output.status.success(), "{output:?}");
     let requests = mock.server().received_requests().await.unwrap();
-    let upload = requests
-        .iter()
-        .find(|request| request.method.as_str() == "PUT")
-        .expect("publish must upload a tarball");
-    let paths = uploaded_file_paths(&extract_lpm_upload_tarball(upload));
+    let paths = uploaded_file_paths(&lpm_published_tarball(&requests));
     assert!(
         paths
             .iter()
@@ -2805,11 +2780,7 @@ async fn publish_uses_publish_config_directory_as_the_artifact_root() {
 
     assert!(output.status.success(), "{output:?}");
     let requests = mock.server().received_requests().await.unwrap();
-    let upload = requests
-        .iter()
-        .find(|request| request.method.as_str() == "PUT")
-        .expect("publish must upload a tarball");
-    let tarball = extract_lpm_upload_tarball(upload);
+    let tarball = lpm_published_tarball(&requests);
     let paths = uploaded_file_paths(&tarball);
     assert!(paths.iter().any(|path| path == "package/projected.js"));
     assert!(
@@ -2858,10 +2829,7 @@ async fn publish_projection_uses_root_lpm_configuration_and_packages_projection_
 
     assert!(output.status.success(), "{output:?}");
     let requests = mock.server().received_requests().await.unwrap();
-    let upload = requests
-        .iter()
-        .find(|request| request.method.as_str() == "PUT")
-        .expect("publish must upload the projected artifact");
+    let upload = lpm_publish_request(&requests);
     let payload: serde_json::Value = serde_json::from_slice(&upload.body).unwrap();
     assert!(
         payload["versions"]["1.0.0"]["name"]
@@ -2869,7 +2837,7 @@ async fn publish_projection_uses_root_lpm_configuration_and_packages_projection_
             .is_some_and(|name| name == "@lpm.dev/testuser.publish-projection-target"),
         "root lpm.json must remain authoritative for target naming: {payload}",
     );
-    let tarball = extract_lpm_upload_tarball(upload);
+    let tarball = lpm_published_tarball(&requests);
     assert_eq!(
         extract_uploaded_file(&tarball, "package/lpm.json"),
         br#"{"publish":{"lpm":{"name":"@lpm.dev/testuser.projection-local-setting"}}}"#,
@@ -3084,11 +3052,7 @@ async fn publish_implicit_file_set_keeps_runtime_directories_named_private() {
 
     assert!(output.status.success(), "{output:?}");
     let requests = mock.server().received_requests().await.unwrap();
-    let upload = requests
-        .iter()
-        .find(|request| request.method.as_str() == "PUT")
-        .expect("publish must upload a tarball");
-    let paths = uploaded_file_paths(&extract_lpm_upload_tarball(upload));
+    let paths = uploaded_file_paths(&lpm_published_tarball(&requests));
     assert!(
         paths
             .iter()
@@ -3123,17 +3087,14 @@ async fn publish_always_includes_readme_and_license_filename_variants() {
 
     assert!(output.status.success(), "{output:?}");
     let requests = mock.server().received_requests().await.unwrap();
-    let upload = requests
-        .iter()
-        .find(|request| request.method.as_str() == "PUT")
-        .expect("publish must upload a tarball");
+    let upload = lpm_publish_request(&requests);
     let payload: serde_json::Value =
         serde_json::from_slice(&upload.body).expect("publish request body must be valid JSON");
     assert_eq!(
         payload["readme"], "Required README variant\n",
         "the always-included README variant must also populate registry metadata",
     );
-    let paths = uploaded_file_paths(&extract_lpm_upload_tarball(upload));
+    let paths = uploaded_file_paths(&lpm_published_tarball(&requests));
     assert!(paths.iter().any(|path| path == "package/ReadMe.rst"));
     assert!(paths.iter().any(|path| path == "package/LICENCE.txt"));
 }
@@ -3163,11 +3124,7 @@ async fn publish_files_patterns_support_npm_brace_alternatives() {
 
     assert!(output.status.success(), "{output:?}");
     let requests = mock.server().received_requests().await.unwrap();
-    let upload = requests
-        .iter()
-        .find(|request| request.method.as_str() == "PUT")
-        .expect("publish must upload a tarball");
-    let paths = uploaded_file_paths(&extract_lpm_upload_tarball(upload));
+    let paths = uploaded_file_paths(&lpm_published_tarball(&requests));
     assert!(paths.iter().any(|path| path == "package/dist/index.js"));
     assert!(paths.iter().any(|path| path == "package/dist/index.ts"));
     assert!(!paths.iter().any(|path| path == "package/dist/index.css"));
@@ -3621,10 +3578,7 @@ async fn lpm_name_override_is_used_for_the_uploaded_route_and_payload() {
         String::from_utf8_lossy(&output.stderr),
     );
     let requests = mock.server().received_requests().await.unwrap();
-    let upload = requests
-        .iter()
-        .find(|request| request.method.as_str() == "PUT")
-        .expect("publish must send one Registry PUT");
+    let upload = lpm_publish_request(&requests);
     assert_eq!(
         upload.url.path(),
         "/api/registry/%40lpm.dev%2Ftestuser.resolved-upload"
@@ -3635,17 +3589,7 @@ async fn lpm_name_override_is_used_for_the_uploaded_route_and_payload() {
     let published_version = &payload["versions"]["1.0.0"];
     assert_eq!(published_version["name"], RESOLVED_NAME);
     assert_eq!(published_version["_id"], format!("{RESOLVED_NAME}@1.0.0"));
-    let attachment = payload["_attachments"]
-        .as_object()
-        .and_then(|attachments| attachments.values().next())
-        .expect("publish payload must contain one tarball attachment");
-    let tarball_data = BASE64
-        .decode(
-            attachment["data"]
-                .as_str()
-                .expect("tarball attachment must be base64 text"),
-        )
-        .expect("tarball attachment must decode");
+    let tarball_data = lpm_published_tarball(&requests);
     let manifest_bytes = extract_uploaded_file(&tarball_data, "package/package.json");
     let published_manifest: serde_json::Value =
         serde_json::from_slice(&manifest_bytes).expect("published manifest must parse");
@@ -3659,8 +3603,6 @@ async fn lpm_name_override_is_used_for_the_uploaded_route_and_payload() {
 
 #[tokio::test]
 async fn real_publish_ships_authored_skills_without_changing_package_json() {
-    use base64::Engine;
-
     let mock = MockRegistry::start().await;
     mock.with_publish_endpoint().await;
     mock.with_whoami("testuser", "test@example.com").await;
@@ -3680,26 +3622,13 @@ async fn real_publish_ships_authored_skills_without_changing_package_json() {
     );
     assert_eq!(project.read_file("package.json"), before);
     let requests = mock.server().received_requests().await.unwrap();
-    let upload = requests
-        .iter()
-        .find(|request| request.method.as_str() == "PUT")
-        .expect("publish must send one Registry PUT");
-    let payload: serde_json::Value = serde_json::from_slice(&upload.body).unwrap();
-    let attachment = payload["_attachments"]
-        .as_object()
-        .and_then(|attachments| attachments.values().next())
-        .expect("publish payload must contain one tarball attachment");
-    let tarball_data = base64::engine::general_purpose::STANDARD
-        .decode(attachment["data"].as_str().unwrap())
-        .unwrap();
+    let tarball_data = lpm_published_tarball(&requests);
     let skill = extract_uploaded_file(&tarball_data, "package/lpm-skills/usage.md");
     assert_eq!(skill, project.read_file("lpm-skills/usage.md").into_bytes());
 }
 
 #[tokio::test]
 async fn publish_rewrites_catalog_dependency_in_uploaded_tarball() {
-    use base64::Engine;
-
     let mock = MockRegistry::start().await;
     mock.with_publish_endpoint().await;
     mock.with_whoami("testuser", "test@example.com").await;
@@ -3754,29 +3683,11 @@ catalog:
         .received_requests()
         .await
         .expect("wiremock request log must be available");
-    let publish_request = requests
-        .iter()
-        .find(|request| request.method.as_str() == "PUT")
-        .unwrap_or_else(|| {
-            panic!(
-                "expected a publish PUT request, got {} request(s)",
-                requests.len()
-            )
-        });
+    let publish_request = lpm_publish_request(&requests);
 
     let payload: serde_json::Value = serde_json::from_slice(&publish_request.body)
         .expect("publish request body must be valid JSON");
-    let attachment = payload["_attachments"]
-        .as_object()
-        .and_then(|attachments| attachments.values().next())
-        .unwrap_or_else(|| panic!("publish payload must contain one tarball attachment"));
-    let tarball_data = base64::engine::general_purpose::STANDARD
-        .decode(
-            attachment["data"]
-                .as_str()
-                .expect("tarball attachment must be base64 text"),
-        )
-        .expect("tarball attachment must decode from base64");
+    let tarball_data = lpm_published_tarball(&requests);
 
     let published_package_json = extract_uploaded_package_json(&tarball_data);
     assert_eq!(
@@ -5152,7 +5063,8 @@ fn extract_uploaded_package_json(tarball_data: &[u8]) -> serde_json::Value {
     serde_json::from_slice(&content).expect("published package.json must parse")
 }
 
-fn extract_lpm_upload_tarball(request: &wiremock::Request) -> Vec<u8> {
+/// The tarball an npm publish request carries in base64.
+fn extract_npm_upload_tarball(request: &wiremock::Request) -> Vec<u8> {
     let payload: serde_json::Value =
         serde_json::from_slice(&request.body).expect("publish request body must be valid JSON");
     let attachment = payload["_attachments"]

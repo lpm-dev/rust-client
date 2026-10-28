@@ -1,5 +1,5 @@
 use super::swift::extract_swift_metadata;
-use crate::commands::publish_common::{self, TarballFile};
+use crate::commands::publish_common::TarballFile;
 use crate::prompt::PromptResultExt as _;
 use crate::{install_ui, quality};
 use lpm_common::LpmError;
@@ -126,7 +126,6 @@ pub(super) async fn publish_to_lpm(
 
     let otp_code = resolve_lpm_otp(client, provided_otp, json_output, whoami_cache).await?;
 
-    let payload = publish_common::prepare_base64_json_publish_body(body.prefix()?, tarball_data)?;
     let published_integrity = body
         .version_data
         .get("dist")
@@ -136,18 +135,35 @@ pub(super) async fn publish_to_lpm(
             LpmError::Registry("prepared publish metadata is missing dist.integrity".into())
         })?;
 
+    // The tarball goes to storage first and the publish names its upload,
+    // so lpm.dev's limit on a request's body bounds only the metadata.
+    let upload = client
+        .create_publish_upload(
+            body.name,
+            body.version,
+            tarball_data.len() as u64,
+            published_integrity,
+        )
+        .await?;
+    client.upload_publish_tarball(&upload, tarball_data).await?;
+    let payload =
+        lpm_http::ReplayableRequestBody::from_bytes(body.payload(&upload.id, tarball_data.len())?);
+
     let encoded_name = urlencoding::encode(body.name);
     client
         .publish_package(
             &encoded_name,
             body.version,
             published_integrity,
-            payload.replayable(),
+            &payload,
             otp_code.as_deref(),
             tarball_data.len(),
         )
         .await
 }
+
+/// The length of an upload's id, which the Registry gives as a UUID.
+const UPLOAD_ID_LEN: usize = 36;
 
 /// What an lpm.dev publish request carries, but its tarball.
 pub(super) struct LpmPublishBody<'a> {
@@ -164,8 +180,9 @@ pub(super) struct LpmPublishBody<'a> {
 }
 
 impl LpmPublishBody<'_> {
-    /// The request's JSON up to the tarball's base64.
-    fn prefix(&self) -> Result<Vec<u8>, LpmError> {
+    /// The request's JSON, naming the upload `upload_id` of a tarball of
+    /// `tarball_len` bytes.
+    fn payload(&self, upload_id: &str, tarball_len: usize) -> Result<Vec<u8>, LpmError> {
         let tarball_key = format!(
             "{}-{}.tgz",
             self.name.replace('/', "-").replace('@', ""),
@@ -185,20 +202,26 @@ impl LpmPublishBody<'_> {
             detected_ecosystem: self.detected_ecosystem,
             swift_metadata: swift_metadata.as_ref(),
         };
-        build_lpm_publish_payload_prefix(LpmPublishPayload {
+        build_lpm_publish_payload(LpmPublishPayload {
             name: self.name,
             version: self.version,
             readme: self.readme,
             detected_ecosystem: self.detected_ecosystem,
             lpm_version: &lpm_version,
             tarball_key: &tarball_key,
+            attachment: LpmUploadedAttachment {
+                content_type: "application/gzip",
+                length: tarball_len,
+                upload_id,
+            },
         })
     }
 
-    /// The length of the request that carries a tarball of `tarball_len`
-    /// bytes, as `publish_to_lpm` sends it.
+    /// The length of the request `publish_to_lpm` sends for a tarball of
+    /// `tarball_len` bytes, known before its upload opens.
     pub(super) fn len_with(&self, tarball_len: usize) -> Result<u64, LpmError> {
-        publish_common::base64_json_publish_body_len(self.prefix()?.len(), tarball_len)
+        let placeholder = "0".repeat(UPLOAD_ID_LEN);
+        Ok(self.payload(&placeholder, tarball_len)?.len() as u64)
     }
 }
 
@@ -356,6 +379,15 @@ struct LpmPublishPayload<'a> {
     detected_ecosystem: &'a str,
     lpm_version: &'a LpmVersionPayload<'a>,
     tarball_key: &'a str,
+    attachment: LpmUploadedAttachment<'a>,
+}
+
+/// The publish's attachment: the tarball's upload in place of its data.
+#[derive(serde::Serialize)]
+struct LpmUploadedAttachment<'a> {
+    content_type: &'a str,
+    length: usize,
+    upload_id: &'a str,
 }
 
 struct LpmVersions<'a> {
@@ -374,13 +406,13 @@ impl serde::Serialize for LpmVersions<'_> {
     }
 }
 
-fn build_lpm_publish_payload_prefix(input: LpmPublishPayload<'_>) -> Result<Vec<u8>, LpmError> {
-    let mut prefix = Vec::with_capacity(64 * 1024);
-    prefix.write_all(b"{").map_err(LpmError::Io)?;
-    write_lpm_json_member(&mut prefix, "_id", input.name, true)?;
-    write_lpm_json_member(&mut prefix, "name", input.name, false)?;
+fn build_lpm_publish_payload(input: LpmPublishPayload<'_>) -> Result<Vec<u8>, LpmError> {
+    let mut payload = Vec::with_capacity(64 * 1024);
+    payload.write_all(b"{").map_err(LpmError::Io)?;
+    write_lpm_json_member(&mut payload, "_id", input.name, true)?;
+    write_lpm_json_member(&mut payload, "name", input.name, false)?;
     write_lpm_json_member(
-        &mut prefix,
+        &mut payload,
         "description",
         input
             .lpm_version
@@ -389,16 +421,16 @@ fn build_lpm_publish_payload_prefix(input: LpmPublishPayload<'_>) -> Result<Vec<
             .unwrap_or(&serde_json::Value::Null),
         false,
     )?;
-    write_lpm_json_member(&mut prefix, "readme", &input.readme, false)?;
-    write_lpm_json_member(&mut prefix, "_ecosystem", input.detected_ecosystem, false)?;
+    write_lpm_json_member(&mut payload, "readme", &input.readme, false)?;
+    write_lpm_json_member(&mut payload, "_ecosystem", input.detected_ecosystem, false)?;
     write_lpm_json_member(
-        &mut prefix,
+        &mut payload,
         "dist-tags",
         &serde_json::json!({"latest": input.version}),
         false,
     )?;
     write_lpm_json_member(
-        &mut prefix,
+        &mut payload,
         "versions",
         &LpmVersions {
             version: input.version,
@@ -406,14 +438,14 @@ fn build_lpm_publish_payload_prefix(input: LpmPublishPayload<'_>) -> Result<Vec<
         },
         false,
     )?;
-    prefix
+    payload
         .write_all(b",\"_attachments\":{")
         .map_err(LpmError::Io)?;
-    serde_json::to_writer(&mut prefix, input.tarball_key).map_err(publish_serialization_error)?;
-    prefix
-        .write_all(b":{\"content_type\":\"application/gzip\",\"data\":\"")
-        .map_err(LpmError::Io)?;
-    Ok(prefix)
+    serde_json::to_writer(&mut payload, input.tarball_key).map_err(publish_serialization_error)?;
+    payload.write_all(b":").map_err(LpmError::Io)?;
+    serde_json::to_writer(&mut payload, &input.attachment).map_err(publish_serialization_error)?;
+    payload.write_all(b"}}").map_err(LpmError::Io)?;
+    Ok(payload)
 }
 
 fn write_lpm_json_member<T: serde::Serialize + ?Sized>(
@@ -467,8 +499,54 @@ fn is_valid_otp(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        LpmPackMetadata, LpmVersionPayload, is_valid_otp, lpm_publish_transport_is_allowed,
+        LpmPackMetadata, LpmPublishBody, LpmVersionPayload, is_valid_otp,
+        lpm_publish_transport_is_allowed,
     };
+
+    #[test]
+    fn lpm_publish_payload_names_the_upload_in_place_of_the_tarball() {
+        let version_data = serde_json::json!({
+            "name": "@lpm.dev/owner.pkg",
+            "version": "1.0.0",
+            "dist": { "integrity": "sha512-abc" },
+        });
+        let files = [crate::commands::publish_common::TarballFile {
+            path: "package.json".into(),
+            size: 10,
+        }];
+        let body = LpmPublishBody {
+            name: "@lpm.dev/owner.pkg",
+            version: "1.0.0",
+            readme: Some("# Pkg"),
+            version_data: &version_data,
+            tarball_files: &files,
+            package_json_size_override: None,
+            quality_result: None,
+            lpm_config: None,
+            detected_ecosystem: "js",
+            swift_manifest: None,
+        };
+        let upload_id = "11111111-1111-4111-8111-111111111111";
+
+        let bytes = body.payload(upload_id, 4096).unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            payload["_attachments"],
+            serde_json::json!({
+                "lpm.dev-owner.pkg-1.0.0.tgz": {
+                    "content_type": "application/gzip",
+                    "length": 4096,
+                    "upload_id": upload_id,
+                }
+            })
+        );
+        assert_eq!(
+            payload["versions"]["1.0.0"]["dist"]["integrity"],
+            "sha512-abc"
+        );
+        assert_eq!(body.len_with(4096).unwrap(), bytes.len() as u64);
+    }
 
     #[test]
     fn lpm_pack_metadata_serializes_borrowed_files_with_the_manifest_size_override() {

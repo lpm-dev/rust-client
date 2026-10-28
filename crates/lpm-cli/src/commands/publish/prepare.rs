@@ -740,7 +740,7 @@ pub(crate) fn validate_lpm_registry_body_size(
             String::new()
         };
         return Err(LpmError::Registry(format!(
-            "publish request too large for the LPM registry: {} (max {}{kept}), the tarball in base64 with the package's metadata; publish fewer or smaller files",
+            "publish request too large for the LPM registry: {} (max {}{kept}), the package's metadata with its file list and README; publish fewer files or a shorter README",
             lpm_common::format_bytes_past(body_size),
             lpm_common::format_bytes(max)
         )));
