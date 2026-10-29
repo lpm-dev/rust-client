@@ -432,13 +432,18 @@ pub(crate) fn listed_in(name: &str, listed: &[&str]) -> bool {
 
 /// Maximum size of the complete uncompressed tar stream, including headers,
 /// padding, metadata, and end markers.
-pub(crate) const MAX_UNCOMPRESSED_TARBALL_BYTES: u64 = 500 * 1024 * 1024;
+pub(crate) const MAX_UNCOMPRESSED_TARBALL_BYTES: u64 = 1024 * 1024 * 1024;
 
 pub(crate) const MAX_COMPRESSED_TARBALL_BYTES: u64 = 500 * 1024 * 1024;
 
 /// The LPM registry's limit for a compressed tarball, below the local one,
 /// checked before any target publishes so a larger one fails up front.
-pub(crate) const MAX_LPM_REGISTRY_TARBALL_BYTES: u64 = 100 * 1024 * 1024;
+pub(crate) const MAX_LPM_REGISTRY_TARBALL_BYTES: u64 = 250 * 1024 * 1024;
+
+/// The LPM registry's limit on a tarball's files, below the local one,
+/// checked before any target publishes so a tarball isn't uploaded only to
+/// be refused for it.
+pub(crate) const MAX_LPM_REGISTRY_ARCHIVE_FILES: usize = 20_000;
 
 /// lpm.dev's limit on a request's body, which a publish request's metadata
 /// must fit, checked before any target publishes too. LPM CLI uploads the

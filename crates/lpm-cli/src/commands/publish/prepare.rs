@@ -722,6 +722,18 @@ pub(crate) fn validate_lpm_registry_tarball_size(tarball_size: usize) -> Result<
     )
 }
 
+/// Refuses a tarball of `files` files, which the LPM registry would refuse
+/// for their number.
+pub(crate) fn validate_lpm_registry_file_count(files: usize) -> Result<(), LpmError> {
+    let max = publish_common::MAX_LPM_REGISTRY_ARCHIVE_FILES;
+    if files > max {
+        return Err(LpmError::Registry(format!(
+            "tarball has too many files for the LPM registry: {files} (max {max}); publish fewer files with the package.json `files` field or .npmignore"
+        )));
+    }
+    Ok(())
+}
+
 /// Refuses a publish request of `body_size` bytes that lpm.dev would refuse
 /// for its size, keeping `reserve` bytes of the limit for what the upload
 /// adds after the check, as a provenance bundle.

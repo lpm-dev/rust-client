@@ -10,8 +10,8 @@ use super::output::{
 use super::prepare::read_publish_manifest;
 use super::prepare::{
     PublishSource, prepare_publish_project_from_manifest, read_publish_manifest_from_source,
-    validate_lpm_registry_body_size, validate_lpm_registry_tarball_size,
-    validate_publish_tarball_size,
+    validate_lpm_registry_body_size, validate_lpm_registry_file_count,
+    validate_lpm_registry_tarball_size, validate_publish_tarball_size,
 };
 use super::provenance::{
     ProvenanceRequest, load_provenance_request_file, materialize_provenance_request,
@@ -1175,6 +1175,7 @@ async fn prepare_publish_manifest_with_workspace_lock_held(
         !allow_secrets,
     )?;
     if targets_lpm {
+        validate_lpm_registry_file_count(tarball_files.len())?;
         check_lpm_target_tarball(
             &target_names,
             &name,
