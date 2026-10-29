@@ -15,13 +15,19 @@
 //!   (`lpm_vault::sync::sharing_key_step_up_scope`).
 //!   - (future) force-push gates → `vault:force-push:*`
 //!
+//! An account with a passkey approves the action in the browser instead,
+//! which can also confirm an authenticator code.
+//!
 //! Always refuses non-interactive callers: a CI environment piping
 //! stdin should never silently advance through a password prompt and
 //! then succeed; the failure must be loud so the operator wires a
 //! different credential flow (long-lived token, OIDC, etc.) instead.
 
 use crate::prompt::PromptResultExt as _;
-use lpm_vault::sync::{CliStepUpCredential, discover_cli_step_up_policy, mint_cli_step_up_proof};
+use lpm_vault::sync::{
+    CliStepUpCredential, discover_cli_step_up_policy, mint_cli_step_up_proof,
+    request_cli_step_up_approval,
+};
 use std::io::IsTerminal;
 
 use lpm_common::LpmError;
@@ -57,6 +63,12 @@ pub async fn request_cli_step_up_proof(
     .await?;
 
     match policy.method.as_str() {
+        "approval" => {
+            if policy.methods.iter().any(|method| method == "totp") && !approve_in_browser()? {
+                return totp_step_up(client, scope).await;
+            }
+            approval_step_up(client, scope).await
+        }
         "password" => {
             output::info(
                 "Confirm your password to authorize this action. This proof is bound to your \
@@ -85,52 +97,7 @@ pub async fn request_cli_step_up_proof(
             )
             .await
         }
-        "totp" => {
-            // Two-factor proof — the server requires password AND a
-            // fresh TOTP code because the CLI bearer is not a Supabase
-            // session and `mfa.verify` can only be reached by signing
-            // in transiently with the password first. See WS2 server
-            // route docstring for the full rationale.
-            output::info(
-                "Confirm your password and a fresh authenticator code to authorize this \
-                 action. This proof is bound to your current CLI session and expires in 5 \
-                 minutes.",
-            );
-            let password: String = cliclack::password("Password")
-                .interact()
-                .map_prompt_err(|e| LpmError::Script(format!("password prompt failed: {e}")))?;
-            let code: String = cliclack::input("Authenticator code (6 digits)")
-                .validate(|input: &String| {
-                    if input.chars().all(|c| c.is_ascii_digit()) && input.len() == 6 {
-                        Ok(())
-                    } else {
-                        Err("must be exactly 6 digits")
-                    }
-                })
-                .interact()
-                .map_prompt_err(|e| LpmError::Script(format!("totp prompt failed: {e}")))?;
-
-            crate::commands::env::auth::execute_sync_with_bearer(
-                client,
-                |registry_url, auth_token| {
-                    let password = password.clone();
-                    let code = code.clone();
-                    async move {
-                        mint_cli_step_up_proof(
-                            &registry_url,
-                            &auth_token,
-                            scope,
-                            &CliStepUpCredential::Totp {
-                                password: &password,
-                                code: &code,
-                            },
-                        )
-                        .await
-                    }
-                },
-            )
-            .await
-        }
+        "totp" => totp_step_up(client, scope).await,
         "unavailable" => {
             let reason = policy.reason.as_deref().unwrap_or("unknown");
             Err(LpmError::Script(format!(
@@ -144,4 +111,102 @@ pub async fn request_cli_step_up_proof(
              try upgrading with `lpm upgrade`"
         ))),
     }
+}
+
+/// Whether to approve in the browser rather than type the password and an
+/// authenticator code here, for an account that can do either. The browser,
+/// which can confirm a passkey, comes first.
+fn approve_in_browser() -> Result<bool, LpmError> {
+    let choice: &str = cliclack::select("How do you want to confirm it's you?")
+        .item(
+            "approval",
+            "Approve in your browser",
+            "With your passkey or authenticator app",
+        )
+        .item("totp", "Type your password and an authenticator code", "")
+        .initial_value("approval")
+        .interact()
+        .map_prompt_err(|e| LpmError::Script(format!("method prompt failed: {e}")))?;
+    Ok(choice == "approval")
+}
+
+/// Has the user approve `scope` in the browser, then mints the proof with
+/// the approval's one-time token.
+async fn approval_step_up(
+    client: &lpm_registry::RegistryClient,
+    scope: &str,
+) -> Result<String, LpmError> {
+    let approval = crate::commands::env::auth::execute_sync_with_bearer(
+        client,
+        |registry_url, auth_token| async move {
+            request_cli_step_up_approval(&registry_url, &auth_token, scope).await
+        },
+    )
+    .await?;
+    let token = crate::commands::web_auth::complete_lpm_browser_approval(
+        &approval.auth_url,
+        &approval.done_url,
+        client.base_url(),
+        "authorize this action",
+    )
+    .await?;
+
+    crate::commands::env::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
+        let token = token.clone();
+        async move {
+            mint_cli_step_up_proof(
+                &registry_url,
+                &auth_token,
+                scope,
+                &CliStepUpCredential::Approval { token: &token },
+            )
+            .await
+        }
+    })
+    .await
+}
+
+async fn totp_step_up(
+    client: &lpm_registry::RegistryClient,
+    scope: &str,
+) -> Result<String, LpmError> {
+    // The server needs the password as well as the code: the CLI bearer
+    // isn't a Supabase session, so `mfa.verify` is reachable only after a
+    // transient password sign-in.
+    output::info(
+        "Confirm your password and a fresh authenticator code to authorize this \
+         action. This proof is bound to your current CLI session and expires in 5 \
+         minutes.",
+    );
+    let password: String = cliclack::password("Password")
+        .interact()
+        .map_prompt_err(|e| LpmError::Script(format!("password prompt failed: {e}")))?;
+    let code: String = cliclack::input("Authenticator code (6 digits)")
+        .validate(|input: &String| {
+            if input.chars().all(|c| c.is_ascii_digit()) && input.len() == 6 {
+                Ok(())
+            } else {
+                Err("must be exactly 6 digits")
+            }
+        })
+        .interact()
+        .map_prompt_err(|e| LpmError::Script(format!("totp prompt failed: {e}")))?;
+
+    crate::commands::env::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
+        let password = password.clone();
+        let code = code.clone();
+        async move {
+            mint_cli_step_up_proof(
+                &registry_url,
+                &auth_token,
+                scope,
+                &CliStepUpCredential::Totp {
+                    password: &password,
+                    code: &code,
+                },
+            )
+            .await
+        }
+    })
+    .await
 }

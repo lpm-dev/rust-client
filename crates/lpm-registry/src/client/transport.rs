@@ -484,7 +484,10 @@ impl RegistryClient {
                         200..=299 | 304 => return Ok(PublishSafeResponse::Response(response)),
 
                         // Non-retryable client errors — fail immediately
-                        401 => return Err(LpmError::AuthRequired),
+                        401 => {
+                            let body = read_publish_error_text(response, &headers, bearer).await;
+                            return Err(publish_unauthorized_error(&body));
+                        }
                         403 => {
                             let body = read_publish_error_text(response, &headers, bearer).await;
                             let duplicate_message = format!(
@@ -931,6 +934,39 @@ pub(super) fn version_exists_error(version: &str) -> LpmError {
     LpmError::Registry(format!(
         "Version {version} already exists. Verify the existing release in the registry if an earlier publish was interrupted. To publish different contents, choose a new version."
     ))
+}
+
+/// What a publish's 401 is: the registry asking for the second factor as a
+/// browser approval or a code, a code or approval it refused, or the
+/// credential itself. A refused approval isn't the credential's fault, so
+/// it must not end as `AuthRequired`, which refreshes the session and
+/// publishes again with the same spent token.
+fn publish_unauthorized_error(body: &str) -> LpmError {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return LpmError::AuthRequired;
+    };
+    let text = |field: &str| value.get(field).and_then(serde_json::Value::as_str);
+    if let (Some(auth_url), Some(done_url)) = (text("authUrl"), text("doneUrl")) {
+        return LpmError::BrowserApprovalRequired {
+            action: "publish".into(),
+            auth_url: auth_url.to_owned(),
+            done_url: done_url.to_owned(),
+        };
+    }
+    match text("code") {
+        Some("OTP_REQUIRED") => LpmError::OtpRequired {
+            command: "lpm publish",
+        },
+        Some("OTP_INVALID") => LpmError::OtpInvalid {
+            command: "lpm publish",
+        },
+        Some("APPROVAL_INVALID") => LpmError::Registry(
+            text("error")
+                .unwrap_or("the browser approval is invalid, expired, or already used")
+                .to_owned(),
+        ),
+        _ => LpmError::AuthRequired,
+    }
 }
 
 async fn read_publish_error_text(

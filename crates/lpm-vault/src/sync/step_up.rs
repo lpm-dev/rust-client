@@ -8,15 +8,19 @@ use super::http::{read_capped_error_text, read_capped_json, sync_http_client};
 pub const CLI_STEP_UP_HEADER_NAME: &str = "X-LPM-Step-Up-Proof";
 
 /// Step-up policy resolved by the server for the calling user. The CLI
-/// prompts for the credential named in `method` (or refuses outright
-/// when `unavailable`).
+/// asks for the credential named in `method` (or refuses outright when
+/// `unavailable`), and may offer the others in `methods`.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CliStepUpPolicy {
-    /// `"password"`, `"totp"`, or `"unavailable"`. The CLI MUST refuse
-    /// any flow when `unavailable` because the prompt would ask for a
-    /// credential the user cannot satisfy.
+    /// `"approval"`, `"password"`, `"totp"`, or `"unavailable"`. The CLI
+    /// MUST refuse any flow when `unavailable` because the prompt would ask
+    /// for a credential the user cannot satisfy.
     pub method: String,
+    /// Every method the account can use, `method` first. Older servers
+    /// don't send it.
+    #[serde(default)]
+    pub methods: Vec<String>,
     /// Present only when `method == "unavailable"`. Currently the only
     /// observed value is `"set_password_required"`.
     pub reason: Option<String>,
@@ -29,13 +33,54 @@ pub struct CliStepUpPolicy {
     pub header: Option<String>,
 }
 
-/// Credential the CLI supplies on mint. Two shapes — password-only for
-/// users with no MFA, and password+TOTP for MFA-enrolled users. The CLI
-/// cannot drive TOTP alone because the server expects password-backed
-/// reauthentication for this proof.
+/// Credential the CLI supplies on mint: password-only for users with no
+/// MFA, password+TOTP for MFA-enrolled users (the server expects password-
+/// backed reauthentication for a code typed here), or the one-time token of
+/// a browser approval.
 pub enum CliStepUpCredential<'a> {
     Password { password: &'a str },
     Totp { password: &'a str, code: &'a str },
+    Approval { token: &'a str },
+}
+
+/// Where the user approves a step-up in the browser, and where the CLI
+/// waits for the token, from `request_cli_step_up_approval`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliStepUpApproval {
+    pub auth_url: String,
+    pub done_url: String,
+}
+
+/// Ask the server for a browser approval of `scope`. The user approves it
+/// with their passkey or authenticator; the token `done_url` then gives the
+/// CLI mints the proof through `CliStepUpCredential::Approval`.
+pub async fn request_cli_step_up_approval(
+    registry_url: &str,
+    auth_token: &str,
+    scope: &str,
+) -> Result<CliStepUpApproval, SyncError> {
+    let client = sync_http_client()?;
+    let url = format!("{registry_url}/api/auth/cli-step-up");
+
+    let response = client
+        .post(&url)
+        .bearer_auth(auth_token)
+        .json(&serde_json::json!({ "scope": scope, "method": "approval" }))
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(super::http::network_error)?;
+
+    let status = response.status();
+    if status != reqwest::StatusCode::ACCEPTED {
+        let body = read_capped_error_text(response).await;
+        return Err(SyncError::http(
+            status,
+            format!("step-up approval: {status}: {body}"),
+        ));
+    }
+    Ok(read_capped_json::<CliStepUpApproval>(response).await?)
 }
 
 /// Discover the step-up method the server expects for the calling
@@ -107,6 +152,11 @@ pub async fn mint_cli_step_up_proof(
             "password": password,
             "totpCode": code,
         }),
+        CliStepUpCredential::Approval { token } => serde_json::json!({
+            "scope": scope,
+            "method": "approval",
+            "approvalToken": token,
+        }),
     };
 
     let response = client
@@ -150,7 +200,7 @@ pub async fn mint_cli_step_up_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     #[tokio::test]
@@ -344,5 +394,112 @@ mod tests {
                 || err.to_string().contains("Incorrect password"),
             "error envelope should be preserved so CLI can render it: {err}"
         );
+    }
+
+    const SCOPE: &str =
+        "vault:public-key:set:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    #[tokio::test]
+    async fn discover_cli_step_up_policy_reads_every_method_the_account_can_use() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/auth/cli-step-up"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "method": "approval",
+                "methods": ["approval", "totp"],
+                "ttlSeconds": 300,
+                "header": "X-LPM-Step-Up-Proof",
+            })))
+            .mount(&server)
+            .await;
+
+        let policy = discover_cli_step_up_policy(&server.uri(), "token")
+            .await
+            .expect("policy");
+
+        assert_eq!(policy.method, "approval");
+        assert_eq!(policy.methods, vec!["approval", "totp"]);
+    }
+
+    #[tokio::test]
+    async fn request_cli_step_up_approval_reads_where_to_approve_and_wait() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/auth/cli-step-up"))
+            .and(body_partial_json(serde_json::json!({
+                "scope": SCOPE,
+                "method": "approval",
+            })))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "ok": false,
+                "code": "approval_required",
+                "authUrl": "https://lpm.dev/cli/approve/approval-1",
+                "doneUrl": "https://lpm.dev/api/auth/cli-approvals/approval-1/secret",
+                "expiresAt": 1_900_000_000_000_u64,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let approval = request_cli_step_up_approval(&server.uri(), "token", SCOPE)
+            .await
+            .expect("approval");
+
+        assert_eq!(approval.auth_url, "https://lpm.dev/cli/approve/approval-1");
+        assert_eq!(
+            approval.done_url,
+            "https://lpm.dev/api/auth/cli-approvals/approval-1/secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_cli_step_up_approval_refuses_a_server_that_minted_nothing_to_wait_for() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/auth/cli-step-up"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "code": "method_not_available",
+            })))
+            .mount(&server)
+            .await;
+
+        let error = request_cli_step_up_approval(&server.uri(), "token", SCOPE)
+            .await
+            .expect_err("refusal");
+
+        assert!(error.to_string().contains("method_not_available"));
+    }
+
+    #[tokio::test]
+    async fn mint_cli_step_up_proof_sends_the_approval_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/auth/cli-step-up"))
+            .and(body_partial_json(serde_json::json!({
+                "scope": SCOPE,
+                "method": "approval",
+                "approvalToken": "approval-token",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "proof": "approved-jwt",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let proof = mint_cli_step_up_proof(
+            &server.uri(),
+            "token",
+            SCOPE,
+            &CliStepUpCredential::Approval {
+                token: "approval-token",
+            },
+        )
+        .await
+        .expect("proof");
+
+        assert_eq!(proof, "approved-jwt");
     }
 }

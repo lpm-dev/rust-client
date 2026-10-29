@@ -369,9 +369,15 @@ fn security_sensitive_client_paths_keep_shared_builders() {
     let registry_api = read_workspace_source("crates/lpm-registry/src/client/api.rs");
     assert_body_contains(
         &registry_api,
-        "pub async fn publish_package(",
+        "async fn send_publish(",
         "self.http.for_url_no_build(&url)",
     );
+    for publish in [
+        "pub async fn publish_package(",
+        "pub async fn publish_approved_package(",
+    ] {
+        assert_body_contains(&registry_api, publish, "self.send_publish(");
+    }
 
     let vault = read_workspace_source("crates/lpm-vault/src/sync/http.rs");
     assert_body_contains(

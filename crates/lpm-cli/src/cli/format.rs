@@ -367,6 +367,16 @@ fn json_error_value(error: &lpm_common::LpmError) -> serde_json::Value {
                 "source": auth_source,
             }
         }),
+        lpm_common::LpmError::BrowserApprovalRequired { action, .. } => serde_json::json!({
+            "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
+            "success": false,
+            "error_code": error.error_code(),
+            "error": {
+                "code": "BROWSER_APPROVAL_REQUIRED",
+                "message": error.to_string(),
+                "action": action,
+            }
+        }),
         lpm_common::LpmError::OtpRequired { command }
         | lpm_common::LpmError::OtpInvalid { command } => serde_json::json!({
             "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
@@ -730,6 +740,14 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
                 "One-time password required",
             ))];
             push_detail(&mut lines, "command", install_ui::yellow(command));
+            push_diagnostic_help(&mut lines, error);
+            lines
+        }
+        lpm_common::LpmError::BrowserApprovalRequired { action, .. } => {
+            let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
+                "Approval required in the browser",
+            ))];
+            push_detail(&mut lines, "action", install_ui::yellow(action));
             push_diagnostic_help(&mut lines, error);
             lines
         }
