@@ -44,7 +44,7 @@ function validDatabaseEndpoint(endpoint, work) {
   let parsed;
   try { parsed = new URL('http://' + host); }
   catch { return false; }
-  return parsed.hostname.length > 0 && validBidiDomain(parsed.hostname,work);
+  return parsed.hostname.length > 0 && validIdnaDomain(parsed.hostname,work);
 }
 const BIDI_LTR = 1, BIDI_RTL = 2, BIDI_AN = 4, BIDI_EN = 8, BIDI_NSM = 16, BIDI_NEUTRAL = 32;
 function decodeRanges(encoded) {
@@ -155,14 +155,22 @@ function punycodeLabel(label, work) {
   }
   return output.length > 1000 || output.every(c=>c < 128) ? null : output;
 }
-function validBidiDomain(host, work) {
+// Some platform parsers keep an xn-- label whose decoded text they'd refuse or
+// map, so the decoded text must encode back to the same label.
+function platformEncodes(label, scalars, work) {
+  if (!label.startsWith('xn--')) return true;
+  spend(work,scalars.length * scalars.length);
+  try { return new URL('http://' + String.fromCodePoint(...scalars)).hostname === label; }
+  catch { return false; }
+}
+function validIdnaDomain(host, work) {
   if (host.startsWith('[') || !host.includes('xn--')) return true;
   const labels = [], parts = host.split('.');
   let triggered = false;
   for (const part of parts) {
     spend(work,part.length + 1);
     const scalars = punycodeLabel(part,work);
-    if (scalars === null || !validJoiners(scalars,work)) return false;
+    if (scalars === null || !validJoiners(scalars,work) || !platformEncodes(part,scalars,work)) return false;
     const classes = scalars.map(c=>bidiClass(c,work));
     for (const c of classes) { spend(work); if (c & (BIDI_RTL | BIDI_AN)) triggered = true; }
     labels.push(classes);
@@ -216,7 +224,7 @@ function parsedUrl(value, work) {
   try { parsed = new URL(value); }
   catch { return false; }
   if (scheme === 'file' && fileDriveSegment(parsed.pathname)) return false;
-  return parsed.hostname.length > 0 && (!special || validBidiDomain(parsed.hostname,work));
+  return parsed.hostname.length > 0 && (!special || validIdnaDomain(parsed.hostname,work));
 }
 function url(value, work) {
   const schemeEnd = value.indexOf(':');
