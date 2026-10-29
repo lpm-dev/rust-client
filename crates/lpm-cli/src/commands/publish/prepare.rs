@@ -1169,12 +1169,15 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
             return Err(swift_inspection_error(error));
         }
     };
+    // A process the kill missed can keep the output pipes open, so an
+    // inspection that failed returns without waiting for its readers.
     let status = crate::commands::rebuild::process_tree::wait_with_timeout_or_cancel(
         child,
         &timeout,
         &cancelled,
         "Swift manifest output exceeded the configured limit",
-    );
+    )
+    .map_err(swift_inspection_error)?;
     let stdout = stdout_reader
         .join()
         .map_err(|_| swift_inspection_error("Swift output reader failed"))?
@@ -1183,7 +1186,6 @@ fn dump_swift_manifest_from_publish_artifact_with_command(
         .join()
         .map_err(|_| swift_inspection_error("Swift diagnostic reader failed"))?
         .map_err(swift_inspection_error)?;
-    let status = status.map_err(swift_inspection_error)?;
     if !status.success() {
         return Err(swift_inspection_error(
             crate::swift_manifest::swift_failure_reason(&status, &stderr),
@@ -2165,6 +2167,37 @@ mod tests {
         assert!(error.to_string().contains("timeout after"), "{error}");
         assert!(
             elapsed < std::time::Duration::from_secs(15),
+            "timed-out inspector returned after {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swift_manifest_inspection_returns_at_the_timeout_when_a_survivor_holds_its_output() {
+        let fixture = swift_fixture_tarball();
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("swift-survivor");
+        // A grandchild in a session of its own, reparented before the
+        // timeout, escapes both the group kill and the descendant snapshot
+        // and keeps the inspector's output open for 10 s.
+        write_executable(
+            &executable,
+            "#!/usr/bin/perl\nuse POSIX ();\ndefined(my $child = fork) or die;\nif ($child == 0) {\n  POSIX::setsid();\n  defined(my $grandchild = fork) or die;\n  if ($grandchild == 0) { sleep 10; exit 0 }\n  exit 0;\n}\nwaitpid($child, 0);\nsleep 30;\n",
+        );
+        let started = std::time::Instant::now();
+
+        let error = dump_swift_manifest_from_publish_artifact_with_command(
+            &fixture,
+            executable.as_os_str(),
+            std::time::Duration::from_millis(500),
+            128,
+        )
+        .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(error.to_string().contains("timeout after"), "{error}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
             "timed-out inspector returned after {elapsed:?}"
         );
     }

@@ -11,9 +11,16 @@ pub(in crate::commands) fn kill_process_tree(child: &mut std::process::Child) {
         // subreaper) and their original PPID is lost.
         let descendants = collect_unix_descendants(pid);
         let signed = pid as i32;
-        // SAFETY: kill(-pid) sends SIGKILL to the whole process group.
-        unsafe {
-            libc::kill(-signed, libc::SIGKILL);
+        // A child forked while the group's signal is delivered can miss it
+        // on macOS, so the group is signalled again once that fork is done.
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // SAFETY: kill(-pid) sends SIGKILL to the whole process group.
+            unsafe {
+                libc::kill(-signed, libc::SIGKILL);
+            }
         }
         // Then mop up any pgid-detached survivors by individual pid.
         for d in descendants {
