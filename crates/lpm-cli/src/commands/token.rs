@@ -1,7 +1,7 @@
 use crate::install_ui;
 use crate::prompt::PromptResultExt as _;
 use lpm_common::LpmError;
-use lpm_registry::RegistryClient;
+use lpm_registry::{RegistryClient, SecondFactorProof};
 use secrecy::{ExposeSecret, SecretString};
 
 const COMMAND: &str = "lpm token-rotate";
@@ -73,14 +73,70 @@ pub async fn run_rotate(
 
     let url = format!("{}/api/registry/-/token/rotate", registry_url);
 
-    let (body, submitted_bearer) = match rotate_once(client, &url, otp.as_ref()).await {
-        Err(LpmError::OtpRequired { .. })
-            if otp.is_none()
-                && !json_output
-                && crate::commands::web_auth::terminal_is_interactive() =>
-        {
+    let interactive = crate::commands::web_auth::terminal_is_interactive();
+    let first = rotate_once(
+        client,
+        &url,
+        otp.as_ref()
+            .map(|code| SecondFactorProof::Code(code.expose())),
+    )
+    .await;
+    let (body, submitted_bearer) = match first {
+        Err(LpmError::BrowserApprovalRequired {
+            action,
+            auth_url,
+            done_url,
+            accepts_code,
+            has_passkey,
+        }) => {
+            if otp.is_some() && !accepts_code {
+                // The registry takes no code from an account without an
+                // authenticator app.
+                return Err(LpmError::Registry(
+                    "--otp needs an authenticator app, and this account has none — it confirms in the browser with its passkey; run without --otp".into(),
+                ));
+            }
+            if accepts_code && !has_passkey {
+                // Without a passkey to prefer, the code is asked for in the
+                // terminal, as it was before browser approvals.
+                if json_output || !interactive {
+                    return Err(LpmError::OtpRequired { command: COMMAND });
+                }
+                let prompted_otp = prompt_otp()?;
+                rotate_once(
+                    client,
+                    &url,
+                    Some(SecondFactorProof::Code(prompted_otp.expose())),
+                )
+                .await?
+            } else if json_output {
+                return Err(LpmError::BrowserApprovalRequired {
+                    action,
+                    auth_url,
+                    done_url,
+                    accepts_code,
+                    has_passkey,
+                });
+            } else {
+                let approval = crate::commands::web_auth::complete_lpm_browser_approval(
+                    &auth_url,
+                    &done_url,
+                    registry_url,
+                    "rotate this token",
+                )
+                .await?;
+                rotate_once(client, &url, Some(SecondFactorProof::Approval(&approval))).await?
+            }
+        }
+        // A registry that doesn't offer browser approvals asks for the code.
+        Err(LpmError::OtpRequired { .. }) if otp.is_none() && !json_output && interactive => {
             let prompted_otp = prompt_otp()?;
-            rotate_once(client, &url, Some(&prompted_otp)).await?
+            rotate_once(
+                client,
+                &url,
+                Some(SecondFactorProof::Code(prompted_otp.expose())),
+            )
+            .await?
         }
         Err(LpmError::AuthRequired) => {
             clear_rejected_local_session_if_current(registry_url, &rejected_access_token)?;
@@ -165,13 +221,13 @@ fn clear_rejected_local_session_if_current(
 async fn rotate_once(
     client: &RegistryClient,
     url: &str,
-    otp: Option<&OtpCode>,
+    proof: Option<SecondFactorProof<'_>>,
 ) -> Result<(serde_json::Value, SecretString), LpmError> {
     client
-        .post_json_with_otp_recovery_and_bearer(
+        .post_json_with_second_factor_and_bearer(
             url,
             &serde_json::json!({}),
-            otp.map(OtpCode::expose),
+            proof,
             COMMAND,
             "token rotation",
         )

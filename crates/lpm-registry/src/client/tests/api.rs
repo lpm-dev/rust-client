@@ -1947,7 +1947,7 @@ async fn a_tarball_upload_stalls_only_after_its_limit_passes_without_progress() 
 
 #[tokio::test]
 async fn publish_package_reports_a_browser_approval_the_registry_asks_for() {
-    use wiremock::matchers::method;
+    use wiremock::matchers::{header, method};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
@@ -1957,9 +1957,12 @@ async fn publish_package_reports_a_browser_approval_the_registry_asks_for() {
     let done_url = format!("{}/api/auth/cli-approvals/approval-1/secret", server.uri());
 
     Mock::given(method("PUT"))
+        .and(header("x-lpm-browser-approval", "1"))
         .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
             "error": "Approve this publish in your browser with your passkey.",
             "code": "OTP_REQUIRED",
+            "otp": false,
+            "passkey": true,
             "authUrl": auth_url,
             "doneUrl": done_url,
         })))
@@ -1974,8 +1977,92 @@ async fn publish_package_reports_a_browser_approval_the_registry_asks_for() {
 
     assert!(matches!(
         result,
-        Err(LpmError::BrowserApprovalRequired { action, auth_url: auth, done_url: done })
-            if action == "publish" && auth == auth_url && done == done_url
+        Err(LpmError::BrowserApprovalRequired {
+            action,
+            auth_url: auth,
+            done_url: done,
+            accepts_code: false,
+            has_passkey: true,
+        }) if action == "publish" && auth == auth_url && done == done_url
+    ));
+}
+
+#[tokio::test]
+async fn post_with_second_factor_says_it_can_wait_and_reports_the_approval_asked_for() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let client = client.with_token("session-token");
+    let url = format!("{}/api/registry/-/token/rotate", server.uri());
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/rotate"))
+        .and(header("x-lpm-browser-approval", "1"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "code": "OTP_REQUIRED",
+            "otp": true,
+            "passkey": false,
+            "authUrl": "https://lpm.dev/cli/approve/a",
+            "doneUrl": "https://lpm.dev/api/auth/cli-approvals/a/b",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = client
+        .post_json_with_second_factor_and_bearer(
+            &url,
+            &serde_json::json!({}),
+            None,
+            "lpm token-rotate",
+            "token rotation",
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(LpmError::BrowserApprovalRequired {
+            action,
+            accepts_code: true,
+            has_passkey: false,
+            ..
+        }) if action == "token rotation"
+    ));
+}
+
+#[tokio::test]
+async fn post_with_second_factor_sends_an_approval_and_reports_a_refused_one_as_final() {
+    use wiremock::matchers::{header, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let client = client.with_token("session-token");
+    let url = format!("{}/api/registry/-/token/rotate", server.uri());
+    Mock::given(method("POST"))
+        .and(header("x-lpm-approval", "approval-token"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": "This approval is invalid, expired, or already used. Try again to get a new one.",
+            "code": "APPROVAL_INVALID",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = client
+        .post_json_with_second_factor_and_bearer(
+            &url,
+            &serde_json::json!({}),
+            Some(crate::SecondFactorProof::Approval("approval-token")),
+            "lpm token-rotate",
+            "token rotation",
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(LpmError::Registry(text)) if text.starts_with("This approval is invalid")
     ));
 }
 

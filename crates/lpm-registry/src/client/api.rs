@@ -687,7 +687,7 @@ impl RegistryClient {
             published_version,
             published_integrity,
             payload,
-            otp.map(|code| ("x-otp", code)),
+            otp.map(SecondFactorProof::Code),
             tarball_size_bytes,
         )
         .await
@@ -710,7 +710,7 @@ impl RegistryClient {
             published_version,
             published_integrity,
             payload,
-            Some((APPROVAL_HEADER, approval_token)),
+            Some(SecondFactorProof::Approval(approval_token)),
             tarball_size_bytes,
         )
         .await
@@ -722,7 +722,7 @@ impl RegistryClient {
         published_version: &str,
         published_integrity: &str,
         payload: &lpm_http::ReplayableRequestBody,
-        second_factor: Option<(&'static str, &str)>,
+        second_factor: Option<SecondFactorProof<'_>>,
         tarball_size_bytes: usize,
     ) -> Result<serde_json::Value, LpmError> {
         let url = format!("{}/api/registry/{}", self.base_url, encoded_name);
@@ -745,12 +745,14 @@ impl RegistryClient {
                             .put(&url)
                             .header(reqwest::header::CONTENT_TYPE, "application/json")
                             .header(reqwest::header::CONTENT_LENGTH, payload.len())
+                            .header(super::second_factor::BROWSER_APPROVAL_SUPPORT_HEADER, "1")
                             .timeout(timeout)
                             .body(body);
                         if let Some(bearer) = bearer.as_ref() {
                             request = request.bearer_auth(bearer);
                         }
-                        if let Some((header, value)) = second_factor {
+                        if let Some(proof) = second_factor {
+                            let (header, value) = proof.header();
                             request = request.header(header, value);
                         }
                         Ok(request)
@@ -1127,6 +1129,3 @@ impl PublishPreflightVerdict {
         }
     }
 }
-
-/// Carries the one-time token of a browser approval on the request it approves.
-const APPROVAL_HEADER: &str = "x-lpm-approval";
