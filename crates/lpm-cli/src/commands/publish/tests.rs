@@ -650,7 +650,21 @@ fn publish_tarball_size_states_one_byte_over_as_past_the_limit() {
 }
 
 #[test]
-fn publish_tarball_size_for_the_lpm_registry_is_its_100_mib_limit() {
+fn publish_file_count_for_the_lpm_registry_is_its_20000_file_limit() {
+    assert!(super::prepare::validate_lpm_registry_file_count(20_000).is_ok());
+
+    let error = super::prepare::validate_lpm_registry_file_count(20_001).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("tarball has too many files for the LPM registry: 20001 (max 20000)"),
+        "unexpected file count error: {error}"
+    );
+}
+
+#[test]
+fn publish_tarball_size_for_the_lpm_registry_is_its_250_mib_limit() {
     let limit = crate::commands::publish_common::MAX_LPM_REGISTRY_TARBALL_BYTES as usize;
     assert!(super::prepare::validate_lpm_registry_tarball_size(limit).is_ok());
 
@@ -659,7 +673,7 @@ fn publish_tarball_size_for_the_lpm_registry_is_its_100_mib_limit() {
     assert!(
         error
             .to_string()
-            .contains("tarball too large for the LPM registry: 100.01 MiB (max 100 MiB)"),
+            .contains("tarball too large for the LPM registry: 250.01 MiB (max 250 MiB)"),
         "unexpected tarball limit error: {error}"
     );
 }

@@ -261,12 +261,11 @@ fn publish_refuses_a_tarball_past_lpm_dev_s_limit_before_any_target_publishes() 
     }"#,
     );
     project.write_file("index.js", "module.exports = {}");
-    // Incompressible, so the gzipped tarball stays past lpm.dev's 100 MiB.
-    std::fs::write(
-        project.path().join("blob.bin"),
-        incompressible(101 * 1024 * 1024),
-    )
-    .unwrap();
+    // Incompressible, so the gzipped tarball stays past lpm.dev's 250 MiB;
+    // two files, as one is capped at 200 MiB.
+    for blob in ["blob-1.bin", "blob-2.bin"] {
+        std::fs::write(project.path().join(blob), incompressible(126 * 1024 * 1024)).unwrap();
+    }
 
     let output = lpm(&project)
         .args(["publish", "--dry-run", "--yes", "--json"])
@@ -281,6 +280,40 @@ fn publish_refuses_a_tarball_past_lpm_dev_s_limit_before_any_target_publishes() 
         envelope["error"]
             .as_str()
             .is_some_and(|error| error.contains("tarball too large for the LPM registry")),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn publish_refuses_more_files_than_lpm_dev_takes_before_any_target_publishes() {
+    let project = TempProject::empty(
+        r#"{
+        "name": "@lpm.dev/testuser.many-files",
+        "version": "1.0.0",
+        "main": "index.js",
+        "license": "MIT"
+    }"#,
+    );
+    project.write_file("index.js", "module.exports = {}");
+    let dir = project.path().join("data");
+    std::fs::create_dir(&dir).unwrap();
+    for index in 0..20_000 {
+        std::fs::write(dir.join(format!("{index}.txt")), "x").unwrap();
+    }
+
+    let output = lpm(&project)
+        .args(["publish", "--dry-run", "--yes", "--json"])
+        .output()
+        .expect("failed to run lpm publish --dry-run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!output.status.success(), "{stdout}");
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|error| panic!("publish --json must print JSON: {error}\n{stdout}"));
+    assert!(
+        envelope["error"].as_str().is_some_and(|error| {
+            error.contains("tarball has too many files for the LPM registry: 20002 (max 20000)")
+        }),
         "{stdout}"
     );
 }
@@ -564,7 +597,7 @@ async fn publish_publishes_no_target_when_lpm_dev_refuses_it_for_good() {
         (
             413,
             Some("TARBALL_TOO_LARGE"),
-            "Tarball too large (101 MiB). Maximum single package size is 100 MiB.",
+            "Tarball too large (251 MiB). Maximum single package size is 250 MiB.",
         ),
         (403, None, "Token does not have publish permissions"),
     ] {
