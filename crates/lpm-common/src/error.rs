@@ -445,7 +445,7 @@ pub enum LpmError {
     OtpInvalid { command: &'static str },
 
     /// A command that asks before it makes a change ran without a terminal
-    /// to ask in, or with `--json`, and without `--yes`. It changed nothing.
+    /// to ask in, or with `--json`, and without `--yes`, and didn't make it.
     #[error("`{command}` needs `--yes` to {change} without asking")]
     #[diagnostic(code(lpm::confirmation_required), help("{help}"))]
     ConfirmationRequired {

@@ -100,7 +100,7 @@ fn run_clean(json_output: bool, yes: bool) -> Result<(), LpmError> {
         return Ok(());
     }
 
-    confirm_hosts_file_clean(&plan, yes)?;
+    confirm_hosts_file_clean(&plan, yes, json_output)?;
     let outcome = apply_hosts_file_clean_plan_with_permission(&plan).map_err(|err| {
         LpmError::Script(format!(
             "local hosts file cleanup failed for {}: {err}. Review the current block count and file access, then run `lpm hosts clean` again.",
@@ -291,11 +291,12 @@ fn validate_hosts(hosts: &[String]) -> Result<(), LpmError> {
 fn confirm_hosts_file_clean(
     plan: &lpm_runner::local_domains::HostsFileCleanPlan,
     yes: bool,
+    json_output: bool,
 ) -> Result<(), LpmError> {
     if yes {
         return Ok(());
     }
-    if !std::io::stdin().is_terminal() {
+    if json_output || !std::io::stdin().is_terminal() {
         return Err(LpmError::ConfirmationRequired {
             command: "lpm hosts clean",
             change: format!(
@@ -308,7 +309,7 @@ fn confirm_hosts_file_clean(
                 },
                 plan.path.display()
             ),
-            help: "Run it in an interactive terminal to be asked first, or run it again with `--yes`.",
+            help: "Run it in an interactive terminal to be asked first, or run it again with `--yes`. It asks only in an interactive terminal, and never with `--json`.",
         });
     }
 
