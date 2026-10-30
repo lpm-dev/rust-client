@@ -237,6 +237,47 @@ pub(crate) struct TokenRotateArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct UnpublishArgs {
+    /// The version to unpublish, as @lpm.dev/owner.package@1.2.3.
+    #[arg(value_name = "PACKAGE@VERSION")]
+    pub(crate) target: String,
+
+    /// Six-digit authenticator code, instead of approving in the browser or typing it when asked.
+    #[arg(long, value_name = "CODE")]
+    pub(crate) otp: Option<String>,
+
+    /// Unpublish without asking first. Required with --json or without a terminal.
+    #[arg(long, short = 'y')]
+    pub(crate) yes: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct DeprecateArgs {
+    /// @lpm.dev/owner.package for every version, or @lpm.dev/owner.package@1.2.3 for one.
+    #[arg(value_name = "PACKAGE[@VERSION]")]
+    pub(crate) target: String,
+
+    /// What installs of it show, up to 500 characters.
+    #[arg(value_parser = crate::commands::deprecate::parse_message)]
+    pub(crate) message: String,
+
+    /// Six-digit authenticator code, instead of approving in the browser or typing it when asked.
+    #[arg(long, value_name = "CODE")]
+    pub(crate) otp: Option<String>,
+}
+
+#[derive(Args)]
+pub(crate) struct UndeprecateArgs {
+    /// @lpm.dev/owner.package for every version, or @lpm.dev/owner.package@1.2.3 for one.
+    #[arg(value_name = "PACKAGE[@VERSION]")]
+    pub(crate) target: String,
+
+    /// Six-digit authenticator code, instead of approving in the browser or typing it when asked.
+    #[arg(long, value_name = "CODE")]
+    pub(crate) otp: Option<String>,
+}
+
+#[derive(Args)]
 pub(crate) struct SetupArgs {
     #[command(subcommand)]
     pub(crate) action: SetupAction,

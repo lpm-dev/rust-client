@@ -1013,7 +1013,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         json_contract_depth: JsonContractDepth::InstaSnapshot,
         scenarios_by_file: &[
             ("crates/lpm-auth/src/session.rs", 1),
-            ("crates/lpm-cli/src/commands/token.rs", 3),
+            ("crates/lpm-cli/src/commands/registry_change.rs", 3),
             ("crates/lpm-cli/tests/token_rotate_interactive_tty.rs", 1),
             ("tests/workflows/tests/token_rotate.rs", 11),
         ],
@@ -3789,6 +3789,68 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             ("tests/workflows/tests/policy_storage.rs", 1),
         ],
         last_audited_at: "2026-08-09",
+    },
+    // ── id 176: lpm unpublish ──
+    SurfaceV2 {
+        id: 176,
+        scenarios: 18,
+        failure_modes_tested: &[
+            "sends the normalized version and reports it in JSON",
+            "human output names the version it unpublished",
+            "--json and runs without a terminal need --yes and send nothing",
+            "a missing version, a range or a dist-tag is refused before any request",
+            "a passkey account approves in the browser and the approval is sent once",
+            "--json reports an approval it can't wait for without its URL",
+            "an explicit code is sent on the first request and never printed",
+            "a code from a passkey-only account is refused",
+            "the registry's refusal is reported with its reason",
+            "the interactive confirmation unpublishes once confirmed",
+            "the interactive confirmation defaults to no and sends nothing",
+            "an authenticator account is asked for its code and retried once",
+        ],
+        failure_modes_known: &["the approval expires while the user is away"],
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[
+            ("crates/lpm-cli/src/commands/release_target.rs", 6),
+            ("crates/lpm-cli/tests/unpublish_interactive_tty.rs", 3),
+            ("tests/workflows/tests/package_changes.rs", 9),
+        ],
+        last_audited_at: "2026-10-30",
+    },
+    // ── id 177: lpm deprecate ──
+    SurfaceV2 {
+        id: 177,
+        scenarios: 8,
+        failure_modes_tested: &[
+            "one version is deprecated with its trimmed message",
+            "every version is deprecated without naming a version",
+            "an empty or too-long message is refused before any request",
+            "a passkey account approves in the browser",
+            "a response for another change is refused",
+            "the message is measured in UTF-16 units as the registry measures it",
+        ],
+        failure_modes_known: &["an already deprecated version is refused only after the approval"],
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[
+            ("crates/lpm-cli/src/commands/deprecate.rs", 3),
+            ("tests/workflows/tests/package_changes.rs", 5),
+        ],
+        last_audited_at: "2026-10-30",
+    },
+    // ── id 178: lpm undeprecate ──
+    SurfaceV2 {
+        id: 178,
+        scenarios: 2,
+        failure_modes_tested: &[
+            "one version's deprecation is removed with a null message",
+            "every version is named by the package, and none deprecated is said",
+        ],
+        failure_modes_known: &[
+            "a version that isn't deprecated is refused only after the approval",
+        ],
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[("tests/workflows/tests/package_changes.rs", 2)],
+        last_audited_at: "2026-10-30",
     },
 ];
 

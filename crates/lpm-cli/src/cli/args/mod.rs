@@ -211,6 +211,15 @@ pub(crate) enum Commands {
     #[command(visible_alias = "p")]
     Publish(registry::PublishArgs),
 
+    /// Unpublish a version from the LPM registry.
+    Unpublish(registry::UnpublishArgs),
+
+    /// Deprecate a package, or one of its versions, on the LPM registry.
+    Deprecate(registry::DeprecateArgs),
+
+    /// Remove the deprecation of a package, or of one of its versions.
+    Undeprecate(registry::UndeprecateArgs),
+
     /// Bump package.json version, optionally committing and tagging it.
     Version(registry::VersionArgs),
 

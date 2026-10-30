@@ -444,6 +444,17 @@ pub enum LpmError {
     )]
     OtpInvalid { command: &'static str },
 
+    /// A command that asks before it makes a change it can't undo has no
+    /// terminal to ask in, or runs with `--json`, and wasn't given `--yes`.
+    #[error("`{command}` needs `--yes` to run without a confirmation prompt")]
+    #[diagnostic(
+        code(lpm::confirmation_required),
+        help(
+            "Check what the command changes, then run it again with `--yes`. It asks only in an interactive terminal, and never with `--json`."
+        )
+    )]
+    ConfirmationRequired { command: &'static str },
+
     #[error("forbidden: {0}")]
     #[diagnostic(
         code(lpm::forbidden),
@@ -861,6 +872,7 @@ impl LpmError {
             LpmError::OtpRequired { .. } => "otp_required",
             LpmError::BrowserApprovalRequired { .. } => "browser_approval_required",
             LpmError::OtpInvalid { .. } => "otp_invalid",
+            LpmError::ConfirmationRequired { .. } => "confirmation_required",
             LpmError::Forbidden(_) => "forbidden",
             LpmError::NpmFirewallBlocked { .. } => "npm_firewall_blocked",
             LpmError::NpmFirewallEntitlementRequired { .. } => "npm_firewall_entitlement_required",
@@ -1092,6 +1104,9 @@ mod tests {
             LpmError::OtpInvalid {
                 command: "lpm token-rotate",
             },
+            LpmError::ConfirmationRequired {
+                command: "lpm unpublish",
+            },
             LpmError::BrowserApprovalRequired {
                 action: "publish".into(),
                 auth_url: "https://lpm.dev/cli/approve/x".into(),
@@ -1275,6 +1290,13 @@ mod tests {
             }
             .error_code(),
             "otp_invalid"
+        );
+        assert_eq!(
+            LpmError::ConfirmationRequired {
+                command: "lpm unpublish",
+            }
+            .error_code(),
+            "confirmation_required"
         );
         assert_eq!(
             LpmError::UnsupportedAuthSource {
