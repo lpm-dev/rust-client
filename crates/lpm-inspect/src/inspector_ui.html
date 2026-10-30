@@ -71,6 +71,12 @@ input, select { font-family: var(--font); }
 .sidebar-nav-item:hover { background: var(--bg-2); color: var(--fg); }
 .sidebar-nav-item.active { background: var(--bg-3); color: var(--fg); }
 .sidebar-edit { background: none; border: none; color: var(--accent); font-size: 10px; cursor: pointer; padding: 0; }
+.sidebar-section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.sidebar-section-head .sidebar-section-title { margin-bottom: 0; }
+.sidebar-delete { background: none; border: none; color: var(--fg-muted); font-size: 13px; line-height: 1; cursor: pointer; padding: 0 2px; }
+.sidebar-delete:hover, .sidebar-delete:focus-visible { color: var(--red); }
+.sidebar-clear { background: none; border: none; color: var(--fg-muted); font-size: 9px; cursor: pointer; padding: 0; }
+.sidebar-clear:hover, .sidebar-clear:focus-visible { color: var(--red); }
 
 /* Request list */
 .req-item { display: grid; grid-template-columns: 50px 44px 1fr auto auto 56px; gap: 6px; align-items: center; padding: 6px 10px; border-bottom: 1px solid var(--bg-2); cursor: pointer; font-size: 11px; }
@@ -230,7 +236,10 @@ input, select { font-family: var(--font); }
 			<div class="sidebar-nav-item" data-view="ws" onclick="switchView('ws')">WebSocket</div>
 		</div>
 		<div class="sidebar-section">
-			<div class="sidebar-section-title">Sessions</div>
+			<div class="sidebar-section-head">
+				<div class="sidebar-section-title">Sessions</div>
+				<button class="sidebar-clear" id="clear-ended-sessions" onclick="promptDeleteEndedSessions()" title="Delete every stopped session and its requests" hidden>clear ended</button>
+			</div>
 			<div id="session-list"></div>
 		</div>
 	</div>
@@ -273,6 +282,7 @@ function connectSSE() {
 		const req = JSON.parse(e.data)
 		requests.unshift(req)
 		if (requests.length > 1000) requests.length = 1000
+		countSessionRequest(req.session_id)
 		renderList(); updateCount()
 	})
 	es.addEventListener("lagged", e => {
@@ -333,6 +343,19 @@ async function downloadExport(id) {
 }
 async function updateTags(id, tags) { await fetch(`/api/requests/${id}/tags`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ tags }) }) }
 async function renameSession(id, name) { await fetch(`/api/sessions/${id}/name`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) }); loadSessions() }
+async function deleteSession(id) {
+	const r = await fetch(`/api/sessions/${encodeURIComponent(id)}`, { method: "DELETE" })
+	if (r.status === 409) { toast("This session is still running"); loadSessions(); return }
+	if (!r.ok) { toast("Could not delete the session"); return }
+	toast("Session deleted"); afterSessionsDeleted(new Set([id]))
+}
+async function deleteEndedSessions() {
+	const ended = new Set(sessions.filter(s => s.ended_at).map(s => s.id))
+	const r = await fetch("/api/sessions", { method: "DELETE" })
+	if (!r.ok) { toast("Could not delete the stopped sessions"); return }
+	const { deleted_sessions } = await r.json()
+	toast(`Deleted ${deleted_sessions} ${deleted_sessions === 1 ? "session" : "sessions"}`); afterSessionsDeleted(ended)
+}
 async function replayReq(id, opts) {
 	const r = await fetch(`/api/requests/${id}/replay`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(opts) })
 	if (!r.ok) { toast("Replay failed"); return null }; return await r.json()
@@ -482,19 +505,44 @@ function showTagInput(id) {
 function removeTag(i, id) { currentDetailTags.splice(i, 1); updateTags(id, currentDetailTags); renderTags(id) }
 
 // ── Sessions ───────────────────────────────────────────
+function sessionName(s) { return s.name || s.domain || s.id.substring(0, 8) }
 function renderSessions() {
 	const el = $("#session-list")
+	$("#clear-ended-sessions").hidden = !sessions.some(s => s.ended_at)
 	if (!sessions.length) { el.innerHTML = `<div style="color:var(--fg-muted);font-size:10px;padding:4px">No sessions yet</div>`; return }
 	el.innerHTML = `<div class="sidebar-item ${!activeSessionFilter?"active":""}" onclick="filterSession(null)"><span class="name">All requests</span></div>` +
 		sessions.map(s => {
 			const active = activeSessionFilter === s.id ? " active" : ""
-			const dot = !s.ended_at ? `<span class="dot"></span>` : ""
-			const name = s.name || s.domain || s.id.substring(0, 8)
-			return `<div class="sidebar-item${active}" onclick="filterSession('${esc(s.id)}')">${dot}<span class="name" title="${esc(s.id)}">${esc(name)}</span><span class="count">${s.request_count}</span><button class="sidebar-edit" onclick="event.stopPropagation();promptRenameSession('${esc(s.id)}')">edit</button></div>`
+			const dot = !s.ended_at ? `<span class="dot" title="Running"></span>` : ""
+			const remove = s.ended_at ? `<button class="sidebar-delete" title="Delete session and its requests" aria-label="Delete session ${esc(sessionName(s))}" onclick="event.stopPropagation();promptDeleteSession('${esc(s.id)}')">×</button>` : ""
+			return `<div class="sidebar-item${active}" onclick="filterSession('${esc(s.id)}')">${dot}<span class="name" title="${esc(s.id)}">${esc(sessionName(s))}</span><span class="count">${s.request_count}</span><button class="sidebar-edit" onclick="event.stopPropagation();promptRenameSession('${esc(s.id)}')">edit</button>${remove}</div>`
 		}).join("")
 }
 function filterSession(id) { activeSessionFilter = id; renderList(); renderSessions() }
 function promptRenameSession(id) { const name = prompt("Session name:"); if (name !== null) renameSession(id, name) }
+function promptDeleteSession(id) {
+	const s = sessions.find(s => s.id === id); if (!s) return
+	const count = s.request_count === 1 ? "its 1 captured request" : `its ${s.request_count} captured requests`
+	if (confirm(`Delete session "${sessionName(s)}" and ${count}? This can't be undone.`)) deleteSession(id)
+}
+function promptDeleteEndedSessions() {
+	const ended = sessions.filter(s => s.ended_at); if (!ended.length) return
+	const total = ended.reduce((sum, s) => sum + s.request_count, 0)
+	const what = ended.length === 1 ? "1 stopped session" : `${ended.length} stopped sessions`
+	if (confirm(`Delete ${what} and ${total === 1 ? "1 captured request" : `${total} captured requests`}? Running sessions are kept. This can't be undone.`)) deleteEndedSessions()
+}
+function afterSessionsDeleted(ids) {
+	const selected = requests.find(r => r.id === selectedId)
+	if (selected && ids.has(selected.session_id)) { selectedId = null; $("#detail-panel").innerHTML = `<div class="detail-empty">Select a request to inspect</div>` }
+	if (ids.has(activeSessionFilter)) activeSessionFilter = null
+	sessions = sessions.filter(s => !ids.has(s.id))
+	requests = requests.filter(r => !ids.has(r.session_id))
+	renderSessions(); renderList(); updateCount(); loadAll(); loadSessions()
+}
+function countSessionRequest(id) {
+	const s = id && sessions.find(s => s.id === id)
+	if (s) { s.request_count++; renderSessions() } else if (id) loadSessions()
+}
 
 // ── Views ──────────────────────────────────────────────
 function switchView(view) {

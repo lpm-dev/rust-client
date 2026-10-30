@@ -57,6 +57,19 @@ async fn require_auth_token(
     Ok(next.run(request).await)
 }
 
+/// Resolves once the inspector starts shutting down, or its handle is dropped.
+///
+/// Graceful shutdown waits for every open response, so endless responses
+/// such as the event streams must end on this signal.
+#[derive(Clone)]
+pub struct ServerShutdown(tokio::sync::watch::Receiver<bool>);
+
+impl ServerShutdown {
+    pub(crate) async fn requested(mut self) {
+        let _ = self.0.wait_for(|stopping| *stopping).await;
+    }
+}
+
 /// Start the inspector server on the given port.
 ///
 /// Pass `port = 0` to let the OS pick a free ephemeral port (preferred default
@@ -66,7 +79,7 @@ async fn require_auth_token(
 ///
 /// Returns a handle for shutdown. The server runs in a background tokio task.
 pub async fn start(state: InspectorState, port: u16) -> Result<InspectorHandle, LpmError> {
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     // Bind FIRST so we know the actual port (matters when `port == 0` and the
     // OS picks). CORS allowlist + advertised URL are derived from the bound
@@ -99,6 +112,7 @@ pub async fn start(state: InspectorState, port: u16) -> Result<InspectorHandle, 
             axum::http::Method::GET,
             axum::http::Method::POST,
             axum::http::Method::PUT,
+            axum::http::Method::DELETE,
         ])
         .allow_headers([axum::http::header::CONTENT_TYPE]);
 
@@ -135,8 +149,14 @@ pub async fn start(state: InspectorState, port: u16) -> Result<InspectorHandle, 
         .route("/api/diff/{id1}/{id2}", get(crate::api::diff_requests))
         .route("/api/failures/patterns", get(crate::api::failure_patterns))
         .route("/api/search", get(crate::api::search))
-        .route("/api/sessions", get(crate::api::list_sessions))
-        .route("/api/sessions/{id}", get(crate::api::get_session))
+        .route(
+            "/api/sessions",
+            get(crate::api::list_sessions).delete(crate::api::delete_ended_sessions),
+        )
+        .route(
+            "/api/sessions/{id}",
+            get(crate::api::get_session).delete(crate::api::delete_session),
+        )
         .route(
             "/api/sessions/{id}/requests",
             get(crate::api::list_session_requests),
@@ -150,7 +170,8 @@ pub async fn start(state: InspectorState, port: u16) -> Result<InspectorHandle, 
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_auth_token,
-        ));
+        ))
+        .layer(axum::Extension(ServerShutdown(shutdown_rx.clone())));
 
     // SPA fallback stays unauthenticated so the browser can fetch
     // HTML/JS/CSS; the injected bootstrap then carries the token on
@@ -169,8 +190,8 @@ pub async fn start(state: InspectorState, port: u16) -> Result<InspectorHandle, 
 
     let server_task = tokio::spawn(async move {
         axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                let _ = shutdown_rx.await;
+            .with_graceful_shutdown(async move {
+                ServerShutdown(shutdown_rx).requested().await;
                 tracing::debug!("inspector server shutting down");
             })
             .await
@@ -270,9 +291,91 @@ mod server_tests {
         rebound.shutdown().await.unwrap();
     }
 
+    /// An open inspector tab holds `/api/stream` and `/api/ws/stream` open
+    /// forever; quitting the tunnel must not wait for the browser to close it.
+    #[tokio::test]
+    async fn shutdown_finishes_while_a_browser_holds_the_event_streams_open() {
+        let state = InspectorState::new(0);
+        let token = state.auth_token().to_string();
+        let handle = start(state, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let mut streams = Vec::with_capacity(2);
+        for path in ["/api/stream", "/api/ws/stream"] {
+            let response = client
+                .get(format!("http://127.0.0.1:{}{path}", handle.port))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            streams.push(response);
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("inspector shutdown waited on open event streams")
+            .unwrap();
+        drop(streams);
+    }
+
+    #[tokio::test]
+    async fn shutdown_finishes_while_a_replay_waits_on_a_silent_local_server() {
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent_port = silent.local_addr().unwrap().port();
+        let inspector_port = {
+            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let state = InspectorState::new(silent_port);
+        state
+            .push(lpm_tunnel::webhook::CapturedWebhook {
+                id: "stuck".to_string(),
+                timestamp: "2026-04-06T12:00:00Z".to_string(),
+                method: "POST".to_string(),
+                path: "/hooks".to_string(),
+                request_headers: std::collections::HashMap::new(),
+                request_body: b"{}".to_vec(),
+                response_status: 200,
+                response_headers: std::collections::HashMap::new(),
+                response_body: Vec::new(),
+                duration_ms: 1,
+                provider: None,
+                summary: String::new(),
+                signature_diagnostic: None,
+                auto_acked: false,
+                response_body_incomplete: false,
+            })
+            .await;
+        let token = state.auth_token().to_string();
+        let handle = start(state, inspector_port).await.unwrap();
+        let replay = tokio::spawn(
+            reqwest::Client::new()
+                .post(format!(
+                    "http://127.0.0.1:{}/api/requests/stuck/replay",
+                    handle.port
+                ))
+                .bearer_auth(&token)
+                .json(&serde_json::json!({}))
+                .send(),
+        );
+        let (_held, _) = silent.accept().await.unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("inspector shutdown waited on a replay to a silent server")
+            .unwrap();
+        start(InspectorState::new(0), inspector_port)
+            .await
+            .expect("shutdown must release the inspector port despite the stuck replay")
+            .shutdown()
+            .await
+            .unwrap();
+        replay.abort();
+    }
+
     #[tokio::test]
     async fn inspector_shutdown_propagates_the_server_task_failure() {
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         drop(shutdown_rx);
         let handle = InspectorHandle {
             port: 0,

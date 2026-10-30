@@ -115,7 +115,7 @@ pub async fn forward_request(
     request: &ServerMessage,
 ) -> Result<ClientMessage, LpmError> {
     Ok(
-        forward_request_inner(http_client, local_target, request, None, None)
+        forward_request_inner(http_client, local_target, None, request, None, None)
             .await?
             .message,
     )
@@ -125,6 +125,7 @@ pub async fn forward_request(
 pub(crate) async fn forward_request_with_memory_budget(
     http_client: &reqwest::Client,
     local_target: &lpm_common::LocalTarget,
+    live_target: Option<&std::sync::RwLock<lpm_common::LocalTarget>>,
     request: &ServerMessage,
     memory_budget: Arc<tokio::sync::Semaphore>,
     memory_budget_permits: usize,
@@ -135,6 +136,7 @@ pub(crate) async fn forward_request_with_memory_budget(
     forward_request_inner(
         http_client,
         local_target,
+        live_target,
         request,
         Some((
             memory_budget,
@@ -150,6 +152,7 @@ pub(crate) async fn forward_request_with_memory_budget(
 async fn forward_request_inner(
     http_client: &reqwest::Client,
     local_target: &lpm_common::LocalTarget,
+    live_target: Option<&std::sync::RwLock<lpm_common::LocalTarget>>,
     request: &ServerMessage,
     memory_budget: Option<(Arc<tokio::sync::Semaphore>, usize, usize, usize)>,
     stream: Option<crate::http_stream::StreamOutput>,
@@ -166,62 +169,38 @@ async fn forward_request_inner(
         _ => return Err(LpmError::Tunnel("expected HttpRequest message".into())),
     };
 
-    let local_path = local_target.upstream_path(url);
-    let local_url = format!(
-        "{}://{}{}",
-        local_target.scheme,
-        local_target.authority(),
-        local_path
-    );
-
-    // Build the request
-    let req_method = method
-        .parse::<reqwest::Method>()
-        .map_err(|e| LpmError::Tunnel(format!("invalid HTTP method '{method}': {e}")))?;
-
-    let mut builder = http_client.request(req_method, &local_url);
-
-    // Forward headers using a whitelist — only known-safe headers are forwarded
-    // to the local dev server. This prevents relay-injected or attacker-controlled
-    // headers from reaching the local service.
-    for (key, value) in headers {
-        if is_header_allowed(key) {
-            builder = builder.header(key.as_str(), value.as_str());
-        }
-    }
-    builder = builder.header("host", local_target.authority());
-
-    // Decode and attach body
-    if !body.is_empty() {
-        let body_bytes =
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, body)
-                .map_err(|e| LpmError::Tunnel(format!("failed to decode request body: {e}")))?;
-        builder = builder.body(body_bytes);
-    }
-
-    // Send with timeout
-    if stream.is_none() {
-        builder = builder.timeout(std::time::Duration::from_secs(30));
-    }
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-    let response = tokio::time::timeout_at(deadline, builder.send())
-        .await
-        .map_err(|_| LpmError::Tunnel("local response headers timed out".into()))?
-        .map_err(|e| {
-            if e.is_connect() {
-                LpmError::Tunnel(format!(
-                    "local server not reachable at {} — is it running?",
-                    local_target.url()
-                ))
-            } else if e.is_timeout() {
-                LpmError::Tunnel(format!(
-                    "request to {}{local_path} timed out",
-                    local_target.authority()
-                ))
-            } else {
-                LpmError::Tunnel(format!("failed to forward request: {e}"))
-            }
-        })?;
+    let local_request = LocalRequest {
+        http_client,
+        method: method
+            .parse::<reqwest::Method>()
+            .map_err(|e| LpmError::Tunnel(format!("invalid HTTP method '{method}': {e}")))?,
+        url,
+        headers,
+        body,
+        streaming: stream.is_some(),
+        deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+    };
+    // A refused connection never reached the server, so retrying it on the
+    // other loopback family is safe for every method.
+    let response = match local_request.send(local_target).await? {
+        Ok(response) => response,
+        Err(error) if error.is_connect() => match local_target.loopback_sibling() {
+            Some(sibling) => match local_request.send(&sibling).await? {
+                Ok(response) => {
+                    if let Some(live_target) = live_target {
+                        crate::adopt_loopback_sibling(live_target, local_target, sibling);
+                    }
+                    response
+                }
+                Err(error) if error.is_connect() => {
+                    return Err(local_request.error(local_target, error));
+                }
+                Err(error) => return Err(local_request.error(&sibling, error)),
+            },
+            None => return Err(local_request.error(local_target, error)),
+        },
+        Err(error) => return Err(local_request.error(local_target, error)),
+    };
 
     let status = response.status().as_u16();
 
@@ -294,7 +273,7 @@ async fn forward_request_inner(
     }
     let mut body_bytes = Vec::with_capacity(initial_capacity);
     let mut response = response;
-    while let Some(chunk) = tokio::time::timeout_at(deadline, response.chunk())
+    while let Some(chunk) = tokio::time::timeout_at(local_request.deadline, response.chunk())
         .await
         .map_err(|_| LpmError::Tunnel("local response body timed out".into()))?
         .map_err(|e| LpmError::Tunnel(format!("failed to read response body: {e}")))?
@@ -343,6 +322,83 @@ fn busy_response(id: &str) -> ForwardedResponse {
         stream_end: None,
         capture_incomplete: false,
         memory_permit: None,
+    }
+}
+
+/// One relayed request, sendable to either loopback family of its target.
+struct LocalRequest<'a> {
+    http_client: &'a reqwest::Client,
+    method: reqwest::Method,
+    url: &'a str,
+    headers: &'a HashMap<String, String>,
+    body: &'a str,
+    streaming: bool,
+    deadline: tokio::time::Instant,
+}
+
+impl LocalRequest<'_> {
+    /// Send to `target`. The outer error ends forwarding; the inner one is the
+    /// HTTP client's, which a connect failure lets the caller retry.
+    async fn send(
+        &self,
+        target: &lpm_common::LocalTarget,
+    ) -> Result<Result<reqwest::Response, reqwest::Error>, LpmError> {
+        let local_url = format!(
+            "{}://{}{}",
+            target.scheme,
+            target.authority(),
+            target.upstream_path(self.url)
+        );
+        let mut builder = self.http_client.request(self.method.clone(), &local_url);
+
+        // Forward headers using a whitelist — only known-safe headers are forwarded
+        // to the local dev server. This prevents relay-injected or attacker-controlled
+        // headers from reaching the local service.
+        for (key, value) in self.headers {
+            if is_header_allowed(key) {
+                builder = builder.header(key.as_str(), value.as_str());
+            }
+        }
+        builder = builder.header("host", target.authority());
+
+        if !self.body.is_empty() {
+            let body_bytes =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, self.body)
+                    .map_err(|e| LpmError::Tunnel(format!("failed to decode request body: {e}")))?;
+            builder = builder.body(body_bytes);
+        }
+        if !self.streaming {
+            builder = builder.timeout(std::time::Duration::from_secs(30));
+        }
+        tokio::time::timeout_at(self.deadline, builder.send())
+            .await
+            .map_err(|_| LpmError::Tunnel("local response headers timed out".into()))
+    }
+
+    fn error(&self, target: &lpm_common::LocalTarget, error: reqwest::Error) -> LpmError {
+        if error.is_connect() {
+            LpmError::Tunnel(format!(
+                "local server not reachable at {} — is it running?",
+                describe_endpoint(target)
+            ))
+        } else if error.is_timeout() {
+            LpmError::Tunnel(format!(
+                "request to {}{} timed out",
+                target.authority(),
+                target.upstream_path(self.url)
+            ))
+        } else {
+            LpmError::Tunnel(format!("failed to forward request: {error}"))
+        }
+    }
+}
+
+/// Name the endpoint a failed connection tried, including both loopback
+/// families when either one would have done.
+fn describe_endpoint(target: &lpm_common::LocalTarget) -> String {
+    match target.loopback_sibling() {
+        Some(sibling) => format!("{} or {}", target.url(), sibling.url()),
+        None => target.url(),
     }
 }
 
@@ -420,32 +476,34 @@ fn response_too_large(request_id: &str, size: u64) -> ClientMessage {
     }
 }
 
+type LocalWebSocketStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// A local WebSocket connection, split for frame forwarding.
+pub struct LocalWebSocketConnection {
+    pub write: futures_util::stream::SplitSink<
+        LocalWebSocketStream,
+        tokio_tungstenite::tungstenite::Message,
+    >,
+    pub read: futures_util::stream::SplitStream<LocalWebSocketStream>,
+    /// Set when the target's other loopback family accepted the connection.
+    pub sibling_target: Option<lpm_common::LocalTarget>,
+}
+
 /// Establish a WebSocket connection to the local dev server for upgrade passthrough.
 ///
 /// Connects to the target's complete WebSocket endpoint, including its address
-/// and base path, and returns the split stream used for HMR frame forwarding.
+/// and base path, falling back to the other loopback family when the target
+/// allows either, and returns the split stream used for HMR frame forwarding.
 pub async fn connect_local_websocket(
     local_target: &lpm_common::LocalTarget,
     url: &str,
     headers: &HashMap<String, String>,
-) -> Result<
-    (
-        futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-            tokio_tungstenite::tungstenite::Message,
-        >,
-        futures_util::stream::SplitStream<
-            tokio_tungstenite::WebSocketStream<
-                tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-            >,
-        >,
-    ),
-    LpmError,
-> {
+) -> Result<LocalWebSocketConnection, LpmError> {
     crate::validate_forward_target(local_target)?;
-    let request = build_local_websocket_request(local_target, url, headers)?;
+    let (socket, sibling_target) = connect_loopback(local_target).await?;
+    let connected = sibling_target.as_ref().unwrap_or(local_target);
+    let request = build_local_websocket_request(connected, url, headers)?;
 
     let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
         write_buffer_size: 128 * 1024,
@@ -454,12 +512,77 @@ pub async fn connect_local_websocket(
         max_frame_size: Some(crate::client::MAX_WS_FRAME_SIZE),
         ..Default::default()
     };
-    let (stream, _) = tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false)
-        .await
-        .map_err(|e| LpmError::Tunnel(format!("failed to connect local WebSocket: {e}")))?;
+    let (stream, _) = tokio_tungstenite::client_async_with_config(
+        request,
+        tokio_tungstenite::MaybeTlsStream::Plain(socket),
+        Some(ws_config),
+    )
+    .await
+    .map_err(|e| LpmError::Tunnel(format!("failed to connect local WebSocket: {e}")))?;
 
     use futures_util::StreamExt;
-    Ok(stream.split())
+    let (write, read) = stream.split();
+    Ok(LocalWebSocketConnection {
+        write,
+        read,
+        sibling_target,
+    })
+}
+
+/// How long [`probe_local_target`] waits for each address to accept.
+const LOCAL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Find where `target` is listening right now.
+///
+/// Returns `target` when its own address accepts a connection, its other
+/// loopback family when only that one does, and `None` when nothing accepts.
+pub async fn probe_local_target(
+    target: &lpm_common::LocalTarget,
+) -> Option<lpm_common::LocalTarget> {
+    async fn accepts(target: &lpm_common::LocalTarget) -> bool {
+        matches!(
+            tokio::time::timeout(
+                LOCAL_PROBE_TIMEOUT,
+                tokio::net::TcpStream::connect((target.address, target.port)),
+            )
+            .await,
+            Ok(Ok(_))
+        )
+    }
+
+    match target.loopback_sibling() {
+        None => accepts(target).await.then(|| target.clone()),
+        Some(sibling) => match tokio::join!(accepts(target), accepts(&sibling)) {
+            (true, _) => Some(target.clone()),
+            (false, true) => Some(sibling),
+            (false, false) => None,
+        },
+    }
+}
+
+/// Open a TCP connection to `target`, or to its other loopback family when
+/// the target allows either and its own address refuses.
+async fn connect_loopback(
+    target: &lpm_common::LocalTarget,
+) -> Result<(tokio::net::TcpStream, Option<lpm_common::LocalTarget>), LpmError> {
+    let unreachable = |error: std::io::Error| {
+        LpmError::Tunnel(format!(
+            "failed to connect local WebSocket: nothing accepted {} ({error})",
+            describe_endpoint(target)
+        ))
+    };
+    match tokio::net::TcpStream::connect((target.address, target.port)).await {
+        Ok(socket) => Ok((socket, None)),
+        Err(error) => {
+            let Some(sibling) = target.loopback_sibling() else {
+                return Err(unreachable(error));
+            };
+            let socket = tokio::net::TcpStream::connect((sibling.address, sibling.port))
+                .await
+                .map_err(unreachable)?;
+            Ok((socket, Some(sibling)))
+        }
+    }
 }
 
 fn build_local_websocket_request(
@@ -674,6 +797,7 @@ mod tests {
             forward_request_inner(
                 &reqwest::Client::builder().no_proxy().build().unwrap(),
                 &lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, address.port()),
+                None,
                 &request,
                 None,
                 Some(crate::http_stream::StreamOutput {
@@ -864,7 +988,7 @@ mod tests {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             forward_request_with_memory_budget(
-                &client, &target, &request, budget, permits, unit_bytes, 4, None,
+                &client, &target, None, &request, budget, permits, unit_bytes, 4, None,
             ),
         )
         .await;
@@ -940,6 +1064,7 @@ mod tests {
             forward_request_with_memory_budget(
                 &client,
                 &target,
+                None,
                 &request,
                 forward_budget,
                 64,
@@ -1059,5 +1184,178 @@ mod tests {
             sec_key_count, 1,
             "local websocket client must send exactly one Sec-WebSocket-Key header, got request:\n{raw_request}"
         );
+    }
+
+    /// An IPv6-only listener on a port whose IPv4 loopback address refuses
+    /// connections, as `npm run dev` leaves Vite on macOS.
+    async fn ipv6_only_listener() -> (tokio::net::TcpListener, tokio::net::TcpSocket) {
+        for _ in 0..16 {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let refused = tokio::net::TcpSocket::new_v4().unwrap();
+            if refused
+                .bind((std::net::Ipv4Addr::LOCALHOST, port).into())
+                .is_ok()
+            {
+                return (listener, refused);
+            }
+        }
+        panic!("no port was free on both loopback families");
+    }
+
+    fn serve_one_response(listener: tokio::net::TcpListener, body: &'static str) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 1024];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+    }
+
+    fn get_root(id: &str) -> ServerMessage {
+        ServerMessage::HttpRequest {
+            id: id.into(),
+            method: "POST".into(),
+            url: "/".into(),
+            headers: HashMap::new(),
+            body: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"{}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn port_only_forward_reaches_the_ipv6_listener_and_remembers_it() {
+        let (listener, _refused) = ipv6_only_listener().await;
+        let port = listener.local_addr().unwrap().port();
+        serve_one_response(listener, "over ipv6");
+        let target = lpm_common::LocalTarget::loopback_port(lpm_common::LocalScheme::Http, port);
+        let live_target = std::sync::RwLock::new(target.clone());
+
+        let response = forward_request_inner(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            &target,
+            Some(&live_target),
+            &get_root("ipv6"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ClientMessage::HttpResponse { status, body, .. } = response.message else {
+            panic!("expected HTTP response")
+        };
+        let body =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, body).unwrap();
+        assert_eq!((status, body.as_slice()), (200, b"over ipv6".as_slice()));
+        assert_eq!(
+            live_target.read().unwrap().url(),
+            format!("http://[::1]:{port}/")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_verified_target_does_not_fall_back_to_the_other_loopback_family() {
+        let (listener, _refused) = ipv6_only_listener().await;
+        let port = listener.local_addr().unwrap().port();
+        serve_one_response(listener, "over ipv6");
+        let target = lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, port);
+
+        let error = forward_request(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            &target,
+            &get_root("verified"),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "tunnel error: local server not reachable at http://127.0.0.1:{port}/ — is it running?"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_port_only_forward_with_no_listener_names_both_loopback_addresses() {
+        let (listener, refused) = ipv6_only_listener().await;
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let target = lpm_common::LocalTarget::loopback_port(lpm_common::LocalScheme::Http, port);
+
+        let error = forward_request(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            &target,
+            &get_root("nobody"),
+        )
+        .await
+        .unwrap_err();
+        drop(refused);
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "tunnel error: local server not reachable at http://127.0.0.1:{port}/ or http://[::1]:{port}/ — is it running?"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn port_only_websocket_upgrade_connects_on_the_ipv6_listener() {
+        let (listener, _refused) = ipv6_only_listener().await;
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(socket).await.unwrap();
+        });
+        let target = lpm_common::LocalTarget::loopback_port(lpm_common::LocalScheme::Http, port);
+
+        let connection = connect_local_websocket(&target, "/hmr", &HashMap::new())
+            .await
+            .unwrap();
+
+        server.await.unwrap();
+        assert_eq!(
+            connection.sibling_target.map(|target| target.url()),
+            Some(format!("http://[::1]:{port}/"))
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_prefers_the_targets_own_family_and_falls_back_to_its_sibling() {
+        let (listener, refused) = ipv6_only_listener().await;
+        let port = listener.local_addr().unwrap().port();
+        let target = lpm_common::LocalTarget::loopback_port(lpm_common::LocalScheme::Http, port);
+
+        let ipv6_only = probe_local_target(&target).await;
+        drop(refused);
+        let ipv4 = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        let both = probe_local_target(&target).await;
+        drop((listener, ipv4));
+
+        assert_eq!(
+            ipv6_only.map(|target| target.url()),
+            Some(format!("http://[::1]:{port}/"))
+        );
+        assert_eq!(both, Some(target));
+    }
+
+    #[tokio::test]
+    async fn probe_finds_nothing_when_neither_loopback_family_listens() {
+        let (listener, _refused) = ipv6_only_listener().await;
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let target = lpm_common::LocalTarget::loopback_port(lpm_common::LocalScheme::Http, port);
+
+        assert_eq!(probe_local_target(&target).await, None);
     }
 }

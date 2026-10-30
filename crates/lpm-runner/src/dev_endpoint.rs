@@ -542,6 +542,7 @@ fn loopback_targets_from(
             address,
             port,
             base_path: base_path.to_string(),
+            any_loopback_family: false,
         })
         .collect()
 }
@@ -650,6 +651,7 @@ mod tests {
                     address: IpAddr::V6(Ipv6Addr::LOCALHOST),
                     port: 5173,
                     base_path: "/".to_string(),
+                    any_loopback_family: false,
                 },
             ]
         );
@@ -666,6 +668,7 @@ mod tests {
                 address: IpAddr::V6(Ipv6Addr::LOCALHOST),
                 port: 8443,
                 base_path: "/app".to_string(),
+                any_loopback_family: false,
             }]
         );
     }
@@ -786,6 +789,7 @@ mod tests {
             address: IpAddr::V6(Ipv6Addr::LOCALHOST),
             port,
             base_path: "/app/".to_string(),
+            any_loopback_family: false,
         };
         let (candidate_tx, candidate_rx) = std::sync::mpsc::channel();
         let endpoint = resolve_spawned_endpoint_until(
@@ -858,6 +862,7 @@ mod tests {
                 address: IpAddr::V6(Ipv6Addr::LOCALHOST),
                 port,
                 base_path: "/app/".to_string(),
+                any_loopback_family: false,
             };
             let (candidate_tx, candidate_rx) = std::sync::mpsc::channel();
             if initially_advertised {

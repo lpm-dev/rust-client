@@ -849,7 +849,9 @@ pub struct TunnelOptions {
     pub pin_provider: Option<TunnelPinProvider>,
     /// Validated local HTTP endpoint to tunnel.
     pub local_target: lpm_common::LocalTarget,
-    /// Live endpoint source for dev services that can restart.
+    /// Live endpoint source for dev services that can restart. When the
+    /// target allows either loopback family, forwarding records here the
+    /// family that answered.
     pub live_local_target: Option<Arc<RwLock<lpm_common::LocalTarget>>>,
     /// Full tunnel domain (e.g., "acme-api.lpm.llc"). If None, the relay uses
     /// the Pro account's `<username>.lpm.fyi`. Organization tunnels need one of
@@ -950,7 +952,7 @@ impl TunnelOptions {
             token,
             token_provider: None,
             pin_provider: None,
-            local_target: lpm_common::LocalTarget::loopback(
+            local_target: lpm_common::LocalTarget::loopback_port(
                 lpm_common::LocalScheme::Http,
                 local_port,
             ),
@@ -1032,6 +1034,17 @@ pub async fn connect_with_usage_fallible(
     on_usage: impl Fn(&TunnelUsageMetadata, bool),
 ) -> Result<(), LpmError> {
     crate::validate_forward_target(&options.current_local_target())?;
+    let with_live_target;
+    let options = if options.live_local_target.is_none() && options.local_target.any_loopback_family
+    {
+        with_live_target = TunnelOptions {
+            live_local_target: Some(Arc::new(RwLock::new(options.local_target.clone()))),
+            ..options.clone()
+        };
+        &with_live_target
+    } else {
+        options
+    };
     let mut retry_count = 0;
     let max_retries = 10;
     let auth_refresh_attempted = std::sync::atomic::AtomicBool::new(false);
@@ -1357,6 +1370,7 @@ fn bounded_websocket_upgrade_headers(
 async fn forward_http_request(
     http_client: reqwest::Client,
     local_target: lpm_common::LocalTarget,
+    live_target: Option<Arc<RwLock<lpm_common::LocalTarget>>>,
     server_msg: ServerMessage,
     auto_ack: bool,
     webhook_tx: Option<tokio::sync::mpsc::Sender<CapturedWebhookEvent>>,
@@ -1379,6 +1393,7 @@ async fn forward_http_request(
     let (mut response, memory_permit) = match proxy::forward_request_with_memory_budget(
         &http_client,
         &local_target,
+        live_target.as_deref(),
         &server_msg,
         memory_budget,
         HTTP_RESPONSE_MEMORY_PERMITS,
@@ -2179,6 +2194,7 @@ async fn try_connect_with_token(
 
                                 let http_client = http_client.clone();
                                 let local_target = options.current_local_target();
+                                let live_target = options.live_local_target.clone();
                                 let auto_ack = options.auto_ack;
                                 let webhook_tx = options.webhook_tx.clone();
                                 let http_response_tx = http_response_tx.clone();
@@ -2194,6 +2210,7 @@ async fn try_connect_with_token(
                                     let forward = forward_http_request(
                                         http_client,
                                         local_target,
+                                        live_target,
                                         server_msg,
                                         auto_ack,
                                         webhook_tx.clone(),
@@ -2327,6 +2344,7 @@ async fn try_connect_with_token(
 
                                 tracing::debug!("WebSocket upgrade request: {url}");
                                 let local_target = options.current_local_target();
+                                let live_target = options.live_local_target.clone();
                                 let upgrade_tx = websocket_upgrade_tx.clone();
                                 let upgrade_id = id.clone();
                                 let upgrade_url = url.clone();
@@ -2347,7 +2365,18 @@ async fn try_connect_with_token(
                                         ) => result,
                                     };
                                     let result = match result {
-                                        Ok(Ok(connection)) => Ok(connection),
+                                        Ok(Ok(connection)) => {
+                                            if let (Some(live_target), Some(sibling)) =
+                                                (live_target.as_deref(), connection.sibling_target)
+                                            {
+                                                crate::adopt_loopback_sibling(
+                                                    live_target,
+                                                    &local_target,
+                                                    sibling,
+                                                );
+                                            }
+                                            Ok((connection.write, connection.read))
+                                        }
                                         Ok(Err(error)) => Err(format!(
                                             "Local server rejected the WebSocket upgrade: {error}"
                                         )),
@@ -4933,6 +4962,7 @@ mod tests {
         let (_, response_permit) = forward_http_request(
             client,
             target,
+            None,
             request,
             false,
             Some(webhook_tx),

@@ -128,7 +128,7 @@ struct Inner {
     /// Active session ID for tagging requests.
     session_id: SyncRwLock<Option<String>>,
     /// The local endpoint being tunneled and replayed.
-    local_target: SyncRwLock<lpm_common::LocalTarget>,
+    local_target: Arc<SyncRwLock<lpm_common::LocalTarget>>,
     /// The tunnel URL (set after connection).
     pub tunnel_url: SyncRwLock<Option<String>>,
     /// Per-process random auth token gating every `/api/*` route — closes
@@ -178,7 +178,7 @@ impl InspectorState {
                 ws_events: RwLock::new(WsEventBuffer::new()),
                 ws_sse_tx,
                 session_id: SyncRwLock::new(None),
-                local_target: SyncRwLock::new(local_target),
+                local_target: Arc::new(SyncRwLock::new(local_target)),
                 tunnel_url: SyncRwLock::new(None),
                 auth_token: generate_auth_token(),
             }),
@@ -238,7 +238,7 @@ impl InspectorState {
                 ws_events: RwLock::new(WsEventBuffer::new()),
                 ws_sse_tx,
                 session_id: SyncRwLock::new(None),
-                local_target: SyncRwLock::new(local_target),
+                local_target: Arc::new(SyncRwLock::new(local_target)),
                 tunnel_url: SyncRwLock::new(None),
                 auth_token: generate_auth_token(),
             }),
@@ -389,9 +389,9 @@ impl InspectorState {
         self.local_target().port
     }
 
-    /// Replace the replay endpoint with a plain IPv4-loopback port.
+    /// Replace the replay endpoint with a port on either loopback family.
     pub fn set_local_port(&self, local_port: u16) {
-        self.set_local_target(lpm_common::LocalTarget::loopback(
+        self.set_local_target(lpm_common::LocalTarget::loopback_port(
             lpm_common::LocalScheme::Http,
             local_port,
         ));
@@ -404,6 +404,12 @@ impl InspectorState {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// The shared endpoint slot, for a tunnel to keep current as it learns
+    /// which loopback family the local server answers on.
+    pub fn local_target_slot(&self) -> Arc<SyncRwLock<lpm_common::LocalTarget>> {
+        Arc::clone(&self.inner.local_target)
     }
 
     /// Replace the endpoint used for replay after child discovery completes.
@@ -493,13 +499,68 @@ impl InspectorState {
         if let Some(ref db) = self.inner.db {
             db.start_session_named(id.clone(), domain, local_port, name)?;
         }
-        let mut session_id = self
+        self.replace_current_session(id);
+        Ok(())
+    }
+
+    /// Make `id` the session new captures join, ending the one it replaces:
+    /// a relay that reconnects under a new session ID never ends the old one.
+    fn replace_current_session(&self, id: String) {
+        let previous = self
             .inner
             .session_id
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *session_id = Some(id);
-        Ok(())
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(id.clone());
+        if let (Some(previous), Some(db)) = (previous, &self.inner.db)
+            && previous != id
+            && let Err(error) = db.end_session(previous)
+        {
+            tracing::warn!("failed to end the superseded inspector session: {error}");
+        }
+    }
+
+    /// Delete an ended session, with its captures in storage and in memory.
+    pub async fn delete_session(
+        &self,
+        id: &str,
+    ) -> Result<crate::db::SessionDeletion, rusqlite::Error> {
+        let Some(db) = &self.inner.db else {
+            return Ok(crate::db::SessionDeletion::NotFound);
+        };
+        let deletion = db.delete_session(id).await?;
+        if let crate::db::SessionDeletion::Deleted(request_ids) = &deletion {
+            self.forget_requests(request_ids).await;
+        }
+        Ok(deletion)
+    }
+
+    /// Delete every ended session, with its captures in storage and in memory.
+    pub async fn delete_ended_sessions(
+        &self,
+    ) -> Result<crate::db::DeletedSessions, rusqlite::Error> {
+        let Some(db) = &self.inner.db else {
+            return Ok(crate::db::DeletedSessions {
+                sessions: 0,
+                request_ids: Vec::new(),
+            });
+        };
+        let deleted = db.delete_ended_sessions().await?;
+        self.forget_requests(&deleted.request_ids).await;
+        Ok(deleted)
+    }
+
+    async fn forget_requests(&self, request_ids: &[String]) {
+        if request_ids.is_empty() {
+            return;
+        }
+        let request_ids: std::collections::HashSet<&str> =
+            request_ids.iter().map(String::as_str).collect();
+        self.inner
+            .buffer
+            .write()
+            .await
+            .remove_where(|webhook| request_ids.contains(webhook.id.as_str()));
     }
 
     /// Start a tunnel session that is rolled back unless the caller accepts it.
@@ -583,12 +644,7 @@ impl PublishedInspectorSession {
             .tunnel_url
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(self.tunnel_url.clone());
-        *self
-            .state
-            .inner
-            .session_id
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(self.session_id.clone());
+        self.state.replace_current_session(self.session_id.clone());
         self.finalized = true;
         Ok(())
     }
@@ -699,6 +755,101 @@ mod inspector_state_tests {
         );
         assert!(db.get_session("old-session").await.unwrap().is_some());
         assert!(db.get_session("new-session").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_under_a_new_session_id_ends_the_session_it_replaces() {
+        let db = InspectorDb::open_temp().unwrap();
+        let state = InspectorState::with_db(3000, db.clone());
+        for session in ["first", "first", "second"] {
+            state
+                .start_session_immediate(session.to_string(), None, 3000, None)
+                .unwrap();
+        }
+        let mut publication = state
+            .start_session_reversible(
+                "third".to_string(),
+                None,
+                3000,
+                None,
+                "https://third.lpm.fyi".to_string(),
+            )
+            .unwrap();
+        publication.finalize().unwrap();
+
+        let ended = |id: &'static str| {
+            let db = db.clone();
+            async move {
+                db.get_session(id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .ended_at
+                    .is_some()
+            }
+        };
+        assert!(ended("first").await);
+        assert!(ended("second").await);
+        assert!(!ended("third").await);
+        assert_eq!(state.current_session_id().as_deref(), Some("third"));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_session_also_forgets_its_requests_held_in_memory() {
+        let db = InspectorDb::open_temp().unwrap();
+        let state = InspectorState::with_db(3000, db.clone());
+        state
+            .start_session_immediate("before-reconnect".to_string(), None, 3000, None)
+            .unwrap();
+        state.push(webhook("old-capture")).await;
+        state
+            .start_session_immediate("after-reconnect".to_string(), None, 3000, None)
+            .unwrap();
+        state.push(webhook("new-capture")).await;
+        db.flush_pending_writes().await.unwrap();
+
+        let refused = state.delete_session("after-reconnect").await.unwrap();
+        let deleted = state.delete_session("before-reconnect").await.unwrap();
+
+        assert_eq!(refused, crate::db::SessionDeletion::Open);
+        assert_eq!(
+            deleted,
+            crate::db::SessionDeletion::Deleted(vec!["old-capture".to_string()])
+        );
+        assert!(
+            state
+                .get_by_id_persisted("old-capture")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .get_by_id_persisted("new-capture")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    fn webhook(id: &str) -> CapturedWebhook {
+        CapturedWebhook {
+            id: id.to_string(),
+            timestamp: "2026-10-30T16:58:35Z".to_string(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            request_headers: std::collections::HashMap::new(),
+            request_body: Vec::new(),
+            response_status: 502,
+            response_headers: std::collections::HashMap::new(),
+            response_body: Vec::new(),
+            duration_ms: 1,
+            provider: None,
+            summary: String::new(),
+            signature_diagnostic: None,
+            auto_acked: false,
+            response_body_incomplete: false,
+        }
     }
 
     #[tokio::test]

@@ -215,8 +215,13 @@ pub async fn diagnose_request(
     Path(id): Path<String>,
 ) -> Result<axum::response::Response, StatusCode> {
     let webhook = load_webhook(&state, &id).await?;
+    let recorded_port = match state.db() {
+        Some(db) => db.request_local_port(&id).await.map_err(database_error)?,
+        None => None,
+    };
+    let local_port = recorded_port.or_else(|| Some(state.local_port()).filter(|port| *port != 0));
 
-    match crate::failure::diagnose(&webhook) {
+    match crate::failure::diagnose(&webhook, local_port) {
         Some(diagnosis) => Ok(Json(diagnosis).into_response()),
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
@@ -317,6 +322,12 @@ pub async fn update_tags(
 #[derive(Deserialize)]
 pub struct RenameSessionBody {
     pub name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeletedSessionsResponse {
+    pub deleted_sessions: usize,
+    pub deleted_requests: usize,
 }
 
 #[derive(Deserialize)]
@@ -614,6 +625,40 @@ pub async fn rename_session(
     } else {
         Err(StatusCode::NOT_FOUND)
     }
+}
+
+/// `DELETE /api/sessions/:id` — delete an ended session and its captures.
+///
+/// An open session answers `409 Conflict`: its tunnel may still capture into it.
+pub async fn delete_session(
+    State(state): State<InspectorState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, StatusCode> {
+    if state.db().is_none() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    match state.delete_session(&id).await.map_err(database_error)? {
+        crate::db::SessionDeletion::Deleted(_) => Ok(StatusCode::NO_CONTENT),
+        crate::db::SessionDeletion::Open => Err(StatusCode::CONFLICT),
+        crate::db::SessionDeletion::NotFound => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+/// `DELETE /api/sessions` — delete every ended session and its captures.
+pub async fn delete_ended_sessions(
+    State(state): State<InspectorState>,
+) -> Result<Json<DeletedSessionsResponse>, StatusCode> {
+    if state.db().is_none() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let deleted = state
+        .delete_ended_sessions()
+        .await
+        .map_err(database_error)?;
+    Ok(Json(DeletedSessionsResponse {
+        deleted_sessions: deleted.sessions,
+        deleted_requests: deleted.request_ids.len(),
+    }))
 }
 
 /// `GET /api/db/requests` — list requests from persistent storage (paginated).

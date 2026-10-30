@@ -1162,6 +1162,8 @@ async fn tunnel_start_under_json_emits_pretty_success_contract_on_stdout() {
         .expect("JSON tunnel relay handshake timed out");
     });
 
+    let local_server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = local_server.local_addr().unwrap().port();
     let output_task = tokio::task::spawn_blocking(move || {
         let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
         let mut command = lpm_spawnable(&project);
@@ -1170,12 +1172,13 @@ async fn tunnel_start_under_json_emits_pretty_success_contract_on_stdout() {
             "workflow-token",
             "--json",
             "tunnel",
-            "5173",
+            &port.to_string(),
             "--no-inspect",
         ]);
         command_output_with_deadline(command, Duration::from_secs(12))
     });
     let output = finish_bounded_tunnel_workflow(output_task, relay_task).await;
+    drop(local_server);
 
     assert!(
         output.status.success(),
@@ -1188,13 +1191,18 @@ async fn tunnel_start_under_json_emits_pretty_success_contract_on_stdout() {
         "tunnel JSON must use the pretty JSON formatter, got:\n{stdout}"
     );
     let contract: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    insta::assert_json_snapshot!(contract, @r#"
+    assert_eq!(contract["local_port"], port);
+    assert_eq!(contract["local_url"], format!("http://127.0.0.1:{port}/"));
+    insta::assert_json_snapshot!(contract, {
+        ".local_port" => "[port]",
+        ".local_url" => "[local url]",
+    }, @r#"
     {
       "success": true,
       "tunnel_url": "https://review-test.lpm.test",
       "domain": "review-test.lpm.test",
-      "local_port": 5173,
-      "local_url": "http://127.0.0.1:5173/",
+      "local_port": "[port]",
+      "local_url": "[local url]",
       "session_id": "session-review-test",
       "plan": "pro",
       "base_domain": "lpm.test",
@@ -1206,6 +1214,208 @@ async fn tunnel_start_under_json_emits_pretty_success_contract_on_stdout() {
       "auto_ack": false
     }
     "#);
+}
+
+/// Serves `body` to every connection on `listener` until the task is aborted.
+fn serve_fixed_body(
+    listener: tokio::net::TcpListener,
+    body: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                read_request_head(&mut socket).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes())
+                    .await
+                    .unwrap();
+            });
+        }
+    })
+}
+
+/// A relay that greets the tunnel, proxies one `GET /` through it, and hands
+/// back the tunnel's `http_response` message.
+fn single_request_relay() -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Receiver<serde_json::Value>,
+) {
+    single_request_relay_after(std::future::ready(()), None)
+}
+
+/// [`single_request_relay`] that reports when the tunnel has connected and
+/// holds the request until `send_request` resolves.
+fn single_request_relay_after(
+    send_request: impl std::future::Future<Output = ()> + Send + 'static,
+    connected: Option<tokio::sync::oneshot::Sender<()>>,
+) -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Receiver<serde_json::Value>,
+) {
+    use futures_util::StreamExt as _;
+
+    let relay = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    relay.set_nonblocking(true).unwrap();
+    let relay = tokio::net::TcpListener::from_std(relay).unwrap();
+    let relay_url = format!("ws://{}/connect", relay.local_addr().unwrap());
+    let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+    let relay_task = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (socket, _) = relay.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            if let Some(connected) = connected {
+                connected.send(()).unwrap();
+            }
+            send_request.await;
+            for message in [
+                serde_json::json!({
+                    "type": "hello",
+                    "subdomain": "family.lpm.test",
+                    "tunnel_url": "https://family.lpm.test",
+                    "session_id": "session-family",
+                    "plan": "pro",
+                    "base_domain": "lpm.test",
+                    "domain_kind": "account"
+                }),
+                serde_json::json!({
+                    "type": "http_request",
+                    "id": "req-family",
+                    "method": "GET",
+                    "url": "/",
+                    "headers": {},
+                    "body": ""
+                }),
+            ] {
+                websocket
+                    .send(Message::Text(message.to_string()))
+                    .await
+                    .unwrap();
+            }
+            let response = loop {
+                let Message::Text(text) = websocket.next().await.unwrap().unwrap() else {
+                    continue;
+                };
+                let message: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if message["type"] == "http_response" && message["id"] == "req-family" {
+                    break message;
+                }
+            };
+            response_tx.send(response).unwrap();
+            websocket.close(None).await.unwrap();
+        })
+        .await
+        .expect("single-request tunnel relay timed out");
+    });
+    (relay_url, relay_task, response_rx)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_port_reaches_a_dev_server_listening_only_on_ipv6_loopback() {
+    let server = tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let port = server.local_addr().unwrap().port();
+    let server_task = serve_fixed_body(server, "served over ipv6");
+    let (relay_url, relay_task, response_rx) = single_request_relay();
+
+    let output_task = tokio::task::spawn_blocking(move || {
+        let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+        let mut command = lpm_spawnable(&project);
+        command.env("LPM_TUNNEL_RELAY", relay_url).args([
+            "--token",
+            "workflow-token",
+            "--json",
+            "tunnel",
+            &port.to_string(),
+            "--no-inspect",
+        ]);
+        command_output_with_deadline(command, Duration::from_secs(15))
+    });
+    let output = finish_bounded_tunnel_workflow(output_task, relay_task).await;
+    server_task.abort();
+
+    assert!(
+        output.status.success(),
+        "tunnel command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response = response_rx.await.expect("relay saw the tunnel's response");
+    let body = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        response["body"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        (response["status"].as_u64(), String::from_utf8_lossy(&body)),
+        (Some(200), "served over ipv6".into()),
+    );
+    let ready: serde_json::Value = serde_json::Deserializer::from_slice(&output.stdout)
+        .into_iter()
+        .next()
+        .expect("tunnel ready event")
+        .unwrap();
+    assert_eq!(
+        ready["local_url"],
+        format!("http://[::1]:{port}/"),
+        "{ready}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_port_reaches_an_ipv6_dev_server_started_after_the_tunnel() {
+    let (port, [reserved_ipv4, reserved_ipv6]) = refused_loopback_port();
+    let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
+    let (server_up_tx, server_up_rx) = tokio::sync::oneshot::channel::<()>();
+    let (relay_url, relay_task, response_rx) = single_request_relay_after(
+        async move { server_up_rx.await.unwrap() },
+        Some(connected_tx),
+    );
+
+    let output_task = tokio::task::spawn_blocking(move || {
+        let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+        let mut command = lpm_spawnable(&project);
+        command.env("LPM_TUNNEL_RELAY", relay_url).args([
+            "--token",
+            "workflow-token",
+            "--json",
+            "tunnel",
+            &port.to_string(),
+            "--no-inspect",
+        ]);
+        command_output_with_deadline(command, Duration::from_secs(15))
+    });
+    connected_rx.await.expect("tunnel connected to the relay");
+    drop(reserved_ipv6);
+    let server = tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    let server_task = serve_fixed_body(server, "started after the tunnel");
+    server_up_tx.send(()).unwrap();
+    let output = finish_bounded_tunnel_workflow(output_task, relay_task).await;
+    server_task.abort();
+    drop(reserved_ipv4);
+
+    assert!(
+        output.status.success(),
+        "tunnel command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response = response_rx.await.expect("relay saw the tunnel's response");
+    let body = base64::Engine::decode(
+        &base64::engine::general_purpose::STANDARD,
+        response["body"].as_str().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        (response["status"].as_u64(), String::from_utf8_lossy(&body)),
+        (Some(200), "started after the tunnel".into()),
+    );
 }
 
 /// A relay that refuses the first connect with `plan_required` and reports
@@ -1374,6 +1584,14 @@ async fn tunnel_json_reports_a_retry_before_a_successful_reconnection() {
 /// Starts `lpm tunnel 5173` against a relay that greets it and closes, in a
 /// project `prepare` sets up, and returns its stderr.
 async fn tunnel_start_stderr(prepare: impl FnOnce(&Path) + Send + 'static) -> String {
+    tunnel_start_stderr_on_port(5173, prepare).await
+}
+
+/// [`tunnel_start_stderr`] for `lpm tunnel <port>`.
+async fn tunnel_start_stderr_on_port(
+    port: u16,
+    prepare: impl FnOnce(&Path) + Send + 'static,
+) -> String {
     let relay = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay_url = format!("ws://{}/connect", relay.local_addr().unwrap());
     let relay_task = tokio::spawn(async move {
@@ -1409,7 +1627,7 @@ async fn tunnel_start_stderr(prepare: impl FnOnce(&Path) + Send + 'static) -> St
             "--token",
             "workflow-token",
             "tunnel",
-            "5173",
+            &port.to_string(),
             "--no-inspect",
         ]);
         command_output_with_deadline(command, Duration::from_secs(12))
@@ -1433,6 +1651,53 @@ fn git(directory: &Path, args: &[&str]) {
         .output()
         .unwrap();
     assert!(output.status.success(), "git {args:?}: {output:?}");
+}
+
+/// A port bound on both loopback families without listening, so every
+/// connection to it is refused while the returned sockets live.
+fn refused_loopback_port() -> (u16, [tokio::net::TcpSocket; 2]) {
+    for _ in 0..16 {
+        let ipv4 = tokio::net::TcpSocket::new_v4().unwrap();
+        ipv4.bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+            .unwrap();
+        let port = ipv4.local_addr().unwrap().port();
+        let ipv6 = tokio::net::TcpSocket::new_v6().unwrap();
+        if ipv6
+            .bind((std::net::Ipv6Addr::LOCALHOST, port).into())
+            .is_ok()
+        {
+            return (port, [ipv4, ipv6]);
+        }
+    }
+    panic!("no port was free on both loopback families");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_port_with_nothing_listening_warns_that_requests_get_a_502() {
+    let (port, _reserved) = refused_loopback_port();
+
+    let stderr = tunnel_start_stderr_on_port(port, |_| {}).await;
+
+    assert!(
+        stderr.contains(&format!(
+            "nothing is listening on port {port} yet; requests get a 502 until your dev server starts"
+        )),
+        "{stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_port_with_a_listener_does_not_warn_about_502s() {
+    let local_server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = local_server.local_addr().unwrap().port();
+
+    let stderr = tunnel_start_stderr_on_port(port, |_| {}).await;
+
+    assert!(!stderr.contains("nothing is listening"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("http://127.0.0.1:{port}/")),
+        "{stderr}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -366,6 +366,77 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn sessions_api_deletes_ended_sessions_and_refuses_the_open_one() {
+        let db = crate::db::InspectorDb::open_temp().unwrap();
+        let state = InspectorState::with_db(4321, db.clone());
+        for (session, request) in [("stopped-1", "req-1"), ("stopped-2", "req-2")] {
+            state
+                .start_session(session.to_string(), None, 4321, None)
+                .await
+                .unwrap();
+            state.push(make_webhook(request, 502)).await;
+            state.end_session().await.unwrap();
+        }
+        for session in ["stopped-3", "running"] {
+            state
+                .start_session(session.to_string(), None, 4321, None)
+                .await
+                .unwrap();
+        }
+        state.push(make_webhook("req-live", 200)).await;
+        state.flush().await.unwrap();
+        let token = state.auth_token().to_string();
+        let handle = crate::start(state, 0).await.unwrap();
+        let client = reqwest::Client::new();
+        let delete = |path: &str, token: Option<&str>| {
+            let mut request = client.delete(format!("http://127.0.0.1:{}{path}", handle.port));
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            request.send()
+        };
+
+        let unauthenticated = delete("/api/sessions/stopped-1", None).await.unwrap();
+        let open = delete("/api/sessions/running", Some(&token)).await.unwrap();
+        let unknown = delete("/api/sessions/never-started", Some(&token))
+            .await
+            .unwrap();
+        let one = delete("/api/sessions/stopped-1", Some(&token))
+            .await
+            .unwrap();
+        let rest = delete("/api/sessions", Some(&token)).await.unwrap();
+
+        assert_eq!(
+            [
+                unauthenticated.status(),
+                open.status(),
+                unknown.status(),
+                one.status()
+            ],
+            [
+                reqwest::StatusCode::UNAUTHORIZED,
+                reqwest::StatusCode::CONFLICT,
+                reqwest::StatusCode::NOT_FOUND,
+                reqwest::StatusCode::NO_CONTENT,
+            ]
+        );
+        assert_eq!(
+            rest.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!({ "deleted_sessions": 2, "deleted_requests": 1 })
+        );
+        let remaining: Vec<String> = db
+            .list_sessions(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect();
+        assert_eq!(remaining, ["running"]);
+        assert!(db.get_webhook("req-live").await.unwrap().is_some());
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn project_observer_revision_changes_after_an_external_capture() {
         let project = tempfile::tempdir().unwrap();
         let writer =

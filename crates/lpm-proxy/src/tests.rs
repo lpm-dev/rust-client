@@ -2164,6 +2164,7 @@ async fn http_frontend_forwards_to_an_ipv6_loopback_upstream() {
         address: std::net::Ipv6Addr::LOCALHOST.into(),
         port: upstream_port,
         base_path: "/".to_string(),
+        any_loopback_family: false,
     };
     let frontend = start_http_frontend_on_listener(listener, upstream).unwrap();
 

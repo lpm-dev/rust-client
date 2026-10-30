@@ -5548,6 +5548,7 @@ mod tests {
                     address: std::net::Ipv6Addr::LOCALHOST.into(),
                     port: old_port,
                     base_path: "/old".to_string(),
+                    any_loopback_family: false,
                 },
                 service: Some("web".to_string()),
             }],
@@ -5565,6 +5566,7 @@ mod tests {
                     address: std::net::Ipv6Addr::LOCALHOST.into(),
                     port: new_port,
                     base_path: "/new".to_string(),
+                    any_loopback_family: false,
                 },
                 service: Some("web".to_string()),
             }],
@@ -5756,6 +5758,7 @@ mod tests {
                 address: std::net::Ipv6Addr::LOCALHOST.into(),
                 port,
                 base_path: base_path.to_string(),
+                any_loopback_family: false,
             },
             service: Some("web".to_string()),
         };
@@ -5827,12 +5830,14 @@ mod tests {
             address: std::net::Ipv6Addr::LOCALHOST.into(),
             port: old_port,
             base_path: "/old".to_string(),
+            any_loopback_family: false,
         };
         let new_target = LocalTarget {
             scheme: LocalScheme::Http,
             address: std::net::Ipv6Addr::LOCALHOST.into(),
             port: new_port,
             base_path: "/new".to_string(),
+            any_loopback_family: false,
         };
         let proxy_lease = Arc::new(tokio::sync::Mutex::new(None));
         register_proxy_route_plan(

@@ -55,24 +55,41 @@ pub async fn start(
     server::start(state, port).await
 }
 
+/// How long in-flight inspector requests may run after shutdown begins.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Handle to a running inspector server.
 ///
-/// Call [`InspectorHandle::shutdown`] to wait for graceful shutdown and surface
-/// any server failure.
+/// Call [`InspectorHandle::shutdown`] to stop the server and surface any
+/// server failure. Dropping the handle also stops it.
 pub struct InspectorHandle {
     pub port: u16,
     pub url: String,
-    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     server_task: tokio::task::JoinHandle<Result<(), lpm_common::LpmError>>,
 }
 
 impl InspectorHandle {
-    /// Stop the server gracefully and wait until its listener is closed.
+    /// Stop the server and wait until its listener is closed.
+    ///
+    /// Event streams end at once. Other in-flight requests get a short grace
+    /// period, after which shutdown returns without waiting for them.
     pub async fn shutdown(mut self) -> Result<(), lpm_common::LpmError> {
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(());
+            shutdown_tx.send_replace(true);
         }
-        self.server_task.await.map_err(|error| {
+        let joined = match tokio::time::timeout(SHUTDOWN_GRACE, &mut self.server_task).await {
+            Ok(joined) => joined,
+            Err(_) => {
+                tracing::debug!("inspector requests outlived the shutdown grace period");
+                self.server_task.abort();
+                match (&mut self.server_task).await {
+                    Err(error) if error.is_cancelled() => return Ok(()),
+                    joined => joined,
+                }
+            }
+        };
+        joined.map_err(|error| {
             lpm_common::LpmError::Tunnel(format!("inspector server task failed: {error}"))
         })?
     }
