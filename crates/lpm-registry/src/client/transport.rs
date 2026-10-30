@@ -82,6 +82,11 @@ impl RegistryClient {
             }
             let response = self.send_once_preserving_status(request).await?;
             let status = response.status();
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(LpmError::RateLimited {
+                    retry_after_secs: retry_after_seconds(&response),
+                });
+            }
             let parsed = parse_capped_api_json::<serde_json::Value>(
                 response,
                 &format!("{operation} response"),
@@ -1030,6 +1035,17 @@ pub(super) struct FailedResponse {
 
 /// Parse `Retry-After` header from a 429 response.
 /// Returns seconds to wait. Falls back to 1 second if header is missing/unparseable.
+/// The seconds a 429's `Retry-After` asks to wait, as the registry says
+/// them, for a change that isn't retried and reports the wait instead.
+fn retry_after_seconds(response: &reqwest::Response) -> u64 {
+    response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(1)
+}
+
 pub(super) fn parse_retry_after(response: &reqwest::Response) -> u64 {
     parse_retry_after_header(
         response

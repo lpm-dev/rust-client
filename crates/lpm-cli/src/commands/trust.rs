@@ -566,14 +566,6 @@ async fn run_prune(
         ));
     }
 
-    if json && !dry_run && !yes {
-        return Err(LpmError::Script(
-            "lpm trust prune --json requires `--yes` before it can mutate package.json. \
-             Pass `--yes` to proceed or `--dry-run` to preview."
-                .into(),
-        ));
-    }
-
     let (_, stale) = load_prune_state(project_dir)?;
 
     if yes && !dry_run {
@@ -610,17 +602,22 @@ async fn run_prune(
         return Ok(());
     }
 
-    if !stdin_is_terminal() {
-        return Err(LpmError::Script(
-            "lpm trust prune needs a TTY for confirmation. Pass `--yes` to \
-             proceed non-interactively, or `--dry-run` to preview."
-                .into(),
-        ));
+    if json || !stdin_is_terminal() {
+        return Err(LpmError::ConfirmationRequired {
+            command: "lpm trust prune",
+            change: format!(
+                "remove {} stale trust {} from package.json",
+                stale.len(),
+                trust_entry_word(stale.len())
+            ),
+            help: "Preview them with `--dry-run`, then run it again with `--yes`. It asks only in an interactive terminal, and never with `--json`.",
+        });
     }
     let initial_workspace_root = discover_workspace_root(project_dir)?;
     let confirmed = cliclack::confirm(format!(
-        "Remove {} stale entry/entries from package.json?",
-        stale.len()
+        "Remove {} stale trust {} from package.json?",
+        stale.len(),
+        trust_entry_word(stale.len())
     ))
     .interact()
     .map_prompt_err(|e| LpmError::Script(format!("prompt failed: {e}")))?;

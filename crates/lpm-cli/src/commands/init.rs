@@ -95,9 +95,11 @@ pub(crate) async fn run(
     let pkg_json_path = project_dir.join("package.json");
     require_missing_manifest(&pkg_json_path)?;
     if !options.yes && (options.json_output || !std::io::stdin().is_terminal()) {
-        return Err(LpmError::Registry(
-            "lpm init requires --yes when prompts are unavailable or --json is used".into(),
-        ));
+        return Err(LpmError::ConfirmationRequired {
+            command: "lpm init",
+            change: "create package.json".into(),
+            help: "Run it in an interactive terminal to answer its questions, or pass `--yes` to take the defaults, with `--name` and `--owner` for the package name. It asks only in an interactive terminal, and never with `--json`.",
+        });
     }
 
     let target = resolve_init_target(&options)?;

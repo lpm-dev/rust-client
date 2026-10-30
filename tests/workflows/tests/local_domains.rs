@@ -459,8 +459,9 @@ fn dev_aborts_non_interactive_non_localhost_host_without_hosts_file_consent() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("non-interactive shell: pass `--yes` to consent to updating")
-            && stderr.contains("the hosts file for local domains (web.test)"),
+        stderr.contains("Confirmation required")
+            && stderr.contains("add web.test to the hosts file")
+            && stderr.contains(".localhost"),
         "stderr should explain hosts-file consent, got:\n{stderr}"
     );
     assert!(

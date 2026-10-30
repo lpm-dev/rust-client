@@ -12,7 +12,6 @@ use lpm_common::{LpmError, LpmRoot};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -2078,6 +2077,16 @@ pub enum Mutation {
     Disable,
 }
 
+impl Mutation {
+    fn command(self) -> &'static str {
+        match self {
+            Self::Remove => "lpm skills remove",
+            Self::Enable => "lpm skills enable",
+            Self::Disable => "lpm skills disable",
+        }
+    }
+}
+
 pub(super) struct ManagedMutationPlan {
     store: Store,
     state_snapshot: Vec<u8>,
@@ -2129,7 +2138,13 @@ pub fn mutate(
     if dry_run {
         return Ok(());
     }
-    require_confirmation(yes, json_output, "Apply the managed skill changes?")?;
+    super::require_confirmation(
+        yes,
+        json_output,
+        mutation.command(),
+        "apply the managed skill changes".into(),
+        "Apply the managed skill changes?",
+    )?;
     let changes = apply_mutation_plan(plan)?;
     if json_output {
         print_applied_changes(&changes);
@@ -2390,7 +2405,13 @@ pub fn prune(project_dir: &Path, args: PruneArgs, json_output: bool) -> Result<(
         }
         return Ok(());
     }
-    require_confirmation(args.yes, json_output, "Prune stale managed skill records?")?;
+    super::require_confirmation(
+        args.yes,
+        json_output,
+        "lpm skills prune",
+        "prune stale managed skill records".into(),
+        "Prune stale managed skill records?",
+    )?;
     let preview_snapshot = state_snapshot(&state)?;
     store.prepare_root()?;
     let _lock = lpm_common::acquire_exclusive_lock(store.root.join(".mutation.lock"))?;
@@ -2533,19 +2554,23 @@ pub async fn update(
         return Ok(());
     }
     let warning_count = plan.warning_count();
-    let confirmation = if warning_count == 0 {
-        "Apply the managed skill updates?".to_string()
+    let (change, confirmation) = if warning_count == 0 {
+        (
+            "apply the managed skill updates".to_string(),
+            "Apply the managed skill updates?".to_string(),
+        )
     } else {
-        format!(
-            "Apply after reviewing {warning_count} security {}?",
-            if warning_count == 1 {
-                "warning"
-            } else {
-                "warnings"
-            }
+        let warnings = if warning_count == 1 {
+            "warning"
+        } else {
+            "warnings"
+        };
+        (
+            format!("apply the managed skill updates, with {warning_count} security {warnings}"),
+            format!("Apply after reviewing {warning_count} security {warnings}?"),
         )
     };
-    require_confirmation(yes, json_output, &confirmation)?;
+    super::require_confirmation(yes, json_output, "lpm skills update", change, &confirmation)?;
     let changes = apply_update_plan(plan)?;
     if json_output {
         print_applied_changes(&changes);
@@ -3277,29 +3302,6 @@ fn print_applied_changes(changes: &[PlannedChange]) {
         )
         .unwrap()
     );
-}
-
-fn require_confirmation(yes: bool, json_output: bool, prompt: &str) -> Result<(), LpmError> {
-    if yes {
-        return Ok(());
-    }
-    if json_output || !std::io::stdin().is_terminal() {
-        return Err(LpmError::Registry(
-            "non-interactive managed skill mutation requires `--yes` after reviewing `--dry-run`"
-                .into(),
-        ));
-    }
-    if cliclack::confirm(crate::prompt::untrusted(prompt))
-        .initial_value(false)
-        .interact()
-        .map_err(crate::prompt::prompt_err)?
-    {
-        Ok(())
-    } else {
-        Err(LpmError::Script(
-            "skill operation cancelled; no files changed".into(),
-        ))
-    }
 }
 
 fn stores_for(project_dir: &Path, include_global: bool) -> Result<Vec<Store>, LpmError> {

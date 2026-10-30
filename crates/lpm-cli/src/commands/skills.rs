@@ -311,15 +311,25 @@ async fn run_add(
         .flat_map(|skill| &skill.findings)
         .filter(|finding| finding.severity == lpm_skill::SkillSecuritySeverity::Warning)
         .count();
-    let confirmation = if warning_count == 0 {
-        "Install the planned standalone skills?".to_string()
+    let (change, confirmation) = if warning_count == 0 {
+        (
+            "install the planned standalone skills".to_string(),
+            "Install the planned standalone skills?".to_string(),
+        )
     } else {
-        format!(
-            "Install after reviewing {warning_count} security {}?",
-            plural(warning_count, "warning", "warnings")
+        let warnings = plural(warning_count, "warning", "warnings");
+        (
+            format!("install skills with {warning_count} security {warnings}"),
+            format!("Install after reviewing {warning_count} security {warnings}?"),
         )
     };
-    require_confirmation(args.yes, json_output, &confirmation)?;
+    require_confirmation(
+        args.yes,
+        json_output,
+        "lpm skills add",
+        change,
+        &confirmation,
+    )?;
     let changes = plan.changes.clone();
     managed::apply_install(&store, &tree, &selected, plan)?;
 
@@ -463,6 +473,8 @@ async fn add_package_skills(
     require_confirmation(
         args.yes,
         json_output,
+        "lpm skills add",
+        "materialize the package's skills".into(),
         "Materialize these package-published skills?",
     )?;
     let result = package::materialize(
@@ -628,14 +640,24 @@ fn choose_agents(
     Ok(agents)
 }
 
-fn require_confirmation(yes: bool, json_output: bool, prompt: &str) -> Result<(), LpmError> {
+/// Asks `prompt` in an interactive terminal. Without one, or with `--json`,
+/// `--yes` is the only answer, and `command` refuses to `change` without it.
+fn require_confirmation(
+    yes: bool,
+    json_output: bool,
+    command: &'static str,
+    change: String,
+    prompt: &str,
+) -> Result<(), LpmError> {
     if yes {
         return Ok(());
     }
     if !is_interactive(json_output) {
-        return Err(LpmError::Registry(
-            "non-interactive mutation requires `--yes` after reviewing `--dry-run`".into(),
-        ));
+        return Err(LpmError::ConfirmationRequired {
+            command,
+            change,
+            help: "Review the change with `--dry-run`, then run it again with `--yes`. It asks only in an interactive terminal, and never with `--json`.",
+        });
     }
     let confirmed = cliclack::confirm(crate::prompt::untrusted(prompt))
         .initial_value(false)
@@ -1131,14 +1153,17 @@ fn clean_skills(project_dir: &Path, args: CleanArgs, json_output: bool) -> Resul
         return Ok(());
     }
 
+    let skill_sets = format!(
+        "{} installed LPM.dev package skill {}",
+        plan.targets.len(),
+        plural(plan.targets.len(), "set", "sets")
+    );
     require_confirmation(
         args.yes,
         json_output,
-        &format!(
-            "Remove {} installed LPM.dev package skill {}?",
-            plan.targets.len(),
-            plural(plan.targets.len(), "set", "sets")
-        ),
+        "lpm skills clean",
+        format!("remove {skill_sets}"),
+        &format!("Remove {skill_sets}?"),
     )?;
 
     let mut removed = Vec::with_capacity(plan.targets.len());

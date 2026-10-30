@@ -249,10 +249,14 @@ fn doctor_fix_json_without_yes_emits_one_error_and_does_not_mutate() {
 
     assert!(!output.status.success(), "the JSON refusal must fail");
     assert_eq!(envelope["success"], false, "{envelope:#}");
+    assert_eq!(
+        envelope["error_code"], "confirmation_required",
+        "{envelope:#}"
+    );
     assert!(
-        envelope["error"]
+        envelope["error"]["help"]
             .as_str()
-            .is_some_and(|error| error.contains("--yes")),
+            .is_some_and(|help| help.contains("--fix --yes")),
         "the JSON error must explain how to confirm automatic fixes: {envelope:#}"
     );
     insta::assert_json_snapshot!("doctor_fix_requires_yes", envelope);

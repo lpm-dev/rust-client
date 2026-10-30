@@ -94,7 +94,11 @@ pub fn run(
             }
             if !yes {
                 if json || !std::io::stdin().is_terminal() {
-                    return Err(LpmError::Script("Review the preview, then pass --yes to apply or remove sandbox permissions in a non-interactive session.".into()));
+                    return Err(LpmError::ConfirmationRequired {
+                        command: "lpm doctor sandbox-setup",
+                        change: format!("{operation} the sandbox permissions"),
+                        help: "Review the preview, then run it again with `--yes`. It asks only in an interactive terminal, and never with `--json`.",
+                    });
                 }
                 if !cliclack::confirm(if remove {
                     "Remove these sandbox permissions?"

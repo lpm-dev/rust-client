@@ -1324,9 +1324,15 @@ async fn publish_json_refuses_lifecycle_scripts_without_an_explicit_choice() {
         "no lifecycle script may run before consent",
     );
     let envelope = parse_json_output(&output.stdout);
-    let error = envelope["error"].as_str().unwrap_or_default();
+    assert_eq!(
+        envelope["error_code"], "confirmation_required",
+        "{envelope}"
+    );
+    assert_eq!(envelope["error"]["command"], "lpm publish", "{envelope}");
+    let message = envelope["error"]["message"].as_str().unwrap_or_default();
+    let help = envelope["error"]["help"].as_str().unwrap_or_default();
     assert!(
-        error.contains("--yes") && error.contains("--ignore-scripts"),
+        message.contains("--yes") && help.contains("--ignore-scripts"),
         "the error must explain both explicit choices: {envelope}",
     );
 }

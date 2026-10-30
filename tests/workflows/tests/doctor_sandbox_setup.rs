@@ -115,12 +115,15 @@ fn sandbox_setup_json_requires_explicit_confirmation_and_rejects_invalid_users()
         assert!(!output.status.success(), "{output:?}");
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(value["success"], false);
-        assert_eq!(value["error_code"], "script");
+        if value["error_code"] == "confirmation_required" {
+            assert_ne!(args[0], "--user-sid", "{value:#}");
+            assert_eq!(value["error"]["command"], "lpm doctor sandbox-setup");
+            continue;
+        }
+        assert_eq!(value["error_code"], "script", "{value:#}");
         let error = value["error"].as_str().unwrap();
         assert!(
-            error.contains("--yes")
-                || error.contains("administrator terminal")
-                || error.contains("invalid target user SID"),
+            error.contains("administrator terminal") || error.contains("invalid target user SID"),
             "{error}"
         );
     }

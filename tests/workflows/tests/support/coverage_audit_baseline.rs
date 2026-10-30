@@ -42,7 +42,7 @@ impl SurfaceBaseline {
     }
 }
 
-pub const EXPECTED_SURFACE_COUNT: usize = 175;
+pub const EXPECTED_SURFACE_COUNT: usize = 178;
 
 pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Info",
@@ -58,6 +58,9 @@ pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Uninstall",
     "Add",
     "Publish",
+    "Unpublish",
+    "Deprecate",
+    "Undeprecate",
     "Version",
     "Release",
     "Stage",
@@ -589,6 +592,7 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         cli_binary: true,
         json_contract: JsonContractStatus::Covered,
         references: &[
+            "crates/lpm-cli/src/commands/registry_change.rs",
             "crates/lpm-cli/src/commands/token.rs",
             "crates/lpm-cli/tests/token_rotate_interactive_tty.rs",
             "tests/workflows/tests/token_rotate.rs",
@@ -2196,6 +2200,47 @@ pub const SURFACES: &[SurfaceBaseline] = &[
             "crates/lpm-cli/src/commands/lifecycle_scope.rs",
             "tests/workflows/tests/trust.rs",
             "tests/workflows/tests/policy_storage.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 176,
+        name: "`lpm unpublish <pkg>@<version>`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: true,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/release_target.rs",
+            "crates/lpm-cli/src/commands/unpublish.rs",
+            "crates/lpm-cli/tests/unpublish_interactive_tty.rs",
+            "tests/workflows/tests/package_changes.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 177,
+        name: "`lpm deprecate <pkg>[@<version>] <message>`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/deprecate.rs",
+            "tests/workflows/tests/package_changes.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 178,
+        name: "`lpm undeprecate <pkg>[@<version>]`",
+        unit: false,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/deprecate.rs",
+            "tests/workflows/tests/package_changes.rs",
         ],
     },
 ];

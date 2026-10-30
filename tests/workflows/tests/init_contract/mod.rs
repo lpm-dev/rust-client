@@ -26,7 +26,11 @@ fn init_requires_yes_before_any_noninteractive_prompt() {
         let out = init(&project, &args);
         assert!(!out.status.success());
         let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert!(json["error"].as_str().unwrap().contains("--yes"), "{json}");
+        assert_eq!(json["error_code"], "confirmation_required", "{json}");
+        assert!(
+            json["error"]["message"].as_str().unwrap().contains("--yes"),
+            "{json}"
+        );
         assert_no_manifest(&project);
     }
 }
