@@ -1755,11 +1755,11 @@ pub async fn run(
                     Ok(())
                 },
                 show_tunnel_notice,
-                move |usage, initial| {
+                move |usage, update| {
                     *usage_for_notices
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(usage.clone());
-                    if !initial
+                    if update == lpm_tunnel::UsageUpdate::Notice
                         && let Some(summary) =
                             crate::commands::tunnel::tunnel_usage_summary(Some(usage))
                     {
@@ -2464,6 +2464,7 @@ pub async fn run(
                         Some(&tunnel_relay_url),
                         tunnel_token_provider,
                         !quiet,
+                        crate::commands::tunnel::TunnelView::Lines,
                         Some(shutdown_rx),
                     )
                     .await;

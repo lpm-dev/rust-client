@@ -1433,6 +1433,160 @@ async fn tunnel_port_reaches_an_ipv6_dev_server_started_after_the_tunnel() {
     );
 }
 
+/// A dev server that, like Vite, completes a WebSocket upgrade only for the
+/// `vite-hmr` subprotocol and leaves any other upgrade unanswered.
+fn serve_vite_hmr_upgrades(listener: tokio::net::TcpListener) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+                let mut head = Vec::with_capacity(1024);
+                let mut chunk = [0_u8; 1024];
+                while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => head.extend_from_slice(&chunk[..read]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let header = |name: &str| {
+                    head.lines().find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.trim()
+                            .eq_ignore_ascii_case(name)
+                            .then(|| value.trim().to_owned())
+                    })
+                };
+                let wants_hmr = header("sec-websocket-protocol").is_some_and(|protocols| {
+                    protocols
+                        .split(',')
+                        .any(|protocol| protocol.trim() == "vite-hmr")
+                });
+                if wants_hmr {
+                    let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(
+                        header("sec-websocket-key").unwrap().as_bytes(),
+                    );
+                    let response = format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: vite-hmr\r\n\r\n"
+                    );
+                    if socket.write_all(response.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+                while matches!(socket.read(&mut chunk).await, Ok(read) if read > 0) {}
+            });
+        }
+    })
+}
+
+/// A relay that greets the tunnel, asks it to open a WebSocket with
+/// `headers`, and hands back the tunnel's `ws_ready` or `ws_reject` answer.
+fn websocket_upgrade_relay(
+    headers: serde_json::Value,
+) -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Receiver<serde_json::Value>,
+) {
+    use futures_util::StreamExt as _;
+
+    let relay = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    relay.set_nonblocking(true).unwrap();
+    let relay = tokio::net::TcpListener::from_std(relay).unwrap();
+    let relay_url = format!("ws://{}/connect", relay.local_addr().unwrap());
+    let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+    let relay_task = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let (socket, _) = relay.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            for message in [
+                serde_json::json!({
+                    "type": "hello",
+                    "subdomain": "family.lpm.test",
+                    "tunnel_url": "https://family.lpm.test",
+                    "session_id": "session-websocket",
+                    "plan": "pro",
+                    "base_domain": "lpm.test",
+                    "domain_kind": "account"
+                }),
+                serde_json::json!({
+                    "type": "ws_upgrade",
+                    "id": "ws-hmr",
+                    "url": "/?token=hmr",
+                    "headers": headers
+                }),
+            ] {
+                websocket
+                    .send(Message::Text(message.to_string()))
+                    .await
+                    .unwrap();
+            }
+            let answer = loop {
+                let Message::Text(text) = websocket.next().await.unwrap().unwrap() else {
+                    continue;
+                };
+                let message: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if matches!(message["type"].as_str(), Some("ws_ready" | "ws_reject"))
+                    && message["id"] == "ws-hmr"
+                {
+                    break message;
+                }
+            };
+            answer_tx.send(answer).unwrap();
+            let _ = websocket.close(None).await;
+        })
+        .await
+        .expect("WebSocket upgrade relay timed out");
+    });
+    (relay_url, relay_task, answer_rx)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_relays_the_websocket_subprotocol_a_vite_dev_server_requires() {
+    let server = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let port = server.local_addr().unwrap().port();
+    let server_task = serve_vite_hmr_upgrades(server);
+    let (relay_url, relay_task, answer_rx) = websocket_upgrade_relay(serde_json::json!({
+        "origin": "https://family.lpm.test",
+        "sec-websocket-protocol": "vite-hmr",
+        "sec-websocket-version": "13",
+        "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==",
+        "upgrade": "websocket",
+        "connection": "Upgrade"
+    }));
+
+    let output_task = tokio::task::spawn_blocking(move || {
+        let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+        let mut command = lpm_spawnable(&project);
+        command.env("LPM_TUNNEL_RELAY", relay_url).args([
+            "--token",
+            "workflow-token",
+            "--json",
+            "tunnel",
+            &port.to_string(),
+            "--no-inspect",
+        ]);
+        command_output_with_deadline(command, Duration::from_secs(20))
+    });
+    let output = finish_bounded_tunnel_workflow(output_task, relay_task).await;
+    server_task.abort();
+
+    assert!(
+        output.status.success(),
+        "tunnel command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let answer = answer_rx.await.expect("relay saw the tunnel's answer");
+    assert_eq!(
+        answer,
+        serde_json::json!({ "type": "ws_ready", "id": "ws-hmr", "protocol": "vite-hmr" })
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn log_clear_removes_the_session_of_a_tunnel_that_was_killed() {
     let server = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))

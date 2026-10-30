@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod panel;
+
 /// Run the `lpm tunnel` command.
 ///
 /// Actions:
@@ -111,6 +113,7 @@ pub async fn run(
                 Some(&effective_relay_url),
                 token_provider,
                 !json_output,
+                TunnelView::Live,
                 None,
             )
             .await
@@ -140,6 +143,7 @@ pub async fn run(
                     Some(&effective_relay_url),
                     token_provider,
                     !json_output,
+                    TunnelView::Live,
                     None,
                 )
                 .await;
@@ -417,6 +421,16 @@ fn tunnel_ready_json(
     })
 }
 
+/// How a human-readable tunnel shows its session and traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TunnelView {
+    /// A panel redrawn in place at the bottom of the terminal, where stderr
+    /// allows it, and one line per request elsewhere.
+    Live,
+    /// One line per request, for a terminal other output shares.
+    Lines,
+}
+
 /// Start a tunnel to expose a local port.
 ///
 /// `inspect_port` carries the user's intent: `Some(n)` → bind that exact
@@ -438,6 +452,7 @@ pub(crate) async fn run_start(
     relay_url: Option<&str>,
     token_provider: Option<lpm_tunnel::client::TunnelTokenProvider>,
     show_capture_warning: bool,
+    view: TunnelView,
     shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<(), LpmError> {
     let token = token.ok_or_else(|| {
@@ -502,6 +517,16 @@ pub(crate) async fn run_start(
         }
     };
 
+    let (panel, panel_renderer) = if view == TunnelView::Live && !json_output {
+        panel::TunnelPanel::open(
+            inspector_handle.is_some(),
+            inspector_state.local_target_slot(),
+        )
+        .unzip()
+    } else {
+        (None, None)
+    };
+
     // Create webhook capture channel.
     let (webhook_tx, mut webhook_rx) =
         tokio::sync::mpsc::channel::<lpm_tunnel::client::CapturedWebhookEvent>(8);
@@ -511,11 +536,14 @@ pub(crate) async fn run_start(
 
     // Spawn webhook consumer: pushes to inspector state for real-time SSE streaming
     let inspector_state_consumer = inspector_state.clone();
-    let print_request_stream = !json_output;
+    let request_panel = panel.clone();
+    let print_request_lines = !json_output && panel.is_none();
     let webhook_consumer = tokio::spawn(async move {
         while let Some(captured) = webhook_rx.recv().await {
             let webhook = Arc::clone(&captured.webhook);
-            if print_request_stream {
+            if let Some(panel) = &request_panel {
+                panel.request(&webhook);
+            } else if print_request_lines {
                 print_tunnel_request(&webhook);
             }
             inspector_state_consumer.push_captured(captured).await;
@@ -524,8 +552,12 @@ pub(crate) async fn run_start(
 
     // Spawn WS event consumer: pushes to inspector state
     let inspector_state_ws = inspector_state.clone();
+    let websocket_panel = panel.clone();
     let ws_consumer = tokio::spawn(async move {
         while let Some(event) = ws_rx.recv().await {
+            if let Some(panel) = &websocket_panel {
+                panel.websocket(&event);
+            }
             inspector_state_ws.push_ws_event(event).await;
         }
     });
@@ -563,6 +595,10 @@ pub(crate) async fn run_start(
     let latest_usage = Arc::new(Mutex::new(None::<lpm_tunnel::TunnelUsageMetadata>));
     let usage_for_connect = latest_usage.clone();
     let usage_for_notices = latest_usage.clone();
+    let connect_panel = panel.clone();
+    let retry_panel = panel.clone();
+    let usage_panel = panel.clone();
+    let control_panel = panel.clone();
 
     let connect = lpm_tunnel::client::connect_with_usage_fallible(
         &options,
@@ -601,41 +637,28 @@ pub(crate) async fn run_start(
                     .unwrap()
                 );
             } else {
-                install_ui::phase("Tunnel ready");
-                tunnel_detail("public URL", &session.tunnel_url);
-                if let Some(ref url) = inspector_url {
-                    tunnel_detail("inspector", url);
-                }
-                if let Some(plan) = session.plan.as_deref() {
-                    tunnel_detail("plan", plan);
-                }
-                if let Some(limits) = tunnel_limit_summary(session.limits.as_ref()) {
-                    tunnel_detail("limits", limits);
-                }
-                if let Some(usage) = tunnel_usage_summary(usage.as_ref()) {
-                    tunnel_detail("usage", usage);
-                }
-                tunnel_detail("session", &session.session_id);
-                tunnel_detail("local", &local_target_url);
-                if auto_ack {
-                    tunnel_detail(
-                        "auto-ack",
-                        "on (200 OK after durable capture on forwarding failure)",
-                    );
-                }
-                if let Some(ref auth) = tunnel_auth_display {
-                    tunnel_detail(
-                        "auth",
-                        tunnel_auth_header_summary(auth, std::io::stderr().is_terminal()),
-                    );
-                }
-                tunnel_detail("domain", &session.domain);
-                install_ui::detail("");
-                install_ui::done("Listening for requests");
-                if inspector_url.is_some() {
-                    install_ui::detail_line(format_tunnel_footer(true));
+                let details = panel::ReadyDetails {
+                    public_url: session.tunnel_url.clone(),
+                    inspector_url: inspector_url.clone(),
+                    plan: session.plan.clone(),
+                    limits: tunnel_limit_summary(session.limits.as_ref()),
+                    session_id: session.session_id.clone(),
+                    auto_ack,
+                    auth: tunnel_auth_display.as_deref().map(|auth| {
+                        tunnel_auth_header_summary(auth, std::io::stderr().is_terminal())
+                    }),
+                    domain: session.domain.clone(),
+                };
+                if let Some(panel) = &connect_panel {
+                    panel.connected(details);
                 } else {
-                    install_ui::detail_line(format_tunnel_footer(false));
+                    install_ui::phase("Tunnel ready");
+                    for row in details.rows(usage.as_ref(), &local_target_url) {
+                        install_ui::detail_line(row);
+                    }
+                    install_ui::detail("");
+                    install_ui::done("Listening for requests");
+                    install_ui::detail_line(format_tunnel_footer(inspector_url.is_some()));
                 }
             }
             Ok(())
@@ -653,13 +676,19 @@ pub(crate) async fn run_start(
                 println!("{event:#}");
             } else {
                 install_ui::warn_untrusted(&lpm_common::sanitize_terminal_inline(msg));
+                if let Some(panel) = &retry_panel {
+                    panel.reconnecting();
+                }
             }
         },
-        move |usage, initial| {
+        move |usage, update| {
             *usage_for_notices
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(usage.clone());
-            if !initial
+            if let Some(panel) = &usage_panel {
+                panel.usage(usage);
+            }
+            if update == lpm_tunnel::UsageUpdate::Notice
                 && !json_output
                 && let Some(summary) = tunnel_usage_summary(Some(usage))
             {
@@ -686,7 +715,7 @@ pub(crate) async fn run_start(
         if let Some(mut shutdown) = shutdown {
             tokio::select! {
                 result = &mut connect => result,
-                control_result = wait_for_tunnel_controls(control_inspector_url) => {
+                control_result = wait_for_tunnel_controls(control_inspector_url, redraw_panel(control_panel)) => {
                     tunnel_cancel.cancel();
                     compose_tunnel_control_and_connect(control_result, connect.await)
                 },
@@ -698,7 +727,7 @@ pub(crate) async fn run_start(
         } else {
             tokio::select! {
                 result = &mut connect => result,
-                control_result = wait_for_tunnel_controls(control_inspector_url) => {
+                control_result = wait_for_tunnel_controls(control_inspector_url, redraw_panel(control_panel)) => {
                     tunnel_cancel.cancel();
                     compose_tunnel_control_and_connect(control_result, connect.await)
                 },
@@ -713,6 +742,9 @@ pub(crate) async fn run_start(
     let websocket_result = ws_consumer
         .await
         .map_err(|error| LpmError::Tunnel(format!("WebSocket capture task failed: {error}")));
+    if let (Some(panel), Some(renderer)) = (panel, panel_renderer) {
+        panel.close(renderer).await;
+    }
     let (session_result, flush_result) = finish_capture_session(&inspector_state).await;
     let inspector_result = match inspector_handle {
         Some(handle) => handle.shutdown().await,
@@ -2197,7 +2229,8 @@ pub(crate) fn tunnel_limit_summary(
 
     if let Some(max_concurrent) = limits.max_concurrent {
         parts.push(format!(
-            "{max_concurrent} {}",
+            "{} {}",
+            lpm_common::format_count(max_concurrent),
             plural(max_concurrent, "tunnel")
         ));
     }
@@ -2206,7 +2239,7 @@ pub(crate) fn tunnel_limit_summary(
         if rate == 0 {
             parts.push("requests unlimited".to_string());
         } else {
-            parts.push(format!("{rate}/min"));
+            parts.push(format!("{}/min", lpm_common::format_count(rate)));
         }
     }
 
@@ -2216,7 +2249,8 @@ pub(crate) fn tunnel_limit_summary(
 
     if let Some(max_custom_domains) = limits.max_custom_domains {
         parts.push(format!(
-            "{max_custom_domains} custom {}",
+            "{} custom {}",
+            lpm_common::format_count(max_custom_domains),
             plural(max_custom_domains, "domain")
         ));
     }
@@ -2225,7 +2259,7 @@ pub(crate) fn tunnel_limit_summary(
         if per_ip_rate == 0 {
             parts.push("per-IP unlimited".to_string());
         } else {
-            parts.push(format!("{per_ip_rate}/min/IP"));
+            parts.push(format!("{}/min/IP", lpm_common::format_count(per_ip_rate)));
         }
     }
 
@@ -2236,25 +2270,61 @@ pub(crate) fn tunnel_limit_summary(
     }
 }
 
+/// The account's request usage on one line, as usage notices state it.
 pub(crate) fn tunnel_usage_summary(
     usage: Option<&lpm_tunnel::TunnelUsageMetadata>,
 ) -> Option<String> {
-    let usage = usage?;
-    let accepted = usage.accepted_requests?;
-    let included = usage.included_requests?;
-    let mut summary = format!("{accepted} / {included} requests");
-    if usage.overage_requests.unwrap_or_default() > 0 {
-        summary.push_str(&format!(
-            " · {} overage",
-            usage.overage_requests.unwrap_or_default()
-        ));
-    }
-    summary.push_str(if usage.overage_enabled.unwrap_or(false) {
-        " · overage on"
+    let usage = TunnelUsageParts::of(usage?)?;
+    Some(format!("{} · {}", usage.count, usage.allowance))
+}
+
+/// The account's request usage with a meter, as `Tunnel ready` shows it.
+fn tunnel_usage_detail(
+    usage: Option<&lpm_tunnel::TunnelUsageMetadata>,
+) -> Option<install_ui::TerminalLine> {
+    let usage = TunnelUsageParts::of(usage?)?;
+    let bar = install_ui::usage_bar(usage.accepted, usage.included, 10);
+    Some(if bar.is_empty() {
+        crate::install_ui::terminal_line!("{}  {}", usage.count, usage.allowance)
     } else {
-        " · hard stop"
-    });
-    Some(summary)
+        crate::install_ui::terminal_line!("{}  {}  {}", usage.count, bar, usage.allowance)
+    })
+}
+
+struct TunnelUsageParts {
+    accepted: u64,
+    included: u64,
+    /// `1,245 / 100,000 requests`
+    count: String,
+    /// What happens past the allowance: `250 overage · overage on`.
+    allowance: String,
+}
+
+impl TunnelUsageParts {
+    fn of(usage: &lpm_tunnel::TunnelUsageMetadata) -> Option<Self> {
+        let accepted = usage.accepted_requests?;
+        let included = usage.included_requests?;
+        let overage = usage.overage_requests.unwrap_or_default();
+        let mode = if usage.overage_enabled.unwrap_or(false) {
+            "overage on"
+        } else {
+            "hard stop"
+        };
+        Some(Self {
+            accepted,
+            included,
+            count: format!(
+                "{} / {} requests",
+                lpm_common::format_count(accepted),
+                lpm_common::format_count(included)
+            ),
+            allowance: if overage > 0 {
+                format!("{} overage · {mode}", lpm_common::format_count(overage))
+            } else {
+                mode.to_owned()
+            },
+        })
+    }
 }
 
 fn format_tunnel_detail(label: &'static str, value: impl Display) -> install_ui::TerminalLine {
@@ -2290,7 +2360,19 @@ fn format_tunnel_footer(has_inspector: bool) -> install_ui::TerminalLine {
     }
 }
 
-async fn wait_for_tunnel_controls(inspector_url: Option<String>) -> Result<(), LpmError> {
+/// Draws the panel again when the terminal resizes, if there is one.
+fn redraw_panel(panel: Option<Arc<panel::TunnelPanel>>) -> impl Fn() {
+    move || {
+        if let Some(panel) = &panel {
+            panel.redraw();
+        }
+    }
+}
+
+async fn wait_for_tunnel_controls(
+    inspector_url: Option<String>,
+    on_resize: impl Fn(),
+) -> Result<(), LpmError> {
     if !std::io::stdin().is_terminal() {
         tokio::signal::ctrl_c()
             .await
@@ -2317,6 +2399,7 @@ async fn wait_for_tunnel_controls(inspector_url: Option<String>) -> Result<(), L
                             install_ui::warn_untrusted(&format!("failed to open inspector: {e}"));
                         }
                     }
+                    TunnelControl::Resized => on_resize(),
                     TunnelControl::Ignore => {}
                 }
             }
@@ -2328,6 +2411,7 @@ async fn wait_for_tunnel_controls(inspector_url: Option<String>) -> Result<(), L
 enum TunnelControl {
     Quit,
     OpenInspector,
+    Resized,
     Ignore,
 }
 
@@ -2412,6 +2496,7 @@ async fn read_tunnel_control() -> Result<TunnelControl, LpmError> {
             .map_err(|e| LpmError::Tunnel(format!("terminal input error: {e}")))?
         {
             crossterm::event::Event::Key(event) => Ok(tunnel_control_from_key(event)),
+            crossterm::event::Event::Resize(..) => Ok(TunnelControl::Resized),
             _ => Ok(TunnelControl::Ignore),
         }
     })
@@ -4872,7 +4957,7 @@ mod tests {
 
         assert_eq!(
             tunnel_limit_summary(Some(&limits)).as_deref(),
-            Some("1 tunnel · 4000/min · 10 MiB body · 0 custom domains · 600/min/IP")
+            Some("1 tunnel · 4,000/min · 10 MiB body · 0 custom domains · 600/min/IP")
         );
     }
 
@@ -4889,7 +4974,7 @@ mod tests {
 
         assert_eq!(
             tunnel_limit_summary(Some(&limits)).as_deref(),
-            Some("3 tunnels · 20000/min · 100 MiB body · 3 custom domains · 600/min/IP")
+            Some("3 tunnels · 20,000/min · 100 MiB body · 3 custom domains · 600/min/IP")
         );
     }
 
@@ -4904,7 +4989,7 @@ mod tests {
         };
         assert_eq!(
             tunnel_usage_summary(Some(&usage)).as_deref(),
-            Some("100250 / 100000 requests · 250 overage · overage on")
+            Some("100,250 / 100,000 requests · 250 overage · overage on")
         );
     }
 

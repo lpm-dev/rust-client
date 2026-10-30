@@ -15,6 +15,7 @@ async fn failed_forward(
         url: "/webhook".into(),
         headers: HashMap::new(),
         body: "e30=".into(),
+        accepted_requests: None,
     };
     let (response, _) = forward_http_request(
         reqwest::Client::builder()

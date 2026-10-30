@@ -165,6 +165,7 @@ async fn forward_request_inner(
             url,
             headers,
             body,
+            ..
         } => (id, method, url, headers, body),
         _ => return Err(LpmError::Tunnel("expected HttpRequest message".into())),
     };
@@ -488,6 +489,9 @@ pub struct LocalWebSocketConnection {
     pub read: futures_util::stream::SplitStream<LocalWebSocketStream>,
     /// Set when the target's other loopback family accepted the connection.
     pub sibling_target: Option<lpm_common::LocalTarget>,
+    /// Subprotocol the local server selected from the visitor's offer, which
+    /// the visitor's handshake must echo or browsers drop the connection.
+    pub protocol: Option<String>,
 }
 
 /// Establish a WebSocket connection to the local dev server for upgrade passthrough.
@@ -512,13 +516,18 @@ pub async fn connect_local_websocket(
         max_frame_size: Some(crate::client::MAX_WS_FRAME_SIZE),
         ..Default::default()
     };
-    let (stream, _) = tokio_tungstenite::client_async_with_config(
+    let (stream, response) = tokio_tungstenite::client_async_with_config(
         request,
         tokio_tungstenite::MaybeTlsStream::Plain(socket),
         Some(ws_config),
     )
     .await
     .map_err(|e| LpmError::Tunnel(format!("failed to connect local WebSocket: {e}")))?;
+    let protocol = response
+        .headers()
+        .get(SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
 
     use futures_util::StreamExt;
     let (write, read) = stream.split();
@@ -526,8 +535,14 @@ pub async fn connect_local_websocket(
         write,
         read,
         sibling_target,
+        protocol,
     })
 }
+
+/// The visitor's subprotocol offer must reach the local server: Vite, for
+/// one, leaves an upgrade without `vite-hmr` unanswered. Extensions such as
+/// permessage-deflate are negotiated per hop, so they stay behind.
+const SEC_WEBSOCKET_PROTOCOL: &str = "sec-websocket-protocol";
 
 /// How long [`probe_local_target`] waits for each address to accept.
 const LOCAL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
@@ -611,7 +626,7 @@ fn build_local_websocket_request(
     );
 
     for (key, value) in headers {
-        if is_header_allowed(key) {
+        if is_header_allowed(key) || key.eq_ignore_ascii_case(SEC_WEBSOCKET_PROTOCOL) {
             let header_name = tokio_tungstenite::tungstenite::http::header::HeaderName::from_bytes(
                 key.as_bytes(),
             )
@@ -749,6 +764,7 @@ mod tests {
             url: "/events".into(),
             headers: HashMap::from([("Last-Event-ID".into(), "event-1230".into())]),
             body: String::new(),
+            accepted_requests: None,
         };
         let response = forward_request(
             &reqwest::Client::builder().no_proxy().build().unwrap(),
@@ -793,6 +809,7 @@ mod tests {
                 url: "/events".into(),
                 headers: HashMap::new(),
                 body: String::new(),
+                accepted_requests: None,
             };
             forward_request_inner(
                 &reqwest::Client::builder().no_proxy().build().unwrap(),
@@ -878,6 +895,7 @@ mod tests {
             url: "/large".to_string(),
             headers: HashMap::new(),
             body: String::new(),
+            accepted_requests: None,
         };
 
         let response = tokio::time::timeout(
@@ -984,6 +1002,7 @@ mod tests {
             url: "/health".into(),
             headers: HashMap::new(),
             body: String::new(),
+            accepted_requests: None,
         };
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -1058,6 +1077,7 @@ mod tests {
             url: "/large".to_string(),
             headers: HashMap::new(),
             body: String::new(),
+            accepted_requests: None,
         };
         let forward_budget = Arc::clone(&budget);
         let forward = tokio::spawn(async move {
@@ -1226,6 +1246,7 @@ mod tests {
             url: "/".into(),
             headers: HashMap::new(),
             body: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"{}"),
+            accepted_requests: None,
         }
     }
 
@@ -1326,6 +1347,72 @@ mod tests {
             connection.sibling_target.map(|target| target.url()),
             Some(format!("http://[::1]:{port}/"))
         );
+    }
+
+    #[tokio::test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "tungstenite fixes the handshake callback's rejection type"
+    )]
+    async fn websocket_upgrade_offers_the_visitors_subprotocol_and_reports_the_selection() {
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut offered = None;
+            tokio_tungstenite::accept_hdr_async(
+                socket,
+                |request: &Request, mut response: Response| {
+                    offered = request
+                        .headers()
+                        .get(SEC_WEBSOCKET_PROTOCOL)
+                        .map(|value| value.to_str().unwrap().to_owned());
+                    response
+                        .headers_mut()
+                        .insert(SEC_WEBSOCKET_PROTOCOL, "vite-hmr".parse().unwrap());
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            offered
+        });
+        let target = lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, port);
+        let headers = HashMap::from([
+            (
+                "Sec-WebSocket-Protocol".to_owned(),
+                "vite-hmr, vite-ping".to_owned(),
+            ),
+            (
+                "sec-websocket-extensions".to_owned(),
+                "permessage-deflate".to_owned(),
+            ),
+        ]);
+
+        let connection = connect_local_websocket(&target, "/?token=hmr", &headers)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            server.await.unwrap().as_deref(),
+            Some("vite-hmr, vite-ping")
+        );
+        assert_eq!(connection.protocol.as_deref(), Some("vite-hmr"));
+    }
+
+    #[test]
+    fn local_websocket_request_keeps_per_hop_extensions_behind() {
+        let target = lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, 5173);
+        let headers = HashMap::from([(
+            "sec-websocket-extensions".to_owned(),
+            "permessage-deflate; client_max_window_bits".to_owned(),
+        )]);
+
+        let request = build_local_websocket_request(&target, "/", &headers).unwrap();
+
+        assert!(!request.headers().contains_key("sec-websocket-extensions"));
     }
 
     #[tokio::test]

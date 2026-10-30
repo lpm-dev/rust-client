@@ -237,7 +237,7 @@ async fn async_main(cli: Cli) -> Result<()> {
         let timeline = super::install_timeline::start(&command)
             .map(|layer| layer.with_filter(diagnostic_filter));
         let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_writer(std::io::stderr)
+            .with_writer(crate::live_region::TracingEvent::default)
             .with_target(false)
             .fmt_fields(crate::terminal_output::SanitizedTracingFields::default())
             .without_time();

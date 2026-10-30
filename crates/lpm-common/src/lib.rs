@@ -558,6 +558,11 @@ fn format_scaled(
     )
 }
 
+/// A count with its thousands grouped, as `100,000`.
+pub fn format_count(count: u64) -> String {
+    group_thousands(u128::from(count))
+}
+
 fn group_thousands(value: u128) -> String {
     let digits = value.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
@@ -573,6 +578,16 @@ fn group_thousands(value: u128) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_count_groups_thousands() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1_000), "1,000");
+        assert_eq!(format_count(100_000), "100,000");
+        assert_eq!(format_count(1_234_567), "1,234,567");
+        assert_eq!(format_count(u64::MAX), "18,446,744,073,709,551,615");
+    }
 
     #[test]
     fn format_bytes_labels_binary_units() {

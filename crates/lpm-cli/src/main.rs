@@ -24,6 +24,7 @@ pub mod install_ui;
 pub mod intelligence;
 mod json_contract;
 mod linker_config;
+mod live_region;
 mod lpm_config;
 mod lpm_insights_config;
 mod lpm_skills_config;
