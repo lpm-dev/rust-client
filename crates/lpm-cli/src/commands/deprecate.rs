@@ -192,6 +192,8 @@ async fn run(
             "Done · removed the deprecation of {}",
             install_ui::yellow(&subject)
         )),
+        // A registry that predates refusing a change to nothing answers it
+        // with 0 changed.
         (None, Some(_), 0) => install_ui::skipped_line(crate::install_ui::terminal_line!(
             "Every version of {} was already deprecated or unpublished",
             install_ui::yellow(&package)

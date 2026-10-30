@@ -462,6 +462,36 @@ async fn undeprecate_sends_no_message() {
 }
 
 #[tokio::test]
+async fn undeprecate_every_version_reports_the_registrys_refusal() {
+    let mock = MockRegistry::start().await;
+    let project = signed_in_project(&mock.url());
+    Mock::given(method("POST"))
+        .and(path(DEPRECATE_PATH))
+        .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+            "error": "No version of @lpm.dev/acme.kit is deprecated.",
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["undeprecate", "acme.kit", "--json"])
+        .output()
+        .expect("run lpm undeprecate");
+
+    assert!(!output.status.success());
+    let envelope = json_output(&output);
+    assert_eq!(envelope["error_code"], "registry", "{envelope}");
+    assert!(
+        envelope["error"]
+            .as_str()
+            .unwrap()
+            .contains("No version of @lpm.dev/acme.kit is deprecated."),
+        "{envelope}"
+    );
+}
+
+#[tokio::test]
 async fn undeprecate_every_version_says_when_none_was_deprecated() {
     let mock = MockRegistry::start().await;
     let project = signed_in_project(&mock.url());
@@ -629,9 +659,12 @@ async fn deprecate_reports_the_registrys_rate_limit() {
 
     assert!(!output.status.success());
     let envelope = json_output(&output);
-    assert_eq!(envelope["error_code"], "registry");
+    assert_eq!(envelope["error_code"], "rate_limited", "{envelope}");
     assert!(
-        envelope.to_string().contains("Rate limit exceeded"),
+        envelope["error"]
+            .as_str()
+            .unwrap()
+            .contains("retry after 42s"),
         "{envelope}"
     );
 }

@@ -519,7 +519,7 @@ pub enum LpmError {
     #[error("rate limited — retry after {retry_after_secs}s")]
     #[diagnostic(
         code(lpm::rate_limited),
-        help("Too many requests. The client will retry automatically.")
+        help("Too many requests. Wait the time it says, then run the command again.")
     )]
     RateLimited { retry_after_secs: u64 },
 
