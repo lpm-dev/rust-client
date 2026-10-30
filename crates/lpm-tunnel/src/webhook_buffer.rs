@@ -106,6 +106,21 @@ impl WebhookBuffer {
         self.webhooks.is_empty()
     }
 
+    /// Remove the webhooks `remove` selects, returning how many it removed.
+    pub fn remove_where(&mut self, mut remove: impl FnMut(&CapturedWebhook) -> bool) -> usize {
+        let before = self.webhooks.len();
+        let mut released_bytes = 0;
+        self.webhooks.retain(|webhook| {
+            let removed = remove(webhook);
+            if removed {
+                released_bytes += retained_size_bytes(webhook);
+            }
+            !removed
+        });
+        self.retained_bytes = self.retained_bytes.saturating_sub(released_bytes);
+        before - self.webhooks.len()
+    }
+
     /// Remove all webhooks from the buffer.
     pub fn clear(&mut self) {
         self.webhooks.clear();
@@ -162,6 +177,24 @@ mod tests {
         assert_eq!(buf.get(0).unwrap().id, "a");
         assert_eq!(buf.get(1).unwrap().id, "b");
         assert_eq!(buf.last().unwrap().id, "b");
+    }
+
+    #[test]
+    fn remove_where_drops_selected_webhooks_and_their_retained_bytes() {
+        let mut buf = WebhookBuffer::new(10);
+        buf.push(make_webhook("keep"));
+        let kept_bytes = buf.retained_bytes();
+        buf.push(make_webhook("drop-1"));
+        buf.push(make_webhook("drop-2"));
+
+        let removed = buf.remove_where(|webhook| webhook.id.starts_with("drop"));
+
+        assert_eq!(removed, 2);
+        assert_eq!(
+            buf.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(),
+            ["keep"]
+        );
+        assert_eq!(buf.retained_bytes(), kept_bytes);
     }
 
     #[test]

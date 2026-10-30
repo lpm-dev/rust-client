@@ -49,6 +49,22 @@ pub(crate) fn validate_forward_target(
     Ok(())
 }
 
+/// Point later connections at the loopback family that just accepted one,
+/// unless the endpoint changed since `attempted` was read.
+pub(crate) fn adopt_loopback_sibling(
+    live_target: &std::sync::RwLock<lpm_common::LocalTarget>,
+    attempted: &lpm_common::LocalTarget,
+    sibling: lpm_common::LocalTarget,
+) {
+    let mut current = live_target
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *current == *attempted {
+        tracing::debug!("local endpoint answered on {}", sibling.url());
+        *current = sibling;
+    }
+}
+
 /// Plan and relay limits advertised by the tunnel service.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TunnelLimitMetadata {

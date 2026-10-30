@@ -23,6 +23,7 @@ async fn failed_forward(
             .build()
             .unwrap(),
         lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, port),
+        None,
         request,
         true,
         webhook_tx,

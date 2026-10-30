@@ -158,7 +158,7 @@ fn resolve_local_target(port: Option<u16>) -> Result<lpm_common::LocalTarget, Lp
                 "port must be between 1 and 65535".to_string(),
             ));
         }
-        return Ok(lpm_common::LocalTarget::loopback(
+        return Ok(lpm_common::LocalTarget::loopback_port(
             lpm_common::LocalScheme::Http,
             port,
         ));
@@ -473,6 +473,7 @@ pub(crate) async fn run_start(
         None
     };
 
+    let local_target = settle_local_target(local_target, json_output).await;
     let inspector_db = open_inspector_db(project_dir)?;
     let store = CaptureStore::of(&inspector_db);
     let inspector_state =
@@ -536,7 +537,7 @@ pub(crate) async fn run_start(
         token_provider,
         pin_provider: Some(crate::relay_trust::pin_provider()),
         local_target: local_target.clone(),
-        live_local_target: None,
+        live_local_target: Some(inspector_state.local_target_slot()),
         domain: domain.map(|s| s.to_string()),
         tunnel_auth: tunnel_auth_token.clone(),
         webhook_tx: Some(webhook_tx),
@@ -559,7 +560,6 @@ pub(crate) async fn run_start(
     let control_inspector_url = inspector_url.clone();
     let inspector_state_for_connect = inspector_state.clone();
     let session_name_owned = session_name.map(|s| s.to_string());
-    let local_target_url = local_target.url();
     let latest_usage = Arc::new(Mutex::new(None::<lpm_tunnel::TunnelUsageMetadata>));
     let usage_for_connect = latest_usage.clone();
     let usage_for_notices = latest_usage.clone();
@@ -585,6 +585,7 @@ pub(crate) async fn run_start(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
+            let local_target_url = inspector_state_for_connect.local_target().url();
 
             if json_output {
                 println!(
@@ -732,6 +733,27 @@ pub(crate) async fn run_start(
             Err(primary)
         }
     }
+}
+
+/// Point a port-only target at the loopback family that is listening now,
+/// and warn when nothing is, since every request would get a 502.
+async fn settle_local_target(
+    local_target: lpm_common::LocalTarget,
+    json_output: bool,
+) -> lpm_common::LocalTarget {
+    if !local_target.any_loopback_family {
+        return local_target;
+    }
+    if let Some(listening) = lpm_tunnel::proxy::probe_local_target(&local_target).await {
+        return listening;
+    }
+    if !json_output {
+        install_ui::warn_line(crate::install_ui::terminal_line!(
+            "nothing is listening on port {} yet; requests get a 502 until your dev server starts",
+            local_target.port
+        ));
+    }
+    local_target
 }
 
 /// Warns that captures persist, and says how git treats them.
@@ -1844,7 +1866,7 @@ async fn run_replay(
 ) -> Result<(), LpmError> {
     let db = open_inspector_db_for_review(project_dir, !json_output)?;
     let local_target = match parse_flag_u16(args, "--port", "-p")? {
-        Some(port) => lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, port),
+        Some(port) => lpm_common::LocalTarget::loopback_port(lpm_common::LocalScheme::Http, port),
         None => resolve_local_target(default_port)?,
     };
 
@@ -2247,10 +2269,12 @@ async fn wait_for_tunnel_controls(inspector_url: Option<String>) -> Result<(), L
         return Ok(());
     }
 
-    let _raw_mode = TunnelRawModeGuard::enter()?;
+    let _key_mode = TunnelKeyModeGuard::enter()?;
+    let interrupted = tokio::signal::ctrl_c();
+    tokio::pin!(interrupted);
     loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
+            signal = &mut interrupted => {
                 signal.map_err(|e| LpmError::Tunnel(format!("signal error: {e}")))?;
                 return Ok(());
             }
@@ -2278,9 +2302,61 @@ enum TunnelControl {
     Ignore,
 }
 
-struct TunnelRawModeGuard;
+/// Delivers keypresses one at a time while the tunnel prints request lines.
+///
+/// Unix full raw mode also turns off output processing, so every `\n` printed
+/// meanwhile would move down without returning to the first column. This
+/// clears only line buffering and echo; Ctrl+C still raises SIGINT.
+#[cfg(unix)]
+struct TunnelKeyModeGuard {
+    fd: std::os::fd::RawFd,
+    original: libc::termios,
+}
 
-impl TunnelRawModeGuard {
+#[cfg(unix)]
+impl TunnelKeyModeGuard {
+    fn enter() -> Result<Self, LpmError> {
+        Self::enter_on(libc::STDIN_FILENO)
+            .map_err(|e| LpmError::Tunnel(format!("terminal input error: {e}")))
+    }
+
+    fn enter_on(fd: std::os::fd::RawFd) -> std::io::Result<Self> {
+        let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: tcgetattr fully initializes `original` when it returns 0.
+        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: initialized by the successful tcgetattr above.
+        let original = unsafe { original.assume_init() };
+        let mut keys = original;
+        keys.c_lflag &= !(libc::ICANON | libc::ECHO);
+        keys.c_cc[libc::VMIN] = 1;
+        keys.c_cc[libc::VTIME] = 0;
+        // SAFETY: `keys` is a valid termios derived from the terminal's own.
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &keys) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { fd, original })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TunnelKeyModeGuard {
+    fn drop(&mut self) {
+        // SAFETY: restores the attributes read from this fd on entry.
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+        }
+    }
+}
+
+/// Delivers keypresses one at a time; Windows raw mode only changes console
+/// input, so output is unaffected.
+#[cfg(not(unix))]
+struct TunnelKeyModeGuard;
+
+#[cfg(not(unix))]
+impl TunnelKeyModeGuard {
     fn enter() -> Result<Self, LpmError> {
         crossterm::terminal::enable_raw_mode()
             .map_err(|e| LpmError::Tunnel(format!("terminal input error: {e}")))?;
@@ -2288,7 +2364,8 @@ impl TunnelRawModeGuard {
     }
 }
 
-impl Drop for TunnelRawModeGuard {
+#[cfg(not(unix))]
+impl Drop for TunnelKeyModeGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
     }
@@ -4377,6 +4454,89 @@ mod tests {
             tunnel_control_from_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             TunnelControl::Ignore
         );
+    }
+
+    /// The terminal side of a fresh pseudo-terminal, closed on drop.
+    #[cfg(unix)]
+    struct PseudoTerminal {
+        controller: std::os::fd::OwnedFd,
+        terminal: std::os::fd::OwnedFd,
+    }
+
+    #[cfg(unix)]
+    impl PseudoTerminal {
+        fn open() -> Self {
+            use std::os::fd::FromRawFd;
+            // SAFETY: each call is checked, and each returned fd is owned once.
+            unsafe {
+                let controller = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+                assert!(controller >= 0, "{}", std::io::Error::last_os_error());
+                let controller = std::os::fd::OwnedFd::from_raw_fd(controller);
+                let raw = std::os::fd::AsRawFd::as_raw_fd(&controller);
+                assert_eq!(libc::grantpt(raw), 0);
+                assert_eq!(libc::unlockpt(raw), 0);
+                let name = libc::ptsname(raw);
+                assert!(!name.is_null());
+                let terminal = libc::open(name, libc::O_RDWR | libc::O_NOCTTY);
+                assert!(terminal >= 0, "{}", std::io::Error::last_os_error());
+                Self {
+                    controller,
+                    terminal: std::os::fd::OwnedFd::from_raw_fd(terminal),
+                }
+            }
+        }
+
+        fn attributes(&self) -> libc::termios {
+            let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
+            // SAFETY: tcgetattr initializes `attributes` when it returns 0.
+            unsafe {
+                assert_eq!(
+                    libc::tcgetattr(
+                        std::os::fd::AsRawFd::as_raw_fd(&self.terminal),
+                        attributes.as_mut_ptr()
+                    ),
+                    0
+                );
+                attributes.assume_init()
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tunnel_key_mode_reads_single_keys_but_keeps_newlines_returning_the_carriage() {
+        let pty = PseudoTerminal::open();
+        let before = pty.attributes();
+        assert_ne!(before.c_oflag & libc::OPOST, 0);
+        assert_ne!(before.c_lflag & libc::ICANON, 0);
+
+        let guard =
+            TunnelKeyModeGuard::enter_on(std::os::fd::AsRawFd::as_raw_fd(&pty.terminal)).unwrap();
+        let during = pty.attributes();
+        drop(guard);
+        let after = pty.attributes();
+
+        assert_eq!(during.c_lflag & (libc::ICANON | libc::ECHO), 0);
+        assert_eq!(
+            during.c_oflag & (libc::OPOST | libc::ONLCR),
+            libc::OPOST | libc::ONLCR,
+            "request lines printed while keys are read must still return the carriage"
+        );
+        assert_ne!(
+            during.c_lflag & libc::ISIG,
+            0,
+            "Ctrl+C must still interrupt"
+        );
+        // The kernel sets PENDIN itself when canonical mode comes back on.
+        assert_eq!(
+            (after.c_lflag & !libc::PENDIN, after.c_oflag, after.c_iflag),
+            (
+                before.c_lflag & !libc::PENDIN,
+                before.c_oflag,
+                before.c_iflag
+            )
+        );
+        drop(pty.controller);
     }
 
     #[test]

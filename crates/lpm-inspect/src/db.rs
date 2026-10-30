@@ -476,6 +476,22 @@ impl InspectorDb {
         }
     }
 
+    /// The local port the session that captured request `id` forwarded to.
+    pub async fn request_local_port(&self, id: &str) -> Result<Option<u16>, rusqlite::Error> {
+        let conn = self.read_conn.lock().await;
+        let port = conn.query_row(
+            "SELECT s.local_port FROM requests r JOIN sessions s ON s.id = r.session_id
+             WHERE r.id = ?1",
+            params![id],
+            |row| row.get::<_, Option<u16>>(0),
+        );
+        match port {
+            Ok(port) => Ok(port.filter(|port| *port != 0)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Get a full captured webhook by ID for detail views and replay.
     pub async fn get_webhook(&self, id: &str) -> Result<Option<CapturedWebhook>, rusqlite::Error> {
         self.get_request(id)
@@ -833,6 +849,61 @@ impl InspectorDb {
         conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
     }
 
+    /// Delete an ended session and every request it captured.
+    ///
+    /// Open sessions are refused, since a running tunnel may still attach
+    /// captures to them. The captures leave no trace, as with
+    /// [`clear_history`](Self::clear_history): merging the full-text index
+    /// drops their terms, `secure_delete` zeroes the freed pages, and the WAL
+    /// is truncated unless another connection is reading.
+    pub async fn delete_session(&self, id: &str) -> Result<SessionDeletion, rusqlite::Error> {
+        let conn = self.read_conn.lock().await;
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let ended = tx.query_row(
+            "SELECT ended_at IS NOT NULL FROM sessions WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, bool>(0),
+        );
+        match ended {
+            Ok(true) => {}
+            Ok(false) => return Ok(SessionDeletion::Open),
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(SessionDeletion::NotFound),
+            Err(error) => return Err(error),
+        }
+        let request_ids = delete_session_requests(
+            &tx,
+            "SELECT id, rowid FROM requests WHERE session_id = ?1",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        Ok(SessionDeletion::Deleted(request_ids))
+    }
+
+    /// Delete every ended session and the requests they captured, leaving no
+    /// trace of them as [`delete_session`](Self::delete_session) does.
+    pub async fn delete_ended_sessions(&self) -> Result<DeletedSessions, rusqlite::Error> {
+        let conn = self.read_conn.lock().await;
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
+        let request_ids = delete_session_requests(
+            &tx,
+            "SELECT r.id, r.rowid FROM requests r
+             JOIN sessions s ON s.id = r.session_id
+             WHERE s.ended_at IS NOT NULL",
+            [],
+        )?;
+        let sessions = tx.execute("DELETE FROM sessions WHERE ended_at IS NOT NULL", [])?;
+        tx.commit()?;
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        Ok(DeletedSessions {
+            sessions,
+            request_ids,
+        })
+    }
+
     /// Return SQLite's connection-local external-write revision.
     ///
     /// `data_version` changes when another connection commits, including
@@ -842,6 +913,60 @@ impl InspectorDb {
         let conn = self.read_conn.lock().await;
         conn.query_row("PRAGMA data_version", [], |row| row.get(0))
     }
+}
+
+/// Outcome of [`InspectorDb::delete_session`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum SessionDeletion {
+    /// The session is gone, with the requests it captured.
+    Deleted(Vec<String>),
+    /// The session is still open; a running tunnel may capture into it.
+    Open,
+    /// No session has this ID.
+    NotFound,
+}
+
+/// What [`InspectorDb::delete_ended_sessions`] removed.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DeletedSessions {
+    pub sessions: usize,
+    pub request_ids: Vec<String>,
+}
+
+/// Delete the requests `select` yields as `(id, rowid)` rows, and their
+/// full-text entries, returning their IDs.
+fn delete_session_requests(
+    tx: &rusqlite::Transaction<'_>,
+    select: &str,
+    select_params: impl rusqlite::Params,
+) -> Result<Vec<String>, rusqlite::Error> {
+    let mut request_ids = Vec::new();
+    let mut rowids = Vec::new();
+    {
+        let mut stmt = tx.prepare(select)?;
+        let mut rows = stmt.query(select_params)?;
+        while let Some(row) = rows.next()? {
+            request_ids.push(row.get::<_, String>(0)?);
+            rowids.push(row.get::<_, i64>(1)?);
+        }
+    }
+    if rowids.is_empty() {
+        return Ok(request_ids);
+    }
+    {
+        let mut delete_text = tx.prepare("DELETE FROM requests_fts WHERE rowid = ?1")?;
+        let mut delete_request = tx.prepare("DELETE FROM requests WHERE rowid = ?1")?;
+        for rowid in &rowids {
+            delete_text.execute(params![rowid])?;
+            delete_request.execute(params![rowid])?;
+        }
+    }
+    // A deleted entry's terms stay in its index segment until segments merge.
+    tx.execute(
+        "INSERT INTO requests_fts(requests_fts) VALUES ('optimize')",
+        [],
+    )?;
+    Ok(request_ids)
 }
 
 /// Why the capture database couldn't be opened.
@@ -5439,6 +5564,120 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "active-session");
         assert_eq!(sessions[0].request_count, 1);
+    }
+
+    async fn ended_and_open_sessions(db: &InspectorDb, secret: &[u8]) {
+        for (session, port) in [("ended", 4321), ("other-ended", 5173), ("open", 3000)] {
+            db.start_session(session.to_string(), None, port).unwrap();
+        }
+        let mut captured = make_webhook("in-ended", 502);
+        captured.request_body = secret.to_vec();
+        captured.summary = String::from_utf8(secret.to_vec()).unwrap();
+        db.insert_request(captured, Some("ended".to_string()));
+        db.insert_request(
+            make_webhook("in-other-ended", 200),
+            Some("other-ended".to_string()),
+        );
+        db.insert_request(make_webhook("in-open", 200), Some("open".to_string()));
+        db.flush_pending_writes().await.unwrap();
+        db.end_session("ended".to_string()).unwrap();
+        db.end_session("other-ended".to_string()).unwrap();
+    }
+
+    async fn session_ids(db: &InspectorDb) -> Vec<String> {
+        let mut ids: Vec<String> = db
+            .list_sessions(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn deleting_an_ended_session_leaves_no_trace_of_its_captures_on_disk() {
+        const SECRET: &[u8] = b"zqxendedsessionsecretzqx";
+        let project = tempfile::tempdir().unwrap();
+        let db = InspectorDb::open(project.path()).unwrap();
+        ended_and_open_sessions(&db, SECRET).await;
+
+        let deletion = db.delete_session("ended").await.unwrap();
+
+        assert_eq!(
+            deletion,
+            SessionDeletion::Deleted(vec!["in-ended".to_string()])
+        );
+        for name in ["inspector.db", "inspector.db-wal"] {
+            let path = project.path().join(".lpm").join(name);
+            let bytes = std::fs::read(&path).unwrap_or_default();
+            assert!(
+                !bytes.windows(SECRET.len()).any(|window| window == SECRET),
+                "{name} still holds the deleted session's capture"
+            );
+        }
+        assert!(db.get_webhook("in-ended").await.unwrap().is_none());
+        assert!(db.get_webhook("in-other-ended").await.unwrap().is_some());
+        assert_eq!(session_ids(&db).await, ["open", "other-ended"]);
+        let found = db
+            .search("zqxendedsessionsecretzqx", None, None, 10)
+            .await
+            .unwrap();
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[tokio::test]
+    async fn deleting_an_open_session_is_refused_and_keeps_its_captures() {
+        let project = tempfile::tempdir().unwrap();
+        let db = InspectorDb::open(project.path()).unwrap();
+        ended_and_open_sessions(&db, b"unused").await;
+
+        assert_eq!(
+            db.delete_session("open").await.unwrap(),
+            SessionDeletion::Open
+        );
+        assert_eq!(
+            db.delete_session("missing").await.unwrap(),
+            SessionDeletion::NotFound
+        );
+        assert!(db.get_webhook("in-open").await.unwrap().is_some());
+        assert_eq!(session_ids(&db).await, ["ended", "open", "other-ended"]);
+    }
+
+    #[tokio::test]
+    async fn deleting_ended_sessions_keeps_open_sessions_and_their_captures() {
+        let project = tempfile::tempdir().unwrap();
+        let db = InspectorDb::open(project.path()).unwrap();
+        ended_and_open_sessions(&db, b"unused").await;
+
+        let deleted = db.delete_ended_sessions().await.unwrap();
+
+        let mut request_ids = deleted.request_ids;
+        request_ids.sort();
+        assert_eq!(
+            (deleted.sessions, request_ids),
+            (
+                2,
+                vec!["in-ended".to_string(), "in-other-ended".to_string()]
+            )
+        );
+        assert_eq!(session_ids(&db).await, ["open"]);
+        assert!(db.get_webhook("in-open").await.unwrap().is_some());
+        assert_eq!(db.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_request_reports_the_local_port_its_session_forwarded_to() {
+        let project = tempfile::tempdir().unwrap();
+        let db = InspectorDb::open(project.path()).unwrap();
+        ended_and_open_sessions(&db, b"unused").await;
+        db.insert_request(make_webhook("sessionless", 502), None);
+        db.flush_pending_writes().await.unwrap();
+
+        assert_eq!(db.request_local_port("in-ended").await.unwrap(), Some(4321));
+        assert_eq!(db.request_local_port("sessionless").await.unwrap(), None);
+        assert_eq!(db.request_local_port("missing").await.unwrap(), None);
     }
 
     #[tokio::test]

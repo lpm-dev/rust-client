@@ -16,15 +16,18 @@ use serde::Serialize;
 
 /// Analyze a captured request and produce a failure diagnosis.
 ///
+/// `local_port` is the port the tunnel forwarded the request to, when known;
+/// server-down guidance names it.
+///
 /// Returns `None` for successful responses (status < 400).
-pub fn diagnose(webhook: &CapturedWebhook) -> Option<FailureDiagnosis> {
+pub fn diagnose(webhook: &CapturedWebhook, local_port: Option<u16>) -> Option<FailureDiagnosis> {
     if webhook.response_status < 400 {
         return None;
     }
 
     let category = classify_failure(webhook);
     let error_extract = extract_error_from_body(&webhook.response_body, webhook.response_status);
-    let guidance = generate_guidance(&category, webhook);
+    let guidance = generate_guidance(&category, webhook, local_port);
 
     Some(FailureDiagnosis {
         category,
@@ -376,13 +379,24 @@ fn compute_fingerprint(webhook: &CapturedWebhook) -> String {
 
 // ── Guidance generation ───────────────────────────────────────────────
 
-fn generate_guidance(category: &FailureCategory, webhook: &CapturedWebhook) -> String {
+fn generate_guidance(
+    category: &FailureCategory,
+    webhook: &CapturedWebhook,
+    local_port: Option<u16>,
+) -> String {
     match category {
-        FailureCategory::ServerDown => format!(
-            "Your local dev server is not running on port {}. Start it and try again, \
-             or use --auto-ack to prevent webhook providers from retrying.",
-            extract_port_from_path(webhook)
-        ),
+        FailureCategory::ServerDown => {
+            let cause = match local_port {
+                Some(port) => format!(
+                    "Nothing accepted the connection on local port {port}, so your dev server is not running"
+                ),
+                None => "Your local dev server is not running".to_string(),
+            };
+            format!(
+                "{cause}. Start it and try again, \
+                 or use --auto-ack to prevent webhook providers from retrying."
+            )
+        }
         FailureCategory::AutoAcked => {
             "This request was auto-acknowledged (200 OK) because your local server was down. \
              The provider won't retry. Use 'Replay' to send it to your server when ready."
@@ -424,12 +438,6 @@ fn generate_guidance(category: &FailureCategory, webhook: &CapturedWebhook) -> S
     }
 }
 
-fn extract_port_from_path(_webhook: &CapturedWebhook) -> String {
-    // The port isn't stored on the webhook itself — it's on the tunnel session.
-    // Return a generic message. The CLI/inspector UI has the port info.
-    "localhost".to_string()
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -462,15 +470,44 @@ mod tests {
     #[test]
     fn classify_200_returns_none() {
         let wh = make_webhook(200, b"ok");
-        assert!(diagnose(&wh).is_none());
+        assert!(diagnose(&wh, None).is_none());
     }
 
     #[test]
     fn classify_server_down() {
         let wh = make_webhook(502, b"502 Bad Gateway: local dev server is not running");
-        let diag = diagnose(&wh).unwrap();
+        let diag = diagnose(&wh, Some(4321)).unwrap();
         assert_eq!(diag.category, FailureCategory::ServerDown);
         assert!(diag.guidance.contains("not running"));
+    }
+
+    #[test]
+    fn server_down_guidance_names_the_local_port_the_tunnel_forwarded_to() {
+        let wh = make_webhook(502, b"502 Bad Gateway: local dev server is not running");
+
+        let diag = diagnose(&wh, Some(4321)).unwrap();
+
+        assert!(
+            diag.guidance.starts_with(
+                "Nothing accepted the connection on local port 4321, so your dev server is not running"
+            ),
+            "{}",
+            diag.guidance
+        );
+    }
+
+    #[test]
+    fn server_down_guidance_without_a_known_port_names_no_port() {
+        let wh = make_webhook(502, b"502 Bad Gateway: local dev server is not running");
+
+        let diag = diagnose(&wh, None).unwrap();
+
+        assert!(
+            diag.guidance
+                .starts_with("Your local dev server is not running."),
+            "{}",
+            diag.guidance
+        );
     }
 
     #[test]
@@ -487,14 +524,14 @@ mod tests {
         // before auto-ack was enabled.
         let mut wh2 = make_webhook(502, b"");
         wh2.auto_acked = true;
-        let diag = diagnose(&wh2).unwrap();
+        let diag = diagnose(&wh2, None).unwrap();
         assert_eq!(diag.category, FailureCategory::AutoAcked);
     }
 
     #[test]
     fn classify_timeout() {
         let wh = make_webhook(502, b"request to localhost:3000/api/webhook timed out");
-        let diag = diagnose(&wh).unwrap();
+        let diag = diagnose(&wh, None).unwrap();
         assert_eq!(diag.category, FailureCategory::Timeout);
     }
 
@@ -502,7 +539,7 @@ mod tests {
     fn classify_signature_failure() {
         let mut wh = make_webhook(401, b"Unauthorized");
         wh.signature_diagnostic = Some("HMAC mismatch".to_string());
-        let diag = diagnose(&wh).unwrap();
+        let diag = diagnose(&wh, None).unwrap();
         assert_eq!(diag.category, FailureCategory::SignatureFailure);
         assert!(diag.guidance.contains("HMAC mismatch"));
     }
@@ -510,7 +547,7 @@ mod tests {
     #[test]
     fn classify_client_error() {
         let wh = make_webhook(404, b"Not Found");
-        let diag = diagnose(&wh).unwrap();
+        let diag = diagnose(&wh, None).unwrap();
         assert_eq!(diag.category, FailureCategory::ClientError);
     }
 
@@ -518,14 +555,14 @@ mod tests {
     fn classify_server_error_with_message() {
         let body = br#"{"error":"Cannot read property 'id' of undefined"}"#;
         let wh = make_webhook(500, body);
-        let diag = diagnose(&wh).unwrap();
+        let diag = diagnose(&wh, None).unwrap();
         assert_eq!(diag.category, FailureCategory::ServerError);
     }
 
     #[test]
     fn classify_server_error_opaque() {
         let wh = make_webhook(500, b"");
-        let diag = diagnose(&wh).unwrap();
+        let diag = diagnose(&wh, None).unwrap();
         assert_eq!(diag.category, FailureCategory::ServerErrorOpaque);
     }
 

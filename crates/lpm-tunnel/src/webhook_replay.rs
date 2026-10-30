@@ -59,19 +59,53 @@ pub async fn replay_webhook(
         )));
     }
 
-    let path = local_target.upstream_path(&webhook.path);
-    let url = format!(
-        "{}://{}{}",
-        local_target.scheme,
-        local_target.authority(),
-        path
-    );
     let method: reqwest::Method = webhook
         .method
         .parse()
         .map_err(|e| LpmError::Tunnel(format!("invalid method '{}': {e}", webhook.method)))?;
 
-    let mut builder = client.request(method, &url);
+    let start = std::time::Instant::now();
+    // A refused connection never reached the server, so the replay is safe to
+    // retry on the other loopback family.
+    let resp = match replay_request(client, webhook, local_target, &method)
+        .send()
+        .await
+    {
+        Err(error) if error.is_connect() => match local_target.loopback_sibling() {
+            Some(sibling) => {
+                replay_request(client, webhook, &sibling, &method)
+                    .send()
+                    .await
+            }
+            None => Err(error),
+        },
+        sent => sent,
+    }
+    .map_err(|e| LpmError::Tunnel(format!("replay failed: {}", lpm_http::display_error(&e))))?;
+
+    let status = resp.status().as_u16();
+    let body = read_capped_replay_body(resp).await?;
+
+    Ok(ReplayResult {
+        status,
+        duration_ms: start.elapsed().as_millis() as u64,
+        response_body: body,
+    })
+}
+
+fn replay_request(
+    client: &reqwest::Client,
+    webhook: &CapturedWebhook,
+    target: &lpm_common::LocalTarget,
+    method: &reqwest::Method,
+) -> reqwest::RequestBuilder {
+    let url = format!(
+        "{}://{}{}",
+        target.scheme,
+        target.authority(),
+        target.upstream_path(&webhook.path)
+    );
+    let mut builder = client.request(method.clone(), &url);
 
     // Preserve original headers (including signatures) — skip hop-by-hop
     // headers that would conflict with the new connection.
@@ -85,21 +119,7 @@ pub async fn replay_webhook(
     if !webhook.request_body.is_empty() {
         builder = builder.body(webhook.request_body.clone());
     }
-
-    let start = std::time::Instant::now();
-    let resp = builder
-        .send()
-        .await
-        .map_err(|e| LpmError::Tunnel(format!("replay failed: {}", lpm_http::display_error(&e))))?;
-
-    let status = resp.status().as_u16();
-    let body = read_capped_replay_body(resp).await?;
-
-    Ok(ReplayResult {
-        status,
-        duration_ms: start.elapsed().as_millis() as u64,
-        response_body: body,
-    })
+    builder
 }
 
 /// Two-stage size cap on the local server's replay response.
@@ -323,5 +343,76 @@ mod tests {
             msg.contains("streamed body exceeded cap"),
             "expected mid-stream rejection, got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn port_only_replay_reaches_a_server_listening_only_on_ipv6_loopback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (listener, port, _refused) = loop {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let refused = tokio::net::TcpSocket::new_v4().unwrap();
+            if refused
+                .bind((std::net::Ipv4Addr::LOCALHOST, port).into())
+                .is_ok()
+            {
+                break (listener, port, refused);
+            }
+        };
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 202 Accepted\r\nContent-Length: 4\r\nConnection: close\r\n\r\nv6ok",
+                )
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&request[..read]).into_owned()
+        });
+        let captured = CapturedWebhook {
+            id: "replay-ipv6".into(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            method: "POST".into(),
+            path: "/hooks/stripe".into(),
+            request_headers: std::collections::HashMap::from([(
+                "stripe-signature".to_string(),
+                "t=1,v1=sig".to_string(),
+            )]),
+            request_body: br#"{"id":"evt_1"}"#.to_vec(),
+            response_status: 502,
+            response_headers: std::collections::HashMap::new(),
+            response_body: vec![],
+            duration_ms: 0,
+            provider: None,
+            summary: String::new(),
+            signature_diagnostic: None,
+            auto_acked: false,
+            response_body_incomplete: false,
+        };
+        let target = lpm_common::LocalTarget::loopback_port(lpm_common::LocalScheme::Http, port);
+
+        let result = replay_webhook(
+            &reqwest::Client::builder().no_proxy().build().unwrap(),
+            &captured,
+            &target,
+        )
+        .await
+        .unwrap();
+
+        let request = server.await.unwrap();
+        assert_eq!(
+            (result.status, result.response_body.as_slice()),
+            (202, b"v6ok".as_slice())
+        );
+        assert!(
+            request.starts_with("POST /hooks/stripe HTTP/1.1"),
+            "{request}"
+        );
+        assert!(request.ends_with(r#"{"id":"evt_1"}"#), "{request}");
     }
 }

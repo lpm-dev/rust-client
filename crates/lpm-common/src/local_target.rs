@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -51,6 +51,11 @@ pub struct LocalTarget {
     /// Path prefix advertised by the child, normalized to start with `/`.
     #[serde(default = "default_base_path")]
     pub base_path: String,
+    /// Whether `address` is only the first family to try. Set when the user
+    /// named a port but no address: a listener on either `127.0.0.1` or `::1`
+    /// is then the endpoint, as it is for `localhost:<port>` in a browser.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub any_loopback_family: bool,
 }
 
 impl LocalTarget {
@@ -61,7 +66,34 @@ impl LocalTarget {
             address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port,
             base_path: default_base_path(),
+            any_loopback_family: false,
         }
+    }
+
+    /// Construct a target for a port whose listener may be on either loopback
+    /// family, trying `127.0.0.1` before `::1`.
+    pub fn loopback_port(scheme: LocalScheme, port: u16) -> Self {
+        Self {
+            any_loopback_family: true,
+            ..Self::loopback(scheme, port)
+        }
+    }
+
+    /// The same endpoint on the other loopback family (`127.0.0.1` ↔ `::1`),
+    /// when [`any_loopback_family`](Self::any_loopback_family) allows it.
+    pub fn loopback_sibling(&self) -> Option<Self> {
+        if !self.any_loopback_family {
+            return None;
+        }
+        let address = match self.address {
+            IpAddr::V4(Ipv4Addr::LOCALHOST) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            _ => return None,
+        };
+        Some(Self {
+            address,
+            ..self.clone()
+        })
     }
 
     /// Replace and normalize the target's base path.
@@ -136,7 +168,6 @@ fn normalize_base_path(path: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv6Addr;
 
     #[test]
     fn loopback_target_formats_an_http_url() {
@@ -153,10 +184,47 @@ mod tests {
             address: IpAddr::V6(Ipv6Addr::LOCALHOST),
             port: 8443,
             base_path: "/app".to_string(),
+            any_loopback_family: false,
         };
 
         assert_eq!(target.url(), "https://[::1]:8443/app");
         assert!(target.is_loopback());
+    }
+
+    #[test]
+    fn port_only_target_alternates_between_the_loopback_families() {
+        let target = LocalTarget::loopback_port(LocalScheme::Http, 4321).with_base_path("/app");
+
+        let sibling = target.loopback_sibling().unwrap();
+
+        assert_eq!(sibling.url(), "http://[::1]:4321/app");
+        assert!(sibling.any_loopback_family);
+        assert_eq!(sibling.loopback_sibling(), Some(target));
+    }
+
+    #[test]
+    fn a_verified_or_unusual_loopback_address_has_no_sibling() {
+        let verified = LocalTarget::loopback(LocalScheme::Http, 4321);
+        let mut unusual = LocalTarget::loopback_port(LocalScheme::Http, 4321);
+        unusual.address = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+
+        assert_eq!(verified.loopback_sibling(), None);
+        assert_eq!(unusual.loopback_sibling(), None);
+    }
+
+    #[test]
+    fn a_verified_target_serializes_without_the_family_flag() {
+        let verified =
+            serde_json::to_value(LocalTarget::loopback(LocalScheme::Http, 5173)).unwrap();
+        let port_only =
+            serde_json::to_value(LocalTarget::loopback_port(LocalScheme::Http, 5173)).unwrap();
+
+        assert!(verified.get("anyLoopbackFamily").is_none(), "{verified}");
+        assert_eq!(port_only["anyLoopbackFamily"], true);
+        assert_eq!(
+            serde_json::from_value::<LocalTarget>(verified).unwrap(),
+            LocalTarget::loopback(LocalScheme::Http, 5173)
+        );
     }
 
     #[test]

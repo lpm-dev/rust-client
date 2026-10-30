@@ -193,7 +193,7 @@ fn replay_target(
 ) -> Result<lpm_common::LocalTarget, LpmError> {
     let target = port_override.map_or_else(
         || default_target.clone(),
-        |port| lpm_common::LocalTarget::loopback(lpm_common::LocalScheme::Http, port),
+        |port| lpm_common::LocalTarget::loopback_port(lpm_common::LocalScheme::Http, port),
     );
     if target.port == 0 {
         return Err(LpmError::Tunnel(

@@ -10,9 +10,12 @@
 //! falls behind (e.g., tab in background), it receives a `lagged` event
 //! with the count of missed events, and should re-fetch via the REST API.
 
+use crate::server::ServerShutdown;
 use crate::state::InspectorState;
+use axum::Extension;
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use futures_util::StreamExt;
 use futures_util::stream::Stream;
 use std::convert::Infallible;
 
@@ -23,6 +26,7 @@ use std::convert::Infallible;
 /// through the authenticated request-detail endpoint.
 pub async fn stream(
     State(state): State<InspectorState>,
+    Extension(shutdown): Extension<ServerShutdown>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let mut rx = state.subscribe();
     let observes_database = state.observes_database();
@@ -76,12 +80,13 @@ pub async fn stream(
         }
     };
 
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(stream.take_until(shutdown.requested())).keep_alive(KeepAlive::default())
 }
 
 /// SSE stream for WebSocket events.
 pub async fn ws_stream(
     State(state): State<InspectorState>,
+    Extension(shutdown): Extension<ServerShutdown>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let mut rx = state.subscribe_ws();
 
@@ -109,5 +114,5 @@ pub async fn ws_stream(
         }
     };
 
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(stream.take_until(shutdown.requested())).keep_alive(KeepAlive::default())
 }
