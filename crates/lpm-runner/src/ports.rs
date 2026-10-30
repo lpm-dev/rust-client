@@ -941,7 +941,8 @@ pub(crate) fn list_listening_ports_for_pids_until(
 pub struct ProcessIdentity(String);
 
 impl ProcessIdentity {
-    pub(crate) fn as_str(&self) -> &str {
+    /// The identity as recorded, for storing beside a PID.
+    pub fn as_str(&self) -> &str {
         &self.0
     }
 }

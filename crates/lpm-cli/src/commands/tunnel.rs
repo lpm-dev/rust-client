@@ -2038,7 +2038,36 @@ async fn run_log(project_dir: &Path, args: &[String], json_output: bool) -> Resu
 pub(crate) fn open_inspector_db(
     project_dir: &Path,
 ) -> Result<lpm_inspect::db::InspectorDb, LpmError> {
-    lpm_inspect::db::InspectorDb::open(project_dir).map_err(inspector_open_error)
+    lpm_inspect::db::InspectorDb::open(project_dir)
+        .map(track_session_owners)
+        .map_err(inspector_open_error)
+}
+
+/// Records this process as the owner of the sessions `db` starts, so a run
+/// that finds it gone can end them, when the system can identify it.
+fn track_session_owners(db: lpm_inspect::db::InspectorDb) -> lpm_inspect::db::InspectorDb {
+    let pid = std::process::id();
+    match lpm_runner::ports::process_identity_for_pid(pid) {
+        Some(identity) => db.with_session_ownership(lpm_inspect::db::SessionOwnership::new(
+            pid,
+            identity.as_str().to_owned(),
+            recorded_owner_state,
+        )),
+        None => db,
+    }
+}
+
+fn recorded_owner_state(pid: u32, identity: &str) -> lpm_inspect::db::OwnerState {
+    use lpm_inspect::db::OwnerState;
+
+    if !lpm_runner::ports::process_is_running(pid) {
+        return OwnerState::Gone;
+    }
+    match lpm_runner::ports::process_identity_for_pid(pid) {
+        Some(current) if current.as_str() == identity => OwnerState::Running,
+        Some(_) => OwnerState::Gone,
+        None => OwnerState::Unknown,
+    }
 }
 
 /// Opens the project's capture database to read and manage the captures it
@@ -2052,7 +2081,7 @@ fn open_inspector_db_for_review(
     if let Some(warning) = review_warning(db.open_to_others(), db.ownership_ignored()) {
         capture_warning(warning, show_human_warning);
     }
-    Ok(db)
+    Ok(track_session_owners(db))
 }
 
 /// What a review tells of a capture database other users could open, and
@@ -4453,6 +4482,37 @@ mod tests {
         assert_eq!(
             tunnel_control_from_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             TunnelControl::Ignore
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorded_owner_state_tells_running_reused_and_exited_recorders_apart() {
+        use lpm_inspect::db::OwnerState;
+
+        let pid = std::process::id();
+        let identity = lpm_runner::ports::process_identity_for_pid(pid).unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let child_identity = lpm_runner::ports::process_identity_for_pid(child.id()).unwrap();
+        let child_running = recorded_owner_state(child.id(), child_identity.as_str());
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        assert_eq!(
+            recorded_owner_state(pid, identity.as_str()),
+            OwnerState::Running
+        );
+        assert_eq!(
+            recorded_owner_state(pid, "an earlier process given this pid"),
+            OwnerState::Gone
+        );
+        assert_eq!(child_running, OwnerState::Running);
+        assert_eq!(
+            recorded_owner_state(child.id(), child_identity.as_str()),
+            OwnerState::Gone
         );
     }
 

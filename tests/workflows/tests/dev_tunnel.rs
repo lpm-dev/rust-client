@@ -1216,7 +1216,9 @@ async fn tunnel_start_under_json_emits_pretty_success_contract_on_stdout() {
     "#);
 }
 
-/// Serves `body` to every connection on `listener` until the task is aborted.
+/// Serves `body` to every request on `listener` until the task is aborted.
+/// A connection closed before its request, as the tunnel's startup probe
+/// does, gets nothing.
 fn serve_fixed_body(
     listener: tokio::net::TcpListener,
     body: &'static str,
@@ -1225,7 +1227,16 @@ fn serve_fixed_body(
         loop {
             let (mut socket, _) = listener.accept().await.unwrap();
             tokio::spawn(async move {
-                read_request_head(&mut socket).await;
+                use tokio::io::AsyncReadExt as _;
+
+                let mut head = Vec::with_capacity(1024);
+                let mut chunk = [0_u8; 1024];
+                while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match socket.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => head.extend_from_slice(&chunk[..read]),
+                    }
+                }
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -1245,14 +1256,16 @@ fn single_request_relay() -> (
     tokio::task::JoinHandle<()>,
     tokio::sync::oneshot::Receiver<serde_json::Value>,
 ) {
-    single_request_relay_after(std::future::ready(()), None)
+    single_request_relay_after(std::future::ready(()), None, std::future::ready(()))
 }
 
-/// [`single_request_relay`] that reports when the tunnel has connected and
-/// holds the request until `send_request` resolves.
+/// [`single_request_relay`] that reports when the tunnel has connected,
+/// holds the request until `send_request` resolves, and closes the tunnel
+/// once `close` resolves.
 fn single_request_relay_after(
     send_request: impl std::future::Future<Output = ()> + Send + 'static,
     connected: Option<tokio::sync::oneshot::Sender<()>>,
+    close: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> (
     String,
     tokio::task::JoinHandle<()>,
@@ -1307,7 +1320,8 @@ fn single_request_relay_after(
                 }
             };
             response_tx.send(response).unwrap();
-            websocket.close(None).await.unwrap();
+            close.await;
+            let _ = websocket.close(None).await;
         })
         .await
         .expect("single-request tunnel relay timed out");
@@ -1375,6 +1389,7 @@ async fn tunnel_port_reaches_an_ipv6_dev_server_started_after_the_tunnel() {
     let (relay_url, relay_task, response_rx) = single_request_relay_after(
         async move { server_up_rx.await.unwrap() },
         Some(connected_tx),
+        std::future::ready(()),
     );
 
     let output_task = tokio::task::spawn_blocking(move || {
@@ -1415,6 +1430,70 @@ async fn tunnel_port_reaches_an_ipv6_dev_server_started_after_the_tunnel() {
     assert_eq!(
         (response["status"].as_u64(), String::from_utf8_lossy(&body)),
         (Some(200), "started after the tunnel".into()),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn log_clear_removes_the_session_of_a_tunnel_that_was_killed() {
+    let server = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let port = server.local_addr().unwrap().port();
+    let server_task = serve_fixed_body(server, "served");
+    let (killed_tx, killed_rx) = tokio::sync::oneshot::channel::<()>();
+    let (relay_url, relay_task, response_rx) =
+        single_request_relay_after(std::future::ready(()), None, async move {
+            let _ = killed_rx.await;
+        });
+    let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+    let mut command = lpm_spawnable(&project);
+    command
+        .env("LPM_TUNNEL_RELAY", relay_url)
+        .args([
+            "--token",
+            "workflow-token",
+            "--json",
+            "tunnel",
+            &port.to_string(),
+            "--no-inspect",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut tunnel = command.spawn().unwrap();
+
+    let response = tokio::time::timeout(Duration::from_secs(15), response_rx)
+        .await
+        .expect("the tunnel forwarded a request")
+        .unwrap();
+    tunnel.kill().unwrap();
+    tunnel.wait().unwrap();
+    killed_tx.send(()).unwrap();
+    relay_task.await.unwrap();
+    server_task.abort();
+    assert_eq!(response["status"], 200, "{response}");
+
+    let output = lpm(&project)
+        .args(["--json", "tunnel", "log", "--clear"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let db = lpm_inspect::db::InspectorDb::open_for_review(project.path()).unwrap();
+    let sessions: Vec<String> = db
+        .list_sessions(10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|session| session.id)
+        .collect();
+    assert!(
+        sessions.is_empty(),
+        "the killed tunnel's session must not stay open: {sessions:?}"
     );
 }
 

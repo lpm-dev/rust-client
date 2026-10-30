@@ -45,6 +45,9 @@ pub struct InspectorDb {
     pub db_path: PathBuf,
     open_to_others: bool,
     ownership_ignored: bool,
+    /// Who records the sessions this handle starts, and how to tell whether
+    /// another session's recorder still runs.
+    session_owners: Option<Arc<SessionOwnership>>,
     /// The directory [`Self::open_temp`]'s database is in, removed with the
     /// last handle.
     #[cfg(test)]
@@ -171,11 +174,47 @@ impl InspectorDb {
             db_path,
             open_to_others,
             ownership_ignored,
+            session_owners: None,
             #[cfg(test)]
             _temp_dir: None,
             #[cfg(test)]
             write_conn: kept_write_conn,
         }
+    }
+
+    /// Records this process as the owner of the sessions this handle starts,
+    /// and ends open sessions whose owner is gone: those of a tunnel that
+    /// crashed, was killed, or lost its terminal never record their end.
+    /// They're ended again whenever sessions are listed, cleared or deleted.
+    pub fn with_session_ownership(mut self, ownership: SessionOwnership) -> Self {
+        self.session_owners = Some(Arc::new(ownership));
+        let conn = self
+            .control_conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.end_abandoned_sessions_on(&conn);
+        drop(conn);
+        self
+    }
+
+    /// Ends abandoned sessions before an operation that shows or removes
+    /// sessions by whether they're open. A failure leaves them open, which
+    /// that operation still handles.
+    fn end_abandoned_sessions_on(&self, conn: &Connection) {
+        if let Some(ownership) = &self.session_owners
+            && let Err(error) = end_abandoned_sessions(conn, ownership)
+        {
+            tracing::warn!("failed to end abandoned inspector sessions: {error}");
+        }
+    }
+
+    /// The owner columns of a session this handle starts.
+    fn owner_columns(&self) -> (Option<u32>, Option<&str>) {
+        self.session_owners
+            .as_deref()
+            .map_or((None, None), |owner| {
+                (Some(owner.pid), Some(owner.identity.as_str()))
+            })
     }
 
     /// Opens a database in a directory of its own, removed with the last
@@ -302,14 +341,16 @@ impl InspectorDb {
         local_port: u16,
         name: Option<String>,
     ) -> Result<(), rusqlite::Error> {
+        let (owner_pid, owner_identity) = self.owner_columns();
         let conn = self
             .control_conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         conn.execute(
-            "INSERT OR IGNORE INTO sessions (id, name, domain, local_port)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![id, name, domain, local_port],
+            "INSERT OR IGNORE INTO sessions
+                 (id, name, domain, local_port, owner_pid, owner_identity)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, name, domain, local_port, owner_pid, owner_identity],
         )?;
         Ok(())
     }
@@ -321,6 +362,7 @@ impl InspectorDb {
         local_port: u16,
         name: Option<String>,
     ) -> Result<bool, rusqlite::Error> {
+        let (owner_pid, owner_identity) = self.owner_columns();
         let mut conn = self
             .control_conn
             .lock()
@@ -328,9 +370,10 @@ impl InspectorDb {
         let transaction =
             conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let inserted = transaction.execute(
-            "INSERT OR IGNORE INTO sessions (id, name, domain, local_port)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![&id, name, domain, local_port],
+            "INSERT OR IGNORE INTO sessions
+                 (id, name, domain, local_port, owner_pid, owner_identity)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![&id, name, domain, local_port, owner_pid, owner_identity],
         )?;
         if inserted != 0 {
             transaction.execute(
@@ -618,6 +661,7 @@ impl InspectorDb {
     /// List sessions, newest first.
     pub async fn list_sessions(&self, limit: usize) -> Result<Vec<StoredSession>, rusqlite::Error> {
         let conn = self.read_conn.lock().await;
+        self.end_abandoned_sessions_on(&conn);
         let mut stmt = conn.prepare_cached(
             "SELECT s.id, s.name, s.domain, s.local_port, s.started_at, s.ended_at,
                     (SELECT COUNT(*) FROM requests r WHERE r.session_id = s.id) as request_count
@@ -833,6 +877,7 @@ impl InspectorDb {
     /// truncated, unless another connection is reading at that moment.
     pub async fn clear_history(&self) -> Result<(), rusqlite::Error> {
         let conn = self.read_conn.lock().await;
+        self.end_abandoned_sessions_on(&conn);
         // Immediate: a deferred transaction that reads before it writes gets
         // SQLITE_BUSY at once, without waiting, if another connection
         // commits in between.
@@ -858,6 +903,7 @@ impl InspectorDb {
     /// is truncated unless another connection is reading.
     pub async fn delete_session(&self, id: &str) -> Result<SessionDeletion, rusqlite::Error> {
         let conn = self.read_conn.lock().await;
+        self.end_abandoned_sessions_on(&conn);
         let tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
         let ended = tx.query_row(
@@ -886,6 +932,7 @@ impl InspectorDb {
     /// trace of them as [`delete_session`](Self::delete_session) does.
     pub async fn delete_ended_sessions(&self) -> Result<DeletedSessions, rusqlite::Error> {
         let conn = self.read_conn.lock().await;
+        self.end_abandoned_sessions_on(&conn);
         let tx =
             rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)?;
         let request_ids = delete_session_requests(
@@ -913,6 +960,102 @@ impl InspectorDb {
         let conn = self.read_conn.lock().await;
         conn.query_row("PRAGMA data_version", [], |row| row.get(0))
     }
+}
+
+/// Whether the process that started an open session still runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerState {
+    /// The recorded process runs.
+    Running,
+    /// No process runs with the recorded PID and identity: it exited, or the
+    /// system gave its PID to another process.
+    Gone,
+    /// A process with the PID runs, but its identity can't be read, as for
+    /// another user's process on some systems.
+    Unknown,
+}
+
+/// The process recording sessions through a database handle, and a check of
+/// whether the recorder of another session still runs. The identity tells a
+/// process apart from a later one given the same PID.
+#[derive(Debug, Clone)]
+pub struct SessionOwnership {
+    pid: u32,
+    identity: String,
+    state_of: fn(pid: u32, identity: &str) -> OwnerState,
+}
+
+impl SessionOwnership {
+    pub fn new(pid: u32, identity: String, state_of: fn(u32, &str) -> OwnerState) -> Self {
+        Self {
+            pid,
+            identity,
+            state_of,
+        }
+    }
+
+    /// Whether an open session's recorder is gone, so the session never ends.
+    fn abandoned(&self, owner_pid: Option<u32>, owner_identity: Option<&str>) -> bool {
+        match (owner_pid, owner_identity) {
+            (Some(pid), Some(identity)) => (self.state_of)(pid, identity) == OwnerState::Gone,
+            // Started before LPM CLI recorded owners. An earlier release still
+            // running could be recording it, but nothing else can end it.
+            (None, _) => true,
+            (Some(_), None) => false,
+        }
+    }
+}
+
+/// Ends the open sessions whose recorder is gone, at their last capture or,
+/// without one, their start. A pending one, never shown, is discarded as its
+/// recorder would have rolled it back.
+fn end_abandoned_sessions(
+    conn: &Connection,
+    ownership: &SessionOwnership,
+) -> Result<usize, rusqlite::Error> {
+    let mut abandoned = Vec::new();
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, owner_pid, owner_identity FROM sessions WHERE ended_at IS NULL",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let owner_identity: Option<String> = row.get(2)?;
+            if ownership.abandoned(row.get(1)?, owner_identity.as_deref()) {
+                abandoned.push(row.get::<_, String>(0)?);
+            }
+        }
+    }
+    if abandoned.is_empty() {
+        return Ok(0);
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let mut ended = 0;
+    {
+        let mut unpend = tx.prepare("DELETE FROM pending_sessions WHERE session_id = ?1")?;
+        let mut discard = tx.prepare(
+            "DELETE FROM sessions
+             WHERE id = ?1 AND ended_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM requests WHERE session_id = ?1)",
+        )?;
+        let mut end = tx.prepare(
+            "UPDATE sessions
+             SET ended_at = COALESCE(
+                 (SELECT MAX(created_at) FROM requests WHERE session_id = ?1),
+                 started_at
+             )
+             WHERE id = ?1 AND ended_at IS NULL",
+        )?;
+        for id in &abandoned {
+            if unpend.execute(params![id])? != 0 && discard.execute(params![id])? != 0 {
+                ended += 1;
+            } else {
+                ended += end.execute(params![id])?;
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(ended)
 }
 
 /// Outcome of [`InspectorDb::delete_session`].
@@ -2284,17 +2427,25 @@ const CAPTURE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS sessions (
 
 fn ensure_capture_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    let has_capture_flag = tx
-        .prepare("PRAGMA table_info(requests)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?
-        .iter()
-        .any(|name| name == "response_body_incomplete");
-    if !has_capture_flag {
-        tx.execute(
-            "ALTER TABLE requests ADD COLUMN response_body_incomplete INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
+    for (table, column, definition) in [
+        (
+            "requests",
+            "response_body_incomplete",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        ("sessions", "owner_pid", "INTEGER"),
+        ("sessions", "owner_identity", "TEXT"),
+    ] {
+        let columns = tx
+            .prepare(&format!("PRAGMA table_info({table})"))?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !columns.is_empty() && !columns.iter().any(|name| name == column) {
+            tx.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+                [],
+            )?;
+        }
     }
     tx.commit()
 }
@@ -4414,6 +4565,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables, 1);
+        let owner_columns: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('sessions')
+                 WHERE name IN ('owner_pid', 'owner_identity')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner_columns, 2);
+        drop(db);
+        assert_eq!(
+            InspectorDb::open(project.path())
+                .expect("an upgraded database must reopen")
+                .count()
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -5501,6 +5670,7 @@ mod tests {
             db_path,
             open_to_others: false,
             ownership_ignored: false,
+            session_owners: None,
             _temp_dir: None,
             write_conn: Arc::clone(&write_conn),
         };
@@ -5665,6 +5835,118 @@ mod tests {
         assert_eq!(session_ids(&db).await, ["open"]);
         assert!(db.get_webhook("in-open").await.unwrap().is_some());
         assert_eq!(db.count().await.unwrap(), 1);
+    }
+
+    /// Owners for tests: `running` and `unknown` report so, anything else
+    /// is gone.
+    fn scripted_owner_state(_pid: u32, identity: &str) -> OwnerState {
+        match identity {
+            "running" => OwnerState::Running,
+            "unknown" => OwnerState::Unknown,
+            _ => OwnerState::Gone,
+        }
+    }
+
+    fn owned(project: &Path, identity: &str) -> InspectorDb {
+        InspectorDb::open(project)
+            .unwrap()
+            .with_session_ownership(SessionOwnership::new(
+                7,
+                identity.to_string(),
+                scripted_owner_state,
+            ))
+    }
+
+    fn session_ends(project: &Path) -> HashMap<String, Option<String>> {
+        let connection = Connection::open(project.join(".lpm/inspector.db")).unwrap();
+        let mut statement = connection
+            .prepare("SELECT id, ended_at FROM sessions")
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn opening_ends_the_open_sessions_whose_recorder_is_gone() {
+        let project = tempfile::tempdir().unwrap();
+        let crashed = owned(project.path(), "crashed");
+        let running = owned(project.path(), "running");
+        let unreadable = owned(project.path(), "unknown");
+        let unowned = InspectorDb::open(project.path()).unwrap();
+        crashed.start_session("crashed".into(), None, 4321).unwrap();
+        crashed.insert_request(make_webhook("last-capture", 200), Some("crashed".into()));
+        crashed.flush_pending_writes().await.unwrap();
+        crashed
+            .start_session_named_reversible("never-published".into(), None, 4321, None)
+            .unwrap();
+        running.start_session("running".into(), None, 4321).unwrap();
+        unreadable
+            .start_session("unknown".into(), None, 4321)
+            .unwrap();
+        unowned
+            .start_session("before-owners".into(), None, 4321)
+            .unwrap();
+        let connection = Connection::open(project.path().join(".lpm/inspector.db")).unwrap();
+        let (last_capture, before_owners_start): (String, String) = connection
+            .query_row(
+                "SELECT (SELECT created_at FROM requests WHERE id = 'last-capture'),
+                        (SELECT started_at FROM sessions WHERE id = 'before-owners')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        drop(owned(project.path(), "running"));
+
+        let ends = session_ends(project.path());
+        assert_eq!(ends["crashed"].as_deref(), Some(last_capture.as_str()));
+        assert_eq!(
+            ends["before-owners"].as_deref(),
+            Some(before_owners_start.as_str())
+        );
+        assert_eq!(ends["running"], None);
+        assert_eq!(ends["unknown"], None);
+        assert!(
+            !ends.contains_key("never-published"),
+            "a pending session of a gone recorder is rolled back: {ends:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_clearing_and_deleting_end_sessions_abandoned_since_opening() {
+        let project = tempfile::tempdir().unwrap();
+        let reviewer = owned(project.path(), "running");
+        let crashed = owned(project.path(), "crashed");
+
+        crashed.start_session("listed".into(), None, 4321).unwrap();
+        let listed = reviewer.list_sessions(10).await.unwrap();
+        crashed.start_session("deleted".into(), None, 4321).unwrap();
+        let deleted = reviewer.delete_session("deleted").await.unwrap();
+        crashed.start_session("cleared".into(), None, 4321).unwrap();
+        reviewer.clear_history().await.unwrap();
+
+        assert!(listed[0].ended_at.is_some(), "{listed:?}");
+        assert_eq!(deleted, SessionDeletion::Deleted(Vec::new()));
+        assert!(session_ends(project.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_handle_without_ownership_ends_no_session() {
+        let project = tempfile::tempdir().unwrap();
+        owned(project.path(), "crashed")
+            .start_session("crashed".into(), None, 4321)
+            .unwrap();
+        let unowned = InspectorDb::open(project.path()).unwrap();
+
+        unowned.list_sessions(10).await.unwrap();
+
+        assert_eq!(
+            unowned.delete_session("crashed").await.unwrap(),
+            SessionDeletion::Open
+        );
     }
 
     #[tokio::test]
