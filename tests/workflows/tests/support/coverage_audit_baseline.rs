@@ -1482,10 +1482,11 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         unit: true,
         integration: false,
         workflow: true,
-        cli_binary: false,
+        cli_binary: true,
         json_contract: JsonContractStatus::Covered,
         references: &[
-            "crates/lpm-cli/src/commands/tunnel.rs",
+            "crates/lpm-cli/src/commands/tunnel/mod.rs",
+            "crates/lpm-cli/tests/tunnel_panel_tty.rs",
             "tests/workflows/tests/dev_tunnel.rs",
         ],
     },

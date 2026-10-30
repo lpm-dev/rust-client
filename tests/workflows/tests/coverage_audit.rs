@@ -211,7 +211,7 @@ fn supplemental_references(surface_id: u16) -> &'static [&'static str] {
         ],
         111 => &["crates/lpm-cli/src/commands/dev.rs"],
         118 => &["tests/workflows/tests/ports.rs"],
-        120 | 121 => &["crates/lpm-cli/src/commands/tunnel.rs"],
+        120 | 121 => &["crates/lpm-cli/src/commands/tunnel/mod.rs"],
         125 => &[
             "crates/lpm-cli/src/commands/migrate_overrides.rs",
             "crates/lpm-cli/src/commands/migrate_patches.rs",
