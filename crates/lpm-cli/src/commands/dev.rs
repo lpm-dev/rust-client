@@ -1153,9 +1153,11 @@ fn build_consent(yes: bool) -> lpm_cert::TrustStoreConsent<'static> {
     }
     lpm_cert::TrustStoreConsent::Prompt(Box::new(|req| {
         if !std::io::stdin().is_terminal() {
-            return Err(LpmError::Cert(
-                "non-interactive shell: pass `--yes` to consent to the trust-store install, or run `lpm cert trust` first".into(),
-            ));
+            return Err(LpmError::ConfirmationRequired {
+                command: "lpm dev",
+                change: "install the LPM local development CA in your system trust store".into(),
+                help: "Run `lpm cert trust` first, or run it again with `--yes`. It asks only in an interactive terminal.",
+            });
         }
         println!();
         println!(
@@ -2958,10 +2960,11 @@ fn confirm_hosts_file_update(
         return Ok(());
     }
     if !std::io::stdin().is_terminal() {
-        return Err(LpmError::Script(format!(
-            "non-interactive shell: pass `--yes` to consent to updating the hosts file for local domains ({})",
-            plan.hosts.join(", ")
-        )));
+        return Err(LpmError::ConfirmationRequired {
+            command: "lpm dev",
+            change: format!("add {} to the hosts file", plan.hosts.join(", ")),
+            help: "Use `.localhost` hosts, which need no hosts file entry, or run it again with `--yes`. It asks only in an interactive terminal.",
+        });
     }
 
     println!();

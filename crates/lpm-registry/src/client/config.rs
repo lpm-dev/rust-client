@@ -173,7 +173,7 @@ impl RegistryClient {
         identity: Option<reqwest::Identity>,
     ) -> Result<HttpClientSet, LpmError> {
         let roots = Self::prepare_tls_roots(tls)?;
-        let build = |redirect| {
+        let build = |read_timeout, redirect| {
             Self::build_http_client_with_prepared_tls_identity_and_transport(
                 connect_timeout,
                 read_timeout,
@@ -185,11 +185,12 @@ impl RegistryClient {
             )
         };
         Ok(HttpClientSet {
-            client: build(HttpRedirectMode::Automatic)?,
-            policy_metadata_client: build(HttpRedirectMode::Manual)?,
+            client: build(Some(read_timeout), HttpRedirectMode::Automatic)?,
+            policy_metadata_client: build(Some(read_timeout), HttpRedirectMode::Manual)?,
             request_lanes: (0..request_lane_count(std::env::var("LPM_HTTP").ok().as_deref()))
-                .map(|_| build(HttpRedirectMode::Manual))
+                .map(|_| build(Some(read_timeout), HttpRedirectMode::Manual))
                 .collect::<Result<_, _>>()?,
+            transfer_client: build(None, HttpRedirectMode::Manual)?,
         })
     }
 
@@ -224,7 +225,7 @@ impl RegistryClient {
         let roots = Self::prepare_tls_roots(tls)?;
         Self::build_http_client_with_prepared_tls_identity_and_transport(
             connect_timeout,
-            read_timeout,
+            Some(read_timeout),
             tls,
             &roots,
             identity,
@@ -235,7 +236,7 @@ impl RegistryClient {
 
     fn build_http_client_with_prepared_tls_identity_and_transport(
         connect_timeout: Duration,
-        read_timeout: Duration,
+        read_timeout: Option<Duration>,
         tls: &TlsOverrides,
         roots: &PreparedTlsRoots,
         identity: Option<reqwest::Identity>,
@@ -244,8 +245,10 @@ impl RegistryClient {
     ) -> Result<reqwest::Client, LpmError> {
         let mut b = lpm_http::client_builder()
             .connect_timeout(connect_timeout)
-            .read_timeout(read_timeout)
             .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")));
+        if let Some(read_timeout) = read_timeout {
+            b = b.read_timeout(read_timeout);
+        }
         if redirect == HttpRedirectMode::Manual {
             b = b.redirect(reqwest::redirect::Policy::none());
         }

@@ -21,6 +21,7 @@ async fn dev_certificate_consent_stays_visible_before_dependency_installation() 
         home.path(),
         Some(&server.uri()),
         &["dev", "--https", "--no-open"],
+        &[],
         &["Fingerprint:", "Install now?"],
         b"n\r",
     );
@@ -31,11 +32,46 @@ async fn dev_certificate_consent_stays_visible_before_dependency_installation() 
 }
 
 #[cfg(all(unix, debug_assertions))]
+#[test]
+fn hosts_clean_json_needs_yes_even_with_a_terminal() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let hosts = project.path().join("hosts");
+    let original = "127.0.0.1 localhost\n# >>> lpm:project-abc >>>\n127.0.0.1 api.test\n# <<< lpm:project-abc <<<\n";
+    std::fs::write(&hosts, original).unwrap();
+
+    let (visible, status, transcript) = run_dev_tty(
+        project.path(),
+        home.path(),
+        None,
+        &["--json", "hosts", "clean"],
+        &[("LPM_HOSTS_FILE", &hosts)],
+        &["confirmation_required"],
+        b"y\r",
+    );
+
+    assert!(
+        visible,
+        "--json must refuse instead of asking:\n{transcript}"
+    );
+    assert!(
+        !transcript.contains("Clean LPM hosts entries now?"),
+        "--json must not ask:\n{transcript}"
+    );
+    assert!(
+        status.is_some_and(|status| !status.success()),
+        "{transcript}"
+    );
+    assert_eq!(std::fs::read_to_string(&hosts).unwrap(), original);
+}
+
+#[cfg(all(unix, debug_assertions))]
 fn run_dev_tty(
     project: &std::path::Path,
     home: &std::path::Path,
     registry: Option<&str>,
     args: &[&str],
+    envs: &[(&str, &std::path::Path)],
     prompts: &[&str],
     reply: &[u8],
 ) -> (bool, Option<std::process::ExitStatus>, String) {
@@ -85,6 +121,7 @@ fn run_dev_tty(
     command
         .env("LPM_CERT_TEST_TRUST_STORE_DIR", home.join("test-trust"))
         .env("LPM_CERT_AUDIT_DIR", home.join("cert-audit"))
+        .envs(envs.iter().copied())
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))
         .stderr(Stdio::from(slave));
@@ -199,6 +236,7 @@ fs.writeFileSync('reply.txt',buffer.subarray(0,count));
             home.path(),
             None,
             &["dev", "--no-install", "--no-open"],
+            &[],
             &["Hook input:"],
             b"yes\r",
         );
@@ -257,6 +295,7 @@ fs.writeFileSync('reply.txt',buffer.subarray(0,count));
             home.path(),
             None,
             &args,
+            &[],
             &["Exec input:"],
             b"yes\r",
         );

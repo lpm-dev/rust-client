@@ -164,10 +164,59 @@ pub async fn complete_web_auth_challenge(
     poll_for_web_auth_token(&challenge.done_url, timeout, poll_interval).await
 }
 
+/// How long the user has to approve an lpm.dev request in the browser.
+const LPM_APPROVAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const LPM_APPROVAL_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Has the user approve an lpm.dev request in the browser, with their
+/// passkey or authenticator: shows and opens `auth_url`, then waits on
+/// `done_url` for the one-time token the request is sent with.
+pub async fn complete_lpm_browser_approval(
+    auth_url: &str,
+    done_url: &str,
+    registry_url: &str,
+    action: &str,
+) -> Result<String, LpmError> {
+    let challenge = WebAuthChallenge::new(auth_url, done_url, registry_url)?;
+    install_ui::settle_spinner();
+    install_ui::phase_untrusted(&format!("Approve in your browser to {action}"));
+    println!(
+        "{}",
+        crate::install_ui::terminal_line!("  {}", install_ui::bold(&challenge.auth_url))
+    );
+    if terminal_is_interactive()
+        && let Err(e) = lpm_common::browser::open(&challenge.auth_url)
+    {
+        install_ui::warn_untrusted(&format!(
+            "Could not open browser automatically: {e}. Open the URL above manually."
+        ));
+    }
+    install_ui::phase("Waiting for your approval");
+    poll_for_token(
+        &challenge.done_url,
+        LPM_APPROVAL_TIMEOUT,
+        LPM_APPROVAL_POLL_INTERVAL,
+        "browser approval",
+    )
+    .await
+}
+
 pub async fn poll_for_web_auth_token(
     done_url: &str,
     timeout: Duration,
     poll_interval: Duration,
+) -> Result<String, LpmError> {
+    poll_for_token(done_url, timeout, poll_interval, "npm web authentication").await
+}
+
+/// Polls `done_url` until it gives a token: 202 while pending, 200 with
+/// `{ token }` once approved, 410 once denied or expired. `label` names the
+/// flow in errors.
+async fn poll_for_token(
+    done_url: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+    label: &str,
 ) -> Result<String, LpmError> {
     let expected_url = validate_web_auth_url(done_url, "doneUrl")?;
     let client = build_web_auth_client(timeout)?;
@@ -176,7 +225,7 @@ pub async fn poll_for_web_auth_token(
     loop {
         if started_at.elapsed() >= timeout {
             return Err(LpmError::Registry(format!(
-                "npm web authentication timed out after {} seconds",
+                "{label} timed out after {} seconds",
                 timeout.as_secs()
             )));
         }
@@ -190,20 +239,22 @@ pub async fn poll_for_web_auth_token(
                 .send(),
         )
         .await
-        .map_err(|_| web_auth_timeout(timeout))?;
+        .map_err(|_| labelled_timeout(label, timeout))?;
 
         let sleep_for = match response {
             Ok(response) => {
                 if response.status().is_redirection() {
-                    return Err(LpmError::Registry(
-                        "npm web authentication refused a redirect from doneUrl".into(),
-                    ));
+                    return Err(LpmError::Registry(format!(
+                        "{label} refused a redirect from doneUrl"
+                    )));
                 }
                 if !same_origin(response.url(), &expected_url) {
-                    return Err(LpmError::Registry(
-                        "npm web authentication response came from outside the registry origin"
-                            .into(),
-                    ));
+                    return Err(LpmError::Registry(format!(
+                        "{label} response came from outside the registry origin"
+                    )));
+                }
+                if response.status() == reqwest::StatusCode::GONE {
+                    return Err(LpmError::Registry(format!("{label} was denied or expired")));
                 }
                 if response.status() == reqwest::StatusCode::ACCEPTED {
                     retry_after_or_default(response.headers(), poll_interval)
@@ -214,13 +265,11 @@ pub async fn poll_for_web_auth_token(
                         lpm_http::read_body_capped(response, NPM_WEB_AUTH_RESPONSE_MAX_BYTES),
                     )
                     .await
-                    .map_err(|_| web_auth_timeout(timeout))?
-                    .map_err(web_auth_response_error)?;
+                    .map_err(|_| labelled_timeout(label, timeout))?
+                    .map_err(|error| labelled_response_error(label, error))?;
                     let body: serde_json::Value =
                         serde_json::from_slice(&body).map_err(|error| {
-                            LpmError::Registry(format!(
-                                "npm web authentication response parse error: {error}"
-                            ))
+                            LpmError::Registry(format!("{label} response parse error: {error}"))
                         })?;
                     if let Some(token) = body.get("token").and_then(|value| value.as_str())
                         && !token.is_empty()
@@ -234,7 +283,7 @@ pub async fn poll_for_web_auth_token(
             }
             Err(error) if lpm_http::is_https_downgrade(&error) => {
                 return Err(LpmError::Registry(format!(
-                    "npm web authentication failed: {}",
+                    "{label} failed: {}",
                     lpm_http::display_error(&error)
                 )));
             }
@@ -290,21 +339,25 @@ fn same_origin(left: &reqwest::Url, right: &reqwest::Url) -> bool {
         && left.port_or_known_default() == right.port_or_known_default()
 }
 
-fn web_auth_timeout(timeout: Duration) -> LpmError {
+fn labelled_timeout(label: &str, timeout: Duration) -> LpmError {
     LpmError::Registry(format!(
-        "npm web authentication timed out after {} seconds",
+        "{label} timed out after {} seconds",
         timeout.as_secs()
     ))
 }
 
 fn web_auth_response_error(error: lpm_http::ResponseBodyError) -> LpmError {
+    labelled_response_error("npm web authentication", error)
+}
+
+fn labelled_response_error(label: &str, error: lpm_http::ResponseBodyError) -> LpmError {
     match error {
         lpm_http::ResponseBodyError::DeclaredTooLarge { .. }
         | lpm_http::ResponseBodyError::StreamedTooLarge { .. } => LpmError::Registry(format!(
-            "npm web authentication response is too large (maximum {NPM_WEB_AUTH_RESPONSE_MAX_BYTES} bytes)"
+            "{label} response is too large (maximum {NPM_WEB_AUTH_RESPONSE_MAX_BYTES} bytes)"
         )),
         lpm_http::ResponseBodyError::Read(error) => LpmError::Registry(format!(
-            "npm web authentication response read failed: {}",
+            "{label} response read failed: {}",
             lpm_http::display_error(&error)
         )),
     }
@@ -484,6 +537,83 @@ mod tests {
         .expect("poll should return token");
 
         assert_eq!(token, "web-token-123");
+    }
+
+    #[tokio::test]
+    async fn poll_for_token_stops_once_the_request_is_denied_or_expired() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/done"))
+            .respond_with(ResponseTemplate::new(410).set_body_json(serde_json::json!({
+                "error": "This approval request was denied, expired, or already used.",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = poll_for_token(
+            &format!("{}/done", server.uri()),
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            "browser approval",
+        )
+        .await
+        .expect_err("a closed request ends the wait");
+
+        assert_eq!(
+            error.to_string(),
+            "registry error: browser approval was denied or expired"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_for_token_waits_while_the_request_is_pending() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/done"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "status": "pending",
+            })))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/done"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "approval-token",
+            })))
+            .mount(&server)
+            .await;
+
+        let token = poll_for_token(
+            &format!("{}/done", server.uri()),
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            "browser approval",
+        )
+        .await
+        .expect("the approval's token");
+
+        assert_eq!(token, "approval-token");
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn complete_lpm_browser_approval_refuses_a_done_url_outside_the_registry() {
+        let error = complete_lpm_browser_approval(
+            "https://lpm.dev/cli/approve/approval-1",
+            "https://elsewhere.example/api/auth/cli-approvals/approval-1/secret",
+            "https://lpm.dev",
+            "publish @lpm.dev/acme.widgets@1.2.0",
+        )
+        .await
+        .expect_err("the token must come from the registry");
+
+        assert!(
+            error
+                .to_string()
+                .contains("doneUrl outside the registry origin")
+        );
     }
 
     #[tokio::test]

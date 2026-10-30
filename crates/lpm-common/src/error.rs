@@ -413,6 +413,28 @@ pub enum LpmError {
     )]
     OtpRequired { command: &'static str },
 
+    /// The registry asks for the account's second factor as a browser
+    /// approval of this request: `auth_url` is where the user approves it,
+    /// `done_url` where the CLI waits for the one-time token. Only a CLI
+    /// that waits can use the approval, so neither is shown once this is
+    /// reported. `accepts_code` and `has_passkey` say how else the account
+    /// can confirm, so a command can ask for an authenticator code in the
+    /// terminal when the account has no passkey to prefer.
+    #[error("{action} needs your approval in the browser")]
+    #[diagnostic(
+        code(lpm::browser_approval_required),
+        help(
+            "Run the command again without `--json` to approve it in the browser with your passkey or authenticator. With an authenticator app, you can pass a 6-digit code with `--otp <CODE>` instead."
+        )
+    )]
+    BrowserApprovalRequired {
+        action: String,
+        auth_url: String,
+        done_url: String,
+        accepts_code: bool,
+        has_passkey: bool,
+    },
+
     #[error("invalid or expired one-time password for `{command}`")]
     #[diagnostic(
         code(lpm::otp_invalid),
@@ -421,6 +443,18 @@ pub enum LpmError {
         )
     )]
     OtpInvalid { command: &'static str },
+
+    /// A command that asks before it makes a change ran without a terminal
+    /// to ask in, or with `--json`, and without `--yes`, and didn't make it.
+    #[error("`{command}` needs `--yes` to {change} without asking")]
+    #[diagnostic(code(lpm::confirmation_required), help("{help}"))]
+    ConfirmationRequired {
+        command: &'static str,
+        /// What the command would do, as in `unpublish @lpm.dev/acme.kit@1.2.3`.
+        change: String,
+        /// What to check, or run instead, before passing `--yes`.
+        help: &'static str,
+    },
 
     #[error("forbidden: {0}")]
     #[diagnostic(
@@ -485,7 +519,7 @@ pub enum LpmError {
     #[error("rate limited — retry after {retry_after_secs}s")]
     #[diagnostic(
         code(lpm::rate_limited),
-        help("Too many requests. The client will retry automatically.")
+        help("Too many requests. Wait the time it says, then run the command again.")
     )]
     RateLimited { retry_after_secs: u64 },
 
@@ -837,7 +871,9 @@ impl LpmError {
             LpmError::CredentialImportUnavailable { .. } => "credential_import_unavailable",
             LpmError::CredentialImportRejected { .. } => "credential_import_rejected",
             LpmError::OtpRequired { .. } => "otp_required",
+            LpmError::BrowserApprovalRequired { .. } => "browser_approval_required",
             LpmError::OtpInvalid { .. } => "otp_invalid",
+            LpmError::ConfirmationRequired { .. } => "confirmation_required",
             LpmError::Forbidden(_) => "forbidden",
             LpmError::NpmFirewallBlocked { .. } => "npm_firewall_blocked",
             LpmError::NpmFirewallEntitlementRequired { .. } => "npm_firewall_entitlement_required",
@@ -1018,6 +1054,23 @@ mod tests {
     }
 
     #[test]
+    fn confirmation_required_names_the_change_and_what_to_do_instead() {
+        let error = LpmError::ConfirmationRequired {
+            command: "lpm ports kill",
+            change: "kill 2 processes listening on ports 3000-3001".into(),
+            help: "Check them with `lpm ports`, then run it again with `--yes`.",
+        };
+        assert_eq!(
+            error.to_string(),
+            "`lpm ports kill` needs `--yes` to kill 2 processes listening on ports 3000-3001 without asking"
+        );
+        assert_eq!(
+            error.help().unwrap().to_string(),
+            "Check them with `lpm ports`, then run it again with `--yes`."
+        );
+    }
+
+    #[test]
     fn script_error_unchanged() {
         let err = LpmError::Script("build failed".to_string());
         assert_eq!(err.to_string(), "script error: build failed");
@@ -1068,6 +1121,18 @@ mod tests {
             },
             LpmError::OtpInvalid {
                 command: "lpm token-rotate",
+            },
+            LpmError::ConfirmationRequired {
+                command: "lpm unpublish",
+                change: "unpublish @lpm.dev/acme.kit@1.2.3".into(),
+                help: "Check the version.",
+            },
+            LpmError::BrowserApprovalRequired {
+                action: "publish".into(),
+                auth_url: "https://lpm.dev/cli/approve/x".into(),
+                done_url: "https://lpm.dev/api/auth/cli-approvals/x/y".into(),
+                accepts_code: false,
+                has_passkey: true,
             },
             LpmError::Forbidden("x".into()),
             LpmError::NpmFirewallBlocked {
@@ -1245,6 +1310,15 @@ mod tests {
             }
             .error_code(),
             "otp_invalid"
+        );
+        assert_eq!(
+            LpmError::ConfirmationRequired {
+                command: "lpm unpublish",
+                change: "unpublish @lpm.dev/acme.kit@1.2.3".into(),
+                help: "Check the version.",
+            }
+            .error_code(),
+            "confirmation_required"
         );
         assert_eq!(
             LpmError::UnsupportedAuthSource {

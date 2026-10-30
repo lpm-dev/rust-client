@@ -530,6 +530,9 @@ pub(super) struct CachedClient {
     /// Redirect-disabled clients that carry registry requests in turn, each
     /// with its own connection pool. Never empty.
     pub(super) request_lanes: Arc<[reqwest::Client]>,
+    /// Redirect-disabled client without a read timeout, for requests that
+    /// move a tarball.
+    pub(super) transfer_client: reqwest::Client,
     pub(super) identity_fp: Option<Arc<str>>,
 }
 

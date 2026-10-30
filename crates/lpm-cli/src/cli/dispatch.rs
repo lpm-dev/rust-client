@@ -1683,6 +1683,38 @@ async fn async_main(cli: Cli) -> Result<()> {
         Commands::TokenRotate(args) => {
             commands::token::run_rotate(&client, registry_url, args.otp, cli.json).await
         }
+        Commands::Unpublish(args) => {
+            commands::unpublish::run(
+                &client,
+                registry_url,
+                &args.target,
+                args.otp,
+                args.yes,
+                cli.json,
+            )
+            .await
+        }
+        Commands::Deprecate(args) => {
+            commands::deprecate::run_deprecate(
+                &client,
+                registry_url,
+                &args.target,
+                &args.message,
+                args.otp,
+                cli.json,
+            )
+            .await
+        }
+        Commands::Undeprecate(args) => {
+            commands::deprecate::run_undeprecate(
+                &client,
+                registry_url,
+                &args.target,
+                args.otp,
+                cli.json,
+            )
+            .await
+        }
         Commands::Outdated(args) => {
             let lifecycle_args::OutdatedArgs {
                 registry_only,

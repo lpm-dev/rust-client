@@ -490,6 +490,12 @@ fn glyph(kind: LineKind) -> String {
     }
 }
 
+/// Leaves the running spinner, if any, as a static line, so a prompt that
+/// follows starts on a line of its own instead of under its frames.
+pub fn settle_spinner() {
+    settle_any_active_spinner();
+}
+
 fn emit_line(kind: LineKind, msg: &str) {
     settle_any_active_spinner();
     eprintln!("{}", format_line(kind, msg));

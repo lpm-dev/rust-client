@@ -26,6 +26,37 @@ struct PublishLifecycleScript {
     command: String,
 }
 
+/// The command a package's lifecycle scripts run for.
+#[derive(Debug, Clone, Copy)]
+enum LifecycleCommand {
+    Publish,
+    Release,
+    Stage,
+}
+
+impl LifecycleCommand {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Publish => "lpm publish",
+            Self::Release => "lpm release",
+            Self::Stage => "lpm stage",
+        }
+    }
+
+    fn operation(self) -> &'static str {
+        match self {
+            Self::Publish | Self::Release => "publish",
+            Self::Stage => "stage",
+        }
+    }
+
+    /// A stage stops before the upload, so `publish` and `postpublish`
+    /// don't run.
+    fn runs_publish_phases(self) -> bool {
+        !matches!(self, Self::Stage)
+    }
+}
+
 impl PublishLifecycle {
     pub(crate) fn load_for_publish(
         project_dir: &Path,
@@ -38,8 +69,7 @@ impl PublishLifecycle {
             yes,
             ignore_scripts,
             json_output,
-            true,
-            "publish",
+            LifecycleCommand::Publish,
         )
     }
 
@@ -54,8 +84,7 @@ impl PublishLifecycle {
             yes,
             ignore_scripts,
             json_output,
-            false,
-            "stage",
+            LifecycleCommand::Stage,
         )
     }
 
@@ -64,21 +93,13 @@ impl PublishLifecycle {
         yes: bool,
         ignore_scripts: bool,
         json_output: bool,
-        include_publish_phases: bool,
-        operation: &str,
+        command: LifecycleCommand,
     ) -> Result<Option<Self>, LpmError> {
         if ignore_scripts {
             return Ok(None);
         }
         let directory = publish_common::open_tarball_source_root(project_dir)?;
-        Self::load_from_directory(
-            project_dir,
-            &directory,
-            yes,
-            json_output,
-            include_publish_phases,
-            operation,
-        )
+        Self::load_from_directory(project_dir, &directory, yes, json_output, command)
     }
 
     pub(crate) fn load_for_release(
@@ -91,7 +112,13 @@ impl PublishLifecycle {
         if ignore_scripts {
             return Ok(None);
         }
-        Self::load_from_directory(project_dir, directory, yes, json_output, true, "publish")
+        Self::load_from_directory(
+            project_dir,
+            directory,
+            yes,
+            json_output,
+            LifecycleCommand::Release,
+        )
     }
 
     fn load_from_directory(
@@ -99,8 +126,7 @@ impl PublishLifecycle {
         directory: &cap_std::fs::Dir,
         yes: bool,
         json_output: bool,
-        include_publish_phases: bool,
-        operation: &str,
+        command: LifecycleCommand,
     ) -> Result<Option<Self>, LpmError> {
         let (file, size) = publish_common::open_tarball_source_file(
             directory,
@@ -117,7 +143,7 @@ impl PublishLifecycle {
             serde_json::from_str(lpm_common::strip_utf8_bom_str(&content))?;
         let before_pack = scripts_for_phases(&package.scripts, BEFORE_PACK_PHASES);
         let after_pack = scripts_for_phases(&package.scripts, AFTER_PACK_PHASES);
-        let after_publish = if include_publish_phases {
+        let after_publish = if command.runs_publish_phases() {
             scripts_for_phases(&package.scripts, AFTER_PUBLISH_PHASES)
         } else {
             Vec::new()
@@ -126,7 +152,7 @@ impl PublishLifecycle {
         if script_count == 0 {
             return Ok(None);
         }
-        require_consent(yes, json_output, operation, script_count)?;
+        require_consent(yes, json_output, command, script_count)?;
         Ok(Some(Self {
             directory_identity: DirectoryIdentity::from_directory(directory)
                 .map_err(LpmError::Io)?,
@@ -272,18 +298,28 @@ impl PublishLifecycle {
 fn require_consent(
     yes: bool,
     json_output: bool,
-    operation: &str,
+    command: LifecycleCommand,
     script_count: usize,
 ) -> Result<(), LpmError> {
     if yes {
         return Ok(());
     }
+    let operation = command.operation();
     let interactive =
         !json_output && std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     if !interactive {
-        return Err(LpmError::Script(format!(
-            "{operation} lifecycle scripts require an explicit choice in non-interactive mode; pass `--yes` to run them or `--ignore-scripts` to skip them"
-        )));
+        return Err(LpmError::ConfirmationRequired {
+            command: command.name(),
+            change: format!(
+                "run {script_count} package lifecycle {}",
+                if script_count == 1 {
+                    "script"
+                } else {
+                    "scripts"
+                }
+            ),
+            help: "Pass `--yes` to run them, or `--ignore-scripts` to skip them. It asks only in an interactive terminal, and never with `--json`.",
+        });
     }
     let confirmed = cliclack::confirm(crate::prompt::untrusted(format!(
         "Run {script_count} package lifecycle script(s) for this {operation}?"

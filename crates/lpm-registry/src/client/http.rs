@@ -5,6 +5,7 @@ enum ClientPool {
     General,
     PolicyMetadata,
     ManualRedirect(usize),
+    Transfer,
 }
 
 /// Connections per origin that carry registry requests in turn.
@@ -29,6 +30,7 @@ pub(super) struct HttpClientSet {
     pub(super) client: reqwest::Client,
     pub(super) policy_metadata_client: reqwest::Client,
     pub(super) request_lanes: Arc<[reqwest::Client]>,
+    pub(super) transfer_client: reqwest::Client,
 }
 
 impl HttpClientSet {
@@ -37,6 +39,7 @@ impl HttpClientSet {
             client: self.client,
             policy_metadata_client: self.policy_metadata_client,
             request_lanes: self.request_lanes,
+            transfer_client: self.transfer_client,
             identity_fp,
         }
     }
@@ -137,7 +140,8 @@ impl HttpClients {
         Self::from_default_client_set(HttpClientSet {
             client: default,
             policy_metadata_client: policy_metadata,
-            request_lanes: Arc::from([manual_redirect]),
+            request_lanes: Arc::from([manual_redirect.clone()]),
+            transfer_client: manual_redirect,
         })
     }
 
@@ -289,6 +293,14 @@ impl HttpClients {
         self.for_url_pool(url, ClientPool::PolicyMetadata).await
     }
 
+    /// Resolve the redirect-disabled client for a request that moves a
+    /// tarball. It has no read timeout, which in reqwest also bounds the
+    /// wait for response headers while the body uploads; the request's own
+    /// total timeout bounds it instead.
+    pub async fn for_transfer_url(&self, url: &str) -> Result<reqwest::Client, LpmError> {
+        self.for_url_pool(url, ClientPool::Transfer).await
+    }
+
     /// Resolve a redirect-disabled client for one explicit redirect hop.
     /// Successive requests rotate across the origin's request lanes.
     pub async fn for_manual_redirect_url(&self, url: &str) -> Result<reqwest::Client, LpmError> {
@@ -388,6 +400,7 @@ fn select_pool(cached: &CachedClient, pool: ClientPool) -> reqwest::Client {
         ClientPool::ManualRedirect(lane) => {
             cached.request_lanes[lane % cached.request_lanes.len()].clone()
         }
+        ClientPool::Transfer => cached.transfer_client.clone(),
     }
 }
 
@@ -577,6 +590,19 @@ impl lpm_http::ReplayableHttpClientProvider for PolicyMetadataClientProvider<'_>
         url: &reqwest::Url,
     ) -> impl std::future::Future<Output = Result<reqwest::Client, Self::Error>> + Send {
         self.0.for_policy_metadata_url(url.as_str())
+    }
+}
+
+pub(super) struct TransferClientProvider<'a>(pub(super) &'a HttpClients);
+
+impl lpm_http::ReplayableHttpClientProvider for TransferClientProvider<'_> {
+    type Error = LpmError;
+
+    fn client_for_url(
+        &self,
+        url: &reqwest::Url,
+    ) -> impl std::future::Future<Output = Result<reqwest::Client, Self::Error>> + Send {
+        self.0.for_transfer_url(url.as_str())
     }
 }
 

@@ -575,6 +575,82 @@ fn trust_prune_human_dry_run_uses_slim_status_lines() {
 }
 
 #[test]
+fn trust_prune_without_yes_or_a_terminal_needs_confirmation_and_leaves_package_json() {
+    let project = TempProject::empty(r#"{}"#);
+    write_pkg_with_trust(
+        &project,
+        json!({
+            "esbuild@0.25.1": { "integrity": "sha512-e" },
+            "removed-pkg@1.0.0": { "integrity": "sha512-r" }
+        }),
+    );
+    write_lockfile(&project, &[("esbuild", "0.25.1")]);
+    let manifest_before =
+        std::fs::read_to_string(project.path().join("package.json")).expect("read package.json");
+
+    for json in [true, false] {
+        let mut command = lpm(&project);
+        command.args(["trust", "prune"]);
+        if json {
+            command.arg("--json");
+        }
+        let output = command.output().expect("failed to run lpm trust prune");
+
+        assert!(
+            !output.status.success(),
+            "trust prune must refuse without --yes"
+        );
+        if json {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let envelope: serde_json::Value = serde_json::from_str(&stdout)
+                .unwrap_or_else(|error| panic!("--json must print JSON: {error}\n{stdout}"));
+            assert_eq!(envelope["error_code"], "confirmation_required");
+            assert_eq!(envelope["error"]["command"], "lpm trust prune");
+            assert!(
+                envelope["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("remove 1 stale trust entry from package.json"),
+                "{envelope:#}"
+            );
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("Confirmation required"), "{stderr}");
+            assert!(stderr.contains("--dry-run"), "{stderr}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(project.path().join("package.json")).unwrap(),
+            manifest_before
+        );
+    }
+}
+
+#[test]
+fn trust_prune_json_with_nothing_stale_needs_no_confirmation() {
+    let project = TempProject::empty(r#"{}"#);
+    write_pkg_with_trust(
+        &project,
+        json!({ "esbuild@0.25.1": { "integrity": "sha512-e" } }),
+    );
+    write_lockfile(&project, &[("esbuild", "0.25.1")]);
+
+    let output = lpm(&project)
+        .args(["trust", "prune", "--json"])
+        .output()
+        .expect("failed to run lpm trust prune --json");
+
+    assert!(
+        output.status.success(),
+        "nothing to prune needs no --yes:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["mutated"], json!(false));
+    assert_eq!(envelope["stale_count"], json!(0));
+}
+
+#[test]
 fn trust_prune_yes_removes_stale_entries_and_preserves_active_ones() {
     let project = TempProject::empty(r#"{}"#);
 

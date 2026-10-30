@@ -577,14 +577,27 @@ fn ports_kill_range_json_without_yes_requires_confirmation_before_killing() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "--json must print JSON: {error}\nstdout: {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        });
+    assert_eq!(
+        envelope["error_code"], "confirmation_required",
+        "{envelope:#}"
+    );
+    assert_eq!(
+        envelope["error"]["command"], "lpm ports kill",
+        "{envelope:#}"
     );
     assert!(
-        combined.contains("pass --yes to confirm"),
-        "got:\n{combined}"
+        envelope["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("listening on ports {range}")),
+        "{envelope:#}"
     );
     assert!(
         TcpStream::connect(("127.0.0.1", busy_port)).is_ok(),

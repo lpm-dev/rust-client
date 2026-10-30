@@ -1132,9 +1132,12 @@ fn skills_add_noninteractive_standalone_source_requires_yes_after_planning() {
         !output.status.success(),
         "noninteractive standalone mutation must require explicit confirmation"
     );
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("requires `--yes`"),
-        "noninteractive refusal must point at the confirmation flag"
+        stderr.contains("Confirmation required")
+            && stderr.contains("lpm skills add")
+            && stderr.contains("--dry-run"),
+        "noninteractive refusal must point at the confirmation flag: {stderr}"
     );
 }
 

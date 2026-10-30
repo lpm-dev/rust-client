@@ -139,7 +139,11 @@ mod tty {
         );
         assert!(!status.success());
         let json: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
-        assert!(json["error"].as_str().unwrap().contains("--yes"), "{json}");
+        assert_eq!(json["error_code"], "confirmation_required", "{json}");
+        assert!(
+            json["error"]["message"].as_str().unwrap().contains("--yes"),
+            "{json}"
+        );
     }
 
     #[test]

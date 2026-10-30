@@ -717,10 +717,19 @@ fn confirm_range_kill(
         return Ok(());
     }
     if json_output || !std::io::stdin().is_terminal() {
-        return Err(LpmError::Script(format!(
-            "range kill {start}-{end} matches {} process(es); pass --yes to confirm",
-            candidates.len()
-        )));
+        return Err(LpmError::ConfirmationRequired {
+            command: "lpm ports kill",
+            change: format!(
+                "kill {} {} listening on ports {start}-{end}",
+                candidates.len(),
+                if candidates.len() == 1 {
+                    "process"
+                } else {
+                    "processes"
+                }
+            ),
+            help: "Check them with `lpm ports list --all`, then run it again with `--yes`. It asks only in an interactive terminal, and never with `--json`.",
+        });
     }
 
     let confirmed = cliclack::confirm(format!(

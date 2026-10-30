@@ -38,29 +38,75 @@ fn refuses_the_token(error: &LpmError) -> bool {
     )
 }
 
-/// The second factor an lpm.dev publish sends: `provided_otp`, checked, or,
-/// for an account with 2FA on, one asked for, which `--json` can't do. Reads
-/// the account through whoami, which also checks the token.
-pub(super) async fn resolve_lpm_otp(
+/// The second factor an lpm.dev publish sends.
+pub(super) enum LpmSecondFactor {
+    /// The account has no 2FA and no code was given.
+    None,
+    /// The code `--otp` gave, checked.
+    Code(String),
+    /// A code to ask for just before the publish request, so a long upload
+    /// doesn't outlast it.
+    Ask,
+    /// The account has a passkey, which the terminal can't confirm: the
+    /// publish goes without a code, and the user approves it in the browser
+    /// when lpm.dev asks.
+    Browser,
+}
+
+impl LpmSecondFactor {
+    /// The code to send, asking for it now if it's one to ask for.
+    pub(super) fn code(self) -> Result<Option<String>, LpmError> {
+        match self {
+            Self::None | Self::Browser => Ok(None),
+            Self::Code(code) => Ok(Some(code)),
+            Self::Ask => {
+                install_ui::settle_spinner();
+                cliclack::input("Enter 2FA code")
+                    .validate(|input: &String| {
+                        if is_valid_otp(input) {
+                            Ok(())
+                        } else {
+                            Err("Must be a 6-digit code")
+                        }
+                    })
+                    .interact()
+                    .map_prompt_err(|e| LpmError::Registry(e.to_string()))
+                    .map(Some)
+            }
+        }
+    }
+}
+
+/// The second factor an lpm.dev publish sends: `provided_otp`, checked, and
+/// refused from an account whose only second factor is a passkey; for an
+/// account with a passkey, a browser approval; or, for an account with an
+/// authenticator app, a code to ask for. `--json` can do neither of the last
+/// two. Reads the account through whoami, which also checks the token.
+pub(super) async fn lpm_second_factor(
     client: &RegistryClient,
     provided_otp: Option<&str>,
     json_output: bool,
     whoami_cache: Option<&tokio::sync::OnceCell<lpm_registry::WhoamiResponse>>,
-) -> Result<Option<String>, OtpFailure> {
+) -> Result<LpmSecondFactor, OtpFailure> {
     if provided_otp.is_some_and(|code| !is_valid_otp(code)) {
         return Err(OtpFailure::Final(LpmError::Registry(
             "--otp must be exactly six ASCII digits".into(),
         )));
     }
+    let second_factors =
+        |account: &lpm_registry::WhoamiResponse| (account.mfa_enabled, account.passkey_enabled);
     let whoami = match whoami_cache {
         Some(cache) => cache
             .get_or_try_init(|| client.whoami())
             .await
-            .map(|account| account.mfa_enabled),
-        None => client.whoami().await.map(|account| account.mfa_enabled),
+            .map(second_factors),
+        None => client
+            .whoami()
+            .await
+            .map(|account| second_factors(&account)),
     };
-    let mfa_enabled = match whoami {
-        Ok(mfa_enabled) => mfa_enabled,
+    let (mfa_enabled, passkey_enabled) = match whoami {
+        Ok(second_factors) => second_factors,
         Err(error) => {
             let refused = refuses_the_token(&error);
             let error = LpmError::Registry(format!("authentication failed: {error}"));
@@ -72,29 +118,38 @@ pub(super) async fn resolve_lpm_otp(
         }
     };
 
+    let authenticator = mfa_enabled == Some(true);
+    let passkey = passkey_enabled == Some(true);
     if let Some(code) = provided_otp {
-        return Ok(Some(code.to_owned()));
+        // lpm.dev ignores a code from an account without an authenticator
+        // and asks for a browser approval at the upload, after the other
+        // targets have published.
+        if passkey && !authenticator {
+            return Err(OtpFailure::Final(LpmError::Registry(
+                "--otp needs an authenticator app, and this account has none — it approves publishes in the browser with its passkey; run without --otp".into(),
+            )));
+        }
+        return Ok(LpmSecondFactor::Code(code.to_owned()));
     }
-    if mfa_enabled != Some(true) {
-        return Ok(None);
+    if passkey {
+        if json_output {
+            return Err(OtpFailure::Final(LpmError::Registry(if authenticator {
+                "2FA required in JSON mode — pass --otp <code>, approve in the browser without --json, or use trusted publishing".into()
+            } else {
+                "2FA required in JSON mode — this account approves publishes in the browser with its passkey; run without --json or use trusted publishing".into()
+            })));
+        }
+        return Ok(LpmSecondFactor::Browser);
+    }
+    if !authenticator {
+        return Ok(LpmSecondFactor::None);
     }
     if json_output {
         return Err(OtpFailure::Final(LpmError::Registry(
-            "2FA required in JSON mode — pass --otp <code> or use a CI token".into(),
+            "2FA required in JSON mode — pass --otp <code> or use trusted publishing".into(),
         )));
     }
-    let code: String = cliclack::input("Enter 2FA code")
-        .validate(|input: &String| {
-            if is_valid_otp(input) {
-                Ok(())
-            } else {
-                Err("Must be a 6-digit code")
-            }
-        })
-        .interact()
-        .map_prompt_err(|e| LpmError::Registry(e.to_string()))
-        .map_err(OtpFailure::Final)?;
-    Ok(Some(code))
+    Ok(LpmSecondFactor::Ask)
 }
 
 /// Publish to the LPM registry (existing behavior).
@@ -124,9 +179,8 @@ pub(super) async fn publish_to_lpm(
         ));
     }
 
-    let otp_code = resolve_lpm_otp(client, provided_otp, json_output, whoami_cache).await?;
+    let second_factor = lpm_second_factor(client, provided_otp, json_output, whoami_cache).await?;
 
-    let payload = publish_common::prepare_base64_json_publish_body(body.prefix()?, tarball_data)?;
     let published_integrity = body
         .version_data
         .get("dist")
@@ -136,18 +190,88 @@ pub(super) async fn publish_to_lpm(
             LpmError::Registry("prepared publish metadata is missing dist.integrity".into())
         })?;
 
+    // The tarball goes to storage first and the publish names its upload,
+    // so lpm.dev's limit on a request's body bounds only the metadata. A
+    // registry that takes no uploads gets the tarball inline, as before.
+    let uploaded;
+    let inline;
+    let payload = match client
+        .create_publish_upload(
+            body.name,
+            body.version,
+            tarball_data.len() as u64,
+            published_integrity,
+        )
+        .await?
+    {
+        Some(upload) => {
+            if !upload.stored {
+                client.upload_publish_tarball(&upload, tarball_data).await?;
+            }
+            uploaded = lpm_http::ReplayableRequestBody::from_bytes(
+                body.payload(&upload.id, tarball_data.len())?,
+            );
+            &uploaded
+        }
+        None => {
+            inline = body.inline_body(tarball_data)?;
+            let max = publish_common::MAX_LPM_REGISTRY_BODY_BYTES;
+            if inline.len() > max {
+                return Err(LpmError::Registry(format!(
+                    "{} doesn't take tarball uploads, and a publish request carrying the tarball would be {} (max {})",
+                    lpm_common::sanitize_terminal_inline(registry_url),
+                    lpm_common::format_bytes_past(inline.len()),
+                    lpm_common::format_bytes(max),
+                )));
+            }
+            inline.replayable()
+        }
+    };
+    let otp_code = second_factor.code()?;
+
     let encoded_name = urlencoding::encode(body.name);
-    client
+    match client
         .publish_package(
             &encoded_name,
             body.version,
             published_integrity,
-            payload.replayable(),
+            payload,
             otp_code.as_deref(),
             tarball_data.len(),
         )
         .await
+    {
+        Err(LpmError::BrowserApprovalRequired {
+            auth_url, done_url, ..
+        }) if !json_output => {
+            let token = crate::commands::web_auth::complete_lpm_browser_approval(
+                &auth_url,
+                &done_url,
+                registry_url,
+                &format!(
+                    "publish {}@{}",
+                    lpm_common::sanitize_terminal_inline(body.name),
+                    lpm_common::sanitize_terminal_inline(body.version)
+                ),
+            )
+            .await?;
+            client
+                .publish_approved_package(
+                    &encoded_name,
+                    body.version,
+                    published_integrity,
+                    payload,
+                    &token,
+                    tarball_data.len(),
+                )
+                .await
+        }
+        result => result,
+    }
 }
+
+/// The length of an upload's id, which the Registry gives as a UUID.
+const UPLOAD_ID_LEN: usize = 36;
 
 /// What an lpm.dev publish request carries, but its tarball.
 pub(super) struct LpmPublishBody<'a> {
@@ -164,8 +288,29 @@ pub(super) struct LpmPublishBody<'a> {
 }
 
 impl LpmPublishBody<'_> {
-    /// The request's JSON up to the tarball's base64.
-    fn prefix(&self) -> Result<Vec<u8>, LpmError> {
+    /// The request's JSON, naming the upload `upload_id` of a tarball of
+    /// `tarball_len` bytes.
+    fn payload(&self, upload_id: &str, tarball_len: usize) -> Result<Vec<u8>, LpmError> {
+        self.json(LpmAttachment::Uploaded(LpmUploadedAttachment {
+            content_type: "application/gzip",
+            length: tarball_len,
+            upload_id,
+        }))
+    }
+
+    /// The request carrying `tarball` inline in base64, for a registry that
+    /// takes no uploads.
+    fn inline_body(
+        &self,
+        tarball: &std::sync::Arc<Vec<u8>>,
+    ) -> Result<publish_common::PreparedPublishBody, LpmError> {
+        publish_common::prepare_base64_json_publish_body(
+            self.json(LpmAttachment::InlineData)?,
+            tarball,
+        )
+    }
+
+    fn json(&self, attachment: LpmAttachment<'_>) -> Result<Vec<u8>, LpmError> {
         let tarball_key = format!(
             "{}-{}.tgz",
             self.name.replace('/', "-").replace('@', ""),
@@ -185,20 +330,22 @@ impl LpmPublishBody<'_> {
             detected_ecosystem: self.detected_ecosystem,
             swift_metadata: swift_metadata.as_ref(),
         };
-        build_lpm_publish_payload_prefix(LpmPublishPayload {
+        build_lpm_publish_payload(LpmPublishPayload {
             name: self.name,
             version: self.version,
             readme: self.readme,
             detected_ecosystem: self.detected_ecosystem,
             lpm_version: &lpm_version,
             tarball_key: &tarball_key,
+            attachment,
         })
     }
 
-    /// The length of the request that carries a tarball of `tarball_len`
-    /// bytes, as `publish_to_lpm` sends it.
+    /// The length of the request `publish_to_lpm` sends for a tarball of
+    /// `tarball_len` bytes, known before its upload opens.
     pub(super) fn len_with(&self, tarball_len: usize) -> Result<u64, LpmError> {
-        publish_common::base64_json_publish_body_len(self.prefix()?.len(), tarball_len)
+        let placeholder = "0".repeat(UPLOAD_ID_LEN);
+        Ok(self.payload(&placeholder, tarball_len)?.len() as u64)
     }
 }
 
@@ -356,6 +503,23 @@ struct LpmPublishPayload<'a> {
     detected_ecosystem: &'a str,
     lpm_version: &'a LpmVersionPayload<'a>,
     tarball_key: &'a str,
+    attachment: LpmAttachment<'a>,
+}
+
+/// The publish's attachment.
+enum LpmAttachment<'a> {
+    /// The tarball's upload in place of its data.
+    Uploaded(LpmUploadedAttachment<'a>),
+    /// The tarball's data, which the JSON stops at the start of, for the
+    /// body to stream its base64 and close.
+    InlineData,
+}
+
+#[derive(serde::Serialize)]
+struct LpmUploadedAttachment<'a> {
+    content_type: &'a str,
+    length: usize,
+    upload_id: &'a str,
 }
 
 struct LpmVersions<'a> {
@@ -374,13 +538,13 @@ impl serde::Serialize for LpmVersions<'_> {
     }
 }
 
-fn build_lpm_publish_payload_prefix(input: LpmPublishPayload<'_>) -> Result<Vec<u8>, LpmError> {
-    let mut prefix = Vec::with_capacity(64 * 1024);
-    prefix.write_all(b"{").map_err(LpmError::Io)?;
-    write_lpm_json_member(&mut prefix, "_id", input.name, true)?;
-    write_lpm_json_member(&mut prefix, "name", input.name, false)?;
+fn build_lpm_publish_payload(input: LpmPublishPayload<'_>) -> Result<Vec<u8>, LpmError> {
+    let mut payload = Vec::with_capacity(64 * 1024);
+    payload.write_all(b"{").map_err(LpmError::Io)?;
+    write_lpm_json_member(&mut payload, "_id", input.name, true)?;
+    write_lpm_json_member(&mut payload, "name", input.name, false)?;
     write_lpm_json_member(
-        &mut prefix,
+        &mut payload,
         "description",
         input
             .lpm_version
@@ -389,16 +553,16 @@ fn build_lpm_publish_payload_prefix(input: LpmPublishPayload<'_>) -> Result<Vec<
             .unwrap_or(&serde_json::Value::Null),
         false,
     )?;
-    write_lpm_json_member(&mut prefix, "readme", &input.readme, false)?;
-    write_lpm_json_member(&mut prefix, "_ecosystem", input.detected_ecosystem, false)?;
+    write_lpm_json_member(&mut payload, "readme", &input.readme, false)?;
+    write_lpm_json_member(&mut payload, "_ecosystem", input.detected_ecosystem, false)?;
     write_lpm_json_member(
-        &mut prefix,
+        &mut payload,
         "dist-tags",
         &serde_json::json!({"latest": input.version}),
         false,
     )?;
     write_lpm_json_member(
-        &mut prefix,
+        &mut payload,
         "versions",
         &LpmVersions {
             version: input.version,
@@ -406,14 +570,21 @@ fn build_lpm_publish_payload_prefix(input: LpmPublishPayload<'_>) -> Result<Vec<
         },
         false,
     )?;
-    prefix
+    payload
         .write_all(b",\"_attachments\":{")
         .map_err(LpmError::Io)?;
-    serde_json::to_writer(&mut prefix, input.tarball_key).map_err(publish_serialization_error)?;
-    prefix
-        .write_all(b":{\"content_type\":\"application/gzip\",\"data\":\"")
-        .map_err(LpmError::Io)?;
-    Ok(prefix)
+    serde_json::to_writer(&mut payload, input.tarball_key).map_err(publish_serialization_error)?;
+    payload.write_all(b":").map_err(LpmError::Io)?;
+    match &input.attachment {
+        LpmAttachment::Uploaded(attachment) => {
+            serde_json::to_writer(&mut payload, attachment).map_err(publish_serialization_error)?;
+            payload.write_all(b"}}").map_err(LpmError::Io)?;
+        }
+        LpmAttachment::InlineData => payload
+            .write_all(b"{\"content_type\":\"application/gzip\",\"data\":\"")
+            .map_err(LpmError::Io)?,
+    }
+    Ok(payload)
 }
 
 fn write_lpm_json_member<T: serde::Serialize + ?Sized>(
@@ -467,8 +638,55 @@ fn is_valid_otp(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        LpmPackMetadata, LpmVersionPayload, is_valid_otp, lpm_publish_transport_is_allowed,
+        LpmPackMetadata, LpmPublishBody, LpmSecondFactor, LpmVersionPayload, OtpFailure,
+        RegistryClient, is_valid_otp, lpm_publish_transport_is_allowed, lpm_second_factor,
+        publish_to_lpm,
     };
+
+    #[test]
+    fn lpm_publish_payload_names_the_upload_in_place_of_the_tarball() {
+        let version_data = serde_json::json!({
+            "name": "@lpm.dev/owner.pkg",
+            "version": "1.0.0",
+            "dist": { "integrity": "sha512-abc" },
+        });
+        let files = [crate::commands::publish_common::TarballFile {
+            path: "package.json".into(),
+            size: 10,
+        }];
+        let body = LpmPublishBody {
+            name: "@lpm.dev/owner.pkg",
+            version: "1.0.0",
+            readme: Some("# Pkg"),
+            version_data: &version_data,
+            tarball_files: &files,
+            package_json_size_override: None,
+            quality_result: None,
+            lpm_config: None,
+            detected_ecosystem: "js",
+            swift_manifest: None,
+        };
+        let upload_id = "11111111-1111-4111-8111-111111111111";
+
+        let bytes = body.payload(upload_id, 4096).unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(
+            payload["_attachments"],
+            serde_json::json!({
+                "lpm.dev-owner.pkg-1.0.0.tgz": {
+                    "content_type": "application/gzip",
+                    "length": 4096,
+                    "upload_id": upload_id,
+                }
+            })
+        );
+        assert_eq!(
+            payload["versions"]["1.0.0"]["dist"]["integrity"],
+            "sha512-abc"
+        );
+        assert_eq!(body.len_with(4096).unwrap(), bytes.len() as u64);
+    }
 
     #[test]
     fn lpm_pack_metadata_serializes_borrowed_files_with_the_manifest_size_override() {
@@ -538,6 +756,201 @@ mod tests {
                 "unexpected rejected registry: {registry}"
             );
         }
+    }
+
+    fn whoami_with_mfa(mfa_enabled: bool) -> tokio::sync::OnceCell<lpm_registry::WhoamiResponse> {
+        tokio::sync::OnceCell::new_with(Some(
+            serde_json::from_value(serde_json::json!({ "mfa_enabled": mfa_enabled })).unwrap(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn lpm_second_factor_leaves_a_2fa_code_to_ask_for_at_the_publish_request() {
+        let whoami = whoami_with_mfa(true);
+
+        let factor = lpm_second_factor(&RegistryClient::new(), None, false, Some(&whoami)).await;
+
+        assert!(matches!(factor, Ok(LpmSecondFactor::Ask)));
+    }
+
+    #[tokio::test]
+    async fn lpm_second_factor_sends_a_given_code_or_none_without_2fa() {
+        let with_2fa = whoami_with_mfa(true);
+        let without_2fa = whoami_with_mfa(false);
+        let client = RegistryClient::new();
+
+        let given = lpm_second_factor(&client, Some("123456"), true, Some(&with_2fa)).await;
+        let none = lpm_second_factor(&client, None, true, Some(&without_2fa)).await;
+
+        assert!(matches!(given, Ok(LpmSecondFactor::Code(code)) if code == "123456"));
+        assert!(matches!(none, Ok(LpmSecondFactor::None)));
+    }
+
+    fn whoami_with(
+        mfa_enabled: bool,
+        passkey_enabled: bool,
+    ) -> tokio::sync::OnceCell<lpm_registry::WhoamiResponse> {
+        tokio::sync::OnceCell::new_with(Some(
+            serde_json::from_value(serde_json::json!({
+                "mfa_enabled": mfa_enabled,
+                "passkey_enabled": passkey_enabled,
+            }))
+            .unwrap(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn lpm_second_factor_approves_a_passkey_account_in_the_browser() {
+        for mfa_enabled in [false, true] {
+            let whoami = whoami_with(mfa_enabled, true);
+
+            let factor =
+                lpm_second_factor(&RegistryClient::new(), None, false, Some(&whoami)).await;
+
+            assert!(matches!(factor, Ok(LpmSecondFactor::Browser)));
+        }
+    }
+
+    #[tokio::test]
+    async fn lpm_second_factor_sends_a_given_code_from_a_passkey_account() {
+        let whoami = whoami_with(true, true);
+
+        let factor =
+            lpm_second_factor(&RegistryClient::new(), Some("123456"), true, Some(&whoami)).await;
+
+        assert!(matches!(factor, Ok(LpmSecondFactor::Code(code)) if code == "123456"));
+    }
+
+    #[tokio::test]
+    async fn lpm_second_factor_refuses_a_code_from_an_account_with_only_a_passkey() {
+        for json_output in [false, true] {
+            let whoami = whoami_with(false, true);
+
+            let factor = lpm_second_factor(
+                &RegistryClient::new(),
+                Some("123456"),
+                json_output,
+                Some(&whoami),
+            )
+            .await;
+
+            assert!(matches!(
+                factor,
+                Err(OtpFailure::Final(error)) if error.to_string().contains("--otp needs an authenticator app")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn lpm_second_factor_refuses_json_output_for_a_passkey_account() {
+        let whoami = whoami_with(false, true);
+
+        let factor = lpm_second_factor(&RegistryClient::new(), None, true, Some(&whoami)).await;
+
+        assert!(matches!(
+            factor,
+            Err(OtpFailure::Final(error)) if error.to_string().contains("approves publishes in the browser")
+        ));
+    }
+
+    #[tokio::test]
+    async fn publish_to_lpm_retries_with_the_token_of_a_browser_approval() {
+        use wiremock::matchers::{header, header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let name = "@lpm.dev/acme.widgets";
+        let encoded = format!("/api/registry/{}", urlencoding::encode(name));
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/package/uploads"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(encoded.as_str()))
+            .and(header_exists("x-lpm-approval"))
+            .and(header("x-lpm-approval", "approval-token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "success": true })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(encoded.as_str()))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": "Approve this publish in your browser with your passkey.",
+                "code": "OTP_REQUIRED",
+                "authUrl": format!("{}/cli/approve/approval-1", server.uri()),
+                "doneUrl": format!("{}/done", server.uri()),
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/done"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "token": "approval-token" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("session-token");
+        let version_data = serde_json::json!({
+            "name": name,
+            "version": "1.0.0",
+            "dist": { "integrity": "sha512-test" },
+        });
+        let body = LpmPublishBody {
+            name,
+            version: "1.0.0",
+            readme: None,
+            version_data: &version_data,
+            tarball_files: &[],
+            package_json_size_override: None,
+            quality_result: None,
+            lpm_config: None,
+            detected_ecosystem: "js",
+            swift_manifest: None,
+        };
+        let whoami = whoami_with(false, true);
+
+        let published = publish_to_lpm(
+            &client,
+            body,
+            &std::sync::Arc::new(b"tarball".to_vec()),
+            None,
+            false,
+            Some(&whoami),
+        )
+        .await
+        .expect("the approved publish succeeds");
+
+        assert_eq!(published["success"], true);
+        let puts = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.method.as_str() == "PUT")
+            .count();
+        assert_eq!(puts, 2);
+    }
+
+    #[tokio::test]
+    async fn lpm_second_factor_refuses_json_output_that_would_need_a_code() {
+        let whoami = whoami_with_mfa(true);
+
+        let factor = lpm_second_factor(&RegistryClient::new(), None, true, Some(&whoami)).await;
+
+        assert!(matches!(
+            factor,
+            Err(OtpFailure::Final(error)) if error.to_string().contains("2FA required in JSON mode")
+        ));
     }
 
     #[test]

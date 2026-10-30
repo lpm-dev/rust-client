@@ -432,18 +432,23 @@ pub(crate) fn listed_in(name: &str, listed: &[&str]) -> bool {
 
 /// Maximum size of the complete uncompressed tar stream, including headers,
 /// padding, metadata, and end markers.
-pub(crate) const MAX_UNCOMPRESSED_TARBALL_BYTES: u64 = 500 * 1024 * 1024;
+pub(crate) const MAX_UNCOMPRESSED_TARBALL_BYTES: u64 = 1024 * 1024 * 1024;
 
 pub(crate) const MAX_COMPRESSED_TARBALL_BYTES: u64 = 500 * 1024 * 1024;
 
 /// The LPM registry's limit for a compressed tarball, below the local one,
 /// checked before any target publishes so a larger one fails up front.
-pub(crate) const MAX_LPM_REGISTRY_TARBALL_BYTES: u64 = 100 * 1024 * 1024;
+pub(crate) const MAX_LPM_REGISTRY_TARBALL_BYTES: u64 = 250 * 1024 * 1024;
 
-/// The LPM registry's limit for a publish request's body, which carries the
-/// tarball in base64 with the package's metadata, checked before any target
-/// publishes too.
-pub(crate) const MAX_LPM_REGISTRY_BODY_BYTES: u64 = 150 * 1024 * 1024;
+/// The LPM registry's limit on a tarball's files, below the local one,
+/// checked before any target publishes so a tarball isn't uploaded only to
+/// be refused for it.
+pub(crate) const MAX_LPM_REGISTRY_ARCHIVE_FILES: usize = 20_000;
+
+/// lpm.dev's limit on a request's body, which a publish request's metadata
+/// must fit, checked before any target publishes too. LPM CLI uploads the
+/// tarball apart from it.
+pub(crate) const MAX_LPM_REGISTRY_BODY_BYTES: u64 = 100 * 1024 * 1024;
 
 pub(crate) const MAX_PUBLISH_ARCHIVE_ENTRIES: usize = 100_000;
 
@@ -3907,24 +3912,6 @@ pub(crate) fn prepare_json_publish_body(
     Ok(PreparedPublishBody { body })
 }
 
-/// The length of the body `prepare_base64_json_publish_body` makes from a
-/// prefix of `prefix_len` bytes and a tarball of `tarball_len`, without
-/// reading the tarball.
-pub(crate) fn base64_json_publish_body_len(
-    prefix_len: usize,
-    tarball_len: usize,
-) -> Result<u64, LpmError> {
-    let mut suffix = Vec::with_capacity(64);
-    write_json_publish_payload_suffix(&mut suffix, tarball_len, None)?;
-    tarball_len
-        .div_ceil(3)
-        .checked_mul(4)
-        .and_then(|encoded| encoded.checked_add(prefix_len))
-        .and_then(|length| length.checked_add(suffix.len()))
-        .and_then(|length| u64::try_from(length).ok())
-        .ok_or_else(|| LpmError::Registry("publish request body length overflow".into()))
-}
-
 pub(crate) fn prepare_base64_json_publish_body(
     prefix: Vec<u8>,
     tarball_data: &std::sync::Arc<Vec<u8>>,
@@ -4192,23 +4179,6 @@ pub(crate) fn ntfs_short_name(path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn base64_json_publish_body_len_is_the_prepared_body_s() {
-        for tarball_len in [0, 1, 2, 3, 4, 1000] {
-            let prefix = b"{\"_attachments\":{\"a.tgz\":{\"data\":\"".to_vec();
-            let prefix_len = prefix.len();
-            let tarball = std::sync::Arc::new(vec![7_u8; tarball_len]);
-
-            let prepared = prepare_base64_json_publish_body(prefix, &tarball).unwrap();
-
-            assert_eq!(
-                base64_json_publish_body_len(prefix_len, tarball_len).unwrap(),
-                prepared.len(),
-                "{tarball_len}"
-            );
-        }
-    }
-
     use super::*;
 
     fn build_test_npm_payload(
