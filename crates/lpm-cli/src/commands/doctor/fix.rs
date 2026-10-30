@@ -68,10 +68,15 @@ pub(super) fn confirm_before_apply(
         return Ok(true);
     }
     if json_output || !std::io::stdin().is_terminal() {
-        return Err(LpmError::Script(
-            "Automatic fixes require confirmation. Pass `--yes` in a non-interactive session."
-                .into(),
-        ));
+        return Err(LpmError::ConfirmationRequired {
+            command: "lpm doctor",
+            change: format!(
+                "apply {} automatic {}",
+                actions.len(),
+                if actions.len() == 1 { "fix" } else { "fixes" }
+            ),
+            help: "Review what it fixes with `lpm doctor`, then run it again with `--fix --yes`. It asks only in an interactive terminal, and never with `--json`.",
+        });
     }
 
     install_ui::phase("Planned auto-fix actions");

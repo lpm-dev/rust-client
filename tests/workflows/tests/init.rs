@@ -33,6 +33,38 @@ fn blank_project_dir() -> TempProject {
 }
 
 #[tokio::test]
+async fn init_without_yes_or_a_terminal_needs_confirmation_and_writes_nothing() {
+    let project = blank_project_dir();
+    let mock = MockRegistry::start().await;
+
+    for json in [true, false] {
+        let mut command = lpm_with_registry(&project, &mock.url());
+        command.arg("init");
+        if json {
+            command.arg("--json");
+        }
+        let output = command.output().expect("failed to run lpm init");
+
+        assert!(
+            !output.status.success(),
+            "lpm init must refuse without --yes"
+        );
+        if json {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let envelope: serde_json::Value = serde_json::from_str(&stdout)
+                .unwrap_or_else(|error| panic!("--json must print JSON: {error}\n{stdout}"));
+            assert_eq!(envelope["error_code"], "confirmation_required");
+            assert_eq!(envelope["error"]["command"], "lpm init");
+        } else {
+            let stderr = strip_ansi(&String::from_utf8_lossy(&output.stderr));
+            assert!(stderr.contains("Confirmation required"), "{stderr}");
+            assert!(stderr.contains("create package.json"), "{stderr}");
+        }
+        assert!(!project.path().join("package.json").exists());
+    }
+}
+
+#[tokio::test]
 async fn init_yes_human_output_uses_slim_success() {
     let project = blank_project_dir();
     let mock = MockRegistry::start().await;

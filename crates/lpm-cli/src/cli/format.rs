@@ -378,8 +378,7 @@ fn json_error_value(error: &lpm_common::LpmError) -> serde_json::Value {
             }
         }),
         lpm_common::LpmError::OtpRequired { command }
-        | lpm_common::LpmError::OtpInvalid { command }
-        | lpm_common::LpmError::ConfirmationRequired { command } => serde_json::json!({
+        | lpm_common::LpmError::OtpInvalid { command } => serde_json::json!({
             "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
             "success": false,
             "error_code": error.error_code(),
@@ -387,6 +386,17 @@ fn json_error_value(error: &lpm_common::LpmError) -> serde_json::Value {
                 "code": error.error_code().to_ascii_uppercase(),
                 "message": error.to_string(),
                 "command": command,
+            }
+        }),
+        lpm_common::LpmError::ConfirmationRequired { command, help, .. } => serde_json::json!({
+            "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
+            "success": false,
+            "error_code": error.error_code(),
+            "error": {
+                "code": error.error_code().to_ascii_uppercase(),
+                "message": error.to_string(),
+                "command": command,
+                "help": help,
             }
         }),
         lpm_common::LpmError::TyposquatSuspected(context) => serde_json::json!({
@@ -760,11 +770,14 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             push_diagnostic_help(&mut lines, error);
             lines
         }
-        lpm_common::LpmError::ConfirmationRequired { command } => {
+        lpm_common::LpmError::ConfirmationRequired {
+            command, change, ..
+        } => {
             let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
                 "Confirmation required",
             ))];
             push_detail(&mut lines, "command", install_ui::yellow(command));
+            push_detail(&mut lines, "change", install_ui::field(change));
             push_diagnostic_help(&mut lines, error);
             lines
         }

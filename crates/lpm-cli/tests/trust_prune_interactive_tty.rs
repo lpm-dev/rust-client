@@ -219,7 +219,7 @@ mod tty {
         let (status, transcript, response_sent) = collect_until_exit(
             &mut child,
             &mut master,
-            Some((b"Remove 1 stale entry/entries from package.json?", b"y\r")),
+            Some((b"Remove 1 stale trust entry from package.json?", b"y\r")),
         );
         let transcript = common::strip_ansi(&transcript);
 

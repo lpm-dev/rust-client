@@ -296,16 +296,20 @@ fn confirm_hosts_file_clean(
         return Ok(());
     }
     if !std::io::stdin().is_terminal() {
-        return Err(LpmError::Script(format!(
-            "non-interactive shell: pass `--yes` to consent to removing {} LPM-managed hosts file {} from {}",
-            plan.block_count,
-            if plan.block_count == 1 {
-                "block"
-            } else {
-                "blocks"
-            },
-            plan.path.display()
-        )));
+        return Err(LpmError::ConfirmationRequired {
+            command: "lpm hosts clean",
+            change: format!(
+                "remove {} LPM-managed hosts file {} from {}",
+                plan.block_count,
+                if plan.block_count == 1 {
+                    "block"
+                } else {
+                    "blocks"
+                },
+                plan.path.display()
+            ),
+            help: "Run it in an interactive terminal to be asked first, or run it again with `--yes`.",
+        });
     }
 
     println!();

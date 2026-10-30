@@ -63,9 +63,9 @@ fn hosts_clean_aborts_non_interactive_without_yes_before_mutation() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("non-interactive shell: pass `--yes` to consent")
-            && stderr.contains("to removing 1")
-            && stderr.contains("LPM-managed hosts file block"),
+        stderr.contains("Confirmation required")
+            && stderr.contains("lpm hosts clean")
+            && stderr.contains("remove 1 LPM-managed hosts file block from"),
         "stderr should explain the consent requirement, got:\n{stderr}"
     );
     assert_eq!(

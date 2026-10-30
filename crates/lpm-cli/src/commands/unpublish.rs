@@ -90,7 +90,11 @@ fn confirmed(target: &ReleaseTarget, yes: bool, json_output: bool) -> Result<boo
         return Ok(true);
     }
     if json_output || !crate::commands::web_auth::terminal_is_interactive() {
-        return Err(LpmError::ConfirmationRequired { command: COMMAND });
+        return Err(LpmError::ConfirmationRequired {
+            command: COMMAND,
+            change: format!("unpublish {target}"),
+            help: "Check the version, then run it again with `--yes`. It asks only in an interactive terminal, and never with `--json`.",
+        });
     }
     cliclack::confirm(crate::prompt::untrusted(format!(
         "Unpublish {target}? This can't be undone."

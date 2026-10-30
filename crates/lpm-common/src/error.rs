@@ -444,16 +444,17 @@ pub enum LpmError {
     )]
     OtpInvalid { command: &'static str },
 
-    /// A command that asks before it makes a change it can't undo has no
-    /// terminal to ask in, or runs with `--json`, and wasn't given `--yes`.
-    #[error("`{command}` needs `--yes` to run without a confirmation prompt")]
-    #[diagnostic(
-        code(lpm::confirmation_required),
-        help(
-            "Check what the command changes, then run it again with `--yes`. It asks only in an interactive terminal, and never with `--json`."
-        )
-    )]
-    ConfirmationRequired { command: &'static str },
+    /// A command that asks before it makes a change ran without a terminal
+    /// to ask in, or with `--json`, and without `--yes`. It changed nothing.
+    #[error("`{command}` needs `--yes` to {change} without asking")]
+    #[diagnostic(code(lpm::confirmation_required), help("{help}"))]
+    ConfirmationRequired {
+        command: &'static str,
+        /// What the command would do, as in `unpublish @lpm.dev/acme.kit@1.2.3`.
+        change: String,
+        /// What to check, or run instead, before passing `--yes`.
+        help: &'static str,
+    },
 
     #[error("forbidden: {0}")]
     #[diagnostic(
@@ -1053,6 +1054,23 @@ mod tests {
     }
 
     #[test]
+    fn confirmation_required_names_the_change_and_what_to_do_instead() {
+        let error = LpmError::ConfirmationRequired {
+            command: "lpm ports kill",
+            change: "kill 2 processes listening on ports 3000-3001".into(),
+            help: "Check them with `lpm ports`, then run it again with `--yes`.",
+        };
+        assert_eq!(
+            error.to_string(),
+            "`lpm ports kill` needs `--yes` to kill 2 processes listening on ports 3000-3001 without asking"
+        );
+        assert_eq!(
+            error.help().unwrap().to_string(),
+            "Check them with `lpm ports`, then run it again with `--yes`."
+        );
+    }
+
+    #[test]
     fn script_error_unchanged() {
         let err = LpmError::Script("build failed".to_string());
         assert_eq!(err.to_string(), "script error: build failed");
@@ -1106,6 +1124,8 @@ mod tests {
             },
             LpmError::ConfirmationRequired {
                 command: "lpm unpublish",
+                change: "unpublish @lpm.dev/acme.kit@1.2.3".into(),
+                help: "Check the version.",
             },
             LpmError::BrowserApprovalRequired {
                 action: "publish".into(),
@@ -1294,6 +1314,8 @@ mod tests {
         assert_eq!(
             LpmError::ConfirmationRequired {
                 command: "lpm unpublish",
+                change: "unpublish @lpm.dev/acme.kit@1.2.3".into(),
+                help: "Check the version.",
             }
             .error_code(),
             "confirmation_required"
