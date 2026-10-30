@@ -2569,10 +2569,54 @@ fn tunnel_entry_time(ts: &str) -> &str {
 }
 
 fn style_http_method_fragment(method: &str) -> install_ui::TerminalFragment {
-    match method {
-        "GET" => install_ui::url(method),
-        "POST" => install_ui::yellow(method),
-        _ => install_ui::field(method),
+    HttpTone::of_method(method).paint(method)
+}
+
+/// The color a method or status class shows in, matching the browser
+/// inspector's so a 304 stands apart from a 200 in both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpTone {
+    Green,
+    Blue,
+    Cyan,
+    Yellow,
+    Magenta,
+    Red,
+    Dim,
+}
+
+impl HttpTone {
+    fn of_method(method: &str) -> Self {
+        match method {
+            "GET" => Self::Green,
+            "POST" => Self::Blue,
+            "PUT" => Self::Yellow,
+            "PATCH" => Self::Magenta,
+            "DELETE" => Self::Red,
+            _ => Self::Dim,
+        }
+    }
+
+    fn of_status(status: u16) -> Self {
+        match status / 100 {
+            2 => Self::Green,
+            3 => Self::Cyan,
+            4 => Self::Yellow,
+            5 => Self::Red,
+            _ => Self::Dim,
+        }
+    }
+
+    fn paint(self, text: &str) -> install_ui::TerminalFragment {
+        match self {
+            Self::Green => install_ui::status_ok(text),
+            Self::Blue => install_ui::url(text),
+            Self::Cyan => install_ui::cyan(text),
+            Self::Yellow => install_ui::yellow(text),
+            Self::Magenta => install_ui::magenta(text),
+            Self::Red => install_ui::red(text),
+            Self::Dim => install_ui::dim(text),
+        }
     }
 }
 
@@ -2585,12 +2629,7 @@ fn style_http_status(status: u16) -> String {
 }
 
 fn style_http_status_fragment(status: u16) -> install_ui::TerminalFragment {
-    let status = status.to_string();
-    match status.as_bytes().first() {
-        Some(b'2') | Some(b'3') => install_ui::status_ok(&status),
-        Some(b'4') | Some(b'5') => install_ui::red(&status),
-        _ => install_ui::yellow(&status),
-    }
+    HttpTone::of_status(status).paint(&status.to_string())
 }
 
 /// Parse a flag with a numeric value from the args list.
@@ -4975,6 +5014,40 @@ mod tests {
         assert_eq!(
             tunnel_limit_summary(Some(&limits)).as_deref(),
             Some("3 tunnels · 20,000/min · 100 MiB body · 3 custom domains · 600/min/IP")
+        );
+    }
+
+    #[test]
+    fn http_tones_tell_each_method_and_status_class_apart() {
+        let statuses = [101, 200, 204, 301, 304, 404, 422, 500, 502].map(HttpTone::of_status);
+        let methods =
+            ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"].map(HttpTone::of_method);
+
+        assert_eq!(
+            statuses,
+            [
+                HttpTone::Dim,
+                HttpTone::Green,
+                HttpTone::Green,
+                HttpTone::Cyan,
+                HttpTone::Cyan,
+                HttpTone::Yellow,
+                HttpTone::Yellow,
+                HttpTone::Red,
+                HttpTone::Red,
+            ]
+        );
+        assert_eq!(
+            methods,
+            [
+                HttpTone::Green,
+                HttpTone::Blue,
+                HttpTone::Yellow,
+                HttpTone::Magenta,
+                HttpTone::Red,
+                HttpTone::Dim,
+                HttpTone::Dim,
+            ]
         );
     }
 
