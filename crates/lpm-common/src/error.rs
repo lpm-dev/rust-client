@@ -413,6 +413,28 @@ pub enum LpmError {
     )]
     OtpRequired { command: &'static str },
 
+    /// The registry asks for the account's second factor as a browser
+    /// approval of this request: `auth_url` is where the user approves it,
+    /// `done_url` where the CLI waits for the one-time token. Only a CLI
+    /// that waits can use the approval, so neither is shown once this is
+    /// reported. `accepts_code` and `has_passkey` say how else the account
+    /// can confirm, so a command can ask for an authenticator code in the
+    /// terminal when the account has no passkey to prefer.
+    #[error("{action} needs your approval in the browser")]
+    #[diagnostic(
+        code(lpm::browser_approval_required),
+        help(
+            "Run the command again without `--json` to approve it in the browser with your passkey or authenticator. With an authenticator app, you can pass a 6-digit code with `--otp <CODE>` instead."
+        )
+    )]
+    BrowserApprovalRequired {
+        action: String,
+        auth_url: String,
+        done_url: String,
+        accepts_code: bool,
+        has_passkey: bool,
+    },
+
     #[error("invalid or expired one-time password for `{command}`")]
     #[diagnostic(
         code(lpm::otp_invalid),
@@ -837,6 +859,7 @@ impl LpmError {
             LpmError::CredentialImportUnavailable { .. } => "credential_import_unavailable",
             LpmError::CredentialImportRejected { .. } => "credential_import_rejected",
             LpmError::OtpRequired { .. } => "otp_required",
+            LpmError::BrowserApprovalRequired { .. } => "browser_approval_required",
             LpmError::OtpInvalid { .. } => "otp_invalid",
             LpmError::Forbidden(_) => "forbidden",
             LpmError::NpmFirewallBlocked { .. } => "npm_firewall_blocked",
@@ -1068,6 +1091,13 @@ mod tests {
             },
             LpmError::OtpInvalid {
                 command: "lpm token-rotate",
+            },
+            LpmError::BrowserApprovalRequired {
+                action: "publish".into(),
+                auth_url: "https://lpm.dev/cli/approve/x".into(),
+                done_url: "https://lpm.dev/api/auth/cli-approvals/x/y".into(),
+                accepts_code: false,
+                has_passkey: true,
             },
             LpmError::Forbidden("x".into()),
             LpmError::NpmFirewallBlocked {

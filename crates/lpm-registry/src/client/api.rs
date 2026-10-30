@@ -663,7 +663,10 @@ impl RegistryClient {
     /// lives inside the closure and runs on each attempt.
     ///
     /// Calls: PUT /api/registry/{encoded_name}
-    /// Optional `otp` header for 2FA-enabled users.
+    /// Optional `otp` header for 2FA-enabled users. When the registry asks
+    /// for the second factor as a browser approval instead, this returns
+    /// `LpmError::BrowserApprovalRequired`; publish again with the token the
+    /// approval gives through `publish_approved_package`.
     ///
     /// Uses publish-safe retry logic (S4): does NOT retry on HTTP 500
     /// (the server may have stored the version before crashing). Only retries
@@ -677,6 +680,49 @@ impl RegistryClient {
         published_integrity: &str,
         payload: &lpm_http::ReplayableRequestBody,
         otp: Option<&str>,
+        tarball_size_bytes: usize,
+    ) -> Result<serde_json::Value, LpmError> {
+        self.send_publish(
+            encoded_name,
+            published_version,
+            published_integrity,
+            payload,
+            otp.map(SecondFactorProof::Code),
+            tarball_size_bytes,
+        )
+        .await
+    }
+
+    /// Publish a package whose second factor the user approved in the
+    /// browser, carrying the approval's one-time token. Otherwise as
+    /// `publish_package`.
+    pub async fn publish_approved_package(
+        &self,
+        encoded_name: &str,
+        published_version: &str,
+        published_integrity: &str,
+        payload: &lpm_http::ReplayableRequestBody,
+        approval_token: &str,
+        tarball_size_bytes: usize,
+    ) -> Result<serde_json::Value, LpmError> {
+        self.send_publish(
+            encoded_name,
+            published_version,
+            published_integrity,
+            payload,
+            Some(SecondFactorProof::Approval(approval_token)),
+            tarball_size_bytes,
+        )
+        .await
+    }
+
+    async fn send_publish(
+        &self,
+        encoded_name: &str,
+        published_version: &str,
+        published_integrity: &str,
+        payload: &lpm_http::ReplayableRequestBody,
+        second_factor: Option<SecondFactorProof<'_>>,
         tarball_size_bytes: usize,
     ) -> Result<serde_json::Value, LpmError> {
         let url = format!("{}/api/registry/{}", self.base_url, encoded_name);
@@ -699,13 +745,15 @@ impl RegistryClient {
                             .put(&url)
                             .header(reqwest::header::CONTENT_TYPE, "application/json")
                             .header(reqwest::header::CONTENT_LENGTH, payload.len())
+                            .header(super::second_factor::BROWSER_APPROVAL_SUPPORT_HEADER, "1")
                             .timeout(timeout)
                             .body(body);
                         if let Some(bearer) = bearer.as_ref() {
                             request = request.bearer_auth(bearer);
                         }
-                        if let Some(code) = otp {
-                            request = request.header("x-otp", code);
+                        if let Some(proof) = second_factor {
+                            let (header, value) = proof.header();
+                            request = request.header(header, value);
                         }
                         Ok(request)
                     },
@@ -726,25 +774,24 @@ impl RegistryClient {
             };
 
             if status.is_success() {
-                Ok(body)
-            } else {
-                let error_msg = body
-                    .get("error")
-                    .and_then(|e| e.as_str())
-                    .unwrap_or("unknown error");
-                let code = body.get("code").and_then(|c| c.as_str()).unwrap_or("");
-
-                Err(LpmError::Registry(format!(
-                    "publish failed ({}): {} {}",
-                    status,
-                    error_msg,
-                    if code.is_empty() {
-                        String::new()
-                    } else {
-                        format!("[{code}]")
-                    }
-                )))
+                return Ok(body);
             }
+            let error_msg = body
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown error");
+            let code = body.get("code").and_then(|c| c.as_str()).unwrap_or("");
+
+            Err(LpmError::Registry(format!(
+                "publish failed ({}): {} {}",
+                status,
+                error_msg,
+                if code.is_empty() {
+                    String::new()
+                } else {
+                    format!("[{code}]")
+                }
+            )))
         })
         .await
     }

@@ -1944,3 +1944,263 @@ async fn a_tarball_upload_stalls_only_after_its_limit_passes_without_progress() 
         .await
         .expect("the upload stalls 60 s after its last piece");
 }
+
+#[tokio::test]
+async fn publish_package_reports_a_browser_approval_the_registry_asks_for() {
+    use wiremock::matchers::{header, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let encoded_name = "@lpm.dev/test.approval";
+    let auth_url = format!("{}/cli/approve/approval-1", server.uri());
+    let done_url = format!("{}/api/auth/cli-approvals/approval-1/secret", server.uri());
+
+    Mock::given(method("PUT"))
+        .and(header("x-lpm-browser-approval", "1"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": "Approve this publish in your browser with your passkey.",
+            "code": "OTP_REQUIRED",
+            "otp": false,
+            "passkey": true,
+            "authUrl": auth_url,
+            "doneUrl": done_url,
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let payload = replayable_json(&serde_json::json!({ "name": encoded_name }));
+    let result = client
+        .publish_package(encoded_name, "1.0.0", "sha512-test", &payload, None, 0)
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(LpmError::BrowserApprovalRequired {
+            action,
+            auth_url: auth,
+            done_url: done,
+            accepts_code: false,
+            has_passkey: true,
+        }) if action == "publish" && auth == auth_url && done == done_url
+    ));
+}
+
+#[tokio::test]
+async fn post_with_second_factor_says_it_can_wait_and_reports_the_approval_asked_for() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let client = client.with_token("session-token");
+    let url = format!("{}/api/registry/-/token/rotate", server.uri());
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/rotate"))
+        .and(header("x-lpm-browser-approval", "1"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "code": "OTP_REQUIRED",
+            "otp": true,
+            "passkey": false,
+            "authUrl": "https://lpm.dev/cli/approve/a",
+            "doneUrl": "https://lpm.dev/api/auth/cli-approvals/a/b",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = client
+        .post_json_with_second_factor_and_bearer(
+            &url,
+            &serde_json::json!({}),
+            None,
+            "lpm token-rotate",
+            "token rotation",
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(LpmError::BrowserApprovalRequired {
+            action,
+            accepts_code: true,
+            has_passkey: false,
+            ..
+        }) if action == "token rotation"
+    ));
+}
+
+#[tokio::test]
+async fn post_with_second_factor_sends_an_approval_and_reports_a_refused_one_as_final() {
+    use wiremock::matchers::{header, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let client = client.with_token("session-token");
+    let url = format!("{}/api/registry/-/token/rotate", server.uri());
+    Mock::given(method("POST"))
+        .and(header("x-lpm-approval", "approval-token"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": "This approval is invalid, expired, or already used. Try again to get a new one.",
+            "code": "APPROVAL_INVALID",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = client
+        .post_json_with_second_factor_and_bearer(
+            &url,
+            &serde_json::json!({}),
+            Some(crate::SecondFactorProof::Approval("approval-token")),
+            "lpm token-rotate",
+            "token rotation",
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(LpmError::Registry(text)) if text.starts_with("This approval is invalid")
+    ));
+}
+
+#[tokio::test]
+async fn publish_approved_package_sends_the_approval_token_instead_of_a_code() {
+    use wiremock::matchers::{header, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let encoded_name = "@lpm.dev/test.approved";
+
+    Mock::given(method("PUT"))
+        .and(header("x-lpm-approval", "approval-token"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "name": encoded_name })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let payload = replayable_json(&serde_json::json!({ "name": encoded_name }));
+    let published = client
+        .publish_approved_package(
+            encoded_name,
+            "1.0.0",
+            "sha512-test",
+            &payload,
+            "approval-token",
+            0,
+        )
+        .await
+        .expect("an approved publish should succeed");
+
+    assert_eq!(published["name"], encoded_name);
+    let requests = server.received_requests().await.unwrap();
+    assert!(requests[0].headers.get("x-otp").is_none());
+}
+
+#[tokio::test]
+async fn publish_package_reports_a_code_the_registry_asks_for() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let encoded_name = "@lpm.dev/test.otp";
+
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": "Two-factor authentication code required.",
+            "code": "OTP_REQUIRED",
+        })))
+        .mount(&server)
+        .await;
+
+    let payload = replayable_json(&serde_json::json!({ "name": encoded_name }));
+    let result = client
+        .publish_package(encoded_name, "1.0.0", "sha512-test", &payload, None, 0)
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(LpmError::OtpRequired {
+            command: "lpm publish"
+        })
+    ));
+}
+
+#[tokio::test]
+async fn publish_package_reports_a_refused_code_instead_of_a_sign_in() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let encoded_name = "@lpm.dev/test.otp-invalid";
+
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": "Invalid two-factor authentication code.",
+            "code": "OTP_INVALID",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let payload = replayable_json(&serde_json::json!({ "name": encoded_name }));
+    let result = client
+        .publish_package(
+            encoded_name,
+            "1.0.0",
+            "sha512-test",
+            &payload,
+            Some("000000"),
+            0,
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(LpmError::OtpInvalid {
+            command: "lpm publish"
+        })
+    ));
+}
+
+#[tokio::test]
+async fn publish_approved_package_reports_a_refused_approval_instead_of_a_sign_in() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let (client, _tmp) = client_with_mock_server(&server.uri());
+    let encoded_name = "@lpm.dev/test.approval-invalid";
+    let message =
+        "This approval is invalid, expired, or already used. Publish again to get a new one.";
+
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": message,
+            "code": "APPROVAL_INVALID",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let payload = replayable_json(&serde_json::json!({ "name": encoded_name }));
+    let result = client
+        .publish_approved_package(
+            encoded_name,
+            "1.0.0",
+            "sha512-test",
+            &payload,
+            "spent-approval-token",
+            0,
+        )
+        .await;
+
+    assert!(matches!(result, Err(LpmError::Registry(text)) if text == message));
+}

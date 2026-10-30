@@ -46,41 +46,39 @@ impl RegistryClient {
         self.send_with_retry(req).await
     }
 
-    /// POST JSON with auth and an optional MFA code, refreshing once when a
-    /// plain bearer rejection is safe to retry.
+    /// POST JSON with auth and, for a request that needs the account's
+    /// second factor, its proof, refreshing once when a plain bearer
+    /// rejection is safe to retry. Says the CLI can wait for a browser
+    /// approval, which the registry then asks for as
+    /// `LpmError::BrowserApprovalRequired` naming `operation`.
     ///
-    /// Valid OTP challenges remain command errors and never trigger refresh.
-    pub async fn post_json_with_otp_recovery(
+    /// Second-factor challenges remain command errors and never trigger a
+    /// refresh. Returns the bearer from the successful attempt, including
+    /// any automatic refresh.
+    pub async fn post_json_with_second_factor_and_bearer(
         &self,
         url: &str,
         body: &serde_json::Value,
-        otp: Option<&str>,
-        command: &'static str,
-        operation: &'static str,
-    ) -> Result<serde_json::Value, LpmError> {
-        self.post_json_with_otp_recovery_and_bearer(url, body, otp, command, operation)
-            .await
-            .map(|(response, _)| response)
-    }
-
-    /// Return the bearer from the successful attempt, including any automatic refresh.
-    pub async fn post_json_with_otp_recovery_and_bearer(
-        &self,
-        url: &str,
-        body: &serde_json::Value,
-        otp: Option<&str>,
+        proof: Option<SecondFactorProof<'_>>,
         command: &'static str,
         operation: &'static str,
     ) -> Result<(serde_json::Value, SecretString), LpmError> {
         self.execute_with_recovery(AuthPosture::AuthRequired, || async {
-            let mut request = self.http.for_url(url).await?.post(url).json(body);
+            let mut request = self
+                .http
+                .for_url(url)
+                .await?
+                .post(url)
+                .json(body)
+                .header(super::second_factor::BROWSER_APPROVAL_SUPPORT_HEADER, "1");
             let bearer = SecretString::from(
                 self.current_bearer(AuthPosture::AuthRequired)?
                     .ok_or(LpmError::AuthRequired)?,
             );
             request = request.bearer_auth(bearer.expose_secret());
-            if let Some(otp) = otp {
-                request = request.header("x-otp", otp);
+            if let Some(proof) = proof {
+                let (header, value) = proof.header();
+                request = request.header(header, value);
             }
             let response = self.send_once_preserving_status(request).await?;
             let status = response.status();
@@ -90,14 +88,12 @@ impl RegistryClient {
             )
             .await;
             if status == reqwest::StatusCode::UNAUTHORIZED {
-                if let Ok(body) = &parsed {
-                    match body.get("code").and_then(serde_json::Value::as_str) {
-                        Some("OTP_REQUIRED") => return Err(LpmError::OtpRequired { command }),
-                        Some("OTP_INVALID") => return Err(LpmError::OtpInvalid { command }),
-                        _ => {}
-                    }
-                }
-                return Err(LpmError::AuthRequired);
+                return Err(match &parsed {
+                    Ok(body) => super::second_factor::second_factor_unauthorized_error(
+                        body, command, operation,
+                    ),
+                    Err(_) => LpmError::AuthRequired,
+                });
             }
             let parsed = parsed?;
             if !status.is_success() {
@@ -484,7 +480,19 @@ impl RegistryClient {
                         200..=299 | 304 => return Ok(PublishSafeResponse::Response(response)),
 
                         // Non-retryable client errors — fail immediately
-                        401 => return Err(LpmError::AuthRequired),
+                        401 => {
+                            let body = read_publish_error_text(response, &headers, bearer).await;
+                            return Err(serde_json::from_str::<serde_json::Value>(&body).map_or(
+                                LpmError::AuthRequired,
+                                |body| {
+                                    super::second_factor::second_factor_unauthorized_error(
+                                        &body,
+                                        "lpm publish",
+                                        "publish",
+                                    )
+                                },
+                            ));
+                        }
                         403 => {
                             let body = read_publish_error_text(response, &headers, bearer).await;
                             let duplicate_message = format!(
@@ -933,6 +941,11 @@ pub(super) fn version_exists_error(version: &str) -> LpmError {
     ))
 }
 
+/// What a publish's 401 is: the registry asking for the second factor as a
+/// browser approval or a code, a code or approval it refused, or the
+/// credential itself. A refused approval isn't the credential's fault, so
+/// it must not end as `AuthRequired`, which refreshes the session and
+/// publishes again with the same spent token.
 async fn read_publish_error_text(
     response: reqwest::Response,
     headers: &reqwest::header::HeaderMap,

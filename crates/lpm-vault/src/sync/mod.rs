@@ -196,8 +196,8 @@ pub use public_key::{
     upload_public_key_for_org,
 };
 pub use step_up::{
-    CLI_STEP_UP_HEADER_NAME, CliStepUpCredential, CliStepUpPolicy, discover_cli_step_up_policy,
-    mint_cli_step_up_proof,
+    CLI_STEP_UP_HEADER_NAME, CliStepUpApproval, CliStepUpCredential, CliStepUpPolicy,
+    discover_cli_step_up_policy, mint_cli_step_up_proof, request_cli_step_up_approval,
 };
 
 #[cfg(test)]

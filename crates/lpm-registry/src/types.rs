@@ -973,6 +973,11 @@ pub struct WhoamiResponse {
     #[serde(default, rename = "mfa_enabled")]
     pub mfa_enabled: Option<bool>,
 
+    /// The account has a passkey, which counts as its second factor. The
+    /// terminal can't confirm it, so a publish is approved in the browser.
+    #[serde(default, rename = "passkey_enabled")]
+    pub passkey_enabled: Option<bool>,
+
     #[serde(default)]
     pub organizations: Vec<WhoamiOrg>,
 

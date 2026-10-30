@@ -833,8 +833,8 @@ async fn register_missing_sharing_key_for_org(
 
     output::info(&format!(
         "no sharing key on file for this account; registering this device's key \
-         before continuing with `{op_label}`. You'll be prompted to confirm your \
-         password (and authenticator code, if enrolled) to authorize the write."
+         before continuing with `{op_label}`. You'll be asked to confirm it's you \
+         to authorize the write."
     ));
     let step_up_scope = lpm_vault::sync::sharing_key_step_up_scope(None, &local.public_key_b64)
         .map_err(LpmError::Script)?;

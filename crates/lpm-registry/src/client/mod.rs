@@ -34,6 +34,7 @@ mod manifest;
 mod metadata;
 mod projection;
 mod public_npm;
+mod second_factor;
 mod state;
 mod tarball;
 #[cfg(test)]
@@ -60,6 +61,7 @@ pub use self::manifest::ManifestVersionMetadata;
 pub use self::metadata::BatchMetadataEntryStream;
 pub use self::projection::{MetadataProjection, NoProjection, ProjectionSlot, ResolutionMetadata};
 pub use self::public_npm::PublicNpmAccess;
+pub use self::second_factor::SecondFactorProof;
 pub use self::state::{
     CompressedTarballSpoolReservation, DownloadedTarball, FanOutStats, HttpClients,
     PackageMetadataFetchError, PackageMetadataFetchTimings, RegistryClient, TimedPackageMetadata,

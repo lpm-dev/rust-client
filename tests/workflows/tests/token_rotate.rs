@@ -1069,3 +1069,139 @@ async fn token_rotate_normalizes_rfc3339_legacy_expiry_reminders() {
         "2032-01-03"
     );
 }
+
+async fn mount_approval_challenge(mock: &MockRegistry, accepts_code: bool, has_passkey: bool) {
+    let base = mock.url();
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/token/rotate"))
+        .and(header("x-lpm-browser-approval", "1"))
+        .respond_with(move |request: &Request| {
+            if request.headers.get("x-lpm-approval").is_some() {
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "token": "approved-replacement-token",
+                    "expiresAt": "2032-01-03T04:05:06Z",
+                }));
+            }
+            ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": "Approve this token's rotation in your browser with your passkey.",
+                "code": "OTP_REQUIRED",
+                "otp": accepts_code,
+                "passkey": has_passkey,
+                "authUrl": format!("{base}/cli/approve/approval-1"),
+                "doneUrl": format!("{base}/api/auth/cli-approvals/approval-1/poll-secret"),
+            }))
+        })
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/auth/cli-approvals/approval-1/poll-secret"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "token": "approval-token" })),
+        )
+        .mount(mock.server())
+        .await;
+}
+
+#[tokio::test]
+async fn token_rotate_approves_a_passkey_account_in_the_browser_and_retries_with_the_approval() {
+    let project = TempProject::empty(r#"{"name":"token-rotate-approval","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    seed_stored_fallback(&project, &registry_url);
+    mount_approval_challenge(&mock, false, true).await;
+
+    let output = lpm_with_registry(&project, &registry_url)
+        .args(["token-rotate"])
+        .output()
+        .expect("failed to run lpm token-rotate");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert_eq!(
+        read_credentials(project.home())[registry_url.as_str()],
+        serde_json::json!("approved-replacement-token")
+    );
+    let requests = mock
+        .server()
+        .received_requests()
+        .await
+        .expect("record requests");
+    let rotations: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/api/registry/-/token/rotate")
+        .collect();
+    assert_eq!(rotations.len(), 2, "the approval is sent once, on a retry");
+    assert!(rotations[0].headers.get("x-lpm-approval").is_none());
+    assert_eq!(
+        rotations[1]
+            .headers
+            .get("x-lpm-approval")
+            .and_then(|value| value.to_str().ok()),
+        Some("approval-token")
+    );
+}
+
+#[tokio::test]
+async fn token_rotate_json_reports_an_approval_it_cant_wait_for_without_its_url() {
+    let project = TempProject::empty(r#"{"name":"token-rotate-approval","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    let credentials_before = seed_stored_fallback(&project, &registry_url);
+    mount_approval_challenge(&mock, true, true).await;
+
+    let output = lpm_with_registry(&project, &registry_url)
+        .args(["token-rotate", "--json"])
+        .output()
+        .expect("failed to run lpm token-rotate --json");
+
+    assert!(!output.status.success());
+    assert_eq!(read_credentials(project.home()), credentials_before);
+    let stdout = String::from_utf8(output.stdout).expect("JSON output must be UTF-8");
+    assert!(!stdout.contains("cli/approve"), "{stdout}");
+    let envelope: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(envelope["error_code"], "browser_approval_required");
+    assert_eq!(envelope["error"]["action"], "token rotation");
+}
+
+#[tokio::test]
+async fn token_rotate_asks_an_authenticator_account_without_a_passkey_for_its_code() {
+    let project = TempProject::empty(r#"{"name":"token-rotate-approval","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    let credentials_before = seed_stored_fallback(&project, &registry_url);
+    mount_approval_challenge(&mock, true, false).await;
+
+    let output = lpm_with_registry(&project, &registry_url)
+        .args(["token-rotate"])
+        .output()
+        .expect("failed to run lpm token-rotate");
+
+    assert!(!output.status.success());
+    assert_eq!(read_credentials(project.home()), credentials_before);
+    let stderr = String::from_utf8(output.stderr).expect("human output must be UTF-8");
+    assert!(stderr.contains("--otp <CODE>"), "{stderr}");
+    assert!(!stderr.contains("cli/approve"), "{stderr}");
+}
+
+#[tokio::test]
+async fn token_rotate_refuses_a_code_from_an_account_with_only_a_passkey() {
+    let project = TempProject::empty(r#"{"name":"token-rotate-approval","version":"1.0.0"}"#);
+    let mock = MockRegistry::start().await;
+    let registry_url = mock.url();
+    let credentials_before = seed_stored_fallback(&project, &registry_url);
+    mount_approval_challenge(&mock, false, true).await;
+
+    let output = lpm_with_registry(&project, &registry_url)
+        .args(["token-rotate", "--otp", VALID_OTP])
+        .output()
+        .expect("failed to run lpm token-rotate --otp");
+
+    assert!(!output.status.success());
+    assert_eq!(read_credentials(project.home()), credentials_before);
+    let stderr = String::from_utf8(output.stderr).expect("human output must be UTF-8");
+    assert!(
+        stderr.contains("--otp needs an authenticator app"),
+        "{stderr}"
+    );
+}

@@ -47,13 +47,17 @@ pub(super) enum LpmSecondFactor {
     /// A code to ask for just before the publish request, so a long upload
     /// doesn't outlast it.
     Ask,
+    /// The account has a passkey, which the terminal can't confirm: the
+    /// publish goes without a code, and the user approves it in the browser
+    /// when lpm.dev asks.
+    Browser,
 }
 
 impl LpmSecondFactor {
     /// The code to send, asking for it now if it's one to ask for.
     pub(super) fn code(self) -> Result<Option<String>, LpmError> {
         match self {
-            Self::None => Ok(None),
+            Self::None | Self::Browser => Ok(None),
             Self::Code(code) => Ok(Some(code)),
             Self::Ask => {
                 install_ui::settle_spinner();
@@ -73,9 +77,11 @@ impl LpmSecondFactor {
     }
 }
 
-/// The second factor an lpm.dev publish sends: `provided_otp`, checked, or,
-/// for an account with 2FA on, one to ask for, which `--json` can't do. Reads
-/// the account through whoami, which also checks the token.
+/// The second factor an lpm.dev publish sends: `provided_otp`, checked, and
+/// refused from an account whose only second factor is a passkey; for an
+/// account with a passkey, a browser approval; or, for an account with an
+/// authenticator app, a code to ask for. `--json` can do neither of the last
+/// two. Reads the account through whoami, which also checks the token.
 pub(super) async fn lpm_second_factor(
     client: &RegistryClient,
     provided_otp: Option<&str>,
@@ -87,15 +93,20 @@ pub(super) async fn lpm_second_factor(
             "--otp must be exactly six ASCII digits".into(),
         )));
     }
+    let second_factors =
+        |account: &lpm_registry::WhoamiResponse| (account.mfa_enabled, account.passkey_enabled);
     let whoami = match whoami_cache {
         Some(cache) => cache
             .get_or_try_init(|| client.whoami())
             .await
-            .map(|account| account.mfa_enabled),
-        None => client.whoami().await.map(|account| account.mfa_enabled),
+            .map(second_factors),
+        None => client
+            .whoami()
+            .await
+            .map(|account| second_factors(&account)),
     };
-    let mfa_enabled = match whoami {
-        Ok(mfa_enabled) => mfa_enabled,
+    let (mfa_enabled, passkey_enabled) = match whoami {
+        Ok(second_factors) => second_factors,
         Err(error) => {
             let refused = refuses_the_token(&error);
             let error = LpmError::Registry(format!("authentication failed: {error}"));
@@ -107,15 +118,35 @@ pub(super) async fn lpm_second_factor(
         }
     };
 
+    let authenticator = mfa_enabled == Some(true);
+    let passkey = passkey_enabled == Some(true);
     if let Some(code) = provided_otp {
+        // lpm.dev ignores a code from an account without an authenticator
+        // and asks for a browser approval at the upload, after the other
+        // targets have published.
+        if passkey && !authenticator {
+            return Err(OtpFailure::Final(LpmError::Registry(
+                "--otp needs an authenticator app, and this account has none — it approves publishes in the browser with its passkey; run without --otp".into(),
+            )));
+        }
         return Ok(LpmSecondFactor::Code(code.to_owned()));
     }
-    if mfa_enabled != Some(true) {
+    if passkey {
+        if json_output {
+            return Err(OtpFailure::Final(LpmError::Registry(if authenticator {
+                "2FA required in JSON mode — pass --otp <code>, approve in the browser without --json, or use trusted publishing".into()
+            } else {
+                "2FA required in JSON mode — this account approves publishes in the browser with its passkey; run without --json or use trusted publishing".into()
+            })));
+        }
+        return Ok(LpmSecondFactor::Browser);
+    }
+    if !authenticator {
         return Ok(LpmSecondFactor::None);
     }
     if json_output {
         return Err(OtpFailure::Final(LpmError::Registry(
-            "2FA required in JSON mode — pass --otp <code> or use a CI token".into(),
+            "2FA required in JSON mode — pass --otp <code> or use trusted publishing".into(),
         )));
     }
     Ok(LpmSecondFactor::Ask)
@@ -199,7 +230,7 @@ pub(super) async fn publish_to_lpm(
     let otp_code = second_factor.code()?;
 
     let encoded_name = urlencoding::encode(body.name);
-    client
+    match client
         .publish_package(
             &encoded_name,
             body.version,
@@ -209,6 +240,34 @@ pub(super) async fn publish_to_lpm(
             tarball_data.len(),
         )
         .await
+    {
+        Err(LpmError::BrowserApprovalRequired {
+            auth_url, done_url, ..
+        }) if !json_output => {
+            let token = crate::commands::web_auth::complete_lpm_browser_approval(
+                &auth_url,
+                &done_url,
+                registry_url,
+                &format!(
+                    "publish {}@{}",
+                    lpm_common::sanitize_terminal_inline(body.name),
+                    lpm_common::sanitize_terminal_inline(body.version)
+                ),
+            )
+            .await?;
+            client
+                .publish_approved_package(
+                    &encoded_name,
+                    body.version,
+                    published_integrity,
+                    payload,
+                    &token,
+                    tarball_data.len(),
+                )
+                .await
+        }
+        result => result,
+    }
 }
 
 /// The length of an upload's id, which the Registry gives as a UUID.
@@ -581,6 +640,7 @@ mod tests {
     use super::{
         LpmPackMetadata, LpmPublishBody, LpmSecondFactor, LpmVersionPayload, OtpFailure,
         RegistryClient, is_valid_otp, lpm_publish_transport_is_allowed, lpm_second_factor,
+        publish_to_lpm,
     };
 
     #[test]
@@ -724,6 +784,161 @@ mod tests {
 
         assert!(matches!(given, Ok(LpmSecondFactor::Code(code)) if code == "123456"));
         assert!(matches!(none, Ok(LpmSecondFactor::None)));
+    }
+
+    fn whoami_with(
+        mfa_enabled: bool,
+        passkey_enabled: bool,
+    ) -> tokio::sync::OnceCell<lpm_registry::WhoamiResponse> {
+        tokio::sync::OnceCell::new_with(Some(
+            serde_json::from_value(serde_json::json!({
+                "mfa_enabled": mfa_enabled,
+                "passkey_enabled": passkey_enabled,
+            }))
+            .unwrap(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn lpm_second_factor_approves_a_passkey_account_in_the_browser() {
+        for mfa_enabled in [false, true] {
+            let whoami = whoami_with(mfa_enabled, true);
+
+            let factor =
+                lpm_second_factor(&RegistryClient::new(), None, false, Some(&whoami)).await;
+
+            assert!(matches!(factor, Ok(LpmSecondFactor::Browser)));
+        }
+    }
+
+    #[tokio::test]
+    async fn lpm_second_factor_sends_a_given_code_from_a_passkey_account() {
+        let whoami = whoami_with(true, true);
+
+        let factor =
+            lpm_second_factor(&RegistryClient::new(), Some("123456"), true, Some(&whoami)).await;
+
+        assert!(matches!(factor, Ok(LpmSecondFactor::Code(code)) if code == "123456"));
+    }
+
+    #[tokio::test]
+    async fn lpm_second_factor_refuses_a_code_from_an_account_with_only_a_passkey() {
+        for json_output in [false, true] {
+            let whoami = whoami_with(false, true);
+
+            let factor = lpm_second_factor(
+                &RegistryClient::new(),
+                Some("123456"),
+                json_output,
+                Some(&whoami),
+            )
+            .await;
+
+            assert!(matches!(
+                factor,
+                Err(OtpFailure::Final(error)) if error.to_string().contains("--otp needs an authenticator app")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn lpm_second_factor_refuses_json_output_for_a_passkey_account() {
+        let whoami = whoami_with(false, true);
+
+        let factor = lpm_second_factor(&RegistryClient::new(), None, true, Some(&whoami)).await;
+
+        assert!(matches!(
+            factor,
+            Err(OtpFailure::Final(error)) if error.to_string().contains("approves publishes in the browser")
+        ));
+    }
+
+    #[tokio::test]
+    async fn publish_to_lpm_retries_with_the_token_of_a_browser_approval() {
+        use wiremock::matchers::{header, header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let name = "@lpm.dev/acme.widgets";
+        let encoded = format!("/api/registry/{}", urlencoding::encode(name));
+        Mock::given(method("POST"))
+            .and(path("/api/registry/-/package/uploads"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(encoded.as_str()))
+            .and(header_exists("x-lpm-approval"))
+            .and(header("x-lpm-approval", "approval-token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "success": true })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path(encoded.as_str()))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": "Approve this publish in your browser with your passkey.",
+                "code": "OTP_REQUIRED",
+                "authUrl": format!("{}/cli/approve/approval-1", server.uri()),
+                "doneUrl": format!("{}/done", server.uri()),
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/done"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "token": "approval-token" })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = RegistryClient::new()
+            .with_base_url(server.uri())
+            .with_token("session-token");
+        let version_data = serde_json::json!({
+            "name": name,
+            "version": "1.0.0",
+            "dist": { "integrity": "sha512-test" },
+        });
+        let body = LpmPublishBody {
+            name,
+            version: "1.0.0",
+            readme: None,
+            version_data: &version_data,
+            tarball_files: &[],
+            package_json_size_override: None,
+            quality_result: None,
+            lpm_config: None,
+            detected_ecosystem: "js",
+            swift_manifest: None,
+        };
+        let whoami = whoami_with(false, true);
+
+        let published = publish_to_lpm(
+            &client,
+            body,
+            &std::sync::Arc::new(b"tarball".to_vec()),
+            None,
+            false,
+            Some(&whoami),
+        )
+        .await
+        .expect("the approved publish succeeds");
+
+        assert_eq!(published["success"], true);
+        let puts = server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.method.as_str() == "PUT")
+            .count();
+        assert_eq!(puts, 2);
     }
 
     #[tokio::test]
