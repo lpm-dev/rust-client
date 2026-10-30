@@ -1087,6 +1087,13 @@ fn generated_url_idna_limits_and_joiners_match_native_validation() {
         "https://\u{200c}ب.example",
         "https://ب\u{200c}.example",
         "postgres://a\u{200c}b.example,example.com/db",
+        "https://xn--a.example",
+        "https://xn--dca.example",
+        "https://xn--e-xbb.example",
+        "https://xn--b-4o0i.example",
+        "https://xn--a-83t.example",
+        "https://xn--9ca.example",
+        "postgres://xn--dca.example,example.com/db",
     ]
     .iter()
     .map(|value| json!({"VALUE":value}))
@@ -1165,7 +1172,7 @@ fn generated_url_helpers_enforce_contextual_joiners() {
         .get_mut("server.js")
         .unwrap()
         .extend_from_slice(
-        b"\nexport function probeDomain(value){return validBidiDomain(value,{left:10000000});}\n",
+        b"\nexport function probeDomain(value){return validIdnaDomain(value,{left:10000000});}\n",
     );
     node(
         &generated,
@@ -1175,6 +1182,35 @@ fn generated_url_helpers_enforce_contextual_joiners() {
 const {probeDomain}=await import('./server.js');
 for(const host of ['xn--ab-j1t.example','xn--ab-m1t.example'])if(probeDomain(host))throw new Error('invalid ContextJ accepted');
 for(const host of ['xn--11ba1o090g.example','xn--ngba799q.example','xn--ngba7ia3604a.example'])if(!probeDomain(host))throw new Error('valid ContextJ rejected');
+"#,
+    );
+}
+
+#[test]
+fn generated_url_helpers_reject_punycode_labels_the_parser_would_not_produce() {
+    let mut generated = generate(
+        &schema(json!({"vars":{"VALUE":{"format":"url"}}})),
+        options(),
+    )
+    .unwrap();
+    generated
+        .files
+        .get_mut("server.js")
+        .unwrap()
+        .extend_from_slice(
+        b"\nexport function probeDomain(value){return validIdnaDomain(value,{left:10000000});}\n",
+    );
+    // Each label decodes, but to text the platform parser maps or refuses: a
+    // C1 control, a capital, a decomposed accent, a fullwidth letter and an
+    // ideographic full stop. Newer parsers keep such a label as it is.
+    node(
+        &generated,
+        "server",
+        &[],
+        r#"
+const {probeDomain}=await import('./server.js');
+for(const host of ['xn--a.example','xn--dca.example','xn--e-xbb.example','xn--b-4o0i.example','xn--a-83t.example'])if(probeDomain(host))throw new Error(`invalid label accepted: ${host}`);
+for(const host of ['xn--9ca.example','xn--9ca.xn--ngba7ia3604a.example'])if(!probeDomain(host))throw new Error(`valid label rejected: ${host}`);
 "#,
     );
 }
