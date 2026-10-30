@@ -565,3 +565,73 @@ async fn deprecate_refuses_a_response_for_another_change() {
         "{envelope}"
     );
 }
+
+#[tokio::test]
+async fn unpublish_stops_when_the_approval_is_denied() {
+    let mock = MockRegistry::start().await;
+    let project = signed_in_project(&mock.url());
+    let base = mock.url();
+    Mock::given(method("POST"))
+        .and(path(UNPUBLISH_PATH))
+        .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+            "error": "Approve this unpublish in your browser with your passkey.",
+            "code": "OTP_REQUIRED",
+            "otp": false,
+            "passkey": true,
+            "authUrl": format!("{base}/cli/approve/approval-1"),
+            "doneUrl": format!("{base}/api/auth/cli-approvals/approval-1/poll-secret"),
+        })))
+        .mount(mock.server())
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/auth/cli-approvals/approval-1/poll-secret"))
+        .respond_with(ResponseTemplate::new(410))
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["unpublish", "@lpm.dev/acme.kit@1.2.3", "--yes"])
+        .output()
+        .expect("run lpm unpublish");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("denied or expired"), "{stderr}");
+    assert!(!stderr.contains("Done ·"), "{stderr}");
+    assert_eq!(
+        requests_to(&mock, UNPUBLISH_PATH).await.len(),
+        1,
+        "nothing is sent again once the approval is denied"
+    );
+}
+
+#[tokio::test]
+async fn deprecate_reports_the_registrys_rate_limit() {
+    let mock = MockRegistry::start().await;
+    let project = signed_in_project(&mock.url());
+    Mock::given(method("POST"))
+        .and(path(DEPRECATE_PATH))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "42")
+                .set_body_json(serde_json::json!({
+                    "error": "Rate limit exceeded. Try again later.",
+                })),
+        )
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["deprecate", "@lpm.dev/acme.kit@1.2.3", "Use 2", "--json"])
+        .output()
+        .expect("run lpm deprecate");
+
+    assert!(!output.status.success());
+    let envelope = json_output(&output);
+    assert_eq!(envelope["error_code"], "registry");
+    assert!(
+        envelope.to_string().contains("Rate limit exceeded"),
+        "{envelope}"
+    );
+}

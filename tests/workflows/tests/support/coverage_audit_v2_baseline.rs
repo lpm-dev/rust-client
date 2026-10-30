@@ -3793,7 +3793,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
     // ── id 176: lpm unpublish ──
     SurfaceV2 {
         id: 176,
-        scenarios: 18,
+        scenarios: 19,
         failure_modes_tested: &[
             "sends the normalized version and reports it in JSON",
             "human output names the version it unpublished",
@@ -3807,20 +3807,21 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "the interactive confirmation unpublishes once confirmed",
             "the interactive confirmation defaults to no and sends nothing",
             "an authenticator account is asked for its code and retried once",
+            "a denied approval stops it without sending it again",
         ],
-        failure_modes_known: &["the approval expires while the user is away"],
+        failure_modes_known: &["the registry rate-limits the token"],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[
             ("crates/lpm-cli/src/commands/release_target.rs", 6),
             ("crates/lpm-cli/tests/unpublish_interactive_tty.rs", 3),
-            ("tests/workflows/tests/package_changes.rs", 9),
+            ("tests/workflows/tests/package_changes.rs", 10),
         ],
         last_audited_at: "2026-10-30",
     },
     // ── id 177: lpm deprecate ──
     SurfaceV2 {
         id: 177,
-        scenarios: 8,
+        scenarios: 9,
         failure_modes_tested: &[
             "one version is deprecated with its trimmed message",
             "every version is deprecated without naming a version",
@@ -3828,12 +3829,13 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "a passkey account approves in the browser",
             "a response for another change is refused",
             "the message is measured in UTF-16 units as the registry measures it",
+            "the registry's rate limit is reported",
         ],
-        failure_modes_known: &["an already deprecated version is refused only after the approval"],
+        failure_modes_known: &["the browser approval is denied or expires"],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[
             ("crates/lpm-cli/src/commands/deprecate.rs", 3),
-            ("tests/workflows/tests/package_changes.rs", 5),
+            ("tests/workflows/tests/package_changes.rs", 6),
         ],
         last_audited_at: "2026-10-30",
     },
@@ -3845,9 +3847,7 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
             "one version's deprecation is removed with a null message",
             "every version is named by the package, and none deprecated is said",
         ],
-        failure_modes_known: &[
-            "a version that isn't deprecated is refused only after the approval",
-        ],
+        failure_modes_known: &["the browser approval is denied or expires"],
         json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[("tests/workflows/tests/package_changes.rs", 2)],
         last_audited_at: "2026-10-30",
