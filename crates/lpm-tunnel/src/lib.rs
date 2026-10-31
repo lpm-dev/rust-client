@@ -123,6 +123,71 @@ pub struct TunnelUsageMetadata {
     pub estimated_overage_cents: Option<f64>,
 }
 
+/// What a usage report given to the usage callback reflects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageUpdate {
+    /// The usage the relay reported when the tunnel connected.
+    Connected,
+    /// An allowance or overage threshold notice from the relay.
+    Notice,
+    /// A request the relay admitted for this tunnel. The count is the
+    /// relay's account-wide one when it sends one; an older relay's leaves
+    /// this tunnel's tally on top of its last report, missing the account's
+    /// other tunnels.
+    Admitted,
+}
+
+/// The account usage a tunnel shows, kept current between relay reports.
+#[derive(Debug, Clone)]
+pub(crate) struct UsageTracker {
+    usage: TunnelUsageMetadata,
+    period_end: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl UsageTracker {
+    pub(crate) fn new(usage: TunnelUsageMetadata) -> Self {
+        let period_end = usage
+            .period_end
+            .as_deref()
+            .and_then(|end| chrono::DateTime::parse_from_rfc3339(end).ok())
+            .map(|end| end.with_timezone(&chrono::Utc));
+        Self { usage, period_end }
+    }
+
+    pub(crate) fn usage(&self) -> &TunnelUsageMetadata {
+        &self.usage
+    }
+
+    /// Counts a request the relay admitted, given the account total it
+    /// reported with the request, if any.
+    pub(crate) fn record_admission(
+        &mut self,
+        reported: Option<u64>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        if self.period_end.is_some_and(|end| now >= end) {
+            // The relay's count starts over in a period it hasn't described yet.
+            self.period_end = None;
+            self.usage.period_start = None;
+            self.usage.period_end = None;
+            self.usage.accepted_requests = Some(0);
+        }
+        let current = self.usage.accepted_requests.unwrap_or(0);
+        // Requests admitted together can arrive in either order, so within a
+        // period the count only moves forward.
+        let accepted = reported.map_or(current.saturating_add(1), |reported| reported.max(current));
+        if Some(accepted) == self.usage.accepted_requests {
+            return;
+        }
+        self.usage.accepted_requests = Some(accepted);
+        self.usage.overage_requests = self
+            .usage
+            .included_requests
+            .map(|included| accepted.saturating_sub(included));
+        self.usage.estimated_overage_cents = None;
+    }
+}
+
 /// Active tunnel session information.
 #[derive(Debug, Clone)]
 pub struct TunnelSession {
@@ -155,3 +220,82 @@ pub const DEFAULT_RELAY_URL: &str = "wss://relay.lpm.fyi/connect";
 pub const DEFAULT_BASE_DOMAIN: &str = "lpm.fyi";
 
 mod http_stream;
+
+#[cfg(test)]
+mod usage_tracker_tests {
+    use super::*;
+
+    fn usage(accepted: u64, period_end: &str) -> TunnelUsageMetadata {
+        TunnelUsageMetadata {
+            accepted_requests: Some(accepted),
+            included_requests: Some(100),
+            overage_requests: Some(accepted.saturating_sub(100)),
+            overage_enabled: Some(true),
+            period_start: Some("2026-10-01T00:00:00Z".into()),
+            period_end: Some(period_end.into()),
+            estimated_overage_cents: Some(12.0),
+            ..TunnelUsageMetadata::default()
+        }
+    }
+
+    fn at(timestamp: &str) -> chrono::DateTime<chrono::Utc> {
+        timestamp.parse().unwrap()
+    }
+
+    #[test]
+    fn an_admission_takes_the_account_total_the_relay_reports() {
+        let mut tracker = UsageTracker::new(usage(99, "2026-11-01T00:00:00Z"));
+
+        tracker.record_admission(Some(104), at("2026-10-30T12:00:00Z"));
+
+        let usage = tracker.usage();
+        assert_eq!(usage.accepted_requests, Some(104));
+        assert_eq!(usage.overage_requests, Some(4));
+        assert_eq!(usage.estimated_overage_cents, None);
+    }
+
+    #[test]
+    fn an_admission_without_a_reported_total_adds_one() {
+        let mut tracker = UsageTracker::new(usage(99, "2026-11-01T00:00:00Z"));
+
+        tracker.record_admission(None, at("2026-10-30T12:00:00Z"));
+        tracker.record_admission(None, at("2026-10-30T12:00:01Z"));
+
+        assert_eq!(tracker.usage().accepted_requests, Some(101));
+        assert_eq!(tracker.usage().overage_requests, Some(1));
+    }
+
+    #[test]
+    fn an_earlier_admission_arriving_late_does_not_lower_the_count() {
+        let mut tracker = UsageTracker::new(usage(10, "2026-11-01T00:00:00Z"));
+
+        tracker.record_admission(Some(12), at("2026-10-30T12:00:00Z"));
+        tracker.record_admission(Some(11), at("2026-10-30T12:00:00Z"));
+
+        assert_eq!(tracker.usage().accepted_requests, Some(12));
+    }
+
+    #[test]
+    fn a_count_already_shown_keeps_the_overage_estimate() {
+        let mut tracker = UsageTracker::new(usage(120, "2026-11-01T00:00:00Z"));
+
+        tracker.record_admission(Some(120), at("2026-10-30T12:00:00Z"));
+
+        assert_eq!(tracker.usage().estimated_overage_cents, Some(12.0));
+    }
+
+    #[test]
+    fn the_count_starts_over_once_the_period_ends() {
+        let mut reported = UsageTracker::new(usage(5_000, "2026-11-01T00:00:00Z"));
+        let mut tallied = reported.clone();
+
+        reported.record_admission(Some(3), at("2026-11-01T00:00:00Z"));
+        reported.record_admission(Some(2), at("2026-11-01T00:00:01Z"));
+        tallied.record_admission(None, at("2026-11-01T00:00:05Z"));
+
+        assert_eq!(reported.usage().accepted_requests, Some(3));
+        assert_eq!(reported.usage().overage_requests, Some(0));
+        assert_eq!(reported.usage().period_end, None);
+        assert_eq!(tallied.usage().accepted_requests, Some(1));
+    }
+}

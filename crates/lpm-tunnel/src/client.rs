@@ -7,8 +7,8 @@ use crate::protocol::{ClientMessage, ServerMessage};
 use crate::webhook::CapturedWebhook;
 use crate::ws_capture::{FrameDirection, WsEvent};
 use crate::{
-    DEFAULT_RELAY_URL, TunnelLimitMetadata, TunnelSession, TunnelUsageMetadata, proxy, webhook,
-    webhook_signature,
+    DEFAULT_RELAY_URL, TunnelLimitMetadata, TunnelSession, TunnelUsageMetadata, UsageTracker,
+    UsageUpdate, proxy, webhook, webhook_signature,
 };
 use futures_util::{SinkExt, StreamExt};
 use lpm_common::LpmError;
@@ -89,7 +89,11 @@ enum RelayHandshakeMessage {
 #[serde(tag = "type")]
 enum ClientExtensionMessage {
     #[serde(rename = "ws_ready")]
-    WebSocketReady { id: String },
+    WebSocketReady {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        protocol: Option<String>,
+    },
     #[serde(rename = "ws_reject")]
     WebSocketReject { id: String, error: String },
 }
@@ -452,7 +456,13 @@ struct CompletedWebSocketUpgrade {
     headers: HashMap<String, String>,
     generation: u64,
     slot: tokio::sync::OwnedSemaphorePermit,
-    result: Result<(LocalWebSocketWrite, LocalWebSocketRead), String>,
+    result: Result<AcceptedLocalWebSocket, String>,
+}
+
+struct AcceptedLocalWebSocket {
+    write: LocalWebSocketWrite,
+    read: LocalWebSocketRead,
+    protocol: Option<String>,
 }
 
 struct LocalWebSocketActivation {
@@ -1004,15 +1014,14 @@ pub async fn connect(
     connect_with_usage(options, on_connected, on_disconnected, |_, _| {}).await
 }
 
-/// Connect to the relay while receiving initial and threshold usage snapshots.
-///
-/// The final callback receives `true` for the usage included in the initial
-/// handshake and `false` for later allowance/overage threshold notices.
+/// Connect to the relay while receiving the account's usage: the snapshot
+/// from the handshake, threshold notices, and the count after each request
+/// the relay admits for this tunnel.
 pub async fn connect_with_usage(
     options: &TunnelOptions,
     on_connected: impl Fn(&TunnelSession),
     on_disconnected: impl Fn(&str),
-    on_usage: impl Fn(&TunnelUsageMetadata, bool),
+    on_usage: impl Fn(&TunnelUsageMetadata, UsageUpdate),
 ) -> Result<(), LpmError> {
     connect_with_usage_fallible(
         options,
@@ -1031,7 +1040,7 @@ pub async fn connect_with_usage_fallible(
     options: &TunnelOptions,
     on_connected: impl Fn(&TunnelSession) -> Result<(), LpmError>,
     on_disconnected: impl Fn(&str),
-    on_usage: impl Fn(&TunnelUsageMetadata, bool),
+    on_usage: impl Fn(&TunnelUsageMetadata, UsageUpdate),
 ) -> Result<(), LpmError> {
     crate::validate_forward_target(&options.current_local_target())?;
     let with_live_target;
@@ -1431,6 +1440,7 @@ async fn forward_http_request(
             ref url,
             ref headers,
             ref body,
+            ..
         } = server_msg
     {
         let request_body = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, body)
@@ -1844,7 +1854,7 @@ fn relay_tls_connector(
 async fn try_connect(
     options: &TunnelOptions,
     on_connected: &impl Fn(&TunnelSession) -> Result<(), LpmError>,
-    on_usage: &impl Fn(&TunnelUsageMetadata, bool),
+    on_usage: &impl Fn(&TunnelUsageMetadata, UsageUpdate),
 ) -> Result<(), TunnelConnectError> {
     try_connect_with_token(options, None, on_connected, on_usage).await
 }
@@ -1853,7 +1863,7 @@ async fn try_connect_with_token(
     options: &TunnelOptions,
     token_override: Option<&str>,
     on_connected: &impl Fn(&TunnelSession) -> Result<(), LpmError>,
-    on_usage: &impl Fn(&TunnelUsageMetadata, bool),
+    on_usage: &impl Fn(&TunnelUsageMetadata, UsageUpdate),
 ) -> Result<(), TunnelConnectError> {
     let connection_target = options.current_local_target();
     // Build connect URL — non-sensitive params only (token goes in Authorization header)
@@ -2016,8 +2026,9 @@ async fn try_connect_with_token(
         }
     };
 
-    if let Some(ref usage) = initial_usage {
-        on_usage(usage, true);
+    let mut usage_tracker = initial_usage.map(UsageTracker::new);
+    if let Some(tracker) = &usage_tracker {
+        on_usage(tracker.usage(), UsageUpdate::Connected);
     }
     on_connected(&session).map_err(|error| TunnelConnectError {
         error,
@@ -2113,6 +2124,12 @@ async fn try_connect_with_token(
                                 continue;
                             }
                         };
+                        if let Some(admission) = server_msg.admission()
+                            && let Some(tracker) = &mut usage_tracker
+                        {
+                            tracker.record_admission(admission.accepted_requests, chrono::Utc::now());
+                            on_usage(tracker.usage(), UsageUpdate::Admitted);
+                        }
 
                         match server_msg {
                             ServerMessage::HttpRequest { ref id, ref url, .. } => {
@@ -2247,7 +2264,9 @@ async fn try_connect_with_token(
                             ServerMessage::HttpCancel { id } => {
                                 if let Some(forward) = http_forwards.get(&id) { forward.cancel.cancel(); }
                             }
-                            ServerMessage::WebSocketUpgrade { id, url, headers } => {
+                            ServerMessage::WebSocketUpgrade {
+                                id, url, headers, ..
+                            } => {
                                 if let Some(error) = websocket_upgrade_metadata_error(&id, &url) {
                                     tracing::warn!(
                                         "rejected WebSocket upgrade with unsafe URL: {:?}",
@@ -2375,7 +2394,11 @@ async fn try_connect_with_token(
                                                     sibling,
                                                 );
                                             }
-                                            Ok((connection.write, connection.read))
+                                            Ok(AcceptedLocalWebSocket {
+                                                write: connection.write,
+                                                read: connection.read,
+                                                protocol: connection.protocol,
+                                            })
                                         }
                                         Ok(Err(error)) => Err(format!(
                                             "Local server rejected the WebSocket upgrade: {error}"
@@ -2569,7 +2592,8 @@ async fn try_connect_with_token(
                                 tracing::debug!("pong received");
                             }
                             ServerMessage::UsageNotice { usage } => {
-                                on_usage(&usage, false);
+                                let tracker = usage_tracker.insert(UsageTracker::new(usage));
+                                on_usage(tracker.usage(), UsageUpdate::Notice);
                             }
                             ServerMessage::Error { message, code } => {
                                 tracing::error!("relay error: {message}");
@@ -2616,14 +2640,14 @@ async fn try_connect_with_token(
                 }
                 pending_websocket_upgrades.remove(&completed.id);
                 match completed.result {
-                    Ok((local_write, local_read)) => {
+                    Ok(accepted) => {
                         let connection = activate_local_websocket(
                             &mut task_handles,
                             LocalWebSocketActivation {
                                 id: completed.id.clone(),
                                 generation: completed.generation,
-                                local_write,
-                                local_read,
+                                local_write: accepted.write,
+                                local_read: accepted.read,
                                 slot: completed.slot,
                                 relay_tx: relay_tx.clone(),
                                 relay_memory: Arc::clone(&relay_websocket_memory),
@@ -2634,6 +2658,7 @@ async fn try_connect_with_token(
                         ws_connections.insert(completed.id.clone(), connection);
                         let ready = ClientExtensionMessage::WebSocketReady {
                             id: completed.id.clone(),
+                            protocol: accepted.protocol,
                         };
                         let json = serde_json::to_string(&ready).map_err(|error| {
                             LpmError::Tunnel(format!(
@@ -3920,6 +3945,91 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn usage_reports_count_each_request_the_relay_admits() {
+        let relay_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_address = relay_listener.local_addr().unwrap();
+        let relay = tokio::spawn(async move {
+            let (socket, _) = relay_listener.accept().await.unwrap();
+            let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            for message in [
+                serde_json::json!({
+                    "type": "hello",
+                    "subdomain": "usage.localhost",
+                    "tunnel_url": "http://usage.localhost",
+                    "session_id": "usage-session",
+                    "usage": { "accepted_requests": 80, "included_requests": 100 }
+                }),
+                serde_json::json!({
+                    "type": "http_request",
+                    "id": "reported",
+                    "method": "GET",
+                    "url": "/",
+                    "headers": {},
+                    "body": "",
+                    "accepted_requests": 90
+                }),
+                serde_json::json!({
+                    "type": "ws_upgrade",
+                    "id": "unreported",
+                    "url": "/hmr",
+                    "headers": {}
+                }),
+                serde_json::json!({
+                    "type": "usage_notice",
+                    "usage": { "accepted_requests": 100, "included_requests": 100 }
+                }),
+            ] {
+                websocket
+                    .send(Message::Text(message.to_string()))
+                    .await
+                    .unwrap();
+            }
+            while let Some(Ok(_)) = websocket.next().await {}
+        });
+        let unused_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut options = TunnelOptions::new("usage-token".into(), unused_port);
+        options.relay_url = format!("ws://{relay_address}/connect");
+        options.no_pin = true;
+        options.shutdown = Some(shutdown.clone());
+        let reports = Mutex::new(Vec::new());
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            connect_with_usage(
+                &options,
+                |_| {},
+                |_| {},
+                |usage, update| {
+                    let mut reports = reports.lock().unwrap();
+                    reports.push((update, usage.accepted_requests, usage.overage_requests));
+                    if reports.len() == 4 {
+                        shutdown.cancel();
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("the tunnel did not report the relay's usage")
+        .unwrap();
+        relay.abort();
+
+        assert_eq!(
+            reports.into_inner().unwrap(),
+            [
+                (UsageUpdate::Connected, Some(80), None),
+                (UsageUpdate::Admitted, Some(90), Some(0)),
+                (UsageUpdate::Admitted, Some(91), Some(0)),
+                (UsageUpdate::Notice, Some(100), None),
+            ]
+        );
+    }
+
     #[test]
     fn private_handshake_preserves_initial_usage_metadata() {
         let message: RelayHandshakeMessage = serde_json::from_str(
@@ -3944,8 +4054,14 @@ mod tests {
     fn private_websocket_upgrade_results_keep_public_enum_exhaustive() {
         let ready = serde_json::to_string(&ClientExtensionMessage::WebSocketReady {
             id: "ws-1".to_string(),
+            protocol: None,
         })
         .expect("serialize ready");
+        let ready_with_protocol = serde_json::to_string(&ClientExtensionMessage::WebSocketReady {
+            id: "ws-3".to_string(),
+            protocol: Some("vite-hmr".to_string()),
+        })
+        .expect("serialize ready with protocol");
         let rejected = serde_json::to_string(&ClientExtensionMessage::WebSocketReject {
             id: "ws-2".to_string(),
             error: "local upgrade failed".to_string(),
@@ -3953,6 +4069,10 @@ mod tests {
         .expect("serialize rejection");
 
         assert_eq!(ready, r#"{"type":"ws_ready","id":"ws-1"}"#);
+        assert_eq!(
+            ready_with_protocol,
+            r#"{"type":"ws_ready","id":"ws-3","protocol":"vite-hmr"}"#
+        );
         assert_eq!(
             rejected,
             r#"{"type":"ws_reject","id":"ws-2","error":"local upgrade failed"}"#
@@ -4954,6 +5074,7 @@ mod tests {
             url: "/".to_string(),
             headers: HashMap::new(),
             body: String::new(),
+            accepted_requests: None,
         };
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let target =
@@ -5009,6 +5130,7 @@ mod tests {
             url: "/webhook".to_string(),
             headers: HashMap::from([("x-large".to_string(), "x".repeat(4 * 1024 * 1024))]),
             body: String::new(),
+            accepted_requests: None,
         };
         let wire_bytes = serde_json::to_string(&request).unwrap().len();
         let permits = request_memory_permits(wire_bytes).unwrap();

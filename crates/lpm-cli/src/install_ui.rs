@@ -22,7 +22,8 @@
 //! Caller is responsible for `if json_output { … } else { install_ui::… }`
 //! gating; this module never inspects `--json`.
 //!
-//! **Stream.** Every line goes to **stderr** (`eprintln!`). Matches the
+//! **Stream.** Every line goes to **stderr**, above the rows of an open
+//! [`crate::live_region::LiveRegion`] when there is one. Matches the
 //! cliclack code path that this module replaces — install progress is
 //! progress, not the "answer" of the command. Keeps stdout reserved for
 //! `--json` envelopes and for output piped to another tool.
@@ -470,14 +471,30 @@ fn spinner_animation_enabled(stderr_is_terminal: bool, color_enabled: bool) -> b
 }
 
 fn should_animate_spinner() -> bool {
-    spinner_animation_enabled(
-        std::io::stderr().is_terminal(),
-        lpm_common::color::enabled(),
-    )
+    !crate::live_region::is_open()
+        && spinner_animation_enabled(
+            std::io::stderr().is_terminal(),
+            lpm_common::color::enabled(),
+        )
 }
 
 fn format_line(kind: LineKind, msg: &str) -> String {
     format!("{}{} {msg}", reset_prefix(), glyph(kind))
+}
+
+/// A `›` phase row for a caller that draws its own rows, as a live region.
+pub(crate) fn phase_row(msg: &TerminalLine) -> String {
+    format_line(LineKind::Phase, msg)
+}
+
+/// A `✓` done row for a caller that draws its own rows.
+pub(crate) fn done_row(msg: &TerminalLine) -> String {
+    format_line(LineKind::Done, msg)
+}
+
+/// A `!` warning row for a caller that draws its own rows.
+pub(crate) fn warn_row(msg: &TerminalLine) -> String {
+    format_line(LineKind::Warn, msg)
 }
 
 fn glyph(kind: LineKind) -> String {
@@ -498,7 +515,7 @@ pub fn settle_spinner() {
 
 fn emit_line(kind: LineKind, msg: &str) {
     settle_any_active_spinner();
-    eprintln!("{}", format_line(kind, msg));
+    crate::live_region::print_line(&format_line(kind, msg));
 }
 
 fn static_spin_fallback_line(msg: &str) -> String {
@@ -527,7 +544,7 @@ fn spin_owned(message: String) -> Spinner {
     settle_any_active_spinner();
 
     if !should_animate_spinner() {
-        eprintln!("{}", static_spin_fallback_line(&message));
+        crate::live_region::print_line(&static_spin_fallback_line(&message));
         return Spinner { id: None, message };
     }
 
@@ -692,20 +709,20 @@ pub fn skipped_line(msg: TerminalLine) {
 /// Plain detail row that belongs to the slim transcript.
 pub fn detail(msg: &'static str) {
     settle_any_active_spinner();
-    eprintln!("{}{}", reset_prefix(), msg);
+    crate::live_region::print_line(&format!("{}{}", reset_prefix(), msg));
 }
 
 /// Emits a detail row containing sanitized dynamic plain text.
 pub fn detail_untrusted(msg: &str) {
     let safe = lpm_common::sanitize_terminal_inline(msg);
     settle_any_active_spinner();
-    eprintln!("{}{}", reset_prefix(), safe);
+    crate::live_region::print_line(&format!("{}{}", reset_prefix(), safe));
 }
 
 /// Emits a typed LPM-owned detail row.
 pub fn detail_line(msg: TerminalLine) {
     settle_any_active_spinner();
-    eprintln!("{}{}", reset_prefix(), msg);
+    crate::live_region::print_line(&format!("{}{}", reset_prefix(), msg));
 }
 
 fn diff_entry(glyph: &str, name: &str, version: Option<&str>, hint: Option<&str>) {
@@ -722,9 +739,13 @@ fn diff_entry(glyph: &str, name: &str, version: Option<&str>, hint: Option<&str>
     }
 
     if suffix.is_empty() {
-        eprintln!("{}{glyph} {name}", reset_prefix());
+        crate::live_region::print_line(&format!("{}{glyph} {name}", reset_prefix()));
     } else {
-        eprintln!("{}{glyph} {name}{}", reset_prefix(), suffix.dimmed());
+        crate::live_region::print_line(&format!(
+            "{}{glyph} {name}{}",
+            reset_prefix(),
+            suffix.dimmed()
+        ));
     }
 }
 
@@ -765,7 +786,7 @@ pub fn minus_target(name: &str, version: Option<&str>, hint: Option<&str>) {
         suffix.push_str(&hint.dimmed());
     }
 
-    eprintln!("{}{} {name}{suffix}", reset_prefix(), "-".red());
+    crate::live_region::print_line(&format!("{}{} {name}{suffix}", reset_prefix(), "-".red()));
 }
 
 /// Render a Duration as a short human string suitable for inlining in

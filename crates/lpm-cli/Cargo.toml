@@ -251,6 +251,9 @@ lpm-common = { workspace = true, features = ["test-support"] }
 # Paused clocks for the publication wait's deadline tests.
 tokio = { workspace = true, features = ["test-util"] }
 wiremock = "0.6"
+# A relay for the live tunnel panel's terminal test.
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
 assert_cmd = "2"
 insta = { version = "1", features = ["json"] }
 lpm-vault = { workspace = true, features = ["acceptance-test-hooks"] }

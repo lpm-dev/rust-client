@@ -123,6 +123,9 @@ pub enum ServerMessage {
         headers: HashMap<String, String>,
         /// Request body (base64-encoded).
         body: String,
+        /// The account's accepted requests this period, counting this one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accepted_requests: Option<u64>,
     },
 
     /// The visitor is ready for one response chunk.
@@ -141,6 +144,9 @@ pub enum ServerMessage {
         url: String,
         /// Upgrade request headers.
         headers: HashMap<String, String>,
+        /// The account's accepted requests this period, counting this one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        accepted_requests: Option<u64>,
     },
 
     /// WebSocket frame from remote client.
@@ -192,6 +198,30 @@ pub enum ServerMessage {
         /// Current request and bandwidth usage reported by the relay.
         usage: crate::TunnelUsageMetadata,
     },
+}
+
+/// A visitor request the relay admitted against the account's limits.
+pub(crate) struct Admission {
+    /// The account's accepted requests this period, counting this one.
+    pub(crate) accepted_requests: Option<u64>,
+}
+
+impl ServerMessage {
+    /// The relay counts every visitor request and WebSocket upgrade it hands
+    /// the tunnel toward the account's allowance.
+    pub(crate) fn admission(&self) -> Option<Admission> {
+        match self {
+            Self::HttpRequest {
+                accepted_requests, ..
+            }
+            | Self::WebSocketUpgrade {
+                accepted_requests, ..
+            } => Some(Admission {
+                accepted_requests: *accepted_requests,
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
