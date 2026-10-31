@@ -52,7 +52,7 @@ oxc_allocator = "=0.128.0"
 oxc_ast = "=0.128.0"
 oxc_ast_visit = "=0.128.0"
 oxc_parser = "=0.128.0"
-oxc_span = "=0.128.0"
+oxc_span = "=0.156.0"
 clap = { workspace = true, features = ["string"] }
 clap_complete = { workspace = true }
 cvss = { workspace = true }
