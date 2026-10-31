@@ -175,7 +175,7 @@ cliclack = "0.5"
 # Pure-Rust (RustCrypto), no OpenSSL transitive dependency.
 # Features: pkcs5 + encryption for the EncryptedPrivateKeyInfo API,
 # pem for PEM I/O (decode_vec / encode_string / PemLabel).
-pkcs8 = { version = "0.10", features = ["pkcs5", "encryption", "pem"] }
+pkcs8 = { version = "0.11", features = ["pkcs5", "encryption", "pem"] }
 # TTY passphrase prompt for encrypted mTLS keyfiles.
 rpassword = "7"
 
