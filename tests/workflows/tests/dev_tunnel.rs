@@ -2054,6 +2054,143 @@ fn tunnel_claim_without_auth_under_json_emits_error_envelope_on_stdout() {
     assert_eq!(envelope["error_code"], serde_json::json!("tunnel"));
 }
 
+/// A registry whose tunnel domain endpoints answer `status` with `body`
+/// exactly once, and an `lpm` command logged in to it.
+async fn tunnel_domain_refusal(
+    method: &str,
+    status: u16,
+    body: serde_json::Value,
+    args: &[&str],
+) -> std::process::Output {
+    use wiremock::matchers::{method as http_method, path_regex};
+
+    let server = MockServer::start().await;
+    Mock::given(http_method(method))
+        .and(path_regex(r"^/api/tunnel/domains"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(body))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);
+    seed_sessions(
+        project.home(),
+        &[SessionSeed {
+            registry_url: &server.uri(),
+            access_token: Some("workflow-access-token"),
+            refresh_token: Some("workflow-refresh-token"),
+            session_access_expires_at: Some("2099-01-01T00:00:00Z"),
+        }],
+    );
+    let mut command = lpm(&project);
+    command
+        .args(["--registry", &server.uri(), "--insecure"])
+        .args(args);
+    let output = tokio::task::spawn_blocking(move || command.output())
+        .await
+        .unwrap()
+        .expect("failed to run lpm tunnel");
+    server.verify().await;
+    output
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_claim_reports_the_registrys_refusal_and_reason_under_json() {
+    let output = tunnel_domain_refusal(
+        "POST",
+        409,
+        serde_json::json!({
+            "error": "Domain \"neo.lpm.llc\" is reserved. \"neo\" is the name of another account.",
+            "reason": "reserved"
+        }),
+        &["--json", "tunnel", "claim", "neo.lpm.llc"],
+    )
+    .await;
+
+    assert!(!output.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    insta::assert_json_snapshot!(envelope, @r#"
+    {
+      "schema_version": 1,
+      "success": false,
+      "error_code": "tunnel_domain",
+      "error": {
+        "code": "TUNNEL_DOMAIN",
+        "reason": "reserved",
+        "message": "Domain \"neo.lpm.llc\" is reserved. \"neo\" is the name of another account."
+      }
+    }
+    "#);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_claim_shows_the_registrys_refusal_instead_of_its_raw_answer() {
+    let output = tunnel_domain_refusal(
+        "POST",
+        409,
+        serde_json::json!({
+            "error": "Domain \"neo.lpm.llc\" is reserved. \"neo\" is the name of another account.",
+            "reason": "reserved"
+        }),
+        &["tunnel", "claim", "neo.lpm.llc"],
+    )
+    .await;
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr
+            .contains(r#"Domain "neo.lpm.llc" is reserved. "neo" is the name of another account."#),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("HTTP 409") && !stderr.contains(r#"{"error""#),
+        "{stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_unclaim_reports_a_release_it_could_not_confirm_without_asking_again() {
+    let output = tunnel_domain_refusal(
+        "DELETE",
+        503,
+        serde_json::json!({
+            "error": "The domain was released, but immediate tunnel enforcement could not be confirmed.",
+            "reason": "revocation_unconfirmed",
+            "released": true,
+            "domain": "staging.lpm.llc"
+        }),
+        &["--json", "tunnel", "unclaim", "staging.lpm.llc"],
+    )
+    .await;
+
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error_code"], "tunnel_domain");
+    assert_eq!(envelope["error"]["reason"], "revocation_unconfirmed");
+    assert_eq!(
+        envelope["error"]["message"],
+        "The domain was released, but immediate tunnel enforcement could not be confirmed."
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tunnel_claim_reports_a_refusal_from_a_registry_that_names_no_reason() {
+    let output = tunnel_domain_refusal(
+        "POST",
+        409,
+        serde_json::json!({ "error": "Domain \"taken.lpm.llc\" is already claimed." }),
+        &["--json", "tunnel", "claim", "taken.lpm.llc"],
+    )
+    .await;
+
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["error_code"], "tunnel_domain");
+    assert_eq!(envelope["error"]["reason"], serde_json::Value::Null);
+    assert_eq!(
+        envelope["error"]["message"],
+        r#"Domain "taken.lpm.llc" is already claimed."#
+    );
+}
+
 #[test]
 fn tunnel_list_without_auth_under_json_emits_error_envelope_on_stdout() {
     let project = TempProject::empty(r#"{"name":"tunnel","version":"1.0.0"}"#);

@@ -1037,7 +1037,7 @@ pub(super) struct FailedResponse {
 /// Returns seconds to wait. Falls back to 1 second if header is missing/unparseable.
 /// The seconds a 429's `Retry-After` asks to wait, as the registry says
 /// them, for a change that isn't retried and reports the wait instead.
-fn retry_after_seconds(response: &reqwest::Response) -> u64 {
+pub(super) fn retry_after_seconds(response: &reqwest::Response) -> u64 {
     response
         .headers()
         .get("retry-after")

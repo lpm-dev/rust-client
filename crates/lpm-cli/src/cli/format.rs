@@ -296,6 +296,16 @@ fn json_error_value(error: &lpm_common::LpmError) -> serde_json::Value {
                 "error": serde_json::Value::Object(detail),
             })
         }
+        lpm_common::LpmError::TunnelDomain { reason, message } => serde_json::json!({
+            "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
+            "success": false,
+            "error_code": error.error_code(),
+            "error": {
+                "code": "TUNNEL_DOMAIN",
+                "reason": reason,
+                "message": message,
+            }
+        }),
         lpm_common::LpmError::TunnelAccess {
             code,
             message,
@@ -920,6 +930,9 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             Some(&format!("{message} ({code})")),
             error,
         ),
+        lpm_common::LpmError::TunnelDomain { message, .. } => {
+            diagnostic_lines("Tunnel domain refused", Some(message), error)
+        }
         lpm_common::LpmError::Store(reason) => diagnostic_lines("Store error", Some(reason), error),
         lpm_common::LpmError::ProjectFile(reason) => {
             diagnostic_lines("Project file error", Some(reason), error)
