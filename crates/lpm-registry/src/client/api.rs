@@ -1,7 +1,50 @@
 use super::transport::{
-    Answered, FailedResponse, MAX_RETRIES, backoff_delay, version_exists_error,
+    Answered, FailedResponse, MAX_RETRIES, backoff_delay, retry_after_seconds, version_exists_error,
 };
 use super::*;
+
+/// An answer to a session-only request, with a 401 as `AuthRequired` so
+/// recovery can renew the session and ask again.
+fn session_answer(response: reqwest::Response) -> Result<reqwest::Response, LpmError> {
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(LpmError::AuthRequired);
+    }
+    Ok(response)
+}
+
+/// The Registry's refusal of a tunnel domain claim or release: its own
+/// message and reason, or the status when its answer gives neither.
+async fn tunnel_domain_refusal(response: reqwest::Response) -> LpmError {
+    let status = response.status().as_u16();
+    let retry_after_secs = retry_after_seconds(&response);
+    let body = parse_capped_api_json::<serde_json::Value>(response, "tunnel domain refusal")
+        .await
+        .ok();
+    let field = |name: &str| {
+        body.as_ref()
+            .and_then(|body| body.get(name))
+            .and_then(serde_json::Value::as_str)
+    };
+    let reason = field("reason")
+        .filter(|reason| is_refusal_reason(reason))
+        .map(str::to_owned);
+    if reason.as_deref() == Some("rate_limited") {
+        return LpmError::RateLimited { retry_after_secs };
+    }
+    let message = field("error").map_or_else(
+        || format!("LPM.dev Registry refused it with HTTP {status}"),
+        |message| lpm_common::sanitize_terminal_inline(message).into_owned(),
+    );
+    LpmError::TunnelDomain { reason, message }
+}
+
+/// A reason is the Registry's snake_case code, as `already_claimed`.
+fn is_refusal_reason(reason: &str) -> bool {
+    (1..=40).contains(&reason.len())
+        && reason
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
 
 /// The longest a tarball upload may take: a minute, and ten seconds a MiB,
 /// about 100 KiB/s, up to half an hour.
@@ -976,20 +1019,21 @@ impl RegistryClient {
         if let Some(slug) = org_slug {
             body["org"] = serde_json::Value::String(slug.to_string());
         }
-        self.execute_with_recovery(AuthPosture::SessionRequired, || async {
-            let response = self.post_json_raw(&url, &body).await?;
-            let status = response.status();
-            let data: serde_json::Value =
-                parse_capped_api_json(response, "tunnel claim response").await?;
-
-            if !status.is_success() {
-                let error = data["error"].as_str().unwrap_or("Unknown error");
-                return Err(LpmError::Tunnel(error.to_string()));
-            }
-
-            Ok(data)
-        })
-        .await
+        // A claim is sent once: a retry after a lost answer would find the
+        // domain already claimed.
+        let response = self
+            .execute_with_recovery(AuthPosture::SessionRequired, || async {
+                let mut request = self.http.for_url(&url).await?.post(&url).json(&body);
+                if let Some(bearer) = self.current_bearer(AuthPosture::AuthRequired)? {
+                    request = request.bearer_auth(bearer);
+                }
+                session_answer(self.send_once_preserving_status(request).await?)
+            })
+            .await?;
+        if !response.status().is_success() {
+            return Err(tunnel_domain_refusal(response).await);
+        }
+        parse_capped_api_json(response, "tunnel claim response").await
     }
 
     /// Release a claimed tunnel domain.
@@ -1017,24 +1061,21 @@ impl RegistryClient {
                 urlencoding::encode(domain)
             )
         };
-        self.execute_with_recovery(AuthPosture::SessionRequired, || async {
-            let mut req = self.http.for_url(&url).await?.delete(&url);
-            if let Some(bearer) = self.current_bearer(AuthPosture::SessionRequired)? {
-                req = req.bearer_auth(bearer);
-            }
-            let response = self.send_with_retry(req).await?;
-            let status = response.status();
-            let data: serde_json::Value =
-                parse_capped_api_json(response, "tunnel unclaim response").await?;
-
-            if !status.is_success() {
-                let error = data["error"].as_str().unwrap_or("Unknown error");
-                return Err(LpmError::Tunnel(error.to_string()));
-            }
-
-            Ok(data)
-        })
-        .await
+        // A release is sent once: retrying one the Registry made but couldn't
+        // confirm everywhere would report the domain as never claimed.
+        let response = self
+            .execute_with_recovery(AuthPosture::SessionRequired, || async {
+                let mut request = self.http.for_url(&url).await?.delete(&url);
+                if let Some(bearer) = self.current_bearer(AuthPosture::SessionRequired)? {
+                    request = request.bearer_auth(bearer);
+                }
+                session_answer(self.send_once_preserving_status(request).await?)
+            })
+            .await?;
+        if !response.status().is_success() {
+            return Err(tunnel_domain_refusal(response).await);
+        }
+        parse_capped_api_json(response, "tunnel unclaim response").await
     }
 
     /// List available tunnel base domains.

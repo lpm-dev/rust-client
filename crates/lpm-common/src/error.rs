@@ -571,6 +571,16 @@ pub enum LpmError {
         help: String,
     },
 
+    /// LPM.dev Registry refused to claim or release a tunnel domain, in its
+    /// own words.
+    #[error("tunnel domain refused: {message}")]
+    #[diagnostic(code(lpm::tunnel_domain))]
+    TunnelDomain {
+        /// The Registry's reason, such as `reserved`, when it names one.
+        reason: Option<String>,
+        message: String,
+    },
+
     #[error("store error: {0}")]
     #[diagnostic(
         code(lpm::store),
@@ -894,6 +904,7 @@ impl LpmError {
             LpmError::Sandbox(_) => "sandbox",
             LpmError::Tunnel(_) => "tunnel",
             LpmError::TunnelAccess { .. } => "tunnel_access",
+            LpmError::TunnelDomain { .. } => "tunnel_domain",
             LpmError::Store(_) => "store",
             LpmError::ProjectFile(_) => "project_file",
             LpmError::ProjectLayout(_) => "project_layout",
