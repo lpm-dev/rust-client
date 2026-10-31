@@ -118,8 +118,11 @@ input, select { font-family: var(--font); }
 [data-theme="light"] .detail-actions button:hover { background: #ccc; }
 .detail-sect { padding: 10px 14px; border-bottom: 1px solid var(--bg-2); }
 .detail-sect-title { font-size: 9px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-muted); margin-bottom: 6px; font-weight: 700; }
-.detail-row { display: flex; gap: 8px; margin-bottom: 2px; font-size: 12px; }
-.detail-key { color: var(--fg-dim); font-family: var(--mono); min-width: 100px; flex-shrink: 0; font-size: 11px; }
+/* A section's rows share one grid, so every value starts in the same column;
+   a key longer than 40% of the panel wraps instead of pushing its value. */
+.detail-rows { display: grid; grid-template-columns: fit-content(40%) minmax(0, 1fr); column-gap: 12px; row-gap: 2px; font-size: 12px; }
+.detail-row { display: contents; }
+.detail-key { color: var(--fg-dim); font-family: var(--mono); font-size: 11px; overflow-wrap: anywhere; }
 .detail-val { font-family: var(--mono); color: var(--fg); word-break: break-all; font-size: 11px; }
 .detail-body { font-family: var(--mono); font-size: 11px; background: var(--bg-2); padding: 8px; border-radius: var(--radius); white-space: pre-wrap; word-break: break-all; max-height: 350px; overflow-y: auto; line-height: 1.5; }
 
@@ -488,7 +491,7 @@ function renderDetail(d) {
 	const rt = d.response_body?.type === "text" ? d.response_body.data : d.response_body?.type === "binary" ? `[Binary: ${d.response_body_size}B]` : "[Empty]"
 	let pb = bt; try { pb = JSON.stringify(JSON.parse(bt), null, 2) } catch {}
 	let pr = rt; try { pr = JSON.stringify(JSON.parse(rt), null, 2) } catch {}
-	const hr = h => Object.entries(h||{}).sort((a,b)=>a[0].localeCompare(b[0])).map(([k,v])=>`<div class="detail-row"><span class="detail-key">${esc(k)}</span><span class="detail-val">${esc(v)}</span></div>`).join("")
+	const hr = h => `<div class="detail-rows">${Object.entries(h||{}).sort((a,b)=>a[0].localeCompare(b[0])).map(([k,v])=>`<div class="detail-row"><span class="detail-key">${esc(k)}</span><span class="detail-val">${esc(v)}</span></div>`).join("")}</div>`
 
 	panel.innerHTML = `
 		<div class="detail-hdr">
@@ -507,11 +510,11 @@ function renderDetail(d) {
 		</div>
 		<div id="diag-slot"></div>
 		<div class="tags-row" id="tags-row"></div>
-		<div class="detail-sect"><div class="detail-sect-title">Overview</div>
+		<div class="detail-sect"><div class="detail-sect-title">Overview</div><div class="detail-rows">
 			<div class="detail-row"><span class="detail-key">ID</span><span class="detail-val">${esc(d.id)}</span></div>
 			<div class="detail-row"><span class="detail-key">Timestamp</span><span class="detail-val">${esc(d.timestamp)}</span></div>
 			<div class="detail-row"><span class="detail-key">Duration</span><span class="detail-val">${d.duration_ms}ms</span></div>
-			${d.summary?`<div class="detail-row"><span class="detail-key">Summary</span><span class="detail-val">${esc(d.summary)}</span></div>`:""}</div>
+			${d.summary?`<div class="detail-row"><span class="detail-key">Summary</span><span class="detail-val">${esc(d.summary)}</span></div>`:""}</div></div>
 		<div class="detail-sect"><div class="detail-sect-title">Request Headers (${Object.keys(d.request_headers||{}).length})</div>${hr(d.request_headers)}</div>
 		<div class="detail-sect"><div class="detail-sect-title">Request Body (${d.request_body_size}B)</div><div class="detail-body">${esc(pb)}</div></div>
 		<div class="detail-sect"><div class="detail-sect-title">Response Headers (${Object.keys(d.response_headers||{}).length})</div>${hr(d.response_headers)}</div>
@@ -608,7 +611,7 @@ function renderWsDetail(connId, events) {
 	const closed = events.find(e => e.type === "closed")
 	panel.innerHTML = `
 		<div class="detail-hdr"><span class="detail-title">WS ${esc(conn?.url || connId)}</span><span class="req-meta">${frames.length} frames</span></div>
-		${conn ? `<div class="detail-sect"><div class="detail-sect-title">Connection</div><div class="detail-row"><span class="detail-key">URL</span><span class="detail-val">${esc(conn.url)}</span></div><div class="detail-row"><span class="detail-key">Connected</span><span class="detail-val">${esc(conn.timestamp)}</span></div>${closed?`<div class="detail-row"><span class="detail-key">Closed</span><span class="detail-val">${esc(closed.timestamp)}${closed.reason?` (${esc(closed.reason)})`:""}</span></div>`:""}</div>` : ""}
+		${conn ? `<div class="detail-sect"><div class="detail-sect-title">Connection</div><div class="detail-rows"><div class="detail-row"><span class="detail-key">URL</span><span class="detail-val">${esc(conn.url)}</span></div><div class="detail-row"><span class="detail-key">Connected</span><span class="detail-val">${esc(conn.timestamp)}</span></div>${closed?`<div class="detail-row"><span class="detail-key">Closed</span><span class="detail-val">${esc(closed.timestamp)}${closed.reason?` (${esc(closed.reason)})`:""}</span></div>`:""}</div></div>` : ""}
 		<div class="detail-sect"><div class="detail-sect-title">Frames (${frames.length})</div>
 		${frames.map(f => {
 			let preview = f.data; try { preview = JSON.stringify(JSON.parse(f.data), null, 2) } catch {}
