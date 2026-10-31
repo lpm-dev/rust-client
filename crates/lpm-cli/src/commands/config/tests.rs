@@ -624,6 +624,8 @@ fn firewall_policy_profile_persistence_writes_nested_policy_table() {
         &mut cfg,
         lpm_registry::client::NpmFirewallPolicyProfile {
             lpm_ai_agent_control_surface: lpm_registry::client::NpmFirewallPolicyAction::Warn,
+            lpm_ai_telemetry: lpm_registry::client::NpmFirewallPolicyAction::Block,
+            lpm_ai_dependency_script_policy: lpm_registry::client::NpmFirewallPolicyAction::Warn,
             lpm_ai_suspicious: lpm_registry::client::NpmFirewallPolicyAction::Allow,
             ..lpm_registry::client::NpmFirewallPolicyProfile::default()
         },
@@ -643,6 +645,18 @@ fn firewall_policy_profile_persistence_writes_nested_policy_table() {
     assert_eq!(
         policies
             .get(crate::npm_firewall_config::LPM_AI_AGENT_CONTROL_SURFACE_POLICY_KEY)
+            .and_then(|value| value.as_str()),
+        Some("warn")
+    );
+    assert_eq!(
+        policies
+            .get(crate::npm_firewall_config::LPM_AI_TELEMETRY_POLICY_KEY)
+            .and_then(|value| value.as_str()),
+        Some("block")
+    );
+    assert_eq!(
+        policies
+            .get(crate::npm_firewall_config::LPM_AI_DEPENDENCY_SCRIPT_POLICY_KEY)
             .and_then(|value| value.as_str()),
         Some("warn")
     );

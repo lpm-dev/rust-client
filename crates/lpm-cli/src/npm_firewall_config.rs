@@ -13,13 +13,41 @@ pub(crate) const FIREWALL_NPM_POLICIES_CONFIG_PATH: &str = "[firewall.npm.polici
 pub(crate) const TRUSTED_PUBLIC_MALICIOUS_ADVISORIES_POLICY_KEY: &str =
     "trusted_public_malicious_advisories";
 pub(crate) const LPM_AI_CONFIRMED_MALWARE_POLICY_KEY: &str = "lpm_ai_confirmed_malware";
+pub(crate) const LPM_AI_DEPENDENCY_SCRIPT_POLICY_KEY: &str = "lpm_ai_dependency_script_policy";
 pub(crate) const LPM_AI_AGENT_CONTROL_SURFACE_POLICY_KEY: &str = "lpm_ai_agent_control_surface";
+pub(crate) const LPM_AI_TELEMETRY_POLICY_KEY: &str = "lpm_ai_telemetry";
 pub(crate) const LPM_AI_SUSPICIOUS_POLICY_KEY: &str = "lpm_ai_suspicious";
 pub(crate) const CRITICAL_VULNERABILITY_POLICY_KEY: &str = "critical_vulnerability";
 pub(crate) const LEGACY_STATIC_ONLY_SUSPICIOUS_POLICY_KEY: &str = "static_only_suspicious";
 
 const ENV_NPM_FIREWALL: &str = "LPM_NPM_FIREWALL";
 const ENV_EXPERIMENT_NPM_FIREWALL: &str = "LPM_EXPERIMENT_NPM_FIREWALL";
+
+/// Where the effective `lpm_ai_telemetry` action comes from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TelemetryPolicyOrigin {
+    Default,
+    Config,
+    /// Telemetry warnings used to be part of `lpm_ai_suspicious`, so a policy
+    /// table that predates `lpm_ai_telemetry` keeps applying its AI-suspicious
+    /// action (or the legacy `static_only_suspicious` one) to telemetry.
+    InheritedFromAiSuspicious,
+}
+
+pub(crate) fn telemetry_policy_origin(policies: Option<&toml::Table>) -> TelemetryPolicyOrigin {
+    let Some(policies) = policies else {
+        return TelemetryPolicyOrigin::Default;
+    };
+    if policies.contains_key(LPM_AI_TELEMETRY_POLICY_KEY) {
+        TelemetryPolicyOrigin::Config
+    } else if policies.contains_key(LPM_AI_SUSPICIOUS_POLICY_KEY)
+        || policies.contains_key(LEGACY_STATIC_ONLY_SUSPICIOUS_POLICY_KEY)
+    {
+        TelemetryPolicyOrigin::InheritedFromAiSuspicious
+    } else {
+        TelemetryPolicyOrigin::Default
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum NpmFirewallMode {
@@ -223,8 +251,14 @@ pub(crate) fn config_policy_profile(
             LPM_AI_CONFIRMED_MALWARE_POLICY_KEY => {
                 profile.lpm_ai_confirmed_malware = action;
             }
+            LPM_AI_DEPENDENCY_SCRIPT_POLICY_KEY => {
+                profile.lpm_ai_dependency_script_policy = action;
+            }
             LPM_AI_AGENT_CONTROL_SURFACE_POLICY_KEY => {
                 profile.lpm_ai_agent_control_surface = action;
+            }
+            LPM_AI_TELEMETRY_POLICY_KEY => {
+                profile.lpm_ai_telemetry = action;
             }
             LPM_AI_SUSPICIOUS_POLICY_KEY => {
                 profile.lpm_ai_suspicious = action;
@@ -241,6 +275,9 @@ pub(crate) fn config_policy_profile(
                 )));
             }
         }
+    }
+    if telemetry_policy_origin(Some(policies)) == TelemetryPolicyOrigin::InheritedFromAiSuspicious {
+        profile.lpm_ai_telemetry = profile.lpm_ai_suspicious;
     }
     Ok(profile)
 }
@@ -364,6 +401,165 @@ mod tests {
             NpmFirewallPolicyAction::Warn
         );
         assert_eq!(profile.lpm_ai_suspicious, NpmFirewallPolicyAction::Warn);
+        assert_eq!(profile.lpm_ai_telemetry, NpmFirewallPolicyAction::Warn);
+        assert_eq!(
+            profile.lpm_ai_dependency_script_policy,
+            NpmFirewallPolicyAction::Block
+        );
+    }
+
+    fn global_with_policies(entries: &[(&str, &str)]) -> GlobalConfig {
+        let policies: toml::Table = entries
+            .iter()
+            .map(|(key, value)| {
+                (
+                    (*key).to_string(),
+                    toml::Value::String((*value).to_string()),
+                )
+            })
+            .collect();
+        let mut npm = toml::Table::new();
+        npm.insert(
+            FIREWALL_NPM_POLICIES_CONFIG_SECTION.to_string(),
+            toml::Value::Table(policies),
+        );
+        let mut firewall = toml::Table::new();
+        firewall.insert(
+            FIREWALL_NPM_CONFIG_SECTION.to_string(),
+            toml::Value::Table(npm),
+        );
+        let mut table = toml::Table::new();
+        table.insert(
+            FIREWALL_CONFIG_SECTION.to_string(),
+            toml::Value::Table(firewall),
+        );
+        GlobalConfig::from_table(table)
+    }
+
+    #[test]
+    fn npm_firewall_config_policy_profile_parses_explicit_telemetry_actions() {
+        for (raw, expected) in [
+            ("allow", NpmFirewallPolicyAction::Allow),
+            ("warn", NpmFirewallPolicyAction::Warn),
+            ("block", NpmFirewallPolicyAction::Block),
+        ] {
+            let global = global_with_policies(&[(LPM_AI_TELEMETRY_POLICY_KEY, raw)]);
+
+            let profile = config_policy_profile(&global).unwrap();
+
+            assert_eq!(
+                profile.lpm_ai_telemetry, expected,
+                "lpm_ai_telemetry = {raw}"
+            );
+            assert_eq!(profile.lpm_ai_suspicious, NpmFirewallPolicyAction::Warn);
+        }
+    }
+
+    #[test]
+    fn npm_firewall_config_telemetry_inherits_ai_suspicious_action_when_unset() {
+        let global = global_with_policies(&[(LPM_AI_SUSPICIOUS_POLICY_KEY, "block")]);
+
+        let profile = config_policy_profile(&global).unwrap();
+
+        assert_eq!(profile.lpm_ai_telemetry, NpmFirewallPolicyAction::Block);
+    }
+
+    #[test]
+    fn npm_firewall_config_telemetry_inherits_legacy_static_only_suspicious_action() {
+        let global = global_with_policies(&[(LEGACY_STATIC_ONLY_SUSPICIOUS_POLICY_KEY, "allow")]);
+
+        let profile = config_policy_profile(&global).unwrap();
+
+        assert_eq!(profile.lpm_ai_telemetry, NpmFirewallPolicyAction::Allow);
+    }
+
+    #[test]
+    fn npm_firewall_config_explicit_telemetry_action_wins_over_ai_suspicious() {
+        let global = global_with_policies(&[
+            (LPM_AI_SUSPICIOUS_POLICY_KEY, "block"),
+            (LPM_AI_TELEMETRY_POLICY_KEY, "allow"),
+        ]);
+
+        let profile = config_policy_profile(&global).unwrap();
+
+        assert_eq!(profile.lpm_ai_telemetry, NpmFirewallPolicyAction::Allow);
+        assert_eq!(profile.lpm_ai_suspicious, NpmFirewallPolicyAction::Block);
+    }
+
+    #[test]
+    fn npm_firewall_config_rejects_invalid_telemetry_action() {
+        let global = global_with_policies(&[(LPM_AI_TELEMETRY_POLICY_KEY, "deny")]);
+
+        let err = config_policy_profile(&global).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("invalid `[firewall.npm.policies].lpm_ai_telemetry` value `deny`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn npm_firewall_config_telemetry_origin_reports_config_inherited_or_default() {
+        let explicit = toml::Table::from_iter([(
+            LPM_AI_TELEMETRY_POLICY_KEY.to_string(),
+            toml::Value::String("warn".to_string()),
+        )]);
+        let inherited = toml::Table::from_iter([(
+            LEGACY_STATIC_ONLY_SUSPICIOUS_POLICY_KEY.to_string(),
+            toml::Value::String("warn".to_string()),
+        )]);
+        let unrelated = toml::Table::from_iter([(
+            CRITICAL_VULNERABILITY_POLICY_KEY.to_string(),
+            toml::Value::String("block".to_string()),
+        )]);
+
+        assert_eq!(
+            telemetry_policy_origin(Some(&explicit)),
+            TelemetryPolicyOrigin::Config
+        );
+        assert_eq!(
+            telemetry_policy_origin(Some(&inherited)),
+            TelemetryPolicyOrigin::InheritedFromAiSuspicious
+        );
+        assert_eq!(
+            telemetry_policy_origin(Some(&unrelated)),
+            TelemetryPolicyOrigin::Default
+        );
+        assert_eq!(
+            telemetry_policy_origin(None),
+            TelemetryPolicyOrigin::Default
+        );
+    }
+
+    #[test]
+    fn npm_firewall_config_policy_profile_parses_dependency_script_policy_actions() {
+        for (raw, expected) in [
+            ("allow", NpmFirewallPolicyAction::Allow),
+            ("warn", NpmFirewallPolicyAction::Warn),
+            ("block", NpmFirewallPolicyAction::Block),
+        ] {
+            let global = global_with_policies(&[(LPM_AI_DEPENDENCY_SCRIPT_POLICY_KEY, raw)]);
+
+            let profile = config_policy_profile(&global).unwrap();
+
+            assert_eq!(
+                profile.lpm_ai_dependency_script_policy, expected,
+                "lpm_ai_dependency_script_policy = {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn npm_firewall_config_dependency_script_policy_does_not_inherit_confirmed_malware_action() {
+        let global = global_with_policies(&[(LPM_AI_CONFIRMED_MALWARE_POLICY_KEY, "warn")]);
+
+        let profile = config_policy_profile(&global).unwrap();
+
+        assert_eq!(
+            profile.lpm_ai_dependency_script_policy,
+            NpmFirewallPolicyAction::Block
+        );
     }
 
     #[test]
