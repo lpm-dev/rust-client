@@ -4,7 +4,7 @@ mod support;
 
 use support::mock_registry::{MockRegistry, make_tarball};
 use support::{TempProject, lpm_with_registry, write_npm_firewall_global_config};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, ResponseTemplate};
 
 async fn install_with_verdict(
@@ -215,4 +215,83 @@ async fn firewall_monitor_continues_after_oidc_exchange_failure_but_enforce_stop
             assert!(stderr.contains("OIDC"), "{stderr}");
         }
     }
+}
+
+#[tokio::test]
+async fn firewall_install_sends_inherited_telemetry_policy_and_names_its_group() {
+    let mock = MockRegistry::start().await;
+    mock.with_package(
+        "usage-reporter",
+        "1.0.0",
+        &make_tarball("usage-reporter", "1.0.0"),
+    )
+    .await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .and(body_string_contains("\"lpmAiSuspicious\":\"block\""))
+        .and(body_string_contains("\"lpmAiTelemetry\":\"block\""))
+        .and(body_string_contains(
+            "\"lpmAiDependencyScriptPolicy\":\"block\"",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "requestId": "firewall-telemetry",
+            "policyMode": "product_default",
+            "summary": {
+                "total": 1, "allow": 0, "warn": 0, "block": 1, "unknown": 0, "matched": 1
+            },
+            "decisions": [{
+                "decisionId": "firewall-telemetry:1",
+                "name": "usage-reporter",
+                "version": "1.0.0",
+                "action": "block",
+                "verdict": "suspicious",
+                "reason": "client policy maps lpm_ai_telemetry to block",
+                "matchSource": "package",
+                "policyMode": "product_default",
+                "enqueueScan": false,
+                "policy": {
+                    "key": "telemetry",
+                    "group": "lpm_ai_telemetry",
+                    "intent": "telemetry",
+                    "defaultAction": "warn"
+                },
+                "authority": {
+                    "source": "lpm_ai",
+                    "sourceType": "lpm",
+                    "externalIntel": false
+                }
+            }]
+        })))
+        .expect(1)
+        .mount(mock.server())
+        .await;
+
+    let project = TempProject::empty(r#"{"name":"consumer","version":"1.0.0"}"#);
+    let lpm_dir = project.home().join(".lpm");
+    std::fs::create_dir_all(&lpm_dir).unwrap();
+    std::fs::write(
+        lpm_dir.join("config.toml"),
+        "[firewall]\nmode = \"enforce\"\n\n[firewall.npm.policies]\nlpm_ai_suspicious = \"block\"\n",
+    )
+    .unwrap();
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args([
+            "--color",
+            "never",
+            "install",
+            "--no-skills",
+            "usage-reporter@1.0.0",
+        ])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "  › usage-reporter@1.0.0 - suspicious: client policy maps lpm_ai_telemetry to block (policy lpm_ai_telemetry, source lpm_ai)"
+        ),
+        "{stderr}"
+    );
 }

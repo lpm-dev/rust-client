@@ -1596,6 +1596,44 @@ mod tests {
     }
 
     #[test]
+    fn firewall_decision_lines_name_telemetry_and_dependency_script_policy_groups() {
+        for (group, reason) in [
+            (
+                "lpm_ai_telemetry",
+                "client policy maps lpm_ai_suspicious to warn (telemetry)",
+            ),
+            (
+                "lpm_ai_dependency_script_policy",
+                "client policy maps lpm_ai_dependency_script_policy to warn",
+            ),
+        ] {
+            let mut decision = firewall_decision_with_display(
+                "",
+                "https://firewall.lpm.dev/npm/moi-computer/v/0.1.0",
+            );
+            decision.reason = reason.to_string();
+            decision.policy = Some(NpmFirewallDecisionPolicy {
+                group: group.to_string(),
+                key: None,
+                intent: None,
+                default_action: Some(lpm_registry::client::NpmFirewallPolicyAction::Warn),
+            });
+            decision.authority = Some(NpmFirewallDecisionAuthority {
+                source: "lpm_ai".to_string(),
+                source_type: None,
+                external_intel: None,
+            });
+
+            assert_eq!(
+                plain_firewall_decision_lines(&decision)[0],
+                format!(
+                    "  › moi-computer@0.1.0 - suspicious: {reason} (policy {group}, source lpm_ai)"
+                ),
+            );
+        }
+    }
+
+    #[test]
     fn firewall_decision_lines_sanitize_fallback_package_and_verdict_fields() {
         let mut decision = firewall_decision_with_display("", "");
         decision.name = "package\nforged".to_string();

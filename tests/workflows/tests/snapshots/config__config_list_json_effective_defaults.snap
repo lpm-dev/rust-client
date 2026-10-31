@@ -5,7 +5,7 @@ expression: snapshot
 {
   "success": true,
   "action": "list",
-  "count": 34,
+  "count": 36,
   "entries": [
     {
       "key": "save-prefix",
@@ -128,7 +128,19 @@ expression: snapshot
       "group": "Supply-chain security"
     },
     {
+      "key": "firewall.npm.policies.lpm_ai_dependency_script_policy",
+      "value": "block",
+      "source": "built-in default",
+      "group": "Supply-chain security"
+    },
+    {
       "key": "firewall.npm.policies.lpm_ai_agent_control_surface",
+      "value": "warn",
+      "source": "built-in default",
+      "group": "Supply-chain security"
+    },
+    {
+      "key": "firewall.npm.policies.lpm_ai_telemetry",
       "value": "warn",
       "source": "built-in default",
       "group": "Supply-chain security"

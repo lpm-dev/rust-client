@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
@@ -5,6 +6,7 @@ use lpm_common::LpmError;
 
 use super::GlobalConfig;
 use crate::commands::install::policy_extensions::load_policy_extension_configs;
+use crate::npm_firewall_config::TelemetryPolicyOrigin;
 use crate::precedence::{PolicyTier, PurePolicyKnob};
 use crate::security_approval::{EffectiveAuthorizedPosture, PostureSourceKind};
 
@@ -22,7 +24,7 @@ const GROUP_NETWORK: &str = "Network";
 const GROUP_EXTENSIONS: &str = "Local policy extensions";
 const GROUP_ADDITIONAL: &str = "Additional saved values";
 
-const STATIC_CONFIG_ENTRY_COUNT: usize = 34;
+const STATIC_CONFIG_ENTRY_COUNT: usize = 36;
 const LEGACY_CONFIG_PATHS: &[&str] = &["firewall.npm.policies.static_only_suspicious", "noSkills"];
 
 #[derive(Debug)]
@@ -811,27 +813,56 @@ fn add_firewall_policy_entries(
     };
     let values = [
         (
-            "trusted_public_malicious_advisories",
+            crate::npm_firewall_config::TRUSTED_PUBLIC_MALICIOUS_ADVISORIES_POLICY_KEY,
             profile.trusted_public_malicious_advisories,
         ),
-        ("lpm_ai_confirmed_malware", profile.lpm_ai_confirmed_malware),
         (
-            "lpm_ai_agent_control_surface",
+            crate::npm_firewall_config::LPM_AI_CONFIRMED_MALWARE_POLICY_KEY,
+            profile.lpm_ai_confirmed_malware,
+        ),
+        (
+            crate::npm_firewall_config::LPM_AI_DEPENDENCY_SCRIPT_POLICY_KEY,
+            profile.lpm_ai_dependency_script_policy,
+        ),
+        (
+            crate::npm_firewall_config::LPM_AI_AGENT_CONTROL_SURFACE_POLICY_KEY,
             profile.lpm_ai_agent_control_surface,
         ),
-        ("critical_vulnerability", profile.critical_vulnerability),
-        ("lpm_ai_suspicious", profile.lpm_ai_suspicious),
+        (
+            crate::npm_firewall_config::LPM_AI_TELEMETRY_POLICY_KEY,
+            profile.lpm_ai_telemetry,
+        ),
+        (
+            crate::npm_firewall_config::CRITICAL_VULNERABILITY_POLICY_KEY,
+            profile.critical_vulnerability,
+        ),
+        (
+            crate::npm_firewall_config::LPM_AI_SUSPICIOUS_POLICY_KEY,
+            profile.lpm_ai_suspicious,
+        ),
     ];
     for (key, value) in values {
-        let source = if key == "lpm_ai_suspicious"
-            && policies.is_some_and(|policies| {
-                policies.contains_key(
-                    crate::npm_firewall_config::LEGACY_STATIC_ONLY_SUSPICIOUS_POLICY_KEY,
-                )
-            }) {
-            user_source
-        } else {
-            policy_source(key)
+        let source: Cow<'_, str> = match key {
+            crate::npm_firewall_config::LPM_AI_SUSPICIOUS_POLICY_KEY
+                if policies.is_some_and(|policies| {
+                    policies.contains_key(
+                        crate::npm_firewall_config::LEGACY_STATIC_ONLY_SUSPICIOUS_POLICY_KEY,
+                    )
+                }) =>
+            {
+                Cow::Borrowed(user_source)
+            }
+            crate::npm_firewall_config::LPM_AI_TELEMETRY_POLICY_KEY => {
+                match crate::npm_firewall_config::telemetry_policy_origin(policies) {
+                    TelemetryPolicyOrigin::Config => Cow::Borrowed(user_source),
+                    TelemetryPolicyOrigin::InheritedFromAiSuspicious => Cow::Owned(format!(
+                        "inherited from {} ({user_source})",
+                        crate::npm_firewall_config::LPM_AI_SUSPICIOUS_POLICY_KEY
+                    )),
+                    TelemetryPolicyOrigin::Default => Cow::Borrowed(DEFAULT_SOURCE),
+                }
+            }
+            _ => Cow::Borrowed(policy_source(key)),
         };
         entries.push(EffectiveConfigEntry::new(
             format!("firewall.npm.policies.{key}"),

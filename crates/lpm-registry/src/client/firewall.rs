@@ -198,7 +198,9 @@ impl NpmFirewallPolicyAction {
 pub struct NpmFirewallPolicyProfile {
     pub trusted_public_malicious_advisories: NpmFirewallPolicyAction,
     pub lpm_ai_confirmed_malware: NpmFirewallPolicyAction,
+    pub lpm_ai_dependency_script_policy: NpmFirewallPolicyAction,
     pub lpm_ai_agent_control_surface: NpmFirewallPolicyAction,
+    pub lpm_ai_telemetry: NpmFirewallPolicyAction,
     pub lpm_ai_suspicious: NpmFirewallPolicyAction,
     pub critical_vulnerability: NpmFirewallPolicyAction,
 }
@@ -208,7 +210,9 @@ impl Default for NpmFirewallPolicyProfile {
         Self {
             trusted_public_malicious_advisories: NpmFirewallPolicyAction::Block,
             lpm_ai_confirmed_malware: NpmFirewallPolicyAction::Block,
+            lpm_ai_dependency_script_policy: NpmFirewallPolicyAction::Block,
             lpm_ai_agent_control_surface: NpmFirewallPolicyAction::Warn,
+            lpm_ai_telemetry: NpmFirewallPolicyAction::Warn,
             lpm_ai_suspicious: NpmFirewallPolicyAction::Warn,
             critical_vulnerability: NpmFirewallPolicyAction::Warn,
         }

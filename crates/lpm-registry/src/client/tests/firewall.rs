@@ -278,6 +278,114 @@ async fn npm_firewall_batch_verdicts_sends_policy_profile_when_configured() {
     );
 }
 
+#[test]
+fn npm_firewall_policy_profile_default_serializes_every_policy_group() {
+    assert_eq!(
+        serde_json::to_value(NpmFirewallPolicyProfile::default()).unwrap(),
+        serde_json::json!({
+            "trustedPublicMaliciousAdvisories": "block",
+            "lpmAiConfirmedMalware": "block",
+            "lpmAiDependencyScriptPolicy": "block",
+            "lpmAiAgentControlSurface": "warn",
+            "lpmAiTelemetry": "warn",
+            "lpmAiSuspicious": "warn",
+            "criticalVulnerability": "warn",
+        })
+    );
+}
+
+#[tokio::test]
+async fn npm_firewall_batch_verdicts_sends_telemetry_and_dependency_script_policies() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let client = RegistryClient::new().with_base_url(server.uri());
+
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("content-type", "application/json")
+                .set_body_json(serde_json::json!({
+                    "requestId": "req-telemetry",
+                    "policyMode": "product_default",
+                    "summary": {
+                        "total": 1,
+                        "allow": 0,
+                        "warn": 0,
+                        "block": 1,
+                        "unknown": 0,
+                        "matched": 1
+                    },
+                    "decisions": [{
+                        "decisionId": "req-telemetry:1",
+                        "name": "usage-reporter",
+                        "version": "1.0.0",
+                        "action": "block",
+                        "verdict": "suspicious",
+                        "reason": "client policy maps lpm_ai_telemetry to block",
+                        "matchSource": "package",
+                        "matchedKey": "fw:npm:v1:usage-reporter@1.0.0",
+                        "policyMode": "product_default",
+                        "policy": {
+                            "key": "telemetry",
+                            "group": "lpm_ai_telemetry",
+                            "intent": "telemetry",
+                            "defaultAction": "warn"
+                        },
+                        "authority": {
+                            "source": "lpm_ai",
+                            "sourceType": "lpm",
+                            "externalIntel": false
+                        }
+                    }]
+                })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let result = client
+        .npm_firewall_batch_verdicts_with_posture_and_policy(
+            &[NpmFirewallBatchPackage {
+                name: "usage-reporter".to_string(),
+                version: "1.0.0".to_string(),
+                integrity: None,
+                published_at: None,
+            }],
+            AuthPosture::AnonymousPreferred,
+            Some(NpmFirewallPolicyProfile {
+                lpm_ai_telemetry: NpmFirewallPolicyAction::Block,
+                lpm_ai_dependency_script_policy: NpmFirewallPolicyAction::Warn,
+                ..NpmFirewallPolicyProfile::default()
+            }),
+        )
+        .await
+        .expect("firewall verdict request should succeed");
+
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(
+        body["policyProfile"]["policies"],
+        serde_json::json!({
+            "trustedPublicMaliciousAdvisories": "block",
+            "lpmAiConfirmedMalware": "block",
+            "lpmAiDependencyScriptPolicy": "warn",
+            "lpmAiAgentControlSurface": "warn",
+            "lpmAiTelemetry": "block",
+            "lpmAiSuspicious": "warn",
+            "criticalVulnerability": "warn",
+        })
+    );
+    let decision = &result.decisions[0];
+    assert_eq!(decision.action, NpmFirewallAction::Block);
+    let policy = decision.policy.as_ref().expect("decision keeps its policy");
+    assert_eq!(policy.group, "lpm_ai_telemetry");
+    assert_eq!(policy.key.as_deref(), Some("telemetry"));
+    assert_eq!(policy.default_action, Some(NpmFirewallPolicyAction::Warn));
+}
+
 #[tokio::test]
 async fn npm_firewall_batch_verdicts_rejects_unknown_action() {
     use wiremock::matchers::{method, path};

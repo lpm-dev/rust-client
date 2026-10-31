@@ -268,8 +268,16 @@ pub(in crate::commands::config) fn persist_firewall_policy_profile_in_config_val
         policy_action_value(profile.lpm_ai_confirmed_malware),
     );
     policies_table.insert(
+        crate::npm_firewall_config::LPM_AI_DEPENDENCY_SCRIPT_POLICY_KEY.to_string(),
+        policy_action_value(profile.lpm_ai_dependency_script_policy),
+    );
+    policies_table.insert(
         crate::npm_firewall_config::LPM_AI_AGENT_CONTROL_SURFACE_POLICY_KEY.to_string(),
         policy_action_value(profile.lpm_ai_agent_control_surface),
+    );
+    policies_table.insert(
+        crate::npm_firewall_config::LPM_AI_TELEMETRY_POLICY_KEY.to_string(),
+        policy_action_value(profile.lpm_ai_telemetry),
     );
     policies_table.insert(
         crate::npm_firewall_config::CRITICAL_VULNERABILITY_POLICY_KEY.to_string(),
@@ -335,8 +343,16 @@ fn policy_profile_json(profile: NpmFirewallPolicyProfile) -> serde_json::Value {
         serde_json::Value::String(profile.lpm_ai_confirmed_malware.as_str().to_string()),
     );
     policies.insert(
+        crate::npm_firewall_config::LPM_AI_DEPENDENCY_SCRIPT_POLICY_KEY.to_string(),
+        serde_json::Value::String(profile.lpm_ai_dependency_script_policy.as_str().to_string()),
+    );
+    policies.insert(
         crate::npm_firewall_config::LPM_AI_AGENT_CONTROL_SURFACE_POLICY_KEY.to_string(),
         serde_json::Value::String(profile.lpm_ai_agent_control_surface.as_str().to_string()),
+    );
+    policies.insert(
+        crate::npm_firewall_config::LPM_AI_TELEMETRY_POLICY_KEY.to_string(),
+        serde_json::Value::String(profile.lpm_ai_telemetry.as_str().to_string()),
     );
     policies.insert(
         crate::npm_firewall_config::CRITICAL_VULNERABILITY_POLICY_KEY.to_string(),
@@ -353,7 +369,9 @@ fn policy_profile_json(profile: NpmFirewallPolicyProfile) -> serde_json::Value {
 enum FirewallPolicyField {
     TrustedPublicMaliciousAdvisories,
     LpmAiConfirmedMalware,
+    LpmAiDependencyScriptPolicy,
     LpmAiAgentControlSurface,
+    LpmAiTelemetry,
     CriticalVulnerability,
     LpmAiSuspicious,
 }
@@ -363,7 +381,9 @@ impl FirewallPolicyField {
         match self {
             Self::TrustedPublicMaliciousAdvisories => profile.trusted_public_malicious_advisories,
             Self::LpmAiConfirmedMalware => profile.lpm_ai_confirmed_malware,
+            Self::LpmAiDependencyScriptPolicy => profile.lpm_ai_dependency_script_policy,
             Self::LpmAiAgentControlSurface => profile.lpm_ai_agent_control_surface,
+            Self::LpmAiTelemetry => profile.lpm_ai_telemetry,
             Self::CriticalVulnerability => profile.critical_vulnerability,
             Self::LpmAiSuspicious => profile.lpm_ai_suspicious,
         }
@@ -375,7 +395,9 @@ impl FirewallPolicyField {
                 profile.trusted_public_malicious_advisories = action;
             }
             Self::LpmAiConfirmedMalware => profile.lpm_ai_confirmed_malware = action,
+            Self::LpmAiDependencyScriptPolicy => profile.lpm_ai_dependency_script_policy = action,
             Self::LpmAiAgentControlSurface => profile.lpm_ai_agent_control_surface = action,
+            Self::LpmAiTelemetry => profile.lpm_ai_telemetry = action,
             Self::CriticalVulnerability => profile.critical_vulnerability = action,
             Self::LpmAiSuspicious => profile.lpm_ai_suspicious = action,
         }
@@ -385,7 +407,9 @@ impl FirewallPolicyField {
         match self {
             Self::TrustedPublicMaliciousAdvisories
             | Self::LpmAiConfirmedMalware
+            | Self::LpmAiDependencyScriptPolicy
             | Self::LpmAiAgentControlSurface
+            | Self::LpmAiTelemetry
             | Self::CriticalVulnerability => &BLOCK_WARN_ALLOW_ACTIONS,
             Self::LpmAiSuspicious => &WARN_ALLOW_ACTIONS,
         }
@@ -399,7 +423,7 @@ struct FirewallPolicyGroup {
     detail: &'static str,
 }
 
-const FIREWALL_POLICY_GROUPS: [FirewallPolicyGroup; 5] = [
+const FIREWALL_POLICY_GROUPS: [FirewallPolicyGroup; 7] = [
     FirewallPolicyGroup {
         field: FirewallPolicyField::TrustedPublicMaliciousAdvisories,
         title: "Trusted public malicious advisories",
@@ -411,9 +435,19 @@ const FIREWALL_POLICY_GROUPS: [FirewallPolicyGroup; 5] = [
         detail: "Credential/data exfiltration, RCE, remote payload execution, persistence, dependency confusion",
     },
     FirewallPolicyGroup {
+        field: FirewallPolicyField::LpmAiDependencyScriptPolicy,
+        title: "LPM Firewall dependency script approval policy",
+        detail: "Install-lifecycle code that widens the project's dependency install-script approvals without explicit approval",
+    },
+    FirewallPolicyGroup {
         field: FirewallPolicyField::LpmAiAgentControlSurface,
         title: "LPM Firewall AI-agent control-surface policy",
         detail: "Silent install-lifecycle writes into foreign or broad AI-agent control surfaces",
+    },
+    FirewallPolicyGroup {
+        field: FirewallPolicyField::LpmAiTelemetry,
+        title: "Telemetry",
+        detail: "Packages that send usage or machine details to their publisher or an analytics service by default (default warn; choose Block to stop these installs)",
     },
     FirewallPolicyGroup {
         field: FirewallPolicyField::CriticalVulnerability,
@@ -597,7 +631,7 @@ fn firewall_policy_profile_from_rows(rows: &[FirewallPolicyEditorRow]) -> NpmFir
 }
 
 fn format_firewall_policy_editor_frame(rows: &[FirewallPolicyEditorRow], cursor: usize) -> String {
-    let mut frame = String::with_capacity(1_200);
+    let mut frame = String::with_capacity(2_048);
     frame.push_str(&format!(
         "◆  {}\n",
         FIREWALL_POLICY_EDITOR_PROMPT.cyan().bold()
@@ -666,9 +700,117 @@ mod tests {
 
         assert!(plain.contains("Trusted public malicious advisories"));
         assert!(plain.contains("LPM Firewall AI-confirmed malware"));
+        assert!(plain.contains("LPM Firewall dependency script approval policy"));
         assert!(plain.contains("LPM Firewall AI-agent control-surface policy"));
+        assert!(plain.contains("Telemetry"));
         assert!(plain.contains("Critical vulnerabilities"));
         assert!(plain.contains("LPM Firewall AI-suspicious findings"));
+    }
+
+    fn row_for(
+        rows: &[FirewallPolicyEditorRow],
+        field: FirewallPolicyField,
+    ) -> &FirewallPolicyEditorRow {
+        rows.iter()
+            .find(|row| row.group.field == field)
+            .expect("every policy field must have an editor row")
+    }
+
+    #[test]
+    fn firewall_policy_editor_places_telemetry_after_ai_agent_control_surface() {
+        let fields: Vec<FirewallPolicyField> = FIREWALL_POLICY_GROUPS
+            .iter()
+            .map(|group| group.field)
+            .collect();
+        let agent = fields
+            .iter()
+            .position(|field| *field == FirewallPolicyField::LpmAiAgentControlSurface)
+            .unwrap();
+
+        assert_eq!(fields[agent + 1], FirewallPolicyField::LpmAiTelemetry);
+    }
+
+    #[test]
+    fn firewall_policy_editor_defaults_telemetry_to_warn_and_offers_block() {
+        let rows = firewall_policy_rows_from_profile(NpmFirewallPolicyProfile::default());
+        let telemetry = row_for(&rows, FirewallPolicyField::LpmAiTelemetry);
+
+        assert_eq!(
+            telemetry.actions,
+            [
+                NpmFirewallPolicyAction::Block,
+                NpmFirewallPolicyAction::Warn,
+                NpmFirewallPolicyAction::Allow,
+            ]
+        );
+        assert_eq!(telemetry.action, NpmFirewallPolicyAction::Warn);
+    }
+
+    #[test]
+    fn firewall_policy_editor_defaults_dependency_script_policy_to_block() {
+        let rows = firewall_policy_rows_from_profile(NpmFirewallPolicyProfile::default());
+        let script_policy = row_for(&rows, FirewallPolicyField::LpmAiDependencyScriptPolicy);
+
+        assert_eq!(
+            script_policy.actions,
+            [
+                NpmFirewallPolicyAction::Block,
+                NpmFirewallPolicyAction::Warn,
+                NpmFirewallPolicyAction::Allow,
+            ]
+        );
+        assert_eq!(script_policy.action, NpmFirewallPolicyAction::Block);
+    }
+
+    #[test]
+    fn firewall_policy_editor_starts_telemetry_from_inherited_ai_suspicious_action() {
+        let mut policies = toml::map::Map::new();
+        policies.insert(
+            crate::npm_firewall_config::LPM_AI_SUSPICIOUS_POLICY_KEY.to_string(),
+            toml::Value::String("block".to_string()),
+        );
+        let mut npm = toml::map::Map::new();
+        npm.insert(
+            crate::npm_firewall_config::FIREWALL_NPM_POLICIES_CONFIG_SECTION.to_string(),
+            toml::Value::Table(policies),
+        );
+        let mut firewall = toml::map::Map::new();
+        firewall.insert(
+            crate::npm_firewall_config::FIREWALL_NPM_CONFIG_SECTION.to_string(),
+            toml::Value::Table(npm),
+        );
+        let mut top = toml::map::Map::new();
+        top.insert(
+            FIREWALL_CONFIG_SECTION.to_string(),
+            toml::Value::Table(firewall),
+        );
+        let profile =
+            crate::npm_firewall_config::config_policy_profile(&GlobalConfig::from_table(top))
+                .unwrap();
+
+        let rows = firewall_policy_rows_from_profile(profile);
+
+        assert_eq!(
+            row_for(&rows, FirewallPolicyField::LpmAiTelemetry).action,
+            NpmFirewallPolicyAction::Block
+        );
+    }
+
+    #[test]
+    fn firewall_policy_editor_round_trips_every_field_through_rows() {
+        let profile = NpmFirewallPolicyProfile {
+            trusted_public_malicious_advisories: NpmFirewallPolicyAction::Warn,
+            lpm_ai_confirmed_malware: NpmFirewallPolicyAction::Warn,
+            lpm_ai_dependency_script_policy: NpmFirewallPolicyAction::Allow,
+            lpm_ai_agent_control_surface: NpmFirewallPolicyAction::Block,
+            lpm_ai_telemetry: NpmFirewallPolicyAction::Block,
+            lpm_ai_suspicious: NpmFirewallPolicyAction::Allow,
+            critical_vulnerability: NpmFirewallPolicyAction::Block,
+        };
+
+        let rows = firewall_policy_rows_from_profile(profile);
+
+        assert_eq!(firewall_policy_profile_from_rows(&rows), profile);
     }
 
     #[test]

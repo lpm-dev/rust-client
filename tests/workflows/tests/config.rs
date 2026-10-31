@@ -1165,7 +1165,9 @@ fn config_list_json_reports_every_known_effective_key() {
             "firewall.mode",
             "firewall.npm.policies.trusted_public_malicious_advisories",
             "firewall.npm.policies.lpm_ai_confirmed_malware",
+            "firewall.npm.policies.lpm_ai_dependency_script_policy",
             "firewall.npm.policies.lpm_ai_agent_control_surface",
+            "firewall.npm.policies.lpm_ai_telemetry",
             "firewall.npm.policies.critical_vulnerability",
             "firewall.npm.policies.lpm_ai_suspicious",
             "integrity",
@@ -1292,6 +1294,88 @@ fn config_list_resolves_project_user_and_environment_sources() {
     assert_eq!(
         entry("custom-future-key")["source"],
         serde_json::json!("~/.lpm/config.toml")
+    );
+}
+
+#[test]
+fn config_list_reports_whether_the_telemetry_policy_is_default_configured_or_inherited() {
+    for (config, expected_value, expected_source) in [
+        ("", "warn", "built-in default"),
+        (
+            "[firewall.npm.policies]\nlpm_ai_suspicious = \"block\"\nlpm_ai_telemetry = \"allow\"\n",
+            "allow",
+            "~/.lpm/config.toml",
+        ),
+        (
+            "[firewall.npm.policies]\nlpm_ai_suspicious = \"block\"\n",
+            "block",
+            "inherited from lpm_ai_suspicious (~/.lpm/config.toml)",
+        ),
+        (
+            "[firewall.npm.policies]\nstatic_only_suspicious = \"allow\"\n",
+            "allow",
+            "inherited from lpm_ai_suspicious (~/.lpm/config.toml)",
+        ),
+    ] {
+        let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+        if !config.is_empty() {
+            seed_config(&project, config);
+        }
+
+        let output = lpm(&project)
+            .args(["config", "list", "--json"])
+            .output()
+            .expect("failed to run lpm config list --json");
+
+        assert!(
+            output.status.success(),
+            "lpm config list --json failed for {config:?}:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .expect("config list --json stdout must be valid JSON");
+        let telemetry = envelope["entries"]
+            .as_array()
+            .expect("config list --json must return an entries array")
+            .iter()
+            .find(|entry| entry["key"] == "firewall.npm.policies.lpm_ai_telemetry")
+            .expect("config list must report the telemetry policy");
+        assert_eq!(
+            telemetry["value"],
+            serde_json::json!(expected_value),
+            "value for {config:?}"
+        );
+        assert_eq!(
+            telemetry["source"],
+            serde_json::json!(expected_source),
+            "source for {config:?}"
+        );
+    }
+}
+
+#[test]
+fn config_list_rejects_an_invalid_telemetry_policy_action() {
+    let project = TempProject::empty(r#"{"name":"config-test","version":"1.0.0"}"#);
+    seed_config(
+        &project,
+        "[firewall.npm.policies]\nlpm_ai_telemetry = \"deny\"\n",
+    );
+
+    let output = lpm(&project)
+        .args(["config", "list", "--json"])
+        .output()
+        .expect("failed to run lpm config list --json");
+
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("invalid `[firewall.npm.policies].lpm_ai_telemetry` value `deny`"),
+        "{combined}"
     );
 }
 
