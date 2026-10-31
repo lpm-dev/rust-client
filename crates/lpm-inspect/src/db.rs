@@ -574,6 +574,7 @@ impl InspectorDb {
         query: &str,
         provider: Option<&str>,
         status: Option<StatusQuery>,
+        method: Option<&MethodQuery>,
         limit: usize,
     ) -> Result<Vec<StoredRequest>, rusqlite::Error> {
         let conn = self.read_conn.lock().await;
@@ -612,12 +613,23 @@ impl InspectorDb {
             None => {}
         }
 
+        match method {
+            Some(MethodQuery::Exact(_)) => conditions.push("r.method = ?3".to_string()),
+            Some(MethodQuery::Other) => conditions.push(format!(
+                "r.method NOT IN ({})",
+                COMMON_METHODS
+                    .map(|method| format!("'{method}'"))
+                    .join(", ")
+            )),
+            None => {}
+        }
+
         if !conditions.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&conditions.join(" AND "));
         }
 
-        sql.push_str(" ORDER BY r.timestamp DESC, r.id DESC LIMIT ?3");
+        sql.push_str(" ORDER BY r.timestamp DESC, r.id DESC LIMIT ?4");
 
         let mut stmt = conn.prepare(&sql)?;
 
@@ -630,24 +642,31 @@ impl InspectorDb {
         };
 
         let provider_str = provider.unwrap_or("");
+        let method_str = match method {
+            Some(MethodQuery::Exact(method)) => method.as_str(),
+            _ => "",
+        };
 
-        let rows = stmt.query_map(params![fts_query, provider_str, sql_count(limit)], |row| {
-            Ok(StoredRequest {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                timestamp: row.get(2)?,
-                method: row.get(3)?,
-                path: row.get(4)?,
-                status: row.get(5)?,
-                duration_ms: row.get(6)?,
-                provider: row.get(7)?,
-                summary: row.get(8)?,
-                req_size: row.get(9)?,
-                res_size: row.get(10)?,
-                has_signature_issue: row.get(11)?,
-                auto_acked: row.get(12)?,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![fts_query, provider_str, method_str, sql_count(limit)],
+            |row| {
+                Ok(StoredRequest {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    timestamp: row.get(2)?,
+                    method: row.get(3)?,
+                    path: row.get(4)?,
+                    status: row.get(5)?,
+                    duration_ms: row.get(6)?,
+                    provider: row.get(7)?,
+                    summary: row.get(8)?,
+                    req_size: row.get(9)?,
+                    res_size: row.get(10)?,
+                    has_signature_issue: row.get(11)?,
+                    auto_acked: row.get(12)?,
+                })
+            },
+        )?;
 
         rows.collect()
     }
@@ -2677,6 +2696,18 @@ pub enum StatusQuery {
     Class(u16),
     /// All errors (>= 400).
     Error,
+}
+
+/// The methods the inspector names; [`MethodQuery::Other`] keeps the rest.
+pub const COMMON_METHODS: [&str; 5] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+
+/// Which request methods a search keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MethodQuery {
+    /// One method, as recorded: `GET`.
+    Exact(String),
+    /// Every method outside [`COMMON_METHODS`], as `OPTIONS` and `HEAD`.
+    Other,
 }
 
 /// Compact request row (no bodies) for list views.
@@ -5552,14 +5583,14 @@ mod tests {
 
         // Search for "insufficient_funds"
         let results = db
-            .search("insufficient_funds", None, None, 10)
+            .search("insufficient_funds", None, None, None, 10)
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "w2");
 
         // Search for "charge" should find w1
-        let results = db.search("charge", None, None, 10).await.unwrap();
+        let results = db.search("charge", None, None, None, 10).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "w1");
     }
@@ -5575,7 +5606,7 @@ mod tests {
         db.insert_request(w2, None);
         db.flush_pending_writes().await.unwrap();
 
-        let results = db.search("", Some("stripe"), None, 10).await.unwrap();
+        let results = db.search("", Some("stripe"), None, None, 10).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "w1");
     }
@@ -5588,17 +5619,65 @@ mod tests {
         db.flush_pending_writes().await.unwrap();
 
         let results = db
-            .search("", None, Some(StatusQuery::Class(5)), 10)
+            .search("", None, Some(StatusQuery::Class(5)), None, 10)
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "w2");
 
         let results = db
-            .search("", None, Some(StatusQuery::Error), 10)
+            .search("", None, Some(StatusQuery::Error), None, 10)
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn search_keeps_one_method_or_every_uncommon_one() {
+        let db = InspectorDb::open_temp().unwrap();
+        for (id, method, status) in [
+            ("get", "GET", 200),
+            ("get-cached", "GET", 304),
+            ("post", "POST", 200),
+            ("options", "OPTIONS", 204),
+            ("head", "HEAD", 200),
+        ] {
+            db.insert_request(
+                CapturedWebhook {
+                    method: method.to_string(),
+                    ..make_webhook(id, status)
+                },
+                None,
+            );
+        }
+        db.flush_pending_writes().await.unwrap();
+        let ids = |results: Vec<StoredRequest>| {
+            let mut ids: Vec<String> = results.into_iter().map(|result| result.id).collect();
+            ids.sort();
+            ids
+        };
+        let post = MethodQuery::Exact("POST".to_string());
+        let get = MethodQuery::Exact("GET".to_string());
+
+        let posts = db.search("", None, None, Some(&post), 10).await.unwrap();
+        let uncommon = db
+            .search("", None, None, Some(&MethodQuery::Other), 10)
+            .await
+            .unwrap();
+        let cached_gets = db
+            .search(
+                "charge",
+                Some("stripe"),
+                Some(StatusQuery::Class(3)),
+                Some(&get),
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(ids(posts), ["post"]);
+        assert_eq!(ids(uncommon), ["head", "options"]);
+        assert_eq!(ids(cached_gets), ["get-cached"]);
     }
 
     #[tokio::test]
@@ -5791,7 +5870,7 @@ mod tests {
         assert!(db.get_webhook("in-other-ended").await.unwrap().is_some());
         assert_eq!(session_ids(&db).await, ["open", "other-ended"]);
         let found = db
-            .search("zqxendedsessionsecretzqx", None, None, 10)
+            .search("zqxendedsessionsecretzqx", None, None, None, 10)
             .await
             .unwrap();
         assert!(found.is_empty(), "{found:?}");
@@ -6098,7 +6177,7 @@ mod tests {
 
         // Verify the search finds it
         let results = db
-            .search("unique_phantom_canary_xyz", None, None, 10)
+            .search("unique_phantom_canary_xyz", None, None, None, 10)
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -6113,7 +6192,7 @@ mod tests {
 
         // Search must return 0 results (JOIN filters the phantom FTS entry)
         let results = db
-            .search("unique_phantom_canary_xyz", None, None, 10)
+            .search("unique_phantom_canary_xyz", None, None, None, 10)
             .await
             .unwrap();
         assert_eq!(

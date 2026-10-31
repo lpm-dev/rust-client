@@ -308,6 +308,56 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn api_search_filters_by_method_and_status_class() {
+        let project = tempfile::tempdir().unwrap();
+        let state =
+            InspectorState::with_db(3000, crate::db::InspectorDb::open(project.path()).unwrap());
+        for (id, method, status) in [
+            ("get", "GET", 200),
+            ("get-cached", "GET", 304),
+            ("post", "POST", 201),
+            ("options", "OPTIONS", 204),
+        ] {
+            state
+                .push(CapturedWebhook {
+                    method: method.to_string(),
+                    ..make_webhook(id, status)
+                })
+                .await;
+        }
+        state.flush().await.unwrap();
+        let handle = crate::start(state.clone(), 0).await.unwrap();
+        let search = |query: &'static str| {
+            let url = url_with_token(handle.port, query, state.auth_token());
+            async move {
+                let body: serde_json::Value =
+                    reqwest::get(url).await.unwrap().json().await.unwrap();
+                let mut ids: Vec<String> = body["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["id"].as_str().unwrap().to_string())
+                    .collect();
+                ids.sort();
+                ids
+            }
+        };
+
+        assert_eq!(
+            search("/api/search?method=get").await,
+            ["get", "get-cached"]
+        );
+        assert_eq!(
+            search("/api/search?method=get&status=3xx").await,
+            ["get-cached"]
+        );
+        assert_eq!(search("/api/search?method=other").await, ["options"]);
+        assert_eq!(search("/api/search?method=").await.len(), 4);
+
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn api_requests_reopens_persisted_project_history() {
         let project = tempfile::tempdir().unwrap();
         let writer_db = crate::db::InspectorDb::open(project.path()).unwrap();

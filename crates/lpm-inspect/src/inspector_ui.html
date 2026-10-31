@@ -9,6 +9,7 @@
 	--bg: #0a0a0a; --bg-1: #111; --bg-2: #1a1a1a; --bg-3: #222;
 	--fg: #e5e5e5; --fg-dim: #888; --fg-muted: #555;
 	--accent: #60a5fa; --green: #22c55e; --yellow: #eab308; --red: #ef4444; --purple: #a78bfa;
+	--cyan: #22d3ee; --orange: #fb923c;
 	--font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 	--mono: "SF Mono", Monaco, "Cascadia Code", monospace;
 	--radius: 6px;
@@ -17,6 +18,7 @@
 	--bg: #f8f8f8; --bg-1: #fff; --bg-2: #f0f0f0; --bg-3: #ddd;
 	--fg: #1a1a1a; --fg-dim: #666; --fg-muted: #999;
 	--accent: #2563eb; --green: #16a34a; --yellow: #ca8a04; --red: #dc2626; --purple: #7c3aed;
+	--cyan: #0891b2; --orange: #ea580c;
 }
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: var(--font); background: var(--bg); color: var(--fg); font-size: 13px; height: 100vh; overflow: hidden; }
@@ -24,14 +26,15 @@ button { font-family: var(--font); cursor: pointer; border: none; background: no
 input, select { font-family: var(--font); }
 
 /* Layout: 3 columns — sidebar | list | detail */
-.app { display: grid; grid-template-columns: 200px 1fr 1fr; grid-template-rows: 44px 36px 1fr 28px; height: 100vh; }
+.app { display: grid; grid-template-columns: 200px 1fr 1fr; grid-template-rows: 44px 36px 32px 1fr auto 28px; height: 100vh; }
 .app.sidebar-hidden { grid-template-columns: 0px 1fr 1fr; }
-.header { grid-column: 1 / -1; background: var(--bg-1); border-bottom: 1px solid var(--bg-3); display: flex; align-items: center; padding: 0 12px; gap: 10px; }
-.toolbar { grid-column: 2 / -1; background: var(--bg-1); border-bottom: 1px solid var(--bg-3); display: flex; align-items: center; padding: 0 8px; gap: 6px; }
-.sidebar { grid-column: 1; grid-row: 2 / 4; overflow-y: auto; background: var(--bg-1); border-right: 1px solid var(--bg-3); font-size: 12px; }
-.list-panel { grid-column: 2; overflow-y: auto; border-right: 1px solid var(--bg-3); }
-.detail-panel { grid-column: 3; overflow-y: auto; }
-.status-bar { grid-column: 1 / -1; background: var(--bg-1); border-top: 1px solid var(--bg-3); display: flex; align-items: center; padding: 0 12px; gap: 16px; font-size: 11px; color: var(--fg-dim); }
+.header { grid-column: 1 / -1; grid-row: 1; background: var(--bg-1); border-bottom: 1px solid var(--bg-3); display: flex; align-items: center; padding: 0 12px; gap: 10px; }
+.toolbar { grid-column: 2 / -1; grid-row: 2; background: var(--bg-1); border-bottom: 1px solid var(--bg-3); display: flex; align-items: center; padding: 0 8px; gap: 6px; }
+.filterbar { grid-column: 2 / -1; grid-row: 3; background: var(--bg-1); border-bottom: 1px solid var(--bg-3); display: flex; align-items: center; padding: 0 8px; gap: 4px; overflow-x: auto; }
+.sidebar { grid-column: 1; grid-row: 2 / 5; overflow-y: auto; background: var(--bg-1); border-right: 1px solid var(--bg-3); font-size: 12px; }
+.list-panel { grid-column: 2; grid-row: 4; overflow-y: auto; border-right: 1px solid var(--bg-3); }
+.detail-panel { grid-column: 3; grid-row: 4; overflow-y: auto; }
+.status-bar { grid-column: 1 / -1; grid-row: 6; background: var(--bg-1); border-top: 1px solid var(--bg-3); display: flex; align-items: center; padding: 0 12px; gap: 16px; font-size: 11px; color: var(--fg-dim); }
 
 /* Header */
 .logo { font-weight: 700; font-size: 14px; color: var(--fg); white-space: nowrap; }
@@ -48,11 +51,16 @@ input, select { font-family: var(--font); }
 /* Toolbar — search + filters */
 .search-input { flex: 1; background: var(--bg-2); border: 1px solid var(--bg-3); color: var(--fg); border-radius: var(--radius); padding: 4px 8px; font-size: 12px; font-family: var(--mono); min-width: 0; }
 .search-input:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
-.filter-chip { padding: 2px 8px; border-radius: 12px; font-size: 10px; font-weight: 600; background: var(--bg-3); color: var(--fg-dim); cursor: pointer; white-space: nowrap; }
+.filter-chip { padding: 2px 8px; border-radius: 12px; font-size: 10px; font-weight: 600; font-family: var(--mono); background: var(--bg-3); color: var(--fg-dim); cursor: pointer; white-space: nowrap; }
 .filter-chip:hover { background: #333; }
+.filter-chip:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
 .filter-chip.active { background: var(--accent); color: #000; }
+.filter-chip.toned { color: var(--tone); }
+.filter-chip.toned.active { color: var(--tone); background: color-mix(in srgb, var(--tone) 22%, transparent); box-shadow: inset 0 0 0 1px var(--tone); }
 [data-theme="light"] .filter-chip:hover { background: #ccc; }
 [data-theme="light"] .filter-chip.active { color: #fff; }
+[data-theme="light"] .filter-chip.toned.active { color: var(--tone); }
+.filter-sep { width: 1px; height: 14px; background: var(--bg-3); margin: 0 6px; flex-shrink: 0; }
 .saved-filter { padding: 2px 8px; border-radius: 12px; font-size: 10px; background: rgba(167,139,250,0.15); color: var(--purple); cursor: pointer; display: flex; align-items: center; gap: 3px; }
 .saved-filter .x { opacity: 0.5; font-size: 8px; }
 .saved-filter .x:hover { opacity: 1; }
@@ -79,13 +87,17 @@ input, select { font-family: var(--font); }
 .sidebar-clear:hover, .sidebar-clear:focus-visible { color: var(--red); }
 
 /* Request list */
-.req-item { display: grid; grid-template-columns: 50px 44px 1fr auto auto 56px; gap: 6px; align-items: center; padding: 6px 10px; border-bottom: 1px solid var(--bg-2); cursor: pointer; font-size: 11px; }
+.m-get { --tone: var(--green); } .m-post { --tone: var(--accent); } .m-put { --tone: var(--orange); }
+.m-patch { --tone: var(--purple); } .m-delete { --tone: var(--red); } .m-other { --tone: var(--fg-dim); }
+.s1 { --tone: var(--fg-dim); } .s2 { --tone: var(--green); } .s3 { --tone: var(--cyan); }
+.s4 { --tone: var(--yellow); } .s5 { --tone: var(--red); }
+.req-item { display: grid; grid-template-columns: 58px 40px 1fr auto auto 56px; gap: 6px; align-items: center; padding: 6px 10px; border-bottom: 1px solid var(--bg-2); cursor: pointer; font-size: 11px; }
 .req-item:hover { background: var(--bg-2); }
 .req-item.selected { background: var(--bg-3); }
 .req-item.acked { opacity: 0.55; }
-.req-method { font-family: var(--mono); font-weight: 600; font-size: 10px; }
-.req-status { font-family: var(--mono); font-weight: 600; text-align: center; padding: 1px 4px; border-radius: 3px; font-size: 10px; }
-.req-status.s2 { color: var(--green); } .req-status.s4 { color: var(--yellow); } .req-status.s5 { color: var(--red); }
+.req-method, .req-status { font-family: var(--mono); font-weight: 700; font-size: 10px; padding: 1px 5px; border-radius: 3px; color: var(--tone); background: color-mix(in srgb, var(--tone) 14%, transparent); }
+.req-method { justify-self: start; }
+.req-status { text-align: center; }
 .req-path { font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
 .req-prov { font-size: 9px; color: var(--accent); background: rgba(96,165,250,0.1); padding: 1px 5px; border-radius: 3px; white-space: nowrap; }
 .req-meta { font-family: var(--mono); font-size: 9px; color: var(--fg-muted); text-align: right; white-space: nowrap; }
@@ -106,8 +118,11 @@ input, select { font-family: var(--font); }
 [data-theme="light"] .detail-actions button:hover { background: #ccc; }
 .detail-sect { padding: 10px 14px; border-bottom: 1px solid var(--bg-2); }
 .detail-sect-title { font-size: 9px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-muted); margin-bottom: 6px; font-weight: 700; }
-.detail-row { display: flex; gap: 8px; margin-bottom: 2px; font-size: 12px; }
-.detail-key { color: var(--fg-dim); font-family: var(--mono); min-width: 100px; flex-shrink: 0; font-size: 11px; }
+/* A section's rows share one grid, so every value starts in the same column;
+   a key longer than 40% of the panel wraps instead of pushing its value. */
+.detail-rows { display: grid; grid-template-columns: fit-content(40%) minmax(0, 1fr); column-gap: 12px; row-gap: 2px; font-size: 12px; }
+.detail-row { display: contents; }
+.detail-key { color: var(--fg-dim); font-family: var(--mono); font-size: 11px; overflow-wrap: anywhere; }
 .detail-val { font-family: var(--mono); color: var(--fg); word-break: break-all; font-size: 11px; }
 .detail-body { font-family: var(--mono); font-size: 11px; background: var(--bg-2); padding: 8px; border-radius: var(--radius); white-space: pre-wrap; word-break: break-all; max-height: 350px; overflow-y: auto; line-height: 1.5; }
 
@@ -196,7 +211,7 @@ input, select { font-family: var(--font); }
 /* Toast + reconnect banner */
 .toast { position: fixed; bottom: 40px; right: 16px; background: var(--bg-3); color: var(--fg); padding: 6px 12px; border-radius: var(--radius); font-size: 12px; z-index: 200; opacity: 0; transition: opacity 0.2s; pointer-events: none; }
 .toast.show { opacity: 1; }
-.reconnect-banner { display: none; grid-column: 1 / -1; background: rgba(239,68,68,0.1); color: var(--red); padding: 6px 14px; font-size: 11px; align-items: center; gap: 8px; }
+.reconnect-banner { display: none; grid-column: 1 / -1; grid-row: 5; background: rgba(239,68,68,0.1); color: var(--red); padding: 6px 14px; font-size: 11px; align-items: center; gap: 8px; }
 .reconnect-banner.show { display: flex; }
 .reconnect-banner button { color: var(--accent); text-decoration: underline; font-size: 11px; }
 
@@ -221,14 +236,25 @@ input, select { font-family: var(--font); }
 	</div>
 	<div class="toolbar" id="toolbar">
 		<input class="search-input" id="search-input" placeholder="Search bodies, paths, summaries... (Enter)" autocomplete="off">
-		<span class="filter-chip" data-filter="provider:Stripe" onclick="toggleFilter(this)">Stripe</span>
-		<span class="filter-chip" data-filter="provider:GitHub" onclick="toggleFilter(this)">GitHub</span>
-		<span class="filter-chip" data-filter="status:2xx" onclick="toggleFilter(this)">2xx</span>
-		<span class="filter-chip" data-filter="status:4xx" onclick="toggleFilter(this)">4xx</span>
-		<span class="filter-chip" data-filter="status:5xx" onclick="toggleFilter(this)">5xx</span>
-		<span class="filter-chip" data-filter="status:error" onclick="toggleFilter(this)">Errors</span>
 		<button class="hdr-btn" onclick="saveCurrentFilter()" title="Bookmark current filter">Save</button>
 		<div id="saved-filters"></div>
+	</div>
+	<div class="filterbar" id="filterbar" role="toolbar" aria-label="Filters">
+		<button class="filter-chip toned m-get" data-filter="method:GET" aria-pressed="false" onclick="toggleFilter(this)">GET</button>
+		<button class="filter-chip toned m-post" data-filter="method:POST" aria-pressed="false" onclick="toggleFilter(this)">POST</button>
+		<button class="filter-chip toned m-put" data-filter="method:PUT" aria-pressed="false" onclick="toggleFilter(this)">PUT</button>
+		<button class="filter-chip toned m-patch" data-filter="method:PATCH" aria-pressed="false" onclick="toggleFilter(this)">PATCH</button>
+		<button class="filter-chip toned m-delete" data-filter="method:DELETE" aria-pressed="false" onclick="toggleFilter(this)">DELETE</button>
+		<button class="filter-chip toned m-other" data-filter="method:other" aria-pressed="false" onclick="toggleFilter(this)" title="OPTIONS, HEAD, and other methods">Other</button>
+		<span class="filter-sep" aria-hidden="true"></span>
+		<button class="filter-chip toned s2" data-filter="status:2xx" aria-pressed="false" onclick="toggleFilter(this)">2xx</button>
+		<button class="filter-chip toned s3" data-filter="status:3xx" aria-pressed="false" onclick="toggleFilter(this)">3xx</button>
+		<button class="filter-chip toned s4" data-filter="status:4xx" aria-pressed="false" onclick="toggleFilter(this)">4xx</button>
+		<button class="filter-chip toned s5" data-filter="status:5xx" aria-pressed="false" onclick="toggleFilter(this)">5xx</button>
+		<button class="filter-chip toned s5" data-filter="status:error" aria-pressed="false" onclick="toggleFilter(this)" title="4xx and 5xx">Errors</button>
+		<span class="filter-sep" aria-hidden="true"></span>
+		<button class="filter-chip" data-filter="provider:Stripe" aria-pressed="false" onclick="toggleFilter(this)">Stripe</button>
+		<button class="filter-chip" data-filter="provider:GitHub" aria-pressed="false" onclick="toggleFilter(this)">GitHub</button>
 	</div>
 	<div class="sidebar" id="sidebar">
 		<div class="sidebar-nav">
@@ -269,7 +295,7 @@ let requests = [], wsConns = [], sessions = []
 let selectedId = null, selectedWsId = null
 let diffSelectMode = false, diffFirstId = null
 let currentView = "http" // "http" | "ws"
-let activeFilters = { provider: null, status: null, query: "" }
+let activeFilters = { provider: null, status: null, method: null, query: "" }
 let activeSessionFilter = null
 let savedFilters = JSON.parse(localStorage.getItem("lpm_filters") || "[]")
 let allTags = new Set()
@@ -315,11 +341,12 @@ async function loadSessions() {
 async function loadWsConnections() {
 	try { const resp = await fetch("/api/ws/connections"); if (resp.ok) { wsConns = await resp.json(); renderWsList() } } catch {}
 }
-async function searchRequests(q, provider, status) {
+async function searchRequests(q, provider, status, method) {
 	const params = new URLSearchParams()
 	if (q) params.set("q", q)
 	if (provider) params.set("provider", provider)
 	if (status) params.set("status", status)
+	if (method) params.set("method", method)
 	params.set("limit", "200")
 	const resp = await fetch(`/api/search?${params}`); if (!resp.ok) return
 	const data = await resp.json(); requests = data.items || []; renderList(); updateCount()
@@ -378,7 +405,17 @@ async function importSnapshot(json) {
 function dl(content, name, type) { const b = new Blob([content], { type }); const u = URL.createObjectURL(b); const a = document.createElement("a"); a.href = u; a.download = name; a.click(); URL.revokeObjectURL(u) }
 
 // ── Helpers ────────────────────────────────────────────
-function sc(s) { return s >= 500 ? "s5" : s >= 400 ? "s4" : "s2" }
+function sc(s) { return s >= 500 ? "s5" : s >= 400 ? "s4" : s >= 300 ? "s3" : s >= 200 ? "s2" : "s1" }
+// Matches the server's method filter: "other" is every method these don't name.
+const COMMON_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
+function mc(m) { return COMMON_METHODS.includes(m) ? `m-${m.toLowerCase()}` : "m-other" }
+function methodMatches(m, filter) { return filter === "other" ? !COMMON_METHODS.includes(m) : m === filter }
+function statusMatches(s, filter) {
+	if (filter === "error") return s >= 400
+	const cls = /^([1-5])xx$/.exec(filter)
+	return cls ? Math.floor(s / 100) === Number(cls[1]) : s === Number(filter)
+}
+function filtersActive() { return Boolean(activeFilters.query || activeFilters.provider || activeFilters.status || activeFilters.method) }
 function fmtT(ts) { return ts?.length >= 19 ? ts.substring(11, 19) : ts || "" }
 function esc(s) { if (s == null) return ""; return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;") }
 function toast(m) { const t = $("#toast"); t.textContent = m; t.classList.add("show"); setTimeout(() => t.classList.remove("show"), 2500) }
@@ -389,38 +426,39 @@ function getFiltered() {
 	let list = requests
 	if (activeSessionFilter) list = list.filter(r => r.session_id === activeSessionFilter)
 	if (activeFilters.provider) list = list.filter(r => r.provider === activeFilters.provider)
-	if (activeFilters.status) {
-		const s = activeFilters.status
-		if (s === "error") list = list.filter(r => r.status >= 400)
-		else if (s === "2xx") list = list.filter(r => r.status >= 200 && r.status < 300)
-		else if (s === "4xx") list = list.filter(r => r.status >= 400 && r.status < 500)
-		else if (s === "5xx") list = list.filter(r => r.status >= 500)
-	}
+	if (activeFilters.method) list = list.filter(r => methodMatches(r.method, activeFilters.method))
+	if (activeFilters.status) list = list.filter(r => statusMatches(r.status, activeFilters.status))
 	return list
 }
 function toggleFilter(el) {
-	const f = el.dataset.filter; const [type, val] = f.split(":")
-	if (el.classList.contains("active")) { el.classList.remove("active"); activeFilters[type] = null }
-	else { $$(".filter-chip").forEach(c => { if (c.dataset.filter.startsWith(type+":")) c.classList.remove("active") }); el.classList.add("active"); activeFilters[type] = val }
-	applyFilters()
+	const [type, val] = el.dataset.filter.split(":")
+	activeFilters[type] = activeFilters[type] === val ? null : val
+	syncFilterChips(); applyFilters()
+}
+function syncFilterChips() {
+	$$(".filter-chip").forEach(c => {
+		const [t, v] = c.dataset.filter.split(":"), on = activeFilters[t] === v
+		c.classList.toggle("active", on); c.setAttribute("aria-pressed", String(on))
+	})
 }
 function applyFilters() {
-	if (activeFilters.query) { searchRequests(activeFilters.query, activeFilters.provider, activeFilters.status) }
-	else if (activeFilters.provider || activeFilters.status) { searchRequests("", activeFilters.provider, activeFilters.status) }
-	else { loadAll() }
+	if (filtersActive()) searchRequests(activeFilters.query, activeFilters.provider, activeFilters.status, activeFilters.method)
+	else loadAll()
+}
+function filterLabel(f) {
+	const method = f.method === "other" ? "other methods" : f.method
+	return [f.query, method, f.status, f.provider].filter(Boolean).join(" + ")
 }
 function saveCurrentFilter() {
-	const f = { provider: activeFilters.provider, status: activeFilters.status, query: activeFilters.query }
-	const label = [f.query, f.provider, f.status].filter(Boolean).join(" + ") || "all"
-	if (!label || label === "all") return
-	savedFilters.push({ label, ...f }); localStorage.setItem("lpm_filters", JSON.stringify(savedFilters)); renderSavedFilters()
+	if (!filtersActive()) return
+	const f = { provider: activeFilters.provider, status: activeFilters.status, method: activeFilters.method, query: activeFilters.query }
+	savedFilters.push({ label: filterLabel(f), ...f }); localStorage.setItem("lpm_filters", JSON.stringify(savedFilters)); renderSavedFilters()
 }
 function applySavedFilter(i) {
 	const f = savedFilters[i]; if (!f) return
-	activeFilters = { provider: f.provider || null, status: f.status || null, query: f.query || "" }
+	activeFilters = { provider: f.provider || null, status: f.status || null, method: f.method || null, query: f.query || "" }
 	$("#search-input").value = activeFilters.query
-	$$(".filter-chip").forEach(c => { const [t,v] = c.dataset.filter.split(":"); c.classList.toggle("active", activeFilters[t] === v) })
-	applyFilters()
+	syncFilterChips(); applyFilters()
 }
 function removeSavedFilter(i, ev) { ev.stopPropagation(); savedFilters.splice(i, 1); localStorage.setItem("lpm_filters", JSON.stringify(savedFilters)); renderSavedFilters() }
 function renderSavedFilters() {
@@ -431,14 +469,14 @@ function renderSavedFilters() {
 function renderList() {
 	if (currentView === "ws") { renderWsList(); return }
 	const panel = $("#list-panel"), list = getFiltered()
-	if (list.length === 0) { panel.innerHTML = `<div class="empty" id="empty-state"><div class="icon">~</div><div>${activeFilters.query || activeFilters.provider || activeFilters.status ? "No matching requests" : "Waiting for requests..."}</div></div>`; return }
+	if (list.length === 0) { panel.innerHTML = `<div class="empty" id="empty-state"><div class="icon">~</div><div>${filtersActive() || activeSessionFilter ? "No matching requests" : "Waiting for requests..."}</div></div>`; return }
 	let html = ""
 	for (const r of list) {
 		const sel = r.id === selectedId ? " selected" : "", ack = r.auto_acked ? " acked" : ""
 		const prov = r.provider ? `<span class="req-prov">${esc(r.provider)}</span>` : ""
 		const badges = []; if (r.auto_acked) badges.push(`<span class="badge badge-ack">ACK</span>`); if (r.has_signature_issue) badges.push(`<span class="badge badge-sig">SIG</span>`)
 		html += `<div class="req-item${sel}${ack}" onclick="selectRequest('${esc(r.id)}')">
-			<span class="req-method">${esc(r.method)}</span><span class="req-status ${sc(r.status)}">${r.status}</span>
+			<span class="req-method ${mc(r.method)}">${esc(r.method)}</span><span class="req-status ${sc(r.status)}">${r.status}</span>
 			<span class="req-path" title="${esc(r.path)}">${esc(r.path)}</span>${prov}
 			<span class="req-badges">${badges.join("")}</span>
 			<span class="req-meta">${r.duration_ms}ms ${fmtT(r.timestamp)}</span></div>`
@@ -453,12 +491,13 @@ function renderDetail(d) {
 	const rt = d.response_body?.type === "text" ? d.response_body.data : d.response_body?.type === "binary" ? `[Binary: ${d.response_body_size}B]` : "[Empty]"
 	let pb = bt; try { pb = JSON.stringify(JSON.parse(bt), null, 2) } catch {}
 	let pr = rt; try { pr = JSON.stringify(JSON.parse(rt), null, 2) } catch {}
-	const hr = h => Object.entries(h||{}).sort((a,b)=>a[0].localeCompare(b[0])).map(([k,v])=>`<div class="detail-row"><span class="detail-key">${esc(k)}</span><span class="detail-val">${esc(v)}</span></div>`).join("")
+	const hr = h => `<div class="detail-rows">${Object.entries(h||{}).sort((a,b)=>a[0].localeCompare(b[0])).map(([k,v])=>`<div class="detail-row"><span class="detail-key">${esc(k)}</span><span class="detail-val">${esc(v)}</span></div>`).join("")}</div>`
 
 	panel.innerHTML = `
 		<div class="detail-hdr">
 			<span class="req-status ${sc(d.status)}" style="font-size:14px">${d.status}</span>
-			<span class="detail-title">${esc(d.method)} ${esc(d.path)}</span>
+			<span class="req-method ${mc(d.method)}" style="font-size:12px">${esc(d.method)}</span>
+			<span class="detail-title">${esc(d.path)}</span>
 			${d.provider ? `<span class="req-prov">${esc(d.provider)}</span>` : ""}
 			<div class="detail-actions">
 				<button onclick="showReplayForm('${esc(d.id)}')">Replay</button>
@@ -471,11 +510,11 @@ function renderDetail(d) {
 		</div>
 		<div id="diag-slot"></div>
 		<div class="tags-row" id="tags-row"></div>
-		<div class="detail-sect"><div class="detail-sect-title">Overview</div>
+		<div class="detail-sect"><div class="detail-sect-title">Overview</div><div class="detail-rows">
 			<div class="detail-row"><span class="detail-key">ID</span><span class="detail-val">${esc(d.id)}</span></div>
 			<div class="detail-row"><span class="detail-key">Timestamp</span><span class="detail-val">${esc(d.timestamp)}</span></div>
 			<div class="detail-row"><span class="detail-key">Duration</span><span class="detail-val">${d.duration_ms}ms</span></div>
-			${d.summary?`<div class="detail-row"><span class="detail-key">Summary</span><span class="detail-val">${esc(d.summary)}</span></div>`:""}</div>
+			${d.summary?`<div class="detail-row"><span class="detail-key">Summary</span><span class="detail-val">${esc(d.summary)}</span></div>`:""}</div></div>
 		<div class="detail-sect"><div class="detail-sect-title">Request Headers (${Object.keys(d.request_headers||{}).length})</div>${hr(d.request_headers)}</div>
 		<div class="detail-sect"><div class="detail-sect-title">Request Body (${d.request_body_size}B)</div><div class="detail-body">${esc(pb)}</div></div>
 		<div class="detail-sect"><div class="detail-sect-title">Response Headers (${Object.keys(d.response_headers||{}).length})</div>${hr(d.response_headers)}</div>
@@ -572,7 +611,7 @@ function renderWsDetail(connId, events) {
 	const closed = events.find(e => e.type === "closed")
 	panel.innerHTML = `
 		<div class="detail-hdr"><span class="detail-title">WS ${esc(conn?.url || connId)}</span><span class="req-meta">${frames.length} frames</span></div>
-		${conn ? `<div class="detail-sect"><div class="detail-sect-title">Connection</div><div class="detail-row"><span class="detail-key">URL</span><span class="detail-val">${esc(conn.url)}</span></div><div class="detail-row"><span class="detail-key">Connected</span><span class="detail-val">${esc(conn.timestamp)}</span></div>${closed?`<div class="detail-row"><span class="detail-key">Closed</span><span class="detail-val">${esc(closed.timestamp)}${closed.reason?` (${esc(closed.reason)})`:""}</span></div>`:""}</div>` : ""}
+		${conn ? `<div class="detail-sect"><div class="detail-sect-title">Connection</div><div class="detail-rows"><div class="detail-row"><span class="detail-key">URL</span><span class="detail-val">${esc(conn.url)}</span></div><div class="detail-row"><span class="detail-key">Connected</span><span class="detail-val">${esc(conn.timestamp)}</span></div>${closed?`<div class="detail-row"><span class="detail-key">Closed</span><span class="detail-val">${esc(closed.timestamp)}${closed.reason?` (${esc(closed.reason)})`:""}</span></div>`:""}</div></div>` : ""}
 		<div class="detail-sect"><div class="detail-sect-title">Frames (${frames.length})</div>
 		${frames.map(f => {
 			let preview = f.data; try { preview = JSON.stringify(JSON.parse(f.data), null, 2) } catch {}
@@ -619,7 +658,7 @@ async function showPatterns() {
 	const rows = patterns.map(p => `<div class="pat-item" onclick="filterByPattern('${esc(p.fingerprint)}')"><div class="pat-head"><span class="pat-count">${p.count}x</span><span class="req-status ${sc(p.status)}">${p.status}</span><span class="pat-msg">${esc(p.error_extract?.message||p.category)}</span>${p.provider?`<span class="req-prov">${esc(p.provider)}</span>`:""}</div><div class="pat-meta">${esc(p.paths.join(", "))} | ${fmtT(p.first_seen)} — ${fmtT(p.last_seen)}</div></div>`).join("")
 	makeOverlay("patterns-panel", `<div class="overlay-hdr"><h3>Failure Patterns (${patterns.length})</h3><span class="overlay-close" onclick="this.closest('.overlay').remove()">&times;</span></div>${rows||'<div style="padding:14px;color:var(--fg-muted)">No failure patterns detected</div>'}`)
 }
-function filterByPattern(fp) { $$(".overlay").forEach(o => o.remove()); activeFilters.status = "error"; applyFilters() }
+function filterByPattern(fp) { $$(".overlay").forEach(o => o.remove()); activeFilters.status = "error"; syncFilterChips(); applyFilters() }
 
 function showSnapshotCreator() {
 	const failed = requests.filter(r => r.status >= 400).slice(0, 20)
@@ -673,9 +712,9 @@ document.addEventListener("keydown", e => {
 	if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") { if (e.key === "Escape") e.target.blur(); return }
 	if (e.key === "Escape") { $$(".overlay").forEach(o => o.remove()); diffSelectMode = false; return }
 	if (e.key === "/" || e.key === "f" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); $("#search-input").focus(); return }
-	const idx = requests.findIndex(r => r.id === selectedId)
-	if (e.key === "j" || e.key === "ArrowDown") { e.preventDefault(); const n = Math.min(idx+1, requests.length-1); if (requests[n]) selectRequest(requests[n].id) }
-	else if (e.key === "k" || e.key === "ArrowUp") { e.preventDefault(); const p = Math.max(idx-1, 0); if (requests[p]) selectRequest(requests[p].id) }
+	const visible = currentView === "http" ? getFiltered() : [], idx = visible.findIndex(r => r.id === selectedId)
+	if (e.key === "j" || e.key === "ArrowDown") { e.preventDefault(); const n = Math.min(idx+1, visible.length-1); if (visible[n]) selectRequest(visible[n].id) }
+	else if (e.key === "k" || e.key === "ArrowUp") { e.preventDefault(); const p = Math.max(idx-1, 0); if (visible[p]) selectRequest(visible[p].id) }
 	else if (e.key === "Enter" && selectedId) loadDetail(selectedId)
 	else if (e.key === "r" && selectedId) showReplayForm(selectedId)
 	else if (e.key === "c" && selectedId) copyCurl(selectedId)
@@ -686,7 +725,7 @@ document.addEventListener("keydown", e => {
 // ── Search input ───────────────────────────────────────
 $("#search-input").addEventListener("keydown", e => {
 	if (e.key === "Enter") { activeFilters.query = e.target.value; applyFilters() }
-	else if (e.key === "Escape") { e.target.value = ""; activeFilters.query = ""; e.target.blur(); loadAll() }
+	else if (e.key === "Escape") { e.target.value = ""; activeFilters.query = ""; e.target.blur(); applyFilters() }
 })
 
 // ── Init ───────────────────────────────────────────────

@@ -2164,7 +2164,7 @@ async fn read_capture_entries(
             StatusFilter::Range(_, _) => StatusQuery::Error,
         });
     let requests = db
-        .search("", provider, status, count)
+        .search("", provider, status, None, count)
         .await
         .map_err(inspector_query_error)?;
 

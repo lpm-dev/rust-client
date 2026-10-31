@@ -477,7 +477,7 @@ pub struct WsConnectionSummary {
     pub total_bytes: usize,
 }
 
-/// `GET /api/search?q=...&provider=...&status=...&limit=...` — full-text search.
+/// `GET /api/search?q=...&provider=...&status=...&method=...&limit=...` — full-text search.
 ///
 /// Searches across request paths, summaries, and bodies using SQLite FTS5.
 /// Returns empty results if persistence is not enabled.
@@ -488,6 +488,7 @@ pub async fn search(
     let db = state.db().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
 
     let status_query = params.status.as_deref().and_then(parse_status_query);
+    let method_query = params.method.as_deref().and_then(parse_method_query);
     let limit = params.limit.unwrap_or(50).min(500);
 
     let results = db
@@ -495,6 +496,7 @@ pub async fn search(
             params.q.as_deref().unwrap_or(""),
             params.provider.as_deref(),
             status_query,
+            method_query.as_ref(),
             limit,
         )
         .await
@@ -699,6 +701,19 @@ fn parse_status_query(s: &str) -> Option<crate::db::StatusQuery> {
     }
 }
 
+/// `other` keeps every method the inspector doesn't name; any other value
+/// keeps that method, as HTTP methods are recorded in upper case.
+fn parse_method_query(method: &str) -> Option<crate::db::MethodQuery> {
+    let method = method.trim();
+    if method.is_empty() {
+        None
+    } else if method.eq_ignore_ascii_case("other") {
+        Some(crate::db::MethodQuery::Other)
+    } else {
+        Some(crate::db::MethodQuery::Exact(method.to_ascii_uppercase()))
+    }
+}
+
 // ── Query parameter types ────────────────
 
 #[derive(Deserialize)]
@@ -706,6 +721,7 @@ pub struct SearchParams {
     pub q: Option<String>,
     pub provider: Option<String>,
     pub status: Option<String>,
+    pub method: Option<String>,
     pub limit: Option<usize>,
 }
 
