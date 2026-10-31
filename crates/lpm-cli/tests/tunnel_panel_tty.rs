@@ -185,12 +185,6 @@ fn run_in_terminal(
     use std::process::Stdio;
     use std::time::{Duration, Instant};
 
-    let mut size = libc::winsize {
-        ws_row: ROWS,
-        ws_col: COLUMNS,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
     let (mut master_fd, mut slave_fd) = (-1, -1);
     // SAFETY: openpty initializes both descriptors on success.
     assert_eq!(
@@ -200,7 +194,7 @@ fn run_in_terminal(
                 &mut slave_fd,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                std::ptr::null_mut(),
             )
         },
         0
@@ -209,6 +203,18 @@ fn run_in_terminal(
     let mut master = unsafe { File::from_raw_fd(master_fd) };
     // SAFETY: as above.
     let slave = unsafe { File::from_raw_fd(slave_fd) };
+    let size = libc::winsize {
+        ws_row: ROWS,
+        ws_col: COLUMNS,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // Sized after opening: openpty's size argument is mutable on macOS only.
+    // SAFETY: the descriptor is a terminal and `size` outlives the call.
+    assert_eq!(
+        unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &size) },
+        0
+    );
     for descriptor in [master.as_raw_fd(), slave.as_raw_fd()] {
         // SAFETY: the descriptor is valid; fcntl only sets close-on-exec.
         assert_eq!(
