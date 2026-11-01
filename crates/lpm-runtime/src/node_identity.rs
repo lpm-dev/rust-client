@@ -731,10 +731,14 @@ fn hash_mise_files(
     }
 }
 
-/// The `package.json` fields that select a runtime: Volta's pin, `devEngines`,
-/// and `engines`, which nodenv's package-json-engine plugin reads. Other
-/// fields change with every dependency edit and do not select one.
-const PACKAGE_SELECTOR_FIELDS: [&str; 3] = ["volta", "devEngines", "engines"];
+/// The `package.json` fields that select a runtime: Volta's pin and
+/// `devEngines`. Other fields change with every dependency edit and do not
+/// select one.
+const PACKAGE_SELECTOR_FIELDS: [&str; 2] = ["volta", "devEngines"];
+/// `engines` only constrains the runtime LPM runs, but nodenv's
+/// package-json-engine plugin selects a release from it, so keys that a
+/// shim's version is shared under cover it too.
+const SHIM_PACKAGE_SELECTOR_FIELDS: [&str; 3] = ["volta", "devEngines", "engines"];
 /// How many `volta.extends` links are followed.
 const MAX_VOLTA_EXTENDS: usize = 8;
 
@@ -750,7 +754,13 @@ fn hash_package_json_selectors(
     names.hash(hasher, base, path);
     match serde_json::from_slice::<serde_json::Value>(&bytes) {
         Ok(manifest) => {
-            for field in PACKAGE_SELECTOR_FIELDS {
+            let fields: &[&str] = match names {
+                ProjectFileNames::Absolute => &PACKAGE_SELECTOR_FIELDS,
+                ProjectFileNames::Local | ProjectFileNames::From(_) => {
+                    &SHIM_PACKAGE_SELECTOR_FIELDS
+                }
+            };
+            for field in fields {
                 hasher.bytes(field.as_bytes());
                 match manifest.get(field) {
                     Some(value) => hasher.bytes(value.to_string().as_bytes()),
@@ -1117,6 +1127,36 @@ mod tests {
             fs::write(b.join("package.json"), r#"{"engines":{"node":"20"}}"#).unwrap();
         });
         assert_ne!(a, b);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_engines_edit_leaves_the_local_runtime_fingerprint_unchanged() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let environment = environment(home.path());
+        let node = project.path().join("bin").join(NODE);
+        fs::create_dir_all(node.parent().unwrap()).unwrap();
+        write_launcher(&node, "v22.0.0");
+        let fingerprint = |engines: &str| {
+            fs::write(
+                project.path().join("package.json"),
+                format!(r#"{{"engines":{{"node":"{engines}"}}}}"#),
+            )
+            .unwrap();
+            identity(
+                &node,
+                project.path(),
+                node.parent().unwrap().as_os_str(),
+                &environment,
+            )
+            .fingerprint
+        };
+        assert_eq!(
+            fingerprint("18"),
+            fingerprint("20"),
+            "engines constrains the runtime LPM runs; it doesn't select one"
+        );
     }
 
     #[cfg(unix)]
