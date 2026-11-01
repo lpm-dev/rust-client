@@ -323,8 +323,9 @@ pub(crate) enum Commands {
     ///   :dynamic-require, :env, :ws, :obfuscated, :possible-obfuscation,
     ///   :high-entropy, :minified,
     ///   :telemetry, :url-strings, :trivial, :protestware, :git-dep, :http-dep,
-    ///   :wildcard-dep, :copyleft, :no-license, :scripts, :built, :vulnerable,
-    ///   :deprecated, :lpm, :npm, :critical, :high, :medium, :info
+    ///   :wildcard-dep, :copyleft, :no-license, :custom-license, :scripts,
+    ///   :built, :vulnerable, :deprecated, :lpm, :npm, :critical, :high,
+    ///   :medium, :info
     ///
     /// Combinators: :a:b (AND), :a,:b (OR), :not(:a), #name, :root > :child
     Query(security::QueryArgs),

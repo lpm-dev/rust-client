@@ -1,4 +1,4 @@
-//! Package manifest (package.json) tag detection (5 tags).
+//! Package manifest (package.json) tag detection (6 tags).
 //!
 //! Analyzes package.json fields for security-relevant signals without
 //! scanning source files. These checks detect dependency configuration
@@ -16,6 +16,9 @@ pub struct ManifestTags {
     pub wildcard_dependency: bool,
     pub copyleft_license: bool,
     pub no_license: bool,
+    /// `SEE LICENSE IN <file>`: the package ships its own license terms
+    /// instead of an SPDX expression.
+    pub custom_license: bool,
 }
 
 /// Known copyleft license identifiers (case-insensitive matching).
@@ -71,32 +74,16 @@ pub fn analyze_manifest_with_privacy(
 
     // ── License checks ────────────────────────────────────────
 
-    if !private_package {
-        match license {
-            None | Some("") => {
-                tags.no_license = true;
-            }
-            Some(lic) => {
-                let lower = lic.to_lowercase();
-
-                // No-license patterns
-                if lower == "unlicensed"
-                    || lower == "none"
-                    || lower.starts_with("see license in")
-                    || lower == "proprietary"
-                {
-                    tags.no_license = true;
-                }
-            }
+    let lower = license.map(|lic| lic.trim().to_lowercase());
+    match lower.as_deref() {
+        None | Some("" | "unlicensed" | "none" | "proprietary") => {
+            tags.no_license = !private_package;
         }
-    }
-
-    if let Some(lic) = license {
-        let lower = lic.to_lowercase();
-
-        // Copyleft check — scan SPDX expression for copyleft identifiers
-        if !tags.no_license && license_expression_is_copyleft_lower(&lower) {
-            tags.copyleft_license = true;
+        Some(lic) if lic.starts_with("see license in") => {
+            tags.custom_license = !private_package;
+        }
+        Some(lic) => {
+            tags.copyleft_license = license_expression_is_copyleft_lower(lic);
         }
     }
 
@@ -225,8 +212,15 @@ mod tests {
     }
 
     #[test]
-    fn no_license_see_license_in() {
-        let tags = analyze_manifest(Some("SEE LICENSE IN LICENSE.md"), None, None, None);
+    fn no_license_blank() {
+        let tags = analyze_manifest(Some("   "), None, None, None);
+        assert!(tags.no_license);
+        assert!(!tags.custom_license);
+    }
+
+    #[test]
+    fn no_license_none() {
+        let tags = analyze_manifest(Some("None"), None, None, None);
         assert!(tags.no_license);
     }
 
@@ -234,6 +228,45 @@ mod tests {
     fn no_license_proprietary() {
         let tags = analyze_manifest(Some("proprietary"), None, None, None);
         assert!(tags.no_license);
+    }
+
+    // ── License: custom terms ─────────────────────────────────
+
+    #[test]
+    fn custom_license_see_license_in() {
+        let tags = analyze_manifest(Some("SEE LICENSE IN LICENSE.md"), None, None, None);
+        assert!(tags.custom_license);
+        assert!(!tags.no_license);
+        assert!(!tags.copyleft_license);
+    }
+
+    #[test]
+    fn custom_license_is_case_and_whitespace_insensitive() {
+        let tags = analyze_manifest(Some("  see license in EULA.txt "), None, None, None);
+        assert!(tags.custom_license);
+        assert!(!tags.no_license);
+    }
+
+    #[test]
+    fn custom_license_private_package_is_ignored() {
+        let tags =
+            analyze_manifest_with_privacy(Some("SEE LICENSE IN LICENSE"), true, None, None, None);
+        assert!(!tags.custom_license);
+        assert!(!tags.no_license);
+    }
+
+    #[test]
+    fn custom_license_file_name_is_not_read_as_copyleft() {
+        let tags = analyze_manifest(Some("SEE LICENSE IN GPL-NOTICE.txt"), None, None, None);
+        assert!(tags.custom_license);
+        assert!(!tags.copyleft_license);
+    }
+
+    #[test]
+    fn spdx_license_is_not_custom() {
+        let tags = analyze_manifest(Some("MIT"), None, None, None);
+        assert!(!tags.custom_license);
+        assert!(!tags.no_license);
     }
 
     // ── License: copyleft ─────────────────────────────────────
@@ -443,6 +476,7 @@ mod tests {
         assert!(tags.http_dependency);
         assert!(tags.copyleft_license);
         assert!(!tags.no_license);
+        assert!(!tags.custom_license);
     }
 
     #[test]
@@ -454,5 +488,6 @@ mod tests {
         assert!(!tags.wildcard_dependency);
         assert!(!tags.copyleft_license);
         assert!(!tags.no_license);
+        assert!(!tags.custom_license);
     }
 }

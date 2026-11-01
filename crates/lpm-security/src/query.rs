@@ -18,7 +18,7 @@
 //! - `:critical` includes obfuscation, protestware, and credential exfiltration
 //! - `:high` = `:eval` OR `:child-process` OR `:shell` OR `:dynamic-require` OR `:scripts` OR `:vulnerable`
 //! - `:medium` = `:network` OR `:git-dep` OR `:http-dep` OR `:wildcard-dep` OR `:no-license` OR `:native`
-//! - `:info` = `:fs` OR `:crypto` OR `:env` OR `:ws` OR `:possible-obfuscation` OR `:high-entropy` OR `:telemetry` OR `:trivial` OR `:copyleft` OR `:minified` OR `:url-strings`
+//! - `:info` = `:fs` OR `:crypto` OR `:env` OR `:ws` OR `:possible-obfuscation` OR `:high-entropy` OR `:telemetry` OR `:trivial` OR `:copyleft` OR `:custom-license` OR `:minified` OR `:url-strings`
 
 use crate::behavioral::PackageAnalysis;
 use std::collections::{HashMap, HashSet};
@@ -129,7 +129,7 @@ impl InstallVisibility {
     }
 }
 
-const BEHAVIORAL_TAG_POLICIES: [BehavioralTagInfo; 27] = [
+const BEHAVIORAL_TAG_POLICIES: [BehavioralTagInfo; 28] = [
     BehavioralTagInfo {
         tag: PseudoClass::Eval,
         token: ":eval",
@@ -373,6 +373,15 @@ const BEHAVIORAL_TAG_POLICIES: [BehavioralTagInfo; 27] = [
         install_visibility: InstallVisibility::Default,
         description: "Have no usable license declaration, except private packages",
     },
+    BehavioralTagInfo {
+        tag: PseudoClass::CustomLicense,
+        token: ":custom-license",
+        label: "custom license",
+        group: TagGroup::Manifest,
+        severity: Severity::Info,
+        install_visibility: InstallVisibility::VerboseOnly,
+        description: "Declare their own license terms with `SEE LICENSE IN <file>`, except private packages",
+    },
 ];
 
 /// The full behavioral-tag catalog, in display order. Length is the
@@ -415,12 +424,13 @@ pub enum PseudoClass {
     DownloadedExecution,
     EncryptedExecution,
 
-    // Manifest selectors (5)
+    // Manifest selectors (6)
     GitDep,
     HttpDep,
     WildcardDep,
     Copyleft,
     NoLicense,
+    CustomLicense,
 
     // State & metadata selectors
     Scripts,
@@ -481,6 +491,7 @@ impl PseudoClass {
             "wildcard-dep" => Some(Self::WildcardDep),
             "copyleft" => Some(Self::Copyleft),
             "no-license" => Some(Self::NoLicense),
+            "custom-license" => Some(Self::CustomLicense),
 
             // State/metadata
             "scripts" => Some(Self::Scripts),
@@ -534,6 +545,7 @@ impl PseudoClass {
             Self::WildcardDep => ":wildcard-dep",
             Self::Copyleft => ":copyleft",
             Self::NoLicense => ":no-license",
+            Self::CustomLicense => ":custom-license",
             Self::Scripts => ":scripts",
             Self::Built => ":built",
             Self::Vulnerable => ":vulnerable",
@@ -582,6 +594,7 @@ impl PseudoClass {
             Self::WildcardDep,
             Self::Copyleft,
             Self::NoLicense,
+            Self::CustomLicense,
         ]
     }
 
@@ -658,6 +671,7 @@ impl PseudoClass {
             Self::WildcardDep => analysis.manifest.wildcard_dependency,
             Self::Copyleft => analysis.manifest.copyleft_license,
             Self::NoLicense => analysis.manifest.no_license,
+            Self::CustomLicense => analysis.manifest.custom_license,
             _ => false,
         }
     }
@@ -2267,6 +2281,7 @@ mod tests {
             "wildcard-dep",
             "copyleft",
             "no-license",
+            "custom-license",
             "scripts",
             "built",
             "vulnerable",
@@ -2312,6 +2327,7 @@ mod tests {
             "wildcard-dep",
             "copyleft",
             "no-license",
+            "custom-license",
             "scripts",
             "built",
             "vulnerable",

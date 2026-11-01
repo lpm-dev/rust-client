@@ -35,7 +35,7 @@ use supply_chain::SupplyChainTags;
 /// Current schema version for `.lpm-security.json`.
 /// Bump this when adding new tags or changing tag semantics — cached
 /// files with older versions will be automatically re-analyzed.
-pub const SCHEMA_VERSION: u32 = 11;
+pub const SCHEMA_VERSION: u32 = 12;
 
 /// Maximum file size for a full scan. Larger source files receive bounded samples.
 const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024;
@@ -68,7 +68,7 @@ pub struct PackageAnalysis {
     pub source: SourceTags,
     /// Supply chain & code quality tags (8).
     pub supply_chain: SupplyChainTags,
-    /// Package manifest tags (5).
+    /// Package manifest tags (6).
     pub manifest: ManifestTags,
     /// Additional metadata (file count, URL domains, etc.)
     pub meta: AnalysisMeta,
@@ -1277,14 +1277,19 @@ fn analyze_package_manifest_content(content: &str) -> Option<ManifestTags> {
         serde_json::from_str(content.trim_start_matches('\u{feff}')).ok()?;
     parsed.as_object()?;
 
-    let license = parsed.get("license").and_then(|v| v.as_str());
+    // A string, or the deprecated `{ "type": "MIT", "url": ... }` object;
+    // `licence` is the common misspelling.
+    let license_field = |field: &str| {
+        let value = parsed.get(field)?;
+        value
+            .as_str()
+            .or_else(|| value.get("type").and_then(|kind| kind.as_str()))
+    };
+    let license = license_field("license").or_else(|| license_field("licence"));
     let private_package = parsed
         .get("private")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-
-    // Also check "licence" typo
-    let license = license.or_else(|| parsed.get("licence").and_then(|v| v.as_str()));
 
     let dependencies = parse_deps_map(parsed.get("dependencies"));
     let dev_dependencies = parse_deps_map(parsed.get("devDependencies"));
@@ -1733,6 +1738,44 @@ mod tests {
 
         let analysis = analyze_package(dir.path());
         assert!(analysis.manifest.copyleft_license);
+        assert!(!analysis.manifest.no_license);
+    }
+
+    #[test]
+    fn analyze_package_reads_deprecated_license_object() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_package(
+            dir.path(),
+            &[
+                (
+                    "package.json",
+                    r#"{"name":"test","license":{"type":"MIT","url":"https://example.com"}}"#,
+                ),
+                ("index.js", "module.exports = 42"),
+            ],
+        );
+
+        let analysis = analyze_package(dir.path());
+        assert!(!analysis.manifest.no_license);
+        assert!(!analysis.manifest.custom_license);
+    }
+
+    #[test]
+    fn analyze_package_custom_license() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_package(
+            dir.path(),
+            &[
+                (
+                    "package.json",
+                    r#"{"name":"test","license":"SEE LICENSE IN LICENSE.md"}"#,
+                ),
+                ("index.js", "module.exports = 42"),
+            ],
+        );
+
+        let analysis = analyze_package(dir.path());
+        assert!(analysis.manifest.custom_license);
         assert!(!analysis.manifest.no_license);
     }
 

@@ -559,6 +559,7 @@ fn collect_registry_warnings(
             (PseudoClass::WildcardDep, tags.wildcard_dependency),
             (PseudoClass::Copyleft, tags.copyleft_license),
             (PseudoClass::NoLicense, tags.no_license),
+            (PseudoClass::CustomLicense, tags.custom_license),
         ] {
             if present {
                 counts.insert_behavioral(tag, pkg_id);

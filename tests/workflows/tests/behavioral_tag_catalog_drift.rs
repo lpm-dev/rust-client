@@ -240,7 +240,7 @@ fn security_audit_links_to_the_complete_tag_reference() {
 
 /// query.mdx splits the catalog into a "Behavioral tags" table (the
 /// 10 source + 7 supply-chain) and a "Dependency state" table that
-/// includes the 5 manifest tags plus state tokens (`:scripts`,
+/// includes the 6 manifest tags plus state tokens (`:scripts`,
 /// `:built`, etc.). Every behavioral tag MUST appear somewhere on the
 /// page.
 #[test]
