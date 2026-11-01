@@ -179,7 +179,7 @@ write_release_asset() {
 build_clean_path() {
   CLEAN_PATH_DIR="$(mktemp -d)"
   # Tools install.sh shells out to during the integrity flow.
-  for tool in sh id uname mktemp rm basename dirname grep awk curl sed cat tr cut chmod mv mkdir ln find readlink cp sleep; do
+  for tool in sh id uname mktemp rm basename dirname grep awk curl sed cat tr cut chmod mv mkdir ln find readlink cp cmp sleep; do
     src="$(command -v "$tool" 2>/dev/null || true)"
     if [ -n "$src" ]; then
       ln -s "$src" "$CLEAN_PATH_DIR/$tool"
@@ -194,15 +194,34 @@ build_clean_path() {
   if [ "$(PATH="$CLEAN_PATH_DIR" uname -s)" = "Darwin" ]; then
     ln -s "$(command -v ditto)" "$CLEAN_PATH_DIR/ditto"
     ln -s "$(command -v unzip)" "$CLEAN_PATH_DIR/unzip"
+    # A staged copy reports the CDHash in $LPM_TEST_TOOL_STATE/staged-cdhash
+    # and has its stapled ticket replaced when tamper-staged-ticket exists.
     cat > "$CLEAN_PATH_DIR/codesign" <<'EOF'
 #!/bin/sh
+for bundle in "$@"; do :; done
+staged_override() {
+  case "$bundle" in
+    */.lpm-install.*/*) [ -n "${LPM_TEST_TOOL_STATE:-}" ] && [ -e "$LPM_TEST_TOOL_STATE/$1" ] ;;
+    *) return 1 ;;
+  esac
+}
 case " $* " in
+  *" --verify "*)
+    if staged_override tamper-staged-ticket; then
+      printf 'replaced-notarization-ticket' > "$bundle/Contents/CodeResources"
+    fi
+    ;;
   *" --entitlements "*)
     printf '%s\n' '<?xml version="1.0"?><plist><dict><key>keychain-access-groups</key><array><string>823S8YKMRW.dev.lpm.vault.shared</string></array></dict></plist>'
     ;;
-  *" -dvv "*)
+  *" -dvvv "*)
     echo 'Identifier=dev.lpm.cli' >&2
     echo 'TeamIdentifier=823S8YKMRW' >&2
+    if staged_override staged-cdhash; then
+      echo "CDHash=$(cat "$LPM_TEST_TOOL_STATE/staged-cdhash")" >&2
+    else
+      echo 'CDHash=0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c' >&2
+    fi
     ;;
 esac
 exit 0
@@ -722,8 +741,8 @@ if [ "$HOST_OS" = "Darwin" ]; then
   pass "icon-bearing macOS release requires its declared icon"
 
   # stapler validate exits 68 (EX_NOHOST) while Apple's CloudKit ticket
-  # lookup doesn't answer. Each install validates the downloaded and then
-  # the staged bundle.
+  # lookup doesn't answer. Apple is asked about the downloaded bundle only;
+  # the staged copy must carry the same code and the same stapled ticket.
   tool_state="$(mktemp -d)"
   rm -f "$CLEAN_PATH_DIR/xcrun" "$CLEAN_PATH_DIR/sleep"
   cat > "$CLEAN_PATH_DIR/xcrun" <<'EOF'
@@ -759,24 +778,62 @@ EOF
     SLEEP_REQUESTS="$(tr '\n' ' ' < "$tool_state/sleep-requests")"
   }
 
-  run_with_stapler_outcomes 68 68 0 0
+  run_with_stapler_outcomes 68 68 0
   [ "$RUN_RC" -eq 0 ] \
     || fail "a brief CloudKit outage failed the install with exit $RUN_RC: $RUN_OUT"
-  [ "$STAPLER_RUNS" -eq 4 ] || fail "brief CloudKit outage ran stapler $STAPLER_RUNS times, expected 4"
+  [ "$STAPLER_RUNS" -eq 3 ] || fail "brief CloudKit outage ran stapler $STAPLER_RUNS times, expected 3"
   [ "$SLEEP_REQUESTS" = "2 5 " ] || fail "notarization ticket retries waited '$SLEEP_REQUESTS', expected '2 5 '"
   echo "$RUN_OUT" | grep -q "checking the notarization ticket again in 2s" \
     || fail "notarization ticket retry was not announced: $RUN_OUT"
   [ -L "$RUN_INSTALL_DIR/lpm" ] || fail "install after a brief CloudKit outage did not link lpm"
   pass "macOS install outlasts a brief CloudKit outage while checking the notarization ticket"
 
-  run_with_stapler_outcomes 68 68 68 0
+  run_with_stapler_outcomes 68 68 68 68 68 0
+  [ "$RUN_RC" -eq 0 ] \
+    || fail "a two-minute CloudKit outage failed the install with exit $RUN_RC: $RUN_OUT"
+  [ "$STAPLER_RUNS" -eq 6 ] || fail "two-minute CloudKit outage ran stapler $STAPLER_RUNS times, expected 6"
+  [ "$SLEEP_REQUESTS" = "2 5 15 30 60 " ] \
+    || fail "notarization ticket retries waited '$SLEEP_REQUESTS', expected '2 5 15 30 60 '"
+  [ -L "$RUN_INSTALL_DIR/lpm" ] || fail "install after a two-minute CloudKit outage did not link lpm"
+  pass "macOS install outlasts a CloudKit outage of about two minutes"
+
+  run_with_stapler_outcomes 68 68 68 68 68 68 0
   [ "$RUN_RC" -ne 0 ] || fail "a lasting CloudKit outage must fail the install"
-  [ "$STAPLER_RUNS" -eq 3 ] || fail "lasting CloudKit outage ran stapler $STAPLER_RUNS times, expected 3"
-  [ "$SLEEP_REQUESTS" = "2 5 " ] || fail "lasting CloudKit outage waited '$SLEEP_REQUESTS', expected '2 5 '"
-  echo "$RUN_OUT" | grep -q "Apple's notarization service did not answer" \
+  [ "$STAPLER_RUNS" -eq 6 ] || fail "lasting CloudKit outage ran stapler $STAPLER_RUNS times, expected 6"
+  [ "$SLEEP_REQUESTS" = "2 5 15 30 60 " ] \
+    || fail "lasting CloudKit outage waited '$SLEEP_REQUESTS', expected '2 5 15 30 60 '"
+  echo "$RUN_OUT" | grep -q "Apple's notarization service did not answer while checking downloaded" \
     || fail "lasting CloudKit outage was reported as something else: $RUN_OUT"
   [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "lasting CloudKit outage must not install anything"
   pass "macOS install fails closed on a lasting CloudKit outage"
+
+  run_with_stapler_outcomes 0 68 68 68 68 68 68
+  [ "$RUN_RC" -eq 0 ] \
+    || fail "CloudKit going quiet after the downloaded bundle passed failed the install with exit $RUN_RC: $RUN_OUT"
+  [ "$STAPLER_RUNS" -eq 1 ] || fail "one install asked Apple about its notarization ticket $STAPLER_RUNS times, expected once"
+  [ -z "$SLEEP_REQUESTS" ] || fail "a confirmed notarization ticket still waited '$SLEEP_REQUESTS'"
+  [ -L "$RUN_INSTALL_DIR/lpm" ] || fail "install with a confirmed notarization ticket did not link lpm"
+  pass "macOS install asks Apple about the notarization ticket once"
+
+  printf '%s' 'a1b2c3d4e5f60718293a4b5c6d7e8f9001122334' > "$tool_state/staged-cdhash"
+  run_with_stapler_outcomes 0 0
+  rm -f "$tool_state/staged-cdhash"
+  [ "$RUN_RC" -ne 0 ] || fail "a staged copy with different code must fail the install"
+  [ "$STAPLER_RUNS" -eq 1 ] || fail "a staged copy with different code was checked with Apple instead of against the download"
+  echo "$RUN_OUT" | grep -q "staged LPM CLI.app differs from the downloaded bundle" \
+    || fail "a staged copy with different code was reported as something else: $RUN_OUT"
+  [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "a staged copy with different code must not install anything"
+  pass "macOS install rejects a staged copy whose code differs from the confirmed download"
+
+  : > "$tool_state/tamper-staged-ticket"
+  run_with_stapler_outcomes 0 0
+  rm -f "$tool_state/tamper-staged-ticket"
+  [ "$RUN_RC" -ne 0 ] || fail "a staged copy with a different ticket must fail the install"
+  [ "$STAPLER_RUNS" -eq 1 ] || fail "a staged copy with a different ticket was checked with Apple instead of against the download"
+  echo "$RUN_OUT" | grep -q "staged LPM CLI.app differs from the downloaded bundle" \
+    || fail "a staged copy with a different ticket was reported as something else: $RUN_OUT"
+  [ ! -e "$RUN_INSTALL_DIR/lpm" ] || fail "a staged copy with a different ticket must not install anything"
+  pass "macOS install rejects a staged copy whose stapled ticket differs from the confirmed download"
 
   run_with_stapler_outcomes 65 0
   [ "$RUN_RC" -ne 0 ] || fail "an invalid notarization ticket must fail the install"

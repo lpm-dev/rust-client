@@ -2445,6 +2445,37 @@ struct StagedMacOSBundle {
     staging_root: tempfile::TempDir,
     app_bundle: PathBuf,
     executable: PathBuf,
+    notarization: ConfirmedNotarization,
+}
+
+/// The code-directory hash and stapled notarization ticket of a bundle whose
+/// ticket Apple's ticketing service confirmed.
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+struct ConfirmedNotarization {
+    cdhash: String,
+    ticket: Vec<u8>,
+}
+
+#[cfg(target_os = "macos")]
+enum NotarizationCheck<'a> {
+    AskApple,
+    /// The bundle was moved from one whose ticket Apple confirmed, so it must
+    /// carry the same code and the same ticket instead of asking Apple again.
+    SameAs(&'a ConfirmedNotarization),
+}
+
+#[cfg(target_os = "macos")]
+impl ConfirmedNotarization {
+    fn confirm_same_bundle(&self, installed: &ConfirmedNotarization) -> Result<(), LpmError> {
+        if self == installed {
+            return Ok(());
+        }
+        Err(LpmError::SelfUpdate(
+            "installed macOS app differs from the staged bundle whose notarization ticket Apple confirmed"
+                .to_string(),
+        ))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2468,12 +2499,13 @@ fn stage_macos_bundle(
         "macOS app extraction",
     )?;
     let app_bundle = staging_root.path().join(MACOS_APP_NAME);
-    validate_macos_app_bundle(&app_bundle)?;
+    let notarization = validate_macos_app_bundle(&app_bundle, NotarizationCheck::AskApple)?;
     let executable = app_bundle.join(MACOS_INTERNAL_EXECUTABLE);
     Ok(StagedMacOSBundle {
         staging_root,
         app_bundle,
         executable,
+        notarization,
     })
 }
 
@@ -2645,9 +2677,16 @@ fn macos_validation_failure(description: &str, output: &std::process::Output) ->
 #[cfg(target_os = "macos")]
 const STAPLER_CLOUDKIT_UNREACHABLE: i32 = 68;
 
+/// CloudKit lookups have kept failing for over 20 s at a time, so the checks
+/// spread over about two minutes before giving up, as install.sh's do.
 #[cfg(target_os = "macos")]
-const NOTARIZATION_TICKET_RETRY_DELAYS: [Duration; 2] =
-    [Duration::from_secs(2), Duration::from_secs(5)];
+const NOTARIZATION_TICKET_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
 
 /// Validates the bundle's stapled notarization ticket, running `stapler`
 /// again after each of `retry_delays` while CloudKit doesn't answer. Any
@@ -2720,7 +2759,10 @@ fn macos_entitlement_inspection_arguments(app_bundle: &Path) -> [&OsStr; 4] {
 }
 
 #[cfg(target_os = "macos")]
-fn validate_macos_app_bundle(app_bundle: &Path) -> Result<(), LpmError> {
+fn validate_macos_app_bundle(
+    app_bundle: &Path,
+    notarization_check: NotarizationCheck<'_>,
+) -> Result<ConfirmedNotarization, LpmError> {
     use std::io::Write as _;
 
     validate_macos_app_inventory(app_bundle)?;
@@ -2737,7 +2779,7 @@ fn validate_macos_app_bundle(app_bundle: &Path) -> Result<(), LpmError> {
 
     let details = run_macos_validation_tool(
         "/usr/bin/codesign",
-        &[OsStr::new("-dvv"), app_bundle.as_os_str()],
+        &[OsStr::new("-dvvv"), app_bundle.as_os_str()],
         "macOS app signing-identity inspection",
     )?;
     let details = format!(
@@ -2758,6 +2800,15 @@ fn validate_macos_app_bundle(app_bundle: &Path) -> Result<(), LpmError> {
             "macOS app has an unexpected Team ID or bundle identifier".to_string(),
         ));
     }
+    let Some(cdhash) = detail_value("CDHash").filter(|cdhash| !cdhash.is_empty()) else {
+        return Err(LpmError::SelfUpdate(
+            "macOS app signature has no code-directory hash".to_string(),
+        ));
+    };
+    let notarization = ConfirmedNotarization {
+        cdhash: cdhash.to_string(),
+        ticket: std::fs::read(app_bundle.join("Contents/CodeResources")).map_err(LpmError::Io)?,
+    };
 
     let entitlement_arguments = macos_entitlement_inspection_arguments(app_bundle);
     let signed_entitlements = run_macos_validation_tool(
@@ -2807,11 +2858,14 @@ fn validate_macos_app_bundle(app_bundle: &Path) -> Result<(), LpmError> {
         ));
     }
 
-    validate_notarization_ticket(
-        "/usr/bin/stapler",
-        app_bundle,
-        &NOTARIZATION_TICKET_RETRY_DELAYS,
-    )?;
+    match notarization_check {
+        NotarizationCheck::AskApple => validate_notarization_ticket(
+            "/usr/bin/stapler",
+            app_bundle,
+            &NOTARIZATION_TICKET_RETRY_DELAYS,
+        )?,
+        NotarizationCheck::SameAs(confirmed) => confirmed.confirm_same_bundle(&notarization)?,
+    }
     run_macos_validation_tool(
         "/usr/sbin/spctl",
         &[
@@ -2823,7 +2877,7 @@ fn validate_macos_app_bundle(app_bundle: &Path) -> Result<(), LpmError> {
         ],
         "macOS Gatekeeper validation",
     )?;
-    Ok(())
+    Ok(notarization)
 }
 
 #[cfg(target_os = "macos")]
@@ -2894,7 +2948,10 @@ fn install_staged_macos_bundle(
         installed_lpm = true;
         lpm_common::replace_symlink_atomic(&layout.lpx_link, link_target).map_err(LpmError::Io)?;
         installed_lpx = true;
-        validate_macos_app_bundle(&layout.app_bundle)?;
+        validate_macos_app_bundle(
+            &layout.app_bundle,
+            NotarizationCheck::SameAs(&staged.notarization),
+        )?;
         let final_executable = layout.app_bundle.join(MACOS_INTERNAL_EXECUTABLE);
         VersionProbe::verify_staged_path(&final_executable, version)?;
         let expected_executable = std::fs::canonicalize(&final_executable).map_err(LpmError::Io)?;
@@ -3623,8 +3680,51 @@ mod tests {
                 staged.executable.clone()
             };
             std::fs::remove_file(sealed).unwrap();
-            assert!(validate_macos_app_bundle(&staged.app_bundle).is_err());
+            assert!(
+                validate_macos_app_bundle(&staged.app_bundle, NotarizationCheck::AskApple).is_err()
+            );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires signed release archives in LPM_TEST_MACOS_RELEASE_ARCHIVES"]
+    fn signed_macos_release_whose_ticket_changes_after_staging_is_not_installed() {
+        let archives = std::env::var_os("LPM_TEST_MACOS_RELEASE_ARCHIVES")
+            .expect("set LPM_TEST_MACOS_RELEASE_ARCHIVES to signed release ZIP paths");
+        let archive = std::env::split_paths(&archives)
+            .next()
+            .expect("at least one signed release archive");
+        let installation = tempfile::tempdir().unwrap();
+        let app_parent = installation.path().join("libexec");
+        let bin = installation.path().join("bin");
+        std::fs::create_dir_all(&app_parent).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let layout = MacOSStandaloneLayout {
+            app_bundle: app_parent.join(MACOS_APP_NAME),
+            app_parent,
+            lpm_link: bin.join("lpm"),
+            lpx_link: bin.join("lpx"),
+        };
+        let staged = stage_macos_bundle(&archive, &layout.app_parent).unwrap();
+        std::fs::write(
+            staged.app_bundle.join("Contents/CodeResources"),
+            b"replaced notarization ticket",
+        )
+        .unwrap();
+
+        let error = install_staged_macos_bundle(&layout, staged, "0.0.0")
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains(
+                "differs from the staged bundle whose notarization ticket Apple confirmed"
+            ),
+            "{error}"
+        );
+        assert!(!layout.app_bundle.exists());
+        assert!(!layout.lpm_link.exists() && !layout.lpx_link.exists());
     }
 
     #[test]
@@ -3728,6 +3828,7 @@ mod tests {
             staging_root,
             app_bundle: staged_app,
             executable: staged_executable,
+            notarization: fixture_notarization(),
         };
 
         let error = install_staged_macos_bundle(&layout, staged, "0.75.0")
@@ -3780,6 +3881,7 @@ mod tests {
             staging_root,
             app_bundle: staged_app,
             executable: staged_executable,
+            notarization: fixture_notarization(),
         };
 
         let error = install_staged_macos_bundle(&layout, staged, "0.75.0")
@@ -5897,12 +5999,12 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
     #[test]
     fn notarization_ticket_check_reports_a_lasting_cloudkit_outage_in_stapler_s_words() {
         let directory = tempfile::tempdir().unwrap();
-        let stapler = fake_stapler(directory.path(), &[68, 68, 68, 0]);
+        let stapler = fake_stapler(directory.path(), &[68, 68, 68, 68, 68, 68, 0]);
 
         let error = validate_notarization_ticket(
             stapler.to_str().unwrap(),
             Path::new("/Applications/LPM CLI.app"),
-            &[Duration::ZERO; 2],
+            &[Duration::ZERO; NOTARIZATION_TICKET_RETRY_DELAYS.len()],
         )
         .unwrap_err()
         .to_string();
@@ -5911,7 +6013,76 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
             error.contains("CloudKit's response is inconsistent"),
             "{error}"
         );
-        assert_eq!(stapler_runs(directory.path()).len(), 3);
+        assert_eq!(
+            stapler_runs(directory.path()).len(),
+            NOTARIZATION_TICKET_RETRY_DELAYS.len() + 1
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn notarization_ticket_retries_wait_out_the_same_cloudkit_outage_as_install_sh() {
+        let install_sh =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../install.sh"))
+                .unwrap();
+        let schedule = install_sh
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("for ticket_retry_delay in ")?
+                    .strip_suffix("; do")
+            })
+            .expect("install.sh retries the notarization ticket check");
+        let install_sh_delays = schedule
+            .split_whitespace()
+            .filter(|delay| *delay != "\"\"")
+            .map(|delay| Duration::from_secs(delay.parse().unwrap()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(install_sh_delays, NOTARIZATION_TICKET_RETRY_DELAYS);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fixture_notarization() -> ConfirmedNotarization {
+        ConfirmedNotarization {
+            cdhash: "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c".to_string(),
+            ticket: b"stapled notarization ticket".to_vec(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn moved_bundle_with_the_confirmed_code_and_ticket_needs_no_second_ticket_check() {
+        fixture_notarization()
+            .confirm_same_bundle(&fixture_notarization())
+            .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn moved_bundle_with_different_code_or_ticket_is_rejected() {
+        let confirmed = fixture_notarization();
+        for installed in [
+            ConfirmedNotarization {
+                cdhash: "a1b2c3d4e5f60718293a4b5c6d7e8f9001122334".to_string(),
+                ..fixture_notarization()
+            },
+            ConfirmedNotarization {
+                ticket: b"replaced notarization ticket".to_vec(),
+                ..fixture_notarization()
+            },
+        ] {
+            let error = confirmed
+                .confirm_same_bundle(&installed)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(
+                    "differs from the staged bundle whose notarization ticket Apple confirmed"
+                ),
+                "{error}"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
