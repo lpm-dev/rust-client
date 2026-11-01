@@ -528,13 +528,15 @@ elif [ -n "$SHA_TOOL" ]; then
 fi
 
 # stapler validate checks the stapled ticket against Apple's CloudKit record
-# and exits with EX_NOHOST when CloudKit doesn't answer.
+# and exits with EX_NOHOST when CloudKit doesn't answer. CloudKit lookups have
+# kept failing for over 20 s at a time, so the checks spread over about two
+# minutes before giving up.
 STAPLER_CLOUDKIT_UNREACHABLE=68
 
 validate_notarization_ticket() {
   ticket_bundle="$1"
   ticket_label="$2"
-  for ticket_retry_delay in 2 5 ""; do
+  for ticket_retry_delay in 2 5 15 30 60 ""; do
     ticket_status=0
     "$MACOS_XCRUN_TOOL" stapler validate "$ticket_bundle" || ticket_status=$?
     if [ "$ticket_status" -eq 0 ]; then
@@ -553,9 +555,15 @@ validate_notarization_ticket() {
   done
 }
 
+# Validates an app bundle and sets app_cdhash to its code-directory hash. Given
+# a bundle Apple already confirmed and that bundle's hash, the bundle is a copy
+# of it: instead of asking Apple again, it must carry the same code and the
+# same stapled ticket.
 validate_macos_bundle() {
   app_bundle="$1"
   app_label="$2"
+  confirmed_bundle="${3:-}"
+  confirmed_cdhash="${4:-}"
   app_contents="$app_bundle/Contents"
   app_executable="$app_contents/MacOS/lpm-rs"
   app_icon="$app_contents/Resources/LPMCLI.icns"
@@ -614,11 +622,16 @@ validate_macos_bundle() {
     echo "ERROR: $app_label failed code-signature validation."
     return 1
   fi
-  signature_details=$("$MACOS_CODESIGN_TOOL" -dvv "$app_bundle" 2>&1) || return 1
+  signature_details=$("$MACOS_CODESIGN_TOOL" -dvvv "$app_bundle" 2>&1) || return 1
   signed_team=$(printf '%s\n' "$signature_details" | awk -F= '/^TeamIdentifier=/{print $2}')
   signed_identifier=$(printf '%s\n' "$signature_details" | awk -F= '/^Identifier=/{print $2}')
   if [ "$signed_team" != "$EXPECTED_TEAM_ID" ] || [ "$signed_identifier" != "$EXPECTED_BUNDLE_ID" ]; then
     echo "ERROR: $app_label has an unexpected signing identity."
+    return 1
+  fi
+  app_cdhash=$(printf '%s\n' "$signature_details" | awk -F= '/^CDHash=/{print $2}')
+  if [ -z "$app_cdhash" ]; then
+    echo "ERROR: $app_label has no code-directory hash."
     return 1
   fi
 
@@ -652,7 +665,13 @@ validate_macos_bundle() {
     return 1
   fi
 
-  validate_notarization_ticket "$app_bundle" "$app_label" || return 1
+  if [ -z "$confirmed_bundle" ]; then
+    validate_notarization_ticket "$app_bundle" "$app_label" || return 1
+  elif [ "$app_cdhash" != "$confirmed_cdhash" ] || \
+       ! cmp -s "$confirmed_bundle/Contents/CodeResources" "$app_ticket"; then
+    echo "ERROR: $app_label differs from the downloaded bundle whose notarization ticket Apple confirmed."
+    return 1
+  fi
   if ! "$MACOS_SPCTL_TOOL" --assess --type execute --verbose=4 "$app_bundle"; then
     echo "ERROR: Gatekeeper rejected $app_label."
     return 1
@@ -680,6 +699,7 @@ install_macos_bundle() {
   "$MACOS_DITTO_TOOL" -x -k "$archive" "$extracted_root"
   extracted_app="$extracted_root/$EXPECTED_APP_NAME"
   validate_macos_bundle "$extracted_app" "downloaded $EXPECTED_APP_NAME"
+  downloaded_cdhash=$app_cdhash
 
   mkdir -p "$LIBEXEC_DIR"
   BUNDLE_STAGE_ROOT=$(mktemp -d "$LIBEXEC_DIR/.lpm-install.XXXXXX")
@@ -693,7 +713,8 @@ install_macos_bundle() {
   new_lpx="$BUNDLE_STAGE_ROOT/new-lpx"
 
   "$MACOS_DITTO_TOOL" "$extracted_app" "$BUNDLE_STAGED_APP"
-  validate_macos_bundle "$BUNDLE_STAGED_APP" "staged $EXPECTED_APP_NAME"
+  validate_macos_bundle "$BUNDLE_STAGED_APP" "staged $EXPECTED_APP_NAME" \
+    "$extracted_app" "$downloaded_cdhash"
   ln -s "$link_target" "$new_lpm"
   ln -s "$link_target" "$new_lpx"
 
