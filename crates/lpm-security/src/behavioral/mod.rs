@@ -35,7 +35,7 @@ use supply_chain::SupplyChainTags;
 /// Current schema version for `.lpm-security.json`.
 /// Bump this when adding new tags or changing tag semantics — cached
 /// files with older versions will be automatically re-analyzed.
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// Maximum file size for a full scan. Larger source files receive bounded samples.
 const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024;

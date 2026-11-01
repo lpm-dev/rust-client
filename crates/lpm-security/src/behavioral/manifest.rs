@@ -107,24 +107,7 @@ pub fn analyze_manifest_with_privacy(
                 tags.git_dependency = true;
             }
 
-            // Also detect GitHub shorthand: "owner/repo" or "owner/repo#branch"
-            if !v.starts_with("http")
-                && !v.starts_with("git")
-                && !v.starts_with("file:")
-                && !v.starts_with("npm:")
-                && !v.starts_with("link:")
-                && !v.starts_with("workspace:")
-                && !v.starts_with("catalog:")
-                && v.contains('/')
-                && !v.contains("://")
-                && !v.starts_with('@')
-                && !v.starts_with('>')
-                && !v.starts_with('<')
-                && !v.starts_with('=')
-                && !v.starts_with('^')
-                && !v.starts_with('~')
-            {
-                // Likely "owner/repo" or "owner/repo#ref"
+            if is_repo_shorthand(v) {
                 tags.git_dependency = true;
             }
 
@@ -141,6 +124,21 @@ pub fn analyze_manifest_with_privacy(
     }
 
     tags
+}
+
+/// `owner/repo` shorthand, optionally with `#ref`, which npm installs from
+/// GitHub. A colon before the first slash marks a protocol (`jsr:`, `file:`,
+/// `portal:`, …) instead.
+fn is_repo_shorthand(spec: &str) -> bool {
+    const NOT_SHORTHAND_PREFIXES: [&str; 8] = ["http", "git", "@", ">", "<", "=", "^", "~"];
+    let Some(slash) = spec.find('/') else {
+        return false;
+    };
+    slash > 0
+        && !spec[..slash].contains(':')
+        && !NOT_SHORTHAND_PREFIXES
+            .iter()
+            .any(|prefix| spec.starts_with(prefix))
 }
 
 /// Check if a license SPDX expression contains a copyleft identifier.
@@ -381,6 +379,28 @@ mod tests {
         let d = deps(&[("my-pkg", "github:owner/repo")]);
         let tags = analyze_manifest(Some("MIT"), Some(&d), None, None);
         assert!(tags.git_dependency);
+    }
+
+    #[test]
+    fn detect_github_shorthand_with_semver_ref() {
+        let d = deps(&[("pkg", "owner/repo#semver:^1.0.0")]);
+        let tags = analyze_manifest(Some("MIT"), Some(&d), None, None);
+        assert!(tags.git_dependency);
+    }
+
+    #[test]
+    fn protocol_specs_are_not_github_shorthand() {
+        for spec in [
+            "jsr:@std/datetime@^0.225.0",
+            "portal:../local",
+            "patch:lodash@npm%3A4.17.21#./lodash.patch",
+            "file:../local",
+            "workspace:packages/ui",
+        ] {
+            let d = deps(&[("pkg", spec)]);
+            let tags = analyze_manifest(Some("MIT"), Some(&d), None, None);
+            assert!(!tags.git_dependency, "{spec} is not a git dependency");
+        }
     }
 
     #[test]
