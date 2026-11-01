@@ -1911,6 +1911,7 @@ mod metadata_cache_schema_tests {
             wildcard_dependency: _,
             copyleft_license: _,
             no_license: _,
+            custom_license: _,
         } = tags;
     }
 

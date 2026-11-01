@@ -227,8 +227,8 @@ pub struct Vulnerability {
 ///   dynamicRequire, nativeBindings, environmentVars, webSocket
 /// - Supply chain (7): obfuscated, highEntropyStrings, minified, telemetry,
 ///   urlStrings, trivial, protestware
-/// - Manifest (5): gitDependency, httpDependency, wildcardDependency,
-///   copyleftLicense, noLicense
+/// - Manifest (6): gitDependency, httpDependency, wildcardDependency,
+///   copyleftLicense, noLicense, customLicense
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BehavioralTags {
     // ── Source code tags (10) ──────────────────���─────────────────
@@ -280,6 +280,8 @@ pub struct BehavioralTags {
     pub copyleft_license: bool,
     #[serde(default, rename = "noLicense")]
     pub no_license: bool,
+    #[serde(default, rename = "customLicense")]
+    pub custom_license: bool,
 }
 
 impl BehavioralTags {
@@ -349,7 +351,7 @@ impl BehavioralTags {
         if self.protestware {
             active.push("protestware");
         }
-        // Manifest tags (5)
+        // Manifest tags (6)
         if self.git_dependency {
             active.push("gitDependency");
         }
@@ -364,6 +366,9 @@ impl BehavioralTags {
         }
         if self.no_license {
             active.push("noLicense");
+        }
+        if self.custom_license {
+            active.push("customLicense");
         }
         // Sort so downstream hashing is order-stable regardless of
         // struct-field declaration order or future additions.
@@ -1826,6 +1831,19 @@ impl From<DistInfo> for BlockedSetDist {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn behavioral_tags_read_custom_license_and_default_it_when_absent() {
+        let custom: BehavioralTags =
+            serde_json::from_str(r#"{"customLicense":true,"network":true}"#).unwrap();
+        assert!(custom.custom_license);
+        assert!(!custom.no_license);
+        assert_eq!(custom.active_tag_names(), ["customLicense", "network"]);
+
+        let older: BehavioralTags = serde_json::from_str(r#"{"noLicense":true}"#).unwrap();
+        assert!(!older.custom_license);
+        assert_eq!(older.active_tag_names(), ["noLicense"]);
+    }
 
     #[test]
     fn absent_ecosystem_metadata_uses_only_two_pointers_per_version() {

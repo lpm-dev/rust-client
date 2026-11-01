@@ -287,7 +287,7 @@ fn collect(meta: &VersionMetadata) -> Vec<AuditIssue> {
 
 type RegistryTagCase = (lpm_security::query::PseudoClass, fn(&mut BehavioralTags));
 
-fn registry_tag_cases() -> [RegistryTagCase; 22] {
+fn registry_tag_cases() -> [RegistryTagCase; 23] {
     use lpm_security::query::PseudoClass;
 
     [
@@ -319,6 +319,9 @@ fn registry_tag_cases() -> [RegistryTagCase; 22] {
         }),
         (PseudoClass::Copyleft, |tags| tags.copyleft_license = true),
         (PseudoClass::NoLicense, |tags| tags.no_license = true),
+        (PseudoClass::CustomLicense, |tags| {
+            tags.custom_license = true
+        }),
     ]
 }
 
@@ -399,6 +402,7 @@ fn registry_all_behavioral_fields_emit_one_policy_issue_each() {
         t.wildcard_dependency = true;
         t.copyleft_license = true;
         t.no_license = true;
+        t.custom_license = true;
     }));
     assert_eq!(issues.len(), registry_tag_cases().len(), "{issues:?}");
 }

@@ -826,6 +826,9 @@ fn collect_active_tags(analysis: &PackageAnalysis) -> Vec<String> {
     if analysis.manifest.no_license {
         tags.push("no-license".into());
     }
+    if analysis.manifest.custom_license {
+        tags.push("custom-license".into());
+    }
 
     tags
 }

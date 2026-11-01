@@ -119,6 +119,7 @@ pub(super) fn collect_registry_issues(
             (PseudoClass::WildcardDep, tags.wildcard_dependency),
             (PseudoClass::Copyleft, tags.copyleft_license),
             (PseudoClass::NoLicense, tags.no_license),
+            (PseudoClass::CustomLicense, tags.custom_license),
         ] {
             if present && let Some(issue) = behavioral_issue(tag, "registry") {
                 issues.push(issue);
