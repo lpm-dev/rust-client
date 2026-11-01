@@ -588,8 +588,9 @@ pub struct TaskConfig {
     #[serde(default, rename = "cacheEnv")]
     pub cache_env: Option<Vec<String>>,
 
-    /// Share cache entries with checkouts of the project at other paths. Defaults to `true`.
-    /// Set `false` for a task whose outputs embed the absolute project path.
+    /// Share cache entries with checkouts of the project at other paths, and across the
+    /// directories a command runs from. Defaults to `true`. Set `false` for a task whose outputs
+    /// embed the absolute project path, or that reads `INIT_CWD`.
     #[serde(default, rename = "cachePortable")]
     #[schemars(with = "bool", extend("default" = true))]
     pub cache_portable: Option<bool>,

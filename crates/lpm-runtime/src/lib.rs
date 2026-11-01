@@ -18,6 +18,7 @@
 //!   bun-index-cache.json   <- cached Bun release index (1h TTL)
 //! ```
 
+mod binary_target;
 pub mod bun;
 pub mod detect;
 pub mod download;

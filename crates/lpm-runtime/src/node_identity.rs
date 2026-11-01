@@ -1,14 +1,14 @@
-//! Identify the Node executable that a script `PATH` selects.
+//! Identify the Node or Bun executable that a script `PATH` selects.
 //!
-//! An earlier `node --version` result may stand in for a new probe only when
-//! the selected executable is a real Node binary with an unchanged
+//! An earlier `--version` result may stand in for a new probe only when the
+//! selected executable is the runtime's own binary with an unchanged
 //! fingerprint. Launchers such as shell scripts and version-manager shims can
 //! print a different version without changing on disk, so they are always
 //! probed.
 //!
-//! The fingerprint also covers the version files and settings that Node
-//! version managers read. A native shim that passes the binary checks still
-//! changes its fingerprint when those inputs select a different version.
+//! The fingerprint also covers the version files and settings that version
+//! managers read. A native shim that passes the binary checks still changes
+//! its fingerprint when those inputs select a different version.
 
 use crate::detect::RuntimeKind;
 use sha2::{Digest, Sha256};
@@ -26,12 +26,13 @@ const MANAGER_VARIABLE_PREFIXES: [&str; 6] =
     ["ASDF_", "MISE_", "RTX_", "NODENV_", "VOLTA_", "PROTO_"];
 const DEFAULT_TOOL_VERSIONS_FILE: &str = ".tool-versions";
 
-/// Fingerprinted Node executable selected by a script's cwd and `PATH`.
+/// Fingerprinted Node or Bun executable selected by a script's cwd and `PATH`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ScriptNodeIdentity {
     pub(crate) canonical_executable: PathBuf,
     pub(crate) fingerprint: String,
-    /// Whether the executable is a real Node binary rather than a launcher.
+    /// Whether the executable is the runtime's own binary rather than a
+    /// launcher.
     pub(crate) node_binary: bool,
 }
 
@@ -50,18 +51,6 @@ pub(crate) fn script_node_identity(
         managed_node_root,
         &SelectorEnvironment::from_process(),
     )
-}
-
-/// Identify a Node or Bun executable as [`script_node_identity`] does Node.
-pub(crate) fn script_runtime_identity(
-    executable: &Path,
-    cwd: &Path,
-    path: &OsStr,
-    managed_root: Option<&Path>,
-    runtime: RuntimeKind,
-) -> Option<ScriptNodeIdentity> {
-    let environment = SelectorEnvironment::from_process();
-    IdentityContext::new(cwd, path, &environment).identify(executable, managed_root, runtime)
 }
 
 fn identity_with_environment(
@@ -84,8 +73,14 @@ pub(crate) fn script_runtime_fingerprints(
     path: &OsStr,
     roots: [Option<&Path>; 2],
 ) -> [Option<String>; 2] {
-    script_runtime_identities(executables, cwd, path, roots)
-        .map(|identity| identity.map(|identity| identity.fingerprint))
+    script_runtime_identities(
+        executables,
+        cwd,
+        path,
+        roots,
+        &SelectorEnvironment::from_process(),
+    )
+    .map(|identity| identity.map(|identity| identity.fingerprint))
 }
 
 /// Identify Node and Bun while reading their shared version selectors once.
@@ -94,9 +89,9 @@ pub(crate) fn script_runtime_identities(
     cwd: &Path,
     path: &OsStr,
     roots: [Option<&Path>; 2],
+    environment: &SelectorEnvironment,
 ) -> [Option<ScriptNodeIdentity>; 2] {
-    let environment = SelectorEnvironment::from_process();
-    let context = IdentityContext::new(cwd, path, &environment);
+    let context = IdentityContext::new(cwd, path, environment);
     std::array::from_fn(|index| {
         let runtime = [RuntimeKind::Node, RuntimeKind::Bun][index];
         context.identify(executables[index].as_deref()?, roots[index], runtime)
@@ -131,7 +126,13 @@ impl<'a> IdentityContext<'a> {
         if !metadata.is_file() {
             return None;
         }
-        let node_binary = is_runtime_binary(&canonical_executable, &metadata, runtime);
+        let node_binary = is_runtime_binary(&canonical_executable, &metadata, runtime)
+            && !is_version_manager_shim(
+                executable,
+                &canonical_executable,
+                self.cwd,
+                self.environment,
+            );
 
         let mut hasher = FieldHasher::new(FINGERPRINT_DOMAIN);
         hasher.bytes(runtime.as_str().as_bytes());
@@ -152,7 +153,12 @@ impl<'a> IdentityContext<'a> {
             }
             let selectors = self.selectors.get_or_init(|| {
                 let mut selectors = FieldHasher::new(b"runtime-version-selectors");
-                hash_version_selectors(&mut selectors, self.cwd, self.environment);
+                hash_version_selectors(
+                    &mut selectors,
+                    self.cwd,
+                    self.environment,
+                    ProjectFileNames::Absolute,
+                );
                 selectors.finish()
             });
             hasher.bytes(selectors.as_bytes());
@@ -172,7 +178,8 @@ pub(crate) enum RuntimeExecutable {
     /// The runtime's own binary.
     Binary,
     /// A version manager's shim: it runs the release that its version
-    /// selectors choose, with the arguments and environment it was given.
+    /// selectors choose. Some managers (mise, proto) also apply environment
+    /// settings from those same files.
     VersionManagerShim,
     /// Any other launcher. It can change the environment or the flags that
     /// the runtime gets, so its version alone doesn't describe what runs.
@@ -180,34 +187,94 @@ pub(crate) enum RuntimeExecutable {
 }
 
 /// Classify an identified runtime executable, `executable` being its `PATH`
-/// entry.
+/// entry for a script in `cwd`.
 pub(crate) fn classify_identified(
     identity: &ScriptNodeIdentity,
     executable: &Path,
+    cwd: &Path,
+    environment: &SelectorEnvironment,
 ) -> RuntimeExecutable {
     if identity.node_binary {
         RuntimeExecutable::Binary
-    } else if is_version_manager_shim(
-        executable,
-        &identity.canonical_executable,
-        &SelectorEnvironment::from_process(),
-    ) {
+    } else if is_version_manager_shim(executable, &identity.canonical_executable, cwd, environment)
+    {
         RuntimeExecutable::VersionManagerShim
     } else {
         RuntimeExecutable::Launcher
     }
 }
 
-/// Shims link to their manager's binary, or live in its shim directory.
+/// A key under which a version-manager shim's version can be reused within
+/// one command: the shim, the manager settings, and the version files around
+/// `cwd` named by file rather than by path. Two workspace members that read
+/// the same version files get the same key.
+pub(crate) fn shim_selection_key(
+    executable: &Path,
+    canonical: &Path,
+    cwd: &Path,
+    environment: &SelectorEnvironment,
+    runtime: RuntimeKind,
+) -> Option<String> {
+    let metadata = canonical.metadata().ok()?;
+    let mut hasher = FieldHasher::new(b"lpm-task-shim-selection-v1");
+    hasher.bytes(runtime.as_str().as_bytes());
+    hash_symlink_chain(&mut hasher, executable);
+    hasher.os(canonical.as_os_str());
+    crate::effective::update_with_file_metadata(&mut hasher.0, &metadata);
+    hash_version_selectors(&mut hasher, cwd, environment, ProjectFileNames::Local);
+    Some(hasher.finish())
+}
+
+/// Digest of the version files from `cwd` up to the workspace `root`, named
+/// by their paths from `root`, so that checkouts at other paths agree. A
+/// shim's version and the environment that some managers set come from these
+/// files.
+pub(crate) fn workspace_selector_digest(
+    cwd: &Path,
+    root: &Path,
+    environment: &SelectorEnvironment,
+) -> Option<String> {
+    let cwd = cwd.canonicalize().ok()?;
+    let root = root.canonicalize().ok()?;
+    if !cwd.starts_with(&root) {
+        return None;
+    }
+    let tool_versions = environment.tool_versions_file();
+    let mut hasher = FieldHasher::new(b"lpm-task-workspace-selectors-v1");
+    for directory in cwd.ancestors() {
+        hash_project_selectors(
+            &mut hasher,
+            directory,
+            tool_versions,
+            ProjectFileNames::From(&root),
+        );
+        if directory == root {
+            break;
+        }
+    }
+    Some(hasher.finish())
+}
+
+/// Shims link to their manager's binary, or live in its shim directory. A
+/// link into the project or `node_modules` is the project's own launcher,
+/// whatever its name.
 fn is_version_manager_shim(
     executable: &Path,
     canonical: &Path,
+    cwd: &Path,
     environment: &SelectorEnvironment,
 ) -> bool {
-    if canonical
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .is_some_and(|stem| matches!(stem, "mise" | "rtx" | "volta-shim" | "proto-shim"))
+    let project_owned = canonical
+        .components()
+        .any(|component| component.as_os_str() == "node_modules")
+        || cwd
+            .canonicalize()
+            .is_ok_and(|project| canonical.starts_with(project));
+    if !project_owned
+        && canonical
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .is_some_and(|stem| matches!(stem, "mise" | "rtx" | "volta-shim" | "proto-shim"))
     {
         return true;
     }
@@ -257,17 +324,16 @@ fn is_runtime_binary(canonical: &Path, metadata: &Metadata, runtime: RuntimeKind
             .is_ok_and(|test_binary| test_binary == canonical);
     }
 
+    // The npm `bun` package ships `bin/bun.exe` on every platform.
     let named_node = canonical.file_name().is_some_and(|name| {
-        #[cfg(windows)]
-        {
-            name.eq_ignore_ascii_case(match runtime {
-                RuntimeKind::Node => "node.exe",
-                RuntimeKind::Bun => "bun.exe",
-            })
-        }
-        #[cfg(not(windows))]
-        {
-            name == runtime.binary_name()
+        let windows_name = match runtime {
+            RuntimeKind::Node => "node.exe",
+            RuntimeKind::Bun => "bun.exe",
+        };
+        if cfg!(windows) {
+            name.eq_ignore_ascii_case(windows_name)
+        } else {
+            name == runtime.binary_name() || name == windows_name
         }
     });
     if !named_node || metadata.len() < MIN_NODE_BINARY_BYTES {
@@ -326,7 +392,10 @@ fn hash_symlink_chain(hasher: &mut FieldHasher, executable: &Path) {
     }
 }
 
-struct SelectorEnvironment {
+/// Where version managers look for their settings, and the manager variables
+/// a script sees.
+#[derive(Debug, Clone)]
+pub(crate) struct SelectorEnvironment {
     home: Option<PathBuf>,
     config_home: Option<PathBuf>,
     data_home: Option<PathBuf>,
@@ -335,10 +404,26 @@ struct SelectorEnvironment {
 }
 
 impl SelectorEnvironment {
-    fn from_process() -> Self {
-        let mut variables: Vec<_> = std::env::vars_os()
+    pub(crate) fn from_process() -> Self {
+        Self::with_script_variables(std::iter::empty::<(OsString, OsString)>())
+    }
+
+    /// The process environment with `script` variables layered over it, as a
+    /// script whose project environment sets them sees it.
+    pub(crate) fn with_script_variables(
+        script: impl IntoIterator<Item = (impl Into<OsString>, impl Into<OsString>)>,
+    ) -> Self {
+        let mut variables: Vec<(OsString, OsString)> = std::env::vars_os()
             .filter(|(name, _)| is_manager_variable(name))
             .collect();
+        for (name, value) in script {
+            let name = name.into();
+            if !is_manager_variable(&name) {
+                continue;
+            }
+            variables.retain(|(existing, _)| !same_variable(existing, &name));
+            variables.push((name, value.into()));
+        }
         variables.sort();
         Self {
             home: dirs::home_dir(),
@@ -346,6 +431,17 @@ impl SelectorEnvironment {
             data_home: std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
             variables,
         }
+    }
+
+    /// The manager variables, for a probe that must select what the script
+    /// selects.
+    pub(crate) fn variables(&self) -> &[(OsString, OsString)] {
+        &self.variables
+    }
+
+    fn tool_versions_file(&self) -> &OsStr {
+        self.variable("ASDF_DEFAULT_TOOL_VERSIONS_FILENAME")
+            .unwrap_or(OsStr::new(DEFAULT_TOOL_VERSIONS_FILE))
     }
 
     fn variable(&self, name: &str) -> Option<&OsStr> {
@@ -362,7 +458,9 @@ impl SelectorEnvironment {
     }
 }
 
-fn is_manager_variable(name: &OsStr) -> bool {
+/// Whether `name` is a version-manager variable, which can select the
+/// runtime that a shim runs.
+pub(crate) fn is_manager_variable(name: &OsStr) -> bool {
     name.to_str().is_some_and(|name| {
         let name = name.to_ascii_uppercase();
         MANAGER_VARIABLE_PREFIXES
@@ -371,18 +469,56 @@ fn is_manager_variable(name: &OsStr) -> bool {
     })
 }
 
-fn hash_version_selectors(hasher: &mut FieldHasher, cwd: &Path, environment: &SelectorEnvironment) {
+fn same_variable(left: &OsStr, right: &OsStr) -> bool {
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
+}
+
+/// How project version files are named in a hash.
+#[derive(Clone, Copy)]
+enum ProjectFileNames<'a> {
+    /// By absolute path, for a fingerprint that stays on this machine.
+    Absolute,
+    /// By path from the directory each one is found in, so that directories
+    /// with the same files hash alike wherever they are. Each directory that
+    /// has version files is marked, so the order of the files still counts.
+    Local,
+    /// By path from a fixed root.
+    From(&'a Path),
+}
+
+impl ProjectFileNames<'_> {
+    fn hash(self, hasher: &mut FieldHasher, directory: &Path, path: &Path) {
+        let base = match self {
+            Self::Absolute => {
+                hasher.os(path.as_os_str());
+                return;
+            }
+            Self::Local => directory,
+            Self::From(root) => root,
+        };
+        hasher.os(path.strip_prefix(base).unwrap_or(path).as_os_str());
+    }
+}
+
+fn hash_version_selectors(
+    hasher: &mut FieldHasher,
+    cwd: &Path,
+    environment: &SelectorEnvironment,
+    names: ProjectFileNames<'_>,
+) {
     hasher.bytes(b"selectors");
     for (name, value) in &environment.variables {
         hasher.os(name);
         hasher.os(value);
     }
 
-    let tool_versions = environment
-        .variable("ASDF_DEFAULT_TOOL_VERSIONS_FILENAME")
-        .unwrap_or(OsStr::new(DEFAULT_TOOL_VERSIONS_FILE));
+    let tool_versions = environment.tool_versions_file();
     for directory in cwd.ancestors() {
-        hash_project_selectors(hasher, directory, tool_versions);
+        hash_project_selectors(hasher, directory, tool_versions, names);
     }
 
     let mut global_files = Vec::with_capacity(6);
@@ -419,7 +555,7 @@ fn hash_version_selectors(hasher: &mut FieldHasher, cwd: &Path, environment: &Se
             .map(PathBuf::from),
     );
     for file in &global_files {
-        hash_selector_file(hasher, file);
+        hash_selector_file(hasher, file, file, ProjectFileNames::Absolute);
     }
 
     let mise_config = environment
@@ -438,31 +574,47 @@ fn hash_version_selectors(hasher: &mut FieldHasher, cwd: &Path, environment: &Se
                 .map(|home| home.join(".config/mise"))
         });
     if let Some(directory) = mise_config {
-        hash_mise_directory(hasher, &directory);
+        hash_mise_directory(hasher, &directory, &directory, ProjectFileNames::Absolute);
     }
     #[cfg(unix)]
-    hash_mise_directory(hasher, Path::new("/etc/mise"));
+    hash_mise_directory(
+        hasher,
+        Path::new("/etc/mise"),
+        Path::new("/etc/mise"),
+        ProjectFileNames::Absolute,
+    );
 }
 
-fn hash_project_selectors(hasher: &mut FieldHasher, directory: &Path, tool_versions: &OsStr) {
+fn hash_project_selectors(
+    hasher: &mut FieldHasher,
+    directory: &Path,
+    tool_versions: &OsStr,
+    names: ProjectFileNames<'_>,
+) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
-    let mut names: Vec<OsString> = entries
+    let mut selectors: Vec<OsString> = entries
         .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
         .filter(|name| is_project_selector(name, tool_versions))
         .collect();
-    names.sort();
-    for name in names {
+    if selectors.is_empty() {
+        return;
+    }
+    selectors.sort();
+    if matches!(names, ProjectFileNames::Local) {
+        hasher.bytes(b"directory");
+    }
+    for name in selectors {
         let path = directory.join(&name);
         match name.to_str() {
-            Some("package.json") => hash_package_json_selectors(hasher, &path),
+            Some("package.json") => hash_package_json_selectors(hasher, directory, &path, names),
             Some(".config") => {
-                hash_mise_files(hasher, &path, is_mise_config_file);
-                hash_mise_directory(hasher, &path.join("mise"));
+                hash_mise_files(hasher, directory, &path, is_mise_config_file, names);
+                hash_mise_directory(hasher, directory, &path.join("mise"), names);
             }
-            Some("mise" | ".mise") => hash_mise_directory(hasher, &path),
-            _ => hash_selector_file(hasher, &path),
+            Some("mise" | ".mise") => hash_mise_directory(hasher, directory, &path, names),
+            _ => hash_selector_file(hasher, directory, &path, names),
         }
     }
 }
@@ -492,14 +644,36 @@ fn is_mise_config_file(name: &str) -> bool {
 }
 
 /// Hash the TOML files of a mise configuration directory and its `conf.d`.
-fn hash_mise_directory(hasher: &mut FieldHasher, directory: &Path) {
-    hash_mise_files(hasher, directory, |name| name.ends_with(".toml"));
-    hash_mise_files(hasher, &directory.join("conf.d"), |name| {
-        name.ends_with(".toml")
-    });
+/// `base` is the directory that `names` measures project paths from.
+fn hash_mise_directory(
+    hasher: &mut FieldHasher,
+    base: &Path,
+    directory: &Path,
+    names: ProjectFileNames<'_>,
+) {
+    hash_mise_files(
+        hasher,
+        base,
+        directory,
+        |name| name.ends_with(".toml"),
+        names,
+    );
+    hash_mise_files(
+        hasher,
+        base,
+        &directory.join("conf.d"),
+        |name| name.ends_with(".toml"),
+        names,
+    );
 }
 
-fn hash_mise_files(hasher: &mut FieldHasher, directory: &Path, include: impl Fn(&str) -> bool) {
+fn hash_mise_files(
+    hasher: &mut FieldHasher,
+    base: &Path,
+    directory: &Path,
+    include: impl Fn(&str) -> bool,
+    names: ProjectFileNames<'_>,
+) {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
@@ -510,20 +684,25 @@ fn hash_mise_files(hasher: &mut FieldHasher, directory: &Path, include: impl Fn(
         .collect();
     files.sort();
     for file in files {
-        hash_selector_file(hasher, &file);
+        hash_selector_file(hasher, base, &file, names);
     }
 }
 
 /// Volta pins Node in `package.json`; other fields change with every
 /// dependency edit and do not select a runtime.
-fn hash_package_json_selectors(hasher: &mut FieldHasher, path: &Path) {
+fn hash_package_json_selectors(
+    hasher: &mut FieldHasher,
+    base: &Path,
+    path: &Path,
+    names: ProjectFileNames<'_>,
+) {
     let Ok((bytes, _)) = lpm_common::read_regular_file_capped_with_metadata(
         path,
         lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
     ) else {
         return;
     };
-    hasher.os(path.as_os_str());
+    names.hash(hasher, base, path);
     match serde_json::from_slice::<serde_json::Value>(&bytes) {
         Ok(manifest) => {
             for field in ["volta", "devEngines"] {
@@ -538,16 +717,21 @@ fn hash_package_json_selectors(hasher: &mut FieldHasher, path: &Path) {
     }
 }
 
-fn hash_selector_file(hasher: &mut FieldHasher, path: &Path) {
+fn hash_selector_file(
+    hasher: &mut FieldHasher,
+    base: &Path,
+    path: &Path,
+    names: ProjectFileNames<'_>,
+) {
     match lpm_common::read_regular_file_capped_with_metadata(path, MAX_SELECTOR_FILE_BYTES) {
         Ok((bytes, _)) => {
-            hasher.os(path.as_os_str());
+            names.hash(hasher, base, path);
             hasher.bytes(&bytes);
         }
         Err(lpm_common::BoundedReadError::NotFound { .. }) => {}
         Err(_) => {
             // Oversized or unreadable: its metadata still changes when it is replaced.
-            hasher.os(path.as_os_str());
+            names.hash(hasher, base, path);
             hasher.bytes(b"metadata");
             if let Ok(metadata) = path.metadata() {
                 crate::effective::update_with_file_metadata(&mut hasher.0, &metadata);
@@ -631,10 +815,15 @@ mod tests {
         }
     }
 
+    fn is_shim(path: &Path, cwd: &Path, environment: &SelectorEnvironment) -> bool {
+        is_version_manager_shim(path, &path.canonicalize().unwrap(), cwd, environment)
+    }
+
     #[cfg(unix)]
     #[test]
     fn version_manager_shims_are_told_from_other_launchers() {
         let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
         let environment = environment(home.path());
         let shim = |relative: &str| {
             let path = home.path().join(relative);
@@ -651,28 +840,42 @@ mod tests {
             ".local/share/mise/shims",
         ] {
             let node = shim(&format!("{shim_dir}/{NODE}"));
-            assert!(
-                is_version_manager_shim(&node, &node.canonicalize().unwrap(), &environment),
-                "{shim_dir}"
-            );
+            assert!(is_shim(&node, project.path(), &environment), "{shim_dir}");
         }
 
         let manager = shim("tools/mise");
         let linked = home.path().join("anywhere/node");
         fs::create_dir_all(linked.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&manager, &linked).unwrap();
-        assert!(is_version_manager_shim(
-            &linked,
-            &linked.canonicalize().unwrap(),
-            &environment
-        ));
+        assert!(is_shim(&linked, project.path(), &environment));
 
         let wrapper = shim("project/node_modules/.bin/node");
-        assert!(!is_version_manager_shim(
-            &wrapper,
-            &wrapper.canonicalize().unwrap(),
-            &environment
-        ));
+        assert!(!is_shim(&wrapper, project.path(), &environment));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_manager_named_binary_inside_the_project_is_not_a_shim() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let environment = environment(home.path());
+        for target in ["tools/mise", "node_modules/volta/volta-shim"] {
+            let target = project.path().join(target);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            write_launcher(&target, "v22.0.0");
+            let link = project.path().join(format!(
+                "bin-{}",
+                target.file_name().unwrap().to_string_lossy()
+            ));
+            fs::create_dir_all(&link).unwrap();
+            let node = link.join(NODE);
+            std::os::unix::fs::symlink(&target, &node).unwrap();
+            assert!(
+                !is_shim(&node, project.path(), &environment),
+                "{}",
+                target.display()
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -680,6 +883,7 @@ mod tests {
     fn a_manager_directory_variable_moves_its_shims() {
         let home = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
         let mut environment = environment(home.path());
         environment.variables = vec![(
             "ASDF_DATA_DIR".into(),
@@ -688,11 +892,113 @@ mod tests {
         let node = data.path().join("shims").join(NODE);
         fs::create_dir_all(node.parent().unwrap()).unwrap();
         write_launcher(&node, "v22.0.0");
-        assert!(is_version_manager_shim(
+        assert!(is_shim(&node, project.path(), &environment));
+    }
+
+    #[test]
+    fn a_runtime_sized_binary_in_a_shim_directory_is_not_a_runtime_binary() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let environment = environment(home.path());
+        let shims = home.path().join(".local/share/mise/shims");
+        fs::create_dir_all(&shims).unwrap();
+        let node = shims.join(NODE);
+        write_unrunnable_node_binary(&node);
+        let identity = identity(
             &node,
-            &node.canonicalize().unwrap(),
-            &environment
+            project.path(),
+            project.path().as_os_str(),
+            &environment,
+        );
+        assert!(
+            !identity.node_binary,
+            "a hard-linked shim that looks like Node must not have its version recorded"
+        );
+    }
+
+    #[test]
+    fn the_npm_bun_package_binary_named_bun_exe_is_a_runtime_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let bun = dir.path().join("bun.exe");
+        write_unrunnable_node_binary(&bun);
+        assert!(is_runtime_binary(
+            &bun.canonicalize().unwrap(),
+            &bun.metadata().unwrap(),
+            RuntimeKind::Bun
         ));
+    }
+
+    #[test]
+    fn script_manager_variables_override_the_process_ones() {
+        let environment =
+            SelectorEnvironment::with_script_variables([("NODENV_VERSION", "18"), ("PATH", "/x")]);
+        assert_eq!(
+            environment.variable("NODENV_VERSION"),
+            Some(OsStr::new("18"))
+        );
+        assert!(environment.variable("PATH").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shim_selection_key_ignores_where_the_same_version_files_are() {
+        let home = tempfile::tempdir().unwrap();
+        let environment = environment(home.path());
+        let shim = home.path().join(".asdf/shims").join(NODE);
+        fs::create_dir_all(shim.parent().unwrap()).unwrap();
+        write_launcher(&shim, "v22.0.0");
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join(".tool-versions"), "nodejs 22.11.0\n").unwrap();
+        let shallow = workspace.path().join("packages/a");
+        let deep = workspace.path().join("apps/web/b");
+        let pinned = workspace.path().join("packages/c");
+        for member in [&shallow, &deep, &pinned] {
+            fs::create_dir_all(member).unwrap();
+            fs::write(member.join("package.json"), r#"{"name":"m"}"#).unwrap();
+        }
+        fs::write(pinned.join(".nvmrc"), "20\n").unwrap();
+        let key = |cwd: &Path| {
+            shim_selection_key(
+                &shim,
+                &shim.canonicalize().unwrap(),
+                cwd,
+                &environment,
+                RuntimeKind::Node,
+            )
+            .unwrap()
+        };
+        assert_eq!(key(&shallow), key(&deep));
+        assert_ne!(key(&shallow), key(&pinned));
+    }
+
+    #[test]
+    fn workspace_selector_digest_names_files_from_the_root() {
+        let environment = environment(Path::new("/nonexistent-home"));
+        let checkouts = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        for checkout in &checkouts {
+            fs::create_dir_all(checkout.path().join("packages/app")).unwrap();
+            fs::write(
+                checkout.path().join("mise.toml"),
+                "[env]\nNODE_ENV = 'production'\n",
+            )
+            .unwrap();
+        }
+        let digest = |root: &Path| {
+            workspace_selector_digest(&root.join("packages/app"), root, &environment).unwrap()
+        };
+        let [first, second] = &checkouts;
+        assert_eq!(digest(first.path()), digest(second.path()));
+
+        fs::write(
+            second.path().join("mise.toml"),
+            "[env]\nNODE_ENV = 'development'\n",
+        )
+        .unwrap();
+        assert_ne!(
+            digest(first.path()),
+            digest(second.path()),
+            "a mise [env] change must change the digest"
+        );
     }
 
     fn identity(

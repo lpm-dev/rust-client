@@ -1,25 +1,166 @@
 //! The runtimes a task-cache key covers, identified so that machines can share
 //! the key.
 
+use crate::binary_target::{binary_target, host_libc};
 use crate::detect::RuntimeKind;
 use crate::effective::{
-    PathNodeVersionCache, PathRuntime, identify_path_runtimes, probe_script_runtime_fingerprints,
+    RecordedNodeVersions, node_version_output, parse_system_node_version,
     runtime_executable_in_path,
 };
-use crate::node_identity::RuntimeExecutable;
-use std::ffi::OsStr;
+use crate::node_identity::{
+    RuntimeExecutable, ScriptNodeIdentity, SelectorEnvironment, classify_identified,
+    script_runtime_identities, shim_selection_key, workspace_selector_digest,
+};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::process::Command;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 const RUNTIMES: [RuntimeKind; 2] = [RuntimeKind::Node, RuntimeKind::Bun];
+const BINARY_FINGERPRINT_DOMAIN: &[u8] = b"lpm-task-runtime-binary-v1\0";
+
+/// Versions of the runtimes that task-cache keys name, shared by every task of
+/// a command. Each distinct runtime is probed at most once, and tasks that
+/// need different runtimes probe concurrently.
+#[derive(Debug, Default)]
+pub struct TaskRuntimeVersions {
+    recorded: Option<RecordedNodeVersions>,
+    probes: Mutex<HashMap<String, Arc<OnceLock<Option<String>>>>>,
+}
+
+impl TaskRuntimeVersions {
+    /// Reuse and record runtime binaries' versions in `recorded`.
+    pub fn new(recorded: Option<RecordedNodeVersions>) -> Self {
+        Self {
+            recorded,
+            probes: Mutex::default(),
+        }
+    }
+
+    fn probe(&self, key: &str) -> Arc<OnceLock<Option<String>>> {
+        let mut probes = self.probes.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(probe) = probes.get(key) {
+            return Arc::clone(probe);
+        }
+        Arc::clone(probes.entry(key.to_owned()).or_default())
+    }
+
+    /// The version a runtime binary reports. It depends on the file alone, so
+    /// one probe serves every project, and later commands reuse the record.
+    fn binary_version(&self, runtime: RuntimeKind, canonical: &Path) -> Option<String> {
+        let fingerprint = binary_fingerprint(runtime, canonical)?;
+        let mut probed = None;
+        let version = self
+            .probe(&fingerprint)
+            .get_or_init(|| {
+                if let Some(version) = self
+                    .recorded
+                    .as_ref()
+                    .and_then(|recorded| recorded.version(&fingerprint))
+                {
+                    return Some(version);
+                }
+                let mut command = Command::new(canonical);
+                command.arg("--version");
+                let version = parse_system_node_version(node_version_output(&mut command)?)?;
+                // A binary replaced while it ran may have reported the old one.
+                if binary_fingerprint(runtime, canonical).as_deref() != Some(&fingerprint) {
+                    return None;
+                }
+                probed = Some(version.clone());
+                Some(version)
+            })
+            .clone();
+        // Written after the version is published, so tasks waiting on this
+        // probe don't also wait for the write.
+        if let (Some(recorded), Some(version)) = (&self.recorded, probed) {
+            recorded.record_now(&fingerprint, &version);
+        }
+        version
+    }
+
+    /// The version a version manager's shim selects for a script in `cwd`
+    /// with `path` and the manager `variables` the script sees. Never
+    /// recorded: a manager can resolve a range to a newly installed release
+    /// without any file the key covers changing.
+    fn shim_version(
+        &self,
+        selection: &str,
+        runtime: RuntimeKind,
+        executable: &Path,
+        cwd: &Path,
+        path: &OsStr,
+        variables: &[(OsString, OsString)],
+    ) -> Option<String> {
+        self.probe(selection)
+            .get_or_init(|| {
+                let mut command = if cfg!(windows) {
+                    let mut command = Command::new("cmd");
+                    command
+                        .args(["/D", "/S", "/C"])
+                        .arg(format!("{} --version", runtime.binary_name()));
+                    command
+                } else {
+                    let mut command = Command::new(executable);
+                    command.arg("--version");
+                    command
+                };
+                command.current_dir(cwd).env("PATH", path);
+                lpm_common::child_env::strip_inherited_env_hooks(&mut command);
+                command.envs(variables.iter().map(|(name, value)| (name, value)));
+                let output = lpm_common::process_output::output_capped(
+                    &mut command,
+                    std::time::Duration::from_secs(2),
+                    4096,
+                )
+                .ok()?;
+                parse_system_node_version(output)
+            })
+            .clone()
+    }
+}
+
+/// A runtime binary's identity: its path and the metadata that changes when
+/// it is replaced or rewritten. Version files don't affect what a binary
+/// reports, so they are left out.
+fn binary_fingerprint(runtime: RuntimeKind, canonical: &Path) -> Option<String> {
+    let metadata = canonical.metadata().ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(BINARY_FINGERPRINT_DOMAIN);
+    hasher.update(runtime.as_str().as_bytes());
+    hasher.update(b"\0");
+    crate::effective::hash_os_string(&mut hasher, canonical.as_os_str());
+    crate::effective::update_with_file_metadata(&mut hasher, &metadata);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        // An edit that restores the old size and mtime still moves ctime.
+        hasher.update(metadata.ctime().to_le_bytes());
+        hasher.update(metadata.ctime_nsec().to_le_bytes());
+    }
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// What a task's environment adds to runtime selection: the workspace root
+/// that portable names are measured from, and the version-manager variables
+/// that the project environment sets.
+#[derive(Debug, Clone, Copy)]
+pub struct TaskRuntimeScope<'a> {
+    pub workspace_root: &'a Path,
+    pub project_variables: &'a [(OsString, OsString)],
+}
 
 /// The Node and Bun that a task's `PATH` selects, by version and platform.
 ///
-/// A runtime binary or a version manager's shim is identified by the release
-/// it runs, so the same release on the same platform gives the same identity
-/// wherever it is installed. Any other launcher is identified by its local
-/// fingerprint, which covers its location, the script `PATH`, and the working
-/// directory.
+/// A runtime binary is identified by its version and the architecture and C
+/// library its header names. A version manager's shim is identified by the
+/// version it selects and by the version files in the workspace, which some
+/// managers also read environment settings from. Any other launcher is
+/// identified by its local fingerprint, which covers its location, the script
+/// `PATH`, and the working directory.
 ///
 /// Each selected executable's local fingerprint is kept too: it changes when
 /// the executable or its version selectors do, so a key can be rechecked
@@ -28,6 +169,7 @@ const RUNTIMES: [RuntimeKind; 2] = [RuntimeKind::Node, RuntimeKind::Bun];
 pub struct TaskRuntimeIdentity {
     identities: Vec<(String, String)>,
     cwd: PathBuf,
+    environment: SelectorEnvironment,
     local: [Option<String>; 2],
 }
 
@@ -35,50 +177,66 @@ impl TaskRuntimeIdentity {
     /// Identify the runtimes `path` selects for a task in `cwd`. `None` when
     /// a selected executable can't be identified, or changes while its version
     /// is probed.
-    ///
-    /// `versions` is locked only to reuse or probe a version, so tasks that
-    /// share it identify their runtimes concurrently.
     pub fn capture(
         cwd: &Path,
         path: &OsStr,
-        versions: &Mutex<PathNodeVersionCache>,
+        scope: TaskRuntimeScope<'_>,
+        versions: &TaskRuntimeVersions,
     ) -> Option<Self> {
-        Self::capture_with(cwd, path, versions, PathRuntime::kind)
+        Self::capture_with(cwd, path, scope, versions, classify_identified)
     }
 
     fn capture_with(
         cwd: &Path,
         path: &OsStr,
-        versions: &Mutex<PathNodeVersionCache>,
-        classify: impl Fn(&PathRuntime) -> RuntimeExecutable,
+        scope: TaskRuntimeScope<'_>,
+        versions: &TaskRuntimeVersions,
+        classify: impl Fn(&ScriptNodeIdentity, &Path, &Path, &SelectorEnvironment) -> RuntimeExecutable,
     ) -> Option<Self> {
-        let selected = identify_path_runtimes(cwd, path);
+        let environment =
+            SelectorEnvironment::with_script_variables(scope.project_variables.iter().cloned());
+        let executables = RUNTIMES.map(|runtime| runtime_executable_in_path(cwd, path, runtime));
+        let selected = identify(cwd, path, &executables, &environment);
         let mut identities = Vec::with_capacity(RUNTIMES.len() + 1);
-        identities.push(("task-platform".to_string(), platform_identity()));
-        let mut local = [None, None];
-        for ((runtime, selected), local) in RUNTIMES.into_iter().zip(&selected).zip(&mut local) {
-            let identity = match selected {
-                None if runtime_executable_in_path(cwd, path, runtime).is_some() => return None,
-                None => "missing".to_string(),
-                Some(selected) => {
-                    let fingerprint = selected.fingerprint();
-                    *local = Some(fingerprint.to_string());
-                    match classify(selected) {
-                        RuntimeExecutable::Launcher => format!("local:{fingerprint}"),
-                        RuntimeExecutable::Binary | RuntimeExecutable::VersionManagerShim => {
-                            let mut versions =
-                                versions.lock().unwrap_or_else(PoisonError::into_inner);
-                            let resolution = versions.resolve_identified(cwd, path, selected);
-                            versions.finish_recordings();
-                            drop(versions);
-                            if resolution.runtime_fingerprint() != Some(fingerprint) {
-                                return None;
-                            }
-                            match resolution.version() {
-                                Some(version) => format!("version:{version}"),
-                                // Without a version, only this executable can
-                                // vouch for the result.
-                                None => format!("local:{fingerprint}"),
+        identities.push(("task-platform".to_string(), host_platform().to_string()));
+        let mut ran_a_shim = false;
+        for ((runtime, executable), selected) in
+            RUNTIMES.into_iter().zip(&executables).zip(&selected)
+        {
+            let identity = match (executable, selected) {
+                (None, None) => "missing".to_string(),
+                (Some(_), None) | (None, Some(_)) => return None,
+                (Some(executable), Some(selected)) => {
+                    match classify(selected, executable, cwd, &environment) {
+                        RuntimeExecutable::Launcher => format!("local:{}", selected.fingerprint),
+                        RuntimeExecutable::Binary => {
+                            binary_identity(versions, runtime, &selected.canonical_executable)
+                                .unwrap_or_else(|| format!("local:{}", selected.fingerprint))
+                        }
+                        RuntimeExecutable::VersionManagerShim => {
+                            ran_a_shim = true;
+                            let selection = shim_selection_key(
+                                executable,
+                                &selected.canonical_executable,
+                                cwd,
+                                &environment,
+                                runtime,
+                            )?;
+                            let version = versions.shim_version(
+                                &selection,
+                                runtime,
+                                executable,
+                                cwd,
+                                path,
+                                environment.variables(),
+                            );
+                            let config =
+                                workspace_selector_digest(cwd, scope.workspace_root, &environment);
+                            match (version, config) {
+                                (Some(version), Some(config)) => {
+                                    format!("version:{version} shim-config:{config}")
+                                }
+                                _ => format!("local:{}", selected.fingerprint),
                             }
                         }
                     }
@@ -86,11 +244,18 @@ impl TaskRuntimeIdentity {
             };
             identities.push((format!("{}-runtime", runtime.as_str()), identity));
         }
-        Some(Self {
+        let identity = Self {
             identities,
             cwd: cwd.to_path_buf(),
-            local,
-        })
+            local: selected.map(|identity| identity.map(|identity| identity.fingerprint)),
+            environment,
+        };
+        // A shim's version came from running it; the selection it reported
+        // must still hold.
+        if ran_a_shim && !identity.is_unchanged_on_path(path) {
+            return None;
+        }
+        Some(identity)
     }
 
     /// The cache-key inputs, as `(name, value)` pairs.
@@ -98,20 +263,82 @@ impl TaskRuntimeIdentity {
         &self.identities
     }
 
+    /// The directory the runtimes were identified for.
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
     /// Whether `path` still selects the executables this identity captured,
     /// unchanged. Reads metadata and selector files only; runs nothing.
     pub fn is_unchanged_on_path(&self, path: &OsStr) -> bool {
-        probe_script_runtime_fingerprints(&self.cwd, path) == self.local
+        let executables =
+            RUNTIMES.map(|runtime| runtime_executable_in_path(&self.cwd, path, runtime));
+        identify(&self.cwd, path, &executables, &self.environment)
+            .map(|identity| identity.map(|identity| identity.fingerprint))
+            == self.local
     }
 }
 
-fn platform_identity() -> String {
-    format!(
-        "{}/{}/{}",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        lpm_common::platform::detect_libc().unwrap_or("-")
+fn identify(
+    cwd: &Path,
+    path: &OsStr,
+    executables: &[Option<PathBuf>; 2],
+    environment: &SelectorEnvironment,
+) -> [Option<ScriptNodeIdentity>; 2] {
+    let roots = RUNTIMES.map(managed_runtime_root);
+    script_runtime_identities(
+        executables,
+        cwd,
+        path,
+        [roots[0].as_deref(), roots[1].as_deref()],
+        environment,
     )
+}
+
+/// A runtime binary by version, and by the architecture and C library its
+/// header names. A binary under Rosetta or a foreign-libc container differs
+/// from the host.
+fn binary_identity(
+    versions: &TaskRuntimeVersions,
+    runtime: RuntimeKind,
+    canonical: &Path,
+) -> Option<String> {
+    let version = versions.binary_version(runtime, canonical)?;
+    let target = binary_target(canonical);
+    let arch = target.map_or(std::env::consts::ARCH, |target| target.arch);
+    let libc = target
+        .and_then(|target| target.libc)
+        .or_else(host_libc)
+        .unwrap_or("-");
+    Some(format!("version:{version} {arch}/{libc}"))
+}
+
+/// Whether a project environment variable named `name` can select the runtime
+/// that a version manager's shim runs.
+pub fn is_version_manager_variable(name: &str) -> bool {
+    crate::node_identity::is_manager_variable(OsStr::new(name))
+}
+
+fn managed_runtime_root(runtime: RuntimeKind) -> Option<PathBuf> {
+    crate::node::runtimes_dir()
+        .ok()?
+        .join(runtime.as_str())
+        .canonicalize()
+        .ok()
+}
+
+/// The host's operating system, CPU architecture, and C library, which every
+/// key names: a task can build native code without Node or Bun.
+fn host_platform() -> &'static str {
+    static HOST_PLATFORM: OnceLock<String> = OnceLock::new();
+    HOST_PLATFORM.get_or_init(|| {
+        format!(
+            "{}/{}/{}",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            host_libc().unwrap_or("-")
+        )
+    })
 }
 
 #[cfg(all(test, unix))]
@@ -119,23 +346,65 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    /// A launcher named `node` that reports `version`.
+    fn write_script(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A launcher named `node` in `bin` that reports `version` and appends a
+    /// line to `bin/probes` each time it runs.
     fn write_launcher(bin: &Path, version: &str) -> PathBuf {
-        std::fs::create_dir_all(bin).unwrap();
         let launcher = bin.join("node");
-        std::fs::write(&launcher, format!("#!/bin/sh\necho v{version}\n")).unwrap();
-        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_script(
+            &launcher,
+            &format!(
+                "echo probe >> '{}'\necho v{version}\n",
+                bin.join("probes").display()
+            ),
+        );
         launcher
     }
 
-    fn capture_as(cwd: &Path, bin: &Path, kind: RuntimeExecutable) -> TaskRuntimeIdentity {
-        TaskRuntimeIdentity::capture_with(cwd, bin.as_os_str(), &Mutex::default(), |_| kind)
-            .unwrap()
+    fn probes(bin: &Path) -> usize {
+        std::fs::read_to_string(bin.join("probes"))
+            .map(|probes| probes.lines().count())
+            .unwrap_or(0)
+    }
+
+    fn scope(root: &Path) -> TaskRuntimeScope<'_> {
+        TaskRuntimeScope {
+            workspace_root: root,
+            project_variables: &[],
+        }
+    }
+
+    fn capture_as(
+        cwd: &Path,
+        root: &Path,
+        bin: &Path,
+        kind: RuntimeExecutable,
+        versions: &TaskRuntimeVersions,
+    ) -> TaskRuntimeIdentity {
+        TaskRuntimeIdentity::capture_with(
+            cwd,
+            bin.as_os_str(),
+            scope(root),
+            versions,
+            |_, _, _, _| kind,
+        )
+        .unwrap()
     }
 
     /// Capture with `bin`'s launchers taken for version-manager shims.
     fn capture(cwd: &Path, bin: &Path) -> TaskRuntimeIdentity {
-        capture_as(cwd, bin, RuntimeExecutable::VersionManagerShim)
+        capture_as(
+            cwd,
+            cwd,
+            bin,
+            RuntimeExecutable::VersionManagerShim,
+            &TaskRuntimeVersions::default(),
+        )
     }
 
     fn runtime(identity: &TaskRuntimeIdentity, name: &str) -> String {
@@ -157,7 +426,7 @@ mod tests {
         let a = capture(first.path(), &first.path().join("bin"));
         let b = capture(second.path(), &second.path().join("tools/bin"));
         assert_eq!(a.identities(), b.identities());
-        assert_eq!(runtime(&a, "node-runtime"), "version:22.11.0");
+        assert!(runtime(&a, "node-runtime").starts_with("version:22.11.0 shim-config:"));
         assert_eq!(runtime(&a, "bun-runtime"), "missing");
     }
 
@@ -173,29 +442,93 @@ mod tests {
     }
 
     #[test]
-    fn other_launchers_keep_their_location_and_skip_the_version_probe() {
+    fn a_workspace_version_file_change_changes_a_shim_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        write_launcher(&bin, "22.11.0");
+        std::fs::write(
+            dir.path().join("mise.toml"),
+            "[env]\nNODE_ENV = 'production'\n",
+        )
+        .unwrap();
+        let before = capture(dir.path(), &bin);
+        std::fs::write(
+            dir.path().join("mise.toml"),
+            "[env]\nNODE_ENV = 'development'\n",
+        )
+        .unwrap();
+        assert_ne!(before.identities(), capture(dir.path(), &bin).identities());
+    }
+
+    #[test]
+    fn other_launchers_are_never_probed_and_keep_their_location() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        // A probe of this launcher would fail the test: it never reports a version.
+        let versions = TaskRuntimeVersions::default();
         for dir in [first.path(), second.path()] {
-            let bin = dir.join("bin");
-            std::fs::create_dir_all(&bin).unwrap();
-            std::fs::write(bin.join("node"), "#!/bin/sh\nexit 1\n").unwrap();
-            std::fs::set_permissions(bin.join("node"), std::fs::Permissions::from_mode(0o755))
-                .unwrap();
+            write_launcher(&dir.join("bin"), "22.11.0");
         }
-        let a = capture_as(
-            first.path(),
-            &first.path().join("bin"),
-            RuntimeExecutable::Launcher,
-        );
-        let b = capture_as(
-            second.path(),
-            &second.path().join("bin"),
-            RuntimeExecutable::Launcher,
+        let launcher = |dir: &Path| {
+            capture_as(
+                dir,
+                dir,
+                &dir.join("bin"),
+                RuntimeExecutable::Launcher,
+                &versions,
+            )
+        };
+        let a = launcher(first.path());
+        let b = launcher(second.path());
+        assert_eq!(
+            probes(&first.path().join("bin")),
+            0,
+            "a launcher must not run"
         );
         assert!(runtime(&a, "node-runtime").starts_with("local:"));
         assert_ne!(a.identities(), b.identities());
+    }
+
+    #[test]
+    fn workspace_members_with_the_same_version_files_share_one_shim_probe() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bin = workspace.path().join("bin");
+        write_launcher(&bin, "22.11.0");
+        let versions = TaskRuntimeVersions::default();
+        for member in ["packages/a", "packages/b", "apps/web/c"] {
+            let member = workspace.path().join(member);
+            std::fs::create_dir_all(&member).unwrap();
+            capture_as(
+                &member,
+                workspace.path(),
+                &bin,
+                RuntimeExecutable::VersionManagerShim,
+                &versions,
+            );
+        }
+        assert_eq!(probes(&bin), 1);
+    }
+
+    #[test]
+    fn a_project_manager_variable_reaches_the_shim_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        write_script(
+            &bin.join("node"),
+            "if [ -n \"$NODENV_VERSION\" ]; then echo \"v$NODENV_VERSION.0.0\"; else echo v99.0.0; fi\n",
+        );
+        let variables = [("NODENV_VERSION".into(), "18".into())];
+        let identity = TaskRuntimeIdentity::capture_with(
+            dir.path(),
+            bin.as_os_str(),
+            TaskRuntimeScope {
+                workspace_root: dir.path(),
+                project_variables: &variables,
+            },
+            &TaskRuntimeVersions::default(),
+            |_, _, _, _| RuntimeExecutable::VersionManagerShim,
+        )
+        .unwrap();
+        assert!(runtime(&identity, "node-runtime").starts_with("version:18.0.0 "));
     }
 
     #[test]
@@ -215,11 +548,26 @@ mod tests {
     fn a_runtime_without_a_version_is_identified_by_this_executable_only() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let launcher = bin.join("node");
-        std::fs::write(&launcher, "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_script(&bin.join("node"), "exit 1\n");
         assert!(runtime(&capture(dir.path(), &bin), "node-runtime").starts_with("local:"));
+    }
+
+    #[test]
+    fn a_runtime_binary_is_probed_once_and_its_record_serves_later_commands() {
+        let Ok(node) = std::process::Command::new("node")
+            .args(["-p", "process.execPath"])
+            .output()
+        else {
+            return;
+        };
+        let node = PathBuf::from(String::from_utf8(node.stdout).unwrap().trim());
+        let records = tempfile::tempdir().unwrap();
+        let versions = TaskRuntimeVersions::new(Some(RecordedNodeVersions::at(records.path())));
+        let first = versions.binary_version(RuntimeKind::Node, &node).unwrap();
+        assert_eq!(std::fs::read_dir(records.path()).unwrap().count(), 1);
+
+        let later = TaskRuntimeVersions::new(Some(RecordedNodeVersions::at(records.path())));
+        assert_eq!(later.binary_version(RuntimeKind::Node, &node), Some(first));
     }
 
     #[test]
@@ -228,6 +576,7 @@ mod tests {
         let bin = dir.path().join("bin");
         let launcher = write_launcher(&bin, "22.11.0");
         let identity = capture(dir.path(), &bin);
+        let probed = probes(&bin);
         assert!(identity.is_unchanged_on_path(bin.as_os_str()));
 
         std::fs::write(dir.path().join(".nvmrc"), "20\n").unwrap();
@@ -245,6 +594,7 @@ mod tests {
             !identity.is_unchanged_on_path(&path),
             "another selected executable must invalidate the identity"
         );
+        assert_eq!(probes(&bin), probed, "a recheck must not run the runtime");
 
         std::fs::remove_file(launcher).unwrap();
         assert!(!identity.is_unchanged_on_path(bin.as_os_str()));

@@ -89,14 +89,11 @@ impl NpmScriptContext {
         );
     }
 
-    /// `npm_package_json` and `INIT_CWD` as a task-cache key sees them: as
-    /// paths under `root`, the workspace root, so that checkouts at other
-    /// paths share the key. A path outside `root` stays absolute. The script
-    /// itself still gets the real paths from [`Self::apply`].
-    pub fn portable_cache_paths(
-        &self,
-        root: &Path,
-    ) -> Result<[(&'static str, String); 2], LpmError> {
+    /// `npm_package_json` as a task-cache key sees it: as a path under
+    /// `root`, the workspace root, so that checkouts at other paths share the
+    /// key. A manifest outside `root` stays absolute. The script itself still
+    /// gets the real path from [`Self::apply`].
+    pub fn portable_manifest_path(&self, root: &Path) -> Result<String, LpmError> {
         let root = root.canonicalize()?;
         let manifest = match self.manifest.canonicalize() {
             Ok(manifest) => manifest,
@@ -108,11 +105,7 @@ impl NpmScriptContext {
                 .join("package.json"),
             Err(error) => return Err(error.into()),
         };
-        let invocation_dir = self.invocation_dir.canonicalize()?;
-        Ok([
-            ("npm_package_json", portable_cache_path(&manifest, &root)),
-            ("INIT_CWD", portable_cache_path(&invocation_dir, &root)),
-        ])
+        Ok(portable_cache_path(&manifest, &root))
     }
 }
 
@@ -146,46 +139,34 @@ fn managed_key_matches(key: &std::ffi::OsStr, managed: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn portable(context: &NpmScriptContext, root: &Path) -> HashMap<&'static str, String> {
-        context
-            .portable_cache_paths(root)
-            .unwrap()
-            .into_iter()
-            .collect()
-    }
-
     #[test]
-    fn portable_paths_are_relative_to_the_workspace_root() {
+    fn portable_manifest_path_is_relative_to_the_workspace_root() {
         let workspace = tempfile::tempdir().unwrap();
         let member = workspace.path().join("packages/app");
         std::fs::create_dir_all(&member).unwrap();
         std::fs::write(member.join("package.json"), "{}").unwrap();
-
-        let from_root = NpmScriptContext::new(Some("app"), None, &member, workspace.path());
-        let paths = portable(&from_root, workspace.path());
-        assert_eq!(
-            paths["npm_package_json"],
-            "workspace:packages/app/package.json"
-        );
-        assert_eq!(paths["INIT_CWD"], "workspace:");
-
-        let from_member = NpmScriptContext::new(Some("app"), None, &member, &member);
-        assert_eq!(
-            portable(&from_member, workspace.path())["INIT_CWD"],
-            "workspace:packages/app"
-        );
+        for invocation_dir in [workspace.path(), member.as_path()] {
+            let context = NpmScriptContext::new(Some("app"), None, &member, invocation_dir);
+            assert_eq!(
+                context.portable_manifest_path(workspace.path()).unwrap(),
+                "workspace:packages/app/package.json"
+            );
+        }
     }
 
     #[test]
-    fn portable_paths_match_for_checkouts_at_other_paths() {
+    fn portable_manifest_paths_match_for_checkouts_at_other_paths() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
         for checkout in [first.path(), second.path()] {
             std::fs::write(checkout.join("package.json"), "{}").unwrap();
         }
-        let a = NpmScriptContext::new(None, None, first.path(), first.path());
-        let b = NpmScriptContext::new(None, None, second.path(), second.path());
-        assert_eq!(portable(&a, first.path()), portable(&b, second.path()));
+        let path = |checkout: &Path| {
+            NpmScriptContext::new(None, None, checkout, checkout)
+                .portable_manifest_path(checkout)
+                .unwrap()
+        };
+        assert_eq!(path(first.path()), path(second.path()));
     }
 
     #[test]
@@ -202,15 +183,30 @@ mod tests {
     }
 
     #[test]
-    fn an_invocation_outside_the_root_stays_absolute_and_a_missing_manifest_is_allowed() {
+    fn a_missing_manifest_still_has_a_portable_path() {
         let project = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         let context = NpmScriptContext::new(None, None, project.path(), elsewhere.path());
-        let paths = portable(&context, project.path());
-        assert_eq!(paths["npm_package_json"], "workspace:package.json");
         assert_eq!(
-            paths["INIT_CWD"],
-            elsewhere.path().canonicalize().unwrap().to_string_lossy()
+            context.portable_manifest_path(project.path()).unwrap(),
+            "workspace:package.json"
+        );
+    }
+
+    #[test]
+    fn a_manifest_outside_the_root_stays_absolute() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("package.json"), "{}").unwrap();
+        let context = NpmScriptContext::new(None, None, outside.path(), outside.path());
+        assert_eq!(
+            context.portable_manifest_path(root.path()).unwrap(),
+            outside
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("package.json")
+                .to_string_lossy()
         );
     }
 

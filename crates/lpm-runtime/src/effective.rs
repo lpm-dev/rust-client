@@ -19,12 +19,8 @@
 //! hatch — `lpm use node@<v>` first, then re-run install.
 
 use crate::detect;
-use crate::detect::RuntimeKind;
 use crate::node;
-use crate::node_identity::{
-    RuntimeExecutable, ScriptNodeIdentity, script_node_identity, script_runtime_identities,
-    script_runtime_identity,
-};
+use crate::node_identity::{ScriptNodeIdentity, script_node_identity};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
@@ -103,8 +99,7 @@ enum PathNodeCacheContext {
 #[derive(Debug, Default)]
 pub struct PathNodeVersionCache {
     resolutions: HashMap<PathNodeIdentity, PathNodeResolution>,
-    /// Managed Node and Bun roots, indexed like [`runtime_index`].
-    managed_roots: [Option<PathBuf>; 2],
+    managed_node_root: Option<PathBuf>,
     recorded: Option<RecordedNodeVersions>,
     recordings: Vec<std::thread::JoinHandle<()>>,
 }
@@ -114,21 +109,21 @@ impl Drop for PathNodeVersionCache {
         // Records are written in the background, off the command's critical
         // path; they finish before the resolutions that produced them are
         // forgotten.
-        self.finish_recordings();
+        for recording in self.recordings.drain(..) {
+            let _ = recording.join();
+        }
     }
 }
 
-fn runtime_index(runtime: RuntimeKind) -> usize {
-    usize::from(runtime == RuntimeKind::Bun)
-}
-
-/// Versions that real Node and Bun binaries reported, stored by fingerprint so
-/// that later commands, in any project, can skip `--version` for the same
-/// binary. A fingerprint covers the runtime kind, so Node and Bun records
-/// share one directory without colliding.
+/// Versions that real Node binaries reported, stored by fingerprint so that
+/// later commands, in any project, can skip `node --version` for the same
+/// binary.
 ///
 /// Launchers are never recorded: a shim can report another version without
 /// its fingerprint changing.
+///
+/// Task-cache keys record Node and Bun binaries here too, under fingerprints
+/// of their own domain, so the two kinds of record never collide.
 #[derive(Debug, Clone)]
 pub struct RecordedNodeVersions {
     directory: PathBuf,
@@ -153,7 +148,7 @@ impl RecordedNodeVersions {
         self
     }
 
-    fn version(&self, fingerprint: &str) -> Option<String> {
+    pub(crate) fn version(&self, fingerprint: &str) -> Option<String> {
         if !self.reuse {
             return None;
         }
@@ -168,18 +163,26 @@ impl RecordedNodeVersions {
     }
 
     fn record(&self, fingerprint: &str, version: &str) -> Option<std::thread::JoinHandle<()>> {
-        let path = self.path(fingerprint)?;
+        self.path(fingerprint)?;
         lpm_semver::Version::parse(version).ok()?;
-        let directory = self.directory.clone();
-        let contents = format!("{version}\n");
-        // A version that cannot be recorded only costs a later probe.
+        let recorded = self.clone();
+        let (fingerprint, version) = (fingerprint.to_owned(), version.to_owned());
         std::thread::Builder::new()
             .name("lpm-node-version-record".into())
-            .spawn(move || {
-                let _ = create_private_directory(&directory)
-                    .and_then(|()| lpm_common::write_file_atomic(&path, contents));
-            })
+            .spawn(move || recorded.record_now(&fingerprint, &version))
             .ok()
+    }
+
+    /// Record `version` before returning, for a caller that has no later
+    /// point at which to wait for a background write. A version that cannot
+    /// be recorded only costs a later probe.
+    pub(crate) fn record_now(&self, fingerprint: &str, version: &str) {
+        if let Some(path) = self.path(fingerprint)
+            && lpm_semver::Version::parse(version).is_ok()
+        {
+            let _ = create_private_directory(&self.directory)
+                .and_then(|()| lpm_common::write_file_atomic(&path, format!("{version}\n")));
+        }
     }
 
     fn path(&self, fingerprint: &str) -> Option<PathBuf> {
@@ -234,17 +237,9 @@ impl PathNodeVersionCache {
     pub fn with_recorded_versions(recorded: RecordedNodeVersions) -> Self {
         Self {
             resolutions: HashMap::new(),
-            managed_roots: [None, None],
+            managed_node_root: None,
             recorded: Some(recorded),
             recordings: Vec::new(),
-        }
-    }
-
-    /// Wait for the version records that earlier resolutions started writing,
-    /// for a cache that lives until the process exits and is never dropped.
-    pub fn finish_recordings(&mut self) {
-        for recording in self.recordings.drain(..) {
-            let _ = recording.join();
         }
     }
 
@@ -268,77 +263,14 @@ impl PathNodeVersionCache {
         path: &OsStr,
         observed: Option<&ObservedNodeVersion>,
     ) -> PathNodeResolution {
-        self.resolve_runtime_with_observed(cwd, path, RuntimeKind::Node, observed)
-    }
-
-    /// Resolve the Node or Bun executable that `path` selects for a script in
-    /// `cwd`, with the reuse rules of [`Self::resolve`].
-    pub fn resolve_runtime(
-        &mut self,
-        cwd: &Path,
-        path: &OsStr,
-        runtime: RuntimeKind,
-    ) -> PathNodeResolution {
-        self.resolve_runtime_with_observed(cwd, path, runtime, None)
-    }
-
-    /// Resolve a runtime that [`identify_path_runtimes`] found, reusing its
-    /// identity instead of reading the version selectors again.
-    pub fn resolve_identified(
-        &mut self,
-        cwd: &Path,
-        path: &OsStr,
-        selected: &PathRuntime,
-    ) -> PathNodeResolution {
-        self.resolve_from(
-            cwd,
-            path,
-            selected.runtime,
-            Some(selected.executable.clone()),
-            Some(selected.identity.clone()),
-            None,
-        )
-    }
-
-    fn managed_root(&mut self, runtime: RuntimeKind) -> Option<&Path> {
-        let root = &mut self.managed_roots[runtime_index(runtime)];
-        if root.is_none() {
-            *root = managed_runtime_root(runtime);
+        if self.managed_node_root.is_none() {
+            self.managed_node_root = managed_node_root();
         }
-        root.as_deref()
-    }
-
-    fn resolve_runtime_with_observed(
-        &mut self,
-        cwd: &Path,
-        path: &OsStr,
-        runtime: RuntimeKind,
-        observed: Option<&ObservedNodeVersion>,
-    ) -> PathNodeResolution {
-        let managed_root = self.managed_root(runtime).map(Path::to_path_buf);
-        let executable_before = runtime_executable_in_path(cwd, path, runtime);
-        let identity_before = executable_before.as_deref().and_then(|executable| {
-            path_runtime_identity(executable, cwd, path, managed_root.as_deref(), runtime)
-        });
-        self.resolve_from(
-            cwd,
-            path,
-            runtime,
-            executable_before,
-            identity_before,
-            observed,
-        )
-    }
-
-    fn resolve_from(
-        &mut self,
-        cwd: &Path,
-        path: &OsStr,
-        runtime: RuntimeKind,
-        executable_before: Option<PathBuf>,
-        identity_before: Option<PathNodeIdentity>,
-        observed: Option<&ObservedNodeVersion>,
-    ) -> PathNodeResolution {
+        let managed_node_root = self.managed_node_root.as_deref();
+        let executable_before = node_executable_in_path(cwd, path);
+        let identity_before = executable_before
+            .as_deref()
+            .and_then(|executable| path_node_identity(executable, cwd, path, managed_node_root));
         if let Some(cached) = identity_before
             .as_ref()
             .and_then(|identity| self.resolutions.get(identity))
@@ -372,13 +304,10 @@ impl PathNodeVersionCache {
             return resolution;
         }
 
-        let version = runtime_version_on_path(cwd, path, executable_before.as_deref(), runtime);
-        let managed_root = self.managed_root(runtime).map(Path::to_path_buf);
-        let identity_after = runtime_executable_in_path(cwd, path, runtime)
+        let version = node_version_on_path(cwd, path, executable_before.as_deref());
+        let identity_after = node_executable_in_path(cwd, path)
             .as_deref()
-            .and_then(|executable| {
-                path_runtime_identity(executable, cwd, path, managed_root.as_deref(), runtime)
-            });
+            .and_then(|executable| path_node_identity(executable, cwd, path, managed_node_root));
         let stable_identity =
             identity_before.filter(|before| Some(before) == identity_after.as_ref());
         let resolution = PathNodeResolution {
@@ -495,13 +424,8 @@ pub fn resolve_node_on_path_with_observed(
 /// Fingerprint the Node executable selected by a script's cwd and `PATH`.
 pub fn probe_node_fingerprint_on_path(cwd: &Path, path: &OsStr) -> Option<String> {
     let executable = node_executable_in_path(cwd, path)?;
-    script_node_identity(
-        &executable,
-        cwd,
-        path,
-        managed_runtime_root(RuntimeKind::Node).as_deref(),
-    )
-    .map(|identity| identity.fingerprint)
+    script_node_identity(&executable, cwd, path, managed_node_root().as_deref())
+        .map(|identity| identity.fingerprint)
 }
 
 /// Fingerprint a Node or Bun executable selected by a script's cwd and `PATH`.
@@ -653,7 +577,7 @@ fn resolve_selected(selected: &SelectedNode) -> Effective {
 /// Run `node --version` and return the bare version string (no `v`
 /// prefix). Returns `None` when `node` is not on `PATH` or the output
 /// is unparseable.
-fn node_version_output(command: &mut Command) -> Option<std::process::Output> {
+pub(crate) fn node_version_output(command: &mut Command) -> Option<std::process::Output> {
     lpm_common::child_env::strip_inherited_env_hooks(command);
     lpm_common::process_output::output_capped(command, std::time::Duration::from_secs(2), 4096).ok()
 }
@@ -669,12 +593,7 @@ fn system_node_version_at(executable: &Path) -> Option<String> {
 }
 
 #[cfg(not(windows))]
-fn runtime_version_on_path(
-    cwd: &Path,
-    path: &OsStr,
-    executable: Option<&Path>,
-    _runtime: RuntimeKind,
-) -> Option<String> {
+fn node_version_on_path(cwd: &Path, path: &OsStr, executable: Option<&Path>) -> Option<String> {
     parse_system_node_version(node_version_output(
         Command::new(executable?)
             .arg("--version")
@@ -684,22 +603,16 @@ fn runtime_version_on_path(
 }
 
 #[cfg(windows)]
-fn runtime_version_on_path(
-    cwd: &Path,
-    path: &OsStr,
-    _executable: Option<&Path>,
-    runtime: RuntimeKind,
-) -> Option<String> {
-    let command = format!("{} --version", runtime.binary_name());
+fn node_version_on_path(cwd: &Path, path: &OsStr, _executable: Option<&Path>) -> Option<String> {
     parse_system_node_version(node_version_output(
         Command::new("cmd")
-            .args(["/D", "/S", "/C", command.as_str()])
+            .args(["/D", "/S", "/C", "node --version"])
             .current_dir(cwd)
             .env("PATH", path),
     )?)
 }
 
-fn parse_system_node_version(output: std::process::Output) -> Option<String> {
+pub(crate) fn parse_system_node_version(output: std::process::Output) -> Option<String> {
     if !output.status.success() {
         return None;
     }
@@ -795,83 +708,31 @@ fn executable_fingerprint(kind: &[u8], executable: &Path) -> Option<String> {
     executable_fingerprint_from_canonical(kind, &canonical)
 }
 
-fn path_runtime_identity(
+fn path_node_identity(
     executable: &Path,
     cwd: &Path,
     path: &OsStr,
-    managed_root: Option<&Path>,
-    runtime: RuntimeKind,
+    managed_node_root: Option<&Path>,
 ) -> Option<PathNodeIdentity> {
-    let script = script_runtime_identity(executable, cwd, path, managed_root, runtime)?;
-    path_node_identity_for(script, managed_root, cwd, path)
-}
-
-fn path_node_identity_for(
-    script: ScriptNodeIdentity,
-    managed_root: Option<&Path>,
-    cwd: &Path,
-    path: &OsStr,
-) -> Option<PathNodeIdentity> {
-    let context = if managed_root.is_some_and(|root| script.canonical_executable.starts_with(root))
-    {
-        PathNodeCacheContext::LpmManaged
-    } else {
-        PathNodeCacheContext::Script {
-            working_directory: cwd.canonicalize().ok()?,
-            search_path: path.to_os_string(),
-        }
-    };
+    let script = script_node_identity(executable, cwd, path, managed_node_root)?;
+    let context =
+        if managed_node_root.is_some_and(|root| script.canonical_executable.starts_with(root)) {
+            PathNodeCacheContext::LpmManaged
+        } else {
+            PathNodeCacheContext::Script {
+                working_directory: cwd.canonicalize().ok()?,
+                search_path: path.to_os_string(),
+            }
+        };
     Some(PathNodeIdentity { script, context })
 }
 
-/// A Node or Bun executable that a script `PATH` selects, identified without
-/// running it.
-#[derive(Debug, Clone)]
-pub struct PathRuntime {
-    runtime: RuntimeKind,
-    executable: PathBuf,
-    identity: PathNodeIdentity,
-}
-
-impl PathRuntime {
-    /// Fingerprint of the executable and of the version selectors it reads.
-    pub fn fingerprint(&self) -> &str {
-        &self.identity.script.fingerprint
-    }
-
-    pub(crate) fn kind(&self) -> RuntimeExecutable {
-        crate::node_identity::classify_identified(&self.identity.script, &self.executable)
-    }
-}
-
-/// Identify the Node and Bun that `path` selects for a script in `cwd`,
-/// reading their version selectors once. An entry is `None` when no executable
-/// is selected, or when the selected one can't be identified.
-pub fn identify_path_runtimes(cwd: &Path, path: &OsStr) -> [Option<PathRuntime>; 2] {
-    let runtimes = [RuntimeKind::Node, RuntimeKind::Bun];
-    let executables = runtimes.map(|runtime| runtime_executable_in_path(cwd, path, runtime));
-    let roots = runtimes.map(managed_runtime_root);
-    let identities = script_runtime_identities(
-        &executables,
-        cwd,
-        path,
-        [roots[0].as_deref(), roots[1].as_deref()],
-    );
-    let mut selected = [None, None];
-    for (index, (executable, script)) in executables.into_iter().zip(identities).enumerate() {
-        let (Some(executable), Some(script)) = (executable, script) else {
-            continue;
-        };
-        selected[index] =
-            path_node_identity_for(script, roots[index].as_deref(), cwd, path).map(|identity| {
-                PathRuntime {
-                    runtime: runtimes[index],
-                    executable,
-                    identity,
-                }
-            });
-    }
-    selected
+fn managed_node_root() -> Option<PathBuf> {
+    crate::node::runtimes_dir()
+        .ok()?
+        .join("node")
+        .canonicalize()
+        .ok()
 }
 
 fn executable_fingerprint_from_canonical(kind: &[u8], canonical: &Path) -> Option<String> {
@@ -924,14 +785,14 @@ pub(crate) fn update_with_file_metadata(hasher: &mut Sha256, metadata: &std::fs:
 }
 
 #[cfg(unix)]
-fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
+pub(crate) fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
     use std::os::unix::ffi::OsStrExt;
 
     hasher.update(value.as_bytes());
 }
 
 #[cfg(windows)]
-fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
+pub(crate) fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
     use std::os::windows::ffi::OsStrExt;
 
     for unit in value.encode_wide() {
@@ -940,7 +801,7 @@ fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
+pub(crate) fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
     hasher.update(value.to_string_lossy().as_bytes());
 }
 
@@ -1117,27 +978,6 @@ mod tests {
             resolution.runtime_fingerprint(),
             probe_node_fingerprint_on_path(first_dir.path(), &path).as_deref()
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn bun_resolves_its_own_version_and_fingerprint_from_the_script_path() {
-        let dir = tempfile::tempdir().unwrap();
-        write_test_executable(&test_node_path(dir.path()), b"#!/bin/sh\necho v22.0.0\n");
-        write_test_executable(&dir.path().join("bun"), b"#!/bin/sh\necho 1.1.30\n");
-        let path = dir.path().as_os_str();
-        let mut versions = PathNodeVersionCache::default();
-
-        let bun = versions.resolve_runtime(dir.path(), path, RuntimeKind::Bun);
-        let node = versions.resolve_runtime(dir.path(), path, RuntimeKind::Node);
-
-        assert_eq!(bun.version(), Some("1.1.30"));
-        assert_eq!(
-            bun.runtime_fingerprint(),
-            probe_runtime_fingerprint_on_path(dir.path(), path, RuntimeKind::Bun).as_deref()
-        );
-        assert_eq!(node.version(), Some("22.0.0"));
-        assert_ne!(bun.runtime_fingerprint(), node.runtime_fingerprint());
     }
 
     #[cfg(unix)]

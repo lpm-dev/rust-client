@@ -541,27 +541,187 @@ async fn remote_restore_is_rejected_when_a_new_project_node_changes_the_runtime(
 }
 
 #[tokio::test]
-async fn remote_cache_warns_once_about_a_cached_task_without_cache_env() {
+async fn remote_cache_warns_once_about_cached_tasks_without_cache_env() {
     let (server, _cache) = RemoteCache::start().await;
     let project = checkout(&server, None);
-    edit_task(&project, |task| {
-        task.as_object_mut().unwrap().remove("cacheEnv");
-    });
+    project.write_file(
+        "package.json",
+        r#"{"name":"portable-build","version":"1.0.0","scripts":{"build":"node build.js","gen":"node build.js"}}"#,
+    );
+    let mut config: serde_json::Value =
+        serde_json::from_str(&project.read_file("lpm.json")).unwrap();
+    for task in ["build", "gen"] {
+        config["tasks"][task] = serde_json::json!({"cache": true, "outputs": ["dist/**"]});
+    }
+    config["tasks"]["build"]["dependsOn"] = serde_json::json!(["gen"]);
+    project.write_file("lpm.json", &config.to_string());
+
     let output = build(&project);
     assert_eq!(
         output.matches("has no cacheEnv").count(),
         1,
-        "expected one cacheEnv hint, got:\n{output}"
+        "two tasks without cacheEnv must give one hint, got:\n{output}"
     );
-    assert!(output.contains("tasks.build.cacheEnv"), "{output}");
+    assert!(output.contains("tasks.gen.cacheEnv"), "{output}");
 
-    edit_task(&project, |task| {
-        task["cacheEnv"] = serde_json::json!([]);
-    });
+    for task in ["build", "gen"] {
+        config["tasks"][task]["cacheEnv"] = serde_json::json!([]);
+    }
+    project.write_file("lpm.json", &config.to_string());
     let output = build(&project);
     assert!(
         !output.contains("has no cacheEnv"),
-        "a task with cacheEnv gets no hint:\n{output}"
+        "tasks with cacheEnv get no hint:\n{output}"
+    );
+
+    for task in ["build", "gen"] {
+        let task = config["tasks"][task].as_object_mut().unwrap();
+        task.remove("cacheEnv");
+        task.insert("cachePortable".into(), false.into());
+    }
+    project.write_file("lpm.json", &config.to_string());
+    let output = build(&project);
+    assert!(
+        !output.contains("has no cacheEnv"),
+        "a task that doesn't share its entries gets no hint:\n{output}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_version_manager_variable_from_the_project_env_selects_what_the_key_names() {
+    let (server, cache) = RemoteCache::start().await;
+    let node = real_node();
+    let producer = checkout(&server, None);
+    let consumer = checkout(&server, None);
+    for (project, release) in [(&producer, "A"), (&consumer, "B")] {
+        // Each machine resolves NODENV_VERSION=18 to a release of its own.
+        let shims = project.home().join(".asdf/shims");
+        std::fs::create_dir_all(&shims).unwrap();
+        let shim = shims.join("node");
+        std::fs::write(
+            &shim,
+            format!(
+                "#!/bin/sh\nif [ -n \"$NODENV_VERSION\" ]; then v=\"v$NODENV_VERSION.0.{release}\"; else v=v99.0.0; fi\nif [ \"$1\" = --version ]; then echo \"$v\" | tr AB 12; exit 0; fi\nexec '{}' \"$@\"\n",
+                node.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        project.write_file(".env", "NODENV_VERSION=18\n");
+        run_build(project, Some(&path_with(&shims)), &[]);
+    }
+    assert!(
+        executed(&consumer),
+        "machines whose project env selects different releases must not share the key"
+    );
+    assert_eq!(cache.stored(), 2);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn bun_installed_from_npm_keeps_task_keys_portable() {
+    let (server, cache) = RemoteCache::start().await;
+    let producer = checkout(&server, None);
+    let consumer = checkout(&server, None);
+    for project in [&producer, &consumer] {
+        // The npm package installs bin/bun.exe on every platform; a copy of
+        // the Node binary stands in for it, as a real native executable.
+        let package = project.path().join("node_modules/bun/bin");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::copy(real_node(), package.join("bun.exe")).unwrap();
+        let bin = project.path().join("node_modules/.bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink("../bun/bin/bun.exe", bin.join("bun")).unwrap();
+        build(project);
+    }
+    assert!(
+        !executed(&consumer),
+        "a Bun binary named bun.exe must be identified by version"
+    );
+    assert_eq!(cache.stored(), 1);
+}
+
+fn workspace_checkout(server: &MockServer) -> TempProject {
+    let project = checkout(server, None);
+    let config = project.read_file("lpm.json");
+    project.write_file(
+        "package.json",
+        r#"{"name":"workspace","private":true,"workspaces":["packages/*"]}"#,
+    );
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"app","version":"1.0.0","scripts":{"build":"node build.js"}}"#,
+    );
+    project.write_file("packages/app/build.js", BUILD_SCRIPT);
+    project.write_file("packages/app/src/value.txt", "app");
+    project.write_file("packages/app/lpm.json", &config);
+    project
+}
+
+fn lpm_in(project: &TempProject, dir: &str) -> assert_cmd::Command {
+    let mut command = lpm(project);
+    command
+        .current_dir(project.path().join(dir))
+        .env("LPM_REMOTE_CACHE_TOKEN", "remote-token")
+        .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key");
+    command
+}
+
+#[tokio::test]
+async fn a_member_directory_run_shares_keys_with_a_filtered_run_from_the_root() {
+    let (server, cache) = RemoteCache::start().await;
+    let producer = workspace_checkout(&server);
+    let consumer = workspace_checkout(&server);
+    lpm_in(&producer, ".")
+        .args(["run", "build", "--filter", "app"])
+        .assert()
+        .success();
+    assert!(producer.file_exists("packages/app/executed-marker"));
+
+    lpm_in(&consumer, "packages/app/src")
+        .args(["run", "build"])
+        .assert()
+        .success();
+    assert_eq!(consumer.read_file("packages/app/dist/value.txt"), "app");
+    assert!(
+        !consumer.file_exists("packages/app/executed-marker"),
+        "a run from a member's subdirectory must restore the root run's artifact"
+    );
+    assert_eq!(cache.stored(), 1);
+}
+
+#[tokio::test]
+async fn a_root_lockfile_change_invalidates_a_member_directory_run() {
+    let (server, _cache) = RemoteCache::start().await;
+    let project = workspace_checkout(&server);
+    let run = || {
+        lpm_in(&project, "packages/app")
+            .args(["run", "build"])
+            .env("LPM_REMOTE_CACHE", "0")
+            .assert()
+            .success();
+    };
+    project.write_file(
+        "package-lock.json",
+        r#"{"lockfileVersion":3,"packages":{}}"#,
+    );
+    run();
+    std::fs::remove_file(project.path().join("packages/app/executed-marker")).unwrap();
+    run();
+    assert!(!project.file_exists("packages/app/executed-marker"));
+
+    project.write_file(
+        "package-lock.json",
+        r#"{"lockfileVersion":3,"packages":{"node_modules/left-pad":{"version":"1.3.0"}}}"#,
+    );
+    run();
+    assert!(
+        project.file_exists("packages/app/executed-marker"),
+        "the workspace lockfile decides the member's dependencies, so it must be in the key"
     );
 }
 
