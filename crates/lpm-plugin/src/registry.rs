@@ -113,7 +113,7 @@ static PLUGINS: &[PluginDef] = &[
     PluginDef {
         name: "oxlint",
         binary_name: "oxlint",
-        latest_version: "1.89.0",
+        latest_version: "1.90.0",
         url_template: "https://github.com/oxc-project/oxc/releases/download/{tag}/{platform}",
         release_tags: &[
             ReleaseTagScheme {
@@ -139,23 +139,23 @@ static PLUGINS: &[PluginDef] = &[
         checksums: &[
             (
                 "darwin-arm64",
-                "fa4349f33b24221e2d303ace66de3dac2ff756eab48126b2cb58429ed36bccbc",
+                "4654e2b8b450f25d3b3186b8e88ffbaf5c20b991a61243758a0944bc46726791",
             ),
             (
                 "darwin-x64",
-                "198261cfb91c0f0387c55642ba5c2c4aa2c3cf9593188f86187c759f280bae88",
+                "c5a633a676cc1efd5ae60b5afc0e36c77fa86a52f0409050b5ec2920f5c1646e",
             ),
             (
                 "linux-x64",
-                "88492c336807a34062fa540416fe75037c04bcce1ed77824e3db3aaec215949a",
+                "dd5b0c99ca7917fd6d3caabae260acc5bf7d65ae094541971862602fe288dca4",
             ),
             (
                 "linux-arm64",
-                "69b3680c38b21395d4ea509fbd1019fa011db0cd717dd7be2ede2575cb6f7915",
+                "dda6ccf8e94d4cddb82672c9d230ab04cc52e13a31075e88e53bb97b31311468",
             ),
             (
                 "win-x64",
-                "50be9b3d180a48f2a33fb9ab6d92383c6464d38e4df347b08b1bce6b999c8c15",
+                "678145d7dd816cc77500878477938d4a73756d75edd6ebed821de51885c39bb2",
             ),
         ],
     },
@@ -165,7 +165,7 @@ static PLUGINS: &[PluginDef] = &[
     PluginDef {
         name: "biome",
         binary_name: "biome",
-        latest_version: "2.6.2",
+        latest_version: "2.6.4",
         url_template: "https://github.com/biomejs/biome/releases/download/{tag}/{platform}",
         release_tags: &[ReleaseTagScheme {
             since: "0.0.0",
@@ -185,23 +185,23 @@ static PLUGINS: &[PluginDef] = &[
         checksums: &[
             (
                 "darwin-arm64",
-                "be66b76dcb930b1e365bd36c4f5d8557c2dda70b31567f8bd15509e487753a69",
+                "1d1edbda5ee33475144c56ba452dbda28e1b061088fb875102a2df6cda84c9b4",
             ),
             (
                 "darwin-x64",
-                "9bba9be8c50bf2a58bc6de8023b599e57613588800bd843273e9ccaa4deba52c",
+                "eea768e85adf17a1680b0333c4305dd42df3f3bf73e1e1578eb04d4a365cb899",
             ),
             (
                 "linux-x64",
-                "43c08f3454d375d38c6441939acc8a557702bc8459272dd513f4f7474a4ed352",
+                "eb9afd5af3c04bd242be6db39fb812a025b42469af8c6a621535036dbd9b0c63",
             ),
             (
                 "linux-arm64",
-                "08536c586089e603dae610f73adc3ab95c0a0fdb00c029662c09456c42ea3ac8",
+                "11a2e6770b3d7c8ce8cbec4652a516584b179dc30febecce0ca852d87074bee8",
             ),
             (
                 "win-x64",
-                "283639d771d82502b7498e87cee2e703f84aa040144b04ea1bcfc0ab942a9184",
+                "ed7aa62b0f22ac4258d3d8668e0af8d53085168d421a8d4ec708040c5e275c0c",
             ),
         ],
     },
