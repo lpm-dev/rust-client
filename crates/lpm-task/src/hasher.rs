@@ -217,7 +217,7 @@ fn compute_cache_key_inner(
 ) -> Result<String, LpmError> {
     let mut hasher = Sha256::new();
 
-    hash_record(&mut hasher, 0, &[b"cache-v7"]);
+    hash_record(&mut hasher, 0, &[b"cache-v8"]);
 
     hash_record(&mut hasher, 1, &[command.as_bytes()]);
 

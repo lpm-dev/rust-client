@@ -52,6 +52,18 @@ pub(crate) fn script_node_identity(
     )
 }
 
+/// Identify a Node or Bun executable as [`script_node_identity`] does Node.
+pub(crate) fn script_runtime_identity(
+    executable: &Path,
+    cwd: &Path,
+    path: &OsStr,
+    managed_root: Option<&Path>,
+    runtime: RuntimeKind,
+) -> Option<ScriptNodeIdentity> {
+    let environment = SelectorEnvironment::from_process();
+    IdentityContext::new(cwd, path, &environment).identify(executable, managed_root, runtime)
+}
+
 fn identity_with_environment(
     executable: &Path,
     cwd: &Path,
@@ -72,13 +84,22 @@ pub(crate) fn script_runtime_fingerprints(
     path: &OsStr,
     roots: [Option<&Path>; 2],
 ) -> [Option<String>; 2] {
+    script_runtime_identities(executables, cwd, path, roots)
+        .map(|identity| identity.map(|identity| identity.fingerprint))
+}
+
+/// Identify Node and Bun while reading their shared version selectors once.
+pub(crate) fn script_runtime_identities(
+    executables: &[Option<PathBuf>; 2],
+    cwd: &Path,
+    path: &OsStr,
+    roots: [Option<&Path>; 2],
+) -> [Option<ScriptNodeIdentity>; 2] {
     let environment = SelectorEnvironment::from_process();
     let context = IdentityContext::new(cwd, path, &environment);
     std::array::from_fn(|index| {
         let runtime = [RuntimeKind::Node, RuntimeKind::Bun][index];
-        context
-            .identify(executables[index].as_deref()?, roots[index], runtime)
-            .map(|identity| identity.fingerprint)
+        context.identify(executables[index].as_deref()?, roots[index], runtime)
     })
 }
 
@@ -143,6 +164,87 @@ impl<'a> IdentityContext<'a> {
             node_binary,
         })
     }
+}
+
+/// What a script `PATH` selects for a runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeExecutable {
+    /// The runtime's own binary.
+    Binary,
+    /// A version manager's shim: it runs the release that its version
+    /// selectors choose, with the arguments and environment it was given.
+    VersionManagerShim,
+    /// Any other launcher. It can change the environment or the flags that
+    /// the runtime gets, so its version alone doesn't describe what runs.
+    Launcher,
+}
+
+/// Classify an identified runtime executable, `executable` being its `PATH`
+/// entry.
+pub(crate) fn classify_identified(
+    identity: &ScriptNodeIdentity,
+    executable: &Path,
+) -> RuntimeExecutable {
+    if identity.node_binary {
+        RuntimeExecutable::Binary
+    } else if is_version_manager_shim(
+        executable,
+        &identity.canonical_executable,
+        &SelectorEnvironment::from_process(),
+    ) {
+        RuntimeExecutable::VersionManagerShim
+    } else {
+        RuntimeExecutable::Launcher
+    }
+}
+
+/// Shims link to their manager's binary, or live in its shim directory.
+fn is_version_manager_shim(
+    executable: &Path,
+    canonical: &Path,
+    environment: &SelectorEnvironment,
+) -> bool {
+    if canonical
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .is_some_and(|stem| matches!(stem, "mise" | "rtx" | "volta-shim" | "proto-shim"))
+    {
+        return true;
+    }
+    let Some(directory) = executable
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+    else {
+        return false;
+    };
+    let mise_data = environment
+        .variable("MISE_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(|| environment.data_home.as_ref().map(|data| data.join("mise")))
+        .or_else(|| {
+            environment
+                .home
+                .as_ref()
+                .map(|home| home.join(".local/share/mise"))
+        });
+    [
+        environment
+            .directory("VOLTA_HOME", ".volta")
+            .map(|root| root.join("bin")),
+        environment
+            .directory("ASDF_DATA_DIR", ".asdf")
+            .map(|root| root.join("shims")),
+        environment
+            .directory("NODENV_ROOT", ".nodenv")
+            .map(|root| root.join("shims")),
+        environment
+            .directory("PROTO_HOME", ".proto")
+            .map(|root| root.join("shims")),
+        mise_data.map(|root| root.join("shims")),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|shims| shims.canonicalize().is_ok_and(|shims| shims == directory))
 }
 
 fn is_runtime_binary(canonical: &Path, metadata: &Metadata, runtime: RuntimeKind) -> bool {
@@ -227,6 +329,7 @@ fn hash_symlink_chain(hasher: &mut FieldHasher, executable: &Path) {
 struct SelectorEnvironment {
     home: Option<PathBuf>,
     config_home: Option<PathBuf>,
+    data_home: Option<PathBuf>,
     /// Version-manager variables, sorted by name.
     variables: Vec<(OsString, OsString)>,
 }
@@ -240,6 +343,7 @@ impl SelectorEnvironment {
         Self {
             home: dirs::home_dir(),
             config_home: std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+            data_home: std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
             variables,
         }
     }
@@ -522,8 +626,73 @@ mod tests {
         SelectorEnvironment {
             home: Some(home.to_path_buf()),
             config_home: None,
+            data_home: None,
             variables: Vec::new(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_manager_shims_are_told_from_other_launchers() {
+        let home = tempfile::tempdir().unwrap();
+        let environment = environment(home.path());
+        let shim = |relative: &str| {
+            let path = home.path().join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            write_launcher(&path, "v22.0.0");
+            path
+        };
+
+        for shim_dir in [
+            ".asdf/shims",
+            ".nodenv/shims",
+            ".volta/bin",
+            ".proto/shims",
+            ".local/share/mise/shims",
+        ] {
+            let node = shim(&format!("{shim_dir}/{NODE}"));
+            assert!(
+                is_version_manager_shim(&node, &node.canonicalize().unwrap(), &environment),
+                "{shim_dir}"
+            );
+        }
+
+        let manager = shim("tools/mise");
+        let linked = home.path().join("anywhere/node");
+        fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&manager, &linked).unwrap();
+        assert!(is_version_manager_shim(
+            &linked,
+            &linked.canonicalize().unwrap(),
+            &environment
+        ));
+
+        let wrapper = shim("project/node_modules/.bin/node");
+        assert!(!is_version_manager_shim(
+            &wrapper,
+            &wrapper.canonicalize().unwrap(),
+            &environment
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_manager_directory_variable_moves_its_shims() {
+        let home = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut environment = environment(home.path());
+        environment.variables = vec![(
+            "ASDF_DATA_DIR".into(),
+            data.path().as_os_str().to_os_string(),
+        )];
+        let node = data.path().join("shims").join(NODE);
+        fs::create_dir_all(node.parent().unwrap()).unwrap();
+        write_launcher(&node, "v22.0.0");
+        assert!(is_version_manager_shim(
+            &node,
+            &node.canonicalize().unwrap(),
+            &environment
+        ));
     }
 
     fn identity(

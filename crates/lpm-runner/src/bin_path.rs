@@ -250,35 +250,6 @@ impl ManagedRuntimeHint {
             Self::Resolved(bins)
         }
     }
-
-    pub fn cache_identities(&self) -> Vec<(String, String)> {
-        let Self::Resolved(bins) = self else {
-            return Vec::new();
-        };
-        bins.iter()
-            .map(|bin| (bin.runtime.as_str().to_string(), bin.version.clone()))
-            .collect()
-    }
-
-    pub fn append_executable_cache_identities(
-        &self,
-        cwd: &Path,
-        path: &std::ffi::OsStr,
-        identities: &mut Vec<(String, String)>,
-    ) {
-        for (runtime, fingerprint) in [
-            lpm_runtime::detect::RuntimeKind::Node,
-            lpm_runtime::detect::RuntimeKind::Bun,
-        ]
-        .into_iter()
-        .zip(lpm_runtime::effective::probe_script_runtime_fingerprints(
-            cwd, path,
-        )) {
-            if let Some(fingerprint) = fingerprint {
-                identities.push((format!("{}-executable", runtime.as_str()), fingerprint));
-            }
-        }
-    }
 }
 
 impl Default for ManagedRuntimeHint {

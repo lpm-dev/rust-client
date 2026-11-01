@@ -25,6 +25,7 @@ pub mod effective;
 pub mod node;
 mod node_identity;
 pub mod platform;
+pub mod task_identity;
 
 /// Result of ensuring a runtime is available before script execution.
 ///
