@@ -174,10 +174,7 @@ pub(crate) async fn run_with_reserved_stdout(
         if no_cache || !is_task_cached_with_config(script_name, lpm_config.as_ref()) {
             None
         } else {
-            WorkspaceCacheContract::for_cached_run(project_dir).unwrap_or_else(|()| {
-                no_cache = true;
-                None
-            })
+            WorkspaceCacheContract::for_cached_project_run(project_dir, &mut no_cache)
         };
     let cache_context = if no_cache {
         None

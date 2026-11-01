@@ -288,6 +288,13 @@ fn is_version_manager_shim(
     else {
         return false;
     };
+    // Volta's Windows installer copies volta-shim.exe as node.exe next to it.
+    if ["volta-shim.exe", "volta-shim"]
+        .iter()
+        .any(|shim| directory.join(shim).is_file())
+    {
+        return true;
+    }
     [
         environment.volta_home().map(|root| root.join("bin")),
         environment
@@ -804,6 +811,12 @@ fn hash_volta_extends(hasher: &mut FieldHasher, path: &Path, manifest: &serde_js
         extends = volta.get("extends").cloned();
         current = next;
     }
+    if extends.is_some() {
+        // Volta follows a longer chain; past this point only the file's own
+        // location tells two chains apart.
+        hasher.bytes(b"volta-extends-deeper");
+        hasher.os(current.as_os_str());
+    }
 }
 
 fn hash_selector_file(
@@ -1186,6 +1199,49 @@ mod tests {
         assert_ne!(a, b, "different linked pins");
         let (a, b) = pins("20.11.0", "20.11.0");
         assert_eq!(a, b, "the same linked pin");
+    }
+
+    #[test]
+    fn a_node_next_to_volta_shim_is_a_volta_shim() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let program_files = tempfile::tempdir().unwrap();
+        let environment = environment(home.path());
+        // Volta's Windows installer copies volta-shim.exe as node.exe.
+        fs::write(program_files.path().join("volta-shim.exe"), b"MZ").unwrap();
+        let node = program_files.path().join(NODE);
+        write_launcher(&node, "v22.0.0");
+        assert!(is_shim(&node, project.path(), &environment));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn volta_extends_chains_that_differ_past_the_followed_links_never_share_a_shim_key() {
+        let environment = environment(Path::new("/nonexistent-home"));
+        let (a, b) = member_keys(&environment, |_, a, b| {
+            for (member, last) in [(a, "18.20.0"), (b, "20.11.0")] {
+                let links = member.join("links");
+                fs::create_dir_all(&links).unwrap();
+                fs::write(
+                    member.join("package.json"),
+                    r#"{"volta":{"extends":"links/0.json"}}"#,
+                )
+                .unwrap();
+                for index in 0..=MAX_VOLTA_EXTENDS {
+                    let volta = if index == MAX_VOLTA_EXTENDS {
+                        format!(r#"{{"node":"{last}"}}"#)
+                    } else {
+                        format!(r#"{{"extends":"{}.json"}}"#, index + 1)
+                    };
+                    fs::write(
+                        links.join(format!("{index}.json")),
+                        format!(r#"{{"volta":{volta}}}"#),
+                    )
+                    .unwrap();
+                }
+            }
+        });
+        assert_ne!(a, b);
     }
 
     #[cfg(unix)]

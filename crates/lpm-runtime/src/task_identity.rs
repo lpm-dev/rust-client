@@ -346,14 +346,20 @@ fn managed_runtime_root(runtime: RuntimeKind) -> Option<PathBuf> {
 }
 
 /// The host's operating system, CPU architecture, and C library, which every
-/// key names: a task can build native code without Node or Bun.
+/// key names: a task can build native code without Node or Bun. A run that
+/// Rosetta translates builds a mix of x86_64 and arm64 code, so it gets an
+/// architecture of its own.
 fn host_platform() -> &'static str {
     static HOST_PLATFORM: OnceLock<String> = OnceLock::new();
     HOST_PLATFORM.get_or_init(|| {
+        let arch = if lpm_common::platform::translated_by_rosetta() {
+            "x86_64-rosetta"
+        } else {
+            std::env::consts::ARCH
+        };
         format!(
-            "{}/{}/{}",
+            "{}/{arch}/{}",
             std::env::consts::OS,
-            lpm_common::platform::host_arch(),
             host_libc().unwrap_or("-")
         )
     })
@@ -584,11 +590,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let identity = capture(dir.path(), &dir.path().join("empty"));
         let platform = runtime(&identity, "task-platform");
-        assert!(platform.starts_with(&format!(
-            "{}/{}/",
-            std::env::consts::OS,
-            lpm_common::platform::host_arch()
-        )));
+        assert!(platform.starts_with(&format!("{}/", std::env::consts::OS)));
+        if !lpm_common::platform::translated_by_rosetta() {
+            assert!(platform.contains(&format!("/{}/", std::env::consts::ARCH)));
+        }
         assert_eq!(runtime(&identity, "node-runtime"), "missing");
     }
 

@@ -231,10 +231,7 @@ fn execute_single_package_task_plan(
     let workspace_contract = if no_cache || !caches_a_task {
         None
     } else {
-        cache::WorkspaceCacheContract::for_cached_run(project_dir).unwrap_or_else(|()| {
-            no_cache = true;
-            None
-        })
+        cache::WorkspaceCacheContract::for_cached_project_run(project_dir, &mut no_cache)
     };
     let report = if parallel || stream {
         let serial_levels;

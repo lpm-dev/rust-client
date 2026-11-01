@@ -72,18 +72,12 @@ fn has_musl_loader() -> bool {
     CANDIDATES.iter().any(|p| Path::new(p).exists())
 }
 
-/// The host's CPU architecture. Under Rosetta, an x86_64 build of LPM still
-/// runs on an arm64 host, whose native tools build arm64 code.
-pub fn host_arch() -> &'static str {
-    #[cfg(target_os = "macos")]
-    if std::env::consts::ARCH == "x86_64" && translated_by_rosetta() {
-        return "aarch64";
-    }
-    std::env::consts::ARCH
-}
-
+/// Whether Rosetta translates this process: an x86_64 build of LPM on an
+/// arm64 Mac. Its children run the x86_64 slice of universal tools but arm64
+/// tools natively, so their output matches neither an Intel Mac's nor a
+/// native arm64 run's.
 #[cfg(target_os = "macos")]
-fn translated_by_rosetta() -> bool {
+pub fn translated_by_rosetta() -> bool {
     static TRANSLATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *TRANSLATED.get_or_init(|| {
         let mut translated: libc::c_int = 0;
@@ -103,6 +97,12 @@ fn translated_by_rosetta() -> bool {
     })
 }
 
+/// Whether Rosetta translates this process. Only macOS has Rosetta.
+#[cfg(not(target_os = "macos"))]
+pub fn translated_by_rosetta() -> bool {
+    false
+}
+
 #[cfg(target_os = "linux")]
 fn has_glibc_loader() -> bool {
     const CANDIDATES: &[&str] = &[
@@ -119,12 +119,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn host_arch_is_the_build_arch_unless_rosetta_translates_it() {
-        let arch = host_arch();
-        if cfg!(target_os = "macos") && std::env::consts::ARCH == "x86_64" {
-            assert!(arch == "x86_64" || arch == "aarch64", "{arch}");
-        } else {
-            assert_eq!(arch, std::env::consts::ARCH);
+    fn only_an_x86_64_build_on_macos_can_be_translated_by_rosetta() {
+        if !(cfg!(target_os = "macos") && std::env::consts::ARCH == "x86_64") {
+            assert!(!translated_by_rosetta());
         }
     }
 

@@ -751,46 +751,10 @@ async fn init_cwd_listed_in_cache_env_keeps_the_invocation_directory_in_the_key(
     );
 }
 
+/// A workspace whose root lockfile the workspace contract refuses: a symlink.
 #[cfg(unix)]
-#[tokio::test]
-async fn an_unreadable_workspace_turns_the_task_cache_off_instead_of_weakening_the_key() {
-    let (server, _cache) = RemoteCache::start().await;
-    let project = workspace_checkout(&server);
-    // The workspace contract refuses a symlinked lockfile.
-    project.write_file("lock-target.json", r#"{"lockfileVersion":3,"packages":{}}"#);
-    std::os::unix::fs::symlink("lock-target.json", project.path().join("package-lock.json"))
-        .unwrap();
-    let run = || {
-        lpm_in(&project, "packages/app")
-            .args(["run", "build"])
-            .env("LPM_REMOTE_CACHE", "0")
-            .output()
-            .unwrap()
-    };
-    let first = run();
-    assert!(first.status.success());
-    assert!(
-        String::from_utf8_lossy(&first.stderr).contains("running without the task cache"),
-        "{}",
-        String::from_utf8_lossy(&first.stderr)
-    );
-    std::fs::remove_file(project.path().join("packages/app/executed-marker")).unwrap();
-    project.write_file(
-        "lock-target.json",
-        r#"{"lockfileVersion":3,"packages":{"node_modules/left-pad":{"version":"1.3.0"}}}"#,
-    );
-    assert!(run().status.success());
-    assert!(
-        project.file_exists("packages/app/executed-marker"),
-        "a dependency change behind an unreadable lockfile must not restore a stale result"
-    );
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn an_uncached_script_never_reads_the_workspace() {
-    let (server, _cache) = RemoteCache::start().await;
-    let project = workspace_checkout(&server);
+fn unreadable_workspace(server: &MockServer) -> TempProject {
+    let project = workspace_checkout(server);
     project.write_file("lock-target.json", r#"{"lockfileVersion":3,"packages":{}}"#);
     std::os::unix::fs::symlink("lock-target.json", project.path().join("package-lock.json"))
         .unwrap();
@@ -798,17 +762,66 @@ async fn an_uncached_script_never_reads_the_workspace() {
         "packages/app/package.json",
         r#"{"name":"app","version":"1.0.0","scripts":{"build":"node build.js","dev":"node -e 0"}}"#,
     );
-    let output = lpm_in(&project, "packages/app")
-        .args(["run", "dev"])
-        .env("LPM_REMOTE_CACHE", "0")
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    assert!(
-        !String::from_utf8_lossy(&output.stderr).contains("workspace"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    project
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unreadable_workspace_turns_the_task_cache_off_instead_of_weakening_the_key() {
+    for (dir, args) in [
+        ("packages/app", &["run", "build"][..]),
+        (".", &["run", "build", "--filter", "app"][..]),
+    ] {
+        let (server, _cache) = RemoteCache::start().await;
+        let project = unreadable_workspace(&server);
+        let run = || {
+            lpm_in(&project, dir)
+                .args(args)
+                .env("LPM_REMOTE_CACHE", "0")
+                .output()
+                .unwrap()
+        };
+        let first = run();
+        let stderr = String::from_utf8_lossy(&first.stderr);
+        assert!(first.status.success(), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("running without the task cache"),
+            "{args:?}: {stderr}"
+        );
+        std::fs::remove_file(project.path().join("packages/app/executed-marker")).unwrap();
+        project.write_file(
+            "lock-target.json",
+            r#"{"lockfileVersion":3,"packages":{"node_modules/left-pad":{"version":"1.3.0"}}}"#,
+        );
+        assert!(run().status.success());
+        assert!(
+            project.file_exists("packages/app/executed-marker"),
+            "{args:?}: a dependency change behind an unreadable lockfile must not restore a stale result"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_uncached_script_never_reads_the_workspace() {
+    for (dir, args) in [
+        ("packages/app", &["run", "dev"][..]),
+        (".", &["run", "dev", "--filter", "app"][..]),
+    ] {
+        let (server, _cache) = RemoteCache::start().await;
+        let project = unreadable_workspace(&server);
+        let output = lpm_in(&project, dir)
+            .args(args)
+            .env("LPM_REMOTE_CACHE", "0")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{args:?}: {stderr}");
+        assert!(
+            !stderr.contains("could not read the workspace"),
+            "{args:?}: {stderr}"
+        );
+    }
 }
 
 #[tokio::test]

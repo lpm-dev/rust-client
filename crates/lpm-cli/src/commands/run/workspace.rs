@@ -464,11 +464,6 @@ pub async fn run_workspace(
         return Ok(());
     }
 
-    let workspace_contract = if no_cache {
-        None
-    } else {
-        Some(WorkspaceCacheContract::capture(&workspace.root)?)
-    };
     let engine_strict =
         crate::engine_strict_config::resolve_for_root(false, &workspace.root_package);
     let member_engine_requirements: Vec<_> = workspace
@@ -489,6 +484,18 @@ pub async fn run_workspace(
         .collect();
     let member_task_plans =
         build_workspace_task_schedule(&ws_graph, package_scripts, &target_set, scripts)?;
+    let mut no_cache = no_cache;
+    let caches_a_task = member_task_plans.iter().flatten().any(|plan| {
+        plan.task_levels
+            .iter()
+            .flatten()
+            .any(|task| is_task_cached_with_config(task, plan.config.lpm_config.as_ref()))
+    });
+    let workspace_contract = if no_cache || !caches_a_task {
+        None
+    } else {
+        WorkspaceCacheContract::for_cached_run(&workspace.root, &mut no_cache)
+    };
     let mut required_task_identities: Vec<HashSet<String>> = (0..ws_graph.members.len())
         .map(|_| HashSet::new())
         .collect();

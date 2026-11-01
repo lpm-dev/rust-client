@@ -26,30 +26,41 @@ impl WorkspaceCacheContract {
         })
     }
 
-    /// The contract of the workspace that `project_dir` belongs to, so that a
-    /// run from a member's directory keys its tasks as a `--filter` run from
-    /// the root does. `Ok(None)` outside a workspace.
-    pub(super) fn for_project(project_dir: &Path) -> Result<Option<Self>, LpmError> {
-        let Some(root) = lpm_workspace::find_workspace_root(project_dir)
-            .map_err(|error| LpmError::Task(error.to_string()))?
-        else {
-            return Ok(None);
-        };
-        Self::capture(&root).map(Some)
+    /// The contract of the workspace at `root`, for a run that caches tasks.
+    /// A workspace that can't be read sets `no_cache` instead: a key without
+    /// the root lockfile would reuse results across dependency changes.
+    pub(super) fn for_cached_run(root: &Path, no_cache: &mut bool) -> Option<Self> {
+        match Self::capture(root) {
+            Ok(contract) => Some(contract),
+            Err(error) => {
+                warn_unreadable_workspace(root, &error);
+                *no_cache = true;
+                None
+            }
+        }
     }
 
-    /// [`Self::for_project`] for a run whose cached tasks need it. A
-    /// workspace that can't be read turns the cache off for the run: a key
-    /// without the root lockfile would reuse results across dependency
-    /// changes.
-    pub(super) fn for_cached_run(project_dir: &Path) -> Result<Option<Self>, ()> {
-        Self::for_project(project_dir).map_err(|error| {
-            tracing::warn!(
-                "could not read the workspace of {} ({error}); running without the task cache",
-                project_dir.display()
-            );
-        })
+    /// [`Self::for_cached_run`] for the workspace that `project_dir` belongs
+    /// to, so that a run from a member's directory keys its tasks as a
+    /// `--filter` run from the root does. `None` outside a workspace.
+    pub(super) fn for_cached_project_run(project_dir: &Path, no_cache: &mut bool) -> Option<Self> {
+        match lpm_workspace::find_workspace_root(project_dir) {
+            Ok(Some(root)) => Self::for_cached_run(&root, no_cache),
+            Ok(None) => None,
+            Err(error) => {
+                warn_unreadable_workspace(project_dir, &error);
+                *no_cache = true;
+                None
+            }
+        }
     }
+}
+
+fn warn_unreadable_workspace(location: &Path, error: &dyn std::fmt::Display) {
+    tracing::warn!(
+        "could not read the workspace at {} ({error}); running without the task cache",
+        location.display()
+    );
 }
 
 /// The runtimes a task's key was computed with, rechecked against the task's
@@ -427,10 +438,9 @@ fn build_task_context(
                 return Ok(None);
             }
         }
-        // Where the command was run from doesn't decide what a build produces,
-        // and a key that named it would differ between a member directory and
-        // the workspace root. The task sees its own directory as PWD and no
-        // OLDPWD whatever the shell exported. A task that reads INIT_CWD lists
+        // These name the caller's directories, not the task's, and a key that
+        // held them would differ between a member directory and the workspace
+        // root, or after any `cd`. A task whose output depends on one lists
         // it in cacheEnv or sets cachePortable: false.
         child_env.retain(|key, _| {
             !is_invocation_directory(key)
