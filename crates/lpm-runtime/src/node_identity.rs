@@ -221,7 +221,16 @@ pub(crate) fn shim_selection_key(
     hash_symlink_chain(&mut hasher, executable);
     hasher.os(canonical.as_os_str());
     crate::effective::update_with_file_metadata(&mut hasher.0, &metadata);
-    hash_version_selectors(&mut hasher, cwd, environment, ProjectFileNames::Local);
+    // Which ancestors mise reads depends on where a directory is relative to
+    // a ceiling, so no two directories share a key then.
+    let names = if environment.variable("MISE_CEILING_PATHS").is_some() {
+        hasher.bytes(b"directory-specific");
+        hasher.os(cwd.as_os_str());
+        ProjectFileNames::Absolute
+    } else {
+        ProjectFileNames::Local
+    };
+    hash_version_selectors(&mut hasher, cwd, environment, names);
     Some(hasher.finish())
 }
 
@@ -239,15 +248,10 @@ pub(crate) fn workspace_selector_digest(
     if !cwd.starts_with(&root) {
         return None;
     }
-    let tool_versions = environment.tool_versions_file();
+    let files = SelectorFiles::of(environment);
     let mut hasher = FieldHasher::new(b"lpm-task-workspace-selectors-v1");
     for directory in cwd.ancestors() {
-        hash_project_selectors(
-            &mut hasher,
-            directory,
-            tool_versions,
-            ProjectFileNames::From(&root),
-        );
+        hash_project_selectors(&mut hasher, directory, files, ProjectFileNames::From(&root));
         if directory == root {
             break;
         }
@@ -284,20 +288,8 @@ fn is_version_manager_shim(
     else {
         return false;
     };
-    let mise_data = environment
-        .variable("MISE_DATA_DIR")
-        .map(PathBuf::from)
-        .or_else(|| environment.data_home.as_ref().map(|data| data.join("mise")))
-        .or_else(|| {
-            environment
-                .home
-                .as_ref()
-                .map(|home| home.join(".local/share/mise"))
-        });
     [
-        environment
-            .directory("VOLTA_HOME", ".volta")
-            .map(|root| root.join("bin")),
+        environment.volta_home().map(|root| root.join("bin")),
         environment
             .directory("ASDF_DATA_DIR", ".asdf")
             .map(|root| root.join("shims")),
@@ -307,7 +299,7 @@ fn is_version_manager_shim(
         environment
             .directory("PROTO_HOME", ".proto")
             .map(|root| root.join("shims")),
-        mise_data.map(|root| root.join("shims")),
+        environment.mise_shims(),
     ]
     .into_iter()
     .flatten()
@@ -339,31 +331,27 @@ fn is_runtime_binary(canonical: &Path, metadata: &Metadata, runtime: RuntimeKind
     if !named_node || metadata.len() < MIN_NODE_BINARY_BYTES {
         return false;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-
-        // Version managers hard-link one shim binary under several tool names.
-        if metadata.nlink() != 1 {
-            return false;
-        }
-    }
     #[cfg(windows)]
     if canonical.with_extension("shim").exists() {
         // Scoop shims read their target from this sidecar.
         return false;
     }
-    has_native_executable_header(canonical)
+    let Ok(mut file) = std::fs::File::open(canonical) else {
+        return false;
+    };
+    // Version managers hard-link one shim binary under several tool names,
+    // as mise does on Windows in its `hardlink` shim mode.
+    if !lpm_common::link_count(&file).is_ok_and(|links| links == 1) {
+        return false;
+    }
+    has_native_executable_header(&mut file)
 }
 
-fn has_native_executable_header(path: &Path) -> bool {
+fn has_native_executable_header(file: &mut std::fs::File) -> bool {
     use std::io::Read;
 
     let mut header = [0_u8; 4];
-    if std::fs::File::open(path)
-        .and_then(|mut file| file.read_exact(&mut header))
-        .is_err()
-    {
+    if file.read_exact(&mut header).is_err() {
         return false;
     }
     matches!(
@@ -399,6 +387,8 @@ pub(crate) struct SelectorEnvironment {
     home: Option<PathBuf>,
     config_home: Option<PathBuf>,
     data_home: Option<PathBuf>,
+    /// `%LOCALAPPDATA%` on Windows, where Volta and mise keep their data.
+    local_data: Option<PathBuf>,
     /// Version-manager variables, sorted by name.
     variables: Vec<(OsString, OsString)>,
 }
@@ -429,8 +419,44 @@ impl SelectorEnvironment {
             home: dirs::home_dir(),
             config_home: std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
             data_home: std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+            local_data: if cfg!(windows) {
+                dirs::data_local_dir()
+            } else {
+                None
+            },
             variables,
         }
+    }
+
+    fn volta_home(&self) -> Option<PathBuf> {
+        self.variable("VOLTA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| match &self.local_data {
+                Some(local) => Some(local.join("Volta")),
+                None => self.home.as_ref().map(|home| home.join(".volta")),
+            })
+    }
+
+    fn mise_shims(&self) -> Option<PathBuf> {
+        if let Some(shims) = self.variable("MISE_SHIMS_DIR") {
+            return Some(PathBuf::from(shims));
+        }
+        self.variable("MISE_DATA_DIR")
+            .map(PathBuf::from)
+            .or_else(|| self.local_data.as_ref().map(|local| local.join("mise")))
+            .or_else(|| self.data_home.as_ref().map(|data| data.join("mise")))
+            .or_else(|| {
+                self.home
+                    .as_ref()
+                    .map(|home| home.join(".local/share/mise"))
+            })
+            .map(|data| data.join("shims"))
+    }
+
+    /// The file name mise reads as each directory's config, when the user
+    /// renamed it.
+    fn mise_config_file(&self) -> Option<&OsStr> {
+        self.variable("MISE_DEFAULT_CONFIG_FILENAME")
     }
 
     /// The manager variables, for a probe that must select what the script
@@ -516,9 +542,9 @@ fn hash_version_selectors(
         hasher.os(value);
     }
 
-    let tool_versions = environment.tool_versions_file();
+    let files = SelectorFiles::of(environment);
     for directory in cwd.ancestors() {
-        hash_project_selectors(hasher, directory, tool_versions, names);
+        hash_project_selectors(hasher, directory, files, names);
     }
 
     let mut global_files = Vec::with_capacity(6);
@@ -532,7 +558,7 @@ fn hash_version_selectors(
         environment
             .home
             .as_ref()
-            .map(|home| home.join(tool_versions)),
+            .map(|home| home.join(files.tool_versions)),
     );
     global_files.extend(
         environment
@@ -541,7 +567,7 @@ fn hash_version_selectors(
     );
     global_files.extend(
         environment
-            .directory("VOLTA_HOME", ".volta")
+            .volta_home()
             .map(|root| root.join("tools/user/platform.json")),
     );
     global_files.extend(
@@ -585,10 +611,26 @@ fn hash_version_selectors(
     );
 }
 
+/// The renamable version-file names a directory's selectors use.
+#[derive(Clone, Copy)]
+struct SelectorFiles<'a> {
+    tool_versions: &'a OsStr,
+    mise_config: Option<&'a OsStr>,
+}
+
+impl<'a> SelectorFiles<'a> {
+    fn of(environment: &'a SelectorEnvironment) -> Self {
+        Self {
+            tool_versions: environment.tool_versions_file(),
+            mise_config: environment.mise_config_file(),
+        }
+    }
+}
+
 fn hash_project_selectors(
     hasher: &mut FieldHasher,
     directory: &Path,
-    tool_versions: &OsStr,
+    files: SelectorFiles<'_>,
     names: ProjectFileNames<'_>,
 ) {
     let Ok(entries) = std::fs::read_dir(directory) else {
@@ -596,7 +638,7 @@ fn hash_project_selectors(
     };
     let mut selectors: Vec<OsString> = entries
         .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
-        .filter(|name| is_project_selector(name, tool_versions))
+        .filter(|name| is_project_selector(name, files))
         .collect();
     if selectors.is_empty() {
         return;
@@ -619,8 +661,9 @@ fn hash_project_selectors(
     }
 }
 
-fn is_project_selector(name: &OsStr, tool_versions: &OsStr) -> bool {
-    name == tool_versions
+fn is_project_selector(name: &OsStr, files: SelectorFiles<'_>) -> bool {
+    name == files.tool_versions
+        || files.mise_config == Some(name)
         || name.to_str().is_some_and(|name| {
             matches!(
                 name,
@@ -688,32 +731,68 @@ fn hash_mise_files(
     }
 }
 
-/// Volta pins Node in `package.json`; other fields change with every
-/// dependency edit and do not select a runtime.
+/// The `package.json` fields that select a runtime: Volta's pin, `devEngines`,
+/// and `engines`, which nodenv's package-json-engine plugin reads. Other
+/// fields change with every dependency edit and do not select one.
+const PACKAGE_SELECTOR_FIELDS: [&str; 3] = ["volta", "devEngines", "engines"];
+/// How many `volta.extends` links are followed.
+const MAX_VOLTA_EXTENDS: usize = 8;
+
 fn hash_package_json_selectors(
     hasher: &mut FieldHasher,
     base: &Path,
     path: &Path,
     names: ProjectFileNames<'_>,
 ) {
-    let Ok((bytes, _)) = lpm_common::read_regular_file_capped_with_metadata(
-        path,
-        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
-    ) else {
+    let Some(bytes) = read_manifest(path) else {
         return;
     };
     names.hash(hasher, base, path);
     match serde_json::from_slice::<serde_json::Value>(&bytes) {
         Ok(manifest) => {
-            for field in ["volta", "devEngines"] {
+            for field in PACKAGE_SELECTOR_FIELDS {
                 hasher.bytes(field.as_bytes());
                 match manifest.get(field) {
                     Some(value) => hasher.bytes(value.to_string().as_bytes()),
                     None => hasher.bytes(b""),
                 }
             }
+            hash_volta_extends(hasher, path, &manifest);
         }
         Err(_) => hasher.bytes(&bytes),
+    }
+}
+
+fn read_manifest(path: &Path) -> Option<Vec<u8>> {
+    lpm_common::read_regular_file_capped_with_metadata(path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
+        .ok()
+        .map(|(bytes, _)| bytes)
+}
+
+/// Volta reads its pin from the file `volta.extends` names, which need not be
+/// an ancestor. Each linked pin is hashed by content, so two directories
+/// whose links lead to different pins never share a key.
+fn hash_volta_extends(hasher: &mut FieldHasher, path: &Path, manifest: &serde_json::Value) {
+    let mut current = path.to_path_buf();
+    let mut extends = manifest.pointer("/volta/extends").cloned();
+    for _ in 0..MAX_VOLTA_EXTENDS {
+        let Some(serde_json::Value::String(target)) = extends else {
+            return;
+        };
+        hasher.bytes(b"volta-extends");
+        let Some(next) = current.parent().map(|parent| parent.join(&target)) else {
+            return;
+        };
+        let pin = read_manifest(&next)
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        let Some(pin) = pin else {
+            hasher.bytes(b"unreadable");
+            return;
+        };
+        let volta = pin.get("volta").cloned().unwrap_or_default();
+        hasher.bytes(volta.to_string().as_bytes());
+        extends = volta.get("extends").cloned();
+        current = next;
     }
 }
 
@@ -811,6 +890,7 @@ mod tests {
             home: Some(home.to_path_buf()),
             config_home: None,
             data_home: None,
+            local_data: None,
             variables: Vec::new(),
         }
     }
@@ -969,6 +1049,123 @@ mod tests {
         };
         assert_eq!(key(&shallow), key(&deep));
         assert_ne!(key(&shallow), key(&pinned));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mise_shims_dir_and_windows_style_data_dirs_hold_shims() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let custom = tempfile::tempdir().unwrap();
+        let local = tempfile::tempdir().unwrap();
+        let mut environment = environment(home.path());
+        environment.variables = vec![(
+            "MISE_SHIMS_DIR".into(),
+            custom.path().as_os_str().to_os_string(),
+        )];
+        environment.local_data = Some(local.path().to_path_buf());
+        for shims in [custom.path().to_path_buf(), local.path().join("Volta/bin")] {
+            fs::create_dir_all(&shims).unwrap();
+            let node = shims.join(NODE);
+            write_launcher(&node, "v22.0.0");
+            assert!(
+                is_shim(&node, project.path(), &environment),
+                "{}",
+                shims.display()
+            );
+        }
+
+        environment.variables.clear();
+        let shims = local.path().join("mise/shims");
+        fs::create_dir_all(&shims).unwrap();
+        let node = shims.join(NODE);
+        write_launcher(&node, "v22.0.0");
+        assert!(is_shim(&node, project.path(), &environment));
+    }
+
+    /// Shim selection keys for members `a` and `b` of a workspace whose
+    /// directories `prepare` fills in.
+    #[cfg(unix)]
+    fn member_keys(
+        environment: &SelectorEnvironment,
+        prepare: impl FnOnce(&Path, &Path, &Path),
+    ) -> (String, String) {
+        let home = tempfile::tempdir().unwrap();
+        let shim = home.path().join(".asdf/shims").join(NODE);
+        fs::create_dir_all(shim.parent().unwrap()).unwrap();
+        write_launcher(&shim, "v22.0.0");
+        let workspace = tempfile::tempdir().unwrap();
+        let a = workspace.path().join("packages/a");
+        let b = workspace.path().join("apps/b");
+        for member in [&a, &b] {
+            fs::create_dir_all(member).unwrap();
+        }
+        prepare(workspace.path(), &a, &b);
+        let canonical = shim.canonicalize().unwrap();
+        let key = |cwd: &Path| {
+            shim_selection_key(&shim, &canonical, cwd, environment, RuntimeKind::Node).unwrap()
+        };
+        (key(&a), key(&b))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn members_whose_engines_differ_never_share_a_shim_key() {
+        let environment = environment(Path::new("/nonexistent-home"));
+        let (a, b) = member_keys(&environment, |_, a, b| {
+            fs::write(a.join("package.json"), r#"{"engines":{"node":"18"}}"#).unwrap();
+            fs::write(b.join("package.json"), r#"{"engines":{"node":"20"}}"#).unwrap();
+        });
+        assert_ne!(a, b);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn members_whose_volta_extends_lead_to_different_pins_never_share_a_shim_key() {
+        let environment = environment(Path::new("/nonexistent-home"));
+        let pins = |node_a: &'static str, node_b: &'static str| {
+            member_keys(&environment, move |root, a, b| {
+                for (member, node) in [(a, node_a), (b, node_b)] {
+                    let shared = member.parent().unwrap().join("shared");
+                    fs::create_dir_all(&shared).unwrap();
+                    fs::write(
+                        shared.join("package.json"),
+                        format!(r#"{{"volta":{{"node":"{node}"}}}}"#),
+                    )
+                    .unwrap();
+                    fs::write(
+                        member.join("package.json"),
+                        r#"{"volta":{"extends":"../shared/package.json"}}"#,
+                    )
+                    .unwrap();
+                }
+                let _ = root;
+            })
+        };
+        let (a, b) = pins("18.20.0", "20.11.0");
+        assert_ne!(a, b, "different linked pins");
+        let (a, b) = pins("20.11.0", "20.11.0");
+        assert_eq!(a, b, "the same linked pin");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_mise_ceiling_keeps_shim_keys_apart_by_position() {
+        let mut environment = environment(Path::new("/nonexistent-home"));
+        environment.variables = vec![("MISE_CEILING_PATHS".into(), "/elsewhere".into())];
+        let (a, b) = member_keys(&environment, |_, _, _| {});
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_renamed_mise_config_file_is_a_version_file() {
+        let mut environment = environment(Path::new("/nonexistent-home"));
+        environment.variables = vec![("MISE_DEFAULT_CONFIG_FILENAME".into(), "tools.toml".into())];
+        let root = tempfile::tempdir().unwrap();
+        let digest = || workspace_selector_digest(root.path(), root.path(), &environment).unwrap();
+        let empty = digest();
+        fs::write(root.path().join("tools.toml"), "[tools]\nnode = '22'\n").unwrap();
+        assert_ne!(digest(), empty);
     }
 
     #[test]

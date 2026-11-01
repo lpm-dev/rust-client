@@ -28,21 +28,27 @@ impl WorkspaceCacheContract {
 
     /// The contract of the workspace that `project_dir` belongs to, so that a
     /// run from a member's directory keys its tasks as a `--filter` run from
-    /// the root does. `None` outside a workspace.
-    pub(super) fn for_project(project_dir: &Path) -> Option<Self> {
-        let root = lpm_workspace::find_workspace_root(project_dir)
-            .ok()
-            .flatten()?;
-        match Self::capture(&root) {
-            Ok(contract) => Some(contract),
-            Err(error) => {
-                tracing::warn!(
-                    "could not read the workspace at {}: {error}",
-                    root.display()
-                );
-                None
-            }
-        }
+    /// the root does. `Ok(None)` outside a workspace.
+    pub(super) fn for_project(project_dir: &Path) -> Result<Option<Self>, LpmError> {
+        let Some(root) = lpm_workspace::find_workspace_root(project_dir)
+            .map_err(|error| LpmError::Task(error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        Self::capture(&root).map(Some)
+    }
+
+    /// [`Self::for_project`] for a run whose cached tasks need it. A
+    /// workspace that can't be read turns the cache off for the run: a key
+    /// without the root lockfile would reuse results across dependency
+    /// changes.
+    pub(super) fn for_cached_run(project_dir: &Path) -> Result<Option<Self>, ()> {
+        Self::for_project(project_dir).map_err(|error| {
+            tracing::warn!(
+                "could not read the workspace of {} ({error}); running without the task cache",
+                project_dir.display()
+            );
+        })
     }
 }
 
@@ -423,8 +429,15 @@ fn build_task_context(
         }
         // Where the command was run from doesn't decide what a build produces,
         // and a key that named it would differ between a member directory and
-        // the workspace root. A task that reads it sets cachePortable: false.
-        child_env.retain(|key, _| !is_init_cwd(key));
+        // the workspace root. The task sees its own directory as PWD and no
+        // OLDPWD whatever the shell exported. A task that reads INIT_CWD lists
+        // it in cacheEnv or sets cachePortable: false.
+        child_env.retain(|key, _| {
+            !is_invocation_directory(key)
+                || cache_env
+                    .as_ref()
+                    .is_some_and(|names| names.contains(key.as_os_str()))
+        });
     }
 
     let project_variables: Vec<(std::ffi::OsString, std::ffi::OsString)> = env_vars
@@ -485,8 +498,7 @@ fn build_task_context(
         }
         RemoteCacheResolution::Omit => None,
     };
-    if remote_cache.is_some() && task_config.cache_env.is_none() && task_config.is_cache_portable()
-    {
+    if remote_cache.is_some() && task_config.cache_env.is_none() {
         crate::commands::remote_cache::warn_task_without_cache_env(script_name);
     }
     Ok(Some(CacheContext {
@@ -508,12 +520,15 @@ fn build_task_context(
     }))
 }
 
-fn is_init_cwd(key: &std::ffi::OsStr) -> bool {
-    if cfg!(windows) {
-        key.eq_ignore_ascii_case("INIT_CWD")
-    } else {
-        key == "INIT_CWD"
-    }
+/// The variables that name the directory a command was run from.
+fn is_invocation_directory(key: &std::ffi::OsStr) -> bool {
+    ["INIT_CWD", "PWD", "OLDPWD"].iter().any(|name| {
+        if cfg!(windows) {
+            key.eq_ignore_ascii_case(name)
+        } else {
+            key == *name
+        }
+    })
 }
 
 /// The directory that portable cache keys name paths from: the workspace

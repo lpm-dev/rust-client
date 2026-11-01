@@ -82,9 +82,10 @@ impl TaskRuntimeVersions {
     }
 
     /// The version a version manager's shim selects for a script in `cwd`
-    /// with `path` and the manager `variables` the script sees. Never
-    /// recorded: a manager can resolve a range to a newly installed release
-    /// without any file the key covers changing.
+    /// with `path` and the manager `variables` the script sees, and whether
+    /// this call ran the shim for it. Never recorded: a manager can resolve a
+    /// range to a newly installed release without any file the key covers
+    /// changing.
     fn shim_version(
         &self,
         selection: &str,
@@ -93,9 +94,12 @@ impl TaskRuntimeVersions {
         cwd: &Path,
         path: &OsStr,
         variables: &[(OsString, OsString)],
-    ) -> Option<String> {
-        self.probe(selection)
+    ) -> (Option<String>, bool) {
+        let mut ran = false;
+        let version = self
+            .probe(selection)
             .get_or_init(|| {
+                ran = true;
                 let mut command = if cfg!(windows) {
                     let mut command = Command::new("cmd");
                     command
@@ -118,7 +122,16 @@ impl TaskRuntimeVersions {
                 .ok()?;
                 parse_system_node_version(output)
             })
-            .clone()
+            .clone();
+        (version, ran)
+    }
+
+    /// Drop a version whose selection changed while it was probed.
+    fn forget(&self, key: &str) {
+        self.probes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(key);
     }
 }
 
@@ -199,7 +212,7 @@ impl TaskRuntimeIdentity {
         let selected = identify(cwd, path, &executables, &environment);
         let mut identities = Vec::with_capacity(RUNTIMES.len() + 1);
         identities.push(("task-platform".to_string(), host_platform().to_string()));
-        let mut ran_a_shim = false;
+        let mut probed_shims = Vec::new();
         for ((runtime, executable), selected) in
             RUNTIMES.into_iter().zip(&executables).zip(&selected)
         {
@@ -214,7 +227,6 @@ impl TaskRuntimeIdentity {
                                 .unwrap_or_else(|| format!("local:{}", selected.fingerprint))
                         }
                         RuntimeExecutable::VersionManagerShim => {
-                            ran_a_shim = true;
                             let selection = shim_selection_key(
                                 executable,
                                 &selected.canonical_executable,
@@ -222,7 +234,7 @@ impl TaskRuntimeIdentity {
                                 &environment,
                                 runtime,
                             )?;
-                            let version = versions.shim_version(
+                            let (version, ran) = versions.shim_version(
                                 &selection,
                                 runtime,
                                 executable,
@@ -230,6 +242,9 @@ impl TaskRuntimeIdentity {
                                 path,
                                 environment.variables(),
                             );
+                            if ran {
+                                probed_shims.push(selection);
+                            }
                             let config =
                                 workspace_selector_digest(cwd, scope.workspace_root, &environment);
                             match (version, config) {
@@ -250,9 +265,12 @@ impl TaskRuntimeIdentity {
             local: selected.map(|identity| identity.map(|identity| identity.fingerprint)),
             environment,
         };
-        // A shim's version came from running it; the selection it reported
-        // must still hold.
-        if ran_a_shim && !identity.is_unchanged_on_path(path) {
+        // A shim this call ran must still be selected as it was. A version
+        // reused from another task was checked by the task that ran it.
+        if !probed_shims.is_empty() && !identity.is_unchanged_on_path(path) {
+            for selection in &probed_shims {
+                versions.forget(selection);
+            }
             return None;
         }
         Some(identity)
@@ -335,7 +353,7 @@ fn host_platform() -> &'static str {
         format!(
             "{}/{}/{}",
             std::env::consts::OS,
-            std::env::consts::ARCH,
+            lpm_common::platform::host_arch(),
             host_libc().unwrap_or("-")
         )
     })
@@ -509,6 +527,36 @@ mod tests {
     }
 
     #[test]
+    fn a_shim_whose_selection_changes_while_it_runs_gives_no_identity_and_is_probed_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        let marker = dir.path().join("probed-once");
+        // The first probe edits a version file, as an auto-install might.
+        write_script(
+            &bin.join("node"),
+            &format!(
+                "echo probe >> '{probes}'\nif [ ! -e '{marker}' ]; then touch '{marker}'; echo 20 > '{nvmrc}'; fi\necho v22.11.0\n",
+                probes = bin.join("probes").display(),
+                marker = marker.display(),
+                nvmrc = dir.path().join(".nvmrc").display(),
+            ),
+        );
+        let versions = TaskRuntimeVersions::default();
+        let capture = || {
+            TaskRuntimeIdentity::capture_with(
+                dir.path(),
+                bin.as_os_str(),
+                scope(dir.path()),
+                &versions,
+                |_, _, _, _| RuntimeExecutable::VersionManagerShim,
+            )
+        };
+        assert!(capture().is_none());
+        assert!(capture().is_some());
+        assert_eq!(probes(&bin), 2);
+    }
+
+    #[test]
     fn a_project_manager_variable_reaches_the_shim_probe() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
@@ -539,7 +587,7 @@ mod tests {
         assert!(platform.starts_with(&format!(
             "{}/{}/",
             std::env::consts::OS,
-            std::env::consts::ARCH
+            lpm_common::platform::host_arch()
         )));
         assert_eq!(runtime(&identity, "node-runtime"), "missing");
     }

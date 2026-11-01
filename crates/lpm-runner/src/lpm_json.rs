@@ -590,7 +590,7 @@ pub struct TaskConfig {
 
     /// Share cache entries with checkouts of the project at other paths, and across the
     /// directories a command runs from. Defaults to `true`. Set `false` for a task whose outputs
-    /// embed the absolute project path, or that reads `INIT_CWD`.
+    /// embed the absolute project path.
     #[serde(default, rename = "cachePortable")]
     #[schemars(with = "bool", extend("default" = true))]
     pub cache_portable: Option<bool>,

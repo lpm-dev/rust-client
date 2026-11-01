@@ -581,9 +581,10 @@ async fn remote_cache_warns_once_about_cached_tasks_without_cache_env() {
     }
     project.write_file("lpm.json", &config.to_string());
     let output = build(&project);
-    assert!(
-        !output.contains("has no cacheEnv"),
-        "a task that doesn't share its entries gets no hint:\n{output}"
+    assert_eq!(
+        output.matches("has no cacheEnv").count(),
+        1,
+        "runners with one checkout path can share a non-portable task, so it still gets the hint:\n{output}"
     );
 }
 
@@ -692,6 +693,122 @@ async fn a_member_directory_run_shares_keys_with_a_filtered_run_from_the_root() 
         "a run from a member's subdirectory must restore the root run's artifact"
     );
     assert_eq!(cache.stored(), 1);
+}
+
+#[tokio::test]
+async fn the_shells_working_directories_stay_out_of_a_key_without_cache_env() {
+    let (server, _cache) = RemoteCache::start().await;
+    let project = workspace_checkout(&server);
+    let mut config: serde_json::Value =
+        serde_json::from_str(&project.read_file("packages/app/lpm.json")).unwrap();
+    config["tasks"]["build"]
+        .as_object_mut()
+        .unwrap()
+        .remove("cacheEnv");
+    project.write_file("packages/app/lpm.json", &config.to_string());
+    let run = |dir: &str, args: &[&str], previous: &str| {
+        // A shell exports where it is and where it was.
+        lpm_in(&project, dir)
+            .args(args)
+            .env("LPM_REMOTE_CACHE", "0")
+            .env("PWD", project.path().join(dir))
+            .env("OLDPWD", previous)
+            .assert()
+            .success();
+    };
+    run(".", &["run", "build", "--filter", "app"], "/somewhere");
+    assert!(project.file_exists("packages/app/executed-marker"));
+    std::fs::remove_file(project.path().join("packages/app/executed-marker")).unwrap();
+
+    run("packages/app", &["run", "build"], "/elsewhere");
+    assert!(
+        !project.file_exists("packages/app/executed-marker"),
+        "PWD and OLDPWD must not keep a member-directory run from reusing the root run"
+    );
+}
+
+#[tokio::test]
+async fn init_cwd_listed_in_cache_env_keeps_the_invocation_directory_in_the_key() {
+    let (server, _cache) = RemoteCache::start().await;
+    let project = workspace_checkout(&server);
+    let mut config: serde_json::Value =
+        serde_json::from_str(&project.read_file("packages/app/lpm.json")).unwrap();
+    config["tasks"]["build"]["cacheEnv"] = serde_json::json!(["INIT_CWD"]);
+    project.write_file("packages/app/lpm.json", &config.to_string());
+    let run = |dir: &str| {
+        lpm_in(&project, dir)
+            .args(["run", "build"])
+            .env("LPM_REMOTE_CACHE", "0")
+            .assert()
+            .success();
+    };
+    run("packages/app");
+    std::fs::remove_file(project.path().join("packages/app/executed-marker")).unwrap();
+    run("packages/app/src");
+    assert!(
+        project.file_exists("packages/app/executed-marker"),
+        "a task that lists INIT_CWD must be keyed by where it was run from"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unreadable_workspace_turns_the_task_cache_off_instead_of_weakening_the_key() {
+    let (server, _cache) = RemoteCache::start().await;
+    let project = workspace_checkout(&server);
+    // The workspace contract refuses a symlinked lockfile.
+    project.write_file("lock-target.json", r#"{"lockfileVersion":3,"packages":{}}"#);
+    std::os::unix::fs::symlink("lock-target.json", project.path().join("package-lock.json"))
+        .unwrap();
+    let run = || {
+        lpm_in(&project, "packages/app")
+            .args(["run", "build"])
+            .env("LPM_REMOTE_CACHE", "0")
+            .output()
+            .unwrap()
+    };
+    let first = run();
+    assert!(first.status.success());
+    assert!(
+        String::from_utf8_lossy(&first.stderr).contains("running without the task cache"),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    std::fs::remove_file(project.path().join("packages/app/executed-marker")).unwrap();
+    project.write_file(
+        "lock-target.json",
+        r#"{"lockfileVersion":3,"packages":{"node_modules/left-pad":{"version":"1.3.0"}}}"#,
+    );
+    assert!(run().status.success());
+    assert!(
+        project.file_exists("packages/app/executed-marker"),
+        "a dependency change behind an unreadable lockfile must not restore a stale result"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_uncached_script_never_reads_the_workspace() {
+    let (server, _cache) = RemoteCache::start().await;
+    let project = workspace_checkout(&server);
+    project.write_file("lock-target.json", r#"{"lockfileVersion":3,"packages":{}}"#);
+    std::os::unix::fs::symlink("lock-target.json", project.path().join("package-lock.json"))
+        .unwrap();
+    project.write_file(
+        "packages/app/package.json",
+        r#"{"name":"app","version":"1.0.0","scripts":{"build":"node build.js","dev":"node -e 0"}}"#,
+    );
+    let output = lpm_in(&project, "packages/app")
+        .args(["run", "dev"])
+        .env("LPM_REMOTE_CACHE", "0")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("workspace"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test]

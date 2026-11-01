@@ -223,10 +223,18 @@ fn execute_single_package_task_plan(
     let levels = &plan.levels;
     let workspace_dependency_identities = HashMap::new();
     let initially_failed_tasks = HashSet::new();
-    let workspace_contract = if no_cache {
+    let mut no_cache = no_cache;
+    let caches_a_task = levels
+        .iter()
+        .flatten()
+        .any(|task| cache::is_task_cached_with_config(task, lpm_config));
+    let workspace_contract = if no_cache || !caches_a_task {
         None
     } else {
-        cache::WorkspaceCacheContract::for_project(project_dir)
+        cache::WorkspaceCacheContract::for_cached_run(project_dir).unwrap_or_else(|()| {
+            no_cache = true;
+            None
+        })
     };
     let report = if parallel || stream {
         let serial_levels;

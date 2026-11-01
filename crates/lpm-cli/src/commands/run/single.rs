@@ -1,6 +1,6 @@
 use super::cache::{
-    CacheStoreRequest, WorkspaceCacheContract, prepare_package_script_cache_context,
-    try_cache_hit_with_context, try_cache_store_with_context,
+    CacheStoreRequest, WorkspaceCacheContract, is_task_cached_with_config,
+    prepare_package_script_cache_context, try_cache_hit_with_context, try_cache_store_with_context,
 };
 use super::format::{print_captured_stderr, print_captured_stdout};
 use super::runtime::prepare_runtime;
@@ -169,11 +169,16 @@ pub(crate) async fn run_with_reserved_stdout(
     // Read lpm.json once so the cache lookup and task predicate share the same config.
     let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
     let command = script_command_for_display(project_dir, script_name, lpm_config.as_ref())?;
-    let workspace_contract = if no_cache {
-        None
-    } else {
-        WorkspaceCacheContract::for_project(project_dir)
-    };
+    let mut no_cache = no_cache;
+    let workspace_contract =
+        if no_cache || !is_task_cached_with_config(script_name, lpm_config.as_ref()) {
+            None
+        } else {
+            WorkspaceCacheContract::for_cached_run(project_dir).unwrap_or_else(|()| {
+                no_cache = true;
+                None
+            })
+        };
     let cache_context = if no_cache {
         None
     } else {
