@@ -72,6 +72,37 @@ fn has_musl_loader() -> bool {
     CANDIDATES.iter().any(|p| Path::new(p).exists())
 }
 
+/// Whether Rosetta translates this process: an x86_64 build of LPM on an
+/// arm64 Mac. Its children run the x86_64 slice of universal tools but arm64
+/// tools natively, so their output matches neither an Intel Mac's nor a
+/// native arm64 run's.
+#[cfg(target_os = "macos")]
+pub fn translated_by_rosetta() -> bool {
+    static TRANSLATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRANSLATED.get_or_init(|| {
+        let mut translated: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        // SAFETY: the name is NUL-terminated, and `translated` and `size`
+        // describe a writable buffer of the size passed.
+        let status = unsafe {
+            libc::sysctlbyname(
+                c"sysctl.proc_translated".as_ptr(),
+                (&raw mut translated).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        status == 0 && translated == 1
+    })
+}
+
+/// Whether Rosetta translates this process. Only macOS has Rosetta.
+#[cfg(not(target_os = "macos"))]
+pub fn translated_by_rosetta() -> bool {
+    false
+}
+
 #[cfg(target_os = "linux")]
 fn has_glibc_loader() -> bool {
     const CANDIDATES: &[&str] = &[
@@ -86,6 +117,13 @@ fn has_glibc_loader() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_x86_64_build_on_macos_can_be_translated_by_rosetta() {
+        if !(cfg!(target_os = "macos") && std::env::consts::ARCH == "x86_64") {
+            assert!(!translated_by_rosetta());
+        }
+    }
 
     #[test]
     fn detect_libc_is_consistent_with_target_os() {

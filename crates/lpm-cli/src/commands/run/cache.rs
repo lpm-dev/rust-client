@@ -1,10 +1,17 @@
 use lpm_common::LpmError;
+use lpm_runtime::task_identity::{TaskRuntimeIdentity, TaskRuntimeScope, TaskRuntimeVersions};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock};
+
+/// Runtime versions probed for task-cache keys, shared by every task of this
+/// process.
+static TASK_RUNTIME_VERSIONS: LazyLock<TaskRuntimeVersions> =
+    LazyLock::new(|| TaskRuntimeVersions::new(crate::engine_check::recorded_node_versions()));
 
 #[derive(Clone)]
 pub(super) struct WorkspaceCacheContract {
+    root: PathBuf,
     fingerprint: lpm_task::hasher::WorkspaceContractFingerprint,
     validation: lpm_task::hasher::FilesystemValidation,
 }
@@ -13,9 +20,67 @@ impl WorkspaceCacheContract {
     pub(super) fn capture(root: &Path) -> Result<Self, LpmError> {
         let snapshot = lpm_task::hasher::compute_workspace_contract_snapshot(root)?;
         Ok(Self {
+            root: root.to_path_buf(),
             fingerprint: snapshot.fingerprint,
             validation: snapshot.validation,
         })
+    }
+
+    /// The contract of the workspace at `root`, for a run that caches tasks.
+    /// A workspace that can't be read sets `no_cache` instead: a key without
+    /// the root lockfile would reuse results across dependency changes.
+    pub(super) fn for_cached_run(root: &Path, no_cache: &mut bool) -> Option<Self> {
+        match Self::capture(root) {
+            Ok(contract) => Some(contract),
+            Err(error) => {
+                warn_unreadable_workspace(root, &error);
+                *no_cache = true;
+                None
+            }
+        }
+    }
+
+    /// [`Self::for_cached_run`] for the workspace that `project_dir` belongs
+    /// to, so that a run from a member's directory keys its tasks as a
+    /// `--filter` run from the root does. `None` outside a workspace.
+    pub(super) fn for_cached_project_run(project_dir: &Path, no_cache: &mut bool) -> Option<Self> {
+        match lpm_workspace::find_workspace_root(project_dir) {
+            Ok(Some(root)) => Self::for_cached_run(&root, no_cache),
+            Ok(None) => None,
+            Err(error) => {
+                warn_unreadable_workspace(project_dir, &error);
+                *no_cache = true;
+                None
+            }
+        }
+    }
+}
+
+fn warn_unreadable_workspace(location: &Path, error: &dyn std::fmt::Display) {
+    tracing::warn!(
+        "could not read the workspace at {} ({error}); running without the task cache",
+        location.display()
+    );
+}
+
+/// The runtimes a task's key was computed with, rechecked against the task's
+/// current `PATH` before a restore or an upload.
+struct RuntimeCheck {
+    bin_hint: lpm_runner::bin_path::ManagedRuntimeHint,
+    identity: TaskRuntimeIdentity,
+}
+
+impl RuntimeCheck {
+    fn is_unchanged(&self) -> Result<bool, LpmError> {
+        // A `node_modules/.bin` created since the key was computed can select
+        // another runtime, so the PATH is built again.
+        let path = lpm_runner::bin_path::build_path_with_bins_pre_resolved(
+            self.identity.cwd(),
+            &self.bin_hint,
+        )?;
+        Ok(self
+            .identity
+            .is_unchanged_on_path(std::ffi::OsStr::new(&path)))
     }
 }
 
@@ -86,6 +151,7 @@ pub(super) struct CacheContext {
     pub(super) remote_cache: Option<crate::commands::remote_cache::RemoteCacheClient>,
     workspace_validation: Option<lpm_task::hasher::FilesystemValidation>,
     input_validation: lpm_task::hasher::FilesystemValidation,
+    runtime: RuntimeCheck,
     schema_snapshot: Option<Arc<lpm_env_source::SchemaSnapshot>>,
     dependencies: Vec<TaskDependencyIdentity>,
     command_preference: CommandPreference,
@@ -280,14 +346,8 @@ fn build_task_context(
         _ => return Ok(None),
     };
 
-    let mut runtime_identities = bin_hint.cache_identities();
     let child_path =
         lpm_runner::bin_path::build_path_with_bins_pre_resolved(project_dir, bin_hint)?;
-    bin_hint.append_executable_cache_identities(
-        project_dir,
-        std::ffi::OsStr::new(&child_path),
-        &mut runtime_identities,
-    );
 
     let pkg_json_path = project_dir.join("package.json");
     let (package, package_json) = if pkg_json_path.exists() {
@@ -364,6 +424,52 @@ fn build_task_context(
             })
             .map(|(key, value)| (key.into(), value.into())),
     );
+    let root = cache_key_root(project_dir, workspace_contract);
+    if task_config.is_cache_portable() {
+        match script_context.portable_manifest_path(&root) {
+            Ok(manifest) => {
+                child_env.insert("npm_package_json".into(), manifest.into());
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "could not place task '{}' in its workspace ({error}); not using the cache for it",
+                    lpm_common::sanitize_terminal_inline(script_name)
+                );
+                return Ok(None);
+            }
+        }
+        // These name the caller's directories, not the task's, and a key that
+        // held them would differ between a member directory and the workspace
+        // root, or after any `cd`. A task whose output depends on one lists
+        // it in cacheEnv or sets cachePortable: false.
+        child_env.retain(|key, _| {
+            !is_invocation_directory(key)
+                || cache_env
+                    .as_ref()
+                    .is_some_and(|names| names.contains(key.as_os_str()))
+        });
+    }
+
+    let project_variables: Vec<(std::ffi::OsString, std::ffi::OsString)> = env_vars
+        .iter()
+        .filter(|(name, _)| lpm_runtime::task_identity::is_version_manager_variable(name))
+        .map(|(name, value)| (name.into(), value.into()))
+        .collect();
+    let Some(runtime) = TaskRuntimeIdentity::capture(
+        project_dir,
+        std::ffi::OsStr::new(&child_path),
+        TaskRuntimeScope {
+            workspace_root: &root,
+            project_variables: &project_variables,
+        },
+        &TASK_RUNTIME_VERSIONS,
+    ) else {
+        tracing::warn!(
+            "the runtime of task '{}' changed or could not be identified; not using the cache for it",
+            lpm_common::sanitize_terminal_inline(script_name)
+        );
+        return Ok(None);
+    };
 
     let cache_inputs = effective_cache_inputs(&task_config, config_ref);
     let schema_snapshot = config_ref.and_then(|config| config.env_schema_resolution.clone());
@@ -385,7 +491,7 @@ fn build_task_context(
         &dependency_pairs,
         &command,
         extra_args,
-        &runtime_identities,
+        runtime.identities(),
         &cache_inputs,
         &child_env,
         &package_json,
@@ -396,6 +502,15 @@ fn build_task_context(
             .verify_dependencies()
             .map_err(|error| LpmError::EnvValidation(error.to_string()))?;
     }
+    let remote_cache = match remote_cache {
+        RemoteCacheResolution::Resolve(session) => {
+            crate::commands::remote_cache::client_from_config(config_ref, session)
+        }
+        RemoteCacheResolution::Omit => None,
+    };
+    if remote_cache.is_some() && task_config.cache_env.is_none() {
+        crate::commands::remote_cache::warn_task_without_cache_env(script_name);
+    }
     Ok(Some(CacheContext {
         command_preference,
         task_config,
@@ -403,17 +518,42 @@ fn build_task_context(
         command,
         env_vars,
         inherited_env,
-        remote_cache: match remote_cache {
-            RemoteCacheResolution::Resolve(session) => {
-                crate::commands::remote_cache::client_from_config(config_ref, session)
-            }
-            RemoteCacheResolution::Omit => None,
-        },
+        remote_cache,
         workspace_validation: workspace_contract.map(|contract| contract.validation.clone()),
         input_validation: cache_snapshot.validation,
+        runtime: RuntimeCheck {
+            bin_hint: bin_hint.clone(),
+            identity: runtime,
+        },
         schema_snapshot,
         dependencies: dependency_identities.to_vec(),
     }))
+}
+
+/// The variables that name the directory a command was run from.
+fn is_invocation_directory(key: &std::ffi::OsStr) -> bool {
+    ["INIT_CWD", "PWD", "OLDPWD"].iter().any(|name| {
+        if cfg!(windows) {
+            key.eq_ignore_ascii_case(name)
+        } else {
+            key == *name
+        }
+    })
+}
+
+/// The directory that portable cache keys name paths from: the workspace
+/// root, or the project itself outside a workspace.
+fn cache_key_root(
+    project_dir: &Path,
+    workspace_contract: Option<&WorkspaceCacheContract>,
+) -> PathBuf {
+    if let Some(contract) = workspace_contract {
+        return contract.root.clone();
+    }
+    lpm_workspace::find_workspace_root(project_dir)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| project_dir.to_path_buf())
 }
 
 #[expect(
@@ -445,8 +585,13 @@ pub(super) fn prepare_cache_context_with_config(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "cache context preserves distinct execution inputs"
+)]
 pub(super) fn prepare_package_script_cache_context(
     project_dir: &Path,
+    workspace_contract: Option<&WorkspaceCacheContract>,
     script_name: &str,
     env_mode: Option<&str>,
     extra_args: &[String],
@@ -456,7 +601,7 @@ pub(super) fn prepare_package_script_cache_context(
 ) -> Result<Option<CacheContext>, LpmError> {
     build_task_context(
         project_dir,
-        None,
+        workspace_contract,
         &[],
         script_name,
         env_mode,
@@ -480,7 +625,7 @@ pub(super) fn try_cache_hit_with_context(
             &ctx.cache_key,
             project_dir,
             &ctx.task_config.outputs,
-            || cache_context_is_unchanged(ctx),
+            || execution_context_is_unchanged(ctx),
         ) {
             Ok(Some(hit)) => return Ok(Some(hit)),
             Ok(None) => return Ok(None),
@@ -499,7 +644,7 @@ pub(super) fn try_cache_hit_with_context(
             &ctx.cache_key,
             project_dir,
             &ctx.task_config.outputs,
-            || cache_context_is_unchanged(ctx),
+            || execution_context_is_unchanged(ctx),
         )
     {
         if let Err(error) = lpm_task::cache::store_cache(
@@ -517,6 +662,14 @@ pub(super) fn try_cache_hit_with_context(
     }
 
     Ok(None)
+}
+
+/// Whether the task's inputs and the runtimes its key names are unchanged.
+/// Checked before a restore replaces outputs and before a result is published,
+/// since a download or the task's own run can take long enough for either to
+/// change.
+fn execution_context_is_unchanged(context: &CacheContext) -> Result<bool, LpmError> {
+    Ok(cache_context_is_unchanged(context)? && context.runtime.is_unchanged()?)
 }
 
 fn cache_context_is_unchanged(context: &CacheContext) -> Result<bool, LpmError> {
@@ -607,9 +760,9 @@ fn store_cache_with_context(
     request: CacheStoreRequest<'_>,
     expected: &CacheContext,
 ) -> Result<bool, LpmError> {
-    if !cache_context_is_unchanged(expected)? {
+    if !execution_context_is_unchanged(expected)? {
         tracing::warn!(
-            "task cache contract, inputs, or dependencies changed while task '{}' ran; skipping cache publication",
+            "task cache contract, inputs, dependencies, or runtime changed while task '{}' ran; skipping cache publication",
             request.script_name
         );
         return Ok(false);

@@ -1749,6 +1749,18 @@ fn is_ci_environment() -> bool {
         .any(|name| std::env::var(name).is_ok_and(|value| !value.is_empty()))
 }
 
+/// Warns, once a process, that `task` has no `cacheEnv`: every inherited
+/// variable, such as `HOME`, is then in its key, which no other machine
+/// shares.
+pub fn warn_task_without_cache_env(task: &str) {
+    static SHOWN: AtomicBool = AtomicBool::new(false);
+    if !SHOWN.swap(true, Ordering::Relaxed) {
+        install_ui::warn_untrusted(&format!(
+            "task '{task}' has no cacheEnv, so all inherited variables are in its cache key and other machines can't reuse its remote cache entries; list the variables it reads in tasks.{task}.cacheEnv"
+        ));
+    }
+}
+
 fn warn_once(message: &str) {
     if !REMOTE_CACHE_WARNING_SHOWN.swap(true, Ordering::Relaxed) {
         install_ui::warn_untrusted(message);

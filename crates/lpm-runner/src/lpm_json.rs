@@ -587,9 +587,22 @@ pub struct TaskConfig {
     /// An empty list ignores inherited values. Project-loaded env values always remain inputs.
     #[serde(default, rename = "cacheEnv")]
     pub cache_env: Option<Vec<String>>,
+
+    /// Share cache entries with checkouts of the project at other paths, and across the
+    /// directories a command runs from. Defaults to `true`. Set `false` for a task whose outputs
+    /// embed the absolute project path.
+    #[serde(default, rename = "cachePortable")]
+    #[schemars(with = "bool", extend("default" = true))]
+    pub cache_portable: Option<bool>,
 }
 
 impl TaskConfig {
+    /// Whether the task's cache key leaves out where the project is checked out.
+    #[inline]
+    pub fn is_cache_portable(&self) -> bool {
+        self.cache_portable.unwrap_or(true)
+    }
+
     /// Get the effective inputs globs (defaults to common source dirs + config files if empty).
     pub fn effective_inputs(&self) -> Vec<String> {
         if self.inputs.is_empty() {

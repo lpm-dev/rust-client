@@ -121,6 +121,9 @@ impl Drop for PathNodeVersionCache {
 ///
 /// Launchers are never recorded: a shim can report another version without
 /// its fingerprint changing.
+///
+/// Task-cache keys record Node and Bun binaries here too, under fingerprints
+/// of their own domain, so the two kinds of record never collide.
 #[derive(Debug, Clone)]
 pub struct RecordedNodeVersions {
     directory: PathBuf,
@@ -145,7 +148,7 @@ impl RecordedNodeVersions {
         self
     }
 
-    fn version(&self, fingerprint: &str) -> Option<String> {
+    pub(crate) fn version(&self, fingerprint: &str) -> Option<String> {
         if !self.reuse {
             return None;
         }
@@ -160,18 +163,26 @@ impl RecordedNodeVersions {
     }
 
     fn record(&self, fingerprint: &str, version: &str) -> Option<std::thread::JoinHandle<()>> {
-        let path = self.path(fingerprint)?;
+        self.path(fingerprint)?;
         lpm_semver::Version::parse(version).ok()?;
-        let directory = self.directory.clone();
-        let contents = format!("{version}\n");
-        // A version that cannot be recorded only costs a later probe.
+        let recorded = self.clone();
+        let (fingerprint, version) = (fingerprint.to_owned(), version.to_owned());
         std::thread::Builder::new()
             .name("lpm-node-version-record".into())
-            .spawn(move || {
-                let _ = create_private_directory(&directory)
-                    .and_then(|()| lpm_common::write_file_atomic(&path, contents));
-            })
+            .spawn(move || recorded.record_now(&fingerprint, &version))
             .ok()
+    }
+
+    /// Record `version` before returning, for a caller that has no later
+    /// point at which to wait for a background write. A version that cannot
+    /// be recorded only costs a later probe.
+    pub(crate) fn record_now(&self, fingerprint: &str, version: &str) {
+        if let Some(path) = self.path(fingerprint)
+            && lpm_semver::Version::parse(version).is_ok()
+        {
+            let _ = create_private_directory(&self.directory)
+                .and_then(|()| lpm_common::write_file_atomic(&path, format!("{version}\n")));
+        }
     }
 
     fn path(&self, fingerprint: &str) -> Option<PathBuf> {
@@ -566,7 +577,7 @@ fn resolve_selected(selected: &SelectedNode) -> Effective {
 /// Run `node --version` and return the bare version string (no `v`
 /// prefix). Returns `None` when `node` is not on `PATH` or the output
 /// is unparseable.
-fn node_version_output(command: &mut Command) -> Option<std::process::Output> {
+pub(crate) fn node_version_output(command: &mut Command) -> Option<std::process::Output> {
     lpm_common::child_env::strip_inherited_env_hooks(command);
     lpm_common::process_output::output_capped(command, std::time::Duration::from_secs(2), 4096).ok()
 }
@@ -601,7 +612,7 @@ fn node_version_on_path(cwd: &Path, path: &OsStr, _executable: Option<&Path>) ->
     )?)
 }
 
-fn parse_system_node_version(output: std::process::Output) -> Option<String> {
+pub(crate) fn parse_system_node_version(output: std::process::Output) -> Option<String> {
     if !output.status.success() {
         return None;
     }
@@ -623,7 +634,7 @@ fn node_executable_in_path(cwd: &Path, path: &OsStr) -> Option<PathBuf> {
     runtime_executable_in_path(cwd, path, detect::RuntimeKind::Node)
 }
 
-fn runtime_executable_in_path(
+pub(crate) fn runtime_executable_in_path(
     cwd: &Path,
     path: &OsStr,
     runtime: detect::RuntimeKind,
@@ -774,14 +785,14 @@ pub(crate) fn update_with_file_metadata(hasher: &mut Sha256, metadata: &std::fs:
 }
 
 #[cfg(unix)]
-fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
+pub(crate) fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
     use std::os::unix::ffi::OsStrExt;
 
     hasher.update(value.as_bytes());
 }
 
 #[cfg(windows)]
-fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
+pub(crate) fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
     use std::os::windows::ffi::OsStrExt;
 
     for unit in value.encode_wide() {
@@ -790,7 +801,7 @@ fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
+pub(crate) fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
     hasher.update(value.to_string_lossy().as_bytes());
 }
 

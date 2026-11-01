@@ -223,6 +223,16 @@ fn execute_single_package_task_plan(
     let levels = &plan.levels;
     let workspace_dependency_identities = HashMap::new();
     let initially_failed_tasks = HashSet::new();
+    let mut no_cache = no_cache;
+    let caches_a_task = levels
+        .iter()
+        .flatten()
+        .any(|task| cache::is_task_cached_with_config(task, lpm_config));
+    let workspace_contract = if no_cache || !caches_a_task {
+        None
+    } else {
+        cache::WorkspaceCacheContract::for_cached_project_run(project_dir, &mut no_cache)
+    };
     let report = if parallel || stream {
         let serial_levels;
         let execution_levels = if parallel {
@@ -239,7 +249,7 @@ fn execute_single_package_task_plan(
         // Parallel: run independent tasks concurrently within each level
         run_tasks_parallel(
             project_dir,
-            None,
+            workspace_contract.as_ref(),
             &workspace_dependency_identities,
             execution_levels,
             extra_args,
@@ -260,7 +270,7 @@ fn execute_single_package_task_plan(
         let topo_order: Vec<String> = levels.iter().flatten().cloned().collect();
         run_tasks_sequential(
             project_dir,
-            None,
+            workspace_contract.as_ref(),
             &workspace_dependency_identities,
             &topo_order,
             extra_args,

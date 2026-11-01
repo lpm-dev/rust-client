@@ -18,6 +18,7 @@
 //!   bun-index-cache.json   <- cached Bun release index (1h TTL)
 //! ```
 
+mod binary_target;
 pub mod bun;
 pub mod detect;
 pub mod download;
@@ -25,6 +26,7 @@ pub mod effective;
 pub mod node;
 mod node_identity;
 pub mod platform;
+pub mod task_identity;
 
 /// Result of ensuring a runtime is available before script execution.
 ///
