@@ -134,6 +134,66 @@ async fn cache_status_json_reports_local_usage_and_remote_status() {
 }
 
 #[tokio::test]
+async fn cache_status_with_a_rejected_token_ends_on_the_warning_not_on_success() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v8/artifacts/status"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let project = TempProject::empty(r#"{"name":"cache-status","version":"1.0.0"}"#);
+    project.write_file(
+        "lpm.json",
+        &format!(
+            r#"{{ "remoteCache": {{ "enabled": true, "url": "{}/v8" }} }}"#,
+            server.uri()
+        ),
+    );
+    let run = |json: bool| {
+        let mut command = lpm(&project);
+        command
+            .env("LPM_REMOTE_CACHE_TOKEN", "revoked-token")
+            .env("LPM_REMOTE_CACHE_SIGNATURE_KEY", "signing-key");
+        if json {
+            command.arg("--json");
+        }
+        command
+            .args(["cache", "status"])
+            .output()
+            .expect("failed to run lpm cache status")
+    };
+
+    let human = run(false);
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&human.stdout),
+        String::from_utf8_lossy(&human.stderr)
+    );
+    assert!(
+        human.status.success(),
+        "a remote problem is reported, not fatal:\n{printed}"
+    );
+    assert!(
+        printed.contains("rejected LPM_REMOTE_CACHE_TOKEN"),
+        "the warning must name the credential to fix:\n{printed}"
+    );
+    assert!(
+        !printed.contains("Cache status loaded"),
+        "a rejected token must not end on a success line:\n{printed}"
+    );
+
+    let json = run(true);
+    assert!(json.status.success());
+    let envelope: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(envelope["success"], serde_json::json!(true));
+    let error = envelope["remote"]["error"].as_str().unwrap();
+    assert!(
+        error.contains("HTTP 401") && error.contains("LPM_REMOTE_CACHE_TOKEN"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn cache_status_reads_an_unlimited_cache_s_usage_in_gib_against_no_limit() {
     let server = MockServer::start().await;
     let usage: u64 = 1253 * 1024 * 1024 * 1024 + 512 * 1024 * 1024;

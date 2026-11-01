@@ -482,10 +482,12 @@ pub fn print_cache_status_human(status: &CacheStatus) {
     }
     println!();
 
-    if let Some(error) = &status.remote.error {
-        install_ui::warn_untrusted(&format!("Remote status unavailable: {error}"));
+    // The local part loaded either way; a remote that couldn't be checked
+    // is the result to leave the reader with.
+    match &status.remote.error {
+        Some(error) => install_ui::warn_untrusted(&format!("Remote status unavailable: {error}")),
+        None => install_ui::done("Cache status loaded"),
     }
-    install_ui::done("Cache status loaded");
 }
 
 fn cache_status_label(label: &'static str) -> install_ui::TerminalFragment {
@@ -1119,28 +1121,33 @@ impl RemoteCacheClient {
     async fn fetch_status_async(&self) -> Result<FetchedRemoteStatus, String> {
         let client = http_client()?;
         let url = self.status_url()?;
+        let rejected = match self.auth {
+            RemoteCacheAuth::Static(_) => {
+                "the remote cache rejected LPM_REMOTE_CACHE_TOKEN (HTTP 401); check that the token is valid and has a cache scope"
+            }
+            RemoteCacheAuth::Session(_) => {
+                "the remote cache rejected your LPM credentials (HTTP 401); run `lpm login` or check LPM_TOKEN"
+            }
+        };
         let response = self
-            .send_authenticated(
-                "remote cache status returned HTTP 401",
-                async |bearer: String| {
-                    let response = client
-                        .get(url.clone())
-                        .bearer_auth(bearer)
-                        .send()
-                        .await
-                        .map_err(|error| {
-                            RemoteCacheRequestError::Message(format!(
-                                "remote cache status failed: {}",
-                                lpm_http::display_error(&error)
-                            ))
-                        })?;
-                    if response.status() == StatusCode::UNAUTHORIZED {
-                        Err(RemoteCacheRequestError::Unauthorized)
-                    } else {
-                        Ok(response)
-                    }
-                },
-            )
+            .send_authenticated(rejected, async |bearer: String| {
+                let response = client
+                    .get(url.clone())
+                    .bearer_auth(bearer)
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        RemoteCacheRequestError::Message(format!(
+                            "remote cache status failed: {}",
+                            lpm_http::display_error(&error)
+                        ))
+                    })?;
+                if response.status() == StatusCode::UNAUTHORIZED {
+                    Err(RemoteCacheRequestError::Unauthorized)
+                } else {
+                    Ok(response)
+                }
+            })
             .await?;
 
         if !response.status().is_success() {
@@ -1688,7 +1695,17 @@ fn env_name_blocks_upload(
     {
         return false;
     }
-    !policy.allow_secrets && default_secret_pattern(name)
+    !policy.allow_secrets && default_secret_pattern(name) && !names_a_location(name)
+}
+
+/// A name such as `POSTGRES_PASSWORD_FILE` or `TOKEN_CACHE_DIR` holds where a
+/// secret is kept, not the secret. A task that reads the file could embed it
+/// as any task can read any file, so the variable itself leaks nothing.
+fn names_a_location(name: &[u8]) -> bool {
+    let upper = name.to_ascii_uppercase();
+    [b"_FILE".as_slice(), b"_PATH", b"_DIR"]
+        .iter()
+        .any(|suffix| upper.ends_with(suffix))
 }
 
 fn default_secret_pattern(name: &[u8]) -> bool {
@@ -1952,6 +1969,42 @@ mod tests {
         .expect("secret-like env must block upload");
 
         assert!(reason.contains("DATABASE_URL"));
+    }
+
+    #[test]
+    fn a_variable_that_names_where_a_secret_is_kept_does_not_block_uploads() {
+        let policy = lpm_runner::lpm_json::RemoteCacheEnvConfig::default();
+        for name in [
+            "CMUX_CUA_AUTH_TOKEN_FILE",
+            "POSTGRES_PASSWORD_FILE",
+            "SECRETS_DIR",
+            "API_KEY_PATH",
+        ] {
+            let mut inherited = HashMap::new();
+            inherited.insert(name.into(), "/run/secrets/value".into());
+            assert_eq!(
+                upload_block_reason(&policy, &HashMap::new(), &inherited, "", ""),
+                None,
+                "{name} holds a location, not a secret"
+            );
+        }
+        let mut inherited = HashMap::new();
+        inherited.insert("AUTH_TOKEN_FILENAME_PREFIX".into(), "x".into());
+        assert!(
+            upload_block_reason(&policy, &HashMap::new(), &inherited, "", "").is_some(),
+            "only a name that ends in a location word is exempt"
+        );
+    }
+
+    #[test]
+    fn an_exclude_pattern_still_blocks_a_location_variable() {
+        let policy = lpm_runner::lpm_json::RemoteCacheEnvConfig {
+            exclude: vec!["*_TOKEN_FILE".into()],
+            ..Default::default()
+        };
+        let mut inherited = HashMap::new();
+        inherited.insert("CMUX_CUA_AUTH_TOKEN_FILE".into(), "/tmp/token".into());
+        assert!(upload_block_reason(&policy, &HashMap::new(), &inherited, "", "").is_some());
     }
 
     #[test]
