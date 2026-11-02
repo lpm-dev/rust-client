@@ -330,11 +330,11 @@ fn decode_response(bytes: &[u8]) -> Result<String, LpmError> {
         if !bytes.len().is_multiple_of(2) {
             return Err(error("invalid UTF-16 compiler response file"));
         }
-        let units = bytes[2..].chunks_exact(2).map(|chunk| {
+        let units = bytes[2..].as_chunks::<2>().0.iter().map(|&unit| {
             if little {
-                u16::from_le_bytes([chunk[0], chunk[1]])
+                u16::from_le_bytes(unit)
             } else {
-                u16::from_be_bytes([chunk[0], chunk[1]])
+                u16::from_be_bytes(unit)
             }
         });
         char::decode_utf16(units)

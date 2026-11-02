@@ -547,19 +547,16 @@ async fn download_tarball_maps_firewall_block_error() {
     let result = client.download_tarball_to_file(&url).await;
 
     match result {
-        Err(LpmError::NpmFirewallBlocked {
-            package,
-            verdict,
-            reason,
-            decision_id,
-            match_source,
-        }) => {
-            assert_eq!(package, "is-number@7.0.0");
-            assert_eq!(verdict, "malicious");
-            assert_eq!(reason, "product_default policy maps malicious to block");
-            assert_eq!(decision_id.as_deref(), Some("decision-1"));
-            assert_eq!(match_source.as_deref(), Some("package"));
-        }
+        Err(LpmError::NpmFirewallBlocked(blocked)) => assert_eq!(
+            *blocked,
+            lpm_common::NpmFirewallBlockedErrorContext {
+                package: "is-number@7.0.0".into(),
+                verdict: "malicious".into(),
+                reason: "product_default policy maps malicious to block".into(),
+                decision_id: Some("decision-1".into()),
+                match_source: Some("package".into()),
+            }
+        ),
         other => panic!("expected typed firewall block error, got {other:?}"),
     }
 }

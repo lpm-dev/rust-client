@@ -44,7 +44,9 @@ def fake_sysroot(directory):
 
 
 ENGINE_METADATA = json.dumps(metadata([package('lpm-env-ffi', source=None)], {}))
+PINNED_TOOLCHAIN = '1.23.4'
 MANIFESTS = {
+    'rust-toolchain.toml': '[toolchain]\nchannel = "' + PINNED_TOOLCHAIN + '"\ncomponents = ["clippy", "rustfmt"]\n',
     'Cargo.toml': '[workspace.dependencies]\nlpm-env = { path = "crates/lpm-env" }\nlpm-env-source = { path = "crates/lpm-env-source" }\n',
     'crates/lpm-env/Cargo.toml': '[dependencies]\n',
     'crates/lpm-env-source/Cargo.toml': '[dependencies]\nlpm-env.workspace = true\n',
@@ -190,7 +192,7 @@ class EngineExportTests(unittest.TestCase):
                     artifact.mkdir()
                     (artifact / 'library').write_bytes(b'new bundle')
 
-            sysroot = fake_sysroot(Path(temporary) / 'pinned/rust-1.94')
+            sysroot = fake_sysroot(Path(temporary) / ('pinned/rust-' + PINNED_TOOLCHAIN))
 
             def read(args, **kwargs):
                 if args[:2] == ['git', 'show']: return (root / args[2].split(':', 1)[1]).read_bytes()
@@ -254,7 +256,7 @@ class EngineExportTests(unittest.TestCase):
                 if args[:2] == ['git', 'show']: return (root / args[2].split(':', 1)[1]).read_bytes()
                 if args[0] == 'rustc':
                     return str(sysroot) + '\n' if '--print' in args else 'host: aarch64-apple-darwin\n'
-                if args[:3] == ['cargo', '+1.94.0', 'metadata']:
+                if args[:3] == ['cargo', '+' + PINNED_TOOLCHAIN, 'metadata']:
                     if 'workspace dependencies' not in cache:
                         if '--offline' in args:
                             raise subprocess.CalledProcessError(101, args, stderr=b'attempting to make an HTTP request, but --offline was specified')
@@ -265,6 +267,64 @@ class EngineExportTests(unittest.TestCase):
             with patch.object(exporter.subprocess, 'run', side_effect=command), patch.object(exporter.subprocess, 'check_output', side_effect=read):
                 exporter.export(root, Path(temporary) / 'target', output)
             self.assertIn('The Rust standard library', (output / exporter.NOTICES).read_text())
+
+    def exported_with(self, root, temporary, output, built):
+        """Export root with stubbed tools, recording the toolchain each cargo and rustc call names in built."""
+        paths = b'\0'.join(str(path.relative_to(root)).encode() for path in root.rglob('*') if path.is_file()) + b'\0'
+        sysroot = fake_sysroot(Path(temporary) / 'sysroot')
+
+        def command(args, **kwargs):
+            if args[0] == 'cargo':
+                built.append(args[1])
+                library = Path(kwargs['env']['CARGO_TARGET_DIR']) / args[-1] / 'release/liblpm_env_ffi.a'
+                library.parent.mkdir(parents=True, exist_ok=True)
+                library.write_bytes(b'library')
+            elif args[0] == 'lipo':
+                Path(args[-1]).write_bytes(b'library')
+            elif args[0] == 'xcodebuild':
+                artifact = Path(args[-1])
+                artifact.mkdir()
+                (artifact / 'library').write_bytes(b'bundle')
+
+        def read(args, **kwargs):
+            if args[:2] == ['git', 'show']: return (root / args[2].split(':', 1)[1]).read_bytes()
+            if args[0] in {'cargo', 'rustc'}:
+                built.append(args[1])
+            if args[0] == 'rustc':
+                return str(sysroot) + '\n' if '--print' in args else 'host: aarch64-apple-darwin\n'
+            if args[0] == 'cargo': return ENGINE_METADATA
+            return paths if args[1] == 'ls-files' else 'a' * 40 + '\n'
+
+        with patch.object(exporter.subprocess, 'run', side_effect=command), patch.object(exporter.subprocess, 'check_output', side_effect=read):
+            exporter.export(root, Path(temporary) / 'target', output)
+
+    def test_builds_and_provenance_use_the_toolchain_the_revision_pins(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / 'source'
+            write_sources(root)
+            output = Path(temporary) / 'engine'
+            built = []
+            self.exported_with(root, temporary, output, built)
+            self.assertEqual(len(built), 6)
+            self.assertEqual(set(built), {'+' + PINNED_TOOLCHAIN})
+            self.assertEqual(json.loads((output / 'provenance.json').read_text())['toolchain'], PINNED_TOOLCHAIN)
+
+    def test_a_toolchain_without_an_exact_release_stops_the_export_before_any_build(self):
+        for text in ['[toolchain]\nchannel = "stable"\n', '[toolchain]\nchannel = "1.99"\n', '[toolchain]\ncomponents = ["clippy"]\n', 'channel = [', None]:
+            with self.subTest(text=text), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / 'source'
+                write_sources(root)
+                toolchain_file = root / 'rust-toolchain.toml'
+                if text is None:
+                    toolchain_file.unlink()
+                else:
+                    toolchain_file.write_text(text)
+                output = Path(temporary) / 'engine'
+                built = []
+                with self.assertRaisesRegex(RuntimeError, 'exact Rust release'):
+                    self.exported_with(root, temporary, output, built)
+                self.assertEqual(built, [])
+                self.assertFalse(output.exists())
 
     def test_concurrent_source_changes_reject_publication(self):
         self.scenario('mutation')

@@ -41,7 +41,7 @@ permissions:
   contents: read
 
 env:
-  RUST_TOOLCHAIN: "1.94.0"
+  RUST_TOOLCHAIN: "1.99.1"
   APPLE_TEAM_ID: "823S8YKMRW"
   APPLE_CODESIGN_IDENTITY: "Developer ID Application: Tolga Ergin (823S8YKMRW)"
   APPLE_CODESIGN_IDENTIFIER: "dev.lpm.cli"

@@ -157,14 +157,14 @@ unsafe fn scan(block: *const u8, length: usize, found: &AtomicBool) {
 /// # Safety
 /// `source` must be valid for reading `into.len()` bytes.
 unsafe fn copy_as_the_machine_holds(source: *const u8, into: &mut [u8]) {
-    let mut words = into.chunks_exact_mut(8);
+    let (words, rest) = into.as_chunks_mut::<8>();
     let mut at = source;
-    for word in &mut words {
+    for word in words {
         // SAFETY: Eight of the bytes the caller guarantees.
-        word.copy_from_slice(&unsafe { machine_word(at) }.to_ne_bytes());
+        *word = unsafe { machine_word(at) }.to_ne_bytes();
         at = at.wrapping_add(8);
     }
-    for byte in words.into_remainder() {
+    for byte in rest {
         // SAFETY: One of the bytes the caller guarantees.
         *byte = unsafe { machine_byte(at) };
         at = at.wrapping_add(1);

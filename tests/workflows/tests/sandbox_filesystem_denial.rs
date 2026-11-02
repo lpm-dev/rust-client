@@ -238,8 +238,7 @@ fn node_available() -> bool {
     std::process::Command::new("node")
         .arg("--version")
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .is_ok_and(|o| o.status.success())
 }
 
 // ─── Contract — filesystem write denial at install time ───────────────

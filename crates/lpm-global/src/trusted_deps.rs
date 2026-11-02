@@ -203,7 +203,7 @@ impl GlobalTrustedDependencies {
         if candidates.is_empty() {
             return TrustMatch::NotTrusted;
         }
-        candidates.sort_by(|(left, _), (right, _)| left.cmp(right));
+        candidates.sort_by_key(|(left, _)| *left);
         if candidates
             .iter()
             .any(|(_, binding)| binding_matches(binding, integrity, script_hash))

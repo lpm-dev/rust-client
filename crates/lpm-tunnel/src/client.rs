@@ -107,7 +107,7 @@ enum RetryClass {
 
 #[derive(Debug)]
 struct TunnelConnectError {
-    error: LpmError,
+    error: Box<LpmError>,
     retry_class: RetryClass,
     capacity_limited: bool,
 }
@@ -217,7 +217,7 @@ struct CompletedHttpForward {
 impl TunnelConnectError {
     fn permanent(message: impl Into<String>) -> Self {
         Self {
-            error: LpmError::Tunnel(message.into()),
+            error: Box::new(LpmError::Tunnel(message.into())),
             retry_class: RetryClass::Permanent,
             capacity_limited: false,
         }
@@ -225,7 +225,7 @@ impl TunnelConnectError {
 
     fn transient(message: impl Into<String>) -> Self {
         Self {
-            error: LpmError::Tunnel(message.into()),
+            error: Box::new(LpmError::Tunnel(message.into())),
             retry_class: RetryClass::Transient,
             capacity_limited: false,
         }
@@ -233,7 +233,7 @@ impl TunnelConnectError {
 
     fn auth_rejected(message: impl Into<String>) -> Self {
         Self {
-            error: LpmError::Tunnel(message.into()),
+            error: Box::new(LpmError::Tunnel(message.into())),
             retry_class: RetryClass::AuthRejected,
             capacity_limited: false,
         }
@@ -246,7 +246,7 @@ impl TunnelConnectError {
             RetryClass::Transient
         };
         Self {
-            error,
+            error: Box::new(error),
             retry_class,
             capacity_limited: false,
         }
@@ -262,7 +262,7 @@ impl std::fmt::Display for TunnelConnectError {
 impl From<LpmError> for TunnelConnectError {
     fn from(error: LpmError) -> Self {
         Self {
-            error,
+            error: Box::new(error),
             retry_class: RetryClass::Transient,
             capacity_limited: false,
         }
@@ -302,7 +302,7 @@ fn relay_error(
 ) -> TunnelConnectError {
     if let Some(code) = code.filter(|code| lpm_common::error::TUNNEL_ACCESS_CODES.contains(code)) {
         return TunnelConnectError {
-            error: LpmError::tunnel_access(code, message),
+            error: Box::new(LpmError::tunnel_access(code, message)),
             retry_class: RetryClass::Permanent,
             capacity_limited: false,
         };
@@ -1092,10 +1092,10 @@ pub async fn connect_with_usage_fallible(
             Err(mut e) => {
                 if e.retry_class == RetryClass::AuthRejected {
                     let Some(provider) = options.token_provider.as_ref() else {
-                        return Err(e.error);
+                        return Err(*e.error);
                     };
                     if auth_refresh_attempted.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        return Err(e.error);
+                        return Err(*e.error);
                     }
                     match provider.refresh_after_rejection().await {
                         Ok(token) => {
@@ -1114,7 +1114,7 @@ pub async fn connect_with_usage_fallible(
                 let recovering_capacity =
                     e.capacity_limited && connected_once.load(std::sync::atomic::Ordering::Relaxed);
                 if e.retry_class == RetryClass::Permanent && !recovering_capacity {
-                    return Err(e.error);
+                    return Err(*e.error);
                 }
                 // Reset retry counter if the connection was healthy (lasted > 60s).
                 // This prevents a long-running tunnel from accumulating retries
@@ -2031,7 +2031,7 @@ async fn try_connect_with_token(
         on_usage(tracker.usage(), UsageUpdate::Connected);
     }
     on_connected(&session).map_err(|error| TunnelConnectError {
-        error,
+        error: Box::new(error),
         retry_class: RetryClass::Permanent,
         capacity_limited: false,
     })?;
@@ -2039,7 +2039,7 @@ async fn try_connect_with_token(
         tokio::select! {
             result = admission.wait() => {
                 result.map_err(|error| TunnelConnectError {
-                    error,
+                    error: Box::new(error),
                     retry_class: RetryClass::Permanent,
                     capacity_limited: false,
                 })?;
@@ -3422,7 +3422,7 @@ mod tests {
                 code: kept,
                 message,
                 help,
-            } = &rejection.error
+            } = rejection.error.as_ref()
             else {
                 panic!("{code}: {}", rejection.error);
             };
@@ -3697,7 +3697,7 @@ mod tests {
             let error = classify_relay_message_error("access ended", Some(code));
             assert_eq!(error.retry_class, RetryClass::Permanent, "code={code}");
             assert!(
-                matches!(&error.error, LpmError::TunnelAccess { code: kept, .. } if kept == code),
+                matches!(error.error.as_ref(), LpmError::TunnelAccess { code: kept, .. } if kept == code),
                 "code={code}: {}",
                 error.error
             );
@@ -5197,7 +5197,7 @@ mod tests {
     async fn relay_websocket_close_preempts_a_full_frame_queue() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         let budget = Arc::new(tokio::sync::Semaphore::new(2));
-        for byte in [b'a', b'b'] {
+        for byte in *b"ab" {
             tx.send(LocalWebSocketCommand::Frame {
                 data: vec![byte],
                 is_binary: true,

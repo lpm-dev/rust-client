@@ -409,6 +409,10 @@ async fn redirect_http_request_inner(
         .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "").into_response())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Ok and Err are both a Response, so boxing Err would not make the Result smaller"
+)]
 pub(crate) async fn proxy_http_request_inner(
     state: Arc<HttpProxyState>,
     request: axum::extract::Request,
@@ -512,6 +516,10 @@ pub(crate) async fn proxy_http_request_inner(
         .map_err(|_| (StatusCode::BAD_GATEWAY, "failed to build proxy response").into_response())
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Ok and Err are both a Response, so boxing Err would not make the Result smaller"
+)]
 async fn proxy_upgrade_request(
     mut request: axum::extract::Request,
     upstream: lpm_common::LocalTarget,

@@ -73,8 +73,9 @@ pub use bounded_read::{
 };
 pub use command_name::{PortableCommandNameError, validate_portable_command_name};
 pub use error::{
-    ArtifactUnavailableErrorContext, ArtifactUnavailableKind, LpmError, ResolutionErrorContext,
-    ResolutionFailureKind, TyposquatErrorContext, TyposquatErrorFinding,
+    ArtifactUnavailableErrorContext, ArtifactUnavailableKind, EngineMismatchErrorContext, LpmError,
+    NpmFirewallBlockedErrorContext, ResolutionErrorContext, ResolutionFailureKind,
+    SecurityApprovalRequiredErrorContext, TyposquatErrorContext, TyposquatErrorFinding,
 };
 pub use global_fs::{GlobalInstallDirectory, GlobalInstallsDirectory, GlobalStateDirectories};
 pub use integrity::Integrity;

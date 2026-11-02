@@ -174,10 +174,8 @@ fn runtime_source_analysis_disable_requires_project_unlock_when_posture_is_enabl
         assert_eq!(error.error_code(), "security_approval_required");
         assert!(matches!(
             error,
-            LpmError::SecurityApprovalRequired {
-                ref requested_scopes,
-                ..
-            } if requested_scopes == &["source-analysis-disable"]
+            LpmError::SecurityApprovalRequired(ref approval)
+                if approval.requested_scopes == ["source-analysis-disable"]
         ));
     });
 }
@@ -1235,10 +1233,8 @@ fn runtime_firewall_config_downgrade_requires_project_unlock() {
         assert_eq!(err.error_code(), "security_approval_required");
         assert!(matches!(
             err,
-            LpmError::SecurityApprovalRequired {
-                ref requested_scopes,
-                ..
-            } if requested_scopes == &["firewall-disable"]
+            LpmError::SecurityApprovalRequired(ref approval)
+                if approval.requested_scopes == ["firewall-disable"]
         ));
     });
 }
@@ -1389,14 +1385,10 @@ fn runtime_cli_approval_for_global_install_suggests_global_unlock() {
                 .unwrap_err();
 
                 match err {
-                    LpmError::SecurityApprovalRequired {
-                        project_root,
-                        suggested_command,
-                        ..
-                    } => {
-                        assert_eq!(project_root, None);
+                    LpmError::SecurityApprovalRequired(approval) => {
+                        assert_eq!(approval.project_root, None);
                         assert_eq!(
-                            suggested_command.as_deref(),
+                            approval.suggested_command.as_deref(),
                             Some("lpm security unlock cooldown-bypass --global --ttl 10m")
                         );
                     }

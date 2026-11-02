@@ -670,7 +670,7 @@ fn hash_lockfile_graph(lockfile: &lpm_lockfile::Lockfile) -> String {
 /// entries these are the bytes the earlier string records hashed.
 fn hash_environment(environment: &super::sandbox_env::ChildEnvironment) -> String {
     let mut records = environment.iter().collect::<Vec<_>>();
-    records.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    records.sort_unstable_by_key(|(left, _)| *left);
     hash_records(records.into_iter().map(|(name, value)| {
         let (name, value) = (name.as_encoded_bytes(), value.as_encoded_bytes());
         let mut record = Vec::with_capacity(name.len() + value.len() + 1);

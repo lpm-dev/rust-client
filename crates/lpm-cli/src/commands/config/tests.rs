@@ -549,10 +549,8 @@ async fn firewall_wizard_set_rejects_disable_when_approved_posture_requires_enfo
     assert_eq!(err.error_code(), "security_approval_required");
     assert!(matches!(
         err,
-        LpmError::SecurityApprovalRequired {
-            ref requested_scopes,
-            ..
-        } if requested_scopes == &["firewall-disable"]
+        LpmError::SecurityApprovalRequired(ref approval)
+            if approval.requested_scopes == ["firewall-disable"]
     ));
     assert_eq!(
         read_firewall_mode(&path).unwrap(),

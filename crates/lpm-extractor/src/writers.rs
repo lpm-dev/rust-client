@@ -34,7 +34,7 @@ struct WriterAdmission(&'static AtomicUsize);
 impl WriterAdmission {
     fn acquire(active: &'static AtomicUsize, capacity: usize) -> Option<Arc<Self>> {
         active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < capacity).then_some(count + 1)
             })
             .ok()

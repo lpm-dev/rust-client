@@ -295,7 +295,7 @@ impl MetadataFetchTelemetry {
         let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
         let _ =
             self.semaphore_wait_ns
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                     Some(current.saturating_add(elapsed_ns))
                 });
     }

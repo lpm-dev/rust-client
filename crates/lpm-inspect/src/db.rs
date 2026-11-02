@@ -273,7 +273,7 @@ impl InspectorDb {
         let retained_bytes = webhook.retained_size_bytes();
         if self
             .queued_capture_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |queued| {
                 queued
                     .checked_add(retained_bytes)
                     .filter(|next| *next <= WRITE_QUEUE_BYTE_BUDGET)

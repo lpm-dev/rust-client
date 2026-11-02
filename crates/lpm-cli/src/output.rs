@@ -119,9 +119,8 @@ fn format_json_answer_for_stdout(
 }
 
 fn format_colorized_json(value: &Value) -> String {
-    let capacity = serde_json::to_string(value)
-        .map(|compact| compact.len().saturating_mul(2))
-        .unwrap_or(128);
+    let capacity =
+        serde_json::to_string(value).map_or(128, |compact| compact.len().saturating_mul(2));
     let mut out = String::with_capacity(capacity);
     push_colorized_json(value, 0, &mut out);
     out

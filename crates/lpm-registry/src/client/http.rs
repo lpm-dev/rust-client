@@ -356,7 +356,7 @@ impl HttpClients {
 
                     if self
                         .built_client_sets
-                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                        .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                             (used < MAX_NPMRC_TLS_CLIENT_SETS).then_some(used + 1)
                         })
                         .is_err()

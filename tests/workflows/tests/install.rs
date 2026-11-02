@@ -2960,7 +2960,7 @@ async fn install_single_package_via_mock_registry() {
                 "version": "2.1.3",
                 "dist": {
                     "tarball": format!("{}/tarballs/ms/-/ms-2.1.3.tgz", mock.url()),
-                    "integrity": format!("sha512-placeholder"),
+                    "integrity": "sha512-placeholder",
                 },
                 "dependencies": {}
             }
@@ -17930,7 +17930,7 @@ async fn install_invalidates_freshness_cache_on_lpm_linker_flip() {
                 "version": "2.1.3",
                 "dist": {
                     "tarball": format!("{}/tarballs/ms/-/ms-2.1.3.tgz", mock.url()),
-                    "integrity": format!("sha512-placeholder"),
+                    "integrity": "sha512-placeholder",
                 },
                 "dependencies": {}
             }
@@ -18043,7 +18043,7 @@ async fn install_invalid_lpm_linker_surfaces_through_sync_fast_lane() {
                 "version": "2.1.3",
                 "dist": {
                     "tarball": format!("{}/tarballs/ms/-/ms-2.1.3.tgz", mock.url()),
-                    "integrity": format!("sha512-placeholder"),
+                    "integrity": "sha512-placeholder",
                 },
                 "dependencies": {}
             }

@@ -13,6 +13,8 @@ spec = importlib.util.spec_from_file_location("skill_validator_export", SCRIPT)
 exporter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(exporter)
 
+PINNED_TOOLCHAIN_FILE = '[toolchain]\nchannel = "1.23.4"\ncomponents = ["clippy"]\n'
+
 
 class ProvenanceTests(unittest.TestCase):
     def setUp(self):
@@ -28,7 +30,7 @@ class ProvenanceTests(unittest.TestCase):
         for name in self.inputs:
             path = self.root / name
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(name)
+            path.write_text(PINNED_TOOLCHAIN_FILE if name == "rust-toolchain.toml" else name)
         subprocess.run(["git", "init", "-q", str(self.root)], check=True)
         self.git("config", "user.name", "Test")
         self.git("config", "user.email", "test@example.com")
@@ -58,6 +60,7 @@ class ProvenanceTests(unittest.TestCase):
         provenance = json.loads((self.output / "provenance.json").read_text())
         self.assertEqual(provenance.get("revision"), self.git("rev-parse", "HEAD"))
         self.assertEqual(provenance.get("repository"), "https://github.com/lpm-dev/rust-client.git")
+        self.assertEqual(provenance.get("toolchain"), "1.23.4")
         for name in self.inputs:
             self.assertEqual(provenance["sources"].get(name), hashlib.sha256((self.root / name).read_bytes()).hexdigest())
         for name in ["validator.js", "wasm.js"]:
@@ -69,6 +72,16 @@ class ProvenanceTests(unittest.TestCase):
         sentinel.write_text("preserve")
         (self.root / "Cargo.toml").write_text("changed")
         with self.assertRaisesRegex(SystemExit, "clean"):
+            self.export()
+        self.assertEqual(sentinel.read_text(), "preserve")
+
+    def test_toolchain_without_an_exact_release_refuses_export_without_overwriting_output(self):
+        self.output.mkdir()
+        sentinel = self.output / "validator.js"
+        sentinel.write_text("preserve")
+        (self.root / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "stable"\n')
+        self.git("commit", "-qam", "floating toolchain")
+        with self.assertRaisesRegex(SystemExit, "exact Rust release"):
             self.export()
         self.assertEqual(sentinel.read_text(), "preserve")
 

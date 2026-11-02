@@ -276,13 +276,15 @@ pub(super) fn parse_lpm_worker_error_body(body: &str) -> Option<LpmError> {
             let verdict = json_string_field(&value, "verdict").unwrap_or("unknown");
             let reason = json_string_field(&value, "reason")
                 .unwrap_or("the registry policy refused this download");
-            Some(LpmError::NpmFirewallBlocked {
-                package: package.to_owned(),
-                verdict: verdict.to_owned(),
-                reason: reason.to_owned(),
-                decision_id: json_string_field(&value, "decisionId").map(str::to_owned),
-                match_source: json_string_field(&value, "matchSource").map(str::to_owned),
-            })
+            Some(LpmError::NpmFirewallBlocked(Box::new(
+                lpm_common::NpmFirewallBlockedErrorContext {
+                    package: package.to_owned(),
+                    verdict: verdict.to_owned(),
+                    reason: reason.to_owned(),
+                    decision_id: json_string_field(&value, "decisionId").map(str::to_owned),
+                    match_source: json_string_field(&value, "matchSource").map(str::to_owned),
+                },
+            )))
         }
         "upstream_proxy_entitlement_required" => {
             let message = json_string_field(&value, "message")

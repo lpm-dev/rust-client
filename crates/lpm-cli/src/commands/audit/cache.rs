@@ -305,7 +305,7 @@ fn read_signed_cache(path: &Path, secret: &[u8]) -> io::Result<ProjectAuditCache
     };
     let mut suffix = [0u8; 1];
     file.read_exact(&mut suffix)?;
-    if suffix != [b'}'] || mac.verify_slice(&signature).is_err() {
+    if suffix != *b"}" || mac.verify_slice(&signature).is_err() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "behavioral analysis cache signature is invalid",

@@ -1125,17 +1125,14 @@ fn privileged_service_starts_when_another_program_holds_its_backend_ports() {
 
     // Another program takes the planned backend ports, and the former defaults, after
     // installation and before the service starts.
-    let mut held_ports: Vec<u16> = ["--tls-port", "--http-redirect-port"]
+    let _held: Vec<std::net::TcpListener> = ["--tls-port", "--http-redirect-port"]
         .into_iter()
         .filter_map(|flag| {
             let value = args.iter().position(|arg| *arg == flag)? + 1;
-            args.get(value)?.parse().ok()
+            args.get(value)?.parse::<u16>().ok()
         })
         .filter(|port| *port != 0)
-        .collect();
-    held_ports.extend([9443, 9080]);
-    let _held: Vec<std::net::TcpListener> = held_ports
-        .into_iter()
+        .chain([9443, 9080])
         .filter_map(|port| std::net::TcpListener::bind(("127.0.0.1", port)).ok())
         .collect();
 

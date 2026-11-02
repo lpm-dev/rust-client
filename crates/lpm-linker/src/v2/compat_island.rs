@@ -861,10 +861,7 @@ fn remove_project_compatibility_root(project_dir: &Path) -> Result<(), LpmError>
     if compatibility_root.symlink_metadata().is_ok() {
         remove_node_modules_entry(&compatibility_root, "stale compatibility directory")?;
     }
-    if std::fs::read_dir(&lpm_dir)
-        .map(|mut entries| entries.next().is_none())
-        .unwrap_or(false)
-    {
+    if std::fs::read_dir(&lpm_dir).is_ok_and(|mut entries| entries.next().is_none()) {
         let _ = std::fs::remove_dir(&lpm_dir);
     }
     remove_legacy_project_compatibility_root(project_dir)?;
@@ -1105,14 +1102,10 @@ fn reconcile_compatibility_node_modules(
         let name = entry.file_name().to_string_lossy().into_owned();
         let is_real_dir = path
             .symlink_metadata()
-            .map(|metadata| metadata.is_dir() && !is_symlink_or_junction(&metadata))
-            .unwrap_or(false);
+            .is_ok_and(|metadata| metadata.is_dir() && !is_symlink_or_junction(&metadata));
         if name.starts_with('@') && is_real_dir {
             reconcile_scoped_root_dir(&path, &name, desired)?;
-            if std::fs::read_dir(&path)
-                .map(|mut entries| entries.next().is_none())
-                .unwrap_or(false)
-            {
+            if std::fs::read_dir(&path).is_ok_and(|mut entries| entries.next().is_none()) {
                 let _ = std::fs::remove_dir(&path);
             }
             continue;

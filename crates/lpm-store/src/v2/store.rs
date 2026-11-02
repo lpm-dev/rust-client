@@ -902,8 +902,7 @@ impl Store {
                 Ok(Some(Some(actual))) => actual.content == expected,
                 Ok(Some(None)) => false,
                 Ok(None) => compute_object_tree_integrities(&source_dir)
-                    .map(|actual| actual.content == expected)
-                    .unwrap_or(false),
+                    .is_ok_and(|actual| actual.content == expected),
                 Err(error) => {
                     tracing::debug!(
                         target = %source_dir.display(),

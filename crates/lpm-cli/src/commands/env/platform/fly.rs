@@ -535,10 +535,7 @@ pub(super) fn fly_api_url() -> Result<String, LpmError> {
 
 fn authorization_header(token: &str) -> Result<HeaderValue, LpmError> {
     let mut token = token.trim();
-    loop {
-        let Some((scheme, value)) = token.split_once(' ') else {
-            break;
-        };
+    while let Some((scheme, value)) = token.split_once(' ') {
         if !scheme.eq_ignore_ascii_case("bearer") && !scheme.eq_ignore_ascii_case("flyv1") {
             break;
         }

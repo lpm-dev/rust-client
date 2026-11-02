@@ -431,7 +431,7 @@ pub fn audit_log_path() -> Result<PathBuf, LpmError> {
 pub fn append(action: AuditAction) -> Result<(), LpmError> {
     #[cfg(test)]
     if FAIL_APPEND_COUNTDOWN
-        .fetch_update(
+        .try_update(
             std::sync::atomic::Ordering::SeqCst,
             std::sync::atomic::Ordering::SeqCst,
             |remaining| match remaining {
