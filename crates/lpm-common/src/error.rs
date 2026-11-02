@@ -131,6 +131,37 @@ impl ArtifactUnavailableErrorContext {
     }
 }
 
+/// The engine a project requires and the version that ran, for an
+/// `engines` constraint the install or run refused.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct EngineMismatchErrorContext {
+    pub engine: String,
+    pub required: String,
+    pub actual: String,
+    pub from: String,
+}
+
+/// A security weakening that needs explicit approval, with the scopes and the
+/// command that grants it.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SecurityApprovalRequiredErrorContext {
+    pub message: String,
+    pub requested_scopes: Vec<String>,
+    pub project_root: Option<String>,
+    pub suggested_command: Option<String>,
+}
+
+/// Structured context for a package the LPM firewall blocked, with the
+/// decision a support request can name.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct NpmFirewallBlockedErrorContext {
+    pub package: String,
+    pub verdict: String,
+    pub reason: String,
+    pub decision_id: Option<String>,
+    pub match_source: Option<String>,
+}
+
 impl fmt::Display for ArtifactUnavailableErrorContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
@@ -463,18 +494,12 @@ pub enum LpmError {
     )]
     Forbidden(String),
 
-    #[error("LPM firewall blocked {package} (verdict: {verdict}): {reason}")]
+    #[error("LPM firewall blocked {} (verdict: {}): {}", .0.package, .0.verdict, .0.reason)]
     #[diagnostic(
         code(lpm::npm_firewall_blocked),
         help("Review the package security report or contact LPM support with the decision ID.")
     )]
-    NpmFirewallBlocked {
-        package: String,
-        verdict: String,
-        reason: String,
-        decision_id: Option<String>,
-        match_source: Option<String>,
-    },
+    NpmFirewallBlocked(Box<NpmFirewallBlockedErrorContext>),
 
     #[error("LPM npm firewall access denied: {message}")]
     #[diagnostic(
@@ -695,7 +720,7 @@ pub enum LpmError {
     #[diagnostic(code(lpm::env_generation), help("{help}"))]
     EnvGeneration { reason: String, help: &'static str },
 
-    #[error("{engine} version {actual} does not satisfy required {required} (from {from})")]
+    #[error("{} version {} does not satisfy required {} (from {})", .0.engine, .0.actual, .0.required, .0.from)]
     #[diagnostic(
         code(lpm::engine_mismatch),
         help(
@@ -704,14 +729,9 @@ pub enum LpmError {
              the check."
         )
     )]
-    EngineMismatch {
-        engine: String,
-        required: String,
-        actual: String,
-        from: String,
-    },
+    EngineMismatch(Box<EngineMismatchErrorContext>),
 
-    #[error("{engine} version {actual} does not satisfy required {required} (from {from})")]
+    #[error("{} version {} does not satisfy required {} (from {})", .0.engine, .0.actual, .0.required, .0.from)]
     #[diagnostic(
         code(lpm::engine_mismatch),
         help(
@@ -720,12 +740,7 @@ pub enum LpmError {
              ~/.lpm/config.toml to skip the check."
         )
     )]
-    RunEngineMismatch {
-        engine: String,
-        required: String,
-        actual: String,
-        from: String,
-    },
+    RunEngineMismatch(Box<EngineMismatchErrorContext>),
 
     /// `lpm self-update` is in cooldown after a previous failed probe.
     /// Distinct from `Network` because the failure isn't a live network
@@ -805,17 +820,12 @@ pub enum LpmError {
     )]
     SecurityApprovalStore(String),
 
-    #[error("security approval required: {message}")]
+    #[error("security approval required: {}", .0.message)]
     #[diagnostic(
         code(lpm::security_approval_required),
         help("Approve the requested weakening explicitly, then retry the original command.")
     )]
-    SecurityApprovalRequired {
-        message: String,
-        requested_scopes: Vec<String>,
-        project_root: Option<String>,
-        suggested_command: Option<String>,
-    },
+    SecurityApprovalRequired(Box<SecurityApprovalRequiredErrorContext>),
 }
 
 /// Relay codes that mean the account can't run a tunnel.
@@ -885,7 +895,7 @@ impl LpmError {
             LpmError::OtpInvalid { .. } => "otp_invalid",
             LpmError::ConfirmationRequired { .. } => "confirmation_required",
             LpmError::Forbidden(_) => "forbidden",
-            LpmError::NpmFirewallBlocked { .. } => "npm_firewall_blocked",
+            LpmError::NpmFirewallBlocked(_) => "npm_firewall_blocked",
             LpmError::NpmFirewallEntitlementRequired { .. } => "npm_firewall_entitlement_required",
             LpmError::UpstreamProxyEntitlementRequired { .. } => {
                 "upstream_proxy_entitlement_required"
@@ -921,16 +931,14 @@ impl LpmError {
             LpmError::EnvValidation(_) => "env_validation",
             LpmError::EnvProjectRefused(_) => "env_project_refused",
             LpmError::EnvGeneration { .. } => "env_generation",
-            LpmError::EngineMismatch { .. } | LpmError::RunEngineMismatch { .. } => {
-                "engine_mismatch"
-            }
+            LpmError::EngineMismatch(_) | LpmError::RunEngineMismatch(_) => "engine_mismatch",
             LpmError::SelfUpdatePaused(_) => "self_update_paused",
             LpmError::SelfUpdateRateLimited(_) => "self_update_rate_limited",
             LpmError::ProvenanceVerification(_) => "provenance_verification",
             LpmError::SelfUpdate(_) => "self_update",
             LpmError::SecurityFloor(_) => "security_floor",
             LpmError::SecurityApprovalStore(_) => "security_approval_store",
-            LpmError::SecurityApprovalRequired { .. } => "security_approval_required",
+            LpmError::SecurityApprovalRequired(_) => "security_approval_required",
         }
     }
 }
@@ -1024,12 +1032,12 @@ mod tests {
 
     #[test]
     fn run_engine_mismatch_help_uses_supported_configuration_opt_outs() {
-        let err = LpmError::RunEngineMismatch {
+        let err = LpmError::RunEngineMismatch(Box::new(EngineMismatchErrorContext {
             engine: "node".into(),
             required: ">=20".into(),
             actual: "18.0.0".into(),
             from: "package.json > engines.node".into(),
-        };
+        }));
         let help = err.help().unwrap().to_string();
 
         assert!(!help.contains("--no-engine-strict"), "help: {help}");
@@ -1146,13 +1154,13 @@ mod tests {
                 has_passkey: true,
             },
             LpmError::Forbidden("x".into()),
-            LpmError::NpmFirewallBlocked {
+            LpmError::NpmFirewallBlocked(Box::new(NpmFirewallBlockedErrorContext {
                 package: "is-number@7.0.0".into(),
                 verdict: "malicious".into(),
                 reason: "product_default policy maps malicious to block".into(),
                 decision_id: Some("decision-1".into()),
                 match_source: Some("package".into()),
-            },
+            })),
             LpmError::NpmFirewallEntitlementRequired {
                 message: "A Pro account or active org membership is required.".into(),
                 reason: Some("personal_plan_not_eligible".into()),
@@ -1208,18 +1216,18 @@ mod tests {
                 specifier: "catalog:shared".into(),
             },
             LpmError::EnvValidation("x".into()),
-            LpmError::EngineMismatch {
+            LpmError::EngineMismatch(Box::new(EngineMismatchErrorContext {
                 engine: "lpm".into(),
                 required: ">=1.0.0".into(),
                 actual: "0.32.0".into(),
                 from: "package.json > engines.lpm".into(),
-            },
-            LpmError::RunEngineMismatch {
+            })),
+            LpmError::RunEngineMismatch(Box::new(EngineMismatchErrorContext {
                 engine: "node".into(),
                 required: ">=20".into(),
                 actual: "18.0.0".into(),
                 from: "package.json > engines.node".into(),
-            },
+            })),
             LpmError::SelfUpdatePaused("x".into()),
             LpmError::SelfUpdateRateLimited("x".into()),
             LpmError::SecurityFloor("x".into()),
@@ -1370,13 +1378,13 @@ mod tests {
         );
         assert_eq!(LpmError::Forbidden("x".into()).error_code(), "forbidden");
         assert_eq!(
-            LpmError::NpmFirewallBlocked {
+            LpmError::NpmFirewallBlocked(Box::new(NpmFirewallBlockedErrorContext {
                 package: "is-number@7.0.0".into(),
                 verdict: "malicious".into(),
                 reason: "product_default policy maps malicious to block".into(),
                 decision_id: Some("decision-1".into()),
                 match_source: Some("package".into()),
-            }
+            }))
             .error_code(),
             "npm_firewall_blocked"
         );
@@ -1453,22 +1461,22 @@ mod tests {
             "env_validation"
         );
         assert_eq!(
-            LpmError::EngineMismatch {
+            LpmError::EngineMismatch(Box::new(EngineMismatchErrorContext {
                 engine: "lpm".into(),
                 required: ">=1.0.0".into(),
                 actual: "0.32.0".into(),
                 from: "package.json > engines.lpm".into(),
-            }
+            }))
             .error_code(),
             "engine_mismatch"
         );
         assert_eq!(
-            LpmError::RunEngineMismatch {
+            LpmError::RunEngineMismatch(Box::new(EngineMismatchErrorContext {
                 engine: "node".into(),
                 required: ">=20".into(),
                 actual: "18.0.0".into(),
                 from: "package.json > engines.node".into(),
-            }
+            }))
             .error_code(),
             "engine_mismatch"
         );

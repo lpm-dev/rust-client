@@ -422,21 +422,16 @@ fn json_error_value(error: &lpm_common::LpmError) -> serde_json::Value {
                 "suggested_command": context.suggested_command,
             }
         }),
-        lpm_common::LpmError::SecurityApprovalRequired {
-            message,
-            requested_scopes,
-            project_root,
-            suggested_command,
-        } => serde_json::json!({
+        lpm_common::LpmError::SecurityApprovalRequired(approval) => serde_json::json!({
             "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
             "success": false,
             "error_code": "security_approval_required",
             "error": {
                 "code": "SECURITY_APPROVAL_REQUIRED",
-                "message": message,
-                "requested_scopes": requested_scopes,
-                "project_root": project_root,
-                "suggested_command": suggested_command,
+                "message": approval.message,
+                "requested_scopes": approval.requested_scopes,
+                "project_root": approval.project_root,
+                "suggested_command": approval.suggested_command,
             }
         }),
         lpm_common::LpmError::PoolAttributionUnconfirmed { reason } => serde_json::json!({
@@ -503,13 +498,14 @@ fn next_steps_for_error(error: &lpm_common::LpmError) -> Option<serde_json::Valu
                 crate::json_contract::command_next_steps("Install the suggested package", command)
             })
         }
-        lpm_common::LpmError::SecurityApprovalRequired {
-            suggested_command: Some(command),
-            ..
-        } => Some(crate::json_contract::command_next_steps(
-            "Approve the requested security change",
-            command,
-        )),
+        lpm_common::LpmError::SecurityApprovalRequired(approval) => {
+            approval.suggested_command.as_deref().map(|command| {
+                crate::json_contract::command_next_steps(
+                    "Approve the requested security change",
+                    command,
+                )
+            })
+        }
         _ => None,
     }
 }
@@ -794,13 +790,14 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         lpm_common::LpmError::Forbidden(reason) => {
             diagnostic_lines("Forbidden", Some(reason), error)
         }
-        lpm_common::LpmError::NpmFirewallBlocked {
-            package,
-            verdict,
-            reason,
-            decision_id,
-            match_source,
-        } => {
+        lpm_common::LpmError::NpmFirewallBlocked(blocked) => {
+            let lpm_common::NpmFirewallBlockedErrorContext {
+                package,
+                verdict,
+                reason,
+                decision_id,
+                match_source,
+            } = blocked.as_ref();
             let mut lines = vec![
                 SlimErrorLine::Failed(install_ui::terminal_line!(
                     "Firewall blocked {}",
@@ -1013,18 +1010,14 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         lpm_common::LpmError::EnvGeneration { reason, .. } => {
             diagnostic_lines("Environment generation failed", Some(reason), error)
         }
-        lpm_common::LpmError::EngineMismatch {
-            engine,
-            required,
-            actual,
-            from,
-        }
-        | lpm_common::LpmError::RunEngineMismatch {
-            engine,
-            required,
-            actual,
-            from,
-        } => {
+        lpm_common::LpmError::EngineMismatch(mismatch)
+        | lpm_common::LpmError::RunEngineMismatch(mismatch) => {
+            let lpm_common::EngineMismatchErrorContext {
+                engine,
+                required,
+                actual,
+                from,
+            } = mismatch.as_ref();
             let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
                 "Engine version mismatch",
             ))];
@@ -1053,12 +1046,13 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         lpm_common::LpmError::SecurityApprovalStore(reason) => {
             diagnostic_lines("Security approval store refused", Some(reason), error)
         }
-        lpm_common::LpmError::SecurityApprovalRequired {
-            message,
-            requested_scopes,
-            project_root,
-            suggested_command,
-        } => {
+        lpm_common::LpmError::SecurityApprovalRequired(approval) => {
+            let lpm_common::SecurityApprovalRequiredErrorContext {
+                message,
+                requested_scopes,
+                project_root,
+                suggested_command,
+            } = approval.as_ref();
             let mut lines = vec![SlimErrorLine::Failed(install_ui::TerminalLine::new(
                 "Security approval required",
             ))];
@@ -1476,13 +1470,15 @@ mod tests {
 
     #[test]
     fn slim_error_lines_render_firewall_block_as_contract_rows() {
-        let error = lpm_common::LpmError::NpmFirewallBlocked {
-            package: "is-number@7.0.0".into(),
-            verdict: "malicious".into(),
-            reason: "product_default policy maps malicious to block".into(),
-            decision_id: Some("decision-1".into()),
-            match_source: Some("package".into()),
-        };
+        let error = lpm_common::LpmError::NpmFirewallBlocked(Box::new(
+            lpm_common::NpmFirewallBlockedErrorContext {
+                package: "is-number@7.0.0".into(),
+                verdict: "malicious".into(),
+                reason: "product_default policy maps malicious to block".into(),
+                decision_id: Some("decision-1".into()),
+                match_source: Some("package".into()),
+            },
+        ));
 
         let lines = slim_error_lines(&error);
         let plain: Vec<_> = lines.iter().map(plain_slim_line).collect();
@@ -1685,12 +1681,14 @@ mod tests {
 
     #[test]
     fn slim_error_lines_render_security_approval_context_rows() {
-        let error = lpm_common::LpmError::SecurityApprovalRequired {
-            message: "strict sandbox weakening needs approval".into(),
-            requested_scopes: vec!["sandbox.strict".into(), "network.host".into()],
-            project_root: Some("/repo/app".into()),
-            suggested_command: Some("lpm security unlock sandbox.strict".into()),
-        };
+        let error = lpm_common::LpmError::SecurityApprovalRequired(Box::new(
+            lpm_common::SecurityApprovalRequiredErrorContext {
+                message: "strict sandbox weakening needs approval".into(),
+                requested_scopes: vec!["sandbox.strict".into(), "network.host".into()],
+                project_root: Some("/repo/app".into()),
+                suggested_command: Some("lpm security unlock sandbox.strict".into()),
+            },
+        ));
 
         let lines = slim_error_lines(&error);
         let plain: Vec<_> = lines.iter().map(plain_slim_line).collect();

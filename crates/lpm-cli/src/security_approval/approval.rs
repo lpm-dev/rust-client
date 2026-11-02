@@ -171,12 +171,12 @@ pub fn approval_required_error(
     project_root: Option<String>,
     suggested_command: Option<String>,
 ) -> LpmError {
-    LpmError::SecurityApprovalRequired {
+    LpmError::SecurityApprovalRequired(Box::new(lpm_common::SecurityApprovalRequiredErrorContext {
         message: message.into(),
         requested_scopes,
         project_root,
         suggested_command,
-    }
+    }))
 }
 
 fn approval_required_for_scopes(

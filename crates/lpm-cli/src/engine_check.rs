@@ -724,21 +724,21 @@ impl std::fmt::Display for Mismatch {
 
 impl Mismatch {
     fn into_error(self, engine: &str) -> LpmError {
-        LpmError::EngineMismatch {
+        LpmError::EngineMismatch(Box::new(lpm_common::EngineMismatchErrorContext {
             engine: engine.to_string(),
             required: self.required,
             actual: self.actual,
             from: self.source,
-        }
+        }))
     }
 
     fn into_run_error(self, engine: &str) -> LpmError {
-        LpmError::RunEngineMismatch {
+        LpmError::RunEngineMismatch(Box::new(lpm_common::EngineMismatchErrorContext {
             engine: engine.to_string(),
             required: self.required,
             actual: self.actual,
             from: self.source,
-        }
+        }))
     }
 }
 
@@ -995,15 +995,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let err = enforce_with_root(dir.path(), &pkg, true, true).unwrap_err();
         match err {
-            LpmError::EngineMismatch {
-                engine,
-                required,
-                from,
-                ..
-            } => {
-                assert_eq!(engine, "lpm");
-                assert_eq!(required, ">=999.0.0");
-                assert!(from.contains("engines.lpm"));
+            LpmError::EngineMismatch(mismatch) => {
+                assert_eq!(mismatch.engine, "lpm");
+                assert_eq!(mismatch.required, ">=999.0.0");
+                assert!(mismatch.from.contains("engines.lpm"));
             }
             other => panic!("expected EngineMismatch, got {other:?}"),
         }
@@ -1028,7 +1023,7 @@ mod tests {
         };
         let dir = tempdir().unwrap();
         let err = enforce_with_root(dir.path(), &pkg, true, true).unwrap_err();
-        assert!(matches!(err, LpmError::EngineMismatch { .. }));
+        assert!(matches!(err, LpmError::EngineMismatch(_)));
     }
 
     #[test]
@@ -1055,7 +1050,7 @@ mod tests {
         .unwrap();
 
         let result = enforce(&member, false, true);
-        assert!(matches!(result, Err(LpmError::EngineMismatch { .. })));
+        assert!(matches!(result, Err(LpmError::EngineMismatch(_))));
     }
 
     /// Regression: workspace-root `lpm.engineStrict = false` must
@@ -1115,7 +1110,7 @@ mod tests {
         )
         .unwrap();
         let result = enforce(&member, false, true);
-        assert!(matches!(result, Err(LpmError::EngineMismatch { .. })));
+        assert!(matches!(result, Err(LpmError::EngineMismatch(_))));
     }
 
     /// Regression: `lpm add` into a directory without a `package.json`
