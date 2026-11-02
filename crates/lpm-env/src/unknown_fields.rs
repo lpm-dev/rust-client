@@ -199,12 +199,8 @@ fn unknown_under_all(
 ) -> Option<UnknownField> {
     let mut first = None;
     for schema in schemas {
-        match walk(value, schema, root, parent) {
-            None => return None,
-            Some(found) => {
-                first.get_or_insert(found);
-            }
-        }
+        let found = walk(value, schema, root, parent)?;
+        first.get_or_insert(found);
     }
     first
 }

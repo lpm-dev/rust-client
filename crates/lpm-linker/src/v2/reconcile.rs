@@ -94,17 +94,13 @@ pub(super) fn reconcile_project_node_modules(
         }
         let is_real_dir = path
             .symlink_metadata()
-            .map(|metadata| metadata.is_dir() && !is_symlink_or_junction(&metadata))
-            .unwrap_or(false);
+            .is_ok_and(|metadata| metadata.is_dir() && !is_symlink_or_junction(&metadata));
         if preserve_internal_lpm_dir && name == ".lpm" && is_real_dir {
             continue;
         }
         if name.starts_with('@') && is_real_dir {
             reconcile_scoped_root_dir(&path, &name, &desired)?;
-            if std::fs::read_dir(&path)
-                .map(|mut entries| entries.next().is_none())
-                .unwrap_or(false)
-            {
+            if std::fs::read_dir(&path).is_ok_and(|mut entries| entries.next().is_none()) {
                 let _ = std::fs::remove_dir(&path);
             }
             continue;

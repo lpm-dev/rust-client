@@ -580,8 +580,7 @@ fn all_analysis_caches_readable(package_dirs: HashSet<PathBuf>) -> bool {
 
     let dirs: Vec<PathBuf> = package_dirs.into_iter().collect();
     let threads = std::thread::available_parallelism()
-        .map(|value| value.get())
-        .unwrap_or(4)
+        .map_or(4, |value| value.get())
         .clamp(1, MAX_THREADS);
     let chunk_size = dirs.len().div_ceil(threads);
     let missing = std::sync::atomic::AtomicBool::new(false);

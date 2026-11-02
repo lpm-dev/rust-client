@@ -933,11 +933,10 @@ fn peer_amplification(telemetry: &GraphTelemetry) -> PeerAmplification {
         unique_identities,
         unique_instances,
         additional_peer_instances: unique_instances.saturating_sub(unique_identities),
-        amplification_basis_points: if unique_identities == 0 {
-            0
-        } else {
-            unique_instances.saturating_mul(10_000) / unique_identities
-        },
+        amplification_basis_points: unique_instances
+            .saturating_mul(10_000)
+            .checked_div(unique_identities)
+            .unwrap_or(0),
         peer_context_instances: telemetry.peer_context_instances,
         peer_binding_count: telemetry.peer_binding_count,
     }

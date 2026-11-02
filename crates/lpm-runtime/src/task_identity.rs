@@ -391,9 +391,7 @@ mod tests {
     }
 
     fn probes(bin: &Path) -> usize {
-        std::fs::read_to_string(bin.join("probes"))
-            .map(|probes| probes.lines().count())
-            .unwrap_or(0)
+        std::fs::read_to_string(bin.join("probes")).map_or(0, |probes| probes.lines().count())
     }
 
     fn scope(root: &Path) -> TaskRuntimeScope<'_> {

@@ -104,7 +104,7 @@ impl PackageInstanceId {
             return Err("package instance id must be 64 lowercase hexadecimal characters".into());
         }
         let mut bytes = [0_u8; 32];
-        for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let Some(high) = lower_hex_value(pair[0]) else {
                 return Err(
                     "package instance id must be 64 lowercase hexadecimal characters".into(),

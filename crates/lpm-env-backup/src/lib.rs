@@ -174,7 +174,7 @@ mod tests {
             br#"{"createdAt":1761171075,"producer":{"name":"LPM Vault","version":"1.4.0"},"projects":[]}"#
         );
         let mut record = vec![4];
-        record.extend_from_slice(&[b'b', b'2'].repeat(32));
+        record.extend_from_slice(&b"b2".repeat(32));
         assert_eq!(split.keys(), record);
         let (bytes, payload, keys) = split.into_plaintext();
         assert_eq!(bytes.len(), bytes.capacity());

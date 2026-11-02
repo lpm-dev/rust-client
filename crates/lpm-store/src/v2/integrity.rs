@@ -312,14 +312,11 @@ pub(crate) fn is_complete_object_dir(dir: &Path) -> bool {
 
 fn is_real_directory(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
-        .map(|metadata| metadata.is_dir() && !lpm_common::is_symlink_or_junction(&metadata))
-        .unwrap_or(false)
+        .is_ok_and(|metadata| metadata.is_dir() && !lpm_common::is_symlink_or_junction(&metadata))
 }
 
 pub(crate) fn is_regular_file_no_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|metadata| metadata.file_type().is_file())
-        .unwrap_or(false)
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
 }
 
 pub(crate) fn object_metadata_dir(dir: &Path) -> Result<PathBuf, LpmError> {

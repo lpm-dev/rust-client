@@ -216,9 +216,7 @@ async fn kill_during_source_copy_is_recovered_before_remove() {
     let target = project.path().join("vendor/output");
     let mut copied = 0;
     while std::time::Instant::now() < deadline {
-        copied = std::fs::read_dir(&target)
-            .map(|entries| entries.count())
-            .unwrap_or(0);
+        copied = std::fs::read_dir(&target).map_or(0, |entries| entries.count());
         if copied >= 3 {
             break;
         }

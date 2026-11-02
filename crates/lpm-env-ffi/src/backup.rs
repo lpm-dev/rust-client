@@ -405,7 +405,7 @@ mod tests {
             record[1..33],
             [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef].repeat(4)
         );
-        assert_eq!(&record[33..], [b'a', b'1'].repeat(32));
+        assert_eq!(&record[33..], b"a1".repeat(32));
 
         let plain = seal(PAYLOAD, PASSPHRASE).data().to_vec();
         let (opened, payload, keys) = open_split(&plain, PASSPHRASE);

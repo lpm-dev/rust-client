@@ -325,7 +325,7 @@ impl TrustedDependencies {
                     .iter()
                     .filter(|(key, _)| rich_key_matches_coordinate(key, name, version))
                     .collect();
-                candidates.sort_by(|(left, _), (right, _)| left.cmp(right));
+                candidates.sort_by_key(|(left, _)| *left);
                 for (_, stored) in &candidates {
                     if binding_matches_query(stored, integrity, script_hash) {
                         return TrustMatch::Strict;

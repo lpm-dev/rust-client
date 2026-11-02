@@ -272,13 +272,9 @@ impl TrustRoot {
                     continue;
                 }
                 saw_active = true;
-                match w.end {
-                    // Open-ended active entry → role has no retirement anchor.
-                    None => return None,
-                    Some(end) => {
-                        latest = Some(latest.map_or(end, |l| l.max(end)));
-                    }
-                }
+                // Open-ended active entry → role has no retirement anchor.
+                let end = w.end?;
+                latest = Some(latest.map_or(end, |l| l.max(end)));
             }
             if saw_active { latest } else { None }
         }

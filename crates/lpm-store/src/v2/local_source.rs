@@ -100,24 +100,24 @@ fn hash_local_source_metadata(
         source_path.push(&entry.name);
         let file_type = entry.metadata.file_type();
         if file_type.is_dir() {
-            hasher.update([b'd']);
+            hasher.update(*b"d");
             hash_local_source_metadata(&source_path, hasher, depth + 1)?;
         } else if file_type.is_file() {
-            hasher.update([b'f']);
+            hasher.update(*b"f");
             hash_unix_file_metadata(hasher, &entry.metadata);
         } else if file_type.is_symlink() {
-            hasher.update([b'l']);
+            hasher.update(*b"l");
             hash_unix_file_metadata(hasher, &entry.metadata);
             let resolved = source_path
                 .canonicalize()
                 .unwrap_or_else(|_| source_path.clone());
             match std::fs::metadata(&resolved) {
                 Ok(metadata) if metadata.is_file() => {
-                    hasher.update([b'f']);
+                    hasher.update(*b"f");
                     hash_unix_file_metadata(hasher, &metadata);
                 }
                 _ => {
-                    hasher.update([b'l']);
+                    hasher.update(*b"l");
                     let target = resolved.as_os_str().as_bytes();
                     hasher.update(
                         u64::try_from(target.len())
@@ -128,7 +128,7 @@ fn hash_local_source_metadata(
                 }
             }
         } else {
-            hasher.update([b'o']);
+            hasher.update(*b"o");
             hash_unix_file_metadata(hasher, &entry.metadata);
         }
         source_path.pop();

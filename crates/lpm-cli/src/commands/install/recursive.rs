@@ -314,8 +314,7 @@ pub(crate) async fn run_recursive_workspace_install(
         let resolution_concurrency = automatic_workspace_resolution_concurrency(
             targets.len(),
             std::thread::available_parallelism()
-                .map(NonZeroUsize::get)
-                .unwrap_or(WORKSPACE_INSTALL_DEFAULT_CONCURRENCY),
+                .map_or(WORKSPACE_INSTALL_DEFAULT_CONCURRENCY, NonZeroUsize::get),
         );
         tracing::debug!(
             concurrency,
@@ -773,8 +772,7 @@ fn resolve_workspace_install_concurrency(
     let configured = explicit_workspace_install_concurrency(cli_override);
     let limit = configured.unwrap_or_else(|| {
         let available_parallelism = std::thread::available_parallelism()
-            .map(NonZeroUsize::get)
-            .unwrap_or(WORKSPACE_INSTALL_DEFAULT_CONCURRENCY);
+            .map_or(WORKSPACE_INSTALL_DEFAULT_CONCURRENCY, NonZeroUsize::get);
         automatic_workspace_install_concurrency(
             target_count,
             automatic_parallel,

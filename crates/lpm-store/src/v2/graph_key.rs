@@ -592,7 +592,7 @@ fn write_exact_targets_hash(
     hasher.update(label);
     hasher.update(b"=");
     let mut sorted = targets.iter().collect::<Vec<_>>();
-    sorted.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    sorted.sort_unstable_by_key(|(left, _)| *left);
     for (index, (local, target)) in sorted.into_iter().enumerate() {
         if index > 0 {
             hasher.update(b",");

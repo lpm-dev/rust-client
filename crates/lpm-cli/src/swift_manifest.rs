@@ -906,10 +906,7 @@ pub fn remove_registry_dependencies(
     for se0292_id in se0292_ids {
         validate_registry_identity(se0292_id)?;
         let mut removal = ManifestRemoval::default();
-        loop {
-            let Some(array) = find_package_argument_array(&content, "dependencies") else {
-                break;
-            };
+        while let Some(array) = find_package_argument_array(&content, "dependencies") {
             let Some(call) = direct_calls_in_array(&content, array)
                 .into_iter()
                 .find(|call| {
@@ -924,10 +921,7 @@ pub fn remove_registry_dependencies(
             removal.removed = true;
         }
 
-        loop {
-            let Some(targets) = find_package_argument_array(&content, "targets") else {
-                break;
-            };
+        while let Some(targets) = find_package_argument_array(&content, "targets") {
             let mut matching = None;
             for target in direct_calls_in_array(&content, targets) {
                 let Some(dependencies) =

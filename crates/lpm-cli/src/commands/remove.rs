@@ -1758,9 +1758,8 @@ fn quarantine_and_prune_owned_directory(
             return Ok(false);
         }
     };
-    let same_identity = directory_identity(&quarantined)
-        .map(|identity| identity == expected_identity)
-        .unwrap_or(false);
+    let same_identity =
+        directory_identity(&quarantined).is_ok_and(|identity| identity == expected_identity);
     let empty = quarantined
         .entries()
         .and_then(|mut entries| entries.next().transpose().map(|entry| entry.is_none()))

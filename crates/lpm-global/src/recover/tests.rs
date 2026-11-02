@@ -42,7 +42,7 @@ fn make_complete_install_root(install_root: &Path, commands: &[&str]) {
 
 fn intent_install(tx_id: &str, package: &str, new_root: &Path, commands: &[&str]) -> WalRecord {
     let new_row = serde_json::json!({
-        "saved_spec": format!("^1"),
+        "saved_spec": "^1",
         "resolved": "1.0.0",
         "integrity": "sha512-x",
         "source": "lpm-dev",

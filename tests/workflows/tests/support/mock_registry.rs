@@ -606,7 +606,7 @@ impl Respond for ProjectTokenReplacementSequence {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         if self
             .failures_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()
@@ -625,7 +625,7 @@ impl Respond for ProjectTokenRetirementSequence {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         if self
             .failures_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()

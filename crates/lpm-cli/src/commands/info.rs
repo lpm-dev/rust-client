@@ -191,7 +191,7 @@ fn print_field(label: &'static str, value: &str) {
 
 fn print_name_value_rows(values: &std::collections::HashMap<String, String>) {
     let mut rows: Vec<_> = values.iter().collect();
-    rows.sort_by(|(left, _), (right, _)| left.cmp(right));
+    rows.sort_by_key(|(left, _)| *left);
     let width = rows.iter().map(|(name, _)| name.len()).max().unwrap_or(0);
     for (name, value) in rows {
         let name = format!("{name:<width$}");
