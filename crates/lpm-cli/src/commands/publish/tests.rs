@@ -1,8 +1,9 @@
 use super::orchestrator::lpm_package_url;
 use super::output::{
     format_dry_run_files_value, format_lpm_publication_notice,
-    format_multi_publish_success_summary, format_publish_retry_detail,
-    format_single_publish_success_summary, publish_check_json, publish_result_json,
+    format_multi_publish_partial_summary, format_multi_publish_success_summary,
+    format_publish_retry_detail, format_single_publish_success_summary, publish_check_json,
+    publish_result_json,
 };
 use super::prepare::{
     MAX_PUBLISH_TARBALL_BYTES, prepare_publish_project_from_manifest, read_publish_manifest,
@@ -830,6 +831,39 @@ fn pending_review_multi_target_summary_does_not_claim_full_publication() {
     assert_eq!(
         summary,
         "Done · completed 2 registry uploads in 10ms; LPM.dev Registry publication review pending"
+    );
+}
+
+#[test]
+fn processing_messages_say_the_version_is_not_available_yet_without_claiming_review() {
+    let status = LpmPublicationStatus::Processing;
+    let plain =
+        |line: crate::install_ui::TerminalLine| console::strip_ansi_codes(&line).into_owned();
+
+    assert_eq!(
+        plain(format_lpm_publication_notice(&status).unwrap()),
+        "Upload succeeded. The version is not available on LPM.dev Registry yet."
+    );
+    assert_eq!(
+        plain(format_single_publish_success_summary(
+            "@lpm.dev/acme.widget",
+            "1.0.0",
+            "10ms",
+            Some(&status),
+        )),
+        "Done · uploaded @lpm.dev/acme.widget@1.0.0 in 10ms; version is not available yet"
+    );
+    assert_eq!(
+        plain(format_multi_publish_success_summary(
+            2,
+            "10ms",
+            Some(&status)
+        )),
+        "Done · completed 2 registry uploads in 10ms; LPM.dev version is not available yet"
+    );
+    assert_eq!(
+        plain(format_multi_publish_partial_summary(1, 2, Some(&status))),
+        "Completed 1 of 2 registry uploads. The LPM.dev version is not available yet."
     );
 }
 
