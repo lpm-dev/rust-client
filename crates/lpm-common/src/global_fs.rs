@@ -256,11 +256,13 @@ fn contextual_io_error(
 
 #[cfg(test)]
 mod tests {
-    use super::{GlobalInstallsDirectory, GlobalStateDirectories};
+    use super::GlobalInstallsDirectory;
     use crate::LpmRoot;
     use std::ffi::OsStr;
     use tempfile::TempDir;
 
+    #[cfg(unix)]
+    use super::GlobalStateDirectories;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 

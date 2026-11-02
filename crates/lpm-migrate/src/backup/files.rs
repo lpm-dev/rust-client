@@ -131,6 +131,13 @@ fn copy_bounded(source: &mut File, destination: &mut File) -> Result<(), LpmErro
     Ok(())
 }
 
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Unix syncs the directory, which can fail"
+    )
+)]
 fn sync_directory(directory: &Dir) -> Result<(), LpmError> {
     #[cfg(unix)]
     // Reopen through the capability: Linux O_PATH descriptors cannot be synced.

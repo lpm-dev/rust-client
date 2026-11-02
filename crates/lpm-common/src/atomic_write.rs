@@ -399,6 +399,10 @@ fn capability_destination_mode(
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which reads the destination mode"
+)]
 fn capability_destination_mode(
     _directory: &cap_std::fs::Dir,
     _destination: &OsStr,
@@ -472,6 +476,10 @@ fn set_capability_file_mode(file: &cap_std::fs::File, mode: u32) -> io::Result<(
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which sets the file mode"
+)]
 fn set_capability_file_mode(_file: &cap_std::fs::File, _mode: u32) -> io::Result<()> {
     Ok(())
 }
@@ -743,6 +751,10 @@ fn destination_mode(path: &Path, options: AtomicWriteOptions) -> io::Result<Opti
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which reads the destination mode"
+)]
 fn destination_mode(_path: &Path, _options: AtomicWriteOptions) -> io::Result<Option<u32>> {
     Ok(None)
 }
@@ -894,6 +906,10 @@ fn set_file_mode(file: &File, mode: u32) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which sets the file mode"
+)]
 fn set_file_mode(_file: &File, _mode: u32) -> io::Result<()> {
     Ok(())
 }
@@ -981,6 +997,10 @@ fn sync_parent(parent: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which syncs the parent directory"
+)]
 fn sync_parent(_parent: &Path) -> io::Result<()> {
     Ok(())
 }
