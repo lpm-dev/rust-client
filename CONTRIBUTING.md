@@ -4,10 +4,10 @@ LPM is a security- and performance-sensitive package manager. Contributions shou
 
 ## Development setup
 
-CI uses Rust 1.94.0. Install that toolchain with `rustfmt` and Clippy, plus `cargo-nextest`:
+CI uses Rust 1.99.1, the release `rust-toolchain.toml` pins. Install that toolchain with `rustfmt` and Clippy, plus `cargo-nextest`:
 
 ```bash
-rustup toolchain install 1.94.0 --component rustfmt,clippy
+rustup toolchain install 1.99.1 --component rustfmt,clippy
 cargo install cargo-nextest --locked
 ```
 
@@ -18,7 +18,7 @@ sudo apt-get update
 sudo apt-get install -y pkg-config libdbus-1-dev
 ```
 
-Run Cargo commands below with Rust 1.94.0, either through a directory override or the `cargo +1.94.0` form.
+Run Cargo commands below with Rust 1.99.1. Inside the repository, `rust-toolchain.toml` selects it for you.
 
 ## Testing changes
 

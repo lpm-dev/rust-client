@@ -77,6 +77,17 @@ def header_abi_version(root):
     raise RuntimeError('lpm_env.h does not define LPM_ENV_ABI_VERSION')
 
 
+def pinned_toolchain(root):
+    """The exact Rust release that rust-toolchain.toml pins, which builds the engine and goes in its provenance."""
+    try:
+        channel = tomllib.loads((root / 'rust-toolchain.toml').read_text())['toolchain']['channel']
+    except (OSError, KeyError, TypeError, tomllib.TOMLDecodeError):
+        channel = None
+    if not isinstance(channel, str) or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', channel):
+        raise RuntimeError('rust-toolchain.toml must pin an exact Rust release, such as channel = "1.99.1"')
+    return channel
+
+
 def linked_packages(metadata_by_target):
     """The registry packages linked into lpm-env-ffi for any of the targets: those its
     normal dependencies reach, without proc macros, which only run while compiling."""
@@ -209,6 +220,7 @@ def export_locked(root, target_dir, output):
         if source_hashes(root) != sources:
             raise RuntimeError('Engine sources changed during capture')
         abi_version = header_abi_version(frozen)
+        toolchain = pinned_toolchain(frozen)
         env = {key: value for key, value in os.environ.items() if key in {
             'PATH', 'HOME', 'TMPDIR', 'CARGO_HOME', 'RUSTUP_HOME', 'DEVELOPER_DIR', 'SDKROOT',
         }}
@@ -222,21 +234,21 @@ def export_locked(root, target_dir, output):
         for target in targets:
             if shutil.disk_usage(target_dir).free < 10 * 1024**3:
                 raise RuntimeError('At least 10 GiB free is required on the Cargo target volume')
-            subprocess.run(['cargo', '+1.94.0', 'build', '--locked', '--release', '-p', 'lpm-env-ffi', '--target', target], cwd=frozen, env=env, check=True)
+            subprocess.run(['cargo', '+' + toolchain, 'build', '--locked', '--release', '-p', 'lpm-env-ffi', '--target', target], cwd=frozen, env=env, check=True)
         staging = Path(publication) / 'bundle'
         staging.mkdir()
         library = Path(publication) / 'libLPMEnv.a'
         artifact = staging / 'LPMEnv.xcframework'
         subprocess.run(['lipo', '-create', *[str(target_dir / target / 'release/liblpm_env_ffi.a') for target in targets], '-output', str(library)], env=env, check=True)
-        sysroot = subprocess.check_output(['rustc', '+1.94.0', '--print', 'sysroot'], env=env, text=True).strip()
-        version = subprocess.check_output(['rustc', '+1.94.0', '-vV'], env=env, text=True)
+        sysroot = subprocess.check_output(['rustc', '+' + toolchain, '--print', 'sysroot'], env=env, text=True).strip()
+        version = subprocess.check_output(['rustc', '+' + toolchain, '-vV'], env=env, text=True)
         host = next(line.removeprefix('host: ') for line in version.splitlines() if line.startswith('host: '))
         objcopy = Path(sysroot) / 'lib/rustlib' / host / 'bin/llvm-objcopy'
         subprocess.run([str(objcopy), '--strip-debug', '--enable-deterministic-archives', '--remove-section=__LLVM,__bitcode', '--remove-section=__LLVM,__cmdline', str(library)], env=env, check=True)
         subprocess.run(['xcodebuild', '-create-xcframework', '-library', str(library), '-headers', str(frozen / 'crates/lpm-env-ffi/include'), '-output', str(artifact)], env=env, check=True)
         files = {str(path.relative_to(staging)): file_hash(path) for path in artifact.rglob('*') if path.is_file()}
         # Not offline: metadata resolves every workspace package, beyond what building lpm-env-ffi fetched.
-        metadata = [json.loads(subprocess.check_output(['cargo', '+1.94.0', 'metadata', '--locked', '--format-version', '1', '--filter-platform', target], cwd=frozen, env=env)) for target in targets]
+        metadata = [json.loads(subprocess.check_output(['cargo', '+' + toolchain, 'metadata', '--locked', '--format-version', '1', '--filter-platform', target], cwd=frozen, env=env)) for target in targets]
         licenses = Path(sysroot) / 'share/doc/rust'
         notices = third_party_notices(
             linked_packages(metadata),
@@ -251,7 +263,7 @@ def export_locked(root, target_dir, output):
             bundled.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(fixture, bundled)
             fixtures[str(BUNDLED_FIXTURES / fixture.name)] = file_hash(bundled)
-        provenance = dict(abiVersion=abi_version, toolchain='1.94.0', targets=targets, repository='https://github.com/lpm-dev/rust-client', revision=revision, sources=sources, artifacts=files, notices=file_hash(staging / NOTICES), fixtures=fixtures)
+        provenance = dict(abiVersion=abi_version, toolchain=toolchain, targets=targets, repository='https://github.com/lpm-dev/rust-client', revision=revision, sources=sources, artifacts=files, notices=file_hash(staging / NOTICES), fixtures=fixtures)
         (staging / 'provenance.json').write_text(json.dumps(provenance, indent=2, sort_keys=True) + '\n')
         if source_hashes(root) != sources or subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip() != revision:
             raise RuntimeError('Engine sources changed during export')

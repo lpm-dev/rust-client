@@ -24,7 +24,7 @@ concurrency:
 env:
   # Pin to exact version so CI is deterministic. Bump after running
   # `cargo clippy -- -D warnings` locally and fixing all lints.
-  RUST_TOOLCHAIN: "1.94.0"
+  RUST_TOOLCHAIN: "1.99.1"
   # Keep debug-profile CI builds inside GitHub's hosted-runner disk budget.
   # Incremental artifacts and line-table debuginfo are useful locally, but the
   # workspace nextest job already exercises thousands of test binaries and can
