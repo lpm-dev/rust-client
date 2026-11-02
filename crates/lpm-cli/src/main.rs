@@ -1,3 +1,9 @@
+// Apple's ld notes that a debug lpm-rs's __eh_frame exceeds the 16 MB its
+// compact unwind table can address, which only slows unwinding a panic. Rust
+// reports linker output as a warning since 1.97; release builds stay under the
+// limit and keep every linker message.
+#![cfg_attr(all(target_os = "macos", debug_assertions), allow(linker_messages))]
+
 use miette::Result;
 
 mod added_sources_state;
