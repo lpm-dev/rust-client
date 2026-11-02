@@ -1048,7 +1048,7 @@ pub fn compute_device_fingerprint() -> String {
 }
 
 fn compute_device_fingerprint_after_initial_read(after_initial_read: impl FnOnce()) -> String {
-    use rand::RngCore;
+    use rand::Rng;
     use std::path::{Path, PathBuf};
 
     fn device_id_path() -> Option<PathBuf> {
@@ -1059,7 +1059,7 @@ fn compute_device_fingerprint_after_initial_read(after_initial_read: impl FnOnce
 
     fn generate_random_id() -> String {
         let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         hex::encode(bytes)
     }
 

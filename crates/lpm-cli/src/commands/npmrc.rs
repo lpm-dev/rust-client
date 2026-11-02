@@ -1,7 +1,7 @@
 use crate::install_ui;
 use lpm_common::LpmError;
 use lpm_registry::RegistryClient;
-use rand::RngCore;
+use rand::TryRng;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -831,7 +831,7 @@ fn normalize_registry_url(url: &str) -> String {
 
 fn generate_project_token() -> Result<String, LpmError> {
     let mut bytes = [0_u8; 32];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .map_err(|error| {
             LpmError::Script(format!(
@@ -843,7 +843,7 @@ fn generate_project_token() -> Result<String, LpmError> {
 
 fn generate_uuid_v4() -> Result<String, LpmError> {
     let mut bytes = [0_u8; 16];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .map_err(|error| {
             LpmError::Script(format!(

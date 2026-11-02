@@ -1066,7 +1066,7 @@ fn tree_digest(files: &BTreeMap<PathBuf, Vec<u8>>) -> String {
         hash.update(content);
         hash.update([0]);
     }
-    format!("{:x}", hash.finalize())
+    hex::encode(hash.finalize())
 }
 
 fn agent_slug(agent: AgentTarget) -> &'static str {

@@ -8,10 +8,10 @@
 
 use aes_gcm::{
     Aes256Gcm, KeyInit,
-    aead::{Aead, generic_array::GenericArray},
+    aead::{Aead, Nonce},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use rand::RngCore;
+use rand::Rng;
 use std::path::{Path, PathBuf};
 
 const FIXED_ENCRYPTION_KEY: [u8; 32] = [0x4a; 32];
@@ -206,8 +206,8 @@ fn encrypt_store(value: &serde_json::Value) -> String {
     let cipher = Aes256Gcm::new_from_slice(&key).expect("failed to init cipher");
 
     let mut iv = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut iv);
-    let nonce = GenericArray::from_slice(&iv);
+    rand::rng().fill_bytes(&mut iv);
+    let nonce = <&Nonce<Aes256Gcm>>::from(&iv);
 
     let ciphertext = cipher
         .encrypt(nonce, plaintext.as_bytes())
@@ -234,7 +234,7 @@ fn decrypt_store(encoded: &str) -> serde_json::Value {
 
     let key = derive_key();
     let cipher = Aes256Gcm::new_from_slice(&key).expect("failed to init cipher");
-    let nonce = GenericArray::from_slice(&iv);
+    let nonce = <&Nonce<Aes256Gcm>>::try_from(iv.as_slice()).expect("invalid iv length");
 
     let mut combined = encrypted;
     combined.extend_from_slice(&auth_tag);

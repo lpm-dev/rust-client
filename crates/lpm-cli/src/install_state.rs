@@ -297,7 +297,7 @@ pub fn compute_install_hash_v8(
     hasher.update(object_integrity_policy.as_str().as_bytes());
     hasher.update(b"\x00");
     hasher.update(platform_tuple_key(platform).as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 pub fn compute_install_hash_v9(
@@ -326,7 +326,7 @@ pub fn compute_install_hash_v9(
     hasher.update(base.as_bytes());
     hasher.update(b"\x00");
     hasher.update(dependency_engine_key.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -368,7 +368,7 @@ pub(crate) fn compute_install_hash_v10(
     hasher.update(base.as_bytes());
     hasher.update(b"\0");
     hasher.update(context.security_analysis_policy.as_str().as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn platform_tuple_key(platform: &PlatformTuple) -> String {
@@ -1894,7 +1894,7 @@ mod tests {
             h.update(pkg.as_bytes());
             h.update(b"\x00");
             h.update(lock.as_bytes());
-            format!("{:x}", h.finalize())
+            hex::encode(h.finalize())
         }
         assert_ne!(
             compute_install_hash("pkg", "lock"),

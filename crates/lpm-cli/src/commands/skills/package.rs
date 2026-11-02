@@ -482,7 +482,7 @@ fn push_yaml_string(output: &mut String, value: &str) -> Result<(), LpmError> {
 }
 
 pub(super) fn digest(content: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(content))
+    hex::encode(Sha256::digest(content))
 }
 
 #[cfg(test)]

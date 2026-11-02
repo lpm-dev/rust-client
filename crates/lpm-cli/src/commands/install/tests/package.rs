@@ -416,7 +416,7 @@ fn store_path_source_aware_routes_local_tarball_to_tarball_local_subtree() {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(body);
-        format!("{:x}", h.finalize())
+        hex::encode(h.finalize())
     };
 
     let mut pkg = install_package_for_tarball("file:./foo.tgz", Some(&sri));
@@ -478,7 +478,7 @@ fn store_path_source_aware_local_tarball_sri_override_wins() {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(b"fresh");
-        format!("{:x}", h.finalize())
+        hex::encode(h.finalize())
     };
 
     let mut pkg = install_package_for_tarball("file:./foo.tgz", Some(&stale_sri));

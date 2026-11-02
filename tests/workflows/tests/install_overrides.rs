@@ -224,7 +224,7 @@ fn override_state_fingerprint(entries: &[(&str, &str, &str)]) -> String {
         hasher.update(line.as_bytes());
         hasher.update(b"\n");
     }
-    format!("sha256-{:x}", hasher.finalize())
+    format!("sha256-{}", hex::encode(hasher.finalize()))
 }
 
 async fn mount_force_override_packages(mock: &MockRegistry) {

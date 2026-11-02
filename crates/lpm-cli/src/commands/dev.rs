@@ -1619,9 +1619,9 @@ pub async fn run(
 
         // Generate tunnel auth token if requested (random 32-byte hex, one per session)
         let tunnel_auth_token = if tunnel_auth {
-            use rand::Rng;
+            use rand::RngExt;
             let mut bytes = [0u8; 32];
-            rand::thread_rng().fill(&mut bytes);
+            rand::rng().fill(&mut bytes);
             let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
             Some(hex)
         } else {

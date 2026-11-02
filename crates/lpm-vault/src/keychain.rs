@@ -2427,7 +2427,7 @@ fn validate_vault_id(vault_id: &str) -> Result<(), String> {
 
 fn generate_project_storage_id() -> String {
     let mut bytes = [0_u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let encoded = hex::encode(bytes);

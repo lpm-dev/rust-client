@@ -131,9 +131,9 @@ pub async fn run(
 
     // Generate CSRF state parameter
     let state: String = {
-        use rand::RngCore;
+        use rand::Rng;
         let mut bytes = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         hex::encode(bytes)
     };
 
@@ -746,9 +746,9 @@ fn pkce_challenge(verifier: &str) -> String {
 /// URL query string and the exchange JSON body untouched.
 fn generate_pkce_pair() -> (String, String) {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let verifier = URL_SAFE_NO_PAD.encode(bytes);
     let challenge = pkce_challenge(&verifier);
     (verifier, challenge)

@@ -633,7 +633,7 @@ async fn legacy_schema_cache_never_supplies_a_validator_to_current_metadata_fetc
     let cache_key = client.npm_direct_metadata_cache_key(npm_name, PublicNpmAccess::ANONYMOUS);
     let mut hasher = Sha256::new();
     hasher.update(cache_key.as_bytes());
-    let legacy_cache_path = tmp.path().join(&format!("{:x}", hasher.finalize())[..16]);
+    let legacy_cache_path = tmp.path().join(&hex::encode(hasher.finalize())[..16]);
     let legacy_payload = rmp_serde::to_vec_named(&serde_json::json!({
         "name": npm_name,
         "dist-tags": { "latest": "1.0.0" },
@@ -720,7 +720,7 @@ fn legacy_schema_file_never_suppresses_current_batch_prefetch() {
     let cache_key = client.batch_metadata_cache_key(package_name).unwrap();
     let mut hasher = Sha256::new();
     hasher.update(cache_key.as_bytes());
-    let legacy_cache_path = tmp.path().join(&format!("{:x}", hasher.finalize())[..16]);
+    let legacy_cache_path = tmp.path().join(&hex::encode(hasher.finalize())[..16]);
     std::fs::write(&legacy_cache_path, b"LPM-MD-V3\n\nlegacy").unwrap();
     filetime::set_file_mtime(
         &legacy_cache_path,

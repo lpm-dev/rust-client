@@ -1157,9 +1157,9 @@ async fn wait_for_tunnel_shutdown(shutdown: Option<&tokio_util::sync::Cancellati
 /// Uses a deterministic-ish source (PID + current time) to avoid requiring
 /// full RNG initialization on the hot path. Returns a value in `[0, base_delay/2]`.
 fn backoff_jitter(base_delay: u64) -> u64 {
-    use rand::Rng;
+    use rand::RngExt;
     let max_jitter = base_delay / 2 + 1;
-    rand::thread_rng().gen_range(0..max_jitter)
+    rand::rng().random_range(0..max_jitter)
 }
 
 /// Validate that a URL path received from the relay is safe to forward locally.

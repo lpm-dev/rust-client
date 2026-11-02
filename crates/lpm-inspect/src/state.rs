@@ -138,9 +138,9 @@ struct Inner {
 }
 
 fn generate_auth_token() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let mut hex = String::with_capacity(64);
     for b in bytes {
         hex.push_str(&format!("{b:02x}"));

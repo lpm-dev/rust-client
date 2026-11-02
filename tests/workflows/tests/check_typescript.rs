@@ -150,7 +150,7 @@ fn hash_directory_tree_for_test(root: &std::path::Path) -> String {
         hasher.update([0]);
     }
 
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn seed_fake_tsgo_engine(project: &TempProject, entry_script: &str) {

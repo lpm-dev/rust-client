@@ -91,6 +91,7 @@ libc = "0.2"
 rayon = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
+hex = { workspace = true }
 windows-sys = { version = "0.61", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",

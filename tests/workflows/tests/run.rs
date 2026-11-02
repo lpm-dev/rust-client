@@ -2004,7 +2004,7 @@ fn task_cache_restore_lock_path(project: &TempProject) -> std::path::PathBuf {
     project
         .home()
         .join(".lpm/cache/tasks/.locks")
-        .join(format!("project-{:x}.lock", hasher.finalize()))
+        .join(format!("project-{}.lock", hex::encode(hasher.finalize())))
 }
 
 fn wait_for_task_marker(
@@ -3475,7 +3475,7 @@ async fn run_remote_cache_accepts_http_ipv6_loopback() {
 #[tokio::test]
 async fn run_remote_cache_rejects_signed_undeclared_outputs_and_runs_the_task() {
     use base64::Engine as _;
-    use hmac::Mac as _;
+    use hmac::{KeyInit as _, Mac as _};
     use sha2::Digest as _;
     use std::io::Read as _;
 
@@ -3524,7 +3524,7 @@ async fn run_remote_cache_rejects_signed_undeclared_outputs_and_runs_the_task() 
         "sha256={}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
     ));
-    *state.sha.lock().unwrap() = Some(format!("{:x}", sha2::Sha256::digest(&artifact)));
+    *state.sha.lock().unwrap() = Some(hex::encode(sha2::Sha256::digest(&artifact)));
     *state.artifact.lock().unwrap() = Some(artifact);
 
     remove_local_task_cache(&project);

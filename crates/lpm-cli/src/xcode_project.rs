@@ -10,7 +10,7 @@ pub(crate) mod native;
 mod repair;
 
 use lpm_common::LpmError;
-use rand::Rng;
+use rand::RngExt;
 use std::path::{Path, PathBuf};
 
 /// Result of linking a local package to an Xcode project.
@@ -363,8 +363,8 @@ pub fn link_local_package(
 
 /// Generate a random 24-character uppercase hex string for pbxproj object IDs.
 fn generate_object_id() -> String {
-    let mut rng = rand::thread_rng();
-    let bytes: [u8; 12] = rng.r#gen();
+    let mut rng = rand::rng();
+    let bytes: [u8; 12] = rng.random();
     bytes.iter().map(|b| format!("{b:02X}")).collect()
 }
 

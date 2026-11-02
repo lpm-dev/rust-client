@@ -222,7 +222,7 @@ mod unix {
 
     #[test]
     fn cancelling_triage_selection_preserves_the_original_script_policy() {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         let project = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();

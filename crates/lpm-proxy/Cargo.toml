@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dependencies]
 axum = { version = "0.8" }
-getrandom = "0.3"
+getrandom = "0.4"
 hyper = { version = "1" }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 lpm-cert = { workspace = true }

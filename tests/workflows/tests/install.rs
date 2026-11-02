@@ -15408,7 +15408,7 @@ async fn legacy_metadata_cache_schema_cannot_change_install_lockfile() {
     );
     let mut cache_path_hash = Sha256::new();
     cache_path_hash.update(cache_key.as_bytes());
-    let cache_filename = format!("{:x}", cache_path_hash.finalize());
+    let cache_filename = hex::encode(cache_path_hash.finalize());
     let cache_dir = legacy.cache_dir().join("metadata");
     std::fs::create_dir_all(&cache_dir).expect("create legacy metadata cache directory");
     let cache_path = cache_dir.join(&cache_filename[..16]);

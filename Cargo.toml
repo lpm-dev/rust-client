@@ -110,17 +110,17 @@ proptest = "1"
 thiserror = "2"
 
 # Hashing & crypto
-sha2 = "0.10"
+sha2 = "0.11"
 # BLAKE3 is used for v2 store graph-key derivation. It is much faster than
 # SHA-256 on common hardware and runs once per resolved package per install.
 # Content integrity remains SHA-512 SRI per the registry contract.
 blake3 = "1"
 base64 = "0.22"
 crypto_box = { version = "0.9.1", features = ["seal"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-ed25519-dalek = "2"
-hkdf = "0.12"
-hmac = "0.12"
+x25519-dalek = { version = "3", features = ["static_secrets", "getrandom"] }
+ed25519-dalek = "3"
+hkdf = "0.13"
+hmac = "0.13"
 
 # Semver
 node-semver = "2"
@@ -155,8 +155,8 @@ memmap2 = "0.9"
 
 # Auth / secure storage
 keyring = "3"
-aes-gcm = "0.10"
-rand = "0.8"
+aes-gcm = "0.11"
+rand = "0.10"
 dirs = "7"
 fd-lock = "4"
 cap-fs-ext = "4.0.2"
@@ -175,7 +175,7 @@ cliclack = "0.5"
 # Pure-Rust (RustCrypto), no OpenSSL transitive dependency.
 # Features: pkcs5 + encryption for the EncryptedPrivateKeyInfo API,
 # pem for PEM I/O (decode_vec / encode_string / PemLabel).
-pkcs8 = { version = "0.10", features = ["pkcs5", "encryption", "pem"] }
+pkcs8 = { version = "0.11", features = ["encryption", "pem"] }
 # TTY passphrase prompt for encrypted mTLS keyfiles.
 rpassword = "7"
 
@@ -186,7 +186,7 @@ open = "5"
 tar = "0.4"
 flate2 = { version = "1", features = ["zlib-rs"], default-features = false }
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
-sha1 = "0.10"
+sha1 = "0.11"
 glob = "0.3"
 globset = "0.4"
 ferralk-glob = "0.6.1"

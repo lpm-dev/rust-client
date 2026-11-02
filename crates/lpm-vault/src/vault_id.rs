@@ -1403,7 +1403,7 @@ pub fn read_project_name(project_dir: &Path) -> String {
 /// Generate a UUID v4 string without external dependencies.
 fn generate_uuid() -> String {
     let mut bytes = [0u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
 
     // Set version 4 and variant bits
     bytes[6] = (bytes[6] & 0x0f) | 0x40;

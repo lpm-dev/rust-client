@@ -305,7 +305,7 @@ pub fn compute_hashes(tarball_data: &[u8]) -> TarballHashes {
         use sha1::Digest as Sha1Digest;
         let mut hasher = sha1::Sha1::new();
         hasher.update(tarball_data);
-        format!("{:x}", hasher.finalize())
+        hex::encode(hasher.finalize())
     };
 
     let integrity = {
@@ -1155,7 +1155,7 @@ impl<W> HashingWriter<W> {
         use sha1::Digest as _;
 
         let hashes = TarballHashes {
-            shasum: format!("{:x}", self.sha1.finalize()),
+            shasum: hex::encode(self.sha1.finalize()),
             integrity: format!("sha512-{}", BASE64.encode(self.sha512.finalize())),
         };
         (self.inner, hashes, self.written)

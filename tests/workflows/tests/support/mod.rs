@@ -611,7 +611,7 @@ pub fn write_signed_unlock(project: &TempProject, scopes: &[&str]) {
 /// Write a short-lived signed unlock for a workspace member or another
 /// project directory that shares the fixture's isolated LPM home.
 pub fn write_signed_unlock_for(project: &TempProject, project_dir: &Path, scopes: &[&str]) {
-    use hmac::Mac;
+    use hmac::{KeyInit, Mac};
 
     let now = chrono::Utc::now();
     let project_root = std::fs::canonicalize(project_dir)
@@ -683,7 +683,7 @@ pub fn write_signed_release_age_exclusion_posture(project: &TempProject, exclusi
 }
 
 fn write_signed_posture(project: &TempProject, typosquat_guard: &str, exclusions: &[&str]) {
-    use hmac::Mac;
+    use hmac::{KeyInit, Mac};
 
     let security_dir = project.home().join(".lpm/security");
     std::fs::create_dir_all(&security_dir).expect("create security dir");

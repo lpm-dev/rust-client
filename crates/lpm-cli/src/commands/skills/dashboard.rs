@@ -13,7 +13,7 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use lpm_common::LpmError;
-use rand::{RngCore, rngs::OsRng};
+use rand::{Rng, rand_core::UnwrapErr, rngs::SysRng};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
 
@@ -616,7 +616,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
 
 fn random_token() -> String {
     let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
+    UnwrapErr(SysRng).fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 

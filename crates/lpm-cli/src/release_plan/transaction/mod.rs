@@ -1194,10 +1194,10 @@ pub(super) fn empty_release_journal_serialized_len() -> usize {
 }
 
 pub(super) fn new_release_transaction_id() -> String {
-    use rand::RngCore as _;
+    use rand::Rng as _;
 
     let mut bytes = [0u8; RELEASE_TRANSACTION_ID_BYTES];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rand_core::UnwrapErr(rand::rngs::SysRng).fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 

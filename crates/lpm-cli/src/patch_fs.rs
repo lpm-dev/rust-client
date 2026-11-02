@@ -421,12 +421,14 @@ fn create_temporary(
     parent: &Dir,
     mode: Option<u32>,
 ) -> Result<(OsString, cap_std::fs::File), LpmError> {
-    use rand::RngCore as _;
+    use rand::TryRng as _;
 
     let mut last_collision = None;
     for _ in 0..32 {
         let mut random = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut random);
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut random)
+            .map_err(std::io::Error::other)?;
         let name = OsString::from(format!(".lpm-patch-{}.tmp", hex::encode(random)));
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(true);

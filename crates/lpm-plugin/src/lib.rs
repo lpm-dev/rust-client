@@ -477,7 +477,7 @@ mod tests {
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
-        let hash = format!("{:x}", Sha256::digest(bytes.as_bytes()));
+        let hash = hex::encode(Sha256::digest(bytes.as_bytes()));
         let s = sidecar::Sidecar::new(
             plugin,
             version,

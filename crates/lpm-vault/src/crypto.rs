@@ -15,12 +15,12 @@
 
 use aes_gcm::{
     Aes256Gcm, KeyInit,
-    aead::{AeadInPlace, generic_array::GenericArray},
+    aead::{AeadInOut, Nonce},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use elliptic_curve::Generate;
 use hkdf::Hkdf;
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
 
@@ -97,7 +97,7 @@ fn get_or_create_wrapping_key_unlocked(
 ) -> Result<[u8; 32], String> {
     if force_file_wrapping_key() {
         let mut candidate = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut candidate);
+        rand::rng().fill_bytes(&mut candidate);
         return get_or_create_wrapping_key_file(directory, &candidate);
     }
 
@@ -107,7 +107,7 @@ fn get_or_create_wrapping_key_unlocked(
             return Ok(key);
         }
         let mut candidate = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut candidate);
+        rand::rng().fill_bytes(&mut candidate);
         get_or_insert_wrapping_key_in_keyring(&candidate)
     }
 
@@ -206,7 +206,7 @@ fn get_or_create_wrapping_key_file(
 /// Generate a random 256-bit AES key.
 pub fn generate_aes_key() -> [u8; 32] {
     let mut key = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut key);
+    rand::rng().fill_bytes(&mut key);
     key
 }
 
@@ -239,8 +239,8 @@ fn encrypt_with_associated_data(
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("cipher init: {e}"))?;
 
     let mut iv = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut iv);
-    let nonce = GenericArray::from_slice(&iv);
+    rand::rng().fill_bytes(&mut iv);
+    let nonce = <&Nonce<Aes256Gcm>>::from(&iv);
     let mut ciphertext = Vec::with_capacity(plaintext.len().saturating_add(16));
     ciphertext.extend_from_slice(plaintext);
     cipher
@@ -279,12 +279,10 @@ fn decrypt_with_associated_data(
         .decode(encoded_ciphertext)
         .map_err(|e| format!("data decode: {e}"))?;
 
-    if iv.len() != 12 {
-        return Err(format!("invalid IV size: {}", iv.len()));
-    }
+    let nonce = <&Nonce<Aes256Gcm>>::try_from(iv.as_slice())
+        .map_err(|_| format!("invalid IV size: {}", iv.len()))?;
 
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("cipher init: {e}"))?;
-    let nonce = GenericArray::from_slice(&iv);
 
     cipher
         .decrypt_in_place(nonce, associated_data, &mut ciphertext)
@@ -497,7 +495,7 @@ pub fn decrypt_vault_from_sync(
 /// Generate a new X25519 keypair. Returns (private_key_bytes, public_key_bytes).
 pub fn generate_x25519_keypair() -> ([u8; 32], [u8; 32]) {
     let mut rng_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut rng_bytes);
+    rand::rng().fill_bytes(&mut rng_bytes);
     let secret = X25519Secret::from(rng_bytes);
     let public = X25519PublicKey::from(&secret);
     (rng_bytes, public.to_bytes())
@@ -543,7 +541,7 @@ pub fn wrap_key_for_recipient(
 ) -> Result<String, String> {
     // Generate ephemeral keypair
     let mut eph_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut eph_bytes);
+    rand::rng().fill_bytes(&mut eph_bytes);
     let ephemeral_secret = X25519Secret::from(eph_bytes);
     let ephemeral_public = X25519PublicKey::from(&ephemeral_secret);
 
@@ -1437,7 +1435,7 @@ mod tests {
                     let chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
                     chars
                         .as_bytes()
-                        .get(rand::random::<usize>() % chars.len())
+                        .get(rand::random_range(..chars.len()))
                         .map(|b| *b as char)
                         .unwrap()
                 })
@@ -1626,6 +1624,69 @@ mod tests {
             browser_key_fingerprint(&key_a).unwrap(),
             browser_key_fingerprint(&key_b).unwrap(),
             "a single-bit pubkey flip MUST change the visible fingerprint"
+        );
+    }
+
+    /// Payloads and keys that released clients stored on the LPM.dev Registry
+    /// keep opening. The expected bytes were computed independently, with
+    /// OpenSSL through Python's `cryptography`.
+    #[test]
+    fn sync_payloads_and_wrapped_keys_from_released_clients_still_open() {
+        let content_key: [u8; 32] = std::array::from_fn(|index| index as u8);
+        let wrapping_key: [u8; 32] = std::array::from_fn(|index| 0x40 + index as u8);
+        let recipient_private: [u8; 32] = std::array::from_fn(|index| 0x80 + index as u8);
+
+        assert_eq!(
+            hex::encode(
+                sync_associated_data(VaultScope::Personal, "user-kat", "vault-kat", 7, 3).unwrap()
+            ),
+            "6c706d2d7661756c742d73796e6300000000030100000008757365722d6b6174000000097661756c742d6b6174000000000000000000000007"
+        );
+        assert_eq!(
+            decrypt_vault_payload(
+                &content_key,
+                "oKGio6Slpqeoqaqr:nToZQzOicNAMCOK9cwni5AuOKWL90zcP6GdJ6F2RDiOTJg6g5GcKH2W+b6l9V/OcNWgpJgO8OAM8I2RGbZLagFL1muF7zlqbACA=",
+                VaultScope::Personal,
+                "user-kat",
+                "vault-kat",
+                7,
+                3,
+            )
+            .unwrap(),
+            br#"{"environments":{"production":{"API_KEY":"kat-personal"}}}"#
+        );
+        assert_eq!(
+            decrypt_vault_payload(
+                &content_key,
+                "sLGys7S1tre4ubq7:4nc/xZqkyTAplfLMuS6q+P8eOqZ0SeZbOey4in7Gs0JECWJpJoHz6ul5mmhX2PaYQh9w5WZGP925CwEMlXNfHy9plksgKSw=",
+                VaultScope::Organization("acme"),
+                "user-kat",
+                "vault-kat",
+                3,
+                3,
+            )
+            .unwrap(),
+            br#"{"environments":{"staging":{"DATABASE_URL":"kat-org"}}}"#
+        );
+        assert_eq!(
+            unwrap_key(
+                &wrapping_key,
+                "wMHCw8TFxsfIycrL:X0UyzX6fO+x8sC49p66swo/kTELKOzgf5KopdzRnZFkrGoFgGUgYlVvBVmBShvj5"
+            )
+            .unwrap(),
+            content_key
+        );
+        assert_eq!(
+            BASE64.encode(x25519_public_from_private(&recipient_private)),
+            "ST6C/HRGSlkmiBdiPSBTxeuOLMSpiLT+4XnsawENUx0="
+        );
+        assert_eq!(
+            unwrap_key_from_sender(
+                "c2hF1U6H3gnWuxFKpwQsUKSgFb2ZAdGgAm9ZVlM6FRk=:0NHS09TV1tfY2drb:MF6ofJREtSoGs+a6y31OgHeDnkWvmfXIGbE++sGan+RPf8CPHOXQfWY3CHxXHUOl",
+                &recipient_private,
+            )
+            .unwrap(),
+            content_key
         );
     }
 }

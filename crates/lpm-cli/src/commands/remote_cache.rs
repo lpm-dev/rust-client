@@ -1,7 +1,7 @@
 use crate::install_ui;
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use lpm_common::{LpmError, LpmRoot, format_bytes};
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_LENGTH, LOCATION};
@@ -3050,5 +3050,22 @@ mod tests {
         };
 
         assert!(env_name_blocks_upload(&policy, b"PUBLIC_API_KEY"));
+    }
+
+    /// The digest and tag the LPM.dev Registry checks for an uploaded artifact.
+    /// The expected values were computed with Python's `hashlib` and `hmac`.
+    #[test]
+    fn artifact_digest_and_signature_tag_match_independently_computed_values() {
+        let mut file = tempfile::tempfile().unwrap();
+        std::io::Write::write_all(&mut file, &b"remote cache artifact kat\n".repeat(64)).unwrap();
+        let digests = hash_artifact(file, Some("remote-cache-kat-key")).unwrap();
+        assert_eq!(
+            digests.sha256_hex,
+            "8b30bef40bf5a5cd3c55cbbbf7f19b98315cf5bf1ecd4375f8c830f2b9123688"
+        );
+        assert_eq!(
+            digests.hmac_tag.as_deref(),
+            Some("sha256=SL8Jsc6nTpiW4RTia2huwm4BPtwf4lhRa-5UOd1AKcM")
+        );
     }
 }

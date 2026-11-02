@@ -108,12 +108,14 @@ fn create_private_directory_with(
     purpose: &str,
     mut after_create: impl FnMut(&Dir, &OsStr) -> std::io::Result<()>,
 ) -> std::io::Result<(OsString, Dir)> {
-    use rand::RngCore as _;
+    use rand::TryRng as _;
 
     let mut last_collision = None;
     for _ in 0..32 {
         let mut random = [0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut random);
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut random)
+            .map_err(std::io::Error::other)?;
         let name = OsString::from(format!(".lpm-{purpose}-{}", hex::encode(random)));
         match create_and_open_private_directory(parent, &name) {
             Ok(directory) => {

@@ -11,8 +11,8 @@ pub(crate) fn tmp_sibling(dir: &Path) -> PathBuf {
     // before we create the dir. PID + thread::id() are both
     // observable in /proc on Linux; the random suffix is uniformly
     // unpredictable across all UIDs that can read the parent dir.
-    use rand::RngCore;
-    let suffix: u64 = rand::thread_rng().next_u64();
+    use rand::Rng;
+    let suffix: u64 = rand::rng().next_u64();
     dir.with_extension(format!("tmp.{suffix:016x}"))
 }
 

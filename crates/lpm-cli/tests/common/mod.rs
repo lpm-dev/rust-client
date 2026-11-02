@@ -34,11 +34,11 @@
 
 use aes_gcm::{
     Aes256Gcm, KeyInit,
-    aead::{Aead, generic_array::GenericArray},
+    aead::{Aead, Nonce},
 };
 use base64::Engine;
 use lpm_registry::{DistInfo, PackageMetadata, VersionMetadata};
-use rand::RngCore;
+use rand::Rng;
 use sha2::Digest;
 use std::collections::HashMap;
 use std::path::Path;
@@ -206,8 +206,8 @@ pub fn seed_lpm_token(lpm_root: &Path, registry_url: &str, token: &str) {
         Aes256Gcm::new_from_slice(&TEST_AUTH_ENCRYPTION_KEY).expect("initialize test auth cipher");
 
     let mut iv = [0_u8; 12];
-    rand::thread_rng().fill_bytes(&mut iv);
-    let nonce = GenericArray::from_slice(&iv);
+    rand::rng().fill_bytes(&mut iv);
+    let nonce = <&Nonce<Aes256Gcm>>::from(&iv);
     let plaintext = serde_json::json!({ registry_url: token }).to_string();
     let ciphertext = cipher
         .encrypt(nonce, plaintext.as_bytes())

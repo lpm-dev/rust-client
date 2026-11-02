@@ -192,16 +192,26 @@ pub(super) fn current_state(root: &Path, path: &Path) -> Result<Option<(String, 
 
 fn hash(file: File) -> Result<String, LpmError> {
     use sha2::Digest as _;
-    let mut hasher = sha2::Sha256::new();
-    let copied = io::copy(&mut file.take(FILE_LIMIT + 1), &mut hasher)?;
+
+    struct Hashing(sha2::Sha256);
+
+    impl io::Write for Hashing {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut hashing = Hashing(sha2::Sha256::new());
+    let copied = io::copy(&mut file.take(FILE_LIMIT + 1), &mut hashing)?;
     if copied > FILE_LIMIT {
         return Err(LpmError::Script("migration file exceeds size limit".into()));
     }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
+    Ok(hex::encode(hashing.0.finalize()))
 }
 
 #[cfg(unix)]

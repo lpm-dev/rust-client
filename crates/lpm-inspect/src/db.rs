@@ -2194,13 +2194,13 @@ fn keep_wal_files(connection: &Connection) -> Result<(), rusqlite::Error> {
 /// once can get SQLITE_BUSY without the busy timeout being waited, so the
 /// switch is retried, a jittered few milliseconds apart, until it passes.
 fn use_wal(connection: &Connection) -> Result<(), rusqlite::Error> {
-    use rand::Rng as _;
+    use rand::RngExt as _;
 
     let deadline = std::time::Instant::now() + busy_timeout();
     loop {
         match connection.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(())) {
             Err(error) if is_busy(&error) && std::time::Instant::now() < deadline => {
-                let pause = rand::thread_rng().gen_range(5..=25);
+                let pause = rand::rng().random_range(5..=25);
                 std::thread::sleep(std::time::Duration::from_millis(pause));
             }
             result => return result,

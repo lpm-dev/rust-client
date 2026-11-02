@@ -37,7 +37,7 @@
 //! to recompute the hash, so the two stay in lockstep.
 
 use super::TempProject;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use lpm_common::ProvenanceSnapshot;
 use lpm_security::triage::StaticTier;
 use serde::{Deserialize, Serialize};

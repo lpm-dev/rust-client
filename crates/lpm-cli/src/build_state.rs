@@ -30,13 +30,13 @@
 //! file and atomic replacement. A crash mid-write leaves the previous state
 //! file intact rather than producing a half-written file the reader chokes on.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use lpm_common::LpmError;
 use lpm_security::{SecurityPolicy, TrustMatch, triage::StaticTier};
 #[cfg(test)]
 use lpm_store::PackageStore;
 use lpm_workspace::ProvenanceSnapshot;
-use rand::RngCore;
+use rand::TryRng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -525,7 +525,7 @@ fn get_or_create_build_state_secret_at(
     }
 
     let mut secret = [0_u8; BUILD_STATE_SECRET_BYTES];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut secret)
         .map_err(|error| {
             LpmError::SecurityApprovalStore(format!(

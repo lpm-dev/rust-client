@@ -41,7 +41,7 @@ pub(super) fn decode(password: &str, directory: &Path) -> Result<[u8; 32], Strin
 
     // Released file stores use this exact KDF. Keep their key, salt, and
     // ciphertext intact so a rollback can still read the same login.
-    let params = scrypt::Params::new(20, 8, 4, 32)
+    let params = scrypt::Params::new(20, 8, 4)
         .map_err(|error| format!("credential key parameters are invalid: {error}"))?;
     let mut key = [0_u8; 32];
     scrypt::scrypt(password.as_bytes(), &salt, &params, &mut key)
@@ -99,7 +99,7 @@ mod tests {
     use super::*;
     use aes_gcm::{
         Aes256Gcm, KeyInit,
-        aead::{Aead, generic_array::GenericArray},
+        aead::{Aead, Nonce},
     };
     use base64::{Engine, engine::general_purpose::STANDARD};
     use std::path::PathBuf;
@@ -111,7 +111,7 @@ mod tests {
         let nonce = [4_u8; 12];
         let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
         let encrypted = cipher
-            .encrypt(GenericArray::from_slice(&nonce), b"{}".as_slice())
+            .encrypt(<&Nonce<Aes256Gcm>>::from(&nonce), b"{}".as_slice())
             .unwrap();
         let (ciphertext, tag) = encrypted.split_at(encrypted.len() - 16);
         let credentials = format!(
@@ -160,7 +160,7 @@ mod tests {
         let nonce = [4_u8; 12];
         let cipher = Aes256Gcm::new_from_slice(&expected).unwrap();
         let encrypted = cipher
-            .encrypt(GenericArray::from_slice(&nonce), b"{}".as_slice())
+            .encrypt(<&Nonce<Aes256Gcm>>::from(&nonce), b"{}".as_slice())
             .unwrap();
         let (ciphertext, tag) = encrypted.split_at(encrypted.len() - 16);
         let credentials = format!(

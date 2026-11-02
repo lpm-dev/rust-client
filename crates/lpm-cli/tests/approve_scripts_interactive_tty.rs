@@ -11,7 +11,7 @@
 //! [`tests/workflows/tests/approve_scripts.rs`].
 
 use assert_cmd::Command;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -39,7 +39,7 @@ struct FixtureBlockedPackage {
 
 fn write_signed_build_state(project: &TempDir, home: &TempDir) {
     let fingerprint_input = b"scripted-pkg@1.0.0|||green\0";
-    let fingerprint = format!("sha256-{:x}", Sha256::digest(fingerprint_input));
+    let fingerprint = format!("sha256-{}", hex::encode(Sha256::digest(fingerprint_input)));
     let mut state = FixtureBuildState {
         state_version: 1,
         blocked_set_fingerprint: fingerprint,

@@ -54,7 +54,7 @@ fn decode_signing_secret(
 
 fn random_signing_secret() -> [u8; SIGNING_SECRET_BYTES] {
     let mut secret = [0u8; SIGNING_SECRET_BYTES];
-    rand::thread_rng().fill_bytes(&mut secret);
+    rand::rng().fill_bytes(&mut secret);
     secret
 }
 

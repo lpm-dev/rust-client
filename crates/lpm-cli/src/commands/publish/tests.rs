@@ -1228,7 +1228,7 @@ fn integrity_to_sha512_hex_roundtrips() {
     // Should be 128 hex chars (512 bits / 4 bits per char)
     assert_eq!(hex.len(), 128);
     // Should match direct hex encoding
-    assert_eq!(hex, format!("{:x}", hash_bytes));
+    assert_eq!(hex, hex::encode(hash_bytes));
 }
 
 // ─── Orchestration: deduplicate_targets ───────────────────────
@@ -1317,7 +1317,7 @@ fn provenance_hash_matches_rewritten_tarball() {
     use sha2::{Digest, Sha512};
     let mut hasher = Sha512::new();
     hasher.update(&rewritten);
-    let direct_hex = format!("{:x}", hasher.finalize());
+    let direct_hex = hex::encode(hasher.finalize());
 
     assert_eq!(
         provenance_hex, direct_hex,

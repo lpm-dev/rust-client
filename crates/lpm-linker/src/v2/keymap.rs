@@ -350,7 +350,8 @@ fn targets_with_patch_context(targets: &[Arc<V2Target>]) -> Option<Vec<Arc<V2Tar
                 if patch_counts[index] == 1 && target.target.patch_fingerprint.is_some() {
                     return Arc::clone(target);
                 }
-                let fingerprint = format!("patch-dependencies-v1:{:x}", context.finalize());
+                let fingerprint =
+                    format!("patch-dependencies-v1:{}", hex::encode(context.finalize()));
                 let mut contextual = target.as_ref().clone();
                 Arc::make_mut(&mut contextual.target).patch_fingerprint = Some(fingerprint);
                 Arc::new(contextual)

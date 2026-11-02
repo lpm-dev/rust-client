@@ -894,3 +894,23 @@ fn every_file_journal_fixture_validates_as_recorded() {
         assert_eq!(parsed.is_ok(), case.valid, "{}: {parsed:?}", case.name);
     }
 }
+
+/// A companion entry a released client sealed on Linux or Windows keeps
+/// opening. The expected bytes were computed independently, with OpenSSL
+/// through Python's `cryptography`.
+#[test]
+fn companion_entry_from_a_released_client_still_opens() {
+    let key: [u8; 32] = std::array::from_fn(|index| 0x60 + index as u8);
+    let account = CompanionAccount::Marker {
+        vault_id: "vault-kat".to_owned(),
+    };
+    assert_eq!(
+        hex::encode(entry_associated_data(&account).unwrap()),
+        "6c706d2d7661756c742d636f6d70616e696f6e0100225f5f7661756c745f66656174757265735f76315f5f3a646d4631624851746132463000097661756c742d6b6174"
+    );
+    let sealed = hex::decode("707172737475767778797a7b62d8779a021804a937840530c919931579da85275759c101cf9b3310e6129e2ee5a3a8c8ddbfa6fad482").unwrap();
+    assert_eq!(
+        open(&key, &account, sealed).unwrap(),
+        br#"{"features":["companion"]}"#
+    );
+}

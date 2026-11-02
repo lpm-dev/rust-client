@@ -601,7 +601,7 @@ pub unsafe extern "C" fn lpm_env_seal_box(
 /// so a box sealed to it would be readable by anyone, and libsodium refuses
 /// to open it.
 fn is_contributory(key: &[u8; crypto_box::KEY_SIZE]) -> bool {
-    x25519_dalek::EphemeralSecret::random_from_rng(crypto_box::aead::OsRng)
+    x25519_dalek::EphemeralSecret::random()
         .diffie_hellman(&x25519_dalek::PublicKey::from(*key))
         .was_contributory()
 }

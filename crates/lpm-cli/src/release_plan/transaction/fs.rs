@@ -944,12 +944,14 @@ pub(in crate::release_plan) fn create_manifest_temporary(
     exact_mode: Option<u32>,
 ) -> std::io::Result<(OsString, cap_std::fs::File)> {
     use base64::Engine as _;
-    use rand::RngCore as _;
+    use rand::TryRng as _;
 
     let mut last_collision = None;
     for _ in 0..32 {
         let mut random = [0u8; 12];
-        rand::rngs::OsRng.fill_bytes(&mut random);
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut random)
+            .map_err(std::io::Error::other)?;
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
         let name = OsString::from(format!(".lpm-{encoded}"));
         let mut options = cap_std::fs::OpenOptions::new();

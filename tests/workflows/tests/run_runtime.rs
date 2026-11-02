@@ -267,7 +267,7 @@ async fn concurrent_projects_share_one_managed_node_install() {
 
     let platform = lpm_runtime::platform::Platform::current().unwrap();
     let archive = fake_node_archive(&platform, "99.0.0");
-    let digest = format!("{:x}", Sha256::digest(&archive));
+    let digest = hex::encode(Sha256::digest(&archive));
     let archive_name = format!("node-v99.0.0-{}.tar.gz", platform.node_suffix());
     let dist_base_url = server.uri();
     let runtimes_dir = project.home().join(".lpm/runtimes");
@@ -1414,7 +1414,7 @@ async fn node_install_requires_exact_unambiguous_checksum_entries() {
     use sha2::{Digest, Sha256};
     let platform = lpm_runtime::platform::Platform::current().unwrap();
     let archive = fake_node_archive(&platform, "99.0.0");
-    let digest = format!("{:x}", Sha256::digest(&archive));
+    let digest = hex::encode(Sha256::digest(&archive));
     let filename = format!("node-v99.0.0-{}.tar.gz", platform.node_suffix());
     let mut accepted = Vec::new();
     for (label, manifest) in [

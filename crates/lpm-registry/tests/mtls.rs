@@ -394,8 +394,8 @@ impl Drop for EnvVarGuard {
 #[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn mtls_encrypted_pkcs8_with_correct_passphrase_succeeds() {
-    use pkcs8::EncryptedPrivateKeyInfo;
-    use pkcs8::PrivateKeyInfo;
+    use pkcs8::EncryptedPrivateKeyInfoRef;
+    use pkcs8::PrivateKeyInfoRef;
     use pkcs8::der::pem::PemLabel;
 
     // Serialize env mutation across tests in this binary.
@@ -410,14 +410,14 @@ async fn mtls_encrypted_pkcs8_with_correct_passphrase_succeeds() {
     let (label, plain_der) =
         pkcs8::der::pem::decode_vec(client_leaf.key_pem.as_bytes()).expect("decode plain key pem");
     assert_eq!(label, "PRIVATE KEY", "expected PKCS#8 PEM label");
-    let plain_info = PrivateKeyInfo::try_from(plain_der.as_slice()).expect("parse pkcs8");
-    let mut rng = rand::thread_rng();
+    let plain_info = PrivateKeyInfoRef::try_from(plain_der.as_slice()).expect("parse pkcs8");
+    let mut rng = rand::rng();
     let passphrase = "horse-battery-staple-mtls";
     let encrypted_doc = plain_info
-        .encrypt(&mut rng, passphrase.as_bytes())
+        .encrypt_with_rng(&mut rng, passphrase.as_bytes())
         .expect("encrypt pkcs8");
     let encrypted_pem = pkcs8::der::pem::encode_string(
-        EncryptedPrivateKeyInfo::PEM_LABEL,
+        EncryptedPrivateKeyInfoRef::PEM_LABEL,
         pkcs8::der::pem::LineEnding::LF,
         encrypted_doc.as_bytes(),
     )

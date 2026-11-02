@@ -513,7 +513,7 @@ fn decrypt_pkcs8(
     key_meta: &TaggedPath,
     passphrase: &dyn PassphraseProvider,
 ) -> Result<String, LpmError> {
-    use pkcs8::EncryptedPrivateKeyInfo;
+    use pkcs8::EncryptedPrivateKeyInfoRef;
     use pkcs8::der::Decode;
     use pkcs8::der::pem::PemLabel;
 
@@ -524,15 +524,15 @@ fn decrypt_pkcs8(
             key_meta.source, key_meta.line
         ))
     })?;
-    if label != EncryptedPrivateKeyInfo::PEM_LABEL {
+    if label != EncryptedPrivateKeyInfoRef::PEM_LABEL {
         return Err(LpmError::Cert(format!(
             "{}:{}: expected '{}' PEM label, got '{label}'",
             key_meta.source,
             key_meta.line,
-            EncryptedPrivateKeyInfo::PEM_LABEL,
+            EncryptedPrivateKeyInfoRef::PEM_LABEL,
         )));
     }
-    let info = EncryptedPrivateKeyInfo::from_der(&der).map_err(|e| {
+    let info = EncryptedPrivateKeyInfoRef::from_der(&der).map_err(|e| {
         LpmError::Cert(format!(
             "{}:{}: encrypted PKCS#8 DER is malformed: {e}",
             key_meta.source, key_meta.line
@@ -961,8 +961,8 @@ mod tests {
     /// `load_identity` to prove the decryption path works end-to-end.
     #[test]
     fn encrypted_pkcs8_round_trips_with_correct_passphrase() {
-        use pkcs8::EncryptedPrivateKeyInfo;
-        use pkcs8::PrivateKeyInfo;
+        use pkcs8::EncryptedPrivateKeyInfoRef;
+        use pkcs8::PrivateKeyInfoRef;
         use pkcs8::der::Decode;
         use pkcs8::der::pem::PemLabel;
 
@@ -977,18 +977,19 @@ mod tests {
             label, "PRIVATE KEY",
             "rcgen 0.13 must emit PKCS#8 PEM (got label '{label}')"
         );
-        let plain_info = PrivateKeyInfo::try_from(plain_der.as_slice()).expect("parse pkcs8 info");
+        let plain_info =
+            PrivateKeyInfoRef::try_from(plain_der.as_slice()).expect("parse pkcs8 info");
 
         // Use the rng-backed `encrypt` (scrypt + AES-256-CBC by
         // default). The exact ciphertext varies per run; that's
         // fine — we test the round-trip, not byte-equality.
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let passphrase = "correct horse battery staple";
         let encrypted_doc = plain_info
-            .encrypt(&mut rng, passphrase.as_bytes())
+            .encrypt_with_rng(&mut rng, passphrase.as_bytes())
             .expect("encrypt pkcs8");
         let encrypted_pem = pkcs8::der::pem::encode_string(
-            EncryptedPrivateKeyInfo::PEM_LABEL,
+            EncryptedPrivateKeyInfoRef::PEM_LABEL,
             pkcs8::der::pem::LineEnding::LF,
             encrypted_doc.as_bytes(),
         )
@@ -996,7 +997,7 @@ mod tests {
 
         // Sanity: the encrypted DER round-trips through our parser.
         let _info =
-            EncryptedPrivateKeyInfo::from_der(encrypted_doc.as_bytes()).expect("decode info");
+            EncryptedPrivateKeyInfoRef::from_der(encrypted_doc.as_bytes()).expect("decode info");
 
         let dir = TempDir::new().unwrap();
         let cert = tagged(write(dir.path(), "cert.pem", &cert_pem));
@@ -1172,5 +1173,33 @@ mod tests {
             }
             other => panic!("expected hard error, got: {other:?}"),
         }
+    }
+
+    /// OpenSSL's default encrypted PKCS#8 format (PBES2, PBKDF2-HMAC-SHA256,
+    /// AES-256-CBC), as `openssl pkcs8 -topk8` writes it. The key was
+    /// encrypted with OpenSSL through Python's `cryptography`.
+    #[test]
+    fn openssl_encrypted_pkcs8_key_decrypts_to_its_plain_key() {
+        const ENCRYPTED: &str = r#"-----BEGIN ENCRYPTED PRIVATE KEY-----
+MIH0MF8GCSqGSIb3DQEFDTBSMDEGCSqGSIb3DQEFDDAkBBABpCWqtIHXa43lcMvS
+cpU4AgIIADAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBKgQQg046muVsnGTDY3vN
+Tl/E8ASBkMeverXFHAR9tTvJmU+SIwITYQ00UfkeLDcTN8uU7Tslumm6TU+3qJjQ
+tyyVjMs3WcoDZfG8Pd/CPaRLjIzBp8JZFvWy8Jvj0mAG40K1a9UUB0W9IVh6Uh1Z
+o25GNaS0omyBSOaeNNSwNG9RGuYixpQsuvu3tW07G4kGZALahL/VtL66BKmKG2OL
+6I9a5oWSZw==
+-----END ENCRYPTED PRIVATE KEY-----
+"#;
+        const PLAIN: &str = r#"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgMzQ1Njc4OTo7PD0+
+P0BBQkNERUZHSElKS0xNTk9QUVKhRANCAASdjaNXDBcfbPJ+eFWEY8+1xnEgIf32
+fBUgtZI6zzXQjXz8XOlabBXMQBqw26PnhrtwDnITrHCkI018svBdC1aU
+-----END PRIVATE KEY-----
+"#;
+        let passphrase = FixedPassphrase::new("kat passphrase");
+        assert_eq!(
+            decrypt_pkcs8(ENCRYPTED, &tagged(PathBuf::from("kat.key")), &passphrase).unwrap(),
+            PLAIN
+        );
+        assert_eq!(passphrase.call_count(), 1);
     }
 }

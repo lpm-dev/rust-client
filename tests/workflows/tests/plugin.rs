@@ -30,7 +30,7 @@ fn seed_installed_plugin(project: &TempProject, name: &str, version: &str) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let hash = format!("{:x}", Sha256::digest(content));
+    let hash = hex::encode(Sha256::digest(content));
     let receipt = lpm_plugin::sidecar::Sidecar::new(
         name,
         version,

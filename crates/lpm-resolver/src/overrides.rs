@@ -860,14 +860,14 @@ fn compute_fingerprint(entries: &[OverrideEntry]) -> String {
         hasher.update(line.as_bytes());
         hasher.update(b"\n");
     }
-    format!("sha256-{:x}", hasher.finalize())
+    format!("sha256-{}", hex::encode(hasher.finalize()))
 }
 
 fn empty_fingerprint() -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(b"");
-    format!("sha256-{:x}", hasher.finalize())
+    format!("sha256-{}", hex::encode(hasher.finalize()))
 }
 
 #[cfg(test)]

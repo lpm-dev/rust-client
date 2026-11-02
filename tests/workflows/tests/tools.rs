@@ -295,7 +295,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
     let mut hasher = sha2::Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(unix)]
@@ -482,7 +482,7 @@ fn hash_directory_tree_for_test(root: &std::path::Path) -> String {
         hasher.update([0]);
     }
 
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(unix)]

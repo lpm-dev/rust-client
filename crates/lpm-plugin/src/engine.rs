@@ -1279,7 +1279,7 @@ fn write_sidecar_atomic(sidecar_path: &Path, sidecar: &EngineSidecar) -> Result<
 fn compute_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 fn hash_directory_tree(root: &Path) -> Result<String, LpmError> {
@@ -1295,7 +1295,7 @@ fn hash_directory_tree(root: &Path) -> Result<String, LpmError> {
         hasher.update([0]);
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn collect_files(
