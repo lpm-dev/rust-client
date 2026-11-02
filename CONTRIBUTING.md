@@ -58,6 +58,15 @@ cargo fmt --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
+CI also runs Clippy on Windows. To check code behind `cfg(windows)` from macOS or Linux, add the Windows target once and run Clippy for it:
+
+```bash
+rustup target add x86_64-pc-windows-msvc
+cargo clippy --workspace --all-targets --locked --keep-going --target x86_64-pc-windows-msvc -- -D warnings
+```
+
+Build scripts that compile C, such as those of `ring` and `zstd-sys`, fail without the Windows SDK. The crates that depend on them are checked only by the **Windows clippy** CI job.
+
 List the exact commands and results in the pull request. The current [CI workflow](.github/workflows/ci.yml) is authoritative for additional platform, shell, npm, audit, and release checks.
 
 ## Contracts and documentation
