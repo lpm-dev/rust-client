@@ -411,4 +411,45 @@ mod tests {
 
         assert!(diagnose_signature_failure(&wh, &env).is_none());
     }
+
+    /// GitHub's documented example and a Stripe signature computed with
+    /// Python's `hmac`, so a provider's real signature is still recognized.
+    #[test]
+    fn provider_signatures_computed_outside_lpm_are_recognized() {
+        let github = |body: &[u8]| {
+            make_webhook(|w| {
+                w.provider = Some(WebhookProvider::GitHub);
+                w.request_body = body.to_vec();
+                w.request_headers.insert(
+                    "x-hub-signature-256".to_string(),
+                    "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17"
+                        .to_string(),
+                );
+            })
+        };
+        let github_env = HashMap::from([(
+            "GITHUB_WEBHOOK_SECRET".to_string(),
+            "It's a Secret to Everybody".to_string(),
+        )]);
+        assert!(diagnose_signature_failure(&github(b"Hello, World!"), &github_env).is_none());
+        assert!(diagnose_signature_failure(&github(b"Hello, World?"), &github_env).is_some());
+
+        let stripe = |body: &[u8]| {
+            make_webhook(|w| {
+                w.provider = Some(WebhookProvider::Stripe);
+                w.request_body = body.to_vec();
+                w.request_headers.insert(
+                    "stripe-signature".to_string(),
+                    "t=1700000000,v1=8492de5fbc3fe74f0949589643178881b7edf50ae1a8851a41af95c0fcb8451f".to_string(),
+                );
+            })
+        };
+        let stripe_env = HashMap::from([(
+            "STRIPE_WEBHOOK_SECRET".to_string(),
+            "whsec_kat_secret".to_string(),
+        )]);
+        let body = br#"{"id":"evt_kat","type":"checkout.session.completed"}"#;
+        assert!(diagnose_signature_failure(&stripe(body), &stripe_env).is_none());
+        assert!(diagnose_signature_failure(&stripe(b"{}"), &stripe_env).is_some());
+    }
 }

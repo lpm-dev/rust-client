@@ -1628,4 +1628,67 @@ mod tests {
             "a single-bit pubkey flip MUST change the visible fingerprint"
         );
     }
+
+    /// Payloads and keys that released clients stored on the LPM.dev Registry
+    /// keep opening. The expected bytes were computed independently, with
+    /// OpenSSL through Python's `cryptography`.
+    #[test]
+    fn sync_payloads_and_wrapped_keys_from_released_clients_still_open() {
+        let content_key: [u8; 32] = std::array::from_fn(|index| index as u8);
+        let wrapping_key: [u8; 32] = std::array::from_fn(|index| 0x40 + index as u8);
+        let recipient_private: [u8; 32] = std::array::from_fn(|index| 0x80 + index as u8);
+
+        assert_eq!(
+            hex::encode(
+                sync_associated_data(VaultScope::Personal, "user-kat", "vault-kat", 7, 3).unwrap()
+            ),
+            "6c706d2d7661756c742d73796e6300000000030100000008757365722d6b6174000000097661756c742d6b6174000000000000000000000007"
+        );
+        assert_eq!(
+            decrypt_vault_payload(
+                &content_key,
+                "oKGio6Slpqeoqaqr:nToZQzOicNAMCOK9cwni5AuOKWL90zcP6GdJ6F2RDiOTJg6g5GcKH2W+b6l9V/OcNWgpJgO8OAM8I2RGbZLagFL1muF7zlqbACA=",
+                VaultScope::Personal,
+                "user-kat",
+                "vault-kat",
+                7,
+                3,
+            )
+            .unwrap(),
+            br#"{"environments":{"production":{"API_KEY":"kat-personal"}}}"#
+        );
+        assert_eq!(
+            decrypt_vault_payload(
+                &content_key,
+                "sLGys7S1tre4ubq7:4nc/xZqkyTAplfLMuS6q+P8eOqZ0SeZbOey4in7Gs0JECWJpJoHz6ul5mmhX2PaYQh9w5WZGP925CwEMlXNfHy9plksgKSw=",
+                VaultScope::Organization("acme"),
+                "user-kat",
+                "vault-kat",
+                3,
+                3,
+            )
+            .unwrap(),
+            br#"{"environments":{"staging":{"DATABASE_URL":"kat-org"}}}"#
+        );
+        assert_eq!(
+            unwrap_key(
+                &wrapping_key,
+                "wMHCw8TFxsfIycrL:X0UyzX6fO+x8sC49p66swo/kTELKOzgf5KopdzRnZFkrGoFgGUgYlVvBVmBShvj5"
+            )
+            .unwrap(),
+            content_key
+        );
+        assert_eq!(
+            BASE64.encode(x25519_public_from_private(&recipient_private)),
+            "ST6C/HRGSlkmiBdiPSBTxeuOLMSpiLT+4XnsawENUx0="
+        );
+        assert_eq!(
+            unwrap_key_from_sender(
+                "c2hF1U6H3gnWuxFKpwQsUKSgFb2ZAdGgAm9ZVlM6FRk=:0NHS09TV1tfY2drb:MF6ofJREtSoGs+a6y31OgHeDnkWvmfXIGbE++sGan+RPf8CPHOXQfWY3CHxXHUOl",
+                &recipient_private,
+            )
+            .unwrap(),
+            content_key
+        );
+    }
 }

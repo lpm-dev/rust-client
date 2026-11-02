@@ -1526,4 +1526,25 @@ mod tests {
         let read_back = std::fs::read_to_string(&key_path).unwrap();
         assert_eq!(read_back, key);
     }
+
+    /// A vault file a released client wrote on Linux or Windows keeps
+    /// opening. The expected bytes were computed independently, with OpenSSL
+    /// through Python's `cryptography`.
+    #[test]
+    fn vault_file_from_a_released_client_still_opens() {
+        with_temp_vault_home(|_| {
+            let store = FakeNativeDataKeyStore::with_key(
+                "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f".to_string(),
+            );
+            assert_eq!(
+                decrypt_with_store(
+                    "vault-kat",
+                    "MDEyMzQ1Njc4OTo7:EQGlMT62ywD8irxkNgI+Cg==:ITkUHnahpEoai1gm1YlWVk68FHaRiKVCDzFr2mNDrus=",
+                    &store,
+                )
+                .unwrap(),
+                r#"{"default":{"TOKEN":"kat-file"}}"#
+            );
+        });
+    }
 }

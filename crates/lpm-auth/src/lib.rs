@@ -6048,4 +6048,20 @@ mod tests {
             "owner-only permissions must allow credentials",
         );
     }
+
+    /// A credential file a released client wrote keeps opening. The expected
+    /// bytes were computed independently, with OpenSSL through Python's
+    /// `cryptography`.
+    #[test]
+    fn credential_file_from_a_released_client_still_opens() {
+        let key: [u8; 32] = std::array::from_fn(|index| 0x90 + index as u8);
+        assert_eq!(
+            decrypt_with_key(
+                "EBESExQVFhcYGRob:2JVVmtqoz3QfFUKlr7uwhQ==:7LBvSYn3m/DYqT0/I8On+QqjZBzW1hUnXfIgQEh2udwbeGFopuvWuA==",
+                &key,
+            )
+            .unwrap(),
+            r#"{"https://registry.lpm.dev":"kat-token"}"#
+        );
+    }
 }

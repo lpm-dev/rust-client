@@ -1173,4 +1173,32 @@ mod tests {
             other => panic!("expected hard error, got: {other:?}"),
         }
     }
+
+    /// OpenSSL's default encrypted PKCS#8 format (PBES2, PBKDF2-HMAC-SHA256,
+    /// AES-256-CBC), as `openssl pkcs8 -topk8` writes it. The key was
+    /// encrypted with OpenSSL through Python's `cryptography`.
+    #[test]
+    fn openssl_encrypted_pkcs8_key_decrypts_to_its_plain_key() {
+        const ENCRYPTED: &str = r#"-----BEGIN ENCRYPTED PRIVATE KEY-----
+MIH0MF8GCSqGSIb3DQEFDTBSMDEGCSqGSIb3DQEFDDAkBBABpCWqtIHXa43lcMvS
+cpU4AgIIADAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBKgQQg046muVsnGTDY3vN
+Tl/E8ASBkMeverXFHAR9tTvJmU+SIwITYQ00UfkeLDcTN8uU7Tslumm6TU+3qJjQ
+tyyVjMs3WcoDZfG8Pd/CPaRLjIzBp8JZFvWy8Jvj0mAG40K1a9UUB0W9IVh6Uh1Z
+o25GNaS0omyBSOaeNNSwNG9RGuYixpQsuvu3tW07G4kGZALahL/VtL66BKmKG2OL
+6I9a5oWSZw==
+-----END ENCRYPTED PRIVATE KEY-----
+"#;
+        const PLAIN: &str = r#"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgMzQ1Njc4OTo7PD0+
+P0BBQkNERUZHSElKS0xNTk9QUVKhRANCAASdjaNXDBcfbPJ+eFWEY8+1xnEgIf32
+fBUgtZI6zzXQjXz8XOlabBXMQBqw26PnhrtwDnITrHCkI018svBdC1aU
+-----END PRIVATE KEY-----
+"#;
+        let passphrase = FixedPassphrase::new("kat passphrase");
+        assert_eq!(
+            decrypt_pkcs8(ENCRYPTED, &tagged(PathBuf::from("kat.key")), &passphrase).unwrap(),
+            PLAIN
+        );
+        assert_eq!(passphrase.call_count(), 1);
+    }
 }
