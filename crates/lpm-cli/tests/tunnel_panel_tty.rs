@@ -168,7 +168,9 @@ async fn serve_ok(listener: tokio::net::TcpListener) {
     }
 }
 
+#[cfg(all(unix, debug_assertions))]
 const COLUMNS: u16 = 100;
+#[cfg(all(unix, debug_assertions))]
 const ROWS: u16 = 30;
 
 /// Runs `command` on a 100×30 terminal, presses `q` once `ready` holds for

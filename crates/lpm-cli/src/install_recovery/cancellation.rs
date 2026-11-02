@@ -19,6 +19,13 @@ pub(super) struct SignalCancellation {
 }
 
 impl SignalCancellation {
+    #[cfg_attr(
+        not(unix),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "Unix registers the signal handlers, which can fail"
+        )
+    )]
     pub(super) fn new() -> std::io::Result<Self> {
         let flag = Arc::new(AtomicBool::new(false));
         #[cfg(unix)]

@@ -29,6 +29,10 @@ enum ElevationBackend {
 }
 
 #[cfg(any(test, unix, windows))]
+#[cfg_attr(
+    all(windows, not(test)),
+    expect(clippy::unnecessary_wraps, reason = "Unix may find no trusted sudo")
+)]
 fn select_elevation_backend(
     platform: ElevationPlatform,
     _candidate_exists: impl Fn(&Path) -> bool,

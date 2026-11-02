@@ -324,6 +324,10 @@ fn restrict_cache_directory(directory: &Dir) -> Result<(), LpmError> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which sets the directory mode"
+)]
 fn restrict_cache_directory(_directory: &Dir) -> Result<(), LpmError> {
     Ok(())
 }

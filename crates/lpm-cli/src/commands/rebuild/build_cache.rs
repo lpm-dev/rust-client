@@ -940,7 +940,7 @@ fn run_indexed_jobs_bounded<T: Send>(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn hash_toolchain(
     trusted_environment: &super::sandbox_env::ChildEnvironment,
     build_environment: &super::sandbox_env::ChildEnvironment,
@@ -949,7 +949,7 @@ fn hash_toolchain(
     hash_toolchain_cached(trusted_environment, build_environment, project_dir, None)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn hash_toolchain_cached(
     trusted_environment: &super::sandbox_env::ChildEnvironment,
     build_environment: &super::sandbox_env::ChildEnvironment,
@@ -1639,6 +1639,7 @@ mod tests {
     }
     use std::collections::HashMap;
 
+    #[cfg(unix)]
     fn scriptable_package(name: &str, command: &str) -> ScriptablePackage {
         ScriptablePackage {
             instance_id: None,

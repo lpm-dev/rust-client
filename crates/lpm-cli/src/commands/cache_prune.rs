@@ -199,7 +199,7 @@ struct PruneDiscovery {
     analysis: PruneAnalysis,
     tombstones_pending: usize,
     tombstone_count_error: Option<String>,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     project_scans: usize,
 }
 
@@ -759,6 +759,10 @@ fn restrict_prune_tombstone_directory(directory: &cap_std::fs::Dir) -> Result<()
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which sets the directory mode"
+)]
 fn restrict_prune_tombstone_directory(_directory: &cap_std::fs::Dir) -> Result<(), LpmError> {
     Ok(())
 }
@@ -858,7 +862,7 @@ fn advisory_lock_key(path: &Path) -> Option<&str> {
 /// Compute (but don't apply) the prune plan. Pulled out so unit tests
 /// exercise the algorithm against synthetic stores without touching
 /// the filesystem outside of a tempdir.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub fn compute_prune_plan(
     root: &LpmRoot,
     v2_store: &V2Store,
@@ -868,7 +872,7 @@ pub fn compute_prune_plan(
     compute_prune(root, v2_store, flags, max_age, true, None).map(|(summary, _)| summary)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub fn compute_prune_stats(
     root: &LpmRoot,
     v2_store: &V2Store,
@@ -976,12 +980,12 @@ fn discover_prune_inputs(
         })
         .collect::<Vec<_>>();
     let mut root_link_dirs = vec![HashSet::new(); stores.len()];
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     let mut project_scans = 0usize;
     if analysis == PruneAnalysis::Available {
         for project in &projects {
             collect_project_link_roots_for_stores(project, &links_roots, &mut root_link_dirs)?;
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             {
                 project_scans = project_scans.saturating_add(1);
             }
@@ -1001,7 +1005,7 @@ fn discover_prune_inputs(
         analysis,
         tombstones_pending,
         tombstone_count_error,
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         project_scans,
     })
 }

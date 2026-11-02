@@ -55,6 +55,8 @@ fn make_executable(path: &std::path::Path) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
             .expect("failed to make runtime binary executable");
     }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 #[cfg(unix)]

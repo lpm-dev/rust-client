@@ -4,7 +4,7 @@ use lpm_common::LpmError;
 
 use crate::cli::Commands;
 
-#[cfg(debug_assertions)]
+#[cfg(all(unix, debug_assertions))]
 const TEST_ASSUME_ROOT_ENV: &str = "LPM_TEST_ASSUME_EUID_ROOT";
 
 pub(crate) fn ensure_user_invocation_allowed() -> Result<(), LpmError> {
@@ -23,11 +23,15 @@ pub(crate) fn ensure_command_allowed(command: &Commands) -> Result<(), LpmError>
     }
 }
 
+#[cfg_attr(
+    not(unix),
+    expect(clippy::unnecessary_wraps, reason = "Unix requires effective root")
+)]
 pub(crate) fn require_effective_root(helper: &str) -> Result<(), LpmError> {
     #[cfg(not(unix))]
     {
         let _ = helper;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(unix)]

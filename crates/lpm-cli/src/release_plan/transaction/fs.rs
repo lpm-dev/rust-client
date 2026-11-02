@@ -679,6 +679,10 @@ fn windows_sid_to_string(sid: windows_sys::Win32::Security::PSID) -> std::io::Re
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which checks the owner and mode"
+)]
 pub(in crate::release_plan) fn validate_private_unix_metadata(
     _path: &Path,
     _metadata: &cap_std::fs::Metadata,
@@ -908,6 +912,13 @@ pub(in crate::release_plan) fn write_relative_file_durable(
     result
 }
 
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Unix reads the file mode, which can fail"
+    )
+)]
 fn relative_file_mode(
     parent: &cap_std::fs::Dir,
     file_name: &OsStr,
@@ -1062,6 +1073,13 @@ pub(in crate::release_plan) fn replace_relative_file(
     ))
 }
 
+#[cfg_attr(
+    windows,
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "other platforms sync the directory, which can fail"
+    )
+)]
 pub(in crate::release_plan) fn sync_cap_directory(dir: &cap_std::fs::Dir) -> std::io::Result<()> {
     #[cfg(windows)]
     {
@@ -1253,14 +1271,14 @@ pub(in crate::release_plan) fn decode_relative_path(encoded: &str) -> Result<Pat
     #[cfg(windows)]
     let path = {
         use std::os::windows::ffi::OsStringExt;
-        if bytes.len() % 2 != 0 {
+        let (pairs, []) = bytes.as_chunks::<2>() else {
             return Err(LpmError::Script(
                 "release journal contains malformed UTF-16 path bytes".into(),
             ));
-        }
-        let wide = bytes
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        };
+        let wide = pairs
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect::<Vec<_>>();
         PathBuf::from(OsString::from_wide(&wide))
     };

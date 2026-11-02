@@ -25,6 +25,7 @@ mod support;
 use std::collections::HashSet;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 use support::assertions::parse_json_output;
 use support::{TempProject, lpm_with_registry};

@@ -1401,6 +1401,10 @@ struct CaptureOwner {
 
 #[cfg(not(unix))]
 impl CaptureOwner {
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "matches the Unix implementation, which reads the project owner"
+    )]
     fn of(_project_dir: &Path) -> std::io::Result<(Self, OwnerIdentity)> {
         Ok((Self { by_root: false }, OWN_IDENTITY))
     }
@@ -1591,6 +1595,10 @@ fn restrict_lpm_dir(lpm_dir: &Path, owner: CaptureOwner, access: Access) -> std:
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which sets the directory mode"
+)]
 fn restrict_lpm_dir(
     _lpm_dir: &Path,
     _owner: CaptureOwner,
@@ -1813,6 +1821,10 @@ fn create_owner_only(path: &Path) -> std::io::Result<bool> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which sets the file mode"
+)]
 fn create_owner_only(_path: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
@@ -3893,6 +3905,7 @@ mod tests {
 
     /// Commits a capture `id` as a connection of an earlier release, which
     /// takes no opening lock, would, giving up at once on a lock.
+    #[cfg(unix)]
     fn commit_unlocked(connection: &Connection, id: &str) -> rusqlite::Result<()> {
         connection.busy_timeout(std::time::Duration::ZERO)?;
         let _ = connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0));

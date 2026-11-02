@@ -58,6 +58,15 @@ cargo fmt --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
+CI also runs Clippy on Windows. To check code behind `cfg(windows)` from macOS or Linux, install mingw-w64 (`brew install mingw-w64`, or your distribution's package), so the build scripts that compile C can run. Then add the target once and run Clippy for it:
+
+```bash
+rustup target add x86_64-pc-windows-gnu
+cargo clippy --workspace --all-targets --locked --keep-going --target x86_64-pc-windows-gnu -- -D warnings
+```
+
+The **Windows clippy** CI job checks `x86_64-pc-windows-msvc`. Its lint results can differ from this check only for code under `cfg(target_env)`, and the workspace has none for Windows.
+
 List the exact commands and results in the pull request. The current [CI workflow](.github/workflows/ci.yml) is authoritative for additional platform, shell, npm, audit, and release checks.
 
 ## Contracts and documentation

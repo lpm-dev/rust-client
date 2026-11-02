@@ -13,7 +13,9 @@ mod support;
 #[cfg(unix)]
 use std::process::{Child, Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
-use support::{TempProject, lpm, lpm_from_path, lpm_spawnable_from_path};
+#[cfg(unix)]
+use support::lpm_spawnable_from_path;
+use support::{TempProject, lpm, lpm_from_path};
 
 #[cfg(unix)]
 struct KillOnDropChild {

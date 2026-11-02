@@ -106,6 +106,13 @@ fn read_regular(directory: &Dir, name: &OsStr, limit: u64) -> io::Result<Vec<u8>
     Ok(bytes)
 }
 
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Unix syncs the directory, which can fail"
+    )
+)]
 fn sync_directory(directory: &Dir) -> io::Result<()> {
     #[cfg(unix)]
     directory.open(".")?.sync_all()?;

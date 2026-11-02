@@ -251,8 +251,10 @@ fn names(
             .filter(|end| *end <= record.len() && length.is_multiple_of(2))
             .ok_or_else(|| failure("Windows returned an invalid directory name"))?;
         let wide: Vec<_> = record[12..end]
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect();
         let name = OsString::from_wide(&wide);
         if name != "." && name != ".." {

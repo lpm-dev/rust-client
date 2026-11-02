@@ -726,6 +726,35 @@ jobs:
       - name: Windows live port kill workflow test
         run: cargo test --locked -p lpm-workflows --test ports ports_kill_range_json_with_yes_terminates_live_listener_process
 
+  # Lint and the macOS job run Clippy on Unix only, so code behind
+  # `cfg(windows)` or `cfg(not(unix))` is linted nowhere else.
+  windows-clippy:
+    name: Windows clippy
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+
+      - name: Cache cargo
+        continue-on-error: true
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-clippy-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-clippy-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
+
   audit-fixtures:
     name: Hoisted-mode compat audit (${{ matrix.os }} / ${{ matrix.store_version }})
     if: github.event_name != 'pull_request'

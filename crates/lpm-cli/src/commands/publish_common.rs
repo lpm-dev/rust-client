@@ -1362,6 +1362,10 @@ fn publish_file_mode(file: &std::fs::File) -> std::io::Result<u32> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which reads the file mode"
+)]
 fn publish_file_mode(_file: &std::fs::File) -> std::io::Result<u32> {
     Ok(0o644)
 }
@@ -8515,8 +8519,7 @@ mod tests {
         lpm_common::create_dir_symlink_or_junction(&external, &dependency.join("linked")).unwrap();
 
         let error = create_tarball(&project, &manifest)
-            .err()
-            .expect("bundled junction must not be traversed")
+            .expect_err("bundled junction must not be traversed")
             .to_string();
 
         assert!(error.contains("unsupported symlink"), "{error}");

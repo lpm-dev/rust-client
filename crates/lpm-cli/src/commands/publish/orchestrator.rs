@@ -3175,10 +3175,9 @@ pub(super) fn lpm_package_url(registry_url: &str, name: &str) -> Option<String> 
 
 #[cfg(test)]
 mod transaction_root_tests {
-    use super::{
-        ensure_publish_transaction_root_unchanged, open_publish_lock_directory,
-        select_publish_transaction_root,
-    };
+    #[cfg(unix)]
+    use super::open_publish_lock_directory;
+    use super::{ensure_publish_transaction_root_unchanged, select_publish_transaction_root};
     use crate::commands::publish::prepare::PublishSource;
 
     #[cfg(unix)]

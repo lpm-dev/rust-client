@@ -593,7 +593,7 @@ pub enum SharingKeyRotationStart {
     Ready {
         scope: SharingKeyScope,
         lock: SharingKeyRotationLock,
-        current: MyPublicKeyState,
+        current: Box<MyPublicKeyState>,
         discarded_pending: bool,
     },
 }
@@ -650,7 +650,7 @@ where
     Ok(SharingKeyRotationStart::Ready {
         scope,
         lock,
-        current,
+        current: Box::new(current),
         discarded_pending,
     })
 }

@@ -378,6 +378,10 @@ fn ca_key_drift_in(ca_dir: &paths::GlobalCaDirectory) -> Result<Option<Permissio
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which reads the key mode"
+)]
 fn ca_key_drift_in(
     _ca_dir: &paths::GlobalCaDirectory,
 ) -> Result<Option<PermissionDrift>, LpmError> {

@@ -889,6 +889,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     fn run_git(directory: &Path, args: &[&str]) -> std::process::Output {
         std::process::Command::new("git")
             .args(args)
@@ -897,6 +898,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(unix)]
     fn initialize_git_repository(directory: &Path) -> String {
         assert!(run_git(directory, &["init", "--quiet"]).status.success());
         assert!(
