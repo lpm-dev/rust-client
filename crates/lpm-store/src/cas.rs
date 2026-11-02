@@ -186,7 +186,7 @@ mod tests {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(body);
-        format!("{:x}", h.finalize())
+        hex::encode(h.finalize())
     }
     #[test]
     fn tarball_store_path_under_versioned_root() {

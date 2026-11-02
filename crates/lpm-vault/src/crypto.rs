@@ -15,12 +15,12 @@
 
 use aes_gcm::{
     Aes256Gcm, KeyInit,
-    aead::{AeadInPlace, generic_array::GenericArray},
+    aead::{AeadInOut, Nonce},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use elliptic_curve::Generate;
 use hkdf::Hkdf;
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
 
@@ -97,7 +97,7 @@ fn get_or_create_wrapping_key_unlocked(
 ) -> Result<[u8; 32], String> {
     if force_file_wrapping_key() {
         let mut candidate = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut candidate);
+        rand::rng().fill_bytes(&mut candidate);
         return get_or_create_wrapping_key_file(directory, &candidate);
     }
 
@@ -107,7 +107,7 @@ fn get_or_create_wrapping_key_unlocked(
             return Ok(key);
         }
         let mut candidate = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut candidate);
+        rand::rng().fill_bytes(&mut candidate);
         get_or_insert_wrapping_key_in_keyring(&candidate)
     }
 
@@ -206,7 +206,7 @@ fn get_or_create_wrapping_key_file(
 /// Generate a random 256-bit AES key.
 pub fn generate_aes_key() -> [u8; 32] {
     let mut key = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut key);
+    rand::rng().fill_bytes(&mut key);
     key
 }
 
@@ -239,8 +239,8 @@ fn encrypt_with_associated_data(
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("cipher init: {e}"))?;
 
     let mut iv = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut iv);
-    let nonce = GenericArray::from_slice(&iv);
+    rand::rng().fill_bytes(&mut iv);
+    let nonce = <&Nonce<Aes256Gcm>>::from(&iv);
     let mut ciphertext = Vec::with_capacity(plaintext.len().saturating_add(16));
     ciphertext.extend_from_slice(plaintext);
     cipher
@@ -279,12 +279,10 @@ fn decrypt_with_associated_data(
         .decode(encoded_ciphertext)
         .map_err(|e| format!("data decode: {e}"))?;
 
-    if iv.len() != 12 {
-        return Err(format!("invalid IV size: {}", iv.len()));
-    }
+    let nonce = <&Nonce<Aes256Gcm>>::try_from(iv.as_slice())
+        .map_err(|_| format!("invalid IV size: {}", iv.len()))?;
 
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("cipher init: {e}"))?;
-    let nonce = GenericArray::from_slice(&iv);
 
     cipher
         .decrypt_in_place(nonce, associated_data, &mut ciphertext)
@@ -497,7 +495,7 @@ pub fn decrypt_vault_from_sync(
 /// Generate a new X25519 keypair. Returns (private_key_bytes, public_key_bytes).
 pub fn generate_x25519_keypair() -> ([u8; 32], [u8; 32]) {
     let mut rng_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut rng_bytes);
+    rand::rng().fill_bytes(&mut rng_bytes);
     let secret = X25519Secret::from(rng_bytes);
     let public = X25519PublicKey::from(&secret);
     (rng_bytes, public.to_bytes())
@@ -543,7 +541,7 @@ pub fn wrap_key_for_recipient(
 ) -> Result<String, String> {
     // Generate ephemeral keypair
     let mut eph_bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut eph_bytes);
+    rand::rng().fill_bytes(&mut eph_bytes);
     let ephemeral_secret = X25519Secret::from(eph_bytes);
     let ephemeral_public = X25519PublicKey::from(&ephemeral_secret);
 
@@ -1437,7 +1435,7 @@ mod tests {
                     let chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
                     chars
                         .as_bytes()
-                        .get(rand::random::<usize>() % chars.len())
+                        .get(rand::random_range(..chars.len()))
                         .map(|b| *b as char)
                         .unwrap()
                 })

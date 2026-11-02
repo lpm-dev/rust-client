@@ -746,7 +746,7 @@ fn executable_fingerprint_from_canonical(kind: &[u8], canonical: &Path) -> Optio
     hasher.update(kind);
     hash_os_string(&mut hasher, canonical.as_os_str());
     update_with_file_metadata(&mut hasher, &metadata);
-    Some(format!("{:x}", hasher.finalize()))
+    Some(hex::encode(hasher.finalize()))
 }
 
 /// Hash the metadata that changes when a file is replaced or rewritten.

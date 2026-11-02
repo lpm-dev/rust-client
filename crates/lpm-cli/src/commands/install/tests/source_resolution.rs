@@ -1920,7 +1920,7 @@ async fn pre_resolve_extracts_local_tarball_from_file_specifier() {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(&body);
-        format!("{:x}", h.finalize())
+        hex::encode(h.finalize())
     };
     let expected_sri = lpm_common::integrity::Integrity::from_bytes(
         lpm_common::integrity::HashAlgorithm::Sha256,
@@ -2023,7 +2023,7 @@ async fn pre_resolve_local_tarball_dedupes_same_content_across_paths() {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();
         h.update(&body);
-        format!("{:x}", h.finalize())
+        hex::encode(h.finalize())
     };
     assert!(store.has_local_tarball(&expected_sha256));
 }

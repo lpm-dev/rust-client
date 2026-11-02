@@ -154,7 +154,7 @@ fn binary_fingerprint(runtime: RuntimeKind, canonical: &Path) -> Option<String> 
         hasher.update(metadata.ctime().to_le_bytes());
         hasher.update(metadata.ctime_nsec().to_le_bytes());
     }
-    Some(format!("{:x}", hasher.finalize()))
+    Some(hex::encode(hasher.finalize()))
 }
 
 /// What a task's environment adds to runtime selection: the workspace root

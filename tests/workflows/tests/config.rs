@@ -2358,7 +2358,7 @@ fn config_list_honors_only_matching_project_script_unlocks() {
             support::write_signed_unlock(&project, &["scripts-allow"]);
         }
         if scenario == "wrong-project" || scenario == "expired" {
-            use hmac::Mac;
+            use hmac::{KeyInit, Mac};
             let directory = project.home().join(".lpm/security/unlocks");
             let path = std::fs::read_dir(directory)
                 .unwrap()

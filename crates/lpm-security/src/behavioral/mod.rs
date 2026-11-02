@@ -266,7 +266,7 @@ pub fn analyze_package_from_open_dir_with_fingerprint(
         hasher.update([u8::from(
             discovery_limit_reached || prefix_limit_reached || runtime_limit_reached,
         )]);
-        format!("sha256-{:x}", hasher.finalize())
+        format!("sha256-{}", hex::encode(hasher.finalize()))
     });
     (analysis, fingerprint)
 }
@@ -324,7 +324,7 @@ pub fn package_input_fingerprint_from_open_dir(
         discovery_limit_reached || total_limit_reached || runtime_limit_reached,
     )]);
 
-    Ok(format!("sha256-{:x}", hasher.finalize()))
+    Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
 }
 
 fn new_fingerprint_hasher() -> Sha256 {

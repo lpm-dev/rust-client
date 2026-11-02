@@ -881,7 +881,7 @@ fn compare_checksum(expected_hex: &str, actual_bytes: &[u8]) -> Result<(), LpmEr
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(actual_bytes);
-    let actual_hex = format!("{:x}", hasher.finalize());
+    let actual_hex = hex::encode(hasher.finalize());
     let expected_hex = expected_hex.to_ascii_lowercase();
 
     if actual_hex == expected_hex {

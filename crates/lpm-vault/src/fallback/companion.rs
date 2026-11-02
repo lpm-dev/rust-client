@@ -24,9 +24,9 @@
 
 use std::collections::BTreeSet;
 
-use aes_gcm::aead::{AeadInPlace, generic_array::GenericArray};
+use aes_gcm::aead::{AeadInOut, Nonce, Tag};
 use aes_gcm::{Aes256Gcm, KeyInit};
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::companion::account::CompanionAccount;
@@ -150,15 +150,15 @@ fn seal(key: &[u8; 32], account: &CompanionAccount, plaintext: &[u8]) -> Result<
     let cipher =
         Aes256Gcm::new_from_slice(key).map_err(|error| format!("cipher init error: {error}"))?;
     let mut nonce = [0u8; NONCE_BYTES];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rand::rng().fill_bytes(&mut nonce);
     let mut sealed = Vec::with_capacity(NONCE_BYTES + plaintext.len() + TAG_BYTES);
     sealed.extend_from_slice(&nonce);
     sealed.extend_from_slice(plaintext);
     let tag = cipher
-        .encrypt_in_place_detached(
-            GenericArray::from_slice(&nonce),
+        .encrypt_inout_detached(
+            <&Nonce<Aes256Gcm>>::from(&nonce),
             &entry_associated_data(account)?,
-            &mut sealed[NONCE_BYTES..],
+            (&mut sealed[NONCE_BYTES..]).into(),
         )
         .map_err(|error| format!("encryption error: {error}"))?;
     sealed.extend_from_slice(&tag);
@@ -181,14 +181,18 @@ fn open(
     let cipher =
         Aes256Gcm::new_from_slice(key).map_err(|error| format!("cipher init error: {error}"))?;
     let tag_start = sealed.len() - TAG_BYTES;
-    let (head, tag) = sealed.split_at_mut(tag_start);
-    let (nonce, ciphertext) = head.split_at_mut(NONCE_BYTES);
+    let (head, tag) = sealed
+        .split_last_chunk_mut::<TAG_BYTES>()
+        .expect("checked above: the entry holds a tag");
+    let (nonce, ciphertext) = head
+        .split_first_chunk_mut::<NONCE_BYTES>()
+        .expect("checked above: the entry holds a nonce");
     cipher
-        .decrypt_in_place_detached(
-            GenericArray::from_slice(nonce),
+        .decrypt_inout_detached(
+            <&Nonce<Aes256Gcm>>::from(&*nonce),
             &entry_associated_data(account)?,
-            ciphertext,
-            GenericArray::from_slice(tag),
+            ciphertext.into(),
+            <&Tag<Aes256Gcm>>::from(&*tag),
         )
         .map_err(|_| {
             format!(
@@ -364,7 +368,7 @@ fn is_transaction_id(value: &str) -> bool {
 
 fn new_transaction_id() -> String {
     let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 

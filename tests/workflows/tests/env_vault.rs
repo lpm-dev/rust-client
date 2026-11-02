@@ -4,7 +4,7 @@ mod support;
 
 use aes_gcm::{
     Aes256Gcm, KeyInit,
-    aead::{AeadInPlace, generic_array::GenericArray},
+    aead::{AeadInOut, Nonce},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use p256::SecretKey as P256SecretKey;
@@ -62,7 +62,7 @@ async fn mount_personal_ci_project(
             Aes256Gcm::new_from_slice(&root)
                 .unwrap()
                 .encrypt_in_place(
-                    GenericArray::from_slice(&nonce),
+                    <&Nonce<Aes256Gcm>>::from(&nonce),
                     &lpm_vault::crypto::personal::key_associated_data(&context, None).unwrap(),
                     &mut bytes,
                 )
@@ -612,7 +612,7 @@ fn write_file_backed_vault(home: &std::path::Path, vault_id: &str, payload: serd
         serde_json::to_string(&payload).expect("failed to serialize local vault payload");
     let cipher = Aes256Gcm::new_from_slice(&data_key).expect("failed to create vault cipher");
     let iv = [0x11u8; 12];
-    let nonce = GenericArray::from_slice(&iv);
+    let nonce = <&Nonce<Aes256Gcm>>::from(&iv);
     let vault_id_bytes = vault_id.as_bytes();
     let vault_id_length = u32::try_from(vault_id_bytes.len()).expect("test vault ID length");
     let mut associated_data = Vec::with_capacity(20 + vault_id_bytes.len());
@@ -621,7 +621,7 @@ fn write_file_backed_vault(home: &std::path::Path, vault_id: &str, payload: serd
     associated_data.extend_from_slice(vault_id_bytes);
     let mut encrypted = plaintext.into_bytes();
     let auth_tag = cipher
-        .encrypt_in_place_detached(nonce, &associated_data, &mut encrypted)
+        .encrypt_inout_detached(nonce, &associated_data, encrypted.as_mut_slice().into())
         .expect("failed to encrypt local vault payload");
     let encoded = format!(
         "{}:{}:{}",
@@ -4497,7 +4497,7 @@ async fn env_rotate_key_preserves_complete_named_remote_payload_with_cas() {
         let mut bytes = BASE64.decode(ciphertext).unwrap();
         Aes256Gcm::new_from_slice(key)
             .unwrap()
-            .decrypt_in_place(GenericArray::from_slice(&nonce), aad, &mut bytes)
+            .decrypt_in_place(nonce.as_slice().try_into().unwrap(), aad, &mut bytes)
             .unwrap();
         <[u8; 32]>::try_from(bytes).unwrap()
     };
@@ -9079,7 +9079,7 @@ async fn assert_personal_push_environments(all_empty: bool) {
     Aes256Gcm::new_from_slice(&root)
         .unwrap()
         .decrypt_in_place(
-            GenericArray::from_slice(&BASE64.decode(nonce).unwrap()),
+            BASE64.decode(nonce).unwrap().as_slice().try_into().unwrap(),
             &lpm_vault::crypto::personal::key_associated_data(&context, None).unwrap(),
             &mut key,
         )

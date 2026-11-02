@@ -757,12 +757,12 @@ async fn rekor_upload(
     let raw_payload = BASE64
         .decode(envelope.payload.as_bytes())
         .unwrap_or_default();
-    let payload_hash = format!("{:x}", Sha256::digest(&raw_payload));
+    let payload_hash = hex::encode(Sha256::digest(&raw_payload));
 
     // hash: SHA-256 of the canonicalized envelope (with publicKey included)
     let envelope_hash = {
         let canonical = serde_json::to_string(&rekor_envelope).unwrap_or_default();
-        format!("{:x}", Sha256::digest(canonical.as_bytes()))
+        hex::encode(Sha256::digest(canonical.as_bytes()))
     };
 
     let body = serde_json::json!({

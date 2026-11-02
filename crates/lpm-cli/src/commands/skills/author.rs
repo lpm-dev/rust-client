@@ -264,7 +264,7 @@ pub(crate) fn compute_validated_digest(skills: &[ValidatedSkillFile]) -> String 
         hasher.update(&skill.content);
         hasher.update(b"\0");
     }
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(test)]

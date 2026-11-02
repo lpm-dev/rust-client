@@ -102,7 +102,7 @@ pub fn compute_fingerprint(patches: &HashMap<String, PatchedDependencyEntry>) ->
         // so adversarially-crafted strings can't fake the boundary.
         hasher.update(b"\x01");
     }
-    format!("sha256-{:x}", hasher.finalize())
+    format!("sha256-{}", hex::encode(hasher.finalize()))
 }
 
 /// Full SHA-256 digest for a project-relative patch file.

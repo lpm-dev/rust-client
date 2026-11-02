@@ -77,7 +77,10 @@ fn integrity_alias_path(store_root: &Path, stored: &str, sri: &str) -> Option<st
         HashAlgorithm::Sha512 => "sha512",
     };
     let mut path = store_root.join("integrity-aliases-v1");
-    path.push(format!("{:x}.{suffix}", Sha512::digest(stored.as_bytes())));
+    path.push(format!(
+        "{}.{suffix}",
+        hex::encode(Sha512::digest(stored.as_bytes()))
+    ));
     Some(path)
 }
 

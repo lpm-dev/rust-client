@@ -706,7 +706,7 @@ impl PruneTombstones {
     }
 
     fn remove(&self, path: &Path) -> Result<u64, LpmError> {
-        use rand::RngCore;
+        use rand::Rng;
 
         let parent_path = path.parent().ok_or_else(|| {
             LpmError::Store(format!(
@@ -731,7 +731,7 @@ impl PruneTombstones {
         else {
             return Ok(0);
         };
-        let suffix = rand::thread_rng().next_u64();
+        let suffix = rand::rng().next_u64();
         let label = source_name.to_string_lossy();
         let tombstone_name = format!("{label}.{suffix:016x}");
         match source_parent.rename(source_name, &self.directory, OsStr::new(&tombstone_name)) {

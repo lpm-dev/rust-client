@@ -6,9 +6,9 @@
 //! The key excludes repository-supplied state and other user accounts from
 //! cache authority; code already running as the same OS user can read it.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use lpm_security::behavioral::PackageAnalysis;
-use rand::RngCore as _;
+use rand::TryRng as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
@@ -243,10 +243,7 @@ impl ProjectAuditCache {
 impl CacheContext {
     fn for_project(project_root: &Path) -> Option<Self> {
         let canonical = project_root.canonicalize().ok()?;
-        let project_id = format!(
-            "{:x}",
-            Sha256::digest(canonical.as_os_str().as_encoded_bytes())
-        );
+        let project_id = hex::encode(Sha256::digest(canonical.as_os_str().as_encoded_bytes()));
         let lpm_root = lpm_common::LpmRoot::from_env().ok()?;
         let root = lpm_root.cache_metadata().join("audit");
         Some(Self {
@@ -416,7 +413,7 @@ fn get_or_create_cache_secret(path: &Path) -> io::Result<Vec<u8>> {
         std::fs::create_dir_all(parent)?;
     }
     let mut secret = [0u8; CACHE_SECRET_BYTES];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut secret)
         .map_err(io::Error::other)?;
     let mut options = std::fs::OpenOptions::new();

@@ -2171,7 +2171,7 @@ async fn dev_prepares_the_selected_runtime_before_dependency_engine_checks() {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     encoder.write_all(&builder.into_inner().unwrap()).unwrap();
     let archive = encoder.finish().unwrap();
-    let digest = format!("{:x}", Sha256::digest(&archive));
+    let digest = hex::encode(Sha256::digest(&archive));
     Mock::given(method("GET"))
         .and(path(format!("/v99.0.0/{archive_name}")))
         .respond_with(

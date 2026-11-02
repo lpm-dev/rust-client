@@ -878,7 +878,7 @@ impl FieldHasher {
     }
 
     fn finish(self) -> String {
-        format!("{:x}", self.0.finalize())
+        hex::encode(self.0.finalize())
     }
 }
 

@@ -400,7 +400,7 @@ fn rebuild_changed_delegate_bytes_invalidate_generic_markers() {
 
 #[test]
 fn rebuild_named_selection_honors_package_limited_script_authorization() {
-    use hmac::Mac;
+    use hmac::{KeyInit, Mac};
     let (project, _) = contract_project("scoped-test", "exit 0");
     let unlocks = project.home().join(".lpm/security/unlocks");
     for entry in std::fs::read_dir(unlocks).unwrap() {

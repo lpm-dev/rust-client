@@ -393,7 +393,7 @@ fn canonical_project_restore_lock_path(root: &LpmRoot, canonical_project: &Path)
     hash_path_identity(&mut hasher, canonical_project);
     root.cache_tasks()
         .join(".locks")
-        .join(format!("project-{:x}.lock", hasher.finalize()))
+        .join(format!("project-{}.lock", hex::encode(hasher.finalize())))
 }
 
 #[cfg(unix)]

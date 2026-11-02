@@ -3207,7 +3207,7 @@ async fn audit_scans_v1_materialized_bytes_for_a_patched_package() {
     let package = "patched-pkg";
     let version = "1.0.0";
     let patch_bytes = b"fixture patch bytes";
-    let patch_digest = format!("sha256-{:x}", sha2::Sha256::digest(patch_bytes));
+    let patch_digest = format!("sha256-{}", hex::encode(sha2::Sha256::digest(patch_bytes)));
     project.write_file(
         "patches/patched-pkg.patch",
         std::str::from_utf8(patch_bytes).unwrap(),
@@ -3287,7 +3287,7 @@ async fn audit_scans_nested_v1_materialized_bytes_for_a_patched_version_conflict
         r#"{"name":"patched-conflict-host","version":"1.0.0","dependencies":{"parent-pkg":"1.0.0","shared-pkg":"2.0.0"}}"#,
     );
     let patch_bytes = b"nested fixture patch bytes";
-    let patch_digest = format!("sha256-{:x}", sha2::Sha256::digest(patch_bytes));
+    let patch_digest = format!("sha256-{}", hex::encode(sha2::Sha256::digest(patch_bytes)));
     project.write_file(
         "patches/shared-pkg.patch",
         std::str::from_utf8(patch_bytes).unwrap(),

@@ -27,10 +27,10 @@
 
 use aes_gcm::{
     Aes256Gcm, KeyInit,
-    aead::{Aead, generic_array::GenericArray},
+    aead::{Aead, Nonce},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use rand::RngCore;
+use rand::Rng;
 use secrecy::{ExposeSecret, SecretString};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -2447,7 +2447,7 @@ fn get_auth_key_material() -> Result<AuthKeyMaterial, String> {
     }
 
     let mut key = [0_u8; 32];
-    rand::thread_rng().fill_bytes(&mut key);
+    rand::rng().fill_bytes(&mut key);
     let value = encode_auth_key(&key);
     write_file_auth_key(&key_path, &value)?;
     Ok(AuthKeyMaterial {
@@ -2510,7 +2510,7 @@ fn get_auth_key_material() -> Result<AuthKeyMaterial, String> {
     }
 
     let mut key = [0_u8; 32];
-    rand::thread_rng().fill_bytes(&mut key);
+    rand::rng().fill_bytes(&mut key);
     let value = encode_auth_key(&key);
 
     let keyring_ok = if force_file_auth() {
@@ -2559,8 +2559,8 @@ fn encrypt(plaintext: &str) -> Result<String, String> {
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| format!("cipher init error: {e}"))?;
 
     let mut iv = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut iv);
-    let nonce = GenericArray::from_slice(&iv);
+    rand::rng().fill_bytes(&mut iv);
+    let nonce = <&Nonce<Aes256Gcm>>::from(&iv);
 
     let ciphertext = cipher
         .encrypt(nonce, plaintext.as_bytes())
@@ -2602,16 +2602,14 @@ fn decrypt_with_key(encoded: &str, key: &[u8; 32]) -> Result<String, String> {
 
     // AES-256-GCM requires exactly 12-byte nonce. If the IV is a different size
     // (e.g., 16 bytes from the JS CLI), this isn't our format.
-    if iv.len() != 12 {
-        return Err(format!(
+    let nonce = <&Nonce<Aes256Gcm>>::try_from(iv.as_slice()).map_err(|_| {
+        format!(
             "incompatible IV size: {} bytes (expected 12, possibly JS CLI format)",
             iv.len()
-        ));
-    }
+        )
+    })?;
 
     let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("cipher init error: {e}"))?;
-
-    let nonce = GenericArray::from_slice(&iv);
 
     // Reconstruct ciphertext + auth_tag (AES-GCM expects them concatenated)
     let mut combined = encrypted;
@@ -4696,7 +4694,7 @@ mod tests {
         let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
         let payload = cipher
             .encrypt(
-                GenericArray::from_slice(&iv),
+                <&Nonce<Aes256Gcm>>::from(&iv),
                 b"saved credential".as_slice(),
             )
             .unwrap();

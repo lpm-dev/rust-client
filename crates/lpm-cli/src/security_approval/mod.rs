@@ -229,9 +229,9 @@ mod prelude {
     pub(super) use crate::sandbox_config::ResolvedSandboxMode;
     pub(super) use crate::script_policy_config::ScriptPolicy;
     pub(super) use chrono::{DateTime, Utc};
-    pub(super) use hmac::Mac;
+    pub(super) use hmac::{KeyInit, Mac};
     pub(super) use lpm_common::LpmError;
-    pub(super) use rand::RngCore;
+    pub(super) use rand::Rng;
     pub(super) use serde::{Deserialize, Serialize};
     pub(super) use sha2::{Digest, Sha256};
     pub(super) use std::collections::{BTreeMap, BTreeSet};

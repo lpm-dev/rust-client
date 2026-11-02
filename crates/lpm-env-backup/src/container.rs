@@ -4,7 +4,7 @@
 use std::sync::Mutex;
 
 use argon2::{Algorithm, Argon2, Block, Params, Version};
-use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+use chacha20poly1305::aead::{AeadInOut, KeyInit};
 use chacha20poly1305::{Tag, XChaCha20Poly1305, XNonce};
 use zeroize::Zeroizing;
 
@@ -162,7 +162,7 @@ fn seal_with(
     file.resize(HEADER_LEN + plaintext_len, 0);
     let (aad, plaintext) = file.split_at_mut(HEADER_LEN);
     let tag = cipher(&key)
-        .encrypt_in_place_detached(XNonce::from_slice(&header.nonce), aad, plaintext)
+        .encrypt_inout_detached(<&XNonce>::from(&header.nonce), aad, plaintext.into())
         .expect("plaintexts within the file cap are far below the cipher's limit");
     file.extend_from_slice(&tag);
     debug_assert_eq!(file.len(), file.capacity());
@@ -190,14 +190,16 @@ impl Plaintext {
 pub(crate) fn open(file: &[u8], passphrase: &Passphrase) -> Result<Plaintext, ContainerError> {
     let header = Header::decode(file)?;
     let key = derive_key(passphrase, &header.salt)?;
-    let (ciphertext, tag) = file[HEADER_LEN..].split_at(file.len() - HEADER_LEN - TAG_LEN);
+    let (ciphertext, tag) = file[HEADER_LEN..]
+        .split_last_chunk::<TAG_LEN>()
+        .expect("a decoded header leaves room for the tag");
     let mut plaintext = Zeroizing::new(ciphertext.to_vec());
     cipher(&key)
-        .decrypt_in_place_detached(
-            XNonce::from_slice(&header.nonce),
+        .decrypt_inout_detached(
+            <&XNonce>::from(&header.nonce),
             &file[..HEADER_LEN],
-            plaintext.as_mut_slice(),
-            Tag::from_slice(tag),
+            plaintext.as_mut_slice().into(),
+            <&Tag>::from(tag),
         )
         .map_err(|_| ContainerError::WrongPassphrase)?;
 
@@ -508,10 +510,10 @@ pub(crate) mod tests {
         let key = derive_key(passphrase, &header.salt).expect("key");
         let encoded = header.encode(plaintext.len() + TAG_LEN);
         let tag = cipher(&key)
-            .encrypt_in_place_detached(
-                XNonce::from_slice(&header.nonce),
+            .encrypt_inout_detached(
+                <&XNonce>::from(&header.nonce),
                 &encoded,
-                plaintext.as_mut_slice(),
+                plaintext.as_mut_slice().into(),
             )
             .expect("encrypt");
         [encoded.as_slice(), &plaintext, &tag].concat()

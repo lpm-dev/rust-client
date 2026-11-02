@@ -213,7 +213,7 @@ pub(super) fn principal_fingerprint(
     if !tagged {
         return "anon".to_string();
     }
-    let hash = format!("{:x}", hasher.finalize());
+    let hash = hex::encode(hasher.finalize());
     format!("principal-{}", &hash[..16])
 }
 
@@ -238,7 +238,7 @@ pub(super) fn bearer_principal_fingerprint(
     if !tagged {
         return "anon".to_string();
     }
-    let hash = format!("{:x}", hasher.finalize());
+    let hash = hex::encode(hasher.finalize());
     format!("principal-{}", &hash[..16])
 }
 
@@ -251,6 +251,6 @@ pub(super) fn cert_pem_fingerprint(pem: &[u8]) -> Arc<str> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(pem);
-    let hash = format!("{:x}", hasher.finalize());
+    let hash = hex::encode(hasher.finalize());
     Arc::from(&hash[..16])
 }

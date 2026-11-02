@@ -242,7 +242,7 @@ fn hash_open_file(file: &mut std::fs::File) -> Result<String, LpmError> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Decide how this download is verified — bundled, upstream-fetched, or
@@ -387,7 +387,7 @@ fn is_lowercase_sha256_hex(token: &str) -> bool {
 fn compute_sha256(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 /// Verify that a computed checksum matches the expected value.

@@ -84,7 +84,7 @@ impl DiscoveredPackage {
                 None => hasher.update(u64::MAX.to_le_bytes()),
             }
         }
-        format!("fallback:{:x}", hasher.finalize())
+        format!("fallback:{}", hex::encode(hasher.finalize()))
     }
 }
 

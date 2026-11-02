@@ -513,7 +513,7 @@ fn decrypt_pkcs8(
     key_meta: &TaggedPath,
     passphrase: &dyn PassphraseProvider,
 ) -> Result<String, LpmError> {
-    use pkcs8::EncryptedPrivateKeyInfo;
+    use pkcs8::EncryptedPrivateKeyInfoRef;
     use pkcs8::der::Decode;
     use pkcs8::der::pem::PemLabel;
 
@@ -524,15 +524,15 @@ fn decrypt_pkcs8(
             key_meta.source, key_meta.line
         ))
     })?;
-    if label != EncryptedPrivateKeyInfo::PEM_LABEL {
+    if label != EncryptedPrivateKeyInfoRef::PEM_LABEL {
         return Err(LpmError::Cert(format!(
             "{}:{}: expected '{}' PEM label, got '{label}'",
             key_meta.source,
             key_meta.line,
-            EncryptedPrivateKeyInfo::PEM_LABEL,
+            EncryptedPrivateKeyInfoRef::PEM_LABEL,
         )));
     }
-    let info = EncryptedPrivateKeyInfo::from_der(&der).map_err(|e| {
+    let info = EncryptedPrivateKeyInfoRef::from_der(&der).map_err(|e| {
         LpmError::Cert(format!(
             "{}:{}: encrypted PKCS#8 DER is malformed: {e}",
             key_meta.source, key_meta.line
@@ -961,8 +961,8 @@ mod tests {
     /// `load_identity` to prove the decryption path works end-to-end.
     #[test]
     fn encrypted_pkcs8_round_trips_with_correct_passphrase() {
-        use pkcs8::EncryptedPrivateKeyInfo;
-        use pkcs8::PrivateKeyInfo;
+        use pkcs8::EncryptedPrivateKeyInfoRef;
+        use pkcs8::PrivateKeyInfoRef;
         use pkcs8::der::Decode;
         use pkcs8::der::pem::PemLabel;
 
@@ -977,18 +977,19 @@ mod tests {
             label, "PRIVATE KEY",
             "rcgen 0.13 must emit PKCS#8 PEM (got label '{label}')"
         );
-        let plain_info = PrivateKeyInfo::try_from(plain_der.as_slice()).expect("parse pkcs8 info");
+        let plain_info =
+            PrivateKeyInfoRef::try_from(plain_der.as_slice()).expect("parse pkcs8 info");
 
         // Use the rng-backed `encrypt` (scrypt + AES-256-CBC by
         // default). The exact ciphertext varies per run; that's
         // fine — we test the round-trip, not byte-equality.
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let passphrase = "correct horse battery staple";
         let encrypted_doc = plain_info
-            .encrypt(&mut rng, passphrase.as_bytes())
+            .encrypt_with_rng(&mut rng, passphrase.as_bytes())
             .expect("encrypt pkcs8");
         let encrypted_pem = pkcs8::der::pem::encode_string(
-            EncryptedPrivateKeyInfo::PEM_LABEL,
+            EncryptedPrivateKeyInfoRef::PEM_LABEL,
             pkcs8::der::pem::LineEnding::LF,
             encrypted_doc.as_bytes(),
         )
@@ -996,7 +997,7 @@ mod tests {
 
         // Sanity: the encrypted DER round-trips through our parser.
         let _info =
-            EncryptedPrivateKeyInfo::from_der(encrypted_doc.as_bytes()).expect("decode info");
+            EncryptedPrivateKeyInfoRef::from_der(encrypted_doc.as_bytes()).expect("decode info");
 
         let dir = TempDir::new().unwrap();
         let cert = tagged(write(dir.path(), "cert.pem", &cert_pem));

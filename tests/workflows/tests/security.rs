@@ -700,7 +700,7 @@ fn security_repair_quarantines_inconsistent_audit_history_and_allows_new_events(
 }
 
 fn rewrite_fixture_unlock(project: &TempProject, edit: impl FnOnce(&mut serde_json::Value)) {
-    use hmac::Mac;
+    use hmac::{KeyInit, Mac};
     let path = std::fs::read_dir(project.home().join(".lpm/security/unlocks"))
         .unwrap()
         .next()

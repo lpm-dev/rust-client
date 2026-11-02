@@ -5,7 +5,7 @@ use super::{
 };
 use futures::StreamExt;
 use lpm_common::LpmError;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -1049,7 +1049,7 @@ fn mutation_result(outcome: &DeleteVariableOutcome) -> String {
 
 fn ownership_sentinel() -> String {
     let mut bytes = [0_u8; 24];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rand_core::UnwrapErr(rand::rngs::SysRng).fill_bytes(&mut bytes);
     format!("__lpm_env_ownership_{}", hex::encode(bytes))
 }
 

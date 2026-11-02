@@ -1440,7 +1440,7 @@ mod tests {
         let server = MockServer::start().await;
         let captured_body = Arc::new(StdMutex::new(None));
         let (_, member_public_key) = crypto::generate_x25519_keypair();
-        let member_fingerprint = format!("{:x}", Sha256::digest(member_public_key));
+        let member_fingerprint = hex::encode(Sha256::digest(member_public_key));
 
         Mock::given(method("GET"))
             .and(path("/api/orgs/acme/members/public-keys"))

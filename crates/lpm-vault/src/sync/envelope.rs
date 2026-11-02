@@ -3,7 +3,7 @@ use super::public_key::ValidatedSharingKey;
 use crate::crypto;
 use crate::crypto::personal::PersonalKeyEnvelope;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use rand::RngCore;
+use rand::TryRng;
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde_json::map::Entry;
 
@@ -1225,7 +1225,7 @@ fn validate_organization_id(value: &str) -> Result<(), String> {
 
 pub(super) fn generate_request_nonce() -> Result<String, String> {
     let mut bytes = [0u8; REQUEST_NONCE_BYTES];
-    rand::thread_rng()
+    rand::rng()
         .try_fill_bytes(&mut bytes)
         .map_err(|error| format!("failed to generate authenticated sync request nonce: {error}"))?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))

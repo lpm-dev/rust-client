@@ -699,7 +699,7 @@ impl RegistryClient {
         let mut hasher = Sha256::new();
         hasher.update(METADATA_CACHE_MAGIC);
         hasher.update(key.as_bytes());
-        let hash = format!("{:x}", hasher.finalize());
+        let hash = hex::encode(hasher.finalize());
         Some(dir.join(&hash[..16]))
     }
 

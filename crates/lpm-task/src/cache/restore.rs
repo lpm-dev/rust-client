@@ -867,7 +867,7 @@ fn restore_registry_record(
     let registry_path = cache_path.join(RESTORE_REGISTRY_DIR);
     let mut hasher = Sha256::new();
     hash_path_identity(&mut hasher, canonical_project);
-    let name = std::ffi::OsString::from(format!("{:x}.bin", hasher.finalize()));
+    let name = std::ffi::OsString::from(format!("{}.bin", hex::encode(hasher.finalize())));
     Ok(RestoreRegistryRecord {
         path: registry_path.join(&name),
         dir: registry_dir,

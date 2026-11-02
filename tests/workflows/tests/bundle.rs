@@ -201,7 +201,7 @@ fn hash_directory_tree_for_test(root: &std::path::Path) -> String {
         hasher.update([0]);
     }
 
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 #[cfg(unix)]

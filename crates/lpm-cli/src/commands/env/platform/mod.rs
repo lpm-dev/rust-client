@@ -7,7 +7,7 @@ use super::prelude::*;
 use crate::prompt::PromptResultExt as _;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::StreamExt;
-use rand::RngCore;
+use rand::TryRng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -1279,13 +1279,11 @@ async fn read_signed_lpm_response(
 
 fn generate_platform_request_nonce() -> Result<String, LpmError> {
     let mut nonce = [0u8; PLATFORM_REQUEST_NONCE_BYTES];
-    rand::thread_rng()
-        .try_fill_bytes(&mut nonce)
-        .map_err(|error| {
-            LpmError::Script(format!(
-                "failed to generate platform request nonce: {error}"
-            ))
-        })?;
+    rand::rng().try_fill_bytes(&mut nonce).map_err(|error| {
+        LpmError::Script(format!(
+            "failed to generate platform request nonce: {error}"
+        ))
+    })?;
     Ok(URL_SAFE_NO_PAD.encode(nonce))
 }
 

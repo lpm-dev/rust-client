@@ -60,7 +60,7 @@ fn diagnose_stripe(
         .map(|p| &p[3..])?;
 
     // Compute expected: HMAC-SHA256(secret, "timestamp.body")
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     type HmacSha256 = Hmac<Sha256>;
@@ -114,7 +114,7 @@ fn diagnose_github(
     // Parse: sha256=<hex>
     let provided_sig = sig_header.strip_prefix("sha256=")?;
 
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
     type HmacSha256 = Hmac<Sha256>;
@@ -192,7 +192,7 @@ mod tests {
 
     /// Compute a valid Stripe signature for testing.
     fn stripe_sign(secret: &str, timestamp: &str, body: &[u8]) -> String {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         type HmacSha256 = Hmac<Sha256>;
 
@@ -204,7 +204,7 @@ mod tests {
 
     /// Compute a valid GitHub signature for testing.
     fn github_sign(secret: &str, body: &[u8]) -> String {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         type HmacSha256 = Hmac<Sha256>;
 

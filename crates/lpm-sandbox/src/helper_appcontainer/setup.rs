@@ -315,7 +315,7 @@ fn grant_for(
     for unit in path.as_os_str().encode_wide() {
         hash.update(unit.to_le_bytes());
     }
-    let capability_name = format!("lpm.filesystem.v1.{:x}", hash.finalize());
+    let capability_name = format!("lpm.filesystem.v1.{}", hex::encode(hash.finalize()));
     let sid = capability_sid(&capability_name)?;
     let configured = has_grant(
         &target.handle,

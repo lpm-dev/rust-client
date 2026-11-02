@@ -11,10 +11,10 @@
 
 use aes_gcm::{
     Aes256Gcm, KeyInit,
-    aead::{AeadInPlace, generic_array::GenericArray},
+    aead::{AeadInOut, Nonce, Tag},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
-use rand::RngCore;
+use rand::Rng;
 use std::collections::HashMap;
 
 pub(crate) mod companion;
@@ -258,7 +258,7 @@ fn get_or_create_file_data_key(
         return Ok(key);
     }
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     persist_fallback_key(directory, &bytes)?;
     Ok(DataKey {
         bytes,
@@ -416,7 +416,7 @@ fn load_data_key_from_store_unlocked(
     }
 
     let mut native_key = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut native_key);
+    rand::rng().fill_bytes(&mut native_key);
     if write_native_data_key(store, &native_key).is_ok() {
         return read_native_data_key(store)?.ok_or_else(|| {
             "native vault data-key write succeeded but no key was readable".to_owned()
@@ -515,13 +515,13 @@ fn encrypt_with_store_unlocked(
         .map_err(|e| format!("cipher init error: {e}"))?;
 
     let mut iv = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut iv);
-    let nonce = GenericArray::from_slice(&iv);
+    rand::rng().fill_bytes(&mut iv);
+    let nonce = <&Nonce<Aes256Gcm>>::from(&iv);
 
     let mut encrypted = plaintext.as_bytes().to_vec();
     let associated_data = local_vault_associated_data(vault_id)?;
     let auth_tag = cipher
-        .encrypt_in_place_detached(nonce, &associated_data, &mut encrypted)
+        .encrypt_inout_detached(nonce, &associated_data, encrypted.as_mut_slice().into())
         .map_err(|e| format!("encryption error: {e}"))?;
 
     let encoded_capacity = padded_base64_len(iv.len())
@@ -583,28 +583,26 @@ fn decrypt_with_store_unlocked(
         .decode(encrypted_encoded)
         .map_err(|e| format!("data decode: {e}"))?;
 
-    if iv.len() != 12 {
-        return Err(format!("incompatible IV size: {} bytes", iv.len()));
-    }
-    if auth_tag.len() != 16 {
-        return Err(format!(
+    let nonce = <&Nonce<Aes256Gcm>>::try_from(iv.as_slice())
+        .map_err(|_| format!("incompatible IV size: {} bytes", iv.len()))?;
+    let auth_tag = <&Tag<Aes256Gcm>>::try_from(auth_tag.as_slice()).map_err(|_| {
+        format!(
             "incompatible authentication tag size: {} bytes",
             auth_tag.len()
-        ));
-    }
+        )
+    })?;
 
     let data_key = load_data_key_with_store_unlocked(directory, store)?;
     let cipher = Aes256Gcm::new_from_slice(&data_key.bytes)
         .map_err(|e| format!("cipher init error: {e}"))?;
 
-    let nonce = GenericArray::from_slice(&iv);
     let associated_data = local_vault_associated_data(vault_id)?;
     cipher
-        .decrypt_in_place_detached(
+        .decrypt_inout_detached(
             nonce,
             &associated_data,
-            &mut encrypted,
-            GenericArray::from_slice(&auth_tag),
+            encrypted.as_mut_slice().into(),
+            auth_tag,
         )
         .map_err(|_| "decryption failed (wrong key or corrupted data)".to_string())?;
 
@@ -1504,9 +1502,9 @@ mod tests {
         // Simulate key generation by creating a temp key file
         // (We can't call get_or_create_fallback_key directly because it uses
         // a fixed path, but we verify the key format requirements.)
-        use rand::Rng;
-        let key: String = rand::thread_rng()
-            .sample_iter(&rand::distributions::Alphanumeric)
+        use rand::RngExt;
+        let key: String = rand::rng()
+            .sample_iter(&rand::distr::Alphanumeric)
             .take(64)
             .map(char::from)
             .collect();

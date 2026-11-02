@@ -22,5 +22,5 @@ pub(super) fn compute_published_skills_digest(skills: &[lpm_registry::Skill]) ->
         hasher.update(content.as_bytes());
         hasher.update(b"\0");
     }
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
