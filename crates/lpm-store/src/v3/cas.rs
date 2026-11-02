@@ -1846,6 +1846,10 @@ fn tighten_directory_permissions(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which sets the directory mode"
+)]
 fn tighten_directory_permissions(_path: &Path) -> io::Result<()> {
     Ok(())
 }
@@ -2567,14 +2571,14 @@ fn decode_os_string(encoded: &[u8]) -> Result<OsString, LpmError> {
 #[cfg(windows)]
 fn decode_os_string(encoded: &[u8]) -> Result<OsString, LpmError> {
     use std::os::windows::ffi::OsStringExt;
-    if !encoded.len().is_multiple_of(2) {
+    let (pairs, []) = encoded.as_chunks::<2>() else {
         return Err(LpmError::Store(
             "invalid v3 CAS UTF-16 path encoding".into(),
         ));
-    }
-    let wide = encoded
-        .chunks_exact(2)
-        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+    };
+    let wide = pairs
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .collect::<Vec<_>>();
     Ok(OsString::from_wide(&wide))
 }
@@ -2613,14 +2617,14 @@ fn validate_relative_path(path: &[u8]) -> Result<(), LpmError> {
 
 #[cfg(windows)]
 fn validate_windows_relative_path(path: &[u8]) -> Result<(), LpmError> {
-    if !path.len().is_multiple_of(2) {
+    let (pairs, []) = path.as_chunks::<2>() else {
         return Err(LpmError::Store(
             "invalid UTF-16 v3 CAS manifest path".into(),
         ));
-    }
-    let units = path
-        .chunks_exact(2)
-        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+    };
+    let units = pairs
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .collect::<Vec<_>>();
     if matches!(units.first(), Some(unit) if *unit == u16::from(b'/') || *unit == u16::from(b'\\'))
     {

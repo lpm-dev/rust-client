@@ -1117,6 +1117,13 @@ fn sync_directory(dir: &Dir) -> Result<(), LpmError> {
         .map_err(|error| LpmError::Cert(format!("failed to sync certificate directory: {error}")))
 }
 
+#[cfg_attr(
+    all(windows, not(test)),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "other platforms sync the directory, which can fail"
+    )
+)]
 fn sync_directory_io(dir: &Dir) -> std::io::Result<()> {
     #[cfg(test)]
     if FAIL_NEXT_DIRECTORY_SYNC.with(|fail| fail.replace(false)) {

@@ -272,6 +272,10 @@ fn tighten_audit_directory(dir: &Dir) -> Result<(), LpmError> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which sets the directory mode"
+)]
 fn tighten_audit_directory(_dir: &Dir) -> Result<(), LpmError> {
     Ok(())
 }

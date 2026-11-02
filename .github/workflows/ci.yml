@@ -753,7 +753,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-clippy-${{ env.RUST_TOOLCHAIN }}-
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked --keep-going -- -D warnings
 
   audit-fixtures:
     name: Hoisted-mode compat audit (${{ matrix.os }} / ${{ matrix.store_version }})

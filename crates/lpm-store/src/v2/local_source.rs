@@ -69,6 +69,10 @@ pub(crate) fn compute_local_source_fingerprint(
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which walks the source"
+)]
 pub(crate) fn compute_local_source_fingerprint(
     _source_root: &Path,
 ) -> Result<Option<LocalSourceFingerprint>, LpmError> {
