@@ -19,9 +19,11 @@ REVIEWED = {
         'over at most the first 100 characters of a passphrase the person types; '
         'opening a backup never estimates strength'
     )),
-    ('jsonschema', '0.46.5'): ('built', (
+    ('jsonschema', '0.46.10'): ('built', (
         'lpm-cli builds its lpm.config.json validator with PatternOptions::regex(), '
-        'so schema patterns run on the linear-time regex crate and fancy-regex is never called'
+        'so schema patterns run on the linear-time regex crate; the one keyword that '
+        'compiles patternProperties with fancy-regex regardless, unevaluatedProperties, '
+        'is absent from the embedded schema, the only one lpm compiles'
     )),
     ('termwiz', '0.23.3'): ('unbuilt', (
         'only ratatui-termwiz depends on it, behind a ratatui feature no workspace crate enables'

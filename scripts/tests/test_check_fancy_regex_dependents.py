@@ -23,7 +23,7 @@ def lockfile(packages):
 REVIEWED_GRAPH = [
     ('fancy-regex', '0.18.0', ['regex-automata']),
     ('zxcvbn', '3.1.1', ['fancy-regex', 'regex']),
-    ('jsonschema', '0.46.5', ['fancy-regex 0.18.0']),
+    ('jsonschema', '0.46.10', ['fancy-regex 0.18.0']),
     ('termwiz', '0.23.3', ['fancy-regex 0.11.0']),
     ('lpm-env-backup', '0.81.0', ['zxcvbn']),
 ]
@@ -42,7 +42,7 @@ class CheckFancyRegexDependentsTests(unittest.TestCase):
     def test_dependents_include_versioned_and_unversioned_references(self):
         self.assertEqual(
             check.dependents(lockfile(REVIEWED_GRAPH)),
-            {('zxcvbn', '3.1.1'), ('jsonschema', '0.46.5'), ('termwiz', '0.23.3')})
+            {('zxcvbn', '3.1.1'), ('jsonschema', '0.46.10'), ('termwiz', '0.23.3')})
 
     def test_the_reviewed_graph_passes(self):
         self.assertEqual(self.run_check(REVIEWED_GRAPH), 0)
