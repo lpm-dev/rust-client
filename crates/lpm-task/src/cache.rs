@@ -249,6 +249,10 @@ fn restrict_open_directory(dir: &Dir, label: &str) -> Result<(), LpmError> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which sets the directory mode"
+)]
 fn restrict_open_directory(_dir: &Dir, _label: &str) -> Result<(), LpmError> {
     Ok(())
 }
@@ -258,6 +262,13 @@ fn sync_open_directory(directory: &Dir) -> Result<(), std::io::Error> {
     sync_directory_handle(directory)
 }
 
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Unix syncs the directory, which can fail"
+    )
+)]
 fn sync_directory_handle(directory: &Dir) -> Result<(), std::io::Error> {
     #[cfg(target_os = "linux")]
     {
@@ -1903,11 +1914,19 @@ fn set_open_file_permissions_restricted(file: &std::fs::File) -> Result<(), LpmE
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which sets the file mode"
+)]
 fn set_open_file_permissions_restricted(_file: &std::fs::File) -> Result<(), LpmError> {
     Ok(())
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which sets the file mode"
+)]
 fn set_staged_file_permissions(_file: &std::fs::File, _mode: u32) -> Result<(), LpmError> {
     Ok(())
 }

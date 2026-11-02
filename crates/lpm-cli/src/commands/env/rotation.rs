@@ -1121,7 +1121,7 @@ pub(super) async fn env_rotate_sharing_key(
                      and starting fresh.",
                 );
             }
-            (scope, lock, current)
+            (scope, lock, *current)
         }
     };
 

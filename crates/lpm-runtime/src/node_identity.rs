@@ -1210,7 +1210,7 @@ mod tests {
         // Volta's Windows installer copies volta-shim.exe as node.exe.
         fs::write(program_files.path().join("volta-shim.exe"), b"MZ").unwrap();
         let node = program_files.path().join(NODE);
-        write_launcher(&node, "v22.0.0");
+        fs::write(&node, b"MZ").unwrap();
         assert!(is_shim(&node, project.path(), &environment));
     }
 

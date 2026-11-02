@@ -139,7 +139,7 @@ impl SafeRoot {
         #[cfg(windows)]
         {
             let _ = exact_mode;
-            return lpm_common::write_file_atomic_in_dir_with(
+            lpm_common::write_file_atomic_in_dir_with(
                 &parent,
                 &name,
                 |temporary| -> std::io::Result<()> {
@@ -147,7 +147,7 @@ impl SafeRoot {
                     temporary.sync_all()
                 },
             )
-            .map_err(LpmError::Io);
+            .map_err(LpmError::Io)
         }
         #[cfg(not(windows))]
         {

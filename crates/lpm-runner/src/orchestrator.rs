@@ -1457,9 +1457,8 @@ pub fn run_services_with_config(
     };
 
     // Set up Ctrl+C handler with double-press escalation
-    let shutdown_state_clone = shutdown_state.clone();
-    let children_clone = children.clone();
-    let _signal_handler = ctrlc_handler(shutdown_state_clone, children_clone);
+    #[cfg(unix)]
+    let _signal_handler = ctrlc_handler(shutdown_state.clone(), children.clone());
 
     let runtime_result = (|| -> Result<(), LpmError> {
         // Start services in dependency order
@@ -2048,11 +2047,6 @@ fn ctrlc_handler(
         #[cfg(test)]
         running,
     })
-}
-
-#[cfg(not(unix))]
-fn ctrlc_handler(shutdown_state: Arc<AtomicU8>, children: Arc<Mutex<Vec<(String, Child)>>>) {
-    let _ = (shutdown_state, children);
 }
 
 /// Immediately SIGKILL all children (used for double Ctrl+C escalation).

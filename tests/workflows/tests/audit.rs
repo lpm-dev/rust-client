@@ -209,6 +209,7 @@ fn seed_v2_audit_link(
     package_dir
 }
 
+#[cfg(unix)]
 fn write_duplicate_instance_lpm_lockfile(
     project: &TempProject,
     package_name: &str,

@@ -134,7 +134,7 @@ enum ProxyPublisherCommand {
     Release {
         reply: tokio::sync::oneshot::Sender<Result<(), LpmError>>,
     },
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     Snapshot {
         reply: tokio::sync::oneshot::Sender<Vec<lpm_proxy::Route>>,
     },
@@ -453,7 +453,7 @@ async fn run_proxy_route_publisher(
                 let _ = reply.send(result);
                 return;
             }
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             ProxyPublisherCommand::Snapshot { reply } => {
                 let _ = reply.send(runtime.routes.clone());
             }
@@ -3403,7 +3403,7 @@ async fn release_proxy_lease(proxy_lease: &ProxyLeaseSlot) -> Result<(), LpmErro
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn proxy_route_snapshot(proxy_lease: &ProxyLeaseSlot) -> Vec<lpm_proxy::Route> {
     let command_tx = proxy_lease
         .lock()
@@ -4706,6 +4706,7 @@ mod tests {
         validate_local_proxy_listener_contract(&config, &status).unwrap();
     }
 
+    #[cfg(unix)]
     fn remove_staged_dev_session(root: &lpm_common::LpmRoot) {
         let staged = fs::read_dir(root.dev_sessions_dir())
             .unwrap()

@@ -52,6 +52,13 @@ fn invalid(message: impl Into<String>) -> LpmError {
     LpmError::Script(message.into())
 }
 
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Unix syncs the directory, which can fail"
+    )
+)]
 fn sync(directory: &Dir) -> io::Result<()> {
     #[cfg(unix)]
     directory.open(".")?.sync_all()?;

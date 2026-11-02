@@ -2006,15 +2006,12 @@ fn restore_journal_path_from_bytes(bytes: &[u8]) -> Result<PathBuf, LpmError> {
 #[cfg(windows)]
 fn restore_journal_path_from_bytes(bytes: &[u8]) -> Result<PathBuf, LpmError> {
     use std::os::windows::ffi::OsStringExt;
-    if !bytes.len().is_multiple_of(2) {
+    let (pairs, []) = bytes.as_chunks::<2>() else {
         return Err(LpmError::Task(
             "invalid Windows path in task cache restore journal".into(),
         ));
-    }
-    let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .collect();
+    };
+    let units: Vec<u16> = pairs.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
     Ok(PathBuf::from(std::ffi::OsString::from_wide(&units)))
 }
 

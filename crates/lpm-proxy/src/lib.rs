@@ -97,7 +97,7 @@ pub(crate) use platform::{
     process_owner_uid, read_forwarder_daemon_state, validate_forwarder_daemon_state,
     validate_unix_control_peer,
 };
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use protocol::read_proxy_request;
 pub(crate) use protocol::{
     read_proxy_request_after_activity, read_proxy_request_with_timeout, send_request_on_stream,

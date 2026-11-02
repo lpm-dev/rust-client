@@ -220,9 +220,9 @@ impl PrivilegedForwarderSpec {
             let _ = requested_options;
             let _ = listener_flags_explicit;
             let _ = replace_existing;
-            return Err(LpmError::Script(
+            Err(LpmError::Script(
                 "`--privileged-ports` is only supported on Unix platforms".into(),
-            ));
+            ))
         }
 
         #[cfg(unix)]
@@ -296,9 +296,9 @@ impl PrivilegedForwarderSpec {
     fn for_uninstall() -> Result<Self, LpmError> {
         #[cfg(not(unix))]
         {
-            return Err(LpmError::Script(
+            Err(LpmError::Script(
                 "`--privileged-ports` is only supported on Unix platforms".into(),
-            ));
+            ))
         }
 
         #[cfg(unix)]
@@ -632,6 +632,10 @@ fn privileged_forwarder_stderr_log() -> PathBuf {
     PathBuf::from("/var/log/lpm-proxy-forwarder.err.log")
 }
 
+#[cfg_attr(
+    not(unix),
+    expect(clippy::unnecessary_wraps, reason = "Unix refuses privileged ports")
+)]
 pub(super) fn reject_privileged_user_service_ports(
     options: lpm_proxy::ProxyDaemonOptions,
 ) -> Result<(), LpmError> {

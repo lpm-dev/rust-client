@@ -648,6 +648,10 @@ fn retarget_internal_symlinks_recursive(
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which rewrites the links"
+)]
 pub(in crate::commands::deploy) fn retarget_internal_node_modules_symlinks(
     _output_dir: &Path,
 ) -> Result<usize, LpmError> {

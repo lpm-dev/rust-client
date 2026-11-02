@@ -246,6 +246,13 @@ fn matches(actual: &Fingerprint, expected: &Fingerprint, alternative_mode: Optio
     a == e && al == el && ai == ei && alternative_mode.is_some() && *am == alternative_mode
 }
 
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Unix sets the mode, which can fail"
+    )
+)]
 fn set_mode(directory: &Dir, name: &OsStr, value: Option<u32>) -> io::Result<()> {
     #[cfg(unix)]
     if let Some(value) = value {

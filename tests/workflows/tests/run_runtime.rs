@@ -2,9 +2,14 @@
 
 mod support;
 
-use support::{TempProject, configure_fake_node, lpm, lpm_spawnable};
+#[cfg(unix)]
+use support::lpm_spawnable;
+use support::{TempProject, configure_fake_node, lpm};
+use wiremock::MockServer;
+#[cfg(unix)]
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+#[cfg(unix)]
+use wiremock::{Mock, ResponseTemplate};
 
 #[cfg(unix)]
 fn fake_node_archive(platform: &lpm_runtime::platform::Platform, version: &str) -> Vec<u8> {

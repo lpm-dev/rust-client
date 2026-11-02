@@ -633,6 +633,13 @@ pub fn digest_file(path: &Path) -> Result<String, LpmError> {
     Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
 }
 
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Unix reads the source mode, which can fail"
+    )
+)]
 pub fn source_delivery_mode(source: &Path) -> Result<Option<u32>, LpmError> {
     #[cfg(unix)]
     {

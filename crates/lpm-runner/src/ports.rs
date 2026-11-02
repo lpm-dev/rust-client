@@ -313,7 +313,7 @@ pub fn find_available_port(start: u16) -> Option<u16> {
 pub fn kill_port_owner(port: u16) -> Result<(), String> {
     #[cfg(windows)]
     {
-        return kill_port_owner_windows(port);
+        kill_port_owner_windows(port)
     }
 
     #[cfg(not(windows))]
@@ -1085,7 +1085,7 @@ pub fn terminate_child_process_tree(
 ) -> std::io::Result<std::process::ExitStatus> {
     #[cfg(windows)]
     {
-        return terminate_child_process_tree_windows(child);
+        terminate_child_process_tree_windows(child)
     }
     #[cfg(not(windows))]
     {
@@ -1097,7 +1097,7 @@ pub fn terminate_child_process_tree(
     }
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(not(windows))]
 fn terminate_child_process_tree_non_windows_with(
     child: &mut Child,
     snapshot: &DescendantProcessSnapshot,
@@ -3904,7 +3904,7 @@ fn query_windows_process_image_path(
 
 #[cfg(windows)]
 fn windows_file_name_from_path(path: &str) -> Option<&str> {
-    path.rsplit(|ch| ch == '\\' || ch == '/')
+    path.rsplit(['\\', '/'])
         .next()
         .filter(|name| !name.is_empty())
 }

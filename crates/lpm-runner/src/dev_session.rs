@@ -309,6 +309,10 @@ fn sync_directory(directory: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which syncs the directory"
+)]
 fn sync_directory(_directory: &Path) -> std::io::Result<()> {
     // Windows cannot open directories as files for fsync. The staged record
     // is already flushed by write_file_atomic, matching its directory policy.
@@ -436,6 +440,10 @@ fn set_private_directory_permissions(path: &Path) -> Result<(), LpmError> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which sets the directory mode"
+)]
 fn set_private_directory_permissions(_path: &Path) -> Result<(), LpmError> {
     Ok(())
 }
@@ -448,6 +456,10 @@ fn set_private_file_permissions(path: &Path) -> Result<(), LpmError> {
 }
 
 #[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "matches the Unix implementation, which sets the file mode"
+)]
 fn set_private_file_permissions(_path: &Path) -> Result<(), LpmError> {
     Ok(())
 }

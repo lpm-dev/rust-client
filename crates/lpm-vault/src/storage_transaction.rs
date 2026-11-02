@@ -265,6 +265,10 @@ impl VaultStorageDirectory {
     }
 
     #[cfg(not(unix))]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "matches the Unix implementation, which checks the directory"
+    )]
     fn validate_directory_path(&self) -> Result<(), String> {
         Ok(())
     }
@@ -302,6 +306,10 @@ impl VaultStorageDirectory {
     }
 
     #[cfg(not(unix))]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "matches the Unix implementation, which checks the lock file"
+    )]
     fn validate_lock_path(
         &self,
         _file: &std::fs::File,
@@ -590,6 +598,13 @@ impl VaultStorageDirectory {
         })
     }
 
+    #[cfg_attr(
+        all(not(unix), not(test)),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "Unix syncs the directory, which can fail"
+        )
+    )]
     fn sync_directory(&self, label: &str) -> Result<(), String> {
         #[cfg(test)]
         DIRECTORY_SYNCS.with(|syncs| syncs.borrow_mut().push(self.display.clone()));

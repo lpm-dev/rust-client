@@ -143,6 +143,13 @@ fn create_file(directory: &Dir, name: &str) -> io::Result<cap_std::fs::File> {
     directory.open_with(name, &options)
 }
 
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Unix sets the mode, which can fail"
+    )
+)]
 fn set_mode(file: &cap_std::fs::File, mode: Option<u32>) -> io::Result<()> {
     #[cfg(unix)]
     if let Some(mode) = mode {

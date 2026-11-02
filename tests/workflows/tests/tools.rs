@@ -267,7 +267,9 @@ fn test_and_bench_json_keeps_pre_hook_services_until_the_script_finishes() {
 use std::os::unix::fs::PermissionsExt;
 
 use support::assertions::parse_json_output;
-use support::{TempProject, lpm, lpm_spawnable};
+#[cfg(unix)]
+use support::lpm_spawnable;
+use support::{TempProject, lpm};
 
 #[cfg(unix)]
 const WORKSPACE_MEMBERS: [&str; 3] = ["packages/utils", "packages/core", "packages/app"];

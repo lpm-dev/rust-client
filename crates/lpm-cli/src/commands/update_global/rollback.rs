@@ -1,10 +1,10 @@
 use super::prepare::{StagedUpgrade, UpgradePrep};
 use chrono::Utc;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use lpm_common::LpmError;
 use lpm_common::LpmRoot;
 use lpm_global::{GlobalManifest, Shim, WalRecord, emit_shim, remove_shim};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use lpm_global::{WalWriter, write_for};
 use std::collections::{HashMap, HashSet};
 
@@ -92,7 +92,7 @@ pub(super) fn restore_prior_shims_after_aborted_upgrade(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn rollback_aborted_upgrade(
     root: &LpmRoot,
     manifest: &mut GlobalManifest,
