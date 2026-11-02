@@ -11,7 +11,7 @@ use super::format::{
 use crate::commands::audit::behavior::BehavioralSummary;
 use crate::commands::audit::discovery::DiscoveryResult;
 use crate::commands::audit::osv::OsvVulnerability;
-use crate::commands::audit::types::AuditResult;
+use crate::commands::audit::types::{AuditIssue, AuditResult};
 
 pub(in crate::commands::audit) fn print_discovery_summary(discovery: &DiscoveryResult) {
     let total = discovery.packages.len();
@@ -111,12 +111,22 @@ pub(in crate::commands::audit) fn print_lpm_results(
                 _ => "ℹ".blue().to_string(),
             };
             eprintln!(
-                "    {icon} {} {} {}",
+                "    {icon} {} {}{} {}",
                 format_severity(&issue.severity),
                 lpm_common::sanitize_terminal_inline(&issue.message),
+                tests_only_suffix(issue),
                 format!("[{}]", lpm_common::sanitize_terminal_inline(&issue.source)).dimmed()
             );
         }
+    }
+}
+
+/// Marks an issue the registry found only in the package's test files.
+fn tests_only_suffix(issue: &AuditIssue) -> &'static str {
+    if issue.tests_only {
+        " (tests only)"
+    } else {
+        ""
     }
 }
 
@@ -165,7 +175,12 @@ pub(in crate::commands::audit) fn print_behavioral_results(
             capabilities
                 .entry(issue.message.clone())
                 .or_default()
-                .push(format!("{}@{}", result.name, result.version));
+                .push(format!(
+                    "{}@{}{}",
+                    result.name,
+                    result.version,
+                    tests_only_suffix(issue)
+                ));
         }
         if lpm_names.contains(result.name.as_str()) {
             continue;
@@ -185,7 +200,7 @@ pub(in crate::commands::audit) fn print_behavioral_results(
             };
             tags.entry(issue.message.clone())
                 .or_default()
-                .push(pkg_id.clone());
+                .push(format!("{pkg_id}{}", tests_only_suffix(issue)));
         }
     }
 

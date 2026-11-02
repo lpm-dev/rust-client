@@ -120,6 +120,9 @@ pub(super) struct AuditIssue {
     pub(super) source: String,
     pub(super) rule_id: Option<&'static str>,
     pub(super) evidence: Vec<lpm_security::behavioral::SourceEvidence>,
+    /// The registry found this tag only in the package's test files. Its
+    /// severity is `info` until local evidence places it elsewhere.
+    pub(super) tests_only: bool,
 }
 
 impl AuditIssue {
@@ -143,6 +146,10 @@ pub(super) fn merge_issues(target: &mut Vec<AuditIssue>, incoming: Vec<AuditIssu
                 existing.rule_id = issue.rule_id.or(existing.rule_id);
                 if existing.source != issue.source {
                     existing.source = "combined".to_string();
+                }
+                if existing.tests_only {
+                    existing.tests_only = false;
+                    existing.severity = issue.severity;
                 }
             }
         } else {

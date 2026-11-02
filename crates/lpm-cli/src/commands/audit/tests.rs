@@ -369,6 +369,71 @@ fn registry_behavioral_fields_use_the_shared_tag_policy() {
 }
 
 #[test]
+fn registry_tags_only_tests_showed_are_info_and_marked_tests_only() {
+    use lpm_security::query::PseudoClass;
+
+    let mut meta = meta_with_tags(|tags| {
+        tags.child_process = true;
+        tags.obfuscated = true;
+        tags.eval = true;
+    });
+    meta.test_only_tags = Some(vec!["childProcess".to_string(), "obfuscated".to_string()]);
+    let issues = collect(&meta);
+    let issue = |tag: PseudoClass| {
+        let label = tag.behavioral_policy().expect("policy").label;
+        issues
+            .iter()
+            .find(|issue| issue.message == label)
+            .unwrap_or_else(|| panic!("no issue for {label}: {issues:?}"))
+    };
+
+    for tag in [PseudoClass::ChildProcess, PseudoClass::Obfuscated] {
+        assert!(issue(tag).tests_only, "{tag:?}");
+        assert_eq!(issue(tag).severity, "info", "{tag:?}");
+    }
+    assert!(!issue(PseudoClass::Eval).tests_only);
+    assert_eq!(issue(PseudoClass::Eval).severity, "high");
+}
+
+#[test]
+fn local_evidence_replaces_a_registry_tests_only_mark() {
+    let mut issues = vec![AuditIssue {
+        severity: "info".to_string(),
+        message: "child process".to_string(),
+        category: "capability".to_string(),
+        source: "registry".to_string(),
+        tests_only: true,
+        ..AuditIssue::default()
+    }];
+    super::types::merge_issues(
+        &mut issues,
+        vec![AuditIssue {
+            severity: "high".to_string(),
+            message: "child process".to_string(),
+            category: "capability".to_string(),
+            source: "local".to_string(),
+            evidence: vec![lpm_security::behavioral::SourceEvidence {
+                rule_id: "child-process".to_string(),
+                path: "lib/run.js".to_string(),
+                line: Some(3),
+                column: Some(1),
+                excerpt: None,
+                reason: "spawns a process".to_string(),
+                file_context: "source".to_string(),
+                sampled: false,
+                heuristic_score: None,
+            }],
+            ..AuditIssue::default()
+        }],
+    );
+
+    assert_eq!(issues.len(), 1);
+    assert!(!issues[0].tests_only);
+    assert_eq!(issues[0].severity, "high");
+    assert_eq!(issues[0].source, "combined");
+}
+
+#[test]
 fn registry_issue_empty_tags_emits_no_issues() {
     let issues = collect(&meta_with_tags(|_| {}));
     assert!(

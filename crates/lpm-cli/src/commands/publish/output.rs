@@ -241,11 +241,13 @@ pub(super) fn format_lpm_publication_notice(
 ) -> Option<install_ui::TerminalLine> {
     match status {
         LpmPublicationStatus::Active => None,
-        LpmPublicationStatus::PendingReview | LpmPublicationStatus::Processing => {
-            Some(crate::install_ui::terminal_line!(
-                "Upload succeeded. The public version is awaiting LPM.dev Registry publication review."
-            ))
-        }
+        LpmPublicationStatus::PendingReview => Some(crate::install_ui::terminal_line!(
+            "Upload succeeded. The public version is awaiting LPM.dev Registry publication review."
+        )),
+        // Held without review, such as a private release in its cooldown.
+        LpmPublicationStatus::Processing => Some(crate::install_ui::terminal_line!(
+            "Upload succeeded. The version is not available on LPM.dev Registry yet."
+        )),
         LpmPublicationStatus::ManualReview => Some(crate::install_ui::terminal_line!(
             "Upload succeeded. LPM.dev Registry publication requires manual review."
         )),
@@ -269,13 +271,16 @@ pub(super) fn format_single_publish_success_summary(
     let package = install_ui::yellow(&format!("{published_name}@{version}"));
     let elapsed = install_ui::green(elapsed);
     match publication_status {
-        Some(LpmPublicationStatus::PendingReview | LpmPublicationStatus::Processing) => {
-            crate::install_ui::terminal_line!(
-                "Done · uploaded {} in {}; awaiting LPM.dev Registry publication review",
-                package,
-                elapsed
-            )
-        }
+        Some(LpmPublicationStatus::PendingReview) => crate::install_ui::terminal_line!(
+            "Done · uploaded {} in {}; awaiting LPM.dev Registry publication review",
+            package,
+            elapsed
+        ),
+        Some(LpmPublicationStatus::Processing) => crate::install_ui::terminal_line!(
+            "Done · uploaded {} in {}; version is not available yet",
+            package,
+            elapsed
+        ),
         Some(
             LpmPublicationStatus::ManualReview
             | LpmPublicationStatus::Rejected
@@ -304,13 +309,16 @@ pub(super) fn format_multi_publish_success_summary(
 ) -> install_ui::TerminalLine {
     let elapsed = install_ui::green(elapsed);
     match publication_status {
-        Some(LpmPublicationStatus::PendingReview | LpmPublicationStatus::Processing) => {
-            crate::install_ui::terminal_line!(
-                "Done · completed {} registry uploads in {}; LPM.dev Registry publication review pending",
-                target_count,
-                elapsed
-            )
-        }
+        Some(LpmPublicationStatus::PendingReview) => crate::install_ui::terminal_line!(
+            "Done · completed {} registry uploads in {}; LPM.dev Registry publication review pending",
+            target_count,
+            elapsed
+        ),
+        Some(LpmPublicationStatus::Processing) => crate::install_ui::terminal_line!(
+            "Done · completed {} registry uploads in {}; LPM.dev version is not available yet",
+            target_count,
+            elapsed
+        ),
         Some(
             LpmPublicationStatus::ManualReview
             | LpmPublicationStatus::Rejected
@@ -340,13 +348,16 @@ pub(super) fn format_multi_publish_partial_summary(
     publication_status: Option<&LpmPublicationStatus>,
 ) -> install_ui::TerminalLine {
     match publication_status {
-        Some(LpmPublicationStatus::PendingReview | LpmPublicationStatus::Processing) => {
-            crate::install_ui::terminal_line!(
-                "Completed {} of {} registry uploads. LPM.dev Registry publication review pending.",
-                succeeded,
-                target_count
-            )
-        }
+        Some(LpmPublicationStatus::PendingReview) => crate::install_ui::terminal_line!(
+            "Completed {} of {} registry uploads. LPM.dev Registry publication review pending.",
+            succeeded,
+            target_count
+        ),
+        Some(LpmPublicationStatus::Processing) => crate::install_ui::terminal_line!(
+            "Completed {} of {} registry uploads. The LPM.dev version is not available yet.",
+            succeeded,
+            target_count
+        ),
         Some(
             LpmPublicationStatus::ManualReview
             | LpmPublicationStatus::Rejected

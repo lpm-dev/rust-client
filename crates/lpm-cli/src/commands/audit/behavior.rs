@@ -279,6 +279,7 @@ pub(super) fn behavioral_issue(tag: PseudoClass, source: &str) -> Option<AuditIs
         source: source.to_string(),
         rule_id: Some(policy.token.trim_start_matches(':')),
         evidence: Vec::new(),
+        tests_only: false,
     })
 }
 
