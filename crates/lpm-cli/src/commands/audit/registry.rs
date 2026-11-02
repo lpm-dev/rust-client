@@ -96,32 +96,62 @@ pub(super) fn collect_registry_issues(
     }
 
     if let Some(tags) = &ver_meta.behavioral_tags {
-        for (tag, present) in [
-            (PseudoClass::Eval, tags.eval),
-            (PseudoClass::Network, tags.network),
-            (PseudoClass::Fs, tags.filesystem),
-            (PseudoClass::Shell, tags.shell),
-            (PseudoClass::ChildProcess, tags.child_process),
-            (PseudoClass::Native, tags.native_bindings),
-            (PseudoClass::Crypto, tags.crypto),
-            (PseudoClass::DynamicRequire, tags.dynamic_require),
-            (PseudoClass::Env, tags.environment_vars),
-            (PseudoClass::Ws, tags.web_socket),
-            (PseudoClass::Obfuscated, tags.obfuscated),
-            (PseudoClass::HighEntropy, tags.high_entropy_strings),
-            (PseudoClass::Minified, tags.minified),
-            (PseudoClass::Telemetry, tags.telemetry),
-            (PseudoClass::UrlStrings, tags.url_strings),
-            (PseudoClass::Trivial, tags.trivial),
-            (PseudoClass::Protestware, tags.protestware),
-            (PseudoClass::GitDep, tags.git_dependency),
-            (PseudoClass::HttpDep, tags.http_dependency),
-            (PseudoClass::WildcardDep, tags.wildcard_dependency),
-            (PseudoClass::Copyleft, tags.copyleft_license),
-            (PseudoClass::NoLicense, tags.no_license),
-            (PseudoClass::CustomLicense, tags.custom_license),
+        let test_only = ver_meta.test_only_tags.as_deref().unwrap_or_default();
+        // The third value is the tag's registry key, as `_testOnlyTags` names it.
+        for (tag, present, key) in [
+            (PseudoClass::Eval, tags.eval, "eval"),
+            (PseudoClass::Network, tags.network, "network"),
+            (PseudoClass::Fs, tags.filesystem, "filesystem"),
+            (PseudoClass::Shell, tags.shell, "shell"),
+            (
+                PseudoClass::ChildProcess,
+                tags.child_process,
+                "childProcess",
+            ),
+            (PseudoClass::Native, tags.native_bindings, "nativeBindings"),
+            (PseudoClass::Crypto, tags.crypto, "crypto"),
+            (
+                PseudoClass::DynamicRequire,
+                tags.dynamic_require,
+                "dynamicRequire",
+            ),
+            (PseudoClass::Env, tags.environment_vars, "environmentVars"),
+            (PseudoClass::Ws, tags.web_socket, "webSocket"),
+            (PseudoClass::Obfuscated, tags.obfuscated, "obfuscated"),
+            (
+                PseudoClass::HighEntropy,
+                tags.high_entropy_strings,
+                "highEntropyStrings",
+            ),
+            (PseudoClass::Minified, tags.minified, "minified"),
+            (PseudoClass::Telemetry, tags.telemetry, "telemetry"),
+            (PseudoClass::UrlStrings, tags.url_strings, "urlStrings"),
+            (PseudoClass::Trivial, tags.trivial, "trivial"),
+            (PseudoClass::Protestware, tags.protestware, "protestware"),
+            (PseudoClass::GitDep, tags.git_dependency, "gitDependency"),
+            (PseudoClass::HttpDep, tags.http_dependency, "httpDependency"),
+            (
+                PseudoClass::WildcardDep,
+                tags.wildcard_dependency,
+                "wildcardDependency",
+            ),
+            (
+                PseudoClass::Copyleft,
+                tags.copyleft_license,
+                "copyleftLicense",
+            ),
+            (PseudoClass::NoLicense, tags.no_license, "noLicense"),
+            (
+                PseudoClass::CustomLicense,
+                tags.custom_license,
+                "customLicense",
+            ),
         ] {
-            if present && let Some(issue) = behavioral_issue(tag, "registry") {
+            if present && let Some(mut issue) = behavioral_issue(tag, "registry") {
+                if test_only.iter().any(|only| only == key) {
+                    issue.tests_only = true;
+                    issue.severity = "info".to_string();
+                }
                 issues.push(issue);
             }
         }

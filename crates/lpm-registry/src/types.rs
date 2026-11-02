@@ -182,6 +182,15 @@ pub struct VersionMetadata {
     #[serde(default, rename = "_behavioralTags")]
     pub behavioral_tags: Option<BehavioralTags>,
 
+    /// Keys of `behavioral_tags` that only the package's test files showed,
+    /// sorted. The tags stay set; this says where the registry found them.
+    #[serde(
+        default,
+        rename = "_testOnlyTags",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub test_only_tags: Option<Vec<String>>,
+
     #[serde(default, rename = "_lifecycleScripts")]
     pub lifecycle_scripts: Option<HashMap<String, String>>,
 
@@ -1846,6 +1855,25 @@ mod tests {
     }
 
     #[test]
+    fn version_metadata_reads_test_only_tags_and_keeps_them_through_the_cache() {
+        let metadata: VersionMetadata = serde_json::from_str(
+            r#"{"name":"kit","version":"1.0.0","_behavioralTags":{"childProcess":true},"_testOnlyTags":["childProcess"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            metadata.test_only_tags.as_deref(),
+            Some(["childProcess".to_string()].as_slice())
+        );
+        let cached: VersionMetadata =
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(&metadata).unwrap()).unwrap();
+        assert_eq!(cached.test_only_tags, metadata.test_only_tags);
+
+        let older: VersionMetadata =
+            serde_json::from_str(r#"{"name":"kit","version":"1.0.0"}"#).unwrap();
+        assert_eq!(older.test_only_tags, None);
+    }
+
+    #[test]
     fn absent_ecosystem_metadata_uses_only_two_pointers_per_version() {
         let metadata = VersionMetadata::default();
         assert_eq!(
@@ -2366,6 +2394,7 @@ mod tests {
             deprecated: Some(serde_json::json!("old")),
             scripts: Some(HashMap::from([("install".into(), "node build.js".into())])),
             has_install_script: Some(true),
+            test_only_tags: Some(vec!["childProcess".into()]),
             optional_dependencies: HashMap::from([("native".into(), "^1".into())]),
             os: vec!["darwin".into()],
             ..alias

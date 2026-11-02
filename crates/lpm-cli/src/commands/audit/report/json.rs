@@ -47,13 +47,17 @@ pub(in crate::commands::audit) fn print_json_report(
                 "path": r.path,
                 "quality_score": r.quality_score,
                 "capabilities": r.issues.iter().filter(|i| i.is_capability()).map(|i| {
-                    serde_json::json!({
+                    let mut capability = serde_json::json!({
                         "rule_id": i.rule_id,
                         "name": i.message,
                         "policy_severity": i.severity,
                         "source": i.source,
                         "evidence": i.evidence,
-                    })
+                    });
+                    if i.tests_only {
+                        capability["tests_only"] = serde_json::json!(true);
+                    }
+                    capability
                 }).collect::<Vec<_>>(),
                 "issues": r.issues.iter().filter(|i| !i.is_capability()).map(|i| {
                     let mut issue = serde_json::json!({
@@ -62,6 +66,9 @@ pub(in crate::commands::audit) fn print_json_report(
                         "message": i.message,
                         "source": i.source,
                     });
+                    if i.tests_only {
+                        issue["tests_only"] = serde_json::json!(true);
+                    }
                     if let Some(rule_id) = i.rule_id {
                         issue["rule_id"] = serde_json::json!(rule_id);
                         issue["evidence"] = serde_json::json!(i.evidence);

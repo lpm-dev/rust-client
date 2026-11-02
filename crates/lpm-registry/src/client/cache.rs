@@ -1864,6 +1864,7 @@ mod metadata_cache_schema_tests {
             swift_meta: _,
             npm_user: _,
             behavioral_tags: _,
+            test_only_tags: _,
             lifecycle_scripts: _,
             scripts: _,
             has_install_script: _,

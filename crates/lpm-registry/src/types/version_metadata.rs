@@ -81,6 +81,9 @@ pub(super) struct VersionMetadataWire<const OMIT_DEV: bool = false> {
     #[serde(default, rename = "_behavioralTags")]
     behavioral_tags: Option<BehavioralTags>,
 
+    #[serde(default, rename = "_testOnlyTags")]
+    test_only_tags: Option<Vec<String>>,
+
     #[serde(default, rename = "_lifecycleScripts")]
     lifecycle_scripts: Option<HashMap<String, String>>,
 
@@ -152,6 +155,7 @@ impl<const OMIT_DEV: bool> TryFrom<VersionMetadataWire<OMIT_DEV>> for VersionMet
             swift_meta: wire.swift_meta,
             npm_user: wire.npm_user,
             behavioral_tags: wire.behavioral_tags,
+            test_only_tags: wire.test_only_tags,
             lifecycle_scripts: wire.lifecycle_scripts,
             scripts: wire.scripts,
             has_install_script: wire.has_install_script,

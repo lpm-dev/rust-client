@@ -365,6 +365,40 @@ async fn mount_registry_advisory(mock: &MockRegistry, package: &str, summary: &s
         .await;
 }
 
+async fn mount_registry_tags(
+    mock: &MockRegistry,
+    package: &str,
+    tags: serde_json::Value,
+    test_only_tags: Option<serde_json::Value>,
+) {
+    let mut version = serde_json::json!({
+        "name": package,
+        "version": "1.0.0",
+        "dependencies": {},
+        "_behavioralTags": tags,
+    });
+    if let Some(test_only_tags) = test_only_tags {
+        version["_testOnlyTags"] = test_only_tags;
+    }
+    let ndjson = format!(
+        "{}\n",
+        serde_json::json!({
+            "name": package,
+            "metadata": {
+                "name": package,
+                "dist-tags": {"latest": "1.0.0"},
+                "versions": {"1.0.0": version}
+            }
+        })
+    );
+    Mock::given(method("POST"))
+        .and(path("/api/registry/batch-metadata"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(ndjson, "application/x-ndjson"))
+        .with_priority(1)
+        .mount(mock.server())
+        .await;
+}
+
 async fn install_signature_fixture_project(
     project: &TempProject,
     mock: &MockRegistry,
@@ -943,6 +977,83 @@ packages:
     let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(envelope["manager"], "pnpm");
     assert_eq!(envelope["scanned"], 1);
+}
+
+#[tokio::test]
+async fn audit_marks_a_registry_tag_only_tests_showed_and_doesnt_fail_on_it() {
+    let package = "@lpm.dev/test.audit-tests-only";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"audit-tests-only","version":"1.0.0","dependencies":{{"{package}":"1.0.0"}}}}"#
+    ));
+    let mock = MockRegistry::start().await;
+    install_one(&project, &mock, package).await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+    mount_registry_tags(
+        &mock,
+        package,
+        serde_json::json!({"obfuscated": true, "childProcess": true}),
+        Some(serde_json::json!(["childProcess", "obfuscated"])),
+    )
+    .await;
+
+    let human = run_audit(&project, &mock, &[]);
+    let rendered = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&human.stdout),
+        String::from_utf8_lossy(&human.stderr)
+    ));
+    assert!(
+        human.status.success(),
+        "a critical tag only tests showed must not fail audit:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("(tests only)"),
+        "human audit must mark the tag tests only:\n{rendered}"
+    );
+
+    let json = run_audit_json(&project, &mock, &[]);
+    let envelope: serde_json::Value = serde_json::from_slice(&json.stdout)
+        .unwrap_or_else(|error| panic!("audit JSON must parse: {error}"));
+    let package_report = &envelope["packages"][0];
+    let obfuscated = package_report["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|issue| issue["category"] == "supply-chain")
+        .unwrap_or_else(|| panic!("no supply-chain issue: {package_report}"));
+    assert_eq!(obfuscated["severity"], "info");
+    assert_eq!(obfuscated["tests_only"], true);
+    let capability = &package_report["capabilities"][0];
+    assert_eq!(capability["tests_only"], true, "{package_report}");
+}
+
+#[tokio::test]
+async fn audit_fails_on_the_same_registry_tag_outside_tests() {
+    let package = "@lpm.dev/test.audit-tests-only-control";
+    let project = TempProject::empty(&format!(
+        r#"{{"name":"audit-tests-only-control","version":"1.0.0","dependencies":{{"{package}":"1.0.0"}}}}"#
+    ));
+    let mock = MockRegistry::start().await;
+    install_one(&project, &mock, package).await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+    mount_registry_tags(
+        &mock,
+        package,
+        serde_json::json!({"obfuscated": true}),
+        None,
+    )
+    .await;
+
+    let json = run_audit_json(&project, &mock, &[]);
+    assert!(
+        !json.status.success(),
+        "a critical registry tag outside tests must fail audit"
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&json.stdout)
+        .unwrap_or_else(|error| panic!("audit JSON must parse: {error}"));
+    let issue = &envelope["packages"][0]["issues"][0];
+    assert_eq!(issue["severity"], "critical", "{envelope}");
+    assert!(issue.get("tests_only").is_none(), "{envelope}");
 }
 
 #[tokio::test]
