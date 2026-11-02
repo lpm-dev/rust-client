@@ -1,3 +1,4 @@
+import collections
 import importlib.util
 import json
 from pathlib import Path
@@ -9,6 +10,17 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location('exporter', Path(__file__).resolve().parents[1] / 'export-env-engine.py')
 exporter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(exporter)
+
+GIB = 1024**3
+DiskUsage = collections.namedtuple('DiskUsage', 'total used free')
+
+
+def setUpModule():
+    # The stubbed builds write almost nothing, so the exporter's 10 GiB free-space check would only make these
+    # tests depend on the host's disk.
+    free_space = patch.object(exporter.shutil, 'disk_usage', return_value=DiskUsage(1024 * GIB, 0, 1024 * GIB))
+    free_space.start()
+    unittest.addModuleCleanup(free_space.stop)
 
 
 HEADER = '#ifndef LPM_ENV_H\n#define LPM_ENV_H\n#define LPM_ENV_ABI_VERSION 7\n#endif\n'
@@ -223,8 +235,14 @@ class EngineExportTests(unittest.TestCase):
                         yield name
 
             with patch.dict(exporter.os.environ, {'CARGO_HOME': str(cargo_home)}), patch.object(exporter.tempfile, 'TemporaryDirectory', side_effect=temporary_directory), patch.object(exporter.subprocess, 'run', side_effect=command), patch.object(exporter.subprocess, 'check_output', side_effect=read):
-                with self.assertRaises((RuntimeError, subprocess.CalledProcessError)):
+                with self.assertRaises((RuntimeError, subprocess.CalledProcessError)) as raised:
                     exporter.export(root, Path(temporary) / 'target', output)
+            # An earlier step's failure, such as too little free disk, would otherwise pass the scenario without running it.
+            if failure == 'mutation':
+                self.assertEqual(str(raised.exception), 'Engine sources changed during export')
+            else:
+                self.assertIsInstance(raised.exception, subprocess.CalledProcessError)
+                self.assertEqual(raised.exception.cmd[0], 'xcodebuild' if failure in {'environment', 'pinned-strip'} else 'lipo')
             self.assertEqual((output / 'LPMEnv.xcframework/old').read_bytes(), b'old bundle')
             self.assertEqual((output / 'provenance.json').read_bytes(), b'old provenance')
 
@@ -326,6 +344,35 @@ class EngineExportTests(unittest.TestCase):
                 self.assertEqual(built, [])
                 self.assertFalse(output.exists())
 
+    def test_less_than_10_gib_free_on_the_target_volume_stops_the_export_before_any_build(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / 'source'
+            write_sources(root)
+            output = Path(temporary) / 'engine'
+            (output / 'LPMEnv.xcframework').mkdir(parents=True)
+            (output / 'LPMEnv.xcframework/old').write_bytes(b'old bundle')
+            built = []
+            with patch.object(exporter.shutil, 'disk_usage', return_value=DiskUsage(1024 * GIB, 1014 * GIB + 1, 10 * GIB - 1)) as disk_usage:
+                with self.assertRaisesRegex(RuntimeError, 'At least 10 GiB free is required on the Cargo target volume'):
+                    self.exported_with(root, temporary, output, built)
+            disk_usage.assert_called_once_with((Path(temporary) / 'target').resolve() / 'env-engine-export')
+            self.assertEqual(built, [])
+            self.assertEqual(sorted(str(path.relative_to(output)) for path in output.rglob('*')), ['LPMEnv.xcframework', 'LPMEnv.xcframework/old'])
+            self.assertEqual((output / 'LPMEnv.xcframework/old').read_bytes(), b'old bundle')
+
+    def test_free_space_is_checked_again_before_each_target_build(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / 'source'
+            write_sources(root)
+            output = Path(temporary) / 'engine'
+            built = []
+            free_before_each_build = [DiskUsage(1024 * GIB, 1014 * GIB, 10 * GIB), DiskUsage(1024 * GIB, 1014 * GIB + 1, 10 * GIB - 1)]
+            with patch.object(exporter.shutil, 'disk_usage', side_effect=free_before_each_build):
+                with self.assertRaisesRegex(RuntimeError, 'At least 10 GiB free is required on the Cargo target volume'):
+                    self.exported_with(root, temporary, output, built)
+            self.assertEqual(built, ['+' + PINNED_TOOLCHAIN])
+            self.assertFalse(output.exists())
+
     def test_concurrent_source_changes_reject_publication(self):
         self.scenario('mutation')
 
@@ -415,11 +462,13 @@ class ConcurrentEngineExportTests(unittest.TestCase):
         import time
         import shutil
         child = r'''
-import importlib.util, pathlib, shutil, subprocess, sys, time
+import collections, importlib.util, pathlib, shutil, subprocess, sys, time
 script, root, target, output, signal, sysroot = map(pathlib.Path, sys.argv[1:])
 spec = importlib.util.spec_from_file_location('exporter', script)
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+usage = collections.namedtuple('usage', 'total used free')
+module.shutil.disk_usage = lambda path: usage(1 << 40, 0, 1 << 40)
 marker = (root / 'crates/lpm-env/src/lib.rs').read_text()
 paths = b'\0'.join(str(path.relative_to(root)).encode() for path in root.rglob('*') if path.is_file()) + b'\0'
 engine_metadata = '{"packages": [{"id": "ffi", "name": "lpm-env-ffi", "version": "1.0.0", "source": null, "targets": []}], "resolve": {"nodes": [{"id": "ffi", "deps": []}]}}'
