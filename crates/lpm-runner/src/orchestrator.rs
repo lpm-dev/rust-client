@@ -2326,6 +2326,34 @@ mod tests {
     use super::*;
     use crate::lpm_json::ServiceConfig;
 
+    /// A readiness timeout far past the 2 s grace a stop gives each process, so
+    /// a startup that waited for readiness can't pass for a slow stop.
+    const READINESS_TIMEOUT_PAST_STOP_GRACE_SECS: u64 = 30;
+
+    /// Time for an interrupted startup to finish, a stop grace included, on a
+    /// loaded machine. It must stay well short of the readiness timeout above.
+    const INTERRUPTED_STARTUP_LIMIT: Duration = Duration::from_secs(10);
+
+    fn wait_for_starting_services(events: &Receiver<OrchestratorEvent>, count: usize) {
+        let started = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    OrchestratorEvent::StatusChange {
+                        status: ServiceStatus::Starting,
+                        ..
+                    }
+                )
+            })
+            .take(count)
+            .count();
+        assert_eq!(
+            started, count,
+            "the orchestrator stopped before {count} services started"
+        );
+    }
+
     fn simple_service(command: &str) -> ServiceConfig {
         ServiceConfig {
             command: command.to_string(),
@@ -3561,7 +3589,7 @@ mod tests {
                 ServiceConfig {
                     command: "sleep 60".to_string(),
                     ready_url: Some(format!("http://127.0.0.1:{unavailable_port}/health")),
-                    ready_timeout: 4,
+                    ready_timeout: READINESS_TIMEOUT_PAST_STOP_GRACE_SECS,
                     ..Default::default()
                 },
             ),
@@ -3577,7 +3605,7 @@ mod tests {
             "crashing startup level unexpectedly succeeded"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < INTERRUPTED_STARTUP_LIMIT,
             "sibling crash waited for the unrelated readiness timeout: {:?}",
             started.elapsed()
         );
@@ -3865,7 +3893,7 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
             ServiceConfig {
                 command: "sleep 60".to_string(),
                 ready_url: Some(format!("http://127.0.0.1:{unavailable_port}/health")),
-                ready_timeout: 4,
+                ready_timeout: READINESS_TIMEOUT_PAST_STOP_GRACE_SECS,
                 ..Default::default()
             },
         )]);
@@ -3877,13 +3905,7 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
             ..Default::default()
         };
         let controller = std::thread::spawn(move || {
-            while !matches!(
-                event_rx.recv_timeout(Duration::from_secs(2)),
-                Ok(OrchestratorEvent::StatusChange {
-                    status: ServiceStatus::Starting,
-                    ..
-                })
-            ) {}
+            wait_for_starting_services(&event_rx, 1);
             drop(command_tx);
         });
         let dir = tempfile::TempDir::new().unwrap();
@@ -3894,7 +3916,7 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
 
         assert!(result.is_ok(), "channel disconnect failed: {result:?}");
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < INTERRUPTED_STARTUP_LIMIT,
             "channel disconnect remained blocked behind initial readiness: {:?}",
             started.elapsed()
         );
@@ -3910,7 +3932,7 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
             ServiceConfig {
                 command: "sleep 60".to_string(),
                 ready_url: Some(format!("http://127.0.0.1:{unavailable_port}/health")),
-                ready_timeout: 4,
+                ready_timeout: READINESS_TIMEOUT_PAST_STOP_GRACE_SECS,
                 ..Default::default()
             },
         )]);
@@ -3922,13 +3944,7 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
             ..Default::default()
         };
         let controller = std::thread::spawn(move || {
-            while !matches!(
-                event_rx.recv_timeout(Duration::from_secs(2)),
-                Ok(OrchestratorEvent::StatusChange {
-                    status: ServiceStatus::Starting,
-                    ..
-                })
-            ) {}
+            wait_for_starting_services(&event_rx, 1);
             command_tx
                 .send(OrchestratorCommand::StopService(0))
                 .unwrap();
@@ -3944,7 +3960,7 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
             "StopService failed during startup: {result:?}"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < INTERRUPTED_STARTUP_LIMIT,
             "StopService remained blocked behind initial readiness: {:?}",
             started.elapsed()
         );
@@ -3989,18 +4005,7 @@ require('net').createServer().listen(Number(process.env.PORT), '127.0.0.1');
         let dir = tempfile::TempDir::new().unwrap();
         let pid_path = dir.path().join("a.pid");
         let controller = std::thread::spawn(move || {
-            let mut starting = 0;
-            while starting < 2 {
-                if matches!(
-                    event_rx.recv_timeout(Duration::from_secs(2)),
-                    Ok(OrchestratorEvent::StatusChange {
-                        status: ServiceStatus::Starting,
-                        ..
-                    })
-                ) {
-                    starting += 1;
-                }
-            }
+            wait_for_starting_services(&event_rx, 2);
             let pid_deadline = std::time::Instant::now() + Duration::from_secs(2);
             let pid = loop {
                 if let Ok(content) = std::fs::read_to_string(&pid_path)
@@ -4608,9 +4613,7 @@ setInterval(() => {{}}, 1000);
             ServiceConfig {
                 command: "node never-ready.js".to_string(),
                 port: Some(ready_port),
-                // Far past the stop's own 2 s grace, so a stop that waited for
-                // readiness can't be mistaken for a slow one.
-                ready_timeout: 30,
+                ready_timeout: READINESS_TIMEOUT_PAST_STOP_GRACE_SECS,
                 ..Default::default()
             },
         )]);
@@ -4643,7 +4646,7 @@ setInterval(() => {{}}, 1000);
 
         assert!(result.is_ok(), "orchestrator failed: {result:?}");
         assert!(
-            stop_sent_at.elapsed() < Duration::from_secs(10),
+            stop_sent_at.elapsed() < INTERRUPTED_STARTUP_LIMIT,
             "StopAll remained blocked behind initial readiness"
         );
         assert!(
