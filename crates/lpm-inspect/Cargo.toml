@@ -23,7 +23,7 @@ async-stream = "0.3"
 futures-util = "0.3"
 base64 = { workspace = true }
 reqwest = { workspace = true }
-rusqlite = { version = "0.40", features = ["backup", "bundled", "fallible_uint", "limits"] }
+rusqlite = { version = "0.41", features = ["backup", "bundled", "fallible_uint", "limits"] }
 chrono = { workspace = true }
 rand = { workspace = true }
 subtle = "2"

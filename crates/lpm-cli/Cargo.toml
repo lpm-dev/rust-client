@@ -245,7 +245,7 @@ assert_cmd = "2"
 insta = { version = "1", features = ["json"] }
 lpm-vault = { workspace = true, features = ["acceptance-test-hooks"] }
 # Damages a test project's capture database to exercise disk failures.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 # Synthetic X.509 certificates with URI SANs, so unit tests exercise the SAN
 # extractor against deterministic inputs, and issuers built from those

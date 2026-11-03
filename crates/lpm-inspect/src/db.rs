@@ -5500,7 +5500,7 @@ mod tests {
         let (waiting_tx, waiting_rx) = std::sync::mpsc::sync_channel(1);
         let second = std::thread::spawn(move || {
             WAITING.with(|waiting| *waiting.borrow_mut() = Some(waiting_tx));
-            let conn = Connection::open(path).unwrap();
+            let mut conn = Connection::open(path).unwrap();
             conn.busy_handler(Some(|attempt| {
                 WAITING.with(|waiting| {
                     if let Some(sender) = waiting.borrow_mut().take() {
