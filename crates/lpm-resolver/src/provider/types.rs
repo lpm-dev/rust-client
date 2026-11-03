@@ -115,6 +115,12 @@ impl SkippedDependencyReason {
     pub(crate) fn counts_as_platform_skip(&self) -> bool {
         matches!(self, Self::NoMatchingVersion { .. })
     }
+
+    /// A range that doesn't parse is part of the published manifest, so every
+    /// resolution that needs this parent version fails the same way.
+    pub(crate) fn makes_parent_version_unusable(&self) -> bool {
+        matches!(self, Self::InvalidRange { .. })
+    }
 }
 
 #[derive(Debug)]
@@ -168,6 +174,9 @@ pub(super) struct PendingOverride {
 
 /// The version a PubGrub resolution selected for each package.
 pub(crate) type PubGrubSolution = pubgrub::SelectedDependencies<ResolverPackage, NpmVersion>;
+
+/// Package versions no solution can use, each with the reason PubGrub reports.
+pub(crate) type UnusableVersions = HashMap<CanonicalKey, HashMap<NpmVersion, String>>;
 
 /// The DependencyProvider that bridges PubGrub with LPM's registry.
 pub struct LpmDependencyProvider {
@@ -226,6 +235,9 @@ pub struct LpmDependencyProvider {
     /// Their effective optionality is decided from the final selected graph.
     pub(super) skipped_dependencies:
         Mutex<HashMap<(ResolverPackage, String, ResolverPackage, String), SkippedDependency>>,
+    /// Versions an earlier pass selected and couldn't use. PubGrub sees each
+    /// as unavailable, so it chooses another version.
+    pub(super) unusable_versions: Arc<UnusableVersions>,
     /// Cache conversions against the exact available-version snapshot and tag.
     pub(super) range_cache: Mutex<HashMap<(ResolverPackage, String), CachedRange>>,
     pub(super) refreshed_metadata: Mutex<HashSet<CanonicalKey>>,

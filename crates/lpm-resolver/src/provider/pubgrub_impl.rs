@@ -1,6 +1,37 @@
 use super::prelude::*;
 use super::types::{PendingOverride, PubGrubSolution};
 
+/// The versions of a package that declare a required dependency with
+/// something other than a registry range, such as `github:owner/repo`, which
+/// this resolver can't follow. Each maps to the reason PubGrub reports.
+pub(crate) fn unusable_versions_of(info: &CachedPackageInfo) -> HashMap<NpmVersion, String> {
+    let mut unusable = HashMap::new();
+    for version in info.versions.iter() {
+        let Some(dependencies) = info.dependencies(&version.to_string()) else {
+            continue;
+        };
+        for dependency in dependencies {
+            if dependency.bundled
+                || dependency.optional
+                || crate::ranges::is_workspace_specifier(dependency.range)
+            {
+                continue;
+            }
+            if let Err(error) = NpmRange::parse_registry_spec(dependency.range) {
+                unusable.insert(
+                    version.clone(),
+                    format!(
+                        "because {}@{} is not a registry range: {error}",
+                        dependency.name, dependency.range
+                    ),
+                );
+                break;
+            }
+        }
+    }
+    unusable
+}
+
 impl LpmDependencyProvider {
     fn record_skipped_dependency(&self, skipped: SkippedDependency) {
         self.skipped_dependencies.lock().insert(
@@ -380,6 +411,13 @@ impl DependencyProvider for LpmDependencyProvider {
 
         let ver_str = version.to_string();
         let key = CanonicalKey::from(package);
+        if let Some(reason) = self
+            .unusable_versions
+            .get(&key)
+            .and_then(|versions| versions.get(version))
+        {
+            return Ok(Dependencies::Unavailable(reason.clone()));
+        }
         let ver_deps = {
             let info = match self.cache.get(&key) {
                 Some(info) => info,

@@ -42,10 +42,11 @@ pub(crate) use policy::{
     select_override_target, trust_downgrade_violation, trust_downgrade_violation_unprofiled,
     version_allowed_by_policy,
 };
+pub(crate) use pubgrub_impl::unusable_versions_of;
 pub(crate) use types::SkippedDependency;
 #[cfg(test)]
 pub(crate) use types::SkippedDependencyReason;
-pub(crate) use types::{LpmDependencyProvider, PubGrubSolution};
+pub(crate) use types::{LpmDependencyProvider, PubGrubSolution, UnusableVersions};
 pub use types::{NotifyMap, SharedCache, StreamingBfsMetrics, WalkerDone};
 
 mod prelude {
@@ -78,7 +79,7 @@ mod prelude {
     #[allow(unused_imports)]
     pub(super) use super::types::{
         LpmDependencyProvider, NotifyMap, SharedCache, SkippedDependency, SkippedDependencyReason,
-        StreamingBfsMetrics, WalkerDone,
+        StreamingBfsMetrics, UnusableVersions, WalkerDone,
     };
     #[allow(unused_imports)]
     pub(super) use crate::npm_version::NpmVersion;

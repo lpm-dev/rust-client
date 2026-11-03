@@ -47,6 +47,24 @@ fn resolution_ids_from_solution(
         .collect()
 }
 
+/// Why a PubGrub solution can't be installed.
+#[derive(Debug)]
+pub(super) struct RejectedSolution {
+    pub(super) error: Box<ResolveError>,
+    /// Selected packages with a version no resolution can use. Solving again
+    /// without those versions may succeed.
+    pub(super) unusable_packages: Vec<CanonicalKey>,
+}
+
+impl From<ResolveError> for RejectedSolution {
+    fn from(error: ResolveError) -> Self {
+        Self {
+            error: Box::new(error),
+            unusable_packages: Vec::new(),
+        }
+    }
+}
+
 /// Convert PubGrub solution + cached metadata into `ResolvedPackage` list
 /// with dependency edges populated.
 pub(super) fn format_solution(
@@ -55,7 +73,7 @@ pub(super) fn format_solution(
     root_dependencies: &RootDependencies,
     root_aliases: &HashMap<String, String>,
     skipped_dependencies: Vec<SkippedDependency>,
-) -> Result<(Vec<ResolvedPackage>, usize), ResolveError> {
+) -> Result<(Vec<ResolvedPackage>, usize), RejectedSolution> {
     let resolution_ids = resolution_ids_from_solution(&solution);
     let resolved_versions: HashMap<ResolverPackage, String> = solution
         .iter()
@@ -226,7 +244,7 @@ fn validate_selected_dependency_skips(
     packages: &[ResolvedPackage],
     cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
     skipped_dependencies: Vec<SkippedDependency>,
-) -> Result<usize, ResolveError> {
+) -> Result<usize, RejectedSolution> {
     if skipped_dependencies.is_empty() {
         return Ok(0);
     }
@@ -235,7 +253,9 @@ fn validate_selected_dependency_skips(
         .iter()
         .map(|package| (package.package.clone(), package))
         .collect();
-    let mut platform_skipped = 0;
+    let mut tolerated = Vec::new();
+    let mut error = None;
+    let mut unusable_packages = Vec::new();
 
     for skipped in skipped_dependencies {
         let Some(parent) = selected.get(&skipped.parent) else {
@@ -258,30 +278,47 @@ fn validate_selected_dependency_skips(
         }
 
         if parent.optional || skipped.edge_is_optional {
-            if skipped.reason.warns_about_auth() {
-                tracing::warn!(
-                    "optional dep {} skipped: requires LPM authentication \
-                     (run `lpm login` to install this package)",
-                    skipped.local_name,
-                );
-            } else {
-                tracing::debug!(
-                    "optional dep {} skipped: {}",
-                    skipped.local_name,
-                    skipped.reason.detail(),
-                );
-            }
-            platform_skipped += usize::from(skipped.reason.counts_as_platform_skip());
+            tolerated.push(skipped);
             continue;
         }
 
-        return Err(ResolveError::DependencyFetch {
+        if skipped.reason.makes_parent_version_unusable() {
+            let package = CanonicalKey::from(&parent.package);
+            if !unusable_packages.contains(&package) {
+                unusable_packages.push(package);
+            }
+        }
+        error.get_or_insert_with(|| ResolveError::DependencyFetch {
             package: parent.package.to_string(),
             version: parent.version.to_string(),
             detail: skipped.reason.detail().to_string(),
         });
     }
 
+    if let Some(error) = error {
+        return Err(RejectedSolution {
+            error: Box::new(error),
+            unusable_packages,
+        });
+    }
+
+    let mut platform_skipped = 0;
+    for skipped in tolerated {
+        if skipped.reason.warns_about_auth() {
+            tracing::warn!(
+                "optional dep {} skipped: requires LPM authentication \
+                 (run `lpm login` to install this package)",
+                skipped.local_name,
+            );
+        } else {
+            tracing::debug!(
+                "optional dep {} skipped: {}",
+                skipped.local_name,
+                skipped.reason.detail(),
+            );
+        }
+        platform_skipped += usize::from(skipped.reason.counts_as_platform_skip());
+    }
     Ok(platform_skipped)
 }
 
