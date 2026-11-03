@@ -199,8 +199,8 @@ strsim = "0.11"
 regex-automata = { version = "0.4", features = ["meta", "syntax"] }
 futures = "0.3"
 pathdiff = "0.2"
-signal-hook = "0.3"
-parking_lot = "0.12"
+signal-hook = "0.4"
+parking_lot = "0.13"
 dashmap = "6"
 chrono = { version = "0.4", features = ["serde"] }
 crc32fast = "1.4"
