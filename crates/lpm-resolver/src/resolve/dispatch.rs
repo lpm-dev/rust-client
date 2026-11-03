@@ -259,6 +259,11 @@ pub async fn resolve_with_shared_cache_options_and_policy_roots(
     // path-selector overrides are declared, which keeps the no-overrides
     // path on the existing zero-allocation hot loop.
     let mut split_packages: HashSet<String> = overrides.split_targets().clone();
+    let mut unusable_versions: Arc<UnusableVersions> = Arc::default();
+    // The error from the first solution that selected an unusable version.
+    // Passes without such versions only run to recover from it, so it stays
+    // the reported error if none of them succeeds.
+    let mut rejection: Option<ResolveError> = None;
     let mut attempt = 0usize;
 
     // Accumulate pubgrub wall-clock across split-retry passes. The
@@ -273,6 +278,7 @@ pub async fn resolve_with_shared_cache_options_and_policy_roots(
         let rt_for_pass = rt.clone();
         let overrides_for_pass = overrides.clone();
         let split_packages_for_pass = split_packages.clone();
+        let unusable_versions_for_pass = Arc::clone(&unusable_versions);
         let route_table_for_pass = route_table.clone();
         let policy_for_pass = policy.clone();
         // Same Arc shared across retry passes. The walker's Arc is the
@@ -316,6 +322,7 @@ pub async fn resolve_with_shared_cache_options_and_policy_roots(
             .with_route_table(route_table_for_pass)
             .with_streaming_metrics(metrics_for_pass)
             .with_include_optional_dependencies(include_optional_dependencies_for_pass)
+            .with_unusable_versions(unusable_versions_for_pass)
             .with_policy(policy_for_pass);
 
             match pubgrub::resolve(&provider, ResolverPackage::Root, NpmVersion::new(0, 0, 0)) {
@@ -349,7 +356,30 @@ pub async fn resolve_with_shared_cache_options_and_policy_roots(
                     skipped_dependencies,
                 ) {
                     Ok(formatted) => formatted,
-                    Err(error) => break Err(error),
+                    Err(rejected) => {
+                        let added = exclude_unusable_versions(
+                            &mut unusable_versions,
+                            &cache,
+                            &rejected.unusable_packages,
+                        );
+                        let error = rejection.take().unwrap_or(*rejected.error);
+                        if added == 0 {
+                            break Err(error);
+                        }
+                        rejection = Some(error);
+                        attempt += 1;
+                        tracing::info!(
+                            "resolving again without {added} version(s) of {} that depend on \
+                             specifiers outside the registry",
+                            rejected
+                                .unusable_packages
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
+                        continue;
+                    }
                 };
                 // Snapshot substage counters at the tail of the happy
                 // path. The registry-side atomics were reset at the
@@ -404,7 +434,9 @@ pub async fn resolve_with_shared_cache_options_and_policy_roots(
 
                 let conflicting = extract_conflicting_packages(&report);
                 if conflicting.is_empty() {
-                    break Err(no_solution_error(report));
+                    break Err(rejection
+                        .take()
+                        .unwrap_or_else(|| no_solution_error(report)));
                 }
 
                 let mut new_splits: Vec<String> = conflicting
@@ -412,7 +444,9 @@ pub async fn resolve_with_shared_cache_options_and_policy_roots(
                     .filter(|pkg| !split_packages.contains(pkg))
                     .collect();
                 if new_splits.is_empty() {
-                    break Err(no_solution_error(report));
+                    break Err(rejection
+                        .take()
+                        .unwrap_or_else(|| no_solution_error(report)));
                 }
 
                 new_splits.sort();
@@ -443,7 +477,7 @@ pub async fn resolve_with_shared_cache_options_and_policy_roots(
                     );
                 }
             }
-            Err(err) => break Err(map_pubgrub_error(err.0)),
+            Err(err) => break Err(rejection.take().unwrap_or_else(|| map_pubgrub_error(err.0))),
         }
     };
 
@@ -455,4 +489,26 @@ pub async fn resolve_with_shared_cache_options_and_policy_roots(
     );
 
     final_result
+}
+
+/// Adds every unusable version of `packages` to `unusable` and returns how
+/// many it added.
+fn exclude_unusable_versions(
+    unusable: &mut Arc<UnusableVersions>,
+    cache: &HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
+    packages: &[CanonicalKey],
+) -> usize {
+    let mut added = 0;
+    for package in packages {
+        let Some(info) = cache.get(package) else {
+            continue;
+        };
+        let versions = Arc::make_mut(unusable).entry(package.clone()).or_default();
+        for (version, reason) in unusable_versions_of(info) {
+            if versions.insert(version, reason).is_none() {
+                added += 1;
+            }
+        }
+    }
+    added
 }

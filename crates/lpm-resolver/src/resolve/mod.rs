@@ -77,7 +77,8 @@ mod prelude {
     #[allow(unused_imports)]
     pub(super) use crate::provider::{
         CachedPackageInfo, LpmDependencyProvider, NotifyMap, PlatformMeta, PubGrubSolution,
-        SharedCache, SkippedDependency, StreamingBfsMetrics,
+        SharedCache, SkippedDependency, StreamingBfsMetrics, UnusableVersions,
+        unusable_versions_of,
     };
     #[allow(unused_imports)]
     pub(super) use crate::ranges::NpmRange;

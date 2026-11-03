@@ -630,6 +630,152 @@ async fn pubgrub_rejects_malformed_required_peer_range() {
     assert!(message.contains("~X0^.00"), "{message}");
 }
 
+const GIT_LAYOUT_SPEC: &str = "github:example/layout#esm";
+
+fn parser_with_a_git_dependency_in_its_newest_version() -> HashMap<String, PackageMetadata> {
+    HashMap::from([
+        (
+            "parser".to_string(),
+            make_package_metadata(
+                "parser",
+                vec![
+                    make_version_metadata(
+                        "parser",
+                        "2.0.0",
+                        vec![("layout", "^1.0.0")],
+                        vec![],
+                        vec![],
+                        vec![],
+                    ),
+                    make_version_metadata(
+                        "parser",
+                        "2.1.0",
+                        vec![("layout", GIT_LAYOUT_SPEC)],
+                        vec![],
+                        vec![],
+                        vec![],
+                    ),
+                ],
+            ),
+        ),
+        (
+            "layout".to_string(),
+            make_package_metadata(
+                "layout",
+                vec![make_version_metadata(
+                    "layout",
+                    "1.0.0",
+                    vec![],
+                    vec![],
+                    vec![],
+                    vec![],
+                )],
+            ),
+        ),
+    ])
+}
+
+#[tokio::test]
+async fn pubgrub_passes_over_a_version_whose_required_dependency_is_not_a_registry_range() {
+    let _lock = env_lock().lock().await;
+    let _env = PubgrubEnvGuard::new();
+
+    let result = resolve_with_prefetch(
+        Arc::new(lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9")),
+        HashMap::from([("parser".to_string(), "^2.0.0".to_string())]),
+        OverrideSet::empty(),
+        Some(parser_with_a_git_dependency_in_its_newest_version()),
+    )
+    .await
+    .expect("an older parser without the git dependency satisfies the range");
+
+    let mut selected: Vec<String> = result
+        .packages
+        .iter()
+        .map(|package| format!("{}@{}", package.package, package.version))
+        .collect();
+    selected.sort();
+    assert_eq!(selected, ["layout@1.0.0", "parser@2.0.0"]);
+}
+
+#[tokio::test]
+async fn pubgrub_reports_the_git_dependency_when_no_other_version_satisfies_the_range() {
+    let _lock = env_lock().lock().await;
+    let _env = PubgrubEnvGuard::new();
+
+    let error = match resolve_with_prefetch(
+        Arc::new(lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9")),
+        HashMap::from([("parser".to_string(), "2.1.0".to_string())]),
+        OverrideSet::empty(),
+        Some(parser_with_a_git_dependency_in_its_newest_version()),
+    )
+    .await
+    {
+        Ok(result) => panic!(
+            "parser@2.1.0 can't be installed without its git dependency: {:?}",
+            result.packages
+        ),
+        Err(error) => error,
+    };
+
+    let message = error.to_string();
+    assert!(message.contains("parser@2.1.0"), "{message}");
+    assert!(message.contains(GIT_LAYOUT_SPEC), "{message}");
+}
+
+#[tokio::test]
+async fn pubgrub_keeps_an_optionally_reached_version_whose_dependency_is_not_a_registry_range() {
+    let _lock = env_lock().lock().await;
+    let _env = PubgrubEnvGuard::new();
+    let prefetched = HashMap::from([
+        (
+            "host".to_string(),
+            make_package_metadata(
+                "host",
+                vec![make_version_metadata(
+                    "host",
+                    "1.0.0",
+                    vec![],
+                    vec![("extras", "^1.0.0")],
+                    vec![],
+                    vec![],
+                )],
+            ),
+        ),
+        (
+            "extras".to_string(),
+            make_package_metadata(
+                "extras",
+                vec![make_version_metadata(
+                    "extras",
+                    "1.0.0",
+                    vec![("layout", GIT_LAYOUT_SPEC)],
+                    vec![],
+                    vec![],
+                    vec![],
+                )],
+            ),
+        ),
+    ]);
+
+    let result = resolve_with_prefetch(
+        Arc::new(lpm_registry::RegistryClient::new().with_base_url("http://127.0.0.1:9")),
+        HashMap::from([("host".to_string(), "^1.0.0".to_string())]),
+        OverrideSet::empty(),
+        Some(prefetched),
+    )
+    .await
+    .expect("an optional subtree may skip a dependency it can't resolve");
+
+    let mut selected: Vec<String> = result
+        .packages
+        .iter()
+        .map(|package| format!("{}@{}", package.package, package.version))
+        .collect();
+    selected.sort();
+    assert_eq!(selected, ["extras@1.0.0", "host@1.0.0"]);
+}
+
 #[tokio::test]
 async fn resolve_with_prefetch_preserves_platform_incompatible_optional_registry_metadata() {
     let _lock = env_lock().lock().await;

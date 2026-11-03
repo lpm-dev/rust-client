@@ -35,6 +35,7 @@ impl LpmDependencyProvider {
             policy: ResolverPolicy::default(),
             root_aliases: Mutex::new(HashMap::new()),
             skipped_dependencies: Mutex::new(HashMap::new()),
+            unusable_versions: Arc::default(),
             range_cache: Mutex::new(HashMap::new()),
             refreshed_metadata: Mutex::new(HashSet::new()),
             available_versions_cache: Mutex::new(HashMap::new()),
@@ -84,11 +85,17 @@ impl LpmDependencyProvider {
             policy: ResolverPolicy::default(),
             root_aliases: Mutex::new(HashMap::new()),
             skipped_dependencies: Mutex::new(HashMap::new()),
+            unusable_versions: Arc::default(),
             range_cache: Mutex::new(HashMap::new()),
             refreshed_metadata: Mutex::new(HashSet::new()),
             available_versions_cache: Mutex::new(HashMap::new()),
             include_optional_dependencies: true,
         }
+    }
+
+    pub(crate) fn with_unusable_versions(mut self, versions: Arc<UnusableVersions>) -> Self {
+        self.unusable_versions = versions;
+        self
     }
 
     pub fn with_include_optional_dependencies(mut self, include: bool) -> Self {
