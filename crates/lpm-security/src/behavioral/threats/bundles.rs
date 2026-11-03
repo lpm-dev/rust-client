@@ -1,11 +1,12 @@
 use oxc_ast::{AstKind, ast::*};
 use oxc_semantic::{Semantic, SymbolId};
+use oxc_str::JSStr;
 use std::collections::HashMap;
 
 #[derive(Default)]
 pub(super) struct Bundles {
     loaders: HashMap<SymbolId, SymbolId>,
-    exports: HashMap<(SymbolId, u64), HashMap<String, SymbolId>>,
+    exports: HashMap<(SymbolId, u64), HashMap<super::NameKey, SymbolId>>,
 }
 
 fn symbol(semantic: &Semantic<'_>, expression: &Expression<'_>) -> Option<SymbolId> {
@@ -32,7 +33,7 @@ impl Bundles {
         for node in semantic.nodes().iter() {
             match node.kind() {
                 AstKind::CallExpression(call) => {
-                    let Some((object, "call")) = super::member(&call.callee) else {
+                    let Some((object, "call")) = super::named_member(&call.callee) else {
                         continue;
                     };
                     let Expression::ComputedMemberExpression(slot) = object.get_inner_expression()
@@ -73,17 +74,13 @@ impl Bundles {
                     else {
                         continue;
                     };
-                    if !getter.expression
-                        || !getter.params.items.is_empty()
-                        || getter.body.statements.len() != 1
-                    {
+                    if !getter.params.items.is_empty() {
                         continue;
                     }
-                    let Statement::ExpressionStatement(statement) = &getter.body.statements[0]
-                    else {
+                    let Some(exported) = getter.get_expression() else {
                         continue;
                     };
-                    let Some(class) = symbol(semantic, &statement.expression) else {
+                    let Some(class) = symbol(semantic, exported) else {
                         continue;
                     };
                     if !matches!(
@@ -114,7 +111,7 @@ impl Bundles {
                                         .exports
                                         .entry((table, module))
                                         .or_default()
-                                        .insert(export.into_owned(), class);
+                                        .insert(export.as_js_str().as_bytes().into(), class);
                                 }
                                 break;
                             }
@@ -132,12 +129,15 @@ impl Bundles {
         &self,
         semantic: &Semantic<'a>,
         request: &CallExpression<'_>,
-        export: &str,
+        export: JSStr<'_>,
     ) -> Option<&'a Class<'a>> {
         let loader = symbol(semantic, &request.callee)?;
         let table = self.loaders.get(&loader)?;
         let module = module_id(request.arguments.first()?.as_expression()?)?;
-        let class = self.exports.get(&(*table, module))?.get(export)?;
+        let class = self
+            .exports
+            .get(&(*table, module))?
+            .get(export.as_bytes())?;
         match semantic
             .nodes()
             .kind(semantic.scoping().symbol_declaration(*class))

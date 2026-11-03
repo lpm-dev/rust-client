@@ -74,7 +74,7 @@ impl<'s> SourceContext<'s> {
             executable: &mut executable,
         }
         .visit_program(&parsed.program);
-        let complete = !parsed.panicked && parsed.errors.is_empty();
+        let complete = !parsed.fatal_error && !parsed.diagnostics.has_errors();
         let calls = complete.then(|| super::bindings::analyze(&parsed.program, complete_input));
         Self {
             stripped: String::from_utf8_lossy(stripped),

@@ -191,8 +191,11 @@ fn transform_source(request: &TsTransformRequest) -> Result<String, LpmError> {
     let allocator = Allocator::default();
     let source_type = source_type_for(&request.filename, request.format)?;
     let parsed = Parser::new(&allocator, &request.source, source_type).parse();
-    if !parsed.errors.is_empty() {
-        return Err(transform_diagnostics_error("parse", parsed.errors));
+    if parsed.diagnostics.has_errors() {
+        return Err(transform_diagnostics_error(
+            "parse",
+            parsed.diagnostics.errors(),
+        ));
     }
 
     let mut program = parsed.program;
@@ -201,15 +204,21 @@ fn transform_source(request: &TsTransformRequest) -> Result<String, LpmError> {
         .with_excess_capacity(2.0)
         .with_enum_eval(true)
         .build(&program);
-    if !semantic.errors.is_empty() {
-        return Err(transform_diagnostics_error("analyze", semantic.errors));
+    if semantic.diagnostics.has_errors() {
+        return Err(transform_diagnostics_error(
+            "analyze",
+            semantic.diagnostics.errors(),
+        ));
     }
 
     let transform_options = transform_options(request);
     let transformed = Transformer::new(&allocator, &request.filename, &transform_options)
         .build_with_scoping(semantic.semantic.into_scoping(), &mut program);
-    if !transformed.errors.is_empty() {
-        return Err(transform_diagnostics_error("transform", transformed.errors));
+    if transformed.diagnostics.has_errors() {
+        return Err(transform_diagnostics_error(
+            "transform",
+            transformed.diagnostics.errors(),
+        ));
     }
 
     let mut code = codegen(&program, &request.filename, request.source_map);
@@ -301,7 +310,10 @@ fn strip_commonjs_empty_export_markers(code: &str) -> String {
     stripped
 }
 
-fn transform_diagnostics_error(stage: &str, diagnostics: Vec<impl std::fmt::Debug>) -> LpmError {
+fn transform_diagnostics_error(
+    stage: &str,
+    diagnostics: impl IntoIterator<Item = impl std::fmt::Debug>,
+) -> LpmError {
     let mut message = format!("LPM OXC TypeScript {stage} failed");
     for diagnostic in diagnostics.into_iter().take(3) {
         message.push('\n');
@@ -344,6 +356,35 @@ mod tests {
         assert!(
             code.contains("const value = \"typed\";"),
             "TypeScript annotations must be stripped, got:\n{code}"
+        );
+    }
+
+    // TypeScript emits these declarations under `useDefineForClassFields`, its
+    // default for ES2022 and later targets: each field is defined before the
+    // constructor body assigns it.
+    #[test]
+    fn transform_request_declares_parameter_properties_as_class_fields() {
+        let code = transform(
+            "class Point {\n  constructor(public x: number, private y = 2) {}\n}\nconsole.log(new Point(1));\n",
+            "point.ts",
+            TsModuleFormat::Module,
+        );
+        let class = code
+            .split("class Point {")
+            .nth(1)
+            .expect("the class survives the transform");
+        let fields = class.find("x;").zip(class.find("y;"));
+        let constructor = class.find("constructor(");
+
+        assert!(
+            fields
+                .zip(constructor)
+                .is_some_and(|((x, y), constructor)| x < constructor && y < constructor),
+            "parameter properties must be declared before the constructor, got:\n{code}"
+        );
+        assert!(
+            class.contains("this.x = x;") && class.contains("this.y = y;"),
+            "the constructor must still assign parameter properties, got:\n{code}"
         );
     }
 

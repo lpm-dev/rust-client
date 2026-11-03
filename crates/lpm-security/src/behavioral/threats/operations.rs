@@ -1,7 +1,8 @@
-use super::{Flow, MAX_DEPTH, MAX_STEPS, callee, member, name};
-use oxc_ast::{AstKind, ast::*};
+use super::{Flow, MAX_DEPTH, MAX_STEPS, callee, member, name, named_member};
+use oxc_ast::{AstKind, StaticPropertyName, ast::*};
 use oxc_semantic::{NodeId, Semantic, SymbolId};
 use oxc_span::GetSpan;
+use oxc_str::JSStr;
 use std::collections::HashMap;
 
 const DECRYPTED: u8 = 1;
@@ -44,13 +45,9 @@ impl<'s, 'a> Flow<'s, 'a> {
                                         None
                                     }
                                 })?;
+                        let source = import.source.value.as_str()?;
                         Some(Api {
-                            module: import
-                                .source
-                                .value
-                                .as_str()
-                                .strip_prefix("node:")
-                                .unwrap_or(import.source.value.as_str()),
+                            module: source.strip_prefix("node:").unwrap_or(source),
                             method: if let AstKind::ImportSpecifier(specifier) = kind {
                                 Some(specifier.imported.name().as_str())
                             } else {
@@ -65,7 +62,7 @@ impl<'s, 'a> Flow<'s, 'a> {
                                 if matches!(&property.value, BindingPattern::BindingIdentifier(binding) if binding.symbol_id.get() == Some(symbol)) {
                                     match &property.key {
                                         PropertyKey::StaticIdentifier(key) => Some(key.name.as_str()),
-                                        PropertyKey::StringLiteral(key) => Some(key.value.as_str()),
+                                        PropertyKey::StringLiteral(key) => key.value.as_str(),
                                         _ => None,
                                     }
                                 } else { None }
@@ -87,17 +84,14 @@ impl<'s, 'a> Flow<'s, 'a> {
                 else {
                     return None;
                 };
+                let module = module.value.as_str()?;
                 Some(Api {
-                    module: module
-                        .value
-                        .as_str()
-                        .strip_prefix("node:")
-                        .unwrap_or(module.value.as_str()),
+                    module: module.strip_prefix("node:").unwrap_or(module),
                     method: None,
                 })
             }
             expression => {
-                let (object, property) = member(expression)?;
+                let (object, property) = named_member(expression)?;
                 let mut api = self.api(object, next)?;
                 if api.method.is_some() {
                     return None;
@@ -134,7 +128,9 @@ impl<'s, 'a> Flow<'s, 'a> {
         self.steps -= 1;
         match expression.get_inner_expression() {
             Expression::StringLiteral(value) => {
-                let path = value.value.as_str();
+                let Some(path) = value.value.as_str() else {
+                    return false;
+                };
                 [
                     ".env",
                     ".npmrc",
@@ -176,7 +172,7 @@ impl<'s, 'a> Flow<'s, 'a> {
                     .take(2)
                     .map(|arg| {
                         if let Expression::StringLiteral(s) = arg.get_inner_expression() {
-                            Some(s.value.as_str())
+                            s.value.as_str()
                         } else {
                             None
                         }
@@ -283,7 +279,7 @@ impl<'s, 'a> Flow<'s, 'a> {
                     }
                     return value;
                 }
-                if let Some((object, method)) = member(&call.callee) {
+                if let Some((object, method)) = named_member(&call.callee) {
                     if matches!(method, "update" | "final") && self.decipher(object, 0) {
                         let encoding = call
                             .arguments
@@ -291,7 +287,7 @@ impl<'s, 'a> Flow<'s, 'a> {
                             .and_then(Argument::as_expression);
                         let returns_text = matches!(encoding.map(Expression::get_inner_expression),
                             Some(Expression::StringLiteral(value)) if matches!(value.value.as_str(),
-                                "utf8" | "utf-8" | "hex" | "base64" | "base64url" | "latin1" | "binary" | "ascii" | "ucs2" | "ucs-2" | "utf16le" | "utf-16le"));
+                                Some("utf8" | "utf-8" | "hex" | "base64" | "base64url" | "latin1" | "binary" | "ascii" | "ucs2" | "ucs-2" | "utf16le" | "utf-16le")));
                         return if !text_only || returns_text {
                             DECRYPTED
                         } else {
@@ -335,17 +331,19 @@ impl<'s, 'a> Flow<'s, 'a> {
             Expression::StringLiteral(value) => {
                 matches!(
                     value.value.as_str(),
-                    "node"
-                        | "nodejs"
-                        | "sh"
-                        | "bash"
-                        | "python"
-                        | "python3"
-                        | "python3.8"
-                        | "python3.9"
-                        | "python3.10"
-                        | "python3.11"
-                        | "python3.12"
+                    Some(
+                        "node"
+                            | "nodejs"
+                            | "sh"
+                            | "bash"
+                            | "python"
+                            | "python3"
+                            | "python3.8"
+                            | "python3.9"
+                            | "python3.10"
+                            | "python3.11"
+                            | "python3.12"
+                    )
                 )
             }
             Expression::Identifier(identifier) => self
@@ -398,7 +396,7 @@ impl<'s, 'a> Flow<'s, 'a> {
             return None;
         }
         match expression.get_inner_expression() {
-            Expression::StringLiteral(value) => Some(PathKey::Literal(value.value.as_str())),
+            Expression::StringLiteral(value) => Some(PathKey::Literal(value.value)),
             Expression::Identifier(identifier) => {
                 let symbol = self.symbol(identifier)?;
                 if self.written.contains(&symbol) {
@@ -422,7 +420,9 @@ impl<'s, 'a> Flow<'s, 'a> {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum PathKey<'a> {
     Symbol(SymbolId),
-    Literal(&'a str),
+    /// The complete JavaScript string, so a path with lone surrogates still
+    /// matches the same path elsewhere.
+    Literal(JSStr<'a>),
 }
 
 pub(super) fn terminators(semantic: &Semantic<'_>) -> HashMap<u32, u32> {
@@ -504,7 +504,11 @@ pub(super) fn has_candidates(semantic: &Semantic<'_>) -> bool {
             "rmSync" | "rm" | "createDecipheriv" | "createDecipher"
         ),
         AstKind::BindingProperty(property) => matches!(
-            property.key.static_name().as_deref(),
+            property
+                .key
+                .static_name()
+                .as_ref()
+                .and_then(StaticPropertyName::as_str),
             Some("rmSync" | "rm" | "createDecipheriv" | "createDecipher")
         ),
         AstKind::StaticMemberExpression(member) => matches!(
@@ -598,7 +602,7 @@ pub(super) fn analyze(flow: &mut Flow<'_, '_>, facts: &mut crate::behavioral::bi
             && let Some(path) = arguments.first().and_then(Argument::as_expression)
             && flow.broad_directory(path, 0)
             && let Some(options) = arguments.get(1).and_then(Argument::as_expression)
-            && matches!(flow.field(options, "recursive", 0).map(Expression::get_inner_expression), Some(Expression::BooleanLiteral(value)) if value.value)
+            && matches!(flow.field(options, "recursive".into(), 0).map(Expression::get_inner_expression), Some(Expression::BooleanLiteral(value)) if value.value)
         {
             facts.destructive_filesystem.get_or_insert(start as usize);
         }

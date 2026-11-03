@@ -460,7 +460,7 @@ fn scan_file(
         )
     })?;
     let parsed = Parser::new(&state.parser_allocator, &content, source_type).parse();
-    if let Some(error) = parsed.errors.first() {
+    if let Some(error) = parsed.diagnostics.errors().next() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
@@ -525,9 +525,12 @@ struct RuntimeImportCollector {
 
 impl<'a> Visit<'a> for RuntimeImportCollector {
     fn visit_ts_import_type(&mut self, import: &TSImportType<'a>) {
-        if self.include_types {
+        // A specifier with lone surrogates names no file or package.
+        if self.include_types
+            && let Some(source) = import.source.value.as_str()
+        {
             self.imports
-                .push((import.span.start, import.source.value.to_string(), false));
+                .push((import.span.start, source.to_owned(), false));
         }
         walk_ts_import_type(self, import);
     }
@@ -535,28 +538,30 @@ impl<'a> Visit<'a> for RuntimeImportCollector {
     fn visit_ts_import_equals_declaration(&mut self, import: &TSImportEqualsDeclaration<'a>) {
         if self.include_types
             && let TSModuleReference::ExternalModuleReference(reference) = &import.module_reference
+            && let Some(source) = reference.expression.value.as_str()
         {
-            self.imports.push((
-                import.span.start,
-                reference.expression.value.to_string(),
-                false,
-            ));
+            self.imports
+                .push((import.span.start, source.to_owned(), false));
         }
         walk_ts_import_equals_declaration(self, import);
     }
 
     fn visit_call_expression(&mut self, expression: &CallExpression<'a>) {
-        if let Some(specifier) = expression.common_js_require() {
+        if let Some(specifier) = expression.common_js_require()
+            && let Some(source) = specifier.value.as_str()
+        {
             self.imports
-                .push((expression.span.start, specifier.value.to_string(), false));
+                .push((expression.span.start, source.to_owned(), false));
         }
         walk_call_expression(self, expression);
     }
 
     fn visit_import_expression(&mut self, expression: &ImportExpression<'a>) {
-        if let Expression::StringLiteral(specifier) = &expression.source {
+        if let Expression::StringLiteral(specifier) = &expression.source
+            && let Some(source) = specifier.value.as_str()
+        {
             self.imports
-                .push((expression.span.start, specifier.value.to_string(), false));
+                .push((expression.span.start, source.to_owned(), false));
         }
         walk_import_expression(self, expression);
     }
