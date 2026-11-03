@@ -713,6 +713,9 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         lpm_common::LpmError::CredentialStorage(reason) => {
             diagnostic_lines("Credential storage error", Some(reason), error)
         }
+        lpm_common::LpmError::CredentialStorageLocked(reason) => {
+            diagnostic_lines("Credential storage is locked", Some(reason), error)
+        }
         lpm_common::LpmError::SudoNotSupported => {
             diagnostic_lines("Sudo is not supported", None, error)
         }
@@ -1599,6 +1602,33 @@ mod tests {
         assert_eq!(
             envelope["error"],
             serde_json::json!("project layout error: project node_modules is a symlink")
+        );
+    }
+
+    #[test]
+    fn locked_credential_storage_error_names_the_lock_without_suggesting_sign_in() {
+        let error = lpm_common::LpmError::CredentialStorageLocked(
+            "failed to read stored access credential: this Mac's session is locked".into(),
+        );
+
+        let envelope = json_error_value(&error);
+        let lines = slim_error_lines(&error);
+        let plain: Vec<_> = lines.iter().map(plain_slim_line).collect();
+
+        assert_eq!(
+            envelope["error_code"],
+            serde_json::json!("credential_storage_locked")
+        );
+        assert_eq!(
+            envelope["error"],
+            serde_json::json!(
+                "credential storage is locked: failed to read stored access credential: this Mac's session is locked"
+            )
+        );
+        assert_eq!(plain[0], "Credential storage is locked");
+        assert!(
+            envelope.get("next_steps").is_none(),
+            "a locked session must not tell users to log in again"
         );
     }
 

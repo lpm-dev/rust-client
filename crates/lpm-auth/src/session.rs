@@ -374,11 +374,8 @@ impl SessionManager {
         match crate::get_refresh_token_with_interaction_notice(&self.registry_url, || {
             self.emit_auth_storage_notice(AuthStorageAccessKind::RefreshToken);
         })
-        .map_err(|error| {
-            LpmError::CredentialStorage(format!(
-                "failed to read stored refresh credential: {error}"
-            ))
-        })? {
+        .map_err(|error| error.into_lpm_error("failed to read stored refresh credential"))?
+        {
             Some(refresh_token) => {
                 self.mark_refresh_available();
                 Ok(refresh_token)
@@ -394,9 +391,7 @@ impl SessionManager {
         crate::get_stored_access_token_with_interaction_notice(&self.registry_url, || {
             self.emit_auth_storage_notice(AuthStorageAccessKind::AccessToken);
         })
-        .map_err(|error| {
-            LpmError::CredentialStorage(format!("failed to read stored access credential: {error}"))
-        })
+        .map_err(|error| error.into_lpm_error("failed to read stored access credential"))
     }
 
     /// The registry URL this session is bound to.
@@ -970,9 +965,8 @@ fn classify_keychain_sources(
         crate::CredentialKind::Access,
         || notice(AuthStorageAccessKind::AccessToken),
     )
-    .map_err(|error| {
-        LpmError::CredentialStorage(format!("failed to read stored access credential: {error}"))
-    })? {
+    .map_err(|error| error.into_lpm_error("failed to read stored access credential"))?
+    {
         return Ok(Some(CachedToken {
             secret: SecretString::from(stored.token),
             source: TokenSource::StoredSession,
@@ -998,9 +992,8 @@ fn classify_keychain_sources(
         crate::CredentialKind::Refresh,
         || notice(AuthStorageAccessKind::RefreshToken),
     )
-    .map_err(|error| {
-        LpmError::CredentialStorage(format!("failed to read stored refresh credential: {error}"))
-    })? {
+    .map_err(|error| error.into_lpm_error("failed to read stored refresh credential"))?
+    {
         return Ok(Some(CachedToken {
             secret: SecretString::from(String::new()),
             source: TokenSource::StoredSession,
