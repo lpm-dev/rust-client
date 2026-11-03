@@ -1,4 +1,4 @@
-use super::{Flow, MAX_DEPTH, member};
+use super::{Flow, MAX_DEPTH, named_member};
 use oxc_ast::{AstKind, ast::*};
 use oxc_span::GetSpan;
 
@@ -22,7 +22,7 @@ impl<'a> Flow<'_, 'a> {
         let next = depth + 1;
         match expression.get_inner_expression() {
             Expression::StringLiteral(value)
-                if matches!(value.value.as_str(), "/" | "C:\\" | "C:/") =>
+                if matches!(value.value.as_str(), Some("/" | "C:\\" | "C:/")) =>
             {
                 ROOT
             }
@@ -94,7 +94,7 @@ impl<'a> Flow<'_, 'a> {
                 self.path_fact(&value.left, next) | self.path_fact(&value.right, next)
             }
             Expression::CallExpression(call) => {
-                if let Some((object, "cwd")) = member(&call.callee)
+                if let Some((object, "cwd")) = named_member(&call.callee)
                     && self.global(object, "process")
                 {
                     return ROOT;
@@ -148,7 +148,7 @@ impl<'a> Flow<'_, 'a> {
                     }
                     return result;
                 }
-                if let Some((object, "filter")) = member(&call.callee)
+                if let Some((object, "filter")) = named_member(&call.callee)
                     && self.path_fact(object, next) == ENTRIES
                     && let Some(predicate) =
                         call.arguments.first().and_then(Argument::as_expression)
@@ -172,7 +172,7 @@ impl<'a> Flow<'_, 'a> {
                 0
             }
             expression => {
-                if let Some((object, "name")) = member(expression)
+                if let Some((object, "name")) = named_member(expression)
                     && self.path_fact(object, next) == ENTRY
                 {
                     NAME

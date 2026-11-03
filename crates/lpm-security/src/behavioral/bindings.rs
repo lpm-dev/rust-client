@@ -152,10 +152,10 @@ fn static_string<'s>(expression: &'s Expression<'_>, depth: usize) -> Option<Cow
         return None;
     }
     match expression.get_inner_expression() {
-        Expression::StringLiteral(value) => Some(Cow::Borrowed(value.value.as_str())),
-        Expression::TemplateLiteral(value) if value.expressions.is_empty() => Some(Cow::Borrowed(
-            value.quasis.first()?.value.cooked.as_ref()?.as_str(),
-        )),
+        Expression::StringLiteral(value) => Some(Cow::Borrowed(value.value.as_str()?)),
+        Expression::TemplateLiteral(value) if value.expressions.is_empty() => {
+            Some(Cow::Borrowed(value.quasis.first()?.value.cooked?.as_str()?))
+        }
         Expression::BinaryExpression(binary) if binary.operator.as_str() == "+" => {
             let left = static_string(&binary.left, depth + 1)?;
             let right = static_string(&binary.right, depth + 1)?;
@@ -237,7 +237,7 @@ fn origin(
                                     None
                                 }
                             })?;
-                    let imported_origin = module(imported.source.value.as_str())?;
+                    let imported_origin = module(imported.source.value.as_str()?)?;
                     if let AstKind::ImportSpecifier(specifier) = kind {
                         Some(imported_origin.member(specifier.imported.name().as_str()))
                     } else {
@@ -252,7 +252,7 @@ fn origin(
                     let initial = if let BindingPattern::ObjectPattern(pattern) = &variable.id {
                         pattern.properties.iter().find_map(|property| {
                             if matches!(&property.value, BindingPattern::BindingIdentifier(binding) if binding.symbol_id.get() == Some(symbol)) {
-                                Some(initial?.member(property.key.static_name()?.as_ref()))
+                                Some(initial?.member(property.key.static_name()?.as_str()?))
                             } else {
                                 None
                             }
@@ -402,7 +402,10 @@ fn shell_option(
                 .rev()
                 .find_map(|property| match property {
                     ObjectPropertyKind::ObjectProperty(property)
-                        if property.key.static_name().as_deref() == Some("shell") =>
+                        if property
+                            .key
+                            .static_name()
+                            .is_some_and(|name| name.as_js_str() == "shell") =>
                     {
                         match property.value.get_inner_expression() {
                             Expression::BooleanLiteral(value) => Some(value.value),
@@ -469,7 +472,10 @@ fn has_local_eval_method(
             .find_map(|property| match property {
                 ObjectPropertyKind::SpreadProperty(_) => Some(false),
                 ObjectPropertyKind::ObjectProperty(property)
-                    if property.key.static_name().as_deref() == Some("eval") =>
+                    if property
+                        .key
+                        .static_name()
+                        .is_some_and(|name| name.as_js_str() == "eval") =>
                 {
                     Some(
                         property.kind == PropertyKind::Init
@@ -530,7 +536,7 @@ fn has_local_eval_method(
                 ClassElement::MethodDefinition(method)
                     if !method.r#static && method.kind == MethodDefinitionKind::Method
                         && method.decorators.is_empty()
-                        && method.key.static_name().as_deref() == Some("eval"))
+                        && method.key.static_name().is_some_and(|name| name.as_js_str() == "eval"))
             })
         }
         _ => false,
@@ -666,16 +672,15 @@ impl<'a> Visit<'a> for CallCandidates {
     }
 
     fn visit_import_declaration(&mut self, import: &ImportDeclaration<'a>) {
-        self.found |= module(import.source.value.as_str()).is_some()
+        self.found |= import.source.value.as_str().and_then(module).is_some()
             || (self.include_threats
                 && matches!(
                     import
                         .source
                         .value
                         .as_str()
-                        .strip_prefix("node:")
-                        .unwrap_or(import.source.value.as_str()),
-                    "fs" | "fs/promises" | "crypto" | "http" | "https"
+                        .map(|source| source.strip_prefix("node:").unwrap_or(source)),
+                    Some("fs" | "fs/promises" | "crypto" | "http" | "https")
                 ));
     }
 }
@@ -689,7 +694,8 @@ pub(super) fn analyze(program: &Program<'_>, complete_input: bool) -> CallFacts 
     if !candidates.found {
         return CallFacts::default();
     }
-    let built = SemanticBuilder::new().build(program);
+    // The analysis walks every node, and oxc builds the node store only on request.
+    let built = SemanticBuilder::new().with_build_nodes(true).build(program);
     let semantic = &built.semantic;
     let mut assignments = HashMap::new();
     let mut mutated_receivers = HashSet::new();

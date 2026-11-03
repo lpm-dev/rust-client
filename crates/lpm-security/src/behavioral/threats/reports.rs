@@ -2,10 +2,11 @@ use super::{CREDENTIAL_FILE, Flow, MAX_DEPTH, member};
 use oxc_ast::{AstKind, ast::*};
 use oxc_semantic::{NodeId, Semantic, SymbolId};
 use oxc_span::GetSpan;
+use oxc_str::JSStr;
 use std::collections::{HashMap, HashSet};
 
 pub(super) struct Write<'a> {
-    key: &'a str,
+    key: JSStr<'a>,
     offset: u32,
     value: &'a Expression<'a>,
 }
@@ -40,14 +41,14 @@ pub(super) fn collect<'a>(flow: &Flow<'_, 'a>) -> HashMap<SymbolId, Vec<Write<'a
         };
         let (object, key) = match &assignment.left {
             AssignmentTarget::StaticMemberExpression(member) => {
-                (&member.object, member.property.name.as_str())
+                (&member.object, JSStr::from(member.property.name.as_str()))
             }
             AssignmentTarget::ComputedMemberExpression(member) => {
                 let Expression::StringLiteral(key) = member.expression.get_inner_expression()
                 else {
                     continue;
                 };
-                (&member.object, key.value.as_str())
+                (&member.object, key.value)
             }
             _ => continue,
         };

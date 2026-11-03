@@ -30,13 +30,13 @@ toml = { workspace = true }
 
 parking_lot = { workspace = true }
 fd-lock = { workspace = true }
-oxc_allocator = "=0.128.0"
-oxc_parser = "=0.128.0"
-oxc_semantic = "=0.128.0"
-oxc_transformer = "=0.128.0"
-oxc_codegen = "=0.128.0"
-oxc_span = "=0.128.0"
-oxc_ast = "=0.128.0"
+oxc_allocator = "=0.157.0"
+oxc_parser = "=0.157.0"
+oxc_semantic = "=0.157.0"
+oxc_transformer = "=0.157.0"
+oxc_codegen = "=0.157.0"
+oxc_span = "=0.157.0"
+oxc_ast = "=0.157.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -49,11 +49,11 @@ lpm-dashboard = { workspace = true }
 lpm-migrate = { workspace = true }
 cap-fs-ext = { workspace = true }
 cap-std = "4.0.2"
-oxc_allocator = "=0.128.0"
-oxc_ast = "=0.128.0"
-oxc_ast_visit = "=0.128.0"
-oxc_parser = "=0.128.0"
-oxc_span = "=0.128.0"
+oxc_allocator = "=0.157.0"
+oxc_ast = "=0.157.0"
+oxc_ast_visit = "=0.157.0"
+oxc_parser = "=0.157.0"
+oxc_span = "=0.157.0"
 clap = { workspace = true, features = ["string"] }
 clap_complete = { workspace = true }
 cvss = { workspace = true }
