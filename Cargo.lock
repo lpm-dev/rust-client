@@ -195,6 +195,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "apple-native-keyring-store"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b350bfd03649e07aa05c0a81b3e15934374e585c98204a57e20b9d49f49bb9a"
+dependencies = [
+ "keyring-core",
+ "log",
+ "security-framework 3.7.0",
+]
+
+[[package]]
 name = "approx"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1601,6 +1612,16 @@ dependencies = [
  "openssl",
  "sha2 0.10.9",
  "zeroize",
+]
+
+[[package]]
+name = "dbus-secret-service-keyring-store"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7227ffd3b4896266bbc100348025cebe51d9aea94ce118a1d68f4a6463963dae"
+dependencies = [
+ "dbus-secret-service",
+ "keyring-core",
 ]
 
 [[package]]
@@ -3199,6 +3220,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyring-core"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29fbf4b551298c67925f38cf341a1ada797a75f1837bdf8ae1fc8e2ebc6efb59"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "kqueue"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3407,10 +3437,10 @@ dependencies = [
  "core-foundation 0.10.1",
  "dirs",
  "hex",
- "keyring",
  "libc",
  "lpm-common",
  "lpm-http",
+ "lpm-keyring",
  "lpm-workspace",
  "objc2-local-authentication",
  "rand 0.10.3",
@@ -3496,7 +3526,6 @@ dependencies = [
  "indicatif",
  "insta",
  "jsonschema",
- "keyring",
  "libc",
  "lpm-auth",
  "lpm-cert",
@@ -3509,6 +3538,7 @@ dependencies = [
  "lpm-global",
  "lpm-http",
  "lpm-inspect",
+ "lpm-keyring",
  "lpm-linker",
  "lpm-lockfile",
  "lpm-migrate",
@@ -3844,6 +3874,17 @@ dependencies = [
  "syn 2.0.119",
  "tempfile",
  "toml",
+]
+
+[[package]]
+name = "lpm-keyring"
+version = "0.84.0"
+dependencies = [
+ "apple-native-keyring-store",
+ "dbus-secret-service-keyring-store",
+ "keyring",
+ "keyring-core",
+ "windows-native-keyring-store",
 ]
 
 [[package]]
@@ -4313,12 +4354,12 @@ dependencies = [
  "futures",
  "hex",
  "hkdf 0.13.0",
- "keyring",
  "libc",
  "lpm-common",
  "lpm-env",
  "lpm-env-companion",
  "lpm-http",
+ "lpm-keyring",
  "objc2-local-authentication",
  "p256",
  "rand 0.10.3",
@@ -8446,6 +8487,19 @@ name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-native-keyring-store"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "063426e76fdec7438d56bb777f67e318a84a25c707b07e575cb8b78e10c028f8"
+dependencies = [
+ "byteorder",
+ "keyring-core",
+ "regex",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
 
 [[package]]
 name = "windows-numerics"

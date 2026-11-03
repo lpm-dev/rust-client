@@ -58,7 +58,7 @@ test("release workflow builds and executes both GNU architectures at glibc 2.28"
   const workflow = fs.readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8");
   const cliManifest = fs.readFileSync(path.join(repoRoot, "crates/lpm-cli/Cargo.toml"), "utf8");
 
-  assert.match(cliManifest, /^portable-linux = \["keyring\/vendored"\]$/m);
+  assert.match(cliManifest, /^portable-linux = \["lpm-keyring\/vendored"\]$/m);
   assert.match(workflow, /manylinux_2_28_x86_64@sha256:[0-9a-f]{64}/);
   assert.match(workflow, /manylinux_2_28_aarch64@sha256:[0-9a-f]{64}/);
   assert.equal(workflow.match(/portable_glibc: true/g)?.length, 2);

@@ -23,6 +23,7 @@ members = [
     "crates/lpm-vault",
     "crates/lpm-cert",
     "crates/lpm-http",
+    "crates/lpm-keyring",
     "crates/lpm-network",
     "crates/lpm-proxy",
     "crates/lpm-tunnel",
@@ -77,6 +78,7 @@ lpm-plugin = { path = "crates/lpm-plugin" }
 lpm-vault = { path = "crates/lpm-vault" }
 lpm-cert = { path = "crates/lpm-cert" }
 lpm-http = { path = "crates/lpm-http" }
+lpm-keyring = { path = "crates/lpm-keyring" }
 lpm-network = { path = "crates/lpm-network" }
 lpm-proxy = { path = "crates/lpm-proxy" }
 lpm-tunnel = { path = "crates/lpm-tunnel" }
@@ -155,7 +157,7 @@ toml_edit = "0.25"
 memmap2 = "0.9"
 
 # Auth / secure storage
-keyring = "3"
+keyring-core = "1.0.1"
 aes-gcm = "0.11"
 rand = "0.10"
 dirs = "7"

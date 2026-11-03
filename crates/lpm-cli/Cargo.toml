@@ -15,6 +15,7 @@ path = "src/main.rs"
 lpm-common = { workspace = true }
 lpm-auth = { workspace = true }
 lpm-http = { workspace = true }
+lpm-keyring = { workspace = true }
 lpm-env = { workspace = true }
 lpm-env-codegen.workspace = true
 lpm-env-source.workspace = true
@@ -162,21 +163,13 @@ libc = "0.2"
 mimalloc = "0.1"
 rustix = { version = "1.1", features = ["fs"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-keyring = { workspace = true, features = ["linux-native-sync-persistent", "crypto-rust"] }
-
-[target.'cfg(all(target_os = "linux", any(target_arch = "aarch64", target_env = "musl")))'.dependencies]
-keyring = { workspace = true, features = ["vendored"] }
-
 [target.'cfg(target_os = "macos")'.dependencies]
-keyring = { workspace = true, features = ["apple-native"] }
 block2 = { version = "0.6", default-features = false, features = ["std"] }
 objc2 = { version = "0.6", default-features = false, features = ["std"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSError", "NSString"] }
 objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "LAContext", "block2"] }
 
 [target.'cfg(windows)'.dependencies]
-keyring = { workspace = true, features = ["windows-native"] }
 windows = { version = "0.62.2", features = [
     "Foundation",
     "Security_Credentials_UI",
@@ -202,12 +195,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
-[target.'cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))'.dependencies]
-keyring = { workspace = true }
-
 [features]
 # Build GNU Linux release artifacts without host DBus/OpenSSL dependencies.
-portable-linux = ["keyring/vendored"]
+portable-linux = ["lpm-keyring/vendored"]
 # Build with `--features dhat-heap` to instrument heap allocations.
 # Outputs dhat-heap.json on exit — view at https://nnethercote.github.io/dh_view/dh_view.html
 # Usage: cargo build -p lpm-cli --features dhat-heap

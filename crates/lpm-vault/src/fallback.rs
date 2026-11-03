@@ -71,11 +71,11 @@ impl NativeDataKeyStore for KeyringNativeDataKeyStore {
             return result;
         }
 
-        let entry = keyring::Entry::new(&native_data_key_service(), NATIVE_DATA_KEY_ACCOUNT)
+        let entry = lpm_keyring::entry(&native_data_key_service(), NATIVE_DATA_KEY_ACCOUNT)
             .map_err(|e| format!("native vault data-key entry error: {e}"))?;
         match entry.get_password() {
             Ok(value) => Ok(Some(value)),
-            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(lpm_keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(format!("native vault data-key read error: {e}")),
         }
     }
@@ -86,7 +86,7 @@ impl NativeDataKeyStore for KeyringNativeDataKeyStore {
             return Err(error);
         }
 
-        let entry = keyring::Entry::new(&native_data_key_service(), NATIVE_DATA_KEY_ACCOUNT)
+        let entry = lpm_keyring::entry(&native_data_key_service(), NATIVE_DATA_KEY_ACCOUNT)
             .map_err(|e| format!("native vault data-key entry error: {e}"))?;
         entry
             .set_password(hex_key)

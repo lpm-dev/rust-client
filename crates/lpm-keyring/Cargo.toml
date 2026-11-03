@@ -1,0 +1,45 @@
+[package]
+name = "lpm-keyring"
+description = "The operating system credential store LPM shares with LPM Vault"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+keyring-core = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-native-keyring-store = "1.1.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+dbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
+
+[target.'cfg(all(target_os = "linux", any(target_arch = "aarch64", target_env = "musl")))'.dependencies]
+dbus-secret-service-keyring-store = { version = "1.0.1", features = ["vendored"] }
+
+[features]
+# Build libdbus into the binary, for Linux release artifacts that can't rely
+# on the host's.
+vendored = ["dbus-secret-service-keyring-store/vendored"]
+
+# keyring 3 writes the items the compatibility tests read, as earlier LPM
+# releases did.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+keyring3 = { package = "keyring", version = "3.6.3", features = ["apple-native"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+keyring3 = { package = "keyring", version = "3.6.3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+keyring3 = { package = "keyring", version = "3.6.3", features = ["linux-native-sync-persistent", "crypto-rust"] }
+
+[target.'cfg(all(target_os = "linux", any(target_arch = "aarch64", target_env = "musl")))'.dev-dependencies]
+keyring3 = { package = "keyring", version = "3.6.3", features = ["vendored"] }
+
+[lints]
+workspace = true

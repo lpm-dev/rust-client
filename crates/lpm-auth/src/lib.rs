@@ -18,8 +18,8 @@
 //! # Three-tier resolution (matching the JS CLI)
 //!
 //! 1. `LPM_TOKEN` (or per-registry env var) — CI/CD, testing
-//! 2. OS keychain via `keyring` (macOS Keychain, Windows Credential
-//!    Manager, Linux Secret Service)
+//! 2. OS keychain via `lpm-keyring` (macOS Keychain, Windows Credential
+//!    Manager, Linux Secret Service cached in keyutils)
 //! 3. Encrypted file fallback at `~/.lpm/.credentials`
 //!    (AES-256-GCM with a versioned random data key)
 //!
@@ -2063,10 +2063,10 @@ fn get_password_from_keychain_account(account: &str) -> Option<String> {
     }
 
     #[cfg(not(target_os = "macos"))]
-    if let Ok(entry) = keyring::Entry::new(service.as_ref(), account)
+    if let Ok(entry) = lpm_keyring::entry(service.as_ref(), account)
         && let Ok(token) = entry.get_password()
     {
-        tracing::debug!("keychain hit via keyring crate");
+        tracing::debug!("keychain hit via lpm-keyring");
         return Some(token);
     }
 
@@ -2125,9 +2125,9 @@ fn probe_keychain_credential(service: &str, account: &str) -> KeychainCredential
 
 #[cfg(not(target_os = "macos"))]
 fn probe_keychain_credential(service: &str, account: &str) -> KeychainCredentialProbe {
-    match keyring::Entry::new(service, account).and_then(|entry| entry.get_password()) {
+    match lpm_keyring::entry(service, account).and_then(|entry| entry.get_password()) {
         Ok(token) if !token.trim().is_empty() => KeychainCredentialProbe::Found(token),
-        Ok(_) | Err(keyring::Error::NoEntry) => KeychainCredentialProbe::NotFound,
+        Ok(_) | Err(lpm_keyring::Error::NoEntry) => KeychainCredentialProbe::NotFound,
         Err(error) => {
             tracing::debug!("keychain lookup failed for {account}: {error}");
             KeychainCredentialProbe::Failed
@@ -2149,7 +2149,7 @@ fn set_password_in_keychain_account(account: &str, token: &str) -> Result<(), St
 
     #[cfg(not(target_os = "macos"))]
     {
-        let entry = keyring::Entry::new(service.as_ref(), account)
+        let entry = lpm_keyring::entry(service.as_ref(), account)
             .map_err(|e| format!("keychain error: {e}"))?;
         entry
             .set_password(token)
@@ -2224,11 +2224,11 @@ fn clear_password_from_keychain_account(account: &str) -> Result<(), String> {
 
     #[cfg(not(target_os = "macos"))]
     {
-        let entry = keyring::Entry::new(service.as_ref(), account)
+        let entry = lpm_keyring::entry(service.as_ref(), account)
             .map_err(|e| format!("keychain error: {e}"))?;
         match entry.delete_credential() {
             Ok(()) => Ok(()),
-            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(lpm_keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(format!("keychain delete error: {e}")),
         }
     }
@@ -2468,11 +2468,11 @@ fn get_auth_key_material() -> Result<AuthKeyMaterial, String> {
     } else {
         #[cfg(target_os = "macos")]
         let _lock = lpm_common::platform::macos_keychain_operation_lock();
-        match keyring::Entry::new(&lpm_common::credential_service(KEY_SERVICE), KEY_ACCOUNT)
+        match lpm_keyring::entry(&lpm_common::credential_service(KEY_SERVICE), KEY_ACCOUNT)
             .and_then(|entry| entry.get_password())
         {
             Ok(value) => Ok(Some(value)),
-            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(lpm_keyring::Error::NoEntry) => Ok(None),
             Err(error) => Err(format!("failed to read native auth data key: {error}")),
         }
     };
@@ -2518,7 +2518,7 @@ fn get_auth_key_material() -> Result<AuthKeyMaterial, String> {
     } else {
         #[cfg(target_os = "macos")]
         let _lock = lpm_common::platform::macos_keychain_operation_lock();
-        keyring::Entry::new(&lpm_common::credential_service(KEY_SERVICE), KEY_ACCOUNT)
+        lpm_keyring::entry(&lpm_common::credential_service(KEY_SERVICE), KEY_ACCOUNT)
             .and_then(|entry| entry.set_password(&value))
             .is_ok()
     };

@@ -147,12 +147,12 @@ fn create_file_signing_secret(path: &Path) -> Result<Vec<u8>, LpmError> {
 fn read_keyring_signing_secret(account: &str) -> Result<Vec<u8>, SigningSecretReadError> {
     #[cfg(target_os = "macos")]
     let _lock = lpm_common::platform::macos_keychain_operation_lock();
-    let entry = keyring::Entry::new(KEYRING_SERVICE, account).map_err(|e| {
+    let entry = lpm_keyring::entry(KEYRING_SERVICE, account).map_err(|e| {
         SigningSecretReadError::Unavailable(format!("security approval keyring error: {e}"))
     })?;
     match entry.get_password() {
         Ok(existing) => decode_signing_secret(&existing, "security approval keyring entry"),
-        Err(keyring::Error::NoEntry) => Err(SigningSecretReadError::Missing),
+        Err(lpm_keyring::Error::NoEntry) => Err(SigningSecretReadError::Missing),
         Err(e) => Err(SigningSecretReadError::Unavailable(format!(
             "security approval keyring read error: {e}"
         ))),
@@ -182,7 +182,7 @@ fn adopt_earlier_keyring_signing_secret(account: &str) -> Result<Vec<u8>, Signin
     let secret = read_keyring_signing_secret(&earlier)?;
     #[cfg(target_os = "macos")]
     let _lock = lpm_common::platform::macos_keychain_operation_lock();
-    let copied = keyring::Entry::new(KEYRING_SERVICE, account)
+    let copied = lpm_keyring::entry(KEYRING_SERVICE, account)
         .and_then(|entry| entry.set_password(&hex::encode(&secret)));
     if let Err(error) = copied {
         tracing::warn!(
@@ -264,7 +264,7 @@ fn create_signing_secret() -> Result<Vec<u8>, LpmError> {
     let account = keyring_account(KEYRING_ACCOUNT)?;
     #[cfg(target_os = "macos")]
     let _lock = lpm_common::platform::macos_keychain_operation_lock();
-    let entry = keyring::Entry::new(KEYRING_SERVICE, &account)
+    let entry = lpm_keyring::entry(KEYRING_SERVICE, &account)
         .map_err(|e| security_store_error(format!("security approval keyring error: {e}")))?;
 
     let secret = random_signing_secret();
