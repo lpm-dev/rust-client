@@ -193,7 +193,7 @@ fn normalized_registry_url(registry_url: &str) -> String {
 }
 
 pub(crate) fn build_npm_oidc_exchange_client() -> Result<reqwest::Client, LpmError> {
-    reqwest::Client::builder()
+    lpm_http::client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))
         .user_agent(format!("lpm-rs/{}", crate::build_version::version()))

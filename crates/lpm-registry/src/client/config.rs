@@ -12,9 +12,23 @@ enum HttpRedirectMode {
     Manual,
 }
 
-struct PreparedTlsRoots {
-    replace_builtin_roots: bool,
-    certificates: Vec<reqwest::Certificate>,
+/// The roots a registry client trusts. CAs from `.npmrc`'s `cafile` or `ca`
+/// replace the bundled roots, as they do for npm.
+#[derive(Debug)]
+enum TrustedRoots {
+    Bundled,
+    Configured(Vec<reqwest::Certificate>),
+}
+
+impl TrustedRoots {
+    fn client_builder(&self) -> reqwest::ClientBuilder {
+        match self {
+            Self::Bundled => lpm_http::client_builder(),
+            Self::Configured(certificates) => {
+                lpm_http::client_builder_trusting_only(certificates.iter().cloned())
+            }
+        }
+    }
 }
 
 impl RegistryClient {
@@ -100,10 +114,10 @@ impl RegistryClient {
     /// Build the underlying `reqwest::Client` with optional `.npmrc`-derived
     /// TLS overrides applied:
     ///
-    /// - `extra_roots` from `cafile=` / `ca=` replace the built-in root
+    /// - `extra_roots` from `cafile=` / `ca=` replace the bundled root
     ///   set, matching npm's configured-CA trust contract.
     /// - `strict_ssl == Some(false)` flips
-    ///   [`reqwest::ClientBuilder::danger_accept_invalid_certs(true)`].
+    ///   [`reqwest::ClientBuilder::tls_danger_accept_invalid_certs(true)`].
     ///   This is process-wide on the resulting client; install.rs gates
     ///   it behind a loud install-start warning so a typo can't
     ///   silently turn off verification.
@@ -194,7 +208,7 @@ impl RegistryClient {
         })
     }
 
-    fn prepare_tls_roots(tls: &TlsOverrides) -> Result<PreparedTlsRoots, LpmError> {
+    fn prepare_tls_roots(tls: &TlsOverrides) -> Result<TrustedRoots, LpmError> {
         let mut certificates = Vec::with_capacity(tls.extra_roots.len());
         for root in &tls.extra_roots {
             validate_pem_root(root.pem_bytes.as_ref(), &root.source, root.line)?;
@@ -207,9 +221,10 @@ impl RegistryClient {
                 })?;
             certificates.push(certificate);
         }
-        Ok(PreparedTlsRoots {
-            replace_builtin_roots: !certificates.is_empty(),
-            certificates,
+        Ok(if certificates.is_empty() {
+            TrustedRoots::Bundled
+        } else {
+            TrustedRoots::Configured(certificates)
         })
     }
 
@@ -238,12 +253,13 @@ impl RegistryClient {
         connect_timeout: Duration,
         read_timeout: Option<Duration>,
         tls: &TlsOverrides,
-        roots: &PreparedTlsRoots,
+        roots: &TrustedRoots,
         identity: Option<reqwest::Identity>,
         transport: HttpTransportMode,
         redirect: HttpRedirectMode,
     ) -> Result<reqwest::Client, LpmError> {
-        let mut b = lpm_http::client_builder()
+        let mut b = roots
+            .client_builder()
             .connect_timeout(connect_timeout)
             .user_agent(format!("lpm-rs/{}", env!("CARGO_PKG_VERSION")));
         if let Some(read_timeout) = read_timeout {
@@ -264,16 +280,10 @@ impl RegistryClient {
                 .tcp_keepalive(Duration::from_secs(60))
                 .tcp_nodelay(true);
         }
-        if roots.replace_builtin_roots {
-            b = b.tls_built_in_root_certs(false);
-        }
-        for certificate in &roots.certificates {
-            b = b.add_root_certificate(certificate.clone());
-        }
         if let Some(tagged) = tls.strict_ssl.as_ref()
             && !tagged.value
         {
-            b = b.danger_accept_invalid_certs(true);
+            b = b.tls_danger_accept_invalid_certs(true);
         }
         if let Some(id) = identity {
             b = b.identity(id);
@@ -1026,8 +1036,18 @@ mod config_tests {
 
         let roots = RegistryClient::prepare_tls_roots(&tls).expect("prepare TLS roots");
 
-        assert!(roots.replace_builtin_roots);
-        assert_eq!(roots.certificates.len(), 1);
+        assert!(
+            matches!(&roots, TrustedRoots::Configured(certificates) if certificates.len() == 1),
+            "{roots:?}"
+        );
+    }
+
+    #[test]
+    fn without_a_configured_ca_the_bundled_roots_are_trusted() {
+        let roots =
+            RegistryClient::prepare_tls_roots(&TlsOverrides::default()).expect("prepare TLS roots");
+
+        assert!(matches!(roots, TrustedRoots::Bundled), "{roots:?}");
     }
 
     #[test]

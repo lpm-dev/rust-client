@@ -13,6 +13,7 @@ bytes = "1"
 futures = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }
+webpki-root-certs = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

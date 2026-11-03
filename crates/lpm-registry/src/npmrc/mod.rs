@@ -20,11 +20,11 @@
 //! - `cafile=<path>` — PEM is read from disk at parse time
 //!   (fail-fast: typos surface as `cfg.errors` before any network).
 //!   Bytes are stored on `NpmrcConfig::tls` for
-//!   `RegistryClient::with_tls_overrides_for` to attach via
-//!   `ClientBuilder::add_root_certificate`.
+//!   `RegistryClient::with_tls_overrides_for` to trust instead of the
+//!   bundled roots, through `lpm_http::client_builder_trusting_only`.
 //! - `ca=<pem>` — inline PEM. Multiple lines accumulate.
 //! - `strict-ssl=false` — maps to
-//!   `ClientBuilder::danger_accept_invalid_certs(true)` and a loud
+//!   `ClientBuilder::tls_danger_accept_invalid_certs(true)` and a loud
 //!   install-start warning (cites contributing source/line). Default
 //!   and explicit `=true` are no-ops.
 //! - `certfile=<path>` + `keyfile=<path>` — global mTLS identity.

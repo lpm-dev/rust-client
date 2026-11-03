@@ -1,11 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use syn::visit::Visit;
 use syn::{
-    Attribute, Expr, ExprCall, ExprMethodCall, ExprPath, ImplItemFn, ItemFn, ItemImpl, ItemMod,
-    ItemUse, UseTree,
+    Attribute, Expr, ExprCall, ExprLit, ExprMethodCall, ExprPath, ImplItemFn, Item, ItemFn,
+    ItemImpl, ItemMod, ItemUse, Lit, UseTree,
 };
 
 fn workspace_root() -> PathBuf {
@@ -38,6 +38,94 @@ fn is_test_source(path: &Path) -> bool {
             .any(|component| component.as_os_str() == "tests")
 }
 
+fn lexically_normal(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                normal.pop();
+            }
+            Component::CurDir => {}
+            other => normal.push(other),
+        }
+    }
+    normal
+}
+
+fn path_attribute(attribute: &Attribute) -> Option<String> {
+    let syn::Meta::NameValue(value) = &attribute.meta else {
+        return None;
+    };
+    if !value.path.is_ident("path") {
+        return None;
+    }
+    let Expr::Lit(ExprLit {
+        lit: Lit::Str(path),
+        ..
+    }) = &value.value
+    else {
+        return None;
+    };
+    Some(path.value())
+}
+
+/// The files `path` declares as modules with `mod name;`, each with whether
+/// the declaration is compiled only for tests.
+fn declared_module_files(path: &Path, syntax: &syn::File) -> Vec<(PathBuf, bool)> {
+    let directory = path.parent().expect("source files have a directory");
+    let owns_directory = path
+        .file_name()
+        .is_some_and(|name| name == "lib.rs" || name == "main.rs" || name == "mod.rs");
+    let child_directory = if owns_directory {
+        directory.to_path_buf()
+    } else {
+        directory.join(path.file_stem().expect("source files have a stem"))
+    };
+    let mut files = Vec::new();
+    for item in &syntax.items {
+        let Item::Mod(module) = item else {
+            continue;
+        };
+        if module.content.is_some() {
+            continue;
+        }
+        let test_only = is_test_only(&module.attrs);
+        if let Some(explicit) = module.attrs.iter().find_map(path_attribute) {
+            files.push((lexically_normal(&directory.join(explicit)), test_only));
+        } else {
+            let name = module.ident.to_string();
+            files.push((child_directory.join(format!("{name}.rs")), test_only));
+            files.push((child_directory.join(name).join("mod.rs"), test_only));
+        }
+    }
+    files
+}
+
+/// Source files compiled only for tests: those a `#[cfg(test)]` module
+/// declaration includes, and the modules they declare in turn.
+fn test_module_files(parsed: &[(PathBuf, String, syn::File)]) -> HashSet<PathBuf> {
+    let declared = parsed
+        .iter()
+        .map(|(path, _, syntax)| (path.as_path(), declared_module_files(path, syntax)))
+        .collect::<HashMap<_, _>>();
+    let mut pending = declared
+        .values()
+        .flatten()
+        .filter(|(_, test_only)| *test_only)
+        .map(|(file, _)| file.clone())
+        .collect::<Vec<_>>();
+    let mut test_files = HashSet::new();
+    while let Some(file) = pending.pop() {
+        if let Some(children) = declared.get(file.as_path())
+            && !test_files.contains(&file)
+        {
+            pending.extend(children.iter().map(|(child, _)| child.clone()));
+        }
+        test_files.insert(file);
+    }
+    test_files
+}
+
 fn is_test_only(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|attr| {
         let path = attr.path();
@@ -58,6 +146,10 @@ fn is_test_only(attrs: &[Attribute]) -> bool {
     })
 }
 
+fn is_client_type(name: &str) -> bool {
+    matches!(name, "Client" | "ClientBuilder")
+}
+
 #[derive(Default)]
 struct ReqwestAliases {
     clients: HashSet<String>,
@@ -72,12 +164,15 @@ impl ReqwestAliases {
                 prefix.pop();
             }
             UseTree::Name(name) => {
-                if prefix.first().is_some_and(|root| root == "reqwest") && name.ident == "Client" {
+                if prefix.first().is_some_and(|root| root == "reqwest")
+                    && is_client_type(&name.ident.to_string())
+                {
                     self.clients.insert(name.ident.to_string());
                 }
             }
             UseTree::Rename(rename) => {
-                if prefix.first().is_some_and(|root| root == "reqwest") && rename.ident == "Client"
+                if prefix.first().is_some_and(|root| root == "reqwest")
+                    && is_client_type(&rename.ident.to_string())
                 {
                     self.clients.insert(rename.rename.to_string());
                 }
@@ -100,7 +195,6 @@ impl<'ast> Visit<'ast> for ReqwestAliases {
 
 struct ClientConstructorAudit<'a> {
     aliases: &'a HashSet<String>,
-    protected_depth: usize,
     violations: Vec<String>,
 }
 
@@ -125,7 +219,7 @@ impl ClientConstructorAudit<'_> {
         let is_fully_qualified = segments.first().is_some_and(|root| root == "reqwest")
             && segments
                 .get(segments.len().saturating_sub(2))
-                .is_some_and(|ty| ty == "Client");
+                .is_some_and(|ty| is_client_type(ty));
         let is_imported = segments.len() == 2
             && self
                 .aliases
@@ -157,6 +251,7 @@ impl ClientConstructorAudit<'_> {
                             function.as_str(),
                             "client_builder"
                                 | "client_builder_with_redirect_limit"
+                                | "client_builder_trusting_only"
                                 | "blocking_client_builder"
                         )
                     })
@@ -183,18 +278,6 @@ fn is_policy_none(expression: &Expr) -> bool {
         && segments
             .next()
             .is_some_and(|segment| segment.ident.to_string().ends_with("Policy"))
-}
-
-fn chain_has_no_follow_policy(expression: &Expr) -> bool {
-    match expression {
-        Expr::MethodCall(call) => {
-            (call.method == "redirect" && call.args.iter().any(is_policy_none))
-                || chain_has_no_follow_policy(&call.receiver)
-        }
-        Expr::Paren(paren) => chain_has_no_follow_policy(&paren.expr),
-        Expr::Group(group) => chain_has_no_follow_policy(&group.expr),
-        _ => false,
-    }
 }
 
 impl<'ast> Visit<'ast> for ClientConstructorAudit<'_> {
@@ -230,22 +313,11 @@ impl<'ast> Visit<'ast> for ClientConstructorAudit<'_> {
             self.violations
                 .push("redirect override without Policy::none".into());
         }
-        if chain_has_no_follow_policy(&Expr::MethodCall(call.clone())) {
-            self.protected_depth += 1;
-            self.visit_expr(&call.receiver);
-            self.protected_depth -= 1;
-            for argument in &call.args {
-                self.visit_expr(argument);
-            }
-        } else {
-            syn::visit::visit_expr_method_call(self, call);
-        }
+        syn::visit::visit_expr_method_call(self, call);
     }
 
     fn visit_expr_call(&mut self, call: &'ast ExprCall) {
-        if self.protected_depth == 0
-            && let Some(constructor) = self.is_reqwest_constructor(call)
-        {
+        if let Some(constructor) = self.is_reqwest_constructor(call) {
             self.violations.push(constructor);
         }
         syn::visit::visit_expr_call(self, call);
@@ -253,50 +325,57 @@ impl<'ast> Visit<'ast> for ClientConstructorAudit<'_> {
 }
 
 #[test]
-fn production_reqwest_clients_use_shared_or_no_follow_redirect_policy() {
+fn production_reqwest_clients_come_from_lpm_http() {
     let root = workspace_root();
     let crates = root.join("crates");
     let mut sources = Vec::new();
     collect_rust_sources(&crates, &mut sources);
     let shared_source = root.join("crates/lpm-http/src");
     let mut violations = Vec::new();
+    let parsed = sources
+        .into_iter()
+        .filter(|path| !is_test_source(path))
+        .map(|path| {
+            let source = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+            let syntax = syn::parse_file(&source)
+                .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
+            (path, source, syntax)
+        })
+        .collect::<Vec<_>>();
+    let test_modules = test_module_files(&parsed);
 
-    for path in sources {
-        if is_test_source(&path) {
+    for (path, source, syntax) in &parsed {
+        if test_modules.contains(path) {
             continue;
         }
-        let source = fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
         if source.contains(".default_headers(") {
             violations.push(format!(
                 "{}: default headers can bypass redirect sanitization",
-                path.strip_prefix(&root).unwrap_or(&path).display()
+                path.strip_prefix(&root).unwrap_or(path).display()
             ));
         }
         if path.starts_with(&shared_source) {
             continue;
         }
-        let syntax = syn::parse_file(&source)
-            .unwrap_or_else(|error| panic!("parse {}: {error}", path.display()));
         let mut aliases = ReqwestAliases::default();
-        aliases.visit_file(&syntax);
+        aliases.visit_file(syntax);
         let mut audit = ClientConstructorAudit {
             aliases: &aliases.clients,
-            protected_depth: 0,
             violations: Vec::new(),
         };
-        audit.visit_file(&syntax);
+        audit.visit_file(syntax);
         for constructor in audit.violations {
             violations.push(format!(
-                "{}: unprotected {constructor}",
-                path.strip_prefix(&root).unwrap_or(&path).display()
+                "{}: raw {constructor}",
+                path.strip_prefix(&root).unwrap_or(path).display()
             ));
         }
     }
 
     assert!(
         violations.is_empty(),
-        "production reqwest constructors must use lpm-http or explicitly apply Policy::none(), and must not configure default headers:\n{}",
+        "production reqwest clients must come from lpm-http, which applies the redirect policy and the trusted roots; a redirect override must be Policy::none(), and default headers are not allowed:\n{}",
         violations.join("\n")
     );
 }
@@ -346,8 +425,14 @@ fn security_sensitive_client_paths_keep_shared_builders() {
     assert_body_contains(
         &registry_config,
         "fn build_http_client_with_prepared_tls_identity_and_transport(",
-        "lpm_http::client_builder()",
+        ".client_builder()",
     );
+    for builder in [
+        "lpm_http::client_builder()",
+        "lpm_http::client_builder_trusting_only(",
+    ] {
+        assert_body_contains(&registry_config, "fn client_builder(&self)", builder);
+    }
     assert_body_contains(
         &registry_config,
         "fn build_http_client_with_tls_and_identity(",

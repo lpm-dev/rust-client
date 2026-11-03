@@ -910,7 +910,7 @@ fn assert_proxy_tls_path_routes_to_service(
         .expect("proxy route should expose an upstream port");
     let tls_port = proxy_tls_port(project);
     let client = reqwest::blocking::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .tls_danger_accept_invalid_certs(true)
         .timeout(Duration::from_secs(5))
         .resolve(host, std::net::SocketAddr::from(([127, 0, 0, 1], tls_port)))
         .build()

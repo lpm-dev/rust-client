@@ -705,7 +705,7 @@ fn proxy_start_tls_port_routes_registered_host_with_project_cert() {
     );
 
     let response = reqwest::blocking::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .tls_danger_accept_invalid_certs(true)
         .resolve(
             "app.localhost",
             std::net::SocketAddr::from(([127, 0, 0, 1], tls_port)),

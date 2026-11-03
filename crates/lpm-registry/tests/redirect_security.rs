@@ -36,7 +36,7 @@ fn redirect_response(status: u16, location: &str) -> Vec<u8> {
 fn trusted_client(ca: &TestCa) -> reqwest::Client {
     let root = reqwest::Certificate::from_pem(ca.cert_pem.as_bytes()).expect("test root PEM");
     lpm_http::client_builder()
-        .add_root_certificate(root)
+        .tls_certs_merge([root])
         .build()
         .expect("build trusted HTTP client")
 }
@@ -315,7 +315,7 @@ async fn no_follow_policy_returns_redirect_without_contacting_target() {
     let root = reqwest::Certificate::from_pem(ca.cert_pem.as_bytes()).expect("test root PEM");
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .add_root_certificate(root)
+        .tls_certs_merge([root])
         .build()
         .expect("build no-follow client");
 
@@ -388,7 +388,7 @@ async fn blocking_client_refuses_https_to_http_before_contacting_target() {
 
     let error = tokio::task::spawn_blocking(move || {
         lpm_http::blocking_client_builder()
-            .add_root_certificate(root)
+            .tls_certs_merge([root])
             .build()
             .expect("build blocking client")
             .get(url)

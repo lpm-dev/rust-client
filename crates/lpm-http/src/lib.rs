@@ -655,19 +655,53 @@ impl fmt::Display for HttpsDowngrade {
 
 impl std::error::Error for HttpsDowngrade {}
 
-/// Build an asynchronous reqwest client with the workspace redirect policy.
+/// The Mozilla root certificates built into LPM, which every client trusts
+/// unless its caller replaces them.
+///
+/// The operating system's certificate store is never consulted, so a server
+/// is trusted the same way on every platform and machine.
+pub fn bundled_root_certificates() -> impl Iterator<Item = reqwest::Certificate> {
+    webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .map(|certificate| {
+            reqwest::Certificate::from_der(certificate.as_ref())
+                .expect("bundled root certificates are DER")
+        })
+}
+
+/// Build an asynchronous reqwest client with the workspace redirect policy,
+/// trusting the [bundled root certificates](bundled_root_certificates).
 pub fn client_builder() -> reqwest::ClientBuilder {
     client_builder_with_redirect_limit(DEFAULT_REDIRECT_LIMIT)
 }
 
-/// Build an asynchronous reqwest client with a caller-selected redirect limit.
+/// Build an asynchronous reqwest client with a caller-selected redirect limit,
+/// trusting the [bundled root certificates](bundled_root_certificates).
 pub fn client_builder_with_redirect_limit(limit: usize) -> reqwest::ClientBuilder {
-    reqwest::Client::builder().redirect(redirect_policy(limit))
+    reqwest::Client::builder()
+        .redirect(redirect_policy(limit))
+        .tls_certs_only(bundled_root_certificates())
 }
 
-/// Build a blocking reqwest client with the workspace redirect policy.
+/// Build an asynchronous reqwest client with the workspace redirect policy
+/// that trusts only `roots`, such as a CA the user configured, instead of the
+/// bundled root certificates.
+///
+/// An empty `roots` trusts no server.
+pub fn client_builder_trusting_only(
+    roots: impl IntoIterator<Item = reqwest::Certificate>,
+) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .redirect(redirect_policy(DEFAULT_REDIRECT_LIMIT))
+        .tls_certs_only(roots)
+}
+
+/// Build a blocking reqwest client with the workspace redirect policy,
+/// trusting the [bundled root certificates](bundled_root_certificates).
 pub fn blocking_client_builder() -> reqwest::blocking::ClientBuilder {
-    reqwest::blocking::Client::builder().redirect(redirect_policy(DEFAULT_REDIRECT_LIMIT))
+    reqwest::blocking::Client::builder()
+        .redirect(redirect_policy(DEFAULT_REDIRECT_LIMIT))
+        .tls_certs_only(bundled_root_certificates())
 }
 
 /// Read a response body while enforcing declared-length and streamed-byte caps.

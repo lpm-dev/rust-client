@@ -248,7 +248,7 @@ fn http_clients_eager_hit_overrides_default() {
     // which we exercise in the integration test for mTLS proper).
     let default = RegistryClient::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
     let per_origin_client = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(&pem).expect("rcgen pem"))
+        .tls_certs_merge([reqwest::Certificate::from_pem(&pem).expect("rcgen pem")])
         .build()
         .expect("client build");
     let origin = OriginKey {
@@ -531,7 +531,7 @@ fn http_clients_eager_portless_scope_excludes_explicit_non_default_ports() {
     let default = RegistryClient::build_http_client(CONNECT_TIMEOUT, READ_TIMEOUT);
     let pem = rcgen_pem();
     let per_origin_client = reqwest::Client::builder()
-        .add_root_certificate(reqwest::Certificate::from_pem(&pem).expect("rcgen pem"))
+        .tls_certs_merge([reqwest::Certificate::from_pem(&pem).expect("rcgen pem")])
         .build()
         .expect("client build");
     // Insert with port: None.
