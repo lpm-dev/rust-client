@@ -893,7 +893,7 @@ mod tests {
     use super::*;
     use crate::provenance_fetch::{ProvenanceFetchRequest, fetch_provenance_snapshot};
     use lpm_registry::AttestationRef;
-    use rcgen::{CertificateParams, Ia5String, KeyPair, SanType};
+    use rcgen::{CertificateParams, KeyPair, SanType, string::Ia5String};
 
     // ── parse_github_actions_uri ─────────────────────────────────
 

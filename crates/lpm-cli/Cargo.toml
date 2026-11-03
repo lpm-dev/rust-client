@@ -147,7 +147,7 @@ ecdsa = { workspace = true }
 
 # Phase 46 P4: x509 cert parsing for Sigstore attestation SAN extraction
 # (identity-only, not full Sigstore verification — see plan §7.1 / D5).
-x509-parser = "0.16"
+x509-parser = "0.18"
 jsonschema = { version = "0.46", default-features = false }
 
 # Typed errors for the C1 Sigstore verifier (`sigstore_verify.rs`).
@@ -239,7 +239,7 @@ lpm-common = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 wiremock = "0.6"
 # A relay for the live tunnel panel's terminal test.
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.30"
 futures-util = "0.3"
 assert_cmd = "2"
 insta = { version = "1", features = ["json"] }
@@ -247,10 +247,10 @@ lpm-vault = { workspace = true, features = ["acceptance-test-hooks"] }
 # Damages a test project's capture database to exercise disk failures.
 rusqlite = { version = "0.40", features = ["bundled"] }
 
-# Phase 46 P4 Chunk 2: generate synthetic x509 certs with URI SANs in
-# unit tests so the SAN-extractor is exercised against deterministic
-# inputs. Same version as lpm-cert already uses.
-rcgen = { version = "0.13", features = ["pem"] }
+# Synthetic X.509 certificates with URI SANs, so unit tests exercise the SAN
+# extractor against deterministic inputs, and issuers built from those
+# certificates. Same version as lpm-cert uses.
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 
 [lints]
 workspace = true

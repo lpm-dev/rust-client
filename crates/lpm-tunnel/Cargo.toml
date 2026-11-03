@@ -12,7 +12,7 @@ lpm-common = { workspace = true }
 lpm-http = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", features = ["ring"] }
 webpki-roots = "1.0.10"
 futures-util = "0.3"
@@ -31,7 +31,7 @@ sha2 = { workspace = true }
 toml = { workspace = true }
 
 [dev-dependencies]
-rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 

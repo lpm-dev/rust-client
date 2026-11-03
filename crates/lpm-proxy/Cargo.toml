@@ -14,14 +14,14 @@ hyper = { version = "1" }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 lpm-cert = { workspace = true }
 lpm-common = { workspace = true }
-pem = "3"
+pem = "4"
 rustls = "0.23"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = "0.26"
-x509-parser = "0.16"
+x509-parser = "0.18"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -36,7 +36,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-rcgen = { version = "0.13", features = ["pem"] }
+rcgen = { version = "0.14", features = ["pem"] }
 reqwest = { workspace = true }
 tempfile = "3"
 

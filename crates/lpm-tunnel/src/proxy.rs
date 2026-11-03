@@ -509,17 +509,10 @@ pub async fn connect_local_websocket(
     let connected = sibling_target.as_ref().unwrap_or(local_target);
     let request = build_local_websocket_request(connected, url, headers)?;
 
-    let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
-        write_buffer_size: 128 * 1024,
-        max_write_buffer_size: 4 * 1024 * 1024,
-        max_message_size: Some(crate::client::MAX_WS_MESSAGE_SIZE),
-        max_frame_size: Some(crate::client::MAX_WS_FRAME_SIZE),
-        ..Default::default()
-    };
     let (stream, response) = tokio_tungstenite::client_async_with_config(
         request,
         tokio_tungstenite::MaybeTlsStream::Plain(socket),
-        Some(ws_config),
+        Some(local_websocket_config()),
     )
     .await
     .map_err(|e| LpmError::Tunnel(format!("failed to connect local WebSocket: {e}")))?;
@@ -642,8 +635,30 @@ fn build_local_websocket_request(
     Ok(request)
 }
 
+/// Tungstenite allocates each connection's read buffer up front, and a tunnel
+/// keeps up to `MAX_CONCURRENT_WEBSOCKETS` local WebSockets open, mostly for
+/// small messages such as hot reloads. Its 128 KiB default would hold 8 MiB
+/// for 64 of them.
+const LOCAL_WEBSOCKET_READ_BUFFER_BYTES: usize = 4 * 1024;
+
+fn local_websocket_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .read_buffer_size(LOCAL_WEBSOCKET_READ_BUFFER_BYTES)
+        .write_buffer_size(128 * 1024)
+        .max_write_buffer_size(4 * 1024 * 1024)
+        .max_message_size(Some(crate::client::MAX_WS_MESSAGE_SIZE))
+        .max_frame_size(Some(crate::client::MAX_WS_FRAME_SIZE))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_read_buffers_of_every_local_websocket_fit_in_a_quarter_mebibyte() {
+        let read_buffer = super::local_websocket_config().read_buffer_size;
+
+        assert!(crate::client::MAX_CONCURRENT_WEBSOCKETS * read_buffer <= 256 * 1024);
+    }
+
     use super::*;
 
     #[test]

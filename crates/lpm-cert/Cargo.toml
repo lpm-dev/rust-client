@@ -12,9 +12,9 @@ cap-primitives = "4.0.2"
 cap-fs-ext = { workspace = true }
 cap-std = "4.0.2"
 lpm-common = { workspace = true }
-rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
-x509-parser = { version = "0.16", features = ["verify"] }
-pem = "3"
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+x509-parser = { version = "0.18", features = ["verify"] }
+pem = "4"
 sha2 = { workspace = true }
 sha1 = { workspace = true }
 regex = "1"

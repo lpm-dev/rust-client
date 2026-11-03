@@ -1218,7 +1218,7 @@ pub async fn fetch_unverified_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcgen::{CertificateParams, Ia5String, KeyPair, SanType};
+    use rcgen::{CertificateParams, KeyPair, SanType, string::Ia5String};
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 

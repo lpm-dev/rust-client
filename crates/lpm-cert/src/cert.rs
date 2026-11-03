@@ -7,8 +7,8 @@ mod root_constraints;
 
 use lpm_common::LpmError;
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, CidrSubnet, DistinguishedName, DnType,
-    GeneralSubtree, IsCa, KeyPair, KeyUsagePurpose, NameConstraints, SanType,
+    BasicConstraints, CertificateParams, CidrSubnet, DistinguishedName, DnType, GeneralSubtree,
+    IsCa, Issuer, KeyPair, KeyUsagePurpose, NameConstraints, PublicKeyData, SanType,
 };
 use sha1::Digest as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -528,7 +528,7 @@ pub fn project_cert_key_matches(cert_path: &Path, key_path: &Path) -> Result<boo
         })?;
     let key_pair = KeyPair::from_pem(&key_pem)
         .map_err(|error| LpmError::Cert(format!("invalid project private key: {error}")))?;
-    Ok(certificate.public_key().raw == key_pair.public_key_der())
+    Ok(certificate.public_key().raw == key_pair.subject_public_key_info())
 }
 
 /// Verify that in-memory project certificate and private-key PEM data match.
@@ -541,7 +541,7 @@ pub fn validate_project_key_pair_bytes(cert_pem: &[u8], key_pem: &[u8]) -> Resul
         .map_err(|error| LpmError::Cert(format!("invalid project private key text: {error}")))?;
     let key_pair = KeyPair::from_pem(key_pem)
         .map_err(|error| LpmError::Cert(format!("invalid project private key: {error}")))?;
-    if certificate.public_key().raw != key_pair.public_key_der() {
+    if certificate.public_key().raw != key_pair.subject_public_key_info() {
         return Err(LpmError::Cert(
             "project certificate and private key do not match".to_string(),
         ));
@@ -687,10 +687,10 @@ pub fn generate_project_cert(
     extra_hostnames: &[String],
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
     root_constraints::validate_requested_names(ca_cert_pem, extra_hostnames)?;
-    let (ca_cert, ca_key_pair) = issuer_from_ca_pem(ca_cert_pem, ca_key_pem)?;
+    let ca = issuer_from_ca_pem(ca_cert_pem, ca_key_pem)?;
     let params = project_leaf_params(extra_hostnames)?;
     let project_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
-    let project_cert = params.signed_by(&project_key, &ca_cert, &ca_key_pair)?;
+    let project_cert = params.signed_by(&project_key, &ca)?;
 
     Ok((project_cert.pem(), project_key.serialize_pem()))
 }
@@ -708,34 +708,37 @@ pub fn generate_project_cert_with_constrained_intermediate(
     extra_permitted_dns_subtrees: &[String],
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
     root_constraints::validate_requested_names(ca_cert_pem, extra_hostnames)?;
-    let (ca_cert, ca_key_pair) = issuer_from_ca_pem(ca_cert_pem, ca_key_pem)?;
+    let ca = issuer_from_ca_pem(ca_cert_pem, ca_key_pem)?;
     let intermediate_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
     let intermediate_params =
         project_intermediate_params(extra_hostnames, extra_permitted_dns_subtrees)?;
-    let intermediate_cert =
-        intermediate_params.signed_by(&intermediate_key, &ca_cert, &ca_key_pair)?;
+    let intermediate_cert = intermediate_params.signed_by(&intermediate_key, &ca)?;
 
     let project_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
     let leaf_params = project_leaf_params(extra_hostnames)?;
-    let leaf_cert = leaf_params.signed_by(&project_key, &intermediate_cert, &intermediate_key)?;
+    let intermediate = Issuer::from_params(&intermediate_params, &intermediate_key);
+    let leaf_cert = leaf_params.signed_by(&project_key, &intermediate)?;
     let chain_pem = format!("{}{}", leaf_cert.pem(), intermediate_cert.pem());
 
     Ok((chain_pem, project_key.serialize_pem()))
 }
 
+/// The root CA as an issuer: certificates it signs take their issuer name,
+/// authority key identifier and the CA's key usages from its certificate.
 fn issuer_from_ca_pem(
     ca_cert_pem: &str,
     ca_key_pem: &str,
-) -> Result<(Certificate, KeyPair), Box<dyn std::error::Error>> {
+) -> Result<Issuer<'static, KeyPair>, Box<dyn std::error::Error>> {
     let ca_key_pair = KeyPair::from_pem(ca_key_pem)?;
     let ca_pem = pem::parse(ca_cert_pem)?;
     let (_, parsed_ca) = x509_parser::parse_x509_certificate(ca_pem.contents())?;
-    if parsed_ca.public_key().raw != ca_key_pair.public_key_der() {
+    if parsed_ca.public_key().raw != ca_key_pair.subject_public_key_info() {
         return Err("CA certificate and private key do not match".into());
     }
-    let ca_cert_params = CertificateParams::from_ca_cert_pem(ca_cert_pem)?;
-    let ca_cert = ca_cert_params.self_signed(&ca_key_pair)?;
-    Ok((ca_cert, ca_key_pair))
+    Ok(Issuer::from_ca_cert_der(
+        &ca_pem.contents().into(),
+        ca_key_pair,
+    )?)
 }
 
 /// Verify that a root certificate and private key contain the same public key.
@@ -1075,7 +1078,7 @@ mod tests {
         intermediate_key_usages: Option<Vec<KeyUsagePurpose>>,
         leaf_extended_key_usages: Option<Vec<rcgen::ExtendedKeyUsagePurpose>>,
     ) -> String {
-        let (root, root_key) = issuer_from_ca_pem(root_cert_pem, root_key_pem).unwrap();
+        let root = issuer_from_ca_pem(root_cert_pem, root_key_pem).unwrap();
         let intermediate_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let mut intermediate_params = project_intermediate_params(intermediate_hosts, &[]).unwrap();
         if let Some((not_before, not_after)) = intermediate_validity {
@@ -1086,15 +1089,16 @@ mod tests {
             intermediate_params.key_usages = key_usages;
         }
         let intermediate = intermediate_params
-            .signed_by(&intermediate_key, &root, &root_key)
+            .signed_by(&intermediate_key, &root)
             .unwrap();
+        let intermediate_issuer = Issuer::from_params(&intermediate_params, &intermediate_key);
         let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let mut leaf_params = project_leaf_params(leaf_hosts).unwrap();
         if let Some(key_usages) = leaf_extended_key_usages {
             leaf_params.extended_key_usages = key_usages;
         }
         let leaf = leaf_params
-            .signed_by(&leaf_key, &intermediate, &intermediate_key)
+            .signed_by(&leaf_key, &intermediate_issuer)
             .unwrap();
         format!("{}{}", leaf.pem(), intermediate.pem())
     }
@@ -1461,12 +1465,12 @@ mod tests {
     #[test]
     fn needs_renewal_rejects_a_certificate_that_is_not_yet_valid() {
         let (ca_cert_pem, ca_key_pem) = ca::generate_ca().unwrap();
-        let (ca_cert, ca_key) = issuer_from_ca_pem(&ca_cert_pem, &ca_key_pem).unwrap();
+        let ca = issuer_from_ca_pem(&ca_cert_pem, &ca_key_pem).unwrap();
         let project_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let mut params = project_leaf_params(&["app.localhost".to_string()]).unwrap();
         params.not_before = OffsetDateTime::now_utc() + Duration::days(2);
         params.not_after = params.not_before + Duration::days(365);
-        let cert = params.signed_by(&project_key, &ca_cert, &ca_key).unwrap();
+        let cert = params.signed_by(&project_key, &ca).unwrap();
 
         assert!(needs_renewal_bytes(cert.pem().as_bytes()).unwrap());
     }

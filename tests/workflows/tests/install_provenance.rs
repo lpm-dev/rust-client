@@ -22,7 +22,7 @@ mod support;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use rcgen::{CertificateParams, Ia5String, KeyPair, SanType};
+use rcgen::{CertificateParams, KeyPair, SanType, string::Ia5String};
 use support::assertions;
 use support::mock_registry::MockRegistry;
 use support::{TempProject, lpm_with_registry, write_signed_unlock};

@@ -30,7 +30,7 @@ fn constrained_root_refuses_existing_outside_chain_at_publication() {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let unconstrained = params.clone().self_signed(&key).unwrap();
+    let unconstrained = params.self_signed(&key).unwrap();
     params.name_constraints = Some(NameConstraints {
         permitted_subtrees: vec![
             GeneralSubtree::DnsName(".test".into()),

@@ -45,12 +45,15 @@ const HTTP_RESPONSE_ESTIMATED_OVERHEAD_MULTIPLIER: usize = 4;
 const HTTP_REQUEST_MEMORY_PERMITS: usize = 256;
 const HTTP_REQUEST_ESTIMATED_OVERHEAD_MULTIPLIER: usize = 4;
 const WEBSOCKET_MEMORY_PERMITS: usize = 128;
-const MAX_CONCURRENT_WEBSOCKETS: usize = 64;
+pub(crate) const MAX_CONCURRENT_WEBSOCKETS: usize = 64;
 const WEBSOCKET_CONNECT_TIMEOUT_SECS: u64 = 10;
 const WEBSOCKET_LOCAL_ENQUEUE_TIMEOUT_MILLIS: u64 = 100;
 const WEBSOCKET_SEND_TIMEOUT_SECS: u64 = 5;
 const WEBSOCKET_CAPTURE_HEADER_BYTES: usize = 64 * 1024;
 const WEBSOCKET_WRITE_BUFFER_BYTES: usize = 128 * 1024;
+/// The relay connection carries every forwarded request; a 128 KiB read
+/// buffer receives bulk transfers about a third faster than a 4 KiB one.
+const WEBSOCKET_RELAY_READ_BUFFER_BYTES: usize = 128 * 1024;
 const WEBSOCKET_MAX_WRITE_BUFFER_BYTES: usize = 72 * 1024 * 1024;
 const MAX_WEBSOCKET_CONNECTION_ID_BYTES: usize = 256;
 const MAX_WEBSOCKET_LOCAL_URL_BYTES: usize = 8 * 1024;
@@ -595,7 +598,7 @@ where
     let json = serde_json::to_string(&close).map_err(|error| {
         LpmError::Tunnel(format!("failed to serialize WebSocket close: {error}"))
     })?;
-    send_to_relay(write, Message::Text(json), "close WebSocket at relay").await
+    send_to_relay(write, Message::text(json), "close WebSocket at relay").await
 }
 
 async fn send_to_relay<S>(
@@ -750,7 +753,7 @@ fn activate_local_websocket(
                 }
             };
             let (bytes, is_binary) = match message {
-                Message::Text(text) => (text.into_bytes(), false),
+                Message::Text(text) => (tokio_tungstenite::tungstenite::Bytes::from(text), false),
                 Message::Binary(bytes) => (bytes, true),
                 Message::Close(frame) => {
                     // Tungstenite queues the reply while reading; flush before dropping either half.
@@ -1284,12 +1287,21 @@ fn inbound_websocket_memory_permits(
         .filter(|permits| *permits as usize <= WEBSOCKET_MEMORY_PERMITS)
 }
 
+fn relay_websocket_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+        .read_buffer_size(WEBSOCKET_RELAY_READ_BUFFER_BYTES)
+        .write_buffer_size(WEBSOCKET_WRITE_BUFFER_BYTES)
+        .max_write_buffer_size(WEBSOCKET_MAX_WRITE_BUFFER_BYTES)
+        .max_message_size(Some(MAX_WS_MESSAGE_SIZE))
+        .max_frame_size(Some(MAX_WS_FRAME_SIZE))
+}
+
 fn local_websocket_message(data: Vec<u8>, is_binary: bool) -> Result<Message, String> {
     if is_binary {
-        Ok(Message::Binary(data))
+        Ok(Message::binary(data))
     } else {
         String::from_utf8(data)
-            .map(Message::Text)
+            .map(Message::text)
             .map_err(|_| "relay WebSocket text frame is not valid UTF-8".to_string())
     }
 }
@@ -1920,19 +1932,11 @@ async fn try_connect_with_token(
     let request =
         build_websocket_connect_request(&connect_url, token, options.tunnel_auth.as_deref())?;
 
-    let ws_config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
-        write_buffer_size: WEBSOCKET_WRITE_BUFFER_BYTES,
-        max_write_buffer_size: WEBSOCKET_MAX_WRITE_BUFFER_BYTES,
-        max_message_size: Some(MAX_WS_MESSAGE_SIZE),
-        max_frame_size: Some(MAX_WS_FRAME_SIZE),
-        ..Default::default()
-    };
-
     let connector =
         relay_tls_connector(options, approved_pins).map_err(TunnelConnectError::permanent)?;
     let (ws_stream, _) = tokio_tungstenite::connect_async_tls_with_config(
         request,
-        Some(ws_config),
+        Some(relay_websocket_config()),
         false,
         Some(connector),
     )
@@ -2148,7 +2152,7 @@ async fn try_connect_with_token(
                                             continue;
                                         }
                                     };
-                                    if let Err(e) = send_to_relay(&mut write, Message::Text(json), "send message to relay").await {
+                                    if let Err(e) = send_to_relay(&mut write, Message::text(json), "send message to relay").await {
                                         tracing::warn!("failed to send error response to relay: {e}");
                                         break;
                                     }
@@ -2161,7 +2165,7 @@ async fn try_connect_with_token(
                                     None => {
                                         let response = proxy::service_unavailable_response(id);
                                         if let Ok(json) = serde_json::to_string(&response)
-                                            && send_to_relay(&mut write, Message::Text(json), "send message to relay").await.is_err()
+                                            && send_to_relay(&mut write, Message::text(json), "send message to relay").await.is_err()
                                         {
                                             break;
                                         }
@@ -2175,7 +2179,7 @@ async fn try_connect_with_token(
                                     Err(_) => {
                                         let response = proxy::service_unavailable_response(id);
                                         if let Ok(json) = serde_json::to_string(&response)
-                                            && send_to_relay(&mut write, Message::Text(json), "send message to relay").await.is_err()
+                                            && send_to_relay(&mut write, Message::text(json), "send message to relay").await.is_err()
                                         {
                                             break;
                                         }
@@ -2199,7 +2203,7 @@ async fn try_connect_with_token(
                                                 continue;
                                             }
                                         };
-                                        if let Err(error) = send_to_relay(&mut write, Message::Text(json), "send message to relay").await {
+                                        if let Err(error) = send_to_relay(&mut write, Message::text(json), "send message to relay").await {
                                             tracing::warn!(
                                                 "failed to send busy response to relay: {error}"
                                             );
@@ -2283,7 +2287,7 @@ async fn try_connect_with_token(
                                             continue;
                                         }
                                     };
-                                    if let Err(e) = send_to_relay(&mut write, Message::Text(json), "send message to relay").await {
+                                    if let Err(e) = send_to_relay(&mut write, Message::text(json), "send message to relay").await {
                                         tracing::warn!("failed to send error response to relay: {e}");
                                         break;
                                     }
@@ -2306,7 +2310,7 @@ async fn try_connect_with_token(
                                             "failed to serialize duplicate WebSocket rejection: {error}"
                                         ))
                                     })?;
-                                    if send_to_relay(&mut write, Message::Text(json), "send message to relay").await.is_err() {
+                                    if send_to_relay(&mut write, Message::text(json), "send message to relay").await.is_err() {
                                         break;
                                     }
                                     continue;
@@ -2323,7 +2327,7 @@ async fn try_connect_with_token(
                                                 "failed to serialize WebSocket header rejection: {error}"
                                             ))
                                         })?;
-                                        if send_to_relay(&mut write, Message::Text(json), "send message to relay").await.is_err() {
+                                        if send_to_relay(&mut write, Message::text(json), "send message to relay").await.is_err() {
                                             break;
                                         }
                                         continue;
@@ -2344,7 +2348,7 @@ async fn try_connect_with_token(
                                                 "failed to serialize WebSocket capacity rejection: {error}"
                                             ))
                                         })?;
-                                        if send_to_relay(&mut write, Message::Text(json), "send message to relay").await.is_err() {
+                                        if send_to_relay(&mut write, Message::text(json), "send message to relay").await.is_err() {
                                             break;
                                         }
                                         continue;
@@ -2665,7 +2669,7 @@ async fn try_connect_with_token(
                                 "failed to serialize WebSocket upgrade confirmation: {error}"
                             ))
                         })?;
-                        if send_to_relay(&mut write, Message::Text(json), "send message to relay").await.is_err() {
+                        if send_to_relay(&mut write, Message::text(json), "send message to relay").await.is_err() {
                             break;
                         }
                         if let (Some(ws_tx), Some(headers)) = (
@@ -2694,7 +2698,7 @@ async fn try_connect_with_token(
                                 "failed to serialize WebSocket rejection: {error}"
                             ))
                         })?;
-                        if send_to_relay(&mut write, Message::Text(json), "send message to relay").await.is_err() {
+                        if send_to_relay(&mut write, Message::text(json), "send message to relay").await.is_err() {
                             break;
                         }
                     }
@@ -2706,7 +2710,7 @@ async fn try_connect_with_token(
                 if !relay_websocket_message_is_current(&ws_connections, &message) {
                     continue;
                 }
-                if let Err(e) = send_to_relay(&mut write, Message::Text(message.json), "send WebSocket frame to relay").await {
+                if let Err(e) = send_to_relay(&mut write, Message::text(message.json), "send WebSocket frame to relay").await {
                     tracing::warn!("failed to send WS frame to relay: {e}");
                     break;
                 }
@@ -2772,13 +2776,13 @@ async fn try_connect_with_token(
                 };
                 if http_forwards.get(id).is_none_or(|forward| forward.cancel.is_cancelled()) { continue; }
                 if let Ok(json) = serde_json::to_string(&message)
-                    && send_to_relay(&mut write, Message::Text(json), "send response stream").await.is_err() { break; }
+                    && send_to_relay(&mut write, Message::text(json), "send response stream").await.is_err() { break; }
             }
             Some(response) = http_response_rx.recv() => {
                 let CompletedHttpForward { id, json, permit, memory_permit } = response;
                 let active = http_forwards.remove(&id);
                 if active.is_some_and(|forward| forward.cancel.is_cancelled()) { continue; }
-                if let Err(error) = send_to_relay(&mut write, Message::Text(json), "send message to relay").await {
+                if let Err(error) = send_to_relay(&mut write, Message::text(json), "send message to relay").await {
                     tracing::warn!("failed to send HTTP response to relay: {error}");
                     break;
                 }
@@ -2803,7 +2807,7 @@ async fn try_connect_with_token(
                     Ok(token) => {
                         let message = serde_json::to_string(&ClientMessage::CredentialRenew { token })
                             .map_err(|error| TunnelConnectError::transient(format!("Cannot encode credential renewal: {error}")))?;
-                        send_to_relay(&mut write, Message::Text(message), "renew tunnel credential").await?;
+                        send_to_relay(&mut write, Message::text(message), "renew tunnel credential").await?;
                     }
                     Err(error) => tracing::warn!("tunnel credential renewal failed: {error}"),
                 }
@@ -2827,7 +2831,7 @@ async fn try_connect_with_token(
                         break;
                     }
                 };
-                if let Err(e) = send_to_relay(&mut write, Message::Text(ping), "send tunnel ping").await {
+                if let Err(e) = send_to_relay(&mut write, Message::text(ping), "send tunnel ping").await {
                     tracing::warn!("failed to send ping: {e}");
                     break;
                 }
@@ -2993,7 +2997,7 @@ mod tests {
             serde_json::json!({"type":"hello","subdomain":"stream.localhost","tunnel_url":"http://stream.localhost","session_id":"stream","protocol":3}),
             serde_json::json!({"type":"http_request","id":"sse","method":"GET","url":"/events","headers":{},"body":""}),
         ] {
-            ws.send(Message::Text(message.to_string())).await.unwrap();
+            ws.send(Message::text(message.to_string())).await.unwrap();
         }
         let start = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next()).await;
         if start.is_err() {
@@ -3015,7 +3019,7 @@ mod tests {
                 .is_err(),
             "body must wait for visitor demand"
         );
-        ws.send(Message::Text(
+        ws.send(Message::text(
             serde_json::json!({"type":"http_response_pull","id":"sse"}).to_string(),
         ))
         .await
@@ -3039,7 +3043,7 @@ mod tests {
             .unwrap(),
             b"data: 1\n\n"
         );
-        ws.send(Message::Text(
+        ws.send(Message::text(
             serde_json::json!({"type":"http_cancel","id":"sse"}).to_string(),
         ))
         .await
@@ -3069,7 +3073,7 @@ mod tests {
                 serde_json::json!({"type": "credential_refresh"}),
             ] {
                 websocket
-                    .send(Message::Text(value.to_string()))
+                    .send(Message::text(value.to_string()))
                     .await
                     .unwrap();
             }
@@ -3106,7 +3110,7 @@ mod tests {
         let relay = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
             let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
-            websocket.send(Message::Text(serde_json::json!({
+            websocket.send(Message::text(serde_json::json!({
                 "type": "hello", "subdomain": "recovery.localhost", "tunnel_url": "http://recovery.localhost", "session_id": "recovery",
             }).to_string())).await.unwrap();
             websocket
@@ -3140,7 +3144,7 @@ mod tests {
         let relay = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
             let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
-            websocket.send(Message::Text(serde_json::json!({
+            websocket.send(Message::text(serde_json::json!({
                 "type": "hello", "subdomain": "heartbeat.localhost", "tunnel_url": "http://heartbeat.localhost", "session_id": "heartbeat",
             }).to_string())).await.unwrap();
             while websocket.next().await.is_some() {
@@ -3212,7 +3216,7 @@ mod tests {
             let (socket, _) = relay_listener.accept().await.unwrap();
             let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
             websocket
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({
                         "type": "hello",
                         "subdomain": "test.localhost",
@@ -3224,7 +3228,7 @@ mod tests {
                 .await
                 .unwrap();
             websocket
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({
                         "type": "http_request",
                         "id": "queued-before-publication",
@@ -3357,9 +3361,9 @@ mod tests {
                 "tunnel_url": "http://recovery.localhost", "session_id": "before-disconnect",
             })
             .to_string();
-            socket.send(Message::Text(hello.clone())).await.unwrap();
+            socket.send(Message::text(hello.clone())).await.unwrap();
             socket
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({
                         "type": "error", "code": "relay_timeout", "message": "Connection lost",
                     })
@@ -3376,7 +3380,7 @@ mod tests {
             drop(stream);
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            socket.send(Message::Text(hello)).await.unwrap();
+            socket.send(Message::text(hello)).await.unwrap();
             socket.close(None).await.unwrap();
         });
         let mut options = TunnelOptions::new("test-token".into(), 5173);
@@ -3441,7 +3445,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             socket
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({
                         "type": "hello",
                         "subdomain": "acme.localhost",
@@ -3453,7 +3457,7 @@ mod tests {
                 .await
                 .unwrap();
             socket
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({
                         "type": "error",
                         "code": code,
@@ -3554,9 +3558,9 @@ mod tests {
     #[test]
     fn relay_invalid_certificate_does_not_enter_transient_retries() {
         let error = tokio_tungstenite::tungstenite::Error::Tls(
-            tokio_tungstenite::tungstenite::error::TlsError::Rustls(
+            tokio_tungstenite::tungstenite::error::TlsError::Rustls(Box::new(
                 rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName),
-            ),
+            )),
         );
         assert_eq!(
             classify_websocket_connect_error(error).retry_class,
@@ -3751,7 +3755,7 @@ mod tests {
             .await
             .unwrap();
             websocket
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({
                         "type": "hello",
                         "subdomain": "refresh.localhost",
@@ -3874,7 +3878,7 @@ mod tests {
             .await
             .unwrap();
             websocket
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({
                         "type": "hello",
                         "subdomain": "refresh.localhost",
@@ -3981,7 +3985,7 @@ mod tests {
                 }),
             ] {
                 websocket
-                    .send(Message::Text(message.to_string()))
+                    .send(Message::text(message.to_string()))
                     .await
                     .unwrap();
             }
@@ -4857,7 +4861,7 @@ mod tests {
             let (socket, _) = relay_listener.accept().await.unwrap();
             let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
             websocket
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({
                         "type": "hello",
                         "subdomain": "test.localhost",
@@ -4870,7 +4874,7 @@ mod tests {
                 .unwrap();
             for (id, url) in [("slow", "/slow"), ("fast", "/fast")] {
                 websocket
-                    .send(Message::Text(
+                    .send(Message::text(
                         serde_json::json!({
                             "type": "http_request",
                             "id": id,
@@ -4952,7 +4956,7 @@ mod tests {
             let (socket, _) = relay_listener.accept().await.unwrap();
             let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
             websocket
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({
                         "type": "hello",
                         "subdomain": "test.localhost",
@@ -4965,7 +4969,7 @@ mod tests {
                 .unwrap();
             for index in 0..MAX_CONCURRENT_HTTP_FORWARDS {
                 websocket
-                    .send(Message::Text(
+                    .send(Message::text(
                         serde_json::json!({
                             "type": "http_request",
                             "id": format!("held-{index}"),
@@ -4987,7 +4991,7 @@ mod tests {
             .await
             .expect("forwarding slots did not become saturated");
             websocket
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({
                         "type": "http_request",
                         "id": "excess",
@@ -5640,7 +5644,7 @@ mod tests {
         let mut sink = StalledSink;
         let send = send_to_relay(
             &mut sink,
-            Message::Text("frame".to_string()),
+            Message::text("frame".to_string()),
             "send test frame",
         );
         let error = tokio::time::timeout(std::time::Duration::from_secs(6), send)

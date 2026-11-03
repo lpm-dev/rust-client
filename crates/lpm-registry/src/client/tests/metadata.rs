@@ -3835,7 +3835,7 @@ async fn blocked_enrichment_rejects_incomplete_wrong_identity_and_invalidated_se
                 let cert = cache.path().join("client-cert.pem");
                 let key = cache.path().join("client-key.pem");
                 std::fs::write(&cert, identity.cert.pem()).unwrap();
-                std::fs::write(&key, identity.key_pair.serialize_pem()).unwrap();
+                std::fs::write(&key, identity.signing_key.serialize_pem()).unwrap();
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
