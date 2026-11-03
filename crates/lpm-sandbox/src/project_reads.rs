@@ -22,7 +22,6 @@ pub(crate) fn allowed_project_reads(spec: &SandboxSpec) -> Vec<PathBuf> {
                     | "yarn.lock"
                     | "pnpm-lock.yaml"
                     | "lpm.lock"
-                    | "lpm.lockb"
             ) || (name.starts_with("tsconfig") && name.ends_with(".json"));
             if metadata && entry.file_type().is_ok_and(|kind| kind.is_file()) {
                 paths.push(entry.path());

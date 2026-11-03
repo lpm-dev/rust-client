@@ -3,7 +3,7 @@
 //! Full migration flow:
 //! 1. Pre-flight checks (package.json exists, no existing lpm.lock unless --force)
 //! 2. Detect source package manager, parse foreign lockfile, convert
-//! 3. Write lpm.lock + lpm.lockb (with backup of source lockfile + .npmrc)
+//! 3. Write lpm.lock (with backup of source lockfile + .npmrc)
 //! 4. Optionally configure .npmrc
 //! 5. Run `lpm install` to resolve exact package-instance identities
 //! 6. Optionally verify build+test scripts pass
@@ -61,7 +61,6 @@ pub async fn run(
     let Some((result, mut migration_backup)) = migrated else {
         return Ok(());
     };
-    let lockb_path = cwd.join("lpm.lockb");
 
     // Step N: Verify build+test (optional)
     if !skip_verify {
@@ -88,9 +87,6 @@ pub async fn run(
     if !json {
         install_ui::done("Converted lockfile");
         render_written_file(LOCKFILE_NAME);
-        if lockb_path.exists() {
-            render_written_file("lpm.lockb");
-        }
     }
 
     // The backup stays so `lpm migrate --rollback` can undo the migration.

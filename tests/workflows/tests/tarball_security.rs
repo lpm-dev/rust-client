@@ -111,7 +111,9 @@ fn evict_install_outputs(project: &TempProject) {
 }
 
 fn remove_binary_lockfile(project: &TempProject) {
-    let lockb = project.path().join(lpm_lockfile::BINARY_LOCKFILE_NAME);
+    let lockb = project
+        .path()
+        .join(lpm_lockfile::OBSOLETE_BINARY_LOCKFILE_NAME);
     if lockb.exists() {
         std::fs::remove_file(&lockb).unwrap_or_else(|e| panic!("remove {}: {e}", lockb.display()));
     }

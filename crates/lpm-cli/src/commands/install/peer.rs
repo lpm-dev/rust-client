@@ -261,38 +261,14 @@ fn update_auto_isolated_peer_conflicts_scan_carry(
     *carry_len = old_keep + chunk.len();
 }
 
-pub(super) fn binary_lockfile_needs_writeback(
-    lockfile_path: &Path,
-    lockfile: &lpm_lockfile::Lockfile,
-) -> bool {
-    let binary_path = lockfile_path.with_extension("lockb");
-    if !lpm_lockfile::binary::binary_format_supports(lockfile) {
-        return match std::fs::symlink_metadata(&binary_path) {
-            Ok(_) => true,
-            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-        };
-    }
-
-    if binary_lockfile_is_older_than_toml(lockfile_path, &binary_path) {
-        return true;
-    }
-
-    match lpm_lockfile::BinaryLockfileReader::open(&binary_path) {
-        Ok(Some(_)) => false,
-        Ok(None) | Err(_) => true,
-    }
-}
-
-pub(super) fn binary_lockfile_is_older_than_toml(lockfile_path: &Path, binary_path: &Path) -> bool {
-    if !binary_path.exists() {
-        return false;
-    }
-    match (
-        lockfile_path.metadata().and_then(|m| m.modified()),
-        binary_path.metadata().and_then(|m| m.modified()),
-    ) {
-        (Ok(toml_time), Ok(binary_time)) => binary_time < toml_time,
-        _ => true,
+/// Whether an `lpm.lockb` from an earlier LPM CLI sits beside the lockfile.
+/// Anything other than a confirmed absence counts, so install removes it or
+/// reports why it can't.
+pub(super) fn obsolete_binary_lockfile_exists(lockfile_path: &Path) -> bool {
+    let binary_path = lockfile_path.with_file_name(lpm_lockfile::OBSOLETE_BINARY_LOCKFILE_NAME);
+    match std::fs::symlink_metadata(&binary_path) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     }
 }
 

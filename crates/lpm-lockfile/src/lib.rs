@@ -1,11 +1,4 @@
-//! Lockfile read/write for LPM.
-//!
-//! Two formats:
-//! - `lpm.lock` (TOML) — human-readable, git-diffable, always written
-//! - `lpm.lockb` (binary) — generated companion for doctor validation/writeback
-//!
-//! The binary lockfile is written alongside TOML on every resolution.
-//! On read, commands use the human-readable TOML as the authoritative input.
+//! Lockfile read/write for LPM: `lpm.lock`, a human-readable TOML file.
 //!
 //! Design principles (from research doc Section 8):
 //! - Sorted entries for deterministic diffs
@@ -13,16 +6,14 @@
 //! - Includes integrity hashes for verification
 //! - Schema-versioned (`lockfile-version`), not tool-versioned
 
-pub mod binary;
 mod error;
 mod io;
 mod model;
 mod parse_cache;
 pub mod source;
 
-pub use binary::{BINARY_LOCKFILE_NAME, BinaryLockfileReader};
 pub use error::LockfileError;
-pub use io::ProjectLockfile;
+pub use io::{ProjectLockfile, remove_obsolete_binary_lockfile};
 pub use model::{
     CatalogSnapshotEntry, CatalogSnapshots, DEFAULT_RESOLVED_WITH, ImporterSnapshot,
     ImporterSnapshots, LOCKFILE_NAME, LOCKFILE_VERSION, LOCKFILE_VERSION_WITH_DEPENDENCY_ENGINES,
@@ -35,6 +26,11 @@ pub use model::{
 };
 pub use parse_cache::{ParseCacheStats, parse_cache_stats};
 pub use source::{Source, SourceParseError, safe_source_identity};
+
+/// The binary lockfile earlier LPM CLI versions wrote beside `lpm.lock`.
+/// Nothing reads it. Lockfile writes remove it, and commands that publish,
+/// copy or snapshot a project leave it out.
+pub const OBSOLETE_BINARY_LOCKFILE_NAME: &str = "lpm.lockb";
 
 /// Maximum accepted size of the authoritative human-readable lockfile.
 pub const TOML_LOCKFILE_SIZE_CAP_BYTES: u64 = 64 * 1024 * 1024;

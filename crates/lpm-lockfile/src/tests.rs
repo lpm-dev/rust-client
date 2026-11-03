@@ -183,7 +183,6 @@ fn current_schema_round_trips_exact_instance_graph() {
     let parsed = Lockfile::from_toml(&toml).expect("parse exact instance graph");
 
     assert_eq!(parsed, lockfile);
-    assert!(!binary::binary_format_supports(&lockfile));
 }
 
 #[test]
@@ -768,24 +767,12 @@ fn lockfile_with_verified_provenance() -> (Lockfile, PackageKey, LockedProvenanc
 }
 
 #[test]
-fn verified_provenance_round_trips_through_toml_and_binary() {
+fn verified_provenance_round_trips_through_toml() {
     let (lockfile, key, evidence) = lockfile_with_verified_provenance();
 
     let toml = lockfile.to_toml().expect("serialize provenance evidence");
     let from_toml = Lockfile::from_toml(&toml).expect("parse provenance evidence");
     assert_eq!(from_toml.verified_provenance(&key), Some(&evidence));
-
-    let binary = binary::to_binary(&lockfile).expect("serialize binary provenance evidence");
-    let dir = tempfile::tempdir().unwrap();
-    let binary_path = dir.path().join(binary::BINARY_LOCKFILE_NAME);
-    std::fs::write(&binary_path, binary).unwrap();
-    let reader = BinaryLockfileReader::open(&binary_path)
-        .unwrap()
-        .expect("open binary lockfile");
-    let from_binary = reader
-        .to_lockfile()
-        .expect("parse binary provenance evidence");
-    assert_eq!(from_binary.verified_provenance(&key), Some(&evidence));
 }
 
 #[test]
@@ -873,8 +860,6 @@ fn dependency_node_engine_round_trips_through_toml() {
 fn dependency_node_engine_metadata_requires_toml_fallback() {
     let mut lf = sample_lockfile();
     lf.packages[0].node_engine = Some(">=22".to_string());
-
-    assert!(!binary::binary_format_supports(&lf));
 }
 
 #[test]
@@ -920,11 +905,7 @@ fn importer_snapshots_round_trip_dependency_sections() {
 }
 
 #[test]
-fn patch_records_round_trip_and_skip_binary() {
-    let dir = tempfile::tempdir().unwrap();
-    let toml_path = dir.path().join("lpm.lock");
-    let binary_path = toml_path.with_extension("lockb");
-
+fn patch_records_round_trip_through_toml() {
     let mut lf = legacy_lockfile();
     lf.add_package(LockedPackage {
         instance_id: None,
@@ -949,11 +930,6 @@ fn patch_records_round_trip_and_skip_binary() {
         peer_edges: Vec::new(),
         tarball: None,
     });
-    lf.write_all(&toml_path).unwrap();
-    assert!(
-        binary_path.exists(),
-        "binary-compatible lockfile must write lpm.lockb before patch metadata is present"
-    );
 
     lf.patches.insert(
         "lodash@4.17.21".to_string(),
@@ -973,62 +949,6 @@ fn patch_records_round_trip_and_skip_binary() {
     );
     let parsed = Lockfile::from_toml(&toml).expect("parse patch records");
     assert_eq!(parsed.patches, lf.patches);
-
-    lf.write_all(&toml_path).unwrap();
-    assert!(
-        !binary_path.exists(),
-        "patch-bearing lockfile must remove stale lpm.lockb"
-    );
-}
-
-#[test]
-fn write_all_skips_binary_when_importer_snapshots_present() {
-    let dir = tempfile::tempdir().unwrap();
-    let toml_path = dir.path().join("lpm.lock");
-    let binary_path = toml_path.with_extension("lockb");
-
-    let mut lf = legacy_lockfile();
-    lf.add_package(LockedPackage {
-        instance_id: None,
-        dependency_targets: std::collections::BTreeMap::new(),
-        peer_targets: std::collections::BTreeMap::new(),
-        name: "foo".to_string(),
-        version: "1.0.0".to_string(),
-        source: None,
-        integrity: None,
-        unpacked_size: None,
-        manifest_fingerprint: None,
-        registry_signatures: Vec::new(),
-        registry_published_at: None,
-        os: Vec::new(),
-        cpu: Vec::new(),
-        libc: Vec::new(),
-        node_engine: None,
-        optional: false,
-        dependencies: vec![],
-        alias_dependencies: vec![],
-        peers: vec![],
-        peer_edges: Vec::new(),
-        tarball: None,
-    });
-    lf.write_all(&toml_path).unwrap();
-    assert!(
-        binary_path.exists(),
-        "binary-compatible lockfile must write lpm.lockb"
-    );
-
-    lf.importers.insert(
-        ".".to_string(),
-        ImporterSnapshot {
-            dependencies: BTreeMap::from([("foo".to_string(), "^1.0.0".to_string())]),
-            ..ImporterSnapshot::default()
-        },
-    );
-    lf.write_all(&toml_path).unwrap();
-    assert!(
-        !binary_path.exists(),
-        "importer-bearing lockfile must remove stale lpm.lockb"
-    );
 }
 
 /// Every default `lpm install` writes a lockfile produced by
@@ -1136,27 +1056,6 @@ resolved-with = "greedy-fusion"
     )
     .unwrap();
     assert!(parsed.catalogs.is_empty());
-}
-
-#[test]
-fn binary_format_does_not_claim_support_for_catalog_snapshots() {
-    let mut lf = legacy_lockfile();
-    lf.catalogs.insert(
-        "default".to_string(),
-        BTreeMap::from([(
-            "react".to_string(),
-            CatalogSnapshotEntry {
-                specifier: "^18.2.0".to_string(),
-                version: "18.3.1".to_string(),
-                reference: "catalog:".to_string(),
-            },
-        )]),
-    );
-
-    assert!(
-        !binary::binary_format_supports(&lf),
-        "binary lockfile format must be skipped when TOML-only catalog snapshots are present"
-    );
 }
 
 #[test]
@@ -1427,10 +1326,6 @@ sig = "MEUCIQDregistrySignature"
 
 #[test]
 fn from_toml_rejects_empty_optional_strings() {
-    // The binary writer rejects empty optional strings at
-    // serialization time; `from_toml` must also reject at parse
-    // time to avoid asymmetric late failure. Reject at the parse
-    // boundary for all three fields.
     for (field, snippet) in [
         ("tarball", "tarball = \"\""),
         ("source", "source = \"\""),
@@ -1737,9 +1632,6 @@ fn tarball_source_requires_integrity_at_every_lockfile_boundary() {
         .to_toml()
         .expect_err("TOML writer must reject missing SRI");
     assert!(write_error.to_string().contains("missing integrity"));
-    let binary_error =
-        binary::to_binary(&lockfile).expect_err("binary writer must reject missing SRI");
-    assert!(binary_error.to_string().contains("missing integrity"));
 }
 
 #[test]
@@ -1765,9 +1657,6 @@ fn directory_and_link_sources_reject_integrity_at_every_lockfile_boundary() {
             .to_toml()
             .expect_err("TOML writer must reject unexpected SRI");
         assert!(write_error.to_string().contains("must not have integrity"));
-        let binary_error =
-            binary::to_binary(&lockfile).expect_err("binary writer must reject unexpected SRI");
-        assert!(binary_error.to_string().contains("must not have integrity"));
     }
 }
 
@@ -2003,101 +1892,6 @@ fn toml_roundtrips_exact_root_resolutions() {
     assert_eq!(parsed.root_resolutions, lockfile.root_resolutions);
 }
 
-/// The binary format cannot express alias metadata;
-/// `binary::to_binary` rejects such lockfiles so callers fall
-/// back to TOML-only. `write_all` goes further and proactively
-/// removes any stale binary file from a prior non-aliased install.
-#[test]
-fn write_all_skips_binary_when_root_aliases_present() {
-    let dir = tempfile::tempdir().unwrap();
-    let toml_path = dir.path().join("lpm.lock");
-    let binary_path = toml_path.with_extension("lockb");
-
-    // First write — non-aliased lockfile produces BOTH files.
-    let mut lf = legacy_lockfile();
-    lf.add_package(LockedPackage {
-        instance_id: None,
-        dependency_targets: std::collections::BTreeMap::new(),
-        peer_targets: std::collections::BTreeMap::new(),
-        name: "foo".to_string(),
-        version: "1.0.0".to_string(),
-        source: None,
-        integrity: None,
-        unpacked_size: None,
-        manifest_fingerprint: None,
-        registry_signatures: Vec::new(),
-        registry_published_at: None,
-        os: Vec::new(),
-        cpu: Vec::new(),
-        libc: Vec::new(),
-        node_engine: None,
-        optional: false,
-
-        dependencies: vec![],
-        alias_dependencies: vec![],
-        peers: vec![],
-        peer_edges: Vec::new(),
-        tarball: None,
-    });
-    lf.write_all(&toml_path).unwrap();
-    assert!(
-        binary_path.exists(),
-        "non-aliased lockfile must write binary"
-    );
-
-    // Second write — alias-bearing lockfile skips binary and
-    // removes any stale file.
-    lf.root_aliases
-        .insert("alias".to_string(), "foo".to_string());
-    lf.write_all(&toml_path).unwrap();
-    assert!(
-        !binary_path.exists(),
-        "alias-bearing lockfile must not leave a stale binary behind"
-    );
-}
-
-#[test]
-fn write_all_skips_binary_when_auto_isolated_peer_conflicts_present() {
-    let dir = tempfile::tempdir().unwrap();
-    let toml_path = dir.path().join("lpm.lock");
-    let binary_path = toml_path.with_extension("lockb");
-
-    let mut lf = legacy_lockfile();
-    lf.add_package(LockedPackage {
-        instance_id: None,
-        dependency_targets: std::collections::BTreeMap::new(),
-        peer_targets: std::collections::BTreeMap::new(),
-        name: "foo".to_string(),
-        version: "1.0.0".to_string(),
-        source: None,
-        integrity: None,
-        unpacked_size: None,
-        manifest_fingerprint: None,
-        registry_signatures: Vec::new(),
-        registry_published_at: None,
-        os: Vec::new(),
-        cpu: Vec::new(),
-        libc: Vec::new(),
-        node_engine: None,
-        optional: false,
-
-        dependencies: vec![],
-        alias_dependencies: vec![],
-        peers: vec![],
-        peer_edges: Vec::new(),
-        tarball: None,
-    });
-    lf.write_all(&toml_path).unwrap();
-    assert!(binary_path.exists(), "plain lockfile must write binary");
-
-    lf.metadata.auto_isolated_peer_conflicts = true;
-    lf.write_all(&toml_path).unwrap();
-    assert!(
-        !binary_path.exists(),
-        "auto-isolated peer-conflict metadata must not leave a stale binary behind"
-    );
-}
-
 #[test]
 fn empty_deps_not_serialized() {
     let mut lf = legacy_lockfile();
@@ -2131,23 +1925,7 @@ fn empty_deps_not_serialized() {
 }
 
 #[test]
-fn read_fast_reads_toml_when_binary_is_newer() {
-    let dir = tempfile::tempdir().unwrap();
-    let toml_path = dir.path().join("lpm.lock");
-    let binary_path = dir.path().join("lpm.lockb");
-
-    let lf = sample_lockfile();
-    lf.write_to_file(&toml_path).unwrap();
-
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    binary::write_binary(&lf, &binary_path).unwrap();
-
-    let result = Lockfile::read_fast(&toml_path).unwrap();
-    assert_eq!(result, lf);
-}
-
-#[test]
-fn read_fast_ignores_newer_binary_that_disagrees_with_toml() {
+fn read_fast_ignores_a_leftover_binary_lockfile() {
     let dir = tempfile::tempdir().unwrap();
     let toml_path = dir.path().join("lpm.lock");
     let binary_path = dir.path().join("lpm.lockb");
@@ -2179,118 +1957,10 @@ fn read_fast_ignores_newer_binary_that_disagrees_with_toml() {
     });
     toml_lockfile.write_to_file(&toml_path).unwrap();
 
-    std::thread::sleep(std::time::Duration::from_millis(50));
-
-    let mut poisoned_binary = legacy_lockfile();
-    poisoned_binary.add_package(LockedPackage {
-        instance_id: None,
-        dependency_targets: std::collections::BTreeMap::new(),
-        peer_targets: std::collections::BTreeMap::new(),
-        name: "reviewed".to_string(),
-        version: "9.9.9".to_string(),
-        source: Some("registry+https://registry.npmjs.org".to_string()),
-        integrity: Some(VALID_SHA512_SRI.to_string()),
-        unpacked_size: None,
-        manifest_fingerprint: None,
-        registry_signatures: Vec::new(),
-        registry_published_at: None,
-        os: Vec::new(),
-        cpu: Vec::new(),
-        libc: Vec::new(),
-        node_engine: None,
-        optional: false,
-
-        dependencies: vec!["payload@1.0.0".to_string()],
-        alias_dependencies: vec![],
-        peers: vec![],
-        peer_edges: Vec::new(),
-        tarball: Some("https://registry.npmjs.org/reviewed/-/reviewed-9.9.9.tgz".to_string()),
-    });
-    binary::write_binary(&poisoned_binary, &binary_path).unwrap();
+    std::fs::write(&binary_path, b"LPMB poisoned binary lockfile bytes").unwrap();
 
     let result = Lockfile::read_fast(&toml_path).unwrap();
     assert_eq!(result, toml_lockfile);
-}
-
-#[test]
-fn read_fast_ignores_stale_binary() {
-    let dir = tempfile::tempdir().unwrap();
-    let toml_path = dir.path().join("lpm.lock");
-    let binary_path = dir.path().join("lpm.lockb");
-
-    let lf = sample_lockfile();
-
-    binary::write_binary(&lf, &binary_path).unwrap();
-
-    std::thread::sleep(std::time::Duration::from_millis(50));
-
-    let mut lf2 = legacy_lockfile();
-    lf2.add_package(LockedPackage {
-        instance_id: None,
-        dependency_targets: std::collections::BTreeMap::new(),
-        peer_targets: std::collections::BTreeMap::new(),
-        name: "only-in-toml".to_string(),
-        version: "9.9.9".to_string(),
-        source: None,
-        integrity: None,
-        unpacked_size: None,
-        manifest_fingerprint: None,
-        registry_signatures: Vec::new(),
-        registry_published_at: None,
-        os: Vec::new(),
-        cpu: Vec::new(),
-        libc: Vec::new(),
-        node_engine: None,
-        optional: false,
-
-        dependencies: vec![],
-        alias_dependencies: vec![],
-        peers: vec![],
-        peer_edges: Vec::new(),
-        tarball: None,
-    });
-    lf2.write_to_file(&toml_path).unwrap();
-
-    let result = Lockfile::read_fast(&toml_path).unwrap();
-    assert_eq!(result, lf2);
-}
-
-#[test]
-fn read_fast_ignores_corrupt_binary() {
-    let dir = tempfile::tempdir().unwrap();
-    let toml_path = dir.path().join("lpm.lock");
-    let binary_path = dir.path().join("lpm.lockb");
-
-    let lf = sample_lockfile();
-    lf.write_to_file(&toml_path).unwrap();
-
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    std::fs::write(&binary_path, b"BADMxxxxxxxxxxxxxxxxx").unwrap();
-
-    let result = Lockfile::read_fast(&toml_path).unwrap();
-    assert_eq!(result, lf);
-}
-
-#[test]
-fn read_fast_preserves_unsupported_binary_while_reading_toml() {
-    let dir = tempfile::tempdir().unwrap();
-    let toml_path = dir.path().join("lpm.lock");
-    let binary_path = dir.path().join("lpm.lockb");
-
-    let lf = sample_lockfile();
-    lf.write_to_file(&toml_path).unwrap();
-
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    let mut v1_header = Vec::with_capacity(16);
-    v1_header.extend_from_slice(b"LPMB");
-    v1_header.extend_from_slice(&1u32.to_le_bytes());
-    v1_header.extend_from_slice(&0u32.to_le_bytes());
-    v1_header.extend_from_slice(&16u32.to_le_bytes());
-    std::fs::write(&binary_path, &v1_header).unwrap();
-
-    let result = Lockfile::read_fast(&toml_path).unwrap();
-    assert_eq!(result, lf);
-    assert!(binary_path.exists());
 }
 
 #[test]
@@ -3075,7 +2745,7 @@ fn from_toml_accepts_non_lpm_scope_at_any_origin() {
 }
 
 #[test]
-fn validate_loaded_packages_rejects_binary_path_scope_mismatch() {
+fn validate_loaded_package_rejects_a_scope_origin_mismatch() {
     let bad = LockedPackage {
         instance_id: None,
         dependency_targets: std::collections::BTreeMap::new(),
@@ -3100,7 +2770,7 @@ fn validate_loaded_packages_rejects_binary_path_scope_mismatch() {
         peer_edges: Vec::new(),
         tarball: None,
     };
-    match Lockfile::validate_loaded_packages(&[bad]) {
+    match Lockfile::validate_loaded_package(&bad) {
         Err(LockfileError::InvalidScopeOrigin {
             package,
             source_identity,
@@ -3280,10 +2950,6 @@ fn writers_reject_unsafe_package_identity() {
 
     assert!(matches!(
         lockfile.to_toml(),
-        Err(LockfileError::InvalidPackageField { field: "name", .. })
-    ));
-    assert!(matches!(
-        binary::to_binary(&lockfile),
         Err(LockfileError::InvalidPackageField { field: "name", .. })
     ));
 }
@@ -3782,8 +3448,7 @@ fn find_package_by_key_disambiguates_cross_source_collisions() {
 //
 // These tests pin: (1) round-trip preservation through TOML
 // serialization, (2) backward-compat with old lockfiles that
-// have neither field, (3) binary-fast-path fallback when either
-// field is non-empty.
+// have neither field.
 
 #[test]
 fn ambient_peer_installs_round_trip_through_toml() {
@@ -4128,154 +3793,6 @@ fn legacy_schema_rejects_structured_peer_edges() {
 
     let error = lockfile.to_toml().unwrap_err().to_string();
     assert!(error.contains("structured peer metadata before"), "{error}");
-}
-
-#[test]
-fn binary_format_falls_back_when_ambient_peers_present() {
-    // The binary mmap format has fixed entry slots with no room
-    // for peer metadata. `binary_format_supports` must return
-    // false when the lockfile carries any peer state, so the
-    // writer skips the binary path and the warm-install reader
-    // falls back to TOML — preserving the auto-install state
-    // that the binary roundtrip would silently drop.
-    let mut lf = legacy_lockfile();
-    lf.add_package(LockedPackage {
-        instance_id: None,
-        dependency_targets: std::collections::BTreeMap::new(),
-        peer_targets: std::collections::BTreeMap::new(),
-        name: "react".to_string(),
-        version: "18.2.0".to_string(),
-        source: None,
-        integrity: None,
-        unpacked_size: None,
-        manifest_fingerprint: None,
-        registry_signatures: Vec::new(),
-        registry_published_at: None,
-        os: Vec::new(),
-        cpu: Vec::new(),
-        libc: Vec::new(),
-        node_engine: None,
-        optional: false,
-
-        dependencies: vec![],
-        alias_dependencies: vec![],
-        peers: vec![],
-        peer_edges: Vec::new(),
-        tarball: None,
-    });
-    // Without peer metadata → binary format OK.
-    assert!(crate::binary::binary_format_supports(&lf));
-
-    // Now add an ambient install → binary format must reject.
-    lf.ambient_peer_installs = vec!["react".to_string()];
-    assert!(
-        !crate::binary::binary_format_supports(&lf),
-        "ambient_peer_installs must trigger binary fallback to TOML"
-    );
-}
-
-#[test]
-fn binary_format_falls_back_when_per_package_peers_present() {
-    // Same gate, on the LockedPackage side. Even ONE package with
-    // a non-empty `peers` field is enough to fall back to TOML.
-    let mut lf = legacy_lockfile();
-    lf.add_package(LockedPackage {
-        instance_id: None,
-        dependency_targets: std::collections::BTreeMap::new(),
-        peer_targets: std::collections::BTreeMap::new(),
-        name: "react-redux".to_string(),
-        version: "9.2.0".to_string(),
-        source: None,
-        integrity: None,
-        unpacked_size: None,
-        manifest_fingerprint: None,
-        registry_signatures: Vec::new(),
-        registry_published_at: None,
-        os: Vec::new(),
-        cpu: Vec::new(),
-        libc: Vec::new(),
-        node_engine: None,
-        optional: false,
-
-        dependencies: vec![],
-        alias_dependencies: vec![],
-        peers: vec!["react@18.2.0".to_string()],
-        peer_edges: Vec::new(),
-        tarball: None,
-    });
-    assert!(
-        !crate::binary::binary_format_supports(&lf),
-        "per-package peers must trigger binary fallback to TOML"
-    );
-}
-
-#[test]
-fn binary_format_falls_back_when_structured_peer_edges_are_present() {
-    let mut lockfile = legacy_lockfile();
-    lockfile.add_package(LockedPackage {
-        instance_id: None,
-        dependency_targets: std::collections::BTreeMap::new(),
-        peer_targets: std::collections::BTreeMap::new(),
-        name: "consumer".to_string(),
-        version: "1.0.0".to_string(),
-        peer_edges: vec![lpm_common::PeerEdge::registry(
-            "react-compat",
-            "react",
-            "18.2.0",
-        )],
-        ..LockedPackage::default()
-    });
-
-    assert!(!crate::binary::binary_format_supports(&lockfile));
-}
-
-#[test]
-fn auto_isolated_peer_conflicts_metadata_triggers_binary_fallback() {
-    let mut lf = legacy_lockfile();
-    assert!(crate::binary::binary_format_supports(&lf));
-
-    lf.metadata.auto_isolated_peer_conflicts = true;
-    assert!(
-        !crate::binary::binary_format_supports(&lf),
-        "auto-isolated peer-conflict metadata must stay in human-readable TOML"
-    );
-}
-
-#[test]
-fn registry_signature_metadata_triggers_binary_fallback() {
-    let mut lf = legacy_lockfile();
-    lf.add_package(LockedPackage {
-        instance_id: None,
-        dependency_targets: std::collections::BTreeMap::new(),
-        peer_targets: std::collections::BTreeMap::new(),
-        name: "signed-pkg".to_string(),
-        version: "1.0.0".to_string(),
-        source: Some("registry+https://registry.npmjs.org".to_string()),
-        integrity: Some(VALID_SHA512_SRI.to_string()),
-        unpacked_size: None,
-        manifest_fingerprint: None,
-        registry_signatures: vec![LockedRegistrySignature {
-            keyid: Some("SHA256:abc123".to_string()),
-            sig: Some("MEUCIQDregistrySignature".to_string()),
-        }],
-        registry_published_at: Some("2025-01-01T00:00:00.000Z".to_string()),
-        os: Vec::new(),
-        cpu: Vec::new(),
-        libc: Vec::new(),
-        node_engine: None,
-        optional: false,
-
-        dependencies: vec![],
-        alias_dependencies: vec![],
-        peers: vec![],
-        peer_edges: Vec::new(),
-        tarball: None,
-    });
-
-    assert!(
-        !crate::binary::binary_format_supports(&lf),
-        "registry signature metadata must stay in human-readable TOML"
-    );
 }
 
 #[test]
@@ -5309,6 +4826,19 @@ fn current_lockfile_write_removes_a_dangling_binary_symlink() {
     let binary_path = toml_path.with_extension("lockb");
     std::os::unix::fs::symlink("absent-target", &binary_path).unwrap();
     Lockfile::new().write_all(&toml_path).unwrap();
+    assert!(std::fs::symlink_metadata(&binary_path).is_err());
+}
+
+#[test]
+fn write_all_removes_a_leftover_binary_lockfile_and_writes_none() {
+    let directory = tempfile::tempdir().unwrap();
+    let toml_path = directory.path().join(LOCKFILE_NAME);
+    let binary_path = directory.path().join(crate::OBSOLETE_BINARY_LOCKFILE_NAME);
+    std::fs::write(&binary_path, b"LPMB leftover").unwrap();
+
+    legacy_lockfile().write_all(&toml_path).unwrap();
+
+    assert!(toml_path.exists());
     assert!(std::fs::symlink_metadata(&binary_path).is_err());
 }
 

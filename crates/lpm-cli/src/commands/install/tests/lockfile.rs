@@ -54,18 +54,6 @@ fn current_leaf_lockfile(name: &str, version: &str, source: &str) -> lpm_lockfil
     lockfile
 }
 
-fn binary_representable_leaf_lockfile(name: &str, version: &str) -> lpm_lockfile::Lockfile {
-    let mut lockfile = lpm_lockfile::Lockfile::new();
-    lockfile.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS;
-    lockfile.add_package(lpm_lockfile::LockedPackage {
-        name: name.to_string(),
-        version: version.to_string(),
-        source: Some(TEST_REGISTRY_SOURCE.to_string()),
-        ..Default::default()
-    });
-    lockfile
-}
-
 #[test]
 fn lockfile_replay_warning_redacts_source_credentials_and_url_components() {
     let source = "registry+https://source-user:source-password@example.invalid/private-path?token=query-secret#fragment-secret";
@@ -1672,7 +1660,7 @@ fn tarball_not_found_error_preserves_project_lockfiles_byte_for_byte() {
     let project_dir = proj.path();
 
     let lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    let lockb_path = project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME);
+    let lockb_path = project_dir.join(lpm_lockfile::OBSOLETE_BINARY_LOCKFILE_NAME);
     let lock_bytes = b"# existing lockfile\n";
     let lockb_bytes = b"LPMBfake\0bytes";
     std::fs::write(&lock_path, lock_bytes).unwrap();
@@ -1715,7 +1703,7 @@ fn tarball_not_found_error_preserves_project_lockfiles_byte_for_byte() {
                     && context.version == "1.0.0"
                     && context.lockfiles_preserved
                     && context.suggested_command.as_deref() == Some("lpm upgrade some-pkg")
-        ) && err.to_string().contains("pins were preserved"),
+        ) && err.to_string().contains("pin was preserved"),
         "error must identify the pinned artifact and preserved lockfiles: {err}"
     );
 }
@@ -1726,7 +1714,7 @@ fn fresh_resolution_artifact_failure_preserves_existing_project_lockfiles() {
     let project_dir = proj.path();
 
     let lock_path = project_dir.join(lpm_lockfile::LOCKFILE_NAME);
-    let lockb_path = project_dir.join(lpm_lockfile::BINARY_LOCKFILE_NAME);
+    let lockb_path = project_dir.join(lpm_lockfile::OBSOLETE_BINARY_LOCKFILE_NAME);
     let lock_bytes = b"# stale existing lockfile\n";
     let lockb_bytes = b"LPMBstale-existing";
     std::fs::write(&lock_path, lock_bytes).unwrap();
@@ -1957,120 +1945,36 @@ fn online_lockfile_replay_allows_fingerprinted_transitive_local_source_from_reac
     ));
 }
 
-#[test]
-fn binary_writeback_detects_unsupported_binary_version() {
-    let dir = tempfile::tempdir().unwrap();
-    let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
-    let binary_path = dir.path().join(lpm_lockfile::BINARY_LOCKFILE_NAME);
-
-    // Write a valid TOML lockfile with one package matching the
-    // single declared root dep.
-    let lf = binary_representable_leaf_lockfile("lodash", "4.17.21");
-    lf.write_to_file(&lockfile_path).unwrap();
-
-    // Hand-roll a v1 `lpm.lockb` header — just the magic + v1 +
-    // zero packages + header-sized string table. `open` rejects
-    // with `UnsupportedVersion`, triggering the `needs_binary_upgrade`
-    // branch.
-    let mut v1_bytes = Vec::with_capacity(16);
-    v1_bytes.extend_from_slice(b"LPMB");
-    v1_bytes.extend_from_slice(&1u32.to_le_bytes());
-    v1_bytes.extend_from_slice(&0u32.to_le_bytes());
-    v1_bytes.extend_from_slice(&16u32.to_le_bytes());
-    // Write bytes AFTER the TOML so `read_fast` prefers binary
-    // (mtime-wise).
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    std::fs::write(&binary_path, &v1_bytes).unwrap();
-
-    // `read_fast` in the 2nd-round follow-up deletes v1 binaries
-    // (`found < BINARY_VERSION`), so by the time `try_lockfile_fast_path`
-    // gets to the `BinaryLockfileReader::open` probe, the binary
-    // might have been deleted already. Either way,
-    // `needs_binary_upgrade` should be true (missing or stale).
-    //
-    // `try_lockfile_fast_path` loads the lockfile, then probes the
-    // binary to decide whether a representable lockfile should be
-    // rewritten. The stale v1 file must still trigger the writeback.
-
-    assert!(binary_lockfile_needs_writeback(&lockfile_path, &lf));
-}
-
-/// `try_lockfile_fast_path` returns `needs_binary_upgrade = true` when `lpm.lockb` is
-/// missing entirely (no binary ever written). Same code path as
-/// the v1→v2 migration case but covers fresh projects that
-/// ship only the TOML lockfile.
-#[test]
-fn binary_writeback_ignores_missing_binary_until_a_sidecar_exists() {
-    let dir = tempfile::tempdir().unwrap();
-    let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
-
-    let lf = binary_representable_leaf_lockfile("lodash", "4.17.21");
-    lf.write_to_file(&lockfile_path).unwrap();
-    // NO binary file written.
-
-    assert!(binary_lockfile_needs_writeback(&lockfile_path, &lf));
-}
-
-#[test]
-fn binary_writeback_detects_stale_binary() {
-    let dir = tempfile::tempdir().unwrap();
-    let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
-
-    let lf = binary_representable_leaf_lockfile("lodash", "4.17.21");
-    lf.write_all(&lockfile_path).unwrap();
-
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    lf.write_to_file(&lockfile_path).unwrap();
-
-    assert!(binary_lockfile_needs_writeback(&lockfile_path, &lf));
-}
-
-#[test]
-fn binary_writeback_detects_corrupt_binary() {
-    let dir = tempfile::tempdir().unwrap();
-    let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
-    let binary_path = dir.path().join(lpm_lockfile::BINARY_LOCKFILE_NAME);
-
-    let lf = binary_representable_leaf_lockfile("lodash", "4.17.21");
-    lf.write_to_file(&lockfile_path).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    std::fs::write(&binary_path, b"not-a-binary-lockfile").unwrap();
-
-    assert!(binary_lockfile_needs_writeback(&lockfile_path, &lf));
-}
-
-/// The writeback trigger skips when the binary is current AND no URL diverged (true happy
-/// path). `needs_binary_upgrade` is false when a v2 binary
-/// exists and opens cleanly.
-#[test]
-fn current_v13_fast_path_does_not_require_a_binary_sidecar() {
-    let dir = tempfile::tempdir().unwrap();
-    let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
-
-    let lf = current_leaf_lockfile("lodash", "4.17.21", TEST_REGISTRY_SOURCE);
-    // `write_all` writes BOTH the TOML and the v2 binary, so the
-    // binary is current by construction.
-    lf.write_all(&lockfile_path).unwrap();
-    assert!(!lockfile_path.with_extension("lockb").exists());
-
+fn fast_path_for_a_current_lockfile(lockfile_path: &Path) -> LockfileFastPath {
+    current_leaf_lockfile("lodash", "4.17.21", TEST_REGISTRY_SOURCE)
+        .write_to_file(lockfile_path)
+        .unwrap();
     let deps: HashMap<String, String> = [("lodash".to_string(), "^4.17.0".to_string())].into();
     let client = RegistryClient::new();
     let gate_stats = GateStats::default();
-    let result = try_lockfile_fast_path(
-        &lockfile_path,
-        &deps,
-        &[],
-        None,
-        &client,
-        &gate_stats,
-        false,
-    )
-    .expect("fast path should succeed with both TOML + virtual-store binary");
+    try_lockfile_fast_path(lockfile_path, &deps, &[], None, &client, &gate_stats, false)
+        .expect("the lockfile satisfies the declared dependency")
+}
 
-    assert!(
-        !result.needs_binary_upgrade,
-        "current virtual-store binary must NOT trigger needs_binary_upgrade"
-    );
+#[test]
+fn fast_path_flags_a_leftover_binary_lockfile_for_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+    std::fs::write(
+        dir.path().join(lpm_lockfile::OBSOLETE_BINARY_LOCKFILE_NAME),
+        b"LPMB leftover",
+    )
+    .unwrap();
+
+    assert!(fast_path_for_a_current_lockfile(&lockfile_path).obsolete_binary_lockfile);
+}
+
+#[test]
+fn fast_path_without_a_binary_lockfile_has_nothing_to_remove() {
+    let dir = tempfile::tempdir().unwrap();
+    let lockfile_path = dir.path().join(lpm_lockfile::LOCKFILE_NAME);
+
+    assert!(!fast_path_for_a_current_lockfile(&lockfile_path).obsolete_binary_lockfile);
 }
 
 /// Core contract: when the lockfile stores a tarball

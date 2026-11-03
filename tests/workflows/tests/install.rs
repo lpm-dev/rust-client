@@ -59,22 +59,18 @@ async fn assert_install_removes_obsolete_binary(workspace: bool) {
         .assert()
         .success();
     let original = std::fs::read(project.path().join("lpm.lock")).unwrap();
-    let mut legacy = lpm_lockfile::Lockfile::new();
-    legacy.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS;
-    let binary = lpm_lockfile::binary::to_binary(&legacy).unwrap();
-    for (warm, expectation) in [
-        (false, "required"),
-        (false, "missing"),
-        (true, "not-required"),
+    let leftover = b"LPMB written by an earlier LPM CLI".to_vec();
+    // Earlier LPM CLI versions recorded in `.lpm/install-hash` whether
+    // `lpm.lockb` was required; that line must not change the outcome.
+    for (warm, earlier_hash_line) in [
+        (false, Some("b:required")),
+        (false, None),
+        (true, Some("b:not-required")),
     ] {
-        let path = project.path().join("lpm.lockb");
-        std::fs::write(&path, &binary).unwrap();
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
-            .unwrap();
+        let path = project
+            .path()
+            .join(lpm_lockfile::OBSOLETE_BINARY_LOCKFILE_NAME);
+        std::fs::write(&path, &leftover).unwrap();
         let frozen_args: Vec<_> = args
             .iter()
             .copied()
@@ -92,8 +88,8 @@ async fn assert_install_removes_obsolete_binary(workspace: bool) {
             .success();
         assert_eq!(
             std::fs::read(&path).unwrap(),
-            binary,
-            "frozen installs preserve legacy bytes"
+            leftover,
+            "frozen installs leave a leftover lpm.lockb alone"
         );
         for directory in if workspace {
             vec![
@@ -103,14 +99,11 @@ async fn assert_install_removes_obsolete_binary(workspace: bool) {
         } else {
             vec![project.path().to_path_buf()]
         } {
-            let hash_path = directory.join(".lpm/install-hash");
-            let hash = std::fs::read_to_string(&hash_path).unwrap();
-            let metadata = if expectation == "missing" {
-                String::new()
-            } else {
-                format!("b:{expectation}\n")
-            };
-            std::fs::write(hash_path, hash.replace("b:not-required\n", &metadata)).unwrap();
+            if let Some(line) = earlier_hash_line {
+                let hash_path = directory.join(".lpm/install-hash");
+                let hash = std::fs::read_to_string(&hash_path).unwrap();
+                std::fs::write(hash_path, format!("{hash}{line}\n")).unwrap();
+            }
         }
         if warm {
             std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
@@ -830,7 +823,9 @@ async fn mutable_install_re_resolves_v12_lockfile_and_offline_fails_closed() {
         root.instance_id = None;
     }
     legacy.write_to_file(&path).expect("write v12 fixture");
-    let binary_path = project.path().join(lpm_lockfile::BINARY_LOCKFILE_NAME);
+    let binary_path = project
+        .path()
+        .join(lpm_lockfile::OBSOLETE_BINARY_LOCKFILE_NAME);
     if binary_path.exists() {
         std::fs::remove_file(&binary_path).unwrap();
     }
@@ -2585,7 +2580,7 @@ fn bare_install_with_importer_snapshot_stays_fresh_without_binary_lockfile() {
     );
     assert!(
         !project.file_exists("lpm.lockb"),
-        "importer state is not representable in the current binary lockfile format"
+        "LPM CLI no longer writes lpm.lockb"
     );
 
     let second = lpm(&project)
@@ -2600,7 +2595,7 @@ fn bare_install_with_importer_snapshot_stays_fresh_without_binary_lockfile() {
     );
     assert!(
         !project.file_exists("lpm.lockb"),
-        "a fresh TOML-only install must not create a lossy binary sidecar"
+        "a repeated install must not write lpm.lockb either"
     );
     let second_output = format!(
         "{}{}",
@@ -2609,7 +2604,7 @@ fn bare_install_with_importer_snapshot_stays_fresh_without_binary_lockfile() {
     );
     assert!(
         second_output.contains("up to date"),
-        "the missing unsupported sidecar must not invalidate freshness:\n{second_output}"
+        "the absent lpm.lockb must not invalidate freshness:\n{second_output}"
     );
 
     let doctor = lpm(&project)
@@ -2623,7 +2618,7 @@ fn bare_install_with_importer_snapshot_stays_fresh_without_binary_lockfile() {
     );
     assert!(
         !doctor_output.contains("lpm.lockb missing"),
-        "doctor must not request a sidecar that cannot represent importer state:\n{doctor_output}"
+        "doctor must not ask for an lpm.lockb:\n{doctor_output}"
     );
 }
 
@@ -3817,7 +3812,9 @@ async fn frozen_install_rejects_unreachable_package_before_any_network_request()
         toml::to_string_pretty(&tampered).expect("serialize malicious lockfile fixture"),
     )
     .expect("write malicious lockfile fixture");
-    let binary_path = project.path().join(lpm_lockfile::BINARY_LOCKFILE_NAME);
+    let binary_path = project
+        .path()
+        .join(lpm_lockfile::OBSOLETE_BINARY_LOCKFILE_NAME);
     if binary_path.exists() {
         std::fs::remove_file(binary_path).unwrap();
     }
@@ -5671,7 +5668,7 @@ async fn install_explicit_v3_lazily_migrates_v2_object_offline_without_rewriting
     assert_eq!(
         std::fs::read(project.path().join("lpm.lockb")).ok(),
         lockb_before,
-        "v2-to-v3 migration must keep a supported lpm.lockb byte-identical and preserve absence when importer metadata requires TOML"
+        "v2-to-v3 migration must leave lpm.lockb as it was"
     );
     assertions::assert_in_node_modules(project.path(), "is-number");
 }
@@ -5754,7 +5751,7 @@ async fn install_default_v2_lazily_migrates_v3_object_offline_without_rewriting_
     assert_eq!(
         std::fs::read(project.path().join("lpm.lockb")).ok(),
         lockb_before,
-        "v3-to-v2 migration must keep a supported lpm.lockb byte-identical and preserve absence when importer metadata requires TOML"
+        "v3-to-v2 migration must leave lpm.lockb as it was"
     );
     assertions::assert_in_node_modules(project.path(), "is-number");
 }
@@ -6686,10 +6683,6 @@ async fn bare_add_persists_finalized_manifest_in_lockfile_and_stays_up_to_date()
     assert!(
         combined.to_lowercase().contains("up to date"),
         "the finalized add state should hit the freshness fast path:\n{combined}",
-    );
-    assert!(
-        !combined.contains("Upgraded lpm.lockb"),
-        "an importer reconciliation must never be reported as a binary format upgrade:\n{combined}",
     );
     assert_eq!(
         project.read_file(lpm_lockfile::LOCKFILE_NAME),

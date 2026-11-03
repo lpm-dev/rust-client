@@ -26,9 +26,8 @@
 //!   registry package with the same dist URL.
 //!
 //! The user-written ref remains in the importer snapshot. The package
-//! source contains the resolved commit so source identity, root
-//! selection, and binary lockfile replay all use the same immutable
-//! value.
+//! source contains the resolved commit so source identity and root
+//! selection use the same immutable value.
 
 use lpm_common::integrity::{HashAlgorithm, Integrity};
 use std::fmt;

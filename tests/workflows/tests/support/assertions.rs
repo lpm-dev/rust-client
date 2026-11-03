@@ -33,20 +33,20 @@ pub fn assert_lockfile_exists(project_dir: &Path) {
     );
 }
 
-/// Assert that lpm.lockb (binary lockfile) exists.
-pub fn assert_binary_lockfile_exists(project_dir: &Path) {
+/// Assert that no `lpm.lockb` exists. LPM CLI no longer writes one.
+pub fn assert_no_binary_lockfile(project_dir: &Path) {
     let lockb_path = project_dir.join("lpm.lockb");
     assert!(
-        lockb_path.exists(),
-        "lpm.lockb not found at {}",
+        std::fs::symlink_metadata(&lockb_path).is_err(),
+        "unexpected {}",
         lockb_path.display()
     );
 }
 
-/// Assert that both lpm.lock and lpm.lockb exist.
-pub fn assert_both_lockfiles_exist(project_dir: &Path) {
+/// Assert that `lpm.lock` exists without an `lpm.lockb` beside it.
+pub fn assert_only_the_text_lockfile_exists(project_dir: &Path) {
     assert_lockfile_exists(project_dir);
-    assert_binary_lockfile_exists(project_dir);
+    assert_no_binary_lockfile(project_dir);
 }
 
 /// The manifest of the migration backup in `.lpm/migrate-backup/`.

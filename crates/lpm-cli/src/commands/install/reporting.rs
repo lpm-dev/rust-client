@@ -845,16 +845,13 @@ pub(super) fn emit_online_install_report(input: OnlineInstallReportInput<'_>) {
                 "  {}",
                 format!("resolve: {resolve_ms}ms  fetch: {fetch_ms}ms  link: {link_ms}ms").dimmed()
             );
-            let lockb_path = lockfile_path.with_extension("lockb");
-            let lockb_size = std::fs::metadata(&lockb_path).map_or(0, |m| m.len());
             let lockfile_pkg_count =
                 workspace_lockfile::package_count(lockfile_path).unwrap_or(packages.len());
             eprintln!(
                 "  {}",
                 format!(
-                    "lpm.lock ({lockfile_pkg_count} {}) + lpm.lockb ({})",
+                    "lpm.lock ({lockfile_pkg_count} {})",
                     install_ui::packages_word(lockfile_pkg_count),
-                    lpm_common::format_bytes(lockb_size),
                 )
                 .dimmed()
             );

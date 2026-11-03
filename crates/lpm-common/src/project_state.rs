@@ -54,7 +54,7 @@ fn ignore_rules(lines: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 /// The project's committed LPM records at its root, which LPM writes
-/// itself.
+/// itself, and the obsolete `lpm.lockb` that earlier LPM CLI versions wrote.
 pub const PROJECT_RECORD_FILES: &[&str] = &[
     "lpm.lock",
     "lpm.lockb",

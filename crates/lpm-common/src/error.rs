@@ -168,8 +168,7 @@ impl fmt::Display for ArtifactUnavailableErrorContext {
             ArtifactUnavailableKind::Pinned => {
                 write!(
                     f,
-                    "pinned artifact {} is unavailable from {}; lpm.lock and lpm.lockb pins were \
-                     preserved. ",
+                    "pinned artifact {} is unavailable from {}; the lpm.lock pin was preserved. ",
                     self.package_request(),
                     self.source,
                 )?;
@@ -194,8 +193,8 @@ impl fmt::Display for ArtifactUnavailableErrorContext {
             }
             ArtifactUnavailableKind::Selected => write!(
                 f,
-                "selected artifact {} is unavailable from {}; existing lpm.lock and lpm.lockb \
-                 files were preserved and no new lockfile was written",
+                "selected artifact {} is unavailable from {}; the existing lpm.lock was preserved \
+                 and no new lockfile was written",
                 self.package_request(),
                 self.source,
             ),

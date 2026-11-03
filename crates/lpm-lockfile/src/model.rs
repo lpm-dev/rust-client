@@ -1577,8 +1577,7 @@ impl Lockfile {
             })
     }
 
-    /// Package-shape invariants that hold for both the TOML and
-    /// binary read sides.
+    /// Package-shape invariants every loaded lockfile package must hold.
     pub fn validate_loaded_package(pkg: &LockedPackage) -> Result<(), LockfileError> {
         Self::validate_package_identity(pkg)?;
         match pkg.source_kind() {
@@ -1883,14 +1882,6 @@ impl Lockfile {
                 }
             })?;
         }
-        Ok(())
-    }
-
-    pub fn validate_loaded_packages(packages: &[LockedPackage]) -> Result<(), LockfileError> {
-        for pkg in packages {
-            Self::validate_loaded_package(pkg)?;
-        }
-        Self::validate_standalone_package_order(packages)?;
         Ok(())
     }
 

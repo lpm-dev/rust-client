@@ -67,9 +67,6 @@ fn write_post_install_hash_with_context(
         crate::install_state::KnownInstallHashRuntimeState {
             lockfile_path: &lock.path,
             node_runtime_fingerprint,
-            // Successful installs use the TOML-only exact-instance schema.
-            // Frozen installs can preserve an obsolete companion on disk.
-            binary_sidecar_required: false,
             security_analysis_policy,
         },
     )

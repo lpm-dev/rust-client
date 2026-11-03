@@ -46,7 +46,7 @@ fn migrate_npm_creates_lockfile() {
         String::from_utf8_lossy(&output.stderr),
     );
 
-    assertions::assert_both_lockfiles_exist(project.path());
+    assertions::assert_only_the_text_lockfile_exists(project.path());
 }
 
 #[test]
@@ -202,7 +202,7 @@ fn migrate_yarn_creates_lockfile() {
         String::from_utf8_lossy(&output.stderr),
     );
 
-    assertions::assert_both_lockfiles_exist(project.path());
+    assertions::assert_only_the_text_lockfile_exists(project.path());
 }
 
 // ─── pnpm Migration ─────────────────────────────────────────────
@@ -223,7 +223,7 @@ fn migrate_pnpm_creates_lockfile() {
         String::from_utf8_lossy(&output.stderr),
     );
 
-    assertions::assert_both_lockfiles_exist(project.path());
+    assertions::assert_only_the_text_lockfile_exists(project.path());
 }
 
 #[test]
@@ -260,7 +260,6 @@ fn migrate_human_output_uses_slim_contract() {
         "✓ Converted lockfile",
         "wrote:",
         "lpm.lock",
-        "lpm.lockb",
         "✓ Done · migration completed successfully",
     ] {
         assert!(
@@ -268,6 +267,10 @@ fn migrate_human_output_uses_slim_contract() {
             "migrate slim output missing {expected:?}, got:\n{stderr}"
         );
     }
+    assert!(
+        !stderr.contains("lpm.lockb"),
+        "migrate no longer writes lpm.lockb, got:\n{stderr}"
+    );
 
     assert!(
         stderr_raw.contains("\u{1b}[2msource:")
@@ -513,11 +516,11 @@ fn migrate_pnpm_translates_patches_to_lpm_section() {
     );
     assert!(
         !project.file_exists("lpm.lockb"),
-        "patch metadata makes the staging lockfile TOML-only"
+        "LPM CLI no longer writes lpm.lockb"
     );
     assert!(
         !stderr.contains("wrote:   lpm.lockb"),
-        "migrate must not report a binary artifact removed by the final TOML-only write: {stderr}"
+        "migrate must not report writing lpm.lockb: {stderr}"
     );
 }
 
@@ -712,7 +715,7 @@ fn migrate_bun_creates_lockfile() {
         String::from_utf8_lossy(&output.stderr),
     );
 
-    assertions::assert_both_lockfiles_exist(project.path());
+    assertions::assert_only_the_text_lockfile_exists(project.path());
 }
 
 // ─── Dry Run ─────────────────────────────────────────────────────
@@ -749,7 +752,7 @@ fn migrate_rollback_restores_original() {
         .assert()
         .success();
 
-    assertions::assert_both_lockfiles_exist(project.path());
+    assertions::assert_only_the_text_lockfile_exists(project.path());
     assertions::assert_backup_exists(project.path(), "package-lock.json");
     assert!(
         !project.file_exists(".gitattributes"),

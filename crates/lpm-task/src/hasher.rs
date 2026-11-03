@@ -232,10 +232,7 @@ fn compute_cache_key_inner(
         "workspace-config",
         "pnpm-workspace.yaml",
     )?;
-    let has_text_lock = hash_implicit_project_file(&mut hasher, &project, "lockfile", "lpm.lock")?;
-    if !has_text_lock {
-        hash_implicit_project_file(&mut hasher, &project, "lockfile", "lpm.lockb")?;
-    }
+    hash_implicit_project_file(&mut hasher, &project, "lockfile", "lpm.lock")?;
     for name in ECOSYSTEM_LOCKFILES {
         hash_implicit_project_file(&mut hasher, &project, "lockfile", name)?;
     }
@@ -319,11 +316,7 @@ fn compute_workspace_contract_fingerprint_inner(
     for name in ["package.json", "lpm.json", "pnpm-workspace.yaml"] {
         hash_implicit_project_file(&mut hasher, &workspace, "workspace-config", name)?;
     }
-    let has_text_lock =
-        hash_implicit_project_file(&mut hasher, &workspace, "workspace-lockfile", "lpm.lock")?;
-    if !has_text_lock {
-        hash_implicit_project_file(&mut hasher, &workspace, "workspace-lockfile", "lpm.lockb")?;
-    }
+    hash_implicit_project_file(&mut hasher, &workspace, "workspace-lockfile", "lpm.lock")?;
     for name in ECOSYSTEM_LOCKFILES {
         hash_implicit_project_file(&mut hasher, &workspace, "workspace-lockfile", name)?;
     }
@@ -346,7 +339,6 @@ fn capture_cache_input_validation(
         "lpm.json".to_string(),
         "pnpm-workspace.yaml".to_string(),
         "lpm.lock".to_string(),
-        "lpm.lockb".to_string(),
     ]);
     fixed_names.extend(ECOSYSTEM_LOCKFILES.iter().map(|name| (*name).to_string()));
     capture_filesystem_validation(
@@ -364,7 +356,6 @@ fn capture_workspace_contract_validation(
         "lpm.json".to_string(),
         "pnpm-workspace.yaml".to_string(),
         "lpm.lock".to_string(),
-        "lpm.lockb".to_string(),
     ]);
     fixed_names.extend(ECOSYSTEM_LOCKFILES.iter().map(|name| (*name).to_string()));
     capture_filesystem_validation(
@@ -1059,12 +1050,12 @@ fn hash_implicit_project_file(
     project: &Dir,
     kind: &str,
     name: &str,
-) -> Result<bool, LpmError> {
+) -> Result<(), LpmError> {
     let mut options = cap_std::fs::OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
     let file = match project.open_with(name, &options) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
             return Err(LpmError::Task(format!(
                 "failed to open task cache {kind} file '{name}' without following links: {error}"
@@ -1087,7 +1078,7 @@ fn hash_implicit_project_file(
         ))
     })?;
     hash_implicit_file_value(hasher, kind, name, &hash);
-    Ok(true)
+    Ok(())
 }
 
 fn hash_implicit_file_value(hasher: &mut Sha256, kind: &str, name: &str, value: &str) {
@@ -1271,17 +1262,20 @@ mod tests {
     }
 
     #[test]
-    fn derived_binary_lockfile_does_not_duplicate_authoritative_lockfile_identity() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("lpm.lock"), "resolution = 1").unwrap();
-        fs::write(dir.path().join("lpm.lockb"), "derived one").unwrap();
+    fn leftover_binary_lockfile_does_not_change_the_cache_key() {
         let env = HashMap::new();
-        let key1 = compute_cache_key(dir.path(), "build", &[], &[], &[], &env, "{}");
+        for with_text_lockfile in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            if with_text_lockfile {
+                fs::write(dir.path().join("lpm.lock"), "resolution = 1").unwrap();
+            }
+            let without = compute_cache_key(dir.path(), "build", &[], &[], &[], &env, "{}");
 
-        fs::write(dir.path().join("lpm.lockb"), "derived two").unwrap();
-        let key2 = compute_cache_key(dir.path(), "build", &[], &[], &[], &env, "{}");
+            fs::write(dir.path().join("lpm.lockb"), "leftover").unwrap();
+            let with = compute_cache_key(dir.path(), "build", &[], &[], &[], &env, "{}");
 
-        assert_eq!(key1, key2);
+            assert_eq!(without, with, "lpm.lock present: {with_text_lockfile}");
+        }
     }
 
     #[test]
