@@ -8,7 +8,8 @@
 //! - Regex compilation (OnceLock): < 10ms (one-time)
 //! - Query ":eval" on 1000-package lockfile: < 500ms
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 use tempfile::TempDir;
 
 /// Create a temporary package directory with N source files for benchmarking.

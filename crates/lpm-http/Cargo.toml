@@ -17,7 +17,7 @@ webpki-root-certs = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
-syn = { version = "2", features = ["full", "visit"] }
+syn = { version = "3", features = ["full", "visit"] }
 wiremock = "0.6"
 
 [lints]

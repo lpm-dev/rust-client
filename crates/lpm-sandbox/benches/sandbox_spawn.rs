@@ -28,8 +28,9 @@
 //! — a 1ms-per-spawn regression across 100 packages is a 100ms
 //! install slowdown.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use lpm_sandbox::{SandboxMode, SandboxSpec, SandboxStdio, SandboxedCommand, new_for_platform};
+use std::hint::black_box;
 use std::path::PathBuf;
 
 fn realistic_spec() -> SandboxSpec {

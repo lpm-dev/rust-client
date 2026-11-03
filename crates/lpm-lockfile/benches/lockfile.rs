@@ -1,8 +1,14 @@
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use lpm_lockfile::{ImporterSnapshot, LockedPackage, Lockfile, ValidatedLockfile, binary};
+use criterion::{Criterion, criterion_group, criterion_main};
+use lpm_lockfile::{
+    ImporterSnapshot, LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES, LockedPackage, LockedRootResolution,
+    Lockfile, ValidatedLockfile, binary,
+};
+use std::hint::black_box;
 
 fn make_lockfile(n: usize) -> Lockfile {
     let mut lf = Lockfile::new();
+    // The binary format holds lockfiles from before package instances.
+    lf.metadata.lockfile_version = LOCKFILE_VERSION_WITH_PACKAGE_INSTANCES - 1;
     for i in 0..n {
         lf.add_package(LockedPackage {
             instance_id: None,
@@ -11,7 +17,7 @@ fn make_lockfile(n: usize) -> Lockfile {
             name: format!("pkg-{i:05}"),
             version: format!("{i}.0.0"),
             source: Some("registry+https://registry.npmjs.org".to_string()),
-            integrity: Some("sha512-abcdef1234567890".to_string()),
+            integrity: Some("sha512-WeQI/8tF1LD+qbGDGvTgZKctO2154IuE90RFjNG3ZEd7Cs6yMvSvI3L2723TLGFpSRRjIuOSJXxlEgv/P+/2/g==".to_string()),
             unpacked_size: None,
             manifest_fingerprint: None,
             registry_signatures: Vec::new(),
@@ -36,12 +42,32 @@ fn make_lockfile(n: usize) -> Lockfile {
     lf
 }
 
+/// [`make_lockfile`]'s packages in the current lockfile format, each naming
+/// its exact instance. They have no dependencies, so any subset of them is a
+/// complete importer.
+fn make_instance_packages(n: usize) -> Vec<LockedPackage> {
+    make_lockfile(n)
+        .packages
+        .into_iter()
+        .map(|mut package| {
+            package.instance_id = Some(lpm_common::PackageInstanceId::derive(
+                &package.name,
+                &package.version,
+                "registry+https://registry.npmjs.org",
+                &format!("node_modules/{}", package.name),
+            ));
+            package.dependencies.clear();
+            package
+        })
+        .collect()
+}
+
 fn make_workspace_union(
     importer_count: usize,
     unique_package_count: usize,
     packages_per_importer: usize,
 ) -> (String, Vec<String>) {
-    let packages = make_lockfile(unique_package_count).packages;
+    let packages = make_instance_packages(unique_package_count);
     let mut union = Lockfile::new();
     let mut importers = Vec::with_capacity(importer_count);
     for importer_index in 0..importer_count {
@@ -52,18 +78,34 @@ fn make_workspace_union(
         package_indices.sort_unstable();
         package_indices.dedup();
         let mut standalone = Lockfile::new();
-        standalone.importers.insert(
-            ".".to_string(),
-            ImporterSnapshot {
-                dependencies: [(format!("direct-{importer_index:03}"), "^1.0.0".to_string())]
-                    .into(),
-                ..ImporterSnapshot::default()
-            },
-        );
         standalone.packages = package_indices
             .into_iter()
             .map(|index| packages[index].clone())
             .collect();
+        // Each member depends directly on every package it holds, so all of
+        // them are reachable from its exact roots.
+        for package in &standalone.packages {
+            standalone.root_resolutions.insert(
+                package.name.clone(),
+                LockedRootResolution {
+                    instance_id: package.instance_id,
+                    package: package.name.clone(),
+                    version: package.version.clone(),
+                    source: package.source.clone(),
+                },
+            );
+        }
+        standalone.importers.insert(
+            ".".to_string(),
+            ImporterSnapshot {
+                dependencies: standalone
+                    .packages
+                    .iter()
+                    .map(|package| (package.name.clone(), package.version.clone()))
+                    .collect(),
+                ..ImporterSnapshot::default()
+            },
+        );
         union.absorb_importer(&importer, standalone).unwrap();
         importers.push(importer);
     }

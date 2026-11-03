@@ -110,7 +110,7 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 tempfile = "3"
 dirs = { workspace = true }
-criterion = "0.5"
+criterion = "0.8"
 # Helper-binary integration tests spawn `lpm-sandbox-helper` via
 # `assert_cmd::Command::cargo_bin`, which consults
 # `CARGO_BIN_EXE_<name>` so the bin is located in cargo's test
