@@ -166,6 +166,9 @@ pub(super) struct PendingOverride {
     pub hit: OverrideHit,
 }
 
+/// The version a PubGrub resolution selected for each package.
+pub(crate) type PubGrubSolution = pubgrub::SelectedDependencies<ResolverPackage, NpmVersion>;
+
 /// The DependencyProvider that bridges PubGrub with LPM's registry.
 pub struct LpmDependencyProvider {
     pub(super) client: Arc<RegistryClient>,

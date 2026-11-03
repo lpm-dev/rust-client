@@ -1096,11 +1096,10 @@ fn selected_hits(
     package: &ResolverPackage,
     version: Option<&NpmVersion>,
 ) -> Vec<OverrideHit> {
-    let mut solution = pubgrub::Map::default();
-    solution.insert(ResolverPackage::Root, NpmVersion::new(0, 0, 0));
-    if let Some(version) = version {
-        solution.insert(package.clone(), version.clone());
-    }
+    let solution: PubGrubSolution =
+        std::iter::once((ResolverPackage::Root, NpmVersion::new(0, 0, 0)))
+            .chain(version.map(|version| (package.clone(), version.clone())))
+            .collect();
     provider.selected_override_hits(&solution)
 }
 
@@ -1357,9 +1356,9 @@ fn edge_override_path_selector_only_applies_to_matching_parent() {
     );
 
     // Drain the apply trace — only the baz hit should be recorded.
-    let mut solution = pubgrub::Map::default();
-    solution.insert(baz, baz_version);
-    solution.insert(qar_baz, chosen_baz.unwrap());
+    let solution: PubGrubSolution = [(baz, baz_version), (qar_baz, chosen_baz.unwrap())]
+        .into_iter()
+        .collect();
     let hits = provider.selected_override_hits(&solution);
     assert_eq!(hits.len(), 1, "only the baz path should record a hit");
     assert_eq!(hits[0].package, "qar");
@@ -1451,7 +1450,8 @@ fn get_dependencies_includes_optional_deps_when_cached() {
         .unwrap();
 
     match deps {
-        Dependencies::Available(map) => {
+        Dependencies::Available(constraints) => {
+            let map: HashMap<_, _> = constraints.into_iter().collect();
             assert!(
                 map.contains_key(&ResolverPackage::npm("express")),
                 "regular dep should be present"
@@ -1501,7 +1501,8 @@ fn get_dependencies_skips_optional_with_no_versions() {
         .unwrap();
 
     match deps {
-        Dependencies::Available(map) => {
+        Dependencies::Available(constraints) => {
+            let map: HashMap<_, _> = constraints.into_iter().collect();
             assert!(
                 map.contains_key(&ResolverPackage::npm("express")),
                 "regular dep should be present"
@@ -1549,7 +1550,8 @@ fn get_dependencies_keeps_optional_with_only_platform_incompatible_versions() {
         .unwrap();
 
     match deps {
-        Dependencies::Available(map) => {
+        Dependencies::Available(constraints) => {
+            let map: HashMap<_, _> = constraints.into_iter().collect();
             assert!(
                 map.contains_key(&ResolverPackage::npm("express")),
                 "regular dep should be present"
@@ -1633,7 +1635,8 @@ fn get_dependencies_transitive_skips_workspace_specifier() {
         .get_dependencies(&pkg, &NpmVersion::parse("1.0.0").unwrap())
         .expect("workspace: transitive dep must be skipped, not error");
     match deps {
-        Dependencies::Available(map) => {
+        Dependencies::Available(constraints) => {
+            let map: HashMap<_, _> = constraints.into_iter().collect();
             assert!(
                 map.contains_key(&ResolverPackage::npm("legit-sibling")),
                 "non-workspace sibling must still resolve"

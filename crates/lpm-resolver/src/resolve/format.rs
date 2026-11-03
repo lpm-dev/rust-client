@@ -1,7 +1,7 @@
 use super::prelude::*;
 
 pub(super) fn root_resolutions_from_solution(
-    solution: &pubgrub::SelectedDependencies<LpmDependencyProvider>,
+    solution: &PubGrubSolution,
     root_dependencies: &RootDependencies,
     root_aliases: &HashMap<String, String>,
 ) -> HashMap<String, RootResolution> {
@@ -12,17 +12,14 @@ pub(super) fn root_resolutions_from_solution(
             .get(local_name)
             .map_or(local_name.as_str(), String::as_str);
         let root_package = ResolverPackage::from_root_dependency(local_name, target);
-        let Some((package, version)) = solution
-            .iter()
-            .find(|(package, _)| package == &&root_package)
-        else {
+        let Some(version) = solution.get(&root_package) else {
             continue;
         };
         resolutions.insert(
             local_name.clone(),
             RootResolution {
-                target: resolution_ids[package],
-                package: package.canonical_name(),
+                target: resolution_ids[&root_package],
+                package: root_package.canonical_name(),
                 version: version.to_string(),
             },
         );
@@ -31,10 +28,11 @@ pub(super) fn root_resolutions_from_solution(
 }
 
 fn resolution_ids_from_solution(
-    solution: &pubgrub::SelectedDependencies<LpmDependencyProvider>,
+    solution: &PubGrubSolution,
 ) -> HashMap<ResolverPackage, lpm_common::ResolutionNodeId> {
     let mut packages = solution
-        .keys()
+        .iter()
+        .map(|(package, _)| package)
         .filter(|package| !package.is_root())
         .cloned()
         .collect::<Vec<_>>();
@@ -52,7 +50,7 @@ fn resolution_ids_from_solution(
 /// Convert PubGrub solution + cached metadata into `ResolvedPackage` list
 /// with dependency edges populated.
 pub(super) fn format_solution(
-    solution: pubgrub::SelectedDependencies<LpmDependencyProvider>,
+    solution: PubGrubSolution,
     cache: &HashMap<CanonicalKey, std::sync::Arc<CachedPackageInfo>>,
     root_dependencies: &RootDependencies,
     root_aliases: &HashMap<String, String>,
@@ -423,16 +421,18 @@ mod root_resolution_tests {
     #[test]
     fn pubgrub_root_resolution_uses_unscoped_selection_when_split_version_also_exists() {
         let package = ResolverPackage::npm("peer-host");
-        let mut solution: pubgrub::SelectedDependencies<LpmDependencyProvider> =
-            pubgrub::Map::default();
-        solution.insert(
-            package.with_context("peer-consumer"),
-            NpmVersion::parse("1.1.0").expect("valid split version"),
-        );
-        solution.insert(
-            package,
-            NpmVersion::parse("1.0.0").expect("valid root version"),
-        );
+        let solution: PubGrubSolution = [
+            (
+                package.with_context("peer-consumer"),
+                NpmVersion::parse("1.1.0").expect("valid split version"),
+            ),
+            (
+                package,
+                NpmVersion::parse("1.0.0").expect("valid root version"),
+            ),
+        ]
+        .into_iter()
+        .collect();
         let root_dependencies = RootDependencies::required(HashMap::from([(
             "peer-host".to_string(),
             "^1.0.0".to_string(),

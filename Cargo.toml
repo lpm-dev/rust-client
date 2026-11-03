@@ -148,7 +148,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rayon = "1"
 
 # Resolution
-pubgrub = "0.3"
+pubgrub = "0.4"
 version-ranges = "0.1"
 
 # Lockfile

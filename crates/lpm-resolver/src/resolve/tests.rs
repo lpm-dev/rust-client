@@ -2151,16 +2151,18 @@ fn peer_binding_uses_declared_range_when_multiple_unsplit_versions_exist() {
 fn peer_binding_from_split_fallback_retains_exact_target_id() {
     let plugin = ResolverPackage::npm("plugin");
     let react = ResolverPackage::npm("react").with_context("host-a");
-    let mut solution: pubgrub::SelectedDependencies<LpmDependencyProvider> =
-        pubgrub::Map::default();
-    solution.insert(
-        plugin.clone(),
-        NpmVersion::parse("1.0.0").expect("valid plugin version"),
-    );
-    solution.insert(
-        react.clone(),
-        NpmVersion::parse("17.0.2").expect("valid react version"),
-    );
+    let solution: PubGrubSolution = [
+        (
+            plugin.clone(),
+            NpmVersion::parse("1.0.0").expect("valid plugin version"),
+        ),
+        (
+            react.clone(),
+            NpmVersion::parse("17.0.2").expect("valid react version"),
+        ),
+    ]
+    .into_iter()
+    .collect();
 
     let cache = HashMap::from([
         (

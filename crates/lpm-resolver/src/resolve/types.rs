@@ -125,10 +125,7 @@ pub struct SelectedPackageEvent {
 
 /// Internal type for PubGrub result + provider (to extract cache).
 pub(super) type PubGrubResult = Result<
-    (
-        pubgrub::SelectedDependencies<LpmDependencyProvider>,
-        LpmDependencyProvider,
-    ),
+    (PubGrubSolution, LpmDependencyProvider),
     Box<(
         pubgrub::PubGrubError<LpmDependencyProvider>,
         LpmDependencyProvider,
