@@ -42,10 +42,10 @@ pub(crate) use policy::{
     select_override_target, trust_downgrade_violation, trust_downgrade_violation_unprofiled,
     version_allowed_by_policy,
 };
-pub(crate) use types::LpmDependencyProvider;
 pub(crate) use types::SkippedDependency;
 #[cfg(test)]
 pub(crate) use types::SkippedDependencyReason;
+pub(crate) use types::{LpmDependencyProvider, PubGrubSolution};
 pub use types::{NotifyMap, SharedCache, StreamingBfsMetrics, WalkerDone};
 
 mod prelude {
@@ -101,7 +101,9 @@ mod prelude {
     #[allow(unused_imports)]
     pub(super) use parking_lot::Mutex;
     #[allow(unused_imports)]
-    pub(super) use pubgrub::{Dependencies, DependencyProvider, PackageResolutionStatistics};
+    pub(super) use pubgrub::{
+        Dependencies, DependencyConstraints, DependencyProvider, PackageResolutionStatistics,
+    };
     #[allow(unused_imports)]
     pub(super) use std::collections::{HashMap, HashSet};
     #[allow(unused_imports)]

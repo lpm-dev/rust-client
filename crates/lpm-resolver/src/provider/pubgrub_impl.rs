@@ -1,5 +1,5 @@
 use super::prelude::*;
-use super::types::PendingOverride;
+use super::types::{PendingOverride, PubGrubSolution};
 
 impl LpmDependencyProvider {
     fn record_skipped_dependency(&self, skipped: SkippedDependency) {
@@ -127,10 +127,7 @@ impl LpmDependencyProvider {
         }
     }
 
-    pub(super) fn selected_override_hits(
-        &self,
-        solution: &pubgrub::SelectedDependencies<Self>,
-    ) -> Vec<OverrideHit> {
+    pub(super) fn selected_override_hits(&self, solution: &PubGrubSolution) -> Vec<OverrideHit> {
         for ((parent, parent_version, _), pending) in self.override_edges.lock().iter() {
             if solution.get(parent) == Some(parent_version)
                 && solution
@@ -376,7 +373,7 @@ impl DependencyProvider for LpmDependencyProvider {
 
                 constraints.insert(pkg, range);
             }
-            return Ok(Dependencies::Available(constraints));
+            return Ok(Dependencies::Available(listed(constraints)));
         }
 
         self.ensure_cached(package)?;
@@ -394,7 +391,7 @@ impl DependencyProvider for LpmDependencyProvider {
             };
             let dependencies = match info.dependencies(&ver_str) {
                 Some(dependencies) => dependencies,
-                None => return Ok(Dependencies::Available(pubgrub::Map::default())),
+                None => return Ok(Dependencies::Available(DependencyConstraints::default())),
             };
             let mut deps = Vec::with_capacity(dependencies.len());
             let mut bundled_count = 0usize;
@@ -644,6 +641,15 @@ impl DependencyProvider for LpmDependencyProvider {
         //
         // See check_unmet_peers() for the post-resolution check.
 
-        Ok(Dependencies::Available(constraints))
+        Ok(Dependencies::Available(listed(constraints)))
     }
+}
+
+/// The map keeps one range per package, the last one inserted. PubGrub breaks
+/// priority ties by the order it first meets packages, so a different order
+/// can change the versions a resolution picks.
+fn listed(
+    constraints: pubgrub::Map<ResolverPackage, Ranges<NpmVersion>>,
+) -> DependencyConstraints<ResolverPackage, Ranges<NpmVersion>> {
+    constraints.into_iter().collect()
 }

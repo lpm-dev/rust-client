@@ -1,6 +1,6 @@
 use super::manifest_core::ManifestVersion;
 use super::prelude::*;
-use super::types::{CachedAvailableVersions, CachedRange};
+use super::types::{CachedAvailableVersions, CachedRange, PubGrubSolution};
 
 pub(crate) fn insert_or_merge_cached_package_info(
     shared_cache: &SharedCache,
@@ -619,7 +619,7 @@ impl LpmDependencyProvider {
     #[allow(clippy::type_complexity)]
     pub fn into_parts(
         self,
-        solution: &pubgrub::SelectedDependencies<Self>,
+        solution: &PubGrubSolution,
     ) -> (
         HashMap<CanonicalKey, Arc<CachedPackageInfo>>,
         Vec<OverrideHit>,

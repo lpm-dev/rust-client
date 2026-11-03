@@ -73,9 +73,12 @@ fn unchanged_override_still_restricts_the_solver_constraint() {
 fn override_trace_excludes_discarded_parent_versions() {
     let provider = provider(&[("target", "2.0.0")]);
     effective(&provider, "parent", "^1");
-    let mut solution = pubgrub::Map::default();
-    solution.insert(ResolverPackage::npm("parent"), NpmVersion::new(2, 0, 0));
-    solution.insert(ResolverPackage::npm("target"), NpmVersion::new(2, 0, 0));
+    let solution: PubGrubSolution = [
+        (ResolverPackage::npm("parent"), NpmVersion::new(2, 0, 0)),
+        (ResolverPackage::npm("target"), NpmVersion::new(2, 0, 0)),
+    ]
+    .into_iter()
+    .collect();
     assert!(provider.selected_override_hits(&solution).is_empty());
 }
 
@@ -105,14 +108,17 @@ fn aliased_self_cycle_reuses_the_same_dependency_identity() {
     else {
         panic!("dependencies unavailable")
     };
-    let child = first.keys().next().unwrap();
+    let (child, _) = first.iter().next().unwrap();
     let Dependencies::Available(second) = provider.get_dependencies(child, &version).unwrap()
     else {
         panic!("dependencies unavailable")
     };
     assert_eq!(
-        first.keys().collect::<Vec<_>>(),
-        second.keys().collect::<Vec<_>>()
+        first.iter().map(|(package, _)| package).collect::<Vec<_>>(),
+        second
+            .iter()
+            .map(|(package, _)| package)
+            .collect::<Vec<_>>()
     );
 }
 
