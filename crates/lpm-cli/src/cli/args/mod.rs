@@ -607,6 +607,11 @@ pub(crate) enum Commands {
     #[command(name = "internal-ts-transform", hide = true)]
     InternalTsTransform(build::InternalTsTransformArgs),
 
+    /// Hidden release-workflow gate: verifies a signed `SHA256SUMS.txt`
+    /// from local files with the exact policy `lpm self-update` enforces.
+    #[command(name = "internal-verify-release", hide = true)]
+    InternalVerifyRelease(build::InternalVerifyReleaseArgs),
+
     /// Generate a shell completion script.
     ///
     /// Pipe the output into your shell's completion-load path:

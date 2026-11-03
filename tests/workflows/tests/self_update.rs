@@ -4,7 +4,9 @@
 //! version and then shells out to the installer, neither of which is
 //! reproducible in CI. Workflow coverage focuses on the cache-driven
 //! branches that don't require network: cache-hit "already on latest"
-//! and the recent-failure backoff path.
+//! and the recent-failure backoff path. It also pins the CLI contract of
+//! `lpm internal-verify-release`, which the release workflow runs against
+//! every freshly signed `SHA256SUMS.txt` before publishing it.
 
 #[cfg(unix)]
 mod self_update_maintenance;
@@ -1497,5 +1499,212 @@ fn self_update_recent_failure_short_circuits_with_backoff_error() {
     assert!(
         !stderr.contains('●') && !stderr.contains('◇'),
         "self-update backoff must not use cliclack spinner glyphs, got:\n{stderr}",
+    );
+}
+
+// ─── release-workflow signing gate ────────────────────────────────────
+
+const V0_84_0_SOURCE_COMMIT: &str = "35edeab28d25a6851519629e99e478c3cd810c3a";
+
+/// The published v0.84.0 `SHA256SUMS.txt` and its Sigstore bundle,
+/// signed by `release.yml` at `refs/heads/main`.
+fn v0_84_0_release_assets() -> (std::path::PathBuf, std::path::PathBuf) {
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/lpm-cli/tests/fixtures");
+    (
+        fixtures.join("release_manifests/lpm-v0.84.0-SHA256SUMS.txt"),
+        fixtures.join("sigstore_bundles/21-real-lpm-release-v0.84.0.json"),
+    )
+}
+
+fn internal_verify_release(
+    project: &TempProject,
+    version: &str,
+    manifest: &std::path::Path,
+    release_commit: &str,
+) -> std::process::Output {
+    let (_, bundle) = v0_84_0_release_assets();
+    lpm(project)
+        .args(["--json", "internal-verify-release", version, "--manifest"])
+        .arg(manifest)
+        .arg("--bundle")
+        .arg(bundle)
+        .args([
+            "--published-at",
+            "2026-11-02T04:06:07Z",
+            "--release-commit",
+            release_commit,
+        ])
+        .output()
+        .expect("failed to run lpm internal-verify-release")
+}
+
+#[test]
+fn internal_verify_release_accepts_published_main_signed_stable_release() {
+    let project = TempProject::empty(r#"{"name":"release-gate"}"#);
+    let (manifest, _) = v0_84_0_release_assets();
+    let output = internal_verify_release(&project, "0.84.0", &manifest, V0_84_0_SOURCE_COMMIT);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the published v0.84.0 assets must pass the self-update policy\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(output.stderr.is_empty(), "JSON mode must keep stderr empty");
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("internal-verify-release --json must be JSON: {e}\n{stdout}"));
+    assert_eq!(envelope["workflow_ref"], "refs/heads/main");
+    assert_eq!(envelope["source_commit"], V0_84_0_SOURCE_COMMIT);
+    insta::assert_json_snapshot!(envelope, @r#"
+    {
+      "success": true,
+      "version": "0.84.0",
+      "publisher": "github:lpm-dev/rust-client",
+      "workflow_path": ".github/workflows/release.yml",
+      "workflow_ref": "refs/heads/main",
+      "source_commit": "35edeab28d25a6851519629e99e478c3cd810c3a",
+      "integrated_time": "2026-11-02T04:04:45+00:00",
+      "log_index": 3637620348,
+      "log_id": "wNI9atQGlz+VWfO6LRygH4QUfY/8W4RFwiT5i5WRgB0=",
+      "leaf_cert_sha256": "sha256-e4049a695828e873021454b01391d022dec03b3d4dcf4879a4e3fd946990ade8",
+      "manifest_sha256": "f0375a712ab9651a59458c7847e8e8dbcff125ebac8b7c8c2be515cc1ce36a30",
+      "assets": [
+        {
+          "name": "lpm-darwin-arm64.zip",
+          "sha256": "bda4ed0a0ac94b7906fac74e4b43e353017a845cc75dcf35e6ac285c9e76e4c9"
+        },
+        {
+          "name": "lpm-darwin-x64.zip",
+          "sha256": "1ec90ef232d5028e5b8654351390cb2dfa2e35b41f35b9685aadbcf526e2ce60"
+        },
+        {
+          "name": "lpm-linux-arm64",
+          "sha256": "3b6fd404a9db119f4ca3925d40871ab1ae7ead8b91730e67cf80f20fdd1e0b7b"
+        },
+        {
+          "name": "lpm-linux-x64",
+          "sha256": "c6a40efa82e90de9fe1dd386cc144834287f74d3da62a0df1e2892dd93124eb3"
+        },
+        {
+          "name": "lpm-linux-x64-musl",
+          "sha256": "0aa7681ed5e1197bed9665f440bbefd04325150577b1f9fd9f695042848ccafd"
+        },
+        {
+          "name": "lpm-sandbox-helper-win32-x64.exe",
+          "sha256": "98231b59cf1419f5a7c7fc27fae2ba0ad06cb817bb84276b79c8c4c47c8a4a05"
+        },
+        {
+          "name": "lpm-win32-x64.exe",
+          "sha256": "4932f6babee63eb0c4b94a45e6443a24af81443a368b15f1fbd397e18397d703"
+        }
+      ]
+    }
+    "#);
+}
+
+#[test]
+fn internal_verify_release_refuses_release_whose_tag_targets_another_commit() {
+    let project = TempProject::empty(r#"{"name":"release-gate"}"#);
+    let (manifest, _) = v0_84_0_release_assets();
+    let output = internal_verify_release(
+        &project,
+        "0.84.0",
+        &manifest,
+        "1e98fb8efbcc00f620678fc8091b512ed503768f",
+    );
+
+    assert!(
+        !output.status.success(),
+        "a mismatched release commit must fail the gate"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let envelope: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("failure must still be a JSON envelope: {e}\n{stdout}"));
+    assert_eq!(envelope["success"], false);
+    assert_eq!(envelope["error_code"], "self_update");
+    let error = envelope["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("targets `1e98fb8efbcc00f620678fc8091b512ed503768f`")
+            && error.contains(V0_84_0_SOURCE_COMMIT),
+        "error must name both commits, got: {error}"
+    );
+}
+
+#[test]
+fn internal_verify_release_refuses_manifest_that_differs_from_attestation() {
+    let project = TempProject::empty(r#"{"name":"release-gate"}"#);
+    let (manifest, _) = v0_84_0_release_assets();
+    let mut tampered = std::fs::read(&manifest).expect("read v0.84.0 manifest fixture");
+    tampered[0] = if tampered[0] == b'0' { b'1' } else { b'0' };
+    let tampered_path = project.path().join("SHA256SUMS.txt");
+    std::fs::write(&tampered_path, tampered).expect("write tampered manifest");
+
+    let output = internal_verify_release(&project, "0.84.0", &tampered_path, V0_84_0_SOURCE_COMMIT);
+
+    assert!(
+        !output.status.success(),
+        "a tampered manifest must fail the gate"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("failure must still be a JSON envelope");
+    assert_eq!(envelope["error_code"], "self_update");
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("may be tampered")),
+        "{envelope}"
+    );
+}
+
+#[test]
+fn internal_verify_release_rejects_tag_prefixed_version() {
+    let project = TempProject::empty(r#"{"name":"release-gate"}"#);
+    let (manifest, _) = v0_84_0_release_assets();
+    let output = internal_verify_release(&project, "v0.84.0", &manifest, V0_84_0_SOURCE_COMMIT);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "clap must reject the version"
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("usage errors are JSON under --json");
+    assert_eq!(envelope["error_code"], "usage");
+    assert_eq!(envelope["value"], "v0.84.0");
+    assert!(
+        envelope["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("expected the canonical version `0.84.0`")),
+        "{envelope}"
+    );
+}
+
+#[test]
+fn internal_verify_release_reports_human_summary_on_stderr() {
+    let project = TempProject::empty(r#"{"name":"release-gate"}"#);
+    let (manifest, bundle) = v0_84_0_release_assets();
+    let output = lpm(&project)
+        .args(["internal-verify-release", "0.84.0", "--manifest"])
+        .arg(&manifest)
+        .arg("--bundle")
+        .arg(&bundle)
+        .args([
+            "--published-at",
+            "2026-11-02T04:06:07Z",
+            "--release-commit",
+            V0_84_0_SOURCE_COMMIT,
+        ])
+        .output()
+        .expect("failed to run lpm internal-verify-release");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(output.stdout.is_empty(), "human output belongs on stderr");
+    assert!(
+        stderr.contains("v0.84.0 satisfies the self-update signing policy")
+            && stderr.contains(".github/workflows/release.yml@refs/heads/main")
+            && stderr.contains(V0_84_0_SOURCE_COMMIT),
+        "{stderr}"
     );
 }

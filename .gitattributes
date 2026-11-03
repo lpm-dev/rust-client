@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Signed release manifests must stay byte-exact: their SHA-256 is pinned by
+# the Sigstore attestation that ships next to them.
+crates/lpm-cli/tests/fixtures/release_manifests/*-SHA256SUMS.txt -text

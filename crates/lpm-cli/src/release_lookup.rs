@@ -913,22 +913,32 @@ pub fn github_release_download_url(version: &str, file: &str) -> String {
     template.replace("{tag}", version).replace("{file}", file)
 }
 
-/// Fetch the `published_at` ISO-8601 timestamp for a specific release tag.
+/// The fields of a GitHub Release that bind a signed release manifest to
+/// the requested tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubRelease {
+    /// Anchors the Sigstore replay window.
+    pub published_at: chrono::DateTime<chrono::Utc>,
+    /// The commitish the release tag was created from. LPM's release
+    /// workflow always records the full 40-character source commit here.
+    pub target_commitish: Option<String>,
+}
+
+/// Fetch the GitHub Release object for a specific release tag.
 ///
-/// Used by the standalone self-update path to anchor the Sigstore-bundle
-/// replay-window check against the actual release publication time,
-/// decoupled from the npm-first version probe. Runs only on the
-/// standalone arm — npm/Homebrew/cargo arms have their own integrity
-/// stories and don't need a window anchor.
+/// Used by the self-update paths that verify the signed
+/// `SHA256SUMS.txt`: `published_at` anchors the Sigstore replay window
+/// and `target_commitish` binds a main-signed attestation to the
+/// requested version, decoupled from the npm-first version probe.
 ///
 /// Failure shapes: `NotFound` for 404 (tag does not exist),
-/// `MalformedResponse` for missing/non-string/unparseable `published_at`,
-/// `RateLimited` / `HttpStatus` / `Transport` for the underlying network
-/// failures (kept identical to `probe_one`'s shape so the wrapping
-/// `LpmError::SelfUpdate` mapping at the call site stays uniform).
-pub async fn fetch_github_release_published_at(
-    version: &str,
-) -> Result<chrono::DateTime<chrono::Utc>, LookupError> {
+/// `MalformedResponse` for a mismatched `tag_name`, a
+/// missing/non-string/unparseable `published_at`, or a non-string
+/// `target_commitish`, and `RateLimited` / `HttpStatus` / `Transport`
+/// for the underlying network failures (kept identical to `probe_one`'s
+/// shape so the wrapping `LpmError::SelfUpdate` mapping at the call site
+/// stays uniform).
+pub async fn fetch_github_release(version: &str) -> Result<GithubRelease, LookupError> {
     let url = github_release_by_tag_url(version);
 
     let client = lpm_http::client_builder()
@@ -1005,13 +1015,28 @@ pub async fn fetch_github_release_published_at(
             ))
         })?;
 
-    chrono::DateTime::parse_from_rfc3339(published_at_str)
+    let published_at = chrono::DateTime::parse_from_rfc3339(published_at_str)
         .map(|dt| dt.with_timezone(&chrono::Utc))
         .map_err(|e| {
             LookupError::MalformedResponse(format!(
                 "release v{version} `published_at` not RFC 3339: {e}"
             ))
-        })
+        })?;
+
+    let target_commitish = match body.get("target_commitish") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(target)) => Some(target.clone()),
+        Some(_) => {
+            return Err(LookupError::MalformedResponse(format!(
+                "release v{version} `target_commitish` is not a string"
+            )));
+        }
+    };
+
+    Ok(GithubRelease {
+        published_at,
+        target_commitish,
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -2134,7 +2159,7 @@ mod tests {
         );
     }
 
-    // ── fetch_github_release_published_at ─────────────────────────
+    // ── fetch_github_release ──────────────────────────────────────
 
     const RELEASE_BY_TAG_OVERRIDE_KEY: &str = "LPM_GITHUB_RELEASE_BY_TAG_URL_OVERRIDE";
 
@@ -2147,32 +2172,77 @@ mod tests {
         fut.await;
     }
 
-    #[tokio::test]
-    async fn fetch_github_release_published_at_parses_timestamp() {
+    async fn fetch_v0_42_0_release_serving(
+        body: serde_json::Value,
+    ) -> Result<GithubRelease, LookupError> {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/releases/tags/v0.42.0"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "tag_name": "v0.42.0",
-                    "published_at": "2026-05-10T12:34:56Z",
-                })),
-            )
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
             .mount(&server)
             .await;
-
         let template = format!("{}/releases/tags/v{{tag}}", server.uri());
-        with_release_by_tag_override(&template, async {
-            let parsed = fetch_github_release_published_at("0.42.0")
-                .await
-                .expect("must parse");
-            assert_eq!(parsed.to_rfc3339(), "2026-05-10T12:34:56+00:00");
-        })
-        .await;
+        let _env =
+            crate::test_env::ScopedEnv::set([(RELEASE_BY_TAG_OVERRIDE_KEY, template.into())]);
+        fetch_github_release("0.42.0").await
     }
 
     #[tokio::test]
-    async fn fetch_github_release_published_at_rejects_mismatched_tag_name() {
+    async fn fetch_github_release_parses_published_at_and_target_commit() {
+        let release = fetch_v0_42_0_release_serving(serde_json::json!({
+            "tag_name": "v0.42.0",
+            "published_at": "2026-05-10T12:34:56Z",
+            "target_commitish": "35edeab28d25a6851519629e99e478c3cd810c3a",
+        }))
+        .await
+        .expect("must parse");
+        assert_eq!(
+            release.published_at.to_rfc3339(),
+            "2026-05-10T12:34:56+00:00"
+        );
+        assert_eq!(
+            release.target_commitish.as_deref(),
+            Some("35edeab28d25a6851519629e99e478c3cd810c3a")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_github_release_leaves_target_commit_unset_when_absent() {
+        for body in [
+            serde_json::json!({
+                "tag_name": "v0.42.0",
+                "published_at": "2026-05-10T12:34:56Z",
+            }),
+            serde_json::json!({
+                "tag_name": "v0.42.0",
+                "published_at": "2026-05-10T12:34:56Z",
+                "target_commitish": null,
+            }),
+        ] {
+            let release = fetch_v0_42_0_release_serving(body)
+                .await
+                .expect("a release without a recorded target still parses");
+            assert_eq!(release.target_commitish, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_github_release_rejects_non_string_target_commit() {
+        let err = fetch_v0_42_0_release_serving(serde_json::json!({
+            "tag_name": "v0.42.0",
+            "published_at": "2026-05-10T12:34:56Z",
+            "target_commitish": 42,
+        }))
+        .await
+        .expect_err("a non-string target_commitish is malformed");
+        match err {
+            LookupError::MalformedResponse(msg) => assert!(msg.contains("target_commitish")),
+            other => panic!("expected MalformedResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_github_release_rejects_mismatched_tag_name() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/releases/tags/v0.42.0"))
@@ -2187,7 +2257,7 @@ mod tests {
 
         let template = format!("{}/releases/tags/v{{tag}}", server.uri());
         with_release_by_tag_override(&template, async {
-            let err = fetch_github_release_published_at("0.42.0")
+            let err = fetch_github_release("0.42.0")
                 .await
                 .expect_err("the response tag must match the requested release");
             match err {
@@ -2199,7 +2269,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_github_release_published_at_rejects_oversized_body() {
+    async fn fetch_github_release_rejects_oversized_body() {
         const RESPONSE_CAP: usize = 4 * 1024 * 1024;
         let server = wiremock::MockServer::start().await;
         let mut body = String::with_capacity(RESPONSE_CAP + 128);
@@ -2217,7 +2287,7 @@ mod tests {
 
         let template = format!("{}/releases/tags/v{{tag}}", server.uri());
         with_release_by_tag_override(&template, async {
-            let error = fetch_github_release_published_at("0.42.0")
+            let error = fetch_github_release("0.42.0")
                 .await
                 .expect_err("oversized release response must be rejected");
             assert!(error.to_string().contains("exceeds cap"));
@@ -2244,7 +2314,7 @@ mod tests {
             (RELEASE_BY_TAG_OVERRIDE_KEY, template.into()),
             ("GITHUB_TOKEN", "must-not-leave-github".into()),
         ]);
-        fetch_github_release_published_at("0.42.0")
+        fetch_github_release("0.42.0")
             .await
             .expect("override response must parse");
 
@@ -2260,7 +2330,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_github_release_published_at_errors_on_404() {
+    async fn fetch_github_release_reports_missing_tag_as_not_found() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/releases/tags/v9.9.9"))
@@ -2270,7 +2340,7 @@ mod tests {
 
         let template = format!("{}/releases/tags/v{{tag}}", server.uri());
         with_release_by_tag_override(&template, async {
-            let err = fetch_github_release_published_at("9.9.9")
+            let err = fetch_github_release("9.9.9")
                 .await
                 .expect_err("404 must surface");
             assert!(
@@ -2282,7 +2352,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_github_release_published_at_errors_on_missing_field() {
+    async fn fetch_github_release_rejects_missing_published_at() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/releases/tags/v0.42.0"))
@@ -2296,7 +2366,7 @@ mod tests {
 
         let template = format!("{}/releases/tags/v{{tag}}", server.uri());
         with_release_by_tag_override(&template, async {
-            let err = fetch_github_release_published_at("0.42.0")
+            let err = fetch_github_release("0.42.0")
                 .await
                 .expect_err("missing published_at must surface");
             match err {
@@ -2310,7 +2380,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_github_release_published_at_errors_on_malformed_timestamp() {
+    async fn fetch_github_release_rejects_non_rfc3339_published_at() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/releases/tags/v0.42.0"))
@@ -2325,7 +2395,7 @@ mod tests {
 
         let template = format!("{}/releases/tags/v{{tag}}", server.uri());
         with_release_by_tag_override(&template, async {
-            let err = fetch_github_release_published_at("0.42.0")
+            let err = fetch_github_release("0.42.0")
                 .await
                 .expect_err("malformed timestamp must surface");
             match err {
