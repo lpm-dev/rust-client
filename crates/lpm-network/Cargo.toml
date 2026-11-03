@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dependencies]
 lpm-common = { workspace = true }
-if-addrs = "0.13"
+if-addrs = "0.15"
 qrcode = "0.14"
 serde = { workspace = true }
 serde_json = { workspace = true }

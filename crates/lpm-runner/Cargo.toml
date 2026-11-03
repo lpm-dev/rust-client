@@ -40,7 +40,7 @@ oxc_ast = "=0.157.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-signal-hook = "0.3"
+signal-hook = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 dirs = { workspace = true }
