@@ -2,36 +2,21 @@ use super::*;
 
 /// Try to use the lockfile as a fast path.
 ///
-/// Returns `Some(LockfileFastPath { packages, lockfile,
-/// needs_binary_upgrade })` if the lockfile exists AND every declared
-/// dependency in package.json has a matching entry in the lockfile.
-/// Otherwise returns `None` to signal that fresh resolution is needed.
+/// Returns `Some(LockfileFastPath)` if the lockfile exists and every declared
+/// dependency in package.json has a matching entry in it. Otherwise returns
+/// `None` to signal that fresh resolution is needed.
 ///
-/// The parsed `Lockfile` is returned alongside the install packages so
-/// the install driver can patch `LockedPackage.tarball` and re-emit
-/// the lockfile on the generalized-writeback path without re-parsing.
-/// The `needs_binary_upgrade` flag
-/// tells the driver whether a rewrite is needed even when no URL
-/// diverged (e.g., pre-existing v1 `lpm.lockb` on disk, or missing
-/// entirely — migration completes on first fast-path install
-/// instead of being deferred to the next fresh resolve).
-/// Return type for [`try_lockfile_fast_path`]. Carries the parsed
-/// lockfile back to the install driver (so it can be patched + re-
-/// written on the generalized-writeback path) alongside the install
-/// packages derived from it, plus a `needs_binary_upgrade` flag
-/// indicating that the binary lockfile is missing or out-of-version
-/// and should be re-emitted at install-end (the fast-path install
-/// itself doesn't normally write the lockfile).
+/// The parsed `Lockfile` is returned alongside the install packages so the
+/// install driver can patch `LockedPackage.tarball` and re-emit the lockfile
+/// on the writeback path without re-parsing.
 pub(super) struct LockfileFastPath {
     pub(super) packages: Vec<InstallPackage>,
     /// Shared parsed lockfile. The writeback path clones it lazily only when
     /// fields actually need to change.
     pub(super) lockfile: Arc<lpm_lockfile::Lockfile>,
-    /// True when the v2 `lpm.lockb` was missing or opened with
-    /// `UnsupportedVersion`. Triggers a writeback even when no URL
-    /// diverged — otherwise the migration from a v1 binary (or no
-    /// binary at all) would never complete on fast-path-only runs.
-    pub(super) needs_binary_upgrade: bool,
+    /// An `lpm.lockb` from an earlier LPM CLI sits beside the lockfile, and
+    /// the install removes it.
+    pub(super) obsolete_binary_lockfile: bool,
 }
 
 pub(super) const MIN_LOCKFILE_VERSION_WITH_AUTHORITATIVE_PEER_STATE: u32 = 2;
@@ -194,7 +179,7 @@ pub(super) struct OnlineLockfileWritePhaseInput<'a> {
     pub(super) frozen_lockfile_active: bool,
     pub(super) fast_path_lockfile: Option<Arc<lpm_lockfile::Lockfile>>,
     pub(super) fresh_urls: &'a HashMap<String, String>,
-    pub(super) needs_binary_upgrade: bool,
+    pub(super) obsolete_binary_lockfile: bool,
     pub(super) json_output: bool,
 }
 
@@ -234,7 +219,7 @@ pub(super) fn run_online_lockfile_write_phase(
             input.current_lockfile_patches,
             input.current_importer_snapshot,
             input.fresh_urls,
-            input.needs_binary_upgrade,
+            input.obsolete_binary_lockfile,
             input.json_output,
         )?
     {
@@ -525,18 +510,22 @@ fn rewrite_fast_path_lockfile_if_needed(
     current_lockfile_patches: &lpm_lockfile::LockfilePatches,
     current_importer_snapshot: &lpm_lockfile::ImporterSnapshot,
     fresh_urls: &HashMap<String, String>,
-    needs_binary_upgrade: bool,
+    obsolete_binary_lockfile: bool,
     json_output: bool,
 ) -> Result<Option<u128>, LpmError> {
     let reasons = FastPathLockfileRewriteReasons {
         fresh_url_count: fresh_urls.len(),
-        binary_writeback: needs_binary_upgrade,
         importer_snapshot_changed: lockfile.importers.get(".") != Some(current_importer_snapshot),
         patch_records_changed: lockfile.patches != *current_lockfile_patches,
         schema_version_changed: lockfile.metadata.lockfile_version < lpm_lockfile::LOCKFILE_VERSION,
     };
 
     if !reasons.requires_write() {
+        if obsolete_binary_lockfile {
+            lpm_lockfile::remove_obsolete_binary_lockfile(lockfile_path)
+                .map_err(|error| LpmError::Registry(error.to_string()))?;
+            emit_obsolete_binary_lockfile_notice(json_output);
+        }
         return Ok(None);
     }
 
@@ -570,13 +559,15 @@ fn rewrite_fast_path_lockfile_if_needed(
     }
     let write_ms = write_lockfile_and_measure(&lockfile, lockfile_path, "rewrite")?;
     emit_fast_path_lockfile_rewrite_notice(json_output, reasons);
+    if obsolete_binary_lockfile {
+        emit_obsolete_binary_lockfile_notice(json_output);
+    }
     Ok(Some(write_ms))
 }
 
 #[derive(Clone, Copy)]
 struct FastPathLockfileRewriteReasons {
     fresh_url_count: usize,
-    binary_writeback: bool,
     importer_snapshot_changed: bool,
     patch_records_changed: bool,
     schema_version_changed: bool,
@@ -585,7 +576,6 @@ struct FastPathLockfileRewriteReasons {
 impl FastPathLockfileRewriteReasons {
     fn requires_write(self) -> bool {
         self.fresh_url_count > 0
-            || self.binary_writeback
             || self.importer_snapshot_changed
             || self.patch_records_changed
             || self.schema_version_changed
@@ -648,20 +638,17 @@ fn emit_fast_path_lockfile_rewrite_notice(
 }
 
 fn fast_path_lockfile_rewrite_notice(reasons: FastPathLockfileRewriteReasons) -> Option<String> {
-    if reasons.fresh_url_count > 0 && reasons.binary_writeback {
-        Some(format!(
-            "Refreshed {} stale tarball URL(s) and reconciled the binary lockfile companion",
-            reasons.fresh_url_count,
-        ))
-    } else if reasons.fresh_url_count > 0 {
-        Some(format!(
+    (reasons.fresh_url_count > 0).then(|| {
+        format!(
             "Refreshed {} stale tarball URL(s) in lockfile",
             reasons.fresh_url_count,
-        ))
-    } else if reasons.binary_writeback {
-        Some("Reconciled the binary lockfile companion".to_string())
-    } else {
-        None
+        )
+    })
+}
+
+fn emit_obsolete_binary_lockfile_notice(json_output: bool) {
+    if !json_output {
+        output::info("Removed lpm.lockb, which LPM CLI no longer uses");
     }
 }
 
@@ -2936,7 +2923,7 @@ fn try_lockfile_fast_path_from_rows(
     package_rows: &[&lpm_lockfile::LockedPackage],
     input: TryLockfileFastPathInput<'_>,
 ) -> Option<LockfileFastPath> {
-    let needs_binary_upgrade = binary_lockfile_needs_writeback(input.lockfile_path, lockfile);
+    let obsolete_binary_lockfile = obsolete_binary_lockfile_exists(input.lockfile_path);
 
     if !lockfile_satisfies_fast_path_with_packages_and_optional_roots(
         lockfile,
@@ -3210,7 +3197,7 @@ fn try_lockfile_fast_path_from_rows(
     Some(LockfileFastPath {
         packages,
         lockfile: Arc::clone(lockfile),
-        needs_binary_upgrade,
+        obsolete_binary_lockfile,
     })
 }
 
@@ -3651,7 +3638,6 @@ mod rewrite_notice_tests {
     fn fast_path_lockfile_notice_is_absent_for_importer_only_rewrite() {
         let notice = fast_path_lockfile_rewrite_notice(FastPathLockfileRewriteReasons {
             fresh_url_count: 0,
-            binary_writeback: false,
             importer_snapshot_changed: true,
             patch_records_changed: false,
             schema_version_changed: false,
@@ -3660,24 +3646,6 @@ mod rewrite_notice_tests {
         assert_eq!(
             notice, None,
             "repairing TOML-only importer metadata must stay silent",
-        );
-    }
-
-    #[test]
-    fn fast_path_lockfile_notice_describes_binary_write_without_claiming_upgrade() {
-        let notice = fast_path_lockfile_rewrite_notice(FastPathLockfileRewriteReasons {
-            fresh_url_count: 0,
-            binary_writeback: true,
-            importer_snapshot_changed: false,
-            patch_records_changed: false,
-            schema_version_changed: false,
-        })
-        .expect("binary writeback should have a notice");
-
-        assert!(notice.contains("Reconciled the binary lockfile companion"));
-        assert!(
-            !notice.contains("Upgraded"),
-            "a missing or stale sidecar is not necessarily an old format: {notice}",
         );
     }
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::{
     LOCKFILE_NAME, LOCKFILE_VERSION, Lockfile, LockfileError, TOML_LOCKFILE_SIZE_CAP_BYTES,
-    ValidatedLockfile, binary,
+    ValidatedLockfile,
 };
 
 fn read_authoritative_toml(path: &Path) -> Result<String, LockfileError> {
@@ -213,13 +213,8 @@ impl Lockfile {
         lockfile.validate_peer_edge_targets()?;
         lockfile.validate_instance_graph()?;
 
-        // Reject empty-string optional fields at the TOML layer,
-        // matching the binary writer's rejection. Without this, a
-        // hand-edited or malformed `tarball = ""` / `source = ""` /
-        // `integrity = ""` would parse cleanly here and only fail
-        // later in `write_all` when the binary writer's
-        // `insert_optional` helper fires. Failing loud at the parse
-        // boundary avoids that asymmetric late failure.
+        // An empty `tarball`, `source` or `integrity` would otherwise
+        // parse as a present value that names nothing.
         for pkg in lockfile
             .packages
             .iter()
@@ -229,9 +224,7 @@ impl Lockfile {
                 && s.is_empty()
             {
                 return Err(LockfileError::Deserialize(format!(
-                    "package '{}' has empty 'source' — empty strings \
-                     are not distinguishable from `None` in the binary \
-                     format and are invalid input",
+                    "package '{}' has an empty 'source'; omit the field instead",
                     pkg.name
                 )));
             }
@@ -239,9 +232,7 @@ impl Lockfile {
                 && s.is_empty()
             {
                 return Err(LockfileError::Deserialize(format!(
-                    "package '{}' has empty 'integrity' — empty strings \
-                     are not distinguishable from `None` in the binary \
-                     format and are invalid input",
+                    "package '{}' has an empty 'integrity'; omit the field instead",
                     pkg.name
                 )));
             }
@@ -249,9 +240,7 @@ impl Lockfile {
                 && s.is_empty()
             {
                 return Err(LockfileError::Deserialize(format!(
-                    "package '{}' has empty 'tarball' — empty strings \
-                     are not distinguishable from `None` in the binary \
-                     format and are invalid input",
+                    "package '{}' has an empty 'tarball'; omit the field instead",
                     pkg.name
                 )));
             }
@@ -272,8 +261,7 @@ impl Lockfile {
                 )));
             }
 
-            // Scope-pin `@lpm.dev/*` to the lpm.dev origin. The binary
-            // reader runs the same check via `validate_loaded_packages`.
+            // Scope-pin `@lpm.dev/*` to the lpm.dev origin.
             if let Some(source) = pkg.lpm_scope_origin_mismatch() {
                 return Err(LockfileError::InvalidScopeOrigin {
                     package: pkg.name.clone(),
@@ -309,49 +297,13 @@ impl Lockfile {
         Self::from_toml(&content)
     }
 
-    /// Write authoritative TOML and any supported binary companion.
-    /// Each file replacement is atomic. For TOML-only graphs, remove an obsolete
-    /// companion without following symlinks and report cleanup failures.
+    /// Write the lockfile and remove an obsolete `lpm.lockb` beside it.
     pub fn write_all(&self, toml_path: &Path) -> Result<(), LockfileError> {
         self.write_to_file(toml_path)?;
-        let binary_path = toml_path.with_extension("lockb");
-        if binary::binary_format_supports(self) {
-            binary::write_binary(self, &binary_path)?;
-        } else {
-            self.remove_obsolete_binary(toml_path)?;
-        }
-        Ok(())
-    }
-
-    /// Remove an obsolete companion without rewriting authoritative TOML or
-    /// following a companion symlink. Legacy representable graphs keep it.
-    pub fn remove_obsolete_binary(&self, toml_path: &Path) -> Result<(), LockfileError> {
-        if binary::binary_format_supports(self) {
-            return Ok(());
-        }
-        let binary_path = toml_path.with_extension("lockb");
-        match std::fs::remove_file(&binary_path) {
-            Ok(()) => tracing::debug!(
-                path = %binary_path.display(),
-                "removed obsolete binary lockfile for TOML-only graph"
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(LockfileError::Io(format!(
-                    "failed to remove obsolete binary lockfile {}: {error}",
-                    binary_path.display()
-                )));
-            }
-        }
-        Ok(())
+        remove_obsolete_binary_lockfile(toml_path)
     }
 
     /// Read the authoritative TOML lockfile.
-    ///
-    /// `lpm.lockb` remains a generated companion that `doctor` and install
-    /// writeback can validate/regenerate, but it is not trusted as an install
-    /// input. A committed binary cache is opaque in code review, so the
-    /// human-readable TOML form is what commands execute.
     pub fn read_fast(toml_path: &Path) -> Result<Self, LockfileError> {
         Self::read_from_file(toml_path)
     }
@@ -359,6 +311,24 @@ impl Lockfile {
     /// Check if a lockfile exists at the given path.
     pub fn exists(path: &Path) -> bool {
         path.exists()
+    }
+}
+
+/// Remove the `lpm.lockb` that earlier LPM CLI versions wrote beside
+/// `toml_path`. Nothing reads it any more. A symlink is removed, not followed,
+/// and a failure other than a missing file is reported.
+pub fn remove_obsolete_binary_lockfile(toml_path: &Path) -> Result<(), LockfileError> {
+    let binary_path = toml_path.with_file_name(crate::OBSOLETE_BINARY_LOCKFILE_NAME);
+    match std::fs::remove_file(&binary_path) {
+        Ok(()) => {
+            tracing::debug!(path = %binary_path.display(), "removed obsolete binary lockfile");
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(LockfileError::Io(format!(
+            "failed to remove obsolete binary lockfile {}: {error}",
+            binary_path.display()
+        ))),
     }
 }
 

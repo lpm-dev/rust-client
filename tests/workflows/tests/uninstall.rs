@@ -171,11 +171,8 @@ fn uninstall_preserves_lpm_lock_after_removal() {
     );
 }
 
-/// The binary lockfile is committed as the twin of `lpm.lock`, not an
-/// independent cache. Uninstall must therefore preserve `lpm.lockb`
-/// alongside the rewritten text lockfile so the pair stays in sync.
 #[test]
-fn uninstall_preserves_lpm_lockb_alongside_lpm_lock_after_removal() {
+fn uninstall_removes_a_leftover_lpm_lockb_when_it_rewrites_lpm_lock() {
     let project = TempProject::empty("");
     seed_installed_package(&project, "drop-lockb", "2.0.0");
     std::fs::write(
@@ -202,8 +199,8 @@ fn uninstall_preserves_lpm_lockb_alongside_lpm_lock_after_removal() {
         "lpm.lock must remain after uninstall"
     );
     assert!(
-        project.path().join("lpm.lockb").exists(),
-        "lpm.lockb must remain alongside lpm.lock after uninstall"
+        !project.path().join("lpm.lockb").exists(),
+        "uninstall must remove the leftover lpm.lockb"
     );
 }
 

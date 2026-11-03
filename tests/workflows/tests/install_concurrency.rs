@@ -24,7 +24,7 @@
 //!   `.lpm` is a regular file. Cross-platform via `#[cfg]`.
 //!
 //! - **Category E — partial state recovery.** Stale install-hash,
-//!   truncated `lpm.lockb`, partial `node_modules/`.
+//!   a leftover truncated `lpm.lockb`, partial `node_modules/`.
 //!
 //! - **Category F — WAL recovery hook.** Proves
 //!   [`lpm_global::recover()`](../../../crates/lpm-global/src/recover.rs) fires
@@ -2273,12 +2273,12 @@ async fn install_with_partial_node_modules_re_links_to_full_state() {
     );
 }
 
-/// **E.3 — `lpm install` ignores an obsolete truncated `lpm.lockb`.**
+/// **E.3 — `lpm install` removes an obsolete truncated `lpm.lockb`.**
 ///
-/// V13 lockfiles are TOML-only. If an obsolete binary companion remains and
-/// is corrupt, install must use the authoritative TOML without panicking.
+/// LPM CLI no longer reads `lpm.lockb`. A leftover one, even a corrupt one,
+/// must not affect the install, which removes it and leaves `lpm.lock` alone.
 #[tokio::test]
-async fn install_with_truncated_lockb_falls_back_to_toml() {
+async fn install_removes_a_truncated_leftover_lockb() {
     let mock = MockRegistry::start().await;
     let tarball = make_tarball("binary-cache-package", "1.0.0");
     mock.with_package("binary-cache-package", "1.0.0", &tarball)
@@ -2295,40 +2295,29 @@ async fn install_with_truncated_lockb_falls_back_to_toml() {
         "setup: first install failed: {}",
         String::from_utf8_lossy(&first.stderr)
     );
+    let lockfile_before = std::fs::read(project.path().join("lpm.lock")).expect("read lpm.lock");
 
-    // Plant an obsolete truncated companion beside the authoritative TOML.
     let lockb_path = project.path().join("lpm.lockb");
     std::fs::write(&lockb_path, b"corrupt").expect("truncate lpm.lockb");
 
-    // Run install again. Must NOT panic; must produce a coherent end
-    // state (either by re-parsing lpm.lock or by re-resolving from
-    // package.json).
     let second = lpm_with_registry(&project, &mock.url())
         .args(install_args_with(&[]))
         .output()
         .expect("run second install");
-    let stderr = String::from_utf8_lossy(&second.stderr);
-    let stdout = String::from_utf8_lossy(&second.stdout);
     assert!(
-        !stderr.contains("panicked at") && !stderr.contains("note: run with `RUST_BACKTRACE"),
-        "install panicked on truncated lockb:\nstderr:\n{stderr}"
+        second.status.success(),
+        "install must ignore the leftover lpm.lockb:\nstderr:\n{}",
+        String::from_utf8_lossy(&second.stderr)
     );
-    // Even if the install fails on truncated lockb, it must do so
-    // CLEANLY (non-zero exit, no panic). We don't pin success here
-    // — the contract is "no panic, well-formed failure if any."
-    if !second.status.success() {
-        // Failure mode is OK as long as it's well-shaped. Leave as
-        // diagnostic: any actionable noun acceptable.
-        let actionable = stderr.to_lowercase().contains("lockb")
-            || stderr.to_lowercase().contains("lockfile")
-            || stderr.to_lowercase().contains("corrupt")
-            || stderr.to_lowercase().contains("parse");
-        assert!(
-            actionable,
-            "truncated-lockb failure didn't surface an actionable noun:\n\
-             stdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-    }
+    assert!(
+        !lockb_path.exists(),
+        "install must remove the leftover lpm.lockb"
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("lpm.lock")).expect("read lpm.lock"),
+        lockfile_before,
+        "removing lpm.lockb must leave lpm.lock unchanged"
+    );
 }
 
 // ─── Category F — WAL recovery hook ─────────────────────────────────

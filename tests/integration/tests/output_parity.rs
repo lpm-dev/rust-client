@@ -374,32 +374,10 @@ fn dag_cycle_detected() {
     assert!(result.unwrap_err().contains("circular"));
 }
 
-// ─── Lockfile Binary Safety ──────────────────────────────────────
+// ─── Lockfile Round Trip ─────────────────────────────────────────
 
 #[test]
-fn binary_lockfile_corrupt_data_no_panic() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("lpm.lockb");
-
-    // Various corrupt inputs — none should panic
-    for data in [
-        b"NOT_LPMB".as_slice(),
-        b"LPMB".as_slice(), // Valid magic but truncated
-        &[0u8; 1024],       // All zeros
-        b"LPMB\x01\x00\x00\x00\xFF\xFF\xFF\xFF\x00\x00\x00\x00", // Huge pkg count
-    ] {
-        std::fs::write(&path, data).unwrap();
-        // Should error, not panic
-        let result = lpm_lockfile::BinaryLockfileReader::open(&path);
-        assert!(
-            matches!(result, Err(_) | Ok(None)),
-            "Should not panic on corrupt data"
-        );
-    }
-}
-
-#[test]
-fn binary_lockfile_roundtrip_100_packages() {
+fn lockfile_round_trip_100_packages() {
     let mut lf = lpm_lockfile::Lockfile::new();
     lf.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS;
     for i in 0..100 {

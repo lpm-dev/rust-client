@@ -154,7 +154,6 @@ version-ranges = "0.1"
 # Lockfile
 toml = "1"
 toml_edit = "0.25"
-memmap2 = "0.9"
 
 # Auth / secure storage
 keyring-core = "1.0.1"

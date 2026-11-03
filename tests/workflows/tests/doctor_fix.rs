@@ -47,6 +47,10 @@ fn seed_minimal_lockfile(project: &TempProject) {
     project.write_file("lpm.lock", "[metadata]\nlockfile-version = 1\n");
 }
 
+fn seed_leftover_binary_lockfile(project: &TempProject) {
+    project.write_file("lpm.lockb", "LPMB written by an earlier LPM CLI");
+}
+
 fn current_bun_asset_name() -> String {
     format!(
         "bun-{}.zip",
@@ -205,13 +209,14 @@ fn doctor_all_fix_does_not_add_a_gitattributes() {
     assert!(!stdout.contains("gitattributes"), "{stdout}");
 }
 
-// ─── lockfile_binary_missing fix ──────────────────────────────────────
+// ─── lockfile_binary_obsolete fix ─────────────────────────────────────
 
 #[test]
 fn doctor_fix_without_yes_in_noninteractive_session_refuses_before_mutation() {
     let project = TempProject::empty(r#"{"name":"doctor-confirm","version":"1.0.0"}"#);
     seed_healthy_hoisted_install(&project);
     seed_minimal_lockfile(&project);
+    seed_leftover_binary_lockfile(&project);
 
     let output = lpm_doctor_offline(&project)
         .arg("doctor")
@@ -228,7 +233,7 @@ fn doctor_fix_without_yes_in_noninteractive_session_refuses_before_mutation() {
         "the refusal must explain how to confirm automatic fixes"
     );
     assert!(
-        !project.file_exists("lpm.lockb"),
+        project.file_exists("lpm.lockb"),
         "doctor must not apply a fix before confirmation"
     );
 }
@@ -238,6 +243,7 @@ fn doctor_fix_json_without_yes_emits_one_error_and_does_not_mutate() {
     let project = TempProject::empty(r#"{"name":"doctor-confirm-json","version":"1.0.0"}"#);
     seed_healthy_hoisted_install(&project);
     seed_minimal_lockfile(&project);
+    seed_leftover_binary_lockfile(&project);
 
     let output = lpm_doctor_offline(&project)
         .args(["--json", "doctor", "--fix"])
@@ -261,21 +267,18 @@ fn doctor_fix_json_without_yes_emits_one_error_and_does_not_mutate() {
     );
     insta::assert_json_snapshot!("doctor_fix_requires_yes", envelope);
     assert!(
-        !project.file_exists("lpm.lockb"),
+        project.file_exists("lpm.lockb"),
         "JSON mode must not apply a fix before confirmation"
     );
 }
 
 #[test]
-fn doctor_fix_regenerates_binary_lockfile_when_toml_present() {
+fn doctor_fix_removes_a_leftover_binary_lockfile() {
     let project = TempProject::empty(r#"{"name":"doctor-lockb","version":"1.0.0"}"#);
     seed_healthy_hoisted_install(&project);
     seed_minimal_lockfile(&project);
-    // No lpm.lockb on disk yet.
-    assert!(
-        !project.file_exists("lpm.lockb"),
-        "preconditions: lpm.lockb must not exist before --fix"
-    );
+    seed_leftover_binary_lockfile(&project);
+    let lockfile = std::fs::read(project.path().join("lpm.lock")).unwrap();
 
     let output = lpm_doctor_offline(&project)
         .arg("doctor")
@@ -291,13 +294,18 @@ fn doctor_fix_regenerates_binary_lockfile_when_toml_present() {
     );
 
     assert!(
-        project.file_exists("lpm.lockb"),
-        "doctor --fix must regenerate lpm.lockb when lpm.lock is present and the binary is missing\noutput:\n{combined}"
+        !project.file_exists("lpm.lockb"),
+        "doctor --fix must remove the leftover lpm.lockb\noutput:\n{combined}"
+    );
+    assert_eq!(
+        std::fs::read(project.path().join("lpm.lock")).unwrap(),
+        lockfile,
+        "removing lpm.lockb must leave lpm.lock unchanged"
     );
 }
 
 #[test]
-fn doctor_fix_lockfile_binary_write_failure_uses_slim_error() {
+fn doctor_fix_binary_lockfile_removal_failure_uses_slim_error() {
     let project = TempProject::empty(r#"{"name":"doctor-lockb-dir","version":"1.0.0"}"#);
     seed_healthy_hoisted_install(&project);
     seed_minimal_lockfile(&project);
@@ -313,7 +321,7 @@ fn doctor_fix_lockfile_binary_write_failure_uses_slim_error() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("✗ reconcile lpm.lockb failed:"),
+        stderr.contains("✗ remove lpm.lockb failed:"),
         "doctor auto-fix failure must use a slim failure line, got:\n{stderr}"
     );
     assert!(
@@ -354,6 +362,7 @@ fn doctor_fix_json_envelope_carries_fix_outcome_arrays() {
     let project = TempProject::empty(r#"{"name":"doctor-json","version":"1.0.0"}"#);
     seed_healthy_hoisted_install(&project);
     seed_minimal_lockfile(&project);
+    seed_leftover_binary_lockfile(&project);
 
     let output = lpm_doctor_offline(&project)
         .arg("--json")
@@ -375,7 +384,7 @@ fn doctor_fix_json_envelope_carries_fix_outcome_arrays() {
         .as_array()
         .expect("fixes_failed must be an array even when no fixes fail");
 
-    // Sanity: the seeded project's missing lpm.lockb gets reconciled.
+    // Sanity: the seeded leftover lpm.lockb gets removed.
     assert!(
         !fixes.is_empty(),
         "doctor --fix --json on the seeded project must report at least one fix, got: {envelope}",
@@ -387,7 +396,7 @@ fn doctor_fix_json_envelope_carries_fix_outcome_arrays() {
     assert!(
         envelope["checks"].as_array().is_some_and(|checks| checks
             .iter()
-            .all(|check| check["code"] != "lockfile_binary_missing")),
+            .all(|check| check["code"] != "lockfile_binary_obsolete")),
         "the final report must not retain the repaired lockfile finding: {envelope:#}"
     );
 }
@@ -415,10 +424,10 @@ fn doctor_fix_json_reports_a_failed_action_and_exits_nonzero() {
     assert!(
         envelope["fixes_failed"].as_array().is_some_and(|failures| {
             failures.iter().any(|failure| {
-                failure["action"] == "reconcile lpm.lockb"
-                    && failure["error"]
-                        .as_str()
-                        .is_some_and(|error| error.contains("write lockfiles failed"))
+                failure["action"] == "remove lpm.lockb"
+                    && failure["error"].as_str().is_some_and(|error| {
+                        error.contains("failed to remove obsolete binary lockfile")
+                    })
             })
         }),
         "the failed action and error must be machine-readable: {envelope:#}"

@@ -272,8 +272,8 @@ async fn flow_migrate_install_audit_lockfile_round_trips() {
         "migrate must produce lpm.lock"
     );
     assert!(
-        project.file_exists("lpm.lockb"),
-        "the v12 migration staging lockfile must retain its supported binary companion"
+        !project.file_exists("lpm.lockb"),
+        "LPM CLI no longer writes lpm.lockb"
     );
 
     // Step 2: seed the store with the package referenced in the

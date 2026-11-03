@@ -74,7 +74,7 @@ pub(in crate::commands::install) struct OnlineResolutionPhaseResult {
     pub(in crate::commands::install) resolver_stage_timing: lpm_resolver::StageTiming,
     pub(in crate::commands::install) fast_path_lockfile: Option<Arc<lpm_lockfile::Lockfile>>,
     pub(in crate::commands::install) lockfile_peer_context_authoritative: bool,
-    pub(in crate::commands::install) needs_binary_upgrade: bool,
+    pub(in crate::commands::install) obsolete_binary_lockfile: bool,
     pub(in crate::commands::install) wf_setup_ms: u128,
     pub(in crate::commands::install) wf_resolve_end_ms: u128,
     pub(in crate::commands::install) auto_isolated_peer_conflicts: bool,
@@ -206,7 +206,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
     let mut resolver_stage_timing = lpm_resolver::StageTiming::default();
     let mut fast_path_lockfile: Option<Arc<lpm_lockfile::Lockfile>> = None;
     let mut lockfile_peer_context_authoritative = false;
-    let mut needs_binary_upgrade = false;
+    let mut obsolete_binary_lockfile = false;
     let wf_setup_ms = start.elapsed().as_millis();
     let mut applied_overrides: Vec<OverrideHit> = Vec::new();
     let mut peer_conflicts: Vec<lpm_resolver::PeerConflictReport> = Vec::new();
@@ -230,7 +230,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
                 ambient_peer_installs_for_lockfile =
                     fast_path.lockfile.ambient_peer_installs.clone();
                 fast_path_lockfile = Some(fast_path.lockfile);
-                needs_binary_upgrade = fast_path.needs_binary_upgrade;
+                obsolete_binary_lockfile = fast_path.obsolete_binary_lockfile;
                 (fast_path.packages, 0u128, true, 0usize, HashMap::new())
             }
             None => {
@@ -813,7 +813,7 @@ pub(in crate::commands::install) async fn run_online_resolution_phase(
         resolver_stage_timing,
         fast_path_lockfile,
         lockfile_peer_context_authoritative,
-        needs_binary_upgrade,
+        obsolete_binary_lockfile,
         wf_setup_ms,
         wf_resolve_end_ms,
         auto_isolated_peer_conflicts,

@@ -47,7 +47,7 @@ fn isolated_wrapper_segments(project_dir: &Path) -> Vec<String> {
 // ─── Lockfile ────────────────────────────────────────────────────
 
 #[test]
-fn lockfile_toml_binary_roundtrip() {
+fn lockfile_round_trips_through_write_all() {
     let mut lf = lpm_lockfile::Lockfile::new();
     lf.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS;
     for i in 0..100 {
@@ -84,10 +84,8 @@ fn lockfile_toml_binary_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
     let toml_path = dir.path().join("lpm.lock");
 
-    // Write both formats
     lf.write_all(&toml_path).unwrap();
 
-    // Read via fast path (binary preferred)
     let restored = lpm_lockfile::Lockfile::read_fast(&toml_path).unwrap();
     assert_eq!(lf.packages.len(), restored.packages.len());
 
@@ -101,7 +99,7 @@ fn lockfile_toml_binary_roundtrip() {
 }
 
 #[test]
-fn lockfile_binary_corrupt_falls_back_to_toml() {
+fn lockfile_read_ignores_a_leftover_binary_lockfile() {
     let mut lf = lpm_lockfile::Lockfile::new();
     lf.metadata.lockfile_version = lpm_lockfile::LOCKFILE_VERSION_WITH_STRUCTURED_PEERS;
     lf.add_package(lpm_lockfile::LockedPackage {
@@ -134,11 +132,8 @@ fn lockfile_binary_corrupt_falls_back_to_toml() {
     let binary_path = dir.path().join("lpm.lockb");
 
     lf.write_all(&toml_path).unwrap();
-
-    // Corrupt binary
     std::fs::write(&binary_path, b"GARBAGE_DATA_NOT_LPMB").unwrap();
 
-    // Should fall back to TOML
     let restored = lpm_lockfile::Lockfile::read_fast(&toml_path).unwrap();
     assert_eq!(restored.packages.len(), 1);
     assert_eq!(restored.packages[0].name, "express");
@@ -434,9 +429,8 @@ fn migrate_writes_valid_lockfile() {
         "lpm.lock should not be empty"
     );
 
-    // Verify binary lockfile was also created
     let lockb_path = dir.path().join("lpm.lockb");
-    assert!(lockb_path.exists(), "lpm.lockb should exist");
+    assert!(!lockb_path.exists(), "LPM CLI no longer writes lpm.lockb");
 
     let restored = lpm_lockfile::Lockfile::read_from_file(&lockfile_path).unwrap();
     assert_eq!(
@@ -707,35 +701,6 @@ fn store_gc_preview_doesnt_delete() {
 
     // Verify package still exists (not deleted)
     assert!(pkg_dir.exists());
-}
-
-// ─── Binary Lockfile Bounds ──────────────────────────────────────
-
-#[test]
-fn binary_lockfile_rejects_corrupt_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("lpm.lockb");
-
-    // Write garbage
-    std::fs::write(&path, b"NOT_A_LOCKFILE_JUST_GARBAGE_DATA").unwrap();
-
-    let result = lpm_lockfile::BinaryLockfileReader::open(&path);
-    assert!(result.is_err()); // Bad magic bytes
-}
-
-#[test]
-fn binary_lockfile_handles_truncated_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("lpm.lockb");
-
-    // Write valid magic but truncated (only 8 bytes instead of 16 header)
-    let mut data = Vec::new();
-    data.extend_from_slice(b"LPMB");
-    data.extend_from_slice(&1u32.to_le_bytes()); // version
-    std::fs::write(&path, &data).unwrap();
-
-    let result = lpm_lockfile::BinaryLockfileReader::open(&path);
-    assert!(result.is_err()); // Too small
 }
 
 // ─── Workspace + Fixture Integration ─────────────────────────────

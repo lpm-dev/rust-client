@@ -6760,8 +6760,8 @@ mod tests {
         let lines: Vec<&str> = on_disk.lines().collect();
         assert_eq!(
             lines.len(),
-            9,
-            "install-hash MUST contain 9 lines (hash + m: + l: + i: + p: + a: + e: + n: + b:), got:\n{on_disk}\n\
+            8,
+            "install-hash MUST contain 8 lines (hash + m: + l: + i: + p: + a: + e: + n:), got:\n{on_disk}\n\
              A bare-hash overwrite anywhere in the dev path would fail here."
         );
         assert_eq!(lines[0].len(), 64, "line 1 must be a SHA-256 hex hash");
@@ -6800,10 +6800,6 @@ mod tests {
         assert_eq!(
             lines[7], "n:none",
             "line 8 must reserve Node runtime fingerprint metadata"
-        );
-        assert_eq!(
-            lines[8], "b:not-required",
-            "line 9 must record that importer state is TOML-only"
         );
 
         // Round-trip: needs_install reads the complete shape as up-to-date.

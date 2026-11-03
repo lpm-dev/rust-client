@@ -1385,7 +1385,7 @@ async fn run_with_options_under_store_lock(
         resolver_stage_timing,
         fast_path_lockfile,
         lockfile_peer_context_authoritative,
-        needs_binary_upgrade,
+        obsolete_binary_lockfile,
         wf_setup_ms,
         wf_resolve_end_ms,
         auto_isolated_peer_conflicts,
@@ -1946,7 +1946,7 @@ async fn run_with_options_under_store_lock(
         frozen_lockfile_active,
         fast_path_lockfile,
         fresh_urls: &fresh_urls,
-        needs_binary_upgrade,
+        obsolete_binary_lockfile,
         json_output,
     })?;
     let wf_tail_lockfile_write_ms = lockfile_write_result.write_ms;

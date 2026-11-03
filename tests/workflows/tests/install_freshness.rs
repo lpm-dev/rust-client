@@ -1043,7 +1043,7 @@ async fn bare_install_repairs_unexpected_sidecars_after_manifest_mtime_changes()
     install(&project, &mock.url()).assert().success();
     bare_install(&project).assert().success();
     let original_hash = project.read_file(".lpm/install-hash");
-    assert!(original_hash.contains("b:not-required"));
+    assert!(!original_hash.lines().any(|line| line.starts_with("b:")));
     let manifest = project.read_file("package.json");
     project.write_file("package.json", &format!("{manifest}\n"));
     bare_install(&project)

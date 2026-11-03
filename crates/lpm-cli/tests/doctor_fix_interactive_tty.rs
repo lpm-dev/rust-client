@@ -38,6 +38,11 @@ mod tty {
             "[metadata]\nlockfile-version = 1\n",
         )
         .expect("seed lpm.lock");
+        std::fs::write(
+            project.join("lpm.lockb"),
+            b"LPMB written by an earlier LPM CLI",
+        )
+        .expect("seed lpm.lockb");
     }
 
     fn run_doctor_fix_in_pty(
@@ -167,11 +172,11 @@ mod tty {
 
         assert!(status.success(), "doctor failed:\n{transcript}");
         assert!(
-            project.path().join("lpm.lockb").exists(),
+            !project.path().join("lpm.lockb").exists(),
             "accepted confirmation must apply the planned fix\n{transcript}"
         );
         assert!(
-            transcript.contains("reconcile lpm.lockb"),
+            transcript.contains("remove lpm.lockb"),
             "the plan must list the lockfile action\n{transcript}"
         );
         assert!(
@@ -191,7 +196,7 @@ mod tty {
 
         assert!(!status.success(), "declined doctor unexpectedly succeeded");
         assert!(
-            !project.path().join("lpm.lockb").exists(),
+            project.path().join("lpm.lockb").exists(),
             "declined confirmation must not apply the planned fix\n{transcript}"
         );
         assert!(

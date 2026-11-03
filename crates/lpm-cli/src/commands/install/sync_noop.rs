@@ -207,32 +207,16 @@ mod tests {
     }
 
     #[test]
-    fn lpm_package_in_binary_lockfile_requires_install_pipeline() {
+    fn leftover_binary_lockfile_cannot_hide_lpm_package_from_the_lockfile() {
         let directory = tempfile::tempdir().unwrap();
-        let lockfile = lockfile_with_packages(&["react", "@lpm.dev/bob.beta"]);
-        lockfile
+        lockfile_with_packages(&["react", "@lpm.dev/alice.alpha"])
             .write_to_file(&directory.path().join(lpm_lockfile::LOCKFILE_NAME))
             .unwrap();
-        lpm_lockfile::binary::write_binary(
-            &lockfile,
-            &directory.path().join(lpm_lockfile::BINARY_LOCKFILE_NAME),
-        )
-        .unwrap();
-
-        assert!(lockfile_contains_lpm_package(directory.path()));
-    }
-
-    #[test]
-    fn binary_lockfile_cannot_hide_lpm_package_from_authoritative_toml() {
-        let directory = tempfile::tempdir().unwrap();
-        let authoritative = lockfile_with_packages(&["react", "@lpm.dev/alice.alpha"]);
-        authoritative
-            .write_to_file(&directory.path().join(lpm_lockfile::LOCKFILE_NAME))
-            .unwrap();
-        let crafted_binary = lockfile_with_packages(&["react"]);
-        lpm_lockfile::binary::write_binary(
-            &crafted_binary,
-            &directory.path().join(lpm_lockfile::BINARY_LOCKFILE_NAME),
+        std::fs::write(
+            directory
+                .path()
+                .join(lpm_lockfile::OBSOLETE_BINARY_LOCKFILE_NAME),
+            b"LPMB lists only react",
         )
         .unwrap();
 

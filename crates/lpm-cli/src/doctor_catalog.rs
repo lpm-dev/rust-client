@@ -92,7 +92,7 @@ pub enum DoctorFix {
     ReplaceNodeModulesLink,
     PruneStore,
     InstallProject,
-    ReconcileBinaryLockfile,
+    RemoveObsoleteBinaryLockfile,
     InstallNodeSpec,
     InstallNode22,
     InstallBunSpec,
@@ -108,7 +108,7 @@ impl DoctorFix {
             Self::ReplaceNodeModulesLink => "lpm doctor --fix",
             Self::PruneStore => "lpm cache prune --apply",
             Self::InstallProject => "lpm install",
-            Self::ReconcileBinaryLockfile => "reconcile lpm.lockb",
+            Self::RemoveObsoleteBinaryLockfile => "remove lpm.lockb",
             Self::InstallNodeSpec => "lpm use node@<spec>",
             Self::InstallNode22 => "lpm use node@22",
             Self::InstallBunSpec => "lpm use bun@<spec>",
@@ -756,52 +756,16 @@ pub static LOCKFILE_CORRUPT: CheckEntry = CheckEntry {
     auto_fix: None,
 };
 
-pub static LOCKFILE_BINARY_VALID: CheckEntry = CheckEntry {
-    code: "lockfile_binary_valid",
+pub static LOCKFILE_BINARY_OBSOLETE: CheckEntry = CheckEntry {
+    code: "lockfile_binary_obsolete",
     name: "Binary lockfile",
     category: Category::ProjectState,
     tier: Tier::Fast,
-    description: "`lpm.lockb` matches `lpm.lock` and parses cleanly.",
-    when_fires: "Both lockfiles agree.",
-    remediation: "No action — informational pass.",
-    possible_severities: &[Severity::Pass],
-    auto_fix: None,
-};
-
-pub static LOCKFILE_BINARY_MISSING: CheckEntry = CheckEntry {
-    code: "lockfile_binary_missing",
-    name: "Binary lockfile",
-    category: Category::ProjectState,
-    tier: Tier::Fast,
-    description: "`lpm.lockb` is missing while `lpm.lock` is present.",
-    when_fires: "Only the TOML lockfile is on disk and the graph fits the binary lockfile format.",
-    remediation: "Run `lpm doctor --fix` to regenerate, or run `lpm install`.",
+    description: "An `lpm.lockb` from an earlier LPM CLI is on disk. LPM CLI no longer reads or writes it.",
+    when_fires: "`lpm.lockb` exists beside `lpm.lock`.",
+    remediation: "Run `lpm doctor --fix` or `lpm install` to remove it, then commit the removal.",
     possible_severities: &[Severity::Warn],
-    auto_fix: Some(DoctorFix::ReconcileBinaryLockfile),
-};
-
-pub static LOCKFILE_BINARY_STALE: CheckEntry = CheckEntry {
-    code: "lockfile_binary_stale",
-    name: "Binary lockfile",
-    category: Category::ProjectState,
-    tier: Tier::Fast,
-    description: "`lpm.lockb` does not match the contents of `lpm.lock`.",
-    when_fires: "TOML lockfile changed but the binary mirror was not regenerated, or stale binary bytes remain for a TOML-only graph.",
-    remediation: "Run `lpm doctor --fix` to reconcile, or run `lpm install`.",
-    possible_severities: &[Severity::Warn],
-    auto_fix: Some(DoctorFix::ReconcileBinaryLockfile),
-};
-
-pub static LOCKFILE_BINARY_CORRUPT: CheckEntry = CheckEntry {
-    code: "lockfile_binary_corrupt",
-    name: "Binary lockfile",
-    category: Category::ProjectState,
-    tier: Tier::Fast,
-    description: "`lpm.lockb` does not parse as a valid binary lockfile.",
-    when_fires: "Binary lockfile bytes are truncated, mis-versioned, or otherwise unreadable.",
-    remediation: "Run `lpm doctor --fix` to reconcile from `lpm.lock`.",
-    possible_severities: &[Severity::Warn],
-    auto_fix: Some(DoctorFix::ReconcileBinaryLockfile),
+    auto_fix: Some(DoctorFix::RemoveObsoleteBinaryLockfile),
 };
 
 pub static PROJECT_STATE_UNTRACKED: CheckEntry = CheckEntry {
@@ -2174,10 +2138,7 @@ pub static CLI_CATALOG: &[&CheckEntry] = &[
     &LOCKFILE_PRESENT,
     &LOCKFILE_MISSING,
     &LOCKFILE_CORRUPT,
-    &LOCKFILE_BINARY_VALID,
-    &LOCKFILE_BINARY_MISSING,
-    &LOCKFILE_BINARY_STALE,
-    &LOCKFILE_BINARY_CORRUPT,
+    &LOCKFILE_BINARY_OBSOLETE,
     &PROJECT_STATE_UNTRACKED,
     &PROJECT_STATE_TRACKED,
     &DEPLOY_OUTPUT_DEPENDENCIES_COMMITTABLE,

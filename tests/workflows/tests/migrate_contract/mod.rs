@@ -1009,6 +1009,10 @@ async fn migration_installs_workspace_members_once_and_restores_their_previous_l
     lpm_lockfile::Lockfile::new()
         .write_all(&project.path().join("packages/core/lpm.lock"))
         .unwrap();
+    project.write_file(
+        "packages/core/lpm.lockb",
+        "LPMB written by an earlier LPM CLI",
+    );
     let old_lock = std::fs::read(project.path().join("packages/core/lpm.lock")).unwrap();
     let old_binary = std::fs::read(project.path().join("packages/core/lpm.lockb")).ok();
     let registry = MockRegistry::start().await;
@@ -1226,6 +1230,10 @@ fn migration_snapshots_members_added_while_waiting_for_the_workspace_lock() {
     lpm_lockfile::Lockfile::new()
         .write_all(&project.path().join("packages/added/lpm.lock"))
         .unwrap();
+    project.write_file(
+        "packages/added/lpm.lockb",
+        "LPMB written by an earlier LPM CLI",
+    );
     let original = std::fs::read(project.path().join("packages/added/lpm.lock")).unwrap();
     let binary = std::fs::read(project.path().join("packages/added/lpm.lockb")).ok();
     let converted_before_lock = project.file_exists("lpm.lock");

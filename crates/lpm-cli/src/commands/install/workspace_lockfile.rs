@@ -405,9 +405,7 @@ impl WorkspaceLockfileCoordinator {
                 .as_ref()
                 .is_some_and(|existing| existing.as_lockfile() == &union)
         {
-            union
-                .remove_obsolete_binary(&path)
-                .map_err(lockfile_error)?;
+            lpm_lockfile::remove_obsolete_binary_lockfile(&path).map_err(lockfile_error)?;
             return Ok(true);
         }
         union.write_all(&path).map_err(lockfile_error)?;
@@ -881,7 +879,7 @@ pub(super) fn remove_member_lockfiles(importers: &[(String, PathBuf)]) {
     for (_, member_path) in importers {
         for name in [
             lpm_lockfile::LOCKFILE_NAME,
-            lpm_lockfile::BINARY_LOCKFILE_NAME,
+            lpm_lockfile::OBSOLETE_BINARY_LOCKFILE_NAME,
         ] {
             let path = member_path.join(name);
             if let Err(error) = std::fs::remove_file(&path)

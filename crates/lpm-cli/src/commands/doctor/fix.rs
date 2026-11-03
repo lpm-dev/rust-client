@@ -10,7 +10,7 @@ use crate::install_ui;
 
 use super::check::{Check, FixTarget};
 use super::install_fix::run_doctor_install;
-use super::lockfile::fix_binary_lockfile;
+use super::lockfile::fix_obsolete_binary_lockfile;
 
 #[derive(Default)]
 pub(super) struct FixReport {
@@ -219,10 +219,10 @@ async fn apply_one(
             run_doctor_install(client, project_dir).await?;
             Ok(Some("lpm install".into()))
         }
-        DoctorFix::ReconcileBinaryLockfile => {
-            phase(json_output, "fixing: reconciling lpm.lockb with lpm.lock");
-            fix_binary_lockfile(project_dir)
-                .map(|()| Some("reconciled lpm.lockb".into()))
+        DoctorFix::RemoveObsoleteBinaryLockfile => {
+            phase(json_output, "fixing: removing lpm.lockb");
+            fix_obsolete_binary_lockfile(project_dir)
+                .map(|()| Some("removed lpm.lockb".into()))
                 .map_err(LpmError::Script)
         }
         DoctorFix::InstallNodeSpec | DoctorFix::InstallNode22 => {
@@ -395,14 +395,14 @@ mod tests {
     #[test]
     fn planned_actions_deduplicate_actions_in_check_order() {
         let checks = vec![
-            Check::warn(&doctor_catalog::LOCKFILE_BINARY_MISSING, "missing"),
-            Check::warn(&doctor_catalog::LOCKFILE_BINARY_STALE, "stale"),
+            Check::warn(&doctor_catalog::LOCKFILE_BINARY_OBSOLETE, "root"),
+            Check::warn(&doctor_catalog::LOCKFILE_BINARY_OBSOLETE, "again"),
             Check::warn(&doctor_catalog::DEPS_SYNC_DRIFT, "drift"),
         ];
 
         assert_eq!(
             planned_actions(&checks).unwrap(),
-            vec!["reconcile lpm.lockb".to_string(), "lpm install".to_string()]
+            vec!["remove lpm.lockb".to_string(), "lpm install".to_string()]
         );
     }
 
@@ -443,8 +443,8 @@ mod tests {
     #[test]
     fn yes_bypasses_confirmation_for_noninteractive_fixes() {
         let checks = [Check::warn(
-            &doctor_catalog::LOCKFILE_BINARY_MISSING,
-            "missing",
+            &doctor_catalog::LOCKFILE_BINARY_OBSOLETE,
+            "leftover",
         )];
 
         assert!(confirm_before_apply(&checks, true, true).unwrap());
