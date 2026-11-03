@@ -2264,7 +2264,7 @@ async fn tls_proxy_routes_registered_host_to_upstream_and_marks_https() {
         .unwrap();
 
     let response = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .tls_danger_accept_invalid_certs(true)
         .resolve(
             "app.localhost",
             SocketAddr::from(([127, 0, 0, 1], proxy.port())),
@@ -2306,7 +2306,7 @@ async fn tls_frontend_terminates_https_for_a_plain_http_upstream() {
     .unwrap();
 
     let response = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .tls_danger_accept_invalid_certs(true)
         .build()
         .unwrap()
         .get(format!("https://localhost:{}/secure", frontend.port()))
@@ -2464,7 +2464,7 @@ async fn tls_frontend_caps_concurrent_handshakes_and_recovers_capacity() {
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
     let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .tls_danger_accept_invalid_certs(true)
         .timeout(Duration::from_millis(250))
         .build()
         .unwrap();

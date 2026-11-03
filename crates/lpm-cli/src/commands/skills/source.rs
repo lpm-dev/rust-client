@@ -671,7 +671,7 @@ fn github_authentication_header() -> Result<Option<reqwest::header::HeaderValue>
 }
 
 fn build_github_client() -> Result<reqwest::Client, LpmError> {
-    reqwest::Client::builder()
+    lpm_http::client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .user_agent("lpm-skills")
         .build()

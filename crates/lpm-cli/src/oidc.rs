@@ -187,7 +187,7 @@ async fn fetch_github_runtime_jwt(audience: &str) -> Result<String, LpmError> {
         .clear()
         .extend_pairs(parameters)
         .append_pair("audience", audience);
-    let client = reqwest::Client::builder()
+    let client = lpm_http::client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(15))
         .build()

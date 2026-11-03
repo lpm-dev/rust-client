@@ -2058,7 +2058,7 @@ async fn try_connect_with_token(
     // dev server's direct response, never the response after a chain
     // of redirects, so refusing them is both safer and more
     // predictable.
-    let http_client = reqwest::Client::builder()
+    let http_client = lpm_http::client_builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()

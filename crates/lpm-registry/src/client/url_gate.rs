@@ -51,7 +51,7 @@ pub fn is_https_url(url: &str) -> bool {
 }
 
 /// Pre-validate a PEM root before handing it to
-/// `reqwest::Certificate::from_pem`. Reqwest's rustls-tls `from_pem` is
+/// `reqwest::Certificate::from_pem`. Reqwest's rustls `from_pem` is
 /// permissive (stores raw bytes; cryptographic validation happens at
 /// `.build()` time), and a `.build()` failure can't tell us WHICH root
 /// caused it. This function fails fast on the common shape mistakes —

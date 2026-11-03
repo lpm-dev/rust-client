@@ -173,7 +173,7 @@ fn parse_numeric_ip_host(host: &str) -> Option<std::net::IpAddr> {
 /// arm. A legitimate Fulcio rotation would be announced as a new
 /// constant + code release, not a transparent redirect.
 fn sigstore_http_client(endpoint_url: &str) -> Result<reqwest::Client, LpmError> {
-    let builder = reqwest::Client::builder()
+    let builder = lpm_http::client_builder()
         .timeout(std::time::Duration::from_secs(SIGSTORE_HTTP_TIMEOUT_SECS))
         .redirect(reqwest::redirect::Policy::none());
     let builder = if reqwest::Url::parse(endpoint_url)
