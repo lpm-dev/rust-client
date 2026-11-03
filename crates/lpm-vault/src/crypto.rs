@@ -146,11 +146,11 @@ fn try_read_wrapping_key_from_keyring() -> Result<Option<[u8; 32]>, String> {
 
     #[cfg(not(target_os = "macos"))]
     let hex_key = {
-        let entry = keyring::Entry::new(&vault_key_service(), VAULT_KEY_ACCOUNT)
+        let entry = lpm_keyring::entry(&vault_key_service(), VAULT_KEY_ACCOUNT)
             .map_err(|error| format!("keyring entry error: {error}"))?;
         match entry.get_password() {
             Ok(value) => value,
-            Err(keyring::Error::NoEntry) => return Ok(None),
+            Err(lpm_keyring::Error::NoEntry) => return Ok(None),
             Err(error) => return Err(format!("keyring get error: {error}")),
         }
     };
@@ -176,7 +176,7 @@ fn decode_wrapping_key(encoded: &str) -> Result<[u8; 32], String> {
 #[cfg(not(target_os = "macos"))]
 fn store_wrapping_key_in_keyring(key: &[u8; 32]) -> Result<(), String> {
     let encoded = hex::encode(key);
-    let entry = keyring::Entry::new(&vault_key_service(), VAULT_KEY_ACCOUNT)
+    let entry = lpm_keyring::entry(&vault_key_service(), VAULT_KEY_ACCOUNT)
         .map_err(|error| format!("keyring entry error: {error}"))?;
     entry
         .set_password(&encoded)

@@ -111,16 +111,16 @@ struct PersonalRootStore<'a> {
 #[cfg(not(target_os = "macos"))]
 impl super::wrapping_store::NativeWrappingKeyStore for PersonalRootStore<'_> {
     fn read(&self) -> Result<Option<[u8; 32]>, String> {
-        let entry = keyring::Entry::new(&root_service(), self.account)
+        let entry = lpm_keyring::entry(&root_service(), self.account)
             .map_err(|error| format!("env root keyring entry: {error}"))?;
         match entry.get_password() {
             Ok(value) => super::decode_wrapping_key(&value).map(Some),
-            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(lpm_keyring::Error::NoEntry) => Ok(None),
             Err(error) => Err(format!("env root keyring read: {error}")),
         }
     }
     fn write(&self, candidate: &[u8; 32]) -> Result<(), String> {
-        keyring::Entry::new(&root_service(), self.account)
+        lpm_keyring::entry(&root_service(), self.account)
             .map_err(|error| format!("env root keyring entry: {error}"))?
             .set_password(&hex::encode(candidate))
             .map_err(|error| format!("env root keyring write: {error}"))

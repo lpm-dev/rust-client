@@ -1,9 +1,18 @@
+//! Credentials must reach the operating system's persistent store on every
+//! supported platform. A crate that reached a keyring crate without a
+//! platform store would keep credentials in memory, losing them at exit.
+
 use std::path::{Path, PathBuf};
 
 const LINUX: &str = r#"cfg(target_os = "linux")"#;
 const MACOS: &str = r#"cfg(target_os = "macos")"#;
 const WINDOWS: &str = "cfg(windows)";
-const WINDOWS_TARGET_OS: &str = r#"cfg(target_os = "windows")"#;
+
+const CREDENTIAL_CRATES: [&str; 3] = [
+    "crates/lpm-auth/Cargo.toml",
+    "crates/lpm-vault/Cargo.toml",
+    "crates/lpm-cli/Cargo.toml",
+];
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -13,78 +22,92 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn keyring_features(manifest_path: &str, target: &str) -> Vec<String> {
-    let path = repo_root().join(manifest_path);
+fn manifest(path: &str) -> toml::Value {
+    let path = repo_root().join(path);
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-    let manifest: toml::Value = toml::from_str(&content)
-        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()));
+    toml::from_str(&content)
+        .unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()))
+}
 
-    manifest
+/// The `dependencies` tables a manifest builds with: its own and each
+/// target's, labeled by where they are.
+fn dependency_tables(manifest: &toml::Value) -> Vec<(String, &toml::Table)> {
+    let mut tables = Vec::new();
+    if let Some(dependencies) = manifest.get("dependencies").and_then(toml::Value::as_table) {
+        tables.push(("dependencies".to_string(), dependencies));
+    }
+    for (target, table) in manifest
         .get("target")
-        .and_then(|targets| targets.get(target))
-        .and_then(|target| target.get("dependencies"))
-        .and_then(|dependencies| dependencies.get("keyring"))
-        .and_then(|keyring| keyring.get("features"))
-        .and_then(toml::Value::as_array)
-        .unwrap_or_else(|| {
-            panic!("{manifest_path} must configure keyring features for target {target}")
-        })
-        .iter()
-        .map(|feature| {
-            feature
-                .as_str()
-                .unwrap_or_else(|| panic!("non-string keyring feature in {manifest_path}"))
-                .to_owned()
-        })
-        .collect()
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(dependencies) = table.get("dependencies").and_then(toml::Value::as_table) {
+            tables.push((format!("target {target}"), dependencies));
+        }
+    }
+    tables
 }
 
 #[test]
-fn credential_crates_enable_persistent_keyring_backends_for_supported_operating_systems() {
+fn lpm_keyring_uses_each_supported_operating_systems_persistent_store() {
+    let manifest = manifest("crates/lpm-keyring/Cargo.toml");
     let expected = [
+        (MACOS, "apple-native-keyring-store", &["keychain"][..]),
+        (WINDOWS, "windows-native-keyring-store", &[][..]),
         (
-            "crates/lpm-auth/Cargo.toml",
             LINUX,
-            &["linux-native-sync-persistent", "crypto-rust"][..],
-        ),
-        ("crates/lpm-auth/Cargo.toml", MACOS, &["apple-native"][..]),
-        (
-            "crates/lpm-auth/Cargo.toml",
-            WINDOWS,
-            &["windows-native"][..],
-        ),
-        (
-            "crates/lpm-vault/Cargo.toml",
-            LINUX,
-            &["linux-native-sync-persistent", "crypto-rust"][..],
-        ),
-        ("crates/lpm-vault/Cargo.toml", MACOS, &["apple-native"][..]),
-        (
-            "crates/lpm-vault/Cargo.toml",
-            WINDOWS_TARGET_OS,
-            &["windows-native"][..],
-        ),
-        (
-            "crates/lpm-cli/Cargo.toml",
-            LINUX,
-            &["linux-native-sync-persistent", "crypto-rust"][..],
-        ),
-        ("crates/lpm-cli/Cargo.toml", MACOS, &["apple-native"][..]),
-        (
-            "crates/lpm-cli/Cargo.toml",
-            WINDOWS,
-            &["windows-native"][..],
+            "dbus-secret-service-keyring-store",
+            &["crypto-rust"][..],
         ),
     ];
 
-    for (manifest, target, required_features) in expected {
-        let actual = keyring_features(manifest, target);
+    for (target, store, required_features) in expected {
+        let dependency = manifest
+            .get("target")
+            .and_then(|targets| targets.get(target))
+            .and_then(|target| target.get("dependencies"))
+            .and_then(|dependencies| dependencies.get(store))
+            .unwrap_or_else(|| panic!("lpm-keyring must depend on {store} for {target}"));
+        let features = dependency
+            .get("features")
+            .and_then(toml::Value::as_array)
+            .map(|features| {
+                features
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         for required in required_features {
             assert!(
-                actual.iter().any(|feature| feature == required),
-                "{manifest} keyring features for {target} must include {required}; found {actual:?}"
+                features.contains(required),
+                "lpm-keyring's {store} for {target} must enable {required}; found {features:?}"
             );
+        }
+    }
+}
+
+#[test]
+fn credential_crates_reach_the_store_only_through_lpm_keyring() {
+    for path in CREDENTIAL_CRATES {
+        let manifest = manifest(path);
+        let tables = dependency_tables(&manifest);
+
+        assert!(
+            tables
+                .iter()
+                .any(|(name, table)| name == "dependencies" && table.contains_key("lpm-keyring")),
+            "{path} must depend on lpm-keyring"
+        );
+        for (name, table) in &tables {
+            for direct in ["keyring", "keyring-core"] {
+                assert!(
+                    !table.contains_key(direct),
+                    "{path} {name} must reach the credential store through lpm-keyring, not {direct}"
+                );
+            }
         }
     }
 }

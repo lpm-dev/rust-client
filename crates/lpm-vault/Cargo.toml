@@ -12,6 +12,7 @@ lpm-common = { workspace = true }
 lpm-env = { workspace = true }
 lpm-env-companion = { workspace = true }
 lpm-http = { workspace = true }
+lpm-keyring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 dirs = { workspace = true }
@@ -36,7 +37,6 @@ p256 = { workspace = true }
 elliptic-curve = { workspace = true }
 
 # Secure storage
-keyring = { workspace = true }
 hex = { workspace = true }
 
 # HTTP (for sync)
@@ -44,21 +44,13 @@ reqwest = { workspace = true }
 futures = { workspace = true }
 urlencoding = "2"
 
-[target.'cfg(target_os = "linux")'.dependencies]
-keyring = { workspace = true, features = ["linux-native-sync-persistent", "crypto-rust"] }
-
-[target.'cfg(all(target_os = "linux", any(target_arch = "aarch64", target_env = "musl")))'.dependencies]
-keyring = { workspace = true, features = ["vendored"] }
-
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
 objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "LAContext"] }
-keyring = { workspace = true, features = ["apple-native"] }
 security-framework = { version = "3", features = ["OSX_10_15"] }
 security-framework-sys = { version = "2", features = ["OSX_10_15"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-keyring = { workspace = true, features = ["windows-native"] }
 windows-sys = { version = "0.61", features = [
     "Wdk_Storage_FileSystem",
     "Win32_Foundation",
