@@ -59,11 +59,12 @@ The archive harness needs no third-party Python packages.
    ```
 
 3. Build the scanner example in an isolated target directory. Make sure that at least 10 GiB is free first.
+   Inside the checkout, `rust-toolchain.toml` selects the pinned toolchain.
 
    ```sh
    df -h /tmp
    CARGO_TARGET_DIR=/tmp/lpm-source-target \
-     cargo +1.94.0 build --release --locked -p lpm-security --example source_corpus
+     cargo build --release --locked -p lpm-security --example source_corpus
    cp /tmp/lpm-source-target/release/examples/source_corpus /tmp/source-corpus-candidate
    ```
 
