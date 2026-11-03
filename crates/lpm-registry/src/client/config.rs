@@ -1058,7 +1058,7 @@ mod config_tests {
         let cert_path = directory.path().join("client.pem");
         let key_path = directory.path().join("client.key");
         std::fs::write(&cert_path, certificate.cert.pem()).unwrap();
-        std::fs::write(&key_path, certificate.key_pair.serialize_pem()).unwrap();
+        std::fs::write(&key_path, certificate.signing_key.serialize_pem()).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;

@@ -31,7 +31,7 @@ async fn the_tunnel_panel_redraws_usage_and_requests_in_place_and_quits_on_q() {
             }
         });
         websocket
-            .send(Message::Text(hello.to_string()))
+            .send(Message::text(hello.to_string()))
             .await
             .unwrap();
         // The relay reports the account's count with the first request; an
@@ -49,7 +49,7 @@ async fn the_tunnel_panel_redraws_usage_and_requests_in_place_and_quits_on_q() {
                 request["accepted_requests"] = accepted.into();
             }
             websocket
-                .send(Message::Text(request.to_string()))
+                .send(Message::text(request.to_string()))
                 .await
                 .unwrap();
             loop {

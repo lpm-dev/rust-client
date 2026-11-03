@@ -33,10 +33,10 @@ tempfile = "3"
 libc = "0.2"
 wiremock = "0.6"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.30"
 futures-util = "0.3"
 chrono = { workspace = true }
-rcgen = { version = "0.13", features = ["pem"] }
+rcgen = { version = "0.14", features = ["pem"] }
 reqwest = { workspace = true }
 lpm-runtime = { path = "../../crates/lpm-runtime" }
 lpm-plugin = { path = "../../crates/lpm-plugin" }

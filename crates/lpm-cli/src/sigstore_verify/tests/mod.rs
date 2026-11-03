@@ -2177,7 +2177,7 @@ fn p256_leaf_signed_by(
 ) -> Vec<u8> {
     let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let leaf = leaf_params
-        .signed_by(&leaf_kp, issuer_cert, issuer_kp)
+        .signed_by(&leaf_kp, &issuer_from(issuer_cert, issuer_kp))
         .unwrap();
     leaf.der().to_vec()
 }
@@ -2405,7 +2405,7 @@ fn rejects_forged_leaf_signed_by_real_leaf_used_as_intermediate() {
     let (attacker_leaf_cert_obj, attacker_leaf_kp) = {
         let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let cert = cert_params_validity(2025)
-            .signed_by(&leaf_kp, &fulcio_root_cert, &fulcio_root_kp)
+            .signed_by(&leaf_kp, &issuer_from(&fulcio_root_cert, &fulcio_root_kp))
             .unwrap();
         (cert, leaf_kp)
     };
@@ -2444,7 +2444,9 @@ fn rejects_chain_with_ca_flagged_leaf() {
         let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let mut params = cert_params_validity(2025);
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let cert = params.signed_by(&leaf_kp, &root_cert, &root_kp).unwrap();
+        let cert = params
+            .signed_by(&leaf_kp, &issuer_from(&root_cert, &root_kp))
+            .unwrap();
         cert.der().to_vec()
     };
     let root = fulcio_root_active_at(2025, root_der.clone());
@@ -2517,7 +2519,9 @@ fn rejects_intermediate_with_path_len_constraint_exceeded() {
         let inter_kp = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384).unwrap();
         let mut params = cert_params_validity(2025);
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        params.signed_by(&inter_kp, &root_cert, &root_kp).unwrap()
+        params
+            .signed_by(&inter_kp, &issuer_from(&root_cert, &root_kp))
+            .unwrap()
     };
     let intermediate_der = intermediate_cert.der().to_vec();
     // The leaf doesn't matter for this test — root rejects
@@ -2553,7 +2557,7 @@ fn rejects_anchor_lacking_ca_flag_during_try_anchor_signature_path() {
     // try_anchor_signature branch.
     let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let leaf_cert = cert_params_validity(2025)
-        .signed_by(&leaf_kp, &bogus_root_cert, &bogus_root_kp)
+        .signed_by(&leaf_kp, &issuer_from(&bogus_root_cert, &bogus_root_kp))
         .unwrap();
     let leaf_der = leaf_cert.der().to_vec();
     let bogus_root_der_clone = bogus_root_cert.der().to_vec();
@@ -2638,6 +2642,14 @@ fn der_wrap_octet_string(content: &[u8]) -> Vec<u8> {
 }
 
 /// Issuer cert + keypair, fresh per test.
+/// `cert` as the issuer of the certificates `key` signs.
+fn issuer_from<'a>(
+    cert: &rcgen::Certificate,
+    key: &'a KeyPair,
+) -> rcgen::Issuer<'static, &'a KeyPair> {
+    rcgen::Issuer::from_ca_cert_der(cert.der(), key).unwrap()
+}
+
 struct SctTestIssuer {
     cert: rcgen::Certificate,
     kp: KeyPair,
@@ -2681,7 +2693,7 @@ fn build_leaf_with_optional_sct(
             ));
     }
     let leaf = leaf_params
-        .signed_by(leaf_kp, &issuer.cert, &issuer.kp)
+        .signed_by(leaf_kp, &issuer_from(&issuer.cert, &issuer.kp))
         .unwrap();
     leaf.der().to_vec()
 }
@@ -3249,7 +3261,7 @@ fn leaf_with_san_and_issuer(san_uri: &str, fulcio_issuer: Option<&str>) -> Vec<u
     let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let mut params = cert_params_validity(2025);
     params.subject_alt_names = vec![rcgen::SanType::URI(
-        rcgen::Ia5String::try_from(san_uri.to_string()).unwrap(),
+        rcgen::string::Ia5String::try_from(san_uri.to_string()).unwrap(),
     )];
     if let Some(iss) = fulcio_issuer {
         // Encode as plain UTF-8 (v1 extension shape).
@@ -3259,7 +3271,7 @@ fn leaf_with_san_and_issuer(san_uri: &str, fulcio_issuer: Option<&str>) -> Vec<u
         )];
     }
     let leaf = params
-        .signed_by(&leaf_kp, &issuer.cert, &issuer.kp)
+        .signed_by(&leaf_kp, &issuer_from(&issuer.cert, &issuer.kp))
         .unwrap();
     leaf.der().to_vec()
 }
@@ -3403,7 +3415,7 @@ fn find_leaf_issuer_spki_picks_intermediate_when_chain_provides_it() {
     let issuer = fresh_sct_issuer();
     let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let leaf_der = cert_params_validity(2025)
-        .signed_by(&leaf_kp, &issuer.cert, &issuer.kp)
+        .signed_by(&leaf_kp, &issuer_from(&issuer.cert, &issuer.kp))
         .unwrap()
         .der()
         .to_vec();
@@ -3818,7 +3830,7 @@ fn build_signed_dsse_envelope_with_self_signed_leaf() -> (DsseEnvelope, Vec<u8>)
     let leaf_kp = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let mut params = cert_params_validity(2025);
     params.subject_alt_names = vec![rcgen::SanType::URI(
-        rcgen::Ia5String::try_from("https://example.invalid/bench".to_string()).unwrap(),
+        rcgen::string::Ia5String::try_from("https://example.invalid/bench".to_string()).unwrap(),
     )];
     let cert = params.self_signed(&leaf_kp).unwrap();
     let leaf_der = cert.der().to_vec();

@@ -615,7 +615,7 @@ mod tests {
         // by default — exactly what `Identity::from_pem` accepts.
         let cert =
             rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("rcgen self-sign");
-        (cert.cert.pem(), cert.key_pair.serialize_pem())
+        (cert.cert.pem(), cert.signing_key.serialize_pem())
     }
 
     fn write(dir: &Path, name: &str, contents: &str) -> PathBuf {

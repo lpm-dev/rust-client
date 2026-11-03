@@ -1001,7 +1001,7 @@ fn lazy_target_origin_identity_fp_namespaces_cache_pre_dispatch() {
     let cert_a =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen a");
     std::fs::write(&cert_path, cert_a.cert.pem()).unwrap();
-    std::fs::write(&key_path, cert_a.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, cert_a.signing_key.serialize_pem()).unwrap();
 
     let origin = OriginKey {
         host_lower: "lazy.internal".into(),
@@ -1047,7 +1047,7 @@ fn lazy_target_origin_identity_fp_namespaces_cache_pre_dispatch() {
     let cert_b =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen b");
     std::fs::write(&cert_path, cert_b.cert.pem()).unwrap();
-    std::fs::write(&key_path, cert_b.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, cert_b.signing_key.serialize_pem()).unwrap();
     let tls_b = TlsOverrides {
         per_origin: per_origin_map,
         ..Default::default()
@@ -1123,7 +1123,7 @@ fn http_clients_identity_fp_for_url_reflects_per_origin_cert() {
     let cert_with_key =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("rcgen");
     let cert_pem_str = cert_with_key.cert.pem();
-    let key_pem_str = cert_with_key.key_pair.serialize_pem();
+    let key_pem_str = cert_with_key.signing_key.serialize_pem();
     let dir = tempfile::tempdir().unwrap();
     let cert_path = dir.path().join("client.pem");
     std::fs::write(&cert_path, &cert_pem_str).unwrap();

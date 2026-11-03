@@ -34,8 +34,8 @@
 //!   0.23's ring provider (idempotent — safe across tests).
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-    KeyUsagePurpose,
+    BasicConstraints, CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa, Issuer,
+    KeyPair, KeyUsagePurpose,
 };
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -50,17 +50,14 @@ use tokio_rustls::TlsAcceptor;
 // ---- Cert factory -----------------------------------------------------
 
 pub struct TestCa {
-    /// CA cert object — needed as the `issuer` argument to
-    /// [`CertificateParams::signed_by`] when minting leaves.
-    pub cert: rcgen::Certificate,
+    /// The CA's name and key, which sign leaves through
+    /// [`CertificateParams::signed_by`].
+    pub issuer: Issuer<'static, KeyPair>,
     /// DER form for inclusion in the server's TLS chain.
     pub cert_der: CertificateDer<'static>,
     /// PEM form for the client's `cafile=` / `ca=` trust-store and
     /// for inclusion in mTLS-verifier root sets.
     pub cert_pem: String,
-    /// CA keypair — needed as the `issuer_key` argument to
-    /// [`CertificateParams::signed_by`].
-    pub key_pair: KeyPair,
 }
 
 pub fn make_root_ca() -> TestCa {
@@ -73,13 +70,10 @@ pub fn make_root_ca() -> TestCa {
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     let cert = params.self_signed(&ca_key).expect("self-sign CA");
-    let cert_der = CertificateDer::from(cert.der().to_vec());
-    let cert_pem = cert.pem();
     TestCa {
-        cert,
-        cert_der,
-        cert_pem,
-        key_pair: ca_key,
+        cert_der: CertificateDer::from(cert.der().to_vec()),
+        cert_pem: cert.pem(),
+        issuer: Issuer::new(params, ca_key),
     }
 }
 
@@ -135,7 +129,7 @@ pub fn make_leaf(ca: &TestCa, shape: LeafShape) -> LeafCert {
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     let key_pair = KeyPair::generate().expect("leaf keypair");
     let cert = params
-        .signed_by(&key_pair, &ca.cert, &ca.key_pair)
+        .signed_by(&key_pair, &ca.issuer)
         .expect("leaf signed by CA");
     let cert_der = CertificateDer::from(cert.der().to_vec());
     let key_der = PrivatePkcs8KeyDer::from(key_pair.serialize_der());
@@ -179,7 +173,7 @@ pub fn make_client_leaf(ca: &TestCa) -> ClientLeaf {
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     let key_pair = KeyPair::generate().expect("client keypair");
     let cert = params
-        .signed_by(&key_pair, &ca.cert, &ca.key_pair)
+        .signed_by(&key_pair, &ca.issuer)
         .expect("client leaf signed by CA");
     ClientLeaf {
         cert_pem: cert.pem(),

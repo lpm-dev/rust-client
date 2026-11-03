@@ -705,7 +705,7 @@ async fn dev_tunnel_stops_a_long_running_server_when_the_relay_fails() {
             let (socket, _) = relay.accept().await.unwrap();
             let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
             websocket
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({
                         "type": "error",
                         "message": "the account plan does not permit this tunnel",
@@ -771,7 +771,7 @@ async fn multi_service_dev_stops_when_the_tunnel_fails_after_readiness() {
             let (socket, _) = relay.accept().await.unwrap();
             let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
             websocket
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({
                         "type": "hello",
                         "subdomain": "multi-ready.lpm.test",
@@ -787,7 +787,7 @@ async fn multi_service_dev_stops_when_the_tunnel_fails_after_readiness() {
                 .unwrap();
             tokio::time::sleep(Duration::from_millis(300)).await;
             websocket
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({
                         "type": "error",
                         "message": "relay failed after all services became ready",
@@ -1142,7 +1142,7 @@ async fn tunnel_start_under_json_emits_pretty_success_contract_on_stdout() {
             let (socket, _) = relay.accept().await.unwrap();
             let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
             websocket
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({
                         "type": "hello",
                         "subdomain": "review-test.lpm.test",
@@ -1306,7 +1306,7 @@ fn single_request_relay_after(
                 }),
             ] {
                 websocket
-                    .send(Message::Text(message.to_string()))
+                    .send(Message::text(message.to_string()))
                     .await
                     .unwrap();
             }
@@ -1519,7 +1519,7 @@ fn websocket_upgrade_relay(
                 }),
             ] {
                 websocket
-                    .send(Message::Text(message.to_string()))
+                    .send(Message::text(message.to_string()))
                     .await
                     .unwrap();
             }
@@ -1757,7 +1757,7 @@ async fn tunnel_json_reports_a_retry_before_a_successful_reconnection() {
             drop(socket);
             let (socket, _) = relay.accept().await.unwrap();
             let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
-            websocket.send(Message::Text(serde_json::json!({
+            websocket.send(Message::text(serde_json::json!({
                 "type":"hello", "subdomain":"retry.lpm.test", "tunnel_url":"https://retry.lpm.test",
                 "session_id":"session-retry", "plan":"pro", "base_domain":"lpm.test", "domain_kind":"account"
             }).to_string())).await.unwrap();
@@ -1832,7 +1832,7 @@ async fn tunnel_start_stderr_on_port(
             let (socket, _) = relay.accept().await.unwrap();
             let mut websocket = tokio_tungstenite::accept_async(socket).await.unwrap();
             websocket
-                .send(Message::Text(
+                .send(Message::text(
                     serde_json::json!({
                         "type": "hello",
                         "subdomain": "capture-warning.lpm.test",

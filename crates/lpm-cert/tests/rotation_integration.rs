@@ -652,7 +652,7 @@ fn seed_chain_outside_constrained_root(project_dir: &Path) {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let unrestricted = params.clone().self_signed(&key).unwrap();
+    let unrestricted = params.self_signed(&key).unwrap();
     let (chain, leaf_key) = cert::generate_project_cert_with_constrained_intermediate(
         &unrestricted.pem(),
         &key.serialize_pem(),
