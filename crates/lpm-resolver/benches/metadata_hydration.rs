@@ -8,7 +8,7 @@
 //! packument JSON hydration from resolver projection and speculation projection
 //! so cache/parser work can be compared without CDN or filesystem noise.
 
-use criterion::{BatchSize, BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use lpm_registry::PackageMetadata;
 use lpm_resolver::{
     SpeculativePackageMetadata, benchmark_merge_cached_package_info,
@@ -18,6 +18,7 @@ use lpm_resolver::{
     benchmark_parse_owned_partial_metadata_to_cache_info,
 };
 use serde_json::{Map, Value};
+use std::hint::black_box;
 use std::sync::Arc;
 
 #[derive(Clone, Copy)]

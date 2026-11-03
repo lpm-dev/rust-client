@@ -30,7 +30,7 @@ fn bench_paths(c: &mut Criterion) {
     let key = make_graph_key();
     // Realistic SRI (base64-encoded SHA-512), matching the shape the
     // npm registry returns. 64 bytes of "hash" → 88-char base64.
-    let sri = "sha512-PnQj4nKhAGgQ7yEUS5JlNGYpemoCx5gqL8sUebNqgWKYWFp64g4nNFstUNbgKb3khA34iCExmgIBjxNzwzL2fOiYAxwSOJrMxA==";
+    let sri = "sha512-WeQI/8tF1LD+qbGDGvTgZKctO2154IuE90RFjNG3ZEd7Cs6yMvSvI3L2723TLGFpSRRjIuOSJXxlEgv/P+/2/g==";
 
     let mut group = c.benchmark_group("store_paths");
     group.bench_function("link_package_dir", |b| {
