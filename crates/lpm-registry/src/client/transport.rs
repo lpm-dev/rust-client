@@ -295,7 +295,7 @@ impl RegistryClient {
         *attempted = true;
         match session.refresh_now().await {
             Ok(_) => Ok(true),
-            Err(error @ LpmError::CredentialStorage(_)) => Err(error),
+            Err(error) if error.is_credential_storage_failure() => Err(error),
             Err(_) => Ok(false),
         }
     }
@@ -401,7 +401,8 @@ impl RegistryClient {
                 || lpm_auth::is_session_access_token_expired(session.registry_url())
                 || lpm_auth::session_metadata_corrupted();
             if needs_proactive
-                && let Err(error @ LpmError::CredentialStorage(_)) = session.refresh_now().await
+                && let Err(error) = session.refresh_now().await
+                && error.is_credential_storage_failure()
             {
                 return Err(error);
             }

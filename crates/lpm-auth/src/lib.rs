@@ -60,7 +60,7 @@ const KEYCHAIN_ACCOUNT_PREFIX: &str = "auth-token";
 
 const DISABLE_HOST_CLI_AUTH_ENV: &str = "LPM_DISABLE_HOST_CLI_AUTH";
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
 
 #[derive(Debug)]
@@ -69,13 +69,70 @@ enum KeychainCredentialProbe {
     NotFound,
     #[cfg(any(target_os = "macos", test))]
     InteractionRequired,
-    Failed,
+    /// The platform refused the read; carries its status for diagnostics.
+    Failed(String),
 }
 
 enum KeychainCredentialResolution {
     Found(String),
     NotFound,
-    Unavailable,
+    #[cfg(any(target_os = "macos", test))]
+    Locked,
+    Unavailable(String),
+}
+
+/// Why a stored LPM credential could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CredentialReadError {
+    /// macOS refused the shared Keychain item because the login session is
+    /// locked. The item is readable again once the user unlocks the Mac.
+    #[cfg(any(target_os = "macos", test))]
+    KeychainLocked,
+    Unavailable(String),
+}
+
+impl CredentialReadError {
+    pub(crate) fn into_lpm_error(self, context: &str) -> lpm_common::LpmError {
+        let message = format!("{context}: {self}");
+        match self {
+            #[cfg(any(target_os = "macos", test))]
+            Self::KeychainLocked => lpm_common::LpmError::CredentialStorageLocked(message),
+            Self::Unavailable(_) => lpm_common::LpmError::CredentialStorage(message),
+        }
+    }
+}
+
+impl std::fmt::Display for CredentialReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            #[cfg(any(target_os = "macos", test))]
+            Self::KeychainLocked => write!(
+                f,
+                "the macOS Keychain refused access because this Mac's session is locked \
+                 (OSStatus {ERR_SEC_INTERACTION_NOT_ALLOWED}, errSecInteractionNotAllowed); \
+                 unlock this Mac, then retry"
+            ),
+            Self::Unavailable(detail) => f.write_str(detail),
+        }
+    }
+}
+
+impl From<String> for CredentialReadError {
+    fn from(detail: String) -> Self {
+        Self::Unavailable(detail)
+    }
+}
+
+impl From<&str> for CredentialReadError {
+    fn from(detail: &str) -> Self {
+        Self::Unavailable(detail.to_owned())
+    }
+}
+
+impl From<CredentialReadError> for String {
+    fn from(error: CredentialReadError) -> Self {
+        error.to_string()
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -301,7 +358,7 @@ fn get_stored_access_token(registry_url: &str) -> Option<String> {
 pub(crate) fn get_stored_access_token_with_interaction_notice(
     registry_url: &str,
     notice: impl FnOnce(),
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, CredentialReadError> {
     get_stored_credential_with_backend_result(registry_url, CredentialKind::Access, notice)
         .map(|stored| stored.map(|credential| credential.token))
 }
@@ -324,6 +381,7 @@ pub fn has_stored_access_token(registry_url: &str) -> bool {
 pub fn has_stored_access_token_checked(registry_url: &str) -> Result<bool, String> {
     get_stored_credential_with_backend_result(registry_url, CredentialKind::Access, || {})
         .map(|credential| credential.is_some())
+        .map_err(String::from)
 }
 
 /// Store a token for a given registry URL.
@@ -430,16 +488,12 @@ fn clear_stored_credential_under_store_lock(
     credential_authority::clear(registry, kind)
 }
 
-fn with_credential_store_lock<T>(
-    operation: impl FnOnce() -> Result<T, String>,
-) -> Result<T, String> {
+fn with_credential_store_lock<T, E: From<String>>(
+    operation: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
     let lock_path = session_lock_path("lpm-auth://credential-store")?;
-    match lpm_common::paths::with_exclusive_lock(lock_path, || {
-        operation().map_err(lpm_common::LpmError::CredentialStorage)
-    }) {
-        Ok(value) => Ok(value),
-        Err(error) => Err(credential_storage_error_message(error)),
-    }
+    lpm_common::paths::with_exclusive_lock(lock_path, || Ok(operation()))
+        .map_err(|error| E::from(credential_storage_error_message(error)))?
 }
 
 fn credential_storage_error_message(error: lpm_common::LpmError) -> String {
@@ -880,7 +934,7 @@ fn get_stored_credential_with_backend_result(
     registry: &str,
     kind: CredentialKind,
     notice: impl FnOnce(),
-) -> Result<Option<StoredToken>, String> {
+) -> Result<Option<StoredToken>, CredentialReadError> {
     with_credential_store_lock(|| {
         get_stored_credential_with_backend_unlocked(registry, kind, notice)
     })
@@ -889,8 +943,8 @@ fn get_stored_credential_with_backend_result(
 fn get_stored_credential_with_backend_unlocked(
     registry: &str,
     kind: CredentialKind,
-    notice: impl FnOnce(),
-) -> Result<Option<StoredToken>, String> {
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] notice: impl FnOnce(),
+) -> Result<Option<StoredToken>, CredentialReadError> {
     let authority = credential_authority::read(registry, kind)?;
     let file_key = kind.file_key(registry);
     let account = match kind {
@@ -898,9 +952,11 @@ fn get_stored_credential_with_backend_unlocked(
         CredentialKind::Refresh => scoped_refresh_account(registry),
     };
 
-    let mut notice = Some(notice);
+    // Only the legacy file Keychain shows an approval sheet; the shared
+    // data-protection items never do, so their reads announce nothing.
     #[cfg(target_os = "macos")]
     let authority = {
+        let mut notice = Some(notice);
         let mut authority = authority;
         if !force_file_auth()
             && let Some(record) = &mut authority
@@ -925,15 +981,10 @@ fn get_stored_credential_with_backend_unlocked(
             })
             .unwrap_or_else(|_| {
                 tracing::debug!("keychain access panicked");
-                KeychainCredentialProbe::Failed
+                KeychainCredentialProbe::Failed("keychain access panicked".to_owned())
             })
         },
-        || {
-            if let Some(notice) = notice.take() {
-                notice();
-            }
-        },
-        || get_password_from_keychain_account(&account),
+        || read_keychain_credential_interactively(&account),
         || probe_token_from_file(&file_key),
     )?;
 
@@ -980,10 +1031,9 @@ fn complete_pending_keychain_cleanup_with(
 fn resolve_stored_credential_from_backends(
     authority: Option<&CredentialAuthority>,
     keychain_probe: impl FnOnce() -> KeychainCredentialProbe,
-    notice: impl FnOnce(),
-    interactive_retry: impl FnOnce() -> Option<String>,
+    interactive_retry: impl FnOnce() -> KeychainCredentialProbe,
     file_lookup: impl FnOnce() -> EncryptedFileCredentialProbe,
-) -> Result<Option<StoredToken>, String> {
+) -> Result<Option<StoredToken>, CredentialReadError> {
     let Some(authority) = authority else {
         return Ok(None);
     };
@@ -1001,18 +1051,19 @@ fn resolve_stored_credential_from_backends(
                 }))
             }
             EncryptedFileCredentialProbe::Found(_) => {
-                Err("encrypted credential does not match its authority record".to_owned())
+                Err("encrypted credential does not match its authority record".into())
             }
             EncryptedFileCredentialProbe::NotFound => {
-                Err("authoritative encrypted credential is unavailable".to_owned())
+                Err("authoritative encrypted credential is unavailable".into())
             }
             EncryptedFileCredentialProbe::Unavailable(error) => Err(format!(
                 "authoritative encrypted credential storage is unavailable: {error}"
-            )),
+            )
+            .into()),
         };
     }
 
-    match resolve_keychain_probe(keychain_probe(), notice, interactive_retry) {
+    match resolve_keychain_probe(keychain_probe(), interactive_retry) {
         KeychainCredentialResolution::Found(token) if !token.is_empty() => {
             if authority.matches_token(&token) {
                 return Ok(Some(StoredToken {
@@ -1020,13 +1071,15 @@ fn resolve_stored_credential_from_backends(
                     backend: AuthStorageBackend::Keychain,
                 }));
             }
-            Err("keychain credential does not match its authority record".to_owned())
+            Err("keychain credential does not match its authority record".into())
         }
         KeychainCredentialResolution::Found(_) | KeychainCredentialResolution::NotFound => {
-            Err("authoritative keychain credential is unavailable".to_owned())
+            Err("authoritative keychain credential is unavailable".into())
         }
-        KeychainCredentialResolution::Unavailable => {
-            Err("keychain credential storage is unavailable".to_owned())
+        #[cfg(any(target_os = "macos", test))]
+        KeychainCredentialResolution::Locked => Err(CredentialReadError::KeychainLocked),
+        KeychainCredentialResolution::Unavailable(detail) => {
+            Err(format!("keychain credential storage is unavailable: {detail}").into())
         }
     }
 }
@@ -1757,7 +1810,7 @@ pub async fn store_rotated_access_token_if_current(
     }
     let lock_path = session_lock_path(registry).map_err(lpm_common::LpmError::CredentialStorage)?;
     lpm_common::paths::with_exclusive_lock_async(lock_path, async {
-        with_credential_store_lock(|| {
+        with_credential_store_lock(|| -> Result<_, String> {
             let current = get_stored_credential_with_backend_unlocked(registry, CredentialKind::Access, || {})?;
             if current.is_none_or(|credential| credential.token != submitted_bearer) {
                 return Err("local credentials changed during rotation; the newer login or logout was preserved".into());
@@ -1815,7 +1868,7 @@ pub fn get_refresh_token(registry: &str) -> Option<String> {
 pub(crate) fn get_refresh_token_with_interaction_notice(
     registry: &str,
     notice: impl FnOnce(),
-) -> Result<Option<String>, String> {
+) -> Result<Option<String>, CredentialReadError> {
     get_stored_credential_with_backend_result(registry, CredentialKind::Refresh, notice)
         .map(|stored| stored.map(|credential| credential.token))
 }
@@ -1835,6 +1888,7 @@ pub fn has_refresh_token(registry: &str) -> bool {
 pub fn has_refresh_token_checked(registry: &str) -> Result<bool, String> {
     get_stored_credential_with_backend_result(registry, CredentialKind::Refresh, || {})
         .map(|credential| credential.is_some())
+        .map_err(String::from)
 }
 
 /// Clear the stored refresh token for a registry.
@@ -2030,95 +2084,101 @@ fn keychain_service() -> std::borrow::Cow<'static, str> {
     std::borrow::Cow::Owned(lpm_common::credential_service(KEYCHAIN_SERVICE))
 }
 
-fn get_password_from_keychain_account(account: &str) -> Option<String> {
+fn read_keychain_credential_interactively(account: &str) -> KeychainCredentialProbe {
     if force_file_auth() {
-        return None;
+        return KeychainCredentialProbe::NotFound;
     }
 
     let service = keychain_service();
-    tracing::debug!(
-        "keychain lookup: service={}, account={account}",
-        service.as_ref()
-    );
 
     #[cfg(target_os = "macos")]
     {
-        match get_password_from_macos_keychain_native(service.as_ref(), account) {
-            MacosKeychainLookup::Found(token) => {
-                tracing::debug!("keychain hit via Security.framework");
-                return Some(token);
-            }
-            MacosKeychainLookup::NotFound => {}
-            MacosKeychainLookup::InteractionRequired => {
-                tracing::debug!(
-                    "Security.framework keychain lookup still requires interaction for {account}"
-                );
-                return None;
-            }
-            MacosKeychainLookup::Failed(error) => {
-                tracing::debug!("Security.framework keychain lookup failed for {account}: {error}");
-                return None;
-            }
-        }
+        keychain_probe_from_macos_lookup(
+            get_password_from_macos_keychain_native(service.as_ref(), account),
+            account,
+            "interactive",
+        )
     }
 
     #[cfg(not(target_os = "macos"))]
-    if let Ok(entry) = lpm_keyring::entry(service.as_ref(), account)
-        && let Ok(token) = entry.get_password()
     {
-        tracing::debug!("keychain hit via lpm-keyring");
-        return Some(token);
+        probe_keychain_credential(service.as_ref(), account)
     }
-
-    tracing::debug!("keychain miss for {account}");
-    None
 }
 
 #[cfg(test)]
 fn resolve_keychain_credential(
     probe: KeychainCredentialProbe,
-    notice: impl FnOnce(),
-    interactive_retry: impl FnOnce() -> Option<String>,
+    interactive_retry: impl FnOnce() -> KeychainCredentialProbe,
     fallback: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
-    match resolve_keychain_probe(probe, notice, interactive_retry) {
+    match resolve_keychain_probe(probe, interactive_retry) {
         KeychainCredentialResolution::Found(token) => Some(token),
         KeychainCredentialResolution::NotFound => fallback(),
-        KeychainCredentialResolution::Unavailable => None,
+        KeychainCredentialResolution::Locked | KeychainCredentialResolution::Unavailable(_) => None,
     }
 }
 
 fn resolve_keychain_probe(
     probe: KeychainCredentialProbe,
-    _notice: impl FnOnce(),
-    _interactive_retry: impl FnOnce() -> Option<String>,
+    #[cfg_attr(not(any(target_os = "macos", test)), allow(unused_variables))]
+    interactive_retry: impl FnOnce() -> KeychainCredentialProbe,
 ) -> KeychainCredentialResolution {
     match probe {
         KeychainCredentialProbe::Found(token) => KeychainCredentialResolution::Found(token),
         KeychainCredentialProbe::NotFound => KeychainCredentialResolution::NotFound,
         #[cfg(any(target_os = "macos", test))]
         KeychainCredentialProbe::InteractionRequired => {
-            _notice();
-            _interactive_retry().map_or(
-                KeychainCredentialResolution::Unavailable,
-                KeychainCredentialResolution::Found,
-            )
+            match interactive_retry() {
+                KeychainCredentialProbe::Found(token) => KeychainCredentialResolution::Found(token),
+                KeychainCredentialProbe::NotFound => KeychainCredentialResolution::NotFound,
+                // LPM and the vault app store auth items WhenUnlockedThisDeviceOnly with
+                // no access control, so nothing about them needs a prompt. A refusal
+                // that survives a read allowed to interact means the keybag is locked.
+                KeychainCredentialProbe::InteractionRequired => {
+                    KeychainCredentialResolution::Locked
+                }
+                KeychainCredentialProbe::Failed(detail) => {
+                    KeychainCredentialResolution::Unavailable(detail)
+                }
+            }
         }
-        KeychainCredentialProbe::Failed => KeychainCredentialResolution::Unavailable,
+        KeychainCredentialProbe::Failed(detail) => {
+            KeychainCredentialResolution::Unavailable(detail)
+        }
     }
 }
 
 #[cfg(target_os = "macos")]
 fn probe_keychain_credential(service: &str, account: &str) -> KeychainCredentialProbe {
-    match get_password_from_macos_keychain_noninteractive(service, account) {
+    keychain_probe_from_macos_lookup(
+        get_password_from_macos_keychain_noninteractive(service, account),
+        account,
+        "noninteractive",
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_probe_from_macos_lookup(
+    lookup: MacosKeychainLookup,
+    account: &str,
+    mode: &str,
+) -> KeychainCredentialProbe {
+    match lookup {
         MacosKeychainLookup::Found(token) => KeychainCredentialProbe::Found(token),
         MacosKeychainLookup::NotFound => KeychainCredentialProbe::NotFound,
-        MacosKeychainLookup::InteractionRequired => KeychainCredentialProbe::InteractionRequired,
-        MacosKeychainLookup::Failed(error) => {
+        MacosKeychainLookup::InteractionRequired => {
             tracing::debug!(
-                "noninteractive Security.framework keychain lookup failed for {account}: {error}"
+                "{mode} Security.framework keychain lookup for {account} was refused with OSStatus {ERR_SEC_INTERACTION_NOT_ALLOWED}"
             );
-            KeychainCredentialProbe::Failed
+            KeychainCredentialProbe::InteractionRequired
+        }
+        MacosKeychainLookup::Failed(error) => {
+            let detail = macos_keychain::describe(error);
+            tracing::debug!(
+                "{mode} Security.framework keychain lookup failed for {account}: {detail}"
+            );
+            KeychainCredentialProbe::Failed(detail)
         }
     }
 }
@@ -2130,7 +2190,7 @@ fn probe_keychain_credential(service: &str, account: &str) -> KeychainCredential
         Ok(_) | Err(lpm_keyring::Error::NoEntry) => KeychainCredentialProbe::NotFound,
         Err(error) => {
             tracing::debug!("keychain lookup failed for {account}: {error}");
-            KeychainCredentialProbe::Failed
+            KeychainCredentialProbe::Failed(error.to_string())
         }
     }
 }
@@ -3134,8 +3194,7 @@ mod tests {
             let resolved = resolve_stored_credential_from_backends(
                 authority.as_ref(),
                 || KeychainCredentialProbe::NotFound,
-                || {},
-                || None,
+                no_interactive_retry,
                 || probe_token_from_file(registry),
             );
 
@@ -3198,8 +3257,7 @@ mod tests {
             let resolved = resolve_stored_credential_from_backends(
                 None,
                 || KeychainCredentialProbe::Found("unclassified-keychain-token".to_owned()),
-                || {},
-                || None,
+                no_interactive_retry,
                 || EncryptedFileCredentialProbe::NotFound,
             )
             .unwrap();
@@ -3259,8 +3317,7 @@ mod tests {
             let resurrected = resolve_stored_credential_from_backends(
                 authority.as_ref(),
                 || KeychainCredentialProbe::Found("rejected-keychain-token".to_owned()),
-                || {},
-                || None,
+                no_interactive_retry,
                 || EncryptedFileCredentialProbe::NotFound,
             )
             .unwrap();
@@ -3268,6 +3325,17 @@ mod tests {
                 resurrected.is_none(),
                 "the revocation tombstone must hide a credential that survived deletion"
             );
+        });
+    }
+
+    #[test]
+    fn credential_store_lock_returns_a_typed_read_error_unchanged() {
+        with_temp_home(|_| {
+            let error =
+                with_credential_store_lock(|| Err::<(), _>(CredentialReadError::KeychainLocked))
+                    .unwrap_err();
+
+            assert_eq!(error, CredentialReadError::KeychainLocked);
         });
     }
 
@@ -3286,7 +3354,7 @@ mod tests {
             let (started_tx, started_rx) = std::sync::mpsc::channel();
             let (finished_tx, finished_rx) = std::sync::mpsc::channel();
 
-            let reader = with_credential_store_lock(|| {
+            let reader = with_credential_store_lock(|| -> Result<_, String> {
                 let registry = registry.to_owned();
                 let reader = std::thread::spawn(move || {
                     started_tx.send(()).unwrap();
@@ -3309,21 +3377,115 @@ mod tests {
         });
     }
 
+    fn no_interactive_retry() -> KeychainCredentialProbe {
+        unreachable!("only a probe that requires interaction retries interactively")
+    }
+
+    #[test]
+    fn keychain_probe_failure_keeps_its_platform_status_in_the_storage_error() {
+        let authority = CredentialAuthority::active(CredentialBackend::Keychain, "keychain-token");
+
+        let error = resolve_stored_credential_from_backends(
+            Some(&authority),
+            || {
+                KeychainCredentialProbe::Failed(
+                    "OSStatus -34018: A required entitlement isn't present.".to_owned(),
+                )
+            },
+            no_interactive_retry,
+            || EncryptedFileCredentialProbe::NotFound,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            CredentialReadError::Unavailable(
+                "keychain credential storage is unavailable: OSStatus -34018: A required entitlement isn't present."
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn interactive_retry_failure_other_than_a_refusal_is_not_reported_as_locked() {
+        let authority = CredentialAuthority::active(CredentialBackend::Keychain, "keychain-token");
+
+        let error = resolve_stored_credential_from_backends(
+            Some(&authority),
+            || KeychainCredentialProbe::InteractionRequired,
+            || {
+                KeychainCredentialProbe::Failed(
+                    "OSStatus -128: User canceled the operation.".to_owned(),
+                )
+            },
+            || EncryptedFileCredentialProbe::NotFound,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            CredentialReadError::Unavailable(
+                "keychain credential storage is unavailable: OSStatus -128: User canceled the operation."
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn locked_keychain_read_becomes_the_locked_credential_storage_error() {
+        let locked = CredentialReadError::KeychainLocked
+            .into_lpm_error("failed to read stored access credential");
+        let unavailable = CredentialReadError::Unavailable("OSStatus -34018".to_owned())
+            .into_lpm_error("failed to read stored access credential");
+
+        assert_eq!(locked.error_code(), "credential_storage_locked");
+        assert_eq!(
+            locked.to_string(),
+            "credential storage is locked: failed to read stored access credential: the macOS \
+             Keychain refused access because this Mac's session is locked (OSStatus -25308, \
+             errSecInteractionNotAllowed); unlock this Mac, then retry"
+        );
+        assert_eq!(unavailable.error_code(), "credential_storage");
+        assert_eq!(
+            unavailable.to_string(),
+            "credential storage error: failed to read stored access credential: OSStatus -34018"
+        );
+    }
+
     #[test]
     fn unavailable_refresh_storage_is_not_classified_as_absent() {
         let authority =
             CredentialAuthority::active(CredentialBackend::Keychain, "stored-refresh-token");
         let resolved = resolve_stored_credential_from_backends(
             Some(&authority),
-            || KeychainCredentialProbe::Failed,
-            || {},
-            || None,
+            || KeychainCredentialProbe::Failed("OSStatus -34018".to_owned()),
+            no_interactive_retry,
             || EncryptedFileCredentialProbe::NotFound,
         );
 
         assert!(
             resolved.is_err(),
             "storage unavailability must remain distinguishable from definitive credential absence"
+        );
+    }
+
+    #[test]
+    fn keychain_refusal_that_survives_the_interactive_retry_reports_a_locked_session() {
+        let authority = CredentialAuthority::active(CredentialBackend::Keychain, "keychain-token");
+
+        let error = resolve_stored_credential_from_backends(
+            Some(&authority),
+            || KeychainCredentialProbe::InteractionRequired,
+            || KeychainCredentialProbe::InteractionRequired,
+            || EncryptedFileCredentialProbe::NotFound,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, CredentialReadError::KeychainLocked);
+        let message = error.to_string();
+        assert!(
+            message.contains("session is locked") && message.contains("-25308"),
+            "a locked macOS session must not collapse into a generic storage failure: {message}"
         );
     }
 
@@ -3473,8 +3635,7 @@ mod tests {
             let resolved = resolve_stored_credential_from_backends(
                 authority.as_ref(),
                 || KeychainCredentialProbe::Found("stale-keychain-token".to_owned()),
-                || {},
-                || None,
+                no_interactive_retry,
                 || probe_token_from_file(registry),
             )
             .unwrap()
@@ -3735,17 +3896,15 @@ mod tests {
     }
 
     #[test]
-    fn conditional_keychain_notice_skips_notice_for_noninteractive_hit() {
-        let notices = std::cell::Cell::new(0);
+    fn noninteractive_keychain_hit_skips_the_interactive_retry() {
         let retries = std::cell::Cell::new(0);
         let fallbacks = std::cell::Cell::new(0);
 
         let credential = resolve_keychain_credential(
             KeychainCredentialProbe::Found("stored-token".to_string()),
-            || notices.set(notices.get() + 1),
             || {
                 retries.set(retries.get() + 1);
-                None
+                KeychainCredentialProbe::NotFound
             },
             || {
                 fallbacks.set(fallbacks.get() + 1);
@@ -3754,72 +3913,50 @@ mod tests {
         );
 
         assert_eq!(credential.as_deref(), Some("stored-token"));
-        assert_eq!(notices.get(), 0);
         assert_eq!(retries.get(), 0);
         assert_eq!(fallbacks.get(), 0);
     }
 
     #[test]
-    fn conditional_keychain_notice_emits_once_and_retries_each_credential_kind() {
-        let notices = std::cell::RefCell::new(Vec::new());
+    fn interaction_required_probe_retries_each_credential_kind_interactively() {
         let retries = std::cell::Cell::new(0);
 
         let access = resolve_keychain_credential(
             KeychainCredentialProbe::InteractionRequired,
             || {
-                notices
-                    .borrow_mut()
-                    .push(AuthStorageAccessKind::AccessToken)
-            },
-            || {
                 retries.set(retries.get() + 1);
-                Some("access-token".to_string())
+                KeychainCredentialProbe::Found("access-token".to_string())
             },
             || None,
         );
         let refresh = resolve_keychain_credential(
             KeychainCredentialProbe::InteractionRequired,
             || {
-                notices
-                    .borrow_mut()
-                    .push(AuthStorageAccessKind::RefreshToken);
-            },
-            || {
                 retries.set(retries.get() + 1);
-                Some("refresh-token".to_string())
+                KeychainCredentialProbe::Found("refresh-token".to_string())
             },
             || None,
         );
 
         assert_eq!(access.as_deref(), Some("access-token"));
         assert_eq!(refresh.as_deref(), Some("refresh-token"));
-        assert_eq!(
-            notices.into_inner(),
-            [
-                AuthStorageAccessKind::AccessToken,
-                AuthStorageAccessKind::RefreshToken,
-            ],
-        );
         assert_eq!(retries.get(), 2);
     }
 
     #[test]
-    fn conditional_keychain_notice_skips_notice_for_not_found_fallback() {
-        let notices = std::cell::Cell::new(0);
+    fn keychain_not_found_falls_back_without_the_interactive_retry() {
         let retries = std::cell::Cell::new(0);
 
         let credential = resolve_keychain_credential(
             KeychainCredentialProbe::NotFound,
-            || notices.set(notices.get() + 1),
             || {
                 retries.set(retries.get() + 1);
-                None
+                KeychainCredentialProbe::NotFound
             },
             || Some("file-token".to_string()),
         );
 
         assert_eq!(credential.as_deref(), Some("file-token"));
-        assert_eq!(notices.get(), 0);
         assert_eq!(retries.get(), 0);
     }
 
@@ -3830,9 +3967,8 @@ mod tests {
 
         let credential = resolve_stored_credential_from_backends(
             Some(&authority),
-            || KeychainCredentialProbe::Failed,
-            || {},
-            || None,
+            || KeychainCredentialProbe::Failed("OSStatus -34018".to_owned()),
+            no_interactive_retry,
             || {
                 file_lookups.set(file_lookups.get() + 1);
                 EncryptedFileCredentialProbe::Found("stale-file-token".to_owned())
@@ -3855,8 +3991,7 @@ mod tests {
                 keychain_probes.set(keychain_probes.get() + 1);
                 KeychainCredentialProbe::Found("stale-keychain-token".to_owned())
             },
-            || {},
-            || None,
+            no_interactive_retry,
             || EncryptedFileCredentialProbe::Found("new-file-token".to_owned()),
         )
         .unwrap()
@@ -3872,21 +4007,18 @@ mod tests {
 
     #[test]
     fn keychain_probe_failure_does_not_activate_ambiguous_file_fallback() {
-        let notices = std::cell::Cell::new(0);
         let retries = std::cell::Cell::new(0);
 
         let credential = resolve_keychain_credential(
-            KeychainCredentialProbe::Failed,
-            || notices.set(notices.get() + 1),
+            KeychainCredentialProbe::Failed("OSStatus -34018".to_owned()),
             || {
                 retries.set(retries.get() + 1);
-                None
+                KeychainCredentialProbe::NotFound
             },
             || Some("file-token".to_string()),
         );
 
         assert_eq!(credential, None);
-        assert_eq!(notices.get(), 0);
         assert_eq!(retries.get(), 0);
     }
 

@@ -382,6 +382,15 @@ pub enum LpmError {
     )]
     CredentialStorage(String),
 
+    #[error("credential storage is locked: {0}")]
+    #[diagnostic(
+        code(lpm::credential_storage_locked),
+        help(
+            "Unlock this computer, then run the command again. LPM can read its saved login only while your session is unlocked; signing in again won't help."
+        )
+    )]
+    CredentialStorageLocked(String),
+
     #[error("LPM does not support user commands through sudo")]
     #[diagnostic(
         code(lpm::sudo_not_supported),
@@ -836,6 +845,17 @@ pub const TUNNEL_ACCESS_CODES: [&str; 4] = [
 ];
 
 impl LpmError {
+    /// Whether local secure storage, not the registry, failed: the saved
+    /// credential exists but could not be read, so callers must not treat it
+    /// as absent or fall back to another source.
+    #[inline]
+    pub fn is_credential_storage_failure(&self) -> bool {
+        matches!(
+            self,
+            LpmError::CredentialStorage(_) | LpmError::CredentialStorageLocked(_)
+        )
+    }
+
     /// The error for a relay refusal with one of [`TUNNEL_ACCESS_CODES`].
     pub fn tunnel_access(code: &str, message: impl Into<String>) -> Self {
         let help = match code {
@@ -884,6 +904,7 @@ impl LpmError {
             LpmError::AuthRequired => "auth_required",
             LpmError::EnvTokenRejected => "env_token_rejected",
             LpmError::CredentialStorage(_) => "credential_storage",
+            LpmError::CredentialStorageLocked(_) => "credential_storage_locked",
             LpmError::SudoNotSupported => "sudo_not_supported",
             LpmError::SessionExpired => "session_expired",
             LpmError::UnsupportedAuthSource { .. } => "unsupported_auth_source",
@@ -1121,6 +1142,7 @@ mod tests {
             },
             LpmError::AuthRequired,
             LpmError::CredentialStorage("x".into()),
+            LpmError::CredentialStorageLocked("x".into()),
             LpmError::SessionExpired,
             LpmError::UnsupportedAuthSource {
                 command: "lpm token-rotate",
@@ -1304,12 +1326,29 @@ mod tests {
     }
 
     #[test]
+    fn locked_credential_storage_is_a_storage_failure_whose_help_does_not_suggest_signing_in() {
+        let locked = LpmError::CredentialStorageLocked("x".into());
+
+        assert!(locked.is_credential_storage_failure());
+        assert!(LpmError::CredentialStorage("x".into()).is_credential_storage_failure());
+        assert!(!LpmError::AuthRequired.is_credential_storage_failure());
+        assert!(!LpmError::Registry("x".into()).is_credential_storage_failure());
+        let help = locked.help().unwrap().to_string();
+        assert!(help.contains("Unlock this computer"), "help: {help}");
+        assert!(!help.contains("lpm login"), "help: {help}");
+    }
+
+    #[test]
     fn error_code_specific_values() {
         assert_eq!(LpmError::AuthRequired.error_code(), "auth_required");
         assert_eq!(LpmError::Sandbox("x".into()).error_code(), "sandbox");
         assert_eq!(
             LpmError::CredentialStorage("x".into()).error_code(),
             "credential_storage"
+        );
+        assert_eq!(
+            LpmError::CredentialStorageLocked("x".into()).error_code(),
+            "credential_storage_locked"
         );
         assert_eq!(
             LpmError::SudoNotSupported.error_code(),

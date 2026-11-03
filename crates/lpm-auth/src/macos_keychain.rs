@@ -66,6 +66,16 @@ fn identity(service: &str, account: &str, scope: Scope) -> Vec<(CFString, CFType
     }
 }
 
+/// `OSStatus <code>: <Security.framework message>`, keeping the raw status
+/// searchable even when the framework has no message for it.
+pub(super) fn describe(error: Error) -> String {
+    let code = error.code();
+    match error.message() {
+        Some(message) => format!("OSStatus {code}: {message}"),
+        None => format!("OSStatus {code}"),
+    }
+}
+
 pub(super) fn read(
     service: &str,
     account: &str,

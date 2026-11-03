@@ -741,6 +741,7 @@ fn npm_firewall_preflight_enforce_error(error: LpmError) -> LpmError {
         | LpmError::EnvTokenRejected
         | LpmError::SessionExpired
         | LpmError::NpmFirewallEntitlementRequired { .. }) => error,
+        error if error.is_credential_storage_failure() => error,
         error => LpmError::Registry(format!("npm firewall verdict preflight failed: {error}")),
     }
 }
@@ -755,6 +756,24 @@ mod error_tests {
             npm_firewall_preflight_enforce_error(LpmError::EnvTokenRejected),
             LpmError::EnvTokenRejected
         ));
+    }
+
+    #[test]
+    fn enforced_preflight_keeps_local_credential_storage_error_codes() {
+        for (error, code) in [
+            (
+                LpmError::CredentialStorage("failed to read stored access credential".into()),
+                "credential_storage",
+            ),
+            (
+                LpmError::CredentialStorageLocked("failed to read stored access credential".into()),
+                "credential_storage_locked",
+            ),
+        ] {
+            let error = npm_firewall_preflight_enforce_error(error);
+
+            assert_eq!(error.error_code(), code, "{error}");
+        }
     }
 
     #[test]

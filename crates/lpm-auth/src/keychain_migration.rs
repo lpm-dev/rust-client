@@ -1,30 +1,32 @@
+use crate::CredentialReadError;
 use crate::credential_authority::{CredentialAuthority, CredentialBackend};
 
 trait MigrationBackend {
-    fn read_legacy(&mut self) -> Result<Option<String>, String>;
-    fn write_shared(&mut self, token: &str) -> Result<(), String>;
-    fn read_shared(&mut self) -> Result<Option<String>, String>;
-    fn save_authority(&mut self, authority: &CredentialAuthority) -> Result<(), String>;
-    fn delete_legacy(&mut self) -> Result<(), String>;
+    fn read_legacy(&mut self) -> Result<Option<String>, CredentialReadError>;
+    fn write_shared(&mut self, token: &str) -> Result<(), CredentialReadError>;
+    fn read_shared(&mut self) -> Result<Option<String>, CredentialReadError>;
+    fn save_authority(
+        &mut self,
+        authority: &CredentialAuthority,
+    ) -> Result<(), CredentialReadError>;
+    fn delete_legacy(&mut self) -> Result<(), CredentialReadError>;
 }
 
 fn migrate(
     authority: &mut CredentialAuthority,
     backend: &mut impl MigrationBackend,
-) -> Result<(), String> {
+) -> Result<(), CredentialReadError> {
     let mut verified = false;
     if authority.backend() == Some(CredentialBackend::Keychain) {
         let token = backend
             .read_legacy()?
             .ok_or("legacy Keychain credential is unavailable")?;
         if !authority.matches_token(&token) {
-            return Err(
-                "legacy Keychain credential does not match its authority record".to_owned(),
-            );
+            return Err("legacy Keychain credential does not match its authority record".into());
         }
         backend.write_shared(&token)?;
         if backend.read_shared()?.as_deref() != Some(token.as_str()) {
-            return Err("shared Keychain migration verification failed".to_owned());
+            return Err("shared Keychain migration verification failed".into());
         }
         let next = authority.with_shared_keychain_cleanup(true);
         backend.save_authority(&next)?;
@@ -38,7 +40,7 @@ fn migrate(
                 .ok_or("shared Keychain credential is unavailable")?;
             if !authority.matches_token(&token) {
                 return Err(
-                    "shared Keychain credential does not match its authority record".to_owned(),
+                    "shared Keychain credential does not match its authority record".into(),
                 );
             }
         }
@@ -57,7 +59,23 @@ pub(super) fn prepare(
     account: &str,
     authority: &mut CredentialAuthority,
     notice: impl FnMut(),
-) -> Result<(), String> {
+) -> Result<(), CredentialReadError> {
+    use crate::macos_keychain::{self, Scope, describe};
+
+    // Shared auth items carry no access control (see `resolve_keychain_probe`),
+    // so the data-protection Keychain refuses them only while the keybag is locked.
+    fn shared_error(context: &str, error: security_framework::base::Error) -> CredentialReadError {
+        if error.code() == crate::ERR_SEC_INTERACTION_NOT_ALLOWED {
+            CredentialReadError::KeychainLocked
+        } else {
+            format!("{context}: {}", describe(error)).into()
+        }
+    }
+
+    fn legacy_error(context: &str, error: security_framework::base::Error) -> CredentialReadError {
+        format!("{context}: {}", describe(error)).into()
+    }
+
     struct Native<'a, F> {
         registry: &'a str,
         kind: crate::credential_authority::CredentialKind,
@@ -66,40 +84,36 @@ pub(super) fn prepare(
         notice: F,
     }
     impl<F: FnMut()> MigrationBackend for Native<'_, F> {
-        fn read_legacy(&mut self) -> Result<Option<String>, String> {
-            use crate::macos_keychain::{self, Scope};
+        fn read_legacy(&mut self) -> Result<Option<String>, CredentialReadError> {
             match macos_keychain::read(&self.service, self.account, Scope::Legacy, false) {
                 Err(error) if error.code() == crate::ERR_SEC_INTERACTION_NOT_ALLOWED => {
                     (self.notice)();
                     macos_keychain::read(&self.service, self.account, Scope::Legacy, true)
-                        .map_err(|error| format!("legacy Keychain read failed: {error}"))
+                        .map_err(|error| legacy_error("legacy Keychain read failed", error))
                 }
-                result => result.map_err(|error| format!("legacy Keychain read failed: {error}")),
+                result => {
+                    result.map_err(|error| legacy_error("legacy Keychain read failed", error))
+                }
             }
         }
-        fn write_shared(&mut self, token: &str) -> Result<(), String> {
-            crate::macos_keychain::write(&self.service, self.account, token)
-                .map_err(|error| format!("shared Keychain migration failed: {error}"))
+        fn write_shared(&mut self, token: &str) -> Result<(), CredentialReadError> {
+            macos_keychain::write(&self.service, self.account, token)
+                .map_err(|error| shared_error("shared Keychain migration failed", error))
         }
-        fn read_shared(&mut self) -> Result<Option<String>, String> {
-            crate::macos_keychain::read(
-                &self.service,
-                self.account,
-                crate::macos_keychain::Scope::Shared,
-                false,
-            )
-            .map_err(|error| format!("shared Keychain read failed: {error}"))
+        fn read_shared(&mut self) -> Result<Option<String>, CredentialReadError> {
+            macos_keychain::read(&self.service, self.account, Scope::Shared, false)
+                .map_err(|error| shared_error("shared Keychain read failed", error))
         }
-        fn save_authority(&mut self, authority: &CredentialAuthority) -> Result<(), String> {
+        fn save_authority(
+            &mut self,
+            authority: &CredentialAuthority,
+        ) -> Result<(), CredentialReadError> {
             crate::credential_authority::set(self.registry, self.kind, authority.clone())
+                .map_err(CredentialReadError::from)
         }
-        fn delete_legacy(&mut self) -> Result<(), String> {
-            crate::macos_keychain::delete(
-                &self.service,
-                self.account,
-                crate::macos_keychain::Scope::Legacy,
-            )
-            .map_err(|error| format!("legacy Keychain cleanup failed: {error}"))
+        fn delete_legacy(&mut self) -> Result<(), CredentialReadError> {
+            macos_keychain::delete(&self.service, self.account, Scope::Legacy)
+                .map_err(|error| legacy_error("legacy Keychain cleanup failed", error))
         }
     }
     migrate(
@@ -124,6 +138,7 @@ mod tests {
         shared: Option<String>,
         saved: Option<CredentialAuthority>,
         fail_write: bool,
+        locked_write: bool,
         fail_delete: bool,
         fail_save: bool,
         corrupt_copy: bool,
@@ -131,29 +146,35 @@ mod tests {
         writes: usize,
     }
     impl MigrationBackend for Memory {
-        fn read_legacy(&mut self) -> Result<Option<String>, String> {
+        fn read_legacy(&mut self) -> Result<Option<String>, CredentialReadError> {
             self.legacy_reads += 1;
             Ok(self.legacy.clone())
         }
-        fn write_shared(&mut self, token: &str) -> Result<(), String> {
+        fn write_shared(&mut self, token: &str) -> Result<(), CredentialReadError> {
             self.writes += 1;
+            if self.locked_write {
+                return Err(CredentialReadError::KeychainLocked);
+            }
             if self.fail_write {
                 return Err("write failed".into());
             }
             self.shared = Some(if self.corrupt_copy { "corrupt" } else { token }.to_owned());
             Ok(())
         }
-        fn read_shared(&mut self) -> Result<Option<String>, String> {
+        fn read_shared(&mut self) -> Result<Option<String>, CredentialReadError> {
             Ok(self.shared.clone())
         }
-        fn save_authority(&mut self, authority: &CredentialAuthority) -> Result<(), String> {
+        fn save_authority(
+            &mut self,
+            authority: &CredentialAuthority,
+        ) -> Result<(), CredentialReadError> {
             if self.fail_save {
                 return Err("save failed".into());
             }
             self.saved = Some(authority.clone());
             Ok(())
         }
-        fn delete_legacy(&mut self) -> Result<(), String> {
+        fn delete_legacy(&mut self) -> Result<(), CredentialReadError> {
             if self.fail_delete {
                 return Err("delete failed".into());
             }
@@ -198,6 +219,19 @@ mod tests {
         assert_eq!(memory.legacy.as_deref(), Some("valid"));
         memory.fail_write = false;
         migrate(&mut authority, &mut memory).unwrap();
+    }
+    #[test]
+    fn locked_shared_keychain_reports_a_locked_session_and_keeps_the_legacy_credential() {
+        let (mut authority, mut memory) = legacy();
+        memory.locked_write = true;
+
+        assert_eq!(
+            migrate(&mut authority, &mut memory),
+            Err(CredentialReadError::KeychainLocked)
+        );
+        assert_eq!(authority.backend(), Some(CredentialBackend::Keychain));
+        assert_eq!(memory.legacy.as_deref(), Some("valid"));
+        assert!(memory.saved.is_none());
     }
     #[test]
     fn failed_verification_or_authority_commit_never_deletes_legacy() {

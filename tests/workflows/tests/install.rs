@@ -5490,6 +5490,57 @@ async fn install_offline_firewall_enforce_fails_closed_before_linking() {
 }
 
 #[tokio::test]
+async fn install_firewall_enforce_reports_unreadable_saved_login_as_credential_storage_json() {
+    let project = warm_public_npm_lockfile_project_for_offline_firewall("enforce").await;
+    let mock = MockRegistry::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/registry/-/npm-firewall/verdicts"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(mock.server())
+        .await;
+    support::auth_state::seed_sessions(
+        project.home(),
+        &[support::auth_state::SessionSeed {
+            registry_url: &mock.url(),
+            access_token: Some("access-before-corruption"),
+            refresh_token: None,
+            session_access_expires_at: Some("2030-01-01T00:00:00Z"),
+        }],
+    );
+    support::auth_state::overwrite_credentials_store_preserving_authority(
+        project.home(),
+        &serde_json::json!({ mock.url(): { "corrupt": true } }),
+    );
+
+    let output = lpm_with_registry(&project, &mock.url())
+        .args(["install", "--json", "--no-security-summary", "--no-skills"])
+        .output()
+        .expect("failed to run install with an unreadable saved login");
+
+    assert!(
+        !output.status.success(),
+        "enforce-mode firewall must fail closed when the saved login is unreadable\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json = assertions::parse_json_output(&output.stdout);
+    assert_eq!(json["success"], false);
+    assert_eq!(
+        json["error_code"], "credential_storage",
+        "a local credential failure must not be reported as a registry error: {json}"
+    );
+    assert!(
+        json.get("next_steps").is_none(),
+        "local storage failures must not tell users to sign in again: {json}"
+    );
+    assert!(
+        !project.path().join("node_modules").exists(),
+        "enforce must fail before linking"
+    );
+}
+
+#[tokio::test]
 async fn install_offline_firewall_enforce_uses_public_lockfile_source_when_npmrc_drifts() {
     let project = warm_public_npm_lockfile_project_for_offline_firewall("enforce").await;
     project.write_file(".npmrc", "registry=https://npm.internal.example.com/\n");
