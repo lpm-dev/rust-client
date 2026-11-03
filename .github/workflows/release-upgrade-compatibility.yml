@@ -6,6 +6,11 @@ on:
       - 'crates/lpm-auth/**'
       - 'crates/lpm-cli/src/commands/self_update*'
       - 'crates/lpm-cli/src/commands/self_update/**'
+      - 'crates/lpm-cli/src/release_lookup.rs'
+      - 'crates/lpm-cli/tests/fixtures/release_manifests/**'
+      - 'crates/lpm-cli/tests/fixtures/sigstore_bundles/21-real-lpm-release-*'
+      - 'scripts/ci/verify-release-signing-policy.sh'
+      - 'scripts/ci/test-verify-release-signing-policy.sh'
       - 'install.sh'
       - 'tests/install-sh/**'
       - '.github/workflows/release-upgrade-compatibility.yml'
@@ -74,6 +79,11 @@ jobs:
           (cd "$RUNNER_TEMP/old-cli" && grep '  lpm-linux-x64$' SHA256SUMS.txt | sha256sum --check)
           chmod +x "$RUNNER_TEMP/old-cli/lpm-linux-x64"
           python3 scripts/ci/test-headless-auth-upgrade.py "$RUNNER_TEMP/old-cli/lpm-linux-x64" target/debug/lpm-rs
+      - name: Release signing-policy gate
+        if: always() && runner.os == 'Linux'
+        run: |
+          cargo build --locked -p lpm-cli
+          bash scripts/ci/test-verify-release-signing-policy.sh target/debug/lpm-rs
       - name: Validate real signed macOS releases
         if: always() && runner.os == 'macOS'
         env:

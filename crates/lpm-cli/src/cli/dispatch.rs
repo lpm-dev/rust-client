@@ -195,6 +195,23 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
     }
 
+    if let Commands::InternalVerifyRelease(args) = &command {
+        let release = crate::release_lookup::GithubRelease {
+            published_at: args.published_at,
+            target_commitish: args.release_commit.clone(),
+        };
+        if let Err(error) = commands::self_update::verify_release::run(
+            &args.version,
+            &args.manifest,
+            &args.bundle,
+            &release,
+            cli.json,
+        ) {
+            exit_with_lpm_error(&error, cli.json);
+        }
+        return Ok(());
+    }
+
     if let Commands::InternalTsTransform(args) = &command {
         let result = if args.persistent {
             lpm_runner::ts_transform::run_persistent_stdio()
@@ -3234,7 +3251,9 @@ async fn async_main(cli: Cli) -> Result<()> {
             update_check::refresh_cache_now().await;
             std::process::exit(0);
         }
-        Commands::InternalTsTransform(_) => unreachable!("handled before async command dispatch"),
+        Commands::InternalTsTransform(_) | Commands::InternalVerifyRelease(_) => {
+            unreachable!("handled before async command dispatch")
+        }
         Commands::External(args) => {
             let cwd = std::env::current_dir().map_err(lpm_common::LpmError::Io)?;
             commands::run::run_external_shortcut(

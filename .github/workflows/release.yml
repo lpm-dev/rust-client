@@ -1531,6 +1531,20 @@ jobs:
       - name: Stage Sigstore bundle next to manifest
         run: cp "${{ steps.attest.outputs.bundle-path }}" binaries/SHA256SUMS.txt.sigstore
 
+      # Run the verifier compiled into the binary being released, so a signing
+      # identity that `lpm self-update` would refuse fails here, before any
+      # draft or published release exists.
+      - name: Verify the signed manifest with the shipped self-update policy
+        env:
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+        run: >-
+          scripts/ci/verify-release-signing-policy.sh
+          binaries/lpm-linux-x64
+          "$RELEASE_VERSION"
+          binaries/SHA256SUMS.txt
+          binaries/SHA256SUMS.txt.sigstore
+          "$GITHUB_SHA"
+
       - name: Remove stale draft release for the exact tag
         if: needs.release-metadata.outputs.mode == 'full'
         env:
@@ -1991,6 +2005,17 @@ jobs:
       - name: Replace candidate smoke proof with promotion proof
         run: cp "${{ steps.attest.outputs.bundle-path }}" release-candidate/github-release/SHA256SUMS.txt.sigstore
 
+      - name: Verify the promotion proof with the shipped self-update policy
+        env:
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+        run: >-
+          scripts/ci/verify-release-signing-policy.sh
+          release-candidate/github-release/lpm-linux-x64
+          "$RELEASE_VERSION"
+          release-candidate/github-release/SHA256SUMS.txt
+          release-candidate/github-release/SHA256SUMS.txt.sigstore
+          "$SOURCE_SHA"
+
       - name: Upload promotion-time GitHub assets
         id: github-assets
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -2377,15 +2402,21 @@ jobs:
             --certificate-identity-regexp '^https://github\.com/lpm-dev/rust-client/\.github/workflows/release\.yml@refs/heads/main$' \
             --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
             "$RUNNER_TEMP/published-release/SHA256SUMS.txt"
-          integrated_time=$(jq -er 'first(.. | objects | .integratedTime? // empty)' \
-            "$RUNNER_TEMP/published-release/SHA256SUMS.txt.sigstore")
+
+      - name: Verify the published release with the shipped self-update policy
+        env:
+          RELEASE_VERSION: ${{ needs.release-metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          target_commit=$(jq -er '.target_commitish' "$RUNNER_TEMP/published-release.json")
           published_at=$(jq -er '.published_at' "$RUNNER_TEMP/published-release.json")
-          published_epoch=$(date -d "$published_at" +%s)
-          if [ "$integrated_time" -lt $((published_epoch - 3600)) ] || \
-             [ "$integrated_time" -gt $((published_epoch + 86400)) ]; then
-            echo "::error::The published Sigstore proof is outside the self-update replay window."
-            exit 1
-          fi
+          scripts/ci/verify-release-signing-policy.sh \
+            release-candidate/github-release/lpm-linux-x64 \
+            "$RELEASE_VERSION" \
+            "$RUNNER_TEMP/published-release/SHA256SUMS.txt" \
+            "$RUNNER_TEMP/published-release/SHA256SUMS.txt.sigstore" \
+            "$target_commit" \
+            "$published_at"
 
       - name: Record promotion recovery instructions
         if: always()
@@ -2432,6 +2463,13 @@ jobs:
             --jq ".[] | select(.tag_name == \"${RELEASE_TAG}\" and .draft == true) | .id")
           if [ -z "$release_id" ] || [ "$(printf '%s\n' "$release_id" | wc -l | tr -d ' ')" != "1" ]; then
             echo "::error::Expected exactly one draft release for $RELEASE_TAG."
+            exit 1
+          fi
+          # `lpm self-update` binds a main-signed stable release to its version
+          # through this target, and the signing-policy gate assumed it.
+          draft_target=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}" --jq .target_commitish)
+          if [ "$draft_target" != "$GITHUB_SHA" ]; then
+            echo "::error::Draft target is $draft_target, expected the signed source commit $GITHUB_SHA."
             exit 1
           fi
           gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \

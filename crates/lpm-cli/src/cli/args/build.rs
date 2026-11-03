@@ -1,4 +1,7 @@
-use super::parsers::{parse_advisor_slug, parse_workspace_concurrency};
+use super::parsers::{
+    parse_advisor_slug, parse_canonical_release_version, parse_rfc3339_utc,
+    parse_workspace_concurrency,
+};
 use super::{BundleFormat, BundlePlatform, CheckEngine, InstallOmitCli, LinkerCli};
 use clap::Args;
 
@@ -592,6 +595,30 @@ pub(crate) struct SelfUpdateArgs {
     /// upgrade itself, which always installs the resolved release.
     #[arg(long)]
     pub(crate) refresh: bool,
+}
+
+#[derive(Args)]
+pub(crate) struct InternalVerifyReleaseArgs {
+    /// Release version without the leading `v`.
+    #[arg(value_parser = parse_canonical_release_version)]
+    pub(crate) version: String,
+
+    /// The release's `SHA256SUMS.txt`.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) manifest: std::path::PathBuf,
+
+    /// The Sigstore bundle attesting `SHA256SUMS.txt`.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) bundle: std::path::PathBuf,
+
+    /// When the GitHub release was, or is about to be, published.
+    #[arg(long, value_name = "RFC3339", value_parser = parse_rfc3339_utc)]
+    pub(crate) published_at: chrono::DateTime<chrono::Utc>,
+
+    /// The full commit SHA the GitHub release records as its
+    /// `target_commitish`.
+    #[arg(long, value_name = "SHA")]
+    pub(crate) release_commit: Option<String>,
 }
 
 #[derive(Args)]

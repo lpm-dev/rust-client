@@ -1,7 +1,7 @@
 use crate::install_ui;
 use crate::release_channel::ReleaseChannel;
 use crate::release_lookup::{
-    FetchOutcome, LookupError, fetch_github_release_published_at, github_release_download_url,
+    FetchOutcome, GithubRelease, LookupError, fetch_github_release, github_release_download_url,
     is_newer_semver, operating_system_home_dir, probe_release, read_cache_at, write_cache_at,
 };
 use crate::sigstore_verify::{
@@ -23,6 +23,7 @@ mod download;
 mod probe;
 #[cfg(target_os = "macos")]
 mod validation;
+pub(crate) mod verify_release;
 #[cfg(windows)]
 mod windows_trust;
 
@@ -1873,35 +1874,84 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// Git ref the release workflow is required to run from.
+const RELEASE_WORKFLOW_BRANCH_REF: &str = "refs/heads/main";
+
+/// Which accepted workflow ref signed a release manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseSigningRef {
+    /// `refs/heads/main`: every nightly, and every stable release
+    /// published since the release workflow became main-only.
+    MainBranch,
+    /// `refs/tags/v{version}`: stable releases signed from their own tag
+    /// before that guard (v0.75.0 through v0.76.x).
+    VersionTag,
+}
+
+/// Enforce LPM's release-signing policy on a verified Sigstore
+/// certificate and its SLSA provenance statement, returning the signed
+/// 40-character source commit.
+///
+/// The certificate, the predicate's `workflow.ref`, and the
+/// `resolvedDependencies` source URI must all name one accepted ref:
+/// `refs/heads/main` for any channel, or `refs/tags/v{version}` for a
+/// stable release. Every other ref is rejected.
+///
+/// A tag ref names the version it signs. A main-branch ref does not, and
+/// a nightly can share the exact commit of a stable release, so the
+/// version is bound separately:
+/// - nightly: the version's 7-character commit suffix must prefix the
+///   signed commit;
+/// - stable: the run must be a manual `workflow_dispatch` (scheduled runs
+///   only ever produce nightlies), and `release_target_commit` (the
+///   GitHub release's `target_commitish`) must equal the signed commit.
+///
+/// The replay window in [`verify_release_manifest`] and the staged
+/// binary's exact version probe complete the binding.
 fn validate_release_provenance(
     version: &str,
     snapshot: &lpm_workspace::ProvenanceSnapshot,
     statement: &serde_json::Value,
+    release_target_commit: Option<&str>,
 ) -> Result<String, LpmError> {
     const REPOSITORY: &str = "https://github.com/lpm-dev/rust-client";
     const PUBLISHER: &str = "github:lpm-dev/rust-client";
     const WORKFLOW_PATH: &str = ".github/workflows/release.yml";
 
     let channel = ReleaseChannel::from_installed_version(version);
-    let expected_ref = match channel {
-        ReleaseChannel::Stable => format!("refs/tags/v{version}"),
-        ReleaseChannel::Nightly => "refs/heads/main".to_string(),
-    };
+    let version_tag_ref = format!("refs/tags/v{version}");
     let invalid = |detail: String| {
         LpmError::SelfUpdate(format!(
             "release v{version} has invalid signed provenance: {detail}"
         ))
     };
 
-    if !snapshot.present
-        || snapshot.publisher.as_deref() != Some(PUBLISHER)
-        || snapshot.workflow_path.as_deref() != Some(WORKFLOW_PATH)
-        || snapshot.workflow_ref.as_deref() != Some(expected_ref.as_str())
-    {
+    let signed_by_release_workflow = snapshot.present
+        && snapshot.publisher.as_deref() == Some(PUBLISHER)
+        && snapshot.workflow_path.as_deref() == Some(WORKFLOW_PATH);
+    let signing_ref = match (channel, snapshot.workflow_ref.as_deref()) {
+        _ if !signed_by_release_workflow => None,
+        (_, Some(RELEASE_WORKFLOW_BRANCH_REF)) => Some(ReleaseSigningRef::MainBranch),
+        (ReleaseChannel::Stable, Some(signed_ref)) if signed_ref == version_tag_ref => {
+            Some(ReleaseSigningRef::VersionTag)
+        }
+        _ => None,
+    };
+    let Some(signing_ref) = signing_ref else {
+        let accepted_refs = match channel {
+            ReleaseChannel::Stable => {
+                format!("`{RELEASE_WORKFLOW_BRANCH_REF}` or `{version_tag_ref}`")
+            }
+            ReleaseChannel::Nightly => format!("`{RELEASE_WORKFLOW_BRANCH_REF}`"),
+        };
         return Err(invalid(format!(
-            "certificate identity must be `{PUBLISHER}` workflow `{WORKFLOW_PATH}` at `{expected_ref}`"
+            "certificate identity must be `{PUBLISHER}` workflow `{WORKFLOW_PATH}` at {accepted_refs}"
         )));
-    }
+    };
+    let expected_ref = match signing_ref {
+        ReleaseSigningRef::MainBranch => RELEASE_WORKFLOW_BRANCH_REF,
+        ReleaseSigningRef::VersionTag => version_tag_ref.as_str(),
+    };
 
     let required_str = |pointer: &str, field: &str| {
         statement
@@ -1958,15 +2008,45 @@ fn validate_release_provenance(
         ));
     }
 
-    if channel == ReleaseChannel::Nightly {
-        let version_commit = version
-            .rsplit_once('.')
-            .map(|(_, suffix)| suffix.strip_prefix('g').unwrap_or(suffix))
-            .ok_or_else(|| invalid("nightly version has no commit suffix".to_string()))?;
-        if version_commit.len() != 7 || !source_commit.starts_with(version_commit) {
-            return Err(invalid(format!(
-                "nightly commit suffix `{version_commit}` does not match signed source commit `{source_commit}`"
-            )));
+    match (channel, signing_ref) {
+        (ReleaseChannel::Nightly, _) => {
+            let version_commit = version
+                .rsplit_once('.')
+                .map(|(_, suffix)| suffix.strip_prefix('g').unwrap_or(suffix))
+                .ok_or_else(|| invalid("nightly version has no commit suffix".to_string()))?;
+            if version_commit.len() != 7 || !source_commit.starts_with(version_commit) {
+                return Err(invalid(format!(
+                    "nightly commit suffix `{version_commit}` does not match signed source commit `{source_commit}`"
+                )));
+            }
+        }
+        (ReleaseChannel::Stable, ReleaseSigningRef::VersionTag) => {}
+        (ReleaseChannel::Stable, ReleaseSigningRef::MainBranch) => {
+            let event_name = required_str(
+                "/predicate/buildDefinition/internalParameters/github/event_name",
+                "github.event_name",
+            )?;
+            if event_name != "workflow_dispatch" {
+                return Err(invalid(format!(
+                    "a stable release signed from `{RELEASE_WORKFLOW_BRANCH_REF}` must come from a \
+                     `workflow_dispatch` release run, not `{event_name}`"
+                )));
+            }
+            match release_target_commit {
+                Some(target) if target == source_commit => {}
+                Some(target) => {
+                    return Err(invalid(format!(
+                        "GitHub release v{version} targets `{target}`, but the attestation was \
+                         signed for source commit `{source_commit}`"
+                    )));
+                }
+                None => {
+                    return Err(invalid(format!(
+                        "GitHub release v{version} does not record the commit it was created from, \
+                         so the `{RELEASE_WORKFLOW_BRANCH_REF}` attestation cannot be bound to this version"
+                    )));
+                }
+            }
         }
     }
 
@@ -1991,7 +2071,7 @@ fn verify_release_manifest(
     version: &str,
     manifest_bytes: &[u8],
     bundle_bytes: &[u8],
-    published_at: chrono::DateTime<chrono::Utc>,
+    release: &GithubRelease,
 ) -> Result<VerifiedReleaseManifest, LpmError> {
     let expectations = IdentityExpectations {
         expected_issuer: Some("https://token.actions.githubusercontent.com".to_string()),
@@ -2009,8 +2089,14 @@ fn verify_release_manifest(
         log_index,
     } = verify_sigstore_bundle(bundle_bytes, &expectations, options).map_err(map_verify_error)?;
 
-    let source_commit = validate_release_provenance(version, &snapshot, &statement)?;
+    let source_commit = validate_release_provenance(
+        version,
+        &snapshot,
+        &statement,
+        release.target_commitish.as_deref(),
+    )?;
 
+    let published_at = release.published_at;
     let integrated_time_utc: chrono::DateTime<chrono::Utc> = integrated_time.into();
     let earliest = published_at - REPLAY_PRE_WINDOW;
     let latest = published_at + REPLAY_POST_WINDOW;
@@ -3073,7 +3159,7 @@ async fn fetch_verified_release_manifest(
             })
     };
     let release_metadata = async {
-        fetch_github_release_published_at(version)
+        fetch_github_release(version)
             .await
             .map_err(|e| match e {
                 LookupError::NotFound(_) => LpmError::SelfUpdate(format!(
@@ -3090,12 +3176,12 @@ async fn fetch_verified_release_manifest(
             })
     };
 
-    let (manifest_bytes, bundle_bytes, published_at) =
+    let (manifest_bytes, bundle_bytes, release) =
         tokio::try_join!(manifest, bundle, release_metadata)?;
     if human_output {
         install_ui::phase("Verifying Sigstore attestation");
     }
-    verify_release_manifest(version, &manifest_bytes, &bundle_bytes, published_at)
+    verify_release_manifest(version, &manifest_bytes, &bundle_bytes, &release)
 }
 
 async fn verify_and_stage_for_standalone(
@@ -4075,6 +4161,9 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
                             "path": ".github/workflows/release.yml",
                         },
                     },
+                    "internalParameters": {
+                        "github": { "event_name": "workflow_dispatch" },
+                    },
                     "resolvedDependencies": [{
                         "uri": format!("git+https://github.com/lpm-dev/rust-client@{workflow_ref}"),
                         "digest": { "gitCommit": source_commit },
@@ -4085,41 +4174,281 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  lpm-linux-x64
         (snapshot, statement)
     }
 
+    const FIXTURE_SOURCE_COMMIT: &str = "1e98fb8efbcc00f620678fc8091b512ed503768f";
+
+    fn set_statement_field(statement: &mut serde_json::Value, pointer: &str, value: &str) {
+        *statement
+            .pointer_mut(pointer)
+            .unwrap_or_else(|| panic!("fixture has no `{pointer}`")) = value.into();
+    }
+
     #[test]
     fn release_provenance_rejects_stable_workflow_ref_for_another_version() {
-        let source_commit = "1e98fb8efbcc00f620678fc8091b512ed503768f";
-        let (snapshot, statement) = release_provenance_fixture("refs/tags/v0.74.1", source_commit);
-        let err = validate_release_provenance("0.75.0", &snapshot, &statement)
-            .expect_err("a stable release must be signed from its requested tag");
-        assert!(err.to_string().contains("refs/tags/v0.75.0"));
+        let (snapshot, statement) =
+            release_provenance_fixture("refs/tags/v0.74.1", FIXTURE_SOURCE_COMMIT);
+        let err = validate_release_provenance("0.75.0", &snapshot, &statement, None)
+            .expect_err("a tag-signed stable release must be signed from its requested tag");
+        let message = err.to_string();
+        assert!(
+            message.contains("`refs/heads/main` or `refs/tags/v0.75.0`"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn release_provenance_rejects_stable_release_signed_from_another_branch() {
+        let (snapshot, statement) =
+            release_provenance_fixture("refs/heads/codex/x", FIXTURE_SOURCE_COMMIT);
+        let err = validate_release_provenance(
+            "0.84.0",
+            &snapshot,
+            &statement,
+            Some(FIXTURE_SOURCE_COMMIT),
+        )
+        .expect_err("only main may sign a stable release");
+        let message = err.to_string();
+        assert!(
+            message.contains("`refs/heads/main` or `refs/tags/v0.84.0`"),
+            "{message}"
+        );
     }
 
     #[test]
     fn release_provenance_rejects_nightly_version_from_another_commit() {
-        let source_commit = "1e98fb8efbcc00f620678fc8091b512ed503768f";
-        let (snapshot, statement) = release_provenance_fixture("refs/heads/main", source_commit);
-        let err =
-            validate_release_provenance("0.75.0-nightly.20260817.1.fffffff", &snapshot, &statement)
-                .expect_err("a nightly version must name its signed source commit");
+        let (snapshot, statement) =
+            release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
+        let err = validate_release_provenance(
+            "0.75.0-nightly.20260817.1.fffffff",
+            &snapshot,
+            &statement,
+            None,
+        )
+        .expect_err("a nightly version must name its signed source commit");
         assert!(err.to_string().contains("fffffff"));
     }
 
     #[test]
+    fn release_provenance_rejects_nightly_signed_from_a_tag() {
+        let version = "0.75.0-nightly.20260817.1.1e98fb8";
+        let (snapshot, statement) =
+            release_provenance_fixture(&format!("refs/tags/v{version}"), FIXTURE_SOURCE_COMMIT);
+        let err = validate_release_provenance(version, &snapshot, &statement, None)
+            .expect_err("nightlies are only ever signed from main");
+        let message = err.to_string();
+        assert!(message.ends_with("at `refs/heads/main`"), "{message}");
+    }
+
+    #[test]
     fn release_provenance_accepts_exact_stable_tag_and_source_commit() {
-        let source_commit = "1e98fb8efbcc00f620678fc8091b512ed503768f";
-        let (snapshot, statement) = release_provenance_fixture("refs/tags/v0.74.1", source_commit);
-        let verified = validate_release_provenance("0.74.1", &snapshot, &statement).unwrap();
-        assert_eq!(verified, source_commit);
+        let (snapshot, statement) =
+            release_provenance_fixture("refs/tags/v0.74.1", FIXTURE_SOURCE_COMMIT);
+        let verified = validate_release_provenance("0.74.1", &snapshot, &statement, None).unwrap();
+        assert_eq!(verified, FIXTURE_SOURCE_COMMIT);
+    }
+
+    #[test]
+    fn release_provenance_accepts_main_signed_stable_release_targeting_its_source_commit() {
+        let (snapshot, statement) =
+            release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
+        let verified = validate_release_provenance(
+            "0.84.0",
+            &snapshot,
+            &statement,
+            Some(FIXTURE_SOURCE_COMMIT),
+        )
+        .unwrap();
+        assert_eq!(verified, FIXTURE_SOURCE_COMMIT);
+    }
+
+    #[test]
+    fn release_provenance_rejects_main_signed_stable_release_targeting_another_commit() {
+        let (snapshot, statement) =
+            release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
+        let other_commit = "35edeab28d25a6851519629e99e478c3cd810c3a";
+        let err = validate_release_provenance("0.84.0", &snapshot, &statement, Some(other_commit))
+            .expect_err("the GitHub release must target the signed commit");
+        let message = err.to_string();
+        assert!(message.contains(other_commit), "{message}");
+        assert!(message.contains(FIXTURE_SOURCE_COMMIT), "{message}");
+    }
+
+    #[test]
+    fn release_provenance_rejects_main_signed_stable_release_without_recorded_target() {
+        let (snapshot, statement) =
+            release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
+        let err = validate_release_provenance("0.84.0", &snapshot, &statement, None)
+            .expect_err("a main-signed stable release needs its target commit to bind the version");
+        assert!(
+            err.to_string().contains("does not record the commit"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn release_provenance_rejects_scheduled_run_as_stable_release() {
+        let (snapshot, mut statement) =
+            release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
+        set_statement_field(
+            &mut statement,
+            "/predicate/buildDefinition/internalParameters/github/event_name",
+            "schedule",
+        );
+        let err = validate_release_provenance(
+            "0.84.0",
+            &snapshot,
+            &statement,
+            Some(FIXTURE_SOURCE_COMMIT),
+        )
+        .expect_err("scheduled release runs only produce nightlies");
+        assert!(err.to_string().contains("`schedule`"), "{err}");
+    }
+
+    #[test]
+    fn release_provenance_accepts_scheduled_nightly() {
+        let (snapshot, mut statement) =
+            release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
+        set_statement_field(
+            &mut statement,
+            "/predicate/buildDefinition/internalParameters/github/event_name",
+            "schedule",
+        );
+        let verified = validate_release_provenance(
+            "0.75.0-nightly.20260817.1.1e98fb8",
+            &snapshot,
+            &statement,
+            None,
+        )
+        .unwrap();
+        assert_eq!(verified, FIXTURE_SOURCE_COMMIT);
+    }
+
+    #[test]
+    fn release_provenance_rejects_predicate_ref_that_differs_from_certificate_ref() {
+        let (snapshot, mut statement) =
+            release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
+        set_statement_field(
+            &mut statement,
+            "/predicate/buildDefinition/externalParameters/workflow/ref",
+            "refs/tags/v0.84.0",
+        );
+        let err = validate_release_provenance(
+            "0.84.0",
+            &snapshot,
+            &statement,
+            Some(FIXTURE_SOURCE_COMMIT),
+        )
+        .expect_err("certificate and predicate must name the same ref");
+        assert!(
+            err.to_string().contains("release.yml@refs/heads/main"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn release_provenance_rejects_source_uri_that_differs_from_certificate_ref() {
+        let (snapshot, mut statement) =
+            release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
+        set_statement_field(
+            &mut statement,
+            "/predicate/buildDefinition/resolvedDependencies/0/uri",
+            "git+https://github.com/lpm-dev/rust-client@refs/tags/v0.84.0",
+        );
+        let err = validate_release_provenance(
+            "0.84.0",
+            &snapshot,
+            &statement,
+            Some(FIXTURE_SOURCE_COMMIT),
+        )
+        .expect_err("the source dependency must use the certificate's ref");
+        assert!(
+            err.to_string()
+                .contains("missing source dependency `git+https://github.com/lpm-dev/rust-client@refs/heads/main`"),
+            "{err}"
+        );
     }
 
     #[test]
     fn release_provenance_accepts_nightly_commit_suffix() {
-        let source_commit = "1e98fb8efbcc00f620678fc8091b512ed503768f";
-        let (snapshot, statement) = release_provenance_fixture("refs/heads/main", source_commit);
-        let verified =
-            validate_release_provenance("0.75.0-nightly.20260817.1.1e98fb8", &snapshot, &statement)
-                .unwrap();
-        assert_eq!(verified, source_commit);
+        let (snapshot, statement) =
+            release_provenance_fixture("refs/heads/main", FIXTURE_SOURCE_COMMIT);
+        let verified = validate_release_provenance(
+            "0.75.0-nightly.20260817.1.1e98fb8",
+            &snapshot,
+            &statement,
+            None,
+        )
+        .unwrap();
+        assert_eq!(verified, FIXTURE_SOURCE_COMMIT);
+    }
+
+    const REAL_V0_84_0_SOURCE_COMMIT: &str = "35edeab28d25a6851519629e99e478c3cd810c3a";
+    const REAL_V0_84_0_PUBLISHED_AT: &str = "2026-11-02T04:06:07Z";
+
+    /// The `SHA256SUMS.txt` and Sigstore bundle published with v0.84.0,
+    /// signed by `release.yml` at `refs/heads/main`. Refresh with
+    /// `gh release download v0.84.0 -R lpm-dev/rust-client -p 'SHA256SUMS.txt*'`.
+    fn real_v0_84_0_release_assets() -> (Vec<u8>, Vec<u8>) {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let manifest = std::fs::read(fixtures.join("release_manifests/lpm-v0.84.0-SHA256SUMS.txt"))
+            .expect("v0.84.0 manifest fixture must exist");
+        let bundle =
+            std::fs::read(fixtures.join("sigstore_bundles/21-real-lpm-release-v0.84.0.json"))
+                .expect("v0.84.0 bundle fixture must exist");
+        (manifest, bundle)
+    }
+
+    fn github_release(published_at: &str, target_commitish: Option<&str>) -> GithubRelease {
+        GithubRelease {
+            published_at: chrono::DateTime::parse_from_rfc3339(published_at)
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            target_commitish: target_commitish.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn real_main_signed_stable_release_v0_84_0_verifies() {
+        let (manifest, bundle) = real_v0_84_0_release_assets();
+        let release = github_release(REAL_V0_84_0_PUBLISHED_AT, Some(REAL_V0_84_0_SOURCE_COMMIT));
+        let verified = verify_release_manifest("0.84.0", &manifest, &bundle, &release)
+            .expect("the published v0.84.0 release must satisfy the self-update policy");
+        assert_eq!(verified.source_commit, REAL_V0_84_0_SOURCE_COMMIT);
+        assert_eq!(verified.workflow_ref.as_deref(), Some("refs/heads/main"));
+        assert_eq!(
+            verified
+                .entries
+                .get("lpm-darwin-arm64.zip")
+                .map(String::as_str),
+            Some("bda4ed0a0ac94b7906fac74e4b43e353017a845cc75dcf35e6ac285c9e76e4c9")
+        );
+    }
+
+    #[test]
+    fn real_v0_84_0_attestation_is_refused_for_a_release_targeting_another_commit() {
+        let (manifest, bundle) = real_v0_84_0_release_assets();
+        let release = github_release(REAL_V0_84_0_PUBLISHED_AT, Some(FIXTURE_SOURCE_COMMIT));
+        let err = verify_release_manifest("0.84.0", &manifest, &bundle, &release)
+            .expect_err("a main-signed attestation must match the release's target commit");
+        assert!(err.to_string().contains("targets"), "{err}");
+    }
+
+    #[test]
+    fn real_v0_84_0_attestation_is_refused_outside_the_replay_window() {
+        let (manifest, bundle) = real_v0_84_0_release_assets();
+        let release = github_release("2026-11-04T04:06:07Z", Some(REAL_V0_84_0_SOURCE_COMMIT));
+        let err = verify_release_manifest("0.84.0", &manifest, &bundle, &release)
+            .expect_err("an attestation older than the replay window must be refused");
+        assert!(err.to_string().contains("replay window"), "{err}");
+    }
+
+    #[test]
+    fn real_v0_84_0_attestation_is_refused_for_a_tampered_manifest() {
+        let (mut manifest, bundle) = real_v0_84_0_release_assets();
+        manifest[0] = if manifest[0] == b'0' { b'1' } else { b'0' };
+        let release = github_release(REAL_V0_84_0_PUBLISHED_AT, Some(REAL_V0_84_0_SOURCE_COMMIT));
+        let err = verify_release_manifest("0.84.0", &manifest, &bundle, &release)
+            .expect_err("the manifest must hash to the attested subject digest");
+        assert!(err.to_string().contains("may be tampered"), "{err}");
     }
 
     /// Wire-shape pin for the audit JSON surface — `--json self-update`

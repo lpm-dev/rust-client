@@ -268,3 +268,99 @@ test("promotion waits for the correlated Homebrew update", () => {
   assert.match(promotion, /actions\/runs/);
   assert.match(promotion, /conclusion.*success/);
 });
+
+test("every SHA256SUMS.txt attestation passes the shipped self-update policy before anything else runs", () => {
+  const workflow = read(".github/workflows/release.yml");
+  const attestingJobs = jobsOf(workflow).filter(([, job]) =>
+    job.includes("uses: actions/attest-build-provenance@"),
+  );
+  const gatedCommit = { release: "$GITHUB_SHA", "stage-promotion-release": "$SOURCE_SHA" };
+  assert.deepEqual(
+    attestingJobs.map(([name]) => name),
+    Object.keys(gatedCommit),
+  );
+
+  for (const [name, job] of attestingJobs) {
+    const steps = stepsOf(job);
+    const attest = steps.findIndex(step => step.includes("uses: actions/attest-build-provenance@"));
+    const gate = steps.findIndex(step => step.includes("scripts/ci/verify-release-signing-policy.sh"));
+    assert.ok(gate > attest, `${name} must verify its fresh attestation with the shipped self-update policy`);
+    for (const step of steps.slice(attest + 1, gate)) {
+      assert.match(
+        step,
+        /run: cp "\$\{\{ steps\.attest\.outputs\.bundle-path \}\}" \S+\/SHA256SUMS\.txt\.sigstore\n/,
+        `${name} may only stage the bundle between attesting and verifying it`,
+      );
+    }
+
+    const manifestDir = steps[attest].match(/subject-path: (\S+)\/SHA256SUMS\.txt\n/)?.[1];
+    assert.ok(manifestDir, `${name} must attest a SHA256SUMS.txt`);
+    const gateStep = steps[gate];
+    assert.match(gateStep, /RELEASE_VERSION: \$\{\{ needs\.release-metadata\.outputs\.version \}\}/);
+    const argumentPositions = [
+      "scripts/ci/verify-release-signing-policy.sh",
+      `${manifestDir}/lpm-linux-x64`,
+      '"$RELEASE_VERSION"',
+      `${manifestDir}/SHA256SUMS.txt`,
+      `${manifestDir}/SHA256SUMS.txt.sigstore`,
+      `"${gatedCommit[name]}"`,
+    ].map(argument => [argument, gateStep.indexOf(`\n          ${argument}\n`)]);
+    for (const [index, [argument, position]] of argumentPositions.entries()) {
+      assert.ok(position >= 0, `${name} gate must pass ${argument}`);
+      assert.ok(
+        index === 0 || position > argumentPositions[index - 1][1],
+        `${name} gate must pass ${argument} after ${argumentPositions[index - 1]?.[0]}`,
+      );
+    }
+  }
+});
+
+test("a full-mode release is published only while its draft targets the commit the signing-policy gate bound", () => {
+  const workflow = read(".github/workflows/release.yml");
+  const release = jobSource(workflow, "release", "smoke-standalone-installer");
+  assert.match(release, /^\s+target_commitish: \$\{\{ github\.sha \}\}$/m);
+
+  const publish = jobSource(workflow, "publish-release", "publish-npm-platform");
+  const targetCheck = publish.indexOf('if [ "$draft_target" != "$GITHUB_SHA" ]; then');
+  assert.ok(targetCheck >= 0, "publish-release must compare the draft target with the gated commit");
+  assert.match(
+    publish,
+    /draft_target=\$\(gh api "repos\/\$\{GITHUB_REPOSITORY\}\/releases\/\$\{release_id\}" --jq \.target_commitish\)/,
+  );
+  assert.ok(
+    targetCheck < publish.indexOf("-F draft=false"),
+    "the draft target must be checked before the draft is published",
+  );
+});
+
+test("a promoted stable release passes the shipped self-update policy with its published metadata", () => {
+  const workflow = read(".github/workflows/release.yml");
+  const finalize = jobSource(workflow, "finalize-promotion-release", "publish-release");
+  const steps = stepsOf(finalize);
+  const published = steps.findIndex(step => step.startsWith("name: Verify published tag and exact release assets\n"));
+  const gate = steps.findIndex(step => step.includes("scripts/ci/verify-release-signing-policy.sh"));
+  assert.ok(published >= 0, "finalize-promotion-release must download the published release");
+  assert.equal(gate, published + 1, "the published release must be verified right after it is downloaded");
+
+  const gateStep = steps[gate];
+  assert.doesNotMatch(gateStep, /^\s+if:/m, "an already-published release must be verified on every run");
+  assert.match(gateStep, /set -euo pipefail\n/);
+  assert.match(gateStep, /target_commit=\$\(jq -er '\.target_commitish' "\$RUNNER_TEMP\/published-release\.json"\)\n/);
+  assert.match(gateStep, /published_at=\$\(jq -er '\.published_at' "\$RUNNER_TEMP\/published-release\.json"\)\n/);
+  const argumentPositions = [
+    "scripts/ci/verify-release-signing-policy.sh",
+    "release-candidate/github-release/lpm-linux-x64",
+    '"$RELEASE_VERSION"',
+    '"$RUNNER_TEMP/published-release/SHA256SUMS.txt"',
+    '"$RUNNER_TEMP/published-release/SHA256SUMS.txt.sigstore"',
+    '"$target_commit"',
+    '"$published_at"',
+  ].map(argument => [argument, gateStep.indexOf(argument)]);
+  for (const [index, [argument, position]] of argumentPositions.entries()) {
+    assert.ok(position >= 0, `published-release gate must pass ${argument}`);
+    assert.ok(
+      index === 0 || position > argumentPositions[index - 1][1],
+      `published-release gate must pass ${argument} after ${argumentPositions[index - 1]?.[0]}`,
+    );
+  }
+});
