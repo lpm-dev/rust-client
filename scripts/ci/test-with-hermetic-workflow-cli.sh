@@ -81,4 +81,42 @@ if [ -e "$(cat "$selected_binary_record")" ]; then
     exit 1
 fi
 
+mkdir -p "$TEST_ROOT/prebuilt/debug"
+cat >"$TEST_ROOT/prebuilt/debug/lpm-rs" <<'BINARY'
+#!/bin/bash
+printf 'prebuilt\n'
+BINARY
+chmod +x "$TEST_ROOT/prebuilt/debug/lpm-rs"
+
+if ! output="$({
+	PATH="$TEST_ROOT/bin:$PATH" \
+		CARGO_TARGET_DIR="$TEST_ROOT/prebuilt" \
+		SELECTED_BINARY_RECORD="$selected_binary_record" \
+		"$WRAPPER" --prebuilt "$TEST_ROOT/exercise-copy"
+} 2>&1)" || [ "$output" != "prebuilt" ]; then
+	echo "expected --prebuilt to stage the existing binary without building, got: $output" >&2
+	exit 1
+fi
+if [ -e "$(cat "$selected_binary_record")" ]; then
+	echo "temporary prebuilt binary was not removed" >&2
+	exit 1
+fi
+
+mkdir -p "$TEST_ROOT/unbuilt/debug"
+if output="$(PATH="$TEST_ROOT/bin:$PATH" CARGO_TARGET_DIR="$TEST_ROOT/unbuilt" "$WRAPPER" --prebuilt true 2>&1)"; then
+	echo "expected --prebuilt to fail when no binary was built" >&2
+	exit 1
+fi
+if [[ "$output" != *"--prebuilt"* ]]; then
+	echo "expected the missing-binary error to name --prebuilt, got: $output" >&2
+	exit 1
+fi
+
+status=0
+"$WRAPPER" --prebuilt >/dev/null 2>&1 || status=$?
+if [ "$status" -ne 2 ]; then
+	echo "expected usage exit 2 for --prebuilt without a command, got: $status" >&2
+	exit 1
+fi
+
 echo "hermetic workflow CLI wrapper tests passed"

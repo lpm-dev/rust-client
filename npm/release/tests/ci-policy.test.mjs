@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
@@ -51,4 +52,95 @@ test("CI compiles experimental HTTP/3 with the required reqwest cfg", () => {
   assert.match(job, /^\s+RUSTFLAGS: "--cfg reqwest_unstable"$/m);
   assert.match(job, /cargo check --locked -p lpm-registry --all-features/);
   assert.match(job, /cargo check --locked -p lpm-cli --features experimental-http3/);
+});
+
+function readCiWorkflow() {
+  return fs
+    .readFileSync(path.join(repoRoot, ".github/workflows/ci.yml"), "utf8")
+    .replaceAll("\r\n", "\n");
+}
+
+function ciJob(workflow, id) {
+  return workflow.match(new RegExp(`^  ${id}:\\n([\\s\\S]*?)(?=^  [a-z][\\w-]*:$|(?![\\s\\S]))`, "m"))?.[1];
+}
+
+function ciStep(job, name) {
+  return job.match(new RegExp(`^      - name: ${escapeRegExp(name)}\\n([\\s\\S]*?)(?=^      - |(?![\\s\\S]))`, "m"))?.[1];
+}
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+test("the required macOS check fails unless every macOS job passes", {
+  skip: process.platform === "win32" && "runs the gate script with bash and jq",
+}, () => {
+  const workflow = readCiWorkflow();
+  const gate = ciJob(workflow, "macos-workspace");
+  assert.ok(gate, "missing macos-workspace job");
+  assert.match(gate, /^    name: macOS workspace checks$/m);
+  assert.match(gate, /^    permissions: \{\}$/m, "the gate reads no repository content");
+  assert.match(gate, /^    if: always\(\)$/m, "a gate skipped by a failed job counts as passing");
+  const needs = gate.match(/^    needs: \[([^\]]+)\]$/m)?.[1].split(",").map((job) => job.trim());
+  assert.deepEqual(needs, ["macos-workspace-tests", "macos-build-checks"]);
+  for (const job of needs) {
+    assert.match(ciJob(workflow, job) ?? "", /^    runs-on: macos-latest$/m, `${job} must run on macOS`);
+  }
+
+  const step = ciStep(gate, "Require every macOS job to pass");
+  assert.ok(step, "missing macOS gate step");
+  assert.match(step, /^          NEEDS: \$\{\{ toJSON\(needs\) \}\}$/m);
+  const script = step
+    .match(/^        run: \|\n((?:          .*\n|\n)+)/m)?.[1]
+    .replace(/^ {10}/gm, "");
+  assert.ok(script, "missing macOS gate script");
+
+  const gateStatus = (results) => {
+    const reported = Object.fromEntries(needs.map((job, index) => [job, { result: results[index], outputs: {} }]));
+    return spawnSync("bash", ["-e", "-c", script], {
+      env: { ...process.env, NEEDS: JSON.stringify(reported) },
+      encoding: "utf8",
+    }).status;
+  };
+  assert.equal(gateStatus(["success", "success"]), 0);
+  for (const result of ["failure", "cancelled", "skipped"]) {
+    assert.notEqual(gateStatus([result, "success"]), 0, `gate passed with ${needs[0]} ${result}`);
+    assert.notEqual(gateStatus(["success", result]), 0, `gate passed with ${needs[1]} ${result}`);
+  }
+});
+
+test("macOS workspace tests compile lpm-rs once, with the hermetic test feature", () => {
+  const job = ciJob(readCiWorkflow(), "macos-workspace-tests");
+  assert.ok(job, "missing macos-workspace-tests job");
+  assert.match(job, /^    name: macOS workspace tests$/m);
+  assert.match(job, /^    permissions:\n      contents: read\n/m);
+  assert.doesNotMatch(job, /^    needs:/m);
+  assert.doesNotMatch(job, /cargo (?:build|check|clippy)\b/);
+
+  const selection = escapeRegExp("--locked --workspace --features lpm-cli/internal-test-sigstore-mock");
+  assert.match(
+    ciStep(job, "Build workspace tests") ?? "",
+    new RegExp(`^        run: cargo nextest run ${selection} --no-run$`, "m"),
+  );
+  assert.match(
+    ciStep(job, "Workspace tests") ?? "",
+    new RegExp(`^        run: scripts/ci/with-hermetic-workflow-cli\\.sh --prebuilt cargo nextest run ${selection} `, "m"),
+  );
+});
+
+test("macOS clippy, keychain and app bundle checks run beside the workspace tests", () => {
+  const job = ciJob(readCiWorkflow(), "macos-build-checks");
+  assert.ok(job, "missing macos-build-checks job");
+  assert.match(job, /^    permissions:\n      contents: read\n/m);
+  assert.doesNotMatch(job, /^    needs:/m);
+  assert.match(job, /^          cargo check --locked -p lpm-keyring$/m);
+  assert.match(job, /^          cargo check --locked -p lpm-auth$/m);
+  assert.match(job, /^          cargo check --locked -p lpm-vault$/m);
+  assert.match(job, /run: cargo test --locked -p lpm-keyring --test keyring3_compatibility -- --ignored$/m);
+  assert.match(job, /run: cargo clippy --workspace --all-targets --locked -- -D warnings$/m);
+  assert.match(
+    ciStep(job, "Assemble and validate unsigned macOS app bundle") ?? "",
+    /^          cargo build --locked -p lpm-cli --bin lpm-rs\n/m,
+    "the bundle must hold a binary built with the shipped features",
+  );
 });
