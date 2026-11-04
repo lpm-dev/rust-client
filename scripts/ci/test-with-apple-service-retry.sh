@@ -48,10 +48,20 @@ exit "$status"
 EOF
 chmod +x "$fixture/bin/codesign" "$fixture/bin/xcrun"
 
+# The fake sleep returns at once and records each wait in $LPM_TEST_SLEEPS, so a
+# test can run the production backoff schedule and check it.
+mkdir -p "$fixture/sleep-bin"
+cat > "$fixture/sleep-bin/sleep" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$1" >> "$LPM_TEST_SLEEPS"
+EOF
+chmod +x "$fixture/sleep-bin/sleep"
+
 export LPM_APPLE_SERVICE_CODESIGN="$fixture/bin/codesign"
 export LPM_APPLE_SERVICE_XCRUN="$fixture/bin/xcrun"
 export LPM_APPLE_SERVICE_BACKOFF_SECONDS=0
 export LPM_TEST_CALLS="$fixture/calls"
+export LPM_TEST_SLEEPS="$fixture/sleeps"
 bundle="$fixture/signed bundle/LPM CLI.app"
 identity="Developer ID Application: Example (TEAMID1234)"
 
@@ -63,8 +73,9 @@ run_helper() {
   outcomes=$1
   shift
   : > "$LPM_TEST_CALLS"
+  : > "$LPM_TEST_SLEEPS"
   status=0
-  LPM_TEST_OUTCOMES="$outcomes" "$helper" "$@" \
+  PATH="$fixture/sleep-bin:$PATH" LPM_TEST_OUTCOMES="$outcomes" "$helper" "$@" \
     > "$fixture/stdout" 2> "$fixture/stderr" || status=$?
   calls=$(wc -l < "$LPM_TEST_CALLS" | tr -d ' ')
 }
@@ -162,6 +173,30 @@ LPM_APPLE_SERVICE_MAX_ATTEMPTS=3 run_helper "$(lines 68 68 68 0)" stapler valida
 grep -Fq "::error::stapler validate still failed after 3 attempts" "$fixture/stderr" \
   || fail "lasting CloudKit outage was not reported"
 echo "PASS: stapler gives up with its own status after the attempt budget"
+
+LPM_APPLE_SERVICE_BACKOFF_SECONDS='' run_helper "$(lines 68 68 68 68 68 0)" stapler validate "$bundle"
+[ "$status" -eq 0 ] || fail "stapler validate through five dropped CloudKit lookups exited $status"
+[ "$calls" -eq 6 ] || fail "stapler validate through five dropped CloudKit lookups ran $calls times, expected 6"
+echo "PASS: stapler validate keeps trying through a CloudKit outage that drops five lookups in a row"
+
+lasting_outage=()
+for ((i = 0; i < 30; i++)); do
+  lasting_outage+=(68)
+done
+expected_waits=(5 20)
+for ((i = 0; i < 19; i++)); do
+  expected_waits+=(30)
+done
+LPM_APPLE_SERVICE_BACKOFF_SECONDS='' run_helper "$(lines "${lasting_outage[@]}")" stapler validate "$bundle"
+[ "$status" -eq 68 ] || fail "an outage that outlasts the default budget exited $status"
+[ "$calls" -eq 22 ] || fail "an outage that outlasts the default budget ran stapler $calls times, expected 22"
+waits=$(paste -sd ' ' "$LPM_TEST_SLEEPS")
+[ "$waits" = "${expected_waits[*]}" ] || fail "default backoff waited '$waits', expected '${expected_waits[*]}'"
+total_wait=$(awk '{ total += $1 } END { print total }' "$LPM_TEST_SLEEPS")
+[ "$total_wait" -eq 595 ] || fail "default backoff waited ${total_wait}s in all, expected about 10 minutes (595s)"
+grep -Fq "::error::stapler validate still failed after 22 attempts" "$fixture/stderr" \
+  || fail "an outage that outlasts the default budget was not reported"
+echo "PASS: by default stapler tries 22 times over about 10 minutes, waiting 5s, 20s, then every 30s"
 
 for arguments in "notarytool submit" "codesign" "stapler" "stapler validate" \
   "stapler verify /tmp/lpm.app" "stapler validate /tmp/lpm.app extra"; do
