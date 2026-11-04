@@ -79,6 +79,7 @@ test("the required macOS check fails unless every macOS job passes", {
   const gate = ciJob(workflow, "macos-workspace");
   assert.ok(gate, "missing macos-workspace job");
   assert.match(gate, /^    name: macOS workspace checks$/m);
+  assert.match(gate, /^    permissions: \{\}$/m, "the gate reads no repository content");
   assert.match(gate, /^    if: always\(\)$/m, "a gate skipped by a failed job counts as passing");
   const needs = gate.match(/^    needs: \[([^\]]+)\]$/m)?.[1].split(",").map((job) => job.trim());
   assert.deepEqual(needs, ["macos-workspace-tests", "macos-build-checks"]);
@@ -112,6 +113,7 @@ test("macOS workspace tests compile lpm-rs once, with the hermetic test feature"
   const job = ciJob(readCiWorkflow(), "macos-workspace-tests");
   assert.ok(job, "missing macos-workspace-tests job");
   assert.match(job, /^    name: macOS workspace tests$/m);
+  assert.match(job, /^    permissions:\n      contents: read\n/m);
   assert.doesNotMatch(job, /^    needs:/m);
   assert.doesNotMatch(job, /cargo (?:build|check|clippy)\b/);
 
@@ -129,6 +131,7 @@ test("macOS workspace tests compile lpm-rs once, with the hermetic test feature"
 test("macOS clippy, keychain and app bundle checks run beside the workspace tests", () => {
   const job = ciJob(readCiWorkflow(), "macos-build-checks");
   assert.ok(job, "missing macos-build-checks job");
+  assert.match(job, /^    permissions:\n      contents: read\n/m);
   assert.doesNotMatch(job, /^    needs:/m);
   assert.match(job, /^          cargo check --locked -p lpm-keyring$/m);
   assert.match(job, /^          cargo check --locked -p lpm-auth$/m);

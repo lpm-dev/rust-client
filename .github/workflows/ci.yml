@@ -407,6 +407,8 @@ jobs:
   macos-workspace-tests:
     name: macOS workspace tests
     runs-on: macos-latest
+    permissions:
+      contents: read
     # From a cold cache, the 3-core runner can spend 35 minutes compiling the
     # workspace tests before running them for 15.
     timeout-minutes: 90
@@ -467,6 +469,8 @@ jobs:
   macos-build-checks:
     name: macOS clippy, keychain and app bundle checks
     runs-on: macos-latest
+    permissions:
+      contents: read
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -516,6 +520,7 @@ jobs:
     # passing, so it has to run, and fail, when a macOS job fails.
     if: always()
     runs-on: ubuntu-latest
+    permissions: {}
     timeout-minutes: 5
     steps:
       - name: Require every macOS job to pass
