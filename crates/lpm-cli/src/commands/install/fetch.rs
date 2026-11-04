@@ -2285,10 +2285,16 @@ pub(super) async fn run_online_fetch_phase(
                     // Source-aware existence check: a registry-CAS hit must NOT
                     // satisfy a Source::Tarball pkg with the same
                     // (name, version).
-                    let store_path_pre_fetch = (!force_flag)
+                    //
+                    // The virtual store skips this check: a v1 entry, perhaps
+                    // left by an older install, says nothing about
+                    // `objects/<sri>/`, and the reusable-object check above
+                    // already found any object a sibling extracted.
+                    let check_v1_store = !force_flag && store_v2_ref.is_none();
+                    let store_path_pre_fetch = check_v1_store
                         .then(|| p.store_path_source_aware(&store_ref, &project_dir_buf, None))
                         .flatten();
-                    if !force_flag
+                    if check_v1_store
                         && p.store_has_source_aware(&store_ref, &project_dir_buf)
                         && let Some(existing_path) = store_path_pre_fetch
                     {
@@ -2306,29 +2312,6 @@ pub(super) async fn run_online_fetch_phase(
                         let sri =
                             lpm_store::read_stored_integrity(&existing_path).unwrap_or_default();
                         let link_h = spawn_link(&p, None)?;
-                        // The v2 object dir was populated by the sibling's fetch
-                        // task. The per-key fetch lock above ensures we observe
-                        // the post-extract state, so dispatch the v2 link entry in
-                        // the same shape as the post-fetch path below.
-                        let v2_link_h: Option<V2LinkHandle> =
-                            if let (Some(plan), Some(target), Some(store_v2)) = (
-                                v2_plan_arc.as_ref(),
-                                v2_target_for_pkg.as_ref(),
-                                store_v2_ref.as_ref(),
-                            ) {
-                                let plan_c = std::sync::Arc::clone(plan);
-                                let target_c = target.clone();
-                                let store_c = std::sync::Arc::clone(store_v2);
-                                Some(spawn_v2_link_task(
-                                    plan_c,
-                                    target_c,
-                                    store_c,
-                                    Arc::clone(&v2_link_task_semaphore_c),
-                                    workspace_coordinator_c.clone(),
-                                )?)
-                            } else {
-                                None
-                            };
                         overall.inc(1);
                         spec_tracker_c.mark_consumed_if_completed(&package_key);
                         return Ok::<FetchTaskResult, LpmError>((
@@ -2340,7 +2323,7 @@ pub(super) async fn run_online_fetch_phase(
                                 ..Default::default()
                             },
                             link_h,
-                            v2_link_h,
+                            None,
                             None,
                         ));
                     }

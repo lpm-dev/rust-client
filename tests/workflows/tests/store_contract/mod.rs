@@ -260,6 +260,47 @@ async fn deep_verify_does_not_bind_an_unrelated_v1_coordinate_to_a_virtual_insta
     assert!(success, "{report}");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn locked_install_downloads_the_object_when_only_an_unrelated_v1_coordinate_is_stored() {
+    let registry = support::mock_registry::MockRegistry::start().await;
+    registry
+        .with_package("legacy", "1.0.0", &npm_tarball("legacy", "1.0.0"))
+        .await;
+    let project = TempProject::empty(r#"{"name":"fixture","dependencies":{"legacy":"1.0.0"}}"#);
+    let install = || {
+        support::lpm_with_registry(&project, &registry.url())
+            .env("LPM_STORE_VERSION", "v2")
+            .args(["install", "--no-security-summary"])
+            .output()
+            .unwrap()
+    };
+    let first = install();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    std::fs::remove_dir_all(store_root(&project).join("v2")).unwrap();
+    std::fs::remove_dir_all(project.path().join("node_modules")).unwrap();
+    seed_v1_entry(&project, "legacy", "1.0.0", true);
+    std::fs::write(
+        v1_entry_dir(&project, "legacy", "1.0.0").join(".integrity"),
+        v2_sri_and_segment(b"other-registry").0,
+    )
+    .unwrap();
+
+    let locked = install();
+
+    assert!(
+        locked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&locked.stderr)
+    );
+    assert_eq!(registry.tarball_request_count("legacy", "1.0.0").await, 2);
+    let (success, report) = verify(&project, project.path());
+    assert!(success, "{report}");
+}
+
 #[test]
 fn deep_verify_does_not_claim_comparison_without_a_stored_marker() {
     let project = TempProject::empty(r#"{"name":"fixture","dependencies":{"legacy":"1.0.0"}}"#);
