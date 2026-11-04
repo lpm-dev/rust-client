@@ -113,7 +113,6 @@ test("macOS workspace tests compile lpm-rs once, with the hermetic test feature"
   const job = ciJob(readCiWorkflow(), "macos-workspace-tests");
   assert.ok(job, "missing macos-workspace-tests job");
   assert.match(job, /^    name: macOS workspace tests$/m);
-  assert.match(job, /^    permissions:\n      contents: read\n/m);
   assert.doesNotMatch(job, /^    needs:/m);
   assert.doesNotMatch(job, /cargo (?:build|check|clippy)\b/);
 
@@ -131,7 +130,6 @@ test("macOS workspace tests compile lpm-rs once, with the hermetic test feature"
 test("macOS clippy, keychain and app bundle checks run beside the workspace tests", () => {
   const job = ciJob(readCiWorkflow(), "macos-build-checks");
   assert.ok(job, "missing macos-build-checks job");
-  assert.match(job, /^    permissions:\n      contents: read\n/m);
   assert.doesNotMatch(job, /^    needs:/m);
   assert.match(job, /^          cargo check --locked -p lpm-keyring$/m);
   assert.match(job, /^          cargo check --locked -p lpm-auth$/m);
@@ -169,4 +167,12 @@ test("Lint builds, tests and type-checks the skills dashboard and compares its c
     / && git add --intent-to-add -- \.\.\/src\/commands\/skills\/dashboard && git diff --exit-code -- \.\.\/src\/commands\/skills\/dashboard$/,
     "check:dist must also catch new, untracked build output",
   );
+});
+
+test("the CI workflow token can only read the repository", () => {
+  const workflow = readCiWorkflow();
+  assert.match(workflow, /^permissions:\n  contents: read\n/m);
+  for (const grant of workflow.matchAll(/^ +permissions:(.*)$/gm)) {
+    assert.equal(grant[1].trim(), "{}", `a job widens the workflow token: ${grant[0].trim()}`);
+  }
 });

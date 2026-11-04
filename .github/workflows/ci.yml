@@ -15,6 +15,9 @@ on:
     # weekday push-traffic peak so it doesn't compete with PR CI.
     - cron: "0 9 * * 1"
 
+permissions:
+  contents: read
+
 # Cancel superseded PR CI, but never cancel `main` push runs. Each merge
 # commit needs its own completed signal before downstream work trusts it.
 concurrency:
@@ -414,8 +417,6 @@ jobs:
   macos-workspace-tests:
     name: macOS workspace tests
     runs-on: macos-latest
-    permissions:
-      contents: read
     # From a cold cache, the 3-core runner can spend 35 minutes compiling the
     # workspace tests before running them for 15.
     timeout-minutes: 90
@@ -476,8 +477,6 @@ jobs:
   macos-build-checks:
     name: macOS clippy, keychain and app bundle checks
     runs-on: macos-latest
-    permissions:
-      contents: read
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
