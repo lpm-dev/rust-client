@@ -43,6 +43,7 @@ pub mod npm_stage;
 pub mod npmrc;
 pub mod outdated;
 pub mod pack;
+pub mod package_signals;
 pub mod patch;
 pub mod plugin;
 pub mod policy;

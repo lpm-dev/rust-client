@@ -15,12 +15,12 @@
 use crate::install_ui;
 use lpm_linker::MaterializedPackage;
 use lpm_registry::RegistryClient;
-use lpm_security::behavioral::{self, PackageAnalysis};
+use lpm_security::behavioral::{self, PackageAnalysis, PackageDirectory};
 use lpm_security::query::{InstallVisibility, PseudoClass, Severity, behavioral_tag_policies};
 use lpm_store::SecurityAnalysisPolicy;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A tagged issue found in a package.
 struct TagIssue {
@@ -126,10 +126,16 @@ pub(crate) async fn post_install_security_summary(
             ));
         }
 
+        let nested = behavioral::nested_packages(
+            materialized
+                .iter()
+                .map(|package| package.destination.as_path()),
+        );
         let analyses: Vec<_> = packages
             .par_iter()
             .filter_map(|package| {
-                analyze_live_package(package, materialized).map(|analysis| (package, analysis))
+                analyze_live_package(package, materialized, &nested)
+                    .map(|analysis| (package, analysis))
             })
             .collect();
         for (package, analysis) in analyses {
@@ -202,6 +208,7 @@ pub(crate) async fn post_install_security_summary(
 fn analyze_live_package(
     package: &SecuritySummaryPackage,
     materialized: &[MaterializedPackage],
+    nested: &HashMap<&Path, Vec<PathBuf>>,
 ) -> Option<PackageAnalysis> {
     tracing::trace!(
         package = %package.name,
@@ -229,12 +236,21 @@ fn analyze_live_package(
             })
         })
     })?;
-    let source = selected
-        .analysis_source
-        .as_deref()
-        .unwrap_or(&selected.destination);
+    let (source, contents) = match selected.analysis_source.as_deref() {
+        Some(source) => (source, PackageDirectory::LocalSource),
+        None => (
+            selected.destination.as_path(),
+            PackageDirectory::Installed(
+                nested
+                    .get(selected.destination.as_path())
+                    .map_or(&[], Vec::as_slice),
+            ),
+        ),
+    };
     let directory = open_materialized_package(source).ok()?;
-    Some(behavioral::analyze_package_from_open_dir(&directory))
+    Some(behavioral::analyze_package_from_open_dir(
+        &directory, contents,
+    ))
 }
 
 fn open_materialized_package(path: &Path) -> std::io::Result<cap_std::fs::Dir> {
@@ -676,6 +692,14 @@ mod tests {
         }
     }
 
+    fn nested_packages(materialized: &[MaterializedPackage]) -> HashMap<&Path, Vec<PathBuf>> {
+        behavioral::nested_packages(
+            materialized
+                .iter()
+                .map(|package| package.destination.as_path()),
+        )
+    }
+
     fn summary_package(name: &str, is_lpm: bool) -> SecuritySummaryPackage {
         SecuritySummaryPackage {
             instance_id: None,
@@ -757,7 +781,8 @@ mod tests {
             is_lpm: false,
         };
 
-        let analysis = analyze_live_package(&package, &materialized).unwrap();
+        let analysis =
+            analyze_live_package(&package, &materialized, &nested_packages(&materialized)).unwrap();
 
         assert!(!analysis.source.eval);
         assert!(analysis.source.child_process);
@@ -791,9 +816,103 @@ mod tests {
         }];
         let package = summary_package("local", false);
 
-        let analysis = analyze_live_package(&package, &materialized).unwrap();
+        let analysis =
+            analyze_live_package(&package, &materialized, &nested_packages(&materialized)).unwrap();
 
         assert!(analysis.source.eval);
+    }
+
+    #[test]
+    fn live_security_analysis_reads_bundled_dependencies_and_not_nested_packages() {
+        let root = tempfile::tempdir().unwrap();
+        let kit = root.path().join("node_modules/kit");
+        let files = [
+            (
+                "package.json",
+                r#"{"name":"kit","version":"1.0.0","license":"MIT"}"#,
+            ),
+            ("index.js", "module.exports = require('helper')\n"),
+            (
+                "node_modules/helper/index.js",
+                "module.exports = input => eval(input)\n",
+            ),
+            (
+                "node_modules/@scope/runner/package.json",
+                r#"{"name":"@scope/runner","version":"2.0.0","license":"MIT"}"#,
+            ),
+            (
+                "node_modules/@scope/runner/index.js",
+                "require('child_process').exec('echo runner')\n",
+            ),
+        ];
+        for (path, content) in files {
+            let path = kit.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        let installed = |name: &str, version: &str, destination: PathBuf| MaterializedPackage {
+            instance_id: None,
+            name: name.to_string(),
+            version: version.to_string(),
+            analysis_source: None,
+            destination,
+        };
+        let materialized = [
+            installed("kit", "1.0.0", kit.clone()),
+            installed(
+                "@scope/runner",
+                "2.0.0",
+                kit.join("node_modules/@scope/runner"),
+            ),
+        ];
+        let nested = nested_packages(&materialized);
+
+        let analysis =
+            analyze_live_package(&summary_package("kit", false), &materialized, &nested).unwrap();
+        let runner = SecuritySummaryPackage {
+            version: "2.0.0".to_string(),
+            ..summary_package("@scope/runner", false)
+        };
+        let runner_analysis = analyze_live_package(&runner, &materialized, &nested).unwrap();
+
+        assert!(analysis.source.eval);
+        assert!(!analysis.source.child_process);
+        assert!(runner_analysis.source.child_process);
+    }
+
+    #[test]
+    fn live_security_analysis_leaves_out_the_installs_of_a_directory_source() {
+        let root = tempfile::tempdir().unwrap();
+        let wrapper = root.path().join("node_modules/local");
+        let source = root.path().join("source");
+        for directory in [&wrapper, &source.join("node_modules/tool")] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(
+            source.join("package.json"),
+            r#"{"name":"local","version":"1.0.0","license":"MIT"}"#,
+        )
+        .unwrap();
+        std::fs::write(source.join("index.js"), "module.exports = 1\n").unwrap();
+        std::fs::write(
+            source.join("node_modules/tool/index.js"),
+            "module.exports = input => eval(input)\n",
+        )
+        .unwrap();
+        let materialized = [MaterializedPackage {
+            instance_id: None,
+            name: "local".to_string(),
+            version: "1.0.0".to_string(),
+            analysis_source: Some(source),
+            destination: wrapper,
+        }];
+        let nested = nested_packages(&materialized);
+
+        let analysis =
+            analyze_live_package(&summary_package("local", false), &materialized, &nested).unwrap();
+
+        assert!(!analysis.source.eval);
+        assert_eq!(analysis.meta.files_scanned, 1);
     }
 
     fn write_cached_analysis_link(

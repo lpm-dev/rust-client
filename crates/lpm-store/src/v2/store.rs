@@ -1455,6 +1455,7 @@ impl Store {
             if !source_analysis_enabled {
                 return;
             }
+            analyzer.borrow_mut().note_entry(entry.relative_path);
             if let Some(bytes) = entry.bytes {
                 analyzer.borrow_mut().feed(entry.relative_path, bytes);
             } else {

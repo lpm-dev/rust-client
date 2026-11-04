@@ -47,27 +47,22 @@ const COPYLEFT_IDENTIFIERS: &[&str] = &[
 /// Analyze a parsed package.json for manifest tags.
 ///
 /// Takes individual fields rather than a full struct to avoid coupling
-/// to a specific package.json parser.
+/// to a specific package.json parser. The dependency tags read only the
+/// dependencies a consumer installs: `devDependencies` never reach them.
 pub fn analyze_manifest(
     license: Option<&str>,
     dependencies: Option<&HashMap<String, String>>,
-    dev_dependencies: Option<&HashMap<String, String>>,
     optional_dependencies: Option<&HashMap<String, String>>,
 ) -> ManifestTags {
-    analyze_manifest_with_privacy(
-        license,
-        false,
-        dependencies,
-        dev_dependencies,
-        optional_dependencies,
-    )
+    analyze_manifest_with_privacy(license, false, dependencies, optional_dependencies)
 }
 
+/// [`analyze_manifest`] for a package that may be `private`, which needs no
+/// license.
 pub fn analyze_manifest_with_privacy(
     license: Option<&str>,
     private_package: bool,
     dependencies: Option<&HashMap<String, String>>,
-    dev_dependencies: Option<&HashMap<String, String>>,
     optional_dependencies: Option<&HashMap<String, String>>,
 ) -> ManifestTags {
     let mut tags = ManifestTags::default();
@@ -89,9 +84,7 @@ pub fn analyze_manifest_with_privacy(
 
     // ── Dependency checks ─────────────────────────────────────
 
-    let all_deps = [dependencies, dev_dependencies, optional_dependencies];
-
-    for deps in all_deps.into_iter().flatten() {
+    for deps in [dependencies, optional_dependencies].into_iter().flatten() {
         for version in deps.values() {
             let v = version.trim();
 
@@ -185,46 +178,46 @@ mod tests {
 
     #[test]
     fn no_license_missing() {
-        let tags = analyze_manifest(None, None, None, None);
+        let tags = analyze_manifest(None, None, None);
         assert!(tags.no_license);
         assert!(!tags.copyleft_license);
     }
 
     #[test]
     fn no_license_private_package_is_ignored() {
-        let tags = analyze_manifest_with_privacy(None, true, None, None, None);
+        let tags = analyze_manifest_with_privacy(None, true, None, None);
         assert!(!tags.no_license);
         assert!(!tags.copyleft_license);
     }
 
     #[test]
     fn no_license_empty() {
-        let tags = analyze_manifest(Some(""), None, None, None);
+        let tags = analyze_manifest(Some(""), None, None);
         assert!(tags.no_license);
     }
 
     #[test]
     fn no_license_unlicensed() {
-        let tags = analyze_manifest(Some("UNLICENSED"), None, None, None);
+        let tags = analyze_manifest(Some("UNLICENSED"), None, None);
         assert!(tags.no_license);
     }
 
     #[test]
     fn no_license_blank() {
-        let tags = analyze_manifest(Some("   "), None, None, None);
+        let tags = analyze_manifest(Some("   "), None, None);
         assert!(tags.no_license);
         assert!(!tags.custom_license);
     }
 
     #[test]
     fn no_license_none() {
-        let tags = analyze_manifest(Some("None"), None, None, None);
+        let tags = analyze_manifest(Some("None"), None, None);
         assert!(tags.no_license);
     }
 
     #[test]
     fn no_license_proprietary() {
-        let tags = analyze_manifest(Some("proprietary"), None, None, None);
+        let tags = analyze_manifest(Some("proprietary"), None, None);
         assert!(tags.no_license);
     }
 
@@ -232,7 +225,7 @@ mod tests {
 
     #[test]
     fn custom_license_see_license_in() {
-        let tags = analyze_manifest(Some("SEE LICENSE IN LICENSE.md"), None, None, None);
+        let tags = analyze_manifest(Some("SEE LICENSE IN LICENSE.md"), None, None);
         assert!(tags.custom_license);
         assert!(!tags.no_license);
         assert!(!tags.copyleft_license);
@@ -240,29 +233,28 @@ mod tests {
 
     #[test]
     fn custom_license_is_case_and_whitespace_insensitive() {
-        let tags = analyze_manifest(Some("  see license in EULA.txt "), None, None, None);
+        let tags = analyze_manifest(Some("  see license in EULA.txt "), None, None);
         assert!(tags.custom_license);
         assert!(!tags.no_license);
     }
 
     #[test]
     fn custom_license_private_package_is_ignored() {
-        let tags =
-            analyze_manifest_with_privacy(Some("SEE LICENSE IN LICENSE"), true, None, None, None);
+        let tags = analyze_manifest_with_privacy(Some("SEE LICENSE IN LICENSE"), true, None, None);
         assert!(!tags.custom_license);
         assert!(!tags.no_license);
     }
 
     #[test]
     fn custom_license_file_name_is_not_read_as_copyleft() {
-        let tags = analyze_manifest(Some("SEE LICENSE IN GPL-NOTICE.txt"), None, None, None);
+        let tags = analyze_manifest(Some("SEE LICENSE IN GPL-NOTICE.txt"), None, None);
         assert!(tags.custom_license);
         assert!(!tags.copyleft_license);
     }
 
     #[test]
     fn spdx_license_is_not_custom() {
-        let tags = analyze_manifest(Some("MIT"), None, None, None);
+        let tags = analyze_manifest(Some("MIT"), None, None);
         assert!(!tags.custom_license);
         assert!(!tags.no_license);
     }
@@ -271,69 +263,69 @@ mod tests {
 
     #[test]
     fn copyleft_gpl() {
-        let tags = analyze_manifest(Some("GPL-3.0"), None, None, None);
+        let tags = analyze_manifest(Some("GPL-3.0"), None, None);
         assert!(tags.copyleft_license);
         assert!(!tags.no_license);
     }
 
     #[test]
     fn copyleft_agpl() {
-        let tags = analyze_manifest(Some("AGPL-3.0-or-later"), None, None, None);
+        let tags = analyze_manifest(Some("AGPL-3.0-or-later"), None, None);
         assert!(tags.copyleft_license);
     }
 
     #[test]
     fn copyleft_lgpl() {
-        let tags = analyze_manifest(Some("LGPL-2.1"), None, None, None);
+        let tags = analyze_manifest(Some("LGPL-2.1"), None, None);
         assert!(tags.copyleft_license);
     }
 
     #[test]
     fn copyleft_mpl() {
-        let tags = analyze_manifest(Some("MPL-2.0"), None, None, None);
+        let tags = analyze_manifest(Some("MPL-2.0"), None, None);
         assert!(tags.copyleft_license);
     }
 
     #[test]
     fn copyleft_in_compound_expression() {
-        let tags = analyze_manifest(Some("MIT OR GPL-3.0"), None, None, None);
+        let tags = analyze_manifest(Some("MIT OR GPL-3.0"), None, None);
         assert!(tags.copyleft_license);
     }
 
     #[test]
     fn copyleft_gpl_2_or_later() {
-        let tags = analyze_manifest(Some("GPL-2.0-or-later"), None, None, None);
+        let tags = analyze_manifest(Some("GPL-2.0-or-later"), None, None);
         assert!(tags.copyleft_license);
     }
 
     #[test]
     fn not_copyleft_mit() {
-        let tags = analyze_manifest(Some("MIT"), None, None, None);
+        let tags = analyze_manifest(Some("MIT"), None, None);
         assert!(!tags.copyleft_license);
         assert!(!tags.no_license);
     }
 
     #[test]
     fn not_copyleft_apache() {
-        let tags = analyze_manifest(Some("Apache-2.0"), None, None, None);
+        let tags = analyze_manifest(Some("Apache-2.0"), None, None);
         assert!(!tags.copyleft_license);
     }
 
     #[test]
     fn not_copyleft_bsd() {
-        let tags = analyze_manifest(Some("BSD-3-Clause"), None, None, None);
+        let tags = analyze_manifest(Some("BSD-3-Clause"), None, None);
         assert!(!tags.copyleft_license);
     }
 
     #[test]
     fn not_copyleft_mit_or_apache() {
-        let tags = analyze_manifest(Some("MIT OR Apache-2.0"), None, None, None);
+        let tags = analyze_manifest(Some("MIT OR Apache-2.0"), None, None);
         assert!(!tags.copyleft_license);
     }
 
     #[test]
     fn not_copyleft_isc() {
-        let tags = analyze_manifest(Some("ISC"), None, None, None);
+        let tags = analyze_manifest(Some("ISC"), None, None);
         assert!(!tags.copyleft_license);
     }
 
@@ -342,49 +334,49 @@ mod tests {
     #[test]
     fn detect_git_protocol() {
         let d = deps(&[("my-pkg", "git://github.com/owner/repo.git")]);
-        let tags = analyze_manifest(Some("MIT"), Some(&d), None, None);
+        let tags = analyze_manifest(Some("MIT"), Some(&d), None);
         assert!(tags.git_dependency);
     }
 
     #[test]
     fn detect_git_ssh() {
         let d = deps(&[("my-pkg", "git+ssh://git@github.com/owner/repo.git")]);
-        let tags = analyze_manifest(Some("MIT"), Some(&d), None, None);
+        let tags = analyze_manifest(Some("MIT"), Some(&d), None);
         assert!(tags.git_dependency);
     }
 
     #[test]
     fn detect_git_https() {
         let d = deps(&[("my-pkg", "git+https://github.com/owner/repo.git")]);
-        let tags = analyze_manifest(Some("MIT"), Some(&d), None, None);
+        let tags = analyze_manifest(Some("MIT"), Some(&d), None);
         assert!(tags.git_dependency);
     }
 
     #[test]
     fn detect_github_shorthand() {
         let d = deps(&[("my-pkg", "owner/repo")]);
-        let tags = analyze_manifest(Some("MIT"), Some(&d), None, None);
+        let tags = analyze_manifest(Some("MIT"), Some(&d), None);
         assert!(tags.git_dependency);
     }
 
     #[test]
     fn detect_github_shorthand_with_ref() {
         let d = deps(&[("my-pkg", "owner/repo#develop")]);
-        let tags = analyze_manifest(Some("MIT"), Some(&d), None, None);
+        let tags = analyze_manifest(Some("MIT"), Some(&d), None);
         assert!(tags.git_dependency);
     }
 
     #[test]
     fn detect_github_prefix() {
         let d = deps(&[("my-pkg", "github:owner/repo")]);
-        let tags = analyze_manifest(Some("MIT"), Some(&d), None, None);
+        let tags = analyze_manifest(Some("MIT"), Some(&d), None);
         assert!(tags.git_dependency);
     }
 
     #[test]
     fn detect_github_shorthand_with_semver_ref() {
         let d = deps(&[("pkg", "owner/repo#semver:^1.0.0")]);
-        let tags = analyze_manifest(Some("MIT"), Some(&d), None, None);
+        let tags = analyze_manifest(Some("MIT"), Some(&d), None);
         assert!(tags.git_dependency);
     }
 
@@ -398,7 +390,7 @@ mod tests {
             "workspace:packages/ui",
         ] {
             let d = deps(&[("pkg", spec)]);
-            let tags = analyze_manifest(Some("MIT"), Some(&d), None, None);
+            let tags = analyze_manifest(Some("MIT"), Some(&d), None);
             assert!(!tags.git_dependency, "{spec} is not a git dependency");
         }
     }
@@ -406,14 +398,14 @@ mod tests {
     #[test]
     fn no_false_positive_scoped_package() {
         let d = deps(&[("@types/node", "^22.0.0")]);
-        let tags = analyze_manifest(Some("MIT"), Some(&d), None, None);
+        let tags = analyze_manifest(Some("MIT"), Some(&d), None);
         assert!(!tags.git_dependency);
     }
 
     #[test]
     fn no_false_positive_semver() {
         let d = deps(&[("express", "^4.18.2")]);
-        let tags = analyze_manifest(Some("MIT"), Some(&d), None, None);
+        let tags = analyze_manifest(Some("MIT"), Some(&d), None);
         assert!(!tags.git_dependency);
     }
 
@@ -422,14 +414,14 @@ mod tests {
     #[test]
     fn detect_http_dependency() {
         let d = deps(&[("my-pkg", "http://example.com/pkg.tgz")]);
-        let tags = analyze_manifest(Some("MIT"), Some(&d), None, None);
+        let tags = analyze_manifest(Some("MIT"), Some(&d), None);
         assert!(tags.http_dependency);
     }
 
     #[test]
     fn no_false_positive_https() {
         let d = deps(&[("my-pkg", "https://example.com/pkg.tgz")]);
-        let tags = analyze_manifest(Some("MIT"), Some(&d), None, None);
+        let tags = analyze_manifest(Some("MIT"), Some(&d), None);
         assert!(!tags.http_dependency);
     }
 
@@ -438,38 +430,29 @@ mod tests {
     #[test]
     fn detect_wildcard_star() {
         let d = deps(&[("my-pkg", "*")]);
-        let tags = analyze_manifest(Some("MIT"), Some(&d), None, None);
+        let tags = analyze_manifest(Some("MIT"), Some(&d), None);
         assert!(tags.wildcard_dependency);
     }
 
     #[test]
     fn detect_wildcard_empty() {
         let d = deps(&[("my-pkg", "")]);
-        let tags = analyze_manifest(Some("MIT"), Some(&d), None, None);
+        let tags = analyze_manifest(Some("MIT"), Some(&d), None);
         assert!(tags.wildcard_dependency);
     }
 
     #[test]
     fn detect_wildcard_latest() {
         let d = deps(&[("my-pkg", "latest")]);
-        let tags = analyze_manifest(Some("MIT"), Some(&d), None, None);
+        let tags = analyze_manifest(Some("MIT"), Some(&d), None);
         assert!(tags.wildcard_dependency);
     }
 
     #[test]
     fn no_false_positive_range() {
         let d = deps(&[("my-pkg", ">=1.0.0")]);
-        let tags = analyze_manifest(Some("MIT"), Some(&d), None, None);
+        let tags = analyze_manifest(Some("MIT"), Some(&d), None);
         assert!(!tags.wildcard_dependency);
-    }
-
-    // ── Dev dependencies also checked ─────────────────────────
-
-    #[test]
-    fn detect_git_in_dev_deps() {
-        let dev = deps(&[("my-tool", "github:owner/tool")]);
-        let tags = analyze_manifest(Some("MIT"), None, Some(&dev), None);
-        assert!(tags.git_dependency);
     }
 
     // ── Optional dependencies also checked ────────────────────
@@ -477,7 +460,7 @@ mod tests {
     #[test]
     fn detect_wildcard_in_optional_deps() {
         let opt = deps(&[("optional-pkg", "*")]);
-        let tags = analyze_manifest(Some("MIT"), None, None, Some(&opt));
+        let tags = analyze_manifest(Some("MIT"), None, Some(&opt));
         assert!(tags.wildcard_dependency);
     }
 
@@ -490,7 +473,7 @@ mod tests {
             ("b", "*"),
             ("c", "http://evil.com/pkg.tgz"),
         ]);
-        let tags = analyze_manifest(Some("GPL-3.0"), Some(&d), None, None);
+        let tags = analyze_manifest(Some("GPL-3.0"), Some(&d), None);
         assert!(tags.git_dependency);
         assert!(tags.wildcard_dependency);
         assert!(tags.http_dependency);
@@ -502,7 +485,7 @@ mod tests {
     #[test]
     fn clean_package() {
         let d = deps(&[("express", "^4.18.2"), ("lodash", "~4.17.21")]);
-        let tags = analyze_manifest(Some("MIT"), Some(&d), None, None);
+        let tags = analyze_manifest(Some("MIT"), Some(&d), None);
         assert!(!tags.git_dependency);
         assert!(!tags.http_dependency);
         assert!(!tags.wildcard_dependency);

@@ -44,6 +44,7 @@ const SOURCE_PATTERNS: &[(&str, &[&str])] = &[
             r#"\bfrom\s+["'](?:node:)?fs/promises["']"#,
             r#"\brequire\s*\(\s*["'](?:node:)?fs["']\s*\)"#,
             r#"\brequire\s*\(\s*["'](?:node:)?fs/promises["']\s*\)"#,
+            r#"\bimport\s*\(\s*["'](?:node:)?fs(?:/promises)?["']\s*\)"#,
             r"\b(?:readFile|writeFile|readdir|mkdir|unlink|rmdir|stat|access|rename|copyFile|appendFile)(?:Sync)?\s*\(",
         ],
     ),
@@ -56,6 +57,7 @@ const SOURCE_PATTERNS: &[(&str, &[&str])] = &[
             r#"\brequire\s*\(\s*["'](?:node:)?https?["']\s*\)"#,
             r#"\bfrom\s+["'](?:node-fetch|axios|got|undici|ky|superagent|request)["']"#,
             r#"\brequire\s*\(\s*["'](?:node-fetch|axios|got|undici|ky|superagent|request)["']\s*\)"#,
+            r#"\bimport\s*\(\s*["'](?:(?:node:)?https?|node-fetch|axios|got|undici|ky|superagent|request)["']\s*\)"#,
             r"\bnew\s+XMLHttpRequest\s*\(",
             r#"\.(?:get|post|put|patch|delete)\s*\(\s*["']https?:"#,
         ],
@@ -67,30 +69,24 @@ const SOURCE_PATTERNS: &[(&str, &[&str])] = &[
             r#"\bfrom\s+["'](?:node:)?child_process["']"#,
             r#"\brequire\s*\(\s*["'](?:node:)?child_process["']\s*\)"#,
             r"\b(?:exec|execSync|execFile|execFileSync|spawn|spawnSync|fork)\s*\(",
+            r#"\bimport\s*\(\s*["'](?:node:)?child_process["']\s*\)"#,
         ],
     ),
     // 3: environmentVars
     ("environmentVars", &[r"\bprocess\.env\b", r"\bDeno\.env\b"]),
     // 4: eval
     ("eval", &[r"\beval\s*\(", r"\bnew\s+Function\s*\("]),
-    // 5: nativeBindings
-    (
-        "nativeBindings",
-        &[
-            r#"\bfrom\s+["'].*\.node["']"#,
-            r#"\brequire\s*\(\s*["'].*\.node["']\s*\)"#,
-            r#"\b(?:require\s*\(\s*|from\s+)["'](?:node-gyp|node-pre-gyp|napi)(?:-[^"']*)?["']"#,
-            r"\bnode-gyp\b",
-            r"\bnode-pre-gyp\b",
-            r"\bnapi\b",
-        ],
-    ),
+    // 5: nativeBindings. Addons themselves come from the files a package
+    // ships (`is_native_artifact_path`): a module name or `.node` path in
+    // code doesn't prove one ships.
+    ("nativeBindings", &[r"\bprocess\.dlopen\s*\("]),
     // 6: crypto
     (
         "crypto",
         &[
             r#"\bfrom\s+["'](?:node:)?crypto["']"#,
             r#"\brequire\s*\(\s*["'](?:node:)?crypto["']\s*\)"#,
+            r#"\bimport\s*\(\s*["'](?:node:)?crypto["']\s*\)"#,
             r"\b(?:createHash|createHmac|createCipher|createSign|randomBytes|pbkdf2|scrypt)\s*\(",
         ],
     ),
@@ -112,6 +108,7 @@ const SOURCE_PATTERNS: &[(&str, &[&str])] = &[
             r#"\bfrom\s+["']ws["']"#,
             r#"\brequire\s*\(\s*["']ws["']\s*\)"#,
             r#"\bfrom\s+["']socket\.io"#,
+            r#"\bimport\s*\(\s*["'](?:ws|socket\.io[^"']*)["']\s*\)"#,
         ],
     ),
     // 9: dynamicRequire
@@ -243,6 +240,24 @@ pub(super) fn analyze_source_context_with_evidence(
     }
 
     (tags, evidence)
+}
+
+/// The `eval()` and `new Function()` calls the eval tag finds: those the call
+/// analysis resolved, or without one, every match of its patterns in code.
+pub(super) fn eval_calls(context: &super::syntax::SourceContext<'_>) -> usize {
+    if let Some(calls) = &context.calls {
+        return calls.evaluation_calls;
+    }
+    compiled_patterns()
+        .tags
+        .iter()
+        .find(|tag| tag.name == "eval")
+        .map_or(0, |tag| {
+            tag.regexes
+                .iter()
+                .map(|regex| context.count_with_context(regex, false))
+                .sum()
+        })
 }
 
 /// Merge two SourceTags with OR logic (if either is true, result is true).
@@ -735,21 +750,43 @@ mod tests {
     // ── Native Bindings ───────────────────────────────────────
 
     #[test]
-    fn detect_node_gyp() {
-        let tags = analyze("node-gyp rebuild");
-        assert!(tags.native_bindings);
+    fn detect_process_dlopen() {
+        assert!(analyze("process.dlopen(module, addonPath)").native_bindings);
     }
 
     #[test]
-    fn detect_napi() {
-        let tags = analyze("const addon = require('napi')");
-        assert!(tags.native_bindings);
+    fn native_addons_come_from_shipped_files_not_names_the_code_mentions() {
+        for code in [
+            r#"module.exports = require("./server.node")"#,
+            r#"import binding from "./binding.node""#,
+            r#"const binding = require("node-gyp-build")(__dirname)"#,
+            "const napi = createBridge()",
+            "node-gyp rebuild",
+        ] {
+            assert!(!analyze(code).native_bindings, "{code}");
+        }
     }
 
     #[test]
-    fn detect_dot_node_import() {
-        let tags = analyze(r#"const binding = require("./binding.node")"#);
-        assert!(tags.native_bindings);
+    fn a_dynamically_imported_child_process_module_is_a_child_process() {
+        for code in [
+            "const { spawn } = await import('child_process'); spawn('man', [page]);",
+            "const cp = await import('node:child_process'); cp.execFile('git', args);",
+            "export const load = () => import('child_process');",
+        ] {
+            assert!(analyze(code).child_process, "{code}");
+        }
+    }
+
+    #[test]
+    fn cross_spawn_starts_child_processes() {
+        for code in [
+            "import { spawn } from 'cross-spawn'; spawn(command, args, { stdio: 'inherit' });",
+            "const spawn = require('cross-spawn'); spawn.sync(command, args);",
+            "const crossSpawn = require('cross-spawn'); crossSpawn(command, args);",
+        ] {
+            assert!(analyze(code).child_process, "{code}");
+        }
     }
 
     // ── Crypto ────────────────────────────────────────────────

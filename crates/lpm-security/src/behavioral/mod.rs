@@ -15,6 +15,8 @@
 mod bindings;
 mod evidence;
 pub mod manifest;
+pub mod release;
+pub mod roles;
 pub mod secrets;
 pub mod source;
 pub mod supply_chain;
@@ -27,7 +29,7 @@ use manifest::ManifestTags;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use source::SourceTags;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use supply_chain::SupplyChainTags;
@@ -35,7 +37,7 @@ use supply_chain::SupplyChainTags;
 /// Current schema version for `.lpm-security.json`.
 /// Bump this when adding new tags or changing tag semantics — cached
 /// files with older versions will be automatically re-analyzed.
-pub const SCHEMA_VERSION: u32 = 13;
+pub const SCHEMA_VERSION: u32 = 14;
 
 /// Maximum file size for a full scan. Larger source files receive bounded samples.
 const MAX_FILE_SIZE: u64 = 4 * 1024 * 1024;
@@ -55,6 +57,40 @@ const MAX_OVERSIZED_SOURCE_FILE_EVIDENCE: usize = 20;
 
 /// Source file extensions that should be scanned.
 const SOURCE_EXTENSIONS: &[&str] = &["js", "mjs", "cjs", "ts", "mts", "cts", "jsx", "tsx"];
+
+/// Paths a tag's [`TagFiles`] lists; `file_count` counts the rest.
+const MAX_TAG_FILES: usize = 5;
+
+/// How much of a package a [`PackageAnalyzer`] reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanLimits {
+    /// A source file up to this size is read whole.
+    pub full_file_bytes: u64,
+    /// Bytes read from each end of a larger source file.
+    pub sample_bytes: usize,
+    /// Source bytes read across the package before the rest is skipped.
+    pub total_bytes: u64,
+    /// Source files read before the rest are skipped.
+    pub files: usize,
+}
+
+impl ScanLimits {
+    /// Installs and audits, which analyze every package of a project.
+    pub const INSTALL: Self = Self {
+        full_file_bytes: MAX_FILE_SIZE,
+        sample_bytes: OVERSIZED_SOURCE_SAMPLE_CHUNK_BYTES,
+        total_bytes: MAX_TOTAL_SCAN_BYTES,
+        files: MAX_FILES_PER_PACKAGE,
+    };
+
+    /// A registry's analysis of one published release.
+    pub const REGISTRY: Self = Self {
+        full_file_bytes: 8 * 1024 * 1024,
+        sample_bytes: 1024 * 1024,
+        total_bytes: 64 * 1024 * 1024,
+        files: MAX_FILES_PER_PACKAGE,
+    };
+}
 
 /// Complete analysis result for a single package.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +138,42 @@ pub struct AnalysisMeta {
     /// Oversized source files that exceeded the full scan ceiling and were sampled.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub oversized_source_files: Vec<OversizedSourceFileEvidence>,
+    /// Source files read only at each end.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub sampled_files: usize,
+    /// Source files left unread past the file or byte limit.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub skipped_files: usize,
+    /// The files each tag came from, by registry tag key.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tag_files: BTreeMap<String, TagFiles>,
+    /// Tags only test files showed, sorted. The tag fields leave them out:
+    /// a test the package doesn't run on install or export doesn't run when
+    /// the package is used.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_only_tags: Vec<String>,
+    /// The `eval()` and `new Function()` calls of the files the tag fields
+    /// cover, as the eval tag finds them.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub eval_calls: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+/// The files a tag came from.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TagFiles {
+    /// Up to five paths: files the package runs first, then tests, each in
+    /// path order.
+    pub files: Vec<String>,
+    /// Every file that showed the tag.
+    pub file_count: usize,
+    /// Each of those files is a test the package doesn't run.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tests_only: bool,
 }
 
 /// Compact evidence for a source file that exceeded the full scan limit.
@@ -125,8 +197,14 @@ pub struct OversizedSourceFileEvidence {
 /// strips comments, and runs all tag detectors. Returns a complete
 /// `PackageAnalysis` that can be serialized to `.lpm-security.json`.
 ///
-/// Respects per-file (4 MiB) and per-package (50 MiB) size limits.
-/// Skips `.min.js` files for source tag analysis (but flags `minified: true`).
+/// The directory holds the package's files as its tarball unpacked them
+/// ([`PackageDirectory::Published`]): a `node_modules/` in it holds the
+/// dependencies the package bundles, which count as the package's code.
+///
+/// Reads within [`ScanLimits::INSTALL`]: a larger source file is sampled at
+/// each end, and files past the package limits are skipped. Test files are
+/// read, and their tags are reported apart unless the manifest runs or
+/// exports them.
 pub fn analyze_package(package_dir: &Path) -> PackageAnalysis {
     analyze_package_with_timings(package_dir).0
 }
@@ -143,51 +221,86 @@ pub fn analyze_package_with_timings(
     package_dir: &Path,
 ) -> (PackageAnalysis, PackageAnalysisTimings) {
     let source_scan_start = std::time::Instant::now();
-    // Walk source files
-    let source_files = collect_source_files(package_dir);
+    let files = collect_package_files(package_dir);
 
     // Use rayon for parallel scanning on packages with many files (20+).
     // Smaller packages don't benefit from thread pool overhead.
-    let file_result = if source_files.len() >= 20 {
-        analyze_files_parallel(package_dir, &source_files)
+    let mut analyzer = if files.sources.len() >= 20 {
+        analyze_files_parallel(package_dir, &files.sources)
     } else {
-        analyze_files_sequential(package_dir, &source_files)
+        analyze_files_sequential(package_dir, &files.sources)
     };
-    let source_scan_ns = source_scan_start.elapsed().as_nanos();
-
-    // Set trivial tag at package level (< 10 lines across ALL source files)
-    let mut supply_chain_tags = file_result.supply_chain;
-    if file_result.meta.files_scanned > 0 {
-        supply_chain_tags.trivial =
-            file_result.total_code_lines < 10 && file_result.total_export_count <= 1;
+    for artifact in &files.native_artifacts {
+        analyzer.note_entry(artifact.strip_prefix(package_dir).unwrap_or(artifact));
     }
-
-    // Deduplicate URL domains
-    let mut url_domains = file_result.url_domains;
-    url_domains.sort_unstable();
-    url_domains.dedup();
-    let mut meta = file_result.meta;
-    meta.url_domains = url_domains;
-
-    // Manifest tags (5) — read package.json
-    let manifest_tags = analyze_package_manifest(package_dir);
-    meta.input_incomplete |= manifest_tags.is_none();
-    let manifest_tags = manifest_tags.unwrap_or_default();
-
-    // Build timestamp
-    let analyzed_at = chrono::Utc::now().to_rfc3339();
+    let source_scan_ns = source_scan_start.elapsed().as_nanos();
+    let manifest = read_package_manifest(package_dir);
 
     (
-        PackageAnalysis {
-            version: SCHEMA_VERSION,
-            analyzed_at,
-            source: file_result.source,
-            supply_chain: supply_chain_tags,
-            manifest: manifest_tags,
-            meta,
-        },
+        analyzer.finish(manifest.as_deref()),
         PackageAnalysisTimings { source_scan_ns },
     )
+}
+
+/// What a package directory an analysis walks holds besides the package's
+/// own files.
+#[derive(Clone, Copy, Debug)]
+pub enum PackageDirectory<'a> {
+    /// The package's files as its tarball unpacked them. A `node_modules/`
+    /// among them holds the dependencies the package bundles, which the
+    /// analysis reads as the package's code.
+    Published,
+    /// A package a project installed. The linker may have nested other
+    /// packages in its `node_modules/`, at these package-relative
+    /// directories. The analysis leaves them out, so their code counts once,
+    /// as theirs, and reads the rest of `node_modules/` as bundled.
+    Installed(&'a [std::path::PathBuf]),
+    /// A local directory a project depends on. Its `node_modules/`
+    /// directories hold its own installs, packages in their own right that
+    /// a project doesn't get from it, so the analysis reads none of them.
+    LocalSource,
+}
+
+/// The packages a linker nested in each installed package directory, from
+/// the directories of every installed package: `node_modules/bar` under
+/// `kit` for a package at `kit/node_modules/bar`. A directory's entry is
+/// what its [`PackageDirectory::Installed`] takes.
+pub fn nested_packages<'a>(
+    package_dirs: impl IntoIterator<Item = &'a Path>,
+) -> HashMap<&'a Path, Vec<std::path::PathBuf>> {
+    let mut nested: HashMap<&Path, Vec<std::path::PathBuf>> = HashMap::new();
+    for package_dir in package_dirs {
+        let Some(parent) = package_dir
+            .ancestors()
+            .skip(1)
+            .find(|ancestor| ancestor.file_name() == Some(std::ffi::OsStr::new("node_modules")))
+            .and_then(Path::parent)
+        else {
+            continue;
+        };
+        if let Ok(relative) = package_dir.strip_prefix(parent) {
+            nested
+                .entry(parent)
+                .or_default()
+                .push(relative.to_path_buf());
+        }
+    }
+    nested
+}
+
+impl PackageDirectory<'_> {
+    /// Whether the analysis walks into the package-relative directory
+    /// `relative`, whose parent it already walks.
+    fn walks_into(self, relative: &Path) -> bool {
+        PackageAnalyzer::should_scan_directory(relative)
+            && match self {
+                Self::Published => true,
+                Self::Installed(nested) => !nested.iter().any(|package| package == relative),
+                Self::LocalSource => {
+                    relative.file_name() != Some(std::ffi::OsStr::new("node_modules"))
+                }
+            }
+    }
 }
 
 /// Analyze a package through an already-open directory capability.
@@ -195,8 +308,11 @@ pub fn analyze_package_with_timings(
 /// The descriptor pins the selected package root. Every nested directory and
 /// file is opened without following links, so concurrent path replacement
 /// cannot redirect the scan outside that root.
-pub fn analyze_package_from_open_dir(package_dir: &cap_std::fs::Dir) -> PackageAnalysis {
-    analyze_package_from_open_dir_with_fingerprint(package_dir).0
+pub fn analyze_package_from_open_dir(
+    package_dir: &cap_std::fs::Dir,
+    contents: PackageDirectory<'_>,
+) -> PackageAnalysis {
+    analyze_package_from_open_dir_with_fingerprint(package_dir, contents).0
 }
 
 /// Analyze a descriptor-rooted package and fingerprint the exact bytes used.
@@ -206,34 +322,35 @@ pub fn analyze_package_from_open_dir(package_dir: &cap_std::fs::Dir) -> PackageA
 /// command, but callers must not persist it for later reuse.
 pub fn analyze_package_from_open_dir_with_fingerprint(
     package_dir: &cap_std::fs::Dir,
+    contents: PackageDirectory<'_>,
 ) -> (PackageAnalysis, Option<String>) {
     let mut source_files = CapSourceFiles::new();
+    let mut native_artifacts = Vec::new();
     let mut discovery_limit_reached = false;
     let discovery_complete = collect_cap_fingerprint_files(
         package_dir,
         Path::new(""),
+        contents,
         &mut source_files,
+        &mut native_artifacts,
         &mut discovery_limit_reached,
     )
     .is_ok();
+    native_artifacts.sort_unstable();
     let source_files = source_files.into_sorted_vec();
     let (source_files, prefix_limit_reached) = cap_scan_prefix(&source_files);
-    let (mut file_result, mut fingerprint, runtime_limit_reached) =
+    let (mut analyzer, mut fingerprint, runtime_limit_reached) =
         analyze_cap_files_with_fingerprint(package_dir, source_files, discovery_complete);
-    file_result.meta.limit_reached |=
+    analyzer.limit_reached |=
         discovery_limit_reached || prefix_limit_reached || runtime_limit_reached;
-    let mut supply_chain_tags = file_result.supply_chain;
-    if file_result.meta.files_scanned > 0 {
-        supply_chain_tags.trivial =
-            file_result.total_code_lines < 10 && file_result.total_export_count <= 1;
+    if let Some(hasher) = fingerprint.as_mut() {
+        hash_native_artifacts(hasher, &native_artifacts);
     }
-    let mut url_domains = file_result.url_domains;
-    url_domains.sort_unstable();
-    url_domains.dedup();
-    let mut meta = file_result.meta;
-    meta.url_domains = url_domains;
+    for artifact in &native_artifacts {
+        analyzer.note_entry(artifact);
+    }
 
-    let manifest_tags = match read_package_manifest_from_open_dir(package_dir) {
+    let manifest = match read_package_manifest_from_open_dir(package_dir) {
         Ok(Some((size, content))) => {
             if let Some(hasher) = fingerprint.as_mut() {
                 hash_fingerprint_record_digest(
@@ -244,23 +361,15 @@ pub fn analyze_package_from_open_dir_with_fingerprint(
                     Sha256::digest(&content).into(),
                 );
             }
-            analyze_package_manifest_bytes(&content)
+            Some(content)
         }
         Ok(None) | Err(_) => None,
     };
-    if manifest_tags.is_none() {
+    let mut analysis = analyzer.finish(manifest.as_deref());
+    if analysis.meta.input_incomplete {
         fingerprint = None;
     }
-    let manifest_tags = manifest_tags.unwrap_or_default();
-    meta.input_incomplete = fingerprint.is_none();
-    let analysis = PackageAnalysis {
-        version: SCHEMA_VERSION,
-        analyzed_at: chrono::Utc::now().to_rfc3339(),
-        source: file_result.source,
-        supply_chain: supply_chain_tags,
-        manifest: manifest_tags,
-        meta,
-    };
+    analysis.meta.input_incomplete = fingerprint.is_none();
     let fingerprint = fingerprint.map(|mut hasher| {
         hasher.update(b"limits\0");
         hasher.update([u8::from(
@@ -274,20 +383,26 @@ pub fn analyze_package_from_open_dir_with_fingerprint(
 /// Hash the exact package inputs that can affect behavioral analysis.
 ///
 /// The walk uses the same path, file-count, file-size, and total-byte policy as
-/// [`analyze_package_from_open_dir`]. Symlinks and ignored paths do not
-/// participate because the analyzer does not read them. Any unexpected I/O
-/// error prevents cache reuse instead of authenticating a partial snapshot.
+/// [`analyze_package_from_open_dir`] given the same `contents`. Symlinks and
+/// ignored paths do not participate because the analyzer does not read them.
+/// Any unexpected I/O error prevents cache reuse instead of authenticating a
+/// partial snapshot.
 pub fn package_input_fingerprint_from_open_dir(
     package_dir: &cap_std::fs::Dir,
+    contents: PackageDirectory<'_>,
 ) -> std::io::Result<String> {
     let mut files = CapSourceFiles::new();
+    let mut native_artifacts = Vec::new();
     let mut discovery_limit_reached = false;
     collect_cap_fingerprint_files(
         package_dir,
         Path::new(""),
+        contents,
         &mut files,
+        &mut native_artifacts,
         &mut discovery_limit_reached,
     )?;
+    native_artifacts.sort_unstable();
     let files = files.into_sorted_vec();
     let (files, total_limit_reached) = cap_scan_prefix(&files);
 
@@ -311,6 +426,7 @@ pub fn package_input_fingerprint_from_open_dir(
             content_digest,
         );
     }
+    hash_native_artifacts(&mut hasher, &native_artifacts);
 
     match digest_package_manifest_from_open_dir(package_dir)? {
         Some((size, bytes_read, digest)) => {
@@ -337,7 +453,9 @@ fn new_fingerprint_hasher() -> Sha256 {
 fn collect_cap_fingerprint_files(
     directory: &cap_std::fs::Dir,
     relative_dir: &Path,
+    contents: PackageDirectory<'_>,
     files: &mut CapSourceFiles,
+    native_artifacts: &mut Vec<std::path::PathBuf>,
     limit_reached: &mut bool,
 ) -> std::io::Result<()> {
     use cap_fs_ext::DirExt as _;
@@ -351,20 +469,46 @@ fn collect_cap_fingerprint_files(
             continue;
         }
         if metadata.is_dir() {
-            if !PackageAnalyzer::should_scan_directory(&relative) {
+            if !contents.walks_into(&relative) {
                 continue;
             }
             let child = directory.open_dir_nofollow(&name)?;
-            collect_cap_fingerprint_files(&child, &relative, files, limit_reached)?;
-        } else if metadata.is_file() && PackageAnalyzer::should_scan(&relative, metadata.len()) {
-            let candidate = CapSourceFile {
-                path: relative,
-                size: metadata.len(),
-            };
-            *limit_reached |= files.insert(candidate);
+            collect_cap_fingerprint_files(
+                &child,
+                &relative,
+                contents,
+                files,
+                native_artifacts,
+                limit_reached,
+            )?;
+        } else if metadata.is_file() {
+            if PackageAnalyzer::should_scan(&relative, metadata.len()) {
+                let candidate = CapSourceFile {
+                    path: relative,
+                    size: metadata.len(),
+                };
+                *limit_reached |= files.insert(candidate);
+            } else if PackageAnalyzer::is_native_artifact(&relative) {
+                if native_artifacts.len() < MAX_FILES_PER_PACKAGE {
+                    native_artifacts.push(relative);
+                } else {
+                    *limit_reached = true;
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Adds the native artifacts a package ships to its input fingerprint: they
+/// set `nativeBindings` without being read.
+fn hash_native_artifacts(hasher: &mut Sha256, artifacts: &[std::path::PathBuf]) {
+    for artifact in artifacts {
+        let path = artifact.as_os_str().as_encoded_bytes();
+        hasher.update(b"native\0");
+        hasher.update((path.len() as u64).to_le_bytes());
+        hasher.update(path);
+    }
 }
 
 fn hash_fingerprint_record_digest(
@@ -521,7 +665,11 @@ fn analyze_open_cap_source_file(
 ) -> std::io::Result<ScannedCapSourceFile> {
     let mut file = source_file.file.into_std();
     let bytes = if source_file.size > MAX_FILE_SIZE {
-        read_oversized_source_sample_from_open_file(&mut file, source_file.size)?
+        read_oversized_source_sample_from_open_file(
+            &mut file,
+            source_file.size,
+            OVERSIZED_SOURCE_SAMPLE_CHUNK_BYTES,
+        )?
     } else {
         lpm_common::read_file_capped_from_open_file(file, &source_file.path, MAX_FILE_SIZE)
             .map_err(std::io::Error::other)?
@@ -561,15 +709,10 @@ fn analyze_cap_files_with_fingerprint(
     package_dir: &cap_std::fs::Dir,
     files: &[CapSourceFile],
     fingerprint_valid: bool,
-) -> (AccumulatedResult, Option<Sha256>, bool) {
+) -> (PackageAnalyzer, Option<Sha256>, bool) {
     use rayon::prelude::*;
 
-    let mut source_tags = SourceTags::default();
-    let mut supply_chain_tags = SupplyChainTags::default();
-    let mut meta = AnalysisMeta::default();
-    let mut all_url_domains = Vec::new();
-    let mut total_code_lines = 0usize;
-    let mut total_export_count = 0usize;
+    let mut analyzer = PackageAnalyzer::new();
     let mut fingerprint = fingerprint_valid.then(new_fingerprint_hasher);
     let mut planned_bytes = 0u64;
     let mut actual_bytes = 0u64;
@@ -643,40 +786,25 @@ fn analyze_cap_files_with_fingerprint(
                 );
             }
             if let Some(result) = scanned.analysis {
-                accumulate_result(
-                    &mut source_tags,
-                    &mut supply_chain_tags,
-                    &mut all_url_domains,
-                    &mut total_code_lines,
-                    &mut total_export_count,
-                    &mut meta,
-                    result,
-                );
+                analyzer.merge(result);
             }
         }
         if runtime_limit_reached {
             break;
         }
     }
-    meta.limit_reached |= runtime_limit_reached;
-    (
-        AccumulatedResult {
-            source: source_tags,
-            supply_chain: supply_chain_tags,
-            url_domains: all_url_domains,
-            total_code_lines,
-            total_export_count,
-            meta,
-        },
-        fingerprint,
-        runtime_limit_reached,
-    )
+    analyzer.limit_reached |= runtime_limit_reached;
+    (analyzer, fingerprint, runtime_limit_reached)
 }
 
 fn digest_cap_source_file(file: cap_std::fs::File, size: u64) -> std::io::Result<(u64, [u8; 32])> {
     if size > MAX_FILE_SIZE {
         let mut file = file.into_std();
-        let sample = read_oversized_source_sample_from_open_file(&mut file, size)?;
+        let sample = read_oversized_source_sample_from_open_file(
+            &mut file,
+            size,
+            OVERSIZED_SOURCE_SAMPLE_CHUNK_BYTES,
+        )?;
         return Ok((sample.len() as u64, Sha256::digest(&sample).into()));
     }
 
@@ -760,6 +888,8 @@ fn read_package_manifest_from_open_dir(
 /// [`analyze_bytes`] and merge results without reopening [`PackageAnalyzer`].
 #[derive(Debug, Default)]
 pub struct FileAnalysisResult {
+    /// The file's package-relative path, with `/` separators.
+    pub path: String,
     pub evidence: Vec<SourceEvidence>,
     pub source: SourceTags,
     pub supply_chain: SupplyChainTags,
@@ -770,16 +900,8 @@ pub struct FileAnalysisResult {
     pub unparsed_files: usize,
     pub bytes_scanned: u64,
     pub oversized_source_files: Vec<OversizedSourceFileEvidence>,
-}
-
-/// Accumulated result from scanning all files.
-struct AccumulatedResult {
-    source: SourceTags,
-    supply_chain: SupplyChainTags,
-    url_domains: Vec<String>,
-    total_code_lines: usize,
-    total_export_count: usize,
-    meta: AnalysisMeta,
+    /// `eval()` and `new Function()` calls the eval tag found.
+    pub eval_calls: usize,
 }
 
 /// Analyze a single file. Returns None if the file should be skipped.
@@ -798,6 +920,7 @@ fn analyze_single_file(
             relative_path,
             file_path,
             file_size,
+            OVERSIZED_SOURCE_SAMPLE_CHUNK_BYTES,
             comment_buf,
         ));
     }
@@ -811,16 +934,16 @@ fn analyze_single_file(
     ))
 }
 
-/// Core scan pass without the filesystem read — takes the file's name and
-/// raw bytes and returns the same `FileAnalysisResult` as
-/// [`analyze_single_file`]. The fused-scan path in `lpm-store` invokes this
-/// during tar extraction, using bytes the extractor already had in hand
-/// instead of re-reading the file a second time.
+/// Core scan pass without the filesystem read — takes the file's
+/// package-relative path and raw bytes and returns the same
+/// `FileAnalysisResult` as [`analyze_single_file`]. The fused-scan path in
+/// `lpm-store` invokes this during tar extraction, using bytes the extractor
+/// already had in hand instead of re-reading the file a second time.
 ///
 /// The caller is responsible for:
 /// - filtering by extension (`SOURCE_EXTENSIONS`), `.d.ts`/`.map`
-///   exclusion, and directory filtering (`node_modules` / `__tests__` /
-///   `test`). [`PackageAnalyzer::should_scan`] encodes the current policy.
+///   exclusion, and directory filtering (hidden directories).
+///   [`PackageAnalyzer::should_scan`] encodes the current policy.
 /// - routing files over the 4 MiB full-scan limit to
 ///   [`PackageAnalyzer::feed_oversized_source_file`] or another bounded
 ///   sampling path instead of passing the entire file here.
@@ -854,8 +977,11 @@ fn analyze_bytes_with_scratch(
     file_supply_tags.minified |= supply_chain::is_minified_filename(filename);
     supply_chain::append_evidence(&context, filename, &file_supply_tags, &mut evidence);
     let trivial = supply_chain::analyze_trivial(stripped);
+    let eval_calls = source::eval_calls(&context);
 
     FileAnalysisResult {
+        path: filename.to_owned(),
+        eval_calls,
         evidence,
         source: file_source_tags,
         supply_chain: file_supply_tags,
@@ -875,9 +1001,10 @@ fn analyze_oversized_source_file(
     relative_path: &Path,
     file_path: &Path,
     size: u64,
+    sample_bytes: usize,
     comment_buf: &mut Vec<u8>,
 ) -> FileAnalysisResult {
-    let sample = read_oversized_source_sample(file_path, size).unwrap_or_default();
+    let sample = read_oversized_source_sample(file_path, size, sample_bytes).unwrap_or_default();
     analyze_oversized_source_sample(relative_path, size, &sample, comment_buf)
 }
 
@@ -891,11 +1018,15 @@ fn analyze_oversized_source_sample(
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or_default();
+    let path = path_to_slash(relative_path);
     let mut result = if sample.is_empty() {
-        FileAnalysisResult::default()
+        FileAnalysisResult {
+            path: path.clone(),
+            ..FileAnalysisResult::default()
+        }
     } else {
         // Disjoint samples cannot establish a data flow between their source ranges.
-        analyze_bytes_with_scratch(&path_to_slash(relative_path), sample, comment_buf, false)
+        analyze_bytes_with_scratch(&path, sample, comment_buf, false)
     };
 
     result.files_scanned = 0;
@@ -908,7 +1039,7 @@ fn analyze_oversized_source_sample(
     result.supply_chain.minified |= supply_chain::is_minified_filename(filename);
 
     let evidence = OversizedSourceFileEvidence {
-        path: path_to_slash(relative_path),
+        path,
         size_bytes: size,
         sample_bytes_scanned: sample.len() as u64,
         signals: oversized_source_signals(&result.source, &result.supply_chain),
@@ -919,16 +1050,21 @@ fn analyze_oversized_source_sample(
     result
 }
 
-fn read_oversized_source_sample(file_path: &Path, size: u64) -> std::io::Result<Vec<u8>> {
+fn read_oversized_source_sample(
+    file_path: &Path,
+    size: u64,
+    sample_bytes: usize,
+) -> std::io::Result<Vec<u8>> {
     let mut file = std::fs::File::open(file_path)?;
-    read_oversized_source_sample_from_open_file(&mut file, size)
+    read_oversized_source_sample_from_open_file(&mut file, size, sample_bytes)
 }
 
 fn read_oversized_source_sample_from_open_file(
     file: &mut std::fs::File,
     size: u64,
+    sample_bytes: usize,
 ) -> std::io::Result<Vec<u8>> {
-    let chunk = OVERSIZED_SOURCE_SAMPLE_CHUNK_BYTES.min(size as usize);
+    let chunk = sample_bytes.min(size as usize);
     let mut sample = Vec::with_capacity(chunk.saturating_mul(2).saturating_add(1));
 
     read_file_chunk(file, 0, chunk, &mut sample)?;
@@ -954,8 +1090,8 @@ fn read_file_chunk(
     Ok(())
 }
 
-fn oversized_source_sample_from_bytes(bytes: &[u8]) -> Vec<u8> {
-    let chunk = OVERSIZED_SOURCE_SAMPLE_CHUNK_BYTES.min(bytes.len());
+fn oversized_source_sample_from_bytes(bytes: &[u8], sample_bytes: usize) -> Vec<u8> {
+    let chunk = sample_bytes.min(bytes.len());
     let tail_start = bytes.len().saturating_sub(chunk);
     let mut sample = Vec::with_capacity(chunk.saturating_mul(2).saturating_add(1));
     sample.extend_from_slice(&bytes[..chunk]);
@@ -969,6 +1105,7 @@ fn oversized_source_sample_from_bytes(bytes: &[u8]) -> Vec<u8> {
 /// Build the "oversized minified" result without reading file bytes.
 fn oversized_minified_result(relative_path: &Path, size: u64) -> FileAnalysisResult {
     let mut result = FileAnalysisResult {
+        path: path_to_slash(relative_path),
         oversized_source_files: vec![OversizedSourceFileEvidence {
             path: path_to_slash(relative_path),
             size_bytes: size,
@@ -984,59 +1121,45 @@ fn oversized_minified_result(relative_path: &Path, size: u64) -> FileAnalysisRes
 }
 
 fn oversized_source_signals(source: &SourceTags, supply_chain: &SupplyChainTags) -> Vec<String> {
-    let mut signals = Vec::new();
-    push_signal(&mut signals, source.filesystem, "filesystem");
-    push_signal(&mut signals, source.network, "network");
-    push_signal(&mut signals, source.child_process, "childProcess");
-    push_signal(&mut signals, source.environment_vars, "environmentVars");
-    push_signal(&mut signals, source.eval, "eval");
-    push_signal(&mut signals, source.native_bindings, "nativeBindings");
-    push_signal(&mut signals, source.crypto, "crypto");
-    push_signal(&mut signals, source.shell, "shell");
-    push_signal(&mut signals, source.web_socket, "webSocket");
-    push_signal(&mut signals, source.dynamic_require, "dynamicRequire");
-    push_signal(&mut signals, supply_chain.obfuscated, "obfuscated");
-    push_signal(
-        &mut signals,
-        supply_chain.possible_obfuscation,
-        "possibleObfuscation",
-    );
-    push_signal(
-        &mut signals,
-        supply_chain.high_entropy_strings,
-        "highEntropyStrings",
-    );
-    push_signal(&mut signals, supply_chain.minified, "minified");
-    push_signal(&mut signals, supply_chain.telemetry, "telemetry");
-    push_signal(&mut signals, supply_chain.url_strings, "urlStrings");
-    push_signal(&mut signals, supply_chain.protestware, "protestware");
-    push_signal(
-        &mut signals,
-        supply_chain.credential_exfiltration,
-        "credentialExfiltration",
-    );
-    push_signal(
-        &mut signals,
-        supply_chain.encrypted_execution,
-        "encryptedExecution",
-    );
-    push_signal(
-        &mut signals,
-        supply_chain.downloaded_execution,
-        "downloadedExecution",
-    );
-    push_signal(
-        &mut signals,
-        supply_chain.destructive_filesystem,
-        "destructiveFilesystem",
-    );
-    signals
+    active_file_tags(source, supply_chain)
+        .map(str::to_owned)
+        .collect()
 }
 
-fn push_signal(signals: &mut Vec<String>, active: bool, name: &str) {
-    if active {
-        signals.push(name.to_string());
-    }
+/// Registry keys of the source and supply-chain tags set, other than
+/// `trivial`, which describes a whole package rather than a file.
+fn active_file_tags<'t>(
+    source: &'t SourceTags,
+    supply_chain: &'t SupplyChainTags,
+) -> impl Iterator<Item = &'static str> + 't {
+    [
+        (source.filesystem, "filesystem"),
+        (source.network, "network"),
+        (source.child_process, "childProcess"),
+        (source.environment_vars, "environmentVars"),
+        (source.eval, "eval"),
+        (source.native_bindings, "nativeBindings"),
+        (source.crypto, "crypto"),
+        (source.shell, "shell"),
+        (source.web_socket, "webSocket"),
+        (source.dynamic_require, "dynamicRequire"),
+        (supply_chain.obfuscated, "obfuscated"),
+        (supply_chain.possible_obfuscation, "possibleObfuscation"),
+        (supply_chain.high_entropy_strings, "highEntropyStrings"),
+        (supply_chain.minified, "minified"),
+        (supply_chain.telemetry, "telemetry"),
+        (supply_chain.url_strings, "urlStrings"),
+        (supply_chain.protestware, "protestware"),
+        (
+            supply_chain.credential_exfiltration,
+            "credentialExfiltration",
+        ),
+        (supply_chain.encrypted_execution, "encryptedExecution"),
+        (supply_chain.downloaded_execution, "downloadedExecution"),
+        (supply_chain.destructive_filesystem, "destructiveFilesystem"),
+    ]
+    .into_iter()
+    .filter_map(|(active, key)| active.then_some(key))
 }
 
 fn path_to_slash(path: &Path) -> String {
@@ -1051,102 +1174,46 @@ fn extend_oversized_source_files(
     target.extend(source.into_iter().take(remaining));
 }
 
-fn accumulate_result(
-    source_tags: &mut SourceTags,
-    supply_chain_tags: &mut SupplyChainTags,
-    all_url_domains: &mut Vec<String>,
-    total_code_lines: &mut usize,
-    total_export_count: &mut usize,
-    meta: &mut AnalysisMeta,
-    result: FileAnalysisResult,
-) {
-    let oversized = !result.oversized_source_files.is_empty();
-    *source_tags = source::merge_source_tags(source_tags, &result.source);
-    *supply_chain_tags =
-        supply_chain::merge_supply_chain_tags(supply_chain_tags, &result.supply_chain);
-    all_url_domains.extend(result.url_domains);
-    *total_code_lines += result.total_code_lines;
-    *total_export_count += result.total_export_count;
-    meta.files_scanned += result.files_scanned;
-    meta.unparsed_files += result.unparsed_files;
-    meta.bytes_scanned += result.bytes_scanned;
-    evidence::merge_evidence(&mut meta.evidence, result.evidence);
-    extend_oversized_source_files(
-        &mut meta.oversized_source_files,
-        result.oversized_source_files,
-    );
-    if oversized {
-        meta.limit_reached = true;
-    }
-}
-
-fn merge_with_limits(analyzer: &mut PackageAnalyzer, result: FileAnalysisResult) {
-    if analyzer.bytes_scanned + result.bytes_scanned > MAX_TOTAL_SCAN_BYTES {
-        analyzer.limit_reached = true;
-        return;
-    }
-    analyzer.merge(result);
-}
-
 /// Sequential file scanning (for packages with < 20 files).
-fn analyze_files_sequential(package_dir: &Path, files: &[std::path::PathBuf]) -> AccumulatedResult {
-    let mut source_tags = SourceTags::default();
-    let mut supply_chain_tags = SupplyChainTags::default();
-    let mut meta = AnalysisMeta::default();
-    let mut all_url_domains = Vec::new();
-    let mut total_code_lines = 0usize;
-    let mut total_export_count = 0usize;
+fn analyze_files_sequential(package_dir: &Path, files: &[std::path::PathBuf]) -> PackageAnalyzer {
+    let mut analyzer = PackageAnalyzer::new();
     let mut comment_buf = Vec::new();
 
-    for file_path in files {
-        if meta.files_scanned >= MAX_FILES_PER_PACKAGE {
-            meta.limit_reached = true;
+    for (index, file_path) in files.iter().enumerate() {
+        if analyzer.files_scanned >= MAX_FILES_PER_PACKAGE {
+            analyzer.skip_remaining(files.len() - index);
             break;
         }
         if let Some(result) = analyze_single_file(package_dir, file_path, &mut comment_buf) {
-            if meta.bytes_scanned + result.bytes_scanned > MAX_TOTAL_SCAN_BYTES {
-                meta.limit_reached = true;
+            if analyzer.bytes_scanned + result.bytes_scanned > MAX_TOTAL_SCAN_BYTES {
+                analyzer.skip_remaining(files.len() - index);
                 break;
             }
-            accumulate_result(
-                &mut source_tags,
-                &mut supply_chain_tags,
-                &mut all_url_domains,
-                &mut total_code_lines,
-                &mut total_export_count,
-                &mut meta,
-                result,
-            );
+            analyzer.merge(result);
         }
     }
 
-    AccumulatedResult {
-        source: source_tags,
-        supply_chain: supply_chain_tags,
-        url_domains: all_url_domains,
-        total_code_lines,
-        total_export_count,
-        meta,
-    }
+    analyzer
 }
 
 /// Parallel file scanning using rayon (for packages with 20+ files).
-fn analyze_files_parallel(package_dir: &Path, files: &[std::path::PathBuf]) -> AccumulatedResult {
+fn analyze_files_parallel(package_dir: &Path, files: &[std::path::PathBuf]) -> PackageAnalyzer {
     use rayon::prelude::*;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     let files_scanned = AtomicUsize::new(0);
     let bytes_scanned = AtomicU64::new(0);
+    let skipped = AtomicUsize::new(0);
 
     // Analyze all files in parallel, collecting results
     let results: Vec<FileAnalysisResult> = files
         .par_iter()
         .map_init(Vec::new, |comment_buf, file_path| {
             // Approximate limit checks (may slightly overshoot — acceptable for safety limits)
-            if files_scanned.load(Ordering::Relaxed) >= MAX_FILES_PER_PACKAGE {
-                return None;
-            }
-            if bytes_scanned.load(Ordering::Relaxed) > MAX_TOTAL_SCAN_BYTES {
+            if files_scanned.load(Ordering::Relaxed) >= MAX_FILES_PER_PACKAGE
+                || bytes_scanned.load(Ordering::Relaxed) > MAX_TOTAL_SCAN_BYTES
+            {
+                skipped.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
 
@@ -1158,52 +1225,42 @@ fn analyze_files_parallel(package_dir: &Path, files: &[std::path::PathBuf]) -> A
         .filter_map(|result| result)
         .collect();
 
-    // Merge all results
-    let mut source_tags = SourceTags::default();
-    let mut supply_chain_tags = SupplyChainTags::default();
-    let mut all_url_domains = Vec::new();
-    let mut total_code_lines = 0usize;
-    let mut total_export_count = 0usize;
-    let mut meta = AnalysisMeta::default();
-
+    let mut analyzer = PackageAnalyzer::new();
     for result in results {
-        accumulate_result(
-            &mut source_tags,
-            &mut supply_chain_tags,
-            &mut all_url_domains,
-            &mut total_code_lines,
-            &mut total_export_count,
-            &mut meta,
-            result,
-        );
+        analyzer.merge(result);
     }
-
-    let limit_reached = files_scanned.load(Ordering::Relaxed) >= MAX_FILES_PER_PACKAGE
-        || bytes_scanned.load(Ordering::Relaxed) > MAX_TOTAL_SCAN_BYTES;
-    meta.limit_reached |= limit_reached;
-
-    AccumulatedResult {
-        source: source_tags,
-        supply_chain: supply_chain_tags,
-        url_domains: all_url_domains,
-        total_code_lines,
-        total_export_count,
-        meta,
+    let skipped = skipped.into_inner();
+    if skipped > 0
+        || files_scanned.load(Ordering::Relaxed) >= MAX_FILES_PER_PACKAGE
+        || bytes_scanned.load(Ordering::Relaxed) > MAX_TOTAL_SCAN_BYTES
+    {
+        analyzer.skip_remaining(skipped);
     }
+    analyzer
 }
 
-/// Collect source files from a package directory, filtered by extension.
+/// The files of a package directory the analysis reads or notes.
+#[derive(Default)]
+struct PackageFiles {
+    sources: Vec<std::path::PathBuf>,
+    native_artifacts: Vec<std::path::PathBuf>,
+}
+
+/// Collect source files and native artifacts from a package directory,
+/// bundled dependencies included.
 ///
-/// Skips `node_modules/`, hidden files/directories, `.d.ts` files, and `.map` files.
+/// Skips hidden files/directories, `.d.ts` files, and `.map` files.
 /// Returns paths sorted for deterministic analysis order.
-fn collect_source_files(dir: &Path) -> Vec<std::path::PathBuf> {
-    let mut files = Vec::new();
+fn collect_package_files(dir: &Path) -> PackageFiles {
+    let mut files = PackageFiles::default();
     collect_source_files_recursive(dir, &mut files);
-    files.sort();
+    files.sources.sort();
+    files.native_artifacts.sort();
+    files.native_artifacts.truncate(MAX_FILES_PER_PACKAGE);
     files
 }
 
-fn collect_source_files_recursive(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+fn collect_source_files_recursive(dir: &Path, files: &mut PackageFiles) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -1227,11 +1284,12 @@ fn collect_source_files_recursive(dir: &Path, files: &mut Vec<std::path::PathBuf
         }
 
         if metadata.is_dir() {
-            // Skip node_modules (shouldn't exist in store, but defensive)
-            if name_str == "node_modules" || name_str == "__tests__" || name_str == "test" {
-                continue;
-            }
             collect_source_files_recursive(&path, files);
+            continue;
+        }
+
+        if roles::is_native_artifact_path(&name_str) {
+            files.native_artifacts.push(path);
             continue;
         }
 
@@ -1255,27 +1313,29 @@ fn collect_source_files_recursive(dir: &Path, files: &mut Vec<std::path::PathBuf
             continue;
         }
 
-        files.push(path);
+        files.sources.push(path);
     }
 }
 
-/// Analyze package.json for manifest tags.
-fn analyze_package_manifest(package_dir: &Path) -> Option<ManifestTags> {
-    let pkg_json_path = package_dir.join("package.json");
-    let content =
-        lpm_common::read_text_file_capped(&pkg_json_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
-            .ok()?;
-    analyze_package_manifest_content(&content)
+/// The `package.json` of a package directory, within the configuration file
+/// size cap.
+fn read_package_manifest(package_dir: &Path) -> Option<Vec<u8>> {
+    lpm_common::read_text_file_capped(
+        &package_dir.join("package.json"),
+        lpm_common::CONFIG_FILE_SIZE_CAP_BYTES,
+    )
+    .ok()
+    .map(String::into_bytes)
 }
 
-fn analyze_package_manifest_bytes(content: &[u8]) -> Option<ManifestTags> {
-    analyze_package_manifest_content(std::str::from_utf8(content).ok()?)
-}
-
-fn analyze_package_manifest_content(content: &str) -> Option<ManifestTags> {
+/// A package manifest's tags, and the scripts and entry points that decide
+/// whether a test file runs.
+fn read_manifest(content: &[u8]) -> Option<(ManifestTags, roles::EntryReferences)> {
+    let content = std::str::from_utf8(content).ok()?;
     let parsed: serde_json::Value =
         serde_json::from_str(content.trim_start_matches('\u{feff}')).ok()?;
     parsed.as_object()?;
+    let references = roles::EntryReferences::from_manifest(&parsed);
 
     // A string, or the deprecated `{ "type": "MIT", "url": ... }` object;
     // `licence` is the common misspelling.
@@ -1292,15 +1352,16 @@ fn analyze_package_manifest_content(content: &str) -> Option<ManifestTags> {
         .unwrap_or(false);
 
     let dependencies = parse_deps_map(parsed.get("dependencies"));
-    let dev_dependencies = parse_deps_map(parsed.get("devDependencies"));
     let optional_dependencies = parse_deps_map(parsed.get("optionalDependencies"));
 
-    Some(manifest::analyze_manifest_with_privacy(
-        license,
-        private_package,
-        dependencies.as_ref(),
-        dev_dependencies.as_ref(),
-        optional_dependencies.as_ref(),
+    Some((
+        manifest::analyze_manifest_with_privacy(
+            license,
+            private_package,
+            dependencies.as_ref(),
+            optional_dependencies.as_ref(),
+        ),
+        references,
     ))
 }
 
@@ -1320,35 +1381,130 @@ fn parse_deps_map(value: Option<&serde_json::Value>) -> Option<HashMap<String, S
 ///
 /// Fed one file at a time during tar extraction — callers pipe each
 /// scannable entry's `(relative_path, bytes)` through [`PackageAnalyzer::feed`]
-/// while the extractor walks the archive. Once extraction completes,
+/// and every entry's path through [`PackageAnalyzer::note_entry`] while the
+/// extractor walks the archive. Once extraction completes,
 /// [`PackageAnalyzer::finalize`] reads `package.json` from the now-written
 /// staging directory, runs the manifest-level analysis, and returns a
-/// [`PackageAnalysis`] that is byte-compatible with [`analyze_package`].
+/// [`PackageAnalysis`] identical to [`analyze_package`]'s.
 ///
-/// Semantics match the two-pass path exactly — same tags, same
-/// deduplication, same limits. The difference is purely operational:
-/// we scan bytes the extractor already had in hand instead of walking
-/// the just-written directory a second time.
-#[derive(Debug, Default)]
+/// A test file's tags wait for the manifest: they count as the package's own
+/// when its lifecycle scripts or entry points name the file, and are
+/// reported as tests-only otherwise.
+#[derive(Debug)]
 pub struct PackageAnalyzer {
-    evidence: Vec<SourceEvidence>,
-    source: SourceTags,
-    supply_chain: SupplyChainTags,
-    url_domains: Vec<String>,
+    limits: ScanLimits,
+    runtime: TagTotals,
+    tests: Vec<FileAnalysisResult>,
+    native_artifacts: Vec<String>,
     oversized_source_files: Vec<OversizedSourceFileEvidence>,
-    total_code_lines: usize,
-    total_export_count: usize,
     files_scanned: usize,
     unparsed_files: usize,
     bytes_scanned: u64,
+    sampled_files: usize,
+    skipped_files: usize,
     limit_reached: bool,
     source_scan_ns: u128,
 }
 
+impl Default for PackageAnalyzer {
+    fn default() -> Self {
+        Self::with_limits(ScanLimits::INSTALL)
+    }
+}
+
+/// The tags of a set of files, and which files showed each.
+#[derive(Debug, Default)]
+struct TagTotals {
+    evidence: Vec<SourceEvidence>,
+    source: SourceTags,
+    supply_chain: SupplyChainTags,
+    url_domains: Vec<String>,
+    total_code_lines: usize,
+    total_export_count: usize,
+    files_scanned: usize,
+    eval_calls: usize,
+    files: BTreeMap<&'static str, TagFileSet>,
+}
+
+/// The first paths, in path order, of the files that showed a tag, and how
+/// many did.
+#[derive(Debug, Default)]
+struct TagFileSet {
+    first: Vec<String>,
+    count: usize,
+}
+
+impl TagFileSet {
+    fn add(&mut self, path: &str) {
+        self.count += 1;
+        let position = self
+            .first
+            .partition_point(|current| current.as_str() < path);
+        if position < MAX_TAG_FILES {
+            self.first.truncate(MAX_TAG_FILES - 1);
+            self.first.insert(position, path.to_owned());
+        }
+    }
+}
+
+impl TagTotals {
+    fn add(&mut self, result: FileAnalysisResult) {
+        for key in active_file_tags(&result.source, &result.supply_chain) {
+            self.files.entry(key).or_default().add(&result.path);
+        }
+        evidence::merge_evidence(&mut self.evidence, result.evidence);
+        self.source = source::merge_source_tags(&self.source, &result.source);
+        self.supply_chain =
+            supply_chain::merge_supply_chain_tags(&self.supply_chain, &result.supply_chain);
+        self.url_domains.extend(result.url_domains);
+        self.total_code_lines += result.total_code_lines;
+        self.total_export_count += result.total_export_count;
+        self.files_scanned += result.files_scanned;
+        self.eval_calls += result.eval_calls;
+    }
+
+    fn add_native_artifact(&mut self, path: &str) {
+        self.source.native_bindings = true;
+        self.files.entry("nativeBindings").or_default().add(path);
+        let reason = if path.ends_with(".node") {
+            "The package ships a compiled native addon."
+        } else {
+            "node-gyp builds a native addon from this file when the package is installed."
+        };
+        evidence::merge_evidence(
+            &mut self.evidence,
+            vec![SourceEvidence::new("native", path, reason)],
+        );
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &'static str> + '_ {
+        active_file_tags(&self.source, &self.supply_chain)
+    }
+}
+
 impl PackageAnalyzer {
-    /// Create an empty analyzer. Cheap — no allocations beyond defaults.
+    /// Create an empty analyzer with [`ScanLimits::INSTALL`]. Cheap — no
+    /// allocations beyond defaults.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create an empty analyzer that reads within `limits`.
+    pub fn with_limits(limits: ScanLimits) -> Self {
+        Self {
+            limits,
+            runtime: TagTotals::default(),
+            tests: Vec::new(),
+            native_artifacts: Vec::new(),
+            oversized_source_files: Vec::new(),
+            files_scanned: 0,
+            unparsed_files: 0,
+            bytes_scanned: 0,
+            sampled_files: 0,
+            skipped_files: 0,
+            limit_reached: false,
+            source_scan_ns: 0,
+        }
     }
 
     /// Does this tar entry qualify for source analysis?
@@ -1356,8 +1512,10 @@ impl PackageAnalyzer {
     /// Returns `true` iff:
     /// - Extension is in `SOURCE_EXTENSIONS` (js/mjs/cjs/ts/mts/cts/jsx/tsx)
     /// - Filename is not `.d.ts` / `.d.mts` / `.d.cts` / `.map`
-    /// - No path component is `node_modules` / `__tests__` / `test`
     /// - No path component starts with `.` (hidden files/dirs)
+    ///
+    /// A file under `node_modules/` qualifies: in a tarball, it's a
+    /// dependency the package bundles.
     ///
     /// The size cap is intentionally NOT checked here: oversized files still
     /// need lightweight metadata via [`PackageAnalyzer::feed_oversized_source_file`].
@@ -1365,18 +1523,8 @@ impl PackageAnalyzer {
     /// Mirrors the `collect_source_files_recursive` filter exactly so the
     /// fused path scans the same set of files as the two-pass path.
     pub fn should_scan(relative_path: &Path, _size: u64) -> bool {
-        for component in relative_path.components() {
-            let name = match component {
-                std::path::Component::Normal(s) => s.to_string_lossy(),
-                _ => continue,
-            };
-            if name.starts_with('.')
-                || name == "node_modules"
-                || name == "__tests__"
-                || name == "test"
-            {
-                return false;
-            }
+        if !Self::in_scanned_tree(relative_path) {
+            return false;
         }
 
         let name_str = relative_path
@@ -1399,16 +1547,26 @@ impl PackageAnalyzer {
         SOURCE_EXTENSIONS.contains(&ext)
     }
 
+    /// Whether an entry is a native addon the analysis notes: a `.node` file
+    /// or `binding.gyp` outside the trees it skips.
+    pub fn is_native_artifact(relative_path: &Path) -> bool {
+        Self::in_scanned_tree(relative_path)
+            && roles::is_native_artifact_path(&path_to_slash(relative_path))
+    }
+
+    fn in_scanned_tree(relative_path: &Path) -> bool {
+        relative_path.components().all(|component| match component {
+            std::path::Component::Normal(name) => !name.as_encoded_bytes().starts_with(b"."),
+            _ => true,
+        })
+    }
+
     fn should_scan_directory(relative_path: &Path) -> bool {
         relative_path.components().all(|component| {
             let std::path::Component::Normal(name) = component else {
                 return false;
             };
-            let name = name.to_string_lossy();
-            !name.starts_with('.')
-                && name != "node_modules"
-                && name != "__tests__"
-                && name != "test"
+            !name.as_encoded_bytes().starts_with(b".")
         })
     }
 
@@ -1417,40 +1575,56 @@ impl PackageAnalyzer {
         Self::should_scan(relative_path, size) && size <= MAX_FILE_SIZE
     }
 
-    /// Feed one scannable file's bytes. Respects per-package limits
-    /// (`MAX_FILES_PER_PACKAGE` / `MAX_TOTAL_SCAN_BYTES`) — once either
-    /// is hit, subsequent `feed` calls are no-ops and `limit_reached`
-    /// flips to `true` in the final meta.
-    pub fn feed(&mut self, relative_path: &Path, bytes: &[u8]) {
-        if self.files_scanned >= MAX_FILES_PER_PACKAGE {
+    /// Note one entry of the package, of any kind. A native addon among them
+    /// sets `nativeBindings`.
+    pub fn note_entry(&mut self, relative_path: &Path) {
+        if Self::is_native_artifact(relative_path) {
+            self.note_native_artifact(path_to_slash(relative_path));
+        }
+    }
+
+    /// Note a native addon at `path`, wherever it is in the package.
+    pub(crate) fn note_native_artifact(&mut self, path: String) {
+        if self.native_artifacts.len() < self.limits.files {
+            self.native_artifacts.push(path);
+        } else {
             self.limit_reached = true;
+        }
+    }
+
+    /// Feed one scannable file's bytes. Respects the package limits — once
+    /// one is hit, later files are skipped and `limit_reached` is set.
+    pub fn feed(&mut self, relative_path: &Path, bytes: &[u8]) {
+        if self.files_scanned >= self.limits.files {
+            self.skip_remaining(1);
             return;
         }
-        if bytes.len() as u64 > MAX_FILE_SIZE {
-            let scan_start = std::time::Instant::now();
-            let sample = oversized_source_sample_from_bytes(bytes);
-            let mut comment_buf = Vec::new();
-            let result = analyze_oversized_source_sample(
-                relative_path,
-                bytes.len() as u64,
-                &sample,
-                &mut comment_buf,
-            );
-            merge_with_limits(self, result);
-            self.source_scan_ns = self
-                .source_scan_ns
-                .saturating_add(scan_start.elapsed().as_nanos());
+        if bytes.len() as u64 > self.limits.full_file_bytes {
+            let sample = oversized_source_sample_from_bytes(bytes, self.limits.sample_bytes);
+            self.feed_sample(relative_path, bytes.len() as u64, &sample);
             return;
         }
 
-        if self.bytes_scanned + bytes.len() as u64 > MAX_TOTAL_SCAN_BYTES {
-            self.limit_reached = true;
+        if self.bytes_scanned + bytes.len() as u64 > self.limits.total_bytes {
+            self.skip_remaining(1);
             return;
         }
 
         let scan_start = std::time::Instant::now();
         let result = analyze_bytes(&path_to_slash(relative_path), bytes);
         self.merge(result);
+        self.source_scan_ns = self
+            .source_scan_ns
+            .saturating_add(scan_start.elapsed().as_nanos());
+    }
+
+    /// Feed the ends of a source file of `size` bytes too large to read whole:
+    /// `sample` is its first bytes, a line break, and its last bytes.
+    pub fn feed_sample(&mut self, relative_path: &Path, size: u64, sample: &[u8]) {
+        let scan_start = std::time::Instant::now();
+        let mut comment_buf = Vec::new();
+        let result = analyze_oversized_source_sample(relative_path, size, sample, &mut comment_buf);
+        self.merge_within_limits(result);
         self.source_scan_ns = self
             .source_scan_ns
             .saturating_add(scan_start.elapsed().as_nanos());
@@ -1468,9 +1642,14 @@ impl PackageAnalyzer {
         }
         let scan_start = std::time::Instant::now();
         let mut comment_buf = Vec::new();
-        let result =
-            analyze_oversized_source_file(relative_path, full_path, size, &mut comment_buf);
-        merge_with_limits(self, result);
+        let result = analyze_oversized_source_file(
+            relative_path,
+            full_path,
+            size,
+            self.limits.sample_bytes,
+            &mut comment_buf,
+        );
+        self.merge_within_limits(result);
         self.source_scan_ns = self
             .source_scan_ns
             .saturating_add(scan_start.elapsed().as_nanos());
@@ -1489,7 +1668,7 @@ impl PackageAnalyzer {
         if supply_chain::is_minified_filename(&filename) {
             let scan_start = std::time::Instant::now();
             let result = oversized_minified_result(relative_path, size);
-            merge_with_limits(self, result);
+            self.merge_within_limits(result);
             self.source_scan_ns = self
                 .source_scan_ns
                 .saturating_add(scan_start.elapsed().as_nanos());
@@ -1501,24 +1680,33 @@ impl PackageAnalyzer {
         self.source_scan_ns
     }
 
-    fn merge(&mut self, result: FileAnalysisResult) {
-        evidence::merge_evidence(&mut self.evidence, result.evidence);
-        let oversized = !result.oversized_source_files.is_empty();
-        self.source = source::merge_source_tags(&self.source, &result.source);
-        self.supply_chain =
-            supply_chain::merge_supply_chain_tags(&self.supply_chain, &result.supply_chain);
-        self.url_domains.extend(result.url_domains);
-        extend_oversized_source_files(
-            &mut self.oversized_source_files,
-            result.oversized_source_files,
-        );
-        self.total_code_lines += result.total_code_lines;
-        self.total_export_count += result.total_export_count;
+    fn skip_remaining(&mut self, files: usize) {
+        self.skipped_files += files;
+        self.limit_reached = true;
+    }
+
+    fn merge_within_limits(&mut self, result: FileAnalysisResult) {
+        if self.bytes_scanned + result.bytes_scanned > self.limits.total_bytes {
+            self.skip_remaining(1);
+            return;
+        }
+        self.merge(result);
+    }
+
+    fn merge(&mut self, mut result: FileAnalysisResult) {
+        let oversized = std::mem::take(&mut result.oversized_source_files);
+        if !oversized.is_empty() {
+            self.sampled_files += 1;
+            self.limit_reached = true;
+            extend_oversized_source_files(&mut self.oversized_source_files, oversized);
+        }
         self.files_scanned += result.files_scanned;
         self.unparsed_files += result.unparsed_files;
         self.bytes_scanned += result.bytes_scanned;
-        if oversized {
-            self.limit_reached = true;
+        if roles::is_test_path(&result.path) {
+            self.tests.push(result);
+        } else {
+            self.runtime.add(result);
         }
     }
 
@@ -1527,36 +1715,103 @@ impl PackageAnalyzer {
     /// tag, and build the final [`PackageAnalysis`]. Mirrors the tail
     /// of [`analyze_package`] exactly so outputs are byte-for-byte
     /// compatible with the two-pass path.
-    pub fn finalize(mut self, package_dir: &Path) -> PackageAnalysis {
-        if self.files_scanned > 0 {
-            self.supply_chain.trivial = self.total_code_lines < 10 && self.total_export_count <= 1;
-        }
+    pub fn finalize(self, package_dir: &Path) -> PackageAnalysis {
+        let manifest = read_package_manifest(package_dir);
+        self.finish(manifest.as_deref())
+    }
 
-        self.url_domains.sort_unstable();
-        self.url_domains.dedup();
-
-        let manifest_tags = analyze_package_manifest(package_dir);
-        let meta = AnalysisMeta {
-            evidence: self.evidence,
-            files_scanned: self.files_scanned,
-            unparsed_files: self.unparsed_files,
-            input_incomplete: manifest_tags.is_none(),
-            bytes_scanned: self.bytes_scanned,
-            limit_reached: self.limit_reached,
-            url_domains: self.url_domains,
-            oversized_source_files: self.oversized_source_files,
+    /// Complete the analysis with the package's `package.json` bytes, or
+    /// `None` when it has none or it couldn't be read.
+    pub fn finish(mut self, manifest: Option<&[u8]>) -> PackageAnalysis {
+        let (manifest_tags, references) = match manifest.and_then(read_manifest) {
+            Some((tags, references)) => (Some(tags), references),
+            None => (None, roles::EntryReferences::default()),
         };
 
-        let manifest_tags = manifest_tags.unwrap_or_default();
-        let analyzed_at = chrono::Utc::now().to_rfc3339();
+        let mut tests = TagTotals::default();
+        for result in std::mem::take(&mut self.tests) {
+            if references.name(&result.path) {
+                self.runtime.add(result);
+            } else {
+                tests.add(result);
+            }
+        }
+        for path in std::mem::take(&mut self.native_artifacts) {
+            if roles::is_test_path(&path) && !references.name(&path) {
+                tests.add_native_artifact(&path);
+            } else {
+                self.runtime.add_native_artifact(&path);
+            }
+        }
+
+        let mut runtime = self.runtime;
+        if runtime.files_scanned > 0 {
+            runtime.supply_chain.trivial =
+                runtime.total_code_lines < 10 && runtime.total_export_count <= 1;
+        }
+        let runtime_keys: std::collections::BTreeSet<&'static str> = runtime.keys().collect();
+        let mut test_only_tags: Vec<&'static str> = tests
+            .keys()
+            .filter(|key| {
+                !runtime_keys.contains(key)
+                    && !(*key == "possibleObfuscation" && runtime_keys.contains("obfuscated"))
+            })
+            .collect();
+        test_only_tags.sort_unstable();
+
+        let mut tag_files = BTreeMap::new();
+        for key in runtime_keys.iter().chain(&test_only_tags) {
+            let ran = runtime.files.remove(key).unwrap_or_default();
+            let tested = tests.files.remove(key).unwrap_or_default();
+            let mut files = ran.first;
+            files.extend(tested.first.into_iter().take(MAX_TAG_FILES - files.len()));
+            tag_files.insert(
+                (*key).to_owned(),
+                TagFiles {
+                    files,
+                    file_count: ran.count + tested.count,
+                    tests_only: ran.count == 0,
+                },
+            );
+        }
+
+        let mut evidence = runtime.evidence;
+        let runtime_rules: std::collections::HashSet<String> =
+            evidence.iter().map(|entry| entry.rule_id.clone()).collect();
+        evidence::merge_evidence(
+            &mut evidence,
+            tests
+                .evidence
+                .into_iter()
+                .filter(|entry| !runtime_rules.contains(&entry.rule_id))
+                .collect(),
+        );
+
+        let mut url_domains = runtime.url_domains;
+        url_domains.sort_unstable();
+        url_domains.dedup();
 
         PackageAnalysis {
             version: SCHEMA_VERSION,
-            analyzed_at,
-            source: self.source,
-            supply_chain: self.supply_chain,
-            manifest: manifest_tags,
-            meta,
+            analyzed_at: chrono::Utc::now().to_rfc3339(),
+            source: runtime.source,
+            supply_chain: runtime.supply_chain,
+            meta: AnalysisMeta {
+                evidence,
+                files_scanned: self.files_scanned,
+                unparsed_files: self.unparsed_files,
+                input_incomplete: manifest_tags.is_none(),
+                bytes_scanned: self.bytes_scanned,
+                limit_reached: self.limit_reached,
+                url_domains,
+                oversized_source_files: self.oversized_source_files,
+                sampled_files: self.sampled_files,
+                skipped_files: self.skipped_files,
+                tag_files,
+                test_only_tags: test_only_tags.into_iter().map(str::to_owned).collect(),
+                eval_calls: runtime.eval_calls,
+            },
+            manifest: manifest_tags.unwrap_or_default(),
         }
     }
 }
@@ -1826,7 +2081,8 @@ mod tests {
                 .unwrap();
 
         let path_analysis = analyze_package(package.path());
-        let capability_analysis = analyze_package_from_open_dir(&directory);
+        let capability_analysis =
+            analyze_package_from_open_dir(&directory, PackageDirectory::Published);
         let mut path_json = serde_json::to_value(path_analysis).unwrap();
         let mut capability_json = serde_json::to_value(capability_analysis).unwrap();
         path_json["analyzedAt"] = serde_json::Value::Null;
@@ -1919,8 +2175,10 @@ mod tests {
                 .unwrap();
 
         let (analysis, fused_fingerprint) =
-            analyze_package_from_open_dir_with_fingerprint(&directory);
-        let standalone_fingerprint = package_input_fingerprint_from_open_dir(&directory).unwrap();
+            analyze_package_from_open_dir_with_fingerprint(&directory, PackageDirectory::Published);
+        let standalone_fingerprint =
+            package_input_fingerprint_from_open_dir(&directory, PackageDirectory::Published)
+                .unwrap();
 
         assert!(analysis.source.eval);
         assert_eq!(
@@ -1930,7 +2188,8 @@ mod tests {
 
         fs::write(package.path().join("index.js"), "module.exports = 1;\n").unwrap();
         assert_ne!(
-            package_input_fingerprint_from_open_dir(&directory).unwrap(),
+            package_input_fingerprint_from_open_dir(&directory, PackageDirectory::Published)
+                .unwrap(),
             standalone_fingerprint
         );
     }
@@ -1946,7 +2205,9 @@ mod tests {
             cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
                 .unwrap();
 
-        let error = package_input_fingerprint_from_open_dir(&directory).unwrap_err();
+        let error =
+            package_input_fingerprint_from_open_dir(&directory, PackageDirectory::Published)
+                .unwrap_err();
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
@@ -1982,10 +2243,18 @@ mod tests {
             cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
                 .unwrap();
         let mut files = CapSourceFiles::new();
+        let mut native_artifacts = Vec::new();
         let mut limit_reached = false;
 
-        collect_cap_fingerprint_files(&directory, Path::new(""), &mut files, &mut limit_reached)
-            .unwrap();
+        collect_cap_fingerprint_files(
+            &directory,
+            Path::new(""),
+            PackageDirectory::Published,
+            &mut files,
+            &mut native_artifacts,
+            &mut limit_reached,
+        )
+        .unwrap();
         let files = files.into_sorted_vec();
 
         assert!(limit_reached);
@@ -2024,7 +2293,7 @@ mod tests {
         fs::rename(&package, parent.path().join("detached")).unwrap();
         symlink(outside.path(), &package).unwrap();
 
-        let analysis = analyze_package_from_open_dir(&directory);
+        let analysis = analyze_package_from_open_dir(&directory, PackageDirectory::Published);
 
         assert!(!analysis.source.eval);
         assert!(!analysis.manifest.no_license);
@@ -2053,7 +2322,7 @@ mod tests {
             cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
                 .unwrap();
 
-        let analysis = analyze_package_from_open_dir(&directory);
+        let analysis = analyze_package_from_open_dir(&directory, PackageDirectory::Published);
 
         assert!(!analysis.source.eval);
     }
@@ -2122,20 +2391,151 @@ mod tests {
     }
 
     #[test]
-    fn skips_node_modules() {
-        let dir = tempfile::tempdir().unwrap();
+    fn reads_the_dependencies_a_package_bundles() {
+        let analysis = analyze_every_way(&[
+            (
+                "package.json",
+                br#"{"name":"kit","license":"MIT","bundleDependencies":["helper"]}"#,
+            ),
+            ("index.js", br#"module.exports = require("helper")"#),
+            ("node_modules/helper/index.js", b"eval(payload)"),
+            (
+                "node_modules/helper/test/run.js",
+                b"require('child_process')",
+            ),
+            (
+                "node_modules/helper/node_modules/inner/addon.node",
+                b"\x7fELF",
+            ),
+        ]);
+
+        assert!(analysis.source.eval);
+        assert!(analysis.source.native_bindings);
+        assert_eq!(analysis.meta.test_only_tags, ["childProcess"]);
+        assert_eq!(analysis.meta.files_scanned, 3);
+        assert_eq!(
+            analysis.meta.tag_files["eval"].files,
+            ["node_modules/helper/index.js"]
+        );
+    }
+
+    #[test]
+    fn an_installed_package_leaves_out_the_packages_nested_in_it() {
+        let package = tempfile::tempdir().unwrap();
         create_test_package(
-            dir.path(),
+            package.path(),
             &[
-                ("package.json", r#"{"name":"test","license":"MIT"}"#),
-                ("index.js", "module.exports = 42"),
-                ("node_modules/evil/index.js", "eval('attack')"),
+                ("package.json", r#"{"name":"kit","license":"MIT"}"#),
+                ("index.js", r#"module.exports = require("helper")"#),
+                ("node_modules/helper/index.js", "eval(payload)"),
+                ("node_modules/bar/index.js", "require('child_process')"),
+                ("node_modules/@scope/baz/index.js", "fetch(url)"),
             ],
         );
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+                .unwrap();
+        let nested = [
+            std::path::PathBuf::from("node_modules/bar"),
+            std::path::PathBuf::from("node_modules/@scope/baz"),
+        ];
+        let installed = PackageDirectory::Installed(&nested);
 
-        let analysis = analyze_package(dir.path());
+        let (analysis, fingerprint) =
+            analyze_package_from_open_dir_with_fingerprint(&directory, installed);
+
+        assert!(analysis.source.eval);
+        assert!(!analysis.source.child_process);
+        assert!(!analysis.source.network);
+        assert_eq!(analysis.meta.files_scanned, 2);
+        let fingerprint = fingerprint.unwrap();
+        assert_eq!(
+            package_input_fingerprint_from_open_dir(&directory, installed).unwrap(),
+            fingerprint
+        );
+        fs::write(
+            package.path().join("node_modules/bar/index.js"),
+            "require('net')",
+        )
+        .unwrap();
+        assert_eq!(
+            package_input_fingerprint_from_open_dir(&directory, installed).unwrap(),
+            fingerprint
+        );
+        fs::write(
+            package.path().join("node_modules/helper/index.js"),
+            "eval(other)",
+        )
+        .unwrap();
+        assert_ne!(
+            package_input_fingerprint_from_open_dir(&directory, installed).unwrap(),
+            fingerprint
+        );
+    }
+
+    #[test]
+    fn finds_the_packages_nested_in_each_installed_package() {
+        let dirs = [
+            "/p/node_modules/kit",
+            "/p/node_modules/kit/node_modules/bar",
+            "/p/node_modules/kit/node_modules/@scope/baz",
+            "/p/node_modules/kit/node_modules/bar/node_modules/deep",
+            "/p/node_modules/other",
+        ]
+        .map(Path::new);
+
+        let nested = nested_packages(dirs);
+
+        assert_eq!(
+            nested[Path::new("/p/node_modules/kit")],
+            [
+                Path::new("node_modules/bar"),
+                Path::new("node_modules/@scope/baz")
+            ]
+        );
+        assert_eq!(
+            nested[Path::new("/p/node_modules/kit/node_modules/bar")],
+            [Path::new("node_modules/deep")]
+        );
+        assert!(!nested.contains_key(Path::new("/p/node_modules/other")));
+    }
+
+    #[test]
+    fn a_local_source_leaves_out_its_own_installs() {
+        let package = tempfile::tempdir().unwrap();
+        create_test_package(
+            package.path(),
+            &[
+                ("package.json", r#"{"name":"kit","license":"MIT"}"#),
+                ("index.js", "module.exports = 1"),
+                ("node_modules/tool/index.js", "eval(payload)"),
+                ("packages/inner/node_modules/tool/index.js", "eval(payload)"),
+            ],
+        );
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+                .unwrap();
+
+        let analysis = analyze_package_from_open_dir(&directory, PackageDirectory::LocalSource);
+
         assert!(!analysis.source.eval);
         assert_eq!(analysis.meta.files_scanned, 1);
+    }
+
+    #[test]
+    fn only_dependencies_a_consumer_installs_set_the_dependency_tags() {
+        let analysis = analyze_every_way(&[
+            (
+                "package.json",
+                br#"{"name":"kit","license":"MIT","dependencies":{"left":"^1.0.0"},
+                    "devDependencies":{"tape":"*","fixture":"github:owner/fixture","mirror":"http://example.com/m.tgz"}}"#,
+            ),
+            ("index.js", b"module.exports = 1"),
+        ]);
+
+        assert!(!analysis.manifest.wildcard_dependency);
+        assert!(!analysis.manifest.git_dependency);
+        assert!(!analysis.manifest.http_dependency);
     }
 
     #[test]
@@ -2567,23 +2967,188 @@ mod tests {
 
     #[test]
     fn native_node_file_detected() {
-        let dir = tempfile::tempdir().unwrap();
-        create_test_package(
-            dir.path(),
-            &[
-                (
-                    "package.json",
-                    r#"{"name":"native-pkg","version":"1.0.0","license":"MIT"}"#,
-                ),
-                (
-                    "index.js",
-                    "const binding = require('./build/Release/addon.node')",
-                ),
-            ],
-        );
-
-        let analysis = analyze_package(dir.path());
+        let analysis = analyze_every_way(&[
+            (
+                "package.json",
+                br#"{"name":"native-pkg","version":"1.0.0","license":"MIT"}"#,
+            ),
+            (
+                "index.js",
+                b"const binding = require('./build/Release/addon.node')",
+            ),
+            ("build/Release/addon.node", b"\x7fELF\x02\x01\x01\0"),
+        ]);
         assert!(analysis.source.native_bindings);
+        assert_eq!(
+            analysis.meta.tag_files["nativeBindings"],
+            TagFiles {
+                files: vec!["build/Release/addon.node".to_owned()],
+                file_count: 1,
+                tests_only: false,
+            }
+        );
+        assert!(
+            analysis
+                .meta
+                .evidence
+                .iter()
+                .any(|entry| entry.rule_id == "native" && entry.path == "build/Release/addon.node")
+        );
+    }
+
+    #[test]
+    fn binding_gyp_is_a_native_addon_and_a_mentioned_addon_is_not() {
+        let gyp = analyze_every_way(&[
+            ("package.json", br#"{"name":"gyp","license":"MIT"}"#),
+            ("binding.gyp", br#"{"targets":[]}"#),
+        ]);
+        assert!(gyp.source.native_bindings);
+
+        let mentioned = analyze_every_way(&[
+            ("package.json", br#"{"name":"plain","license":"MIT"}"#),
+            ("server.js", br#"module.exports = require("./server.node")"#),
+            ("server.node.js", b"module.exports = 1"),
+        ]);
+        assert!(!mentioned.source.native_bindings);
+        assert!(!mentioned.meta.tag_files.contains_key("nativeBindings"));
+    }
+
+    // ── Files each tag came from, and tags only tests showed ──
+
+    /// Analyzes a package by its directory path, through an open directory,
+    /// and streamed as an extraction does, and checks the three agree.
+    fn analyze_every_way(files: &[(&str, &[u8])]) -> PackageAnalysis {
+        let package = tempfile::tempdir().unwrap();
+        for (path, content) in files {
+            let file_path = package.path().join(path);
+            fs::create_dir_all(file_path.parent().unwrap()).unwrap();
+            fs::write(&file_path, content).unwrap();
+        }
+        let by_path = analyze_package(package.path());
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+                .unwrap();
+        let by_capability = analyze_package_from_open_dir(&directory, PackageDirectory::Published);
+        let mut streaming = PackageAnalyzer::new();
+        for (path, content) in files.iter().rev() {
+            let path = Path::new(path);
+            streaming.note_entry(path);
+            if PackageAnalyzer::should_buffer_source(path, content.len() as u64) {
+                streaming.feed(path, content);
+            }
+        }
+        let streamed = streaming.finalize(package.path());
+
+        let comparable = |analysis: &PackageAnalysis| {
+            let mut value = serde_json::to_value(analysis).unwrap();
+            value["analyzedAt"] = serde_json::Value::Null;
+            value
+        };
+        assert_eq!(comparable(&by_capability), comparable(&by_path));
+        assert_eq!(comparable(&streamed), comparable(&by_path));
+        by_path
+    }
+
+    #[test]
+    fn names_the_files_each_tag_came_from_runtime_files_first() {
+        let mut files: Vec<(String, &[u8])> =
+            vec![("test/eval.test.js".to_owned(), b"eval(a)".as_slice())];
+        files.extend((0..6).map(|index| (format!("dist/chunk-{index}.js"), b"eval(b)".as_slice())));
+        let files: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(path, content)| (path.as_str(), *content))
+            .collect();
+
+        let analysis = analyze_every_way(&files);
+
+        assert_eq!(
+            analysis.meta.tag_files["eval"],
+            TagFiles {
+                files: (0..5)
+                    .map(|index| format!("dist/chunk-{index}.js"))
+                    .collect(),
+                file_count: 7,
+                tests_only: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_tag_only_test_files_showed_is_tests_only_not_runtime() {
+        let analysis = analyze_every_way(&[
+            ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+            (
+                "src/__tests__/run.test.ts",
+                br#"require("child_process").spawn("node")"#,
+            ),
+            ("src/e.test.js", b"eval(code)"),
+            ("lib/index.js", b"module.exports = fetch(url)"),
+        ]);
+
+        assert!(!analysis.source.child_process);
+        assert!(!analysis.source.eval);
+        assert!(analysis.source.network);
+        assert_eq!(analysis.meta.test_only_tags, ["childProcess", "eval"]);
+        assert_eq!(
+            analysis.meta.tag_files["childProcess"],
+            TagFiles {
+                files: vec!["src/__tests__/run.test.ts".to_owned()],
+                file_count: 1,
+                tests_only: true,
+            }
+        );
+        assert!(!analysis.meta.tag_files["network"].tests_only);
+        assert_eq!(analysis.meta.eval_calls, 0);
+    }
+
+    #[test]
+    fn a_test_file_the_package_runs_on_install_or_exports_counts_as_runtime() {
+        let analysis = analyze_every_way(&[
+            (
+                "package.json",
+                br#"{"name":"kit","license":"MIT","scripts":{"postinstall":"node test/setup","test":"node tests/other.js"},"exports":{"./client":{"default":"./tests/client.js"}}}"#,
+            ),
+            ("test/setup.js", br#"require("child_process").spawn("node")"#),
+            ("tests/client.js", b"module.exports = fetch(url)"),
+            ("tests/other.js", b"eval(code)"),
+        ]);
+
+        assert!(analysis.source.child_process);
+        assert!(analysis.source.network);
+        assert!(!analysis.source.eval);
+        assert_eq!(analysis.meta.test_only_tags, ["eval"]);
+        assert!(!analysis.meta.tag_files["childProcess"].tests_only);
+    }
+
+    #[test]
+    fn counts_the_eval_calls_of_runtime_files() {
+        let analysis = analyze_every_way(&[
+            ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+            (
+                "index.js",
+                br#"var u="https://example.test/";eval(u);new Function("return 1")()
+const usage = "eval(x)" /* eval(y) */"#,
+            ),
+            ("unparsed.js", br#"const usage = "eval(x)"; )("#),
+            ("test/eval.test.js", b"eval(a); eval(b)"),
+        ]);
+
+        assert_eq!(analysis.meta.eval_calls, 3);
+    }
+
+    #[test]
+    fn trivial_counts_only_runtime_code() {
+        let tests = (0..20)
+            .map(|index| format!("it('case {index}', () => {{}})"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let analysis = analyze_every_way(&[
+            ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+            ("index.js", b"module.exports = (a, b) => a + b"),
+            ("test/index.test.js", tests.as_bytes()),
+        ]);
+
+        assert!(analysis.supply_chain.trivial);
     }
 
     // ── Edge case: process.env.NODE_ENV (React pattern) ──────────

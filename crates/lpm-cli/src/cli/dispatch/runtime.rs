@@ -14,6 +14,14 @@ pub(in crate::cli) fn keep_state_ignored_at_exit_from(started_in: &std::path::Pa
     }
 }
 
+/// Ends the command without the exit hook's writes, for a helper that
+/// reads stdin and writes stdout and nothing else.
+pub(in crate::cli) fn leave_state_alone_at_exit() {
+    if let Ok(mut slot) = STARTED_IN.lock() {
+        *slot = None;
+    }
+}
+
 /// Keeps the project's `.lpm` and the LPM home out of git as the command
 /// ends, once.
 pub(in crate::cli) fn keep_state_ignored_at_exit() {

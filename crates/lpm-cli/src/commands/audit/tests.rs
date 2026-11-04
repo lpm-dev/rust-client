@@ -434,6 +434,114 @@ fn local_evidence_replaces_a_registry_tests_only_mark() {
 }
 
 #[test]
+fn local_tags_only_tests_showed_are_info_and_marked_tests_only() {
+    let package = tempfile::tempdir().unwrap();
+    for (path, content) in [
+        (
+            "package.json",
+            r#"{"name":"kit","version":"1.0.0","license":"MIT"}"#,
+        ),
+        ("lib/index.js", "module.exports = input => eval(input)"),
+        (
+            "test/run.test.js",
+            r#"require("child_process").spawn("node")"#,
+        ),
+    ] {
+        let path = package.path().join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+    let analysis = lpm_security::behavioral::analyze_package(package.path());
+
+    let issues = super::behavior::analysis_to_issues(&analysis, "local");
+    let issue = |rule: &str| {
+        issues
+            .iter()
+            .find(|issue| issue.rule_id == Some(rule))
+            .unwrap_or_else(|| panic!("no {rule} issue in {issues:?}"))
+    };
+
+    let child_process = issue("child-process");
+    assert!(child_process.tests_only);
+    assert_eq!(child_process.severity, "info");
+    assert_eq!(child_process.evidence[0].path, "test/run.test.js");
+    assert!(!issue("eval").tests_only);
+    assert_eq!(issue("eval").severity, "high");
+}
+
+fn evidence_at(path: &str) -> lpm_security::behavioral::SourceEvidence {
+    lpm_security::behavioral::SourceEvidence {
+        rule_id: "child-process".to_string(),
+        path: path.to_string(),
+        line: Some(1),
+        column: Some(1),
+        excerpt: None,
+        reason: "spawns a process".to_string(),
+        file_context: "source".to_string(),
+        sampled: false,
+        heuristic_score: None,
+    }
+}
+
+#[test]
+fn local_tests_only_evidence_leaves_a_registry_runtime_issue_alone() {
+    let mut issues = vec![AuditIssue {
+        severity: "high".to_string(),
+        message: "child process".to_string(),
+        category: "capability".to_string(),
+        source: "registry".to_string(),
+        ..AuditIssue::default()
+    }];
+    super::types::merge_issues(
+        &mut issues,
+        vec![AuditIssue {
+            severity: "info".to_string(),
+            message: "child process".to_string(),
+            category: "capability".to_string(),
+            source: "local".to_string(),
+            evidence: vec![evidence_at("test/run.test.js")],
+            tests_only: true,
+            ..AuditIssue::default()
+        }],
+    );
+
+    assert_eq!(issues.len(), 1);
+    assert!(!issues[0].tests_only);
+    assert_eq!(issues[0].severity, "high");
+    assert_eq!(issues[0].source, "registry");
+    assert!(issues[0].evidence.is_empty());
+}
+
+#[test]
+fn local_tests_only_evidence_keeps_a_registry_tests_only_mark() {
+    let mut issues = vec![AuditIssue {
+        severity: "info".to_string(),
+        message: "child process".to_string(),
+        category: "capability".to_string(),
+        source: "registry".to_string(),
+        tests_only: true,
+        ..AuditIssue::default()
+    }];
+    super::types::merge_issues(
+        &mut issues,
+        vec![AuditIssue {
+            severity: "info".to_string(),
+            message: "child process".to_string(),
+            category: "capability".to_string(),
+            source: "local".to_string(),
+            evidence: vec![evidence_at("test/run.test.js")],
+            tests_only: true,
+            ..AuditIssue::default()
+        }],
+    );
+
+    assert!(issues[0].tests_only);
+    assert_eq!(issues[0].severity, "info");
+    assert_eq!(issues[0].source, "combined");
+    assert_eq!(issues[0].evidence[0].path, "test/run.test.js");
+}
+
+#[test]
 fn registry_issue_empty_tags_emits_no_issues() {
     let issues = collect(&meta_with_tags(|_| {}));
     assert!(

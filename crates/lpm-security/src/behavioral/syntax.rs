@@ -11,10 +11,22 @@ pub(super) struct SourceContext<'s> {
     pub executable: Vec<u8>,
     pub complete: bool,
     pub calls: Option<super::bindings::CallFacts>,
+    /// Where the first random-looking string literal the parser found starts,
+    /// or `None` when the parser stopped before reading the literals.
+    pub random_literal: Option<Option<usize>>,
 }
 
 struct LiteralSpans<'s> {
     executable: &'s mut [u8],
+    random_literal: Option<usize>,
+}
+
+impl LiteralSpans<'_> {
+    fn note_value(&mut self, value: Option<&str>, span: Span) {
+        if self.random_literal.is_none() && value.is_some_and(super::supply_chain::looks_random) {
+            self.random_literal = Some(span.start as usize);
+        }
+    }
 }
 
 fn mask(bytes: &mut [u8], span: Span) {
@@ -30,6 +42,7 @@ fn mask(bytes: &mut [u8], span: Span) {
 impl<'a> Visit<'a> for LiteralSpans<'_> {
     fn visit_string_literal(&mut self, literal: &StringLiteral<'a>) {
         mask(self.executable, literal.span);
+        self.note_value(literal.value.as_str(), literal.span);
     }
 
     fn visit_reg_exp_literal(&mut self, literal: &RegExpLiteral<'a>) {
@@ -38,6 +51,11 @@ impl<'a> Visit<'a> for LiteralSpans<'_> {
 
     fn visit_template_element(&mut self, literal: &TemplateElement<'a>) {
         mask(self.executable, literal.span);
+        let value = match literal.value.cooked {
+            Some(cooked) => cooked.as_str(),
+            None => Some(literal.value.raw.as_str()),
+        };
+        self.note_value(value, literal.span);
     }
 
     fn visit_jsx_text(&mut self, literal: &JSXText<'a>) {
@@ -70,10 +88,12 @@ impl<'s> SourceContext<'s> {
             mask(stripped, comment.span);
         }
         let mut executable = stripped.clone();
-        LiteralSpans {
+        let mut literals = LiteralSpans {
             executable: &mut executable,
-        }
-        .visit_program(&parsed.program);
+            random_literal: None,
+        };
+        literals.visit_program(&parsed.program);
+        let random_literal = (!parsed.fatal_error).then_some(literals.random_literal);
         let complete = !parsed.fatal_error && !parsed.diagnostics.has_errors();
         let calls = complete.then(|| super::bindings::analyze(&parsed.program, complete_input));
         Self {
@@ -81,13 +101,28 @@ impl<'s> SourceContext<'s> {
             executable,
             complete,
             calls,
+            random_literal,
         }
     }
 
     pub fn find_with_context(&self, regex: &Regex, bare: bool) -> Option<usize> {
+        self.matches_with_context(regex, bare).next()
+    }
+
+    pub fn count_with_context(&self, regex: &Regex, bare: bool) -> usize {
+        self.matches_with_context(regex, bare).count()
+    }
+
+    /// Starts of the matches that begin in code, outside comments and literals,
+    /// and with `bare`, not as a property of something else.
+    fn matches_with_context<'r>(
+        &'r self,
+        regex: &'r Regex,
+        bare: bool,
+    ) -> impl Iterator<Item = usize> + 'r {
         regex
             .find_iter(&self.stripped)
-            .find(|matched| {
+            .filter(move |matched| {
                 self.executable
                     .get(matched.start())
                     .is_some_and(|byte| !byte.is_ascii_whitespace())

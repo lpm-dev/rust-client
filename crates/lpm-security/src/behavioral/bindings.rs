@@ -15,6 +15,8 @@ pub(super) struct CallFacts {
     pub dynamic_load: Option<usize>,
     pub evaluation: Option<usize>,
     pub unresolved_evaluation: Option<usize>,
+    /// Every call or construction `evaluation` and `unresolved_evaluation` found.
+    pub evaluation_calls: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -120,7 +122,8 @@ fn union(a: Option<Origin>, b: Option<Origin>) -> Option<Origin> {
 fn module(name: &str) -> Option<Origin> {
     let module = match name.strip_prefix("node:").unwrap_or(name) {
         "child_process" => Module::Process,
-        "execa" => Module::Execa,
+        // cross-spawn is called, or its `spawn` and `sync` are, as execa is.
+        "execa" | "cross-spawn" => Module::Execa,
         "shelljs" => Module::Shell,
         "module" => Module::Loader,
         "util" => Module::Util,
@@ -137,7 +140,7 @@ fn method(name: &str) -> Method {
         "execFile" => Method::ExecFile,
         "execFileSync" => Method::ExecFileSync,
         "spawn" | "execa" | "execaCommand" | "execaNode" | "$" => Method::Spawn,
-        "spawnSync" | "execaSync" | "execaCommandSync" => Method::SpawnSync,
+        "spawnSync" | "execaSync" | "execaCommandSync" | "sync" => Method::SpawnSync,
         "fork" => Method::Fork,
         "require" => Method::Require,
         "createRequire" => Method::CreateRequire,
@@ -293,6 +296,10 @@ fn origin(
             }
             None
         }
+        Expression::AwaitExpression(awaited) => {
+            origin(&awaited.argument, semantic, assignments, depth + 1)
+        }
+        Expression::ImportExpression(import) => module(static_string(&import.source, 0)?.as_ref()),
         Expression::SequenceExpression(sequence) => origin(
             sequence.expressions.last()?,
             semantic,
@@ -667,7 +674,8 @@ impl<'a> Visit<'a> for CallCandidates {
     }
 
     fn visit_import_expression(&mut self, import: &ImportExpression<'a>) {
-        self.found |= dynamic_argument(Some(&import.source));
+        self.found |= dynamic_argument(Some(&import.source))
+            || static_string(&import.source, 0).is_some_and(|name| module(name.as_ref()).is_some());
         walk::walk_import_expression(self, import);
     }
 
@@ -767,6 +775,7 @@ pub(super) fn analyze(program: &Program<'_>, complete_input: bool) -> CallFacts 
                     facts
                         .evaluation
                         .get_or_insert(expression.span.start as usize);
+                    facts.evaluation_calls += 1;
                 }
             }
             AstKind::CallExpression(call) => {
@@ -775,10 +784,12 @@ pub(super) fn analyze(program: &Program<'_>, complete_input: bool) -> CallFacts 
                     || indirect_evaluation(call, semantic, &assignments)
                 {
                     facts.evaluation.get_or_insert(call.span.start as usize);
+                    facts.evaluation_calls += 1;
                 } else if unresolved_eval_call(&call.callee, semantic, &mutated_receivers) {
                     facts
                         .unresolved_evaluation
                         .get_or_insert(call.span.start as usize);
+                    facts.evaluation_calls += 1;
                 }
                 if value.is_some_and(|value| value.contains(Module::Util, Method::Promisify)) {
                     value = call

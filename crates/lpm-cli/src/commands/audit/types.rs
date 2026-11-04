@@ -141,13 +141,15 @@ pub(super) fn merge_issues(target: &mut Vec<AuditIssue>, incoming: Vec<AuditIssu
         let key = (issue.category.clone(), issue.message.clone());
         if let Some(index) = indexes.get(&key).copied() {
             let existing = &mut target[index];
-            if !issue.evidence.is_empty() {
+            // Evidence only tests showed doesn't stand in for evidence of
+            // what the package runs.
+            if !issue.evidence.is_empty() && (existing.tests_only || !issue.tests_only) {
                 existing.evidence = issue.evidence;
                 existing.rule_id = issue.rule_id.or(existing.rule_id);
                 if existing.source != issue.source {
                     existing.source = "combined".to_string();
                 }
-                if existing.tests_only {
+                if existing.tests_only && !issue.tests_only {
                     existing.tests_only = false;
                     existing.severity = issue.severity;
                 }

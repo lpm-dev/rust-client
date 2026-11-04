@@ -182,7 +182,7 @@ const BEHAVIORAL_TAG_POLICIES: [BehavioralTagInfo; 28] = [
         group: TagGroup::Source,
         severity: Severity::Medium,
         install_visibility: InstallVisibility::Default,
-        description: "Ship native modules (`.node`, `.wasm`)",
+        description: "Ship native addons (`.node`, `binding.gyp`) or load one with `process.dlopen`",
     },
     BehavioralTagInfo {
         tag: PseudoClass::Crypto,
@@ -640,6 +640,49 @@ impl PseudoClass {
             | Self::WorkspaceRoot => Severity::Info,
             _ => unreachable!("behavioral tags return from their shared policy"),
         }
+    }
+
+    /// The key a behavioral analysis and a registry name this tag by, as
+    /// `testOnlyTags` and `_testOnlyTags` list it; `None` for selectors that
+    /// aren't behavioral tags.
+    pub fn tag_key(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Eval => "eval",
+            Self::Network => "network",
+            Self::Fs => "filesystem",
+            Self::Shell => "shell",
+            Self::ChildProcess => "childProcess",
+            Self::Native => "nativeBindings",
+            Self::Crypto => "crypto",
+            Self::DynamicRequire => "dynamicRequire",
+            Self::Env => "environmentVars",
+            Self::Ws => "webSocket",
+            Self::Obfuscated => "obfuscated",
+            Self::PossibleObfuscation => "possibleObfuscation",
+            Self::HighEntropy => "highEntropyStrings",
+            Self::Minified => "minified",
+            Self::Telemetry => "telemetry",
+            Self::UrlStrings => "urlStrings",
+            Self::Trivial => "trivial",
+            Self::Protestware => "protestware",
+            Self::CredentialExfiltration => "credentialExfiltration",
+            Self::DestructiveFilesystem => "destructiveFilesystem",
+            Self::DownloadedExecution => "downloadedExecution",
+            Self::EncryptedExecution => "encryptedExecution",
+            Self::GitDep => "gitDependency",
+            Self::HttpDep => "httpDependency",
+            Self::WildcardDep => "wildcardDependency",
+            Self::Copyleft => "copyleftLicense",
+            Self::NoLicense => "noLicense",
+            Self::CustomLicense => "customLicense",
+            _ => return None,
+        })
+    }
+
+    /// Whether only test files the package doesn't run showed this tag.
+    pub fn tests_only_in_analysis(self, analysis: &PackageAnalysis) -> bool {
+        self.tag_key()
+            .is_some_and(|key| analysis.meta.test_only_tags.iter().any(|only| only == key))
     }
 
     pub fn matches_analysis(self, analysis: &PackageAnalysis) -> bool {

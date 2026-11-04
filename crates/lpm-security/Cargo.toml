@@ -9,10 +9,12 @@ description = "Security auditing, provenance verification, and trust policies fo
 
 [dependencies]
 lpm-common = { workspace = true }
+lpm-extractor = { workspace = true }
 lpm-lockfile = { workspace = true }
 lpm-workspace = { path = "../lpm-workspace" }
 cap-fs-ext = { workspace = true }
 cap-std = "4.0.2"
+flate2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 strsim = { workspace = true }
@@ -39,6 +41,7 @@ oxc_semantic = "=0.157.0"
 [dev-dependencies]
 criterion = "0.8"
 serde_json = { workspace = true }
+tar = { workspace = true }
 tempfile = "3"
 
 [[bench]]
