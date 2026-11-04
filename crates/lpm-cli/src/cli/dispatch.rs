@@ -213,7 +213,6 @@ async fn async_main(cli: Cli) -> Result<()> {
     }
 
     if let Commands::InternalPackageSignals(args) = &command {
-        runtime::leave_state_alone_at_exit();
         if let Err(error) = commands::package_signals::run(args.ecosystem.into()) {
             exit_with_lpm_error(&error, true);
         }

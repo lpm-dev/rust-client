@@ -570,10 +570,9 @@ pub(super) fn analyze_supply_chain_context(
     SupplyChainTags {
         obfuscated: is_critical_obfuscation(confidence),
         possible_obfuscation: is_possible_obfuscation(confidence),
-        high_entropy_strings: match context.random_literal {
-            Some(found) => found.is_some(),
-            None => detect_high_entropy(stripped),
-        },
+        high_entropy_strings: context
+            .random_literal
+            .unwrap_or_else(|| detect_high_entropy(stripped)),
         minified: is_minified,
         telemetry: patterns.telemetry,
         url_strings: has_url_strings,

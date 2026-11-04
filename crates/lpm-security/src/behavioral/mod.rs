@@ -15,6 +15,7 @@
 mod bindings;
 mod evidence;
 pub mod manifest;
+mod nesting;
 pub mod release;
 pub mod roles;
 pub mod secrets;
@@ -62,16 +63,25 @@ const SOURCE_EXTENSIONS: &[&str] = &["js", "mjs", "cjs", "ts", "mts", "cts", "js
 const MAX_TAG_FILES: usize = 5;
 
 /// How much of a package a [`PackageAnalyzer`] reads.
+///
+/// The files the package runs and its test files are read within budgets of
+/// their own, so tests can never crowd out the code the package runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanLimits {
     /// A source file up to this size is read whole.
     pub full_file_bytes: u64,
     /// Bytes read from each end of a larger source file.
     pub sample_bytes: usize,
-    /// Source bytes read across the package before the rest is skipped.
+    /// Bytes read from the files the package runs before the rest of them
+    /// are skipped.
     pub total_bytes: u64,
-    /// Source files read before the rest are skipped.
+    /// Files the package runs read, whole or sampled, before the rest are
+    /// skipped.
     pub files: usize,
+    /// Bytes read from test files before the rest of them are skipped.
+    pub test_bytes: u64,
+    /// Test files read, whole or sampled, before the rest are skipped.
+    pub test_files: usize,
 }
 
 impl ScanLimits {
@@ -81,6 +91,8 @@ impl ScanLimits {
         sample_bytes: OVERSIZED_SOURCE_SAMPLE_CHUNK_BYTES,
         total_bytes: MAX_TOTAL_SCAN_BYTES,
         files: MAX_FILES_PER_PACKAGE,
+        test_bytes: MAX_TOTAL_SCAN_BYTES / 4,
+        test_files: MAX_FILES_PER_PACKAGE / 4,
     };
 
     /// A registry's analysis of one published release.
@@ -89,7 +101,203 @@ impl ScanLimits {
         sample_bytes: 1024 * 1024,
         total_bytes: 64 * 1024 * 1024,
         files: MAX_FILES_PER_PACKAGE,
+        test_bytes: 16 * 1024 * 1024,
+        test_files: MAX_FILES_PER_PACKAGE / 4,
     };
+
+    /// Bytes a scan reads of a source file of `size` bytes: all of it, or
+    /// each end and the line break that joins them.
+    fn read_bytes(self, size: u64) -> u64 {
+        if size <= self.full_file_bytes {
+            return size;
+        }
+        let chunk = (self.sample_bytes as u64).min(size);
+        if size.saturating_sub(chunk) > chunk {
+            chunk.saturating_mul(2).saturating_add(1)
+        } else {
+            size
+        }
+    }
+}
+
+/// What a scan has read of its [`ScanLimits`] budgets.
+#[derive(Clone, Copy, Debug)]
+struct ScanBudget {
+    limits: ScanLimits,
+    files: usize,
+    bytes: u64,
+    test_files: usize,
+    test_bytes: u64,
+}
+
+impl ScanBudget {
+    fn new(limits: ScanLimits) -> Self {
+        Self {
+            limits,
+            files: 0,
+            bytes: 0,
+            test_files: 0,
+            test_bytes: 0,
+        }
+    }
+
+    /// Takes a file that reads `bytes` from the tests' or the package's
+    /// budget, or says it doesn't fit.
+    fn admit(&mut self, test: bool, bytes: u64) -> bool {
+        let (files, used, max_files, max_bytes) = if test {
+            (
+                &mut self.test_files,
+                &mut self.test_bytes,
+                self.limits.test_files,
+                self.limits.test_bytes,
+            )
+        } else {
+            (
+                &mut self.files,
+                &mut self.bytes,
+                self.limits.files,
+                self.limits.total_bytes,
+            )
+        };
+        if *files >= max_files || used.saturating_add(bytes) > max_bytes {
+            return false;
+        }
+        *files += 1;
+        *used += bytes;
+        true
+    }
+}
+
+/// What a source file is to its package. A directory scan reads its files
+/// in this order: the package's own code, the dependencies it bundles, and
+/// then its tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum FileRole {
+    Own,
+    Bundled,
+    Test,
+}
+
+impl FileRole {
+    fn of(relative_path: &Path) -> Self {
+        if roles::is_test_path(&path_to_slash(relative_path)) {
+            Self::Test
+        } else if relative_path
+            .components()
+            .any(|component| component.as_os_str() == "node_modules")
+        {
+            Self::Bundled
+        } else {
+            Self::Own
+        }
+    }
+
+    #[inline]
+    fn is_test(self) -> bool {
+        self == Self::Test
+    }
+}
+
+/// A source file a directory scan found. The derived order is read order.
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct SourceFile {
+    role: FileRole,
+    path: std::path::PathBuf,
+    size: u64,
+}
+
+/// The source files a directory walk found: for the package's code and for
+/// its tests, the first in read order up to the budget's file limit, and how
+/// many files there were in all.
+struct SourceFiles {
+    runtime: FirstFiles,
+    tests: FirstFiles,
+    found: usize,
+}
+
+impl SourceFiles {
+    fn new(limits: ScanLimits) -> Self {
+        Self {
+            runtime: FirstFiles::new(limits.files),
+            tests: FirstFiles::new(limits.test_files),
+            found: 0,
+        }
+    }
+
+    /// Adds a file the walk found, and says whether a file limit left a file
+    /// out.
+    fn insert(&mut self, file: SourceFile) -> bool {
+        self.found += 1;
+        if file.role.is_test() {
+            self.tests.insert(file)
+        } else {
+            self.runtime.insert(file)
+        }
+    }
+
+    /// The files kept, in read order, and how many the walk found.
+    fn into_read_order(self) -> (Vec<SourceFile>, usize) {
+        let mut files = self.runtime.into_sorted_vec();
+        files.extend(self.tests.into_sorted_vec());
+        (files, self.found)
+    }
+}
+
+/// The first `max` files in read order of the files inserted.
+struct FirstFiles {
+    max: usize,
+    files: FirstFilesState,
+}
+
+enum FirstFilesState {
+    Collecting(Vec<SourceFile>),
+    Limited(BinaryHeap<SourceFile>),
+}
+
+impl FirstFiles {
+    fn new(max: usize) -> Self {
+        Self {
+            max,
+            files: FirstFilesState::Collecting(Vec::new()),
+        }
+    }
+
+    /// Adds a file, and says whether the limit left a file out.
+    fn insert(&mut self, candidate: SourceFile) -> bool {
+        match &mut self.files {
+            FirstFilesState::Collecting(files) if files.len() < self.max => {
+                files.push(candidate);
+                false
+            }
+            FirstFilesState::Collecting(files) => {
+                let mut limited = BinaryHeap::from(std::mem::take(files));
+                keep_if_earlier(&mut limited, candidate);
+                self.files = FirstFilesState::Limited(limited);
+                true
+            }
+            FirstFilesState::Limited(files) => {
+                keep_if_earlier(files, candidate);
+                true
+            }
+        }
+    }
+
+    fn into_sorted_vec(self) -> Vec<SourceFile> {
+        match self.files {
+            FirstFilesState::Collecting(mut files) => {
+                files.sort_unstable();
+                files
+            }
+            FirstFilesState::Limited(files) => files.into_sorted_vec(),
+        }
+    }
+}
+
+fn keep_if_earlier(files: &mut BinaryHeap<SourceFile>, candidate: SourceFile) {
+    if files.peek().is_some_and(|latest| candidate < *latest) {
+        files.pop();
+        files.push(candidate);
+    }
 }
 
 /// Complete analysis result for a single package.
@@ -152,8 +360,9 @@ pub struct AnalysisMeta {
     /// the package is used.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub test_only_tags: Vec<String>,
-    /// The `eval()` and `new Function()` calls of the files the tag fields
-    /// cover, as the eval tag finds them.
+    /// The calls that run code from a string in the files the tag fields
+    /// cover, as the eval tag finds them: `eval()`, `new Function()`, the
+    /// `vm` module's script runs, and indirect `eval`.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub eval_calls: usize,
 }
@@ -221,17 +430,51 @@ pub fn analyze_package_with_timings(
     package_dir: &Path,
 ) -> (PackageAnalysis, PackageAnalysisTimings) {
     let source_scan_start = std::time::Instant::now();
-    let files = collect_package_files(package_dir);
+    let limits = ScanLimits::INSTALL;
+    let mut sources = SourceFiles::new(limits);
+    let mut native_artifacts = Vec::new();
+    collect_source_files_recursive(
+        package_dir,
+        Path::new(""),
+        &mut sources,
+        &mut native_artifacts,
+    );
+    let (candidates, found) = sources.into_read_order();
+    let mut budget = ScanBudget::new(limits);
+    let admitted: Vec<SourceFile> = candidates
+        .into_iter()
+        .filter(|file| budget.admit(file.role.is_test(), limits.read_bytes(file.size)))
+        .collect();
 
-    // Use rayon for parallel scanning on packages with many files (20+).
     // Smaller packages don't benefit from thread pool overhead.
-    let mut analyzer = if files.sources.len() >= 20 {
-        analyze_files_parallel(package_dir, &files.sources)
+    let results: Vec<Option<FileAnalysisResult>> = if admitted.len() >= 20 {
+        use rayon::prelude::*;
+        admitted
+            .par_iter()
+            .map_init(Vec::new, |comment_buf, file| {
+                analyze_source_file(package_dir, file, limits, comment_buf)
+            })
+            .collect()
     } else {
-        analyze_files_sequential(package_dir, &files.sources)
+        let mut comment_buf = Vec::new();
+        admitted
+            .iter()
+            .map(|file| analyze_source_file(package_dir, file, limits, &mut comment_buf))
+            .collect()
     };
-    for artifact in &files.native_artifacts {
-        analyzer.note_entry(artifact.strip_prefix(package_dir).unwrap_or(artifact));
+
+    let mut analyzer = PackageAnalyzer::with_limits(limits);
+    for result in results.into_iter().flatten() {
+        analyzer.merge(result);
+    }
+    analyzer.skip(found - admitted.len());
+    native_artifacts.sort_unstable();
+    if native_artifacts.len() > MAX_FILES_PER_PACKAGE {
+        native_artifacts.truncate(MAX_FILES_PER_PACKAGE);
+        analyzer.limit_reached = true;
+    }
+    for artifact in &native_artifacts {
+        analyzer.note_entry(artifact);
     }
     let source_scan_ns = source_scan_start.elapsed().as_nanos();
     let manifest = read_package_manifest(package_dir);
@@ -263,24 +506,27 @@ pub enum PackageDirectory<'a> {
 
 /// The packages a linker nested in each installed package directory, from
 /// the directories of every installed package: `node_modules/bar` under
-/// `kit` for a package at `kit/node_modules/bar`. A directory's entry is
-/// what its [`PackageDirectory::Installed`] takes.
+/// `kit` for a package at `kit/node_modules/bar`. A package is nested in the
+/// closest installed package around it, even through a directory that isn't
+/// one, such as a dependency `kit` bundles. A directory's entry is what its
+/// [`PackageDirectory::Installed`] takes.
 pub fn nested_packages<'a>(
     package_dirs: impl IntoIterator<Item = &'a Path>,
 ) -> HashMap<&'a Path, Vec<std::path::PathBuf>> {
+    let package_dirs: Vec<&Path> = package_dirs.into_iter().collect();
+    let installed: std::collections::HashSet<&Path> = package_dirs.iter().copied().collect();
     let mut nested: HashMap<&Path, Vec<std::path::PathBuf>> = HashMap::new();
     for package_dir in package_dirs {
-        let Some(parent) = package_dir
+        let Some(owner) = package_dir
             .ancestors()
             .skip(1)
-            .find(|ancestor| ancestor.file_name() == Some(std::ffi::OsStr::new("node_modules")))
-            .and_then(Path::parent)
+            .find_map(|ancestor| installed.get(ancestor).copied())
         else {
             continue;
         };
-        if let Ok(relative) = package_dir.strip_prefix(parent) {
+        if let Ok(relative) = package_dir.strip_prefix(owner) {
             nested
-                .entry(parent)
+                .entry(owner)
                 .or_default()
                 .push(relative.to_path_buf());
         }
@@ -324,25 +570,28 @@ pub fn analyze_package_from_open_dir_with_fingerprint(
     package_dir: &cap_std::fs::Dir,
     contents: PackageDirectory<'_>,
 ) -> (PackageAnalysis, Option<String>) {
-    let mut source_files = CapSourceFiles::new();
+    let limits = ScanLimits::INSTALL;
+    let mut sources = SourceFiles::new(limits);
     let mut native_artifacts = Vec::new();
     let mut discovery_limit_reached = false;
     let discovery_complete = collect_cap_fingerprint_files(
         package_dir,
         Path::new(""),
         contents,
-        &mut source_files,
+        &mut sources,
         &mut native_artifacts,
         &mut discovery_limit_reached,
     )
     .is_ok();
     native_artifacts.sort_unstable();
-    let source_files = source_files.into_sorted_vec();
-    let (source_files, prefix_limit_reached) = cap_scan_prefix(&source_files);
-    let (mut analyzer, mut fingerprint, runtime_limit_reached) =
-        analyze_cap_files_with_fingerprint(package_dir, source_files, discovery_complete);
-    analyzer.limit_reached |=
-        discovery_limit_reached || prefix_limit_reached || runtime_limit_reached;
+    let (candidates, found) = sources.into_read_order();
+    let candidate_count = candidates.len();
+    let (mut analyzer, mut fingerprint, over_budget) =
+        analyze_cap_files_with_fingerprint(package_dir, candidates, limits, discovery_complete);
+    let skipped = found - candidate_count + over_budget;
+    analyzer.skip(skipped);
+    let limit_reached = discovery_limit_reached || skipped > 0;
+    analyzer.limit_reached |= limit_reached;
     if let Some(hasher) = fingerprint.as_mut() {
         hash_native_artifacts(hasher, &native_artifacts);
     }
@@ -372,9 +621,7 @@ pub fn analyze_package_from_open_dir_with_fingerprint(
     analysis.meta.input_incomplete = fingerprint.is_none();
     let fingerprint = fingerprint.map(|mut hasher| {
         hasher.update(b"limits\0");
-        hasher.update([u8::from(
-            discovery_limit_reached || prefix_limit_reached || runtime_limit_reached,
-        )]);
+        hasher.update([u8::from(limit_reached)]);
         format!("sha256-{}", hex::encode(hasher.finalize()))
     });
     (analysis, fingerprint)
@@ -382,7 +629,7 @@ pub fn analyze_package_from_open_dir_with_fingerprint(
 
 /// Hash the exact package inputs that can affect behavioral analysis.
 ///
-/// The walk uses the same path, file-count, file-size, and total-byte policy as
+/// The walk uses the same path, file-count, file-size, and byte budgets as
 /// [`analyze_package_from_open_dir`] given the same `contents`. Symlinks and
 /// ignored paths do not participate because the analyzer does not read them.
 /// Any unexpected I/O error prevents cache reuse instead of authenticating a
@@ -391,33 +638,31 @@ pub fn package_input_fingerprint_from_open_dir(
     package_dir: &cap_std::fs::Dir,
     contents: PackageDirectory<'_>,
 ) -> std::io::Result<String> {
-    let mut files = CapSourceFiles::new();
+    let limits = ScanLimits::INSTALL;
+    let mut sources = SourceFiles::new(limits);
     let mut native_artifacts = Vec::new();
     let mut discovery_limit_reached = false;
     collect_cap_fingerprint_files(
         package_dir,
         Path::new(""),
         contents,
-        &mut files,
+        &mut sources,
         &mut native_artifacts,
         &mut discovery_limit_reached,
     )?;
     native_artifacts.sort_unstable();
-    let files = files.into_sorted_vec();
-    let (files, total_limit_reached) = cap_scan_prefix(&files);
+    let (candidates, found) = sources.into_read_order();
 
     let mut hasher = new_fingerprint_hasher();
-    let mut planned_bytes = 0u64;
-    let mut runtime_limit_reached = false;
-    for source_file in files {
+    let mut budget = ScanBudget::new(limits);
+    let mut over_budget = 0usize;
+    for source_file in &candidates {
         let (file, size) = open_cap_source_file(package_dir, &source_file.path)?;
-        let file_bytes = planned_scan_bytes(size);
-        if planned_bytes.saturating_add(file_bytes) > MAX_TOTAL_SCAN_BYTES {
-            runtime_limit_reached = true;
-            break;
+        if !budget.admit(source_file.role.is_test(), limits.read_bytes(size)) {
+            over_budget += 1;
+            continue;
         }
-        planned_bytes += file_bytes;
-        let (bytes_read, content_digest) = digest_cap_source_file(file, size)?;
+        let (bytes_read, content_digest) = digest_cap_source_file(file, size, limits)?;
         hash_fingerprint_record_digest(
             &mut hasher,
             source_file.path.as_os_str().as_encoded_bytes(),
@@ -435,10 +680,9 @@ pub fn package_input_fingerprint_from_open_dir(
         None => hasher.update(b"package.json\0missing\0"),
     }
 
+    let skipped = found - candidates.len() + over_budget;
     hasher.update(b"limits\0");
-    hasher.update([u8::from(
-        discovery_limit_reached || total_limit_reached || runtime_limit_reached,
-    )]);
+    hasher.update([u8::from(discovery_limit_reached || skipped > 0)]);
 
     Ok(format!("sha256-{}", hex::encode(hasher.finalize())))
 }
@@ -454,7 +698,7 @@ fn collect_cap_fingerprint_files(
     directory: &cap_std::fs::Dir,
     relative_dir: &Path,
     contents: PackageDirectory<'_>,
-    files: &mut CapSourceFiles,
+    files: &mut SourceFiles,
     native_artifacts: &mut Vec<std::path::PathBuf>,
     limit_reached: &mut bool,
 ) -> std::io::Result<()> {
@@ -483,7 +727,8 @@ fn collect_cap_fingerprint_files(
             )?;
         } else if metadata.is_file() {
             if PackageAnalyzer::should_scan(&relative, metadata.len()) {
-                let candidate = CapSourceFile {
+                let candidate = SourceFile {
+                    role: FileRole::of(&relative),
                     path: relative,
                     size: metadata.len(),
                 };
@@ -523,84 +768,6 @@ fn hash_fingerprint_record_digest(
     hasher.update(size.to_le_bytes());
     hasher.update(bytes_read.to_le_bytes());
     hasher.update(content_digest);
-}
-
-#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct CapSourceFile {
-    path: std::path::PathBuf,
-    size: u64,
-}
-
-enum CapSourceFiles {
-    Collecting(Vec<CapSourceFile>),
-    Limited(BinaryHeap<CapSourceFile>),
-}
-
-impl CapSourceFiles {
-    fn new() -> Self {
-        Self::Collecting(Vec::new())
-    }
-
-    fn insert(&mut self, candidate: CapSourceFile) -> bool {
-        match self {
-            Self::Collecting(files) if files.len() < MAX_FILES_PER_PACKAGE => {
-                files.push(candidate);
-                false
-            }
-            Self::Collecting(files) => {
-                let mut collected = std::mem::take(files);
-                collected.shrink_to_fit();
-                let mut limited = BinaryHeap::from(collected);
-                if limited.peek().is_some_and(|largest| candidate < *largest) {
-                    limited.pop();
-                    limited.push(candidate);
-                }
-                *self = Self::Limited(limited);
-                true
-            }
-            Self::Limited(files) => {
-                if files.peek().is_some_and(|largest| candidate < *largest) {
-                    files.pop();
-                    files.push(candidate);
-                }
-                true
-            }
-        }
-    }
-
-    fn into_sorted_vec(self) -> Vec<CapSourceFile> {
-        match self {
-            Self::Collecting(mut files) => {
-                files.sort_unstable();
-                files
-            }
-            Self::Limited(files) => files.into_sorted_vec(),
-        }
-    }
-}
-
-fn cap_scan_prefix(files: &[CapSourceFile]) -> (&[CapSourceFile], bool) {
-    let mut planned_bytes = 0u64;
-    for (index, file) in files.iter().enumerate() {
-        let file_bytes = planned_scan_bytes(file.size);
-        if planned_bytes.saturating_add(file_bytes) > MAX_TOTAL_SCAN_BYTES {
-            return (&files[..index], true);
-        }
-        planned_bytes += file_bytes;
-    }
-    (files, false)
-}
-
-fn planned_scan_bytes(size: u64) -> u64 {
-    if size <= MAX_FILE_SIZE {
-        return size;
-    }
-    let chunk = (OVERSIZED_SOURCE_SAMPLE_CHUNK_BYTES as u64).min(size);
-    if size.saturating_sub(chunk) > chunk {
-        chunk.saturating_mul(2).saturating_add(1)
-    } else {
-        chunk
-    }
 }
 
 fn open_cap_source_file(
@@ -661,17 +828,19 @@ struct ScannedCapSourceFile {
 
 fn analyze_open_cap_source_file(
     source_file: OpenCapSourceFile,
+    limits: ScanLimits,
     comment_buf: &mut Vec<u8>,
 ) -> std::io::Result<ScannedCapSourceFile> {
     let mut file = source_file.file.into_std();
-    let bytes = if source_file.size > MAX_FILE_SIZE {
+    let sampled = source_file.size > limits.full_file_bytes;
+    let bytes = if sampled {
         read_oversized_source_sample_from_open_file(
             &mut file,
             source_file.size,
-            OVERSIZED_SOURCE_SAMPLE_CHUNK_BYTES,
+            limits.sample_bytes,
         )?
     } else {
-        lpm_common::read_file_capped_from_open_file(file, &source_file.path, MAX_FILE_SIZE)
+        lpm_common::read_file_capped_from_open_file(file, &source_file.path, limits.full_file_bytes)
             .map_err(std::io::Error::other)?
             .0
     };
@@ -679,8 +848,8 @@ fn analyze_open_cap_source_file(
         .path
         .file_name()
         .and_then(|name| name.to_str())
-        .map(|_filename| {
-            if source_file.size > MAX_FILE_SIZE {
+        .map(|_| {
+            if sampled {
                 analyze_oversized_source_sample(
                     &source_file.path,
                     source_file.size,
@@ -705,18 +874,21 @@ fn analyze_open_cap_source_file(
     })
 }
 
+/// Reads the `files` a directory walk kept, in read order, within the
+/// package's budgets. Returns the analysis, the input fingerprint unless a
+/// read failed, and how many files the budgets left unread.
 fn analyze_cap_files_with_fingerprint(
     package_dir: &cap_std::fs::Dir,
-    files: &[CapSourceFile],
+    files: Vec<SourceFile>,
+    limits: ScanLimits,
     fingerprint_valid: bool,
-) -> (PackageAnalyzer, Option<Sha256>, bool) {
+) -> (PackageAnalyzer, Option<Sha256>, usize) {
     use rayon::prelude::*;
 
-    let mut analyzer = PackageAnalyzer::new();
+    let mut analyzer = PackageAnalyzer::with_limits(limits);
     let mut fingerprint = fingerprint_valid.then(new_fingerprint_hasher);
-    let mut planned_bytes = 0u64;
-    let mut actual_bytes = 0u64;
-    let mut runtime_limit_reached = false;
+    let mut budget = ScanBudget::new(limits);
+    let mut over_budget = 0usize;
     let batch_size = if files.len() >= 20 {
         rayon::current_num_threads()
             .saturating_mul(2)
@@ -725,9 +897,10 @@ fn analyze_cap_files_with_fingerprint(
         files.len().max(1)
     };
 
-    'batches: for batch in files.chunks(batch_size) {
-        let mut opened = Vec::with_capacity(batch.len());
-        for source_file in batch {
+    let mut files = files.into_iter().peekable();
+    while files.peek().is_some() {
+        let mut opened = Vec::with_capacity(batch_size);
+        for source_file in files.by_ref().take(batch_size) {
             let (file, size) = match open_cap_source_file(package_dir, &source_file.path) {
                 Ok(opened) => opened,
                 Err(_) => {
@@ -735,14 +908,12 @@ fn analyze_cap_files_with_fingerprint(
                     continue;
                 }
             };
-            let file_bytes = planned_scan_bytes(size);
-            if planned_bytes.saturating_add(file_bytes) > MAX_TOTAL_SCAN_BYTES {
-                runtime_limit_reached = true;
-                break;
+            if !budget.admit(source_file.role.is_test(), limits.read_bytes(size)) {
+                over_budget += 1;
+                continue;
             }
-            planned_bytes += file_bytes;
             opened.push(OpenCapSourceFile {
-                path: source_file.path.clone(),
+                path: source_file.path,
                 file,
                 size,
             });
@@ -752,14 +923,16 @@ fn analyze_cap_files_with_fingerprint(
             opened
                 .into_par_iter()
                 .map_init(Vec::new, |comment_buf, source_file| {
-                    analyze_open_cap_source_file(source_file, comment_buf)
+                    analyze_open_cap_source_file(source_file, limits, comment_buf)
                 })
                 .collect()
         } else {
             let mut comment_buf = Vec::new();
             opened
                 .into_iter()
-                .map(|source_file| analyze_open_cap_source_file(source_file, &mut comment_buf))
+                .map(|source_file| {
+                    analyze_open_cap_source_file(source_file, limits, &mut comment_buf)
+                })
                 .collect()
         };
 
@@ -771,11 +944,6 @@ fn analyze_cap_files_with_fingerprint(
                     continue;
                 }
             };
-            if actual_bytes.saturating_add(scanned.bytes_read) > MAX_TOTAL_SCAN_BYTES {
-                runtime_limit_reached = true;
-                break 'batches;
-            }
-            actual_bytes += scanned.bytes_read;
             if let Some(hasher) = fingerprint.as_mut() {
                 hash_fingerprint_record_digest(
                     hasher,
@@ -789,26 +957,25 @@ fn analyze_cap_files_with_fingerprint(
                 analyzer.merge(result);
             }
         }
-        if runtime_limit_reached {
-            break;
-        }
     }
-    analyzer.limit_reached |= runtime_limit_reached;
-    (analyzer, fingerprint, runtime_limit_reached)
+    (analyzer, fingerprint, over_budget)
 }
 
-fn digest_cap_source_file(file: cap_std::fs::File, size: u64) -> std::io::Result<(u64, [u8; 32])> {
-    if size > MAX_FILE_SIZE {
+fn digest_cap_source_file(
+    file: cap_std::fs::File,
+    size: u64,
+    limits: ScanLimits,
+) -> std::io::Result<(u64, [u8; 32])> {
+    if size > limits.full_file_bytes {
         let mut file = file.into_std();
-        let sample = read_oversized_source_sample_from_open_file(
-            &mut file,
-            size,
-            OVERSIZED_SOURCE_SAMPLE_CHUNK_BYTES,
-        )?;
+        let sample =
+            read_oversized_source_sample_from_open_file(&mut file, size, limits.sample_bytes)?;
         return Ok((sample.len() as u64, Sha256::digest(&sample).into()));
     }
 
-    let mut file = file.into_std().take(MAX_FILE_SIZE.saturating_add(1));
+    let mut file = file
+        .into_std()
+        .take(limits.full_file_bytes.saturating_add(1));
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     let mut bytes_read = 0u64;
@@ -818,7 +985,7 @@ fn digest_cap_source_file(file: cap_std::fs::File, size: u64) -> std::io::Result
             break;
         }
         bytes_read = bytes_read.saturating_add(read as u64);
-        if bytes_read > MAX_FILE_SIZE {
+        if bytes_read > limits.full_file_bytes {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "source file grew beyond the scan limit while fingerprinting",
@@ -900,34 +1067,32 @@ pub struct FileAnalysisResult {
     pub unparsed_files: usize,
     pub bytes_scanned: u64,
     pub oversized_source_files: Vec<OversizedSourceFileEvidence>,
-    /// `eval()` and `new Function()` calls the eval tag found.
+    /// Calls that run code from a string, as the eval tag finds them.
     pub eval_calls: usize,
 }
 
-/// Analyze a single file. Returns None if the file should be skipped.
-fn analyze_single_file(
+/// Analyze one source file a directory walk found. `None` when it can't be
+/// read.
+fn analyze_source_file(
     package_dir: &Path,
-    file_path: &std::path::PathBuf,
+    file: &SourceFile,
+    limits: ScanLimits,
     comment_buf: &mut Vec<u8>,
 ) -> Option<FileAnalysisResult> {
-    let file_size = std::fs::metadata(file_path).ok()?.len();
-    let relative_path = file_path
-        .strip_prefix(package_dir)
-        .unwrap_or(file_path.as_path());
-
-    if file_size > MAX_FILE_SIZE {
+    let full_path = package_dir.join(&file.path);
+    if file.size > limits.full_file_bytes {
         return Some(analyze_oversized_source_file(
-            relative_path,
-            file_path,
-            file_size,
-            OVERSIZED_SOURCE_SAMPLE_CHUNK_BYTES,
+            &file.path,
+            &full_path,
+            file.size,
+            limits.sample_bytes,
             comment_buf,
         ));
     }
 
-    let raw_content = std::fs::read(file_path).ok()?;
+    let raw_content = std::fs::read(&full_path).ok()?;
     Some(analyze_bytes_with_scratch(
-        &path_to_slash(relative_path),
+        &path_to_slash(&file.path),
         &raw_content,
         comment_buf,
         true,
@@ -1059,46 +1224,49 @@ fn read_oversized_source_sample(
     read_oversized_source_sample_from_open_file(&mut file, size, sample_bytes)
 }
 
+/// The first and last `sample_bytes` of a file of `size` bytes, joined by a
+/// line break, or the whole file when the two would meet.
 fn read_oversized_source_sample_from_open_file(
     file: &mut std::fs::File,
     size: u64,
     sample_bytes: usize,
 ) -> std::io::Result<Vec<u8>> {
-    let chunk = sample_bytes.min(size as usize);
-    let mut sample = Vec::with_capacity(chunk.saturating_mul(2).saturating_add(1));
-
-    read_file_chunk(file, 0, chunk, &mut sample)?;
-
-    let tail_start = size.saturating_sub(chunk as u64);
-    if tail_start > chunk as u64 {
-        sample.push(b'\n');
-        read_file_chunk(file, tail_start, chunk, &mut sample)?;
+    let chunk = (sample_bytes as u64).min(size);
+    let tail_start = size.saturating_sub(chunk);
+    if tail_start <= chunk {
+        let mut whole = Vec::with_capacity(usize::try_from(size).unwrap_or_default());
+        read_file_chunk(file, 0, size, &mut whole)?;
+        return Ok(whole);
     }
-
+    let mut sample = Vec::with_capacity(sample_bytes.saturating_mul(2).saturating_add(1));
+    read_file_chunk(file, 0, chunk, &mut sample)?;
+    sample.push(b'\n');
+    read_file_chunk(file, tail_start, chunk, &mut sample)?;
     Ok(sample)
 }
 
 fn read_file_chunk(
     file: &mut std::fs::File,
     start: u64,
-    max_bytes: usize,
+    max_bytes: u64,
     out: &mut Vec<u8>,
 ) -> std::io::Result<()> {
     file.seek(SeekFrom::Start(start))?;
-    let mut limited = file.by_ref().take(max_bytes as u64);
-    limited.read_to_end(out)?;
+    file.by_ref().take(max_bytes).read_to_end(out)?;
     Ok(())
 }
 
+/// [`read_oversized_source_sample_from_open_file`] for bytes in memory.
 fn oversized_source_sample_from_bytes(bytes: &[u8], sample_bytes: usize) -> Vec<u8> {
     let chunk = sample_bytes.min(bytes.len());
-    let tail_start = bytes.len().saturating_sub(chunk);
-    let mut sample = Vec::with_capacity(chunk.saturating_mul(2).saturating_add(1));
-    sample.extend_from_slice(&bytes[..chunk]);
-    if tail_start > chunk {
-        sample.push(b'\n');
-        sample.extend_from_slice(&bytes[tail_start..]);
+    let tail_start = bytes.len() - chunk;
+    if tail_start <= chunk {
+        return bytes.to_vec();
     }
+    let mut sample = Vec::with_capacity(chunk * 2 + 1);
+    sample.extend_from_slice(&bytes[..chunk]);
+    sample.push(b'\n');
+    sample.extend_from_slice(&bytes[tail_start..]);
     sample
 }
 
@@ -1174,146 +1342,46 @@ fn extend_oversized_source_files(
     target.extend(source.into_iter().take(remaining));
 }
 
-/// Sequential file scanning (for packages with < 20 files).
-fn analyze_files_sequential(package_dir: &Path, files: &[std::path::PathBuf]) -> PackageAnalyzer {
-    let mut analyzer = PackageAnalyzer::new();
-    let mut comment_buf = Vec::new();
-
-    for (index, file_path) in files.iter().enumerate() {
-        if analyzer.files_scanned >= MAX_FILES_PER_PACKAGE {
-            analyzer.skip_remaining(files.len() - index);
-            break;
-        }
-        if let Some(result) = analyze_single_file(package_dir, file_path, &mut comment_buf) {
-            if analyzer.bytes_scanned + result.bytes_scanned > MAX_TOTAL_SCAN_BYTES {
-                analyzer.skip_remaining(files.len() - index);
-                break;
-            }
-            analyzer.merge(result);
-        }
-    }
-
-    analyzer
-}
-
-/// Parallel file scanning using rayon (for packages with 20+ files).
-fn analyze_files_parallel(package_dir: &Path, files: &[std::path::PathBuf]) -> PackageAnalyzer {
-    use rayon::prelude::*;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-
-    let files_scanned = AtomicUsize::new(0);
-    let bytes_scanned = AtomicU64::new(0);
-    let skipped = AtomicUsize::new(0);
-
-    // Analyze all files in parallel, collecting results
-    let results: Vec<FileAnalysisResult> = files
-        .par_iter()
-        .map_init(Vec::new, |comment_buf, file_path| {
-            // Approximate limit checks (may slightly overshoot — acceptable for safety limits)
-            if files_scanned.load(Ordering::Relaxed) >= MAX_FILES_PER_PACKAGE
-                || bytes_scanned.load(Ordering::Relaxed) > MAX_TOTAL_SCAN_BYTES
-            {
-                skipped.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
-
-            let result = analyze_single_file(package_dir, file_path, comment_buf)?;
-            files_scanned.fetch_add(result.files_scanned, Ordering::Relaxed);
-            bytes_scanned.fetch_add(result.bytes_scanned, Ordering::Relaxed);
-            Some(result)
-        })
-        .filter_map(|result| result)
-        .collect();
-
-    let mut analyzer = PackageAnalyzer::new();
-    for result in results {
-        analyzer.merge(result);
-    }
-    let skipped = skipped.into_inner();
-    if skipped > 0
-        || files_scanned.load(Ordering::Relaxed) >= MAX_FILES_PER_PACKAGE
-        || bytes_scanned.load(Ordering::Relaxed) > MAX_TOTAL_SCAN_BYTES
-    {
-        analyzer.skip_remaining(skipped);
-    }
-    analyzer
-}
-
-/// The files of a package directory the analysis reads or notes.
-#[derive(Default)]
-struct PackageFiles {
-    sources: Vec<std::path::PathBuf>,
-    native_artifacts: Vec<std::path::PathBuf>,
-}
-
-/// Collect source files and native artifacts from a package directory,
-/// bundled dependencies included.
+/// Collect the source files and native artifacts of a package directory,
+/// bundled dependencies included, as package-relative paths.
 ///
-/// Skips hidden files/directories, `.d.ts` files, and `.map` files.
-/// Returns paths sorted for deterministic analysis order.
-fn collect_package_files(dir: &Path) -> PackageFiles {
-    let mut files = PackageFiles::default();
-    collect_source_files_recursive(dir, &mut files);
-    files.sources.sort();
-    files.native_artifacts.sort();
-    files.native_artifacts.truncate(MAX_FILES_PER_PACKAGE);
-    files
-}
-
-fn collect_source_files_recursive(dir: &Path, files: &mut PackageFiles) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
+/// Skips symlinks, hidden files and directories, declaration files, and
+/// source maps.
+fn collect_source_files_recursive(
+    package_dir: &Path,
+    relative_dir: &Path,
+    files: &mut SourceFiles,
+    native_artifacts: &mut Vec<std::path::PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(package_dir.join(relative_dir)) else {
+        return;
     };
 
     for entry in entries.flatten() {
-        let path = entry.path();
         let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        if name.as_encoded_bytes().starts_with(b".") {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
             continue;
         };
-
         if lpm_common::is_symlink_or_junction(&metadata) {
             continue;
         }
-
-        // Skip hidden files/directories
-        if name_str.starts_with('.') {
-            continue;
-        }
-
+        let relative = relative_dir.join(&name);
         if metadata.is_dir() {
-            collect_source_files_recursive(&path, files);
+            collect_source_files_recursive(package_dir, &relative, files, native_artifacts);
+        } else if !metadata.is_file() {
             continue;
+        } else if PackageAnalyzer::should_scan(&relative, metadata.len()) {
+            files.insert(SourceFile {
+                role: FileRole::of(&relative),
+                path: relative,
+                size: metadata.len(),
+            });
+        } else if PackageAnalyzer::is_native_artifact(&relative) {
+            native_artifacts.push(relative);
         }
-
-        if roles::is_native_artifact_path(&name_str) {
-            files.native_artifacts.push(path);
-            continue;
-        }
-
-        // Skip non-source files
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-
-        if !SOURCE_EXTENSIONS.contains(&ext) {
-            continue;
-        }
-
-        // Skip .d.ts type declaration files (no runtime behavior)
-        if name_str.ends_with(".d.ts")
-            || name_str.ends_with(".d.mts")
-            || name_str.ends_with(".d.cts")
-        {
-            continue;
-        }
-
-        // Skip .map source maps
-        if name_str.ends_with(".map") {
-            continue;
-        }
-
-        files.sources.push(path);
     }
 }
 
@@ -1392,7 +1460,7 @@ fn parse_deps_map(value: Option<&serde_json::Value>) -> Option<HashMap<String, S
 /// reported as tests-only otherwise.
 #[derive(Debug)]
 pub struct PackageAnalyzer {
-    limits: ScanLimits,
+    budget: ScanBudget,
     runtime: TagTotals,
     tests: Vec<FileAnalysisResult>,
     native_artifacts: Vec<String>,
@@ -1492,7 +1560,7 @@ impl PackageAnalyzer {
     /// Create an empty analyzer that reads within `limits`.
     pub fn with_limits(limits: ScanLimits) -> Self {
         Self {
-            limits,
+            budget: ScanBudget::new(limits),
             runtime: TagTotals::default(),
             tests: Vec::new(),
             native_artifacts: Vec::new(),
@@ -1549,9 +1617,12 @@ impl PackageAnalyzer {
 
     /// Whether an entry is a native addon the analysis notes: a `.node` file
     /// or `binding.gyp` outside the trees it skips.
+    #[inline]
     pub fn is_native_artifact(relative_path: &Path) -> bool {
-        Self::in_scanned_tree(relative_path)
-            && roles::is_native_artifact_path(&path_to_slash(relative_path))
+        relative_path
+            .file_name()
+            .is_some_and(|name| roles::is_native_artifact_name(name.as_encoded_bytes()))
+            && Self::in_scanned_tree(relative_path)
     }
 
     fn in_scanned_tree(relative_path: &Path) -> bool {
@@ -1585,49 +1656,54 @@ impl PackageAnalyzer {
 
     /// Note a native addon at `path`, wherever it is in the package.
     pub(crate) fn note_native_artifact(&mut self, path: String) {
-        if self.native_artifacts.len() < self.limits.files {
+        if self.native_artifacts.len() < self.budget.limits.files {
             self.native_artifacts.push(path);
         } else {
             self.limit_reached = true;
         }
     }
 
-    /// Feed one scannable file's bytes. Respects the package limits — once
-    /// one is hit, later files are skipped and `limit_reached` is set.
+    /// Feed one scannable file's bytes. A file past its budget, the tests'
+    /// or the package's, is skipped and sets `limit_reached`.
     pub fn feed(&mut self, relative_path: &Path, bytes: &[u8]) {
-        if self.files_scanned >= self.limits.files {
-            self.skip_remaining(1);
+        let limits = self.budget.limits;
+        let size = bytes.len() as u64;
+        if size > limits.full_file_bytes {
+            if self.admit(relative_path, limits.read_bytes(size)) {
+                let sample = oversized_source_sample_from_bytes(bytes, limits.sample_bytes);
+                self.analyze_sample(relative_path, size, &sample);
+            }
             return;
         }
-        if bytes.len() as u64 > self.limits.full_file_bytes {
-            let sample = oversized_source_sample_from_bytes(bytes, self.limits.sample_bytes);
-            self.feed_sample(relative_path, bytes.len() as u64, &sample);
-            return;
-        }
-
-        if self.bytes_scanned + bytes.len() as u64 > self.limits.total_bytes {
-            self.skip_remaining(1);
+        let path = path_to_slash(relative_path);
+        if !self
+            .budget
+            .admit(roles::is_test_path(&path), bytes.len() as u64)
+        {
+            self.skip(1);
             return;
         }
 
         let scan_start = std::time::Instant::now();
-        let result = analyze_bytes(&path_to_slash(relative_path), bytes);
+        let result = analyze_bytes(&path, bytes);
         self.merge(result);
-        self.source_scan_ns = self
-            .source_scan_ns
-            .saturating_add(scan_start.elapsed().as_nanos());
+        self.note_scan_time(scan_start);
     }
 
     /// Feed the ends of a source file of `size` bytes too large to read whole:
     /// `sample` is its first bytes, a line break, and its last bytes.
     pub fn feed_sample(&mut self, relative_path: &Path, size: u64, sample: &[u8]) {
+        if self.admit(relative_path, sample.len() as u64) {
+            self.analyze_sample(relative_path, size, sample);
+        }
+    }
+
+    fn analyze_sample(&mut self, relative_path: &Path, size: u64, sample: &[u8]) {
         let scan_start = std::time::Instant::now();
         let mut comment_buf = Vec::new();
         let result = analyze_oversized_source_sample(relative_path, size, sample, &mut comment_buf);
-        self.merge_within_limits(result);
-        self.source_scan_ns = self
-            .source_scan_ns
-            .saturating_add(scan_start.elapsed().as_nanos());
+        self.merge(result);
+        self.note_scan_time(scan_start);
     }
 
     /// Sample an oversized source file from disk after extraction.
@@ -1637,7 +1713,11 @@ impl PackageAnalyzer {
         full_path: &Path,
         size: u64,
     ) {
-        if !Self::should_scan(relative_path, size) || size <= MAX_FILE_SIZE {
+        let limits = self.budget.limits;
+        if !Self::should_scan(relative_path, size)
+            || size <= limits.full_file_bytes
+            || !self.admit(relative_path, limits.read_bytes(size))
+        {
             return;
         }
         let scan_start = std::time::Instant::now();
@@ -1646,13 +1726,11 @@ impl PackageAnalyzer {
             relative_path,
             full_path,
             size,
-            self.limits.sample_bytes,
+            limits.sample_bytes,
             &mut comment_buf,
         );
-        self.merge_within_limits(result);
-        self.source_scan_ns = self
-            .source_scan_ns
-            .saturating_add(scan_start.elapsed().as_nanos());
+        self.merge(result);
+        self.note_scan_time(scan_start);
     }
 
     /// Record an "oversized minified" file without reading its bytes.
@@ -1665,13 +1743,11 @@ impl PackageAnalyzer {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if supply_chain::is_minified_filename(&filename) {
+        if supply_chain::is_minified_filename(&filename) && self.admit(relative_path, 0) {
             let scan_start = std::time::Instant::now();
             let result = oversized_minified_result(relative_path, size);
-            self.merge_within_limits(result);
-            self.source_scan_ns = self
-                .source_scan_ns
-                .saturating_add(scan_start.elapsed().as_nanos());
+            self.merge(result);
+            self.note_scan_time(scan_start);
         }
     }
 
@@ -1680,17 +1756,30 @@ impl PackageAnalyzer {
         self.source_scan_ns
     }
 
-    fn skip_remaining(&mut self, files: usize) {
-        self.skipped_files += files;
-        self.limit_reached = true;
+    /// Takes a file at `relative_path` that reads `bytes` from its budget,
+    /// or skips it.
+    fn admit(&mut self, relative_path: &Path, bytes: u64) -> bool {
+        let admitted = self
+            .budget
+            .admit(roles::is_test_path(&path_to_slash(relative_path)), bytes);
+        if !admitted {
+            self.skip(1);
+        }
+        admitted
     }
 
-    fn merge_within_limits(&mut self, result: FileAnalysisResult) {
-        if self.bytes_scanned + result.bytes_scanned > self.limits.total_bytes {
-            self.skip_remaining(1);
-            return;
+    /// Counts `files` a budget left unread.
+    fn skip(&mut self, files: usize) {
+        if files > 0 {
+            self.skipped_files += files;
+            self.limit_reached = true;
         }
-        self.merge(result);
+    }
+
+    fn note_scan_time(&mut self, scan_start: std::time::Instant) {
+        self.source_scan_ns = self
+            .source_scan_ns
+            .saturating_add(scan_start.elapsed().as_nanos());
     }
 
     fn merge(&mut self, mut result: FileAnalysisResult) {
@@ -2213,20 +2302,17 @@ mod tests {
     }
 
     #[test]
-    fn capability_scan_prefix_is_deterministic_at_the_package_byte_limit() {
-        let files = (0..30)
-            .map(|index| CapSourceFile {
-                path: format!("source-{index:02}.js").into(),
-                size: MAX_FILE_SIZE,
-            })
-            .collect::<Vec<_>>();
+    fn package_budget_admits_files_in_read_order_until_its_bytes_run_out() {
+        let limits = ScanLimits::INSTALL;
+        let mut budget = ScanBudget::new(limits);
 
-        let (selected, limit_reached) = cap_scan_prefix(&files);
+        let admitted = (0..30)
+            .filter(|_| budget.admit(false, limits.read_bytes(MAX_FILE_SIZE)))
+            .count();
 
-        assert!(limit_reached);
-        assert_eq!(selected.len(), 12);
-        assert_eq!(selected[0].path, Path::new("source-00.js"));
-        assert_eq!(selected[11].path, Path::new("source-11.js"));
+        assert_eq!(admitted, 12);
+        assert!(budget.admit(false, 1024));
+        assert!(budget.admit(true, MAX_FILE_SIZE));
     }
 
     #[test]
@@ -2242,7 +2328,7 @@ mod tests {
         let directory =
             cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
                 .unwrap();
-        let mut files = CapSourceFiles::new();
+        let mut files = SourceFiles::new(ScanLimits::INSTALL);
         let mut native_artifacts = Vec::new();
         let mut limit_reached = false;
 
@@ -2255,12 +2341,178 @@ mod tests {
             &mut limit_reached,
         )
         .unwrap();
-        let files = files.into_sorted_vec();
+        let (files, found) = files.into_read_order();
 
         assert!(limit_reached);
+        assert_eq!(found, MAX_FILES_PER_PACKAGE + 1);
         assert_eq!(files.len(), MAX_FILES_PER_PACKAGE);
         assert_eq!(files.first().unwrap().path, Path::new("source-00000.js"));
         assert_eq!(files.last().unwrap().path, Path::new("source-04999.js"));
+    }
+
+    /// A package whose test fixtures alone are larger than the package's
+    /// read budget, and whose entry point evaluates code.
+    fn package_with_large_test_fixtures() -> tempfile::TempDir {
+        let package = tempfile::tempdir().unwrap();
+        create_test_package(
+            package.path(),
+            &[
+                (
+                    "package.json",
+                    r#"{"name":"kit","license":"MIT","main":"lib/index.js"}"#,
+                ),
+                (
+                    "lib/index.js",
+                    "module.exports = payload => eval(payload)\n",
+                ),
+            ],
+        );
+        fs::create_dir_all(package.path().join("__tests__")).unwrap();
+        for index in 0..13 {
+            fs::File::create(
+                package
+                    .path()
+                    .join(format!("__tests__/fixture-{index:02}.js")),
+            )
+            .unwrap()
+            .set_len(MAX_FILE_SIZE)
+            .unwrap();
+        }
+        package
+    }
+
+    #[test]
+    fn test_fixtures_never_crowd_out_the_code_a_package_runs() {
+        let package = package_with_large_test_fixtures();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
+                .unwrap();
+
+        for analysis in [
+            analyze_package(package.path()),
+            analyze_package_from_open_dir(&directory, PackageDirectory::Published),
+        ] {
+            assert!(analysis.source.eval);
+            assert_eq!(analysis.meta.tag_files["eval"].files, ["lib/index.js"]);
+            assert_eq!(analysis.meta.skipped_files, 10);
+            assert!(analysis.meta.limit_reached);
+        }
+    }
+
+    #[test]
+    fn streamed_test_fixtures_never_crowd_out_the_code_a_package_runs() {
+        let fixture = vec![b' '; MAX_FILE_SIZE as usize];
+        let fixtures_size = MAX_TOTAL_SCAN_BYTES as usize;
+        let mut analyzer = PackageAnalyzer::new();
+        for (index, start) in (0..fixtures_size).step_by(fixture.len()).enumerate() {
+            let size = fixture.len().min(fixtures_size - start);
+            analyzer.feed(
+                Path::new(&format!("__tests__/fixture-{index:02}.js")),
+                &fixture[..size],
+            );
+        }
+        analyzer.feed(
+            Path::new("lib/index.js"),
+            b"module.exports = payload => eval(payload)",
+        );
+
+        let analysis = analyzer.finish(Some(br#"{"name":"kit","license":"MIT"}"#));
+
+        assert!(analysis.source.eval);
+        assert_eq!(analysis.meta.skipped_files, 10);
+    }
+
+    #[test]
+    fn directory_scans_read_own_code_before_bundled_dependencies() {
+        let package = tempfile::tempdir().unwrap();
+        create_test_package(
+            package.path(),
+            &[
+                ("package.json", r#"{"name":"kit","license":"MIT"}"#),
+                (
+                    "src/index.js",
+                    "module.exports = payload => eval(payload)\n",
+                ),
+            ],
+        );
+        fs::create_dir_all(package.path().join("node_modules/bundled")).unwrap();
+        for index in 0..13 {
+            fs::File::create(
+                package
+                    .path()
+                    .join(format!("node_modules/bundled/part-{index:02}.js")),
+            )
+            .unwrap()
+            .set_len(MAX_FILE_SIZE)
+            .unwrap();
+        }
+
+        let analysis = analyze_package(package.path());
+
+        assert!(analysis.source.eval);
+        assert_eq!(analysis.meta.skipped_files, 1);
+    }
+
+    /// Analyzes `source` on a thread with the stack a rayon worker has.
+    fn analyze_on_a_worker_stack(source: String) -> FileAnalysisResult {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || analyze_bytes("index.js", source.as_bytes()))
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn source_nested_deeper_than_a_worker_stack_is_parsed_on_a_stack_that_fits() {
+        for source in [
+            format!("x={}eval(y){};", "[".repeat(3_000), "]".repeat(3_000)),
+            format!("x={}eval(y);", "a=>".repeat(2_500)),
+            format!("{}eval(y);", "if(a)x;else ".repeat(3_000)),
+            format!(
+                "{}eval(y){}",
+                "(function(){return ".repeat(1_000),
+                "})()".repeat(1_000)
+            ),
+        ] {
+            let result = analyze_on_a_worker_stack(source);
+            assert!(result.source.eval);
+            assert_eq!(result.unparsed_files, 0);
+        }
+    }
+
+    #[test]
+    fn source_nested_too_deeply_to_parse_is_read_without_parsing() {
+        for source in [
+            format!("x={}eval(y){};", "[".repeat(100_000), "]".repeat(100_000)),
+            format!("x={}eval(y);", "!".repeat(1_000_000)),
+            format!("x=a{}+eval(y);", ".b".repeat(1_000_000)),
+        ] {
+            let result = analyze_on_a_worker_stack(source);
+            assert!(result.source.eval);
+            assert_eq!(result.unparsed_files, 1);
+        }
+    }
+
+    #[test]
+    fn samples_cover_a_whole_file_no_larger_than_two_samples() {
+        let bytes = b"eval(payload); module.exports = 1;";
+        assert_eq!(oversized_source_sample_from_bytes(bytes, 20), bytes);
+        let limits = ScanLimits {
+            full_file_bytes: 10,
+            sample_bytes: 20,
+            ..ScanLimits::INSTALL
+        };
+        assert_eq!(limits.read_bytes(bytes.len() as u64), bytes.len() as u64);
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), bytes).unwrap();
+        let mut opened = fs::File::open(file.path()).unwrap();
+        assert_eq!(
+            read_oversized_source_sample_from_open_file(&mut opened, bytes.len() as u64, 20)
+                .unwrap(),
+            bytes
+        );
     }
 
     #[cfg(unix)]
@@ -2498,6 +2750,23 @@ mod tests {
             [Path::new("node_modules/deep")]
         );
         assert!(!nested.contains_key(Path::new("/p/node_modules/other")));
+    }
+
+    #[test]
+    fn a_package_nested_inside_a_bundled_dependency_belongs_to_the_installed_package() {
+        let dirs = [
+            "/p/node_modules/kit",
+            "/p/node_modules/kit/node_modules/bundled/node_modules/bar",
+        ]
+        .map(Path::new);
+
+        let nested = nested_packages(dirs);
+
+        assert_eq!(
+            nested[Path::new("/p/node_modules/kit")],
+            [Path::new("node_modules/bundled/node_modules/bar")]
+        );
+        assert_eq!(nested.len(), 1);
     }
 
     #[test]

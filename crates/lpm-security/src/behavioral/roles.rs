@@ -63,7 +63,13 @@ pub fn is_test_path(path: &str) -> bool {
 /// Whether a package file is native code: a compiled `.node` addon, or the
 /// `binding.gyp` node-gyp builds one from on install.
 pub fn is_native_artifact_path(path: &str) -> bool {
-    path.ends_with(".node") || path == "binding.gyp" || path.ends_with("/binding.gyp")
+    is_native_artifact_name(path.rsplit('/').next().unwrap_or(path).as_bytes())
+}
+
+/// [`is_native_artifact_path`] by the file's name alone.
+#[inline]
+pub fn is_native_artifact_name(name: &[u8]) -> bool {
+    name.ends_with(b".node") || name == b"binding.gyp"
 }
 
 /// The strings of a manifest's lifecycle scripts and entry points. A file one
@@ -82,7 +88,7 @@ impl EntryReferences {
             .collect();
         while let Some(value) = pending.pop() {
             match value {
-                serde_json::Value::String(text) => references.push(text.clone()),
+                serde_json::Value::String(text) => references.push(text.replace('\\', "/")),
                 serde_json::Value::Array(items) => pending.extend(items),
                 serde_json::Value::Object(entries) => pending.extend(entries.values()),
                 _ => {}
@@ -92,16 +98,52 @@ impl EntryReferences {
     }
 
     /// Whether a script or entry point names `path`, with or without its
-    /// extension.
+    /// extension, or names the directory of an `index` file as Node resolves
+    /// a directory to it.
     pub(super) fn name(&self, path: &str) -> bool {
-        let stem = match (path.rfind('.'), path.rfind('/')) {
-            (Some(dot), slash) if slash.is_none_or(|slash| dot > slash) => &path[..dot],
-            _ => path,
+        let (directory, name) = match path.rsplit_once('/') {
+            Some((directory, name)) => (Some(directory), name),
+            None => (None, path),
         };
-        self.0
-            .iter()
-            .any(|reference| reference.contains(path) || reference.contains(stem))
+        let stem = match name.rfind('.') {
+            Some(dot) => &path[..path.len() - name.len() + dot],
+            None => path,
+        };
+        let index_directory = directory.filter(|_| {
+            name.rsplit_once('.')
+                .map_or(name, |(stem, _)| stem)
+                .eq("index")
+        });
+        self.0.iter().any(|reference| {
+            reference.contains(path)
+                || reference.contains(stem)
+                || index_directory.is_some_and(|directory| names_directory(reference, directory))
+        })
     }
+}
+
+/// Whether `reference` names `directory` as a whole path, optionally after
+/// `./`: the path starts the reference or follows a character that can't be
+/// part of a path in a script, and ends the reference or is followed by `/`
+/// or such a character.
+fn names_directory(reference: &str, directory: &str) -> bool {
+    reference.match_indices(directory).any(|(start, _)| {
+        let before = &reference[..start];
+        let before = before.strip_suffix("./").unwrap_or(before);
+        let starts_path = before
+            .chars()
+            .next_back()
+            .is_none_or(|character| !is_path_character(character));
+        let ends_path = reference[start + directory.len()..]
+            .chars()
+            .next()
+            .is_none_or(|character| character == '/' || !is_path_character(character));
+        starts_path && ends_path
+    })
+}
+
+fn is_path_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '/' | '.' | '-' | '_' | '@' | '+' | '~')
 }
 
 #[cfg(test)]
@@ -178,5 +220,27 @@ mod tests {
         }
         assert!(!references.name("test/other.js"));
         assert!(!EntryReferences::default().name("test/setup.js"));
+    }
+
+    #[test]
+    fn entry_references_name_the_index_of_a_directory_and_windows_style_paths() {
+        let manifest = serde_json::json!({
+            "main": "./spec",
+            "bin": "tests\\cli.js",
+            "module": "lib/specs/",
+        });
+        let references = EntryReferences::from_manifest(&manifest);
+
+        for path in [
+            "spec/index.js",
+            "spec/index.mjs",
+            "tests/cli.js",
+            "lib/specs/index.ts",
+        ] {
+            assert!(references.name(path), "{path}");
+        }
+        for path in ["spec/helper.js", "specs/index.js", "lib/spec/index.js"] {
+            assert!(!references.name(path), "{path}");
+        }
     }
 }

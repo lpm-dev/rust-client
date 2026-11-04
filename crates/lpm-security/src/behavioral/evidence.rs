@@ -55,12 +55,11 @@ impl SourceEvidence {
 }
 
 fn file_context(path: &str) -> &'static str {
-    if path.split('/').any(|part| {
-        matches!(
-            part,
-            "test" | "tests" | "__tests__" | "fixtures" | "examples" | "example"
-        )
-    }) {
+    if super::roles::is_test_path(path)
+        || path
+            .split('/')
+            .any(|part| matches!(part, "fixtures" | "examples" | "example"))
+    {
         "test-or-example"
     } else if super::supply_chain::is_minified_filename(path) {
         "minified"

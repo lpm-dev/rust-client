@@ -5,15 +5,17 @@
 //! hidden files included, within [`ScanLimits::REGISTRY`], and reports each
 //! tag with the files it came from, the tags only tests showed, the eval
 //! calls of the files the package runs, and how much of the package it read.
+//! JavaScript and TypeScript are parsed; the sources of another ecosystem
+//! are read by the linear detectors alone.
 
 use super::{
     PackageAnalysis, PackageAnalyzer, ScanLimits, SourceEvidence, TagFiles, path_to_slash, roles,
 };
-use flate2::read::GzDecoder;
+use flate2::bufread::GzDecoder;
 use lpm_common::LpmError;
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::io::{self, Read};
+use std::io::{self, BufRead, BufReader, Read};
 use std::ops::ControlFlow;
 
 /// Version of the [`ReleaseSignals`] document. Bump it when a field changes
@@ -33,6 +35,16 @@ const ARCHIVE_LIMITS: lpm_extractor::TarArchiveLimits = lpm_extractor::TarArchiv
     max_path_bytes: lpm_extractor::DEFAULT_MAX_ARCHIVE_PATH_BYTES,
     max_metadata_bytes: lpm_extractor::DEFAULT_MAX_TAR_METADATA_BYTES,
 };
+
+/// Largest tar stream decompressed: the entries' payload, and room for
+/// their headers, padding and path records. Metadata payloads aren't part of
+/// the entry total, so without this a stream of metadata records could
+/// inflate far past it.
+const MAX_DECOMPRESSED_BYTES: u64 = ARCHIVE_LIMITS.max_total_entry_bytes + 128 * 1024 * 1024;
+
+/// Read size for the compressed input and the decompressed tar stream, so
+/// tar headers and small files don't re-enter inflate on every short read.
+const READ_BUFFER_BYTES: usize = 64 * 1024;
 
 /// The language whose source files a release's analysis reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,7 +92,9 @@ pub struct ReleaseSignals {
     /// Up to three located examples of each rule, files the package runs
     /// first.
     pub evidence: Vec<SourceEvidence>,
-    /// The `eval()` and `new Function()` calls of the files the package runs.
+    /// The calls that run code from a string in the files the package runs:
+    /// `eval()`, `new Function()`, the `vm` module's script runs, and
+    /// indirect `eval`.
     pub eval_calls: usize,
     pub url_domains: Vec<String>,
     pub coverage: ReleaseCoverage,
@@ -93,41 +107,60 @@ pub struct ReleaseCoverage {
     /// Source files read, whole or sampled.
     pub source_files: usize,
     pub scanned_bytes: u64,
-    /// Read but not completely parsed, sampled files included.
+    /// Read but not completely parsed: sampled files, source that doesn't
+    /// parse or nests too deeply to, and every source of an ecosystem other
+    /// than `js`.
     pub unparsed_files: usize,
     /// Read only at each end.
     pub sampled_files: usize,
-    /// Left unread past the file or byte limit.
+    /// Left unread past a file or byte limit, the package's or the tests'.
     pub skipped_files: usize,
     /// The release has a readable `package.json`.
     pub manifest: bool,
-    /// Every source file was read whole and parsed.
+    /// Every source file was read whole and parsed, so never for an
+    /// ecosystem other than `js`.
     pub complete: bool,
 }
 
 /// Analyze a release from its gzipped tarball.
 ///
+/// The input is read to its end, every file an npm client unpacks included:
+/// each gzip member and every tar entry, past zero blocks that end the
+/// archive early, so a file can't sit where one extractor reads and this
+/// analysis doesn't.
+///
 /// # Errors
 ///
-/// Returns an error when the input isn't a gzipped tar archive, breaks an
-/// archive limit, holds an entry path outside the package, or can't be read.
+/// Returns an error when the input isn't a gzipped tar archive, a gzip
+/// member is corrupt, bytes that aren't a gzip member or zero padding follow
+/// one, the input breaks an archive limit, holds an entry path outside the
+/// package, or can't be read.
 pub fn analyze_release_tarball<R: Read>(
     gzipped: R,
     ecosystem: Ecosystem,
 ) -> Result<ReleaseSignals, LpmError> {
-    let compressed = CappedReader {
-        inner: gzipped,
-        remaining: MAX_COMPRESSED_BYTES,
-    };
+    let compressed = BufReader::with_capacity(
+        READ_BUFFER_BYTES,
+        LimitedReader::new(gzipped, MAX_COMPRESSED_BYTES, "compressed"),
+    );
+    let tar = BufReader::with_capacity(
+        READ_BUFFER_BYTES,
+        LimitedReader::new(
+            GzipMembers::new(compressed),
+            MAX_DECOMPRESSED_BYTES,
+            "decompressed",
+        ),
+    );
     let mut analyzer = PackageAnalyzer::with_limits(ScanLimits::REGISTRY);
     let mut manifest = None;
     let mut buffer = Vec::new();
 
-    lpm_extractor::visit_tar_archive(GzDecoder::new(compressed), ARCHIVE_LIMITS, |mut entry| {
-        if !entry.header().entry_type().is_file() {
+    lpm_extractor::visit_tar_archive_to_end(tar, ARCHIVE_LIMITS, |mut entry| {
+        let entry_type = entry.header().entry_type();
+        if !entry_type.is_file() && entry_type != tar::EntryType::Continuous {
             return Ok(ControlFlow::Continue(()));
         }
-        let Some(relative) = lpm_extractor::sanitize_entry_path(entry.path())? else {
+        let Some(relative) = lpm_extractor::package_relative_entry_path(entry.path())? else {
             return Ok(ControlFlow::Continue(()));
         };
         let path = path_to_slash(&relative);
@@ -165,20 +198,22 @@ fn read_whole(reader: &mut impl Read, size: u64) -> io::Result<Vec<u8>> {
 }
 
 /// The first and last `sample_bytes` of an entry of `size` bytes, joined by
-/// a line break, as [`PackageAnalyzer::feed`] samples a buffered file.
+/// a line break, or the whole entry when the two would meet, as
+/// [`PackageAnalyzer::feed`] samples a buffered file.
 fn read_ends(reader: &mut impl Read, size: u64, sample_bytes: usize) -> io::Result<Vec<u8>> {
     let chunk = (sample_bytes as u64).min(size);
+    let tail_start = size.saturating_sub(chunk);
+    if tail_start <= chunk {
+        return read_whole(reader, size);
+    }
     let mut sample = Vec::with_capacity(sample_bytes.saturating_mul(2).saturating_add(1));
     reader.by_ref().take(chunk).read_to_end(&mut sample)?;
-    let tail_start = size.saturating_sub(chunk);
-    if tail_start > chunk {
-        io::copy(
-            &mut reader.by_ref().take(tail_start - chunk),
-            &mut io::sink(),
-        )?;
-        sample.push(b'\n');
-        reader.by_ref().take(chunk).read_to_end(&mut sample)?;
-    }
+    io::copy(
+        &mut reader.by_ref().take(tail_start - chunk),
+        &mut io::sink(),
+    )?;
+    sample.push(b'\n');
+    reader.by_ref().take(chunk).read_to_end(&mut sample)?;
     Ok(sample)
 }
 
@@ -247,22 +282,100 @@ fn release_signals(analysis: PackageAnalysis) -> ReleaseSignals {
     }
 }
 
-/// A reader that fails once more than `remaining` bytes have been read, so a
-/// tarball larger than a registry accepts isn't decompressed.
-struct CappedReader<R> {
-    inner: R,
-    remaining: u64,
+/// The members of a gzip stream, decoded one after another. Zero bytes after
+/// a member are padding; any other byte starts another member, as gunzip
+/// and Node's zlib read them, so data can't follow the first member unread.
+struct GzipMembers<B> {
+    decoder: Option<GzDecoder<B>>,
 }
 
-impl<R: Read> Read for CappedReader<R> {
+impl<B: BufRead> GzipMembers<B> {
+    fn new(input: B) -> Self {
+        Self {
+            decoder: Some(GzDecoder::new(input)),
+        }
+    }
+}
+
+impl<B: BufRead> Read for GzipMembers<B> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let read = self.inner.read(buffer)?;
-        self.remaining = self.remaining.checked_sub(read as u64).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("the tarball is larger than {MAX_COMPRESSED_BYTES} bytes"),
-            )
-        })?;
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        while let Some(decoder) = self.decoder.as_mut() {
+            let read = decoder.read(buffer)?;
+            if read > 0 {
+                return Ok(read);
+            }
+            if let Some(finished) = self.decoder.take() {
+                let mut input = finished.into_inner();
+                if skip_zero_padding(&mut input)? {
+                    self.decoder = Some(GzDecoder::new(input));
+                }
+            }
+        }
+        Ok(0)
+    }
+}
+
+/// Consumes the zero bytes at the front of `input`, and says whether any
+/// other byte follows them.
+fn skip_zero_padding(input: &mut impl BufRead) -> io::Result<bool> {
+    loop {
+        let available = input.fill_buf()?;
+        if available.is_empty() {
+            return Ok(false);
+        }
+        let zeros = available.iter().take_while(|&&byte| byte == 0).count();
+        let more = zeros < available.len();
+        input.consume(zeros);
+        if more {
+            return Ok(true);
+        }
+    }
+}
+
+/// A reader that fails on reading past `limit` bytes, naming which `stream`
+/// was too large.
+struct LimitedReader<R> {
+    inner: R,
+    remaining: u64,
+    limit: u64,
+    stream: &'static str,
+}
+
+impl<R> LimitedReader<R> {
+    fn new(inner: R, limit: u64, stream: &'static str) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+            limit,
+            stream,
+        }
+    }
+}
+
+impl<R: Read> Read for LimitedReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            return match self.inner.read(&mut [0u8; 1])? {
+                0 => Ok(0),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "the tarball's {} size is over the {}-byte limit",
+                        self.stream, self.limit
+                    ),
+                )),
+            };
+        }
+        let window = usize::try_from(self.remaining)
+            .map_or(buffer.len(), |remaining| remaining.min(buffer.len()));
+        let read = self.inner.read(&mut buffer[..window])?;
+        self.remaining -= read as u64;
         Ok(read)
     }
 }
@@ -274,17 +387,37 @@ mod tests {
     use flate2::write::GzEncoder;
 
     fn tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+        gzip(&tar_archive(entries, tar::EntryType::Regular))
+    }
+
+    fn tar_archive(entries: &[(&str, &[u8])], entry_type: tar::EntryType) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
         for (path, content) in entries {
             let mut header = tar::Header::new_gnu();
             header.set_size(content.len() as u64);
             header.set_mode(0o644);
-            header.set_entry_type(tar::EntryType::Regular);
+            header.set_entry_type(entry_type);
             builder
                 .append_data(&mut header, format!("package/{path}"), *content)
                 .unwrap();
         }
-        builder.into_inner().unwrap().finish().unwrap()
+        builder.into_inner().unwrap()
+    }
+
+    fn gzip(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        io::Write::write_all(&mut encoder, bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    const PAYLOAD: &[u8] = br#"require("child_process").exec(process.argv[2])"#;
+
+    fn first_part() -> Vec<u8> {
+        let archive = tar_archive(
+            &[("package.json", br#"{"name":"kit","license":"MIT"}"#)],
+            tar::EntryType::Regular,
+        );
+        archive[..archive.len() - 1024].to_vec()
     }
 
     fn analyze(entries: &[(&str, &[u8])]) -> ReleaseSignals {
@@ -401,6 +534,34 @@ mod tests {
     }
 
     #[test]
+    fn reads_another_ecosystem_s_sources_without_the_javascript_parser() {
+        let entries: &[(&str, &[u8])] = &[
+            ("pkg/run.py", br#"print("eval(x)")"#),
+            ("pkg/kit.py", b"def run():\n    return 1\n"),
+        ];
+        let signals =
+            analyze_release_tarball(tarball(entries).as_slice(), Ecosystem::Python).unwrap();
+
+        assert!(signals.tags["eval"]);
+        assert_eq!(signals.coverage.source_files, 2);
+        assert_eq!(signals.coverage.unparsed_files, 2);
+        assert!(!signals.coverage.complete);
+    }
+
+    #[test]
+    fn reads_a_release_nested_too_deeply_to_parse_without_failing() {
+        let nested = format!("x={}eval(y){};", "[".repeat(100_000), "]".repeat(100_000));
+        let signals = analyze(&[
+            ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+            ("index.js", nested.as_bytes()),
+        ]);
+
+        assert!(signals.tags["eval"]);
+        assert_eq!(signals.coverage.unparsed_files, 1);
+        assert!(!signals.coverage.complete);
+    }
+
+    #[test]
     fn refuses_input_that_is_not_a_gzipped_tarball() {
         assert!(analyze_release_tarball(b"not a tarball".as_slice(), Ecosystem::Js).is_err());
         let mut truncated = tarball(&[("index.js", b"module.exports = 1")]);
@@ -428,11 +589,78 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_files_of_every_gzip_member() {
+        let mut input = gzip(&first_part());
+        input.extend(gzip(&tar_archive(
+            &[("lib/run.js", PAYLOAD)],
+            tar::EntryType::Regular,
+        )));
+        input.extend_from_slice(&[0; 64]);
+
+        let signals = analyze_release_tarball(input.as_slice(), Ecosystem::Js).unwrap();
+
+        assert!(signals.tags["childProcess"]);
+        assert_eq!(signals.tag_files["childProcess"].files, ["lib/run.js"]);
+    }
+
+    #[test]
+    fn reads_the_entries_after_a_zero_block_inside_the_archive() {
+        let mut archive = first_part();
+        archive.extend_from_slice(&[0; 512]);
+        archive.extend(tar_archive(
+            &[("lib/run.js", PAYLOAD)],
+            tar::EntryType::Regular,
+        ));
+
+        let signals = analyze_release_tarball(gzip(&archive).as_slice(), Ecosystem::Js).unwrap();
+
+        assert!(signals.tags["childProcess"]);
+    }
+
+    #[test]
+    fn refuses_input_after_a_gzip_member_that_is_not_another_member() {
+        for trailing in [b"trailing bytes".as_slice(), b"\x00\x00trailing bytes"] {
+            let mut input = tarball(&[("index.js", b"module.exports = 1")]);
+            input.extend_from_slice(trailing);
+            assert!(analyze_release_tarball(input.as_slice(), Ecosystem::Js).is_err());
+        }
+
+        let mut corrupt = tarball(&[("index.js", b"module.exports = 1")]);
+        let crc = corrupt.len() - 8;
+        corrupt[crc] ^= 0xff;
+        assert!(analyze_release_tarball(corrupt.as_slice(), Ecosystem::Js).is_err());
+    }
+
+    #[test]
+    fn reads_contiguous_files_git_paths_and_windows_device_names_as_npm_unpacks_them() {
+        for (path, entry_type) in [
+            ("lib/run.js", tar::EntryType::Continuous),
+            (".git/run.js", tar::EntryType::Regular),
+            ("lib/aux.js", tar::EntryType::Regular),
+        ] {
+            let archive = tar_archive(&[(path, PAYLOAD)], entry_type);
+            let signals =
+                analyze_release_tarball(gzip(&archive).as_slice(), Ecosystem::Js).unwrap();
+            assert!(signals.tags["childProcess"], "{path}");
+            assert_eq!(signals.coverage.source_files, 1, "{path}");
+        }
+    }
+
+    #[test]
+    fn stops_decompressing_past_the_archive_size_limit() {
+        let mut reader = LimitedReader::new([0u8; 16].as_slice(), 8, "decompressed");
+        let mut sink = Vec::new();
+        let error = reader.read_to_end(&mut sink).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("decompressed"), "{error}");
+
+        let mut exact = LimitedReader::new([0u8; 8].as_slice(), 8, "decompressed");
+        assert_eq!(exact.read_to_end(&mut sink).unwrap(), 8);
+    }
+
+    #[test]
     fn stops_reading_input_past_the_compressed_size_limit() {
-        let mut reader = CappedReader {
-            inner: [0u8; 16].as_slice(),
-            remaining: 8,
-        };
+        let mut reader = LimitedReader::new([0u8; 16].as_slice(), 8, "compressed");
         let mut sink = Vec::new();
         let error = reader.read_to_end(&mut sink).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);

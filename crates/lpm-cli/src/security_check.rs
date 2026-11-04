@@ -545,7 +545,9 @@ fn collect_tags_from_analysis(
 
 /// Collect registry metadata used by the normal install summary.
 ///
-/// Merges registry behavioral tags (OR with client-side) and lifecycle scripts.
+/// Merges registry behavioral tags (OR with client-side) and lifecycle
+/// scripts. A tag the registry found only in tests is left out, as a local
+/// analysis leaves it out of its tags.
 fn collect_registry_warnings(
     ver_meta: &lpm_registry::VersionMetadata,
     pkg_id: &str,
@@ -577,7 +579,11 @@ fn collect_registry_warnings(
             (PseudoClass::NoLicense, tags.no_license),
             (PseudoClass::CustomLicense, tags.custom_license),
         ] {
-            if present {
+            if present
+                && !tag
+                    .tag_key()
+                    .is_some_and(|key| ver_meta.tag_is_tests_only(key))
+            {
                 counts.insert_behavioral(tag, pkg_id);
             }
         }
@@ -1483,6 +1489,24 @@ mod tests {
         ] {
             assert!(counts.behavioral.get(&tag).unwrap().contains("pkg@1.0.0"));
         }
+    }
+
+    #[test]
+    fn registry_warnings_leave_out_tags_the_registry_found_only_in_tests() {
+        let ver_meta = lpm_registry::VersionMetadata {
+            behavioral_tags: Some(lpm_registry::BehavioralTags {
+                eval: true,
+                child_process: true,
+                ..Default::default()
+            }),
+            test_only_tags: Some(vec!["childProcess".to_string()]),
+            ..Default::default()
+        };
+        let mut counts = SummaryCounts::default();
+        collect_registry_warnings(&ver_meta, "pkg@1.0.0", &mut counts);
+
+        assert!(counts.behavioral[&PseudoClass::Eval].contains("pkg@1.0.0"));
+        assert!(!counts.behavioral.contains_key(&PseudoClass::ChildProcess));
     }
 
     #[test]

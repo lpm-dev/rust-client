@@ -2723,14 +2723,7 @@ async fn audit_unsupported_syntax_cannot_be_hidden_by_severity_filtering() {
 
 /// Seed a node_modules package with high-confidence obfuscated source.
 fn seed_high_confidence_obfuscated_package(project: &TempProject, name: &str) {
-    seed_node_modules_package(
-        project,
-        name,
-        &[(
-            "index.js",
-            "var _0x1a2b=[\"\\x48\",\"\\x65\",\"\\x6c\",\"\\x6c\",\"\\x6f\"];\nfunction _0x3c4d(_0x5e6f) { return _0x1a2b[_0x5e6f]; }\nmodule.exports = _0x3c4d(0x1);\n",
-        )],
-    );
+    seed_node_modules_package(project, name, &[("index.js", OBFUSCATED_SOURCE)]);
 }
 
 /// Wire `lpm audit` with `LPM_OSV_URL` pointed at a mock returning no
@@ -2786,6 +2779,81 @@ async fn audit_reports_info_behavioral_metadata_without_failing() {
         "{combined}"
     );
     assert!(combined.contains("URL literals"), "{combined}");
+}
+
+const OBFUSCATED_SOURCE: &str = "var _0x1a2b=[\"\\x48\",\"\\x65\",\"\\x6c\",\"\\x6c\",\"\\x6f\"];\nfunction _0x3c4d(_0x5e6f) { return _0x1a2b[_0x5e6f]; }\nmodule.exports = _0x3c4d(0x1);\n";
+
+/// Audits a project with one package of `files` under the default fail
+/// policy. Returns its report and whether audit failed.
+async fn audit_one_seeded_package(files: &[(&str, &str)]) -> (serde_json::Value, bool) {
+    let project = TempProject::empty(r#"{"name":"tests-only-host","version":"1.0.0"}"#);
+    seed_node_modules_package(&project, "kit", files);
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+
+    let output = lpm(&project)
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args(["--json", "audit"])
+        .output()
+        .expect("failed to spawn lpm audit");
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("audit JSON must parse: {error}"));
+    (envelope["packages"][0].clone(), !output.status.success())
+}
+
+fn finding<'a>(report: &'a serde_json::Value, list: &str, rule_id: &str) -> &'a serde_json::Value {
+    report[list]
+        .as_array()
+        .and_then(|findings| {
+            findings
+                .iter()
+                .find(|finding| finding["rule_id"] == rule_id)
+        })
+        .unwrap_or_else(|| panic!("no {rule_id} in {list}: {report}"))
+}
+
+#[tokio::test]
+async fn audit_reports_code_only_a_package_s_tests_contain_as_tests_only_and_passes() {
+    let (report, failed) = audit_one_seeded_package(&[
+        ("index.js", "module.exports = (a, b) => a + b\n"),
+        ("test/fixture.js", OBFUSCATED_SOURCE),
+        ("test/run.test.js", "eval(process.argv[2])\n"),
+    ])
+    .await;
+
+    let obfuscated = finding(&report, "issues", "obfuscated");
+    assert_eq!(obfuscated["severity"], "info", "{report}");
+    assert_eq!(obfuscated["tests_only"], true, "{report}");
+    let eval = finding(&report, "capabilities", "eval");
+    assert_eq!(eval["policy_severity"], "info", "{report}");
+    assert_eq!(eval["tests_only"], true, "{report}");
+    assert!(
+        !failed,
+        "code only tests contain must not fail audit: {report}"
+    );
+}
+
+#[tokio::test]
+async fn audit_counts_a_test_file_a_lifecycle_script_runs_as_package_code() {
+    let (report, failed) = audit_one_seeded_package(&[
+        (
+            "package.json",
+            r#"{"name":"kit","version":"1.0.0","scripts":{"postinstall":"node test/fixture.js"}}"#,
+        ),
+        ("index.js", "module.exports = (a, b) => a + b\n"),
+        ("test/fixture.js", OBFUSCATED_SOURCE),
+        ("test/run.test.js", "eval(process.argv[2])\n"),
+    ])
+    .await;
+
+    let obfuscated = finding(&report, "issues", "obfuscated");
+    assert_eq!(obfuscated["severity"], "critical", "{report}");
+    assert!(obfuscated.get("tests_only").is_none(), "{report}");
+    assert_eq!(finding(&report, "capabilities", "eval")["tests_only"], true);
+    assert!(
+        failed,
+        "obfuscated code a lifecycle script runs must fail audit"
+    );
 }
 
 /// `--fail-on=behavior` must fire on a HIGH-severity behavioral finding

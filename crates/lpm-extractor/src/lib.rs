@@ -148,13 +148,51 @@ struct PaxMetadata {
 pub fn visit_tar_archive<R, T, F>(
     reader: R,
     limits: TarArchiveLimits,
-    mut visitor: F,
+    visitor: F,
+) -> Result<(R, Option<T>), LpmError>
+where
+    R: Read,
+    F: FnMut(BoundedTarEntry<'_, R>) -> Result<ControlFlow<T>, LpmError>,
+{
+    visit_tar_entries(tar::Archive::new(reader), limits, visitor)
+}
+
+/// Visits every entry header in a tar stream, as [`visit_tar_archive`]
+/// does, but reads past end-of-archive zero blocks to the end of the input.
+///
+/// An extractor that stops only at two zero blocks, or that is fed archives
+/// concatenated together, unpacks entries [`visit_tar_archive`] never
+/// reaches. A reader that has to see everything any extractor could unpack,
+/// such as a registry's analysis of a published tarball, uses this. Bytes
+/// past the last entry that aren't zero blocks are an error.
+///
+/// # Errors
+///
+/// Returns the errors of [`visit_tar_archive`], and an error for a trailing
+/// partial or malformed block.
+pub fn visit_tar_archive_to_end<R, T, F>(
+    reader: R,
+    limits: TarArchiveLimits,
+    visitor: F,
 ) -> Result<(R, Option<T>), LpmError>
 where
     R: Read,
     F: FnMut(BoundedTarEntry<'_, R>) -> Result<ControlFlow<T>, LpmError>,
 {
     let mut archive = tar::Archive::new(reader);
+    archive.set_ignore_zeros(true);
+    visit_tar_entries(archive, limits, visitor)
+}
+
+fn visit_tar_entries<R, T, F>(
+    mut archive: tar::Archive<R>,
+    limits: TarArchiveLimits,
+    mut visitor: F,
+) -> Result<(R, Option<T>), LpmError>
+where
+    R: Read,
+    F: FnMut(BoundedTarEntry<'_, R>) -> Result<ControlFlow<T>, LpmError>,
+{
     let mut local_metadata = PaxMetadata::default();
     let mut long_path: Option<Vec<u8>> = None;
     let mut long_link: Option<Vec<u8>> = None;
@@ -1995,10 +2033,7 @@ pub fn sanitize_entry_path(path: &Path) -> Result<Option<PathBuf>, LpmError> {
     for component in relative_path.components() {
         match component {
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(LpmError::Registry(format!(
-                    "path traversal detected in tarball: {}",
-                    path.display()
-                )));
+                return Err(path_traversal_error(path));
             }
             Component::Normal(name) if is_windows_reserved_device_name(name) => {
                 return Err(LpmError::Registry(format!(
@@ -2011,6 +2046,35 @@ pub fn sanitize_entry_path(path: &Path) -> Result<Option<PathBuf>, LpmError> {
     }
 
     Ok(Some(relative_path))
+}
+
+/// A tar entry's path inside its package, for a reader that reads the files
+/// an npm client unpacks rather than writing them.
+///
+/// The first component, conventionally `package/`, is stripped, and `None`
+/// is that component itself. A remaining traversal, root, or platform-prefix
+/// component is an error. Unlike [`sanitize_entry_path`], `.git` paths and
+/// reserved Windows device names are kept: npm unpacks them.
+pub fn package_relative_entry_path(path: &Path) -> Result<Option<PathBuf>, LpmError> {
+    let Some(relative_path) = strip_first_component(path) else {
+        return Ok(None);
+    };
+    if relative_path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(path_traversal_error(path));
+    }
+    Ok(Some(relative_path))
+}
+
+fn path_traversal_error(path: &Path) -> LpmError {
+    LpmError::Registry(format!(
+        "path traversal detected in tarball: {}",
+        path.display()
+    ))
 }
 
 struct PathLedgerBudget {
@@ -3039,6 +3103,86 @@ mod tests {
             builder.finish().unwrap();
         }
         tar_data
+    }
+
+    fn visited_paths(tar_data: &[u8], to_end: bool) -> Result<Vec<PathBuf>, LpmError> {
+        let mut seen = Vec::new();
+        let visitor = |entry: BoundedTarEntry<'_, &[u8]>| {
+            seen.push(entry.path().to_path_buf());
+            Ok(ControlFlow::<()>::Continue(()))
+        };
+        if to_end {
+            visit_tar_archive_to_end(tar_data, TarArchiveLimits::new(10), visitor)?;
+        } else {
+            visit_tar_archive(tar_data, TarArchiveLimits::new(10), visitor)?;
+        }
+        Ok(seen)
+    }
+
+    #[test]
+    fn visiting_to_the_end_reads_entries_past_zero_blocks_that_end_the_archive_early() {
+        let first = create_raw_tarball_with_paths(&["package/index.js"]);
+        let second = create_raw_tarball_with_paths(&["package/hidden.js"]);
+        let mut single_zero_block = first[..first.len() - 1024].to_vec();
+        single_zero_block.extend_from_slice(&[0; 512]);
+        single_zero_block.extend_from_slice(&second);
+        let concatenated = [first.as_slice(), second.as_slice()].concat();
+
+        for tar_data in [&single_zero_block, &concatenated] {
+            assert_eq!(
+                visited_paths(tar_data, false).unwrap(),
+                [PathBuf::from("package/index.js")]
+            );
+            assert_eq!(
+                visited_paths(tar_data, true).unwrap(),
+                [
+                    PathBuf::from("package/index.js"),
+                    PathBuf::from("package/hidden.js")
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn visiting_to_the_end_refuses_bytes_after_the_archive_that_are_not_entries() {
+        let mut tar_data = create_raw_tarball_with_paths(&["package/index.js"]);
+        tar_data.extend_from_slice(&[b'x'; 512]);
+        assert!(visited_paths(&tar_data, false).is_ok());
+        assert!(visited_paths(&tar_data, true).is_err());
+
+        let mut padded = create_raw_tarball_with_paths(&["package/index.js"]);
+        padded.extend_from_slice(&[0; 10 * 512]);
+        assert_eq!(
+            visited_paths(&padded, true).unwrap(),
+            [PathBuf::from("package/index.js")]
+        );
+    }
+
+    #[test]
+    fn package_relative_entry_path_keeps_what_npm_unpacks_and_refuses_traversal() {
+        for (entry, relative) in [
+            ("package/lib/index.js", "lib/index.js"),
+            ("package/.git/hooks/run.js", ".git/hooks/run.js"),
+            ("package/lib/aux.js", "lib/aux.js"),
+            ("other/con.js", "con.js"),
+        ] {
+            assert_eq!(
+                package_relative_entry_path(Path::new(entry)).unwrap(),
+                Some(PathBuf::from(relative)),
+                "{entry}"
+            );
+        }
+        assert_eq!(
+            package_relative_entry_path(Path::new("package")).unwrap(),
+            None
+        );
+        assert!(package_relative_entry_path(Path::new("package/../escape.js")).is_err());
+
+        assert_eq!(
+            sanitize_entry_path(Path::new("package/.git/hooks/run.js")).unwrap(),
+            None
+        );
+        assert!(sanitize_entry_path(Path::new("package/lib/aux.js")).is_err());
     }
 
     #[test]

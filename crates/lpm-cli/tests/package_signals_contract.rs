@@ -1,7 +1,9 @@
-//! CLI-binary tier justification: `lpm internal-package-signals` is a hidden
+//! **Tier placement: cli-binary.** Justification class: **intentionally
+//! minimal binary-surface repro**. `lpm internal-package-signals` is a hidden
 //! helper a registry runs as a subprocess, feeding a release's tarball on
 //! stdin and reading one JSON document from stdout. These tests pin that
-//! stdin / stdout / exit-code contract, which the workflow harness hides.
+//! stdin / stdout / exit-code contract, and that the helper writes nothing,
+//! which the workflow harness's project setup would hide.
 
 mod common;
 
@@ -27,13 +29,16 @@ fn release_tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 /// Runs the helper in empty directories, feeding `input` on stdin, and
-/// checks it left both empty.
+/// checks it left both empty. The update check and telemetry stay enabled,
+/// so a write from either would show.
 fn package_signals(args: &[&str], input: &[u8]) -> Output {
     let project = TempDir::new().unwrap();
     let lpm_home = TempDir::new().unwrap();
     let mut command_args = vec!["internal-package-signals"];
     command_args.extend_from_slice(args);
     let mut child = common::lpm_command(project.path(), lpm_home.path(), None, &command_args)
+        .env_remove("LPM_NO_UPDATE_CHECK")
+        .env_remove("LPM_DISABLE_TELEMETRY")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -109,6 +114,35 @@ fn reads_the_sources_of_the_ecosystem_it_is_given() {
     assert_eq!(document["tags"]["eval"], false);
     assert_eq!(document["coverage"]["sourceFiles"], 1);
     assert_eq!(document["coverage"]["manifest"], false);
+}
+
+#[test]
+fn reads_a_source_nested_deeper_than_any_stack_without_aborting() {
+    let nested = format!("x={}eval(y){};", "[".repeat(20_000), "]".repeat(20_000));
+    let tarball = release_tarball(&[
+        ("package.json", br#"{"name":"kit","license":"MIT"}"#),
+        ("index.js", nested.as_bytes()),
+    ]);
+
+    let output = package_signals(&[], &tarball);
+
+    assert!(output.status.success(), "{output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["tags"]["eval"], true);
+    assert_eq!(document["coverage"]["sourceFiles"], 1);
+}
+
+#[test]
+fn reads_files_past_the_first_gzip_member() {
+    let first = release_tarball(&[("package.json", br#"{"name":"kit","license":"MIT"}"#)]);
+    let second = release_tarball(&[("lib/run.js", br#"require("child_process").exec(cmd)"#)]);
+
+    let output = package_signals(&[], &[first, second].concat());
+
+    assert!(output.status.success(), "{output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["tags"]["childProcess"], true);
+    assert_eq!(document["coverage"]["manifest"], true);
 }
 
 #[test]

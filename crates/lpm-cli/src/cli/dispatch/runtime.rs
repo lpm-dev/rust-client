@@ -14,12 +14,10 @@ pub(in crate::cli) fn keep_state_ignored_at_exit_from(started_in: &std::path::Pa
     }
 }
 
-/// Ends the command without the exit hook's writes, for a helper that
-/// reads stdin and writes stdout and nothing else.
-pub(in crate::cli) fn leave_state_alone_at_exit() {
-    if let Ok(mut slot) = STARTED_IN.lock() {
-        *slot = None;
-    }
+/// A helper that reads stdin and writes stdout and nothing else, so the exit
+/// hook isn't set up to write for it on any path, an early error included.
+fn writes_nothing(command: Option<&Commands>) -> bool {
+    matches!(command, Some(Commands::InternalPackageSignals(_)))
 }
 
 /// Keeps the project's `.lpm` and the LPM home out of git as the command
@@ -46,7 +44,9 @@ pub(super) fn run_async_main() -> Result<()> {
             runtime_builder.enable_all();
             runtime_builder.thread_stack_size(ASYNC_STACK_BYTES);
             let project_dir = std::env::current_dir().ok();
-            if let Some(cwd) = project_dir.as_deref() {
+            if let Some(cwd) = project_dir.as_deref()
+                && !writes_nothing(cli.command.as_ref())
+            {
                 keep_state_ignored_at_exit_from(cwd);
             }
             if let Some(workers) = install_runtime_worker_threads(
