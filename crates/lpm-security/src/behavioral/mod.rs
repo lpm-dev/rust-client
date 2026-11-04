@@ -1090,7 +1090,7 @@ fn analyze_source_file(
         ));
     }
 
-    let raw_content = std::fs::read(&full_path).ok()?;
+    let raw_content = lpm_common::read_file_capped(&full_path, limits.full_file_bytes).ok()?;
     Some(analyze_bytes_with_scratch(
         &path_to_slash(&file.path),
         &raw_content,
