@@ -42,7 +42,7 @@ use rand::Rng;
 use sha2::Digest;
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Stdio};
 use wiremock::matchers::{method, path as match_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -104,6 +104,42 @@ pub fn lpm_command(
 /// Same as [`lpm_command`] but accepts additional env-var pairs to set after
 /// the standard isolation env is applied.
 pub fn lpm_command_with_env(
+    cwd: &Path,
+    lpm_home: &Path,
+    registry_url: Option<&str>,
+    extra_env: &[(&str, &str)],
+    args: &[&str],
+) -> Command {
+    warm_lpm_binary();
+    isolated_lpm_command(cwd, lpm_home, registry_url, extra_env, args)
+}
+
+/// Launches `lpm-rs` once per test process, before the first command a test
+/// builds. macOS holds the first launch of a newly built executable in each
+/// test process while it checks the binary, which takes seconds on a busy
+/// runner, so a deadline started around a test's first command would
+/// otherwise count that check.
+fn warm_lpm_binary() {
+    static WARMED: std::sync::Once = std::sync::Once::new();
+    WARMED.call_once(|| {
+        let directory = tempfile::TempDir::new().expect("create lpm-rs warm-up directory");
+        let status = isolated_lpm_command(
+            directory.path(),
+            &directory.path().join(".lpm"),
+            None,
+            &[],
+            &["--version"],
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("launch lpm-rs --version");
+        assert!(status.success(), "lpm-rs --version failed: {status}");
+    });
+}
+
+fn isolated_lpm_command(
     cwd: &Path,
     lpm_home: &Path,
     registry_url: Option<&str>,

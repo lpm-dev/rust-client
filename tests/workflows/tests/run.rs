@@ -302,7 +302,6 @@ fn watch_rejects_upstream_dependencies_before_starting_tasks() {
         r#"{"tasks":{"build":{"command":"node build.js","dependsOn":["^build"]}}}"#,
     );
     project.write_file("build.js", "require('fs').writeFileSync('ran','yes');");
-    support::warm_lpm_binary(&project);
     let mut watcher = TaskWatcher::start(&project, "build", &[]);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while watcher.child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
@@ -331,7 +330,6 @@ fn watch_rejects_invalid_tasks_even_when_an_import_is_missing() {
                 .to_string(),
         );
         project.write_file("build.js", "require('fs').writeFileSync('ran','yes');");
-        support::warm_lpm_binary(&project);
         let mut watcher = TaskWatcher::start(&project, "build", &[]);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while watcher.child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
@@ -5092,6 +5090,7 @@ fn run_workspace_does_not_publish_output_under_a_changed_root_contract() {
         || assert_cmd::cargo::cargo_bin("lpm-rs"),
         std::path::PathBuf::from,
     );
+    support::warm_binary(&binary);
     let mut command = lpm_spawnable_from_path(&project, &binary);
     command.args(["run", "build", "--filter", "@test/app"]);
     let mut child = command.spawn().expect("start the blocked workspace task");
@@ -5178,6 +5177,7 @@ fn run_workspace_does_not_publish_output_when_member_inputs_change_during_execut
         || assert_cmd::cargo::cargo_bin("lpm-rs"),
         std::path::PathBuf::from,
     );
+    support::warm_binary(&binary);
     let mut command = lpm_spawnable_from_path(&project, &binary);
     command.args(["run", "build", "--filter", "@test/app"]);
     let mut child = command.spawn().expect("start the blocked workspace task");
@@ -5274,6 +5274,7 @@ fn run_workspace_does_not_publish_output_when_a_local_dependency_output_changes(
     );
 
     let binary = assert_cmd::cargo::cargo_bin("lpm-rs");
+    support::warm_binary(&binary);
     let mut command = lpm_spawnable_from_path(&project, &binary);
     command.args(["run", "build", "--filter", "@test/app"]);
     let mut child = command.spawn().expect("start the blocked dependent task");
