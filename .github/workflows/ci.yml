@@ -198,6 +198,13 @@ jobs:
       - name: Portable skill decoder regression
         run: python3 -m unittest discover -s scripts/tests -p test_export_skill_validator.py
 
+      - name: Skills dashboard UI tests and committed bundle
+        working-directory: crates/lpm-cli/dashboard-ui
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+          npm run check:dist
+
       - name: npm wrapper tests
         run: npm --prefix npm/cli test
 

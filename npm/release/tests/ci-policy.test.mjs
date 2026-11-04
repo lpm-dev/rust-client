@@ -144,3 +144,29 @@ test("macOS clippy, keychain and app bundle checks run beside the workspace test
     "the bundle must hold a binary built with the shipped features",
   );
 });
+
+test("Lint builds, tests and type-checks the skills dashboard and compares its committed bundle", () => {
+  const job = ciJob(readCiWorkflow(), "lint");
+  assert.ok(job, "missing lint job");
+  const step = ciStep(job, "Skills dashboard UI tests and committed bundle");
+  assert.ok(step, "missing skills dashboard step");
+  assert.ok(
+    job.indexOf("      - name: Install Node 22\n") < job.indexOf("      - name: Skills dashboard UI tests and committed bundle\n"),
+    "the dashboard step must run after Node is installed",
+  );
+  assert.match(step, /^        working-directory: crates\/lpm-cli\/dashboard-ui$/m);
+  assert.match(step, /^          npm ci --no-audit --no-fund$/m);
+  assert.match(step, /^          npm test$/m);
+  assert.match(step, /^          npm run check:dist$/m);
+
+  const { scripts } = JSON.parse(
+    fs.readFileSync(path.join(repoRoot, "crates/lpm-cli/dashboard-ui/package.json"), "utf8"),
+  );
+  assert.equal(scripts.build, "tsc -b && vite build");
+  assert.match(scripts["check:dist"], /^npm run build && /);
+  assert.match(
+    scripts["check:dist"],
+    / && git add --intent-to-add -- \.\.\/src\/commands\/skills\/dashboard && git diff --exit-code -- \.\.\/src\/commands\/skills\/dashboard$/,
+    "check:dist must also catch new, untracked build output",
+  );
+});

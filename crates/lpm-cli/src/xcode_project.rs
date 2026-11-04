@@ -1335,6 +1335,22 @@ mod tests {
     }
 
     #[test]
+    fn workspace_discovery_rejects_deeply_nested_workspace_data_without_overflowing_the_stack() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("App.xcworkspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let depth = 200_000;
+        let contents = format!(
+            "<Workspace>{}{}</Workspace>",
+            "<Group>".repeat(depth),
+            "</Group>".repeat(depth)
+        );
+        std::fs::write(workspace.join("contents.xcworkspacedata"), contents).unwrap();
+        let error = find_xcodeproj(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("nesting limit"), "{error}");
+    }
+
+    #[test]
     fn dictionary_boundary_ignores_braces_in_comments_and_escaped_strings() {
         let content = r#"{ /* } */ value = "quoted \" }"; child = {}; }; trailing"#;
         let end = find_block_end(content).unwrap();

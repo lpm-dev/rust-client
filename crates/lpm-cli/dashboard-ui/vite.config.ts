@@ -14,11 +14,11 @@ export default defineConfig({
     cssCodeSplit: false,
     outDir: '../src/commands/skills/dashboard',
     emptyOutDir: true,
-    rollupOptions: {
+    rolldownOptions: {
       output: {
         entryFileNames: 'assets/dashboard.js',
         assetFileNames: 'assets/dashboard.[ext]',
-        inlineDynamicImports: true,
+        codeSplitting: false,
       },
     },
   },
