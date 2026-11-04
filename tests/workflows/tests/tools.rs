@@ -1936,19 +1936,6 @@ fn bench_workspace_json_workers_do_not_read_shared_stdin() {
 }
 
 #[cfg(unix)]
-fn warm_lpm_binary(project: &TempProject) {
-    let output = lpm(project)
-        .arg("--version")
-        .output()
-        .expect("warm lpm binary before timing");
-    assert!(
-        output.status.success(),
-        "lpm warm gate failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[cfg(unix)]
 #[test]
 fn test_workspace_releases_dependent_when_its_own_prerequisite_finishes() {
     let project = TempProject::empty(
@@ -1980,12 +1967,10 @@ fn test_workspace_releases_dependent_when_its_own_prerequisite_finishes() {
         ),
     );
 
-    warm_lpm_binary(&project);
+    let mut command = lpm(&project);
+    command.args(["test", "--all", "--workspace-concurrency", "2"]);
     let started = std::time::Instant::now();
-    let output = lpm(&project)
-        .args(["test", "--all", "--workspace-concurrency", "2"])
-        .output()
-        .expect("run dependency-aware ready queue");
+    let output = command.output().expect("run dependency-aware ready queue");
 
     assert!(
         output.status.success(),
@@ -2031,10 +2016,10 @@ fn bench_workspace_releases_dependent_when_its_own_prerequisite_finishes() {
         ),
     );
 
-    warm_lpm_binary(&project);
+    let mut command = lpm(&project);
+    command.args(["bench", "--all", "--workspace-concurrency", "2"]);
     let started = std::time::Instant::now();
-    let output = lpm(&project)
-        .args(["bench", "--all", "--workspace-concurrency", "2"])
+    let output = command
         .output()
         .expect("run dependency-aware benchmark ready queue");
 
@@ -2068,11 +2053,15 @@ fn test_workspace_process_waits_do_not_block_tokio_workers() {
         );
     }
 
-    warm_lpm_binary(&project);
+    let mut command = lpm(&project);
+    command.env("TOKIO_WORKER_THREADS", "1").args([
+        "test",
+        "--all",
+        "--workspace-concurrency",
+        "4",
+    ]);
     let started = std::time::Instant::now();
-    let output = lpm(&project)
-        .env("TOKIO_WORKER_THREADS", "1")
-        .args(["test", "--all", "--workspace-concurrency", "4"])
+    let output = command
         .output()
         .expect("run test processes with one Tokio worker");
 
@@ -2106,11 +2095,15 @@ fn bench_workspace_process_waits_do_not_block_tokio_workers() {
         );
     }
 
-    warm_lpm_binary(&project);
+    let mut command = lpm(&project);
+    command.env("TOKIO_WORKER_THREADS", "1").args([
+        "bench",
+        "--all",
+        "--workspace-concurrency",
+        "4",
+    ]);
     let started = std::time::Instant::now();
-    let output = lpm(&project)
-        .env("TOKIO_WORKER_THREADS", "1")
-        .args(["bench", "--all", "--workspace-concurrency", "4"])
+    let output = command
         .output()
         .expect("run benchmark processes with one Tokio worker");
 

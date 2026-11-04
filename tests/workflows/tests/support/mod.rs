@@ -909,10 +909,12 @@ fn apply_lpm_env<S: LpmEnvSink>(cmd: &mut S, project: &TempProject) {
 /// This ensures the binary never touches the developer's real HOME, store,
 /// auth tokens, or cache.
 pub fn lpm(project: &TempProject) -> assert_cmd::Command {
-    let binary = assert_cmd::cargo::cargo_bin("lpm-rs");
-    lpm_from_path(project, &binary)
+    lpm_from_path(project, &lpm_under_test())
 }
 
+/// Builds an isolated command for `binary` without launching it first, since
+/// a binary other than the `lpm-rs` under test may not accept `--version`.
+/// Call [`warm_binary`] before timing such a command.
 pub fn lpm_from_path(project: &TempProject, binary: &Path) -> assert_cmd::Command {
     let mut cmd = assert_cmd::Command::new(binary);
     cmd.current_dir(project.path());
@@ -951,23 +953,11 @@ pub fn lpm_v1_with_registry(project: &TempProject, registry_url: &str) -> assert
 /// Defaults `stdout` and `stderr` to `Stdio::piped()` so callers can
 /// capture output after a `kill()` — `inherit` would lose it.
 pub fn lpm_spawnable(project: &TempProject) -> std::process::Command {
-    let bin = assert_cmd::cargo::cargo_bin("lpm-rs");
-    lpm_spawnable_from_path(project, &bin)
+    lpm_spawnable_from_path(project, &lpm_under_test())
 }
 
-/// Runs the binary once and waits, so a deadline the caller then starts
-/// measures the command under test rather than the first launch of a
-/// freshly built or staged binary, which macOS scans before it runs.
-pub fn warm_lpm_binary(project: &TempProject) {
-    let status = lpm_spawnable(project)
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .expect("run lpm --version");
-    assert!(status.success(), "lpm --version failed: {status}");
-}
-
+/// Spawnable counterpart of [`lpm_from_path`], which likewise doesn't launch
+/// `binary` first.
 pub fn lpm_spawnable_from_path(project: &TempProject, binary: &Path) -> std::process::Command {
     let mut cmd = std::process::Command::new(binary);
     cmd.current_dir(project.path());
@@ -976,6 +966,45 @@ pub fn lpm_spawnable_from_path(project: &TempProject, binary: &Path) -> std::pro
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd
+}
+
+/// The `lpm-rs` under test, launched by [`warm_binary`] before the first
+/// command built for it.
+fn lpm_under_test() -> PathBuf {
+    let binary = assert_cmd::cargo::cargo_bin("lpm-rs");
+    warm_binary(&binary);
+    binary
+}
+
+/// Runs `binary --version` once per test process. macOS holds the first launch
+/// of a newly built or staged executable in each test process while it checks
+/// the binary, which takes seconds on a busy runner, so a deadline started
+/// around a test's first command would otherwise count that check.
+pub fn warm_binary(binary: &Path) {
+    static WARMED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let mut warmed = WARMED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if warmed.iter().any(|path| path == binary) {
+        return;
+    }
+    let project = TempProject::empty("{}");
+    let mut command = std::process::Command::new(binary);
+    command.current_dir(project.path());
+    apply_lpm_env(&mut command, &project);
+    let status = command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|error| panic!("launch {} --version: {error}", binary.display()));
+    assert!(
+        status.success(),
+        "{} --version failed: {status}",
+        binary.display()
+    );
+    warmed.push(binary.to_path_buf());
 }
 
 pub fn wait_for_lock_contention(
