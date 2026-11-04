@@ -404,10 +404,12 @@ jobs:
           cargo test --release --locked -p lpm-vault --test acceptance_response_signing
           cargo test --release --locked -p lpm-vault --features acceptance-test-hooks --test acceptance_response_signing
 
-  macos-workspace:
-    name: macOS workspace checks
+  macos-workspace-tests:
+    name: macOS workspace tests
     runs-on: macos-latest
-    timeout-minutes: 60
+    # From a cold cache, the 3-core runner can spend 35 minutes compiling the
+    # workspace tests before running them for 15.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -415,7 +417,6 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: clippy
 
       - name: Cache cargo
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -426,15 +427,6 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-macos-workspace-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-macos-workspace-${{ env.RUST_TOOLCHAIN }}-
-
-      - name: Check standalone macOS keyring consumers
-        run: |
-          cargo check --locked -p lpm-keyring
-          cargo check --locked -p lpm-auth
-          cargo check --locked -p lpm-vault
-
-      - name: Credential store compatibility with keyring 3
-        run: cargo test --locked -p lpm-keyring --test keyring3_compatibility -- --ignored
 
       - name: Install nextest
         uses: taiki-e/install-action@68a389c788b2cd04016ce8c80ee23b80d2ab3d68 # v2.88.1
@@ -464,6 +456,46 @@ jobs:
           echo "Pre-warming npm cache for verdaccio@$VERDACCIO_VERSION"
           npx --yes "verdaccio@$VERDACCIO_VERSION" --version
 
+      # The workflow tests need lpm-rs built with the Sigstore mock feature, so
+      # every test is built with it and one lpm-rs serves them all.
+      - name: Build workspace tests
+        run: cargo nextest run --locked --workspace --features lpm-cli/internal-test-sigstore-mock --no-run
+
+      - name: Workspace tests
+        run: scripts/ci/with-hermetic-workflow-cli.sh --prebuilt cargo nextest run --locked --workspace --features lpm-cli/internal-test-sigstore-mock --no-fail-fast --status-level slow --final-status-level fail
+
+  macos-build-checks:
+    name: macOS clippy, keychain and app bundle checks
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-macos-build-checks-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-macos-build-checks-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Check standalone macOS keyring consumers
+        run: |
+          cargo check --locked -p lpm-keyring
+          cargo check --locked -p lpm-auth
+          cargo check --locked -p lpm-vault
+
+      - name: Credential store compatibility with keyring 3
+        run: cargo test --locked -p lpm-keyring --test keyring3_compatibility -- --ignored
+
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -477,8 +509,21 @@ jobs:
             "$RUNNER_TEMP/LPM CLI.app" \
             "$RUNNER_TEMP/lpm-cli.provisionprofile"
 
-      - name: Workspace tests
-        run: scripts/ci/with-hermetic-workflow-cli.sh cargo nextest run --locked --workspace --no-fail-fast --status-level slow --final-status-level fail
+  macos-workspace:
+    name: macOS workspace checks
+    needs: [macos-workspace-tests, macos-build-checks]
+    # Branch protection requires this check and counts a skipped job as
+    # passing, so it has to run, and fail, when a macOS job fails.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every macOS job to pass
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          jq -e 'all(.[]; .result == "success")' <<<"$NEEDS" >/dev/null
 
   full-nextest:
     name: Full isolated nextest

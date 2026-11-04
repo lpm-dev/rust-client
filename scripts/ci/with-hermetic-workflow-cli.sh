@@ -1,8 +1,18 @@
 #!/bin/bash
 set -euo pipefail
 
+# --prebuilt stages the lpm-rs already in the target directory instead of
+# building one. The caller must have built it with the
+# internal-test-sigstore-mock feature, as
+# `cargo nextest run --no-run --features lpm-cli/internal-test-sigstore-mock` does.
+prebuilt=false
+if [ "${1:-}" = "--prebuilt" ]; then
+	prebuilt=true
+	shift
+fi
+
 if [ "$#" -eq 0 ]; then
-	echo "usage: $0 <command> [args...]" >&2
+	echo "usage: $0 [--prebuilt] <command> [args...]" >&2
 	exit 2
 fi
 
@@ -10,7 +20,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd -P)"
 
 cd "$REPO_ROOT"
-cargo build --locked -p lpm-cli --bin lpm-rs --features internal-test-sigstore-mock
+if [ "$prebuilt" = false ]; then
+	cargo build --locked -p lpm-cli --bin lpm-rs --features internal-test-sigstore-mock
+fi
 
 target_root="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
 if [[ "$target_root" != /* ]]; then
@@ -34,7 +46,11 @@ if [ -f "$source_binary.exe" ]; then
 	binary_name="lpm-rs.exe"
 fi
 if [ ! -f "$source_binary" ] || [ -L "$source_binary" ] || [ ! -x "$source_binary" ]; then
-	echo "error: feature-built lpm-rs binary is unavailable: $source_binary" >&2
+	if [ "$prebuilt" = true ]; then
+		echo "error: --prebuilt found no lpm-rs binary: $source_binary" >&2
+	else
+		echo "error: feature-built lpm-rs binary is unavailable: $source_binary" >&2
+	fi
 	exit 1
 fi
 
