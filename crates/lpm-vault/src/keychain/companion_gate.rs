@@ -144,7 +144,7 @@ pub(super) fn read_for_run(
 /// A record that follows values but claims no approval while the values item
 /// requires it, as a client that predates this check leaves it after turning
 /// approval on: strengthen it before its bytes are used.
-fn match_values_approval(
+pub(super) fn match_values_approval(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
     account: &str,

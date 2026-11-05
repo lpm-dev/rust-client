@@ -865,28 +865,38 @@ fn with_directory_transaction<T>(
         OsStr::new(TRANSACTION_LOCK_NAME),
         "vault transaction lock",
     )?;
-    let _scope = LockScope::enter();
-    operation(&directory)
+    let scope = LockScope::enter();
+    let result = operation(&directory);
+    if scope.companion.is_outermost() {
+        // History records what the operation stored, whether or not it
+        // failed after a values write; its own failures never change the
+        // operation's result.
+        crate::history::finish_scope(&directory);
+    }
+    result
 }
 
 /// What one held vault lock remembers, forgotten when it's released: each
-/// project's feature marker state, and the file store's data key, so an
-/// operation loads that key once.
+/// project's feature marker state, the file store's data key, so an
+/// operation loads that key once, and the changes history records.
 struct LockScope {
     companion: crate::companion::LockScope,
 }
 
 impl LockScope {
     fn enter() -> Self {
-        Self {
-            companion: crate::companion::LockScope::enter(),
+        let companion = crate::companion::LockScope::enter();
+        if companion.is_outermost() {
+            crate::history::scope::enter();
         }
+        Self { companion }
     }
 }
 
 impl Drop for LockScope {
     fn drop(&mut self) {
         if self.companion.is_outermost() {
+            crate::history::scope::leave();
             crate::fallback::forget_scoped_data_key();
         }
     }

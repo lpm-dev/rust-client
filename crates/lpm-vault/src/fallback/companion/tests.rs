@@ -43,14 +43,24 @@ fn write(account: CompanionAccount, value: Vec<u8>) -> Mutation {
     }
 }
 
+/// Values written the way a client that doesn't record history writes
+/// them, so these tests see only the companion records they plant.
 fn seed_values() {
-    crate::fallback::write_all_environments(
-        VAULT,
-        &HashMap::from([(
-            "default".to_owned(),
-            HashMap::from([("TOKEN".to_owned(), "team".to_owned())]),
-        )]),
-    )
+    with_vault_transaction(|directory| {
+        let source = crate::history::Source::new(crate::history::Action::Set);
+        let recording = crate::history::scope::begin(VAULT, &source);
+        crate::fallback::write_all_environments_unlocked(
+            directory,
+            VAULT,
+            &HashMap::from([(
+                "default".to_owned(),
+                HashMap::from([("TOKEN".to_owned(), "team".to_owned())]),
+            )]),
+            &recording,
+        )?;
+        crate::history::scope::forget(VAULT);
+        Ok(())
+    })
     .expect("write values");
 }
 

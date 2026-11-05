@@ -1232,5 +1232,9 @@ pub(crate) fn companion_folder_count(directory: &VaultStorageDirectory) -> Resul
         .count())
 }
 
+mod history;
+
+pub(crate) use history::history_store;
+
 #[cfg(test)]
 mod tests;

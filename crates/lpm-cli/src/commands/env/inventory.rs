@@ -108,6 +108,7 @@ fn perform_init_actions(
         &initializations,
         force,
         snapshot,
+        &lpm_vault::history::Source::new(lpm_vault::history::Action::InitFromFiles),
     )
     .map_err(LpmError::Script)
     .map(|results| {
@@ -674,6 +675,7 @@ pub(super) fn vars_copy(
         &resolved_src.storage_key,
         &resolved_dst.storage_key,
         overwrite,
+        &lpm_vault::history::Source::new(lpm_vault::history::Action::CopyEnvironment),
     )
     .map_err(LpmError::Script)?;
     let Some(copy) = copy else {

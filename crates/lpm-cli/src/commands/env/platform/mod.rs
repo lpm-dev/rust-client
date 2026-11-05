@@ -2846,11 +2846,18 @@ pub(super) async fn vars_platform_pull(
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect::<Vec<_>>();
+    let source = lpm_vault::history::Source::with_detail(
+        lpm_vault::history::Action::PlatformPull,
+        lpm_vault::history::SourceDetail {
+            platform: lpm_vault::history::Platform::from_name(platform),
+            ..lpm_vault::history::SourceDetail::default()
+        },
+    );
     if env_name == "default" {
-        lpm_vault::set(project_dir, &pairs)
+        lpm_vault::set(project_dir, &pairs, &source)
             .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
     } else {
-        lpm_vault::set_env(project_dir, env_name, &pairs)
+        lpm_vault::set_env(project_dir, env_name, &pairs, &source)
             .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
     }
     let audit = record_platform_audit_with_recovery(

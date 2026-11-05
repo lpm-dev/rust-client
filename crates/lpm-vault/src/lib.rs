@@ -27,6 +27,7 @@
 mod companion;
 pub mod crypto;
 mod fallback;
+pub mod history;
 mod selected_environment;
 pub mod signature;
 pub mod sync;
@@ -485,7 +486,11 @@ fn validate_explicit_vault_id(vault_id: &str) -> Result<(), String> {
 /// Set one or more secrets in the vault.
 ///
 /// Creates the vault (and vault ID in lpm.json) if it doesn't exist.
-pub fn set(project_dir: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
+pub fn set(
+    project_dir: &Path,
+    pairs: &[(&str, &str)],
+    source: &history::Source,
+) -> Result<(), String> {
     reject_invalid_keys(pairs.iter().map(|(k, _)| *k))?;
 
     let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
@@ -506,11 +511,17 @@ pub fn set(project_dir: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
                 secrets.insert((*key).to_owned(), (*value).to_owned());
             }
         },
+        source,
     )
 }
 
 /// Set secrets for a specific environment.
-pub fn set_env(project_dir: &Path, env: &str, pairs: &[(&str, &str)]) -> Result<(), String> {
+pub fn set_env(
+    project_dir: &Path,
+    env: &str,
+    pairs: &[(&str, &str)],
+    source: &history::Source,
+) -> Result<(), String> {
     reject_invalid_keys(pairs.iter().map(|(k, _)| *k))?;
 
     let vault_id = vault_id::get_or_create_vault_id(project_dir)?;
@@ -521,11 +532,18 @@ pub fn set_env(project_dir: &Path, env: &str, pairs: &[(&str, &str)]) -> Result<
         .display()
         .to_string();
 
-    mutate_secrets_env(&vault_id, &project_name, &project_path, env, |secrets| {
-        for (key, value) in pairs {
-            secrets.insert((*key).to_owned(), (*value).to_owned());
-        }
-    })
+    mutate_secrets_env(
+        &vault_id,
+        &project_name,
+        &project_path,
+        env,
+        |secrets| {
+            for (key, value) in pairs {
+                secrets.insert((*key).to_owned(), (*value).to_owned());
+            }
+        },
+        source,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -738,12 +756,19 @@ fn load_environment_initialization_vault<'a>(
 /// Inspect and initialize multiple dotenv sources in one vault transaction.
 ///
 /// Sources are read and parsed one at a time. Results retain input order.
-pub fn initialize_environments_from_files(
+#[cfg(test)]
+pub(crate) fn initialize_environments_from_files(
     project_dir: &Path,
     initializations: &[EnvironmentFileInitialization],
     overwrite: bool,
 ) -> Result<Vec<EnvironmentFileInitializationResult>, String> {
-    initialize_environments_from_files_inner(project_dir, initializations, overwrite, None)
+    initialize_environments_from_files_inner(
+        project_dir,
+        initializations,
+        overwrite,
+        None,
+        &history::Source::new(history::Action::InitFromFiles),
+    )
 }
 
 /// Initialize dotenv sources while reusing an earlier decoded inventory snapshot when unchanged.
@@ -752,12 +777,14 @@ pub fn initialize_environments_from_files_with_snapshot(
     initializations: &[EnvironmentFileInitialization],
     overwrite: bool,
     snapshot: EnvironmentInitializationSnapshot,
+    source: &history::Source,
 ) -> Result<Vec<EnvironmentFileInitializationResult>, String> {
     initialize_environments_from_files_inner(
         project_dir,
         initializations,
         overwrite,
         Some(snapshot),
+        source,
     )
 }
 
@@ -766,6 +793,7 @@ fn initialize_environments_from_files_inner(
     initializations: &[EnvironmentFileInitialization],
     overwrite: bool,
     snapshot: Option<EnvironmentInitializationSnapshot>,
+    source: &history::Source,
 ) -> Result<Vec<EnvironmentFileInitializationResult>, String> {
     if initializations.is_empty() {
         return Ok(Vec::new());
@@ -885,12 +913,14 @@ fn initialize_environments_from_files_inner(
                 Some(vault_id) => vault_id,
                 None => vault_id::get_or_create_vault_id(project_dir)?,
             };
+            let recording = history::scope::begin(&vault_id, source);
             write_all_environments_unlocked(
                 directory,
                 &vault_id,
                 &vault.project_name,
                 &vault.project_path,
                 &vault.environments,
+                &recording,
             )?;
         }
 
@@ -906,6 +936,7 @@ pub fn copy_environment(
     source: &str,
     target: &str,
     overwrite: bool,
+    history_source: &history::Source,
 ) -> Result<Option<EnvironmentCopyResult>, String> {
     if source == target {
         return Err("source and target environments are the same".to_owned());
@@ -922,6 +953,7 @@ pub fn copy_environment(
         .to_string();
 
     with_project_vault_transaction(|directory| {
+        let recording = history::scope::begin(&vault_id, history_source);
         let mut environments =
             read_all_environments_unlocked(directory, &vault_id)?.unwrap_or_default();
         let Some(source_secrets) = environments.remove(source) else {
@@ -951,6 +983,7 @@ pub fn copy_environment(
                 &project_name,
                 &project_path,
                 &environments,
+                &recording,
             )?;
         }
         Ok(Some(EnvironmentCopyResult { copied, skipped }))
@@ -960,6 +993,7 @@ pub fn copy_environment(
 pub fn replace_all_environments(
     project_dir: &Path,
     environments: &HashMap<String, HashMap<String, String>>,
+    source: &history::Source,
 ) -> Result<(), String> {
     reject_invalid_keys(
         environments
@@ -975,7 +1009,13 @@ pub fn replace_all_environments(
         .display()
         .to_string();
 
-    write_all_environments(&vault_id, &project_name, &project_path, environments)
+    write_all_environments(
+        &vault_id,
+        &project_name,
+        &project_path,
+        environments,
+        source,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1127,7 +1167,19 @@ fn commit_remote_environments_inner(
         .display()
         .to_string();
 
+    let source = history::Source::with_detail(
+        history::Action::Pull,
+        history::SourceDetail {
+            remote: Some(match target {
+                RemoteSyncTarget::Personal => history::RemoteSource::Personal,
+                RemoteSyncTarget::Organization { slug } => history::RemoteSource::Org(slug.clone()),
+            }),
+            remote_version: u64::try_from(version).ok(),
+            ..history::SourceDetail::default()
+        },
+    );
     with_project_vault_transaction(|directory| {
+        let recording = history::scope::begin(expected_vault_id, &source);
         let mut latest =
             Some(read_all_environments_unlocked(directory, expected_vault_id)?.unwrap_or_default());
         let (mut resolved, mut organization_undo) = match target {
@@ -1165,6 +1217,7 @@ fn commit_remote_environments_inner(
                 &project_name,
                 &project_path,
                 &resolved,
+                &recording,
             )?;
             vault_written = true;
             Ok(())
@@ -1202,6 +1255,7 @@ fn commit_remote_environments_inner(
                 &project_name,
                 &project_path,
                 rollback_environments,
+                &recording,
             ) {
                 Ok(()) => Err(metadata_error),
                 Err(rollback_error) => Err(format!(
@@ -1264,9 +1318,15 @@ fn write_all_environments_unlocked(
     project_name: &str,
     project_path: &str,
     environments: &EnvironmentMap,
+    recording: &history::scope::Recording,
 ) -> Result<(), String> {
     if force_file_vault_backend() {
-        return fallback::write_all_environments_unlocked(directory, vault_id, environments);
+        return fallback::write_all_environments_unlocked(
+            directory,
+            vault_id,
+            environments,
+            recording,
+        );
     }
     #[cfg(target_os = "macos")]
     {
@@ -1275,17 +1335,18 @@ fn write_all_environments_unlocked(
             project_name,
             project_path,
             environments,
+            recording,
         )
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (project_name, project_path);
-        fallback::write_all_environments_unlocked(directory, vault_id, environments)
+        fallback::write_all_environments_unlocked(directory, vault_id, environments, recording)
     }
 }
 
 /// Delete one or more secrets from the vault.
-pub fn delete(project_dir: &Path, keys: &[&str]) -> Result<(), String> {
+pub fn delete(project_dir: &Path, keys: &[&str], source: &history::Source) -> Result<(), String> {
     let vault_id = match vault_id::read_vault_id(project_dir) {
         Some(id) => id,
         None => return Err("no vault configured for this project".to_string()),
@@ -1308,6 +1369,7 @@ pub fn delete(project_dir: &Path, keys: &[&str]) -> Result<(), String> {
                 secrets.remove(*key);
             }
         },
+        source,
     )
 }
 
@@ -1318,7 +1380,12 @@ pub fn try_get_env(project_dir: &Path, env: &str, key: &str) -> Result<Option<St
 }
 
 /// Delete secrets from a specific environment.
-pub fn delete_env(project_dir: &Path, env: &str, keys: &[&str]) -> Result<(), String> {
+pub fn delete_env(
+    project_dir: &Path,
+    env: &str,
+    keys: &[&str],
+    source: &history::Source,
+) -> Result<(), String> {
     let vault_id = match vault_id::read_vault_id(project_dir) {
         Some(id) => id,
         None => return Err("no vault configured for this project".to_string()),
@@ -1331,11 +1398,18 @@ pub fn delete_env(project_dir: &Path, env: &str, keys: &[&str]) -> Result<(), St
         .display()
         .to_string();
 
-    mutate_secrets_env(&vault_id, &project_name, &project_path, env, |secrets| {
-        for key in keys {
-            secrets.remove(*key);
-        }
-    })
+    mutate_secrets_env(
+        &vault_id,
+        &project_name,
+        &project_path,
+        env,
+        |secrets| {
+            for key in keys {
+                secrets.remove(*key);
+            }
+        },
+        source,
+    )
 }
 
 /// Import secrets from a .env file into the vault, as they're written there.
@@ -1343,6 +1417,7 @@ pub fn import_env_file(
     project_dir: &Path,
     env_path: &Path,
     overwrite: bool,
+    source: &history::Source,
 ) -> Result<EnvFileImport, String> {
     let content =
         lpm_common::read_text_file_capped(env_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
@@ -1367,6 +1442,7 @@ pub fn import_env_file(
         &project_path,
         "default",
         move |secrets| merge_imported_secrets(secrets, parsed, overwrite),
+        source,
     )?;
 
     Ok(imported)
@@ -1379,6 +1455,7 @@ pub fn import_env_file_to_env(
     env: &str,
     env_path: &Path,
     overwrite: bool,
+    source: &history::Source,
 ) -> Result<EnvFileImport, String> {
     let content =
         lpm_common::read_text_file_capped(env_path, lpm_common::CONFIG_FILE_SIZE_CAP_BYTES)
@@ -1403,6 +1480,7 @@ pub fn import_env_file_to_env(
         &project_path,
         env,
         move |secrets| merge_imported_secrets(secrets, parsed, overwrite),
+        source,
     )?;
 
     Ok(imported)
@@ -1537,20 +1615,21 @@ fn mutate_secrets_env<T>(
     project_path: &str,
     env: &str,
     operation: impl FnOnce(&mut HashMap<String, String>) -> T,
+    source: &history::Source,
 ) -> Result<T, String> {
     if force_file_vault_backend() {
-        return fallback::mutate_vault_file_env(vault_id, env, operation);
+        return fallback::mutate_vault_file_env(vault_id, env, operation, source);
     }
 
     #[cfg(target_os = "macos")]
     {
-        keychain::mutate_vault_env(vault_id, project_name, project_path, env, operation)
+        keychain::mutate_vault_env(vault_id, project_name, project_path, env, operation, source)
     }
 
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (project_name, project_path);
-        fallback::mutate_vault_file_env(vault_id, env, operation)
+        fallback::mutate_vault_file_env(vault_id, env, operation, source)
     }
 }
 
@@ -1559,20 +1638,21 @@ fn write_all_environments(
     project_name: &str,
     project_path: &str,
     environments: &HashMap<String, HashMap<String, String>>,
+    source: &history::Source,
 ) -> Result<(), String> {
     if force_file_vault_backend() {
-        return fallback::write_all_environments(vault_id, environments);
+        return fallback::write_all_environments(vault_id, environments, source);
     }
 
     #[cfg(target_os = "macos")]
     {
-        keychain::write_all_environments(vault_id, project_name, project_path, environments)
+        keychain::write_all_environments(vault_id, project_name, project_path, environments, source)
     }
 
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (project_name, project_path);
-        fallback::write_all_environments(vault_id, environments)
+        fallback::write_all_environments(vault_id, environments, source)
     }
 }
 
@@ -1790,6 +1870,71 @@ fn find_closing_quote(value: &str, quote: char) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The writers as tests call them, each with the source its action takes.
+    fn set(project_dir: &Path, pairs: &[(&str, &str)]) -> Result<(), String> {
+        super::set(
+            project_dir,
+            pairs,
+            &history::Source::new(history::Action::Set),
+        )
+    }
+
+    fn set_env(project_dir: &Path, env: &str, pairs: &[(&str, &str)]) -> Result<(), String> {
+        super::set_env(
+            project_dir,
+            env,
+            pairs,
+            &history::Source::new(history::Action::Set),
+        )
+    }
+
+    fn delete(project_dir: &Path, keys: &[&str]) -> Result<(), String> {
+        super::delete(
+            project_dir,
+            keys,
+            &history::Source::new(history::Action::Delete),
+        )
+    }
+
+    fn import_env_file(
+        project_dir: &Path,
+        env_path: &Path,
+        overwrite: bool,
+    ) -> Result<EnvFileImport, String> {
+        super::import_env_file(
+            project_dir,
+            env_path,
+            overwrite,
+            &history::Source::new(history::Action::Import),
+        )
+    }
+
+    fn initialize_environments_from_files_with_snapshot(
+        project_dir: &Path,
+        initializations: &[EnvironmentFileInitialization],
+        overwrite: bool,
+        snapshot: EnvironmentInitializationSnapshot,
+    ) -> Result<Vec<EnvironmentFileInitializationResult>, String> {
+        super::initialize_environments_from_files_with_snapshot(
+            project_dir,
+            initializations,
+            overwrite,
+            snapshot,
+            &history::Source::new(history::Action::InitFromFiles),
+        )
+    }
+
+    fn replace_all_environments(
+        project_dir: &Path,
+        environments: &HashMap<String, HashMap<String, String>>,
+    ) -> Result<(), String> {
+        super::replace_all_environments(
+            project_dir,
+            environments,
+            &history::Source::new(history::Action::Set),
+        )
+    }
 
     // Tests share `crate::test_env_lock::ENV_LOCK` (with crypto.rs)
     // so env mutations are serialised across the crate, not just

@@ -23,6 +23,9 @@ use crate::macos_keychain::{
 };
 
 mod companion_gate;
+mod history;
+
+pub(crate) use history::history_store;
 
 type SecretMap = HashMap<String, String>;
 type EnvironmentMap = HashMap<String, SecretMap>;
@@ -1433,12 +1436,14 @@ pub(crate) fn try_read_all_environments_with_digest_unlocked(
     let Some(json) =
         companion_gate::read_values_excluding_overrides(&mut KeychainProjectStorage, vault_id)?
     else {
+        crate::history::scope::observe_read(vault_id, None);
         return Ok((None, None));
     };
     let digest = sha2::Sha256::digest(json.as_bytes()).into();
 
     let environments = crate::selected_environment::parse_all(&json)
         .map_err(|error| format!("vault keychain data is not valid JSON: {error}"))?;
+    crate::history::scope::observe_read(vault_id, Some(&environments));
     Ok((Some(environments), Some(digest)))
 }
 
@@ -1449,23 +1454,22 @@ pub(crate) fn vault_payload_digest_unlocked(vault_id: &str) -> Result<Option<[u8
         .map(|json| json.map(|json| sha2::Sha256::digest(json.as_bytes()).into()))
 }
 
-pub fn write_vault(
-    vault_id: &str,
-    project_name: &str,
-    project_path: &str,
-    secrets: &SecretMap,
-) -> Result<(), String> {
-    write_vault_env(vault_id, project_name, project_path, "default", secrets)
-}
-
-pub fn write_all_environments(
+pub(crate) fn write_all_environments(
     vault_id: &str,
     project_name: &str,
     project_path: &str,
     environments: &EnvironmentMap,
+    source: &crate::history::Source,
 ) -> Result<(), String> {
     with_keychain_transaction(|| {
-        write_all_environments_unlocked(vault_id, project_name, project_path, environments)
+        let recording = crate::history::scope::begin(vault_id, source);
+        write_all_environments_unlocked(
+            vault_id,
+            project_name,
+            project_path,
+            environments,
+            &recording,
+        )
     })
 }
 
@@ -1474,6 +1478,7 @@ pub(crate) fn write_all_environments_unlocked(
     project_name: &str,
     project_path: &str,
     environments: &EnvironmentMap,
+    recording: &crate::history::scope::Recording,
 ) -> Result<(), String> {
     write_all_environments_with_storage_after_recovery(
         &mut KeychainProjectStorage,
@@ -1481,28 +1486,8 @@ pub(crate) fn write_all_environments_unlocked(
         project_name,
         project_path,
         environments,
+        recording,
     )
-}
-
-pub fn write_vault_env(
-    vault_id: &str,
-    project_name: &str,
-    project_path: &str,
-    env: &str,
-    secrets: &SecretMap,
-) -> Result<(), String> {
-    with_keychain_transaction(|| {
-        let mut environments = try_read_all_environments_unlocked(vault_id)?.unwrap_or_default();
-        environments.insert(env.to_owned(), secrets.clone());
-
-        write_all_environments_with_storage_after_recovery(
-            &mut KeychainProjectStorage,
-            vault_id,
-            project_name,
-            project_path,
-            &environments,
-        )
-    })
 }
 
 pub(crate) fn mutate_vault_env<T>(
@@ -1511,9 +1496,11 @@ pub(crate) fn mutate_vault_env<T>(
     project_path: &str,
     env: &str,
     operation: impl FnOnce(&mut SecretMap) -> T,
+    source: &crate::history::Source,
 ) -> Result<T, String> {
     crate::storage_transaction::with_vault_transaction(|directory| {
         recover_project_transaction(&mut KeychainProjectStorage)?;
+        let recording = crate::history::scope::begin(vault_id, source);
         let mut environments = match try_read_all_environments_unlocked(vault_id)? {
             Some(environments) => environments,
             None => crate::fallback::read_all_environments_unlocked(directory, vault_id)?
@@ -1526,6 +1513,7 @@ pub(crate) fn mutate_vault_env<T>(
             project_name,
             project_path,
             &environments,
+            &recording,
         )?;
         Ok(result)
     })
@@ -1546,23 +1534,43 @@ fn large_env_warning(size: usize) -> Option<String> {
     })
 }
 
+/// The commit primitive every Keychain values write goes through. It takes
+/// the write's [`Recording`](crate::history::scope::Recording), so a write
+/// without a source doesn't compile, and tells history what it stored.
 fn write_all_environments_with_storage_after_recovery(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
     project_name: &str,
     project_path: &str,
     environments: &EnvironmentMap,
+    recording: &crate::history::scope::Recording,
 ) -> Result<(), String> {
     let encoded = crate::selected_environment::serialize(environments)?;
     warn_if_large(encoded.len());
     let payload =
         ValidatedVaultPayload::from_serialized_environments(vault_id, encoded, environments)?;
+    if crate::history::scope::needs_before(recording) {
+        let before = storage
+            .read(vault_id)?
+            .map(|bytes| {
+                String::from_utf8(bytes).map_err(|_| "vault keychain data is not UTF-8".to_owned())
+            })
+            .transpose()?
+            .map(|json| {
+                crate::selected_environment::parse_all(&json)
+                    .map_err(|error| format!("vault keychain data is not valid JSON: {error}"))
+            })
+            .transpose()?;
+        crate::history::scope::observe_read(vault_id, before.as_ref());
+    }
     save_validated_vault_data_with_storage_after_recovery(
         storage,
         project_name,
         project_path,
         payload,
-    )
+    )?;
+    crate::history::scope::committed(recording, environments);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2962,6 +2970,10 @@ mod tests {
             "New Vault",
             "/workspace/new",
             &environments,
+            &crate::history::scope::begin(
+                "new-vault",
+                &crate::history::Source::new(crate::history::Action::Set),
+            ),
         )
         .expect("locally generated project save should succeed");
 
