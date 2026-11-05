@@ -20,6 +20,7 @@ pub mod keyring;
 pub mod lifecycle;
 pub mod marker;
 pub mod overrides;
+mod work;
 
 #[cfg(test)]
 mod contract_tests;

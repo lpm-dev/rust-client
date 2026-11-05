@@ -264,6 +264,13 @@ impl Head {
         self.parts.len() < usize::from(self.ring_limit)
     }
 
+    /// Whether the ring is full at a limit below a full ring's, which it got
+    /// while the service held too many records: a rollover asks admission
+    /// whether it may grow again.
+    pub fn may_regrow(&self, log: LogKind) -> bool {
+        self.ring_limit < log.max_parts && !self.would_grow()
+    }
+
     /// The head a rollover writes, and the part it writes next. With
     /// `may_grow`, a ring below its limit takes the smallest free part
     /// number; otherwise the oldest part's account is reused, and a ring

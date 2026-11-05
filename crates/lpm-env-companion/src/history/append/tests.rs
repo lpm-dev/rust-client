@@ -236,6 +236,7 @@ fn a_full_ring_reuses_its_oldest_part() {
     ));
     let (_, project) = append_until_not_steady(&mut store, project, 4);
     assert_eq!(store.head().parts, vec![0, 1]);
+    store.growth = Some(false);
     let ((head_written, shape, part, _, _), _) = append_until_not_steady(&mut store, project, 4);
     assert!(head_written);
     assert_eq!((shape, part), (AppendShape::Rollover { grew: false }, 0));
@@ -340,6 +341,7 @@ fn a_reused_part_that_still_holds_an_older_epoch_is_an_interrupted_rollover() {
         head.encode(HISTORY).expect("head"),
     ));
     let (_, project) = append_until_not_steady(&mut store, project, 4);
+    store.growth = Some(false);
     let stale = store.get(&part_account(VAULT, 0)).expect("part 0").to_vec();
     let ((_, shape, part, _, _), project) = append_until_not_steady(&mut store, project, 4);
     assert_eq!((shape, part), (AppendShape::Rollover { grew: false }, 0));
@@ -528,6 +530,206 @@ fn appends_stop_for_a_rotating_key_a_running_removal_and_damage() {
             ),
             "{}",
             account.name()
+        );
+    }
+}
+
+#[test]
+fn a_shrunk_ring_grows_back_to_a_full_limit_once_admission_allows() {
+    let (mut store, project) = created();
+    let (_, project) = append_until_not_steady(&mut store, project, 4);
+    store.growth = Some(false);
+    let (_, project) = append_until_not_steady(&mut store, project, 4);
+    assert_eq!(
+        store.head().ring_limit,
+        2,
+        "shrunk while the service was full"
+    );
+    let asked = store.admissions;
+    store.growth = Some(true);
+    let ((head_written, shape, part, _, _), _) = append_until_not_steady(&mut store, project, 4);
+    assert!(head_written);
+    assert_eq!((shape, part), (AppendShape::Rollover { grew: true }, 2));
+    let head = store.head();
+    assert_eq!((head.parts, head.ring_limit), (vec![1, 0, 2], 16));
+    assert_eq!(store.admissions, asked + 1, "asked once, at the rollover");
+}
+
+#[test]
+fn a_sliding_ring_asks_to_grow_again_only_every_interval() {
+    let (mut store, mut project) = created();
+    store.growth = Some(false);
+    let (_, slid) = append_until_not_steady(&mut store, project, 4);
+    project = slid;
+    assert_eq!(store.head().ring_limit, 1);
+    let asked = store.admissions;
+    for round in 0..REGROW_CHECK_INTERVAL as usize {
+        let mut changed = project.clone();
+        changed.set("default", "A", &format!("{round}{}", big('s', 4)));
+        store
+            .record(Action::Set, &project, &changed, &[])
+            .expect("recorded");
+        project = changed;
+        if store.head().parts.len() > 1 {
+            break;
+        }
+    }
+    assert!(
+        store.admissions - asked <= 1,
+        "{} admissions for {} slides",
+        store.admissions - asked,
+        REGROW_CHECK_INTERVAL
+    );
+    store.growth = Some(true);
+    for round in 0..REGROW_CHECK_INTERVAL as usize {
+        let mut changed = project.clone();
+        changed.set("default", "A", &format!("{round}{}", big('t', 4)));
+        store
+            .record(Action::Set, &project, &changed, &[])
+            .expect("recorded");
+        project = changed;
+        if store.head().parts.len() > 1 {
+            break;
+        }
+    }
+    let head = store.head();
+    assert_eq!(
+        (head.parts.len(), head.ring_limit),
+        (2, 16),
+        "a sliding ring grows again once the service has room"
+    );
+}
+
+#[test]
+fn a_growth_rollover_digests_each_value_once_across_its_plans() {
+    let (mut store, mut project) = created();
+    for index in 0..200 {
+        project.set("default", &format!("K{index:03}"), "v");
+    }
+    let base = project.clone();
+    let mut changed = base.clone();
+    changed.set("default", "A", "2");
+    store
+        .record(Action::Set, &created().1, &base, &[])
+        .expect("many keys");
+    let mut round = 0;
+    loop {
+        round += 1;
+        let mut next = project.clone();
+        next.set("default", "A", &format!("{round}{}", big('g', 4)));
+        let admissions = store.admissions;
+        crate::work::reset();
+        store
+            .record(Action::Set, &project, &next, &[])
+            .expect("recorded");
+        project = next;
+        if store.admissions > admissions {
+            let digests = crate::work::count(crate::work::Work::ValueDigest);
+            assert!(
+                digests <= 202 + 4,
+                "{digests} digests for 202 values across a growth rollover's two plans"
+            );
+            break;
+        }
+        assert!(round < 64, "the ring grows within a few large changes");
+    }
+}
+
+#[test]
+fn a_change_tells_whether_it_touches_a_key_without_digests() {
+    use crate::history::values::Rename;
+    let cases: Vec<(Project, Project, Vec<Rename<'static>>)> = vec![
+        (Project::default(), Project::with(&[("e", &[])]), vec![]),
+        (Project::with(&[("e", &[])]), Project::default(), vec![]),
+        (
+            Project::with(&[("e", &[("A", "1")])]),
+            Project::with(&[("f", &[("A", "1")])]),
+            vec![Rename::Environment { from: "e", to: "f" }],
+        ),
+        (
+            Project::with(&[("e", &[("A", "1")])]),
+            Project::with(&[("f", &[("A", "1")])]),
+            vec![],
+        ),
+        (
+            Project::with(&[("e", &[("A", "1")])]),
+            Project::with(&[("e", &[("B", "1")])]),
+            vec![Rename::Key {
+                environment: "e",
+                from: "A",
+                to: "B",
+            }],
+        ),
+        (
+            Project::with(&[("e", &[("A", "1")])]),
+            Project::with(&[("e", &[("A", "2")])]),
+            vec![],
+        ),
+        (
+            Project::with(&[("e", &[("A", "1")]), ("g", &[])]),
+            Project::with(&[("e", &[("A", "1")])]),
+            vec![],
+        ),
+        (
+            Project::with(&[("e", &[("A", "1")])]),
+            Project::with(&[("e", &[("A", "1")]), ("f", &[("A", "1")])]),
+            vec![Rename::Environment { from: "e", to: "f" }],
+        ),
+    ];
+    let keys = KeyRecord::generate(
+        Approval::Automatic,
+        &mut crate::keyring::tests::CountingRandom(3),
+    )
+    .expect("record")
+    .digest_keys(VAULT);
+    for (before, after, renames) in &cases {
+        let before_values = before.values();
+        let after_values = after.values();
+        let change = Change {
+            id: [1; 16],
+            time: 0,
+            actor: Actor::Cli,
+            action: Action::Set,
+            detail: Detail::default(),
+            before: &before_values,
+            after: &after_values,
+            renames,
+        };
+        let entry_changes_keys = crate::history::values::net_change(
+            &before_values,
+            &before_values.summary(&keys),
+            &after_values,
+            renames,
+            &keys,
+        )
+        .iter()
+        .any(|environment| environment.key_count() > 0);
+        assert_eq!(
+            change.changes_keys(),
+            entry_changes_keys,
+            "{before:?} -> {after:?} with {renames:?}"
+        );
+    }
+}
+
+#[test]
+fn too_many_values_agrees_with_the_summary_check() {
+    for keys in [10_usize, 2_000, 2_400, 2_600, 3_000] {
+        let mut project = Project::with(&[("e", &[])]);
+        for index in 0..keys {
+            project.set("e", &format!("KEY_NUMBER_{index:08}"), "v");
+        }
+        let values = project.values();
+        let record = KeyRecord::generate(
+            Approval::Automatic,
+            &mut crate::keyring::tests::CountingRandom(4),
+        )
+        .expect("record");
+        let summary = values.summary(&record.digest_keys(VAULT));
+        assert_eq!(
+            too_many_values(&values),
+            check_summary(&summary).is_err(),
+            "{keys} keys"
         );
     }
 }

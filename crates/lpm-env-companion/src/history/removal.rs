@@ -16,7 +16,7 @@
 //! client finishes what another started. A rotation without a removal runs
 //! the same steps with nothing to scrub.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use crate::append_log::{HISTORY, Head, MAX_REMOVAL_PLACES, Removing};
@@ -26,7 +26,7 @@ use crate::history::codec::{
 use crate::history::read::{Opened, PartRead, PartSource, ReadError, Scrub};
 use crate::history::values::Values;
 use crate::history::{RecordWrite, head_account, key_account, part_account, part_identity};
-use crate::keyring::{self, Approval, Digest, KeyRecord, Random, RotationError};
+use crate::keyring::{self, Approval, Digest, DigestKeys, KeyRecord, Random, RotationError};
 
 /// The value a person chose on an entry: a key's value before or after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +64,8 @@ pub struct Place {
     pub key: String,
     /// The key's other names, sorted.
     pub renamed_from: Vec<String>,
+    /// The environment's other names, sorted.
+    pub renamed_environments: Vec<String>,
     pub group: PlaceGroup,
     /// Newest first.
     pub occurrences: Vec<Occurrence>,
@@ -153,11 +155,12 @@ impl From<ReadError> for RemovalError {
 /// Names linked by renames, so a place keeps one identity through them.
 #[derive(Default)]
 struct Aliases {
-    parent: BTreeMap<String, String>,
+    parent: HashMap<String, String>,
 }
 
 impl Aliases {
     fn root(&mut self, name: &str) -> String {
+        crate::work::note(crate::work::Work::AliasStep);
         let parent = self
             .parent
             .entry(name.to_owned())
@@ -178,21 +181,26 @@ impl Aliases {
         }
     }
 
-    /// The root of `name` without shortening any path, for reads.
-    fn find<'a>(&'a self, mut name: &'a str) -> &'a str {
-        while let Some(parent) = self.parent.get(name).filter(|parent| *parent != name) {
-            name = parent;
+    /// Every name, by its group's root.
+    fn groups(&mut self) -> HashMap<String, Vec<String>> {
+        let names: Vec<String> = self.parent.keys().cloned().collect();
+        let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+        for name in names {
+            let root = self.root(&name);
+            groups.entry(root).or_default().push(name);
         }
-        name
+        groups
     }
+}
 
-    fn members(&self, root: &str) -> Vec<String> {
-        self.parent
-            .keys()
-            .filter(|name| self.find(name) == root)
-            .cloned()
-            .collect()
-    }
+/// A side holding some value, seen before the walk knew which value the
+/// review is for.
+struct Sighting {
+    digest: Digest,
+    place: (String, String),
+    time: i64,
+    set: bool,
+    seq: u64,
 }
 
 /// What the review's walk collects, resolved into places once every rename
@@ -209,8 +217,18 @@ struct Found {
     seen: BTreeMap<(String, String), u64>,
 }
 
+impl Found {
+    fn add(&mut self, place: (String, String), time: i64, set: bool, seq: u64) {
+        let seen = self.seen.entry(place.clone()).or_insert(seq);
+        *seen = (*seen).max(seq);
+        self.events.entry(place).or_default().push((time, set));
+    }
+}
+
 /// Review removing the value `chosen` names: every place it appears, in
-/// every readable part, grouped and with its occurrences.
+/// every readable part, grouped and with its occurrences. One walk: sides
+/// read before the chosen entry are held, names and digests only, until
+/// its value is known.
 pub fn review_removal(
     opened: &Opened,
     source: &mut impl PartSource,
@@ -220,41 +238,42 @@ pub fn review_removal(
     if opened.record.is_rotating() || opened.head.removing.is_some() {
         return Err(RemovalError::Running);
     }
-    let mut value = None;
-    let mut found_entry = false;
+    let mut value: Option<Option<Digest>> = None;
+    let mut found = Found::default();
+    let mut sightings: Vec<Sighting> = Vec::new();
+    let mut entries: HashSet<EntryId> = HashSet::new();
     opened.walk(source, |read| {
-        let PartRead::Readable { plaintext, .. } = read else {
+        let PartRead::Readable { decoded, .. } = read else {
             return true;
         };
-        let part = Part::decode(&plaintext).expect("walk decoded it");
-        for entry in part.decoded_entries() {
-            if entry.id != chosen.entry {
+        for entry in decoded.decoded_entries() {
+            if !entries.insert(entry.id) {
                 continue;
             }
-            found_entry = true;
-            value = side_of(&entry, chosen).map(|side| side.digest());
-            return false;
+            if value.is_none() && entry.id == chosen.entry {
+                let Some(side) = side_of(entry, chosen) else {
+                    return false;
+                };
+                let digest = side.digest();
+                value = Some(digest);
+                let Some(digest) = digest else {
+                    return false;
+                };
+                for sighting in sightings.drain(..) {
+                    if sighting.digest == digest {
+                        found.add(sighting.place, sighting.time, sighting.set, sighting.seq);
+                    }
+                }
+            }
+            collect(entry, value.flatten(), &mut found, &mut sightings);
         }
         true
     })?;
-    if !found_entry {
-        return Err(RemovalError::NotFound);
-    }
     let value = value
         .ok_or(RemovalError::NotFound)?
         .ok_or(RemovalError::NothingToRemove)?;
+    drop(sightings);
 
-    let mut found = Found::default();
-    opened.walk(source, |read| {
-        let PartRead::Readable { plaintext, .. } = read else {
-            return true;
-        };
-        let part = Part::decode(&plaintext).expect("walk decoded it");
-        for entry in part.decoded_entries() {
-            collect(&entry, value, &mut found);
-        }
-        true
-    })?;
     let mut environments = Aliases::default();
     for (from, to) in &found.environment_renames {
         environments.link(from, to);
@@ -264,35 +283,29 @@ pub fn review_removal(
         let root = environments.root(environment);
         keys.link(&key_identity(&root, from), &key_identity(&root, to));
     }
-
-    // The chosen key in every environment: any place whose names share one
-    // with the chosen key's names through its renames.
-    let chosen_names: BTreeSet<String> = {
-        let environment = environments.root(chosen.environment);
-        let root = keys.root(&key_identity(&environment, chosen.key));
-        keys.members(&root)
-            .into_iter()
-            .filter_map(|identity| identity.split_once('\u{0}').map(|(_, key)| key.to_owned()))
-            .collect()
-    };
     let mut places: BTreeMap<(String, String), Place> = BTreeMap::new();
     let mut newest: BTreeMap<(String, String), u64> = BTreeMap::new();
+    let chosen_identity = {
+        let environment = environments.root(chosen.environment);
+        keys.root(&key_identity(&environment, chosen.key))
+    };
     for ((environment, key), events) in &found.events {
         let environment_root = environments.root(environment);
         let key_root = keys.root(&key_identity(&environment_root, key));
-        let place_key = (environment_root.clone(), key_root.clone());
+        let place_key = (environment_root, key_root);
         let order = found.seen[&(environment.clone(), key.clone())];
         let place = places.entry(place_key.clone()).or_insert_with(|| Place {
             environment: environment.clone(),
             key: key.clone(),
             renamed_from: Vec::new(),
+            renamed_environments: Vec::new(),
             group: PlaceGroup::OtherKey,
             occurrences: Vec::new(),
             current: false,
             digests: Vec::new(),
         });
         if newest.get(&place_key).is_none_or(|seen| order > *seen) {
-            newest.insert(place_key.clone(), order);
+            newest.insert(place_key, order);
             place.environment = environment.clone();
             place.key = key.clone();
         }
@@ -300,20 +313,36 @@ pub fn review_removal(
         sorted.sort_unstable();
         place.occurrences.extend(pair(&sorted));
     }
+    let environment_groups = environments.groups();
+    let key_groups = keys.groups();
+    let names_of = |identity: &str| -> BTreeSet<String> {
+        key_groups
+            .get(identity)
+            .map_or_else(|| vec![identity.to_owned()], Clone::clone)
+            .iter()
+            .filter_map(|identity| identity.split_once('\u{0}').map(|(_, key)| key.to_owned()))
+            .collect()
+    };
+    let chosen_names = names_of(&chosen_identity);
     let digest_keys = &opened.keys;
+    let holding = current_places(digest_keys, current, value);
     let mut out: Vec<Place> = Vec::with_capacity(places.len());
     for ((environment_root, key_root), mut place) in places {
-        let environment_names = environments.members(&environment_root);
-        let key_names: BTreeSet<String> = keys
-            .members(&key_root)
-            .into_iter()
-            .filter_map(|identity| identity.split_once('\u{0}').map(|(_, key)| key.to_owned()))
-            .collect();
+        let environment_names = environment_groups
+            .get(&environment_root)
+            .map_or_else(|| vec![environment_root.clone()], Clone::clone);
+        let key_names = names_of(&key_root);
         place.renamed_from = key_names
             .iter()
             .filter(|name| **name != place.key)
             .cloned()
             .collect();
+        place.renamed_environments = environment_names
+            .iter()
+            .filter(|name| **name != place.environment)
+            .cloned()
+            .collect();
+        place.renamed_environments.sort_unstable();
         if !key_names.is_disjoint(&chosen_names) {
             place.group = PlaceGroup::ThisKey;
         }
@@ -324,9 +353,7 @@ pub fn review_removal(
             }
         }
         place.digests = digests.into_iter().collect();
-        place.current = current
-            .get(&place.environment, &place.key)
-            .is_some_and(|stored| digest_keys.value(stored.as_bytes()) == value);
+        place.current = place.digests.iter().any(|digest| holding.contains(digest));
         place
             .occurrences
             .sort_by_key(|occurrence| std::cmp::Reverse(occurrence.set.or(occurrence.replaced)));
@@ -344,6 +371,23 @@ pub fn review_removal(
         generation: opened.record.current().generation(),
         places: out,
     })
+}
+
+/// The place digest of every key that holds `value` now. A place is
+/// current when any name it had is one of them: removing the value there
+/// would last only until the next change recorded it again, since removal
+/// scrubs by name.
+fn current_places(keys: &DigestKeys, current: &Values<'_>, value: Digest) -> HashSet<Digest> {
+    current
+        .environments()
+        .iter()
+        .flat_map(|(environment, values)| {
+            values
+                .iter()
+                .filter(|(_, stored)| keys.value(stored.as_bytes()) == value)
+                .map(|(key, _)| keys.place(environment, key))
+        })
+        .collect()
 }
 
 /// A key's identity within an environment's alias group.
@@ -373,7 +417,14 @@ fn side_of<'a>(entry: &Entry<'a>, chosen: Chosen<'_>) -> Option<Side<'a>> {
     })
 }
 
-fn collect(entry: &Entry<'_>, value: Digest, found: &mut Found) {
+/// Collect `entry`'s renames and its sides that hold `value`, or, before
+/// the value is known, every side that holds some value.
+fn collect(
+    entry: &Entry<'_>,
+    value: Option<Digest>,
+    found: &mut Found,
+    sightings: &mut Vec<Sighting>,
+) {
     for environment in &entry.environments {
         let before_environment = match environment.kind {
             EnvironmentKind::RenamedFrom(from) => {
@@ -403,17 +454,21 @@ fn collect(entry: &Entry<'_>, value: Digest, found: &mut Found) {
                 (&change.before, before_environment, before_key, false),
                 (&change.after, environment.name, change.key, true),
             ] {
-                if side.digest() != Some(value) {
+                let Some(digest) = side.digest() else {
                     continue;
-                }
+                };
                 let place = (environment_name.to_owned(), key.to_owned());
-                found
-                    .events
-                    .entry(place.clone())
-                    .or_default()
-                    .push((entry.time, set));
-                let seen = found.seen.entry(place).or_insert(entry.seq);
-                *seen = (*seen).max(entry.seq);
+                match value {
+                    Some(value) if digest == value => found.add(place, entry.time, set, entry.seq),
+                    Some(_) => {}
+                    None => sightings.push(Sighting {
+                        digest,
+                        place,
+                        time: entry.time,
+                        set,
+                        seq: entry.seq,
+                    }),
+                }
             }
         }
     }
@@ -464,6 +519,7 @@ pub fn start_removal(
     if opened.record.current().generation() != review.generation {
         return Err(RemovalError::ChangedSinceReview);
     }
+    let holding = current_places(&opened.keys, current, review.value);
     let mut places: BTreeSet<Digest> = BTreeSet::new();
     let mut chosen = 0;
     for index in selection {
@@ -474,10 +530,7 @@ pub fn start_removal(
         if place.current {
             continue;
         }
-        if current
-            .get(&place.environment, &place.key)
-            .is_some_and(|stored| opened.keys.value(stored.as_bytes()) == review.value)
-        {
+        if place.digests.iter().any(|digest| holding.contains(digest)) {
             return Err(RemovalError::ChangedSinceReview);
         }
         chosen += 1;
@@ -621,7 +674,7 @@ fn scrubbed_part(
     let entries: Vec<Entry<'_>> = part
         .decoded_entries()
         .map(|entry| {
-            let (scrubbed, entry_changed) = scrub.entry(&entry);
+            let (scrubbed, entry_changed) = scrub.entry(entry);
             changed |= entry_changed;
             scrubbed
         })

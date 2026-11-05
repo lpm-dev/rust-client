@@ -63,6 +63,18 @@ pub fn admit_growth(existing: usize) -> bool {
     existing.saturating_add(1) <= ADMISSION_TARGET
 }
 
+/// Whether the ring `head` describes may add a part: a ring below its limit
+/// while the service stays within its target, and a ring shrunk below a
+/// full one once the service is back below [`REGROW_BELOW`], so rings
+/// don't flap around the target.
+pub fn admit_growth_of(head: &Head, existing: usize) -> bool {
+    if head.would_grow() {
+        admit_growth(existing)
+    } else {
+        head.may_regrow(HISTORY) && existing.saturating_add(1) < REGROW_BELOW
+    }
+}
+
 /// One project's ring, from the names-only inventory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ring {

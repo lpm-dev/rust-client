@@ -325,6 +325,39 @@ fn diff_keys<'a>(
     changes
 }
 
+/// The keys of two sorted maps in order, each with its value on either
+/// side, in one pass and without collecting them.
+fn merged<'m, 'k, A, B>(
+    left: &'m BTreeMap<&'k str, A>,
+    right: &'m BTreeMap<&'k str, B>,
+) -> impl Iterator<Item = (&'k str, Option<&'m A>, Option<&'m B>)> + 'm {
+    let mut left = left.iter().peekable();
+    let mut right = right.iter().peekable();
+    std::iter::from_fn(move || {
+        let order = match (left.peek(), right.peek()) {
+            (None, None) => return None,
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (Some((left_key, _)), Some((right_key, _))) => left_key.cmp(right_key),
+        };
+        Some(match order {
+            std::cmp::Ordering::Less => {
+                let (key, value) = left.next().expect("peeked");
+                (*key, Some(value), None)
+            }
+            std::cmp::Ordering::Greater => {
+                let (key, value) = right.next().expect("peeked");
+                (*key, None, Some(value))
+            }
+            std::cmp::Ordering::Equal => {
+                let (key, left_value) = left.next().expect("peeked");
+                let (_, right_value) = right.next().expect("peeked");
+                (*key, Some(left_value), Some(right_value))
+            }
+        })
+    })
+}
+
 /// Every difference between `baseline`, the summary of what history last
 /// recorded, and `current`, the stored values with their summary, as an
 /// `outside` entry's environments. Each changed key's before side keeps
@@ -335,15 +368,7 @@ pub fn gap_changes<'a>(
     current_summary: &Summary<'a>,
 ) -> Vec<EnvironmentChange<'a>> {
     let mut changes = Vec::new();
-    let names: BTreeSet<&'a str> = baseline
-        .environments
-        .keys()
-        .chain(current.environments.keys())
-        .copied()
-        .collect();
-    for name in names {
-        let recorded_keys = baseline.environments.get(name);
-        let stored = current.environments.get(name);
+    for (name, recorded_keys, stored) in merged(&baseline.environments, &current.environments) {
         let digests = current_summary.environments.get(name);
         let after_side = |key: &'a str, value: &'a str| Side::Value {
             value,
@@ -386,10 +411,8 @@ pub fn gap_changes<'a>(
             }),
             (Some(recorded_keys), Some(stored)) => {
                 let mut key_changes = Vec::new();
-                let keys: BTreeSet<&'a str> =
-                    recorded_keys.keys().chain(stored.keys()).copied().collect();
-                for key in keys {
-                    match (recorded_keys.get(key), stored.get(key)) {
+                for (key, slot, value) in merged(recorded_keys, stored) {
+                    match (slot, value) {
                         (None, None) => {}
                         (Some(slot), None) => key_changes.push(KeyChange {
                             key,

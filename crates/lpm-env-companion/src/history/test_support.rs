@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use crate::account::CompanionAccount;
 use crate::append_log::{HISTORY, Head};
 use crate::history::append::{
-    AppendPlan, AppendWrite, Change, CreationPlan, Growth, NotRecorded, Stored, plan_append,
-    plan_creation,
+    AppendCache, AppendPlan, AppendWrite, Change, CreationPlan, Growth, NotRecorded, Stored,
+    plan_append, plan_creation,
 };
 use crate::history::codec::{Action, Actor, Detail, Entry, Part};
 use crate::history::values::{Rename, Values};
@@ -67,6 +67,8 @@ pub(crate) struct Store {
     pub(crate) time: i64,
     pub(crate) growth: Option<bool>,
     pub(crate) ring_limit: u16,
+    /// How many times a plan asked admission whether its ring may grow.
+    pub(crate) admissions: usize,
 }
 
 /// What one recording did, for assertions.
@@ -212,6 +214,7 @@ impl Store {
         }
         let mut growth = Growth::Unasked;
         let mut previous: Option<Vec<u8>> = None;
+        let mut cache = AppendCache::default();
         loop {
             let tail = Head::parse(
                 HISTORY,
@@ -230,7 +233,7 @@ impl Store {
                 previous: previous.as_deref(),
             };
             let mut random = self.random();
-            match plan_append(VAULT, &stored, &change, growth, &mut random)? {
+            match plan_append(VAULT, &stored, &change, growth, &mut cache, &mut random)? {
                 AppendPlan::Unchanged => return Ok(Recorded::Unchanged),
                 AppendPlan::AlreadyRecorded => return Ok(Recorded::AlreadyRecorded),
                 AppendPlan::NeedsPrevious { part } => {
@@ -239,6 +242,7 @@ impl Store {
                 }
                 AppendPlan::NeedsGrowthAdmission => {
                     assert_eq!(growth, Growth::Unasked, "admission is asked once");
+                    self.admissions += 1;
                     growth = if self.growth.unwrap_or(true) {
                         Growth::Allowed
                     } else {
@@ -283,7 +287,7 @@ impl Store {
     pub(crate) fn with_entries(&self, part: u16, check: impl FnOnce(&[Entry<'_>])) {
         let plaintext = self.plaintext(part);
         let decoded = Part::decode(&plaintext).expect("part decodes");
-        let entries: Vec<Entry<'_>> = decoded.decoded_entries().collect();
+        let entries: Vec<Entry<'_>> = decoded.decoded_entries().cloned().collect();
         check(&entries);
     }
 }

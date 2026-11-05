@@ -3,12 +3,13 @@
 //! gap between the newest summary and the stored values, and the scrub
 //! readers apply while a removal runs.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 use zeroize::Zeroizing;
 
-use crate::append_log::{HISTORY, Head};
+use crate::append_log::{self, HISTORY, Head};
 use crate::history::codec::{
     Action, Actor, Detail, Entry, EntryId, EnvironmentChange, EnvironmentKind, Flags, KeyChange,
     KeyKind, Keys, Part, Platform, Related, Remote, Side, Slot, Summary, Unkept,
@@ -18,15 +19,17 @@ use crate::history::values::{Values, gap_changes};
 use crate::keyring::{self, Digest, DigestKeys, KeyRecord};
 
 /// Damage in history's records that a names-only listing can't see: a head
-/// or key that won't parse, or a tail that won't open. A tail that's absent
-/// or from another epoch is a rollover a crash interrupted, which the next
-/// append finishes, so it isn't damage. Repairing any of these removes
-/// history; it stays on and restarts at the next change.
+/// or key that won't parse, or a newest part an append can't build on. A
+/// tail that's absent or from another epoch is a rollover a crash
+/// interrupted, which the next append finishes from the part before it, so
+/// it's damage only when that part is missing or won't read too. Repairing
+/// any of these removes history; it stays on and restarts at the next
+/// change. `part` reads one part's sealed bytes.
 pub fn check_records(
     vault_id: &str,
     head: Option<&[u8]>,
     key: Option<&[u8]>,
-    tail: impl FnOnce(u16) -> Option<Vec<u8>>,
+    mut part: impl FnMut(u16) -> Option<Vec<u8>>,
 ) -> Vec<crate::gate::Damage> {
     use crate::gate::Damage;
     let mut damage = Vec::new();
@@ -44,36 +47,60 @@ pub fn check_records(
             reason: error.to_string(),
         });
     }
-    if let (Some(Ok(head)), Some(Ok(record))) = (head, record)
-        && let Some(sealed) = tail(head.tail())
-    {
-        let opened = keyring::open(&record, &part_identity(vault_id, head.tail()), &sealed)
+    let (Some(Ok(head)), Some(Ok(record))) = (head, record) else {
+        return damage;
+    };
+    let epoch_of = |number: u16, sealed: &[u8]| {
+        keyring::open(&record, &part_identity(vault_id, number), sealed)
             .map_err(|error| error.to_string())
             .and_then(|plaintext| {
                 Part::decode(&plaintext)
-                    .map(|part| part.epoch)
+                    .map(|decoded| decoded.epoch)
                     .map_err(|error| error.to_string())
-            });
-        if let Err(reason) = opened {
+            })
+    };
+    let tail = head.tail();
+    let tail_epoch = match part(tail).map(|sealed| epoch_of(tail, &sealed)) {
+        Some(Err(reason)) => {
             damage.push(Damage::InvalidRecord {
                 kind: HISTORY.kind.to_owned(),
                 reason: format!("the newest part won't read: {reason}"),
             });
+            return damage;
         }
+        Some(Ok(epoch)) => Some(epoch),
+        None => None,
+    };
+    if append_log::tail_state(&head, tail_epoch) == append_log::TailState::Current {
+        return damage;
     }
+    let reason = match head.before_tail() {
+        None => "the newest part is missing and no part comes before it".to_owned(),
+        Some(previous) => match part(previous).map(|sealed| epoch_of(previous, &sealed)) {
+            Some(Ok(_)) => return damage,
+            Some(Err(reason)) => {
+                format!("the newest part is missing and the part before it won't read: {reason}")
+            }
+            None => "the newest part and the part before it are missing".to_owned(),
+        },
+    };
+    damage.push(Damage::InvalidRecord {
+        kind: HISTORY.kind.to_owned(),
+        reason,
+    });
     damage
 }
 
 /// Where a reader gets parts from: the store, read one at a time inside the
-/// client's lock, or the array the app passed.
+/// client's lock, or the array the app passed, lent without a copy.
 pub trait PartSource {
     /// The sealed bytes of `part`, or `None` when its account is absent.
-    fn part(&mut self, part: u16) -> Result<Option<Vec<u8>>, String>;
+    fn part(&mut self, part: u16) -> Result<Option<Cow<'_, [u8]>>, String>;
 }
 
 impl<F: FnMut(u16) -> Result<Option<Vec<u8>>, String>> PartSource for F {
-    fn part(&mut self, part: u16) -> Result<Option<Vec<u8>>, String> {
-        self(part)
+    fn part(&mut self, part: u16) -> Result<Option<Cow<'_, [u8]>>, String> {
+        self(part).map(|sealed| sealed.map(Cow::Owned))
     }
 }
 
@@ -114,15 +141,19 @@ impl fmt::Debug for Opened {
     }
 }
 
-/// One part as a reader found it.
-pub enum PartRead {
+/// One part as a reader found it. A readable part is decoded once and lent
+/// to the visitor; its plaintext is wiped when the visitor returns.
+pub enum PartRead<'p> {
     Readable {
         part: u16,
-        plaintext: Zeroizing<Vec<u8>>,
+        decoded: &'p Part<'p>,
     },
     /// Listed but absent, sealed under a key this history doesn't hold,
     /// changed, or not a valid part.
-    Unreadable { part: u16, tail: bool },
+    Unreadable {
+        part: u16,
+        tail: bool,
+    },
 }
 
 impl Opened {
@@ -152,6 +183,24 @@ impl Opened {
         self.scrub.as_ref()
     }
 
+    /// `entry` as readers may return it: scrubbed while a removal runs,
+    /// borrowed otherwise.
+    pub fn scrubbed<'e, 'a>(&self, entry: &'e Entry<'a>) -> Cow<'e, Entry<'a>> {
+        match &self.scrub {
+            Some(scrub) => Cow::Owned(scrub.entry(entry).0),
+            None => Cow::Borrowed(entry),
+        }
+    }
+
+    /// `summary` as readers may use it: scrubbed while a removal runs,
+    /// borrowed otherwise.
+    pub fn scrubbed_summary<'s, 'a>(&self, summary: &'s Summary<'a>) -> Cow<'s, Summary<'a>> {
+        match &self.scrub {
+            Some(scrub) => Cow::Owned(scrub.summary(summary).0),
+            None => Cow::Borrowed(summary),
+        }
+    }
+
     /// Read each listed part, newest first, and hand it to `visit` until it
     /// returns `false`. A tail a rollover's crash left behind (absent, or
     /// from another epoch) holds nothing newer, so it's skipped; any other
@@ -159,36 +208,46 @@ impl Opened {
     pub fn walk(
         &self,
         source: &mut impl PartSource,
-        mut visit: impl FnMut(PartRead) -> bool,
+        mut visit: impl FnMut(PartRead<'_>) -> bool,
     ) -> Result<(), ReadError> {
         let tail = self.head.tail();
         for part in self.head.parts.iter().rev().copied() {
             let is_tail = part == tail;
+            let unreadable = PartRead::Unreadable {
+                part,
+                tail: is_tail,
+            };
             let Some(sealed) = source.part(part).map_err(ReadError::Storage)? else {
                 if is_tail {
                     continue;
                 }
-                if !visit(PartRead::Unreadable { part, tail: false }) {
+                if !visit(unreadable) {
                     break;
                 }
                 continue;
             };
-            let read =
-                match keyring::open(&self.record, &part_identity(&self.vault_id, part), &sealed) {
-                    Err(_) => PartRead::Unreadable {
-                        part,
-                        tail: is_tail,
-                    },
-                    Ok(plaintext) => match Part::decode(&plaintext).map(|decoded| decoded.epoch) {
-                        Err(_) => PartRead::Unreadable {
-                            part,
-                            tail: is_tail,
-                        },
-                        Ok(epoch) if is_tail && epoch != self.head.tail_epoch => continue,
-                        Ok(_) => PartRead::Readable { part, plaintext },
-                    },
-                };
-            if !visit(read) {
+            let Ok(plaintext) =
+                keyring::open(&self.record, &part_identity(&self.vault_id, part), &sealed)
+            else {
+                if !visit(unreadable) {
+                    break;
+                }
+                continue;
+            };
+            drop(sealed);
+            let Ok(decoded) = Part::decode(&plaintext) else {
+                if !visit(unreadable) {
+                    break;
+                }
+                continue;
+            };
+            if is_tail && decoded.epoch != self.head.tail_epoch {
+                continue;
+            }
+            if !visit(PartRead::Readable {
+                part,
+                decoded: &decoded,
+            }) {
                 break;
             }
         }
@@ -523,28 +582,27 @@ impl SourceGroup {
 /// How a listing matches keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyMatch<'a> {
-    /// The key's name, or a name it was renamed from, exactly.
+    /// The key under its name now, and under every name it had before,
+    /// following renames back.
     Exact(&'a str),
     /// Names containing the text, ignoring ASCII case, as a search box does.
     Contains(&'a str),
 }
 
-impl KeyMatch<'_> {
-    fn matches(&self, name: &str) -> bool {
-        match self {
-            Self::Exact(wanted) => name == *wanted,
-            Self::Contains(text) => name
-                .to_ascii_lowercase()
-                .contains(&text.to_ascii_lowercase()),
-        }
-    }
+fn contains_ignoring_ascii_case(name: &str, text: &str) -> bool {
+    text.is_empty()
+        || name
+            .as_bytes()
+            .windows(text.len())
+            .any(|window| window.eq_ignore_ascii_case(text.as_bytes()))
 }
 
 /// What a listing shows.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Filter<'a> {
-    /// Entries touching this environment, under this name or a name it was
-    /// renamed from.
+    /// Entries touching this environment, named as it is now (or as it was
+    /// when deleted), and under every name it had before, following renames
+    /// back.
     pub environment: Option<&'a str>,
     pub key: Option<KeyMatch<'a>>,
     pub source: Option<SourceGroup>,
@@ -553,21 +611,116 @@ pub struct Filter<'a> {
 }
 
 impl Filter<'_> {
-    fn touches(&self, environments: &[EnvironmentInfo]) -> bool {
-        environments.iter().any(|environment| {
-            let environment_matches = self.environment.is_none_or(|wanted| {
-                environment.name == wanted
-                    || matches!(&environment.kind, EnvironmentKindInfo::RenamedFrom(from) if from == wanted)
-            });
-            let key_matches = self.key.is_none_or(|key| match &environment.keys {
-                KeysInfo::Count(_) => false,
-                KeysInfo::Changes(changes) => changes.iter().any(|change| {
-                    key.matches(&change.key)
-                        || matches!(&change.kind, KeyKindInfo::RenamedFrom(from) if key.matches(from))
-                }),
-            });
-            environment_matches && key_matches
-        })
+    fn narrows(&self) -> bool {
+        self.environment.is_some() || self.key.is_some()
+    }
+}
+
+/// A filter's environment and exact key, followed back through renames as
+/// a listing goes from the newest entry to the oldest.
+struct Matcher<'f> {
+    filter: &'f Filter<'f>,
+    /// The filtered environment's name before the entries matched so far.
+    environment: Option<String>,
+    /// An exact key's name before the entries matched so far, by the name
+    /// its environment had then, where it differs from the filter's.
+    renamed_keys: HashMap<String, String>,
+}
+
+impl<'f> Matcher<'f> {
+    fn new(filter: &'f Filter<'f>) -> Self {
+        Self {
+            filter,
+            environment: filter.environment.map(str::to_owned),
+            renamed_keys: HashMap::new(),
+        }
+    }
+
+    /// Whether `environments`, one entry's changes, touch what the filter
+    /// follows; then step back across the renames they record.
+    fn matches(&mut self, environments: &[EnvironmentInfo]) -> bool {
+        let mut matched = false;
+        let mut environment_rename: Option<String> = None;
+        let mut key_moves: Vec<(String, String, Option<String>)> = Vec::new();
+        for environment in environments {
+            if self
+                .environment
+                .as_deref()
+                .is_some_and(|wanted| environment.name != wanted)
+            {
+                continue;
+            }
+            let earlier_name = match &environment.kind {
+                EnvironmentKindInfo::RenamedFrom(from) => Some(from.clone()),
+                _ => None,
+            };
+            let key_matches = match self.filter.key {
+                None => true,
+                Some(KeyMatch::Contains(text)) => match &environment.keys {
+                    KeysInfo::Count(_) => false,
+                    KeysInfo::Changes(changes) => changes.iter().any(|change| {
+                        contains_ignoring_ascii_case(&change.key, text)
+                            || matches!(&change.kind, KeyKindInfo::RenamedFrom(from)
+                                if contains_ignoring_ascii_case(from, text))
+                    }),
+                },
+                Some(KeyMatch::Exact(wanted)) => {
+                    let name = self
+                        .renamed_keys
+                        .get(&environment.name)
+                        .map_or(wanted, String::as_str);
+                    let change = match &environment.keys {
+                        KeysInfo::Count(_) => None,
+                        KeysInfo::Changes(changes) => {
+                            changes.iter().find(|change| change.key == name)
+                        }
+                    };
+                    let earlier_key = match change.map(|change| &change.kind) {
+                        Some(KeyKindInfo::RenamedFrom(from)) => Some(from.clone()),
+                        _ => None,
+                    };
+                    if earlier_name.is_some() || earlier_key.is_some() {
+                        key_moves.push((
+                            environment.name.clone(),
+                            earlier_name
+                                .clone()
+                                .unwrap_or_else(|| environment.name.clone()),
+                            earlier_key
+                                .or_else(|| self.renamed_keys.get(&environment.name).cloned()),
+                        ));
+                    }
+                    change.is_some()
+                }
+            };
+            matched |= key_matches;
+            if self.environment.is_some()
+                && let Some(from) = earlier_name
+            {
+                environment_rename = Some(from);
+            }
+        }
+        if let Some(from) = environment_rename {
+            self.environment = Some(from);
+        }
+        for (name, earlier_name, key) in key_moves {
+            self.renamed_keys.remove(&name);
+            match key {
+                Some(key) if Some(key.as_str()) != self.exact_key() => {
+                    self.renamed_keys.insert(earlier_name, key);
+                }
+                _ => {
+                    self.renamed_keys.remove(&earlier_name);
+                }
+            }
+        }
+        matched
+    }
+
+    fn exact_key(&self) -> Option<&str> {
+        match self.filter.key {
+            Some(KeyMatch::Exact(key)) => Some(key),
+            _ => None,
+        }
     }
 }
 
@@ -592,7 +745,9 @@ pub struct LiveGap {
     pub environments: Vec<EnvironmentInfo>,
 }
 
-/// An environment the timeline names, current or deleted.
+/// An environment the timeline names, current or deleted. A name an
+/// environment had before a rename isn't listed: its entries are the
+/// renamed environment's, which a filter on its name follows back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvironmentName {
     pub name: String,
@@ -615,6 +770,44 @@ pub struct Timeline {
     pub environments: Vec<EnvironmentName>,
 }
 
+/// The environments a timeline names, gathered from the newest entry to
+/// the oldest.
+struct Names {
+    names: BTreeMap<String, Option<i64>>,
+    /// Names environments had before a rename seen so far.
+    earlier: HashSet<String>,
+}
+
+impl Names {
+    fn new(current: &Values<'_>) -> Self {
+        Self {
+            names: current
+                .environments()
+                .keys()
+                .map(|name| ((*name).to_owned(), None))
+                .collect(),
+            earlier: HashSet::new(),
+        }
+    }
+
+    fn note(&mut self, entry: &Entry<'_>) {
+        for environment in &entry.environments {
+            if !self.names.contains_key(environment.name)
+                && !self.earlier.contains(environment.name)
+            {
+                let deleted_at =
+                    (environment.kind == EnvironmentKind::Removed).then_some(entry.time);
+                self.names.insert(environment.name.to_owned(), deleted_at);
+            }
+            if let EnvironmentKind::RenamedFrom(from) = environment.kind
+                && !self.names.contains_key(from)
+            {
+                self.earlier.insert(from.to_owned());
+            }
+        }
+    }
+}
+
 /// Read the timeline: entries newest first, each repeated entry ID once
 /// (the oldest copy, as a retry after someone else's rollover stores it
 /// twice), unreadable parts at their place, and the live gap against
@@ -630,12 +823,10 @@ pub fn read_timeline(
     let mut newest_summary_seen = false;
     let mut damaged_tail = false;
     let mut unreadable_parts = 0;
-    let mut names: BTreeMap<String, Option<i64>> = current
-        .environments()
-        .keys()
-        .map(|name| ((*name).to_owned(), None))
-        .collect();
-    let current_summary = current.summary(&opened.keys);
+    let mut names = Names::new(current);
+    let gap_shown = filter
+        .source
+        .is_none_or(|group| group == SourceGroup::Outside);
     opened.walk(source, |read| {
         match read {
             PartRead::Unreadable { part, tail } => {
@@ -647,33 +838,24 @@ pub fn read_timeline(
                     before: None,
                 });
             }
-            PartRead::Readable { plaintext, .. } => {
-                let part = Part::decode(&plaintext).expect("walk decoded it");
+            PartRead::Readable { decoded, .. } => {
                 if !newest_summary_seen {
                     newest_summary_seen = true;
-                    let summary = scrubbed_summary(opened, &part.summary);
-                    let gaps = gap_changes(&summary, current, &current_summary);
-                    if !gaps.is_empty() {
-                        live_gap = Some(LiveGap {
-                            since: part.last_header().map(|header| header.time),
-                            environments: environments_info(&gaps),
-                        });
-                    }
-                }
-                for entry in part.decoded_entries().rev() {
-                    let entry = match opened.scrub() {
-                        Some(scrub) => scrub.entry(&entry).0,
-                        None => entry,
-                    };
-                    for environment in &entry.environments {
-                        if environment.kind == EnvironmentKind::Removed {
-                            names
-                                .entry(environment.name.to_owned())
-                                .or_insert(Some(entry.time));
-                        } else {
-                            names.entry(environment.name.to_owned()).or_insert(None);
+                    if gap_shown {
+                        let summary = opened.scrubbed_summary(&decoded.summary);
+                        let current_summary = current.summary(&opened.keys);
+                        let gaps = gap_changes(&summary, current, &current_summary);
+                        if !gaps.is_empty() {
+                            live_gap = Some(LiveGap {
+                                since: decoded.last_header().map(|header| header.time),
+                                environments: environments_info(&gaps),
+                            });
                         }
                     }
+                }
+                for entry in decoded.decoded_entries().rev() {
+                    let entry = opened.scrubbed(entry);
+                    names.note(&entry);
                     rows.push(TimelineRow::Entry(entry_info(&entry)));
                 }
             }
@@ -682,8 +864,8 @@ pub fn read_timeline(
     })?;
     // A retry after someone else's rollover can store an entry twice; the
     // oldest copy stays, in its place.
+    let mut kept_ids: HashSet<EntryId> = HashSet::with_capacity(rows.len());
     let mut deduplicated: Vec<TimelineRow> = Vec::with_capacity(rows.len());
-    let mut kept_ids: BTreeSet<EntryId> = BTreeSet::new();
     for row in rows.into_iter().rev() {
         if let TimelineRow::Entry(info) = &row
             && !kept_ids.insert(info.id)
@@ -700,45 +882,49 @@ pub fn read_timeline(
         .collect();
     let mut readable = 0;
     let mut oldest = None;
-    let mut matched: Vec<TimelineRow> = Vec::with_capacity(deduplicated.len());
+    let mut matcher = Matcher::new(filter);
     let mut shown = 0;
-    for (index, row) in deduplicated.iter().enumerate() {
+    let mut newer_time = None;
+    let mut matched: Vec<TimelineRow> = Vec::with_capacity(deduplicated.len());
+    let mut open_unreadable: Vec<usize> = Vec::new();
+    for row in deduplicated {
         match row {
             TimelineRow::Entry(info) => {
-                let filtered = filter.environment.is_some() || filter.key.is_some();
-                if filtered && !filter.touches(&info.environments) {
+                let time = info.time;
+                for index in open_unreadable.drain(..) {
+                    if let TimelineRow::Unreadable { after, .. } = &mut matched[index] {
+                        *after = Some(time);
+                    }
+                }
+                newer_time = Some(time);
+                if filter.narrows() && !matcher.matches(&info.environments) {
                     continue;
                 }
                 readable += 1;
                 *counts.entry(info.source()).or_default() += 1;
-                oldest = Some(info.time);
+                oldest = Some(time);
                 if filter.source.is_some_and(|group| group != info.source())
                     || filter.limit.is_some_and(|limit| shown >= limit)
                 {
                     continue;
                 }
                 shown += 1;
-                matched.push(row.clone());
+                matched.push(TimelineRow::Entry(info));
             }
             TimelineRow::Unreadable { part, .. } => {
-                let newer = deduplicated[..index].iter().rev().find_map(row_time);
-                let older = deduplicated[index + 1..].iter().find_map(row_time);
                 if filter.limit.is_none_or(|limit| shown < limit) {
+                    open_unreadable.push(matched.len());
                     matched.push(TimelineRow::Unreadable {
-                        part: *part,
-                        after: older,
-                        before: newer,
+                        part,
+                        after: None,
+                        before: newer_time,
                     });
                 }
             }
         }
     }
     let live_gap = live_gap.filter(|gap: &LiveGap| {
-        filter
-            .source
-            .is_none_or(|group| group == SourceGroup::Outside)
-            && (filter.environment.is_none() && filter.key.is_none()
-                || filter.touches(&gap.environments))
+        !filter.narrows() || Matcher::new(filter).matches(&gap.environments)
     });
     Ok(Timeline {
         rows: matched,
@@ -749,24 +935,48 @@ pub fn read_timeline(
         damaged_tail,
         unreadable_parts,
         environments: names
+            .names
             .into_iter()
             .map(|(name, deleted_at)| EnvironmentName { name, deleted_at })
             .collect(),
     })
 }
 
-fn row_time(row: &TimelineRow) -> Option<i64> {
-    match row {
-        TimelineRow::Entry(info) => Some(info.time),
-        TimelineRow::Unreadable { .. } => None,
-    }
+/// How much history holds, from entry headers alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Retained {
+    /// Readable entries, each repeated ID once.
+    pub readable: usize,
+    pub oldest: Option<i64>,
+    pub unreadable_parts: usize,
+    /// Whether the tail won't read, which damages history.
+    pub damaged_tail: bool,
 }
 
-fn scrubbed_summary<'a>(opened: &Opened, summary: &Summary<'a>) -> Summary<'a> {
-    match opened.scrub() {
-        Some(scrub) => scrub.summary(summary).0,
-        None => summary.clone(),
-    }
+/// Count what history holds without building any listing.
+pub fn read_retained(opened: &Opened, source: &mut impl PartSource) -> Result<Retained, ReadError> {
+    let mut retained = Retained::default();
+    let mut ids: HashSet<EntryId> = HashSet::new();
+    opened.walk(source, |read| {
+        match read {
+            PartRead::Unreadable { tail, .. } => {
+                retained.damaged_tail |= tail;
+                retained.unreadable_parts += 1;
+            }
+            PartRead::Readable { decoded, .. } => {
+                for entry in decoded.decoded_entries() {
+                    if ids.insert(entry.id) {
+                        retained.readable += 1;
+                    }
+                }
+                if let Some(first) = decoded.decoded_entries().next() {
+                    retained.oldest = Some(first.time);
+                }
+            }
+        }
+        true
+    })?;
+    Ok(retained)
 }
 
 /// A key change's kept values, before and after.
@@ -794,13 +1004,109 @@ impl fmt::Debug for RevealedEntry {
     }
 }
 
+/// An entry ID, or the start of one, as the hex digits a person types: the
+/// 8-digit short ID, any prefix of at least [`IdPrefix::MIN_DIGITS`], or
+/// all 32.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdPrefix {
+    bytes: EntryId,
+    digits: usize,
+}
+
+impl IdPrefix {
+    pub const MIN_DIGITS: usize = 6;
+
+    /// The prefix `text` spells, in either case, or `None` when it's too
+    /// short, too long or not hex.
+    pub fn parse(text: &str) -> Option<Self> {
+        let digits = text.len();
+        if !(Self::MIN_DIGITS..=32).contains(&digits) {
+            return None;
+        }
+        let mut bytes = [0_u8; 16];
+        for (index, digit) in text.bytes().enumerate() {
+            let nibble = char::from(digit).to_digit(16)? as u8;
+            bytes[index / 2] |= if index % 2 == 0 { nibble << 4 } else { nibble };
+        }
+        Some(Self { bytes, digits })
+    }
+
+    pub fn whole(id: EntryId) -> Self {
+        Self {
+            bytes: id,
+            digits: 32,
+        }
+    }
+
+    pub fn is_whole(&self) -> bool {
+        self.digits == 32
+    }
+
+    pub fn matches(&self, id: &EntryId) -> bool {
+        let full = self.digits / 2;
+        id[..full] == self.bytes[..full]
+            && (self.digits.is_multiple_of(2) || id[full] >> 4 == self.bytes[full] >> 4)
+    }
+}
+
 /// What looking an entry up by a prefix of its ID found.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EntryLookup {
+pub enum EntryLookup<T = RevealedEntry> {
     NotFound,
     /// More than one entry starts with the prefix.
     Ambiguous,
-    Found(Box<RevealedEntry>),
+    Found(Box<T>),
+}
+
+/// Find the one entry whose ID starts with `prefix`, and make `found` of
+/// it. A whole ID stops at its entry; a shorter prefix reads every part, so
+/// another entry starting the same way makes the lookup ambiguous.
+fn lookup<T>(
+    opened: &Opened,
+    source: &mut impl PartSource,
+    prefix: &IdPrefix,
+    found: impl Fn(&Entry<'_>) -> T,
+) -> Result<EntryLookup<T>, ReadError> {
+    let mut result: Option<(EntryId, T)> = None;
+    let mut ambiguous = false;
+    opened.walk(source, |read| {
+        let PartRead::Readable { decoded, .. } = read else {
+            return true;
+        };
+        for entry in decoded.decoded_entries() {
+            if !prefix.matches(&entry.id) {
+                continue;
+            }
+            match &result {
+                Some((id, _)) if *id != entry.id => {
+                    ambiguous = true;
+                    return false;
+                }
+                Some(_) => continue,
+                None => {
+                    result = Some((entry.id, found(&opened.scrubbed(entry))));
+                    if prefix.is_whole() {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    })?;
+    Ok(match (ambiguous, result) {
+        (true, _) => EntryLookup::Ambiguous,
+        (false, None) => EntryLookup::NotFound,
+        (false, Some((_, found))) => EntryLookup::Found(Box::new(found)),
+    })
+}
+
+/// Find the entry whose ID starts with `prefix`, names and kinds only.
+pub fn find_entry(
+    opened: &Opened,
+    source: &mut impl PartSource,
+    prefix: &IdPrefix,
+) -> Result<EntryLookup<EntryInfo>, ReadError> {
+    lookup(opened, source, prefix, entry_info)
 }
 
 /// Find the entry whose ID starts with `prefix` and return it with its
@@ -808,39 +1114,9 @@ pub enum EntryLookup {
 pub fn reveal_entry(
     opened: &Opened,
     source: &mut impl PartSource,
-    prefix: &[u8],
+    prefix: &IdPrefix,
 ) -> Result<EntryLookup, ReadError> {
-    let mut found: Option<RevealedEntry> = None;
-    let mut ambiguous = false;
-    opened.walk(source, |read| {
-        let PartRead::Readable { plaintext, .. } = read else {
-            return true;
-        };
-        let part = Part::decode(&plaintext).expect("walk decoded it");
-        for entry in part.decoded_entries() {
-            if !entry.id.starts_with(prefix) {
-                continue;
-            }
-            if found
-                .as_ref()
-                .is_some_and(|found| found.info.id != entry.id)
-            {
-                ambiguous = true;
-                return false;
-            }
-            let entry = match opened.scrub() {
-                Some(scrub) => scrub.entry(&entry).0,
-                None => entry,
-            };
-            found = Some(revealed(&entry));
-        }
-        true
-    })?;
-    Ok(match (ambiguous, found) {
-        (true, _) => EntryLookup::Ambiguous,
-        (false, None) => EntryLookup::NotFound,
-        (false, Some(found)) => EntryLookup::Found(Box::new(found)),
-    })
+    lookup(opened, source, prefix, revealed)
 }
 
 /// The entries whose IDs are in `ids`, with their values, in one walk.
@@ -851,19 +1127,14 @@ pub fn reveal_entries(
 ) -> Result<Vec<RevealedEntry>, ReadError> {
     let mut found: BTreeMap<EntryId, RevealedEntry> = BTreeMap::new();
     opened.walk(source, |read| {
-        let PartRead::Readable { plaintext, .. } = read else {
+        let PartRead::Readable { decoded, .. } = read else {
             return true;
         };
-        let part = Part::decode(&plaintext).expect("walk decoded it");
-        for entry in part.decoded_entries() {
+        for entry in decoded.decoded_entries() {
             if !ids.contains(&entry.id) || found.contains_key(&entry.id) {
                 continue;
             }
-            let entry = match opened.scrub() {
-                Some(scrub) => scrub.entry(&entry).0,
-                None => entry,
-            };
-            found.insert(entry.id, revealed(&entry));
+            found.insert(entry.id, revealed(&opened.scrubbed(entry)));
         }
         found.len() < ids.len()
     })?;

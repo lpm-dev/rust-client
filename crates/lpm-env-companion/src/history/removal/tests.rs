@@ -1,7 +1,7 @@
 use super::*;
 use crate::history::codec::Action;
-use crate::history::read::{EntryLookup, reveal_entry};
-use crate::history::rebuild::{TargetValue, UnknownReason, plan_key_rollback};
+use crate::history::read::{EntryLookup, IdPrefix, reveal_entry};
+use crate::history::rebuild::{EnvironmentRef, TargetValue, UnknownReason, plan_key_rollback};
 use crate::history::test_support::{Project, Store, VAULT};
 use crate::history::values::Rename;
 use crate::keyring::tests::CountingRandom;
@@ -179,7 +179,9 @@ fn removing_scrubs_the_checked_places_and_keeps_a_shared_value_elsewhere() {
     assert_eq!(store.head().removing, None);
 
     let opened = opened(&store);
-    let Ok(EntryLookup::Found(first)) = reveal_entry(&opened, &mut source(&store), &id(1)) else {
+    let Ok(EntryLookup::Found(first)) =
+        reveal_entry(&opened, &mut source(&store), &IdPrefix::whole(id(1)))
+    else {
         panic!("found");
     };
     let after_values: Vec<Option<&str>> = first
@@ -221,7 +223,7 @@ fn removing_scrubs_the_checked_places_and_keeps_a_shared_value_elsewhere() {
         &opened,
         &mut source(&store),
         &values,
-        "production",
+        EnvironmentRef::Now("production"),
         "API_KEY",
         id(2),
     )
@@ -344,7 +346,8 @@ fn a_rename_keeps_one_place_and_is_scrubbed_under_either_name() {
 
     let opened = opened(&store);
     for entry in [id(1), id(2), id(3)] {
-        let Ok(EntryLookup::Found(found)) = reveal_entry(&opened, &mut source(&store), &entry)
+        let Ok(EntryLookup::Found(found)) =
+            reveal_entry(&opened, &mut source(&store), &IdPrefix::whole(entry))
         else {
             panic!("found");
         };
@@ -431,8 +434,11 @@ fn readers_scrub_while_a_removal_is_partway_and_any_client_finishes_it() {
     // The crash came before any part was rewritten.
     let opened_partway = opened(&store);
     assert!(needs_finishing(&opened_partway));
-    let Ok(EntryLookup::Found(first)) = reveal_entry(&opened_partway, &mut source(&store), &id(1))
-    else {
+    let Ok(EntryLookup::Found(first)) = reveal_entry(
+        &opened_partway,
+        &mut source(&store),
+        &IdPrefix::whole(id(1)),
+    ) else {
         panic!("found");
     };
     assert_eq!(
@@ -588,4 +594,96 @@ fn a_removal_or_rotation_cannot_start_while_one_runs() {
         start_rotation(&opened(&store), Approval::Automatic, &mut CountingRandom(4)),
         Err(RemovalError::Running)
     ));
+}
+
+#[test]
+fn a_place_holding_the_value_under_its_renamed_environment_is_current() {
+    let mut store = Store::new();
+    let empty = Project::with(&[("stage", &[])]);
+    let first = Project::with(&[("stage", &[("K", "secret")])]);
+    store
+        .record(Action::Set, &empty, &first, &[])
+        .expect("created");
+    let renamed = Project::with(&[("staging", &[("K", "secret")])]);
+    store
+        .record(
+            Action::RenameEnvironment,
+            &first,
+            &renamed,
+            &[Rename::Environment {
+                from: "stage",
+                to: "staging",
+            }],
+        )
+        .expect("renamed");
+    let current = renamed.values();
+    let review = review_removal(
+        &opened(&store),
+        &mut source(&store),
+        &current,
+        Chosen {
+            entry: id(1),
+            environment: "stage",
+            key: "K",
+            side: RelatedSide::After,
+        },
+    )
+    .expect("review");
+    assert_eq!(review.places.len(), 1);
+    assert_eq!(review.places[0].renamed_environments, vec!["staging"]);
+    assert!(review.places[0].current, "staging's K holds it now");
+    assert!(review.default_selection().is_empty());
+}
+
+#[test]
+fn a_review_reads_each_part_once_and_groups_places_in_linear_steps() {
+    let mut store = Store::new();
+    let empty = Project::with(&[("e", &[])]);
+    let mut project = empty.clone();
+    for index in 0..300 {
+        project.set("e", &format!("K{index:03}"), "true");
+    }
+    store
+        .record(Action::Set, &empty, &project, &[])
+        .expect("created");
+    let mut round = 0;
+    while store.head().parts.len() < 4 {
+        round += 1;
+        let mut next = project.clone();
+        next.set("e", "BULK", &format!("{round}{}", "x".repeat(6 * 1024)));
+        store
+            .record(Action::Set, &project, &next, &[])
+            .expect("recorded");
+        project = next;
+    }
+    let mut changed = project.clone();
+    changed.set("e", "K000", "false");
+    store
+        .record(Action::Set, &project, &changed, &[])
+        .expect("changed");
+    let newest = id(store.next_id);
+    let parts = store.head().parts.len();
+    let current = changed.values();
+    let mut reads = 0;
+    let mut counted = |part: u16| {
+        reads += 1;
+        Ok(store.get(&part_account(VAULT, part)).map(<[u8]>::to_vec))
+    };
+    crate::work::reset();
+    let review = review_removal(
+        &opened(&store),
+        &mut counted,
+        &current,
+        Chosen {
+            entry: newest,
+            environment: "e",
+            key: "K000",
+            side: RelatedSide::Before,
+        },
+    )
+    .expect("review");
+    assert_eq!(review.places.len(), 300);
+    assert_eq!(reads, parts, "one walk");
+    let steps = crate::work::count(crate::work::Work::AliasStep);
+    assert!(steps <= 300 * 6, "{steps} alias steps for 300 places");
 }

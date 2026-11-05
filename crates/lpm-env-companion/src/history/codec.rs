@@ -698,6 +698,16 @@ pub struct EntryHeader {
     pub time: i64,
 }
 
+impl Entry<'_> {
+    pub fn header(&self) -> EntryHeader {
+        EntryHeader {
+            seq: self.seq,
+            id: self.id,
+            time: self.time,
+        }
+    }
+}
+
 impl EntryHeader {
     pub fn of(bytes: &[u8]) -> Result<Self> {
         let mut reader = Reader::new(bytes);
@@ -922,13 +932,15 @@ impl Summary<'_> {
     }
 }
 
-/// A decoded part. Entries stay encoded until they're needed, and borrow
-/// from the plaintext.
+/// A decoded part, borrowing from the plaintext. Each entry is decoded
+/// once, when the part is checked, and kept with its encoded bytes, which
+/// an append copies into the next part unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Part<'a> {
     pub epoch: u64,
     pub summary: Summary<'a>,
     pub entries: Vec<&'a [u8]>,
+    decoded: Vec<Entry<'a>>,
 }
 
 /// The bytes of a part with `summary` and entries of the given lengths.
@@ -945,6 +957,7 @@ pub fn part_len(summary_len: usize, entry_lens: impl IntoIterator<Item = usize>)
 impl<'a> Part<'a> {
     /// Decode a part's plaintext, checking every entry.
     pub fn decode(bytes: &'a [u8]) -> Result<Self> {
+        crate::work::note(crate::work::Work::PartDecode);
         if bytes.len() > PART_CAPACITY {
             return Err(InvalidPart("the part is larger than its capacity"));
         }
@@ -984,43 +997,39 @@ impl<'a> Part<'a> {
             summary.environments.insert(name, keys);
         }
         let entry_count = reader.u32()? as usize;
-        let mut entries = Vec::with_capacity(entry_count.min(reader.remaining() / 4));
-        let mut last_seq = None;
+        let capacity = entry_count.min(reader.remaining() / 4);
+        let mut entries = Vec::with_capacity(capacity);
+        let mut decoded: Vec<Entry<'a>> = Vec::with_capacity(capacity);
         for _ in 0..entry_count {
             let length = reader.u32()? as usize;
             let bytes = reader.bytes(length)?;
             let entry = Entry::decode(bytes)?;
-            if last_seq.is_some_and(|last| last >= entry.seq) {
+            if decoded.last().is_some_and(|last| last.seq >= entry.seq) {
                 return Err(InvalidPart("the part's entries aren't in sequence"));
             }
-            last_seq = Some(entry.seq);
             entries.push(bytes);
+            decoded.push(entry);
         }
         reader.finish()?;
         Ok(Self {
             epoch,
             summary,
             entries,
+            decoded,
         })
     }
 
     /// The decoded entries, oldest first.
-    pub fn decoded_entries(&self) -> impl DoubleEndedIterator<Item = Entry<'a>> + '_ {
-        self.entries
-            .iter()
-            .map(|bytes| Entry::decode(bytes).expect("a decoded part's entries decode"))
+    pub fn decoded_entries(&self) -> std::slice::Iter<'_, Entry<'a>> {
+        self.decoded.iter()
     }
 
     pub fn last_header(&self) -> Option<EntryHeader> {
-        self.entries
-            .last()
-            .map(|bytes| EntryHeader::of(bytes).expect("a decoded part's entries decode"))
+        self.decoded.last().map(Entry::header)
     }
 
     pub fn contains_id(&self, id: &EntryId) -> bool {
-        self.entries
-            .iter()
-            .any(|bytes| EntryHeader::of(bytes).is_ok_and(|header| header.id == *id))
+        self.decoded.iter().any(|entry| entry.id == *id)
     }
 }
 
@@ -1442,7 +1451,10 @@ pub(crate) mod tests {
         assert_eq!(part.epoch, 3);
         assert_eq!(part.summary, summary());
         assert_eq!(part.entries.len(), 2);
-        assert_eq!(part.decoded_entries().collect::<Vec<_>>(), entries.to_vec());
+        assert_eq!(
+            part.decoded_entries().cloned().collect::<Vec<_>>(),
+            entries.to_vec()
+        );
         assert!(part.contains_id(&[5; 16]));
         assert!(!part.contains_id(&[6; 16]));
         assert_eq!(part.last_header().map(|header| header.seq), Some(5));

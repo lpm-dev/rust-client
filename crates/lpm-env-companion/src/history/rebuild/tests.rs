@@ -1,7 +1,7 @@
 use super::*;
 use crate::history::codec::{Actor, Detail, Remote};
 use crate::history::read::{
-    EntryLookup, Filter, KeyMatch, SourceGroup, TimelineRow, read_timeline, reveal_entry,
+    EntryLookup, Filter, IdPrefix, KeyMatch, SourceGroup, TimelineRow, read_timeline, reveal_entry,
 };
 use crate::history::test_support::{Project, Recorded, Store, VAULT};
 use crate::history::values::Rename;
@@ -115,7 +115,7 @@ fn an_environment_rolls_back_to_its_whole_state_after_an_entry() {
         &opened(&store),
         &mut source(&store),
         &current,
-        "production",
+        EnvironmentRef::AtPoint("production"),
         after(1),
     )
     .expect("plan");
@@ -168,7 +168,7 @@ fn a_key_rolls_back_to_its_value_before_a_change_even_the_newest() {
         &opened(&store),
         &mut source(&store),
         &current,
-        "production",
+        EnvironmentRef::Now("production"),
         "A",
         id(2),
     )
@@ -179,7 +179,7 @@ fn a_key_rolls_back_to_its_value_before_a_change_even_the_newest() {
         &opened(&store),
         &mut source(&store),
         &current,
-        "production",
+        EnvironmentRef::Now("production"),
         "B",
         id(3),
     )
@@ -282,7 +282,7 @@ fn a_rollback_recreates_a_deleted_environment() {
         &opened(&store),
         &mut source(&store),
         &current,
-        "local",
+        EnvironmentRef::AtPoint("local"),
         after(1),
     )
     .expect("plan");
@@ -326,7 +326,7 @@ fn a_rollback_to_before_an_environment_existed_removes_its_keys_and_deletes_it()
         &opened(&store),
         &mut source(&store),
         &current,
-        "preview",
+        EnvironmentRef::AtPoint("preview"),
         after(1),
     )
     .expect("plan");
@@ -387,7 +387,7 @@ fn rollbacks_follow_key_and_environment_renames() {
         &opened(&store),
         &mut source(&store),
         &current,
-        "staging",
+        EnvironmentRef::Now("staging"),
         "NEW",
         id(3),
     )
@@ -398,7 +398,7 @@ fn rollbacks_follow_key_and_environment_renames() {
         &opened(&store),
         &mut source(&store),
         &current,
-        "stage",
+        EnvironmentRef::AtPoint("stage"),
         after(1),
     )
     .expect("plan");
@@ -460,7 +460,7 @@ fn a_gap_resolves_against_a_kept_value_with_the_same_digest() {
         &opened(&store),
         &mut source(&store),
         &current,
-        "e",
+        EnvironmentRef::AtPoint("e"),
         after(2),
     )
     .expect("plan");
@@ -488,7 +488,7 @@ fn a_value_history_never_kept_stays_unknown() {
         &opened(&store),
         &mut source(&store),
         &current,
-        "e",
+        EnvironmentRef::Now("e"),
         "A",
         id(2),
     )
@@ -502,7 +502,7 @@ fn a_value_history_never_kept_stays_unknown() {
         &opened(&store),
         &mut source(&store),
         &current,
-        "e",
+        EnvironmentRef::AtPoint("e"),
         after(1),
     )
     .expect("plan");
@@ -515,7 +515,7 @@ fn a_value_history_never_kept_stays_unknown() {
         &opened(&store),
         &mut source(&store),
         &live_values,
-        "e",
+        EnvironmentRef::Now("e"),
         "A",
         id(2),
     )
@@ -550,7 +550,7 @@ fn oversized_entries_leave_their_keys_unknown() {
         &opened(&store),
         &mut source(&store),
         &current,
-        "e",
+        EnvironmentRef::Now("e"),
         "KEY_00000000000000000000000001",
         id(1),
     )
@@ -592,7 +592,7 @@ fn an_unreadable_part_makes_the_keys_that_changed_across_it_unknown() {
         &opened(&store),
         &mut source(&store),
         &current,
-        "e",
+        EnvironmentRef::AtPoint("e"),
         after(1),
     )
     .expect("plan");
@@ -636,7 +636,7 @@ fn every_binding_refuses_a_rollback_after_its_values_or_key_changed() {
         &opened(&store),
         &mut source(&store),
         &current,
-        "production",
+        EnvironmentRef::AtPoint("production"),
         after(1),
     )
     .expect("plan");
@@ -669,7 +669,7 @@ fn every_binding_refuses_a_rollback_after_its_values_or_key_changed() {
         &opened(&store),
         &mut source(&store),
         &current,
-        "production",
+        EnvironmentRef::Now("production"),
         "A",
         id(2),
     )
@@ -716,7 +716,7 @@ fn an_unknown_entry_or_environment_is_refused() {
             &opened(&store),
             &mut source(&store),
             &current,
-            "nowhere",
+            EnvironmentRef::AtPoint("nowhere"),
             after(1)
         ),
         Err(PlanError::UnknownEnvironment)
@@ -732,7 +732,7 @@ fn undoing_a_rollback_puts_back_what_it_replaced() {
         &opened(&store),
         &mut source(&store),
         &current,
-        "production",
+        EnvironmentRef::AtPoint("production"),
         before(2),
     )
     .expect("plan");
@@ -864,12 +864,23 @@ fn the_timeline_lists_newest_first_with_partitioned_counts_and_filters() {
     assert_eq!(by_key.rows.len(), 1);
     assert_eq!(by_key.readable, 1);
 
-    let found = reveal_entry(&opened, &mut source(&store), &id(2)[..3]);
+    let found = reveal_entry(
+        &opened,
+        &mut source(&store),
+        &IdPrefix::parse(
+            &id(2)[..3]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+        )
+        .expect("a prefix"),
+    );
     assert!(
         matches!(found, Ok(EntryLookup::Ambiguous)),
         "every test ID shares 3 bytes"
     );
-    let Ok(EntryLookup::Found(revealed)) = reveal_entry(&opened, &mut source(&store), &id(2))
+    let Ok(EntryLookup::Found(revealed)) =
+        reveal_entry(&opened, &mut source(&store), &IdPrefix::whole(id(2)))
     else {
         panic!("found");
     };
@@ -936,8 +947,684 @@ fn damaged_history_records_are_found_beyond_the_listing() {
     assert!(
         matches!(&damage[..], [crate::gate::Damage::InvalidRecord { kind, .. }] if kind == "history")
     );
+    let mut rolled = Store::new();
+    let mut project = Project::with(&[("e", &[("A", "1")])]);
+    rolled
+        .record(Action::Set, &Project::with(&[("e", &[])]), &project, &[])
+        .expect("created");
+    while rolled.head().parts.len() < 2 {
+        let mut next = project.clone();
+        next.set(
+            "e",
+            "A",
+            &format!("{}{}", rolled.time, "x".repeat(6 * 1024)),
+        );
+        rolled
+            .record(Action::Set, &project, &next, &[])
+            .expect("recorded");
+        project = next;
+    }
+    let head = rolled.get(&head_account(VAULT)).expect("head").to_vec();
+    let key = rolled.get(&key_account(VAULT)).expect("key").to_vec();
+    let tail = rolled.head().tail();
+    let without_tail = |part: u16| {
+        (part != tail)
+            .then(|| rolled.get(&part_account(VAULT, part)).map(<[u8]>::to_vec))
+            .flatten()
+    };
     assert!(
-        check_records(VAULT, Some(&head), Some(&key), |_| None).is_empty(),
-        "an absent tail is an interrupted rollover, not damage"
+        check_records(VAULT, Some(&head), Some(&key), without_tail).is_empty(),
+        "an absent tail with a readable part before it is an interrupted rollover"
     );
+    let damage = check_records(VAULT, Some(&head), Some(&key), |_| None);
+    assert!(
+        matches!(&damage[..], [crate::gate::Damage::InvalidRecord { kind, .. }] if kind == "history"),
+        "with the part before it missing too, no append can recover: {damage:?}"
+    );
+}
+
+fn renamed_environment_history() -> (Store, Project) {
+    let first = Project::with(&[("stage", &[("K", "1")])]);
+    let renamed = Project::with(&[("staging", &[("K", "1")])]);
+    let recreated = Project::with(&[("stage", &[("J", "2")]), ("staging", &[("K", "1")])]);
+    let changed = Project::with(&[("stage", &[("J", "2")]), ("staging", &[("K", "3")])]);
+    let mut store = Store::new();
+    store
+        .record(Action::Set, &Project::with(&[("stage", &[])]), &first, &[])
+        .expect("created");
+    store
+        .record(
+            Action::RenameEnvironment,
+            &first,
+            &renamed,
+            &[Rename::Environment {
+                from: "stage",
+                to: "staging",
+            }],
+        )
+        .expect("renamed");
+    store
+        .record(Action::Set, &renamed, &recreated, &[])
+        .expect("a new stage");
+    store
+        .record(Action::Set, &recreated, &changed, &[])
+        .expect("changed");
+    (store, changed)
+}
+
+#[test]
+fn a_key_rolls_back_through_a_removal_and_a_re_add() {
+    let steps = vec![
+        Project::with(&[("e", &[])]),
+        Project::with(&[("e", &[("K", "a")])]),
+        Project::with(&[("e", &[("K", "b")])]),
+        Project::with(&[("e", &[])]),
+        Project::with(&[("e", &[("K", "c")])]),
+    ];
+    let store = history(&steps);
+    let current = steps[4].values();
+    let plan = plan_key_rollback(
+        &opened(&store),
+        &mut source(&store),
+        &current,
+        EnvironmentRef::Now("e"),
+        "K",
+        id(3),
+    )
+    .expect("plan");
+    assert_eq!(rows(&plan), vec![row("K", "= b")]);
+
+    let undo = plan_undo(&opened(&store), &mut source(&store), &current, id(2)).expect("plan");
+    assert_eq!(rows(&undo), vec![row("K", "= a")]);
+    let undone = &undo.environments[0].rows[0];
+    assert_eq!(undone.current.as_deref().map(String::as_str), Some("c"));
+    assert!(
+        undone.changed_again.is_some(),
+        "undoing it replaces the later value"
+    );
+}
+
+#[test]
+fn a_key_rolls_back_through_a_deleted_and_recreated_environment() {
+    let steps = vec![
+        Project::with(&[("production", &[])]),
+        Project::with(&[("production", &[]), ("stage", &[("K", "a")])]),
+        Project::with(&[("production", &[]), ("stage", &[("K", "b")])]),
+        Project::with(&[("production", &[])]),
+        Project::with(&[("production", &[]), ("stage", &[("K", "c")])]),
+    ];
+    let store = history(&steps);
+    let current = steps[4].values();
+    let plan = plan_key_rollback(
+        &opened(&store),
+        &mut source(&store),
+        &current,
+        EnvironmentRef::Now("stage"),
+        "K",
+        id(3),
+    )
+    .expect("plan");
+    assert_eq!(rows(&plan), vec![row("K", "= b")]);
+}
+
+#[test]
+fn a_rollback_never_overwrites_another_environment_with_its_earlier_name() {
+    let (store, changed) = renamed_environment_history();
+    let current = changed.values();
+    let plan = plan_environment_rollback(
+        &opened(&store),
+        &mut source(&store),
+        &current,
+        EnvironmentRef::AtPoint("stage"),
+        after(1),
+    );
+    assert_eq!(plan, Err(PlanError::NameTaken("stage".to_owned())));
+    let undo = plan_undo(&opened(&store), &mut source(&store), &current, id(2));
+    assert_eq!(undo, Err(PlanError::NameTaken("stage".to_owned())));
+}
+
+#[test]
+fn a_recreating_rollback_is_refused_once_another_environment_takes_the_name() {
+    let steps = vec![
+        Project::with(&[("production", &[])]),
+        Project::with(&[("production", &[]), ("local", &[("DB", "d")])]),
+        Project::with(&[("production", &[("X", "x")])]),
+    ];
+    let store = history(&steps);
+    let reviewed = steps[2].values();
+    let plan = plan_environment_rollback(
+        &opened(&store),
+        &mut source(&store),
+        &reviewed,
+        EnvironmentRef::AtPoint("local"),
+        after(1),
+    )
+    .expect("plan");
+    assert!(plan.environments[0].recreates());
+    let taken = Project::with(&[("local", &[("MINE", "m")]), ("production", &[("X", "x")])]);
+    assert_eq!(
+        apply_rollback(
+            &plan,
+            &Choices::default(),
+            &taken.values(),
+            &opened(&store).keys,
+            plan.generation,
+        ),
+        Err(Refusal::ChangedSinceReview)
+    );
+}
+
+#[test]
+fn undoing_a_change_that_kept_no_values_resolves_them_from_older_entries() {
+    let mut store = Store::new();
+    let base = Project::with(&[("e", &[])]);
+    let mut small = base.clone();
+    small.set("e", "A", "kept");
+    store
+        .record(Action::Set, &base, &small, &[])
+        .expect("created");
+    let mut imported = small.clone();
+    imported.set("e", "A", "imported");
+    for index in 0..700 {
+        imported.set("e", &format!("KEY_{index:04}"), &"v".repeat(100));
+    }
+    let recorded = store
+        .record(Action::Import, &small, &imported, &[])
+        .expect("imported");
+    assert!(
+        matches!(recorded, Recorded::Appended { write, .. } if !write.values_kept),
+        "{recorded:?}"
+    );
+    let current = imported.values();
+    let undo = plan_undo(&opened(&store), &mut source(&store), &current, id(2)).expect("plan");
+    let a = undo.environments[0]
+        .rows
+        .iter()
+        .find(|row| row.key == "A")
+        .expect("A");
+    assert_eq!(
+        a.target,
+        TargetValue::Known(zeroize::Zeroizing::new("kept".to_owned())),
+        "its earlier value is kept in the entry before"
+    );
+}
+
+#[test]
+fn a_rollback_recreates_an_environment_that_was_empty_at_the_point() {
+    let steps = vec![
+        Project::with(&[("production", &[("A", "1")])]),
+        Project::with(&[("production", &[("A", "2")]), ("preview", &[])]),
+        Project::with(&[("production", &[("A", "3")])]),
+    ];
+    let store = history(&steps);
+    let current = steps[2].values();
+    let plan = plan_environment_rollback(
+        &opened(&store),
+        &mut source(&store),
+        &current,
+        EnvironmentRef::AtPoint("preview"),
+        after(1),
+    )
+    .expect("plan");
+    assert!(plan.environments[0].recreates());
+    assert!(plan.changes_anything());
+    let writes = apply_rollback(
+        &plan,
+        &Choices::default(),
+        &current,
+        &opened(&store).keys,
+        plan.generation,
+    )
+    .expect("applies");
+    assert_eq!(
+        written(&writes),
+        vec![("preview".to_owned(), None, Some(vec![]))]
+    );
+}
+
+#[test]
+fn an_oversized_change_that_removed_keys_says_so_and_its_boundary_names_them() {
+    let mut store = Store::new();
+    let mut project = Project::with(&[("big", &[("X", "x")])]);
+    store
+        .record(Action::Set, &Project::with(&[("big", &[])]), &project, &[])
+        .expect("created");
+    let name = |index: usize| format!("{index:03}{}", "K".repeat(197));
+    for step in 0..4 {
+        let mut next = project.clone();
+        for index in step * 95..(step + 1) * 95 {
+            next.set("big", &name(index), "v");
+        }
+        store
+            .record(Action::Set, &project, &next, &[])
+            .expect("added");
+        project = next;
+    }
+    let mut pulled = project.clone();
+    pulled.environments.get_mut("big").expect("big").remove("X");
+    for index in 0..380 {
+        pulled.set("big", &name(index), "w");
+    }
+    store
+        .record(Action::Pull, &project, &pulled, &[])
+        .expect("pulled");
+    let pull = id(6);
+    store.with_entries(store.head().tail(), |entries| {
+        assert_eq!(entries[0].id, pull, "the pull starts its part");
+        assert!(matches!(entries[0].environments[0].keys, Keys::Count(_)));
+    });
+    let current = pulled.values();
+    let undo = plan_undo(&opened(&store), &mut source(&store), &current, pull).expect("plan");
+    assert_eq!(
+        undo.environments[0].unnamed_keys,
+        Some(UnknownReason::TooLarge)
+    );
+    assert!(undo.environments[0].rows.is_empty());
+
+    let before_pull = plan_environment_rollback(
+        &opened(&store),
+        &mut source(&store),
+        &current,
+        EnvironmentRef::AtPoint("big"),
+        before(6),
+    )
+    .expect("plan");
+    assert_eq!(before_pull.environments[0].unnamed_keys, None);
+    let x = before_pull.environments[0]
+        .rows
+        .iter()
+        .find(|row| row.key == "X")
+        .expect("the part before names X");
+    assert_eq!(
+        x.target,
+        TargetValue::Known(zeroize::Zeroizing::new("x".to_owned()))
+    );
+    assert_eq!(before_pull.environments[0].changing_rows(), 381);
+}
+
+#[test]
+fn undoing_a_rename_whose_key_was_renamed_back_lists_the_key_once() {
+    let first = Project::with(&[("e", &[("A", "1")])]);
+    let renamed = Project::with(&[("e", &[("B", "1")])]);
+    let changed = Project::with(&[("e", &[("B", "2")])]);
+    let back = Project::with(&[("e", &[("A", "2")])]);
+    let mut store = Store::new();
+    store
+        .record(Action::Set, &Project::with(&[("e", &[])]), &first, &[])
+        .expect("created");
+    store
+        .record(
+            Action::RenameKey,
+            &first,
+            &renamed,
+            &[Rename::Key {
+                environment: "e",
+                from: "A",
+                to: "B",
+            }],
+        )
+        .expect("renamed");
+    store
+        .record(Action::Set, &renamed, &changed, &[])
+        .expect("changed");
+    store
+        .record(
+            Action::RenameKey,
+            &changed,
+            &back,
+            &[Rename::Key {
+                environment: "e",
+                from: "B",
+                to: "A",
+            }],
+        )
+        .expect("renamed back");
+    let current = back.values();
+    let undo = plan_undo(&opened(&store), &mut source(&store), &current, id(2)).expect("plan");
+    assert_eq!(rows(&undo), vec![row("A", "= 1")]);
+}
+
+#[test]
+fn the_rows_of_a_renamed_key_are_linked_and_apply_together() {
+    let before_rename = Project::with(&[("e", &[("OLD", "1"), ("OTHER", "o")])]);
+    let renamed = Project::with(&[("e", &[("NEW", "1"), ("OTHER", "p")])]);
+    let mut store = Store::new();
+    store
+        .record(
+            Action::Set,
+            &Project::with(&[("e", &[])]),
+            &before_rename,
+            &[],
+        )
+        .expect("created");
+    store
+        .record(
+            Action::RenameKey,
+            &before_rename,
+            &renamed,
+            &[Rename::Key {
+                environment: "e",
+                from: "OLD",
+                to: "NEW",
+            }],
+        )
+        .expect("renamed");
+    let current = renamed.values();
+    let plan = plan_environment_rollback(
+        &opened(&store),
+        &mut source(&store),
+        &current,
+        EnvironmentRef::AtPoint("e"),
+        after(1),
+    )
+    .expect("plan");
+    let linked: Vec<(String, Vec<String>)> = plan.environments[0]
+        .rows
+        .iter()
+        .map(|row| (row.key.clone(), row.linked.clone()))
+        .collect();
+    assert_eq!(
+        linked,
+        vec![
+            ("NEW".to_owned(), vec!["OLD".to_owned()]),
+            ("OLD".to_owned(), vec!["NEW".to_owned()]),
+            ("OTHER".to_owned(), vec![]),
+        ]
+    );
+    let new_row = plan.environments[0]
+        .rows
+        .iter()
+        .position(|row| row.key == "NEW")
+        .expect("NEW");
+    let skip_new = Choices {
+        skipped: HashSet::from([(0, new_row)]),
+        ..Choices::default()
+    };
+    let writes = apply_rollback(
+        &plan,
+        &skip_new,
+        &current,
+        &opened(&store).keys,
+        plan.generation,
+    )
+    .expect("applies");
+    assert_eq!(
+        written(&writes),
+        vec![(
+            "e".to_owned(),
+            None,
+            Some(vec![
+                ("NEW".to_owned(), "1".to_owned()),
+                ("OTHER".to_owned(), "o".to_owned())
+            ])
+        )],
+        "skipping one half of the rename skips the other, so the value stays"
+    );
+}
+
+#[test]
+fn a_rollback_resolves_digests_with_one_pass_over_the_keys() {
+    let mut store = Store::new();
+    let base = Project::with(&[("e", &[])]);
+    let mut first = base.clone();
+    for index in 0..400 {
+        first.set("e", &format!("K{index:03}"), &format!("first {index}"));
+    }
+    store
+        .record(Action::Set, &base, &first, &[])
+        .expect("created");
+    let mut outside = first.clone();
+    for index in 0..400 {
+        outside.set("e", &format!("K{index:03}"), &format!("outside {index}"));
+    }
+    let mut next = outside.clone();
+    next.set("e", "NEW", "n");
+    store
+        .record(Action::Set, &outside, &next, &[])
+        .expect("gap and change");
+    let current = next.values();
+    let plan = plan_environment_rollback(
+        &opened(&store),
+        &mut source(&store),
+        &current,
+        EnvironmentRef::AtPoint("e"),
+        after(1),
+    )
+    .expect("plan");
+    assert_eq!(plan.environments[0].changing_rows(), 401);
+    assert!(
+        plan.environments[0]
+            .rows
+            .iter()
+            .all(|row| !matches!(row.target, TargetValue::Unknown(_)))
+    );
+}
+
+#[test]
+fn the_timeline_follows_a_key_and_an_environment_back_through_renames() {
+    let first = Project::with(&[("stage", &[("OLD", "1")])]);
+    let changed = Project::with(&[("stage", &[("OLD", "2")])]);
+    let renamed = Project::with(&[("staging", &[("NEW", "2")])]);
+    let after_rename = Project::with(&[("staging", &[("NEW", "3")])]);
+    let mut store = Store::new();
+    store
+        .record(Action::Set, &Project::with(&[("stage", &[])]), &first, &[])
+        .expect("created");
+    store
+        .record(Action::Set, &first, &changed, &[])
+        .expect("changed");
+    store
+        .record(
+            Action::RenameKey,
+            &changed,
+            &renamed,
+            &[
+                Rename::Environment {
+                    from: "stage",
+                    to: "staging",
+                },
+                Rename::Key {
+                    environment: "staging",
+                    from: "OLD",
+                    to: "NEW",
+                },
+            ],
+        )
+        .expect("renamed");
+    store
+        .record(Action::Set, &renamed, &after_rename, &[])
+        .expect("changed again");
+    let current = after_rename.values();
+    let timeline = |filter: Filter<'_>| {
+        read_timeline(&opened(&store), &mut source(&store), &current, &filter).expect("timeline")
+    };
+    let by_key = timeline(Filter {
+        key: Some(KeyMatch::Exact("NEW")),
+        ..Filter::default()
+    });
+    assert_eq!(
+        by_key.readable, 4,
+        "every change to the key, under both names"
+    );
+    let by_environment = timeline(Filter {
+        environment: Some("staging"),
+        ..Filter::default()
+    });
+    assert_eq!(by_environment.readable, 4);
+    assert_eq!(
+        timeline(Filter::default())
+            .environments
+            .iter()
+            .map(|environment| environment.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["staging"],
+        "stage is staging's earlier name, not another environment"
+    );
+}
+
+#[test]
+fn a_missing_newest_part_with_nothing_before_it_is_damage() {
+    let steps = steps();
+    let store = history(&steps[..2]);
+    let head = store.get(&head_account(VAULT)).expect("head").to_vec();
+    let key = store.get(&key_account(VAULT)).expect("key").to_vec();
+    let damage = crate::history::read::check_records(VAULT, Some(&head), Some(&key), |_| None);
+    assert_eq!(damage.len(), 1, "{damage:?}");
+}
+
+/// A project of `keys` keys whose history spans several parts, every key
+/// changed once outside history at the end.
+fn spread_history(keys: usize) -> (Store, Project) {
+    let mut store = Store::new();
+    let base = Project::with(&[("e", &[])]);
+    let mut project = base.clone();
+    for index in 0..keys {
+        project.set("e", &format!("K{index:04}"), &format!("first {index}"));
+    }
+    store
+        .record(Action::Set, &base, &project, &[])
+        .expect("created");
+    let mut round = 0;
+    while store.head().parts.len() < 6 {
+        round += 1;
+        let mut next = project.clone();
+        next.set("e", "BULK", &format!("{round}{}", "x".repeat(6 * 1024)));
+        store
+            .record(Action::Set, &project, &next, &[])
+            .expect("recorded");
+        project = next;
+    }
+    let mut outside = project.clone();
+    for index in 0..keys {
+        outside.set("e", &format!("K{index:04}"), &format!("outside {index}"));
+    }
+    let mut next = outside.clone();
+    next.set("e", "NEW", "n");
+    store
+        .record(Action::Set, &outside, &next, &[])
+        .expect("gap and change");
+    (store, next)
+}
+
+#[test]
+fn a_rollback_digests_each_value_once_and_visits_each_key_a_bounded_number_of_times() {
+    let keys = 300;
+    let (store, current_project) = spread_history(keys);
+    let parts = store.head().parts.len();
+    let current = current_project.values();
+    let opened = opened(&store);
+    crate::work::reset();
+    let plan = plan_environment_rollback(
+        &opened,
+        &mut source(&store),
+        &current,
+        EnvironmentRef::AtPoint("e"),
+        after(1),
+    )
+    .expect("plan");
+    assert_eq!(plan.environments[0].changing_rows(), keys + 2);
+    let digests = crate::work::count(crate::work::Work::ValueDigest);
+    assert!(
+        digests <= keys + 2 + 2,
+        "{digests} value digests for {keys} keys over {parts} parts"
+    );
+    let visits = crate::work::count(crate::work::Work::KeyVisit);
+    assert!(
+        visits <= (keys + 2) * (parts + 2),
+        "{visits} key visits for {keys} keys over {parts} parts"
+    );
+    assert_eq!(
+        crate::work::count(crate::work::Work::PartDecode),
+        parts,
+        "each part is decoded once"
+    );
+}
+
+#[test]
+fn an_environment_named_as_it_is_now_is_found_at_the_point_under_its_earlier_name() {
+    let before_rename = Project::with(&[("stage", &[("K", "1")])]);
+    let renamed = Project::with(&[("staging", &[("K", "1")])]);
+    let changed = Project::with(&[("staging", &[("K", "2")])]);
+    let mut store = Store::new();
+    store
+        .record(
+            Action::Set,
+            &Project::with(&[("stage", &[])]),
+            &before_rename,
+            &[],
+        )
+        .expect("created");
+    store
+        .record(
+            Action::RenameEnvironment,
+            &before_rename,
+            &renamed,
+            &[Rename::Environment {
+                from: "stage",
+                to: "staging",
+            }],
+        )
+        .expect("renamed");
+    store
+        .record(Action::Set, &renamed, &changed, &[])
+        .expect("changed");
+    let current = changed.values();
+    let by_now = plan_environment_rollback(
+        &opened(&store),
+        &mut source(&store),
+        &current,
+        EnvironmentRef::Now("staging"),
+        after(1),
+    )
+    .expect("plan");
+    let at_point = plan_environment_rollback(
+        &opened(&store),
+        &mut source(&store),
+        &current,
+        EnvironmentRef::AtPoint("stage"),
+        after(1),
+    )
+    .expect("plan");
+    assert_eq!(by_now, at_point);
+    assert_eq!(by_now.environments[0].target.as_deref(), Some("stage"));
+    assert!(by_now.environments[0].renames());
+
+    let key = plan_key_rollback(
+        &opened(&store),
+        &mut source(&store),
+        &current,
+        EnvironmentRef::AtPoint("stage"),
+        "K",
+        id(2),
+    )
+    .expect("plan");
+    assert_eq!(key.environments[0].current.as_deref(), Some("staging"));
+    assert_eq!(rows(&key), vec![row("K", "= 1")]);
+}
+
+#[test]
+fn an_id_prefix_matches_by_hex_digit_and_a_whole_id_stops_at_its_entry() {
+    let id = [0xab, 0xcd, 0xef, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    assert!(IdPrefix::parse("abcde").is_none(), "too short");
+    assert!(IdPrefix::parse("abcdeg").is_none(), "not hex");
+    assert!(IdPrefix::parse("ABCDEF1").expect("odd").matches(&id));
+    assert!(!IdPrefix::parse("abcdef2").expect("odd").matches(&id));
+    assert!(IdPrefix::whole(id).matches(&id));
+
+    let steps = steps();
+    let store = history(&steps);
+    let mut reads = 0;
+    let mut counted = |part: u16| {
+        reads += 1;
+        Ok(store.get(&part_account(VAULT, part)).map(<[u8]>::to_vec))
+    };
+    let found =
+        crate::history::read::find_entry(&opened(&store), &mut counted, &IdPrefix::whole(id_of(3)))
+            .expect("lookup");
+    assert!(matches!(found, EntryLookup::Found(info) if info.id == id_of(3)));
+    assert_eq!(reads, 1);
+}
+
+fn id_of(n: u8) -> EntryId {
+    id(n)
 }

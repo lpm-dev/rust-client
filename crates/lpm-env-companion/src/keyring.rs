@@ -425,6 +425,7 @@ impl DigestKeys {
     /// The digest of a value's exact bytes, so canonically equivalent text
     /// digests differently.
     pub fn value(&self, value: &[u8]) -> Digest {
+        crate::work::note(crate::work::Work::ValueDigest);
         let mut mac = self.value.clone();
         mac.update(value);
         truncated(mac)

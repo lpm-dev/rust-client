@@ -15,7 +15,7 @@ use crate::account::CompanionAccount;
 use crate::append_log::{self, HISTORY, Head, TailState};
 use crate::history::codec::{
     Action, Actor, Detail, Entry, EntryHeader, EntryId, Flags, InvalidPart, Part, Summary,
-    encode_part, part_len,
+    encode_part, fits_str16, part_len,
 };
 use crate::history::values::{Rename, Values, gap_changes, net_change};
 use crate::history::{RecordWrite, feature_entry, part_identity};
@@ -26,6 +26,10 @@ use crate::marker::{Marker, ProjectState};
 pub const PART_TARGET: usize = 32 * 1024;
 /// The room every part leaves for entries beside its summary.
 pub const ENTRY_ROOM: usize = 16 * 1024;
+/// A sliding ring slides at every append once it's full, so it asks
+/// admission whether it may grow again only at every this many entries,
+/// about as often as a shrunk ring rolls over.
+pub const REGROW_CHECK_INTERVAL: u64 = 64;
 
 /// The part target for a summary of `summary_len` bytes: the larger of
 /// [`PART_TARGET`] and the summary plus [`ENTRY_ROOM`], never more than a
@@ -57,6 +61,87 @@ impl Change<'_, '_> {
     pub fn changes_values(&self) -> bool {
         self.before != self.after
     }
+
+    /// Whether the change adds, changes, removes or renames a key, which
+    /// creating history needs, told from the values alone, without digests:
+    /// the same answer the entry's key count gives.
+    pub fn changes_keys(&self) -> bool {
+        let origins = environment_origins(self.before, self.after, self.renames);
+        let renamed_away: Vec<&str> = origins.iter().map(|(_, from)| *from).collect();
+        for (name, after_values) in self.after.environments() {
+            let origin = origins
+                .iter()
+                .find(|(to, _)| to == name)
+                .map(|(_, from)| *from)
+                .or_else(|| self.before.environment(name).map(|_| *name));
+            match origin.and_then(|origin| self.before.environment(origin)) {
+                None if !after_values.is_empty() => return true,
+                None => {}
+                Some(before_values) if before_values != after_values => return true,
+                Some(_) => {}
+            }
+        }
+        self.before.environments().iter().any(|(name, values)| {
+            !values.is_empty()
+                && self.after.environment(name).is_none()
+                && !renamed_away.contains(name)
+        })
+    }
+}
+
+/// The environment renames `renames` hints that the net change applies,
+/// as (new name, old name).
+fn environment_origins<'a>(
+    before: &Values<'a>,
+    after: &Values<'a>,
+    renames: &[Rename<'a>],
+) -> Vec<(&'a str, &'a str)> {
+    let mut origins: Vec<(&'a str, &'a str)> = Vec::new();
+    for rename in renames {
+        if let Rename::Environment { from, to } = *rename
+            && from != to
+            && before.environment(from).is_some()
+            && before.environment(to).is_none()
+            && after.environment(to).is_some()
+            && after.environment(from).is_none()
+            && !origins.iter().any(|(new, old)| *old == from || *new == to)
+        {
+            origins.push((to, from));
+        }
+    }
+    origins
+}
+
+/// Whether `values` are too many for history: a summary that leaves no
+/// room for entries in a part, or a name too long to encode. Told from the
+/// names alone, so a client can stop before reading history.
+pub fn too_many_values(values: &Values<'_>) -> bool {
+    let environments = values.environments();
+    if environments.len() > usize::from(u16::MAX) {
+        return true;
+    }
+    let mut length = 2_usize;
+    for (name, keys) in environments {
+        if !fits_str16(name) {
+            return true;
+        }
+        length += 2 + name.len() + 4;
+        for key in keys.keys() {
+            if !fits_str16(key) {
+                return true;
+            }
+            length += 2 + key.len() + 1 + 16;
+        }
+    }
+    length + ENTRY_ROOM > PART_CAPACITY
+}
+
+/// What the plans of one append share while the client answers their
+/// requests for another read or for admission, so a plan made again
+/// doesn't digest every value again. One cache serves one append.
+#[derive(Debug, Default)]
+pub struct AppendCache<'v> {
+    before_summary: Option<Summary<'v>>,
 }
 
 /// Why a change wasn't recorded, which the values write it follows never
@@ -147,7 +232,7 @@ pub fn plan_creation(
     let mut summary = before_summary;
     summary.apply(&entry.environments);
     check_summary(&summary)?;
-    let entries = fit(&summary, &[], vec![entry], PART_CAPACITY)?;
+    let entries = fit(summary.encoded_len(), &[], vec![entry], PART_CAPACITY)?;
     let values_kept = !entries[0].flags.values_not_kept;
     let plaintext = encode_part(1, &summary, &[], &entries).map_err(damaged)?;
     let part = keyring::seal(
@@ -200,7 +285,11 @@ pub struct Stored<'a> {
     pub previous: Option<&'a [u8]>,
 }
 
-/// Whether a rollover may add a part, which only admission decides.
+/// Whether a rollover may add a part, which only admission decides: a
+/// ring below its limit grows, and a ring shrunk to fewer parts than a full
+/// one grows again once the service has room ([`admission::admit_growth_of`]).
+///
+/// [`admission::admit_growth_of`]: crate::history::admission::admit_growth_of
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Growth {
     /// Admission hasn't been asked; a plan that would grow asks for it.
@@ -253,12 +342,14 @@ pub enum AppendShape {
     Recovered,
 }
 
-/// Plan appending `change` to the history `stored` holds.
-pub fn plan_append(
+/// Plan appending `change` to the history `stored` holds. `cache` carries
+/// work from an earlier plan of the same append.
+pub fn plan_append<'v>(
     vault_id: &str,
     stored: &Stored<'_>,
-    change: &Change<'_, '_>,
+    change: &Change<'_, 'v>,
     growth: Growth,
+    cache: &mut AppendCache<'v>,
     random: &mut impl Random,
 ) -> Result<AppendPlan, NotRecorded> {
     if !change.changes_values() {
@@ -290,7 +381,7 @@ pub fn plan_append(
             return Ok(AppendPlan::AlreadyRecorded);
         }
         let shape = if head.slides() {
-            Shape::SteadyOrSlide
+            Shape::SteadyOrSlide(growth)
         } else {
             Shape::SteadyOrRollover(growth)
         };
@@ -303,6 +394,7 @@ pub fn plan_append(
             &tail.entries,
             tail.last_header(),
             shape,
+            cache,
             random,
         );
     }
@@ -330,31 +422,36 @@ pub fn plan_append(
         &[],
         previous.last_header(),
         Shape::Recover,
+        cache,
         random,
     )
 }
 
 #[derive(Debug, Clone, Copy)]
 enum Shape {
-    SteadyOrSlide,
+    SteadyOrSlide(Growth),
     SteadyOrRollover(Growth),
     Recover,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn finish(
+fn finish<'v>(
     vault_id: &str,
     head: &Head,
     record: &KeyRecord,
-    change: &Change<'_, '_>,
+    change: &Change<'_, 'v>,
     baseline: &Summary<'_>,
     existing: &[&[u8]],
     last: Option<EntryHeader>,
     shape: Shape,
+    cache: &mut AppendCache<'v>,
     random: &mut impl Random,
 ) -> Result<AppendPlan, NotRecorded> {
     let keys = record.digest_keys(vault_id);
-    let before_summary = change.before.summary(&keys);
+    let before_summary = cache
+        .before_summary
+        .get_or_insert_with(|| change.before.summary(&keys))
+        .clone();
     let gaps = gap_changes(baseline, change.before, &before_summary);
     let changes = net_change(
         change.before,
@@ -408,14 +505,22 @@ fn finish(
         environments: changes,
     });
 
-    let target = part_target(summary.encoded_len());
+    let summary_len = summary.encoded_len();
+    let target = part_target(summary_len);
+    let new_len: usize = entries.iter().map(Entry::encoded_len).sum();
     let fits_with = |kept: &[&[u8]]| {
-        part_len(
-            summary.encoded_len(),
-            kept.iter()
-                .map(|bytes| bytes.len())
-                .chain(entries.iter().map(Entry::encoded_len)),
-        ) <= target
+        part_len(summary_len, kept.iter().map(|bytes| bytes.len())) + 4 * entries.len() + new_len
+            <= target
+    };
+    let slide = |next_head: Option<Head>| {
+        let dropped = oldest_to_drop(summary_len, existing, entries.len(), new_len, target);
+        (
+            head.tail(),
+            head.tail_epoch,
+            &existing[dropped..],
+            next_head,
+            AppendShape::Slid { dropped },
+        )
     };
     let (part, epoch, kept, next_head, shape_out) = match shape {
         Shape::Recover => (
@@ -432,19 +537,17 @@ fn finish(
             None,
             AppendShape::Steady,
         ),
-        Shape::SteadyOrSlide => {
-            let dropped = oldest_to_drop(existing, &fits_with);
-            (
-                head.tail(),
-                head.tail_epoch,
-                &existing[dropped..],
-                None,
-                AppendShape::Slid { dropped },
-            )
-        }
+        Shape::SteadyOrSlide(growth) => match growth {
+            _ if !head.may_regrow(HISTORY) || !seq.is_multiple_of(REGROW_CHECK_INTERVAL) => {
+                slide(None)
+            }
+            Growth::Unasked => return Ok(AppendPlan::NeedsGrowthAdmission),
+            Growth::Allowed => rollover(head, true),
+            Growth::Refused => slide(None),
+        },
         Shape::SteadyOrRollover(growth) => {
             let may_grow = match growth {
-                _ if !head.would_grow() => false,
+                _ if !head.would_grow() && !head.may_regrow(HISTORY) => false,
                 Growth::Unasked => return Ok(AppendPlan::NeedsGrowthAdmission),
                 Growth::Allowed => true,
                 Growth::Refused => false,
@@ -453,31 +556,15 @@ fn finish(
                 // Reusing a ring's only part would drop history to one entry,
                 // so a ring that can't grow past one part slides, and keeps
                 // one part as its limit so later appends don't ask again.
-                let dropped = oldest_to_drop(existing, &fits_with);
                 let mut sliding = head.clone();
                 sliding.ring_limit = 1;
-                (
-                    head.tail(),
-                    head.tail_epoch,
-                    &existing[dropped..],
-                    Some(sliding),
-                    AppendShape::Slid { dropped },
-                )
+                slide(Some(sliding))
             } else {
-                let rollover = head.rollover(HISTORY, may_grow);
-                (
-                    rollover.part,
-                    rollover.head.tail_epoch,
-                    &existing[..0],
-                    Some(rollover.head),
-                    AppendShape::Rollover {
-                        grew: !rollover.reused,
-                    },
-                )
+                rollover(head, may_grow)
             }
         }
     };
-    let entries = fit(&summary, kept, entries, PART_CAPACITY)?;
+    let entries = fit(summary_len, kept, entries, PART_CAPACITY)?;
     let values_kept = entries.iter().all(|entry| !entry.flags.values_not_kept);
     let plaintext = encode_part(epoch, &summary, kept, &entries).map_err(damaged)?;
     let sealed = keyring::seal(
@@ -504,30 +591,69 @@ fn finish(
     }))
 }
 
+/// A rollover's place, epoch, entries kept and head. A ring shrunk below
+/// a full ring that may grow takes a full limit again first.
+fn rollover<'k>(
+    head: &Head,
+    may_grow: bool,
+) -> (u16, u64, &'k [&'k [u8]], Option<Head>, AppendShape) {
+    let regrown;
+    let from = if may_grow && !head.would_grow() {
+        let mut full = head.clone();
+        full.ring_limit = HISTORY.max_parts;
+        regrown = full;
+        &regrown
+    } else {
+        head
+    };
+    let rollover = from.rollover(HISTORY, may_grow);
+    (
+        rollover.part,
+        rollover.head.tail_epoch,
+        &[],
+        Some(rollover.head),
+        AppendShape::Rollover {
+            grew: !rollover.reused,
+        },
+    )
+}
+
 /// How many of the oldest `existing` entries a sliding tail drops so the
-/// rest fit beside the new entries; all of them when even the new entries
-/// alone don't fit the target.
-fn oldest_to_drop(existing: &[&[u8]], fits_with: &impl Fn(&[&[u8]]) -> bool) -> usize {
-    (0..existing.len())
-        .find(|dropped| fits_with(&existing[*dropped..]))
-        .unwrap_or(existing.len())
+/// rest fit beside `new_count` new entries of `new_len` bytes; all of them
+/// when even the new entries alone don't fit the target. One pass.
+fn oldest_to_drop(
+    summary_len: usize,
+    existing: &[&[u8]],
+    new_count: usize,
+    new_len: usize,
+    target: usize,
+) -> usize {
+    let mut length =
+        part_len(summary_len, existing.iter().map(|bytes| bytes.len())) + 4 * new_count + new_len;
+    for (dropped, bytes) in existing.iter().enumerate() {
+        if length <= target {
+            return dropped;
+        }
+        length -= 4 + bytes.len();
+    }
+    existing.len()
 }
 
 /// `entries` as they fit beside `kept` within `limit`: as they are, then
 /// without values, then oversized.
 fn fit<'e>(
-    summary: &Summary<'_>,
+    summary_len: usize,
     kept: &[&[u8]],
     entries: Vec<Entry<'e>>,
     limit: usize,
 ) -> Result<Vec<Entry<'e>>, NotRecorded> {
+    let kept_len = part_len(summary_len, kept.iter().map(|bytes| bytes.len()));
     let length = |entries: &[Entry<'_>]| {
-        part_len(
-            summary.encoded_len(),
-            kept.iter()
-                .map(|bytes| bytes.len())
-                .chain(entries.iter().map(Entry::encoded_len)),
-        )
+        kept_len
+            + entries
+                .iter()
+                .map(|entry| 4 + entry.encoded_len())
+                .sum::<usize>()
     };
     if length(&entries) <= limit {
         return Ok(entries);
