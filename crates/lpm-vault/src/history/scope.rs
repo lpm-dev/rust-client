@@ -10,8 +10,9 @@ use std::collections::BTreeMap;
 use super::Source;
 use crate::EnvironmentMap;
 
-/// One project's change within a lock scope.
-#[derive(Debug, Clone)]
+/// One project's change within a lock scope. Its values are wiped when
+/// it's dropped, and its `Debug` names no value.
+#[derive(Clone)]
 pub(crate) struct Tracked {
     pub(crate) source: Source,
     /// The stored values when the scope first read them, or when its first
@@ -23,6 +24,39 @@ pub(crate) struct Tracked {
     /// entry records a rename rather than a removal and a creation.
     pub(crate) environment_renames: Vec<(String, String)>,
 }
+
+impl std::fmt::Debug for Tracked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let environments = |values: &Option<EnvironmentMap>| {
+            values.as_ref().map(|values| {
+                values
+                    .iter()
+                    .map(|(name, keys)| (name.clone(), keys.len()))
+                    .collect::<BTreeMap<_, _>>()
+            })
+        };
+        formatter
+            .debug_struct("Tracked")
+            .field("source", &self.source)
+            .field("before", &environments(&self.before))
+            .field("after", &environments(&self.after))
+            .field("environment_renames", &self.environment_renames)
+            .finish()
+    }
+}
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        for values in [self.before.as_mut(), self.after.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            super::wipe_values(values);
+        }
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for Tracked {}
 
 thread_local! {
     /// `None` outside a lock.

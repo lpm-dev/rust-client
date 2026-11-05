@@ -384,7 +384,7 @@ fn a_change_built_on_the_file_store_s_values_records_them_as_its_before() {
             let base = read_mutation_base(&mut keychain, directory, VAULT)?;
             assert_eq!(base, stored);
             assert_eq!(
-                crate::history::scope::tracked(VAULT).and_then(|tracked| tracked.before),
+                crate::history::scope::tracked(VAULT).and_then(|tracked| tracked.before.clone()),
                 Some(stored.clone()),
                 "the change read the file store's values, so they're its before"
             );

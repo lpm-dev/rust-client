@@ -715,14 +715,16 @@ fn print_values(info: &EntryInfo, revealed: &RevealedEntry) {
             continue;
         };
         for (change, values) in changes.iter().zip(values) {
-            let show = |side: SideInfo, value: Option<&str>| match (side, value) {
-                (_, Some(value)) => value.to_owned(),
-                (SideInfo::Absent, None) => "(not set)".to_owned(),
-                (SideInfo::NotRecorded, None) => "(not recorded)".to_owned(),
-                (SideInfo::TooLarge, None) => "(too large to keep)".to_owned(),
-                (SideInfo::Removed, None) => "(removed from history)".to_owned(),
-                (SideInfo::Kept, None) => "(hidden)".to_owned(),
-            };
+            fn show(side: SideInfo, value: Option<&str>) -> &str {
+                match (side, value) {
+                    (_, Some(value)) => value,
+                    (SideInfo::Absent, None) => "(not set)",
+                    (SideInfo::NotRecorded, None) => "(not recorded)",
+                    (SideInfo::TooLarge, None) => "(too large to keep)",
+                    (SideInfo::Removed, None) => "(removed from history)",
+                    (SideInfo::Kept, None) => "(hidden)",
+                }
+            }
             println!(
                 "          {} {}: {} → {}",
                 install_ui::dim(&environment.name),

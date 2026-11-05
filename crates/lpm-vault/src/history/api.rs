@@ -631,14 +631,16 @@ pub fn commit_rollback(
             }
             written.push(write.name);
         }
-        crate::write_all_environments_unlocked(
+        let committed = crate::write_all_environments_unlocked(
             directory,
             &vault_id,
             &project_name,
             &project_path,
             &values,
             &recording,
-        )?;
+        );
+        super::wipe_values(&mut values);
+        committed?;
         Ok(Ok(written))
     });
     match result {

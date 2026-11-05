@@ -223,6 +223,16 @@ pub(crate) fn finish_scope(directory: &VaultStorageDirectory) {
     }
 }
 
+/// Zero every value of `environments` in place, for copies history made.
+pub(crate) fn wipe_values(environments: &mut EnvironmentMap) {
+    use zeroize::Zeroize as _;
+    for values in environments.values_mut() {
+        for value in values.values_mut() {
+            value.zeroize();
+        }
+    }
+}
+
 /// A project's values as history sees them.
 pub(crate) fn values_of(environments: &EnvironmentMap) -> Values<'_> {
     Values::from_environments(environments.iter().map(|(name, keys)| {

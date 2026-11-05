@@ -554,7 +554,7 @@ mod api {
                 // pull stored is what history records.
                 let tracked = crate::history::scope::tracked(VAULT).expect("tracked");
                 assert_eq!(
-                    (tracked.before, tracked.after),
+                    (tracked.before.clone(), tracked.after.clone()),
                     (Some(one.clone()), Some(two.clone()))
                 );
                 crate::history::scope::forget(VAULT);
@@ -661,4 +661,29 @@ mod api {
             assert_eq!(ids(&dir).len(), 1, "history starts at the next change");
         });
     }
+}
+
+#[test]
+fn what_a_scope_tracks_never_prints_values_and_is_wiped_when_dropped() {
+    fn wipes_on_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+    let environments = std::collections::HashMap::from([(
+        "default".to_owned(),
+        std::collections::HashMap::from([("TOKEN".to_owned(), "value-sentinel".to_owned())]),
+    )]);
+    let tracked = scope::Tracked {
+        source: Source::new(Action::Set),
+        before: Some(environments.clone()),
+        after: Some(environments.clone()),
+        environment_renames: Vec::new(),
+    };
+    let shown = format!("{tracked:?}");
+    assert!(!shown.contains("value-sentinel"), "{shown}");
+    wipes_on_drop(&tracked);
+
+    let mut wiped = environments;
+    crate::history::wipe_values(&mut wiped);
+    assert!(
+        wiped["default"]["TOKEN"].bytes().all(|byte| byte == 0),
+        "values are zeroed in place"
+    );
 }

@@ -96,10 +96,12 @@ struct ProjectEnvironmentSummary {
 mod validated_vault_payload {
     use super::ProjectEnvironmentSummary;
 
+    /// A values payload ready to write. The serialized values are wiped
+    /// when it's dropped.
     #[derive(Clone)]
     pub(super) struct ValidatedVaultPayload {
         vault_id: String,
-        encoded: String,
+        encoded: zeroize::Zeroizing<String>,
         environment_summaries: Vec<ProjectEnvironmentSummary>,
     }
 
@@ -113,7 +115,7 @@ mod validated_vault_payload {
             let environment_summaries = super::project_environment_summaries(encoded)?;
             Ok(Self {
                 vault_id: vault_id.to_owned(),
-                encoded: encoded.to_owned(),
+                encoded: zeroize::Zeroizing::new(encoded.to_owned()),
                 environment_summaries,
             })
         }
@@ -129,9 +131,14 @@ mod validated_vault_payload {
             }
             Ok(Self {
                 vault_id: vault_id.to_owned(),
-                encoded,
+                encoded: zeroize::Zeroizing::new(encoded),
                 environment_summaries: super::environment_summaries(environments),
             })
+        }
+
+        #[cfg(test)]
+        pub(super) fn encoded_buffer(&self) -> &zeroize::Zeroizing<String> {
+            &self.encoded
         }
 
         pub(super) fn vault_id(&self) -> &str {
@@ -2697,6 +2704,17 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    #[test]
+    fn a_validated_values_write_wipes_its_payload_when_dropped() {
+        fn wipes_on_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+        let payload = ValidatedVaultPayload::parse(
+            "proj",
+            r#"{"environments":{"default":{"TOKEN":"secret"}}}"#,
+        )
+        .expect("payload");
+        wipes_on_drop(payload.encoded_buffer());
     }
 
     #[derive(Default)]
