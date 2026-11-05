@@ -123,13 +123,11 @@ pub(super) fn replace(
         Some(AccessClass::FollowsValues) => {
             storage.write_verified_with_access_from(&name, bytes, account.vault_id())
         }
-        Some(AccessClass::Open) | None => {
-            storage.write(&name, bytes)?;
-            if storage.read(&name)?.as_deref() != Some(bytes) {
-                return Err(format!("local history couldn't verify {name}"));
-            }
-            Ok(())
-        }
+        // The storage verifies its own write: the Keychain's reads it back
+        // below this boundary, so reading it here would verify it twice.
+        Some(AccessClass::Open) | None => storage
+            .write_verified(&name, bytes)
+            .map_err(|error| format!("local history couldn't write {name}: {error}")),
     }
 }
 

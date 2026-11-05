@@ -81,6 +81,26 @@ impl HistoryError {
             Self::Storage(_) => "storage",
         }
     }
+
+    /// The code JSON output gives: `history.` and [`code`](Self::code).
+    pub fn qualified_code(&self) -> &'static str {
+        match self {
+            Self::NoProject => "history.no_project",
+            Self::Off => "history.off",
+            Self::Unsupported => "history.unsupported",
+            Self::Damaged => "history.damaged",
+            Self::EntryNotFound => "history.entry_not_found",
+            Self::AmbiguousEntry => "history.ambiguous_entry",
+            Self::ValueIsCurrent => "history.value_is_current",
+            Self::ChangedSinceReview => "history.changed_since_review",
+            Self::TargetUnknown => "history.target_unknown",
+            Self::Limit => "history.limit",
+            Self::UnknownEnvironment => "history.unknown_environment",
+            Self::NameTaken(_) => "history.name_taken",
+            Self::EnvironmentRequired => "history.environment_required",
+            Self::Storage(_) => "history.storage",
+        }
+    }
 }
 
 impl fmt::Display for HistoryError {
@@ -260,6 +280,32 @@ enum Values {
 /// Run `run` with history opened for reading or changing, inside the lock,
 /// after the read gate, with the project's current values when needed.
 /// `None` before the project's first recorded change.
+/// Run `operation` inside the values lock as a history command: on macOS,
+/// its one approval prompt says it's for the project's local history.
+fn in_history_lock<T>(
+    operation: impl FnOnce(&crate::storage_transaction::VaultStorageDirectory) -> Result<T, String>,
+) -> Result<T, String> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos_keychain::prompting_for_local_history(|| {
+            crate::with_project_vault_transaction(operation)
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        crate::with_project_vault_transaction(operation)
+    }
+}
+
+/// The project's current values, held so they're wiped on every way out.
+fn read_values(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+) -> Result<ZeroizingValues, String> {
+    crate::read_all_environments_unlocked(directory, vault_id)
+        .map(|values| ZeroizingValues::from(values.unwrap_or_default()))
+}
+
 fn with_opened<T>(
     project_dir: &Path,
     values: Values,
@@ -267,13 +313,11 @@ fn with_opened<T>(
 ) -> Result<Option<T>, HistoryError> {
     let run: Box<Run<'_, T>> = Box::new(run);
     let vault_id = project_vault_id(project_dir)?;
-    let result = crate::with_project_vault_transaction(|directory| {
+    let result = in_history_lock(|directory| {
         crate::authorize_companion(directory, &vault_id, Operation::ReadExcludingOverrides)?;
         let values = match values {
-            Values::Needed => {
-                crate::read_all_environments_unlocked(directory, &vault_id)?.unwrap_or_default()
-            }
-            Values::Unused => EnvironmentMap::new(),
+            Values::Needed => read_values(directory, &vault_id)?,
+            Values::Unused => ZeroizingValues::default(),
         };
         with_history_store!(directory, |store| open_and_run(
             store, &vault_id, &values, run
@@ -350,7 +394,7 @@ pub fn status(project_dir: &Path) -> Result<HistoryStatus, HistoryError> {
         oldest: None,
         unreadable_parts: 0,
     };
-    let result = crate::with_project_vault_transaction(|directory| {
+    let result = in_history_lock(|directory| {
         crate::authorize_companion(directory, &vault_id, Operation::ReadExcludingOverrides)?;
         let empty = HistoryStatus {
             state: HistoryState::On,
@@ -374,8 +418,7 @@ pub fn status(project_dir: &Path) -> Result<HistoryStatus, HistoryError> {
                 Ok(history) => history,
             };
         // Only a project history records, or will, needs its values here.
-        let values =
-            crate::read_all_environments_unlocked(directory, &vault_id)?.unwrap_or_default();
+        let values = read_values(directory, &vault_id)?;
         let too_many = too_many_values(&values_of(&values));
         with_history_store!(directory, |store| {
             match history {
@@ -510,7 +553,7 @@ pub fn commit_rollback(
         name: &project_name,
         path: &project_path,
     };
-    let result = crate::with_project_vault_transaction(|directory| {
+    let result = in_history_lock(|directory| {
         let recording = super::scope::begin(&vault_id, &source);
         crate::authorize_companion(directory, &vault_id, Operation::Write)?;
         let values =
@@ -559,7 +602,7 @@ pub(super) fn roll_back(
             choices,
             &values_of(&values),
             &opened.keys,
-            opened.record.current().generation(),
+            opened.record.current().history_key(),
         )
         .map_err(|refusal| match refusal {
             Refusal::ChangedSinceReview => HistoryError::ChangedSinceReview,
@@ -647,10 +690,9 @@ pub fn forget(
     selection: &BTreeSet<usize>,
 ) -> Result<(), HistoryError> {
     let vault_id = project_vault_id(project_dir)?;
-    let result = crate::with_project_vault_transaction(|directory| {
+    let result = in_history_lock(|directory| {
         crate::authorize_companion(directory, &vault_id, Operation::Write)?;
-        let values =
-            crate::read_all_environments_unlocked(directory, &vault_id)?.unwrap_or_default();
+        let values = read_values(directory, &vault_id)?;
         with_history_store!(directory, |store| {
             let mut random = SystemRandom;
             match marker_history(store, &vault_id)? {
@@ -700,7 +742,7 @@ pub fn turn_on(project_dir: &Path) -> Result<(), HistoryError> {
 
 fn switch(project_dir: &Path, off: bool) -> Result<(), HistoryError> {
     let vault_id = project_vault_id(project_dir)?;
-    let result = crate::with_project_vault_transaction(|directory| {
+    let result = in_history_lock(|directory| {
         crate::authorize_companion(directory, &vault_id, Operation::Write)?;
         with_history_store!(directory, |store| {
             let gate =

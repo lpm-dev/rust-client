@@ -126,7 +126,7 @@ fn an_environment_rolls_back_to_its_whole_state_after_an_entry() {
         &Choices::default(),
         &current,
         &opened(&store).keys,
-        plan.generation,
+        plan.history_key(),
     )
     .expect("applies");
     assert_eq!(
@@ -146,7 +146,7 @@ fn an_environment_rolls_back_to_its_whole_state_after_an_entry() {
         &skip_b,
         &current,
         &opened(&store).keys,
-        plan.generation,
+        plan.history_key(),
     )
     .expect("applies");
     assert_eq!(
@@ -262,7 +262,7 @@ fn an_undo_of_an_entry_that_touched_several_environments_covers_and_binds_each()
             &Choices::default(),
             &changed_values,
             &opened(&store).keys,
-            plan.generation
+            plan.history_key()
         ),
         Err(Refusal::ChangedSinceReview),
         "each environment it covers is bound"
@@ -294,7 +294,7 @@ fn a_rollback_recreates_a_deleted_environment() {
         &Choices::default(),
         &current,
         &opened(&store).keys,
-        plan.generation,
+        plan.history_key(),
     )
     .expect("applies");
     assert_eq!(
@@ -333,14 +333,21 @@ fn a_rollback_to_before_an_environment_existed_removes_its_keys_and_deletes_it()
     assert!(plan.environments[0].offers_deletion());
     assert_eq!(rows(&plan), vec![row("F", "absent"), row("U", "absent")]);
     let keys = opened(&store).keys;
-    let writes = apply_rollback(&plan, &Choices::default(), &current, &keys, plan.generation)
-        .expect("applies");
+    let writes = apply_rollback(
+        &plan,
+        &Choices::default(),
+        &current,
+        &keys,
+        plan.history_key(),
+    )
+    .expect("applies");
     assert_eq!(written(&writes), vec![("preview".to_owned(), None, None)]);
     let keep = Choices {
         keep_empty: HashSet::from([0]),
         ..Choices::default()
     };
-    let writes = apply_rollback(&plan, &keep, &current, &keys, plan.generation).expect("applies");
+    let writes =
+        apply_rollback(&plan, &keep, &current, &keys, plan.history_key()).expect("applies");
     assert_eq!(
         written(&writes),
         vec![("preview".to_owned(), None, Some(vec![]))]
@@ -416,7 +423,7 @@ fn rollbacks_follow_key_and_environment_renames() {
         &Choices::default(),
         &current,
         &opened(&store).keys,
-        environment.generation,
+        environment.history_key(),
     )
     .expect("applies");
     assert_eq!(
@@ -768,7 +775,7 @@ fn every_binding_refuses_a_rollback_after_its_values_or_key_changed() {
             &Choices::default(),
             &edited_values,
             &keys,
-            environment.generation
+            environment.history_key()
         ),
         Err(Refusal::ChangedSinceReview)
     );
@@ -778,10 +785,27 @@ fn every_binding_refuses_a_rollback_after_its_values_or_key_changed() {
             &Choices::default(),
             &current,
             &keys,
-            environment.generation + 1
+            crate::keyring::HistoryKey {
+                generation: environment.generation + 1,
+                ..environment.history_key()
+            }
         ),
         Err(Refusal::ChangedSinceReview),
         "a removal in between rotates the key"
+    );
+    assert_eq!(
+        apply_rollback(
+            &environment,
+            &Choices::default(),
+            &current,
+            &keys,
+            crate::keyring::HistoryKey {
+                id: [0xee; 16],
+                ..environment.history_key()
+            }
+        ),
+        Err(Refusal::ChangedSinceReview),
+        "history turned off and on again starts at the same generation with a new key"
     );
 
     let key = plan_key_rollback(
@@ -799,7 +823,7 @@ fn every_binding_refuses_a_rollback_after_its_values_or_key_changed() {
             &Choices::default(),
             &edited_values,
             &keys,
-            key.generation
+            key.history_key()
         )
         .is_ok(),
         "a key rollback is bound to its key only"
@@ -808,7 +832,13 @@ fn every_binding_refuses_a_rollback_after_its_values_or_key_changed() {
     a_changed.set("production", "A", "9");
     let a_changed = a_changed.values();
     assert_eq!(
-        apply_rollback(&key, &Choices::default(), &a_changed, &keys, key.generation),
+        apply_rollback(
+            &key,
+            &Choices::default(),
+            &a_changed,
+            &keys,
+            key.history_key()
+        ),
         Err(Refusal::ChangedSinceReview)
     );
     let all_off = Choices {
@@ -816,7 +846,7 @@ fn every_binding_refuses_a_rollback_after_its_values_or_key_changed() {
         ..Choices::default()
     };
     assert_eq!(
-        apply_rollback(&key, &all_off, &current, &keys, key.generation),
+        apply_rollback(&key, &all_off, &current, &keys, key.history_key()),
         Err(Refusal::NothingToApply)
     );
 }
@@ -860,7 +890,7 @@ fn undoing_a_rollback_puts_back_what_it_replaced() {
         &Choices::default(),
         &current,
         &opened(&store).keys,
-        plan.generation,
+        plan.history_key(),
     )
     .expect("applies");
     let rolled_back = Project::with(&[("production", &[("A", "1")])]);
@@ -1239,7 +1269,7 @@ fn a_recreating_rollback_is_refused_once_another_environment_takes_the_name() {
             &Choices::default(),
             &taken.values(),
             &opened(&store).keys,
-            plan.generation,
+            plan.history_key(),
         ),
         Err(Refusal::ChangedSinceReview)
     );
@@ -1304,7 +1334,7 @@ fn a_rollback_recreates_an_environment_that_was_empty_at_the_point() {
         &Choices::default(),
         &current,
         &opened(&store).keys,
-        plan.generation,
+        plan.history_key(),
     )
     .expect("applies");
     assert_eq!(
@@ -1531,7 +1561,7 @@ fn the_rows_of_a_renamed_key_are_linked_and_apply_together() {
         &skip_new,
         &current,
         &opened(&store).keys,
-        plan.generation,
+        plan.history_key(),
     )
     .expect("applies");
     assert_eq!(

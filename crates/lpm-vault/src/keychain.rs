@@ -1033,12 +1033,14 @@ fn roll_forward_persisted_project_transaction(
     finish_project_transaction(storage, journal)
 }
 
+/// A journal's staged bytes, checked against the journal. They may be a
+/// key, so they're wiped once dropped, a refusal included.
 fn read_validated_stage(
     storage: &mut impl ProjectStorage,
     operation: &TransactionJournalOperation,
     stage: &str,
-) -> Result<Option<Vec<u8>>, String> {
-    let Some(value) = storage.read(stage)? else {
+) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, String> {
+    let Some(value) = storage.read(stage)?.map(zeroize::Zeroizing::new) else {
         return Ok(None);
     };
     if value.len() > MAX_TRANSACTION_VALUE_BYTES
@@ -1054,9 +1056,10 @@ fn read_validated_stage(
 fn read_validated_applied_target(
     storage: &mut impl ProjectStorage,
     operation: &TransactionJournalOperation,
-) -> Result<Vec<u8>, String> {
+) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
     let target = storage
         .read(&operation.target_account)?
+        .map(zeroize::Zeroizing::new)
         .ok_or_else(|| "committed vault transaction lost both stage and target".to_owned())?;
     validate_transaction_target(&operation.target_account, Some(&target))?;
     if transaction_operation_sha256("write", &operation.target_account, Some(&target))
@@ -1071,7 +1074,7 @@ fn read_validated_applied_target(
 /// its journal operation, so replay reads it no more.
 enum CheckedMarker {
     /// The stage's bytes, still to be written.
-    Staged(Vec<u8>),
+    Staged(zeroize::Zeroizing<Vec<u8>>),
     /// The target already holds the journal's bytes.
     Applied,
 }
@@ -1090,7 +1093,7 @@ fn check_persisted_companion_invariants(
     journal: &TransactionJournal,
 ) -> Result<HashMap<usize, CheckedMarker>, String> {
     let mut checked = HashMap::new();
-    let mut changes: Vec<(&str, Option<Vec<u8>>)> = Vec::new();
+    let mut changes: Vec<(&str, Option<zeroize::Zeroizing<Vec<u8>>>)> = Vec::new();
     for (index, operation) in journal.operations.iter().enumerate() {
         let account = operation.target_account.as_str();
         if !crate::companion::account::is_in_companion_namespace(account) {
@@ -1109,7 +1112,7 @@ fn check_persisted_companion_invariants(
                     }
                 })
             }
-            ("write", _) => Some(Vec::new()),
+            ("write", _) => Some(zeroize::Zeroizing::new(Vec::new())),
             _ => None,
         };
         changes.push((account, value));
@@ -1119,7 +1122,7 @@ fn check_persisted_companion_invariants(
     }
     let changes: Vec<(&str, Option<&[u8]>)> = changes
         .iter()
-        .map(|(account, value)| (*account, value.as_deref()))
+        .map(|(account, value)| (*account, value.as_ref().map(|value| value.as_slice())))
         .collect();
     check_companion_invariants(storage, &changes)?;
     Ok(checked)
@@ -1693,10 +1696,7 @@ fn write_all_environments_with_storage_after_recovery(
     warn_if_large(encoded.len());
     let payload =
         ValidatedVaultPayload::from_serialized_environments(vault_id, encoded, &environments)?;
-    if crate::history::scope::needs_before(recording) {
-        let before = read_before(storage, vault_id)?;
-        crate::history::scope::observe_owned_read(vault_id, before);
-    }
+    crate::history::scope::observe_before(recording, || read_before(storage, vault_id));
     save_validated_vault_data_with_storage_after_recovery(
         storage,
         project_name,
@@ -2751,6 +2751,41 @@ mod tests {
 
     #[cfg(not(miri))]
     #[test]
+    fn recovery_reads_a_staged_history_key_without_leaving_a_copy() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        let target = lpm_env_companion::history::key_account("proj").name();
+        let stage = format!("{TRANSACTION_STAGE_PREFIX}history-key");
+        let operation = TransactionJournalOperation {
+            action: "write".to_owned(),
+            target_account: target.clone(),
+            staged_account: Some(stage.clone()),
+            operation_sha256: transaction_operation_sha256(
+                "write",
+                &target,
+                Some(MARKER.as_bytes()),
+            ),
+        };
+        let mut storage = MemoryProjectStorage::default();
+        storage
+            .values
+            .insert(stage.clone(), MARKER.as_bytes().to_vec());
+        let ((), found) = watch(|| {
+            let staged = read_validated_stage(&mut storage, &operation, &stage)
+                .expect("valid")
+                .expect("staged");
+            assert_eq!(staged.as_slice(), MARKER.as_bytes());
+        });
+        assert!(!found, "the staged key is wiped once replayed");
+
+        storage.values.insert(target, MARKER.as_bytes().to_vec());
+        let ((), found) = watch(|| {
+            read_validated_applied_target(&mut storage, &operation).expect("valid");
+        });
+        assert!(!found, "the applied key is wiped once checked");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
     fn a_values_payload_refused_before_it_is_written_is_wiped() {
         use crate::freed_memory_probe::{MARKER, watch};
         let environments = &EnvironmentMap::new();
@@ -2840,6 +2875,10 @@ mod tests {
         fail_committed_marker_verification_once: bool,
         fail_final_marker_delete_verification_once: bool,
         final_marker_was_deleted: bool,
+        /// Whether a verified write checks its own result below this
+        /// boundary, as the Keychain storage's does, instead of reading it
+        /// back through `read`.
+        verifies_writes_itself: bool,
     }
 
     impl ProjectStorage for MemoryProjectStorage {
@@ -2903,6 +2942,20 @@ mod tests {
                 return Err("injected final-marker deletion verification failure".to_owned());
             }
             Ok(self.values.get_bytes(account).map(<[u8]>::to_vec))
+        }
+
+        fn write_verified(&mut self, account: &str, value: &[u8]) -> Result<(), String> {
+            self.write(account, value)?;
+            let verified = if self.verifies_writes_itself {
+                self.values.get_bytes(account) == Some(value)
+            } else {
+                self.read(account)?.as_deref() == Some(value)
+            };
+            if verified {
+                Ok(())
+            } else {
+                Err(format!("vault transaction could not verify {account}"))
+            }
         }
 
         fn write(&mut self, account: &str, value: &[u8]) -> Result<(), String> {

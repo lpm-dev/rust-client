@@ -31,6 +31,9 @@ pub(super) const MAX_TRIMS_PER_OPERATION: usize = 16;
 
 /// Record `tracked`, the change one lock scope made to `vault_id`.
 pub(crate) fn record(store: &mut impl HistoryStore, vault_id: &str, tracked: &Tracked) -> Outcome {
+    if let (Some(reason), Some(_)) = (&tracked.unreadable_before, &tracked.after) {
+        return unrecordable(store, vault_id, reason);
+    }
     let (Some(before), Some(after)) = (&tracked.before, &tracked.after) else {
         return Outcome::Nothing;
     };
@@ -79,6 +82,30 @@ pub(crate) fn record(store: &mut impl HistoryStore, vault_id: &str, tracked: &Tr
             .unwrap_or_else(Outcome::NotRecorded),
         MarkerHistory::On => append(store, vault_id, marker, &change, &mut random)
             .unwrap_or_else(Outcome::NotRecorded),
+    }
+}
+
+/// What history says of a change whose "before" couldn't be read: nothing
+/// when it wouldn't record the change anyway, otherwise why it didn't.
+fn unrecordable(store: &mut impl HistoryStore, vault_id: &str, reason: &str) -> Outcome {
+    let gate = match crate::companion::open_project(store, vault_id) {
+        Ok(gate) => gate,
+        Err(error) => return Outcome::NotRecorded(NotRecorded::Failed(error)),
+    };
+    let marker = match &gate {
+        ProjectGate::Plain => None,
+        ProjectGate::Marked(marker) => Some(marker),
+        ProjectGate::Damaged(_) => return Outcome::NotRecorded(NotRecorded::Damaged),
+    };
+    match MarkerHistory::of(marker) {
+        MarkerHistory::Off => Outcome::Off,
+        MarkerHistory::Removing | MarkerHistory::Unsupported { .. } => {
+            Outcome::NotRecorded(NotRecorded::NewerVersion)
+        }
+        MarkerHistory::Both => Outcome::NotRecorded(NotRecorded::Damaged),
+        MarkerHistory::Default | MarkerHistory::On => Outcome::NotRecorded(NotRecorded::Failed(
+            format!("the values it replaced couldn't be read: {reason}"),
+        )),
     }
 }
 

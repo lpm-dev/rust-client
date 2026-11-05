@@ -83,10 +83,21 @@ pub struct RemovalReview {
     pub value: Digest,
     /// The key's generation at review.
     pub generation: u32,
+    /// The key's ID at review, so a review from a history since turned off
+    /// and on doesn't start a removal in the new one.
+    pub key_id: crate::keyring::KeyId,
     pub places: Vec<Place>,
 }
 
 impl RemovalReview {
+    /// The history and key the review was made under.
+    pub fn history_key(&self) -> crate::keyring::HistoryKey {
+        crate::keyring::HistoryKey {
+            id: self.key_id,
+            generation: self.generation,
+        }
+    }
+
     /// The places checked by default: the chosen key's, unless current.
     pub fn default_selection(&self) -> BTreeSet<usize> {
         self.places
@@ -492,6 +503,7 @@ fn places_of(
     RemovalReview {
         value,
         generation: opened.record.current().generation(),
+        key_id: opened.record.current().id(),
         places: out,
     }
 }
@@ -667,7 +679,7 @@ pub fn start_removal(
     if opened.record.is_rotating() || opened.head.removing.is_some() {
         return Err(RemovalError::Running);
     }
-    if opened.record.current().generation() != review.generation {
+    if opened.record.current().history_key() != review.history_key() {
         return Err(RemovalError::ChangedSinceReview);
     }
     let holding = current_places(&opened.keys, current, review.value);

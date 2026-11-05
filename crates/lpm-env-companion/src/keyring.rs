@@ -56,6 +56,16 @@ const BINDING_SALT: &[u8] = b"lpm-vault-history-binding\x01";
 pub type Digest = [u8; 16];
 pub type KeyId = [u8; 16];
 
+/// Which history, and which of its keys, something was made under: the
+/// key's ID, random for each history, and its generation, which each
+/// rotation raises. A history turned off and on again starts at generation
+/// 1 with a new ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryKey {
+    pub id: KeyId,
+    pub generation: u32,
+}
+
 /// Where random bytes come from: the system, or a fixed sequence in tests
 /// and exported fixtures.
 pub trait Random {
@@ -133,6 +143,14 @@ impl KeySlot {
 
     pub fn id(&self) -> KeyId {
         self.id
+    }
+
+    /// Which history and key this is, for binding what was made under it.
+    pub fn history_key(&self) -> HistoryKey {
+        HistoryKey {
+            id: self.id,
+            generation: self.generation,
+        }
     }
 
     pub fn generation(&self) -> u32 {

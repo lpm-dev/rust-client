@@ -361,7 +361,8 @@ LPMEnvResult lpm_env_history_rollback(const uint8_t *input, size_t input_length)
  * and chosen: {entry, environment, key, side}, or start: {review (as returned),
  * selection: [place index], approval, fingerprint (the review's)}; a review
  * that isn't the one returned refuses with history.changed_since_review. Review output {review: {value,
- * generation, places: [{environment, key, renamedFrom, group: "thisKey" |
+ * generation, keyId (the history's key, so a review never applies to a
+ * history turned off and on since), places: [{environment, key, renamedFrom, group: "thisKey" |
  * "otherKey", current, occurrences, digests, renamedEnvironments}],
  * defaultSelection, fingerprint}}. A place is current, and can't be checked, when any name
  * it had holds the value now. Start output

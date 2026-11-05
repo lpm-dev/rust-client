@@ -1289,6 +1289,7 @@ fn fingerprint(opened: &Opened, plan: &RollbackPlan) -> String {
         .sum::<usize>();
     let mut encoded = Zeroizing::new(Vec::with_capacity(length));
     encoded.extend_from_slice(&plan.generation.to_be_bytes());
+    encoded.extend_from_slice(&plan.key_id);
     for environment in &plan.environments {
         for name in [&environment.current, &environment.target] {
             match name {
@@ -1533,7 +1534,7 @@ pub unsafe extern "C" fn lpm_env_history_rollback(input: *const u8, length: usiz
                     &choices,
                     &values,
                     &opening.opened.keys,
-                    opening.opened.record.current().generation(),
+                    opening.opened.record.current().history_key(),
                 ) {
                     Ok(writes) => writes,
                     Err(Refusal::ChangedSinceReview) => {
@@ -1609,6 +1610,7 @@ struct PlaceRequest {
 struct ReviewRequest {
     value: String,
     generation: u32,
+    key_id: String,
     places: Vec<PlaceRequest>,
 }
 
@@ -1663,6 +1665,7 @@ fn review_fingerprint(opened: &Opened, review: &RemovalReview) -> String {
     let mut encoded = Vec::with_capacity(length);
     encoded.extend_from_slice(&review.value);
     encoded.extend_from_slice(&review.generation.to_be_bytes());
+    encoded.extend_from_slice(&review.key_id);
     for place in &review.places {
         text(&mut encoded, &place.environment);
         text(&mut encoded, &place.key);
@@ -1726,6 +1729,7 @@ struct PlaceOut<'a> {
 struct ReviewOut<'a> {
     value: String,
     generation: u32,
+    key_id: String,
     places: Vec<PlaceOut<'a>>,
     default_selection: BTreeSet<usize>,
     fingerprint: String,
@@ -1736,6 +1740,7 @@ fn review_out<'a>(opened: &Opened, review: &'a RemovalReview) -> ReviewOut<'a> {
         fingerprint: review_fingerprint(opened, review),
         value: digest_text(&review.value),
         generation: review.generation,
+        key_id: hex::encode(review.key_id),
         places: review
             .places
             .iter()
@@ -1768,6 +1773,7 @@ fn review_from(request: &ReviewRequest) -> Option<RemovalReview> {
     Some(RemovalReview {
         value: digest_from(&request.value)?,
         generation: request.generation,
+        key_id: hex::decode(&request.key_id).ok()?.try_into().ok()?,
         places: request
             .places
             .iter()

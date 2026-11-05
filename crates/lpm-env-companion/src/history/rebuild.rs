@@ -22,7 +22,7 @@ use crate::history::read::{
     EntryInfo, IdPrefix, Opened, PartRead, PartSource, ReadError, entry_info,
 };
 use crate::history::values::Values;
-use crate::keyring::{Digest, DigestKeys};
+use crate::keyring::{Digest, DigestKeys, HistoryKey};
 
 /// A point in history: right after an entry, or right before it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1211,10 +1211,21 @@ pub struct RollbackPlan {
     pub point_time: i64,
     /// The key's generation at review; a removal in between rotates it.
     pub generation: u32,
+    /// The key's ID at review, so a review from a history since turned off
+    /// and on doesn't apply to the new one.
+    pub key_id: crate::keyring::KeyId,
     pub environments: Vec<EnvironmentPlan>,
 }
 
 impl RollbackPlan {
+    /// The history and key the plan was made under.
+    pub fn history_key(&self) -> HistoryKey {
+        HistoryKey {
+            id: self.key_id,
+            generation: self.generation,
+        }
+    }
+
     /// Whether applying the plan as reviewed changes anything.
     pub fn changes_anything(&self) -> bool {
         self.environments
@@ -1355,17 +1366,17 @@ pub fn plan_rollback<E: From<PlanError>>(
     choose: impl FnOnce(&EntryInfo) -> Result<Target, E>,
 ) -> Result<(EntryInfo, RollbackPlan), E> {
     let mut walked = walk(opened, source, current, entry, choose)?;
-    let generation = opened.record.current().generation();
+    let history_key = opened.record.current().history_key();
     let target = walked.target.clone();
     let plan = match &target {
         Target::Environment { environment, .. } => {
-            plan_environment(&mut walked, current, &opened.keys, generation, environment)
+            plan_environment(&mut walked, current, &opened.keys, history_key, environment)
         }
         Target::Key { environment, key } => plan_key(
             &mut walked,
             current,
             &opened.keys,
-            generation,
+            history_key,
             environment,
             key,
         ),
@@ -1373,7 +1384,7 @@ pub fn plan_rollback<E: From<PlanError>>(
             &mut walked,
             current,
             &opened.keys,
-            generation,
+            history_key,
             only.as_ref(),
         ),
     }
@@ -1443,7 +1454,7 @@ fn plan_environment(
     walked: &mut Walked,
     current: &Values<'_>,
     keys: &DigestKeys,
-    generation: u32,
+    history_key: HistoryKey,
     environment: &EnvironmentName,
 ) -> Result<RollbackPlan, PlanError> {
     let state = &walked.state;
@@ -1524,7 +1535,8 @@ fn plan_environment(
         kind: RollbackKind::Environment,
         point: walked.point,
         point_time: walked.point_time,
-        generation,
+        generation: history_key.generation,
+        key_id: history_key.id,
         environments: vec![EnvironmentPlan {
             binding: Binding::Environment(environment_binding(keys, current_values)),
             current: current_name,
@@ -1539,7 +1551,7 @@ fn plan_key(
     walked: &mut Walked,
     current: &Values<'_>,
     keys: &DigestKeys,
-    generation: u32,
+    history_key: HistoryKey,
     environment: &EnvironmentName,
     key: &str,
 ) -> Result<RollbackPlan, PlanError> {
@@ -1572,7 +1584,8 @@ fn plan_key(
         kind: RollbackKind::Key,
         point: walked.point,
         point_time: walked.point_time,
-        generation,
+        generation: history_key.generation,
+        key_id: history_key.id,
         environments: vec![EnvironmentPlan {
             current: environment_exists.then(|| environment_name.clone()),
             target: Some(environment_name),
@@ -1587,7 +1600,7 @@ fn plan_undo_walked(
     walked: &mut Walked,
     current: &Values<'_>,
     keys: &DigestKeys,
-    generation: u32,
+    history_key: HistoryKey,
     only: Option<&EnvironmentName>,
 ) -> Result<RollbackPlan, PlanError> {
     let undone = walked
@@ -1757,7 +1770,8 @@ fn plan_undo_walked(
         kind: RollbackKind::Undo,
         point: walked.point,
         point_time: walked.point_time,
-        generation,
+        generation: history_key.generation,
+        key_id: history_key.id,
         environments,
     })
 }
@@ -1820,9 +1834,9 @@ pub fn apply_rollback(
     choices: &Choices,
     current: &Values<'_>,
     keys: &DigestKeys,
-    generation: u32,
+    history_key: HistoryKey,
 ) -> Result<Vec<EnvironmentWrite>, Refusal> {
-    if generation != plan.generation {
+    if history_key != plan.history_key() {
         return Err(Refusal::ChangedSinceReview);
     }
     let mut writes = Vec::with_capacity(plan.environments.len());

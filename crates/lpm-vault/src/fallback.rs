@@ -817,10 +817,9 @@ fn commit_environments(
     recording: &crate::history::scope::Recording,
 ) -> Result<(), String> {
     crate::authorize_companion(directory, vault_id, Operation::Write)?;
-    if crate::history::scope::needs_before(recording) {
-        let before = read_environments_with_digest(directory, vault_id)?.0;
-        crate::history::scope::observe_owned_read(vault_id, before);
-    }
+    crate::history::scope::observe_before(recording, || {
+        read_environments_with_digest(directory, vault_id).map(|(before, _)| before)
+    });
     let json = crate::selected_environment::serialize(&environments)?;
     let encrypted =
         encrypt_with_store_unlocked(directory, vault_id, &json, &KeyringNativeDataKeyStore)?;
@@ -830,9 +829,10 @@ fn commit_environments(
         encrypted.as_bytes(),
         "encrypted vault",
     )?;
-    remove_legacy_vault_file(&vaults, vault_id)?;
+    // The write is durable now, so history records it even if the cleanup
+    // after it fails.
     crate::history::scope::committed(recording, environments);
-    Ok(())
+    remove_legacy_vault_file(&vaults, vault_id)
 }
 
 /// Removes the vault's legacy file, when an entry is named that exactly.

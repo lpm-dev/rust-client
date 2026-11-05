@@ -30,6 +30,7 @@ fn change(before: &str, after: &str) -> Tracked {
         before: Some(environments(before).into()),
         after: Some(environments(after).into()),
         environment_renames: Vec::new(),
+        unreadable_before: None,
     }
 }
 
@@ -113,6 +114,22 @@ fn a_steady_append_reads_the_head_key_and_tail_once_and_writes_the_tail_once() {
         attribute_reads <= 1,
         "the values item's attributes are read at most once: {:?}",
         storage.attribute_reads
+    );
+
+    // The Keychain's own verified write reads its result back itself, so
+    // history mustn't read it again.
+    storage.verifies_writes_itself = true;
+    storage.reads.clear();
+    let appended = record(
+        &mut test_history(&mut storage),
+        VAULT,
+        &change("two", "three"),
+    );
+    assert!(matches!(appended, Outcome::Recorded { .. }), "{appended:?}");
+    assert_eq!(
+        reads(&storage, &tail),
+        1,
+        "the tail is read once; the write verifies itself"
     );
 }
 
@@ -367,6 +384,74 @@ fn a_trim_past_the_cap_keeps_the_part_an_interrupted_rollover_recovers_from() {
 }
 
 #[test]
+fn another_project_s_orphan_part_never_takes_its_ring_below_the_floor() {
+    use lpm_env_companion::append_log::{HISTORY, Head};
+    let mut storage = MemoryProjectStorage::default();
+    // Another project with real history, grown to two parts, so its tail
+    // is current and only the floor keeps a trim from taking it to one.
+    save_vault_data_with_storage(
+        &mut storage,
+        "other",
+        "Other",
+        "/other",
+        r#"{"environments":{"default":{"TOKEN":"one"}}}"#,
+    )
+    .expect("create the other project");
+    let head_account = lpm_env_companion::history::head_account("other").name();
+    let other_head = |storage: &MemoryProjectStorage| {
+        Head::parse(
+            HISTORY,
+            "other",
+            storage.values.get_bytes(&head_account).expect("head"),
+        )
+        .expect("head")
+    };
+    let mut previous = "zero".to_owned();
+    for round in 0..64 {
+        let next = format!("{round}{}", "x".repeat(6 * 1024));
+        let outcome = record(
+            &mut test_history(&mut storage),
+            "other",
+            &change(&previous, &next),
+        );
+        assert!(matches!(outcome, Outcome::Recorded { .. }), "{outcome:?}");
+        previous = next;
+        if other_head(&storage).parts.len() == 2 {
+            break;
+        }
+    }
+    let parts = other_head(&storage).parts;
+    assert_eq!(parts.len(), 2);
+    // A trim that crashed before its deletion left part 7, so the listing
+    // counts three parts.
+    storage.values.insert(
+        lpm_env_companion::history::part_account("other", 7).name(),
+        b"orphan".to_vec(),
+    );
+    fill_service(&mut storage, lpm_env_companion::budgets::ADMISSION_TARGET);
+
+    save_vault_data_with_storage(
+        &mut storage,
+        VAULT,
+        "Project",
+        "/project",
+        r#"{"environments":{"default":{"TOKEN":"one"}}}"#,
+    )
+    .expect("create the project");
+    let created = record(
+        &mut test_history(&mut storage),
+        VAULT,
+        &change("zero", "one"),
+    );
+    assert!(matches!(created, Outcome::Recorded { .. }), "{created:?}");
+    assert_eq!(
+        other_head(&storage).parts,
+        parts,
+        "past the target the floor is two listed parts, orphans aside"
+    );
+}
+
+#[test]
 fn admission_learns_every_project_s_approval_from_the_listing() {
     let mut storage = MemoryProjectStorage::default();
     save_vault_data_with_storage(
@@ -430,6 +515,7 @@ fn a_change_history_cant_record_costs_no_listing_or_probe() {
         before: Some(environments("one").into()),
         after: Some(HashMap::from([("default".to_owned(), many)]).into()),
         environment_renames: Vec::new(),
+        unreadable_before: None,
     };
     assert_eq!(
         record(&mut test_history(&mut storage), VAULT, &too_many),
@@ -449,6 +535,7 @@ fn a_change_history_cant_record_costs_no_listing_or_probe() {
             .into(),
         ),
         environment_renames: Vec::new(),
+        unreadable_before: None,
     };
     assert_eq!(
         record(&mut test_history(&mut storage), VAULT, &environment_only),

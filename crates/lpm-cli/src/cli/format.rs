@@ -242,7 +242,8 @@ fn print_json_error(error: &lpm_common::LpmError) {
     );
 }
 
-fn json_error_value(error: &lpm_common::LpmError) -> serde_json::Value {
+/// The shared JSON error envelope for `error`, as the CLI prints it.
+pub(crate) fn json_error_value(error: &lpm_common::LpmError) -> serde_json::Value {
     let mut json = match error {
         lpm_common::LpmError::ScriptPhase { phase, code, .. } => serde_json::json!({
             "schema_version": crate::json_contract::ERROR_ENVELOPE_SCHEMA_VERSION,
@@ -1008,6 +1009,9 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
         }
         lpm_common::LpmError::EnvValidation(reason) => {
             diagnostic_lines("Environment validation failed", Some(reason), error)
+        }
+        lpm_common::LpmError::History { message, .. } => {
+            diagnostic_lines("Local history error", Some(message), error)
         }
         lpm_common::LpmError::EnvProjectRefused(reason) => {
             diagnostic_lines("This env project needs attention", Some(reason), error)

@@ -724,6 +724,12 @@ pub enum LpmError {
     #[diagnostic(code(lpm::env_project_refused))]
     EnvProjectRefused(String),
 
+    /// Local history refused or couldn't do what was asked. `code` is the
+    /// stable `history.*` code JSON output gives, and the message says why.
+    #[error("{message}")]
+    #[diagnostic(code(lpm::history))]
+    History { code: &'static str, message: String },
+
     #[error("environment generation failed:\n{reason}")]
     #[diagnostic(code(lpm::env_generation), help("{help}"))]
     EnvGeneration { reason: String, help: &'static str },
@@ -950,6 +956,7 @@ impl LpmError {
             }
             LpmError::EnvValidation(_) => "env_validation",
             LpmError::EnvProjectRefused(_) => "env_project_refused",
+            LpmError::History { code, .. } => code,
             LpmError::EnvGeneration { .. } => "env_generation",
             LpmError::EngineMismatch(_) | LpmError::RunEngineMismatch(_) => "engine_mismatch",
             LpmError::SelfUpdatePaused(_) => "self_update_paused",
@@ -1237,6 +1244,10 @@ mod tests {
                 specifier: "catalog:shared".into(),
             },
             LpmError::EnvValidation("x".into()),
+            LpmError::History {
+                code: "history.entry_not_found",
+                message: "x".into(),
+            },
             LpmError::EngineMismatch(Box::new(EngineMismatchErrorContext {
                 engine: "lpm".into(),
                 required: ">=1.0.0".into(),
@@ -1497,6 +1508,14 @@ mod tests {
         assert_eq!(
             LpmError::EnvValidation("x".into()).error_code(),
             "env_validation"
+        );
+        assert_eq!(
+            LpmError::History {
+                code: "history.entry_not_found",
+                message: "no entry in local history has that ID".into(),
+            }
+            .error_code(),
+            "history.entry_not_found"
         );
         assert_eq!(
             LpmError::EngineMismatch(Box::new(EngineMismatchErrorContext {

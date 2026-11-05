@@ -547,6 +547,192 @@ mod api {
     }
 
     #[test]
+    fn a_review_from_a_history_since_turned_off_and_on_never_applies_to_the_new_one() {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            let dir = home.join("project");
+            std::fs::create_dir_all(&dir).expect("project dir");
+            project_set(&dir, "TOKEN", "secret");
+            crate::delete(&dir, &["TOKEN"], &Source::new(Action::Delete)).expect("delete");
+            take_outcomes();
+            let entries = ids(&dir);
+            // A rollback that would put the deleted value back, and a
+            // removal of it, both reviewed now. TOKEN is absent, so its
+            // binding holds no digest of the current value.
+            let (_, plan) = crate::history::review_rollback(&dir, &hex::encode(entries[1]), |_| {
+                Ok(Target::Key {
+                    environment: EnvironmentName::Now("default".to_owned()),
+                    key: "TOKEN".to_owned(),
+                })
+            })
+            .expect("rollback review");
+            let chosen = ChosenSide {
+                environment: "default".to_owned(),
+                key: "TOKEN".to_owned(),
+                side: RelatedSide::Before,
+            };
+            let (_, review) =
+                crate::history::review_forget(&dir, &hex::encode(entries[1]), |_| Ok(chosen))
+                    .expect("removal review");
+
+            // History is turned off, which erases it, then on, and a new
+            // one starts at the next change, at the same key generation.
+            crate::history::turn_off(&dir).expect("off");
+            crate::history::turn_on(&dir).expect("on");
+            project_set(&dir, "OTHER", "x");
+
+            assert_eq!(
+                crate::history::commit_rollback(&dir, &plan, &Choices::default()),
+                Err(HistoryError::ChangedSinceReview)
+            );
+            assert_eq!(stored(&dir, "TOKEN"), None, "the erased value stays gone");
+            assert_eq!(
+                crate::history::forget(&dir, &review, &review.default_selection()),
+                Err(HistoryError::ChangedSinceReview)
+            );
+        });
+    }
+
+    #[test]
+    fn a_values_write_goes_through_when_history_can_t_read_what_it_replaces() {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            let dir = home.join("project");
+            std::fs::create_dir_all(&dir).expect("project dir");
+            project_set(&dir, "A", "1");
+            let vault_id = crate::vault_id::read_vault_id(&dir).expect("vault ID");
+            let payload = home
+                .join(".lpm")
+                .join("vaults")
+                .join(crate::fallback::vault_file_name(&vault_id));
+            let replacement = std::collections::HashMap::from([(
+                "default".to_owned(),
+                std::collections::HashMap::from([("A".to_owned(), "2".to_owned())]),
+            )]);
+
+            // Replacing every value needs nothing from the stored payload,
+            // so a damaged one doesn't stop it; only history needed it.
+            std::fs::write(&payload, b"damaged").expect("damage the payload");
+            crate::replace_all_environments(&dir, &replacement, &Source::new(Action::Import))
+                .expect("the values write goes through");
+            assert_eq!(stored(&dir, "A").as_deref(), Some("2"));
+            let outcomes = take_outcomes();
+            assert!(
+                matches!(
+                    outcomes.as_slice(),
+                    [Recorded { outcome: Outcome::NotRecorded(NotRecorded::Failed(reason)), .. }]
+                        if reason.contains("couldn't be read")
+                ),
+                "{outcomes:?}"
+            );
+
+            // With history off, the write never reads what it replaces.
+            crate::history::turn_off(&dir).expect("off");
+            std::fs::write(&payload, b"damaged").expect("damage the payload");
+            crate::replace_all_environments(&dir, &replacement, &Source::new(Action::Import))
+                .expect("the values write goes through");
+            assert_eq!(stored(&dir, "A").as_deref(), Some("2"));
+        });
+    }
+
+    #[test]
+    fn a_values_write_whose_cleanup_fails_afterwards_is_still_recorded() {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            let dir = home.join("project");
+            std::fs::create_dir_all(&dir).expect("project dir");
+            project_set(&dir, "A", "1");
+            let vault_id = crate::vault_id::read_vault_id(&dir).expect("vault ID");
+            // A directory with the legacy file's name makes the cleanup
+            // after the write fail.
+            std::fs::create_dir(
+                home.join(".lpm")
+                    .join("vaults")
+                    .join(format!("{vault_id}.enc")),
+            )
+            .expect("a directory in the legacy file's place");
+            assert!(
+                crate::set(&dir, &[("A", "2")], &Source::new(Action::Set)).is_err(),
+                "the cleanup after the write failed"
+            );
+            assert_eq!(
+                stored(&dir, "A").as_deref(),
+                Some("2"),
+                "the write is durable"
+            );
+            let outcomes = take_outcomes();
+            assert!(
+                matches!(
+                    outcomes.last().map(|recorded| &recorded.outcome),
+                    Some(Outcome::Recorded { gap: false, .. })
+                ),
+                "{outcomes:?}"
+            );
+            assert_eq!(ids(&dir).len(), 2, "both writes, and no outside change");
+        });
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn reading_history_leaves_no_copy_of_the_current_values() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            let dir = home.join("project");
+            std::fs::create_dir_all(&dir).expect("project dir");
+            project_set(&dir, "TOKEN", "old");
+            project_set(&dir, "TOKEN", MARKER);
+            let entries = ids(&dir);
+            let first = hex::encode(entries[0]);
+            let ((), found) = watch(|| {
+                drop(crate::history::timeline(&dir, &Filter::default(), false));
+            });
+            assert!(!found, "timeline");
+            let ((), found) = watch(|| drop(crate::history::status(&dir)));
+            assert!(!found, "status");
+            let ((), found) = watch(|| {
+                drop(crate::history::review_rollback(&dir, &first, |_| {
+                    Ok(Target::Environment {
+                        environment: EnvironmentName::Now("default".to_owned()),
+                        side: RelatedSide::After,
+                    })
+                }));
+            });
+            assert!(!found, "review_rollback");
+            let chosen = || ChosenSide {
+                environment: "default".to_owned(),
+                key: "TOKEN".to_owned(),
+                side: RelatedSide::After,
+            };
+            let ((), found) = watch(|| {
+                drop(crate::history::review_forget(
+                    &dir,
+                    &first,
+                    |_| Ok(chosen()),
+                ));
+            });
+            assert!(!found, "review_forget");
+            let (_, review) =
+                crate::history::review_forget(&dir, &first, |_| Ok(chosen())).expect("review");
+            let ((), found) = watch(|| {
+                drop(crate::history::forget(
+                    &dir,
+                    &review,
+                    &review.default_selection(),
+                ));
+            });
+            assert!(!found, "forget");
+
+            // A refusal after the values are read wipes them too.
+            crate::history::turn_off(&dir).expect("off");
+            let (refused, found) =
+                watch(|| crate::history::forget(&dir, &review, &review.default_selection()));
+            assert_eq!(refused, Err(HistoryError::Off));
+            assert!(!found, "a refused forget");
+        });
+    }
+
+    #[test]
     fn status_pauses_for_damage_for_a_store_that_fails_and_for_too_many_values() {
         with_temp_vault_home(|home| {
             force_file_vault();
@@ -785,6 +971,7 @@ fn what_a_scope_tracks_never_prints_values_and_is_wiped_when_dropped() {
         before: Some(environments.clone().into()),
         after: Some(environments.clone().into()),
         environment_renames: Vec::new(),
+        unreadable_before: None,
     };
     let shown = format!("{tracked:?}");
     assert!(!shown.contains("value-sentinel"), "{shown}");

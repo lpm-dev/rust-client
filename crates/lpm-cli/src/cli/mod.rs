@@ -1,6 +1,7 @@
 mod args;
 mod dispatch;
 mod format;
+pub(crate) use format::json_error_value;
 mod helpers;
 mod install_timeline;
 

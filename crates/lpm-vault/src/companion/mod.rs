@@ -132,6 +132,11 @@ pub(crate) fn forget(vault_id: &str) {
 
 /// Replace what this lock scope knows about `vault_id`, after a change to its
 /// marker or records.
+/// The marker state this lock already read for `vault_id`, if it has.
+pub(crate) fn known_gate(vault_id: &str) -> Option<ProjectGate> {
+    remembered(vault_id)
+}
+
 pub(crate) fn remember(vault_id: &str, gate: &ProjectGate) {
     LOCK_SCOPE.with_borrow_mut(|scope| {
         if let Some(gates) = scope.as_mut() {

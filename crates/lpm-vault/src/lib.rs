@@ -34,6 +34,7 @@ mod selected_environment;
 pub mod signature;
 pub mod sync;
 pub mod vault_id;
+mod wiping;
 
 mod storage_transaction;
 
@@ -54,6 +55,8 @@ use std::path::{Path, PathBuf};
 
 pub type SecretMap = HashMap<String, String>;
 pub type EnvironmentMap = HashMap<String, SecretMap>;
+
+pub use wiping::json_line;
 
 /// `bytes` as text that's wiped when dropped. Bytes that aren't UTF-8 are
 /// wiped before the error returns.

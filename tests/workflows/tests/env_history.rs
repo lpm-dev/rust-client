@@ -243,6 +243,94 @@ fn env_history_forget_removes_an_old_value_and_refuses_a_current_one() {
 }
 
 #[test]
+fn env_history_forget_only_env_with_all_keys_keeps_to_that_environment() {
+    let project = project();
+    for args in [
+        ["env", "set", "A=same", "--env", "production", "--json"],
+        ["env", "set", "B=same", "--env", "staging", "--json"],
+        ["env", "set", "A=new", "--env", "production", "--json"],
+        ["env", "set", "B=new", "--env", "staging", "--json"],
+    ] {
+        let (success, response) = json(&project, &args);
+        assert!(success, "{response}");
+    }
+    let ids = entry_ids(&project);
+    let (production_set, staging_set) = (&ids[3], &ids[2]);
+    let (success, response) = json(
+        &project,
+        &[
+            "env",
+            "history",
+            "forget",
+            production_set,
+            "A",
+            "--env",
+            "production",
+            "--only-env",
+            "--all-keys",
+            "--yes",
+            "--json",
+        ],
+    );
+    assert!(success, "{response}");
+    let (_, staging) = json(
+        &project,
+        &["env", "history", "show", staging_set, "--reveal", "--json"],
+    );
+    let after = &staging["entry"]["environments"][0]["keys"][0]["after"];
+    assert_eq!(
+        after["value"], "same",
+        "staging's B holds the value too, but --only-env keeps to production: {staging}"
+    );
+}
+
+#[test]
+fn env_history_errors_use_the_shared_json_error_envelope() {
+    let project = project();
+    set(&project, "A=1");
+    set(&project, "A=2");
+    let (success, missing) = json(&project, &["env", "history", "show", "abcdef", "--json"]);
+    assert!(!success);
+    assert_eq!(missing["schema_version"], 1, "{missing}");
+    assert_eq!(missing["error_code"], "history.entry_not_found");
+    assert_eq!(missing["error"], "no entry in local history has that ID");
+
+    let ids = entry_ids(&project);
+    let first = ids[1].as_str();
+    for (args, command) in [
+        (
+            vec!["env", "rollback", "--to", first, "--json"],
+            "lpm env rollback",
+        ),
+        (
+            vec!["env", "history", "forget", first, "A", "--json"],
+            "lpm env history forget",
+        ),
+        (
+            vec!["env", "history", "off", "--json"],
+            "lpm env history off",
+        ),
+    ] {
+        let (success, response) = json(&project, &args);
+        assert!(!success, "{args:?}");
+        assert_eq!(response["schema_version"], 1, "{response}");
+        assert_eq!(response["error_code"], "confirmation_required");
+        assert_eq!(response["error"]["code"], "CONFIRMATION_REQUIRED");
+        assert_eq!(response["error"]["command"], command, "{response}");
+        assert!(
+            response["error"]["help"]
+                .as_str()
+                .is_some_and(|help| help.contains("--yes")),
+            "{response}"
+        );
+        assert!(
+            response.get("review").is_some(),
+            "the review stays: {response}"
+        );
+    }
+}
+
+#[test]
 fn a_values_write_that_history_cant_record_still_succeeds_and_says_why() {
     let project = project();
     set(&project, "A=1");
