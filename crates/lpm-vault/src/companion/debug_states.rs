@@ -280,11 +280,12 @@ pub(crate) fn planting(
                 vec![
                     Mutation::Write {
                         account: marker_account(&orphan),
-                        value: marker(&orphan, "active", json!({ "overrides": overrides_v1 }), None),
+                        value: marker(&orphan, "active", json!({ "overrides": overrides_v1 }), None)
+                            .into(),
                     },
                     Mutation::Write {
                         account: record(&orphan, OVERRIDES_KIND, None),
-                        value: placeholder_overrides(&orphan),
+                        value: placeholder_overrides(&orphan).into(),
                     },
                 ],
             ));
@@ -326,7 +327,7 @@ impl Planting {
             })
             .chain(self.writes.iter().map(|(account, value)| Mutation::Write {
                 account: account.clone(),
-                value: value.clone(),
+                value: value.clone().into(),
             }))
             .collect()
     }
@@ -441,11 +442,11 @@ mod tests {
         for mutation in &planting.one_transaction() {
             if let Mutation::Write { account, value } = mutation {
                 match account {
-                    CompanionAccount::Marker { .. } => marker = Some(value.clone()),
+                    CompanionAccount::Marker { .. } => marker = Some(value.to_vec()),
                     CompanionAccount::Record {
                         kind, part: None, ..
                     } if kind == OVERRIDES_KIND => {
-                        overrides = Some(value.clone());
+                        overrides = Some(value.to_vec());
                         inventory.push(account.clone());
                     }
                     other => inventory.push(other.clone()),

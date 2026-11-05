@@ -46,7 +46,10 @@ impl<S: ProjectStorage> CompanionBackend for KeychainCompanion<'_, S> {
 
 pub(super) fn storage_mutation(mutation: Mutation) -> ProjectStorageMutation {
     match mutation {
-        Mutation::Write { account, value } => ProjectStorageMutation::write(account.name(), value),
+        Mutation::Write { account, value } => ProjectStorageMutation::Write {
+            account: account.name(),
+            value,
+        },
         Mutation::Delete { account } => ProjectStorageMutation::delete(account.name()),
     }
 }

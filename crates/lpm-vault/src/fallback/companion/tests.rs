@@ -37,7 +37,10 @@ fn commit(mutations: Vec<Mutation>) {
 }
 
 fn write(account: CompanionAccount, value: Vec<u8>) -> Mutation {
-    Mutation::Write { account, value }
+    Mutation::Write {
+        account,
+        value: value.into(),
+    }
 }
 
 fn seed_values() {

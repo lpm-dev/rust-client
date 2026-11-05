@@ -18,21 +18,40 @@ use std::collections::{BTreeSet, HashSet};
 use crate::account::CompanionAccount;
 use crate::graph::SHARED_KEY_KIND;
 use crate::invariants::is_listed;
+use zeroize::Zeroizing;
+
 use crate::marker::{FeatureState, MAX_RECORD_BYTES, Marker, ProjectState, RestorePhase};
 
 pub const MAX_TRANSACTION_OPERATIONS: usize = 32;
 pub const MAX_TRANSACTION_PAYLOAD_BYTES: usize = 1024 * 1024;
 
-/// A change one transaction makes to a store.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A change one transaction makes to a store. Written bytes are wiped when
+/// dropped: a record can hold the history key or personal values.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Mutation {
     Write {
         account: CompanionAccount,
-        value: Vec<u8>,
+        value: Zeroizing<Vec<u8>>,
     },
     Delete {
         account: CompanionAccount,
     },
+}
+
+impl std::fmt::Debug for Mutation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Write { account, value } => formatter
+                .debug_struct("Write")
+                .field("account", account)
+                .field("bytes", &value.len())
+                .finish(),
+            Self::Delete { account } => formatter
+                .debug_struct("Delete")
+                .field("account", account)
+                .finish(),
+        }
+    }
 }
 
 impl Mutation {
@@ -121,7 +140,7 @@ impl Transaction {
         match self.marker {
             Some(MarkerChange::Write(next)) => mutations.push(Mutation::Write {
                 account: marker,
-                value: next.encode().map_err(|error| error.to_string())?,
+                value: next.encode().map_err(|error| error.to_string())?.into(),
             }),
             Some(MarkerChange::Delete) => mutations.push(Mutation::Delete { account: marker }),
             None => {}
@@ -318,7 +337,7 @@ fn run(store: &mut impl LifecycleStore, plan: Plan) -> Result<Option<Marker>, Re
                             [
                                 Mutation::Write {
                                     account: live,
-                                    value,
+                                    value: value.into(),
                                 },
                                 Mutation::Delete { account: staged },
                             ],
@@ -332,7 +351,8 @@ fn run(store: &mut impl LifecycleStore, plan: Plan) -> Result<Option<Marker>, Re
                 account: marker_account.clone(),
                 value: marker
                     .encode()
-                    .map_err(|error| ResumeError::Unfinishable(error.to_string()))?,
+                    .map_err(|error| ResumeError::Unfinishable(error.to_string()))?
+                    .into(),
             },
             Some(MarkerChange::Delete) => Mutation::Delete {
                 account: marker_account.clone(),
@@ -857,7 +877,7 @@ mod tests {
             for mutation in mutations {
                 match mutation {
                     Mutation::Write { account, value } => {
-                        self.records.insert(account, value);
+                        self.records.insert(account, value.to_vec());
                     }
                     Mutation::Delete { account } => {
                         self.records.remove(&account);
@@ -1050,7 +1070,7 @@ mod tests {
         match &first.marker {
             Some(MarkerChange::Write(marker)) => mutations.push(Mutation::Write {
                 account: marker_account(),
-                value: marker.encode().expect("valid marker"),
+                value: marker.encode().expect("valid marker").into(),
             }),
             Some(MarkerChange::Delete) => mutations.push(Mutation::Delete {
                 account: marker_account(),

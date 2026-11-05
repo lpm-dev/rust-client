@@ -713,7 +713,7 @@ impl<'directory> FileCompanion<'directory> {
                     FileChange::Companion(Mutation::Write { account, value }) => Some((
                         account.name(),
                         Some(match account {
-                            CompanionAccount::Marker { .. } => value.clone(),
+                            CompanionAccount::Marker { .. } => value.to_vec(),
                             _ => Vec::new(),
                         }),
                     )),

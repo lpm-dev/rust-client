@@ -4449,6 +4449,7 @@ dependencies = [
  "windows-sys 0.61.2",
  "wiremock",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

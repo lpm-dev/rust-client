@@ -83,7 +83,7 @@ pub mod acceptance {
                     account: CompanionAccount::Marker {
                         vault_id: vault_id.to_owned(),
                     },
-                    value: marker.as_bytes().to_vec(),
+                    value: marker.as_bytes().to_vec().into(),
                 });
             }
             if let Some(overrides) = overrides {
@@ -93,7 +93,7 @@ pub mod acceptance {
                         vault_id: vault_id.to_owned(),
                         part: None,
                     },
-                    value: overrides.as_bytes().to_vec(),
+                    value: overrides.as_bytes().to_vec().into(),
                 });
             }
             crate::fallback::companion::commit_unchecked(directory, vault_id, mutations)

@@ -31,6 +31,7 @@ sha2 = { workspace = true }
 x25519-dalek = { workspace = true }
 ed25519-dalek = { workspace = true }
 hkdf = { workspace = true }
+zeroize = { version = "1", features = ["std"] }
 
 # P-256 ECDH (dashboard device pairing — Web Crypto only supports P-256, not X25519)
 p256 = { workspace = true }

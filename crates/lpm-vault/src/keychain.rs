@@ -169,17 +169,24 @@ struct ProjectDiscoverySnapshot {
 }
 
 #[derive(Clone)]
+/// A change a journal transaction makes. Written bytes are wiped when
+/// dropped: they're values or companion records.
 enum ProjectStorageMutation {
-    Write { account: String, value: Vec<u8> },
+    Write {
+        account: String,
+        value: zeroize::Zeroizing<Vec<u8>>,
+    },
     ValidatedVaultWrite(ValidatedVaultPayload),
-    Delete { account: String },
+    Delete {
+        account: String,
+    },
 }
 
 impl ProjectStorageMutation {
     fn write(account: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
         Self::Write {
             account: account.into(),
-            value: value.into(),
+            value: zeroize::Zeroizing::new(value.into()),
         }
     }
 
@@ -1772,7 +1779,10 @@ fn plant_debug_companion_state_with_storage<S: ProjectStorage>(
         planting
             .writes
             .into_iter()
-            .map(|(account, value)| Mutation::Write { account, value })
+            .map(|(account, value)| Mutation::Write {
+                account,
+                value: value.into(),
+            })
             .collect(),
     )?;
     if let Some((orphan, mutations)) = planting.orphans {
@@ -2983,7 +2993,10 @@ mod tests {
             &mut storage,
             vec![ProjectStorageMutation::Write {
                 account: "vault".to_owned(),
-                value: r#"{"environments":{"default":{"TOKEN":"fixture"}}}"#.to_owned().into(),
+                value: r#"{"environments":{"default":{"TOKEN":"fixture"}}}"#
+                    .as_bytes()
+                    .to_vec()
+                    .into(),
             }],
         )
         .expect("project update should succeed");
@@ -3025,7 +3038,8 @@ mod tests {
             vec![ProjectStorageMutation::Write {
                 account: "vault".to_owned(),
                 value: r#"{"environments":{"default":{"TOKEN":"replacement"}}}"#
-                    .to_owned()
+                    .as_bytes()
+                    .to_vec()
                     .into(),
             }],
         )
