@@ -8,6 +8,7 @@ pub mod append;
 pub mod codec;
 pub mod read;
 pub mod rebuild;
+pub mod removal;
 pub mod values;
 
 #[cfg(test)]
