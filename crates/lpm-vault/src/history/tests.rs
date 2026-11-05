@@ -837,3 +837,27 @@ fn a_scope_wipes_what_a_write_stored_once_a_later_write_replaces_it() {
         Some("2")
     );
 }
+
+#[test]
+fn a_computer_s_phrases_name_only_what_it_has() {
+    let phrases = |device: Device| {
+        [
+            device.this(),
+            device.others(),
+            device.unreadable(),
+            device.backups(),
+        ]
+    };
+    for phrase in phrases(Device::Computer) {
+        for word in ["Mac", "Time Machine", "APFS", "LPM Vault", "Keychain"] {
+            assert!(!phrase.contains(word), "{word:?} in {phrase:?}");
+        }
+    }
+    assert_eq!(phrases(Device::Mac)[0], "this Mac");
+    assert!(phrases(Device::Mac)[3].contains("Time Machine"));
+    assert!(
+        NotRecorded::Limit
+            .to_string()
+            .contains(Device::CURRENT.this())
+    );
+}

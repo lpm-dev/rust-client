@@ -198,7 +198,8 @@ pub enum Paused {
     Damaged,
     /// A newer LPM keeps it, or is removing it.
     NewerVersion,
-    /// It can't be read right now: the Keychain is locked or unavailable.
+    /// It can't be read right now: the store failed, as a locked Keychain
+    /// or files LPM can't read do.
     Unavailable(String),
     TooManyValues,
 }

@@ -1,4 +1,4 @@
-//! `lpm env history` and `lpm env rollback`: local history on this Mac, and
+//! `lpm env history` and `lpm env rollback`: local history on this computer, and
 //! the notice every command that writes values gives when a change wasn't
 //! added to it.
 
@@ -7,25 +7,47 @@ use std::collections::{BTreeSet, HashSet};
 use chrono::{DateTime, Local, TimeZone as _, Utc};
 use lpm_common::LpmError;
 use lpm_vault::history::{
-    Action, Choices, ChosenSide, EntryInfo, EnvironmentInfo, EnvironmentKindInfo, EnvironmentName,
-    EnvironmentPlan, Filter, HistoryError, HistoryState, KeyKindInfo, KeyMatch, KeysInfo, Outcome,
-    Paused, Place, PlaceGroup, Platform, RelatedSide, RemoteInfo, RemoteName, RemovalReview,
-    RevealedValues, RollbackKind, RollbackPlan, Row, SideInfo, SourceGroup, Target, TargetValue,
-    Timeline, TimelineRow, UnknownReason,
+    Action, Choices, ChosenSide, Device, EntryInfo, EnvironmentInfo, EnvironmentKindInfo,
+    EnvironmentName, EnvironmentPlan, Filter, HistoryError, HistoryState, KeyKindInfo, KeyMatch,
+    KeysInfo, Outcome, Paused, Place, PlaceGroup, Platform, RelatedSide, RemoteInfo, RemoteName,
+    RemovalReview, RevealedValues, RollbackKind, RollbackPlan, Row, SideInfo, SourceGroup, Target,
+    TargetValue, Timeline, TimelineRow, UnknownReason,
 };
 use serde::Serialize;
 
 use super::arguments::HistoryAction;
 use crate::{install_ui, output};
 
-const REMOVAL_WARNING: &str = "LPM Vault and the LPM CLI can't read it any more. Copies in Time Machine, APFS snapshots or other backups of this Mac can remain. Current values don't change.";
-const OFF_WARNING: &str = "LPM deletes this project's history on this Mac and stops recording changes. Values stay as they are. Deleting means LPM Vault and the LPM CLI can't read the history any more. Copies in Time Machine, APFS snapshots or other backups of this Mac can remain. Turning history back on starts an empty history.";
+/// What removing a value from history means on `device`.
+fn removal_warning(device: Device) -> String {
+    let readers = match device {
+        Device::Mac => "LPM Vault and the LPM CLI",
+        Device::Computer => "The LPM CLI",
+    };
+    format!(
+        "{readers} can't read it any more. {} Current values don't change.",
+        device.backups()
+    )
+}
+
+/// What turning history off means on `device`.
+fn off_warning(device: Device) -> String {
+    let readers = match device {
+        Device::Mac => "LPM Vault and the LPM CLI",
+        Device::Computer => "the LPM CLI",
+    };
+    format!(
+        "LPM deletes this project's history on {} and stops recording changes. Values stay as they are. Deleting means {readers} can't read the history any more. {} Turning history back on starts an empty history.",
+        device.this(),
+        device.backups()
+    )
+}
 const ROLLBACK_FOOTER: &str =
     "The rollback is saved as a new change in this project's history. Nothing is pushed.";
 
 /// Report what history did after a command wrote values: a line on stderr
-/// when the change wasn't recorded, and once per command when the Mac holds
-/// so much LPM data that history keeps less. Returns the `history` field
+/// when the change wasn't recorded, and once per command when the computer
+/// holds so much LPM data that history keeps less. Returns the `history` field
 /// the command's JSON gains, if any.
 pub(super) fn report_write() -> Option<serde_json::Value> {
     let mut field = None;
@@ -46,7 +68,8 @@ pub(super) fn report_write() -> Option<serde_json::Value> {
             } if !crowded_warned => {
                 crowded_warned = true;
                 eprintln!(
-                    "lpm: this Mac holds a lot of LPM data ({records} records), so LPM keeps less local history for each project."
+                    "lpm: {} holds a lot of LPM data ({records} records), so LPM keeps less local history for each project.",
+                    Device::CURRENT.this()
                 );
             }
             Outcome::Recorded { .. } | Outcome::Nothing | Outcome::Off => {}
@@ -471,7 +494,10 @@ pub(super) fn env_history(
             if json_output {
                 println!("{}", serde_json::json!({"success": true, "state": "on"}));
             } else {
-                output::success("local history is on; it starts with the next change on this Mac");
+                output::success(&format!(
+                    "local history is on; it starts with the next change on {}",
+                    Device::CURRENT.this()
+                ));
             }
             Ok(())
         }
@@ -540,9 +566,10 @@ fn history_list(
                 })
             );
         } else {
-            output::info(
-                "no changes recorded yet; local history starts with the next change on this Mac",
-            );
+            output::info(&format!(
+                "no changes recorded yet; local history starts with the next change on {}",
+                Device::CURRENT.this()
+            ));
         }
         return Ok(());
     };
@@ -639,8 +666,9 @@ fn print_timeline_json(timeline: &Timeline, project_dir: &std::path::Path) {
 
 fn print_timeline(timeline: &Timeline, project_dir: &std::path::Path, reveal: bool) {
     println!(
-        "Local history for {} on this Mac.{}",
+        "Local history for {} on {}.{}",
         install_ui::bold(&project_name(project_dir)),
+        Device::CURRENT.this(),
         if reveal {
             ""
         } else {
@@ -847,16 +875,19 @@ fn history_status(project_dir: &std::path::Path, json_output: bool) -> Result<()
             "local history is paused for {name}: it's damaged; repair it with lpm env repair"
         )),
         HistoryState::Paused(Paused::Limit) => output::warn(&format!(
-            "local history is paused for {name}: this Mac holds too much LPM data to keep history for it"
+            "local history is paused for {name}: {} holds too much LPM data to keep history for it",
+            Device::CURRENT.this()
         )),
         HistoryState::Paused(Paused::TooManyValues) => output::warn(&format!(
             "local history is paused for {name}: it has too many values to keep history"
         )),
         HistoryState::Paused(Paused::Unavailable(message)) => output::warn(&format!(
-            "local history for {name} can't be read right now: the Keychain is locked or unavailable ({message})"
+            "local history for {name} can't be read right now: {} ({message})",
+            Device::CURRENT.unreadable()
         )),
         HistoryState::On if status.retained == 0 => output::success(&format!(
-            "local history is on for {name}; it starts with the next change on this Mac"
+            "local history is on for {name}; it starts with the next change on {}",
+            Device::CURRENT.this()
         )),
         HistoryState::On => {
             let mut line = format!(
@@ -888,13 +919,13 @@ fn history_off(
     let name = project_name(project_dir);
     if !json_output {
         output::warn(&format!("Turn off local history for {name}?"));
-        println!("    {OFF_WARNING}");
+        println!("    {}", off_warning(Device::CURRENT));
     }
     match confirm("Turn off local history and delete it?", yes, json_output)? {
         None => {
             return Err(confirmation_required(
                 json_output,
-                &serde_json::json!({ "action": "off", "message": OFF_WARNING }),
+                &serde_json::json!({ "action": "off", "message": off_warning(Device::CURRENT) }),
                 "lpm env history off --yes",
             ));
         }
@@ -1102,7 +1133,7 @@ fn history_forget(
             }
             println!("{line}");
         }
-        println!("{REMOVAL_WARNING}");
+        println!("{}", removal_warning(Device::CURRENT));
     }
     if selection.is_empty() {
         return Err(fail(&HistoryError::ValueIsCurrent, json_output));
@@ -1171,19 +1202,21 @@ fn row_change(row: &Row) -> (&'static str, Option<&'static str>) {
     }
 }
 
-fn pulled_notice(key: &str, pulled: &lpm_vault::history::Pulled) -> String {
+fn pulled_notice(device: Device, key: &str, pulled: &lpm_vault::history::Pulled) -> String {
     let source = match pulled.version {
         Some(version) => format!("pulled {}, v{version}", moment(pulled.time)),
         None => format!("pulled {}", moment(pulled.time)),
     };
     let reach = match pulled.remote {
-        Some(RemoteName::Org(_)) => "replaces that value for everyone on the team",
-        Some(RemoteName::Personal) | None => {
-            "replaces that value on lpm.dev and on your other Macs when they pull"
-        }
+        Some(RemoteName::Org(_)) => "replaces that value for everyone on the team".to_owned(),
+        Some(RemoteName::Personal) | None => format!(
+            "replaces that value on lpm.dev and on {} when they pull",
+            device.others()
+        ),
     };
     format!(
-        "{key}'s current value came from lpm.dev ({source}). If you push this rollback, it {reach}, and the value it replaces then stays only in this Mac's history. Until you push, pulling again brings lpm.dev's value back."
+        "{key}'s current value came from lpm.dev ({source}). If you push this rollback, it {reach}, and the value it replaces then stays only in the local history on {}. Until you push, pulling again brings lpm.dev's value back.",
+        device.this()
     )
 }
 
@@ -1443,7 +1476,7 @@ fn print_rollback(plan: &RollbackPlan, choices: &Choices, title: &str) {
             {
                 println!(
                     "        {}",
-                    install_ui::dim(&pulled_notice(&row.key, pulled))
+                    install_ui::dim(&pulled_notice(Device::CURRENT, &row.key, pulled))
                 );
             }
         }
@@ -1613,6 +1646,42 @@ pub(super) fn env_rollback(
 mod tests {
     use super::*;
     use lpm_vault::history::{Binding, DetailInfo, Flags, Point};
+
+    /// What only a Mac has, which text for Linux and Windows never names.
+    const MAC_ONLY: [&str; 5] = ["Mac", "Time Machine", "APFS", "LPM Vault", "Keychain"];
+
+    #[test]
+    fn history_text_names_only_what_the_computer_has() {
+        let pulled = lpm_vault::history::Pulled {
+            remote: None,
+            version: Some(3),
+            time: 0,
+        };
+        let computer = [
+            removal_warning(Device::Computer),
+            off_warning(Device::Computer),
+            pulled_notice(Device::Computer, "API_KEY", &pulled),
+        ];
+        for text in &computer {
+            for word in MAC_ONLY {
+                assert!(!text.contains(word), "{word:?} in {text:?}");
+            }
+            assert!(text.contains("this computer"), "{text:?}");
+        }
+        assert!(removal_warning(Device::Mac).contains("Time Machine, APFS snapshots"));
+        assert!(off_warning(Device::Mac).contains("LPM Vault and the LPM CLI"));
+        assert!(pulled_notice(Device::Mac, "API_KEY", &pulled).contains("your other Macs"));
+    }
+
+    #[test]
+    fn history_text_is_written_for_the_computer_the_cli_runs_on() {
+        let expected = if cfg!(target_os = "macos") {
+            Device::Mac
+        } else {
+            Device::Computer
+        };
+        assert_eq!(Device::CURRENT, expected);
+    }
 
     fn row(key: &str, current: Option<&str>, target: TargetValue, linked: &[&str]) -> Row {
         Row {

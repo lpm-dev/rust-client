@@ -1,4 +1,4 @@
-//! Local history: an encrypted record, kept on this Mac, of how a project's
+//! Local history: an encrypted record, kept on the user's computer, of how a project's
 //! values changed, so a person can see and roll back those changes.
 //!
 //! Everything here is pure. Plans take the bytes a client read inside its

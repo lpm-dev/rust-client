@@ -152,8 +152,15 @@ pub(super) enum LocalAction {
         #[arg(long = "unset", value_name = "NAME")]
         unset: Vec<String>,
     },
-    /// Show how this project's values changed on this Mac, from local
-    /// history. lpm.dev's activity log is `lpm env log`.
+    #[cfg_attr(
+        target_os = "macos",
+        doc = "Show how this project's values changed on this Mac, from local history."
+    )]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        doc = "Show how this project's values changed on this computer, from local history."
+    )]
+    /// lpm.dev's activity log is `lpm env log`.
     #[command(args_conflicts_with_subcommands = true)]
     History {
         #[command(subcommand)]
@@ -227,7 +234,14 @@ pub(super) enum HistoryAction {
     Status,
     /// Turn local history on. It starts empty at the next change.
     On,
-    /// Turn local history off and delete it on this Mac.
+    #[cfg_attr(
+        target_os = "macos",
+        doc = "Turn local history off and delete it on this Mac."
+    )]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        doc = "Turn local history off and delete it on this computer."
+    )]
     Off {
         /// Turn it off without asking first.
         #[arg(long)]

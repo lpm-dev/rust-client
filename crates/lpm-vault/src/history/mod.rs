@@ -162,8 +162,11 @@ impl fmt::Display for NotRecorded {
             Self::Damaged => {
                 formatter.write_str("local history is damaged; repair it with lpm env repair")
             }
-            Self::Limit => formatter
-                .write_str("this Mac holds too much LPM data to keep history for this env project"),
+            Self::Limit => write!(
+                formatter,
+                "{} holds too much LPM data to keep history for this env project",
+                Device::CURRENT.this()
+            ),
             Self::TooManyValues => {
                 formatter.write_str("this env project has too many values to keep history")
             }
@@ -221,6 +224,60 @@ pub(crate) fn finish_scope(directory: &VaultStorageDirectory) {
         ))
         .unwrap_or_else(|error| Outcome::NotRecorded(NotRecorded::Failed(error)));
         OUTCOMES.with_borrow_mut(|outcomes| outcomes.push(Recorded { vault_id, outcome }));
+    }
+}
+
+/// The computer local history is kept on, as messages name it. A Mac keeps
+/// it in the Keychain; Linux and Windows keep it in LPM's own files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Device {
+    Mac,
+    Computer,
+}
+
+impl Device {
+    /// The computer this build runs on.
+    pub const CURRENT: Self = if cfg!(target_os = "macos") {
+        Self::Mac
+    } else {
+        Self::Computer
+    };
+
+    /// The computer as a sentence names it.
+    pub fn this(self) -> &'static str {
+        match self {
+            Self::Mac => "this Mac",
+            Self::Computer => "this computer",
+        }
+    }
+
+    /// The user's other computers.
+    pub fn others(self) -> &'static str {
+        match self {
+            Self::Mac => "your other Macs",
+            Self::Computer => "your other computers",
+        }
+    }
+
+    /// Why its history can't be read right now, besides the store's own
+    /// error.
+    pub fn unreadable(self) -> &'static str {
+        match self {
+            Self::Mac => "the Keychain is locked or unavailable",
+            Self::Computer => "LPM's files can't be read",
+        }
+    }
+
+    /// Where history LPM deleted can still remain.
+    pub fn backups(self) -> &'static str {
+        match self {
+            Self::Mac => {
+                "Copies in Time Machine, APFS snapshots or other backups of this Mac can remain."
+            }
+            Self::Computer => {
+                "Copies in backups or file system snapshots of this computer can remain."
+            }
+        }
     }
 }
 
