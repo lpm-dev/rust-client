@@ -495,13 +495,13 @@ pub enum PackageDirectory<'a> {
     /// A package a project installed. The linker may have nested other
     /// packages in its `node_modules/`, at these package-relative
     /// directories. The analysis leaves them out, so their code counts once,
-    /// as theirs, and the package manager's hidden entries directly in a
-    /// `node_modules/`, and reads the rest as bundled.
+    /// as theirs, and reads the rest of `node_modules/` as bundled.
     Installed(&'a [std::path::PathBuf]),
     /// A local directory a project depends on. Its `node_modules/`
     /// directories hold its own installs, packages in their own right that
-    /// a project doesn't get from it, and its hidden files are its tooling
-    /// and caches, so the analysis reads neither.
+    /// a project doesn't get from it, so the analysis reads none of them.
+    /// Its hidden files are its tooling and caches; the analysis reads only
+    /// those its lifecycle scripts or entry points name.
     LocalSource,
 }
 
@@ -535,33 +535,64 @@ pub fn nested_packages<'a>(
     nested
 }
 
-impl PackageDirectory<'_> {
-    /// Whether the analysis reads the package-relative entry `relative`, a
-    /// directory it walks into or a file, whose parent it already walks.
-    ///
-    /// A `.git` directory is never package content: an npm client doesn't
-    /// unpack one. Otherwise a published or installed package's hidden
-    /// files are read, as a registry reads them, except the package
-    /// manager's own entries directly in a `node_modules/` (`.bin`, `.lpm`).
-    /// A local source's hidden files are its tooling and caches (`.next`,
-    /// `.turbo`), not what it publishes.
-    fn reads(self, relative: &Path) -> bool {
+/// What a directory walk reads of a [`PackageDirectory`].
+///
+/// A published or installed package's files are read as an npm client
+/// unpacks them, hidden files and `.git` included, except, in an installed
+/// package, the packages the linker nested in it. A local source's
+/// `node_modules/` holds its own installs, and its hidden files and `.git`
+/// are its tooling and caches (`.next`, `.turbo`): only the hidden files its
+/// lifecycle scripts or entry points name are read.
+struct WalkRules<'a> {
+    contents: PackageDirectory<'a>,
+    /// A local source's lifecycle scripts and entry points.
+    local_entries: Option<roles::EntryReferences>,
+}
+
+impl<'a> WalkRules<'a> {
+    fn new(package_dir: &cap_std::fs::Dir, contents: PackageDirectory<'a>) -> Self {
+        let local_entries = matches!(contents, PackageDirectory::LocalSource)
+            .then(|| read_package_manifest_from_open_dir(package_dir))
+            .and_then(|manifest| manifest.ok().flatten())
+            .and_then(|(_, content)| read_manifest(&content))
+            .map(|(_, references)| references);
+        Self {
+            contents,
+            local_entries,
+        }
+    }
+
+    /// Whether the walk reads the package-relative entry `relative`, a
+    /// directory to walk into or a file, whose parent it already walks.
+    fn reads(&self, relative: &Path, directory: bool) -> bool {
         let Some(name) = relative.file_name() else {
             return false;
         };
-        if is_git_dir_component(name) {
-            return false;
-        }
-        let hidden = name.as_encoded_bytes().starts_with(b".");
-        match self {
-            Self::Published => true,
-            Self::Installed(nested) => {
-                !(hidden
-                    && relative.parent().and_then(Path::file_name)
-                        == Some(std::ffi::OsStr::new("node_modules")))
-                    && !nested.iter().any(|package| package == relative)
+        match self.contents {
+            PackageDirectory::Published => true,
+            PackageDirectory::Installed(nested) => {
+                !nested.iter().any(|package| package == relative)
             }
-            Self::LocalSource => !hidden && name != "node_modules",
+            PackageDirectory::LocalSource => {
+                if name == "node_modules" || is_git_dir_component(name) {
+                    return false;
+                }
+                let hidden = relative
+                    .components()
+                    .any(|component| component.as_os_str().as_encoded_bytes().starts_with(b"."));
+                if !hidden {
+                    return true;
+                }
+                let Some(entries) = &self.local_entries else {
+                    return false;
+                };
+                let path = path_to_slash(relative);
+                if directory {
+                    entries.mention_directory(&path)
+                } else {
+                    entries.name(&path)
+                }
+            }
         }
     }
 }
@@ -598,10 +629,11 @@ pub fn analyze_package_from_open_dir_with_fingerprint(
     let mut sources = SourceFiles::new(limits);
     let mut native_artifacts = Vec::new();
     let mut discovery_limit_reached = false;
+    let rules = WalkRules::new(package_dir, contents);
     let discovery_complete = collect_cap_fingerprint_files(
         package_dir,
         Path::new(""),
-        contents,
+        &rules,
         &mut sources,
         &mut native_artifacts,
         &mut discovery_limit_reached,
@@ -666,10 +698,11 @@ pub fn package_input_fingerprint_from_open_dir(
     let mut sources = SourceFiles::new(limits);
     let mut native_artifacts = Vec::new();
     let mut discovery_limit_reached = false;
+    let rules = WalkRules::new(package_dir, contents);
     collect_cap_fingerprint_files(
         package_dir,
         Path::new(""),
-        contents,
+        &rules,
         &mut sources,
         &mut native_artifacts,
         &mut discovery_limit_reached,
@@ -721,7 +754,7 @@ fn new_fingerprint_hasher() -> Sha256 {
 fn collect_cap_fingerprint_files(
     directory: &cap_std::fs::Dir,
     relative_dir: &Path,
-    contents: PackageDirectory<'_>,
+    rules: &WalkRules<'_>,
     files: &mut SourceFiles,
     native_artifacts: &mut Vec<std::path::PathBuf>,
     limit_reached: &mut bool,
@@ -736,7 +769,7 @@ fn collect_cap_fingerprint_files(
         if metadata.is_symlink() {
             continue;
         }
-        if !contents.reads(&relative) {
+        if !rules.reads(&relative, metadata.is_dir()) {
             continue;
         }
         if metadata.is_dir() {
@@ -744,7 +777,7 @@ fn collect_cap_fingerprint_files(
             collect_cap_fingerprint_files(
                 &child,
                 &relative,
-                contents,
+                rules,
                 files,
                 native_artifacts,
                 limit_reached,
@@ -1130,8 +1163,8 @@ fn analyze_source_file(
 /// already had in hand instead of re-reading the file a second time.
 ///
 /// The caller is responsible for:
-/// - filtering by extension (`SOURCE_EXTENSIONS`), `.d.ts`/`.map`
-///   exclusion, and directory filtering (`.git`).
+/// - filtering by extension (`SOURCE_EXTENSIONS`) and `.d.ts`/`.map`
+///   exclusion.
 ///   [`PackageAnalyzer::should_scan`] encodes the current policy.
 /// - routing files over the 4 MiB full-scan limit to
 ///   [`PackageAnalyzer::feed_oversized_source_file`] or another bounded
@@ -1370,7 +1403,7 @@ fn extend_oversized_source_files(
 /// its tarball unpacked them ([`PackageDirectory::Published`]), bundled
 /// dependencies and hidden files included, as package-relative paths.
 ///
-/// Skips symlinks, `.git`, declaration files, and source maps.
+/// Skips symlinks, declaration files, and source maps.
 fn collect_source_files_recursive(
     package_dir: &Path,
     relative_dir: &Path,
@@ -1383,9 +1416,6 @@ fn collect_source_files_recursive(
 
     for entry in entries.flatten() {
         let name = entry.file_name();
-        if is_git_dir_component(&name) {
-            continue;
-        }
         let Ok(metadata) = std::fs::symlink_metadata(entry.path()) else {
             continue;
         };
@@ -1604,11 +1634,11 @@ impl PackageAnalyzer {
     /// Returns `true` iff:
     /// - Extension is in `SOURCE_EXTENSIONS` (js/mjs/cjs/ts/mts/cts/jsx/tsx)
     /// - Filename is not `.d.ts` / `.d.mts` / `.d.cts` / `.map`
-    /// - No path component is `.git`
     ///
     /// Hidden files qualify, as an npm client unpacks them. A file under
     /// `node_modules/` qualifies: in a tarball, it's a dependency the
-    /// package bundles.
+    /// package bundles. Which directories a scan walks is the walk's
+    /// decision ([`PackageDirectory`]).
     ///
     /// The size cap is intentionally NOT checked here: oversized files still
     /// need lightweight metadata via [`PackageAnalyzer::feed_oversized_source_file`].
@@ -1616,10 +1646,6 @@ impl PackageAnalyzer {
     /// Mirrors the `collect_source_files_recursive` filter exactly so the
     /// fused path scans the same set of files as the two-pass path.
     pub fn should_scan(relative_path: &Path, _size: u64) -> bool {
-        if !Self::in_scanned_tree(relative_path) {
-            return false;
-        }
-
         let name_str = relative_path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -1641,20 +1667,12 @@ impl PackageAnalyzer {
     }
 
     /// Whether an entry is a native addon the analysis notes: a `.node` file
-    /// or `binding.gyp` outside the trees it skips.
+    /// or `binding.gyp`.
     #[inline]
     pub fn is_native_artifact(relative_path: &Path) -> bool {
         relative_path
             .file_name()
             .is_some_and(|name| roles::is_native_artifact_name(name.as_encoded_bytes()))
-            && Self::in_scanned_tree(relative_path)
-    }
-
-    fn in_scanned_tree(relative_path: &Path) -> bool {
-        !relative_path.components().any(|component| match component {
-            std::path::Component::Normal(name) => is_git_dir_component(name),
-            _ => false,
-        })
     }
 
     /// Should the extractor buffer this source entry for full byte-level scanning?
@@ -2351,7 +2369,7 @@ mod tests {
         collect_cap_fingerprint_files(
             &directory,
             Path::new(""),
-            PackageDirectory::Published,
+            &WalkRules::new(&directory, PackageDirectory::Published),
             &mut files,
             &mut native_artifacts,
             &mut limit_reached,
@@ -2555,6 +2573,15 @@ mod tests {
             assert!(result.source.eval);
             assert_eq!(result.unparsed_files, 1);
         }
+    }
+
+    #[test]
+    fn a_long_expression_chain_is_parsed_whole() {
+        let result =
+            analyze_on_a_worker_stack("index.js", format!("x=1{}+eval(y);", "+1".repeat(30_000)));
+
+        assert!(result.source.eval);
+        assert_eq!(result.unparsed_files, 0);
     }
 
     #[test]
@@ -2815,8 +2842,10 @@ mod tests {
         assert!(!nested.contains_key(Path::new("/p/node_modules/other")));
     }
 
-    /// A package whose hidden files hold code it runs, beside a `.git`
-    /// directory and package-manager state.
+    /// A package with code in each kind of hidden place npm unpacks: a
+    /// hidden directory its `postinstall` runs, a hidden directory in its
+    /// `node_modules/`, `node_modules/.bin`, and `.git`, beside a hidden
+    /// build cache nothing names.
     fn package_with_hidden_files() -> tempfile::TempDir {
         let package = tempfile::tempdir().unwrap();
         create_test_package(
@@ -2824,25 +2853,30 @@ mod tests {
             &[
                 (
                     "package.json",
-                    r#"{"name":"kit","license":"MIT","scripts":{"postinstall":"node .x/run.js"}}"#,
+                    r#"{"name":"kit","license":"MIT","scripts":{"postinstall":"node .x/run.js && node node_modules/.x/env.js"}}"#,
                 ),
                 ("index.js", "module.exports = 1\n"),
                 (
                     ".x/run.js",
                     "require('child_process').exec(process.argv[2])\n",
                 ),
-                (".git/hooks/run.js", "eval(process.argv[2])\n"),
+                (
+                    "node_modules/.x/env.js",
+                    "module.exports = process.env.TOKEN\n",
+                ),
                 (
                     "node_modules/.bin/tool.js",
                     "fetch('https://tool.example/')\n",
                 ),
+                (".git/hooks/run.js", "eval(process.argv[2])\n"),
+                (".cache/build.js", "require('crypto').randomBytes(16)\n"),
             ],
         );
         package
     }
 
     #[test]
-    fn published_packages_read_hidden_files_but_never_git() {
+    fn published_and_installed_packages_read_every_hidden_file_npm_unpacks() {
         let package = package_with_hidden_files();
         let directory =
             cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
@@ -2851,43 +2885,44 @@ mod tests {
         for analysis in [
             analyze_package(package.path()),
             analyze_package_from_open_dir(&directory, PackageDirectory::Published),
+            analyze_package_from_open_dir(&directory, PackageDirectory::Installed(&[])),
         ] {
             assert!(analysis.source.child_process);
+            assert!(analysis.source.environment_vars);
             assert!(analysis.source.network);
-            assert!(!analysis.source.eval);
+            assert!(analysis.source.eval);
+            assert!(analysis.source.crypto);
         }
-        assert!(PackageAnalyzer::should_scan(Path::new(".x/run.js"), 1));
-        assert!(!PackageAnalyzer::should_scan(
+        assert!(PackageAnalyzer::should_scan(
             Path::new(".git/hooks/run.js"),
             1
         ));
     }
 
     #[test]
-    fn installed_packages_read_hidden_files_but_not_package_manager_state() {
+    fn a_local_source_reads_only_the_hidden_files_its_scripts_or_entry_points_name() {
         let package = package_with_hidden_files();
         let directory =
             cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
                 .unwrap();
 
-        let analysis = analyze_package_from_open_dir(&directory, PackageDirectory::Installed(&[]));
+        let (analysis, fingerprint) = analyze_package_from_open_dir_with_fingerprint(
+            &directory,
+            PackageDirectory::LocalSource,
+        );
 
         assert!(analysis.source.child_process);
+        assert!(!analysis.source.environment_vars);
         assert!(!analysis.source.network);
         assert!(!analysis.source.eval);
-    }
-
-    #[test]
-    fn a_local_source_leaves_out_its_hidden_files() {
-        let package = package_with_hidden_files();
-        let directory =
-            cap_std::fs::Dir::open_ambient_dir(package.path(), cap_std::ambient_authority())
-                .unwrap();
-
-        let analysis = analyze_package_from_open_dir(&directory, PackageDirectory::LocalSource);
-
-        assert!(!analysis.source.child_process);
-        assert!(!analysis.source.network);
+        assert!(!analysis.source.crypto);
+        assert_eq!(
+            fingerprint,
+            Some(
+                package_input_fingerprint_from_open_dir(&directory, PackageDirectory::LocalSource)
+                    .unwrap()
+            )
+        );
     }
 
     #[test]

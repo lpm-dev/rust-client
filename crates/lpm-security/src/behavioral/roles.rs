@@ -122,6 +122,17 @@ impl EntryReferences {
     }
 }
 
+impl EntryReferences {
+    /// Whether a script or entry point mentions a path under `directory`.
+    pub(super) fn mention_directory(&self, directory: &str) -> bool {
+        self.0.iter().any(|reference| {
+            reference
+                .match_indices(directory)
+                .any(|(start, _)| reference[start + directory.len()..].starts_with('/'))
+        })
+    }
+}
+
 /// Whether `reference` names `directory` as a whole path, optionally after
 /// `./`: the path starts the reference or follows a character that can't be
 /// part of a path in a script, and ends the reference or is followed by `/`

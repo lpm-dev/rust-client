@@ -29,16 +29,21 @@ const STACK_RED_ZONE: usize = 256 * 1024;
 const DEEP_PARSE_STACK: usize = 64 * 1024 * 1024;
 
 /// Stack semantic analysis takes before any nesting, and per level of AST
-/// depth: the most measured for any construct, with room for platforms
-/// whose frames are larger. Semantic analysis is the one recursive pass
+/// depth: at least twice the most measured for any construct, so platforms
+/// with larger frames fit too. Semantic analysis is the one recursive pass
 /// that can't check the stack itself, so the literal visitor measures the
-/// AST's depth first and the pass runs only when this much stack is left.
+/// AST's depth first, and the pass runs on a stack this large.
 const SEMANTIC_BASE_STACK: usize = 128 * 1024;
 const SEMANTIC_LEVEL_STACK: usize = if cfg!(debug_assertions) {
     8 * 1024
 } else {
     2 * 1024
 };
+
+/// The most stack semantic analysis is given. Only pages it touches use
+/// memory, and a left-deep chain, the deepest AST a source can have without
+/// the parser recursing, touches a small fraction of its reservation.
+const SEMANTIC_MAX_STACK: usize = 256 * 1024 * 1024;
 
 /// A visitor stopped at the stack floor.
 struct StackExhausted;
@@ -122,16 +127,25 @@ struct Parsed {
     random_literal: Option<bool>,
 }
 
+/// Why a source wasn't parsed.
+enum Unparsed {
+    /// It nests too deeply for the stack the parse had; more may do.
+    OutOfStack,
+    /// Its AST is too deep for semantic analysis on any stack it's given.
+    TooDeep,
+}
+
 /// Parses `source` and runs the syntax passes over it, masking its comments
-/// in `stripped`, which holds a copy of it. `None` when a pass would go
-/// below `stack_floor`: the source nests too deeply for the stack left.
+/// in `stripped`, which holds a copy of it. The parser and the literal
+/// visitor stop at `stack_floor`; semantic analysis runs on a stack sized
+/// for the AST's depth.
 fn parse_above(
     source: &str,
     source_type: SourceType,
     stripped: &mut [u8],
     complete_input: bool,
     stack_floor: usize,
-) -> Option<Parsed> {
+) -> Result<Parsed, Unparsed> {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, source_type)
         .with_options(ParseOptions {
@@ -141,7 +155,7 @@ fn parse_above(
         })
         .parse();
     if parsed.stack_exhausted {
-        return None;
+        return Err(Unparsed::OutOfStack);
     }
     for comment in &parsed.program.comments {
         mask(stripped, comment.span);
@@ -157,23 +171,39 @@ fn parse_above(
     std::panic::catch_unwind(AssertUnwindSafe(|| {
         literals.visit_program(&parsed.program);
     }))
-    .ok()?;
+    .map_err(|_| Unparsed::OutOfStack)?;
     let random_literal = (!parsed.fatal_error).then_some(literals.random_literal);
     let complete = !parsed.fatal_error && !parsed.diagnostics.has_errors();
-    let semantic_stack = literals
-        .max_depth
-        .saturating_mul(SEMANTIC_LEVEL_STACK)
-        .saturating_add(SEMANTIC_BASE_STACK);
-    if complete && stack_address().saturating_sub(stack_floor) < semantic_stack {
-        return None;
-    }
-    let calls = complete.then(|| super::bindings::analyze(&parsed.program, complete_input));
-    Some(Parsed {
+    let calls = if complete {
+        let semantic_stack = literals
+            .max_depth
+            .saturating_mul(SEMANTIC_LEVEL_STACK)
+            .saturating_add(SEMANTIC_BASE_STACK);
+        let analyze = || super::bindings::analyze(&parsed.program, complete_input);
+        Some(
+            if stack_address().saturating_sub(stack_floor) >= semantic_stack {
+                analyze()
+            } else if semantic_stack <= SEMANTIC_MAX_STACK {
+                on_new_stack(semantic_stack, analyze).ok_or(Unparsed::TooDeep)?
+            } else {
+                return Err(Unparsed::TooDeep);
+            },
+        )
+    } else {
+        None
+    };
+    Ok(Parsed {
         executable,
         complete,
         calls,
         random_literal,
     })
+}
+
+/// Runs `task` on a new stack segment of `bytes`. `None` when the segment
+/// can't be mapped: the stack crate panics then, before switching stacks.
+fn on_new_stack<T>(bytes: usize, task: impl FnOnce() -> T) -> Option<T> {
+    std::panic::catch_unwind(AssertUnwindSafe(|| stacker::grow(bytes, task))).ok()
 }
 
 /// The lowest address a parse on the current stack may use, or `None` when
@@ -194,18 +224,21 @@ fn parse(
     complete_input: bool,
 ) -> Option<Parsed> {
     let remaining = stacker::remaining_stack().unwrap_or(0);
-    if let Some(floor) = current_stack_floor()
-        && let Some(parsed) = parse_above(source, source_type, stripped, complete_input, floor)
-    {
-        return Some(parsed);
+    if let Some(floor) = current_stack_floor() {
+        match parse_above(source, source_type, stripped, complete_input, floor) {
+            Ok(parsed) => return Some(parsed),
+            Err(Unparsed::TooDeep) => return None,
+            Err(Unparsed::OutOfStack) => {}
+        }
     }
     if remaining >= DEEP_PARSE_STACK {
         return None;
     }
-    stacker::grow(DEEP_PARSE_STACK, || {
+    on_new_stack(DEEP_PARSE_STACK, || {
         let floor = current_stack_floor()?;
-        parse_above(source, source_type, stripped, complete_input, floor)
+        parse_above(source, source_type, stripped, complete_input, floor).ok()
     })
+    .flatten()
 }
 
 impl<'s> SourceContext<'s> {
