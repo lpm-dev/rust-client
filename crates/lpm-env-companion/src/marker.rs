@@ -550,6 +550,13 @@ mod tests {
                     "history",
                     entry(1, Level::ReadOnly, &["history-head", "history", "key"]),
                 )],
+                Level::Ignore,
+            ),
+            (
+                vec![(
+                    "history",
+                    entry(2, Level::ReadOnly, &["history-head", "history", "key"]),
+                )],
                 Level::ReadOnly,
             ),
             (

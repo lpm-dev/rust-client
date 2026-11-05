@@ -10,7 +10,7 @@ use std::collections::HashSet;
 
 use crate::account::CompanionAccount;
 use crate::gate::{Damage, GateError, Operation, ProjectGate};
-use crate::graph::{OVERRIDES, known_feature};
+use crate::graph::{HISTORY, HISTORY_OFF, OVERRIDES, SHARED_KEY_KIND, known_feature};
 use crate::invariants::is_listed;
 use crate::lifecycle::needs_resume;
 use crate::marker::{FeatureState, Marker};
@@ -70,6 +70,17 @@ pub fn assess(vault_id: &str, observed: Observed<'_>) -> Assessment {
     };
     if let Some(reason) = observed.unfinished {
         found(Damage::Unfinished(reason.to_owned()));
+    }
+    if let Some(marker) = gate.marker()
+        && marker
+            .feature(HISTORY.name)
+            .is_some_and(|entry| entry.state == FeatureState::Active)
+        && marker.feature(HISTORY_OFF.name).is_some()
+    {
+        found(Damage::InvalidRecord {
+            kind: HISTORY_OFF.name.to_owned(),
+            reason: "local history is both on and off".to_owned(),
+        });
     }
     let records_are_read = match &gate {
         ProjectGate::Plain => true,
@@ -141,12 +152,47 @@ impl Assessment {
         self.gate.marker().is_some_and(needs_resume)
     }
 
-    /// The operation matrix over the marker and every damage found.
+    /// The operation matrix over the marker and every damage found. Damage
+    /// to local history alone never stops values reads and writes; history
+    /// operations check [`Assessment::history_damage`] themselves.
     pub fn authorize(&self, operation: Operation) -> Result<(), GateError> {
         self.gate.authorize(operation)?;
         self.damage
             .iter()
+            .filter(|damage| !self.is_history_damage(damage))
             .try_for_each(|damage| ProjectGate::Damaged(damage.clone()).authorize(operation))
+    }
+
+    /// Whether `damage` touches local history only: its head, parts, or
+    /// "off" setting, or the shared key while history alone lists it.
+    pub fn is_history_damage(&self, damage: &Damage) -> bool {
+        let kind = match damage {
+            Damage::MissingRecord { kind }
+            | Damage::InvalidRecord { kind, .. }
+            | Damage::UnlistedRecord { kind } => kind.as_str(),
+            Damage::InvalidMarker(_) | Damage::Access(_) | Damage::Unfinished(_) => return false,
+        };
+        if kind == SHARED_KEY_KIND {
+            let Some(marker) = self.gate.marker() else {
+                return false;
+            };
+            let listers: Vec<&str> = marker
+                .features
+                .iter()
+                .filter(|(_, entry)| entry.kinds.iter().any(|listed| listed == SHARED_KEY_KIND))
+                .map(|(name, _)| name.as_str())
+                .collect();
+            return listers == [HISTORY.name];
+        }
+        HISTORY.kinds.contains(&kind) || kind == HISTORY_OFF.name
+    }
+
+    /// The first damage to local history, which stops every history
+    /// operation but turning it off and repairing it.
+    pub fn history_damage(&self) -> Option<&Damage> {
+        self.damage
+            .iter()
+            .find(|damage| self.is_history_damage(damage))
     }
 
     /// Every damage, an invalid marker first.
@@ -185,6 +231,10 @@ impl Assessment {
             Damage::InvalidMarker(_) | Damage::Unfinished(_) => Some(Repair::DiscardProject),
             Damage::UnlistedRecord { .. } if marker.is_none() => Some(Repair::DiscardProject),
             Damage::UnlistedRecord { .. } => Some(Repair::RemoveUnlisted),
+            // History both on and off: removing history keeps it off.
+            Damage::InvalidRecord { kind, .. } if kind == HISTORY_OFF.name => {
+                Some(Repair::RemoveFeature(HISTORY.name.to_owned()))
+            }
             Damage::MissingRecord { kind } | Damage::InvalidRecord { kind, .. } => Some(
                 marker
                     .and_then(|marker| {
@@ -466,9 +516,10 @@ mod tests {
             assessment.repairs(),
             [
                 Repair::RemoveUnlisted,
+                Repair::RemoveFeature("history".to_owned()),
                 Repair::RemoveFeature("overrides".to_owned()),
             ],
-            "two unlisted kinds need one removal"
+            "two unlisted kinds need one removal; history v1 misses its head and key"
         );
 
         let invalid = assess(
@@ -522,5 +573,130 @@ mod tests {
         assert_eq!(assessment.repairs(), [Repair::DiscardProject]);
         assert_eq!(assessment.authorize(Operation::Maintenance), Ok(()));
         assert!(assessment.authorize(Operation::Write).is_err());
+    }
+
+    fn history_marker(extra: &str) -> Vec<u8> {
+        format!(
+            r#"{{"schemaVersion":1,"vaultId":"proj","state":"active","features":{{"history":{{"version":1,"ifUnsupported":"ignore","kinds":["history-head","history","key"],"state":"active"}}{extra}}}}}"#
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn history_damage_never_stops_values_but_is_reported_for_history_operations() {
+        let marker = history_marker("");
+        let inventory = [record("history", Some(0))];
+        let assessment = assess(
+            "proj",
+            Observed {
+                marker: Some(&marker),
+                inventory: Some(&inventory),
+                ..Observed::default()
+            },
+        );
+        assert!(
+            !assessment.damage.is_empty(),
+            "the head and key are missing"
+        );
+        for operation in [
+            Operation::ReadExcludingOverrides,
+            Operation::ReadApplyingOverrides,
+            Operation::Write,
+        ] {
+            assert_eq!(assessment.authorize(operation), Ok(()), "{operation:?}");
+        }
+        assert!(assessment.history_damage().is_some());
+        assert_eq!(
+            assessment.repairs(),
+            [Repair::RemoveFeature("history".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_missing_key_is_history_damage_only_while_history_alone_lists_it() {
+        let shared = history_marker(
+            r#","future":{"version":1,"ifUnsupported":"ignore","kinds":["future-log","key"],"state":"active"}"#,
+        );
+        let inventory = [record("history-head", None)];
+        let assessment = assess(
+            "proj",
+            Observed {
+                marker: Some(&shared),
+                inventory: Some(&inventory),
+                ..Observed::default()
+            },
+        );
+        let missing_key = Damage::MissingRecord {
+            kind: "key".to_owned(),
+        };
+        assert!(assessment.damage.contains(&missing_key));
+        assert!(!assessment.is_history_damage(&missing_key));
+        assert!(assessment.authorize(Operation::Write).is_err());
+    }
+
+    #[test]
+    fn history_both_on_and_off_is_history_damage_whose_repair_keeps_it_off() {
+        let marker = history_marker(
+            r#","history-off":{"version":1,"ifUnsupported":"ignore","kinds":["history-off"],"state":"active"}"#,
+        );
+        let inventory = [
+            record("history-head", None),
+            record("key", None),
+            record("history", Some(0)),
+        ];
+        let assessment = assess(
+            "proj",
+            Observed {
+                marker: Some(&marker),
+                inventory: Some(&inventory),
+                ..Observed::default()
+            },
+        );
+        assert_eq!(
+            assessment.history_damage(),
+            Some(&Damage::InvalidRecord {
+                kind: "history-off".to_owned(),
+                reason: "local history is both on and off".to_owned()
+            })
+        );
+        assert_eq!(assessment.authorize(Operation::Write), Ok(()));
+        assert_eq!(
+            assessment.repairs(),
+            [Repair::RemoveFeature("history".to_owned())]
+        );
+    }
+
+    #[test]
+    fn a_history_off_record_is_unlisted_history_damage_that_its_removal_repairs() {
+        let marker = br#"{"schemaVersion":1,"vaultId":"proj","state":"active","features":{"history-off":{"version":1,"ifUnsupported":"ignore","kinds":["history-off"],"state":"active"}}}"#;
+        let inventory = [record("history-off", None)];
+        let assessment = assess(
+            "proj",
+            Observed {
+                marker: Some(marker),
+                inventory: Some(&inventory),
+                ..Observed::default()
+            },
+        );
+        assert_eq!(
+            assessment.damage,
+            [Damage::UnlistedRecord {
+                kind: "history-off".to_owned()
+            }]
+        );
+        assert!(assessment.history_damage().is_some());
+        assert_eq!(
+            assessment.authorize(Operation::ReadApplyingOverrides),
+            Ok(())
+        );
+        assert_eq!(assessment.repairs(), [Repair::RemoveUnlisted]);
+        assert!(
+            crate::invariants::check_written(
+                Marker::parse("proj", marker).ok().as_ref(),
+                &inventory
+            )
+            .is_err(),
+            "no transaction may write one"
+        );
     }
 }

@@ -153,6 +153,7 @@ pub fn feature_description(feature: &str) -> String {
     match feature {
         "overrides" => "personal overrides".to_owned(),
         "history" => "local history".to_owned(),
+        "history-off" => "a local history setting".to_owned(),
         "releases" => "a release log".to_owned(),
         "details" => "project details".to_owned(),
         other => format!("the feature \"{other}\""),

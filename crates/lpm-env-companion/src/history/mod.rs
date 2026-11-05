@@ -4,11 +4,13 @@
 //! Everything here is pure. Plans take the bytes a client read inside its
 //! lock and return what to write; each client's executor writes it.
 
+pub mod admission;
 pub mod append;
 pub mod codec;
 pub mod read;
 pub mod rebuild;
 pub mod removal;
+pub mod switch;
 pub mod values;
 
 #[cfg(test)]
