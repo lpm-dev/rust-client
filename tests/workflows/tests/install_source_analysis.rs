@@ -498,6 +498,7 @@ async fn audit_and_query_expose_targeted_execution_and_deletion_findings() {
         });
         for selector in [format!(":{rule}"), format!(":{severity}")] {
             let query = lpm_with_registry(&project, &mock.url())
+                .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
                 .args(["--json", "query", &selector, "--assert-none"])
                 .output()
                 .unwrap();
