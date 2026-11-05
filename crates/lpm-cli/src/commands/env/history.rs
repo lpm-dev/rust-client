@@ -598,7 +598,7 @@ fn history_list(
 #[allow(clippy::large_enum_variant)]
 #[derive(Serialize)]
 #[serde(untagged)]
-enum RowJson<'a> {
+enum TimelineRowJson<'a> {
     Entry(EntryJson<'a>),
     Unreadable {
         unreadable: bool,
@@ -625,7 +625,7 @@ struct TimelineJson<'a> {
     oldest: Option<String>,
     counts: serde_json::Map<String, serde_json::Value>,
     unreadable_parts: usize,
-    entries: Vec<RowJson<'a>>,
+    entries: Vec<TimelineRowJson<'a>>,
     live_gap: Option<LiveGapJson<'a>>,
 }
 
@@ -634,11 +634,11 @@ fn print_timeline_json(timeline: &Timeline, project_dir: &std::path::Path) -> Re
         .rows
         .iter()
         .map(|row| match row {
-            TimelineRow::Entry(info) => RowJson::Entry(entry_json(
+            TimelineRow::Entry(info) => TimelineRowJson::Entry(entry_json(
                 info,
                 timeline.values.get(&info.id).map(Vec::as_slice),
             )),
-            TimelineRow::Unreadable { after, before, .. } => RowJson::Unreadable {
+            TimelineRow::Unreadable { after, before, .. } => TimelineRowJson::Unreadable {
                 unreadable: true,
                 after: after.map(utc),
                 before: before.map(utc),
@@ -1256,7 +1256,7 @@ struct PulledJson<'a> {
 }
 
 #[derive(Serialize)]
-struct RowJson2<'a> {
+struct RollbackRowJson<'a> {
     key: &'a str,
     change: &'static str,
     reason: Option<&'static str>,
@@ -1277,7 +1277,7 @@ struct EnvironmentPlanJson<'a> {
     deletes_when_empty: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     unnamed_keys: Option<&'static str>,
-    rows: Vec<RowJson2<'a>>,
+    rows: Vec<RollbackRowJson<'a>>,
 }
 
 #[derive(Serialize)]
@@ -1360,7 +1360,7 @@ fn rollback_json<'a>(plan: &'a RollbackPlan, choices: &Choices) -> RollbackJson<
                     .iter()
                     .map(|row| {
                         let (change, reason) = row_change(row);
-                        RowJson2 {
+                        RollbackRowJson {
                             key: &row.key,
                             change,
                             reason,
