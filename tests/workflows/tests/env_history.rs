@@ -271,3 +271,37 @@ fn env_repair_removes_damaged_history_which_restarts_at_the_next_change() {
     set(&project, "A=2");
     assert_eq!(entry_ids(&project).len(), 1);
 }
+
+fn companion_folder(project: &TempProject) -> std::path::PathBuf {
+    std::fs::read_dir(project.home().join(".lpm").join("vaults"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().ends_with(".companion"))
+        .expect("the project's companion folder")
+        .path()
+}
+
+#[test]
+fn damaged_history_reads_as_paused_in_the_list_and_in_status() {
+    let project = project();
+    set(&project, "A=1");
+    std::fs::write(
+        companion_folder(&project).join("record.history.000"),
+        b"damaged",
+    )
+    .unwrap();
+    let (success, listing) = json(&project, &["env", "history", "--json"]);
+    assert!(success, "{listing}");
+    assert_eq!(
+        (listing["state"].as_str(), listing["reason"].as_str()),
+        (Some("paused"), Some("damaged")),
+        "{listing}"
+    );
+    let (success, status) = json(&project, &["env", "history", "status", "--json"]);
+    assert!(success, "{status}");
+    assert_eq!(
+        (status["state"].as_str(), status["reason"].as_str()),
+        (Some("paused"), Some("damaged")),
+        "{status}"
+    );
+}

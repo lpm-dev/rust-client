@@ -63,7 +63,7 @@ pub async fn run(
     }
     if let Some(action) = arguments::parse(&args, json_output)? {
         use arguments::LocalAction;
-        return match action {
+        let result = match action {
             LocalAction::Set {
                 environment,
                 assignments,
@@ -232,9 +232,10 @@ pub async fn run(
                 overwrite,
             } => inventory::vars_copy(project_dir, &source, &target, overwrite, json_output),
         };
+        return reported(result);
     }
 
-    match args[0] {
+    let result = match args[0] {
         "push" => push::vars_push(client, &args, project_dir, json_output).await,
         "pull" => pull::vars_pull(client, &args, project_dir, json_output).await,
         "share" => remote::env_share(client, &args, project_dir, json_output).await,
@@ -255,7 +256,17 @@ pub async fn run(
         unknown => Err(LpmError::Script(format!(
             "unknown env action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, schema, generate, example, print, check, connect, status, log, history, rollback, share, rotate-key, rotate-sharing-key, pair, unpair, init, ls, list-remote, copy, oidc, repair"
         ))),
+    };
+    reported(result)
+}
+
+/// A command that failed after it wrote values still says when history
+/// didn't record that write; one that succeeded said so already.
+fn reported(result: Result<(), LpmError>) -> Result<(), LpmError> {
+    if result.is_err() {
+        history::report_write();
     }
+    result
 }
 
 #[cfg(test)]

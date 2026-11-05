@@ -7,12 +7,13 @@ use std::collections::{BTreeSet, HashSet};
 use chrono::{DateTime, Local, TimeZone as _, Utc};
 use lpm_common::LpmError;
 use lpm_vault::history::{
-    Action, Choices, ChosenValue, EntryInfo, EnvironmentInfo, EnvironmentKindInfo, Filter,
-    HistoryError, HistoryState, KeyKindInfo, KeyMatch, KeysInfo, Outcome, Place, PlaceGroup,
-    Platform, Point, RelatedSide, RemoteInfo, RemoteName, RemovalReview, RevealedEntry,
-    RollbackKind, RollbackPlan, RollbackRequest, Row, SideInfo, SourceGroup, TargetValue, Timeline,
-    TimelineRow, UnknownReason,
+    Action, Choices, ChosenValue, EntryInfo, EnvironmentInfo, EnvironmentKindInfo, EnvironmentName,
+    EnvironmentPlan, Filter, HistoryError, HistoryState, KeyKindInfo, KeyMatch, KeysInfo, Listing,
+    Outcome, Paused, Place, PlaceGroup, Platform, Point, RelatedSide, RemoteInfo, RemoteName,
+    RemovalReview, RevealedEntry, RollbackKind, RollbackPlan, RollbackRequest, Row, SideInfo,
+    SourceGroup, TargetValue, TimelineRow, UnknownReason,
 };
+use serde::Serialize;
 
 use super::arguments::HistoryAction;
 use crate::{install_ui, output};
@@ -204,20 +205,21 @@ fn describe(info: &EntryInfo) -> String {
     }
 }
 
-fn key_names(environments: &[EnvironmentInfo]) -> Vec<String> {
-    let mut names: Vec<String> = environments
+fn key_names(environments: &[EnvironmentInfo]) -> Vec<&str> {
+    let mut names: Vec<&str> = environments
         .iter()
         .flat_map(|environment| match &environment.keys {
-            KeysInfo::Changes(changes) => changes.iter().map(|change| change.key.clone()).collect(),
-            KeysInfo::Count(_) => Vec::new(),
+            KeysInfo::Changes(changes) => changes.as_slice(),
+            KeysInfo::Count(_) => &[],
         })
+        .map(|change| change.key.as_str())
         .collect();
     names.sort_unstable();
     names.dedup();
     names
 }
 
-fn keys_column(info_keys: &[String], count: usize) -> String {
+fn keys_column(info_keys: &[&str], count: usize) -> String {
     match info_keys.len() {
         0 if count == 0 => String::new(),
         0 => format!("{count} keys"),
@@ -233,26 +235,115 @@ fn keys_column(info_keys: &[String], count: usize) -> String {
     }
 }
 
-fn side_json(side: SideInfo, value: Option<&str>) -> serde_json::Value {
-    let state = match side {
-        SideInfo::Absent => "absent",
-        SideInfo::Kept => "kept",
-        SideInfo::NotRecorded => "not_recorded",
-        SideInfo::TooLarge => "too_large",
-        SideInfo::Removed => "removed",
-    };
-    let mut object = serde_json::json!({
-        "kept": side == SideInfo::Kept,
-        "state": state,
-    });
-    if let Some(value) = value {
-        object["value"] = serde_json::Value::String(value.to_owned());
+/// Print `value` as one line of JSON, written straight to stdout.
+fn print_json(value: &impl Serialize) {
+    use std::io::Write as _;
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    if serde_json::to_writer(&mut out, value).is_ok() {
+        let _ = writeln!(out);
     }
-    object
+    let _ = out.flush();
 }
 
-fn entry_json(info: &EntryInfo, revealed: Option<&RevealedEntry>) -> serde_json::Value {
-    let environments: Vec<serde_json::Value> = info
+#[derive(Serialize)]
+struct SideJson<'a> {
+    kept: bool,
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<&'a str>,
+}
+
+fn side_json(side: SideInfo, value: Option<&str>) -> SideJson<'_> {
+    SideJson {
+        kept: side == SideInfo::Kept,
+        state: match side {
+            SideInfo::Absent => "absent",
+            SideInfo::Kept => "kept",
+            SideInfo::NotRecorded => "not_recorded",
+            SideInfo::TooLarge => "too_large",
+            SideInfo::Removed => "removed",
+        },
+        value,
+    }
+}
+
+#[derive(Serialize)]
+struct KeyJson<'a> {
+    key: &'a str,
+    change: &'static str,
+    before: SideJson<'a>,
+    after: SideJson<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    renamed_from: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct EnvironmentJson<'a> {
+    name: &'a str,
+    change: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    renamed_from: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    keys: Option<Vec<KeyJson<'a>>>,
+}
+
+#[derive(Serialize)]
+struct SourceJson {
+    actor: &'static str,
+    action: &'static str,
+    group: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum RemoteJson<'a> {
+    Personal(&'static str),
+    Org { org: &'a str },
+}
+
+#[derive(Serialize)]
+struct RelatedJson {
+    id: String,
+    side: &'static str,
+    time: String,
+}
+
+#[derive(Serialize)]
+struct EntryJson<'a> {
+    id: String,
+    short_id: String,
+    seq: u64,
+    time: String,
+    source: SourceJson,
+    description: String,
+    values_kept: bool,
+    environments: Vec<EnvironmentJson<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote: Option<RemoteJson<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_version: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    platform: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    related: Option<RelatedJson>,
+}
+
+fn side_name(side: RelatedSide) -> &'static str {
+    match side {
+        RelatedSide::Before => "before",
+        RelatedSide::After => "after",
+    }
+}
+
+fn entry_json<'a>(info: &'a EntryInfo, revealed: Option<&'a RevealedEntry>) -> EntryJson<'a> {
+    let environments = info
         .environments
         .iter()
         .enumerate()
@@ -261,103 +352,91 @@ fn entry_json(info: &EntryInfo, revealed: Option<&RevealedEntry>) -> serde_json:
                 EnvironmentKindInfo::Unchanged => ("unchanged", None),
                 EnvironmentKindInfo::Created => ("created", None),
                 EnvironmentKindInfo::Removed => ("removed", None),
-                EnvironmentKindInfo::RenamedFrom(from) => ("renamed", Some(from.clone())),
+                EnvironmentKindInfo::RenamedFrom(from) => ("renamed", Some(from.as_str())),
             };
-            let mut object = serde_json::json!({
-                "name": environment.name,
-                "change": change,
-            });
-            if let Some(from) = renamed_from {
-                object["renamed_from"] = serde_json::Value::String(from);
+            let (key_count, keys) = match &environment.keys {
+                KeysInfo::Count(count) => (Some(*count), None),
+                KeysInfo::Changes(changes) => (
+                    None,
+                    Some(
+                        changes
+                            .iter()
+                            .enumerate()
+                            .map(|(key_index, key)| {
+                                let values = revealed
+                                    .and_then(|revealed| revealed.values.get(environment_index))
+                                    .and_then(|values| values.get(key_index));
+                                let (change, renamed_from) = match &key.kind {
+                                    KeyKindInfo::Added => ("added", None),
+                                    KeyKindInfo::Changed => ("changed", None),
+                                    KeyKindInfo::Removed => ("removed", None),
+                                    KeyKindInfo::RenamedFrom(from) => {
+                                        ("renamed", Some(from.as_str()))
+                                    }
+                                };
+                                KeyJson {
+                                    key: &key.key,
+                                    change,
+                                    before: side_json(
+                                        key.before,
+                                        values
+                                            .and_then(|values| values.before.as_deref())
+                                            .map(String::as_str),
+                                    ),
+                                    after: side_json(
+                                        key.after,
+                                        values
+                                            .and_then(|values| values.after.as_deref())
+                                            .map(String::as_str),
+                                    ),
+                                    renamed_from,
+                                }
+                            })
+                            .collect(),
+                    ),
+                ),
+            };
+            EnvironmentJson {
+                name: &environment.name,
+                change,
+                renamed_from,
+                key_count,
+                keys,
             }
-            match &environment.keys {
-                KeysInfo::Count(count) => object["key_count"] = serde_json::json!(count),
-                KeysInfo::Changes(changes) => {
-                    let keys: Vec<serde_json::Value> = changes
-                        .iter()
-                        .enumerate()
-                        .map(|(key_index, key)| {
-                            let values = revealed
-                                .and_then(|revealed| revealed.values.get(environment_index))
-                                .and_then(|values| values.get(key_index));
-                            let (change, renamed_from) = match &key.kind {
-                                KeyKindInfo::Added => ("added", None),
-                                KeyKindInfo::Changed => ("changed", None),
-                                KeyKindInfo::Removed => ("removed", None),
-                                KeyKindInfo::RenamedFrom(from) => ("renamed", Some(from.clone())),
-                            };
-                            let mut object = serde_json::json!({
-                                "key": key.key,
-                                "change": change,
-                                "before": side_json(
-                                    key.before,
-                                    values.and_then(|values| values.before.as_deref()).map(String::as_str),
-                                ),
-                                "after": side_json(
-                                    key.after,
-                                    values.and_then(|values| values.after.as_deref()).map(String::as_str),
-                                ),
-                            });
-                            if let Some(from) = renamed_from {
-                                object["renamed_from"] = serde_json::Value::String(from);
-                            }
-                            object
-                        })
-                        .collect();
-                    object["keys"] = serde_json::Value::Array(keys);
-                }
-            }
-            object
         })
         .collect();
     let detail = &info.detail;
-    let mut object = serde_json::json!({
-        "id": hex::encode(info.id),
-        "short_id": hex::encode(&info.id[..4]),
-        "seq": info.seq,
-        "time": utc(info.time),
-        "source": {
-            "actor": match info.actor {
+    EntryJson {
+        id: hex::encode(info.id),
+        short_id: hex::encode(&info.id[..4]),
+        seq: info.seq,
+        time: utc(info.time),
+        source: SourceJson {
+            actor: match info.actor {
                 lpm_vault::history::Actor::App => "app",
                 lpm_vault::history::Actor::Cli => "cli",
                 lpm_vault::history::Actor::Outside => "outside",
             },
-            "action": info.action.name(),
-            "group": info.source().name(),
+            action: info.action.name(),
+            group: info.source().name(),
         },
-        "description": describe(info),
-        "values_kept": !info.flags.values_not_kept,
-        "environments": environments,
-    });
-    if let Some(since) = info.since {
-        object["since"] = serde_json::Value::String(utc(since));
+        description: describe(info),
+        values_kept: !info.flags.values_not_kept,
+        environments,
+        since: info.since.map(utc),
+        file_name: detail.file_name.as_deref(),
+        remote: detail.remote.as_ref().map(|remote| match remote {
+            RemoteInfo::Personal => RemoteJson::Personal("personal"),
+            RemoteInfo::Org(slug) => RemoteJson::Org { org: slug },
+        }),
+        remote_version: detail.remote_version,
+        platform: detail.platform.map(Platform::name),
+        related: detail.related.map(|related| RelatedJson {
+            id: hex::encode(related.id),
+            side: side_name(related.side),
+            time: utc(related.time),
+        }),
     }
-    if let Some(name) = &detail.file_name {
-        object["file_name"] = serde_json::Value::String(name.clone());
-    }
-    if let Some(remote) = &detail.remote {
-        object["remote"] = match remote {
-            RemoteInfo::Personal => serde_json::json!("personal"),
-            RemoteInfo::Org(slug) => serde_json::json!({ "org": slug }),
-        };
-    }
-    if let Some(version) = detail.remote_version {
-        object["remote_version"] = serde_json::json!(version);
-    }
-    if let Some(platform) = detail.platform {
-        object["platform"] = serde_json::json!(platform.name());
-    }
-    if let Some(related) = detail.related {
-        object["related"] = serde_json::json!({
-            "id": hex::encode(related.id),
-            "side": match related.side {
-                RelatedSide::Before => "before",
-                RelatedSide::After => "after",
-            },
-            "time": utc(related.time),
-        });
-    }
-    object
 }
 
 pub(super) struct ListArgs<'a> {
@@ -437,9 +516,9 @@ fn history_list(
         source: list.source,
         limit: list.limit,
     };
-    let timeline = lpm_vault::history::timeline(project_dir, &filter)
+    let listing = lpm_vault::history::timeline(project_dir, &filter, list.reveal)
         .map_err(|error| fail(&error, json_output))?;
-    let Some(timeline) = timeline else {
+    let Some(listing) = listing else {
         if json_output {
             println!(
                 "{}",
@@ -460,76 +539,99 @@ fn history_list(
         }
         return Ok(());
     };
-    let revealed = if list.reveal {
-        let ids: BTreeSet<[u8; 16]> = timeline
-            .rows
-            .iter()
-            .filter_map(|row| match row {
-                TimelineRow::Entry(info) => Some(info.id),
-                TimelineRow::Unreadable { .. } => None,
-            })
-            .collect();
-        lpm_vault::history::reveal(project_dir, &ids).map_err(|error| fail(&error, json_output))?
-    } else {
-        Vec::new()
-    };
-    let revealed_for = |id: &[u8; 16]| revealed.iter().find(|entry| entry.info.id == *id);
     if json_output {
-        print_timeline_json(&timeline, project_dir, &revealed_for);
+        print_timeline_json(&listing, project_dir);
         return Ok(());
     }
-    print_timeline(&timeline, project_dir, list.reveal, &revealed_for);
+    print_timeline(&listing, project_dir, list.reveal);
     Ok(())
 }
 
-fn print_timeline_json<'a>(
-    timeline: &Timeline,
-    project_dir: &std::path::Path,
-    revealed_for: &dyn Fn(&[u8; 16]) -> Option<&'a RevealedEntry>,
-) {
-    let entries: Vec<serde_json::Value> = timeline
+// Unreadable rows are rare, and boxing every entry would cost an allocation
+// per row of every listing.
+#[allow(clippy::large_enum_variant)]
+#[derive(Serialize)]
+#[serde(untagged)]
+enum RowJson<'a> {
+    Entry(EntryJson<'a>),
+    Unreadable {
+        unreadable: bool,
+        after: Option<String>,
+        before: Option<String>,
+    },
+}
+
+#[derive(Serialize)]
+struct LiveGapJson<'a> {
+    since: Option<String>,
+    keys: Vec<&'a str>,
+    environments: Vec<&'a str>,
+}
+
+#[derive(Serialize)]
+struct TimelineJson<'a> {
+    success: bool,
+    project: String,
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+    retained: usize,
+    oldest: Option<String>,
+    counts: serde_json::Map<String, serde_json::Value>,
+    unreadable_parts: usize,
+    entries: Vec<RowJson<'a>>,
+    live_gap: Option<LiveGapJson<'a>>,
+}
+
+fn print_timeline_json(listing: &Listing, project_dir: &std::path::Path) {
+    let timeline = &listing.timeline;
+    let entries = timeline
         .rows
         .iter()
         .map(|row| match row {
-            TimelineRow::Entry(info) => entry_json(info, revealed_for(&info.id)),
-            TimelineRow::Unreadable { after, before, .. } => serde_json::json!({
-                "unreadable": true,
-                "after": after.map(utc),
-                "before": before.map(utc),
-            }),
+            TimelineRow::Entry(info) => {
+                RowJson::Entry(entry_json(info, listing.revealed.get(&info.id)))
+            }
+            TimelineRow::Unreadable { after, before, .. } => RowJson::Unreadable {
+                unreadable: true,
+                after: after.map(utc),
+                before: before.map(utc),
+            },
         })
         .collect();
-    let counts: serde_json::Map<String, serde_json::Value> = timeline
-        .counts
-        .iter()
-        .map(|(group, count)| (group.name().to_owned(), serde_json::json!(count)))
-        .collect();
-    println!(
-        "{}",
-        serde_json::json!({
-            "success": true,
-            "project": project_name(project_dir),
-            "state": if timeline.damaged_tail { "damaged" } else { "on" },
-            "retained": timeline.readable,
-            "oldest": timeline.oldest.map(utc),
-            "counts": counts,
-            "unreadable_parts": timeline.unreadable_parts,
-            "entries": entries,
-            "live_gap": timeline.live_gap.as_ref().map(|gap| serde_json::json!({
-                "since": gap.since.map(utc),
-                "keys": key_names(&gap.environments),
-                "environments": gap.environments.iter().map(|environment| environment.name.clone()).collect::<Vec<_>>(),
-            })),
-        })
-    );
+    let (state, reason) = if timeline.damaged_tail {
+        ("paused", Some(Paused::Damaged.code()))
+    } else {
+        ("on", None)
+    };
+    print_json(&TimelineJson {
+        success: true,
+        project: project_name(project_dir),
+        state,
+        reason,
+        retained: timeline.readable,
+        oldest: timeline.oldest.map(utc),
+        counts: timeline
+            .counts
+            .iter()
+            .map(|(group, count)| (group.name().to_owned(), serde_json::json!(count)))
+            .collect(),
+        unreadable_parts: timeline.unreadable_parts,
+        entries,
+        live_gap: timeline.live_gap.as_ref().map(|gap| LiveGapJson {
+            since: gap.since.map(utc),
+            keys: key_names(&gap.environments),
+            environments: gap
+                .environments
+                .iter()
+                .map(|environment| environment.name.as_str())
+                .collect(),
+        }),
+    });
 }
 
-fn print_timeline<'a>(
-    timeline: &Timeline,
-    project_dir: &std::path::Path,
-    reveal: bool,
-    revealed_for: &dyn Fn(&[u8; 16]) -> Option<&'a RevealedEntry>,
-) {
+fn print_timeline(listing: &Listing, project_dir: &std::path::Path, reveal: bool) {
+    let timeline = &listing.timeline;
     println!(
         "Local history for {} on this Mac.{}",
         install_ui::bold(&project_name(project_dir)),
@@ -576,7 +678,7 @@ fn print_timeline<'a>(
                     line.push_str(&format!("   ({} to {})", clock(since), clock(info.time)));
                 }
                 println!("{line}");
-                if let Some(revealed) = revealed_for(&info.id) {
+                if let Some(revealed) = listing.revealed.get(&info.id) {
                     print_values(info, revealed);
                 }
             }
@@ -632,58 +734,32 @@ fn print_values(info: &EntryInfo, revealed: &RevealedEntry) {
     }
 }
 
-fn find_entry(
-    project_dir: &std::path::Path,
-    prefix: &str,
-    json_output: bool,
-) -> Result<(Timeline, [u8; 16]), LpmError> {
-    let timeline = lpm_vault::history::timeline(project_dir, &Filter::default())
-        .map_err(|error| fail(&error, json_output))?
-        .ok_or_else(|| fail(&HistoryError::EntryNotFound, json_output))?;
-    let id = lpm_vault::history::resolve_entry(&timeline, prefix)
-        .map_err(|error| fail(&error, json_output))?;
-    Ok((timeline, id))
-}
-
-fn entry_info(timeline: &Timeline, id: &[u8; 16]) -> Option<EntryInfo> {
-    timeline.rows.iter().find_map(|row| match row {
-        TimelineRow::Entry(info) if info.id == *id => Some(info.clone()),
-        _ => None,
-    })
-}
-
 fn history_show(
     prefix: &str,
     reveal: bool,
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let (timeline, id) = find_entry(project_dir, prefix, json_output)?;
-    let info = entry_info(&timeline, &id)
-        .ok_or_else(|| fail(&HistoryError::EntryNotFound, json_output))?;
-    let revealed = if reveal {
-        lpm_vault::history::reveal(project_dir, &BTreeSet::from([id]))
-            .map_err(|error| fail(&error, json_output))?
-            .into_iter()
-            .next()
-    } else {
-        None
-    };
+    let shown = lpm_vault::history::show(project_dir, prefix, reveal)
+        .map_err(|error| fail(&error, json_output))?;
+    let info = &shown.info;
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({
-                "success": true,
-                "entry": entry_json(&info, revealed.as_ref()),
-            })
-        );
+        #[derive(Serialize)]
+        struct ShowJson<'a> {
+            success: bool,
+            entry: EntryJson<'a>,
+        }
+        print_json(&ShowJson {
+            success: true,
+            entry: entry_json(info, shown.revealed.as_ref()),
+        });
         return Ok(());
     }
     println!(
         "{}  {}  {}",
         install_ui::bold(&hex::encode(info.id)),
         local_time(info.time).format("%b %-d, %Y at %H:%M:%S"),
-        describe(&info)
+        describe(info)
     );
     for environment in &info.environments {
         let heading = match &environment.kind {
@@ -710,8 +786,8 @@ fn history_show(
             }
         }
     }
-    if let Some(revealed) = &revealed {
-        print_values(&info, revealed);
+    if let Some(revealed) = &shown.revealed {
+        print_values(info, revealed);
     } else {
         println!("Values are hidden; add --reveal to show them.");
     }
@@ -721,37 +797,49 @@ fn history_show(
 fn history_status(project_dir: &std::path::Path, json_output: bool) -> Result<(), LpmError> {
     let status =
         lpm_vault::history::status(project_dir).map_err(|error| fail(&error, json_output))?;
-    let state = match status.state {
-        HistoryState::On => "on",
-        HistoryState::Off => "off",
-        HistoryState::Unsupported => "paused",
-        HistoryState::Damaged => "paused",
+    let paused = match &status.state {
+        HistoryState::Paused(reason) => Some(reason),
+        HistoryState::On | HistoryState::Off => None,
     };
     if json_output {
         let mut object = serde_json::json!({
             "success": true,
             "project": project_name(project_dir),
-            "state": state,
+            "state": match status.state {
+                HistoryState::On => "on",
+                HistoryState::Off => "off",
+                HistoryState::Paused(_) => "paused",
+            },
             "retained": status.retained,
             "oldest": status.oldest.map(utc),
             "unreadable_parts": status.unreadable_parts,
         });
-        match status.state {
-            HistoryState::Unsupported => object["reason"] = serde_json::json!("newer_version"),
-            HistoryState::Damaged => object["reason"] = serde_json::json!("damaged"),
-            HistoryState::On | HistoryState::Off => {}
+        if let Some(reason) = paused {
+            object["reason"] = serde_json::json!(reason.code());
+            if let Paused::Unavailable(message) = reason {
+                object["message"] = serde_json::json!(message);
+            }
         }
         println!("{object}");
         return Ok(());
     }
     let name = project_name(project_dir);
-    match status.state {
+    match &status.state {
         HistoryState::Off => output::info(&format!("local history is off for {name}")),
-        HistoryState::Unsupported => output::warn(&format!(
+        HistoryState::Paused(Paused::NewerVersion) => output::warn(&format!(
             "local history is paused for {name}: a newer LPM keeps it; update the LPM CLI: lpm self-update"
         )),
-        HistoryState::Damaged => output::warn(&format!(
+        HistoryState::Paused(Paused::Damaged) => output::warn(&format!(
             "local history is paused for {name}: it's damaged; repair it with lpm env repair"
+        )),
+        HistoryState::Paused(Paused::Limit) => output::warn(&format!(
+            "local history is paused for {name}: this Mac holds too much LPM data to keep history for it"
+        )),
+        HistoryState::Paused(Paused::TooManyValues) => output::warn(&format!(
+            "local history is paused for {name}: it has too many values to keep history"
+        )),
+        HistoryState::Paused(Paused::Unavailable(message)) => output::warn(&format!(
+            "local history for {name} can't be read right now: the Keychain is locked or unavailable ({message})"
         )),
         HistoryState::On if status.retained == 0 => output::success(&format!(
             "local history is on for {name}; it starts with the next change on this Mac"
@@ -823,26 +911,45 @@ struct ForgetArgs<'a> {
     yes: bool,
 }
 
-/// The environment of `info` a command acts on: the one `--env` names, or
-/// the entry's only one.
-fn entry_environment(
+/// The environment of `info` a removal starts from, as the entry names it:
+/// the one `--env` names, under the name the entry has for it or the one it
+/// had before the entry renamed it, or the entry's only one.
+fn forget_environment(info: &EntryInfo, environment: Option<&str>) -> Result<String, HistoryError> {
+    match environment {
+        Some(wanted) => info
+            .environments
+            .iter()
+            .find(|environment| {
+                environment.name == wanted
+                    || matches!(&environment.kind, EnvironmentKindInfo::RenamedFrom(from) if from == wanted)
+            })
+            .map(|environment| environment.name.clone())
+            .ok_or(HistoryError::UnknownEnvironment),
+        None => match info.environments.as_slice() {
+            [only] => Ok(only.name.clone()),
+            _ => Err(HistoryError::EnvironmentRequired),
+        },
+    }
+}
+
+/// The environment a rollback to `side` of `info` acts on: the one `--env`
+/// names as it's named now, or the entry's only one as it was named at that
+/// point.
+fn rollback_environment(
     info: &EntryInfo,
     environment: Option<&str>,
-    project_dir: &std::path::Path,
-    json_output: bool,
-) -> Result<String, LpmError> {
-    if let Some(environment) = canonical_environment(environment, project_dir)? {
-        return Ok(environment);
+    side: RelatedSide,
+) -> Result<EnvironmentName, HistoryError> {
+    if let Some(environment) = environment {
+        return Ok(EnvironmentName::Now(environment.to_owned()));
     }
-    match info.environments.as_slice() {
-        [only] => Ok(only.name.clone()),
-        _ => Err(fail(
-            &HistoryError::Storage(
-                "that entry touched several environments; choose one with --env".to_owned(),
-            ),
-            json_output,
-        )),
-    }
+    let [only] = info.environments.as_slice() else {
+        return Err(HistoryError::EnvironmentRequired);
+    };
+    Ok(EnvironmentName::AtPoint(match (&only.kind, side) {
+        (EnvironmentKindInfo::RenamedFrom(from), RelatedSide::Before) => from.clone(),
+        _ => only.name.clone(),
+    }))
 }
 
 fn occurrences(place: &Place) -> String {
@@ -872,7 +979,14 @@ fn forget_selection(
         .enumerate()
         .filter(|(_, place)| !place.current)
         .filter(|(_, place)| match place.group {
-            PlaceGroup::ThisKey => !args.only_env || place.environment == environment,
+            PlaceGroup::ThisKey => {
+                !args.only_env
+                    || place.environment == environment
+                    || place
+                        .renamed_environments
+                        .iter()
+                        .any(|name| name == environment)
+            }
             PlaceGroup::OtherKey => args.all_keys,
         })
         .map(|(index, _)| index)
@@ -884,22 +998,21 @@ fn history_forget(
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let (timeline, id) = find_entry(project_dir, args.entry, json_output)?;
-    let info = entry_info(&timeline, &id)
-        .ok_or_else(|| fail(&HistoryError::EntryNotFound, json_output))?;
-    let environment = entry_environment(&info, args.environment, project_dir, json_output)?;
-    let chosen = ChosenValue {
-        entry: id,
-        environment: environment.clone(),
-        key: args.key.to_owned(),
-        side: if args.before {
-            RelatedSide::Before
-        } else {
-            RelatedSide::After
-        },
-    };
-    let review = lpm_vault::history::review_forget(project_dir, &chosen)
-        .map_err(|error| fail(&error, json_output))?;
+    let mut environment = String::new();
+    let (info, review) = lpm_vault::history::review_forget(project_dir, args.entry, |info| {
+        environment = forget_environment(info, args.environment)?;
+        Ok(ChosenValue {
+            entry: info.id,
+            environment: environment.clone(),
+            key: args.key.to_owned(),
+            side: if args.before {
+                RelatedSide::Before
+            } else {
+                RelatedSide::After
+            },
+        })
+    })
+    .map_err(|error| fail(&error, json_output))?;
     let selection = forget_selection(&review, &environment, args);
     let places_json: Vec<serde_json::Value> = review
         .places
@@ -1038,64 +1151,158 @@ fn pulled_notice(key: &str, pulled: &lpm_vault::history::Pulled) -> String {
     )
 }
 
-fn rollback_json(plan: &RollbackPlan, choices: &Choices) -> serde_json::Value {
-    let environments: Vec<serde_json::Value> = plan
-        .environments
+#[derive(Serialize)]
+struct GapJson {
+    since: Option<String>,
+    until: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PulledJson<'a> {
+    remote: RemoteJson<'a>,
+    version: Option<u64>,
+    time: String,
+}
+
+#[derive(Serialize)]
+struct RowJson2<'a> {
+    key: &'a str,
+    change: &'static str,
+    reason: Option<&'static str>,
+    applied: bool,
+    gaps: Vec<GapJson>,
+    pulled: Option<PulledJson<'a>>,
+    changed_again: Option<String>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    linked: &'a [String],
+}
+
+#[derive(Serialize)]
+struct EnvironmentPlanJson<'a> {
+    current: Option<&'a str>,
+    target: Option<&'a str>,
+    recreates: bool,
+    renames: bool,
+    deletes_when_empty: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unnamed_keys: Option<&'static str>,
+    rows: Vec<RowJson2<'a>>,
+}
+
+#[derive(Serialize)]
+struct PointJson {
+    entry: String,
+    side: &'static str,
+    time: String,
+}
+
+#[derive(Serialize)]
+struct RollbackJson<'a> {
+    kind: &'static str,
+    point: PointJson,
+    environments: Vec<EnvironmentPlanJson<'a>>,
+}
+
+fn unknown_reason(reason: UnknownReason) -> &'static str {
+    match reason {
+        UnknownReason::NotRecorded => "not_recorded",
+        UnknownReason::TooLarge => "too_large",
+        UnknownReason::Removed => "removed",
+        UnknownReason::Unreadable => "unreadable",
+    }
+}
+
+/// The keys of an environment's rows that are switched off.
+fn skipped_keys<'a>(
+    environment: &'a EnvironmentPlan,
+    environment_index: usize,
+    choices: &Choices,
+) -> HashSet<&'a str> {
+    environment
+        .rows
         .iter()
         .enumerate()
-        .map(|(environment_index, environment)| {
-            let rows: Vec<serde_json::Value> = environment
-                .rows
-                .iter()
-                .enumerate()
-                .map(|(row_index, row)| {
-                    let (change, reason) = row_change(row);
-                    serde_json::json!({
-                        "key": row.key,
-                        "change": change,
-                        "reason": reason,
-                        "applied": row.changes() && !choices.skipped.contains(&(environment_index, row_index)),
-                        "gaps": row.gaps.iter().map(|gap| serde_json::json!({
-                            "since": gap.since.map(utc),
-                            "until": gap.until.map(utc),
-                        })).collect::<Vec<_>>(),
-                        "pulled": row.pulled.as_ref().map(|pulled| serde_json::json!({
-                            "remote": match &pulled.remote {
-                                Some(RemoteName::Org(slug)) => serde_json::json!({ "org": slug }),
-                                Some(RemoteName::Personal) | None => serde_json::json!("personal"),
-                            },
-                            "version": pulled.version,
-                            "time": utc(pulled.time),
-                        })),
-                        "changed_again": row.changed_again.as_ref().map(|changed| utc(changed.time)),
-                    })
-                })
-                .collect();
-            serde_json::json!({
-                "current": environment.current,
-                "target": environment.target,
-                "recreates": environment.recreates(),
-                "deletes_when_empty": environment.offers_deletion(),
-                "rows": rows,
-            })
-        })
-        .collect();
-    serde_json::json!({
-        "kind": match plan.kind {
+        .filter(|(row_index, _)| choices.skipped.contains(&(environment_index, *row_index)))
+        .map(|(_, row)| row.key.as_str())
+        .collect()
+}
+
+/// Whether a row applies: it changes a value, and neither it nor a row it's
+/// linked to is switched off.
+fn applies(row: &Row, skipped: &HashSet<&str>) -> bool {
+    row.changes()
+        && !skipped.contains(row.key.as_str())
+        && !row.linked.iter().any(|key| skipped.contains(key.as_str()))
+}
+
+fn rollback_json<'a>(plan: &'a RollbackPlan, choices: &Choices) -> RollbackJson<'a> {
+    RollbackJson {
+        kind: match plan.kind {
             RollbackKind::Environment => "environment",
             RollbackKind::Key => "key",
             RollbackKind::Undo => "undo",
         },
-        "point": {
-            "entry": hex::encode(plan.point.entry),
-            "side": match plan.point.side {
-                RelatedSide::Before => "before",
-                RelatedSide::After => "after",
-            },
-            "time": utc(plan.point_time),
+        point: PointJson {
+            entry: hex::encode(plan.point.entry),
+            side: side_name(plan.point.side),
+            time: utc(plan.point_time),
         },
-        "environments": environments,
-    })
+        environments: plan
+            .environments
+            .iter()
+            .enumerate()
+            .map(|(environment_index, environment)| {
+                (
+                    environment,
+                    skipped_keys(environment, environment_index, choices),
+                )
+            })
+            .map(|(environment, skipped)| EnvironmentPlanJson {
+                current: environment.current.as_deref(),
+                target: environment.target.as_deref(),
+                recreates: environment.recreates(),
+                renames: environment.renames(),
+                deletes_when_empty: environment.offers_deletion(),
+                unnamed_keys: environment.unnamed_keys.map(unknown_reason),
+                rows: environment
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        let (change, reason) = row_change(row);
+                        RowJson2 {
+                            key: &row.key,
+                            change,
+                            reason,
+                            applied: applies(row, &skipped),
+                            gaps: row
+                                .gaps
+                                .iter()
+                                .map(|gap| GapJson {
+                                    since: gap.since.map(utc),
+                                    until: gap.until.map(utc),
+                                })
+                                .collect(),
+                            pulled: row.pulled.as_ref().map(|pulled| PulledJson {
+                                remote: match &pulled.remote {
+                                    Some(RemoteName::Org(slug)) => RemoteJson::Org { org: slug },
+                                    Some(RemoteName::Personal) | None => {
+                                        RemoteJson::Personal("personal")
+                                    }
+                                },
+                                version: pulled.version,
+                                time: utc(pulled.time),
+                            }),
+                            changed_again: row
+                                .changed_again
+                                .as_ref()
+                                .map(|changed| utc(changed.time)),
+                            linked: &row.linked,
+                        }
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
 }
 
 fn print_rollback(plan: &RollbackPlan, choices: &Choices, title: &str) {
@@ -1115,27 +1322,37 @@ fn print_rollback(plan: &RollbackPlan, choices: &Choices, title: &str) {
                 )
             );
         }
+        let note = |text: String| println!("    {}", install_ui::dim(&text));
+        let skipped_rows = skipped_keys(environment, environment_index, choices);
         if environment.recreates() {
-            println!(
-                "    {}",
-                install_ui::dim(&format!(
-                    "{} was deleted. Rolling back recreates it.",
-                    environment.target.as_deref().unwrap_or("")
-                ))
-            );
+            note(format!(
+                "{} was deleted. Rolling back recreates it.",
+                environment.target.as_deref().unwrap_or("")
+            ));
+        }
+        if environment.renames() {
+            note(format!(
+                "{} was named {} then. Rolling back renames it back.",
+                environment.current.as_deref().unwrap_or(""),
+                environment.target.as_deref().unwrap_or("")
+            ));
         }
         if environment.offers_deletion() {
-            println!(
-                "    {}",
-                install_ui::dim(&format!(
-                    "{} didn't exist at that point; it's deleted once it's empty.",
-                    environment.current.as_deref().unwrap_or("")
-                ))
+            note(format!(
+                "{} didn't exist at that point; it's deleted once it's empty.",
+                environment.current.as_deref().unwrap_or("")
+            ));
+        }
+        if environment.unnamed_keys.is_some() {
+            note(
+                "Some keys it had then can't be named: the change that removed them was too large to keep. They stay as they are."
+                    .to_owned(),
             );
         }
         for (row_index, row) in environment.rows.iter().enumerate() {
             total += 1;
             let skipped = choices.skipped.contains(&(environment_index, row_index));
+            let applied = applies(row, &skipped_rows);
             let (change, reason) = row_change(row);
             let mark = match change {
                 "changed" => "~",
@@ -1143,12 +1360,19 @@ fn print_rollback(plan: &RollbackPlan, choices: &Choices, title: &str) {
                 "removed" => "-",
                 _ => "?",
             };
-            if row.changes() && !skipped {
+            if applied {
                 changing += 1;
             }
             let mut line = format!("    {mark} {}", row.key);
-            if skipped {
-                line.push_str("  (kept)");
+            if !row.linked.is_empty() {
+                line.push_str(&format!("  (renamed, with {})", row.linked.join(", ")));
+            }
+            if row.changes() && !applied {
+                line.push_str(if skipped {
+                    "  (kept)"
+                } else {
+                    "  (kept with its rename)"
+                });
             }
             if let Some(reason) = reason {
                 line.push_str(&format!("  ({reason})"));
@@ -1191,107 +1415,126 @@ fn print_rollback(plan: &RollbackPlan, choices: &Choices, title: &str) {
     println!("{changing} of {total} keys change. {ROLLBACK_FOOTER}");
 }
 
+/// The rows a rollback leaves out when the person names keys: all but
+/// those keys' rows, and the rows a renamed key's rows are linked to.
+fn choices_for_keys(plan: &RollbackPlan, keys: &[String]) -> Choices {
+    let mut choices = Choices::default();
+    if keys.is_empty() {
+        return choices;
+    }
+    let wanted: HashSet<&str> = keys.iter().map(String::as_str).collect();
+    for (environment_index, environment) in plan.environments.iter().enumerate() {
+        for (row_index, row) in environment.rows.iter().enumerate() {
+            let asked = wanted.contains(row.key.as_str())
+                || row.linked.iter().any(|key| wanted.contains(key.as_str()));
+            if !asked {
+                choices.skipped.insert((environment_index, row_index));
+            }
+        }
+    }
+    choices
+}
+
+/// How many rows applying `plan` with `choices` changes.
+fn changing_rows(plan: &RollbackPlan, choices: &Choices) -> usize {
+    plan.environments
+        .iter()
+        .enumerate()
+        .map(|(environment_index, environment)| {
+            let skipped = skipped_keys(environment, environment_index, choices);
+            environment
+                .rows
+                .iter()
+                .filter(|row| applies(row, &skipped))
+                .count()
+        })
+        .sum()
+}
+
+/// Whether the rollback renames, recreates or deletes an environment, which
+/// changes the project even when no value changes.
+fn changes_an_environment(plan: &RollbackPlan) -> bool {
+    plan.environments.iter().any(|environment| {
+        environment.renames() || environment.recreates() || environment.offers_deletion()
+    })
+}
+
 pub(super) fn env_rollback(
     args: &RollbackArgs<'_>,
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
     let prefix = args.to.or(args.before).or(args.undo).unwrap_or_default();
-    let (timeline, id) = find_entry(project_dir, prefix, json_output)?;
-    let info = entry_info(&timeline, &id)
-        .ok_or_else(|| fail(&HistoryError::EntryNotFound, json_output))?;
-    let (request, title) = if args.undo.is_some() {
-        (
-            RollbackRequest::Undo { entry: id },
-            format!("Undo \"{}\" from {}:", describe(&info), moment(info.time)),
-        )
+    let environment = canonical_environment(args.environment, project_dir)?;
+    let side = if args.to.is_some() {
+        RelatedSide::After
     } else {
-        let environment = entry_environment(&info, args.environment, project_dir, json_output)?;
-        let side = if args.to.is_some() {
-            RelatedSide::After
-        } else {
-            RelatedSide::Before
-        };
-        match (side, args.keys) {
-            (RelatedSide::Before, [key]) => (
-                RollbackRequest::Key {
-                    environment: environment.clone(),
-                    key: key.clone(),
-                    entry: id,
-                },
-                format!(
-                    "Roll back {key} in {environment} to its value before {}:",
-                    moment(info.time)
-                ),
-            ),
-            _ => (
-                RollbackRequest::Environment {
-                    environment: environment.clone(),
-                    point: Point { entry: id, side },
-                },
-                format!(
-                    "Roll back {environment} to {}{}:",
-                    if side == RelatedSide::Before {
-                        "before "
-                    } else {
-                        ""
-                    },
-                    moment(info.time)
-                ),
-            ),
-        }
+        RelatedSide::Before
     };
-    let mut plan = lpm_vault::history::review_rollback(project_dir, &request)
-        .map_err(|error| fail(&error, json_output))?;
+    let (info, mut plan) = lpm_vault::history::review_rollback(project_dir, prefix, |info| {
+        if args.undo.is_some() {
+            return Ok(RollbackRequest::Undo { entry: info.id });
+        }
+        let named = rollback_environment(info, environment.as_deref(), side)?;
+        Ok(match (side, args.keys) {
+            (RelatedSide::Before, [key]) => RollbackRequest::Key {
+                environment: named,
+                key: key.clone(),
+                entry: info.id,
+            },
+            _ => RollbackRequest::Environment {
+                environment: named,
+                point: Point {
+                    entry: info.id,
+                    side,
+                },
+            },
+        })
+    })
+    .map_err(|error| fail(&error, json_output))?;
+    let target_name = plan
+        .environments
+        .first()
+        .and_then(|environment| environment.target.clone().or(environment.current.clone()))
+        .unwrap_or_default();
+    let title = match plan.kind {
+        RollbackKind::Undo => format!("Undo \"{}\" from {}:", describe(&info), moment(info.time)),
+        RollbackKind::Key => format!(
+            "Roll back {} in {target_name} to its value before {}:",
+            args.keys.first().map(String::as_str).unwrap_or_default(),
+            moment(info.time)
+        ),
+        RollbackKind::Environment => format!(
+            "Roll back {target_name} to {}{}:",
+            if side == RelatedSide::Before {
+                "before "
+            } else {
+                ""
+            },
+            moment(info.time)
+        ),
+    };
     if args.undo.is_some()
-        && let Some(environment) = canonical_environment(args.environment, project_dir)?
+        && let Some(environment) = &environment
     {
         plan.environments.retain(|candidate| {
             candidate.current.as_deref() == Some(environment.as_str())
                 || candidate.target.as_deref() == Some(environment.as_str())
         });
     }
-    let wanted: HashSet<&str> = args.keys.iter().map(String::as_str).collect();
-    let mut choices = Choices::default();
-    if !wanted.is_empty() {
-        for (environment_index, environment) in plan.environments.iter().enumerate() {
-            for (row_index, row) in environment.rows.iter().enumerate() {
-                if !wanted.contains(row.key.as_str()) {
-                    choices.skipped.insert((environment_index, row_index));
-                }
-            }
-        }
-    }
-    let changing = plan
-        .environments
-        .iter()
-        .enumerate()
-        .flat_map(|(environment_index, environment)| {
-            environment
-                .rows
-                .iter()
-                .enumerate()
-                .map(move |(row_index, row)| (environment_index, row_index, row))
-        })
-        .filter(|(environment_index, row_index, row)| {
-            row.changes() && !choices.skipped.contains(&(*environment_index, *row_index))
-        })
-        .count();
-    let deletes = plan
-        .environments
-        .iter()
-        .any(|environment| environment.offers_deletion());
+    let choices = choices_for_keys(&plan, args.keys);
+    let changing = changing_rows(&plan, &choices);
     if !json_output {
         print_rollback(&plan, &choices, &title);
     }
-    if changing == 0 && !deletes {
+    if changing == 0 && !changes_an_environment(&plan) {
         return Err(fail(&HistoryError::TargetUnknown, json_output));
     }
     match confirm("Roll back these values?", args.yes, json_output)? {
         None => {
             return Err(confirmation_required(
                 json_output,
-                rollback_json(&plan, &choices),
+                serde_json::to_value(rollback_json(&plan, &choices)).unwrap_or_default(),
                 "lpm env rollback ... --yes",
             ));
         }
@@ -1307,7 +1550,7 @@ pub(super) fn env_rollback(
         let json = with_history_field(serde_json::json!({
             "success": true,
             "rolled_back": written,
-            "rollback": rollback_json(&plan, &choices),
+            "rollback": serde_json::to_value(rollback_json(&plan, &choices)).unwrap_or_default(),
         }));
         println!("{json}");
     } else {
@@ -1320,4 +1563,137 @@ pub(super) fn env_rollback(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lpm_vault::history::{Binding, DetailInfo, Flags};
+
+    fn row(key: &str, current: Option<&str>, target: TargetValue, linked: &[&str]) -> Row {
+        Row {
+            key: key.to_owned(),
+            current: current.map(|value| lpm_vault::history::Zeroizing::new(value.to_owned())),
+            target,
+            gaps: Vec::new(),
+            pulled: None,
+            changed_again: None,
+            linked: linked.iter().map(|key| (*key).to_owned()).collect(),
+        }
+    }
+
+    fn known(value: &str) -> TargetValue {
+        TargetValue::Known(lpm_vault::history::Zeroizing::new(value.to_owned()))
+    }
+
+    fn plan(environments: Vec<EnvironmentPlan>) -> RollbackPlan {
+        RollbackPlan {
+            kind: RollbackKind::Environment,
+            point: Point {
+                entry: [1; 16],
+                side: RelatedSide::After,
+            },
+            point_time: 0,
+            generation: 1,
+            environments,
+        }
+    }
+
+    fn environment(current: &str, target: &str, rows: Vec<Row>) -> EnvironmentPlan {
+        EnvironmentPlan {
+            current: Some(current.to_owned()),
+            target: Some(target.to_owned()),
+            rows,
+            binding: Binding::Environment(None),
+            unnamed_keys: None,
+        }
+    }
+
+    #[test]
+    fn naming_a_renamed_key_keeps_both_of_its_rows() {
+        let plan = plan(vec![environment(
+            "e",
+            "e",
+            vec![
+                row("NEW", Some("1"), TargetValue::Absent, &["OLD"]),
+                row("OLD", None, known("1"), &["NEW"]),
+                row("OTHER", Some("p"), known("o"), &[]),
+            ],
+        )]);
+        let choices = choices_for_keys(&plan, &["NEW".to_owned()]);
+        assert_eq!(choices.skipped, HashSet::from([(0, 2)]));
+        assert_eq!(
+            changing_rows(&plan, &choices),
+            2,
+            "the rename applies whole"
+        );
+    }
+
+    #[test]
+    fn a_rollback_that_only_renames_an_environment_changes_something() {
+        let plan = plan(vec![environment("staging", "stage", Vec::new())]);
+        assert_eq!(changing_rows(&plan, &Choices::default()), 0);
+        assert!(changes_an_environment(&plan));
+    }
+
+    fn entry(environments: Vec<EnvironmentInfo>) -> EntryInfo {
+        EntryInfo {
+            seq: 1,
+            id: [2; 16],
+            time: 0,
+            actor: lpm_vault::history::Actor::App,
+            action: Action::RenameEnvironment,
+            flags: Flags::default(),
+            since: None,
+            detail: DetailInfo::default(),
+            environments,
+        }
+    }
+
+    #[test]
+    fn a_rollback_names_the_entry_s_environment_as_it_was_at_the_point() {
+        let renamed = entry(vec![EnvironmentInfo {
+            name: "staging".to_owned(),
+            kind: EnvironmentKindInfo::RenamedFrom("stage".to_owned()),
+            keys: KeysInfo::Changes(Vec::new()),
+        }]);
+        assert_eq!(
+            rollback_environment(&renamed, None, RelatedSide::Before),
+            Ok(EnvironmentName::AtPoint("stage".to_owned()))
+        );
+        assert_eq!(
+            rollback_environment(&renamed, None, RelatedSide::After),
+            Ok(EnvironmentName::AtPoint("staging".to_owned()))
+        );
+        assert_eq!(
+            rollback_environment(&renamed, Some("prod"), RelatedSide::After),
+            Ok(EnvironmentName::Now("prod".to_owned())),
+            "--env names an environment as it is now"
+        );
+        let two = entry(vec![
+            EnvironmentInfo {
+                name: "a".to_owned(),
+                kind: EnvironmentKindInfo::Unchanged,
+                keys: KeysInfo::Changes(Vec::new()),
+            },
+            EnvironmentInfo {
+                name: "b".to_owned(),
+                kind: EnvironmentKindInfo::Unchanged,
+                keys: KeysInfo::Changes(Vec::new()),
+            },
+        ]);
+        assert_eq!(
+            rollback_environment(&two, None, RelatedSide::After),
+            Err(HistoryError::EnvironmentRequired)
+        );
+        assert_eq!(
+            forget_environment(&renamed, Some("stage")),
+            Ok("staging".to_owned()),
+            "an entry's environment under the name it had before the entry"
+        );
+        assert_eq!(
+            forget_environment(&two, None),
+            Err(HistoryError::EnvironmentRequired)
+        );
+    }
 }
