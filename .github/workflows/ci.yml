@@ -147,6 +147,11 @@ jobs:
       - name: Reject unreviewed fancy-regex dependents (ReDoS prevention)
         run: python3 scripts/check-fancy-regex-dependents.py
 
+      # vendor/zxcvbn is outside the workspace, so its tests, including the
+      # one for LPM's patch, run here. See vendor/zxcvbn/LPM-PATCH.md.
+      - name: Test vendored zxcvbn
+        run: cargo test --locked --manifest-path vendor/zxcvbn/Cargo.toml
+
       - name: install.sh smoke tests
         run: sh tests/install-sh/run.sh
 
