@@ -308,17 +308,28 @@ pub async fn run(
             serde_json::Value::String(hex::encode(Sha256::digest(previous_bearer.as_bytes())));
     }
     let url = registry.token_url("replace-project");
-    let response = match client.post_json_raw_status_with_recovery(&url, &body).await {
-        Ok(response) => response,
-        Err(error @ (LpmError::AuthRequired | LpmError::SessionExpired)) => {
-            return Err(rollback_files(error, rollback));
+    let mut response = send_token_replacement(client, &url, &body, rollback).await?;
+    let mut warnings = ignore_warnings;
+    if response.status() == reqwest::StatusCode::NOT_FOUND && pending.previous_bearer.is_some() {
+        let status = response.status();
+        let parsed =
+            lpm_registry::parse_capped_api_json(response, "project token replacement error").await;
+        if !refused_inactive_predecessor(parsed.as_ref().ok()) {
+            return Err(replacement_client_error(
+                status,
+                parsed,
+                &pending.token,
+                rollback,
+            ));
         }
-        Err(error) => {
-            return Err(pending_recovery_error(format!(
-                "the setup-token replacement response was not received: {error}"
-            )));
+        // A token revoked in the dashboard, or one that isn't this account's
+        // setup token, leaves nothing to retire: set up a new one instead.
+        if let Some(fields) = body.as_object_mut() {
+            fields.remove("previousTokenHash");
         }
-    };
+        warnings.push(INACTIVE_PREDECESSOR_WARNING.to_string());
+        response = send_token_replacement(client, &url, &body, rollback).await?;
+    }
 
     if !response.status().is_success() {
         let status = response.status();
@@ -336,24 +347,10 @@ pub async fn run(
                 .unwrap_or_else(|| "Registry returned an ambiguous failure".to_string());
             return Err(pending_recovery_error(format!("{detail} ({status})")));
         }
-        let error: serde_json::Value = match parsed {
-            Ok(error) => error,
-            Err(_) => {
-                return Err(rollback_files(
-                    LpmError::Registry(format!(
-                        "invalid project token replacement error response ({status})"
-                    )),
-                    rollback,
-                ));
-            }
-        };
-        let message = error
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("project token replacement failed");
-        let message = sanitize_registry_message(message, &pending.token);
-        return Err(rollback_files(
-            LpmError::Registry(format!("{message} ({status})")),
+        return Err(replacement_client_error(
+            status,
+            parsed,
+            &pending.token,
             rollback,
         ));
     }
@@ -416,7 +413,7 @@ pub async fn run(
             "expires_at": expires_at,
             "expiry_days": days,
             "gitignore_updated": gitignore_updated,
-            "warnings": ignore_warnings,
+            "warnings": warnings,
         });
         let rendered = serde_json::to_string_pretty(&json).map_err(|error| {
             LpmError::Registry(format!("failed to encode JSON output: {error}"))
@@ -424,7 +421,7 @@ pub async fn run(
         println!("{rendered}");
     } else {
         install_ui::done(".npmrc configured with read-only LPM token.");
-        for warning in &ignore_warnings {
+        for warning in &warnings {
             crate::output::warn(warning);
         }
         if gitignore_updated {
@@ -465,6 +462,62 @@ pub(super) fn reject_tracked_npmrc(project_dir: &Path) -> Result<(), LpmError> {
             "refused to write .npmrc: Git tracking can't be inspected, so it can't tell whether .npmrc is tracked ({reason}). Repair the repository, then run the command again"
         ))),
     }
+}
+
+const INACTIVE_PREDECESSOR_WARNING: &str = "The token .npmrc held is no longer active for this account, so LPM CLI set up a new one instead of replacing it. If it was revoked in the dashboard, nothing else is needed.";
+
+/// Sends the setup-token replacement. A response that never arrives leaves
+/// the pending token in `.npmrc` for a rerun to finish.
+async fn send_token_replacement(
+    client: &lpm_registry::RegistryClient,
+    url: &str,
+    body: &serde_json::Value,
+    rollback: SetupRollback<'_>,
+) -> Result<reqwest::Response, LpmError> {
+    match client.post_json_raw_status_with_recovery(url, body).await {
+        Ok(response) => Ok(response),
+        Err(error @ (LpmError::AuthRequired | LpmError::SessionExpired)) => {
+            Err(rollback_files(error, rollback))
+        }
+        Err(error) => Err(pending_recovery_error(format!(
+            "the setup-token replacement response was not received: {error}"
+        ))),
+    }
+}
+
+/// Whether the Registry refused the replacement because the token it was to
+/// retire is revoked, or isn't a setup token of this account.
+fn refused_inactive_predecessor(error: Option<&serde_json::Value>) -> bool {
+    error
+        .and_then(|error| error.get("code"))
+        .and_then(serde_json::Value::as_str)
+        == Some("previous_token_not_found")
+}
+
+/// The error a refused replacement ends setup with, after restoring `.npmrc`.
+fn replacement_client_error(
+    status: reqwest::StatusCode,
+    parsed: Result<serde_json::Value, LpmError>,
+    pending_token: &str,
+    rollback: SetupRollback<'_>,
+) -> LpmError {
+    let Ok(error) = parsed else {
+        return rollback_files(
+            LpmError::Registry(format!(
+                "invalid project token replacement error response ({status})"
+            )),
+            rollback,
+        );
+    };
+    let message = error
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("project token replacement failed");
+    let message = sanitize_registry_message(message, pending_token);
+    rollback_files(
+        LpmError::Registry(format!("{message} ({status})")),
+        rollback,
+    )
 }
 
 fn rollback_files(primary: LpmError, rollback: SetupRollback<'_>) -> LpmError {

@@ -956,7 +956,9 @@ fn build_oidc_pull_error_message(error: &str, hint: &str, code: &str) -> String 
         ),
         "policy_misconfigured" => Some(
             "The OIDC policy exists but is missing required fields (likely a pre-migration \
-             row). Open the dashboard at <registry>/dashboard/vaults to update it.",
+             row). Inspect it with `lpm env oidc list`, then replace it with the complete \
+             `lpm env oidc allow` command. Owners and admins of an organization project can \
+             also replace it on the project's Access tab in the dashboard.",
         ),
         "branch_not_allowed" => Some(
             "The branch claim from your CI's OIDC token isn't in the policy's allowedBranches. \
@@ -979,11 +981,6 @@ fn build_oidc_pull_error_message(error: &str, hint: &str, code: &str) -> String 
         ),
         "event_not_allowed" => Some(
             "The CI event_name that triggered this run isn't in the policy's allowedEvents. \
-             Inspect the complete policy with `lpm env oidc list`, then review \
-             `lpm env oidc allow --help` before deliberately replacing its allowlists.",
-        ),
-        "fork_not_allowed" => Some(
-            "The OIDC token was minted by a fork PR but the policy has allowForks=false. \
              Inspect the complete policy with `lpm env oidc list`, then review \
              `lpm env oidc allow --help` before deliberately replacing its allowlists. \
              Fork-triggerable pull_request_target events run with base-repository secrets, \
@@ -1100,15 +1097,17 @@ mod oidc_error_hint_tests {
     }
 
     #[test]
-    fn policy_misconfigured_code_maps_to_dashboard_hint() {
+    fn policy_misconfigured_names_the_commands_and_the_organization_access_tab() {
         let msg = build_oidc_pull_error_message(
             "OIDC policy is misconfigured (no allowed branches set).",
             "",
             "policy_misconfigured",
         );
         assert!(msg.contains("OIDC policy is misconfigured"));
-        assert!(msg.contains("dashboard"));
-        assert!(msg.contains("Hint:"));
+        assert!(msg.contains("lpm env oidc list"), "{msg}");
+        assert!(msg.contains("lpm env oidc allow"), "{msg}");
+        assert!(msg.contains("Access tab"), "{msg}");
+        assert!(!msg.contains("/dashboard/vaults"), "{msg}");
     }
 
     #[test]
@@ -1144,11 +1143,7 @@ mod oidc_error_hint_tests {
 
     #[test]
     fn complete_policy_denials_require_review_instead_of_authorizing_the_denied_claim() {
-        for code in [
-            "workflow_not_allowed",
-            "event_not_allowed",
-            "fork_not_allowed",
-        ] {
+        for code in ["workflow_not_allowed", "event_not_allowed"] {
             let message = build_oidc_pull_error_message("not allowed", "", code);
             assert!(message.contains("lpm env oidc list"), "{code}: {message}");
             assert!(
@@ -1161,10 +1156,10 @@ mod oidc_error_hint_tests {
     }
 
     #[test]
-    fn fork_not_allowed_warns_about_pull_request_target() {
-        let msg = build_oidc_pull_error_message("Forks not allowed", "", "fork_not_allowed");
+    fn event_not_allowed_warns_about_fork_triggerable_events() {
+        let msg = build_oidc_pull_error_message("Event not allowed", "", "event_not_allowed");
         assert!(!msg.contains("--allow-forks"));
-        assert!(msg.contains("pull_request_target"));
+        assert!(msg.contains("pull_request_target"), "{msg}");
         assert!(msg.contains("lpm env oidc list"));
     }
 

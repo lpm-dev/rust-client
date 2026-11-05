@@ -60,6 +60,10 @@ pub(super) fn prepare_recipients(
     Ok(recipients)
 }
 
+/// How organization members get a sharing key that a share can wrap the
+/// vault key for: an organization pull registers one.
+pub(super) const REGISTER_MEMBER_KEY_HINT: &str = "Each member registers a sharing key by running `lpm env pull --org <slug>` once. Then share again.";
+
 pub(super) fn prepare_authenticated_recipients(
     members: &[MemberPublicKey],
 ) -> Result<Vec<PreparedRecipient>, String> {
@@ -86,7 +90,9 @@ pub(super) fn prepare_authenticated_recipients(
     }
 
     if recipients.is_empty() {
-        return Err("no org members have registered public keys. Each member needs to run `lpm env share --org <slug>` once to generate their keypair.".to_owned());
+        return Err(format!(
+            "no org members have registered public keys. {REGISTER_MEMBER_KEY_HINT}"
+        ));
     }
     Ok(recipients)
 }
@@ -348,6 +354,18 @@ mod tests {
         let bytes = serialize_recipient_set(&proposed).expect("serialize proposal");
         let digest = recipient_set_digest(&bytes);
         (proposed, bytes, digest, recipients)
+    }
+
+    #[test]
+    fn members_without_sharing_keys_are_told_to_pull_not_share() {
+        let members = [MemberPublicKey::without_test_key("user-a", "member")];
+
+        let Err(error) = prepare_authenticated_recipients(&members) else {
+            panic!("a member set without sharing keys must be refused");
+        };
+
+        assert!(error.contains("lpm env pull --org <slug>"), "{error}");
+        assert!(!error.contains("lpm env share"), "{error}");
     }
 
     #[test]

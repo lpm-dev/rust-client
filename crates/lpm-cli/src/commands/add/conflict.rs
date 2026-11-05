@@ -21,11 +21,74 @@ fn read_existing_conflict_bytes(
     }
 }
 
+const COMPARE_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Whether the destination already holds exactly what `lpm add` would write:
+/// the rewritten text of a JavaScript or TypeScript file, or the bytes of
+/// any other source file.
+fn destination_matches_incoming(
+    source_path: &Path,
+    target_path: &Path,
+    new_content: Option<&str>,
+) -> Result<bool, LpmError> {
+    let target_len = target_path.metadata()?.len();
+    match new_content {
+        Some(text) => {
+            if target_len != text.len() as u64 {
+                return Ok(false);
+            }
+            Ok(same_contents(
+                std::fs::File::open(target_path)?,
+                text.as_bytes(),
+            )?)
+        }
+        None => {
+            if target_len != source_path.metadata()?.len() {
+                return Ok(false);
+            }
+            Ok(same_contents(
+                std::fs::File::open(target_path)?,
+                std::fs::File::open(source_path)?,
+            )?)
+        }
+    }
+}
+
+fn same_contents(mut left: impl Read, mut right: impl Read) -> std::io::Result<bool> {
+    let mut left_chunk = vec![0_u8; COMPARE_CHUNK_BYTES];
+    let mut right_chunk = vec![0_u8; COMPARE_CHUNK_BYTES];
+    loop {
+        let left_read = read_chunk(&mut left, &mut left_chunk)?;
+        let right_read = read_chunk(&mut right, &mut right_chunk)?;
+        if left_chunk[..left_read] != right_chunk[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+/// Fills `chunk` unless the reader ends first, so two readers of the same
+/// bytes yield chunks of the same length.
+fn read_chunk(reader: &mut impl Read, chunk: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < chunk.len() {
+        match reader.read(&mut chunk[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(filled)
+}
+
 /// Handle a file conflict when the destination already exists.
 ///
 /// Compares content and prompts the user with diff preview when interactive.
 pub(super) fn handle_file_conflict(
-    _source_path: &Path,
+    source_path: &Path,
     target_path: &Path,
     new_content: Option<&str>,
     force: bool,
@@ -36,23 +99,8 @@ pub(super) fn handle_file_conflict(
         return Ok(ConflictAction::Overwrite);
     }
 
-    if let Some(new_text) = new_content {
-        let expected = new_text.as_bytes();
-        if target_path.metadata()?.len() == expected.len() as u64 {
-            let mut file = std::fs::File::open(target_path)?;
-            let mut offset = 0;
-            let mut buffer = [0_u8; 64 * 1024];
-            loop {
-                let read = file.read(&mut buffer)?;
-                if read == 0 {
-                    return Ok(ConflictAction::Skip);
-                }
-                if buffer[..read] != expected[offset..offset + read] {
-                    break;
-                }
-                offset += read;
-            }
-        }
+    if destination_matches_incoming(source_path, target_path, new_content)? {
+        return Ok(ConflictAction::Skip);
     }
 
     if yes || json_output || !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
@@ -162,6 +210,45 @@ fn format_file_conflict_header(rel_display: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn files(source: &[u8], target: &[u8]) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("incoming.css");
+        let target_path = directory.path().join("existing.css");
+        std::fs::write(&source_path, source).unwrap();
+        std::fs::write(&target_path, target).unwrap();
+        (directory, source_path, target_path)
+    }
+
+    #[test]
+    fn an_identical_file_that_is_not_rewritten_matches() {
+        let contents = b".card { color: red }\n".repeat(10_000);
+        let (_directory, source, target) = files(&contents, &contents);
+
+        assert!(destination_matches_incoming(&source, &target, None).unwrap());
+    }
+
+    #[test]
+    fn a_file_that_is_not_rewritten_and_differs_does_not_match() {
+        let (_directory, source, target) = files(b".card { color: red }", b".card { color: tan }");
+        assert!(!destination_matches_incoming(&source, &target, None).unwrap());
+
+        let (_directory, source, target) = files(b".card {}", b".card {}\n.extra {}");
+        assert!(!destination_matches_incoming(&source, &target, None).unwrap());
+    }
+
+    #[test]
+    fn rewritten_text_is_compared_instead_of_the_source_file() {
+        let (_directory, source, target) = files(b"import x from '~/x'", b"import x from '@/x'");
+
+        assert!(
+            destination_matches_incoming(&source, &target, Some("import x from '@/x'")).unwrap()
+        );
+        assert!(
+            !destination_matches_incoming(&source, &target, Some("import x from '#/x'")).unwrap()
+        );
+    }
 
     #[test]
     fn conflict_preview_reads_the_existing_destination_bytes() {
