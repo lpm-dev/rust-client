@@ -341,20 +341,21 @@ fn admit(
     adding: usize,
     own: Option<&Head>,
 ) -> Result<Admitted, NotRecorded> {
-    let inventory = store
+    let mut inventory = store
         .admission_inventory(vault_id)
         .map_err(NotRecorded::Failed)?;
     let mut existing = inventory.count;
     if let Some(head) = own
-        && inventory
+        && let Some(ring) = inventory
             .rings
-            .iter()
-            .any(|ring| ring.vault_id == vault_id && ring.parts > head.parts.len())
+            .iter_mut()
+            .find(|ring| ring.vault_id == vault_id && ring.parts > head.parts.len())
     {
         let accounts = store.inventory(vault_id).map_err(NotRecorded::Failed)?;
         for orphan in admission::orphan_parts(head, &accounts) {
             store.delete(&orphan).map_err(NotRecorded::Failed)?;
             existing -= 1;
+            ring.parts -= 1;
         }
     }
     let mut trimmed_own = false;

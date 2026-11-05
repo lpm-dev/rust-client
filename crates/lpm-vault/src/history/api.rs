@@ -4,7 +4,7 @@
 //! protected project asks for approval once, and finishes any rotation or
 //! removal another client started before doing anything else.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
 
@@ -12,14 +12,13 @@ use lpm_env_companion::history::admission::{self, CreationAdmission};
 use lpm_env_companion::history::append::too_many_values;
 use lpm_env_companion::history::read::{
     EntryInfo, EntryLookup, Filter, IdPrefix, Opened, PartSource, ReadError, RevealedEntry,
-    Timeline, TimelineRow, find_entry, read_retained, read_timeline, reveal_entries, reveal_entry,
+    Timeline, find_entry, read_retained, read_timeline, reveal_entry,
 };
 use lpm_env_companion::history::rebuild::{
-    Choices, EnvironmentRef, PlanError, Point, Refusal, RollbackKind, RollbackPlan, apply_rollback,
-    plan_environment_rollback, plan_key_rollback, plan_undo,
+    Choices, PlanError, Refusal, RollbackKind, RollbackPlan, Target, apply_rollback, plan_rollback,
 };
 use lpm_env_companion::history::removal::{
-    Chosen, RemovalError, RemovalReview, needs_finishing, review_removal, start_removal,
+    ChosenSide, RemovalError, RemovalReview, needs_finishing, review_removal_for, start_removal,
 };
 use lpm_env_companion::history::switch::{MarkerHistory, plan_off, plan_on};
 use lpm_env_companion::keyring::SystemRandom;
@@ -151,6 +150,7 @@ impl From<PlanError> for HistoryError {
         match error {
             PlanError::Read(error) => error.into(),
             PlanError::EntryNotFound => Self::EntryNotFound,
+            PlanError::AmbiguousEntry => Self::AmbiguousEntry,
             PlanError::UnknownEnvironment => Self::UnknownEnvironment,
             PlanError::NameTaken(name) => Self::NameTaken(name),
         }
@@ -162,6 +162,7 @@ impl From<RemovalError> for HistoryError {
         match error {
             RemovalError::Read(error) => error.into(),
             RemovalError::NotFound => Self::EntryNotFound,
+            RemovalError::AmbiguousEntry => Self::AmbiguousEntry,
             RemovalError::ValueIsCurrent => Self::ValueIsCurrent,
             RemovalError::Limit => Self::Limit,
             RemovalError::ChangedSinceReview => Self::ChangedSinceReview,
@@ -317,41 +318,22 @@ fn project_vault_id(project_dir: &Path) -> Result<String, HistoryError> {
     crate::vault_id::read_vault_id(project_dir).ok_or(HistoryError::NoProject)
 }
 
-/// A timeline, with the values of the entries it shows when asked.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Listing {
-    pub timeline: Timeline,
-    /// The shown entries' values, by entry ID; empty unless revealed.
-    pub revealed: HashMap<[u8; 16], RevealedEntry>,
-}
-
-/// The timeline of the env project at `project_dir`, and with `reveal`
-/// the values of the entries it shows, in one lock. `None` before its
+/// The timeline of the env project at `project_dir`, with the values of the
+/// entries it shows when `reveal` is set, in one walk. `None` before its
 /// first recorded change.
 pub fn timeline(
     project_dir: &Path,
     filter: &Filter<'_>,
     reveal: bool,
-) -> Result<Option<Listing>, HistoryError> {
+) -> Result<Option<Timeline>, HistoryError> {
     with_opened(project_dir, Values::Needed, |parts, opened, values| {
-        let timeline = read_timeline(opened, parts, &values_of(values), filter)?;
-        let revealed = if reveal {
-            let ids: BTreeSet<[u8; 16]> = timeline
-                .rows
-                .iter()
-                .filter_map(|row| match row {
-                    TimelineRow::Entry(info) => Some(info.id),
-                    TimelineRow::Unreadable { .. } => None,
-                })
-                .collect();
-            reveal_entries(opened, parts, &ids)?
-                .into_iter()
-                .map(|entry| (entry.info.id, entry))
-                .collect()
-        } else {
-            HashMap::new()
-        };
-        Ok(Listing { timeline, revealed })
+        Ok(read_timeline(
+            opened,
+            parts,
+            &values_of(values),
+            filter,
+            reveal,
+        )?)
     })
 }
 
@@ -368,28 +350,33 @@ pub fn status(project_dir: &Path) -> Result<HistoryStatus, HistoryError> {
     };
     let result = crate::with_project_vault_transaction(|directory| {
         crate::authorize_companion(directory, &vault_id, Operation::ReadExcludingOverrides)?;
+        let empty = HistoryStatus {
+            state: HistoryState::On,
+            retained: 0,
+            oldest: None,
+            unreadable_parts: 0,
+        };
+        let history =
+            match with_history_store!(directory, |store| marker_history(store, &vault_id))? {
+                Err(error) => return Ok(Err(error)),
+                Ok(MarkerHistory::Off) => {
+                    return Ok(Ok(HistoryStatus {
+                        state: HistoryState::Off,
+                        ..empty
+                    }));
+                }
+                Ok(MarkerHistory::Removing | MarkerHistory::Unsupported { .. }) => {
+                    return Ok(Ok(paused(Paused::NewerVersion)));
+                }
+                Ok(MarkerHistory::Both) => return Ok(Ok(paused(Paused::Damaged))),
+                Ok(history) => history,
+            };
+        // Only a project history records, or will, needs its values here.
         let values =
             crate::read_all_environments_unlocked(directory, &vault_id)?.unwrap_or_default();
         let too_many = too_many_values(&values_of(&values));
         with_history_store!(directory, |store| {
-            let history = marker_history(store, &vault_id)?;
-            let empty = HistoryStatus {
-                state: HistoryState::On,
-                retained: 0,
-                oldest: None,
-                unreadable_parts: 0,
-            };
             match history {
-                MarkerHistory::Off => {
-                    return Ok(HistoryStatus {
-                        state: HistoryState::Off,
-                        ..empty
-                    });
-                }
-                MarkerHistory::Removing | MarkerHistory::Unsupported { .. } => {
-                    return Ok(paused(Paused::NewerVersion));
-                }
-                MarkerHistory::Both => return Ok(paused(Paused::Damaged)),
                 MarkerHistory::Default | MarkerHistory::On if too_many => {
                     return Ok(paused(Paused::TooManyValues));
                 }
@@ -414,7 +401,7 @@ pub fn status(project_dir: &Path) -> Result<HistoryStatus, HistoryError> {
                         empty
                     });
                 }
-                MarkerHistory::On => {}
+                _ => {}
             }
             let opened = match open_maintained(store, &vault_id, &mut SystemRandom) {
                 Ok(Maintained { opened, .. }) => opened,
@@ -473,75 +460,17 @@ pub fn show(project_dir: &Path, prefix_text: &str, reveal: bool) -> Result<Shown
     .ok_or(HistoryError::EntryNotFound)
 }
 
-/// How a rollback names its environment.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EnvironmentName {
-    /// As it's named now; a name no environment has now names a deleted
-    /// one by its name at the point.
-    Now(String),
-    /// As it was named at the point.
-    AtPoint(String),
-}
-
-impl EnvironmentName {
-    fn reference(&self) -> EnvironmentRef<'_> {
-        match self {
-            Self::Now(name) => EnvironmentRef::Now(name),
-            Self::AtPoint(name) => EnvironmentRef::AtPoint(name),
-        }
-    }
-}
-
-/// What a rollback goes back to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RollbackRequest {
-    /// An environment back to its whole state after or before an entry.
-    Environment {
-        environment: EnvironmentName,
-        point: Point,
-    },
-    /// One key, named as it is now, back to its value before an entry.
-    Key {
-        environment: EnvironmentName,
-        key: String,
-        entry: [u8; 16],
-    },
-    /// The keys an entry changed, in every environment it touched, back to
-    /// their values before it.
-    Undo { entry: [u8; 16] },
-}
-
 /// Find the entry whose ID starts with `prefix`, let `choose` say what to
-/// roll back given that entry, and plan it for review, all in one lock.
+/// roll back given that entry, and plan it for review, in one lock and one
+/// walk.
 pub fn review_rollback(
     project_dir: &Path,
     prefix_text: &str,
-    choose: impl FnOnce(&EntryInfo) -> Result<RollbackRequest, HistoryError>,
+    choose: impl FnOnce(&EntryInfo) -> Result<Target, HistoryError>,
 ) -> Result<(EntryInfo, RollbackPlan), HistoryError> {
     let prefix = prefix(prefix_text)?;
     with_opened(project_dir, Values::Needed, |parts, opened, values| {
-        let info = lookup(find_entry(opened, parts, &prefix)?)?;
-        let request = choose(&info)?;
-        let current = values_of(values);
-        let plan = match &request {
-            RollbackRequest::Environment { environment, point } => {
-                plan_environment_rollback(opened, parts, &current, environment.reference(), *point)?
-            }
-            RollbackRequest::Key {
-                environment,
-                key,
-                entry,
-            } => plan_key_rollback(
-                opened,
-                parts,
-                &current,
-                environment.reference(),
-                key,
-                *entry,
-            )?,
-            RollbackRequest::Undo { entry } => plan_undo(opened, parts, &current, *entry)?,
-        };
-        Ok((info, plan))
+        plan_rollback(opened, parts, &values_of(values), &prefix, choose)
     })?
     .ok_or(HistoryError::EntryNotFound)
 }
@@ -621,11 +550,13 @@ pub fn commit_rollback(
         let mut written = Vec::with_capacity(writes.len());
         for write in writes {
             if let Some(environment) = write.values {
+                // The value moves out of its wiped buffer rather than being
+                // copied; the map it joins is wiped once written.
                 values.insert(
                     write.name.clone(),
                     environment
                         .into_iter()
-                        .map(|(key, value)| (key, value.as_str().to_owned()))
+                        .map(|(key, mut value)| (key, std::mem::take(&mut *value)))
                         .collect(),
                 );
             }
@@ -649,40 +580,17 @@ pub fn commit_rollback(
     }
 }
 
-/// The value a removal starts from: a key's value before or after an entry,
-/// named as that entry names it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChosenValue {
-    pub entry: [u8; 16],
-    pub environment: String,
-    pub key: String,
-    pub side: RelatedSide,
-}
-
 /// Find the entry whose ID starts with `prefix`, let `choose` say which of
 /// its values to remove, and list every place that value appears, grouped,
-/// for review, all in one lock.
+/// for review, in one lock and one walk.
 pub fn review_forget(
     project_dir: &Path,
     prefix_text: &str,
-    choose: impl FnOnce(&EntryInfo) -> Result<ChosenValue, HistoryError>,
+    choose: impl FnOnce(&EntryInfo) -> Result<ChosenSide, HistoryError>,
 ) -> Result<(EntryInfo, RemovalReview), HistoryError> {
     let prefix = prefix(prefix_text)?;
     with_opened(project_dir, Values::Needed, |parts, opened, values| {
-        let info = lookup(find_entry(opened, parts, &prefix)?)?;
-        let chosen = choose(&info)?;
-        let review = review_removal(
-            opened,
-            parts,
-            &values_of(values),
-            Chosen {
-                entry: chosen.entry,
-                environment: &chosen.environment,
-                key: &chosen.key,
-                side: chosen.side,
-            },
-        )?;
-        Ok((info, review))
+        review_removal_for(opened, parts, &values_of(values), &prefix, choose)
     })?
     .ok_or(HistoryError::EntryNotFound)
 }

@@ -394,3 +394,36 @@ fn a_change_built_on_the_file_store_s_values_records_them_as_its_before() {
         .expect("transaction");
     });
 }
+
+#[test]
+fn collected_orphans_leave_the_own_ring_at_its_floor() {
+    let mut storage = created_storage();
+    let previous = grow_to(&mut storage, 2, "one".to_owned());
+    let orphan = lpm_env_companion::history::part_account(VAULT, 9).name();
+    storage
+        .values
+        .insert(orphan.clone(), b"left by a crashed trim".to_vec());
+    fill_service(
+        &mut storage,
+        lpm_env_companion::budgets::ADMISSION_TARGET + 2,
+    );
+    let mut previous = previous;
+    for round in 0..64 {
+        let next = format!("again {round}{}", "z".repeat(6 * 1024));
+        record(
+            &mut test_history(&mut storage),
+            VAULT,
+            &change(&previous, &next),
+        );
+        previous = next;
+        if !storage.values.contains_key(&orphan) {
+            break;
+        }
+    }
+    assert!(!storage.values.contains_key(&orphan));
+    assert_eq!(
+        head_of(&storage).parts.len(),
+        2,
+        "the orphan doesn't count as a part to trim"
+    );
+}

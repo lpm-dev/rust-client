@@ -140,19 +140,18 @@ pub(super) fn admission_inventory(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
 ) -> Result<AdmissionInventory, String> {
-    let listed = storage.accounts_with_access()?;
-    let mut claims: std::collections::HashMap<&str, ClaimedAccess> =
-        std::collections::HashMap::with_capacity(listed.len());
-    let mut accounts: Vec<CompanionAccount> = Vec::with_capacity(listed.len());
-    for (name, claim) in &listed {
-        match CompanionAccount::parse(name) {
-            Some(CompanionAccount::Marker { .. }) => {}
-            Some(account) => accounts.push(account),
-            None => {
-                claims.insert(name.as_str(), *claim);
+    let mut claims: std::collections::HashMap<String, ClaimedAccess> =
+        std::collections::HashMap::new();
+    let mut accounts: Vec<CompanionAccount> = Vec::new();
+    storage.for_each_account(&mut |name, claim| match CompanionAccount::parse(name) {
+        Some(CompanionAccount::Marker { .. }) => {}
+        Some(account) => accounts.push(account),
+        None => {
+            if claim != ClaimedAccess::Automatic {
+                claims.insert(name.to_owned(), claim);
             }
         }
-    }
+    })?;
     let rings = admission::rings(&accounts);
     let trimmable = rings
         .iter()

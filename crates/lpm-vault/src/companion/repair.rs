@@ -188,10 +188,10 @@ fn history_damage(
         head.as_deref(),
         key.as_deref().map(Vec::as_slice),
         |part| match backend.read_checked(&part_account(vault_id, part)) {
-            Ok(Checked::Present(sealed)) => Some(sealed),
+            Ok(Checked::Present(sealed)) => Some(std::borrow::Cow::Owned(sealed)),
             Ok(Checked::Absent) => None,
             // Content that won't decrypt won't open as a part either.
-            Ok(Checked::Unreadable(_)) => Some(Vec::new()),
+            Ok(Checked::Unreadable(_)) => Some(std::borrow::Cow::Owned(Vec::new())),
             Err(error) => {
                 failure.get_or_insert(error);
                 None

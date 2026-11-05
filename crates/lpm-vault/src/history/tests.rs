@@ -62,6 +62,7 @@ fn timeline() -> Vec<Action> {
             &mut |part| companion.read(&part_account(VAULT, part)),
             &current,
             &Filter::default(),
+            false,
         )
         .map_err(|error| error.to_string())?;
         Ok(timeline
@@ -188,8 +189,7 @@ fn a_values_write_succeeds_and_reports_why_when_history_is_damaged() {
 mod api {
     use super::*;
     use crate::history::{
-        Choices, ChosenValue, EnvironmentName, HistoryError, HistoryState, Point, RollbackRequest,
-        TimelineRow,
+        Choices, ChosenSide, EnvironmentName, HistoryError, HistoryState, Target, TimelineRow,
     };
 
     fn project_set(dir: &std::path::Path, key: &str, value: &str) {
@@ -201,7 +201,6 @@ mod api {
         crate::history::timeline(dir, &Filter::default(), false)
             .expect("timeline")
             .expect("history exists")
-            .timeline
             .rows
             .iter()
             .rev()
@@ -248,7 +247,7 @@ mod api {
             let listing = crate::history::timeline(&dir, &Filter::default(), true)
                 .expect("timeline")
                 .expect("history");
-            assert_eq!(listing.revealed.len(), 2, "every shown entry's values");
+            assert_eq!(listing.values.len(), 2, "every shown entry's values");
         });
     }
 
@@ -262,12 +261,9 @@ mod api {
             project_set(&dir, "A", "2");
             project_set(&dir, "B", "b");
             let entries = ids(&dir);
-            let request = RollbackRequest::Environment {
+            let request = Target::Environment {
                 environment: EnvironmentName::Now("default".to_owned()),
-                point: Point {
-                    entry: entries[0],
-                    side: RelatedSide::After,
-                },
+                side: RelatedSide::After,
             };
             let (_, plan) =
                 crate::history::review_rollback(&dir, &hex::encode(entries[0]), |_| Ok(request))
@@ -291,7 +287,7 @@ mod api {
             let listing = crate::history::timeline(&dir, &Filter::default(), false)
                 .expect("timeline")
                 .expect("history");
-            let TimelineRow::Entry(newest) = &listing.timeline.rows[0] else {
+            let TimelineRow::Entry(newest) = &listing.rows[0] else {
                 panic!("an entry");
             };
             assert_eq!(newest.action, Action::Rollback);
@@ -317,8 +313,7 @@ mod api {
             project_set(&dir, "TOKEN", "leaked");
             project_set(&dir, "TOKEN", "rotated");
             let entries = ids(&dir);
-            let chosen = ChosenValue {
-                entry: entries[1],
+            let chosen = ChosenSide {
                 environment: "default".to_owned(),
                 key: "TOKEN".to_owned(),
                 side: RelatedSide::Before,
@@ -335,8 +330,7 @@ mod api {
             assert_eq!(found.values[0][0].before, None, "the value is gone");
             assert_eq!(stored(&dir, "TOKEN").as_deref(), Some("rotated"));
 
-            let current = ChosenValue {
-                entry: entries[1],
+            let current = ChosenSide {
                 environment: "default".to_owned(),
                 key: "TOKEN".to_owned(),
                 side: RelatedSide::After,
@@ -389,7 +383,7 @@ mod api {
                 let listing = crate::history::timeline(dir, &Filter::default(), false)
                     .expect("timeline")
                     .expect("history");
-                let TimelineRow::Entry(newest) = &listing.timeline.rows[0] else {
+                let TimelineRow::Entry(newest) = &listing.rows[0] else {
                     panic!("an entry");
                 };
                 newest
@@ -406,12 +400,9 @@ mod api {
                 )]
             );
             let (_, plan) = crate::history::review_rollback(&dir, &hex::encode(entries[0]), |_| {
-                Ok(RollbackRequest::Environment {
+                Ok(Target::Environment {
                     environment: EnvironmentName::AtPoint("default".to_owned()),
-                    point: Point {
-                        entry: entries[0],
-                        side: RelatedSide::After,
-                    },
+                    side: RelatedSide::After,
                 })
             })
             .expect("review");
@@ -436,8 +427,7 @@ mod api {
             project_set(&dir, "TOKEN", "leaked");
             project_set(&dir, "TOKEN", "rotated");
             let entries = ids(&dir);
-            let chosen = ChosenValue {
-                entry: entries[1],
+            let chosen = ChosenSide {
                 environment: "default".to_owned(),
                 key: "TOKEN".to_owned(),
                 side: RelatedSide::Before,
@@ -529,8 +519,8 @@ mod api {
             let listing = crate::history::timeline(&dir, &Filter::default(), false)
                 .expect("a part that won't read doesn't fail the read")
                 .expect("history");
-            assert_eq!(listing.timeline.unreadable_parts, 1);
-            assert!(!listing.timeline.damaged_tail);
+            assert_eq!(listing.unreadable_parts, 1);
+            assert!(!listing.damaged_tail);
         });
     }
 
@@ -574,17 +564,13 @@ mod api {
             project_set(&dir, "TOKEN", "rotated");
             let entries = ids(&dir);
             let (_, plan) = crate::history::review_rollback(&dir, &hex::encode(entries[0]), |_| {
-                Ok(RollbackRequest::Environment {
+                Ok(Target::Environment {
                     environment: EnvironmentName::AtPoint("default".to_owned()),
-                    point: Point {
-                        entry: entries[0],
-                        side: RelatedSide::After,
-                    },
+                    side: RelatedSide::After,
                 })
             })
             .expect("review");
-            let chosen = ChosenValue {
-                entry: entries[1],
+            let chosen = ChosenSide {
                 environment: "default".to_owned(),
                 key: "TOKEN".to_owned(),
                 side: RelatedSide::Before,
@@ -628,6 +614,28 @@ mod api {
                 "the rollback would put back the value being removed"
             );
             assert_eq!(stored(&dir, "TOKEN").as_deref(), Some("rotated"));
+        });
+    }
+
+    #[test]
+    fn status_reads_no_values_when_history_is_off() {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            let dir = home.join("project");
+            std::fs::create_dir_all(&dir).expect("project dir");
+            project_set(&dir, "A", "1");
+            crate::history::turn_off(&dir).expect("off");
+            let before =
+                crate::ENVIRONMENT_FULL_DECODE_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                crate::history::status(&dir).expect("status").state,
+                HistoryState::Off
+            );
+            assert_eq!(
+                crate::ENVIRONMENT_FULL_DECODE_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+                before,
+                "the marker answers; the values aren't read"
+            );
         });
     }
 

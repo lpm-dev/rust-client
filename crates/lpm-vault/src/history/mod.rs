@@ -41,9 +41,8 @@ macro_rules! with_history_store {
 mod api;
 
 pub use api::{
-    ChosenValue, EnvironmentName, HistoryError, HistoryState, HistoryStatus, Listing, Paused,
-    RollbackRequest, Shown, commit_rollback, forget, review_forget, review_rollback, show, status,
-    timeline, turn_off, turn_on,
+    HistoryError, HistoryState, HistoryStatus, Paused, Shown, commit_rollback, forget,
+    review_forget, review_rollback, show, status, timeline, turn_off, turn_on,
 };
 pub use lpm_env_companion::history::codec::Flags;
 pub use lpm_env_companion::history::read::{
@@ -52,10 +51,12 @@ pub use lpm_env_companion::history::read::{
     SourceGroup, Timeline, TimelineRow,
 };
 pub use lpm_env_companion::history::rebuild::{
-    Binding, Choices, EnvironmentPlan, Gap, Point, Pulled, RemoteName, RollbackKind, RollbackPlan,
-    Row, TargetValue, UnknownReason,
+    Binding, Choices, EnvironmentName, EnvironmentPlan, Gap, Point, Pulled, RemoteName,
+    RollbackKind, RollbackPlan, Row, Target, TargetValue, UnknownReason,
 };
-pub use lpm_env_companion::history::removal::{Occurrence, Place, PlaceGroup, RemovalReview};
+pub use lpm_env_companion::history::removal::{
+    ChosenSide, Occurrence, Place, PlaceGroup, RemovalReview,
+};
 /// The wiped buffer past values come back in.
 pub use zeroize::Zeroizing;
 

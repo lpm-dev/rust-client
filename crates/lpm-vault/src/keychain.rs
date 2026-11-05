@@ -271,6 +271,17 @@ pub(crate) trait ProjectStorage {
         self.accounts_with_access()
             .map(|accounts| accounts.into_iter().map(|(name, _)| name).collect())
     }
+    /// Visit every account in the service with the approval its attributes
+    /// claim, from one attributes-only listing.
+    fn for_each_account(
+        &mut self,
+        visit: &mut dyn FnMut(&str, ClaimedAccess),
+    ) -> Result<(), String> {
+        for (name, claim) in self.accounts_with_access()? {
+            visit(&name, claim);
+        }
+        Ok(())
+    }
     /// The account names that contain `needle`, from attributes alone.
     fn account_names_containing(&mut self, needle: &str) -> Result<Vec<String>, String> {
         let mut names = self.account_names()?;
@@ -408,6 +419,22 @@ impl<S: ProjectStorage> ProjectStorage for ListedStorage<'_, S> {
 
     fn account_names(&mut self) -> Result<Vec<String>, String> {
         Ok(self.listing()?.keys().cloned().collect())
+    }
+
+    fn for_each_account(
+        &mut self,
+        visit: &mut dyn FnMut(&str, ClaimedAccess),
+    ) -> Result<(), String> {
+        let unknown = self.listing()?.values().any(Option::is_none);
+        if unknown {
+            self.accounts_with_access()?;
+        }
+        for (name, claim) in self.listing()? {
+            if let Some(claim) = claim {
+                visit(name, *claim);
+            }
+        }
+        Ok(())
     }
 
     fn account_names_containing(&mut self, needle: &str) -> Result<Vec<String>, String> {
