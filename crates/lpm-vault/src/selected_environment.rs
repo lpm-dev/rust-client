@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use serde::de::{DeserializeSeed, Deserializer, Error as _, MapAccess, Visitor};
+use zeroize::Zeroizing;
 
 use crate::{EnvironmentMap, SecretMap};
 pub(crate) use lpm_common::stored_env::is_valid_environment_name;
@@ -90,7 +91,9 @@ pub(crate) fn validate_environments(environments: &EnvironmentMap) -> Result<(),
     Ok(())
 }
 
-pub(crate) fn serialize(environments: &EnvironmentMap) -> Result<String, String> {
+/// The stored payload of `environments`. It holds the values, so it's wiped
+/// when dropped, and no buffer it outgrows while being written keeps a copy.
+pub(crate) fn serialize(environments: &EnvironmentMap) -> Result<Zeroizing<String>, String> {
     #[derive(serde::Serialize)]
     struct BorrowedPayload<'a> {
         environments: &'a EnvironmentMap,
@@ -98,10 +101,53 @@ pub(crate) fn serialize(environments: &EnvironmentMap) -> Result<String, String>
 
     validate_environments(environments)?;
     if environments.is_empty() {
-        return Ok(r#"{"environments":{"default":{}}}"#.to_owned());
+        return Ok(Zeroizing::new(
+            r#"{"environments":{"default":{}}}"#.to_owned(),
+        ));
     }
-    serde_json::to_string(&BorrowedPayload { environments })
-        .map_err(|error| format!("failed to serialize environments: {error}"))
+    let mut payload = WipingBuffer(Zeroizing::new(Vec::with_capacity(unescaped_len(
+        environments,
+    ))));
+    serde_json::to_writer(&mut payload, &BorrowedPayload { environments })
+        .map_err(|error| format!("failed to serialize environments: {error}"))?;
+    crate::zeroizing_text(std::mem::take(&mut *payload.0))
+        .map_err(|_| "serialized environments are not UTF-8".to_owned())
+}
+
+/// Room for the payload when nothing in it needs escaping, a few bytes
+/// over its length.
+fn unescaped_len(environments: &EnvironmentMap) -> usize {
+    // `{"environments":{` and `}}`; per environment `"name":{},`; per
+    // value `"KEY":"value",`.
+    environments.iter().fold(19, |length, (name, keys)| {
+        keys.iter()
+            .fold(length + name.len() + 6, |length, (key, value)| {
+                length + key.len() + value.len() + 6
+            })
+    })
+}
+
+/// A buffer that, when it outgrows its block, moves to a larger one and
+/// wipes the old, so no freed block keeps what was written.
+struct WipingBuffer(Zeroizing<Vec<u8>>);
+
+impl std::io::Write for WipingBuffer {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let needed = self.0.len() + bytes.len();
+        if needed > self.0.capacity() {
+            let mut grown = Zeroizing::new(Vec::with_capacity(
+                needed.max(self.0.capacity().saturating_mul(2)),
+            ));
+            grown.extend_from_slice(&self.0);
+            self.0 = grown;
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) fn parse(
@@ -411,6 +457,52 @@ impl Visitor<'_> for ValidateStringVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_payload_with_nothing_to_escape_is_written_without_moving() {
+        let environments = EnvironmentMap::from([
+            (
+                "default".to_owned(),
+                SecretMap::from([
+                    ("API_KEY".to_owned(), "abc123".to_owned()),
+                    ("EMPTY".to_owned(), String::new()),
+                ]),
+            ),
+            ("preview".to_owned(), SecretMap::new()),
+        ]);
+        let serialized = serialize(&environments).expect("serialize");
+        assert_eq!(parse_all(&serialized).expect("parse"), environments);
+        assert_eq!(serialized.capacity(), unescaped_len(&environments));
+        assert!(unescaped_len(&environments) - serialized.len() < 8);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn serializing_values_leaves_no_copy_of_them_in_freed_memory() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        // Control characters are written as six-byte escapes, so the
+        // payload outgrows a buffer sized from the values' own lengths.
+        let environments = EnvironmentMap::from([(
+            "default".to_owned(),
+            (0..64)
+                .map(|index| {
+                    (
+                        format!("KEY_{index}"),
+                        format!("{MARKER}\"{index}\n{}", "\u{1}".repeat(index)),
+                    )
+                })
+                .collect(),
+        )]);
+        let (serialized, found) = watch(|| serialize(&environments).expect("serialize"));
+        assert!(
+            serialized.len() > unescaped_len(&environments),
+            "the payload outgrew its first buffer"
+        );
+        assert!(!found, "no buffer outgrown while writing keeps a copy");
+        assert_eq!(parse_all(&serialized).expect("parse"), environments);
+        let ((), found) = watch(move || drop(serialized));
+        assert!(!found, "the payload is wiped when dropped");
+    }
 
     #[test]
     fn selects_only_the_requested_versioned_environment() {

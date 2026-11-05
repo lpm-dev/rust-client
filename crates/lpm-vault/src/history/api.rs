@@ -15,7 +15,8 @@ use lpm_env_companion::history::read::{
     Timeline, find_entry, read_retained, read_timeline, reveal_entry,
 };
 use lpm_env_companion::history::rebuild::{
-    Choices, PlanError, Refusal, RollbackKind, RollbackPlan, Target, apply_rollback, plan_rollback,
+    Choices, EnvironmentWrite, PlanError, Refusal, RollbackKind, RollbackPlan, Target,
+    apply_rollback, plan_rollback,
 };
 use lpm_env_companion::history::removal::{
     ChosenSide, RemovalError, RemovalReview, needs_finishing, review_removal_for, start_removal,
@@ -27,7 +28,7 @@ use super::record::{
     MAX_TRIMS_PER_OPERATION, Maintained, commit, finish_running, open_maintained, read_head_and_key,
 };
 use super::store::{HistoryStore, read_part};
-use super::{Action, NotRecorded, RelatedSide, Source, SourceDetail, values_of};
+use super::{Action, NotRecorded, RelatedSide, Source, SourceDetail, ZeroizingValues, values_of};
 use crate::EnvironmentMap;
 use crate::companion::CompanionBackend as _;
 use crate::companion::gate::{Operation, ProjectGate};
@@ -503,81 +504,123 @@ pub fn commit_rollback(
             ..SourceDetail::default()
         },
     );
+    let project = RollbackProject {
+        vault_id: &vault_id,
+        name: &project_name,
+        path: &project_path,
+    };
     let result = crate::with_project_vault_transaction(|directory| {
         let recording = super::scope::begin(&vault_id, &source);
         crate::authorize_companion(directory, &vault_id, Operation::Write)?;
-        let mut values =
+        let values =
             crate::read_all_environments_unlocked(directory, &vault_id)?.unwrap_or_default();
-        let writes = match with_history_store!(directory, |store| {
-            match marker_history(store, &vault_id)? {
-                MarkerHistory::On => {}
-                _ => return Err(HistoryError::ChangedSinceReview),
-            }
-            let (head, key) = read_head_and_key(store, &vault_id)?;
-            let opened = Opened::open(&vault_id, &head, &key)?;
-            // A removal that started since the review may be taking out a
-            // value the review would put back.
-            if needs_finishing(&opened) {
-                return Err(HistoryError::ChangedSinceReview);
-            }
-            apply_rollback(
-                plan,
-                choices,
-                &values_of(&values),
-                &opened.keys,
-                opened.record.current().generation(),
-            )
-            .map_err(|refusal| match refusal {
-                Refusal::ChangedSinceReview => HistoryError::ChangedSinceReview,
-                Refusal::NothingToApply => HistoryError::TargetUnknown,
-            })
-        })? {
-            Ok(writes) => writes,
-            Err(error) => return Ok(Err(error)),
-        };
-        for write in &writes {
-            match &write.renamed_from {
-                Some(from) => {
-                    values.remove(from);
-                    super::scope::renamed_environment(&recording, from, &write.name);
-                }
-                None if write.values.is_none() => {
-                    values.remove(&write.name);
-                }
-                None => {}
-            }
-        }
-        let mut written = Vec::with_capacity(writes.len());
-        for write in writes {
-            if let Some(environment) = write.values {
-                // The value moves out of its wiped buffer rather than being
-                // copied; the map it joins is wiped once written.
-                values.insert(
-                    write.name.clone(),
-                    environment
-                        .into_iter()
-                        .map(|(key, mut value)| (key, std::mem::take(&mut *value)))
-                        .collect(),
-                );
-            }
-            written.push(write.name);
-        }
-        let committed = crate::write_all_environments_unlocked(
-            directory,
-            &vault_id,
-            &project_name,
-            &project_path,
-            &values,
-            &recording,
-        );
-        super::wipe_values(&mut values);
-        committed?;
-        Ok(Ok(written))
+        roll_back(directory, &project, plan, choices, &recording, values)
     });
     match result {
         Ok(result) => result,
         Err(error) => Err(HistoryError::Storage(error)),
     }
+}
+
+/// The project a rollback writes.
+pub(super) struct RollbackProject<'a> {
+    pub(super) vault_id: &'a str,
+    pub(super) name: &'a str,
+    pub(super) path: &'a str,
+}
+
+/// Apply a reviewed rollback to the project's current `values` and write
+/// them, inside the values lock. The values are wiped on every way out.
+pub(super) fn roll_back(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    project: &RollbackProject<'_>,
+    plan: &RollbackPlan,
+    choices: &Choices,
+    recording: &super::scope::Recording,
+    values: EnvironmentMap,
+) -> Result<Result<Vec<String>, HistoryError>, String> {
+    let mut values = ZeroizingValues::from(values);
+    let vault_id = project.vault_id;
+    let writes = match with_history_store!(directory, |store| {
+        match marker_history(store, vault_id)? {
+            MarkerHistory::On => {}
+            _ => return Err(HistoryError::ChangedSinceReview),
+        }
+        let (head, key) = read_head_and_key(store, vault_id)?;
+        let opened = Opened::open(vault_id, &head, &key)?;
+        // A removal that started since the review may be taking out a
+        // value the review would put back.
+        if needs_finishing(&opened) {
+            return Err(HistoryError::ChangedSinceReview);
+        }
+        apply_rollback(
+            plan,
+            choices,
+            &values_of(&values),
+            &opened.keys,
+            opened.record.current().generation(),
+        )
+        .map_err(|refusal| match refusal {
+            Refusal::ChangedSinceReview => HistoryError::ChangedSinceReview,
+            Refusal::NothingToApply => HistoryError::TargetUnknown,
+        })
+    })? {
+        Ok(writes) => writes,
+        Err(error) => return Ok(Err(error)),
+    };
+    let written = apply_writes(&mut values, writes, recording);
+    crate::write_all_environments_unlocked(
+        directory,
+        vault_id,
+        project.name,
+        project.path,
+        &values,
+        recording,
+    )?;
+    Ok(Ok(written))
+}
+
+/// Put a rollback's `writes` into `values`, and return the environments it
+/// wrote. Every environment it takes out or replaces is wiped.
+pub(super) fn apply_writes(
+    values: &mut EnvironmentMap,
+    writes: Vec<EnvironmentWrite>,
+    recording: &super::scope::Recording,
+) -> Vec<String> {
+    let mut taken_out = |name: &str| {
+        if let Some(mut keys) = values.remove(name) {
+            super::wipe_environment(&mut keys);
+        }
+    };
+    for write in &writes {
+        match &write.renamed_from {
+            Some(from) => {
+                taken_out(from);
+                super::scope::renamed_environment(recording, from, &write.name);
+            }
+            None if write.values.is_none() => taken_out(&write.name),
+            None => {}
+        }
+    }
+    let mut written = Vec::with_capacity(writes.len());
+    for write in writes {
+        if let Some(environment) = write.values {
+            // Each value moves out of its wiping buffer rather than being
+            // copied, into a map that's wiped once written.
+            let replaced = values.insert(
+                write.name.clone(),
+                environment
+                    .into_iter()
+                    .map(|(key, mut value)| (key, std::mem::take(&mut *value)))
+                    .collect(),
+            );
+            if let Some(mut keys) = replaced {
+                super::wipe_environment(&mut keys);
+            }
+        }
+        written.push(write.name);
+    }
+    written
 }
 
 /// Find the entry whose ID starts with `prefix`, let `choose` say which of

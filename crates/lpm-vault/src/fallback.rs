@@ -556,15 +556,18 @@ fn decrypt_with_store(
 ) -> Result<String, String> {
     crate::storage_transaction::with_vault_transaction(|directory| {
         decrypt_with_store_unlocked(directory, vault_id, encoded, store)
+            .map(|json| json.as_str().to_owned())
     })
 }
 
+/// The decrypted payload, wiped when dropped. AES-GCM decrypts in place
+/// before it checks the tag, so the buffer wipes from the start.
 fn decrypt_with_store_unlocked(
     directory: &crate::storage_transaction::VaultStorageDirectory,
     vault_id: &str,
     encoded: &str,
     store: &dyn NativeDataKeyStore,
-) -> Result<String, String> {
+) -> Result<zeroize::Zeroizing<String>, String> {
     let (iv_encoded, remainder) = encoded
         .split_once(':')
         .ok_or_else(|| "invalid encrypted format".to_owned())?;
@@ -579,9 +582,11 @@ fn decrypt_with_store_unlocked(
     let auth_tag = BASE64
         .decode(tag_encoded)
         .map_err(|e| format!("tag decode: {e}"))?;
-    let mut encrypted = BASE64
-        .decode(encrypted_encoded)
-        .map_err(|e| format!("data decode: {e}"))?;
+    let mut encrypted = zeroize::Zeroizing::new(
+        BASE64
+            .decode(encrypted_encoded)
+            .map_err(|e| format!("data decode: {e}"))?,
+    );
 
     let nonce = <&Nonce<Aes256Gcm>>::try_from(iv.as_slice())
         .map_err(|_| format!("incompatible IV size: {} bytes", iv.len()))?;
@@ -606,7 +611,8 @@ fn decrypt_with_store_unlocked(
         )
         .map_err(|_| "decryption failed (wrong key or corrupted data)".to_string())?;
 
-    String::from_utf8(encrypted).map_err(|e| format!("utf8 error: {e}"))
+    crate::zeroizing_text(std::mem::take(&mut *encrypted))
+        .map_err(|error| format!("utf8 error: {error}"))
 }
 
 /// Read vault secrets for a specific environment.
@@ -898,6 +904,36 @@ pub(crate) mod tests {
         let selected = take_environment(environments, "default").unwrap();
 
         assert_eq!(selected["TOKEN"].as_ptr(), value_pointer);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn reading_the_file_store_s_values_leaves_no_decrypted_copy() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        with_temp_vault_home(|_| {
+            force_file_vault();
+            mutate_vault_file_env(
+                "proj",
+                "default",
+                |secrets| {
+                    secrets.insert("TOKEN".to_owned(), MARKER.to_owned());
+                },
+                &crate::history::Source::new(crate::history::Action::Set),
+            )
+            .expect("write");
+            let (read, found) = watch(|| {
+                with_storage_directory(|directory| {
+                    let mut values = read_environments_with_digest(directory, "proj")?
+                        .0
+                        .expect("stored values");
+                    let read = values["default"]["TOKEN"] == MARKER;
+                    crate::history::wipe_values(&mut values);
+                    Ok(read)
+                })
+            });
+            assert!(read);
+            assert!(!found, "the decrypted payload is wiped");
+        });
     }
 
     #[derive(Default)]

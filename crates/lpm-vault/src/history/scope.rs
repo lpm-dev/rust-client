@@ -7,19 +7,19 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-use super::Source;
+use super::{Source, ZeroizingValues};
 use crate::EnvironmentMap;
 
 /// One project's change within a lock scope. Its values are wiped when
-/// it's dropped, and its `Debug` names no value.
+/// it's dropped or they're replaced, and its `Debug` names no value.
 #[derive(Clone)]
 pub(crate) struct Tracked {
     pub(crate) source: Source,
     /// The stored values when the scope first read them, or when its first
     /// write began.
-    pub(crate) before: Option<EnvironmentMap>,
+    pub(crate) before: Option<ZeroizingValues>,
     /// What the scope's last write stored.
-    pub(crate) after: Option<EnvironmentMap>,
+    pub(crate) after: Option<ZeroizingValues>,
     /// Environments the scope renamed, as (old name, new name), so the
     /// entry records a rename rather than a removal and a creation.
     pub(crate) environment_renames: Vec<(String, String)>,
@@ -27,7 +27,7 @@ pub(crate) struct Tracked {
 
 impl std::fmt::Debug for Tracked {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let environments = |values: &Option<EnvironmentMap>| {
+        let environments = |values: &Option<ZeroizingValues>| {
             values.as_ref().map(|values| {
                 values
                     .iter()
@@ -42,17 +42,6 @@ impl std::fmt::Debug for Tracked {
             .field("after", &environments(&self.after))
             .field("environment_renames", &self.environment_renames)
             .finish()
-    }
-}
-
-impl Drop for Tracked {
-    fn drop(&mut self) {
-        for values in [self.before.as_mut(), self.after.as_mut()]
-            .into_iter()
-            .flatten()
-        {
-            super::wipe_values(values);
-        }
     }
 }
 
@@ -114,7 +103,7 @@ pub(crate) fn observe_read(vault_id: &str, environments: Option<&EnvironmentMap>
         if let Some(tracked) = scope.as_mut().and_then(|scope| scope.get_mut(vault_id))
             && tracked.before.is_none()
         {
-            tracked.before = Some(environments.cloned().unwrap_or_default());
+            tracked.before = Some(environments.cloned().unwrap_or_default().into());
         }
     });
 }
@@ -125,7 +114,7 @@ pub(crate) fn observe_owned_read(vault_id: &str, environments: Option<Environmen
         if let Some(tracked) = scope.as_mut().and_then(|scope| scope.get_mut(vault_id))
             && tracked.before.is_none()
         {
-            tracked.before = Some(environments.unwrap_or_default());
+            tracked.before = Some(environments.unwrap_or_default().into());
         }
     });
 }
@@ -174,7 +163,7 @@ pub(crate) fn committed(recording: &Recording, after: Cow<'_, EnvironmentMap>) {
             .as_mut()
             .and_then(|scope| scope.get_mut(&recording.vault_id))
         {
-            tracked.after = Some(after.into_owned());
+            tracked.after = Some(after.into_owned().into());
         }
     });
 }

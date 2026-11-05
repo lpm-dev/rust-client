@@ -27,6 +27,8 @@
 mod companion;
 pub mod crypto;
 mod fallback;
+#[cfg(all(test, not(miri)))]
+mod freed_memory_probe;
 pub mod history;
 mod selected_environment;
 pub mod signature;
@@ -52,6 +54,20 @@ use std::path::{Path, PathBuf};
 
 pub type SecretMap = HashMap<String, String>;
 pub type EnvironmentMap = HashMap<String, SecretMap>;
+
+/// `bytes` as text that's wiped when dropped. Bytes that aren't UTF-8 are
+/// wiped before the error returns.
+pub(crate) fn zeroizing_text(
+    bytes: Vec<u8>,
+) -> Result<zeroize::Zeroizing<String>, std::str::Utf8Error> {
+    String::from_utf8(bytes)
+        .map(zeroize::Zeroizing::new)
+        .map_err(|error| {
+            let reason = error.utf8_error();
+            drop(zeroize::Zeroizing::new(error.into_bytes()));
+            reason
+        })
+}
 
 #[cfg(debug_assertions)]
 pub use companion::debug_states::DebugCompanionState;

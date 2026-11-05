@@ -96,15 +96,16 @@ fn read_values(
     }
 }
 
-/// The values item's payload for a read that excludes personal overrides.
+/// The values item's payload for a read that excludes personal overrides,
+/// wiped when dropped.
 pub(super) fn read_values_excluding_overrides(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
-) -> Result<Option<String>, String> {
+) -> Result<Option<zeroize::Zeroizing<String>>, String> {
     authorize(storage, vault_id, Operation::ReadExcludingOverrides)?;
     read_values(storage, vault_id)?
         .map(|(bytes, _)| {
-            String::from_utf8(bytes).map_err(|_| "vault keychain data is not UTF-8".to_owned())
+            crate::zeroizing_text(bytes).map_err(|_| "vault keychain data is not UTF-8".to_owned())
         })
         .transpose()
 }

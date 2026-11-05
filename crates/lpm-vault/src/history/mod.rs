@@ -226,13 +226,51 @@ pub(crate) fn finish_scope(directory: &VaultStorageDirectory) {
 
 /// Zero every value of `environments` in place, for copies history made.
 pub(crate) fn wipe_values(environments: &mut EnvironmentMap) {
-    use zeroize::Zeroize as _;
-    for values in environments.values_mut() {
-        for value in values.values_mut() {
-            value.zeroize();
-        }
+    for keys in environments.values_mut() {
+        wipe_environment(keys);
     }
 }
+
+/// Zero every value of one environment in place.
+pub(crate) fn wipe_environment(keys: &mut crate::SecretMap) {
+    use zeroize::Zeroize as _;
+    for value in keys.values_mut() {
+        value.zeroize();
+    }
+}
+
+/// A project's values that history holds, wiped when they're dropped or
+/// replaced. It has no `Debug`, so they can't be printed.
+#[derive(Clone, Default)]
+pub(crate) struct ZeroizingValues(EnvironmentMap);
+
+impl From<EnvironmentMap> for ZeroizingValues {
+    fn from(environments: EnvironmentMap) -> Self {
+        Self(environments)
+    }
+}
+
+impl std::ops::Deref for ZeroizingValues {
+    type Target = EnvironmentMap;
+
+    fn deref(&self) -> &EnvironmentMap {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ZeroizingValues {
+    fn deref_mut(&mut self) -> &mut EnvironmentMap {
+        &mut self.0
+    }
+}
+
+impl Drop for ZeroizingValues {
+    fn drop(&mut self) {
+        wipe_values(&mut self.0);
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for ZeroizingValues {}
 
 /// A project's values as history sees them.
 pub(crate) fn values_of(environments: &EnvironmentMap) -> Values<'_> {

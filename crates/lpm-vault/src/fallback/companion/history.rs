@@ -92,7 +92,7 @@ impl HistoryStore for FileCompanion<'_> {
         account: &CompanionAccount,
     ) -> Result<Option<Zeroizing<Vec<u8>>>, RecordError> {
         match self.read_checked(account)? {
-            Checked::Present(bytes) => Ok(Some(Zeroizing::new(bytes))),
+            Checked::Present(bytes) => Ok(Some(bytes)),
             Checked::Absent => Ok(None),
             Checked::Unreadable(reason) => Err(RecordError::Damaged(reason)),
         }

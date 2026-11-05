@@ -57,7 +57,7 @@ pub(crate) fn read_part(
 ) -> Result<Option<Vec<u8>>, String> {
     Ok(
         match store.read_checked(&lpm_env_companion::history::part_account(vault_id, part))? {
-            Checked::Present(sealed) => Some(sealed),
+            Checked::Present(mut sealed) => Some(std::mem::take(&mut *sealed)),
             Checked::Absent => None,
             Checked::Unreadable(_) => Some(Vec::new()),
         },

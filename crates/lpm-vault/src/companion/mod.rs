@@ -23,6 +23,7 @@ use account::CompanionAccount;
 use gate::{Damage, Operation, ProjectGate};
 use lifecycle::LifecycleStore;
 use marker::Marker;
+use zeroize::Zeroizing;
 
 /// A store of one platform's companion records.
 pub(crate) trait CompanionBackend: LifecycleStore {
@@ -34,19 +35,32 @@ pub(crate) trait CompanionBackend: LifecycleStore {
     /// tried again and so is never damage.
     fn read_checked(&mut self, account: &CompanionAccount) -> Result<Checked, String> {
         Ok(match self.read(account)? {
-            Some(bytes) => Checked::Present(bytes),
+            Some(bytes) => Checked::Present(Zeroizing::new(bytes)),
             None => Checked::Absent,
         })
     }
 }
 
-/// A record as a damage check found it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A record as a damage check found it. A present record may be a key, so
+/// its bytes are wiped when dropped and never printed.
 pub(crate) enum Checked {
-    Present(Vec<u8>),
+    Present(Zeroizing<Vec<u8>>),
     Absent,
     /// The store holds it, but its content won't read.
     Unreadable(String),
+}
+
+impl std::fmt::Debug for Checked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Present(bytes) => formatter
+                .debug_tuple("Present")
+                .field(&format_args!("{} bytes", bytes.len()))
+                .finish(),
+            Self::Absent => formatter.write_str("Absent"),
+            Self::Unreadable(reason) => formatter.debug_tuple("Unreadable").field(reason).finish(),
+        }
+    }
 }
 
 thread_local! {
@@ -233,6 +247,23 @@ pub(crate) fn damaged(damage: Damage) -> String {
 mod tests {
     use super::*;
     use marker::{FeatureState, ProjectState, RestorePhase};
+
+    #[test]
+    fn a_checked_record_never_prints_its_bytes() {
+        let checked = Checked::Present(vec![222, 173, 190, 239].into());
+        let printed = format!("{checked:?}");
+        assert!(!printed.contains("222, 173, 190, 239"), "{printed}");
+        assert!(printed.contains("4 bytes"), "{printed}");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn a_checked_record_wipes_its_bytes_when_dropped() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        let checked = Checked::Present(MARKER.as_bytes().to_vec().into());
+        let ((), found) = watch(move || drop(checked));
+        assert!(!found);
+    }
 
     #[test]
     fn resume_notices_name_the_project_in_one_sentence() {

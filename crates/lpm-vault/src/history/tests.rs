@@ -304,6 +304,108 @@ mod api {
         });
     }
 
+    #[cfg(not(miri))]
+    #[test]
+    fn a_rollback_refused_after_it_reads_the_values_wipes_them() {
+        use crate::freed_memory_probe::watch;
+        use crate::history::api::{RollbackProject, roll_back};
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            let dir = home.join("project");
+            std::fs::create_dir_all(&dir).expect("project dir");
+            project_set(&dir, "A", "1");
+            project_set(&dir, "A", "2");
+            let entries = ids(&dir);
+            let request = Target::Environment {
+                environment: EnvironmentName::Now("default".to_owned()),
+                side: RelatedSide::After,
+            };
+            let (_, plan) =
+                crate::history::review_rollback(&dir, &hex::encode(entries[0]), |_| Ok(request))
+                    .expect("review");
+            let vault_id = crate::vault_id::read_vault_id(&dir).expect("vault ID");
+            // Not the values the review saw, so the rollback is refused
+            // once it has read them.
+            let values = marked(&["default"]);
+            let (outcome, found) = crate::with_project_vault_transaction(|directory| {
+                let recording = scope::begin(&vault_id, &Source::new(Action::Rollback));
+                let project = RollbackProject {
+                    vault_id: &vault_id,
+                    name: "project",
+                    path: "project",
+                };
+                Ok(watch(move || {
+                    roll_back(
+                        directory,
+                        &project,
+                        &plan,
+                        &Choices::default(),
+                        &recording,
+                        values,
+                    )
+                }))
+            })
+            .expect("lock");
+            assert_eq!(outcome, Ok(Err(HistoryError::ChangedSinceReview)));
+            assert!(!found, "the values the rollback read are wiped");
+        });
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn applying_a_rollback_wipes_each_environment_it_takes_out_or_replaces() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        use crate::history::api::apply_writes;
+        use lpm_env_companion::history::rebuild::EnvironmentWrite;
+        let replacement = || {
+            Some(std::collections::BTreeMap::from([(
+                "A".to_owned(),
+                zeroize::Zeroizing::new("1".to_owned()),
+            )]))
+        };
+        let cases = [
+            (
+                "old",
+                EnvironmentWrite {
+                    name: "staging".to_owned(),
+                    renamed_from: Some("old".to_owned()),
+                    values: replacement(),
+                },
+            ),
+            (
+                "gone",
+                EnvironmentWrite {
+                    name: "gone".to_owned(),
+                    renamed_from: None,
+                    values: None,
+                },
+            ),
+            (
+                "default",
+                EnvironmentWrite {
+                    name: "default".to_owned(),
+                    renamed_from: None,
+                    values: replacement(),
+                },
+            ),
+        ];
+        for (taken_out, write) in cases {
+            let mut values = marked(&[taken_out]);
+            let recording = scope::begin(VAULT, &Source::new(Action::Rollback));
+            let (written, found) = watch(|| apply_writes(&mut values, vec![write], &recording));
+            assert_eq!(written.len(), 1, "{taken_out}");
+            assert!(!found, "{taken_out}: the environment it took out is wiped");
+            assert!(
+                values
+                    .values()
+                    .flat_map(|keys| keys.values())
+                    .all(|value| value != MARKER),
+                "{taken_out}"
+            );
+            crate::history::wipe_values(&mut values);
+        }
+    }
+
     #[test]
     fn removing_a_value_scrubs_it_and_leaves_the_current_values_alone() {
         with_temp_vault_home(|home| {
@@ -544,8 +646,8 @@ mod api {
                 // pull stored is what history records.
                 let tracked = crate::history::scope::tracked(VAULT).expect("tracked");
                 assert_eq!(
-                    (tracked.before.clone(), tracked.after.clone()),
-                    (Some(one.clone()), Some(two.clone()))
+                    (tracked.before.as_deref(), tracked.after.as_deref()),
+                    (Some(&one), Some(&two))
                 );
                 crate::history::scope::forget(VAULT);
                 Ok(())
@@ -680,8 +782,8 @@ fn what_a_scope_tracks_never_prints_values_and_is_wiped_when_dropped() {
     )]);
     let tracked = scope::Tracked {
         source: Source::new(Action::Set),
-        before: Some(environments.clone()),
-        after: Some(environments.clone()),
+        before: Some(environments.clone().into()),
+        after: Some(environments.clone().into()),
         environment_renames: Vec::new(),
     };
     let shown = format!("{tracked:?}");
@@ -693,5 +795,45 @@ fn what_a_scope_tracks_never_prints_values_and_is_wiped_when_dropped() {
     assert!(
         wiped["default"]["TOKEN"].bytes().all(|byte| byte == 0),
         "values are zeroed in place"
+    );
+}
+
+/// Values whose `environments` each hold the freed-memory probe's marker.
+#[cfg(not(miri))]
+fn marked(environments: &[&str]) -> EnvironmentMap {
+    environments
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_owned(),
+                crate::SecretMap::from([(
+                    "TOKEN".to_owned(),
+                    crate::freed_memory_probe::MARKER.to_owned(),
+                )]),
+            )
+        })
+        .collect()
+}
+
+#[cfg(not(miri))]
+#[test]
+fn a_scope_wipes_what_a_write_stored_once_a_later_write_replaces_it() {
+    use crate::freed_memory_probe::watch;
+    assert!(scope::enter(), "no scope is open on a test's thread");
+    let recording = scope::begin(VAULT, &Source::new(Action::Set));
+    scope::committed(&recording, std::borrow::Cow::Owned(marked(&["default"])));
+    let replacement = EnvironmentMap::from([(
+        "default".to_owned(),
+        crate::SecretMap::from([("TOKEN".to_owned(), "2".to_owned())]),
+    )]);
+    let ((), found) = watch(|| scope::committed(&recording, std::borrow::Cow::Owned(replacement)));
+    let tracked = scope::leave();
+    assert!(!found, "what the earlier write stored is wiped");
+    assert_eq!(
+        tracked[VAULT]
+            .after
+            .as_deref()
+            .map(|after| after["default"]["TOKEN"].as_str()),
+        Some("2")
     );
 }

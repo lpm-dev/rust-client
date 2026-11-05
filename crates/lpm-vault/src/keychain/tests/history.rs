@@ -27,8 +27,8 @@ fn environments(token: &str) -> EnvironmentMap {
 fn change(before: &str, after: &str) -> Tracked {
     Tracked {
         source: Source::new(Action::Set),
-        before: Some(environments(before)),
-        after: Some(environments(after)),
+        before: Some(environments(before).into()),
+        after: Some(environments(after).into()),
         environment_renames: Vec::new(),
     }
 }
@@ -308,8 +308,8 @@ fn a_change_history_cant_record_costs_no_listing_or_probe() {
     }
     let too_many = Tracked {
         source: Source::new(Action::Import),
-        before: Some(environments("one")),
-        after: Some(HashMap::from([("default".to_owned(), many)])),
+        before: Some(environments("one").into()),
+        after: Some(HashMap::from([("default".to_owned(), many)]).into()),
         environment_renames: Vec::new(),
     };
     assert_eq!(
@@ -318,14 +318,17 @@ fn a_change_history_cant_record_costs_no_listing_or_probe() {
     );
     let environment_only = Tracked {
         source: Source::new(Action::CreateEnvironment),
-        before: Some(environments("one")),
-        after: Some(HashMap::from([
-            (
-                "default".to_owned(),
-                HashMap::from([("TOKEN".to_owned(), "one".to_owned())]),
-            ),
-            ("preview".to_owned(), HashMap::new()),
-        ])),
+        before: Some(environments("one").into()),
+        after: Some(
+            HashMap::from([
+                (
+                    "default".to_owned(),
+                    HashMap::from([("TOKEN".to_owned(), "one".to_owned())]),
+                ),
+                ("preview".to_owned(), HashMap::new()),
+            ])
+            .into(),
+        ),
         environment_renames: Vec::new(),
     };
     assert_eq!(
@@ -384,7 +387,8 @@ fn a_change_built_on_the_file_store_s_values_records_them_as_its_before() {
             let base = read_mutation_base(&mut keychain, directory, VAULT)?;
             assert_eq!(base, stored);
             assert_eq!(
-                crate::history::scope::tracked(VAULT).and_then(|tracked| tracked.before.clone()),
+                crate::history::scope::tracked(VAULT)
+                    .and_then(|tracked| tracked.before.as_deref().cloned()),
                 Some(stored.clone()),
                 "the change read the file store's values, so they're its before"
             );

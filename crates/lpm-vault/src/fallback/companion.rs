@@ -946,7 +946,7 @@ impl CompanionBackend for FileCompanion<'_> {
         };
         let key = self.data_key()?;
         Ok(match open(&key, account, sealed) {
-            Ok(bytes) => Checked::Present(bytes),
+            Ok(bytes) => Checked::Present(zeroize::Zeroizing::new(bytes)),
             Err(reason) => Checked::Unreadable(reason),
         })
     }

@@ -122,7 +122,7 @@ mod validated_vault_payload {
 
         pub(super) fn from_serialized_environments(
             vault_id: &str,
-            encoded: String,
+            encoded: zeroize::Zeroizing<String>,
             environments: &super::EnvironmentMap,
         ) -> Result<Self, String> {
             super::validate_vault_id(vault_id)?;
@@ -131,7 +131,7 @@ mod validated_vault_payload {
             }
             Ok(Self {
                 vault_id: vault_id.to_owned(),
-                encoded: zeroize::Zeroizing::new(encoded),
+                encoded,
                 environment_summaries: super::environment_summaries(environments),
             })
         }
@@ -1694,17 +1694,7 @@ fn write_all_environments_with_storage_after_recovery(
     let payload =
         ValidatedVaultPayload::from_serialized_environments(vault_id, encoded, &environments)?;
     if crate::history::scope::needs_before(recording) {
-        let before = storage
-            .read(vault_id)?
-            .map(|bytes| {
-                String::from_utf8(bytes).map_err(|_| "vault keychain data is not UTF-8".to_owned())
-            })
-            .transpose()?
-            .map(|json| {
-                crate::selected_environment::parse_all(&json)
-                    .map_err(|error| format!("vault keychain data is not valid JSON: {error}"))
-            })
-            .transpose()?;
+        let before = read_before(storage, vault_id)?;
         crate::history::scope::observe_owned_read(vault_id, before);
     }
     save_validated_vault_data_with_storage_after_recovery(
@@ -1715,6 +1705,21 @@ fn write_all_environments_with_storage_after_recovery(
     )?;
     crate::history::scope::committed(recording, environments);
     Ok(())
+}
+
+/// The values a write replaces, read for history only.
+fn read_before(
+    storage: &mut impl ProjectStorage,
+    vault_id: &str,
+) -> Result<Option<EnvironmentMap>, String> {
+    let Some(stored) = storage.read(vault_id)? else {
+        return Ok(None);
+    };
+    let json =
+        crate::zeroizing_text(stored).map_err(|_| "vault keychain data is not UTF-8".to_owned())?;
+    crate::selected_environment::parse_all(&json)
+        .map(Some)
+        .map_err(|error| format!("vault keychain data is not valid JSON: {error}"))
 }
 
 #[cfg(test)]
@@ -2742,6 +2747,69 @@ mod tests {
         )
         .expect("payload");
         wipes_on_drop(payload.encoded_buffer());
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn a_values_payload_refused_before_it_is_written_is_wiped() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        let environments = &EnvironmentMap::new();
+        let oversized = MARKER.repeat(MAX_TRANSACTION_VALUE_BYTES / MARKER.len() + 1);
+        for (vault_id, encoded) in [("../escape", MARKER.to_owned()), ("proj", oversized)] {
+            let (refused, found) = watch(move || {
+                ValidatedVaultPayload::from_serialized_environments(
+                    vault_id,
+                    encoded.into(),
+                    environments,
+                )
+                .is_err()
+            });
+            assert!(refused, "{vault_id}");
+            assert!(!found, "{vault_id}: the refused payload is wiped");
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn reading_the_keychain_s_values_leaves_no_copy_of_the_payload() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        let mut storage = MemoryProjectStorage::default();
+        storage.values.insert(
+            "proj",
+            format!(r#"{{"environments":{{"default":{{"TOKEN":"{MARKER}"}}}}}}"#),
+        );
+        let (read, found) = watch(|| {
+            let mut values = read_environments_with_digest(&mut storage, "proj")
+                .expect("read")
+                .0
+                .expect("stored values");
+            let read = values["default"]["TOKEN"] == MARKER;
+            crate::history::wipe_values(&mut values);
+            read
+        });
+        assert!(read);
+        assert!(!found, "the payload read from the Keychain is wiped");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn the_values_a_write_replaces_are_read_for_history_without_leaving_a_copy() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        let mut storage = MemoryProjectStorage::default();
+        storage.values.insert(
+            "proj",
+            format!(r#"{{"environments":{{"default":{{"TOKEN":"{MARKER}"}}}}}}"#),
+        );
+        let (read, found) = watch(|| {
+            let mut before = read_before(&mut storage, "proj")
+                .expect("read")
+                .expect("stored values");
+            let read = before["default"]["TOKEN"] == MARKER;
+            crate::history::wipe_values(&mut before);
+            read
+        });
+        assert!(read);
+        assert!(!found, "the stored payload read for history is wiped");
     }
 
     #[derive(Default)]

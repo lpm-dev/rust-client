@@ -178,17 +178,19 @@ fn history_damage(
         .read_checked(&key_account(vault_id))
         .map_err(failed)?
     {
-        Checked::Present(key) => Some(zeroize::Zeroizing::new(key)),
+        Checked::Present(key) => Some(key),
         Checked::Absent => None,
         Checked::Unreadable(reason) => return Ok(vec![unreadable("key", reason)]),
     };
     let mut failure = None;
     let damage = lpm_env_companion::history::read::check_records(
         vault_id,
-        head.as_deref(),
+        head.as_deref().map(Vec::as_slice),
         key.as_deref().map(Vec::as_slice),
         |part| match backend.read_checked(&part_account(vault_id, part)) {
-            Ok(Checked::Present(sealed)) => Some(std::borrow::Cow::Owned(sealed)),
+            Ok(Checked::Present(mut sealed)) => {
+                Some(std::borrow::Cow::Owned(std::mem::take(&mut *sealed)))
+            }
             Ok(Checked::Absent) => None,
             // Content that won't decrypt won't open as a part either.
             Ok(Checked::Unreadable(_)) => Some(std::borrow::Cow::Owned(Vec::new())),
