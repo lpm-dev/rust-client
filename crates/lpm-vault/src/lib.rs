@@ -2659,6 +2659,13 @@ KEY3=no-quotes"#;
             assert!(error.contains("exceeds"), "{error}");
             assert_eq!(try_get_all_environments(dir.path()).unwrap(), baseline);
             assert_eq!(vault_id::read_personal_sync_version(dir.path()), None);
+            assert_eq!(
+                history::take_outcomes()
+                    .last()
+                    .map(|recorded| recorded.outcome.clone()),
+                Some(history::Outcome::Nothing),
+                "a compensation that put the old values back records nothing"
+            );
         });
     }
 

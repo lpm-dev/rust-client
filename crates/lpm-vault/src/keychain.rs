@@ -252,12 +252,24 @@ struct TransactionJournalOperation {
     operation_sha256: String,
 }
 
-trait ProjectStorage {
+pub(crate) trait ProjectStorage {
     fn read(&mut self, account: &str) -> Result<Option<Vec<u8>>, String>;
     fn write(&mut self, account: &str, value: &[u8]) -> Result<(), String>;
     fn delete(&mut self, account: &str) -> Result<bool, String>;
+    /// Every account in the service with the approval its attributes claim,
+    /// from one attributes-only listing.
+    fn accounts_with_access(&mut self) -> Result<Vec<(String, ClaimedAccess)>, String>;
     /// Every account name in the service, from attributes alone.
-    fn account_names(&mut self) -> Result<Vec<String>, String>;
+    fn account_names(&mut self) -> Result<Vec<String>, String> {
+        self.accounts_with_access()
+            .map(|accounts| accounts.into_iter().map(|(name, _)| name).collect())
+    }
+    /// The account names that contain `needle`, from attributes alone.
+    fn account_names_containing(&mut self, needle: &str) -> Result<Vec<String>, String> {
+        let mut names = self.account_names()?;
+        names.retain(|name| name.contains(needle));
+        Ok(names)
+    }
     /// An item's data with the CLI approval its attributes claim.
     fn read_with_access(
         &mut self,
@@ -299,26 +311,46 @@ trait ProjectStorage {
     }
 }
 
-/// A project storage that lists the service once and keeps that listing
-/// current through the writes and deletions it makes, for the several
-/// transactions of one lifecycle operation inside one lock.
+/// A project storage that lists the service once, and learns each item's
+/// claimed approval once, keeping both current through the writes and
+/// deletions it makes, for the several transactions of one operation inside
+/// one lock. Nothing else writes the service while the lock is held.
 struct ListedStorage<'storage, S: ProjectStorage> {
     storage: &'storage mut S,
-    names: Option<HashSet<String>>,
+    /// Every account and its claim from one listing; `None` for an account
+    /// this storage wrote since, whose claim isn't known.
+    listing: Option<HashMap<String, Option<ClaimedAccess>>>,
+    /// Claims learned without a listing; `None` for an absent item.
+    claims: HashMap<String, Option<ClaimedAccess>>,
 }
 
 impl<'storage, S: ProjectStorage> ListedStorage<'storage, S> {
     fn new(storage: &'storage mut S) -> Self {
         Self {
             storage,
-            names: None,
+            listing: None,
+            claims: HashMap::new(),
         }
     }
 
     fn wrote(&mut self, account: &str) {
-        if let Some(names) = self.names.as_mut() {
-            names.insert(account.to_owned());
+        self.claims.remove(account);
+        if let Some(listing) = self.listing.as_mut() {
+            listing.insert(account.to_owned(), None);
         }
+    }
+
+    fn listing(&mut self) -> Result<&HashMap<String, Option<ClaimedAccess>>, String> {
+        if self.listing.is_none() {
+            let accounts = self.storage.accounts_with_access()?;
+            self.listing = Some(
+                accounts
+                    .into_iter()
+                    .map(|(name, claim)| (name, Some(claim)))
+                    .collect(),
+            );
+        }
+        Ok(self.listing.as_ref().expect("listed above"))
     }
 }
 
@@ -335,33 +367,75 @@ impl<S: ProjectStorage> ProjectStorage for ListedStorage<'_, S> {
 
     fn delete(&mut self, account: &str) -> Result<bool, String> {
         let deleted = self.storage.delete(account);
-        if deleted.is_ok()
-            && let Some(names) = self.names.as_mut()
-        {
-            names.remove(account);
+        if deleted.is_ok() {
+            self.claims.insert(account.to_owned(), None);
+            if let Some(listing) = self.listing.as_mut() {
+                listing.remove(account);
+            }
         }
         deleted
     }
 
+    fn accounts_with_access(&mut self) -> Result<Vec<(String, ClaimedAccess)>, String> {
+        let unknown: Vec<String> = self
+            .listing()?
+            .iter()
+            .filter(|(_, claim)| claim.is_none())
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in unknown {
+            let claim = self.storage.claimed_access(&name)?;
+            if let Some(listing) = self.listing.as_mut() {
+                match claim {
+                    Some(claim) => listing.insert(name, Some(claim)),
+                    None => listing.remove(&name),
+                };
+            }
+        }
+        Ok(self
+            .listing()?
+            .iter()
+            .filter_map(|(name, claim)| claim.map(|claim| (name.clone(), claim)))
+            .collect())
+    }
+
     fn account_names(&mut self) -> Result<Vec<String>, String> {
-        let names = match &mut self.names {
-            Some(names) => names,
-            None => self
-                .names
-                .insert(self.storage.account_names()?.into_iter().collect()),
-        };
-        Ok(names.iter().cloned().collect())
+        Ok(self.listing()?.keys().cloned().collect())
+    }
+
+    fn account_names_containing(&mut self, needle: &str) -> Result<Vec<String>, String> {
+        Ok(self
+            .listing()?
+            .keys()
+            .filter(|name| name.contains(needle))
+            .cloned()
+            .collect())
     }
 
     fn read_with_access(
         &mut self,
         account: &str,
     ) -> Result<Option<(Vec<u8>, ClaimedAccess)>, String> {
-        self.storage.read_with_access(account)
+        let read = self.storage.read_with_access(account)?;
+        self.claims
+            .insert(account.to_owned(), read.as_ref().map(|(_, claim)| *claim));
+        Ok(read)
     }
 
     fn claimed_access(&mut self, account: &str) -> Result<Option<ClaimedAccess>, String> {
-        self.storage.claimed_access(account)
+        if let Some(claim) = self.claims.get(account) {
+            return Ok(*claim);
+        }
+        if let Some(listing) = &self.listing {
+            match listing.get(account) {
+                Some(Some(claim)) => return Ok(Some(*claim)),
+                None => return Ok(None),
+                Some(None) => {}
+            }
+        }
+        let claim = self.storage.claimed_access(account)?;
+        self.claims.insert(account.to_owned(), claim);
+        Ok(claim)
     }
 
     fn probe(&mut self, account: &str, open_accounts: &[&str]) -> ProbeOutcome {
@@ -425,7 +499,7 @@ pub(crate) fn recover_project_transaction_unlocked() -> Result<(), String> {
     recover_project_transaction(&mut KeychainProjectStorage).map(|_| ())
 }
 
-struct KeychainProjectStorage;
+pub(crate) struct KeychainProjectStorage;
 
 impl ProjectStorage for KeychainProjectStorage {
     fn read(&mut self, account: &str) -> Result<Option<Vec<u8>>, String> {
@@ -466,8 +540,8 @@ impl ProjectStorage for KeychainProjectStorage {
             .map(|outcome| outcome == crate::macos_keychain::KeychainDeleteOutcome::Deleted)
     }
 
-    fn account_names(&mut self) -> Result<Vec<String>, String> {
-        crate::macos_keychain::account_names(&service())
+    fn accounts_with_access(&mut self) -> Result<Vec<(String, ClaimedAccess)>, String> {
+        crate::macos_keychain::accounts_with_access(&service())
     }
 
     fn read_with_access(
@@ -1443,20 +1517,47 @@ pub(crate) fn try_read_all_environments_unlocked(
 pub(crate) fn try_read_all_environments_with_digest_unlocked(
     vault_id: &str,
 ) -> Result<(Option<EnvironmentMap>, Option<[u8; 32]>), String> {
+    let (environments, digest) =
+        read_environments_with_digest(&mut KeychainProjectStorage, vault_id)?;
+    crate::history::scope::observe_read(vault_id, environments.as_ref());
+    Ok((environments, digest))
+}
+
+/// A project's values and their payload digest, which history doesn't see:
+/// the caller says what its operation read.
+fn read_environments_with_digest(
+    storage: &mut impl ProjectStorage,
+    vault_id: &str,
+) -> Result<(Option<EnvironmentMap>, Option<[u8; 32]>), String> {
     use sha2::Digest as _;
 
-    let Some(json) =
-        companion_gate::read_values_excluding_overrides(&mut KeychainProjectStorage, vault_id)?
-    else {
-        crate::history::scope::observe_read(vault_id, None);
+    let Some(json) = companion_gate::read_values_excluding_overrides(storage, vault_id)? else {
         return Ok((None, None));
     };
     let digest = sha2::Sha256::digest(json.as_bytes()).into();
-
     let environments = crate::selected_environment::parse_all(&json)
         .map_err(|error| format!("vault keychain data is not valid JSON: {error}"))?;
-    crate::history::scope::observe_read(vault_id, Some(&environments));
     Ok((Some(environments), Some(digest)))
+}
+
+/// The values a one-environment change starts from: the Keychain's, or,
+/// when it holds none, the file store's. History's "before" is whichever
+/// the change read.
+fn read_mutation_base(
+    storage: &mut impl ProjectStorage,
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+) -> Result<EnvironmentMap, String> {
+    match read_environments_with_digest(storage, vault_id)?.0 {
+        Some(environments) => {
+            crate::history::scope::observe_read(vault_id, Some(&environments));
+            Ok(environments)
+        }
+        None => Ok(
+            crate::fallback::read_all_environments_unlocked(directory, vault_id)?
+                .unwrap_or_default(),
+        ),
+    }
 }
 
 pub(crate) fn vault_payload_digest_unlocked(vault_id: &str) -> Result<Option<[u8; 32]>, String> {
@@ -1497,7 +1598,7 @@ pub(crate) fn write_all_environments_unlocked(
         vault_id,
         project_name,
         project_path,
-        environments,
+        std::borrow::Cow::Borrowed(environments),
         recording,
     )
 }
@@ -1513,18 +1614,15 @@ pub(crate) fn mutate_vault_env<T>(
     crate::storage_transaction::with_vault_transaction(|directory| {
         recover_project_transaction(&mut KeychainProjectStorage)?;
         let recording = crate::history::scope::begin(vault_id, source);
-        let mut environments = match try_read_all_environments_unlocked(vault_id)? {
-            Some(environments) => environments,
-            None => crate::fallback::read_all_environments_unlocked(directory, vault_id)?
-                .unwrap_or_default(),
-        };
+        let mut environments =
+            read_mutation_base(&mut KeychainProjectStorage, directory, vault_id)?;
         let result = operation(environments.entry(env.to_owned()).or_default());
         write_all_environments_with_storage_after_recovery(
             &mut KeychainProjectStorage,
             vault_id,
             project_name,
             project_path,
-            &environments,
+            std::borrow::Cow::Owned(environments),
             &recording,
         )?;
         Ok(result)
@@ -1554,13 +1652,13 @@ fn write_all_environments_with_storage_after_recovery(
     vault_id: &str,
     project_name: &str,
     project_path: &str,
-    environments: &EnvironmentMap,
+    environments: std::borrow::Cow<'_, EnvironmentMap>,
     recording: &crate::history::scope::Recording,
 ) -> Result<(), String> {
-    let encoded = crate::selected_environment::serialize(environments)?;
+    let encoded = crate::selected_environment::serialize(&environments)?;
     warn_if_large(encoded.len());
     let payload =
-        ValidatedVaultPayload::from_serialized_environments(vault_id, encoded, environments)?;
+        ValidatedVaultPayload::from_serialized_environments(vault_id, encoded, &environments)?;
     if crate::history::scope::needs_before(recording) {
         let before = storage
             .read(vault_id)?
@@ -1573,7 +1671,7 @@ fn write_all_environments_with_storage_after_recovery(
                     .map_err(|error| format!("vault keychain data is not valid JSON: {error}"))
             })
             .transpose()?;
-        crate::history::scope::observe_read(vault_id, before.as_ref());
+        crate::history::scope::observe_owned_read(vault_id, before);
     }
     save_validated_vault_data_with_storage_after_recovery(
         storage,
@@ -2615,6 +2713,10 @@ mod tests {
         approvals_required: Vec<String>,
         listings: usize,
         reads: HashMap<String, usize>,
+        /// Attributes-only reads, by account.
+        attribute_reads: HashMap<String, usize>,
+        /// Accounts whose reads fail, as a locked Keychain's do.
+        failing_reads: HashSet<String>,
         writes: HashMap<String, usize>,
         deletes: HashMap<String, usize>,
         rejected_writes: HashSet<String>,
@@ -2666,6 +2768,9 @@ mod tests {
 
         fn read(&mut self, account: &str) -> Result<Option<Vec<u8>>, String> {
             *self.reads.entry(account.to_owned()).or_default() += 1;
+            if self.failing_reads.contains(account) {
+                return Err("the macOS Keychain is locked".to_owned());
+            }
             if account == TRANSACTION_MARKER_ACCOUNT
                 && self.fail_committed_marker_verification_once
                 && self
@@ -2727,9 +2832,21 @@ mod tests {
             Ok(deleted)
         }
 
-        fn account_names(&mut self) -> Result<Vec<String>, String> {
+        fn accounts_with_access(&mut self) -> Result<Vec<(String, ClaimedAccess)>, String> {
             self.listings += 1;
-            Ok(self.values.keys().cloned().collect())
+            Ok(self
+                .values
+                .keys()
+                .map(|name| {
+                    (
+                        name.clone(),
+                        self.claims
+                            .get(name)
+                            .copied()
+                            .unwrap_or(ClaimedAccess::Automatic),
+                    )
+                })
+                .collect())
         }
 
         fn read_with_access(
@@ -2745,6 +2862,7 @@ mod tests {
         }
 
         fn claimed_access(&mut self, account: &str) -> Result<Option<ClaimedAccess>, String> {
+            *self.attribute_reads.entry(account.to_owned()).or_default() += 1;
             Ok(self.values.contains_key(account).then(|| {
                 self.claims
                     .get(account)
@@ -2982,7 +3100,7 @@ mod tests {
             "new-vault",
             "New Vault",
             "/workspace/new",
-            &environments,
+            std::borrow::Cow::Borrowed(&environments),
             &crate::history::scope::begin(
                 "new-vault",
                 &crate::history::Source::new(crate::history::Action::Set),

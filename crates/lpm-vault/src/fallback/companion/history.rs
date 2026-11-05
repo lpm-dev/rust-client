@@ -9,8 +9,8 @@ use super::{
     FileCompanion, MARKER_ENTRY, companion_folder_name, entry_name, seal, stage_folder_name,
 };
 use crate::companion::account::CompanionAccount;
-use crate::companion::lifecycle::LifecycleStore;
-use crate::history::store::{AdmissionInventory, HistoryStore};
+use crate::companion::{Checked, CompanionBackend as _};
+use crate::history::store::{AdmissionInventory, HistoryStore, RecordError};
 use crate::storage_transaction::VaultStorageDirectory;
 use lpm_env_companion::history::admission;
 use lpm_env_companion::keyring::Approval;
@@ -90,8 +90,12 @@ impl HistoryStore for FileCompanion<'_> {
     fn read_following_values(
         &mut self,
         account: &CompanionAccount,
-    ) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
-        Ok(self.read(account)?.map(Zeroizing::new))
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, RecordError> {
+        match self.read_checked(account)? {
+            Checked::Present(bytes) => Ok(Some(Zeroizing::new(bytes))),
+            Checked::Absent => Ok(None),
+            Checked::Unreadable(reason) => Err(RecordError::Damaged(reason)),
+        }
     }
 
     fn replace(&mut self, account: &CompanionAccount, bytes: &[u8]) -> Result<(), String> {
@@ -103,9 +107,11 @@ impl HistoryStore for FileCompanion<'_> {
     }
 
     fn admission_inventory(&mut self, vault_id: &str) -> Result<AdmissionInventory, String> {
+        let rings = admission::rings(&self.inventory_of(vault_id)?);
         Ok(AdmissionInventory {
             count: self.record_count()?,
-            rings: admission::rings(&self.inventory_of(vault_id)?),
+            trimmable: rings.iter().map(|ring| ring.vault_id.clone()).collect(),
+            rings,
         })
     }
 
@@ -115,9 +121,5 @@ impl HistoryStore for FileCompanion<'_> {
 
     fn verified_approval(&mut self, _vault_id: &str) -> Result<Option<Approval>, String> {
         Ok(Some(Approval::FileStore))
-    }
-
-    fn writes_without_prompt(&mut self, _vault_id: &str) -> Result<bool, String> {
-        Ok(true)
     }
 }

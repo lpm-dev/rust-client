@@ -7,8 +7,8 @@ use lpm_env_companion::append_log::{HISTORY, Head};
 use lpm_env_companion::budgets::ADMISSION_TARGET;
 use lpm_env_companion::history::admission::{self, CreationAdmission};
 use lpm_env_companion::history::append::{
-    AppendPlan, Change, CreationPlan, Growth, NotRecorded as PlanNotRecorded, Stored, plan_append,
-    plan_creation,
+    AppendCache, AppendPlan, Change, CreationPlan, Growth, NotRecorded as PlanNotRecorded, Stored,
+    plan_append, plan_creation, too_many_values,
 };
 use lpm_env_companion::history::codec::Actor;
 use lpm_env_companion::history::read::Opened;
@@ -16,17 +16,18 @@ use lpm_env_companion::history::removal::{
     KeyMaintenance, finish_rotation, key_maintenance, needs_finishing, rotate_part, start_rotation,
 };
 use lpm_env_companion::history::switch::MarkerHistory;
-use lpm_env_companion::history::{RecordWrite, head_account, key_account, part_account};
+use lpm_env_companion::history::values::Rename;
+use lpm_env_companion::history::{RecordWrite, head_account, key_account};
 use lpm_env_companion::keyring::{Random, SystemRandom};
 
 use super::scope::Tracked;
-use super::store::HistoryStore;
+use super::store::{HistoryStore, RecordError, read_part};
 use super::{NotRecorded, Outcome, values_of};
 use crate::companion::gate::ProjectGate;
 use crate::companion::lifecycle::Mutation;
 
 /// Trims one operation may make before creating history or growing a ring.
-const MAX_TRIMS_PER_OPERATION: usize = 16;
+pub(super) const MAX_TRIMS_PER_OPERATION: usize = 16;
 
 /// Record `tracked`, the change one lock scope made to `vault_id`.
 pub(crate) fn record(store: &mut impl HistoryStore, vault_id: &str, tracked: &Tracked) -> Outcome {
@@ -47,6 +48,11 @@ pub(crate) fn record(store: &mut impl HistoryStore, vault_id: &str, tracked: &Tr
         ProjectGate::Marked(marker) => Some(marker),
         ProjectGate::Damaged(_) => return Outcome::NotRecorded(NotRecorded::Damaged),
     };
+    let renames: Vec<Rename<'_>> = tracked
+        .environment_renames
+        .iter()
+        .map(|(from, to)| Rename::Environment { from, to })
+        .collect();
     let detail = tracked.source.detail.borrowed();
     let change = Change {
         id: tracked.source.id,
@@ -56,7 +62,7 @@ pub(crate) fn record(store: &mut impl HistoryStore, vault_id: &str, tracked: &Tr
         detail,
         before: &before,
         after: &after,
-        renames: &[],
+        renames: &renames,
     };
     let mut random = SystemRandom;
     match MarkerHistory::of(marker) {
@@ -65,6 +71,10 @@ pub(crate) fn record(store: &mut impl HistoryStore, vault_id: &str, tracked: &Tr
             Outcome::NotRecorded(NotRecorded::NewerVersion)
         }
         MarkerHistory::Both => Outcome::NotRecorded(NotRecorded::Damaged),
+        MarkerHistory::Default if !change.changes_keys() => Outcome::Nothing,
+        MarkerHistory::Default | MarkerHistory::On if too_many_values(&after) => {
+            Outcome::NotRecorded(NotRecorded::TooManyValues)
+        }
         MarkerHistory::Default => create(store, vault_id, marker, &change, &mut random)
             .unwrap_or_else(Outcome::NotRecorded),
         MarkerHistory::On => {
@@ -80,7 +90,7 @@ fn create(
     change: &Change<'_, '_>,
     random: &mut impl Random,
 ) -> Result<Outcome, NotRecorded> {
-    let existing = admit(store, vault_id, admission::CREATION_ACCOUNTS)?;
+    let existing = admit(store, vault_id, admission::CREATION_ACCOUNTS, None)?.existing;
     let admission = admission::admit_creation(existing);
     let Some(ring_limit) = admission.ring_limit() else {
         return Err(NotRecorded::Limit);
@@ -121,59 +131,78 @@ fn append(
     change: &Change<'_, '_>,
     random: &mut impl Random,
 ) -> Result<Outcome, NotRecorded> {
-    let (head, key) = open_maintained(store, vault_id, random)?;
+    let Maintained {
+        mut head,
+        key,
+        mut opened,
+    } = open_maintained(store, vault_id, random)?;
     let mut growth = Growth::Unasked;
-    let mut previous: Option<Vec<u8>> = None;
     let mut crowded = None;
-    let parsed_head = Head::parse(HISTORY, vault_id, &head).map_err(|_| NotRecorded::Damaged)?;
-    let tail = store
-        .read(&part_account(vault_id, parsed_head.tail()))
-        .map_err(NotRecorded::Failed)?;
-    loop {
-        let stored = Stored {
-            head: &head,
-            key: &key,
-            tail: tail.as_deref(),
-            previous: previous.as_deref(),
-        };
-        match plan_append(vault_id, &stored, change, growth, random).map_err(NotRecorded::from)? {
-            AppendPlan::Unchanged => return Ok(Outcome::Nothing),
-            AppendPlan::AlreadyRecorded => {
-                return Ok(Outcome::Recorded {
-                    crowded: None,
-                    gap: false,
-                });
-            }
-            AppendPlan::NeedsPrevious { part } => {
-                previous = Some(
-                    store
-                        .read(&part_account(vault_id, part))
-                        .map_err(NotRecorded::Failed)?
-                        .ok_or(NotRecorded::Damaged)?,
-                );
-            }
-            AppendPlan::NeedsGrowthAdmission => {
-                let existing = admit(store, vault_id, 1)?;
-                growth = if admission::admit_growth(existing) {
-                    Growth::Allowed
-                } else {
-                    crowded = Some(existing);
-                    Growth::Refused
-                };
-            }
-            AppendPlan::Write(write) => {
-                if let Some(head) = write.head {
-                    store
-                        .replace(&head.account, &head.bytes)
-                        .map_err(NotRecorded::Failed)?;
+    let mut cache = AppendCache::default();
+    'read: loop {
+        let tail = read_part(store, vault_id, opened.head.tail()).map_err(NotRecorded::Failed)?;
+        let mut previous: Option<Vec<u8>> = None;
+        loop {
+            let stored = Stored {
+                head: &head,
+                key: &key,
+                tail: tail.as_deref(),
+                previous: previous.as_deref(),
+            };
+            match plan_append(vault_id, &stored, change, growth, &mut cache, random)
+                .map_err(NotRecorded::from)?
+            {
+                AppendPlan::Unchanged => return Ok(Outcome::Nothing),
+                AppendPlan::AlreadyRecorded => {
+                    return Ok(Outcome::Recorded {
+                        crowded: None,
+                        gap: false,
+                    });
                 }
-                store
-                    .replace(&write.part.account, &write.part.bytes)
-                    .map_err(NotRecorded::Failed)?;
-                return Ok(Outcome::Recorded {
-                    crowded,
-                    gap: write.gap,
-                });
+                AppendPlan::NeedsPrevious { part } => {
+                    previous = Some(
+                        read_part(store, vault_id, part)
+                            .map_err(NotRecorded::Failed)?
+                            .ok_or(NotRecorded::Damaged)?,
+                    );
+                }
+                AppendPlan::NeedsGrowthAdmission => {
+                    let admitted = admit(store, vault_id, 1, Some(&opened.head))?;
+                    if admitted.trimmed_own {
+                        // A trim rewrote this project's head: plan again on
+                        // the head as it is now.
+                        head = store
+                            .read_following_values(&head_account(vault_id))?
+                            .ok_or(NotRecorded::Damaged)?;
+                        opened = Opened::open(vault_id, &head, &key)
+                            .map_err(|_| NotRecorded::Damaged)?;
+                    }
+                    growth = if admission::admit_growth_of(&opened.head, admitted.existing) {
+                        Growth::Allowed
+                    } else {
+                        if opened.head.would_grow() {
+                            crowded = Some(admitted.existing);
+                        }
+                        Growth::Refused
+                    };
+                    if admitted.trimmed_own {
+                        continue 'read;
+                    }
+                }
+                AppendPlan::Write(write) => {
+                    if let Some(head) = write.head {
+                        store
+                            .replace(&head.account, &head.bytes)
+                            .map_err(NotRecorded::Failed)?;
+                    }
+                    store
+                        .replace(&write.part.account, &write.part.bytes)
+                        .map_err(NotRecorded::Failed)?;
+                    return Ok(Outcome::Recorded {
+                        crowded,
+                        gap: write.gap,
+                    });
+                }
             }
         }
     }
@@ -181,20 +210,35 @@ fn append(
 
 type Secret = zeroize::Zeroizing<Vec<u8>>;
 
+impl From<RecordError> for NotRecorded {
+    fn from(error: RecordError) -> Self {
+        match error {
+            RecordError::Damaged(_) => Self::Damaged,
+            RecordError::Store(error) => Self::Failed(error),
+        }
+    }
+}
+
 /// The head and key, read with their access.
 pub(super) fn read_head_and_key(
     store: &mut impl HistoryStore,
     vault_id: &str,
 ) -> Result<(Secret, Secret), NotRecorded> {
     let head = store
-        .read_following_values(&head_account(vault_id))
-        .map_err(NotRecorded::Failed)?
+        .read_following_values(&head_account(vault_id))?
         .ok_or(NotRecorded::Damaged)?;
     let key = store
-        .read_following_values(&key_account(vault_id))
-        .map_err(NotRecorded::Failed)?
+        .read_following_values(&key_account(vault_id))?
         .ok_or(NotRecorded::Damaged)?;
     Ok((head, key))
+}
+
+/// History's head and key after any upkeep they needed, as read and as
+/// opened.
+pub(super) struct Maintained {
+    pub(super) head: Secret,
+    pub(super) key: Secret,
+    pub(super) opened: Opened,
 }
 
 /// The head and key, read once, after any key upkeep they need: an append
@@ -204,7 +248,7 @@ pub(super) fn open_maintained(
     store: &mut impl HistoryStore,
     vault_id: &str,
     random: &mut impl Random,
-) -> Result<(Secret, Secret), NotRecorded> {
+) -> Result<Maintained, NotRecorded> {
     let (head, key) = read_head_and_key(store, vault_id)?;
     let opened = Opened::open(vault_id, &head, &key).map_err(|_| NotRecorded::Damaged)?;
     let claimed = store
@@ -213,10 +257,12 @@ pub(super) fn open_maintained(
     if !needs_finishing(&opened)
         && matches!(key_maintenance(&opened, claimed), KeyMaintenance::Nothing)
     {
-        return Ok((head, key));
+        return Ok(Maintained { head, key, opened });
     }
     maintain_key(store, vault_id, random)?;
-    read_head_and_key(store, vault_id)
+    let (head, key) = read_head_and_key(store, vault_id)?;
+    let opened = Opened::open(vault_id, &head, &key).map_err(|_| NotRecorded::Damaged)?;
+    Ok(Maintained { head, key, opened })
 }
 
 fn opened(store: &mut impl HistoryStore, vault_id: &str) -> Result<Opened, NotRecorded> {
@@ -263,8 +309,7 @@ pub(super) fn finish_running(
         return Ok(());
     }
     for part in opened.head.parts.clone() {
-        let account = part_account(vault_id, part);
-        let sealed = store.read(&account).map_err(NotRecorded::Failed)?;
+        let sealed = read_part(store, vault_id, part).map_err(NotRecorded::Failed)?;
         if let Some(write) = rotate_part(&opened, part, sealed.as_deref(), random)
             .map_err(|error| NotRecorded::Failed(error.to_string()))?
         {
@@ -277,44 +322,60 @@ pub(super) fn finish_running(
     commit(store, writes)
 }
 
+/// What admission found, after its trims.
+struct Admitted {
+    /// The service's record count.
+    existing: usize,
+    /// Whether a trim rewrote this project's own head.
+    trimmed_own: bool,
+}
+
 /// The service's record count for an operation that adds `adding`
 /// accounts, after trimming the largest rings this client may write when
-/// it would pass the target.
+/// it would pass the target. With `own`, this project's head, the parts it
+/// doesn't list, left by a trim that crashed before its deletion, are
+/// deleted too.
 fn admit(
     store: &mut impl HistoryStore,
     vault_id: &str,
     adding: usize,
-) -> Result<usize, NotRecorded> {
+    own: Option<&Head>,
+) -> Result<Admitted, NotRecorded> {
     let inventory = store
         .admission_inventory(vault_id)
         .map_err(NotRecorded::Failed)?;
     let mut existing = inventory.count;
-    if existing + adding <= ADMISSION_TARGET {
-        return Ok(existing);
-    }
-    let rings = inventory.rings;
-    let mut trimmable = std::collections::BTreeSet::new();
-    for ring in &rings {
-        if ring.vault_id == vault_id
-            || store
-                .writes_without_prompt(&ring.vault_id)
-                .map_err(NotRecorded::Failed)?
-        {
-            trimmable.insert(ring.vault_id.clone());
+    if let Some(head) = own
+        && inventory
+            .rings
+            .iter()
+            .any(|ring| ring.vault_id == vault_id && ring.parts > head.parts.len())
+    {
+        let accounts = store.inventory(vault_id).map_err(NotRecorded::Failed)?;
+        for orphan in admission::orphan_parts(head, &accounts) {
+            store.delete(&orphan).map_err(NotRecorded::Failed)?;
+            existing -= 1;
         }
+    }
+    let mut trimmed_own = false;
+    if existing + adding <= ADMISSION_TARGET {
+        return Ok(Admitted {
+            existing,
+            trimmed_own,
+        });
     }
     for (project, count) in admission::plan_trims(
         existing + adding,
-        &rings,
+        &inventory.rings,
         MAX_TRIMS_PER_OPERATION,
-        |project| trimmable.contains(project),
+        |project| inventory.trimmable.contains(project),
     ) {
         for _ in 0..count {
-            let Some(head) = store
-                .read_following_values(&head_account(&project))
-                .map_err(NotRecorded::Failed)?
-            else {
-                break;
+            let head = match store.read_following_values(&head_account(&project)) {
+                Ok(Some(head)) => head,
+                // Another project's damaged history is its own to repair.
+                Ok(None) | Err(RecordError::Damaged(_)) => break,
+                Err(RecordError::Store(error)) => return Err(NotRecorded::Failed(error)),
             };
             let Ok(head) = Head::parse(HISTORY, &project, &head) else {
                 break;
@@ -327,9 +388,13 @@ fn admit(
                 .map_err(NotRecorded::Failed)?;
             store.delete(&trim.delete).map_err(NotRecorded::Failed)?;
             existing -= 1;
+            trimmed_own |= project == vault_id;
         }
     }
-    Ok(existing)
+    Ok(Admitted {
+        existing,
+        trimmed_own,
+    })
 }
 
 /// Commit `writes` as one journal transaction.

@@ -188,7 +188,7 @@ fn a_values_write_succeeds_and_reports_why_when_history_is_damaged() {
 mod api {
     use super::*;
     use crate::history::{
-        Choices, ChosenValue, EntryLookup, HistoryError, HistoryState, Point, RollbackRequest,
+        Choices, ChosenValue, EnvironmentName, HistoryError, HistoryState, Point, RollbackRequest,
         TimelineRow,
     };
 
@@ -198,9 +198,10 @@ mod api {
     }
 
     fn ids(dir: &std::path::Path) -> Vec<[u8; 16]> {
-        crate::history::timeline(dir, &Filter::default())
+        crate::history::timeline(dir, &Filter::default(), false)
             .expect("timeline")
             .expect("history exists")
+            .timeline
             .rows
             .iter()
             .rev()
@@ -222,7 +223,7 @@ mod api {
             let dir = home.join("project");
             std::fs::create_dir_all(&dir).expect("project dir");
             assert_eq!(
-                crate::history::timeline(&dir, &Filter::default()),
+                crate::history::timeline(&dir, &Filter::default(), false),
                 Err(HistoryError::NoProject)
             );
             project_set(&dir, "A", "1");
@@ -230,26 +231,24 @@ mod api {
             let status = crate::history::status(&dir).expect("status");
             assert_eq!((status.state, status.retained), (HistoryState::On, 2));
             let entries = ids(&dir);
-            let timeline = crate::history::timeline(&dir, &Filter::default())
-                .expect("timeline")
-                .expect("history");
             let short = hex::encode(entries[1])[..8].to_owned();
+            let shown = crate::history::show(&dir, &short, false).expect("show");
+            assert_eq!((shown.info.id, shown.revealed), (entries[1], None));
             assert_eq!(
-                crate::history::resolve_entry(&timeline, &short),
-                Ok(entries[1])
-            );
-            assert_eq!(
-                crate::history::resolve_entry(&timeline, "zzzzzz"),
+                crate::history::show(&dir, "zzzzzz", false),
                 Err(HistoryError::EntryNotFound)
             );
-            let Some(EntryLookup::Found(found)) =
-                crate::history::show(&dir, entries[1]).expect("show")
-            else {
-                panic!("found");
-            };
+            let found = crate::history::show(&dir, &hex::encode(entries[1]), true)
+                .expect("show")
+                .revealed
+                .expect("revealed");
             let values = &found.values[0][0];
             assert_eq!(values.before.as_deref().map(String::as_str), Some("1"));
             assert_eq!(values.after.as_deref().map(String::as_str), Some("2"));
+            let listing = crate::history::timeline(&dir, &Filter::default(), true)
+                .expect("timeline")
+                .expect("history");
+            assert_eq!(listing.revealed.len(), 2, "every shown entry's values");
         });
     }
 
@@ -264,13 +263,15 @@ mod api {
             project_set(&dir, "B", "b");
             let entries = ids(&dir);
             let request = RollbackRequest::Environment {
-                environment: "default".to_owned(),
+                environment: EnvironmentName::Now("default".to_owned()),
                 point: Point {
                     entry: entries[0],
                     side: RelatedSide::After,
                 },
             };
-            let plan = crate::history::review_rollback(&dir, &request).expect("review");
+            let (_, plan) =
+                crate::history::review_rollback(&dir, &hex::encode(entries[0]), |_| Ok(request))
+                    .expect("review");
             assert_eq!(plan.environments[0].changing_rows(), 2);
 
             let stale = plan.clone();
@@ -287,10 +288,10 @@ mod api {
                 ),
                 "{outcomes:?}"
             );
-            let timeline = crate::history::timeline(&dir, &Filter::default())
+            let listing = crate::history::timeline(&dir, &Filter::default(), false)
                 .expect("timeline")
                 .expect("history");
-            let TimelineRow::Entry(newest) = &timeline.rows[0] else {
+            let TimelineRow::Entry(newest) = &listing.timeline.rows[0] else {
                 panic!("an entry");
             };
             assert_eq!(newest.action, Action::Rollback);
@@ -322,14 +323,15 @@ mod api {
                 key: "TOKEN".to_owned(),
                 side: RelatedSide::Before,
             };
-            let review = crate::history::review_forget(&dir, &chosen).expect("review");
+            let (_, review) =
+                crate::history::review_forget(&dir, &hex::encode(entries[1]), |_| Ok(chosen))
+                    .expect("review");
             assert_eq!(review.places.len(), 1);
             crate::history::forget(&dir, &review, &review.default_selection()).expect("forget");
-            let Some(EntryLookup::Found(found)) =
-                crate::history::show(&dir, entries[1]).expect("show")
-            else {
-                panic!("found");
-            };
+            let found = crate::history::show(&dir, &hex::encode(entries[1]), true)
+                .expect("show")
+                .revealed
+                .expect("revealed");
             assert_eq!(found.values[0][0].before, None, "the value is gone");
             assert_eq!(stored(&dir, "TOKEN").as_deref(), Some("rotated"));
 
@@ -339,11 +341,293 @@ mod api {
                 key: "TOKEN".to_owned(),
                 side: RelatedSide::After,
             };
-            let review = crate::history::review_forget(&dir, &current).expect("review");
+            let (_, review) =
+                crate::history::review_forget(&dir, &hex::encode(entries[1]), |_| Ok(current))
+                    .expect("review");
             assert_eq!(
                 crate::history::forget(&dir, &review, &review.default_selection()),
                 Err(HistoryError::ValueIsCurrent)
             );
+        });
+    }
+
+    fn companion_folder(home: &std::path::Path) -> std::path::PathBuf {
+        std::fs::read_dir(home.join(".lpm").join("vaults"))
+            .expect("vaults")
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".companion"))
+            .expect("the project's companion folder")
+            .path()
+    }
+
+    #[test]
+    fn a_rollback_that_renames_an_environment_back_records_a_rename() {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            let dir = home.join("project");
+            std::fs::create_dir_all(&dir).expect("project dir");
+            project_set(&dir, "A", "1");
+            let vault_id = crate::vault_id::read_vault_id(&dir).expect("vault id");
+            with_vault_transaction(|directory| {
+                let recording = crate::history::scope::begin(
+                    &vault_id,
+                    &Source::new(Action::RenameEnvironment),
+                );
+                crate::history::scope::renamed_environment(&recording, "default", "prod");
+                let renamed = std::collections::HashMap::from([(
+                    "prod".to_owned(),
+                    std::collections::HashMap::from([("A".to_owned(), "1".to_owned())]),
+                )]);
+                crate::write_all_environments_unlocked(
+                    directory, &vault_id, "project", "/project", &renamed, &recording,
+                )
+            })
+            .expect("renamed");
+            take_outcomes();
+            let entries = ids(&dir);
+            let newest_kind = |dir: &std::path::Path| {
+                let listing = crate::history::timeline(dir, &Filter::default(), false)
+                    .expect("timeline")
+                    .expect("history");
+                let TimelineRow::Entry(newest) = &listing.timeline.rows[0] else {
+                    panic!("an entry");
+                };
+                newest
+                    .environments
+                    .iter()
+                    .map(|environment| (environment.name.clone(), environment.kind.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                newest_kind(&dir),
+                vec![(
+                    "prod".to_owned(),
+                    crate::history::EnvironmentKindInfo::RenamedFrom("default".to_owned())
+                )]
+            );
+            let (_, plan) = crate::history::review_rollback(&dir, &hex::encode(entries[0]), |_| {
+                Ok(RollbackRequest::Environment {
+                    environment: EnvironmentName::AtPoint("default".to_owned()),
+                    point: Point {
+                        entry: entries[0],
+                        side: RelatedSide::After,
+                    },
+                })
+            })
+            .expect("review");
+            crate::history::commit_rollback(&dir, &plan, &Choices::default()).expect("commit");
+            assert_eq!(
+                newest_kind(&dir),
+                vec![(
+                    "default".to_owned(),
+                    crate::history::EnvironmentKindInfo::RenamedFrom("prod".to_owned())
+                )],
+                "the rollback is recorded as a rename, not a removal and a creation"
+            );
+        });
+    }
+
+    #[test]
+    fn removing_a_value_after_history_was_removed_says_it_changed_since_the_review() {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            let dir = home.join("project");
+            std::fs::create_dir_all(&dir).expect("project dir");
+            project_set(&dir, "TOKEN", "leaked");
+            project_set(&dir, "TOKEN", "rotated");
+            let entries = ids(&dir);
+            let chosen = ChosenValue {
+                entry: entries[1],
+                environment: "default".to_owned(),
+                key: "TOKEN".to_owned(),
+                side: RelatedSide::Before,
+            };
+            let (_, review) =
+                crate::history::review_forget(&dir, &hex::encode(entries[1]), |_| Ok(chosen))
+                    .expect("review");
+            crate::history::turn_off(&dir).expect("off");
+            crate::history::turn_on(&dir).expect("on");
+            assert_eq!(
+                crate::history::forget(&dir, &review, &review.default_selection()),
+                Err(HistoryError::ChangedSinceReview)
+            );
+        });
+    }
+
+    #[test]
+    fn status_pauses_for_damage_for_a_store_that_fails_and_for_too_many_values() {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            let dir = home.join("project");
+            std::fs::create_dir_all(&dir).expect("project dir");
+            project_set(&dir, "A", "1");
+            let head = companion_folder(home).join("record.history-head");
+            let sealed = std::fs::read(&head).expect("head");
+
+            std::fs::write(&head, b"damaged").expect("damage the head");
+            assert_eq!(
+                crate::history::status(&dir).expect("status").state,
+                HistoryState::Paused(crate::history::Paused::Damaged)
+            );
+
+            std::fs::write(&head, &sealed).expect("restore the head");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&head, std::fs::Permissions::from_mode(0o000))
+                    .expect("lock the head");
+                let state = crate::history::status(&dir).expect("status").state;
+                std::fs::set_permissions(&head, std::fs::Permissions::from_mode(0o600))
+                    .expect("unlock the head");
+                assert!(
+                    matches!(
+                        state,
+                        HistoryState::Paused(crate::history::Paused::Unavailable(_))
+                    ),
+                    "{state:?}"
+                );
+            }
+            assert_eq!(
+                crate::history::status(&dir).expect("status").state,
+                HistoryState::On
+            );
+
+            let pairs: Vec<(String, String)> = (0..3_000)
+                .map(|index| (format!("A_RATHER_LONG_KEY_NAME_{index:08}"), "v".to_owned()))
+                .collect();
+            let borrowed: Vec<(&str, &str)> = pairs
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect();
+            crate::set(&dir, &borrowed, &Source::new(Action::Import)).expect("set");
+            take_outcomes();
+            assert_eq!(
+                crate::history::status(&dir).expect("status").state,
+                HistoryState::Paused(crate::history::Paused::TooManyValues)
+            );
+        });
+    }
+
+    #[test]
+    fn a_part_the_file_store_cant_decrypt_reads_as_an_unreadable_part() {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            let dir = home.join("project");
+            std::fs::create_dir_all(&dir).expect("project dir");
+            project_set(&dir, "A", "1");
+            let mut round = 0;
+            while !companion_folder(home).join("record.history.001").exists() {
+                round += 1;
+                assert!(round < 64, "the ring grows within a few large changes");
+                project_set(&dir, "A", &format!("{round}{}", "x".repeat(6 * 1024)));
+            }
+            std::fs::write(
+                companion_folder(home).join("record.history.000"),
+                b"garbage",
+            )
+            .expect("damage part 0");
+            let listing = crate::history::timeline(&dir, &Filter::default(), false)
+                .expect("a part that won't read doesn't fail the read")
+                .expect("history");
+            assert_eq!(listing.timeline.unreadable_parts, 1);
+            assert!(!listing.timeline.damaged_tail);
+        });
+    }
+
+    #[test]
+    fn a_scope_records_what_its_last_successful_write_stored() {
+        with_temp_vault_home(|_| {
+            force_file_vault();
+            let one = std::collections::HashMap::from([(
+                "default".to_owned(),
+                std::collections::HashMap::from([("A".to_owned(), "1".to_owned())]),
+            )]);
+            let two = std::collections::HashMap::from([(
+                "default".to_owned(),
+                std::collections::HashMap::from([("A".to_owned(), "2".to_owned())]),
+            )]);
+            with_vault_transaction(|_| {
+                let recording = crate::history::scope::begin(VAULT, &Source::new(Action::Pull));
+                crate::history::scope::observe_read(VAULT, Some(&one));
+                crate::history::scope::committed(&recording, std::borrow::Cow::Borrowed(&two));
+                // A compensation that failed never reports a write, so what the
+                // pull stored is what history records.
+                let tracked = crate::history::scope::tracked(VAULT).expect("tracked");
+                assert_eq!(
+                    (tracked.before, tracked.after),
+                    (Some(one.clone()), Some(two.clone()))
+                );
+                crate::history::scope::forget(VAULT);
+                Ok(())
+            })
+            .expect("transaction");
+        });
+    }
+
+    #[test]
+    fn a_rollback_is_refused_while_a_removal_that_started_after_its_review_runs() {
+        with_temp_vault_home(|home| {
+            force_file_vault();
+            let dir = home.join("project");
+            std::fs::create_dir_all(&dir).expect("project dir");
+            project_set(&dir, "TOKEN", "leaked");
+            project_set(&dir, "TOKEN", "rotated");
+            let entries = ids(&dir);
+            let (_, plan) = crate::history::review_rollback(&dir, &hex::encode(entries[0]), |_| {
+                Ok(RollbackRequest::Environment {
+                    environment: EnvironmentName::AtPoint("default".to_owned()),
+                    point: Point {
+                        entry: entries[0],
+                        side: RelatedSide::After,
+                    },
+                })
+            })
+            .expect("review");
+            let chosen = ChosenValue {
+                entry: entries[1],
+                environment: "default".to_owned(),
+                key: "TOKEN".to_owned(),
+                side: RelatedSide::Before,
+            };
+            let (_, review) =
+                crate::history::review_forget(&dir, &hex::encode(entries[1]), |_| Ok(chosen))
+                    .expect("review");
+            let vault_id = crate::vault_id::read_vault_id(&dir).expect("vault id");
+            // The removal's first transaction committed, then the client stopped.
+            with_vault_transaction(|directory| {
+                let mut companion = FileCompanion::open(directory)?;
+                let head = companion.read(&head_account(&vault_id))?.expect("head");
+                let key = companion.read(&key_account(&vault_id))?.expect("key");
+                let opened =
+                    Opened::open(&vault_id, &head, &key).map_err(|error| error.to_string())?;
+                let values = crate::fallback::read_all_environments_unlocked(directory, &vault_id)?
+                    .unwrap_or_default();
+                let writes = lpm_env_companion::history::removal::start_removal(
+                    &opened,
+                    &review,
+                    &review.default_selection(),
+                    &values_of(&values),
+                    lpm_env_companion::keyring::Approval::FileStore,
+                    &mut lpm_env_companion::keyring::SystemRandom,
+                )
+                .map_err(|error| error.to_string())?;
+                companion.commit(
+                    writes
+                        .into_iter()
+                        .map(|write| lifecycle::Mutation::Write {
+                            account: write.account,
+                            value: write.bytes,
+                        })
+                        .collect(),
+                )
+            })
+            .expect("start the removal");
+            assert_eq!(
+                crate::history::commit_rollback(&dir, &plan, &Choices::default()),
+                Err(HistoryError::ChangedSinceReview),
+                "the rollback would put back the value being removed"
+            );
+            assert_eq!(stored(&dir, "TOKEN").as_deref(), Some("rotated"));
         });
     }
 
@@ -360,7 +644,7 @@ mod api {
                 HistoryState::Off
             );
             assert_eq!(
-                crate::history::timeline(&dir, &Filter::default()),
+                crate::history::timeline(&dir, &Filter::default(), false),
                 Err(HistoryError::Off)
             );
             crate::set(&dir, &[("A", "2")], &Source::new(Action::Set)).expect("set");

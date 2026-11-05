@@ -401,10 +401,11 @@ impl SecurityFrameworkBackend {
         Ok(Some(Self::claim(&attributes)))
     }
 
-    /// The account names of every item in `service`, from attributes alone,
-    /// which never ask for authentication. Like [`Self::claimed_access`], it
-    /// passes no authentication context.
-    fn account_names(service: &str) -> Result<Vec<String>, KeychainStorageError> {
+    /// The account name of every item in `service`, with the approval its
+    /// attributes claim, from attributes alone, which never ask for
+    /// authentication. Like [`Self::claimed_access`], it passes no
+    /// authentication context.
+    fn accounts(service: &str) -> Result<Vec<(String, ClaimedAccess)>, KeychainStorageError> {
         let mut pairs = Self::identity_pairs(service, "");
         let account_key = unsafe { CFString::wrap_under_get_rule(kSecAttrAccount) };
         pairs.retain(|(key, _)| key != &account_key);
@@ -440,7 +441,7 @@ impl SecurityFrameworkBackend {
                 .find(&account_key)
                 .and_then(|value| value.downcast::<CFString>())
                 .ok_or(KeychainStorageError::VerificationFailed)?;
-            names.push(account.to_string());
+            names.push((account.to_string(), Self::claim(&attributes)));
         }
         Ok(names)
     }
@@ -663,8 +664,10 @@ pub(crate) fn write_bytes(service: &str, account: &str, value: &[u8]) -> Result<
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn account_names(service: &str) -> Result<Vec<String>, String> {
-    SecurityFrameworkBackend::account_names(service).map_err(|error| error.to_string())
+/// Every account in `service` with the approval its attributes claim, in
+/// one attributes-only listing.
+pub(crate) fn accounts_with_access(service: &str) -> Result<Vec<(String, ClaimedAccess)>, String> {
+    SecurityFrameworkBackend::accounts(service).map_err(|error| error.to_string())
 }
 
 /// Read `account` without authentication UI to learn whether it demands user
@@ -1054,10 +1057,17 @@ mod tests {
             Some(ClaimedAccess::Contradictory),
             "a policy LPM doesn't know contradicts itself"
         );
-        let names = account_names(&service)
+        let accounts = accounts_with_access(&service)
             .expect("items that demand user presence never stop the listing");
         for account in ["open", "automatic", "protected", "contradictory"] {
-            assert!(names.iter().any(|name| name == account), "{names:?}");
+            assert_eq!(
+                accounts
+                    .iter()
+                    .find(|(name, _)| name == account)
+                    .map(|(_, claim)| *claim),
+                claimed_access(&service, account).expect("attributes"),
+                "the listing reports {account}'s claim as reading its attributes does"
+            );
         }
     }
 

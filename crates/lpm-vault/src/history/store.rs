@@ -1,10 +1,12 @@
 //! What history needs from a store of companion records, beyond the
 //! journal transactions and names-only inventory every companion store has.
 
+use std::collections::HashSet;
+
 use zeroize::Zeroizing;
 
-use crate::companion::CompanionBackend;
 use crate::companion::account::CompanionAccount;
+use crate::companion::{Checked, CompanionBackend};
 use lpm_env_companion::history::admission::Ring;
 use lpm_env_companion::keyring::Approval;
 
@@ -15,6 +17,51 @@ pub(crate) struct AdmissionInventory {
     pub(crate) count: usize,
     /// The history rings this client can name, for trims.
     pub(crate) rings: Vec<Ring>,
+    /// The rings' projects whose records this client can write without
+    /// asking for approval, which trimming another project's history
+    /// needs. Known from the same listing, with no read per project.
+    pub(crate) trimmable: HashSet<String>,
+}
+
+/// Why a record that follows values couldn't be used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RecordError {
+    /// The store holds it, but its content or access is damaged: Repair
+    /// removes history.
+    Damaged(String),
+    /// The store failed; trying again may work.
+    Store(String),
+}
+
+impl std::fmt::Display for RecordError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Damaged(reason) | Self::Store(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+impl From<String> for RecordError {
+    fn from(error: String) -> Self {
+        Self::Store(error)
+    }
+}
+
+/// One history part's sealed bytes. A part whose content the store can't
+/// read comes back empty, so it reads as an unreadable part, as one that
+/// won't open does.
+pub(crate) fn read_part(
+    store: &mut impl HistoryStore,
+    vault_id: &str,
+    part: u16,
+) -> Result<Option<Vec<u8>>, String> {
+    Ok(
+        match store.read_checked(&lpm_env_companion::history::part_account(vault_id, part))? {
+            Checked::Present(sealed) => Some(sealed),
+            Checked::Absent => None,
+            Checked::Unreadable(_) => Some(Vec::new()),
+        },
+    )
 }
 
 pub(crate) trait HistoryStore: CompanionBackend {
@@ -24,7 +71,7 @@ pub(crate) trait HistoryStore: CompanionBackend {
     fn read_following_values(
         &mut self,
         account: &CompanionAccount,
-    ) -> Result<Option<Zeroizing<Vec<u8>>>, String>;
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, RecordError>;
 
     /// Replace one record outside the journal, verified, with the access its
     /// kind takes: the values item's for records that follow values.
@@ -44,8 +91,4 @@ pub(crate) trait HistoryStore: CompanionBackend {
     /// The values item's access, verified by a probe when its claim needs
     /// one; `None` when the Keychain is unavailable, so nothing is known.
     fn verified_approval(&mut self, vault_id: &str) -> Result<Option<Approval>, String>;
-
-    /// Whether this client can write `vault_id`'s records without asking
-    /// for approval, which trimming another project's history needs.
-    fn writes_without_prompt(&mut self, vault_id: &str) -> Result<bool, String>;
 }

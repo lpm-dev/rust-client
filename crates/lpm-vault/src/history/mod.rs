@@ -41,20 +41,23 @@ macro_rules! with_history_store {
 mod api;
 
 pub use api::{
-    ChosenValue, HistoryError, HistoryState, HistoryStatus, RollbackRequest, commit_rollback,
-    forget, resolve_entry, reveal, review_forget, review_rollback, show, status, timeline,
-    turn_off, turn_on,
+    ChosenValue, EnvironmentName, HistoryError, HistoryState, HistoryStatus, Listing, Paused,
+    RollbackRequest, Shown, commit_rollback, forget, review_forget, review_rollback, show, status,
+    timeline, turn_off, turn_on,
 };
+pub use lpm_env_companion::history::codec::Flags;
 pub use lpm_env_companion::history::read::{
-    EntryInfo, EntryLookup, EnvironmentInfo, EnvironmentKindInfo, Filter, KeyInfo, KeyKindInfo,
-    KeyMatch, KeysInfo, LiveGap, RemoteInfo, RevealedEntry, RevealedValues, SideInfo, SourceGroup,
-    Timeline, TimelineRow,
+    DetailInfo, EntryInfo, EntryLookup, EnvironmentInfo, EnvironmentKindInfo, Filter, KeyInfo,
+    KeyKindInfo, KeyMatch, KeysInfo, LiveGap, RemoteInfo, RevealedEntry, RevealedValues, SideInfo,
+    SourceGroup, Timeline, TimelineRow,
 };
 pub use lpm_env_companion::history::rebuild::{
-    Choices, EnvironmentPlan, Gap, Point, Pulled, RemoteName, RollbackKind, RollbackPlan, Row,
-    TargetValue, UnknownReason,
+    Binding, Choices, EnvironmentPlan, Gap, Point, Pulled, RemoteName, RollbackKind, RollbackPlan,
+    Row, TargetValue, UnknownReason,
 };
 pub use lpm_env_companion::history::removal::{Occurrence, Place, PlaceGroup, RemovalReview};
+/// The wiped buffer past values come back in.
+pub use zeroize::Zeroizing;
 
 /// Where a pull came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,8 +147,8 @@ impl NotRecorded {
         match self {
             Self::Damaged => "damaged",
             Self::Limit => "limit",
-            Self::TooManyValues => "tooManyValues",
-            Self::NewerVersion => "newerVersion",
+            Self::TooManyValues => "too_many_values",
+            Self::NewerVersion => "newer_version",
             Self::Unavailable => "unavailable",
             Self::Failed(_) => "storage",
         }

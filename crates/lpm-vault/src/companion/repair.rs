@@ -3,12 +3,12 @@
 //! The engine decides what's damaged and how each damage is repaired; a
 //! repair runs only against the state the person reviewed.
 
-use super::CompanionBackend;
 use super::account::CompanionAccount;
 use super::assessment::{Observed, Repair, assess};
 use super::lifecycle::{FoundMarker, execute, plan_discard};
 use super::marker::Marker;
 use super::overrides::OVERRIDES_KIND;
+use super::{Checked, CompanionBackend};
 
 /// What's damaged in a project's newer data, and how each problem is
 /// repaired, in the order the engine found them.
@@ -114,7 +114,7 @@ pub(crate) fn review(
         })?),
     };
     let history = match (unfinished, marker.as_deref()) {
-        (None, Some(bytes)) => history_damage(backend, vault_id, bytes),
+        (None, Some(bytes)) => history_damage(backend, vault_id, bytes)?,
         _ => Vec::new(),
     };
     let assessment = assess(
@@ -145,50 +145,63 @@ pub(crate) fn review(
 }
 
 /// What's wrong with local history's records beyond what the listing shows,
-/// while the marker has history v1 on.
+/// while the marker has history v1 on. A record the store holds but can't
+/// read is damage; a store that failed fails the review, so a locked
+/// Keychain or a cancelled prompt never offers to delete history.
 fn history_damage(
     backend: &mut impl CompanionBackend,
     vault_id: &str,
     marker: &[u8],
-) -> Vec<super::gate::Damage> {
+) -> Result<Vec<super::gate::Damage>, String> {
     use lpm_env_companion::history::switch::MarkerHistory;
+    use lpm_env_companion::history::{head_account, key_account, part_account};
     let Ok(marker) = Marker::parse(vault_id, marker) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     if MarkerHistory::of(Some(&marker)) != MarkerHistory::On {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    // On the file store a corrupt entry fails to open as a read error, so a
-    // history record that won't read is damage like one that won't parse.
-    let unreadable = |kind: &str, error: String| super::gate::Damage::InvalidRecord {
+    let unreadable = |kind: &str, reason: String| super::gate::Damage::InvalidRecord {
         kind: kind.to_owned(),
-        reason: format!("it can't be read: {error}"),
+        reason: format!("it can't be read: {reason}"),
     };
-    let head = match backend.read(&lpm_env_companion::history::head_account(vault_id)) {
-        Ok(head) => head,
-        Err(error) => return vec![unreadable("history-head", error)],
+    let failed = |error: String| format!("local history couldn't be read: {error}");
+    let head = match backend
+        .read_checked(&head_account(vault_id))
+        .map_err(failed)?
+    {
+        Checked::Present(head) => Some(head),
+        Checked::Absent => None,
+        Checked::Unreadable(reason) => return Ok(vec![unreadable("history-head", reason)]),
     };
-    let key = match backend.read(&lpm_env_companion::history::key_account(vault_id)) {
-        Ok(key) => zeroize::Zeroizing::new(key),
-        Err(error) => return vec![unreadable("key", error)],
+    let key = match backend
+        .read_checked(&key_account(vault_id))
+        .map_err(failed)?
+    {
+        Checked::Present(key) => Some(zeroize::Zeroizing::new(key)),
+        Checked::Absent => None,
+        Checked::Unreadable(reason) => return Ok(vec![unreadable("key", reason)]),
     };
-    let mut tail_error = None;
-    let mut damage = lpm_env_companion::history::read::check_records(
+    let mut failure = None;
+    let damage = lpm_env_companion::history::read::check_records(
         vault_id,
         head.as_deref(),
-        key.as_deref(),
-        |part| match backend.read(&lpm_env_companion::history::part_account(vault_id, part)) {
-            Ok(sealed) => sealed,
+        key.as_deref().map(Vec::as_slice),
+        |part| match backend.read_checked(&part_account(vault_id, part)) {
+            Ok(Checked::Present(sealed)) => Some(sealed),
+            Ok(Checked::Absent) => None,
+            // Content that won't decrypt won't open as a part either.
+            Ok(Checked::Unreadable(_)) => Some(Vec::new()),
             Err(error) => {
-                tail_error = Some(error);
+                failure.get_or_insert(error);
                 None
             }
         },
     );
-    if let Some(error) = tail_error {
-        damage.push(unreadable("history", error));
+    match failure {
+        Some(error) => Err(failed(error)),
+        None => Ok(damage),
     }
-    damage
 }
 
 /// Run every repair `reviewed` lists, after checking `vault_id` still shows

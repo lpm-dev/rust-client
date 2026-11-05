@@ -3,6 +3,7 @@
 //! what its last write stored. The change is recorded when the outermost
 //! lock ends, still inside it, after the operation's last durable step.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
@@ -18,6 +19,9 @@ pub(crate) struct Tracked {
     pub(crate) before: Option<EnvironmentMap>,
     /// What the scope's last write stored.
     pub(crate) after: Option<EnvironmentMap>,
+    /// Environments the scope renamed, as (old name, new name), so the
+    /// entry records a rename rather than a removal and a creation.
+    pub(crate) environment_renames: Vec<(String, String)>,
 }
 
 thread_local! {
@@ -59,6 +63,7 @@ pub(crate) fn begin(vault_id: &str, source: &Source) -> Recording {
                 source: source.clone(),
                 before: None,
                 after: None,
+                environment_renames: Vec::new(),
             });
         }
     });
@@ -68,13 +73,39 @@ pub(crate) fn begin(vault_id: &str, source: &Source) -> Recording {
 }
 
 /// A values read inside the lock: the first one for a project being written
-/// is its "before".
+/// is its "before". The caller keeps its own values, so they're copied,
+/// only when this is that first read.
 pub(crate) fn observe_read(vault_id: &str, environments: Option<&EnvironmentMap>) {
     SCOPE.with_borrow_mut(|scope| {
         if let Some(tracked) = scope.as_mut().and_then(|scope| scope.get_mut(vault_id))
             && tracked.before.is_none()
         {
             tracked.before = Some(environments.cloned().unwrap_or_default());
+        }
+    });
+}
+
+/// A values read only history needed: the values move into the scope.
+pub(crate) fn observe_owned_read(vault_id: &str, environments: Option<EnvironmentMap>) {
+    SCOPE.with_borrow_mut(|scope| {
+        if let Some(tracked) = scope.as_mut().and_then(|scope| scope.get_mut(vault_id))
+            && tracked.before.is_none()
+        {
+            tracked.before = Some(environments.unwrap_or_default());
+        }
+    });
+}
+
+/// Record that the write `recording` declared renames `from` to `to`.
+pub(crate) fn renamed_environment(recording: &Recording, from: &str, to: &str) {
+    SCOPE.with_borrow_mut(|scope| {
+        if let Some(tracked) = scope
+            .as_mut()
+            .and_then(|scope| scope.get_mut(&recording.vault_id))
+        {
+            tracked
+                .environment_renames
+                .push((from.to_owned(), to.to_owned()));
         }
     });
 }
@@ -101,14 +132,21 @@ pub(crate) fn forget(vault_id: &str) {
     });
 }
 
-/// A values write that succeeded.
-pub(crate) fn committed(recording: &Recording, after: &EnvironmentMap) {
+/// A values write that succeeded. A writer that's done with its values
+/// passes them owned, so they move into the scope instead of being copied.
+pub(crate) fn committed(recording: &Recording, after: Cow<'_, EnvironmentMap>) {
     SCOPE.with_borrow_mut(|scope| {
         if let Some(tracked) = scope
             .as_mut()
             .and_then(|scope| scope.get_mut(&recording.vault_id))
         {
-            tracked.after = Some(after.clone());
+            tracked.after = Some(after.into_owned());
         }
     });
+}
+
+/// What the scope tracks for `vault_id` so far.
+#[cfg(test)]
+pub(crate) fn tracked(vault_id: &str) -> Option<Tracked> {
+    SCOPE.with_borrow(|scope| scope.as_ref()?.get(vault_id).cloned())
 }

@@ -28,6 +28,25 @@ use marker::Marker;
 pub(crate) trait CompanionBackend: LifecycleStore {
     /// The companion records and staged records of `vault_id`, by name only.
     fn inventory(&mut self, vault_id: &str) -> Result<Vec<CompanionAccount>, String>;
+
+    /// One record, for a damage check: content the store holds but can't
+    /// read is told apart from a store that failed, which may work when
+    /// tried again and so is never damage.
+    fn read_checked(&mut self, account: &CompanionAccount) -> Result<Checked, String> {
+        Ok(match self.read(account)? {
+            Some(bytes) => Checked::Present(bytes),
+            None => Checked::Absent,
+        })
+    }
+}
+
+/// A record as a damage check found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Checked {
+    Present(Vec<u8>),
+    Absent,
+    /// The store holds it, but its content won't read.
+    Unreadable(String),
 }
 
 thread_local! {

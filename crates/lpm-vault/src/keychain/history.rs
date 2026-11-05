@@ -10,13 +10,22 @@ use crate::companion::CompanionBackend;
 use crate::companion::account::CompanionAccount;
 use crate::companion::graph::{AccessClass, record_access_class};
 use crate::companion::lifecycle::{LifecycleStore, Mutation};
-use crate::history::store::{AdmissionInventory, HistoryStore};
+use crate::history::store::{AdmissionInventory, HistoryStore, RecordError};
 use lpm_env_companion::history::admission;
 use lpm_env_companion::keyring::Approval;
 
-/// The Keychain as history's store, listing the service at most once.
-pub(crate) struct KeychainHistory<'storage> {
-    storage: ListedStorage<'storage, KeychainProjectStorage>,
+/// The Keychain as history's store, listing the service, and learning each
+/// item's claimed approval, at most once.
+pub(crate) struct KeychainHistory<'storage, S: ProjectStorage = KeychainProjectStorage> {
+    storage: ListedStorage<'storage, S>,
+}
+
+impl<'storage, S: ProjectStorage> KeychainHistory<'storage, S> {
+    pub(super) fn new(storage: &'storage mut S) -> Self {
+        Self {
+            storage: ListedStorage::new(storage),
+        }
+    }
 }
 
 /// Run `run` against the Keychain inside the caller's lock. It returns a
@@ -26,13 +35,10 @@ pub(crate) fn history_store<T>(
     run: impl FnOnce(&mut KeychainHistory<'_>) -> T,
 ) -> Result<T, String> {
     let mut storage = KeychainProjectStorage;
-    let mut history = KeychainHistory {
-        storage: ListedStorage::new(&mut storage),
-    };
-    Ok(run(&mut history))
+    Ok(run(&mut KeychainHistory::new(&mut storage)))
 }
 
-impl LifecycleStore for KeychainHistory<'_> {
+impl<S: ProjectStorage> LifecycleStore for KeychainHistory<'_, S> {
     fn read(&mut self, account: &CompanionAccount) -> Result<Option<Vec<u8>>, String> {
         KeychainCompanion(&mut self.storage).read(account)
     }
@@ -42,17 +48,17 @@ impl LifecycleStore for KeychainHistory<'_> {
     }
 }
 
-impl CompanionBackend for KeychainHistory<'_> {
+impl<S: ProjectStorage> CompanionBackend for KeychainHistory<'_, S> {
     fn inventory(&mut self, vault_id: &str) -> Result<Vec<CompanionAccount>, String> {
         KeychainCompanion(&mut self.storage).inventory(vault_id)
     }
 }
 
-impl HistoryStore for KeychainHistory<'_> {
+impl<S: ProjectStorage> HistoryStore for KeychainHistory<'_, S> {
     fn read_following_values(
         &mut self,
         account: &CompanionAccount,
-    ) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, RecordError> {
         read_following_values(&mut self.storage, account)
     }
 
@@ -64,8 +70,8 @@ impl HistoryStore for KeychainHistory<'_> {
         self.storage.delete(&account.name()).map(|_| ())
     }
 
-    fn admission_inventory(&mut self, _vault_id: &str) -> Result<AdmissionInventory, String> {
-        admission_inventory(&mut self.storage)
+    fn admission_inventory(&mut self, vault_id: &str) -> Result<AdmissionInventory, String> {
+        admission_inventory(&mut self.storage, vault_id)
     }
 
     fn claimed_approval(&mut self, vault_id: &str) -> Result<Approval, String> {
@@ -75,16 +81,12 @@ impl HistoryStore for KeychainHistory<'_> {
     fn verified_approval(&mut self, vault_id: &str) -> Result<Option<Approval>, String> {
         verified_approval(&mut self.storage, vault_id)
     }
-
-    fn writes_without_prompt(&mut self, vault_id: &str) -> Result<bool, String> {
-        Ok(claimed_approval(&mut self.storage, vault_id)? == Approval::Automatic)
-    }
 }
 
 pub(super) fn read_following_values(
     storage: &mut impl ProjectStorage,
     account: &CompanionAccount,
-) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
+) -> Result<Option<Zeroizing<Vec<u8>>>, RecordError> {
     let name = account.name();
     let Some((bytes, access)) = storage.read_with_access(&name)? else {
         return Ok(None);
@@ -92,10 +94,10 @@ pub(super) fn read_following_values(
     let bytes = Zeroizing::new(bytes);
     match access {
         ClaimedAccess::Contradictory => {
-            return Err(format!(
+            return Err(RecordError::Damaged(format!(
                 "local history's {} record has approval attributes that contradict each other",
                 account.kind().unwrap_or("marker")
-            ));
+            )));
         }
         ClaimedAccess::Automatic
             if storage.claimed_access(account.vault_id())?
@@ -131,18 +133,42 @@ pub(super) fn replace(
     }
 }
 
+/// The service's records for admission, and which rings this client can
+/// trim without a prompt: its own, and those whose values item claims no
+/// approval, or is gone. One listing, with no read per project.
 pub(super) fn admission_inventory(
     storage: &mut impl ProjectStorage,
+    vault_id: &str,
 ) -> Result<AdmissionInventory, String> {
-    let accounts: Vec<CompanionAccount> = storage
-        .account_names()?
+    let listed = storage.accounts_with_access()?;
+    let mut claims: std::collections::HashMap<&str, ClaimedAccess> =
+        std::collections::HashMap::with_capacity(listed.len());
+    let mut accounts: Vec<CompanionAccount> = Vec::with_capacity(listed.len());
+    for (name, claim) in &listed {
+        match CompanionAccount::parse(name) {
+            Some(CompanionAccount::Marker { .. }) => {}
+            Some(account) => accounts.push(account),
+            None => {
+                claims.insert(name.as_str(), *claim);
+            }
+        }
+    }
+    let rings = admission::rings(&accounts);
+    let trimmable = rings
         .iter()
-        .filter_map(|name| CompanionAccount::parse(name))
-        .filter(|account| !matches!(account, CompanionAccount::Marker { .. }))
+        .filter(|ring| {
+            ring.vault_id == vault_id
+                || matches!(
+                    claims.get(ring.vault_id.as_str()),
+                    None | Some(ClaimedAccess::Automatic)
+                )
+        })
+        .map(|ring| ring.vault_id.clone())
         .collect();
     Ok(AdmissionInventory {
         count: accounts.len(),
-        rings: admission::rings(&accounts),
+        rings,
+        trimmable,
     })
 }
 

@@ -715,12 +715,22 @@ pub(crate) fn read_all_environments_with_digest_unlocked(
     directory: &crate::storage_transaction::VaultStorageDirectory,
     vault_id: &str,
 ) -> Result<(Option<EnvironmentMap>, Option<[u8; 32]>), String> {
+    let (environments, digest) = read_environments_with_digest(directory, vault_id)?;
+    crate::history::scope::observe_read(vault_id, environments.as_ref());
+    Ok((environments, digest))
+}
+
+/// A project's values and their payload digest, which history doesn't see:
+/// the caller says what its operation read.
+fn read_environments_with_digest(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+) -> Result<(Option<EnvironmentMap>, Option<[u8; 32]>), String> {
     use sha2::Digest as _;
 
     crate::authorize_companion(directory, vault_id, Operation::ReadExcludingOverrides)?;
     let vaults = directory.open_or_create_directory("vaults")?;
     let Some((name, content)) = read_vault_content(&vaults, vault_id)? else {
-        crate::history::scope::observe_read(vault_id, None);
         return Ok((None, None));
     };
     let digest = sha2::Sha256::digest(&content).into();
@@ -739,7 +749,6 @@ pub(crate) fn read_all_environments_with_digest_unlocked(
 
     let environments = crate::selected_environment::parse_all(&json)
         .map_err(|error| format!("vault payload is invalid: {error}"))?;
-    crate::history::scope::observe_read(vault_id, Some(&environments));
     Ok((Some(environments), Some(digest)))
 }
 
@@ -787,11 +796,26 @@ pub(crate) fn write_all_environments_unlocked(
     environments: &EnvironmentMap,
     recording: &crate::history::scope::Recording,
 ) -> Result<(), String> {
+    commit_environments(
+        directory,
+        vault_id,
+        std::borrow::Cow::Borrowed(environments),
+        recording,
+    )
+}
+
+fn commit_environments(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+    environments: std::borrow::Cow<'_, EnvironmentMap>,
+    recording: &crate::history::scope::Recording,
+) -> Result<(), String> {
     crate::authorize_companion(directory, vault_id, Operation::Write)?;
     if crate::history::scope::needs_before(recording) {
-        read_all_environments_unlocked(directory, vault_id)?;
+        let before = read_environments_with_digest(directory, vault_id)?.0;
+        crate::history::scope::observe_owned_read(vault_id, before);
     }
-    let json = crate::selected_environment::serialize(environments)?;
+    let json = crate::selected_environment::serialize(&environments)?;
     let encrypted =
         encrypt_with_store_unlocked(directory, vault_id, &json, &KeyringNativeDataKeyStore)?;
     let vaults = directory.open_or_create_directory("vaults")?;
@@ -827,7 +851,12 @@ pub(crate) fn mutate_vault_file_env<T>(
         let mut environments =
             read_all_environments_unlocked(directory, vault_id)?.unwrap_or_default();
         let result = operation(environments.entry(env.to_owned()).or_default());
-        write_all_environments_unlocked(directory, vault_id, &environments, &recording)?;
+        commit_environments(
+            directory,
+            vault_id,
+            std::borrow::Cow::Owned(environments),
+            &recording,
+        )?;
         Ok(result)
     })
 }

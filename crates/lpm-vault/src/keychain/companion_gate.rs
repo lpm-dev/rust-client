@@ -31,9 +31,10 @@ impl<S: ProjectStorage> LifecycleStore for KeychainCompanion<'_, S> {
 
 impl<S: ProjectStorage> CompanionBackend for KeychainCompanion<'_, S> {
     fn inventory(&mut self, vault_id: &str) -> Result<Vec<CompanionAccount>, String> {
+        let encoded = lpm_env_companion::account::encode_vault_id(vault_id);
         Ok(self
             .0
-            .account_names()?
+            .account_names_containing(&encoded)?
             .iter()
             .filter_map(|name| CompanionAccount::parse(name))
             .filter(|account| {
