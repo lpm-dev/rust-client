@@ -1298,6 +1298,25 @@ async fn audit_osv_outage_exits_nonzero_without_clean_summary() {
 }
 
 #[tokio::test]
+async fn workflow_commands_reach_no_real_osv_service_unless_a_test_points_them_at_one() {
+    let project = TempProject::empty(
+        r#"{"name":"osv-isolation","version":"1.0.0","dependencies":{"clean-pkg":"1.0.0"}}"#,
+    );
+    let mock = MockRegistry::start().await;
+    install_one(&project, &mock, "clean-pkg").await;
+
+    let out = lpm_with_registry(&project, &mock.url())
+        .args(["--json", "audit"])
+        .output()
+        .unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        envelope["osv_degraded"], true,
+        "without a mock, OSV must be unreachable rather than api.osv.dev: {envelope}"
+    );
+}
+
+#[tokio::test]
 async fn audit_osv_timeout_reports_an_incomplete_scan() {
     let project = TempProject::empty(
         r#"{"name":"osv-timeout","version":"1.0.0","dependencies":{"clean-pkg":"1.0.0"}}"#,
