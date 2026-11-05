@@ -5,13 +5,19 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The companion storage contract the LPM CLI and the LPM Vault app share: account names, the feature marker, the operation matrix, personal overrides and lifecycle plans"
+description = "The companion storage contract the LPM CLI and the LPM Vault app share: account names, the feature marker, the operation matrix, personal overrides, lifecycle plans and local history"
 
 [dependencies]
 base64 = { workspace = true }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["zeroize"] }
+getrandom = "0.4"
+hkdf = { workspace = true }
+hmac = { workspace = true, features = ["zeroize"] }
 lpm-common = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true, features = ["zeroize"] }
+zeroize = { version = "1", features = ["std"] }
 
 [lints]
 workspace = true

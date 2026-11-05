@@ -42,7 +42,7 @@ impl SurfaceBaseline {
     }
 }
 
-pub const EXPECTED_SURFACE_COUNT: usize = 178;
+pub const EXPECTED_SURFACE_COUNT: usize = 180;
 
 pub const EXPECTED_COMMAND_VARIANTS: &[&str] = &[
     "Info",
@@ -2244,6 +2244,34 @@ pub const SURFACES: &[SurfaceBaseline] = &[
         references: &[
             "crates/lpm-cli/src/commands/deprecate.rs",
             "tests/workflows/tests/package_changes.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 179,
+        name: "`lpm env history / history show / status / on / off / forget`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/env/history.rs",
+            "crates/lpm-vault/src/history/tests.rs",
+            "tests/workflows/tests/env_history.rs",
+        ],
+    },
+    SurfaceBaseline {
+        id: 180,
+        name: "`lpm env rollback`",
+        unit: true,
+        integration: false,
+        workflow: true,
+        cli_binary: false,
+        json_contract: JsonContractStatus::Covered,
+        references: &[
+            "crates/lpm-cli/src/commands/env/history.rs",
+            "crates/lpm-env-companion/src/history/rebuild/tests.rs",
+            "tests/workflows/tests/env_history.rs",
         ],
     },
 ];

@@ -23,6 +23,9 @@ use crate::macos_keychain::{
 };
 
 mod companion_gate;
+mod history;
+
+pub(crate) use history::history_store;
 
 type SecretMap = HashMap<String, String>;
 type EnvironmentMap = HashMap<String, SecretMap>;
@@ -93,10 +96,12 @@ struct ProjectEnvironmentSummary {
 mod validated_vault_payload {
     use super::ProjectEnvironmentSummary;
 
+    /// A values payload ready to write. The serialized values are wiped
+    /// when it's dropped.
     #[derive(Clone)]
     pub(super) struct ValidatedVaultPayload {
         vault_id: String,
-        encoded: String,
+        encoded: zeroize::Zeroizing<String>,
         environment_summaries: Vec<ProjectEnvironmentSummary>,
     }
 
@@ -110,14 +115,14 @@ mod validated_vault_payload {
             let environment_summaries = super::project_environment_summaries(encoded)?;
             Ok(Self {
                 vault_id: vault_id.to_owned(),
-                encoded: encoded.to_owned(),
+                encoded: zeroize::Zeroizing::new(encoded.to_owned()),
                 environment_summaries,
             })
         }
 
         pub(super) fn from_serialized_environments(
             vault_id: &str,
-            encoded: String,
+            encoded: zeroize::Zeroizing<String>,
             environments: &super::EnvironmentMap,
         ) -> Result<Self, String> {
             super::validate_vault_id(vault_id)?;
@@ -129,6 +134,11 @@ mod validated_vault_payload {
                 encoded,
                 environment_summaries: super::environment_summaries(environments),
             })
+        }
+
+        #[cfg(test)]
+        pub(super) fn encoded_buffer(&self) -> &zeroize::Zeroizing<String> {
+            &self.encoded
         }
 
         pub(super) fn vault_id(&self) -> &str {
@@ -169,17 +179,24 @@ struct ProjectDiscoverySnapshot {
 }
 
 #[derive(Clone)]
+/// A change a journal transaction makes. Written bytes are wiped when
+/// dropped: they're values or companion records.
 enum ProjectStorageMutation {
-    Write { account: String, value: Vec<u8> },
+    Write {
+        account: String,
+        value: zeroize::Zeroizing<Vec<u8>>,
+    },
     ValidatedVaultWrite(ValidatedVaultPayload),
-    Delete { account: String },
+    Delete {
+        account: String,
+    },
 }
 
 impl ProjectStorageMutation {
     fn write(account: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
         Self::Write {
             account: account.into(),
-            value: value.into(),
+            value: zeroize::Zeroizing::new(value.into()),
         }
     }
 
@@ -242,12 +259,35 @@ struct TransactionJournalOperation {
     operation_sha256: String,
 }
 
-trait ProjectStorage {
+pub(crate) trait ProjectStorage {
     fn read(&mut self, account: &str) -> Result<Option<Vec<u8>>, String>;
     fn write(&mut self, account: &str, value: &[u8]) -> Result<(), String>;
     fn delete(&mut self, account: &str) -> Result<bool, String>;
+    /// Every account in the service with the approval its attributes claim,
+    /// from one attributes-only listing.
+    fn accounts_with_access(&mut self) -> Result<Vec<(String, ClaimedAccess)>, String>;
     /// Every account name in the service, from attributes alone.
-    fn account_names(&mut self) -> Result<Vec<String>, String>;
+    fn account_names(&mut self) -> Result<Vec<String>, String> {
+        self.accounts_with_access()
+            .map(|accounts| accounts.into_iter().map(|(name, _)| name).collect())
+    }
+    /// Visit every account in the service with the approval its attributes
+    /// claim, from one attributes-only listing.
+    fn for_each_account(
+        &mut self,
+        visit: &mut dyn FnMut(&str, ClaimedAccess),
+    ) -> Result<(), String> {
+        for (name, claim) in self.accounts_with_access()? {
+            visit(&name, claim);
+        }
+        Ok(())
+    }
+    /// The account names that contain `needle`, from attributes alone.
+    fn account_names_containing(&mut self, needle: &str) -> Result<Vec<String>, String> {
+        let mut names = self.account_names()?;
+        names.retain(|name| name.contains(needle));
+        Ok(names)
+    }
     /// An item's data with the CLI approval its attributes claim.
     fn read_with_access(
         &mut self,
@@ -289,26 +329,46 @@ trait ProjectStorage {
     }
 }
 
-/// A project storage that lists the service once and keeps that listing
-/// current through the writes and deletions it makes, for the several
-/// transactions of one lifecycle operation inside one lock.
+/// A project storage that lists the service once, and learns each item's
+/// claimed approval once, keeping both current through the writes and
+/// deletions it makes, for the several transactions of one operation inside
+/// one lock. Nothing else writes the service while the lock is held.
 struct ListedStorage<'storage, S: ProjectStorage> {
     storage: &'storage mut S,
-    names: Option<HashSet<String>>,
+    /// Every account and its claim from one listing; `None` for an account
+    /// this storage wrote since, whose claim isn't known.
+    listing: Option<HashMap<String, Option<ClaimedAccess>>>,
+    /// Claims learned without a listing; `None` for an absent item.
+    claims: HashMap<String, Option<ClaimedAccess>>,
 }
 
 impl<'storage, S: ProjectStorage> ListedStorage<'storage, S> {
     fn new(storage: &'storage mut S) -> Self {
         Self {
             storage,
-            names: None,
+            listing: None,
+            claims: HashMap::new(),
         }
     }
 
     fn wrote(&mut self, account: &str) {
-        if let Some(names) = self.names.as_mut() {
-            names.insert(account.to_owned());
+        self.claims.remove(account);
+        if let Some(listing) = self.listing.as_mut() {
+            listing.insert(account.to_owned(), None);
         }
+    }
+
+    fn listing(&mut self) -> Result<&HashMap<String, Option<ClaimedAccess>>, String> {
+        if self.listing.is_none() {
+            let accounts = self.storage.accounts_with_access()?;
+            self.listing = Some(
+                accounts
+                    .into_iter()
+                    .map(|(name, claim)| (name, Some(claim)))
+                    .collect(),
+            );
+        }
+        Ok(self.listing.as_ref().expect("listed above"))
     }
 }
 
@@ -325,33 +385,91 @@ impl<S: ProjectStorage> ProjectStorage for ListedStorage<'_, S> {
 
     fn delete(&mut self, account: &str) -> Result<bool, String> {
         let deleted = self.storage.delete(account);
-        if deleted.is_ok()
-            && let Some(names) = self.names.as_mut()
-        {
-            names.remove(account);
+        if deleted.is_ok() {
+            self.claims.insert(account.to_owned(), None);
+            if let Some(listing) = self.listing.as_mut() {
+                listing.remove(account);
+            }
         }
         deleted
     }
 
+    fn accounts_with_access(&mut self) -> Result<Vec<(String, ClaimedAccess)>, String> {
+        let unknown: Vec<String> = self
+            .listing()?
+            .iter()
+            .filter(|(_, claim)| claim.is_none())
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in unknown {
+            let claim = self.storage.claimed_access(&name)?;
+            if let Some(listing) = self.listing.as_mut() {
+                match claim {
+                    Some(claim) => listing.insert(name, Some(claim)),
+                    None => listing.remove(&name),
+                };
+            }
+        }
+        Ok(self
+            .listing()?
+            .iter()
+            .filter_map(|(name, claim)| claim.map(|claim| (name.clone(), claim)))
+            .collect())
+    }
+
     fn account_names(&mut self) -> Result<Vec<String>, String> {
-        let names = match &mut self.names {
-            Some(names) => names,
-            None => self
-                .names
-                .insert(self.storage.account_names()?.into_iter().collect()),
-        };
-        Ok(names.iter().cloned().collect())
+        Ok(self.listing()?.keys().cloned().collect())
+    }
+
+    fn for_each_account(
+        &mut self,
+        visit: &mut dyn FnMut(&str, ClaimedAccess),
+    ) -> Result<(), String> {
+        let unknown = self.listing()?.values().any(Option::is_none);
+        if unknown {
+            self.accounts_with_access()?;
+        }
+        for (name, claim) in self.listing()? {
+            if let Some(claim) = claim {
+                visit(name, *claim);
+            }
+        }
+        Ok(())
+    }
+
+    fn account_names_containing(&mut self, needle: &str) -> Result<Vec<String>, String> {
+        Ok(self
+            .listing()?
+            .keys()
+            .filter(|name| name.contains(needle))
+            .cloned()
+            .collect())
     }
 
     fn read_with_access(
         &mut self,
         account: &str,
     ) -> Result<Option<(Vec<u8>, ClaimedAccess)>, String> {
-        self.storage.read_with_access(account)
+        let read = self.storage.read_with_access(account)?;
+        self.claims
+            .insert(account.to_owned(), read.as_ref().map(|(_, claim)| *claim));
+        Ok(read)
     }
 
     fn claimed_access(&mut self, account: &str) -> Result<Option<ClaimedAccess>, String> {
-        self.storage.claimed_access(account)
+        if let Some(claim) = self.claims.get(account) {
+            return Ok(*claim);
+        }
+        if let Some(listing) = &self.listing {
+            match listing.get(account) {
+                Some(Some(claim)) => return Ok(Some(*claim)),
+                None => return Ok(None),
+                Some(None) => {}
+            }
+        }
+        let claim = self.storage.claimed_access(account)?;
+        self.claims.insert(account.to_owned(), claim);
+        Ok(claim)
     }
 
     fn probe(&mut self, account: &str, open_accounts: &[&str]) -> ProbeOutcome {
@@ -415,7 +533,7 @@ pub(crate) fn recover_project_transaction_unlocked() -> Result<(), String> {
     recover_project_transaction(&mut KeychainProjectStorage).map(|_| ())
 }
 
-struct KeychainProjectStorage;
+pub(crate) struct KeychainProjectStorage;
 
 impl ProjectStorage for KeychainProjectStorage {
     fn read(&mut self, account: &str) -> Result<Option<Vec<u8>>, String> {
@@ -456,8 +574,8 @@ impl ProjectStorage for KeychainProjectStorage {
             .map(|outcome| outcome == crate::macos_keychain::KeychainDeleteOutcome::Deleted)
     }
 
-    fn account_names(&mut self) -> Result<Vec<String>, String> {
-        crate::macos_keychain::account_names(&service())
+    fn accounts_with_access(&mut self) -> Result<Vec<(String, ClaimedAccess)>, String> {
+        crate::macos_keychain::accounts_with_access(&service())
     }
 
     fn read_with_access(
@@ -667,37 +785,49 @@ fn verified_values_access(
     vault_id: &str,
     written_in_transaction: bool,
 ) -> Result<CliAccess, String> {
+    probe_values_access(storage, vault_id, written_in_transaction)?.ok_or_else(|| {
+        "the macOS Keychain is unavailable, so env approval couldn't be confirmed; retry once the Mac is unlocked"
+            .to_owned()
+    })
+}
+
+/// [`verified_values_access`], with `None` when the Keychain is unavailable,
+/// so nothing about the values item's access can be concluded.
+fn probe_values_access(
+    storage: &mut impl ProjectStorage,
+    vault_id: &str,
+    written_in_transaction: bool,
+) -> Result<Option<CliAccess>, String> {
     let marker = crate::companion::account::marker_account(vault_id);
     let open = [PROJECT_INDEX_MARKER_ACCOUNT, marker.as_str()];
-    match storage.probe(vault_id, &open) {
+    Ok(Some(match storage.probe(vault_id, &open) {
         // A weak item that claims approval gets the approval it claims, and
         // passes approval on, never its weakness.
         ProbeOutcome::Automatic => match storage.claimed_access(vault_id)? {
-            Some(ClaimedAccess::Automatic) | None => Ok(CliAccess::Automatic),
+            Some(ClaimedAccess::Automatic) | None => CliAccess::Automatic,
             Some(ClaimedAccess::RequireApproval) => {
                 storage.require_approval(vault_id, &open)?;
                 tracing::warn!(
                     "this env project's values claimed CLI approval that the macOS Keychain wasn't enforcing; LPM now requires it, as they claimed"
                 );
-                Ok(CliAccess::RequireApproval)
+                CliAccess::RequireApproval
             }
             Some(ClaimedAccess::Contradictory) => {
                 tracing::warn!(
                     "this env project's values have approval attributes that contradict each other, so its newer data is stored with approval; switch the project's CLI approval in LPM Vault to set it again"
                 );
-                Ok(CliAccess::RequireApproval)
+                CliAccess::RequireApproval
             }
         },
-        ProbeOutcome::Protected => Ok(CliAccess::RequireApproval),
-        ProbeOutcome::Absent if written_in_transaction => Ok(CliAccess::Automatic),
-        ProbeOutcome::Absent => Err(format!(
-            "env project {vault_id} has no values, so its newer data can't be written"
-        )),
-        ProbeOutcome::Inconclusive => Err(
-            "the macOS Keychain is unavailable, so env approval couldn't be confirmed; retry once the Mac is unlocked"
-                .to_owned(),
-        ),
-    }
+        ProbeOutcome::Protected => CliAccess::RequireApproval,
+        ProbeOutcome::Absent if written_in_transaction => CliAccess::Automatic,
+        ProbeOutcome::Absent => {
+            return Err(format!(
+                "env project {vault_id} has no values, so its newer data can't be written"
+            ));
+        }
+        ProbeOutcome::Inconclusive => return Ok(None),
+    }))
 }
 
 /// Check a transaction's companion changes as both its commit and its
@@ -903,12 +1033,14 @@ fn roll_forward_persisted_project_transaction(
     finish_project_transaction(storage, journal)
 }
 
+/// A journal's staged bytes, checked against the journal. They may be a
+/// key, so they're wiped once dropped, a refusal included.
 fn read_validated_stage(
     storage: &mut impl ProjectStorage,
     operation: &TransactionJournalOperation,
     stage: &str,
-) -> Result<Option<Vec<u8>>, String> {
-    let Some(value) = storage.read(stage)? else {
+) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, String> {
+    let Some(value) = storage.read(stage)?.map(zeroize::Zeroizing::new) else {
         return Ok(None);
     };
     if value.len() > MAX_TRANSACTION_VALUE_BYTES
@@ -924,9 +1056,10 @@ fn read_validated_stage(
 fn read_validated_applied_target(
     storage: &mut impl ProjectStorage,
     operation: &TransactionJournalOperation,
-) -> Result<Vec<u8>, String> {
+) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
     let target = storage
         .read(&operation.target_account)?
+        .map(zeroize::Zeroizing::new)
         .ok_or_else(|| "committed vault transaction lost both stage and target".to_owned())?;
     validate_transaction_target(&operation.target_account, Some(&target))?;
     if transaction_operation_sha256("write", &operation.target_account, Some(&target))
@@ -941,7 +1074,7 @@ fn read_validated_applied_target(
 /// its journal operation, so replay reads it no more.
 enum CheckedMarker {
     /// The stage's bytes, still to be written.
-    Staged(Vec<u8>),
+    Staged(zeroize::Zeroizing<Vec<u8>>),
     /// The target already holds the journal's bytes.
     Applied,
 }
@@ -960,7 +1093,7 @@ fn check_persisted_companion_invariants(
     journal: &TransactionJournal,
 ) -> Result<HashMap<usize, CheckedMarker>, String> {
     let mut checked = HashMap::new();
-    let mut changes: Vec<(&str, Option<Vec<u8>>)> = Vec::new();
+    let mut changes: Vec<(&str, Option<zeroize::Zeroizing<Vec<u8>>>)> = Vec::new();
     for (index, operation) in journal.operations.iter().enumerate() {
         let account = operation.target_account.as_str();
         if !crate::companion::account::is_in_companion_namespace(account) {
@@ -979,7 +1112,7 @@ fn check_persisted_companion_invariants(
                     }
                 })
             }
-            ("write", _) => Some(Vec::new()),
+            ("write", _) => Some(zeroize::Zeroizing::new(Vec::new())),
             _ => None,
         };
         changes.push((account, value));
@@ -989,7 +1122,7 @@ fn check_persisted_companion_invariants(
     }
     let changes: Vec<(&str, Option<&[u8]>)> = changes
         .iter()
-        .map(|(account, value)| (*account, value.as_deref()))
+        .map(|(account, value)| (*account, value.as_ref().map(|value| value.as_slice())))
         .collect();
     check_companion_invariants(storage, &changes)?;
     Ok(checked)
@@ -1421,18 +1554,47 @@ pub(crate) fn try_read_all_environments_unlocked(
 pub(crate) fn try_read_all_environments_with_digest_unlocked(
     vault_id: &str,
 ) -> Result<(Option<EnvironmentMap>, Option<[u8; 32]>), String> {
+    let (environments, digest) =
+        read_environments_with_digest(&mut KeychainProjectStorage, vault_id)?;
+    crate::history::scope::observe_read(vault_id, environments.as_ref());
+    Ok((environments, digest))
+}
+
+/// A project's values and their payload digest, which history doesn't see:
+/// the caller says what its operation read.
+fn read_environments_with_digest(
+    storage: &mut impl ProjectStorage,
+    vault_id: &str,
+) -> Result<(Option<EnvironmentMap>, Option<[u8; 32]>), String> {
     use sha2::Digest as _;
 
-    let Some(json) =
-        companion_gate::read_values_excluding_overrides(&mut KeychainProjectStorage, vault_id)?
-    else {
+    let Some(json) = companion_gate::read_values_excluding_overrides(storage, vault_id)? else {
         return Ok((None, None));
     };
     let digest = sha2::Sha256::digest(json.as_bytes()).into();
-
     let environments = crate::selected_environment::parse_all(&json)
         .map_err(|error| format!("vault keychain data is not valid JSON: {error}"))?;
     Ok((Some(environments), Some(digest)))
+}
+
+/// The values a one-environment change starts from: the Keychain's, or,
+/// when it holds none, the file store's. History's "before" is whichever
+/// the change read.
+fn read_mutation_base(
+    storage: &mut impl ProjectStorage,
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+) -> Result<EnvironmentMap, String> {
+    match read_environments_with_digest(storage, vault_id)?.0 {
+        Some(environments) => {
+            crate::history::scope::observe_read(vault_id, Some(&environments));
+            Ok(environments)
+        }
+        None => Ok(
+            crate::fallback::read_all_environments_unlocked(directory, vault_id)?
+                .unwrap_or_default(),
+        ),
+    }
 }
 
 pub(crate) fn vault_payload_digest_unlocked(vault_id: &str) -> Result<Option<[u8; 32]>, String> {
@@ -1442,23 +1604,22 @@ pub(crate) fn vault_payload_digest_unlocked(vault_id: &str) -> Result<Option<[u8
         .map(|json| json.map(|json| sha2::Sha256::digest(json.as_bytes()).into()))
 }
 
-pub fn write_vault(
-    vault_id: &str,
-    project_name: &str,
-    project_path: &str,
-    secrets: &SecretMap,
-) -> Result<(), String> {
-    write_vault_env(vault_id, project_name, project_path, "default", secrets)
-}
-
-pub fn write_all_environments(
+pub(crate) fn write_all_environments(
     vault_id: &str,
     project_name: &str,
     project_path: &str,
     environments: &EnvironmentMap,
+    source: &crate::history::Source,
 ) -> Result<(), String> {
     with_keychain_transaction(|| {
-        write_all_environments_unlocked(vault_id, project_name, project_path, environments)
+        let recording = crate::history::scope::begin(vault_id, source);
+        write_all_environments_unlocked(
+            vault_id,
+            project_name,
+            project_path,
+            environments,
+            &recording,
+        )
     })
 }
 
@@ -1467,35 +1628,16 @@ pub(crate) fn write_all_environments_unlocked(
     project_name: &str,
     project_path: &str,
     environments: &EnvironmentMap,
+    recording: &crate::history::scope::Recording,
 ) -> Result<(), String> {
     write_all_environments_with_storage_after_recovery(
         &mut KeychainProjectStorage,
         vault_id,
         project_name,
         project_path,
-        environments,
+        std::borrow::Cow::Borrowed(environments),
+        recording,
     )
-}
-
-pub fn write_vault_env(
-    vault_id: &str,
-    project_name: &str,
-    project_path: &str,
-    env: &str,
-    secrets: &SecretMap,
-) -> Result<(), String> {
-    with_keychain_transaction(|| {
-        let mut environments = try_read_all_environments_unlocked(vault_id)?.unwrap_or_default();
-        environments.insert(env.to_owned(), secrets.clone());
-
-        write_all_environments_with_storage_after_recovery(
-            &mut KeychainProjectStorage,
-            vault_id,
-            project_name,
-            project_path,
-            &environments,
-        )
-    })
 }
 
 pub(crate) fn mutate_vault_env<T>(
@@ -1504,21 +1646,21 @@ pub(crate) fn mutate_vault_env<T>(
     project_path: &str,
     env: &str,
     operation: impl FnOnce(&mut SecretMap) -> T,
+    source: &crate::history::Source,
 ) -> Result<T, String> {
     crate::storage_transaction::with_vault_transaction(|directory| {
         recover_project_transaction(&mut KeychainProjectStorage)?;
-        let mut environments = match try_read_all_environments_unlocked(vault_id)? {
-            Some(environments) => environments,
-            None => crate::fallback::read_all_environments_unlocked(directory, vault_id)?
-                .unwrap_or_default(),
-        };
+        let recording = crate::history::scope::begin(vault_id, source);
+        let mut environments =
+            read_mutation_base(&mut KeychainProjectStorage, directory, vault_id)?;
         let result = operation(environments.entry(env.to_owned()).or_default());
         write_all_environments_with_storage_after_recovery(
             &mut KeychainProjectStorage,
             vault_id,
             project_name,
             project_path,
-            &environments,
+            std::borrow::Cow::Owned(environments),
+            &recording,
         )?;
         Ok(result)
     })
@@ -1539,23 +1681,45 @@ fn large_env_warning(size: usize) -> Option<String> {
     })
 }
 
+/// The commit primitive every Keychain values write goes through. It takes
+/// the write's [`Recording`](crate::history::scope::Recording), so a write
+/// without a source doesn't compile, and tells history what it stored.
 fn write_all_environments_with_storage_after_recovery(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
     project_name: &str,
     project_path: &str,
-    environments: &EnvironmentMap,
+    environments: std::borrow::Cow<'_, EnvironmentMap>,
+    recording: &crate::history::scope::Recording,
 ) -> Result<(), String> {
-    let encoded = crate::selected_environment::serialize(environments)?;
+    let encoded = crate::selected_environment::serialize(&environments)?;
     warn_if_large(encoded.len());
     let payload =
-        ValidatedVaultPayload::from_serialized_environments(vault_id, encoded, environments)?;
+        ValidatedVaultPayload::from_serialized_environments(vault_id, encoded, &environments)?;
+    crate::history::scope::observe_before(recording, || read_before(storage, vault_id));
     save_validated_vault_data_with_storage_after_recovery(
         storage,
         project_name,
         project_path,
         payload,
-    )
+    )?;
+    crate::history::scope::committed(recording, environments);
+    Ok(())
+}
+
+/// The values a write replaces, read for history only.
+fn read_before(
+    storage: &mut impl ProjectStorage,
+    vault_id: &str,
+) -> Result<Option<EnvironmentMap>, String> {
+    let Some(stored) = storage.read(vault_id)? else {
+        return Ok(None);
+    };
+    let json =
+        crate::zeroizing_text(stored).map_err(|_| "vault keychain data is not UTF-8".to_owned())?;
+    crate::selected_environment::parse_all(&json)
+        .map(Some)
+        .map_err(|error| format!("vault keychain data is not valid JSON: {error}"))
 }
 
 #[cfg(test)]
@@ -1772,7 +1936,10 @@ fn plant_debug_companion_state_with_storage<S: ProjectStorage>(
         planting
             .writes
             .into_iter()
-            .map(|(account, value)| Mutation::Write { account, value })
+            .map(|(account, value)| Mutation::Write {
+                account,
+                value: value.into(),
+            })
             .collect(),
     )?;
     if let Some((orphan, mutations)) = planting.orphans {
@@ -2484,6 +2651,7 @@ mod tests {
     use super::*;
 
     mod companion;
+    mod history;
 
     #[test]
     fn large_env_data_is_warned_of_in_binary_units() {
@@ -2570,6 +2738,115 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_validated_values_write_wipes_its_payload_when_dropped() {
+        fn wipes_on_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+        let payload = ValidatedVaultPayload::parse(
+            "proj",
+            r#"{"environments":{"default":{"TOKEN":"secret"}}}"#,
+        )
+        .expect("payload");
+        wipes_on_drop(payload.encoded_buffer());
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn recovery_reads_a_staged_history_key_without_leaving_a_copy() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        let target = lpm_env_companion::history::key_account("proj").name();
+        let stage = format!("{TRANSACTION_STAGE_PREFIX}history-key");
+        let operation = TransactionJournalOperation {
+            action: "write".to_owned(),
+            target_account: target.clone(),
+            staged_account: Some(stage.clone()),
+            operation_sha256: transaction_operation_sha256(
+                "write",
+                &target,
+                Some(MARKER.as_bytes()),
+            ),
+        };
+        let mut storage = MemoryProjectStorage::default();
+        storage
+            .values
+            .insert(stage.clone(), MARKER.as_bytes().to_vec());
+        let ((), found) = watch(|| {
+            let staged = read_validated_stage(&mut storage, &operation, &stage)
+                .expect("valid")
+                .expect("staged");
+            assert_eq!(staged.as_slice(), MARKER.as_bytes());
+        });
+        assert!(!found, "the staged key is wiped once replayed");
+
+        storage.values.insert(target, MARKER.as_bytes().to_vec());
+        let ((), found) = watch(|| {
+            read_validated_applied_target(&mut storage, &operation).expect("valid");
+        });
+        assert!(!found, "the applied key is wiped once checked");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn a_values_payload_refused_before_it_is_written_is_wiped() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        let environments = &EnvironmentMap::new();
+        let oversized = MARKER.repeat(MAX_TRANSACTION_VALUE_BYTES / MARKER.len() + 1);
+        for (vault_id, encoded) in [("../escape", MARKER.to_owned()), ("proj", oversized)] {
+            let (refused, found) = watch(move || {
+                ValidatedVaultPayload::from_serialized_environments(
+                    vault_id,
+                    encoded.into(),
+                    environments,
+                )
+                .is_err()
+            });
+            assert!(refused, "{vault_id}");
+            assert!(!found, "{vault_id}: the refused payload is wiped");
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn reading_the_keychain_s_values_leaves_no_copy_of_the_payload() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        let mut storage = MemoryProjectStorage::default();
+        storage.values.insert(
+            "proj",
+            format!(r#"{{"environments":{{"default":{{"TOKEN":"{MARKER}"}}}}}}"#),
+        );
+        let (read, found) = watch(|| {
+            let mut values = read_environments_with_digest(&mut storage, "proj")
+                .expect("read")
+                .0
+                .expect("stored values");
+            let read = values["default"]["TOKEN"] == MARKER;
+            crate::history::wipe_values(&mut values);
+            read
+        });
+        assert!(read);
+        assert!(!found, "the payload read from the Keychain is wiped");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn the_values_a_write_replaces_are_read_for_history_without_leaving_a_copy() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        let mut storage = MemoryProjectStorage::default();
+        storage.values.insert(
+            "proj",
+            format!(r#"{{"environments":{{"default":{{"TOKEN":"{MARKER}"}}}}}}"#),
+        );
+        let (read, found) = watch(|| {
+            let mut before = read_before(&mut storage, "proj")
+                .expect("read")
+                .expect("stored values");
+            let read = before["default"]["TOKEN"] == MARKER;
+            crate::history::wipe_values(&mut before);
+            read
+        });
+        assert!(read);
+        assert!(!found, "the stored payload read for history is wiped");
+    }
+
     #[derive(Default)]
     struct MemoryProjectStorage {
         access_sources: Vec<(String, String)>,
@@ -2584,6 +2861,10 @@ mod tests {
         approvals_required: Vec<String>,
         listings: usize,
         reads: HashMap<String, usize>,
+        /// Attributes-only reads, by account.
+        attribute_reads: HashMap<String, usize>,
+        /// Accounts whose reads fail, as a locked Keychain's do.
+        failing_reads: HashSet<String>,
         writes: HashMap<String, usize>,
         deletes: HashMap<String, usize>,
         rejected_writes: HashSet<String>,
@@ -2594,6 +2875,10 @@ mod tests {
         fail_committed_marker_verification_once: bool,
         fail_final_marker_delete_verification_once: bool,
         final_marker_was_deleted: bool,
+        /// Whether a verified write checks its own result below this
+        /// boundary, as the Keychain storage's does, instead of reading it
+        /// back through `read`.
+        verifies_writes_itself: bool,
     }
 
     impl ProjectStorage for MemoryProjectStorage {
@@ -2635,6 +2920,9 @@ mod tests {
 
         fn read(&mut self, account: &str) -> Result<Option<Vec<u8>>, String> {
             *self.reads.entry(account.to_owned()).or_default() += 1;
+            if self.failing_reads.contains(account) {
+                return Err("the macOS Keychain is locked".to_owned());
+            }
             if account == TRANSACTION_MARKER_ACCOUNT
                 && self.fail_committed_marker_verification_once
                 && self
@@ -2654,6 +2942,20 @@ mod tests {
                 return Err("injected final-marker deletion verification failure".to_owned());
             }
             Ok(self.values.get_bytes(account).map(<[u8]>::to_vec))
+        }
+
+        fn write_verified(&mut self, account: &str, value: &[u8]) -> Result<(), String> {
+            self.write(account, value)?;
+            let verified = if self.verifies_writes_itself {
+                self.values.get_bytes(account) == Some(value)
+            } else {
+                self.read(account)?.as_deref() == Some(value)
+            };
+            if verified {
+                Ok(())
+            } else {
+                Err(format!("vault transaction could not verify {account}"))
+            }
         }
 
         fn write(&mut self, account: &str, value: &[u8]) -> Result<(), String> {
@@ -2696,9 +2998,21 @@ mod tests {
             Ok(deleted)
         }
 
-        fn account_names(&mut self) -> Result<Vec<String>, String> {
+        fn accounts_with_access(&mut self) -> Result<Vec<(String, ClaimedAccess)>, String> {
             self.listings += 1;
-            Ok(self.values.keys().cloned().collect())
+            Ok(self
+                .values
+                .keys()
+                .map(|name| {
+                    (
+                        name.clone(),
+                        self.claims
+                            .get(name)
+                            .copied()
+                            .unwrap_or(ClaimedAccess::Automatic),
+                    )
+                })
+                .collect())
         }
 
         fn read_with_access(
@@ -2714,6 +3028,7 @@ mod tests {
         }
 
         fn claimed_access(&mut self, account: &str) -> Result<Option<ClaimedAccess>, String> {
+            *self.attribute_reads.entry(account.to_owned()).or_default() += 1;
             Ok(self.values.contains_key(account).then(|| {
                 self.claims
                     .get(account)
@@ -2951,7 +3266,11 @@ mod tests {
             "new-vault",
             "New Vault",
             "/workspace/new",
-            &environments,
+            std::borrow::Cow::Borrowed(&environments),
+            &crate::history::scope::begin(
+                "new-vault",
+                &crate::history::Source::new(crate::history::Action::Set),
+            ),
         )
         .expect("locally generated project save should succeed");
 
@@ -2983,7 +3302,10 @@ mod tests {
             &mut storage,
             vec![ProjectStorageMutation::Write {
                 account: "vault".to_owned(),
-                value: r#"{"environments":{"default":{"TOKEN":"fixture"}}}"#.to_owned().into(),
+                value: r#"{"environments":{"default":{"TOKEN":"fixture"}}}"#
+                    .as_bytes()
+                    .to_vec()
+                    .into(),
             }],
         )
         .expect("project update should succeed");
@@ -3025,7 +3347,8 @@ mod tests {
             vec![ProjectStorageMutation::Write {
                 account: "vault".to_owned(),
                 value: r#"{"environments":{"default":{"TOKEN":"replacement"}}}"#
-                    .to_owned()
+                    .as_bytes()
+                    .to_vec()
                     .into(),
             }],
         )

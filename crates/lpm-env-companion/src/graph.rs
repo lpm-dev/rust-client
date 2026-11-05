@@ -26,12 +26,22 @@ pub const OVERRIDES: KnownFeature = KnownFeature {
     supported_versions: &[1],
 };
 
-const HISTORY: KnownFeature = KnownFeature {
+pub const HISTORY: KnownFeature = KnownFeature {
     name: "history",
     kinds: &["history-head", "history", SHARED_KEY_KIND],
     required: &["history-head", SHARED_KEY_KIND],
     minimum: Level::Ignore,
-    supported_versions: &[],
+    supported_versions: &[1],
+};
+
+/// History turned off: an entry with no records, so clients that don't know
+/// it read it as an unknown feature at `ignore` and keep it.
+pub const HISTORY_OFF: KnownFeature = KnownFeature {
+    name: "history-off",
+    kinds: &["history-off"],
+    required: &[],
+    minimum: Level::Ignore,
+    supported_versions: &[1],
 };
 
 const RELEASES: KnownFeature = KnownFeature {
@@ -50,7 +60,7 @@ const DETAILS: KnownFeature = KnownFeature {
     supported_versions: &[],
 };
 
-const KNOWN_FEATURES: [KnownFeature; 4] = [OVERRIDES, HISTORY, RELEASES, DETAILS];
+const KNOWN_FEATURES: [KnownFeature; 5] = [OVERRIDES, HISTORY, HISTORY_OFF, RELEASES, DETAILS];
 
 pub fn known_feature(name: &str) -> Option<&'static KnownFeature> {
     KNOWN_FEATURES.iter().find(|feature| feature.name == name)
@@ -97,6 +107,7 @@ mod tests {
         assert_eq!(reserved_owner("history-head"), Some("history"));
         assert_eq!(reserved_owner("releases"), Some("releases"));
         assert_eq!(reserved_owner("notes"), Some("details"));
+        assert_eq!(reserved_owner("history-off"), Some("history-off"));
         assert_eq!(reserved_owner("key"), None);
         assert_eq!(reserved_owner("future-kind"), None);
     }
@@ -122,12 +133,11 @@ mod tests {
     }
 
     #[test]
-    fn this_client_supports_only_overrides_version_one() {
+    fn this_client_supports_overrides_history_and_history_off_version_one() {
         for feature in KNOWN_FEATURES {
-            let expected: &[u16] = if feature.name == "overrides" {
-                &[1]
-            } else {
-                &[]
+            let expected: &[u16] = match feature.name {
+                "overrides" | "history" | "history-off" => &[1],
+                _ => &[],
             };
             assert_eq!(feature.supported_versions, expected, "{}", feature.name);
         }

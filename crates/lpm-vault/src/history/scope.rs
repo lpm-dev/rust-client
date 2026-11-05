@@ -1,0 +1,223 @@
+//! What one held vault lock remembers for history: for each project whose
+//! values it writes, the source, the values when it first read them, and
+//! what its last write stored. The change is recorded when the outermost
+//! lock ends, still inside it, after the operation's last durable step.
+
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+
+use lpm_env_companion::history::switch::MarkerHistory;
+
+use super::{Source, ZeroizingValues};
+use crate::EnvironmentMap;
+use crate::companion::gate::ProjectGate;
+
+/// One project's change within a lock scope. Its values are wiped when
+/// it's dropped or they're replaced, and its `Debug` names no value.
+#[derive(Clone)]
+pub(crate) struct Tracked {
+    pub(crate) source: Source,
+    /// The stored values when the scope first read them, or when its first
+    /// write began.
+    pub(crate) before: Option<ZeroizingValues>,
+    /// What the scope's last write stored.
+    pub(crate) after: Option<ZeroizingValues>,
+    /// Environments the scope renamed, as (old name, new name), so the
+    /// entry records a rename rather than a removal and a creation.
+    pub(crate) environment_renames: Vec<(String, String)>,
+    /// Why the values the scope's first write replaced couldn't be read, so
+    /// its change isn't recorded; the next recorded change finds a gap.
+    pub(crate) unreadable_before: Option<String>,
+}
+
+impl std::fmt::Debug for Tracked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let environments = |values: &Option<ZeroizingValues>| {
+            values.as_ref().map(|values| {
+                values
+                    .iter()
+                    .map(|(name, keys)| (name.clone(), keys.len()))
+                    .collect::<BTreeMap<_, _>>()
+            })
+        };
+        formatter
+            .debug_struct("Tracked")
+            .field("source", &self.source)
+            .field("before", &environments(&self.before))
+            .field("after", &environments(&self.after))
+            .field("environment_renames", &self.environment_renames)
+            .field("unreadable_before", &self.unreadable_before)
+            .finish()
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for Tracked {}
+
+thread_local! {
+    /// `None` outside a lock.
+    static SCOPE: RefCell<Option<BTreeMap<String, Tracked>>> = const { RefCell::new(None) };
+}
+
+/// Proof that a values write declared its source, which every commit
+/// primitive takes, so a write without a source doesn't compile.
+#[derive(Debug)]
+pub(crate) struct Recording {
+    vault_id: String,
+}
+
+/// Start remembering for the outermost lock. Returns whether this call
+/// started it.
+pub(crate) fn enter() -> bool {
+    SCOPE.with_borrow_mut(|scope| {
+        if scope.is_some() {
+            false
+        } else {
+            *scope = Some(BTreeMap::new());
+            true
+        }
+    })
+}
+
+/// Stop remembering, returning what the scope tracked.
+pub(crate) fn leave() -> BTreeMap<String, Tracked> {
+    SCOPE.with_borrow_mut(Option::take).unwrap_or_default()
+}
+
+/// Declare that this lock scope writes `vault_id`'s values for `source`.
+/// The first declaration in a scope is the one recorded.
+pub(crate) fn begin(vault_id: &str, source: &Source) -> Recording {
+    SCOPE.with_borrow_mut(|scope| {
+        if let Some(scope) = scope.as_mut() {
+            scope.entry(vault_id.to_owned()).or_insert_with(|| Tracked {
+                source: source.clone(),
+                before: None,
+                after: None,
+                environment_renames: Vec::new(),
+                unreadable_before: None,
+            });
+        }
+    });
+    Recording {
+        vault_id: vault_id.to_owned(),
+    }
+}
+
+/// A values read inside the lock: the first one for a project being written
+/// is its "before". The caller keeps its own values, so they're copied,
+/// only when this is that first read.
+pub(crate) fn observe_read(vault_id: &str, environments: Option<&EnvironmentMap>) {
+    SCOPE.with_borrow_mut(|scope| {
+        if let Some(tracked) = scope.as_mut().and_then(|scope| scope.get_mut(vault_id))
+            && tracked.before.is_none()
+            && tracked.unreadable_before.is_none()
+        {
+            tracked.before = Some(environments.cloned().unwrap_or_default().into());
+        }
+    });
+}
+
+/// A values read only history needed: the values move into the scope.
+pub(crate) fn observe_owned_read(vault_id: &str, environments: Option<EnvironmentMap>) {
+    SCOPE.with_borrow_mut(|scope| {
+        if let Some(tracked) = scope.as_mut().and_then(|scope| scope.get_mut(vault_id))
+            && tracked.before.is_none()
+            && tracked.unreadable_before.is_none()
+        {
+            tracked.before = Some(environments.unwrap_or_default().into());
+        }
+    });
+}
+
+/// Record that the write `recording` declared renames `from` to `to`.
+pub(crate) fn renamed_environment(recording: &Recording, from: &str, to: &str) {
+    SCOPE.with_borrow_mut(|scope| {
+        if let Some(tracked) = scope
+            .as_mut()
+            .and_then(|scope| scope.get_mut(&recording.vault_id))
+        {
+            tracked
+                .environment_renames
+                .push((from.to_owned(), to.to_owned()));
+        }
+    });
+}
+
+/// Whether the write `recording` declared still needs its "before", which
+/// the commit primitive then reads itself.
+fn needs_before(recording: &Recording) -> bool {
+    SCOPE.with_borrow(|scope| {
+        scope
+            .as_ref()
+            .and_then(|scope| scope.get(&recording.vault_id))
+            .is_some_and(|tracked| tracked.before.is_none() && tracked.unreadable_before.is_none())
+    })
+}
+
+/// Whether history may record `vault_id`'s change, as far as the marker
+/// this lock read says: not when history is off, from a newer version,
+/// being removed or damaged, which never need the values it replaced.
+fn may_record(vault_id: &str) -> bool {
+    match crate::companion::known_gate(vault_id) {
+        None | Some(ProjectGate::Plain) => true,
+        Some(ProjectGate::Marked(marker)) => matches!(
+            MarkerHistory::of(Some(&marker)),
+            MarkerHistory::Default | MarkerHistory::On
+        ),
+        Some(ProjectGate::Damaged(_)) => false,
+    }
+}
+
+/// Before a commit primitive writes, read the values it replaces with
+/// `read`, for history only, when its scope still needs them and history
+/// may record the change. A read that fails never fails the write: the
+/// scope remembers why, and the change isn't recorded.
+pub(crate) fn observe_before(
+    recording: &Recording,
+    read: impl FnOnce() -> Result<Option<EnvironmentMap>, String>,
+) {
+    if !needs_before(recording) || !may_record(&recording.vault_id) {
+        return;
+    }
+    match read() {
+        Ok(before) => observe_owned_read(&recording.vault_id, before),
+        Err(reason) => SCOPE.with_borrow_mut(|scope| {
+            if let Some(tracked) = scope
+                .as_mut()
+                .and_then(|scope| scope.get_mut(&recording.vault_id))
+            {
+                tracked.unreadable_before = Some(reason);
+            }
+        }),
+    }
+}
+
+/// Stop tracking `vault_id`, so its write goes unrecorded, as a client that
+/// doesn't record history writes.
+#[cfg(test)]
+pub(crate) fn forget(vault_id: &str) {
+    SCOPE.with_borrow_mut(|scope| {
+        if let Some(scope) = scope.as_mut() {
+            scope.remove(vault_id);
+        }
+    });
+}
+
+/// A values write that succeeded. A writer that's done with its values
+/// passes them owned, so they move into the scope instead of being copied.
+pub(crate) fn committed(recording: &Recording, after: Cow<'_, EnvironmentMap>) {
+    SCOPE.with_borrow_mut(|scope| {
+        if let Some(tracked) = scope
+            .as_mut()
+            .and_then(|scope| scope.get_mut(&recording.vault_id))
+        {
+            tracked.after = Some(after.into_owned().into());
+        }
+    });
+}
+
+/// What the scope tracks for `vault_id` so far.
+#[cfg(test)]
+pub(crate) fn tracked(vault_id: &str) -> Option<Tracked> {
+    SCOPE.with_borrow(|scope| scope.as_ref()?.get(vault_id).cloned())
+}

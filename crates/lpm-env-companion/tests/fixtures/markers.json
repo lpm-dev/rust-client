@@ -34,7 +34,7 @@
       "needsResume": false
     },
     {
-      "name": "history ignored by this client",
+      "name": "history v1, which this client supports",
       "vaultId": "proj",
       "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"history\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-head\",\"history\",\"key\"],\"state\":\"active\"}}}",
       "valid": true,
@@ -42,9 +42,9 @@
       "needsResume": false
     },
     {
-      "name": "history and releases share key; strictest level wins",
+      "name": "a newer history and releases share key; strictest level wins",
       "vaultId": "proj",
-      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"history\":{\"version\":1,\"ifUnsupported\":\"readOnly\",\"kinds\":[\"history-head\",\"history\",\"key\"],\"state\":\"active\"},\"releases\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"releases-head\",\"releases\",\"key\"],\"state\":\"active\"}}}",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"history\":{\"version\":2,\"ifUnsupported\":\"readOnly\",\"kinds\":[\"history-head\",\"history\",\"key\"],\"state\":\"active\"},\"releases\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"releases-head\",\"releases\",\"key\"],\"state\":\"active\"}}}",
       "valid": true,
       "level": "readOnly",
       "needsResume": false
@@ -235,6 +235,56 @@
       "name": "restore with an unknown phase",
       "vaultId": "proj",
       "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"restoring\",\"features\":{},\"restore\":{\"phase\":\"done\",\"replaces\":[],\"features\":{\"history\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-head\",\"history\",\"key\"],\"state\":\"active\"}}}}",
+      "valid": false
+    },
+    {
+      "name": "history off",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"history-off\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-off\"],\"state\":\"active\"}}}",
+      "valid": true,
+      "level": "ignore",
+      "needsResume": false
+    },
+    {
+      "name": "history on and off together is a valid marker whose history is damaged",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"history\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-head\",\"history\",\"key\"],\"state\":\"active\"},\"history-off\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-off\"],\"state\":\"active\"}}}",
+      "valid": true,
+      "level": "ignore",
+      "needsResume": false
+    },
+    {
+      "name": "history off beside a newer history",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"history\":{\"version\":2,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-head\",\"history\",\"key\"],\"state\":\"active\"},\"history-off\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-off\"],\"state\":\"active\"}}}",
+      "valid": true,
+      "level": "ignore",
+      "needsResume": false
+    },
+    {
+      "name": "history being turned off",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"history\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-head\",\"history\",\"key\"],\"state\":\"removing\"},\"history-off\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-off\"],\"state\":\"active\"}}}",
+      "valid": true,
+      "level": "ignore",
+      "needsResume": true
+    },
+    {
+      "name": "history off listing another kind",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"history-off\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-off\",\"notes-extra\"],\"state\":\"active\"}}}",
+      "valid": false
+    },
+    {
+      "name": "an unknown feature claiming the history-off kind",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"future\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-off\"],\"state\":\"active\"}}}",
+      "valid": false
+    },
+    {
+      "name": "history v1 listing fewer kinds",
+      "vaultId": "proj",
+      "json": "{\"schemaVersion\":1,\"vaultId\":\"proj\",\"state\":\"active\",\"features\":{\"history\":{\"version\":1,\"ifUnsupported\":\"ignore\",\"kinds\":[\"history-head\",\"key\"],\"state\":\"active\"}}}",
       "valid": false
     }
   ]

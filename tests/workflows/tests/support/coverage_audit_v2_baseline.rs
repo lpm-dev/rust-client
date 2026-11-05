@@ -3851,6 +3851,41 @@ pub const SURFACES_V2: &[SurfaceV2] = &[
         json_contract_depth: JsonContractDepth::SemanticAsserts,
         scenarios_by_file: &[("tests/workflows/tests/package_changes.rs", 2)],
         last_audited_at: "2026-10-30",
+    }, // ── id 179: lpm env history ──
+    SurfaceV2 {
+        id: 179,
+        scenarios: 5,
+        failure_modes_tested: &[
+            "each change is listed newest first with values hidden until --reveal",
+            "show finds an entry by its short ID and reports an unknown one by code",
+            "off needs --yes without a terminal, deletes history and stops recording",
+            "on starts an empty history at the next change",
+            "forget removes an old value and refuses one that's still current",
+        ],
+        failure_modes_known: &[
+            "a protected project on a signed build prompts once",
+            "history damaged by a crash mid-rollover",
+        ],
+        json_contract_depth: JsonContractDepth::InstaSnapshot,
+        scenarios_by_file: &[("tests/workflows/tests/env_history.rs", 5)],
+        last_audited_at: "2026-11-05",
+    },
+    // ── id 180: lpm env rollback ──
+    SurfaceV2 {
+        id: 180,
+        scenarios: 3,
+        failure_modes_tested: &[
+            "the review needs --yes without a terminal and changes nothing",
+            "an environment rolls back to its state after an entry, recorded as a rollback",
+            "--before with one --key restores that key only",
+        ],
+        failure_modes_known: &[
+            "the values changed between the review and the commit",
+            "a rollback across a change made outside local history",
+        ],
+        json_contract_depth: JsonContractDepth::SemanticAsserts,
+        scenarios_by_file: &[("tests/workflows/tests/env_history.rs", 3)],
+        last_audited_at: "2026-11-05",
     },
 ];
 

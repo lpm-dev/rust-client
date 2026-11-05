@@ -31,9 +31,10 @@ impl<S: ProjectStorage> LifecycleStore for KeychainCompanion<'_, S> {
 
 impl<S: ProjectStorage> CompanionBackend for KeychainCompanion<'_, S> {
     fn inventory(&mut self, vault_id: &str) -> Result<Vec<CompanionAccount>, String> {
+        let encoded = lpm_env_companion::account::encode_vault_id(vault_id);
         Ok(self
             .0
-            .account_names()?
+            .account_names_containing(&encoded)?
             .iter()
             .filter_map(|name| CompanionAccount::parse(name))
             .filter(|account| {
@@ -46,7 +47,10 @@ impl<S: ProjectStorage> CompanionBackend for KeychainCompanion<'_, S> {
 
 pub(super) fn storage_mutation(mutation: Mutation) -> ProjectStorageMutation {
     match mutation {
-        Mutation::Write { account, value } => ProjectStorageMutation::write(account.name(), value),
+        Mutation::Write { account, value } => ProjectStorageMutation::Write {
+            account: account.name(),
+            value,
+        },
         Mutation::Delete { account } => ProjectStorageMutation::delete(account.name()),
     }
 }
@@ -92,15 +96,16 @@ fn read_values(
     }
 }
 
-/// The values item's payload for a read that excludes personal overrides.
+/// The values item's payload for a read that excludes personal overrides,
+/// wiped when dropped.
 pub(super) fn read_values_excluding_overrides(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
-) -> Result<Option<String>, String> {
+) -> Result<Option<zeroize::Zeroizing<String>>, String> {
     authorize(storage, vault_id, Operation::ReadExcludingOverrides)?;
     read_values(storage, vault_id)?
         .map(|(bytes, _)| {
-            String::from_utf8(bytes).map_err(|_| "vault keychain data is not UTF-8".to_owned())
+            crate::zeroizing_text(bytes).map_err(|_| "vault keychain data is not UTF-8".to_owned())
         })
         .transpose()
 }
@@ -141,7 +146,7 @@ pub(super) fn read_for_run(
 /// A record that follows values but claims no approval while the values item
 /// requires it, as a client that predates this check leaves it after turning
 /// approval on: strengthen it before its bytes are used.
-fn match_values_approval(
+pub(super) fn match_values_approval(
     storage: &mut impl ProjectStorage,
     vault_id: &str,
     account: &str,

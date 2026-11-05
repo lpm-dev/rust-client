@@ -1,0 +1,90 @@
+---
+source: tests/workflows/tests/env_history.rs
+expression: response
+---
+{
+  "success": true,
+  "project": "history-app",
+  "state": "on",
+  "retained": 2,
+  "oldest": "[time]",
+  "counts": {
+    "app": 0,
+    "cli": 2,
+    "import": 0,
+    "restore": 0,
+    "pull": 0,
+    "rollback": 0,
+    "outside": 0
+  },
+  "unreadable_parts": 0,
+  "entries": [
+    {
+      "id": "[id]",
+      "short_id": "[short id]",
+      "seq": 2,
+      "time": "[time]",
+      "source": {
+        "actor": "cli",
+        "action": "set",
+        "group": "cli"
+      },
+      "description": "LPM CLI · set",
+      "values_kept": true,
+      "environments": [
+        {
+          "name": "default",
+          "change": "unchanged",
+          "keys": [
+            {
+              "key": "API_URL",
+              "change": "changed",
+              "before": {
+                "kept": true,
+                "state": "kept"
+              },
+              "after": {
+                "kept": true,
+                "state": "kept"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "[id]",
+      "short_id": "[short id]",
+      "seq": 1,
+      "time": "[time]",
+      "source": {
+        "actor": "cli",
+        "action": "set",
+        "group": "cli"
+      },
+      "description": "LPM CLI · set",
+      "values_kept": true,
+      "environments": [
+        {
+          "name": "default",
+          "change": "created",
+          "keys": [
+            {
+              "key": "API_URL",
+              "change": "added",
+              "before": {
+                "kept": false,
+                "state": "absent"
+              },
+              "after": {
+                "kept": true,
+                "state": "kept"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "live_gap": null
+}

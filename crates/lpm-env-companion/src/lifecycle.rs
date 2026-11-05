@@ -18,21 +18,40 @@ use std::collections::{BTreeSet, HashSet};
 use crate::account::CompanionAccount;
 use crate::graph::SHARED_KEY_KIND;
 use crate::invariants::is_listed;
+use zeroize::Zeroizing;
+
 use crate::marker::{FeatureState, MAX_RECORD_BYTES, Marker, ProjectState, RestorePhase};
 
 pub const MAX_TRANSACTION_OPERATIONS: usize = 32;
 pub const MAX_TRANSACTION_PAYLOAD_BYTES: usize = 1024 * 1024;
 
-/// A change one transaction makes to a store.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A change one transaction makes to a store. Written bytes are wiped when
+/// dropped: a record can hold the history key or personal values.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Mutation {
     Write {
         account: CompanionAccount,
-        value: Vec<u8>,
+        value: Zeroizing<Vec<u8>>,
     },
     Delete {
         account: CompanionAccount,
     },
+}
+
+impl std::fmt::Debug for Mutation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Write { account, value } => formatter
+                .debug_struct("Write")
+                .field("account", account)
+                .field("bytes", &value.len())
+                .finish(),
+            Self::Delete { account } => formatter
+                .debug_struct("Delete")
+                .field("account", account)
+                .finish(),
+        }
+    }
 }
 
 impl Mutation {
@@ -121,7 +140,7 @@ impl Transaction {
         match self.marker {
             Some(MarkerChange::Write(next)) => mutations.push(Mutation::Write {
                 account: marker,
-                value: next.encode().map_err(|error| error.to_string())?,
+                value: next.encode().map_err(|error| error.to_string())?.into(),
             }),
             Some(MarkerChange::Delete) => mutations.push(Mutation::Delete { account: marker }),
             None => {}
@@ -202,8 +221,9 @@ pub fn plan_resume(
     };
     loop {
         let step = match marker.state {
-            ProjectState::Deleting | ProjectState::Discarding => {
-                remove_everything(std::mem::take(&mut inventory))
+            ProjectState::Deleting => remove_everything(std::mem::take(&mut inventory), None),
+            ProjectState::Discarding => {
+                remove_everything(std::mem::take(&mut inventory), off_only(&marker))
             }
             ProjectState::Restoring => {
                 let phase = marker
@@ -317,7 +337,7 @@ fn run(store: &mut impl LifecycleStore, plan: Plan) -> Result<Option<Marker>, Re
                             [
                                 Mutation::Write {
                                     account: live,
-                                    value,
+                                    value: value.into(),
                                 },
                                 Mutation::Delete { account: staged },
                             ],
@@ -331,7 +351,8 @@ fn run(store: &mut impl LifecycleStore, plan: Plan) -> Result<Option<Marker>, Re
                 account: marker_account.clone(),
                 value: marker
                     .encode()
-                    .map_err(|error| ResumeError::Unfinishable(error.to_string()))?,
+                    .map_err(|error| ResumeError::Unfinishable(error.to_string()))?
+                    .into(),
             },
             Some(MarkerChange::Delete) => Mutation::Delete {
                 account: marker_account.clone(),
@@ -519,7 +540,15 @@ fn plan_removal(
         transactions: Vec::new(),
         result: None,
     };
-    let marker = (found != FoundMarker::Absent).then_some(MarkerChange::Delete);
+    let kept_off = match (state, found) {
+        (ProjectState::Discarding, FoundMarker::Valid(current)) => off_only(current),
+        _ => None,
+    };
+    let ending = || match &kept_off {
+        Some(off) => MarkerChange::Write(off.clone()),
+        None => MarkerChange::Delete,
+    };
+    let marker = (found != FoundMarker::Absent).then(ending);
     if inventory.len() + usize::from(marker.is_some()) <= room {
         if marker.is_some() || !inventory.is_empty() {
             plan.transactions.push(Transaction {
@@ -527,6 +556,7 @@ fn plan_removal(
                 marker,
             });
         }
+        plan.result = kept_off;
         return Ok(plan);
     }
     let first = inventory
@@ -548,11 +578,23 @@ fn plan_removal(
     pack(
         Step {
             changes: rest.into_iter().map(PlannedChange::Delete).collect(),
-            marker: MarkerChange::Delete,
+            marker: ending(),
         },
         &mut plan.transactions,
     )?;
+    plan.result = kept_off;
     Ok(plan)
+}
+
+/// The marker a discard leaves when the project's history is off: only the
+/// `history-off` entry, so discarding newer data never turns history back
+/// on. Deleting the project removes it with everything else.
+fn off_only(marker: &Marker) -> Option<Marker> {
+    let entry = marker.features.get(crate::graph::HISTORY_OFF.name)?;
+    let mut off = Marker::empty(&marker.vault_id, ProjectState::Active);
+    off.features
+        .insert(crate::graph::HISTORY_OFF.name.to_owned(), entry.clone());
+    Some(off)
 }
 
 /// One lifecycle step before it's split into transactions: its changes,
@@ -647,10 +689,10 @@ fn ending(next: Marker, leaves_records: bool) -> MarkerChange {
     }
 }
 
-fn remove_everything(inventory: Vec<CompanionAccount>) -> Step {
+fn remove_everything(inventory: Vec<CompanionAccount>, kept: Option<Marker>) -> Step {
     Step {
         changes: deletions(inventory),
-        marker: MarkerChange::Delete,
+        marker: kept.map_or(MarkerChange::Delete, MarkerChange::Write),
     }
 }
 
@@ -835,7 +877,7 @@ mod tests {
             for mutation in mutations {
                 match mutation {
                     Mutation::Write { account, value } => {
-                        self.records.insert(account, value);
+                        self.records.insert(account, value.to_vec());
                     }
                     Mutation::Delete { account } => {
                         self.records.remove(&account);
@@ -1028,7 +1070,7 @@ mod tests {
         match &first.marker {
             Some(MarkerChange::Write(marker)) => mutations.push(Mutation::Write {
                 account: marker_account(),
-                value: marker.encode().expect("valid marker"),
+                value: marker.encode().expect("valid marker").into(),
             }),
             Some(MarkerChange::Delete) => mutations.push(Mutation::Delete {
                 account: marker_account(),
@@ -1579,5 +1621,67 @@ mod tests {
         let plan = plan_resume(marker.clone(), store.inventory()).expect("a plan");
         assert!(plan.transactions.is_empty());
         assert_eq!(plan.result, Some(marker));
+    }
+
+    fn off_entry() -> FeatureEntry {
+        entry(&["history-off"], FeatureState::Active)
+    }
+
+    #[test]
+    fn a_project_wide_discard_keeps_history_off() {
+        let mut store = history_store(2);
+        let mut marker = store.marker().expect("marker");
+        marker.features.remove("history");
+        marker
+            .features
+            .insert("history-off".to_owned(), off_entry());
+        store.store_marker(&marker);
+        let plan =
+            plan_discard("proj", FoundMarker::Valid(&marker), store.inventory()).expect("a plan");
+        let result = execute(&mut store, plan).expect("discarded");
+        let kept = result.expect("the marker stays");
+        assert_eq!(kept.features.keys().collect::<Vec<_>>(), ["history-off"]);
+        assert_eq!(store.inventory(), Vec::<CompanionAccount>::new());
+        assert_eq!(store.marker(), Some(kept));
+    }
+
+    #[test]
+    fn a_discard_split_across_transactions_still_ends_with_history_off() {
+        let mut store = history_store(40);
+        let mut marker = store.marker().expect("marker");
+        marker
+            .features
+            .insert("history-off".to_owned(), off_entry());
+        store.store_marker(&marker);
+        let plan =
+            plan_discard("proj", FoundMarker::Valid(&marker), store.inventory()).expect("a plan");
+        assert!(plan.transactions.len() > 1);
+        store.crash_after = Some(1);
+        assert!(
+            execute(&mut store, plan).is_err(),
+            "crashes after the first commit"
+        );
+        assert_eq!(
+            store.marker().map(|marker| marker.state),
+            Some(ProjectState::Discarding)
+        );
+        let result = store.resume_through_crashes().expect("the marker stays");
+        assert_eq!(result.features.keys().collect::<Vec<_>>(), ["history-off"]);
+        assert_eq!(result.state, ProjectState::Active);
+        assert!(store.inventory().is_empty());
+    }
+
+    #[test]
+    fn deleting_a_project_removes_history_off_with_everything_else() {
+        let mut store = history_store(2);
+        let mut marker = store.marker().expect("marker");
+        marker
+            .features
+            .insert("history-off".to_owned(), off_entry());
+        store.store_marker(&marker);
+        let plan = plan_deletion("proj", FoundMarker::Valid(&marker), store.inventory(), 2)
+            .expect("a plan");
+        assert_eq!(execute(&mut store, plan).expect("deleted"), None);
+        assert!(store.records.is_empty());
     }
 }

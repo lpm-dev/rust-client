@@ -24,13 +24,14 @@ pub(super) fn env_set(
     let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
     let env_label = resolved_env.as_deref().unwrap_or("default");
 
+    let source = lpm_vault::history::Source::new(lpm_vault::history::Action::Set);
     match &resolved_env {
         Some(env) => {
-            lpm_vault::set_env(project_dir, env, &pairs)
+            lpm_vault::set_env(project_dir, env, &pairs, &source)
                 .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
         }
         None => {
-            lpm_vault::set(project_dir, &pairs)
+            lpm_vault::set(project_dir, &pairs, &source)
                 .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
         }
     }
@@ -52,15 +53,16 @@ pub(super) fn env_set(
             .collect();
         println!(
             "{}",
-            serde_json::json!({
+            super::history::with_history_field(serde_json::json!({
                 "success": true,
                 "stored": keys,
                 "ignored": ignored,
                 "env": env_label,
                 "value_warnings": value_warnings,
-            })
+            }))
         );
     } else {
+        super::history::report_write();
         for (key, value) in &stored {
             output::success_line(install_ui::terminal_line!(
                 "stored {} ({})",
@@ -158,13 +160,14 @@ pub(super) fn env_delete(
     let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
     let env_label = resolved_env.as_deref().unwrap_or("default");
 
+    let source = lpm_vault::history::Source::new(lpm_vault::history::Action::Delete);
     match &resolved_env {
         Some(env) => {
-            lpm_vault::delete_env(project_dir, env, &keys)
+            lpm_vault::delete_env(project_dir, env, &keys, &source)
                 .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
         }
         None => {
-            lpm_vault::delete(project_dir, &keys)
+            lpm_vault::delete(project_dir, &keys, &source)
                 .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
         }
     }
@@ -172,9 +175,12 @@ pub(super) fn env_delete(
     if json_output {
         println!(
             "{}",
-            serde_json::json!({"success": true, "deleted": keys, "env": env_label})
+            super::history::with_history_field(
+                serde_json::json!({"success": true, "deleted": keys, "env": env_label})
+            )
         );
     } else {
+        super::history::report_write();
         for key in &keys {
             output::success_line(install_ui::terminal_line!(
                 "deleted {} ({})",
@@ -198,10 +204,21 @@ pub(super) fn env_import(
     let (resolved_env, _config) = resolve_env_from_flag(env_input, project_dir)?;
     let env_label = resolved_env.as_deref().unwrap_or("default");
 
+    let source = lpm_vault::history::Source::with_detail(
+        lpm_vault::history::Action::Import,
+        lpm_vault::history::SourceDetail {
+            file_name: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty() && name.len() <= 255)
+                .map(str::to_owned),
+            ..lpm_vault::history::SourceDetail::default()
+        },
+    );
     let imported = match &resolved_env {
-        Some(env) => lpm_vault::import_env_file_to_env(project_dir, env, &path, overwrite)
+        Some(env) => lpm_vault::import_env_file_to_env(project_dir, env, &path, overwrite, &source)
             .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?,
-        None => lpm_vault::import_env_file(project_dir, &path, overwrite)
+        None => lpm_vault::import_env_file(project_dir, &path, overwrite, &source)
             .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?,
     };
     let count = imported.count;
@@ -210,16 +227,17 @@ pub(super) fn env_import(
     if json_output {
         println!(
             "{}",
-            serde_json::json!({
+            super::history::with_history_field(serde_json::json!({
                 "success": true,
                 "imported": count,
                 "from": file,
                 "env": env_label,
                 "warnings": warnings,
                 "value_warnings": super::characters::json_list(&imported.characters),
-            })
+            }))
         );
     } else {
+        super::history::report_write();
         print_secret_file_warnings(&warnings);
         output::success_line(install_ui::terminal_line!(
             "imported {} secret{} from {} ({})",

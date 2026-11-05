@@ -18,8 +18,10 @@ use crate::marker::{Marker, ProjectState};
 /// a record whose kind a feature or the restore in progress lists, a staged
 /// record whose kind the restore lists, and under a `deleting` or
 /// `discarding` marker every record, since none is read for its content
-/// again. Without a marker no record may exist.
+/// again. Without a marker no record may exist. `history-off` never has
+/// records, so one of its kind is never listed.
 pub fn is_listed(marker: Option<&Marker>, account: &CompanionAccount) -> bool {
+    let recordless = matches!(account.kind(), Some(kind) if kind == crate::graph::HISTORY_OFF.name);
     match (account, marker) {
         (CompanionAccount::Marker { .. }, _) => true,
         (_, Some(marker))
@@ -30,6 +32,7 @@ pub fn is_listed(marker: Option<&Marker>, account: &CompanionAccount) -> bool {
         {
             true
         }
+        _ if recordless => false,
         (CompanionAccount::Record { kind, .. }, Some(marker)) => {
             marker.lists_kind(kind) || marker.restore_lists_kind(kind)
         }

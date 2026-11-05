@@ -1,5 +1,4 @@
 use futures::StreamExt;
-use std::sync::OnceLock;
 
 use super::SyncError;
 use super::envelope::{
@@ -246,13 +245,29 @@ pub(super) fn sync_http_client_builder() -> reqwest::ClientBuilder {
 }
 
 pub(super) fn sync_http_client() -> Result<&'static reqwest::Client, SyncError> {
-    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            sync_http_client_builder()
-                .build()
-                .map_err(|error| format!("failed to build http client: {error}"))
-        })
+    fn build() -> Result<reqwest::Client, String> {
+        sync_http_client_builder()
+            .build()
+            .map_err(|error| format!("failed to build http client: {error}"))
+    }
+    // Each test thread gets its own client: wiremock hands every test a pooled
+    // server on a port an earlier test used, and a connection that test kept
+    // alive, closed since by the server, fails the next request.
+    #[cfg(test)]
+    let client: &'static Result<reqwest::Client, String> = {
+        thread_local! {
+            static CLIENT: &'static Result<reqwest::Client, String> =
+                Box::leak(Box::new(build()));
+        }
+        CLIENT.with(|client| *client)
+    };
+    #[cfg(not(test))]
+    let client = {
+        static CLIENT: std::sync::OnceLock<Result<reqwest::Client, String>> =
+            std::sync::OnceLock::new();
+        CLIENT.get_or_init(build)
+    };
+    client
         .as_ref()
         .map_err(|error| SyncError::from(error.clone()))
 }

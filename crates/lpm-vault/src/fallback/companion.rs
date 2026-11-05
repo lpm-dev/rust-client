@@ -39,7 +39,7 @@ use crate::companion::lifecycle::{
 use crate::companion::marker::MAX_RECORD_BYTES;
 use crate::companion::overrides::{OVERRIDES_KIND, PersonalOverrides};
 use crate::companion::repair::{CompanionRepair, CompanionReview};
-use crate::companion::{CompanionBackend, damaged};
+use crate::companion::{Checked, CompanionBackend, damaged};
 use crate::storage_transaction::VaultStorageDirectory;
 
 const VAULTS_FOLDER: &str = "vaults";
@@ -713,7 +713,7 @@ impl<'directory> FileCompanion<'directory> {
                     FileChange::Companion(Mutation::Write { account, value }) => Some((
                         account.name(),
                         Some(match account {
-                            CompanionAccount::Marker { .. } => value.clone(),
+                            CompanionAccount::Marker { .. } => value.to_vec(),
                             _ => Vec::new(),
                         }),
                     )),
@@ -935,6 +935,20 @@ impl LifecycleStore for FileCompanion<'_> {
 impl CompanionBackend for FileCompanion<'_> {
     fn inventory(&mut self, vault_id: &str) -> Result<Vec<CompanionAccount>, String> {
         self.inventory_of(vault_id)
+    }
+
+    fn read_checked(&mut self, account: &CompanionAccount) -> Result<Checked, String> {
+        let Some(folder) = self.folder(account.vault_id())? else {
+            return Ok(Checked::Absent);
+        };
+        let Some(sealed) = self.read_sealed(&folder, &entry_name(account))? else {
+            return Ok(Checked::Absent);
+        };
+        let key = self.data_key()?;
+        Ok(match open(&key, account, sealed) {
+            Ok(bytes) => Checked::Present(zeroize::Zeroizing::new(bytes)),
+            Err(reason) => Checked::Unreadable(reason),
+        })
     }
 }
 
@@ -1231,6 +1245,10 @@ pub(crate) fn companion_folder_count(directory: &VaultStorageDirectory) -> Resul
         .filter(|name| name.ends_with(".companion"))
         .count())
 }
+
+mod history;
+
+pub(crate) use history::history_store;
 
 #[cfg(test)]
 mod tests;

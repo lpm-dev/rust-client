@@ -2846,11 +2846,18 @@ pub(super) async fn vars_platform_pull(
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect::<Vec<_>>();
+    let source = lpm_vault::history::Source::with_detail(
+        lpm_vault::history::Action::PlatformPull,
+        lpm_vault::history::SourceDetail {
+            platform: lpm_vault::history::Platform::from_name(platform),
+            ..lpm_vault::history::SourceDetail::default()
+        },
+    );
     if env_name == "default" {
-        lpm_vault::set(project_dir, &pairs)
+        lpm_vault::set(project_dir, &pairs, &source)
             .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
     } else {
-        lpm_vault::set_env(project_dir, env_name, &pairs)
+        lpm_vault::set_env(project_dir, env_name, &pairs, &source)
             .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
     }
     let audit = record_platform_audit_with_recovery(
@@ -2868,7 +2875,7 @@ pub(super) async fn vars_platform_pull(
     )
     .await;
     if json_output {
-        super::response::print_json_value(&serde_json::json!({
+        super::response::print_json_value(&super::history::with_history_field(serde_json::json!({
             "success": true,
             "status": "imported",
             "platform": platform,
@@ -2878,8 +2885,9 @@ pub(super) async fn vars_platform_pull(
             "skippedSecrets": skipped_secrets,
             "secretVerification": client.secret_verification(),
             "auditRecorded": audit.is_ok(),
-        }));
+        })));
     } else {
+        super::history::report_write();
         output::success(&format!(
             "imported {} value(s) from {display_name} into {env_name}",
             pairs.len()

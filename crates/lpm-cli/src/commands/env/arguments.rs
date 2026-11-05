@@ -152,6 +152,57 @@ pub(super) enum LocalAction {
         #[arg(long = "unset", value_name = "NAME")]
         unset: Vec<String>,
     },
+    #[cfg_attr(
+        target_os = "macos",
+        doc = "Show how this project's values changed on this Mac, from local history."
+    )]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        doc = "Show how this project's values changed on this computer, from local history."
+    )]
+    /// lpm.dev's activity log is `lpm env log`.
+    #[command(args_conflicts_with_subcommands = true)]
+    History {
+        #[command(subcommand)]
+        action: Option<HistoryAction>,
+        /// Only changes to this key.
+        key: Option<String>,
+        #[command(flatten)]
+        environment: Environment,
+        /// Only changes from one source: app, cli, import, restore, pull,
+        /// rollback or outside.
+        #[arg(long, value_parser = source_group)]
+        source: Option<lpm_vault::history::SourceGroup>,
+        /// Show at most this many changes, newest first.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+        /// Show values. Without it, values are hidden.
+        #[arg(long)]
+        reveal: bool,
+    },
+    /// Roll back changes recorded in local history. Nothing is pushed.
+    #[command(group(clap::ArgGroup::new("target").required(true).multiple(false)))]
+    Rollback {
+        /// Roll an environment back to its state right after this entry.
+        #[arg(long, value_name = "ENTRY", group = "target")]
+        to: Option<String>,
+        /// Roll an environment back to its state right before this entry,
+        /// or with one --key, that key to its value before it.
+        #[arg(long, value_name = "ENTRY", group = "target")]
+        before: Option<String>,
+        /// Undo the keys this entry changed, in every environment it
+        /// touched unless --env picks one.
+        #[arg(long, value_name = "ENTRY", group = "target")]
+        undo: Option<String>,
+        #[command(flatten)]
+        environment: Environment,
+        /// Only these keys.
+        #[arg(long = "key", value_name = "KEY")]
+        keys: Vec<String>,
+        /// Roll back without asking first.
+        #[arg(long)]
+        yes: bool,
+    },
     Ls,
     Log,
     Unpair,
@@ -166,6 +217,62 @@ pub(super) enum LocalAction {
         #[arg(long)]
         overwrite: bool,
     },
+}
+
+#[derive(Subcommand)]
+pub(super) enum HistoryAction {
+    /// Show one entry.
+    Show {
+        /// The entry's ID: the 8-digit short ID, any unique prefix of at least
+        /// 6 hex digits, or all 32.
+        entry: String,
+        /// Show values. Without it, values are hidden.
+        #[arg(long)]
+        reveal: bool,
+    },
+    /// Show whether local history is on and how much it keeps.
+    Status,
+    /// Turn local history on. It starts empty at the next change.
+    On,
+    #[cfg_attr(
+        target_os = "macos",
+        doc = "Turn local history off and delete it on this Mac."
+    )]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        doc = "Turn local history off and delete it on this computer."
+    )]
+    Off {
+        /// Turn it off without asking first.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove one value from local history: by default KEY's value after
+    /// ENTRY, from KEY in every environment.
+    Forget {
+        entry: String,
+        key: String,
+        #[command(flatten)]
+        environment: Environment,
+        /// The value before ENTRY instead of after it.
+        #[arg(long)]
+        before: bool,
+        /// Only the chosen environment.
+        #[arg(long)]
+        only_env: bool,
+        /// Every other key that holds the same value too.
+        #[arg(long)]
+        all_keys: bool,
+        /// Remove it without asking first.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+fn source_group(value: &str) -> Result<lpm_vault::history::SourceGroup, String> {
+    lpm_vault::history::SourceGroup::from_name(value).ok_or_else(|| {
+        "source must be app, cli, import, restore, pull, rollback, or outside".into()
+    })
 }
 
 pub(super) fn parse(args: &[&str], json_output: bool) -> Result<Option<LocalAction>, LpmError> {
@@ -192,6 +299,8 @@ pub(super) fn parse(args: &[&str], json_output: bool) -> Result<Option<LocalActi
                     | "copy"
                     | "cp"
                     | "log"
+                    | "history"
+                    | "rollback"
                     | "unpair"
                     | "diff"
             )

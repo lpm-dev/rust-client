@@ -150,15 +150,18 @@ pub(super) async fn vars_pull(
             .sum::<usize>();
 
         if json_output {
-            super::response::print_json_value(&serde_json::json!({
-                "success": true,
-                "status": "pulled",
-                "org": org_slug,
-                "version": pulled.version,
-                "content_key_version": pulled.content_key_version,
-                "count": total_keys,
-            }));
+            super::response::print_json_value(&super::history::with_history_field(
+                serde_json::json!({
+                    "success": true,
+                    "status": "pulled",
+                    "org": org_slug,
+                    "version": pulled.version,
+                    "content_key_version": pulled.content_key_version,
+                    "count": total_keys,
+                }),
+            ));
         } else {
+            super::history::report_write();
             output::success_line(crate::install_ui::terminal_line!(
                 "pulled {} key{} from org {} (version {})",
                 install_ui::bold(&total_keys.to_string()),
@@ -249,13 +252,14 @@ pub(super) async fn vars_pull(
         .sum::<usize>();
 
     if json_output {
-        super::response::print_json_value(&serde_json::json!({
+        super::response::print_json_value(&super::history::with_history_field(serde_json::json!({
             "success": true,
             "status": "pulled",
             "version": pulled.version,
             "count": total_keys,
-        }));
+        })));
     } else {
+        super::history::report_write();
         output::success_line(crate::install_ui::terminal_line!(
             "pulled {} key{} (version {})",
             install_ui::bold(&total_keys.to_string()),

@@ -3,12 +3,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define LPM_ENV_ABI_VERSION 1
+#define LPM_ENV_ABI_VERSION 2
 #define LPM_ENV_INPUT_LIMIT (2 * 1024 * 1024)
 #define LPM_ENV_OUTPUT_LIMIT (8 * 1024 * 1024)
 #define LPM_ENV_SEAL_INPUT_LIMIT (64 * 1024)
 #define LPM_ENV_BACKUP_FILE_LIMIT (64 * 1024 * 1024)
 #define LPM_ENV_BACKUP_PASSPHRASE_LIMIT (4 * 1024)
+#define LPM_ENV_HISTORY_INPUT_LIMIT (4 * 1024 * 1024)
 
 typedef struct LPMEnvSnapshot LPMEnvSnapshot;
 typedef struct {
@@ -237,7 +238,9 @@ LPMEnvResult lpm_env_companion_account_names(const uint8_t *input, size_t input_
  * so damage only a listing finds counts when inventory is given. Maintenance is
  * always allowed; with needsResume nothing else is until a resume plan has run.
  * An overrides feature of a version this engine doesn't support is never judged
- * as damage. Reasons never quote record contents. status: 0=assessed. */
+ * as damage. Reasons never quote record contents. historyDamage?: [{kind,
+ * reason}] passes on the damage lpm_env_history_check found, so history damage
+ * is judged, and repaired, as the CLI judges it. status: 0=assessed. */
 LPMEnvResult lpm_env_companion_assess(const uint8_t *input, size_t input_length);
 /* Plan a lifecycle operation as transactions to commit in order, each
  * atomically. Input {action, vaultId, marker: bytes | null, inventory: [names]
@@ -248,7 +251,13 @@ LPMEnvResult lpm_env_companion_assess(const uint8_t *input, size_t input_length)
  *     transaction;
  *   discard: every record, keeping the values;
  *   removeFeature: one feature of a valid marker and the records only it lists;
- *   removeUnlisted: the records a valid marker doesn't list.
+ *   removeUnlisted: the records a valid marker doesn't list;
+ *   historyOff: turn local history off, deleting its key (unless another
+ *     feature lists it), head and every part, and leaving "history-off" in the
+ *     marker, which is created when needed; works when history is damaged or
+ *     newer than this engine, but not on an invalid marker;
+ *   historyOn: remove "history-off" from a valid marker, deleting the marker
+ *     when nothing else is left.
  * Output {transactions: [{deletes: [name], moves: [{staged, live}],
  * writesMarker: bytes | null, deletesMarker}], result: the marker left, bytes |
  * null, notice: {kind: "deletion" | "discard" | "restoreUndone" | "restore" |
@@ -275,6 +284,122 @@ LPMEnvResult lpm_env_companion_check_move(const uint8_t *input, size_t input_len
  * status: 0=passes, 2=companion.missing_marker or companion.missing_names,
  * 5=refused. */
 LPMEnvResult lpm_env_companion_check_transaction(const uint8_t *input, size_t input_length);
+/* Local history: an encrypted record, on this Mac, of how a project's values
+ * changed, decided exactly as the CLI decides it. Nothing here reads or writes
+ * a store. Every function takes one frame of at most LPM_ENV_HISTORY_INPUT_LIMIT
+ * bytes and returns one:
+ *   "LPMF", version 1 (one byte), a big-endian uint32 field count, then each
+ *   field as a big-endian uint32 length and its bytes.
+ * Field 0 is UTF-8 JSON with everything that isn't secret; the other fields are
+ * blobs that JSON names by index (the first blob is 1), at most 64 of them. Values, values payloads
+ * and the key record only ever travel as blobs. A values payload is the stored
+ * {"environments":{name:{KEY:VALUE}}}. Outputs list records to write as
+ * writes: [{account, blob}]; with journal true they commit as one journal
+ * transaction, otherwise each is a verified replacement in order (a rollover's
+ * head before its part). Status 2 is {code: "history.invalid_input"}, 3 a panic,
+ * 5 a refusal {code: "history.<reason>", message?}. Every output is wiped when
+ * released.
+ *
+ * Most functions read history: {vaultId, head, key, values?, parts: [{part,
+ * blob?}]}, every part the head lists, blob omitted when its account is absent.
+ *
+ * Plan recording a change. Input {vaultId, change: {id (32 hex), time (ms),
+ * action, detail?: {fileName?, pasted?, remote?: "personal" | {org},
+ * remoteVersion?, platform?, related?: {id, side, time}}, renames?:
+ * [{environment: {from, to}} | {key: {environment, from, to}}]}, before, after
+ * (payload blobs), and create: {marker?, approval: "automatic" | "protected" |
+ * "fileStore", ringLimit} when no history exists, or append: {marker, head,
+ * key, tail?, previous?, growth: "unasked" | "allowed" | "refused"}}, with the
+ * marker read in the same lock. Output {result:
+ * "noKeyChanges" | "unchanged" | "alreadyRecorded" | "needsPrevious" (read
+ * part, pass it as previous, call again) | "needsGrowthAdmission" (ask
+ * lpm_env_history_admission with this vaultId and head, call again; asked when
+ * a ring below its limit would grow, at a rollover of a ring shrunk below a
+ * full one, and at every 64th entry of a sliding ring) | "write" |
+ * "notRecorded" (reason: "damaged" | "needsMaintenance" | "tooManyValues" |
+ * "random", or what the marker says when it doesn't allow the step: "off" |
+ * "newerVersion" | "removing" | "exists" (creating) | "noHistory" (appending)),
+ * writes, journal, entry, gap, valuesKept, shape?: "steady" | "slid"
+ * | "rollover" | "recovered"}. When admission's trims include this project's
+ * own ring, read its head and tail again before calling again. */
+LPMEnvResult lpm_env_history_record(const uint8_t *input, size_t input_length);
+/* The timeline, newest first, names and kinds only. Input: reading fields,
+ * values (for the live gap), filter?: {environment?, exactKey?, keyContains?,
+ * source?: "app" | "cli" | "import" | "restore" | "pull" | "rollback" |
+ * "outside", limit?}. environment and exactKey name them as they are now (or as
+ * a deleted environment was named), and follow them back through renames.
+ * Output {rows: [entry | {unreadable: true, part, after, before}], liveGap,
+ * readable, counts: {group: n}, oldest, damagedTail, unreadableParts,
+ * environments: [{name, deletedAt}], keyGeneration}. environments lists current
+ * and deleted environments, never a name an environment had before a rename. */
+LPMEnvResult lpm_env_history_timeline(const uint8_t *input, size_t input_length);
+/* Entries with their values. Input: reading fields, ids: [32 hex]. Output
+ * {entries: [entry with values: [[{before: blob | null, after: blob | null}]],
+ * one list per environment, in its keys' order]}. */
+LPMEnvResult lpm_env_history_reveal(const uint8_t *input, size_t input_length);
+/* Plan a rollback, or apply one. Input: reading fields with values, rollback:
+ * {kind: "environment" (environment, entry, side) | "key" (environment, key,
+ * entry: back to its value before it) | "undo" (entry, environment?: only that
+ * environment), environmentNamed?:
+ * "now" | "atPoint" (the default for an environment rollback; "now" for a
+ * key)}, and to apply, apply: {fingerprint, skipped?: [[environment, row]],
+ * keepEmpty?: [environment]}. A plan's output {plan: {kind, point, generation,
+ * fingerprint, environments: [{current, target, recreates, offersDeletion,
+ * renames, unnamedKeys: reason | null (keys it had then that an oversized
+ * change hid), rows: [{key, change: "changed" | "added" | "removed" |
+ * "unknown", changes, reason?, current: blob?, target: blob?, gaps, pulled?,
+ * changedAgain?, linked: [key]}]}]}}. linked rows are one renamed key's: they
+ * apply together, and skipping one skips the others. A rollback that would
+ * give an environment a name another holds now refuses with
+ * history.name_taken. Apply plans again and refuses with
+ * history.changed_since_review unless the fingerprint and the values match;
+ * output {writes: [{name, renamedFrom, values: [{key, value: blob}] | null
+ * (delete)}]}. Apply the writes as one values write: remove every renamedFrom
+ * and every deleted name first, then store each write's values. */
+LPMEnvResult lpm_env_history_rollback(const uint8_t *input, size_t input_length);
+/* Review removing one value, then start it. Input: reading fields with values,
+ * and chosen: {entry, environment, key, side}, or start: {review (as returned),
+ * selection: [place index], approval, fingerprint (the review's)}; a review
+ * that isn't the one returned refuses with history.changed_since_review. Review output {review: {value,
+ * generation, keyId (the history's key, so a review never applies to a
+ * history turned off and on since), places: [{environment, key, renamedFrom, group: "thisKey" |
+ * "otherKey", current, occurrences, digests, renamedEnvironments}],
+ * defaultSelection, fingerprint}}. A place is current, and can't be checked, when any name
+ * it had holds the value now. Start output
+ * {journal: true, writes}; then finish with lpm_env_history_maintenance. */
+LPMEnvResult lpm_env_history_removal(const uint8_t *input, size_t input_length);
+/* Key upkeep. Input: reading fields and step: "check" (approval: the values
+ * item's claimed access) -> {needsFinishing, parts, key: "nothing" | "rotate" |
+ * "lower", writes}; "start" (approval) -> {journal: true, writes}; "rotatePart"
+ * (part, with its blob in parts) -> {writes}; "finish" (every part, as stored
+ * after its rotatePart) -> {journal: true, writes}, refused with
+ * history.part_not_rotated while a readable part is still under the old key.
+ * Every history operation finishes a running rotation first. */
+LPMEnvResult lpm_env_history_maintenance(const uint8_t *input, size_t input_length);
+/* What the marker says and what's damaged beyond a listing. Input {vaultId,
+ * marker?, head?, key?, parts?}. Output {history: "default" | "on" | "off" |
+ * "removing" | "unsupported" | "both", version, tailPart, needsParts: [part] |
+ * null, damage: [{kind, reason, description}] | null}. With needsParts, read
+ * those parts (the tail and the part before it), list each in parts, with its
+ * blob or without one when absent, and call again. Pass damage to
+ * lpm_env_companion_assess as historyDamage. */
+LPMEnvResult lpm_env_history_check(const uint8_t *input, size_t input_length);
+/* Admission from a names-only listing. Input {names, operation: "creation" |
+ * "growth" | "trim", trimmable?: [vaultId], maxTrims?, vaultId?, head?: blob}.
+ * For growth, vaultId and head name the growing ring. Output {existing, trims:
+ * [{vaultId, count, floor}], afterTrims, creation: "full" | "reduced" | "refused",
+ * ringLimit, growth, regrow}. growth says whether that ring may add a part: a
+ * ring below its limit while the service stays within its target, a ring
+ * shrunk below a full one once it's back below 3,584 records. */
+LPMEnvResult lpm_env_history_admission(const uint8_t *input, size_t input_length);
+/* One ring's upkeep. Input {vaultId, head, action: "trim" (floor, tail?: {key,
+ * part?}) | "raiseLimit" (existing) | "orphans" (inventory)}. Output {writes,
+ * delete}: a trim writes the head first, then deletes the part. A trim never
+ * leaves fewer parts than floor, the one admission gave. A trim to one part
+ * deletes the part an interrupted rollover recovers from, so it first answers
+ * {needsTail: true}: read the key and the tail (part omitted when absent) and
+ * call again. It trims nothing while the tail isn't the head's. */
+LPMEnvResult lpm_env_history_ring(const uint8_t *input, size_t input_length);
 /* Release only the output buffer after decoding; the snapshot stays live.
  * Exclusively borrow result. Clears data/length; repeated calls are harmless.
  * A matching lpm_env_release is still required for the result. */

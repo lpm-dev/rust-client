@@ -304,11 +304,21 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
         access_damage: Option<String>,
         #[serde(default)]
         unfinished: Option<String>,
+        /// The damage `lpm_env_history_check` found in history's records,
+        /// passed on unchanged.
+        #[serde(default)]
+        history_damage: Vec<HistoryDamage>,
     }
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Read {
         bytes: Option<Bytes>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct HistoryDamage {
+        kind: String,
+        reason: String,
     }
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
@@ -403,6 +413,14 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
                 .inventory
                 .as_deref()
                 .map(|names| project_inventory(&request.vault_id, names));
+            let history: Vec<Damage> = request
+                .history_damage
+                .iter()
+                .map(|damage| Damage::InvalidRecord {
+                    kind: damage.kind.clone(),
+                    reason: damage.reason.clone(),
+                })
+                .collect();
             let assessment = assess(
                 &request.vault_id,
                 Observed {
@@ -414,6 +432,7 @@ pub unsafe extern "C" fn lpm_env_companion_assess(input: *const u8, length: usiz
                         .map(|read| read.bytes.as_ref().map(|bytes| bytes.0.as_slice())),
                     access: request.access_damage.as_deref(),
                     unfinished: request.unfinished.as_deref(),
+                    history: &history,
                 },
             );
             let marker = assessment.gate.marker();
@@ -474,6 +493,8 @@ pub unsafe extern "C" fn lpm_env_companion_plan(input: *const u8, length: usize)
         Discard,
         RemoveFeature,
         RemoveUnlisted,
+        HistoryOff,
+        HistoryOn,
     }
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -617,6 +638,19 @@ pub unsafe extern "C" fn lpm_env_companion_plan(input: *const u8, length: usize)
                 },
                 Action::RemoveUnlisted => valid().and_then(|marker| {
                     plan_unlisted_removal(marker, inventory).map(|plan| (plan, None))
+                }),
+                Action::HistoryOff => match &parsed {
+                    Some(Err(error)) => Err(format!("the feature marker is invalid: {error}")),
+                    marker => lpm_env_companion::history::switch::plan_off(
+                        vault_id,
+                        marker.as_ref().and_then(|marker| marker.as_ref().ok()),
+                        inventory,
+                    )
+                    .map(|plan| (plan, None)),
+                },
+                Action::HistoryOn => valid().and_then(|marker| {
+                    lpm_env_companion::history::switch::plan_on(marker, &inventory)
+                        .map(|plan| (plan, None))
                 }),
             };
             match planned.and_then(|(plan, notice)| output(plan, notice)) {

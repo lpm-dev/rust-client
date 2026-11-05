@@ -3,12 +3,219 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use serde::de::{DeserializeSeed, Deserializer, Error as _, MapAccess, Visitor};
+use zeroize::Zeroizing;
 
 use crate::{EnvironmentMap, SecretMap};
 pub(crate) use lpm_common::stored_env::is_valid_environment_name;
 use lpm_common::stored_env::is_valid_variable_name;
 use lpm_env::{DEFAULT_ENVIRONMENT, reads_default_environment};
 
+/// Why a stored payload didn't parse.
+#[derive(Debug)]
+pub(crate) struct PayloadError(String);
+
+impl fmt::Display for PayloadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Every environment of the stored payload `{"environments":{name:{KEY:
+/// VALUE}}}`, by the rules serde applies to it: one `environments` field,
+/// unique valid environment and variable names, and string values. A
+/// parser of its own, because serde_json decodes escaped strings through a
+/// scratch buffer it never wipes: here each string is decoded into a buffer
+/// sized to its encoded length, and a payload that doesn't parse wipes what
+/// it built.
+pub(crate) fn parse_all(json: &str) -> Result<EnvironmentMap, PayloadError> {
+    let mut parser = PayloadParser { text: json, at: 0 };
+    let mut environments = crate::history::ZeroizingValues::default();
+    let mut found = false;
+    parser.object(|parser, field| {
+        if field != "environments" {
+            return Err(parser.error(&format!("unknown field `{field}`, expected `environments`")));
+        }
+        if std::mem::replace(&mut found, true) {
+            return Err(parser.error("duplicate field `environments`"));
+        }
+        parser.object(|parser, environment| {
+            if !is_valid_environment_name(&environment) {
+                return Err(parser.error(&format!("environment name {environment:?} is invalid")));
+            }
+            if environments.contains_key(&environment) {
+                return Err(parser.error(&format!("duplicate environment name {environment:?}")));
+            }
+            let secrets = environments.entry(environment).or_default();
+            parser.object(|parser, variable| {
+                if !is_valid_variable_name(&variable) {
+                    return Err(parser.error(&format!("env variable name {variable:?} is invalid")));
+                }
+                let mut value = Zeroizing::new(parser.string()?);
+                if secrets.contains_key(&variable) {
+                    return Err(parser.error(&format!("duplicate env variable name {variable:?}")));
+                }
+                secrets.insert(variable, std::mem::take(&mut *value));
+                Ok(())
+            })
+        })
+    })?;
+    parser.skip_whitespace();
+    if parser.at != json.len() {
+        return Err(parser.error("trailing characters"));
+    }
+    if !found {
+        return Err(parser.error("missing field `environments`"));
+    }
+    if environments.is_empty() {
+        environments.insert(DEFAULT_ENVIRONMENT.to_owned(), HashMap::new());
+    }
+    Ok(std::mem::take(&mut *environments))
+}
+
+struct PayloadParser<'a> {
+    text: &'a str,
+    at: usize,
+}
+
+impl PayloadParser<'_> {
+    fn error(&self, message: &str) -> PayloadError {
+        PayloadError(format!("{message} at byte {}", self.at))
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(
+            self.text.as_bytes().get(self.at),
+            Some(b' ' | b'\t' | b'\n' | b'\r')
+        ) {
+            self.at += 1;
+        }
+    }
+
+    fn next_is(&mut self, byte: u8) -> bool {
+        self.skip_whitespace();
+        if self.text.as_bytes().get(self.at) == Some(&byte) {
+            self.at += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// An object, calling `member` with each key once its colon is read.
+    fn object(
+        &mut self,
+        mut member: impl FnMut(&mut Self, String) -> Result<(), PayloadError>,
+    ) -> Result<(), PayloadError> {
+        if !self.next_is(b'{') {
+            return Err(self.error("expected an object"));
+        }
+        if self.next_is(b'}') {
+            return Ok(());
+        }
+        loop {
+            let key = self.string()?;
+            if !self.next_is(b':') {
+                return Err(self.error("expected `:`"));
+            }
+            member(self, key)?;
+            if self.next_is(b'}') {
+                return Ok(());
+            }
+            if !self.next_is(b',') {
+                return Err(self.error("expected `,` or `}`"));
+            }
+        }
+    }
+
+    /// A string, decoded into a buffer the size of its encoded form, which
+    /// a decoded string never exceeds, so it's never moved.
+    fn string(&mut self) -> Result<String, PayloadError> {
+        if !self.next_is(b'"') {
+            return Err(self.error("expected a string"));
+        }
+        let bytes = self.text.as_bytes();
+        let start = self.at;
+        let mut end = start;
+        loop {
+            match bytes.get(end) {
+                None => {
+                    self.at = end;
+                    return Err(self.error("unterminated string"));
+                }
+                Some(b'"') => break,
+                Some(b'\\') => end += 2,
+                Some(_) => end += 1,
+            }
+        }
+        let mut decoded = Zeroizing::new(String::with_capacity(end - start));
+        while self.at < end {
+            let run = bytes[self.at..end]
+                .iter()
+                .position(|byte| *byte == b'\\' || *byte < 0x20)
+                .map_or(end, |offset| self.at + offset);
+            decoded.push_str(&self.text[self.at..run]);
+            self.at = run;
+            if self.at == end {
+                break;
+            }
+            if bytes[self.at] < 0x20 {
+                return Err(self.error("control character in a string"));
+            }
+            self.at += 1;
+            let escaped = bytes.get(self.at).copied();
+            self.at += 1;
+            match escaped {
+                Some(b'"') => decoded.push('"'),
+                Some(b'\\') => decoded.push('\\'),
+                Some(b'/') => decoded.push('/'),
+                Some(b'b') => decoded.push('\u{8}'),
+                Some(b'f') => decoded.push('\u{c}'),
+                Some(b'n') => decoded.push('\n'),
+                Some(b'r') => decoded.push('\r'),
+                Some(b't') => decoded.push('\t'),
+                Some(b'u') => decoded.push(self.unicode_escape(end)?),
+                _ => return Err(self.error("invalid escape")),
+            }
+        }
+        self.at = end + 1;
+        Ok(std::mem::take(&mut *decoded))
+    }
+
+    /// The character a `\u` escape names, after its `\u`: a surrogate pair
+    /// takes two escapes, and a lone surrogate is refused.
+    fn unicode_escape(&mut self, end: usize) -> Result<char, PayloadError> {
+        let high = self.hex4(end)?;
+        let code = match high {
+            0xD800..=0xDBFF => {
+                if self.text.as_bytes().get(self.at..self.at + 2) != Some(b"\\u") {
+                    return Err(self.error("lone leading surrogate in a \\u escape"));
+                }
+                self.at += 2;
+                let low = self.hex4(end)?;
+                if !(0xDC00..=0xDFFF).contains(&low) {
+                    return Err(self.error("lone leading surrogate in a \\u escape"));
+                }
+                0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00)
+            }
+            0xDC00..=0xDFFF => return Err(self.error("lone trailing surrogate in a \\u escape")),
+            code => code,
+        };
+        char::from_u32(code).ok_or_else(|| self.error("invalid \\u escape"))
+    }
+
+    fn hex4(&mut self, end: usize) -> Result<u32, PayloadError> {
+        let digits = self
+            .text
+            .get(self.at..self.at + 4)
+            .filter(|_| self.at + 4 <= end)
+            .filter(|digits| digits.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| self.error("invalid \\u escape"))?;
+        self.at += 4;
+        u32::from_str_radix(digits, 16).map_err(|_| self.error("invalid \\u escape"))
+    }
+}
+
+#[cfg(test)]
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CompleteVaultPayload {
@@ -16,7 +223,10 @@ struct CompleteVaultPayload {
     environments: EnvironmentMap,
 }
 
-pub(crate) fn parse_all(json: &str) -> Result<EnvironmentMap, serde_json::Error> {
+/// `parse_all` as serde parses it: the oracle the hand-written parser is
+/// tested against.
+#[cfg(test)]
+fn parse_all_with_serde(json: &str) -> Result<EnvironmentMap, serde_json::Error> {
     let payload = serde_json::from_str::<CompleteVaultPayload>(json)?;
     let mut environments = payload.environments;
     if environments.is_empty() {
@@ -25,6 +235,7 @@ pub(crate) fn parse_all(json: &str) -> Result<EnvironmentMap, serde_json::Error>
     Ok(environments)
 }
 
+#[cfg(test)]
 fn deserialize_environment_map<'de, D>(deserializer: D) -> Result<EnvironmentMap, D::Error>
 where
     D: Deserializer<'de>,
@@ -32,8 +243,10 @@ where
     deserializer.deserialize_map(EnvironmentMapVisitor)
 }
 
+#[cfg(test)]
 struct EnvironmentMapVisitor;
 
+#[cfg(test)]
 impl<'de> Visitor<'de> for EnvironmentMapVisitor {
     type Value = EnvironmentMap;
 
@@ -90,7 +303,9 @@ pub(crate) fn validate_environments(environments: &EnvironmentMap) -> Result<(),
     Ok(())
 }
 
-pub(crate) fn serialize(environments: &EnvironmentMap) -> Result<String, String> {
+/// The stored payload of `environments`. It holds the values, so it's wiped
+/// when dropped, and no buffer it outgrows while being written keeps a copy.
+pub(crate) fn serialize(environments: &EnvironmentMap) -> Result<Zeroizing<String>, String> {
     #[derive(serde::Serialize)]
     struct BorrowedPayload<'a> {
         environments: &'a EnvironmentMap,
@@ -98,10 +313,28 @@ pub(crate) fn serialize(environments: &EnvironmentMap) -> Result<String, String>
 
     validate_environments(environments)?;
     if environments.is_empty() {
-        return Ok(r#"{"environments":{"default":{}}}"#.to_owned());
+        return Ok(Zeroizing::new(
+            r#"{"environments":{"default":{}}}"#.to_owned(),
+        ));
     }
-    serde_json::to_string(&BorrowedPayload { environments })
-        .map_err(|error| format!("failed to serialize environments: {error}"))
+    let mut payload = crate::wiping::WipingBuffer::with_capacity(unescaped_len(environments));
+    serde_json::to_writer(&mut payload, &BorrowedPayload { environments })
+        .map_err(|error| format!("failed to serialize environments: {error}"))?;
+    crate::zeroizing_text(payload.into_bytes())
+        .map_err(|_| "serialized environments are not UTF-8".to_owned())
+}
+
+/// Room for the payload when nothing in it needs escaping, a few bytes
+/// over its length.
+fn unescaped_len(environments: &EnvironmentMap) -> usize {
+    // `{"environments":{` and `}}`; per environment `"name":{},`; per
+    // value `"KEY":"value",`.
+    environments.iter().fold(19, |length, (name, keys)| {
+        keys.iter()
+            .fold(length + name.len() + 6, |length, (key, value)| {
+                length + key.len() + value.len() + 6
+            })
+    })
 }
 
 pub(crate) fn parse(
@@ -411,6 +644,155 @@ impl Visitor<'_> for ValidateStringVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_payload_parser_agrees_with_serde_on_every_payload() {
+        let cases = [
+            r#"{"environments":{}}"#,
+            r#"{"environments":{"default":{"A":"1"}}}"#,
+            " { \"environments\" : { \"default\" : { \"A\" : \"1\" , \"B\" : \"\" } ,\n\t\"staging\" : { } } }\r\n",
+            r#"{"environments":{"default":{"A":"line\nbreak \"quoted\" back\\slash \/ \b\f\r\t"}}}"#,
+            r#"{"environments":{"default":{"A":"é中😀 \u0000 ﻿"}}}"#,
+            r#"{"environments":{"default":{"A":"é中😀"}}}"#,
+            r#"{"environments":{"default":{"A":"x"}}}"#,
+            "",
+            "{",
+            "{}",
+            "null",
+            "[]",
+            r#"{"environments":null}"#,
+            r#"{"environments":[]}"#,
+            r#"{"environments":{"default":{"A":1}}}"#,
+            r#"{"environments":{"default":{"A":null}}}"#,
+            r#"{"environments":{"default":{"A":{"B":"c"}}}}"#,
+            r#"{"environments":{"default":{"A":"1"}}} x"#,
+            r#"{"environments":{"default":{"A":"1"}}}}"#,
+            r#"{"environments":{},"extra":true}"#,
+            r#"{"environments":{},"environments":{}}"#,
+            r#"{"environments":{"default":{},"default":{}}}"#,
+            r#"{"environments":{"default":{"A":"1","A":"2"}}}"#,
+            r#"{"environments":{"bad name":{}}}"#,
+            r#"{"environments":{"default":{"1BAD":"x"}}}"#,
+            r#"{"environments":{"default":{"A":"\ud83d"}}}"#,
+            r#"{"environments":{"default":{"A":"\ud83dx"}}}"#,
+            r#"{"environments":{"default":{"A":"\ud83dA"}}}"#,
+            r#"{"environments":{"default":{"A":"\ude00"}}}"#,
+            r#"{"environments":{"default":{"A":"\x"}}}"#,
+            r#"{"environments":{"default":{"A":"\u12"}}}"#,
+            r#"{"environments":{"default":{"A":"\u12g4"}}}"#,
+            "{\"environments\":{\"default\":{\"A\":\"tab\there\"}}}",
+            "{\"environments\":{\"default\":{\"A\":\"new\nline\"}}}",
+            r#"{"environments":{"default":{"A":"1",}}}"#,
+            r#"{"environments":{"default":{"A" "1"}}}"#,
+            r#"{"environments":{"default":{"A":"unterminated}}}"#,
+            r#"{"environments":{"default":{"A":"ends in a backslash\"#,
+            "\u{feff}{\"environments\":{}}",
+        ];
+        for case in cases {
+            match (parse_all(case), parse_all_with_serde(case)) {
+                (Ok(ours), Ok(serde)) => assert_eq!(ours, serde, "{case:?}"),
+                (Err(_), Err(_)) => {}
+                (ours, serde) => panic!("{case:?}: ours {ours:?}, serde {serde:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_payload_parser_reads_back_whatever_serialize_writes() {
+        let values = (0_u32..0x250)
+            .chain([0x2028, 0x2029, 0xFEFF, 0x1F600])
+            .filter_map(char::from_u32)
+            .map(|character| format!("a{character}b"));
+        let environments = EnvironmentMap::from([
+            (
+                "default".to_owned(),
+                values
+                    .enumerate()
+                    .map(|(index, value)| (format!("KEY_{index}"), value))
+                    .collect(),
+            ),
+            ("empty".to_owned(), SecretMap::new()),
+        ]);
+        let serialized = serialize(&environments).expect("serializes");
+        assert_eq!(parse_all(&serialized).expect("parses"), environments);
+        assert_eq!(
+            parse_all_with_serde(&serialized).expect("parses"),
+            environments
+        );
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn parsing_escaped_values_leaves_no_copy_of_them_in_freed_memory() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        // A newline and a quote need escaping, as in a PEM private key.
+        let payload = format!(
+            r#"{{"environments":{{"default":{{"KEY":"{MARKER}\n-----END-----","QUOTED":"say \"{MARKER}\""}}}}}}"#
+        );
+        let (read, found) = watch(|| {
+            let mut environments = parse_all(&payload).expect("parses");
+            let key = &environments["default"]["KEY"];
+            let read = key.strip_prefix(MARKER) == Some("\n-----END-----");
+            crate::history::wipe_values(&mut environments);
+            read
+        });
+        assert!(read);
+        assert!(!found, "no buffer the parser used keeps an escaped value");
+
+        let truncated = format!(r#"{{"environments":{{"default":{{"KEY":"{MARKER}\n"#);
+        let (failed, found) = watch(|| parse_all(&truncated).is_err());
+        assert!(failed);
+        assert!(
+            !found,
+            "a payload that doesn't parse leaves nothing behind either"
+        );
+    }
+
+    #[test]
+    fn a_payload_with_nothing_to_escape_is_written_without_moving() {
+        let environments = EnvironmentMap::from([
+            (
+                "default".to_owned(),
+                SecretMap::from([
+                    ("API_KEY".to_owned(), "abc123".to_owned()),
+                    ("EMPTY".to_owned(), String::new()),
+                ]),
+            ),
+            ("preview".to_owned(), SecretMap::new()),
+        ]);
+        let serialized = serialize(&environments).expect("serialize");
+        assert_eq!(parse_all(&serialized).expect("parse"), environments);
+        assert_eq!(serialized.capacity(), unescaped_len(&environments));
+        assert!(unescaped_len(&environments) - serialized.len() < 8);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn serializing_values_leaves_no_copy_of_them_in_freed_memory() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        // Control characters are written as six-byte escapes, so the
+        // payload outgrows a buffer sized from the values' own lengths.
+        let environments = EnvironmentMap::from([(
+            "default".to_owned(),
+            (0..64)
+                .map(|index| {
+                    (
+                        format!("KEY_{index}"),
+                        format!("{MARKER}\"{index}\n{}", "\u{1}".repeat(index)),
+                    )
+                })
+                .collect(),
+        )]);
+        let (serialized, found) = watch(|| serialize(&environments).expect("serialize"));
+        assert!(
+            serialized.len() > unescaped_len(&environments),
+            "the payload outgrew its first buffer"
+        );
+        assert!(!found, "no buffer outgrown while writing keeps a copy");
+        assert_eq!(parse_all(&serialized).expect("parse"), environments);
+        let ((), found) = watch(move || drop(serialized));
+        assert!(!found, "the payload is wiped when dropped");
+    }
 
     #[test]
     fn selects_only_the_requested_versioned_environment() {

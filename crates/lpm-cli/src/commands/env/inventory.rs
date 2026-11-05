@@ -108,6 +108,7 @@ fn perform_init_actions(
         &initializations,
         force,
         snapshot,
+        &lpm_vault::history::Source::new(lpm_vault::history::Action::InitFromFiles),
     )
     .map_err(LpmError::Script)
     .map(|results| {
@@ -298,17 +299,18 @@ pub(super) fn vars_init(
             .collect::<Vec<_>>();
         println!(
             "{}",
-            serde_json::json!({
+            super::history::with_history_field(serde_json::json!({
                 "success": true,
                 "environments": json_actions.unwrap_or_default(),
                 "actions": results,
                 "skipped": admitted.skipped,
                 "warnings": warnings,
-            })
+            }))
         );
         return Ok(());
     }
 
+    super::history::report_write();
     let mut imported_count = 0;
     let mut created_count = 0;
     let mut skipped_count = 0;
@@ -674,6 +676,7 @@ pub(super) fn vars_copy(
         &resolved_src.storage_key,
         &resolved_dst.storage_key,
         overwrite,
+        &lpm_vault::history::Source::new(lpm_vault::history::Action::CopyEnvironment),
     )
     .map_err(LpmError::Script)?;
     let Some(copy) = copy else {
@@ -710,15 +713,16 @@ pub(super) fn vars_copy(
     if json_output {
         println!(
             "{}",
-            serde_json::json!({
+            super::history::with_history_field(serde_json::json!({
                 "success": true,
                 "copied": copy.copied,
                 "skipped": copy.skipped,
                 "source": resolved_src.canonical,
                 "target": resolved_dst.canonical,
-            })
+            }))
         );
     } else {
+        super::history::report_write();
         let message = if copy.skipped == 0 {
             install_ui::terminal_line!(
                 "copied {} secret{} from \"{}\" to \"{}\"",

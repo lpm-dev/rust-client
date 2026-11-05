@@ -21,22 +21,41 @@ unsafe extern "C" {
     static kSecUseOperationPrompt: CFStringRef;
 }
 
+thread_local! {
+    /// What the running command reads for, when it's more than one item:
+    /// local history reads the values first, and only one prompt shows.
+    static PURPOSE: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run `run` with every approval prompt saying it's for the project's
+/// local history, as a history command's one prompt must.
+pub(crate) fn prompting_for_local_history<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<&'static str>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PURPOSE.set(self.0);
+        }
+    }
+    let _restore = Restore(PURPOSE.replace(Some("local history")));
+    run()
+}
+
 /// The reason the approval prompt gives for reading `account`: a values
-/// item is named by its vault ID, a companion record by what it holds.
+/// item is named by its vault ID, a companion record by what it holds, and
+/// either by what the running command reads for when it says.
 fn operation_prompt(account: &str) -> String {
     use crate::companion::account::CompanionAccount;
-    match CompanionAccount::parse(account) {
-        Some(record) => {
-            let holds = match record.kind() {
-                Some(crate::companion::overrides::OVERRIDES_KIND) => "personal overrides",
-                _ => "newer data",
-            };
-            format!(
-                "Allow LPM CLI to access env project {}'s {holds}",
-                record.vault_id()
-            )
-        }
-        None => format!("Allow LPM CLI to access env project {account}"),
+    let history = lpm_env_companion::append_log::HISTORY;
+    let record = CompanionAccount::parse(account);
+    let vault_id = record.as_ref().map_or(account, CompanionAccount::vault_id);
+    let holds = PURPOSE.get().or_else(|| match record.as_ref()?.kind() {
+        Some(crate::companion::overrides::OVERRIDES_KIND) => Some("personal overrides"),
+        Some(kind) if kind == history.kind || kind == history.head_kind => Some("local history"),
+        _ => Some("newer data"),
+    });
+    match holds {
+        Some(holds) => format!("Allow LPM CLI to access env project {vault_id}'s {holds}"),
+        None => format!("Allow LPM CLI to access env project {vault_id}"),
     }
 }
 
@@ -401,10 +420,11 @@ impl SecurityFrameworkBackend {
         Ok(Some(Self::claim(&attributes)))
     }
 
-    /// The account names of every item in `service`, from attributes alone,
-    /// which never ask for authentication. Like [`Self::claimed_access`], it
-    /// passes no authentication context.
-    fn account_names(service: &str) -> Result<Vec<String>, KeychainStorageError> {
+    /// The account name of every item in `service`, with the approval its
+    /// attributes claim, from attributes alone, which never ask for
+    /// authentication. Like [`Self::claimed_access`], it passes no
+    /// authentication context.
+    fn accounts(service: &str) -> Result<Vec<(String, ClaimedAccess)>, KeychainStorageError> {
         let mut pairs = Self::identity_pairs(service, "");
         let account_key = unsafe { CFString::wrap_under_get_rule(kSecAttrAccount) };
         pairs.retain(|(key, _)| key != &account_key);
@@ -440,7 +460,7 @@ impl SecurityFrameworkBackend {
                 .find(&account_key)
                 .and_then(|value| value.downcast::<CFString>())
                 .ok_or(KeychainStorageError::VerificationFailed)?;
-            names.push(account.to_string());
+            names.push((account.to_string(), Self::claim(&attributes)));
         }
         Ok(names)
     }
@@ -633,8 +653,14 @@ pub(crate) fn write_bytes_with_access(
 }
 
 fn verify_stored(service: &str, account: &str, value: &[u8]) -> Result<(), KeychainStorageError> {
-    match SecurityFrameworkBackend::read(service, account)? {
-        Some(stored) if stored == value => Ok(()),
+    stored_matches(SecurityFrameworkBackend::read(service, account)?, value)
+}
+
+/// Whether `stored`, read back after a write, is `value`. The bytes may be
+/// a key, so they're wiped either way.
+fn stored_matches(stored: Option<Vec<u8>>, value: &[u8]) -> Result<(), KeychainStorageError> {
+    match stored.map(zeroize::Zeroizing::new) {
+        Some(stored) if stored.as_slice() == value => Ok(()),
         _ => Err(KeychainStorageError::VerificationFailed),
     }
 }
@@ -663,8 +689,10 @@ pub(crate) fn write_bytes(service: &str, account: &str, value: &[u8]) -> Result<
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn account_names(service: &str) -> Result<Vec<String>, String> {
-    SecurityFrameworkBackend::account_names(service).map_err(|error| error.to_string())
+/// Every account in `service` with the approval its attributes claim, in
+/// one attributes-only listing.
+pub(crate) fn accounts_with_access(service: &str) -> Result<Vec<(String, ClaimedAccess)>, String> {
+    SecurityFrameworkBackend::accounts(service).map_err(|error| error.to_string())
 }
 
 /// Read `account` without authentication UI to learn whether it demands user
@@ -800,6 +828,20 @@ pub(crate) fn delete(service: &str, account: &str) -> Result<KeychainDeleteOutco
 mod tests {
     use super::*;
 
+    #[cfg(not(miri))]
+    #[test]
+    fn verifying_a_write_wipes_what_it_read_back() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        let (verified, found) =
+            watch(|| stored_matches(Some(MARKER.as_bytes().to_vec()), MARKER.as_bytes()).is_ok());
+        assert!(verified);
+        assert!(!found, "the read-back bytes, perhaps a key, are wiped");
+        let (verified, found) =
+            watch(|| stored_matches(Some(MARKER.as_bytes().to_vec()), b"other").is_ok());
+        assert!(!verified);
+        assert!(!found, "and wiped when they differ");
+    }
+
     #[test]
     fn approval_prompts_say_what_they_read() {
         assert_eq!(
@@ -821,6 +863,29 @@ mod tests {
                 Some(3)
             )),
             "Allow LPM CLI to access env project proj's newer data"
+        );
+    }
+
+    #[test]
+    fn approval_prompts_name_local_history_for_its_records_and_its_commands() {
+        let head = lpm_env_companion::history::head_account("proj").name();
+        let part = lpm_env_companion::history::part_account("proj", 3).name();
+        for account in [&head, &part] {
+            assert_eq!(
+                operation_prompt(account),
+                "Allow LPM CLI to access env project proj's local history"
+            );
+        }
+        let values = "8c1f0d2e-6a35-4c1b-9f3e-2d7b5a1c9e40";
+        assert_eq!(
+            prompting_for_local_history(|| operation_prompt(values)),
+            "Allow LPM CLI to access env project 8c1f0d2e-6a35-4c1b-9f3e-2d7b5a1c9e40's local history",
+            "a history command's first prompt, for the values, says what it's for"
+        );
+        assert_eq!(
+            operation_prompt(values),
+            "Allow LPM CLI to access env project 8c1f0d2e-6a35-4c1b-9f3e-2d7b5a1c9e40",
+            "and only while it runs"
         );
     }
 
@@ -1054,10 +1119,17 @@ mod tests {
             Some(ClaimedAccess::Contradictory),
             "a policy LPM doesn't know contradicts itself"
         );
-        let names = account_names(&service)
+        let accounts = accounts_with_access(&service)
             .expect("items that demand user presence never stop the listing");
         for account in ["open", "automatic", "protected", "contradictory"] {
-            assert!(names.iter().any(|name| name == account), "{names:?}");
+            assert_eq!(
+                accounts
+                    .iter()
+                    .find(|(name, _)| name == account)
+                    .map(|(_, claim)| *claim),
+                claimed_access(&service, account).expect("attributes"),
+                "the listing reports {account}'s claim as reading its attributes does"
+            );
         }
     }
 

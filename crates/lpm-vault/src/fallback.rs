@@ -556,15 +556,18 @@ fn decrypt_with_store(
 ) -> Result<String, String> {
     crate::storage_transaction::with_vault_transaction(|directory| {
         decrypt_with_store_unlocked(directory, vault_id, encoded, store)
+            .map(|json| json.as_str().to_owned())
     })
 }
 
+/// The decrypted payload, wiped when dropped. AES-GCM decrypts in place
+/// before it checks the tag, so the buffer wipes from the start.
 fn decrypt_with_store_unlocked(
     directory: &crate::storage_transaction::VaultStorageDirectory,
     vault_id: &str,
     encoded: &str,
     store: &dyn NativeDataKeyStore,
-) -> Result<String, String> {
+) -> Result<zeroize::Zeroizing<String>, String> {
     let (iv_encoded, remainder) = encoded
         .split_once(':')
         .ok_or_else(|| "invalid encrypted format".to_owned())?;
@@ -579,9 +582,11 @@ fn decrypt_with_store_unlocked(
     let auth_tag = BASE64
         .decode(tag_encoded)
         .map_err(|e| format!("tag decode: {e}"))?;
-    let mut encrypted = BASE64
-        .decode(encrypted_encoded)
-        .map_err(|e| format!("data decode: {e}"))?;
+    let mut encrypted = zeroize::Zeroizing::new(
+        BASE64
+            .decode(encrypted_encoded)
+            .map_err(|e| format!("data decode: {e}"))?,
+    );
 
     let nonce = <&Nonce<Aes256Gcm>>::try_from(iv.as_slice())
         .map_err(|_| format!("incompatible IV size: {} bytes", iv.len()))?;
@@ -606,7 +611,8 @@ fn decrypt_with_store_unlocked(
         )
         .map_err(|_| "decryption failed (wrong key or corrupted data)".to_string())?;
 
-    String::from_utf8(encrypted).map_err(|e| format!("utf8 error: {e}"))
+    crate::zeroizing_text(std::mem::take(&mut *encrypted))
+        .map_err(|error| format!("utf8 error: {error}"))
 }
 
 /// Read vault secrets for a specific environment.
@@ -715,6 +721,17 @@ pub(crate) fn read_all_environments_with_digest_unlocked(
     directory: &crate::storage_transaction::VaultStorageDirectory,
     vault_id: &str,
 ) -> Result<(Option<EnvironmentMap>, Option<[u8; 32]>), String> {
+    let (environments, digest) = read_environments_with_digest(directory, vault_id)?;
+    crate::history::scope::observe_read(vault_id, environments.as_ref());
+    Ok((environments, digest))
+}
+
+/// A project's values and their payload digest, which history doesn't see:
+/// the caller says what its operation read.
+fn read_environments_with_digest(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+) -> Result<(Option<EnvironmentMap>, Option<[u8; 32]>), String> {
     use sha2::Digest as _;
 
     crate::authorize_companion(directory, vault_id, Operation::ReadExcludingOverrides)?;
@@ -759,23 +776,51 @@ pub(crate) fn vault_payload_digest_unlocked(
 }
 
 /// Write vault secrets to encrypted file (specific environment).
-pub fn write_vault_file(vault_id: &str, secrets: &SecretMap) -> Result<(), String> {
+#[cfg(test)]
+pub(crate) fn write_vault_file(vault_id: &str, secrets: &SecretMap) -> Result<(), String> {
     write_vault_file_env(vault_id, "default", secrets)
 }
 
-pub fn write_all_environments(vault_id: &str, environments: &EnvironmentMap) -> Result<(), String> {
+pub(crate) fn write_all_environments(
+    vault_id: &str,
+    environments: &EnvironmentMap,
+    source: &crate::history::Source,
+) -> Result<(), String> {
     crate::storage_transaction::with_vault_transaction(|directory| {
-        write_all_environments_unlocked(directory, vault_id, environments)
+        let recording = crate::history::scope::begin(vault_id, source);
+        write_all_environments_unlocked(directory, vault_id, environments, &recording)
     })
 }
 
+/// The commit primitive every file-store values write goes through. It
+/// takes the write's [`Recording`](crate::history::scope::Recording), so a
+/// write without a source doesn't compile, and tells history what it
+/// stored.
 pub(crate) fn write_all_environments_unlocked(
     directory: &crate::storage_transaction::VaultStorageDirectory,
     vault_id: &str,
     environments: &EnvironmentMap,
+    recording: &crate::history::scope::Recording,
+) -> Result<(), String> {
+    commit_environments(
+        directory,
+        vault_id,
+        std::borrow::Cow::Borrowed(environments),
+        recording,
+    )
+}
+
+fn commit_environments(
+    directory: &crate::storage_transaction::VaultStorageDirectory,
+    vault_id: &str,
+    environments: std::borrow::Cow<'_, EnvironmentMap>,
+    recording: &crate::history::scope::Recording,
 ) -> Result<(), String> {
     crate::authorize_companion(directory, vault_id, Operation::Write)?;
-    let json = crate::selected_environment::serialize(environments)?;
+    crate::history::scope::observe_before(recording, || {
+        read_environments_with_digest(directory, vault_id).map(|(before, _)| before)
+    });
+    let json = crate::selected_environment::serialize(&environments)?;
     let encrypted =
         encrypt_with_store_unlocked(directory, vault_id, &json, &KeyringNativeDataKeyStore)?;
     let vaults = directory.open_or_create_directory("vaults")?;
@@ -784,6 +829,9 @@ pub(crate) fn write_all_environments_unlocked(
         encrypted.as_bytes(),
         "encrypted vault",
     )?;
+    // The write is durable now, so history records it even if the cleanup
+    // after it fails.
+    crate::history::scope::committed(recording, environments);
     remove_legacy_vault_file(&vaults, vault_id)
 }
 
@@ -802,32 +850,32 @@ pub(crate) fn mutate_vault_file_env<T>(
     vault_id: &str,
     env: &str,
     operation: impl FnOnce(&mut SecretMap) -> T,
+    source: &crate::history::Source,
 ) -> Result<T, String> {
     crate::storage_transaction::with_vault_transaction(|directory| {
+        let recording = crate::history::scope::begin(vault_id, source);
         let mut environments =
             read_all_environments_unlocked(directory, vault_id)?.unwrap_or_default();
         let result = operation(environments.entry(env.to_owned()).or_default());
-        write_all_environments_unlocked(directory, vault_id, &environments)?;
+        commit_environments(
+            directory,
+            vault_id,
+            std::borrow::Cow::Owned(environments),
+            &recording,
+        )?;
         Ok(result)
     })
 }
 
 /// Write vault secrets for a specific environment.
-pub fn write_vault_file_env(vault_id: &str, env: &str, secrets: &SecretMap) -> Result<(), String> {
-    crate::storage_transaction::with_vault_transaction(|directory| {
-        write_vault_file_env_unlocked(directory, vault_id, env, secrets)
-    })
-}
-
-fn write_vault_file_env_unlocked(
-    directory: &crate::storage_transaction::VaultStorageDirectory,
+#[cfg(test)]
+pub(crate) fn write_vault_file_env(
     vault_id: &str,
     env: &str,
     secrets: &SecretMap,
 ) -> Result<(), String> {
-    let mut environments = read_all_environments_unlocked(directory, vault_id)?.unwrap_or_default();
-    environments.insert(env.to_owned(), secrets.clone());
-    write_all_environments_unlocked(directory, vault_id, &environments)
+    let source = crate::history::Source::new(crate::history::Action::Set);
+    mutate_vault_file_env(vault_id, env, |current| *current = secrets.clone(), &source)
 }
 
 /// Delete the encrypted vault files and every companion record through the
@@ -839,7 +887,7 @@ pub fn delete_vault_file(vault_id: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::path::Path;
@@ -856,6 +904,36 @@ mod tests {
         let selected = take_environment(environments, "default").unwrap();
 
         assert_eq!(selected["TOKEN"].as_ptr(), value_pointer);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn reading_the_file_store_s_values_leaves_no_decrypted_copy() {
+        use crate::freed_memory_probe::{MARKER, watch};
+        with_temp_vault_home(|_| {
+            force_file_vault();
+            mutate_vault_file_env(
+                "proj",
+                "default",
+                |secrets| {
+                    secrets.insert("TOKEN".to_owned(), MARKER.to_owned());
+                },
+                &crate::history::Source::new(crate::history::Action::Set),
+            )
+            .expect("write");
+            let (read, found) = watch(|| {
+                with_storage_directory(|directory| {
+                    let mut values = read_environments_with_digest(directory, "proj")?
+                        .0
+                        .expect("stored values");
+                    let read = values["default"]["TOKEN"] == MARKER;
+                    crate::history::wipe_values(&mut values);
+                    Ok(read)
+                })
+            });
+            assert!(read);
+            assert!(!found, "the decrypted payload is wiped");
+        });
     }
 
     #[derive(Default)]
@@ -901,7 +979,7 @@ mod tests {
         }
     }
 
-    pub(super) fn with_temp_vault_home<T>(test: impl FnOnce(&Path) -> T) -> T {
+    pub(crate) fn with_temp_vault_home<T>(test: impl FnOnce(&Path) -> T) -> T {
         let _lock = crate::test_env_lock::acquire_env_lock();
         let temp_home = tempfile::tempdir().expect("create temp HOME");
         let original_home = crate::test_env_lock::HomeEnvSnapshot::set(temp_home.path());
@@ -1021,9 +1099,14 @@ mod tests {
                 let barrier = Arc::clone(&barrier);
                 handles.push(std::thread::spawn(move || {
                     barrier.wait();
-                    mutate_vault_file_env("concurrent-vault", "default", |secrets| {
-                        secrets.insert(format!("KEY_{index}"), format!("value-{index}"));
-                    })
+                    mutate_vault_file_env(
+                        "concurrent-vault",
+                        "default",
+                        |secrets| {
+                            secrets.insert(format!("KEY_{index}"), format!("value-{index}"));
+                        },
+                        &crate::history::Source::new(crate::history::Action::Set),
+                    )
                 }));
             }
 
@@ -1045,7 +1128,7 @@ mod tests {
         HashMap::from([("TOKEN".to_owned(), value.to_owned())])
     }
 
-    pub(super) fn force_file_vault() {
+    pub(crate) fn force_file_vault() {
         unsafe {
             std::env::set_var("LPM_FORCE_FILE_VAULT", "1");
         }
@@ -1394,9 +1477,14 @@ mod tests {
                 r#"{"environments":{"default":{"TOKEN":123}}}"#,
             );
 
-            let error = mutate_vault_file_env("invalid-mutation", "default", |secrets| {
-                secrets.insert("NEW".to_owned(), "value".to_owned());
-            })
+            let error = mutate_vault_file_env(
+                "invalid-mutation",
+                "default",
+                |secrets| {
+                    secrets.insert("NEW".to_owned(), "value".to_owned());
+                },
+                &crate::history::Source::new(crate::history::Action::Set),
+            )
             .expect_err("invalid authenticated payloads must stop mutation");
 
             assert!(error.contains("vault payload is invalid"), "{error}");
