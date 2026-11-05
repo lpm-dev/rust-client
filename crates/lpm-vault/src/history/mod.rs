@@ -38,6 +38,24 @@ macro_rules! with_history_store {
     }};
 }
 
+mod api;
+
+pub use api::{
+    ChosenValue, HistoryError, HistoryState, HistoryStatus, RollbackRequest, commit_rollback,
+    forget, resolve_entry, review_forget, review_rollback, show, status, timeline, turn_off,
+    turn_on,
+};
+pub use lpm_env_companion::history::read::{
+    EntryInfo, EntryLookup, EnvironmentInfo, EnvironmentKindInfo, Filter, KeyInfo, KeyKindInfo,
+    KeyMatch, KeysInfo, LiveGap, RemoteInfo, RevealedEntry, RevealedValues, SideInfo, SourceGroup,
+    Timeline, TimelineRow,
+};
+pub use lpm_env_companion::history::rebuild::{
+    Choices, EnvironmentPlan, Gap, Point, Pulled, RemoteName, RollbackKind, RollbackPlan, Row,
+    TargetValue, UnknownReason,
+};
+pub use lpm_env_companion::history::removal::{Occurrence, Place, PlaceGroup, RemovalReview};
+
 /// Where a pull came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteSource {
