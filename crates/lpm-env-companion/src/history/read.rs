@@ -785,24 +785,7 @@ pub fn reveal_entry(
                 Some(scrub) => scrub.entry(&entry).0,
                 None => entry,
             };
-            let values = entry
-                .environments
-                .iter()
-                .map(|environment| match &environment.keys {
-                    Keys::Count(_) => Vec::new(),
-                    Keys::Changes(changes) => changes
-                        .iter()
-                        .map(|change| RevealedValues {
-                            before: kept(&change.before),
-                            after: kept(&change.after),
-                        })
-                        .collect(),
-                })
-                .collect();
-            found = Some(RevealedEntry {
-                info: entry_info(&entry),
-                values,
-            });
+            found = Some(revealed(&entry));
         }
         true
     })?;
@@ -811,6 +794,53 @@ pub fn reveal_entry(
         (false, None) => EntryLookup::NotFound,
         (false, Some(found)) => EntryLookup::Found(Box::new(found)),
     })
+}
+
+/// The entries whose IDs are in `ids`, with their values, in one walk.
+pub fn reveal_entries(
+    opened: &Opened,
+    source: &mut impl PartSource,
+    ids: &BTreeSet<EntryId>,
+) -> Result<Vec<RevealedEntry>, ReadError> {
+    let mut found: BTreeMap<EntryId, RevealedEntry> = BTreeMap::new();
+    opened.walk(source, |read| {
+        let PartRead::Readable { plaintext, .. } = read else {
+            return true;
+        };
+        let part = Part::decode(&plaintext).expect("walk decoded it");
+        for entry in part.decoded_entries() {
+            if !ids.contains(&entry.id) || found.contains_key(&entry.id) {
+                continue;
+            }
+            let entry = match opened.scrub() {
+                Some(scrub) => scrub.entry(&entry).0,
+                None => entry,
+            };
+            found.insert(entry.id, revealed(&entry));
+        }
+        found.len() < ids.len()
+    })?;
+    Ok(found.into_values().collect())
+}
+
+fn revealed(entry: &Entry<'_>) -> RevealedEntry {
+    RevealedEntry {
+        info: entry_info(entry),
+        values: entry
+            .environments
+            .iter()
+            .map(|environment| match &environment.keys {
+                Keys::Count(_) => Vec::new(),
+                Keys::Changes(changes) => changes
+                    .iter()
+                    .map(|change| RevealedValues {
+                        before: kept(&change.before),
+                        after: kept(&change.after),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
 }
 
 fn kept(side: &Side<'_>) -> Option<Zeroizing<String>> {

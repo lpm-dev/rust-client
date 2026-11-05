@@ -13,7 +13,7 @@ pub(crate) mod store;
 use std::cell::RefCell;
 use std::fmt;
 
-pub use lpm_env_companion::history::codec::{Action, Platform, RelatedSide};
+pub use lpm_env_companion::history::codec::{Action, Actor, Platform, RelatedSide};
 use lpm_env_companion::history::codec::{Detail, Related, Remote};
 use lpm_env_companion::history::values::Values;
 use lpm_env_companion::keyring::{Random as _, SystemRandom};
@@ -42,8 +42,8 @@ mod api;
 
 pub use api::{
     ChosenValue, HistoryError, HistoryState, HistoryStatus, RollbackRequest, commit_rollback,
-    forget, resolve_entry, review_forget, review_rollback, show, status, timeline, turn_off,
-    turn_on,
+    forget, resolve_entry, reveal, review_forget, review_rollback, show, status, timeline,
+    turn_off, turn_on,
 };
 pub use lpm_env_companion::history::read::{
     EntryInfo, EntryLookup, EnvironmentInfo, EnvironmentKindInfo, Filter, KeyInfo, KeyKindInfo,

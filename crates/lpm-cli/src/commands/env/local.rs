@@ -53,15 +53,16 @@ pub(super) fn env_set(
             .collect();
         println!(
             "{}",
-            serde_json::json!({
+            super::history::with_history_field(serde_json::json!({
                 "success": true,
                 "stored": keys,
                 "ignored": ignored,
                 "env": env_label,
                 "value_warnings": value_warnings,
-            })
+            }))
         );
     } else {
+        super::history::report_write();
         for (key, value) in &stored {
             output::success_line(install_ui::terminal_line!(
                 "stored {} ({})",
@@ -174,9 +175,12 @@ pub(super) fn env_delete(
     if json_output {
         println!(
             "{}",
-            serde_json::json!({"success": true, "deleted": keys, "env": env_label})
+            super::history::with_history_field(
+                serde_json::json!({"success": true, "deleted": keys, "env": env_label})
+            )
         );
     } else {
+        super::history::report_write();
         for key in &keys {
             output::success_line(install_ui::terminal_line!(
                 "deleted {} ({})",
@@ -223,16 +227,17 @@ pub(super) fn env_import(
     if json_output {
         println!(
             "{}",
-            serde_json::json!({
+            super::history::with_history_field(serde_json::json!({
                 "success": true,
                 "imported": count,
                 "from": file,
                 "env": env_label,
                 "warnings": warnings,
                 "value_warnings": super::characters::json_list(&imported.characters),
-            })
+            }))
         );
     } else {
+        super::history::report_write();
         print_secret_file_warnings(&warnings);
         output::success_line(install_ui::terminal_line!(
             "imported {} secret{} from {} ({})",

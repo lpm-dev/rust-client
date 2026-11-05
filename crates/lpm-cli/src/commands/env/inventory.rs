@@ -299,17 +299,18 @@ pub(super) fn vars_init(
             .collect::<Vec<_>>();
         println!(
             "{}",
-            serde_json::json!({
+            super::history::with_history_field(serde_json::json!({
                 "success": true,
                 "environments": json_actions.unwrap_or_default(),
                 "actions": results,
                 "skipped": admitted.skipped,
                 "warnings": warnings,
-            })
+            }))
         );
         return Ok(());
     }
 
+    super::history::report_write();
     let mut imported_count = 0;
     let mut created_count = 0;
     let mut skipped_count = 0;
@@ -712,15 +713,16 @@ pub(super) fn vars_copy(
     if json_output {
         println!(
             "{}",
-            serde_json::json!({
+            super::history::with_history_field(serde_json::json!({
                 "success": true,
                 "copied": copy.copied,
                 "skipped": copy.skipped,
                 "source": resolved_src.canonical,
                 "target": resolved_dst.canonical,
-            })
+            }))
         );
     } else {
+        super::history::report_write();
         let message = if copy.skipped == 0 {
             install_ui::terminal_line!(
                 "copied {} secret{} from \"{}\" to \"{}\"",

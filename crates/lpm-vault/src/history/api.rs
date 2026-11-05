@@ -10,7 +10,8 @@ use std::path::Path;
 
 use lpm_env_companion::history::part_account;
 use lpm_env_companion::history::read::{
-    EntryLookup, Filter, Opened, PartSource, ReadError, Timeline, read_timeline, reveal_entry,
+    EntryLookup, Filter, Opened, PartSource, ReadError, RevealedEntry, Timeline, read_timeline,
+    reveal_entries, reveal_entry,
 };
 use lpm_env_companion::history::rebuild::{
     Choices, PlanError, Point, Refusal, RollbackPlan, apply_rollback, plan_environment_rollback,
@@ -316,6 +317,19 @@ pub fn show(project_dir: &Path, entry: [u8; 16]) -> Result<Option<EntryLookup>, 
         Operation::ReadExcludingOverrides,
         |parts, opened, _| Ok(reveal_entry(opened, parts, &entry)?),
     )
+}
+
+/// The entries `ids` names, with their values, in one read of history.
+pub fn reveal(
+    project_dir: &Path,
+    ids: &BTreeSet<[u8; 16]>,
+) -> Result<Vec<RevealedEntry>, HistoryError> {
+    Ok(with_opened(
+        project_dir,
+        Operation::ReadExcludingOverrides,
+        |parts, opened, _| Ok(reveal_entries(opened, parts, ids)?),
+    )?
+    .unwrap_or_default())
 }
 
 /// What a rollback goes back to.

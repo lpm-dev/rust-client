@@ -2875,7 +2875,7 @@ pub(super) async fn vars_platform_pull(
     )
     .await;
     if json_output {
-        super::response::print_json_value(&serde_json::json!({
+        super::response::print_json_value(&super::history::with_history_field(serde_json::json!({
             "success": true,
             "status": "imported",
             "platform": platform,
@@ -2885,8 +2885,9 @@ pub(super) async fn vars_platform_pull(
             "skippedSecrets": skipped_secrets,
             "secretVerification": client.secret_verification(),
             "auditRecorded": audit.is_ok(),
-        }));
+        })));
     } else {
+        super::history::report_write();
         output::success(&format!(
             "imported {} value(s) from {display_name} into {env_name}",
             pairs.len()
