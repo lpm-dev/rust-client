@@ -30,14 +30,14 @@ use lpm_env_companion::history::codec::{
     Action, Actor, Detail, EntryId, Platform, Related, RelatedSide, Remote,
 };
 use lpm_env_companion::history::read::{
-    EntryInfo, EnvironmentInfo, EnvironmentKindInfo, Filter, KeyKindInfo, KeyMatch, KeysInfo,
-    Opened, PartSource, ReadError, RemoteInfo, RevealedValues, SideInfo, SourceGroup, Timeline,
-    TimelineRow, check_records, read_timeline, reveal_entries,
+    EntryInfo, EnvironmentInfo, EnvironmentKindInfo, Filter, IdPrefix, KeyKindInfo, KeyMatch,
+    KeysInfo, Opened, PartSource, ReadError, RemoteInfo, RevealedValues, SideInfo, SourceGroup,
+    Timeline, TimelineRow, check_records, read_timeline, reveal_entries,
 };
 use lpm_env_companion::history::rebuild::{
-    Binding, Choices, EnvironmentRef, PlanError, Point, Refusal, RollbackKind, RollbackPlan,
-    TargetValue, UnknownReason, apply_rollback, plan_environment_rollback, plan_key_rollback,
-    plan_undo,
+    Binding, Choices, EnvironmentName, EnvironmentRef, PlanError, Point, Refusal, RollbackKind,
+    RollbackPlan, Target, TargetValue, UnknownReason, apply_rollback, plan_environment_rollback,
+    plan_key_rollback, plan_rollback as plan_by_entry,
 };
 use lpm_env_companion::history::removal::{
     Chosen, KeyMaintenance, Occurrence, Place, PlaceGroup, RemovalError, RemovalReview,
@@ -134,23 +134,42 @@ impl Output {
             response: &'r R,
             abi_version: u32,
         }
-        let request = serde_json::to_vec(&Framed {
+        /// Counts what a serialization writes, so the frame is sized once.
+        struct Counted(usize);
+        impl std::io::Write for Counted {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 += bytes.len();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let framed = Framed {
             response,
             abi_version: ABI_VERSION,
-        })
-        .unwrap_or_default();
+        };
+        // Serializing twice costs less than holding the JSON twice: the
+        // frame is written once, at its exact size.
+        let mut counted = Counted(0);
+        if serde_json::to_writer(&mut counted, &framed).is_err() {
+            return failure(3, "history.serialization");
+        }
+        let request_len = counted.0;
         let total = 4
             + 1
             + 4
             + 4
-            + request.len()
+            + request_len
             + self.blobs.iter().map(|blob| 4 + blob.len()).sum::<usize>();
         let mut frame = Vec::with_capacity(total);
         frame.extend_from_slice(&FRAME_MAGIC);
         frame.push(FRAME_VERSION);
         frame.extend_from_slice(&((self.blobs.len() + 1) as u32).to_be_bytes());
-        frame.extend_from_slice(&(request.len() as u32).to_be_bytes());
-        frame.extend_from_slice(&request);
+        frame.extend_from_slice(&(request_len as u32).to_be_bytes());
+        if serde_json::to_writer(&mut frame, &framed).is_err() {
+            return failure(3, "history.serialization");
+        }
         for blob in &self.blobs {
             frame.extend_from_slice(&(blob.len() as u32).to_be_bytes());
             frame.extend_from_slice(blob);
@@ -1003,11 +1022,16 @@ pub unsafe extern "C" fn lpm_env_history_timeline(input: *const u8, length: usiz
                     limit: filter_request.and_then(|filter| filter.limit),
                 };
                 let values = opening.values();
-                let timeline =
-                    match read_timeline(&opening.opened, &mut opening.source(), &values, &filter) {
-                        Ok(timeline) => timeline,
-                        Err(error) => return read_refusal(error),
-                    };
+                let timeline = match read_timeline(
+                    &opening.opened,
+                    &mut opening.source(),
+                    &values,
+                    &filter,
+                    false,
+                ) {
+                    Ok(timeline) => timeline,
+                    Err(error) => return read_refusal(error),
+                };
                 Output::default().finish(&timeline_out(
                     &timeline,
                     opening.opened.record.current().generation(),
@@ -1190,12 +1214,33 @@ fn plan_rollback(
                 entry,
             )
         }
-        "undo" => plan_undo(&opening.opened, &mut opening.source(), &values, entry),
+        "undo" => {
+            let only = match request.environment.as_deref() {
+                Some(name) => match environment_ref(
+                    name,
+                    request.environment_named.as_deref(),
+                    EnvironmentRef::Now,
+                ) {
+                    Some(only) => Some(EnvironmentName::from(only)),
+                    None => return Err(failure(2, "history.invalid_input")),
+                },
+                None => None,
+            };
+            plan_by_entry(
+                &opening.opened,
+                &mut opening.source(),
+                &values,
+                &IdPrefix::whole(entry),
+                |_| Ok::<_, PlanError>(Target::Undo { only }),
+            )
+            .map(|(_, plan)| plan)
+        }
         _ => return Err(failure(2, "history.invalid_input")),
     };
     planned.map_err(|error| match error {
         PlanError::Read(error) => read_refusal(error),
         PlanError::EntryNotFound => refused("history.entry_not_found", None),
+        PlanError::AmbiguousEntry => refused("history.ambiguous_entry", None),
         PlanError::UnknownEnvironment => refused("history.unknown_environment", None),
         PlanError::NameTaken(name) => refused(
             "history.name_taken",
@@ -1630,6 +1675,7 @@ fn removal_refusal(error: RemovalError) -> LPMEnvResult {
     let code = match &error {
         RemovalError::Read(_) | RemovalError::Damaged(_) => "history.damaged",
         RemovalError::NotFound => "history.entry_not_found",
+        RemovalError::AmbiguousEntry => "history.ambiguous_entry",
         RemovalError::NothingToRemove => "history.nothing_to_remove",
         RemovalError::ValueIsCurrent => "history.value_is_current",
         RemovalError::Limit => "history.limit",
@@ -1993,7 +2039,13 @@ pub unsafe extern "C" fn lpm_env_history_check(input: *const u8, length: usize) 
                         vault_id,
                         request.head.and_then(|index| blob(blobs, index)),
                         request.key.and_then(|index| blob(blobs, index)),
-                        |part| listed.get(&part).copied().flatten().map(<[u8]>::to_vec),
+                        |part| {
+                            listed
+                                .get(&part)
+                                .copied()
+                                .flatten()
+                                .map(std::borrow::Cow::Borrowed)
+                        },
                     )
                     .into_iter()
                     .map(|damage| {
@@ -2109,9 +2161,23 @@ pub unsafe extern "C" fn lpm_env_history_admission(
                 "afterTrims": after_trims,
                 "creation": creation,
                 "ringLimit": admission::admit_creation(after_trims).ring_limit(),
-                "growth": growing.as_ref().map_or_else(
+                "growth": growing.map_or_else(
                     || admission::admit_growth(after_trims),
-                    |head| admission::admit_growth_of(head, after_trims),
+                    |mut head| {
+                        // Trims of the growing ring itself leave it at its new
+                        // size, which may only grow back below the regrowth
+                        // threshold.
+                        let own = trims
+                            .iter()
+                            .find(|(vault_id, _)| *vault_id == head.vault_id)
+                            .map_or(0, |(_, count)| *count);
+                        for _ in 0..own {
+                            if let Some((trimmed, _)) = head.trim_oldest() {
+                                head = trimmed;
+                            }
+                        }
+                        admission::admit_growth_of(&head, after_trims)
+                    },
                 ),
                 "regrow": after_trims < admission::REGROW_BELOW,
             }))

@@ -598,3 +598,39 @@ fn a_removal_starts_only_from_the_review_it_was_shown() {
     }
     assert_eq!(start(&review).0, 0, "the review as shown starts");
 }
+
+#[test]
+fn growth_admission_answers_for_the_ring_its_own_trims_left() {
+    let mut names: Vec<String> = (0..4_093)
+        .map(|index| {
+            format!(
+                "__vault_companion_v1__:notes:{}",
+                URL_SAFE_NO_PAD.encode(format!("p{index}"))
+            )
+        })
+        .collect();
+    let mut head = Head::new(VAULT, 16);
+    head.parts = vec![0, 1, 2, 3];
+    for part in &head.parts {
+        names.push(lpm_env_companion::history::part_account(VAULT, *part).name());
+    }
+    let head = head.encode(HISTORY).expect("head");
+    let request = json!({
+        "names": names,
+        "operation": "growth",
+        "vaultId": VAULT,
+        "head": 1,
+        "trimmable": [VAULT],
+    });
+    let (status, admission, _) = call(lpm_env_history_admission, &request, &[&head]);
+    assert_eq!(status, 0, "{admission}");
+    assert_eq!(
+        admission["trims"],
+        json!([{ "vaultId": VAULT, "count": 2 }]),
+        "{admission}"
+    );
+    assert_eq!(
+        admission["growth"], false,
+        "trimmed to two parts, the ring grows back only below 3,584 records"
+    );
+}

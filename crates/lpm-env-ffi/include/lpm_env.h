@@ -336,7 +336,8 @@ LPMEnvResult lpm_env_history_timeline(const uint8_t *input, size_t input_length)
 LPMEnvResult lpm_env_history_reveal(const uint8_t *input, size_t input_length);
 /* Plan a rollback, or apply one. Input: reading fields with values, rollback:
  * {kind: "environment" (environment, entry, side) | "key" (environment, key,
- * entry: back to its value before it) | "undo" (entry), environmentNamed?:
+ * entry: back to its value before it) | "undo" (entry, environment?: only that
+ * environment), environmentNamed?:
  * "now" | "atPoint" (the default for an environment rollback; "now" for a
  * key)}, and to apply, apply: {fingerprint, skipped?: [[environment, row]],
  * keepEmpty?: [environment]}. A plan's output {plan: {kind, point, generation,
