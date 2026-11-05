@@ -3,12 +3,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define LPM_ENV_ABI_VERSION 1
+#define LPM_ENV_ABI_VERSION 2
 #define LPM_ENV_INPUT_LIMIT (2 * 1024 * 1024)
 #define LPM_ENV_OUTPUT_LIMIT (8 * 1024 * 1024)
 #define LPM_ENV_SEAL_INPUT_LIMIT (64 * 1024)
 #define LPM_ENV_BACKUP_FILE_LIMIT (64 * 1024 * 1024)
 #define LPM_ENV_BACKUP_PASSPHRASE_LIMIT (4 * 1024)
+#define LPM_ENV_HISTORY_INPUT_LIMIT (4 * 1024 * 1024)
 
 typedef struct LPMEnvSnapshot LPMEnvSnapshot;
 typedef struct {
@@ -248,7 +249,13 @@ LPMEnvResult lpm_env_companion_assess(const uint8_t *input, size_t input_length)
  *     transaction;
  *   discard: every record, keeping the values;
  *   removeFeature: one feature of a valid marker and the records only it lists;
- *   removeUnlisted: the records a valid marker doesn't list.
+ *   removeUnlisted: the records a valid marker doesn't list;
+ *   historyOff: turn local history off, deleting its key (unless another
+ *     feature lists it), head and every part, and leaving "history-off" in the
+ *     marker, which is created when needed; works when history is damaged or
+ *     newer than this engine, but not on an invalid marker;
+ *   historyOn: remove "history-off" from a valid marker, deleting the marker
+ *     when nothing else is left.
  * Output {transactions: [{deletes: [name], moves: [{staged, live}],
  * writesMarker: bytes | null, deletesMarker}], result: the marker left, bytes |
  * null, notice: {kind: "deletion" | "discard" | "restoreUndone" | "restore" |
@@ -275,6 +282,88 @@ LPMEnvResult lpm_env_companion_check_move(const uint8_t *input, size_t input_len
  * status: 0=passes, 2=companion.missing_marker or companion.missing_names,
  * 5=refused. */
 LPMEnvResult lpm_env_companion_check_transaction(const uint8_t *input, size_t input_length);
+/* Local history: an encrypted record, on this Mac, of how a project's values
+ * changed, decided exactly as the CLI decides it. Nothing here reads or writes
+ * a store. Every function takes one frame of at most LPM_ENV_HISTORY_INPUT_LIMIT
+ * bytes and returns one:
+ *   "LPMF", version 1 (one byte), a big-endian uint32 field count, then each
+ *   field as a big-endian uint32 length and its bytes.
+ * Field 0 is UTF-8 JSON with everything that isn't secret; the other fields are
+ * blobs that JSON names by index (the first blob is 1). Values, values payloads
+ * and the key record only ever travel as blobs. A values payload is the stored
+ * {"environments":{name:{KEY:VALUE}}}. Outputs list records to write as
+ * writes: [{account, blob}]; with journal true they commit as one journal
+ * transaction, otherwise each is a verified replacement in order (a rollover's
+ * head before its part). Status 2 is {code: "history.invalid_input"}, 3 a panic,
+ * 5 a refusal {code: "history.<reason>", message?}. Every output is wiped when
+ * released.
+ *
+ * Most functions read history: {vaultId, head, key, values?, parts: [{part,
+ * blob?}]}, every part the head lists, blob omitted when its account is absent.
+ *
+ * Plan recording a change. Input {vaultId, change: {id (32 hex), time (ms),
+ * action, detail?: {fileName?, pasted?, remote?: "personal" | {org},
+ * remoteVersion?, platform?, related?: {id, side, time}}, renames?:
+ * [{environment: {from, to}} | {key: {environment, from, to}}]}, before, after
+ * (payload blobs), and create: {marker?, approval: "automatic" | "protected" |
+ * "fileStore", ringLimit} when no history exists, or append: {head, key, tail?,
+ * previous?, growth: "unasked" | "allowed" | "refused"}}. Output {result:
+ * "noKeyChanges" | "unchanged" | "alreadyRecorded" | "needsPrevious" (read
+ * part, pass it as previous, call again) | "needsGrowthAdmission" (ask
+ * lpm_env_history_admission, call again) | "write" | "notRecorded" (reason:
+ * "damaged" | "needsMaintenance" | "tooManyValues" | "random"), writes, journal,
+ * entry, gap, valuesKept, shape?: "steady" | "slid" | "rollover" | "recovered"}. */
+LPMEnvResult lpm_env_history_record(const uint8_t *input, size_t input_length);
+/* The timeline, newest first, names and kinds only. Input: reading fields,
+ * values (for the live gap), filter?: {environment?, exactKey?, keyContains?,
+ * source?: "app" | "cli" | "import" | "restore" | "pull" | "rollback" |
+ * "outside", limit?}. Output {rows: [entry | {unreadable: true, part, after,
+ * before}], liveGap, readable, counts: {group: n}, oldest, damagedTail,
+ * unreadableParts, environments: [{name, deletedAt}], keyGeneration}. */
+LPMEnvResult lpm_env_history_timeline(const uint8_t *input, size_t input_length);
+/* Entries with their values. Input: reading fields, ids: [32 hex]. Output
+ * {entries: [entry with values: [[{before: blob | null, after: blob | null}]],
+ * one list per environment, in its keys' order]}. */
+LPMEnvResult lpm_env_history_reveal(const uint8_t *input, size_t input_length);
+/* Plan a rollback, or apply one. Input: reading fields with values, rollback:
+ * {kind: "environment" (environment, entry, side) | "key" (environment, key,
+ * entry: back to its value before it) | "undo" (entry)}, and to apply,
+ * apply: {fingerprint, skipped?: [[environment, row]], keepEmpty?:
+ * [environment]}. A plan's output {plan: {kind, point, generation, fingerprint,
+ * environments: [{current, target, recreates, offersDeletion, rows: [{key,
+ * change: "changed" | "added" | "removed" | "unknown", changes, reason?,
+ * current: blob?, target: blob?, gaps, pulled?, changedAgain?}]}]}}. Apply plans
+ * again and refuses with history.changed_since_review unless the fingerprint and
+ * the values match; output {writes: [{name, renamedFrom, values: blob of
+ * {KEY: VALUE} | null (delete)}]}. */
+LPMEnvResult lpm_env_history_rollback(const uint8_t *input, size_t input_length);
+/* Review removing one value, then start it. Input: reading fields with values,
+ * and chosen: {entry, environment, key, side}, or start: {review (as returned),
+ * selection: [place index], approval}. Review output {review: {value,
+ * generation, places: [{environment, key, renamedFrom, group: "thisKey" |
+ * "otherKey", current, occurrences, digests}], defaultSelection}}. Start output
+ * {journal: true, writes}; then finish with lpm_env_history_maintenance. */
+LPMEnvResult lpm_env_history_removal(const uint8_t *input, size_t input_length);
+/* Key upkeep. Input: reading fields and step: "check" (approval: the values
+ * item's claimed access) -> {needsFinishing, parts, key: "nothing" | "rotate" |
+ * "lower", writes}; "start" (approval) -> {journal: true, writes}; "rotatePart"
+ * (part, with its blob in parts) -> {writes}; "finish" -> {journal: true,
+ * writes}. Every history operation finishes a running rotation first. */
+LPMEnvResult lpm_env_history_maintenance(const uint8_t *input, size_t input_length);
+/* What the marker says and what's damaged beyond a listing. Input {vaultId,
+ * marker?, head?, key?, parts?}. Output {history: "default" | "on" | "off" |
+ * "removing" | "unsupported" | "both", version, tailPart, damage:
+ * [{description}]}; with tailPart and no tail blob, read it and call again. */
+LPMEnvResult lpm_env_history_check(const uint8_t *input, size_t input_length);
+/* Admission from a names-only listing; a JSON-only frame. Input {names,
+ * operation: "creation" | "growth" | "trim", trimmable?: [vaultId], maxTrims?}.
+ * Output {existing, trims: [{vaultId, count}], afterTrims, creation: "full" |
+ * "reduced" | "refused", ringLimit, growth, regrow}. */
+LPMEnvResult lpm_env_history_admission(const uint8_t *input, size_t input_length);
+/* One ring's upkeep. Input {vaultId, head, action: "trim" | "raiseLimit"
+ * (existing) | "orphans" (inventory)}. Output {writes, delete}: a trim writes the
+ * head first, then deletes the part. */
+LPMEnvResult lpm_env_history_ring(const uint8_t *input, size_t input_length);
 /* Release only the output buffer after decoding; the snapshot stays live.
  * Exclusively borrow result. Clears data/length; repeated calls are harmless.
  * A matching lpm_env_release is still required for the result. */

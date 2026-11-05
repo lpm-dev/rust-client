@@ -475,6 +475,8 @@ pub unsafe extern "C" fn lpm_env_companion_plan(input: *const u8, length: usize)
         Discard,
         RemoveFeature,
         RemoveUnlisted,
+        HistoryOff,
+        HistoryOn,
     }
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -618,6 +620,19 @@ pub unsafe extern "C" fn lpm_env_companion_plan(input: *const u8, length: usize)
                 },
                 Action::RemoveUnlisted => valid().and_then(|marker| {
                     plan_unlisted_removal(marker, inventory).map(|plan| (plan, None))
+                }),
+                Action::HistoryOff => match &parsed {
+                    Some(Err(error)) => Err(format!("the feature marker is invalid: {error}")),
+                    marker => lpm_env_companion::history::switch::plan_off(
+                        vault_id,
+                        marker.as_ref().and_then(|marker| marker.as_ref().ok()),
+                        inventory,
+                    )
+                    .map(|plan| (plan, None)),
+                },
+                Action::HistoryOn => valid().and_then(|marker| {
+                    lpm_env_companion::history::switch::plan_on(marker, &inventory)
+                        .map(|plan| (plan, None))
                 }),
             };
             match planned.and_then(|(plan, notice)| output(plan, notice)) {

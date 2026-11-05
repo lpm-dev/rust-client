@@ -18,13 +18,14 @@ mod backup;
 mod characters;
 mod companion;
 mod files;
+mod history;
 
 /// The engine holds env values, decrypted backups and passphrases, so all
 /// memory it frees is wiped first, including what its dependencies free.
 #[global_allocator]
 static ALLOCATOR: lpm_env_backup::WipingAllocator = lpm_env_backup::WipingAllocator;
 
-const ABI_VERSION: u32 = 1;
+const ABI_VERSION: u32 = 2;
 const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 /// The most a resolution's `Provenance` adds on top of `OUTPUT_LIMIT`. It
 /// grows with the overrides, groups, and prefixes, whose counts and names
@@ -1115,7 +1116,7 @@ mod tests {
         assert_eq!(
             output,
             serde_json::json!({
-                "abiVersion": 1,
+                "abiVersion": 2,
                 "environments": {
                     "default": {
                         "readsDefaultEnvironment": false,
@@ -1297,7 +1298,7 @@ mod tests {
         ] {
             let (status, output) = check(&schema, input);
             assert_eq!(status, 2, "{}", String::from_utf8_lossy(input));
-            assert_eq!(output["abiVersion"], 1);
+            assert_eq!(output["abiVersion"], ABI_VERSION);
             assert!(output.get("environments").is_none());
         }
         let values = br#"{"environments":{"default":{"A":"PRIVATE"}}}"#;
@@ -1532,7 +1533,7 @@ mod tests {
             assert_eq!(result.status, 2, "{} is refused", hex::encode(key));
             // SAFETY: The result remains owned and unreleased for the complete read.
             let body = unsafe { std::slice::from_raw_parts(result.data, result.length) };
-            assert_eq!(body, br#"{"abiVersion":1,"code":"env.invalid_input"}"#);
+            assert_eq!(body, br#"{"abiVersion":2,"code":"env.invalid_input"}"#);
             // SAFETY: This is the sole release of the returned result.
             unsafe {
                 lpm_env_release(result);
@@ -1558,7 +1559,7 @@ mod tests {
             assert_eq!(result.status, 2);
             // SAFETY: The result remains owned and unreleased for the complete read.
             let body = unsafe { std::slice::from_raw_parts(result.data, result.length) };
-            assert_eq!(body, br#"{"abiVersion":1,"code":"env.invalid_input"}"#);
+            assert_eq!(body, br#"{"abiVersion":2,"code":"env.invalid_input"}"#);
             // SAFETY: This is the sole release of the returned result.
             unsafe {
                 lpm_env_release(result);

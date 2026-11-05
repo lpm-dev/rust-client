@@ -480,7 +480,7 @@ mod tests {
         let file = seal(PAYLOAD, PASSPHRASE).data().to_vec();
         let info = inspect(&file);
         assert_eq!(info.status(), 0);
-        assert_eq!(info.json(), json!({ "abiVersion": 1, "formatVersion": 1 }));
+        assert_eq!(info.json(), json!({ "abiVersion": 2, "formatVersion": 1 }));
         let mut newer = file.clone();
         newer[9] = 2;
         assert_eq!(inspect(&newer).json()["formatVersion"], 2);

@@ -274,7 +274,7 @@ mod tests {
         assert_eq!(
             output,
             serde_json::json!({
-                "abiVersion": 1,
+                "abiVersion": 2,
                 "environments": {
                     "default": {"API_KEY": {
                         "characters": [{
@@ -317,7 +317,7 @@ mod tests {
         let (status, output) = check(r#"{"environments":{}}"#);
         assert_eq!(
             (status, output),
-            (0, serde_json::json!({"abiVersion": 1, "environments": {}}))
+            (0, serde_json::json!({"abiVersion": 2, "environments": {}}))
         );
         for input in [
             r#"{"environments":{"default":{"bad key":"v"}}}"#,
@@ -370,14 +370,14 @@ mod tests {
         let output: serde_json::Value = serde_json::from_slice(&output).expect("JSON output");
         assert_eq!(
             output,
-            serde_json::json!({"abiVersion": 1, "text": "😀a\\u{200b}b\\u{20}", "marks": [[3, 8], [12, 6]]})
+            serde_json::json!({"abiVersion": 2, "text": "😀a\\u{200b}b\\u{20}", "marks": [[3, 8], [12, 6]]})
         );
         // SAFETY: An empty value may be null.
         let (status, output) = take(unsafe { lpm_env_show_characters(std::ptr::null(), 0) });
         assert_eq!(status, 0);
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&output).expect("JSON output"),
-            serde_json::json!({"abiVersion": 1, "text": "", "marks": []})
+            serde_json::json!({"abiVersion": 2, "text": "", "marks": []})
         );
     }
 
