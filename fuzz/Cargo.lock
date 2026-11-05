@@ -931,7 +931,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "lpm-common"
-version = "0.84.0"
+version = "0.85.0"
 dependencies = [
  "base64",
  "cap-fs-ext",
@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-env"
-version = "0.84.0"
+version = "0.85.0"
 dependencies = [
  "icu_properties",
  "regex-automata",
@@ -977,7 +977,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-env-backup"
-version = "0.84.0"
+version = "0.85.0"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -990,7 +990,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-extractor"
-version = "0.84.0"
+version = "0.85.0"
 dependencies = [
  "blake3",
  "cap-fs-ext",
@@ -1020,7 +1020,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-lockfile"
-version = "0.84.0"
+version = "0.85.0"
 dependencies = [
  "hex",
  "lpm-common",
@@ -1036,7 +1036,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-migrate"
-version = "0.84.0"
+version = "0.85.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
@@ -1057,7 +1057,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-semver"
-version = "0.84.0"
+version = "0.85.0"
 dependencies = [
  "lpm-common",
  "node-semver",
@@ -1067,7 +1067,7 @@ dependencies = [
 
 [[package]]
 name = "lpm-workspace"
-version = "0.84.0"
+version = "0.85.0"
 dependencies = [
  "cap-fs-ext",
  "cap-std",
