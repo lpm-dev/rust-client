@@ -30,9 +30,29 @@ def file_hash(path):
 
 
 def engine_crates(root):
-    """The workspace crates the engine builds from, relative to root: lpm-env-ffi and every path dependency it reaches, build and target-specific ones included."""
-    shared = tomllib.loads((root / 'Cargo.toml').read_text()).get('workspace', {}).get('dependencies', {})
+    """The crate directories the engine builds from, relative to root: lpm-env-ffi, every path dependency it
+    reaches, build and target-specific ones included, and every directory a `[patch]` puts in place of a
+    package the engine reaches, directly or through other packages."""
+    workspace = tomllib.loads((root / 'Cargo.toml').read_text())
+    shared = workspace.get('workspace', {}).get('dependencies', {})
+    patched = {
+        spec.get('package', name): spec['path']
+        for source in workspace.get('patch', {}).values()
+        for name, spec in source.items()
+        if isinstance(spec, dict) and 'path' in spec
+    }
+    # Cargo.lock lists the normal and build dependencies of each package outside the workspace, so it gives
+    # what a patched package is reached through. It is read only when a patch could be reached.
+    locked = None
+
+    def inside(name, path):
+        path = Path(os.path.normpath(path))
+        if path.is_absolute() or path.parts[:1] == ('..',):
+            raise RuntimeError('Engine dependency outside the repository: ' + name)
+        return path
+
     found = set()
+    reached = set()
     pending = [Path('crates/lpm-env-ffi')]
     while pending:
         crate = pending.pop()
@@ -47,10 +67,24 @@ def engine_crates(root):
                     if isinstance(spec, dict) and spec.get('workspace'):
                         spec, base = shared.get(name), Path()
                     if isinstance(spec, dict) and 'path' in spec:
-                        path = Path(os.path.normpath(base / spec['path']))
-                        if path.is_absolute() or path.parts[:1] == ('..',):
-                            raise RuntimeError('Engine dependency outside the repository: ' + name)
-                        pending.append(path)
+                        pending.append(inside(name, base / spec['path']))
+                        continue
+                    if not patched:
+                        continue
+                    if locked is None:
+                        locked = {}
+                        for entry in tomllib.loads((root / 'Cargo.lock').read_text()).get('package', []):
+                            locked.setdefault(entry['name'], set()).update(dependency.split()[0] for dependency in entry.get('dependencies', []))
+                    packages = [spec.get('package', name) if isinstance(spec, dict) else name]
+                    while packages:
+                        package = packages.pop()
+                        if package in reached:
+                            continue
+                        reached.add(package)
+                        if package in patched:
+                            pending.append(inside(package, patched[package]))
+                        else:
+                            packages.extend(locked.get(package, ()))
     return sorted(found)
 
 
@@ -107,10 +141,10 @@ def linked_packages(metadata_by_target):
                 normal = any(kind['kind'] is None for kind in dependency['dep_kinds'])
                 if normal and not any('proc-macro' in target['kind'] for target in package['targets']):
                     pending.append(dependency['pkg'])
-        for node in reached:
+        workspace = set(metadata['workspace_members'])
+        for node in reached - workspace:
             package = packages[node]
-            if package['source'] is not None:
-                linked[(package['name'], package['version'])] = package
+            linked[(package['name'], package['version'])] = package
     return [linked[key] for key in sorted(linked)]
 
 
@@ -160,7 +194,7 @@ def third_party_notices(packages, mit_text, data_notices, std_notice):
         name, version = html.escape(package['name']), html.escape(package['version'])
         items.append(
             '<li><b>' + name + '</b> ' + version + ', ' + html.escape(package.get('license') or 'see its texts')
-            + ', source https://crates.io/crates/' + name + '/' + version
+            + ', source https://crates.io/crates/' + name + '/' + version + (' with changes by LPM' if package['source'] is None else '')
             + ', texts ' + ', '.join('<a href="#text-' + str(number) + '">' + str(number) + '</a>' for number in texts) + '</li>')
     parts = [
         '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="UTF-8">\n<title>Third-party notices for the LPM env engine</title>\n</head>\n<body>',
