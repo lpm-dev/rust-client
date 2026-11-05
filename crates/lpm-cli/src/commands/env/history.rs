@@ -7,11 +7,11 @@ use std::collections::{BTreeSet, HashSet};
 use chrono::{DateTime, Local, TimeZone as _, Utc};
 use lpm_common::LpmError;
 use lpm_vault::history::{
-    Action, Choices, ChosenValue, EntryInfo, EnvironmentInfo, EnvironmentKindInfo, EnvironmentName,
-    EnvironmentPlan, Filter, HistoryError, HistoryState, KeyKindInfo, KeyMatch, KeysInfo, Listing,
-    Outcome, Paused, Place, PlaceGroup, Platform, Point, RelatedSide, RemoteInfo, RemoteName,
-    RemovalReview, RevealedEntry, RollbackKind, RollbackPlan, RollbackRequest, Row, SideInfo,
-    SourceGroup, TargetValue, TimelineRow, UnknownReason,
+    Action, Choices, ChosenSide, EntryInfo, EnvironmentInfo, EnvironmentKindInfo, EnvironmentName,
+    EnvironmentPlan, Filter, HistoryError, HistoryState, KeyKindInfo, KeyMatch, KeysInfo, Outcome,
+    Paused, Place, PlaceGroup, Platform, RelatedSide, RemoteInfo, RemoteName, RemovalReview,
+    RevealedValues, RollbackKind, RollbackPlan, Row, SideInfo, SourceGroup, Target, TargetValue,
+    Timeline, TimelineRow, UnknownReason,
 };
 use serde::Serialize;
 
@@ -83,17 +83,21 @@ fn fail(error: &HistoryError, json_output: bool) -> LpmError {
 
 /// A review was printed, but there's no terminal to confirm it on and no
 /// `--yes`.
-fn confirmation_required(json_output: bool, review: serde_json::Value, rerun: &str) -> LpmError {
+fn confirmation_required(json_output: bool, review: &impl Serialize, rerun: &str) -> LpmError {
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({
-                "success": false,
-                "error": format!("confirm by running it again with --yes: {rerun}"),
-                "error_code": "confirmation_required",
-                "review": review,
-            })
-        );
+        #[derive(Serialize)]
+        struct Required<'a, R> {
+            success: bool,
+            error: String,
+            error_code: &'static str,
+            review: &'a R,
+        }
+        print_json(&Required {
+            success: false,
+            error: format!("confirm by running it again with --yes: {rerun}"),
+            error_code: "confirmation_required",
+            review,
+        });
         LpmError::ExitCode(1)
     } else {
         LpmError::Script(format!(
@@ -342,7 +346,10 @@ fn side_name(side: RelatedSide) -> &'static str {
     }
 }
 
-fn entry_json<'a>(info: &'a EntryInfo, revealed: Option<&'a RevealedEntry>) -> EntryJson<'a> {
+fn entry_json<'a>(
+    info: &'a EntryInfo,
+    revealed: Option<&'a [Vec<RevealedValues>]>,
+) -> EntryJson<'a> {
     let environments = info
         .environments
         .iter()
@@ -364,7 +371,7 @@ fn entry_json<'a>(info: &'a EntryInfo, revealed: Option<&'a RevealedEntry>) -> E
                             .enumerate()
                             .map(|(key_index, key)| {
                                 let values = revealed
-                                    .and_then(|revealed| revealed.values.get(environment_index))
+                                    .and_then(|revealed| revealed.get(environment_index))
                                     .and_then(|values| values.get(key_index));
                                 let (change, renamed_from) = match &key.kind {
                                     KeyKindInfo::Added => ("added", None),
@@ -516,9 +523,9 @@ fn history_list(
         source: list.source,
         limit: list.limit,
     };
-    let listing = lpm_vault::history::timeline(project_dir, &filter, list.reveal)
+    let timeline = lpm_vault::history::timeline(project_dir, &filter, list.reveal)
         .map_err(|error| fail(&error, json_output))?;
-    let Some(listing) = listing else {
+    let Some(timeline) = timeline else {
         if json_output {
             println!(
                 "{}",
@@ -540,10 +547,10 @@ fn history_list(
         return Ok(());
     };
     if json_output {
-        print_timeline_json(&listing, project_dir);
+        print_timeline_json(&timeline, project_dir);
         return Ok(());
     }
-    print_timeline(&listing, project_dir, list.reveal);
+    print_timeline(&timeline, project_dir, list.reveal);
     Ok(())
 }
 
@@ -583,15 +590,15 @@ struct TimelineJson<'a> {
     live_gap: Option<LiveGapJson<'a>>,
 }
 
-fn print_timeline_json(listing: &Listing, project_dir: &std::path::Path) {
-    let timeline = &listing.timeline;
+fn print_timeline_json(timeline: &Timeline, project_dir: &std::path::Path) {
     let entries = timeline
         .rows
         .iter()
         .map(|row| match row {
-            TimelineRow::Entry(info) => {
-                RowJson::Entry(entry_json(info, listing.revealed.get(&info.id)))
-            }
+            TimelineRow::Entry(info) => RowJson::Entry(entry_json(
+                info,
+                timeline.values.get(&info.id).map(Vec::as_slice),
+            )),
             TimelineRow::Unreadable { after, before, .. } => RowJson::Unreadable {
                 unreadable: true,
                 after: after.map(utc),
@@ -630,8 +637,7 @@ fn print_timeline_json(listing: &Listing, project_dir: &std::path::Path) {
     });
 }
 
-fn print_timeline(listing: &Listing, project_dir: &std::path::Path, reveal: bool) {
-    let timeline = &listing.timeline;
+fn print_timeline(timeline: &Timeline, project_dir: &std::path::Path, reveal: bool) {
     println!(
         "Local history for {} on this Mac.{}",
         install_ui::bold(&project_name(project_dir)),
@@ -678,8 +684,8 @@ fn print_timeline(listing: &Listing, project_dir: &std::path::Path, reveal: bool
                     line.push_str(&format!("   ({} to {})", clock(since), clock(info.time)));
                 }
                 println!("{line}");
-                if let Some(revealed) = listing.revealed.get(&info.id) {
-                    print_values(info, revealed);
+                if let Some(values) = timeline.values.get(&info.id) {
+                    print_values(info, values);
                 }
             }
             TimelineRow::Unreadable { after, before, .. } => {
@@ -709,8 +715,8 @@ fn print_timeline(listing: &Listing, project_dir: &std::path::Path, reveal: bool
     println!("{summary}.");
 }
 
-fn print_values(info: &EntryInfo, revealed: &RevealedEntry) {
-    for (environment, values) in info.environments.iter().zip(&revealed.values) {
+fn print_values(info: &EntryInfo, revealed: &[Vec<RevealedValues>]) {
+    for (environment, values) in info.environments.iter().zip(revealed) {
         let KeysInfo::Changes(changes) = &environment.keys else {
             continue;
         };
@@ -753,7 +759,13 @@ fn history_show(
         }
         print_json(&ShowJson {
             success: true,
-            entry: entry_json(info, shown.revealed.as_ref()),
+            entry: entry_json(
+                info,
+                shown
+                    .revealed
+                    .as_ref()
+                    .map(|revealed| revealed.values.as_slice()),
+            ),
         });
         return Ok(());
     }
@@ -789,7 +801,7 @@ fn history_show(
         }
     }
     if let Some(revealed) = &shown.revealed {
-        print_values(info, revealed);
+        print_values(info, &revealed.values);
     } else {
         println!("Values are hidden; add --reveal to show them.");
     }
@@ -882,7 +894,7 @@ fn history_off(
         None => {
             return Err(confirmation_required(
                 json_output,
-                serde_json::json!({ "action": "off", "message": OFF_WARNING }),
+                &serde_json::json!({ "action": "off", "message": OFF_WARNING }),
                 "lpm env history off --yes",
             ));
         }
@@ -916,14 +928,20 @@ struct ForgetArgs<'a> {
 /// The environment of `info` a removal starts from, as the entry names it:
 /// the one `--env` names, under the name the entry has for it or the one it
 /// had before the entry renamed it, or the entry's only one.
-fn forget_environment(info: &EntryInfo, environment: Option<&str>) -> Result<String, HistoryError> {
+fn forget_environment(
+    info: &EntryInfo,
+    environment: Option<&str>,
+    canonical: Option<&str>,
+) -> Result<String, HistoryError> {
     match environment {
-        Some(wanted) => info
+        Some(typed) => info
             .environments
             .iter()
             .find(|environment| {
-                environment.name == wanted
-                    || matches!(&environment.kind, EnvironmentKindInfo::RenamedFrom(from) if from == wanted)
+                [Some(typed), canonical].into_iter().flatten().any(|wanted| {
+                    environment.name == wanted
+                        || matches!(&environment.kind, EnvironmentKindInfo::RenamedFrom(from) if from == wanted)
+                })
             })
             .map(|environment| environment.name.clone())
             .ok_or(HistoryError::UnknownEnvironment),
@@ -1000,11 +1018,11 @@ fn history_forget(
     project_dir: &std::path::Path,
     json_output: bool,
 ) -> Result<(), LpmError> {
+    let canonical = canonical_environment(args.environment, project_dir)?;
     let mut environment = String::new();
     let (info, review) = lpm_vault::history::review_forget(project_dir, args.entry, |info| {
-        environment = forget_environment(info, args.environment)?;
-        Ok(ChosenValue {
-            entry: info.id,
+        environment = forget_environment(info, args.environment, canonical.as_deref())?;
+        Ok(ChosenSide {
             environment: environment.clone(),
             key: args.key.to_owned(),
             side: if args.before {
@@ -1016,24 +1034,43 @@ fn history_forget(
     })
     .map_err(|error| fail(&error, json_output))?;
     let selection = forget_selection(&review, &environment, args);
-    let places_json: Vec<serde_json::Value> = review
-        .places
-        .iter()
-        .enumerate()
-        .map(|(index, place)| {
-            serde_json::json!({
-                "environment": place.environment,
-                "key": place.key,
-                "renamed_from": place.renamed_from,
-                "group": match place.group {
+    #[derive(Serialize)]
+    struct PlaceJson<'a> {
+        environment: &'a str,
+        key: &'a str,
+        renamed_from: &'a [String],
+        group: &'static str,
+        current: bool,
+        removed: bool,
+    }
+    #[derive(Serialize)]
+    struct PlacesJson<'a> {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        action: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        success: Option<bool>,
+        places: Vec<PlaceJson<'a>>,
+    }
+    let places_json = |action: Option<&'static str>, success: Option<bool>| PlacesJson {
+        action,
+        success,
+        places: review
+            .places
+            .iter()
+            .enumerate()
+            .map(|(index, place)| PlaceJson {
+                environment: &place.environment,
+                key: &place.key,
+                renamed_from: &place.renamed_from,
+                group: match place.group {
                     PlaceGroup::ThisKey => "this_key",
                     PlaceGroup::OtherKey => "other_key",
                 },
-                "current": place.current,
-                "removed": selection.contains(&index),
+                current: place.current,
+                removed: selection.contains(&index),
             })
-        })
-        .collect();
+            .collect(),
+    };
     if !json_output {
         println!(
             "Remove {}'s value {} {} from local history:",
@@ -1078,7 +1115,7 @@ fn history_forget(
         None => {
             return Err(confirmation_required(
                 json_output,
-                serde_json::json!({ "action": "forget", "places": places_json }),
+                &places_json(Some("forget"), None),
                 "lpm env history forget ENTRY KEY --yes",
             ));
         }
@@ -1091,10 +1128,7 @@ fn history_forget(
     lpm_vault::history::forget(project_dir, &review, &selection)
         .map_err(|error| fail(&error, json_output))?;
     if json_output {
-        println!(
-            "{}",
-            serde_json::json!({"success": true, "places": places_json})
-        );
+        print_json(&places_json(None, Some(true)));
     } else {
         output::success(&format!(
             "removed the value from {} {}",
@@ -1454,11 +1488,24 @@ fn changing_rows(plan: &RollbackPlan, choices: &Choices) -> usize {
 }
 
 /// Whether the rollback renames, recreates or deletes an environment, which
-/// changes the project even when no value changes.
-fn changes_an_environment(plan: &RollbackPlan) -> bool {
-    plan.environments.iter().any(|environment| {
-        environment.renames() || environment.recreates() || environment.offers_deletion()
-    })
+/// changes the project even when no value changes. One is deleted only when
+/// the rows that apply empty it.
+fn changes_an_environment(plan: &RollbackPlan, choices: &Choices) -> bool {
+    plan.environments
+        .iter()
+        .enumerate()
+        .any(|(environment_index, environment)| {
+            environment.renames()
+                || environment.recreates()
+                || (environment.offers_deletion() && {
+                    let skipped = skipped_keys(environment, environment_index, choices);
+                    environment
+                        .rows
+                        .iter()
+                        .filter(|row| row.current.is_some())
+                        .all(|row| applies(row, &skipped))
+                })
+        })
 }
 
 pub(super) fn env_rollback(
@@ -1473,24 +1520,19 @@ pub(super) fn env_rollback(
     } else {
         RelatedSide::Before
     };
-    let (info, mut plan) = lpm_vault::history::review_rollback(project_dir, prefix, |info| {
+    let (info, plan) = lpm_vault::history::review_rollback(project_dir, prefix, |info| {
         if args.undo.is_some() {
-            return Ok(RollbackRequest::Undo { entry: info.id });
+            return Ok(Target::Undo {
+                only: environment.clone().map(EnvironmentName::Now),
+            });
         }
-        let named = rollback_environment(info, environment.as_deref(), side)?;
+        let environment = rollback_environment(info, environment.as_deref(), side)?;
         Ok(match (side, args.keys) {
-            (RelatedSide::Before, [key]) => RollbackRequest::Key {
-                environment: named,
+            (RelatedSide::Before, [key]) => Target::Key {
+                environment,
                 key: key.clone(),
-                entry: info.id,
             },
-            _ => RollbackRequest::Environment {
-                environment: named,
-                point: Point {
-                    entry: info.id,
-                    side,
-                },
-            },
+            _ => Target::Environment { environment, side },
         })
     })
     .map_err(|error| fail(&error, json_output))?;
@@ -1516,27 +1558,19 @@ pub(super) fn env_rollback(
             moment(info.time)
         ),
     };
-    if args.undo.is_some()
-        && let Some(environment) = &environment
-    {
-        plan.environments.retain(|candidate| {
-            candidate.current.as_deref() == Some(environment.as_str())
-                || candidate.target.as_deref() == Some(environment.as_str())
-        });
-    }
     let choices = choices_for_keys(&plan, args.keys);
     let changing = changing_rows(&plan, &choices);
     if !json_output {
         print_rollback(&plan, &choices, &title);
     }
-    if changing == 0 && !changes_an_environment(&plan) {
+    if changing == 0 && !changes_an_environment(&plan, &choices) {
         return Err(fail(&HistoryError::TargetUnknown, json_output));
     }
     match confirm("Roll back these values?", args.yes, json_output)? {
         None => {
             return Err(confirmation_required(
                 json_output,
-                serde_json::to_value(rollback_json(&plan, &choices)).unwrap_or_default(),
+                &rollback_json(&plan, &choices),
                 "lpm env rollback ... --yes",
             ));
         }
@@ -1549,12 +1583,20 @@ pub(super) fn env_rollback(
     let written = lpm_vault::history::commit_rollback(project_dir, &plan, &choices)
         .map_err(|error| fail(&error, json_output))?;
     if json_output {
-        let json = with_history_field(serde_json::json!({
-            "success": true,
-            "rolled_back": written,
-            "rollback": serde_json::to_value(rollback_json(&plan, &choices)).unwrap_or_default(),
-        }));
-        println!("{json}");
+        #[derive(Serialize)]
+        struct RolledBack<'a> {
+            success: bool,
+            rolled_back: &'a [String],
+            rollback: RollbackJson<'a>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            history: Option<serde_json::Value>,
+        }
+        print_json(&RolledBack {
+            success: true,
+            rolled_back: &written,
+            rollback: rollback_json(&plan, &choices),
+            history: report_write(),
+        });
     } else {
         report_write();
         output::success(&format!(
@@ -1570,7 +1612,7 @@ pub(super) fn env_rollback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lpm_vault::history::{Binding, DetailInfo, Flags};
+    use lpm_vault::history::{Binding, DetailInfo, Flags, Point};
 
     fn row(key: &str, current: Option<&str>, target: TargetValue, linked: &[&str]) -> Row {
         Row {
@@ -1635,7 +1677,7 @@ mod tests {
     fn a_rollback_that_only_renames_an_environment_changes_something() {
         let plan = plan(vec![environment("staging", "stage", Vec::new())]);
         assert_eq!(changing_rows(&plan, &Choices::default()), 0);
-        assert!(changes_an_environment(&plan));
+        assert!(changes_an_environment(&plan, &Choices::default()));
     }
 
     fn entry(environments: Vec<EnvironmentInfo>) -> EntryInfo {
@@ -1689,13 +1731,46 @@ mod tests {
             Err(HistoryError::EnvironmentRequired)
         );
         assert_eq!(
-            forget_environment(&renamed, Some("stage")),
+            forget_environment(&renamed, Some("stage"), None),
             Ok("staging".to_owned()),
             "an entry's environment under the name it had before the entry"
         );
         assert_eq!(
-            forget_environment(&two, None),
+            forget_environment(&two, None, None),
             Err(HistoryError::EnvironmentRequired)
+        );
+    }
+
+    #[test]
+    fn an_environment_a_key_filter_keeps_from_emptying_isn_t_deleted() {
+        let mut leaving = environment(
+            "preview",
+            "preview",
+            vec![
+                row("A", Some("1"), TargetValue::Absent, &[]),
+                row("B", Some("2"), TargetValue::Absent, &[]),
+            ],
+        );
+        leaving.target = None;
+        let plan = plan(vec![leaving]);
+        assert!(changes_an_environment(&plan, &Choices::default()));
+        let choices = choices_for_keys(&plan, &["A".to_owned()]);
+        assert!(
+            !changes_an_environment(&plan, &choices),
+            "B stays, so the environment does"
+        );
+    }
+
+    #[test]
+    fn forget_names_the_entry_s_environment_by_its_alias() {
+        let entry = entry(vec![EnvironmentInfo {
+            name: "development".to_owned(),
+            kind: EnvironmentKindInfo::Unchanged,
+            keys: KeysInfo::Changes(Vec::new()),
+        }]);
+        assert_eq!(
+            forget_environment(&entry, Some("dev"), Some("development")),
+            Ok("development".to_owned())
         );
     }
 }
