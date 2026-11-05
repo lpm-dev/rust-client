@@ -393,7 +393,7 @@ pub fn status(project_dir: &Path) -> Result<HistoryStatus, HistoryError> {
                         |project| inventory.trimmable.contains(project),
                     )
                     .iter()
-                    .map(|(_, count)| count)
+                    .map(|planned| planned.count)
                     .sum();
                     let refused = admission::admit_creation(inventory.count - trims)
                         == CreationAdmission::Refused;

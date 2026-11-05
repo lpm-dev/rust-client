@@ -76,6 +76,132 @@ fn creation_needs_a_key_change_and_writes_the_marker_key_head_and_part_zero() {
     });
 }
 
+/// A marker holding `entries`, as `MarkerHistory` reads them.
+fn marker_with(entries: &[(&str, crate::marker::FeatureEntry)]) -> crate::marker::Marker {
+    let mut marker = crate::marker::Marker::empty(VAULT, crate::marker::ProjectState::Active);
+    for (name, entry) in entries {
+        marker.features.insert((*name).to_owned(), entry.clone());
+    }
+    marker
+}
+
+/// Markers in every state but the two a step allows, with the state each
+/// is read as.
+fn markers_in_every_state() -> Vec<(crate::marker::Marker, crate::history::switch::MarkerHistory)> {
+    use crate::history::switch::MarkerHistory;
+    use crate::history::{FEATURE, OFF_FEATURE, feature_entry, off_entry};
+    let newer = crate::marker::FeatureEntry {
+        version: 2,
+        ..feature_entry()
+    };
+    let removing = crate::marker::FeatureEntry {
+        state: crate::marker::FeatureState::Removing,
+        ..feature_entry()
+    };
+    vec![
+        (marker_with(&[]), MarkerHistory::Default),
+        (
+            marker_with(&[(FEATURE, feature_entry())]),
+            MarkerHistory::On,
+        ),
+        (
+            marker_with(&[(OFF_FEATURE, off_entry())]),
+            MarkerHistory::Off,
+        ),
+        (
+            marker_with(&[(FEATURE, feature_entry()), (OFF_FEATURE, off_entry())]),
+            MarkerHistory::Both,
+        ),
+        (
+            marker_with(&[(FEATURE, newer)]),
+            MarkerHistory::Unsupported { version: 2 },
+        ),
+        (marker_with(&[(FEATURE, removing)]), MarkerHistory::Removing),
+    ]
+}
+
+#[test]
+fn history_is_created_and_appended_to_only_where_the_marker_allows_it() {
+    use crate::history::switch::MarkerHistory;
+    let (empty, secret) = (
+        Project::with(&[("default", &[])]),
+        Project::with(&[("default", &[("API_KEY", "secret")])]),
+    );
+    let (before, after) = (empty.values(), secret.values());
+    let change = Change {
+        id: [7; 16],
+        time: 1,
+        actor: Actor::App,
+        action: Action::Set,
+        detail: Detail::default(),
+        before: &before,
+        after: &after,
+        renames: &[],
+    };
+    let mut random = crate::keyring::tests::CountingRandom(1);
+    for (marker, state) in markers_in_every_state() {
+        assert_eq!(MarkerHistory::of(Some(&marker)), state);
+        let created = plan_creation(
+            VAULT,
+            Some(&marker),
+            &change,
+            crate::keyring::Approval::Automatic,
+            16,
+            &mut random,
+        );
+        match state {
+            MarkerHistory::Default => assert!(
+                matches!(created, Ok(CreationPlan::Create(_))),
+                "{state:?}: {created:?}"
+            ),
+            _ => assert!(
+                matches!(&created, Err(NotRecorded::Marker(refused)) if *refused == state),
+                "{state:?}: {created:?}"
+            ),
+        }
+    }
+
+    let (store, project) = created();
+    let next_project = Project::with(&[("default", &[("A", "2")])]);
+    let next = next_project.values();
+    let project = project.values();
+    let change = Change {
+        before: &project,
+        after: &next,
+        ..change
+    };
+    let head = store.get(&head_account(VAULT)).expect("head").to_vec();
+    let key = store.get(&key_account(VAULT)).expect("key").to_vec();
+    let tail = store.get(&part_account(VAULT, 0)).expect("tail").to_vec();
+    let stored = Stored {
+        head: &head,
+        key: &key,
+        tail: Some(&tail),
+        previous: None,
+    };
+    for (marker, state) in markers_in_every_state() {
+        let planned = plan_append(
+            VAULT,
+            Some(&marker),
+            &stored,
+            &change,
+            Growth::Unasked,
+            &mut AppendCache::default(),
+            &mut random,
+        );
+        match state {
+            MarkerHistory::On => assert!(
+                matches!(planned, Ok(AppendPlan::Write(_))),
+                "{state:?}: {planned:?}"
+            ),
+            _ => assert!(
+                matches!(&planned, Err(NotRecorded::Marker(refused)) if *refused == state),
+                "{state:?}: {planned:?}"
+            ),
+        }
+    }
+}
+
 #[test]
 fn a_change_without_key_changes_is_recorded_once_history_exists() {
     let (mut store, project) = created();
@@ -329,6 +455,124 @@ fn a_rollover_interrupted_before_its_part_is_recovered_with_the_lost_change_as_a
     assert!(entries[0].flags.interrupted_rollover);
     assert_eq!(entries[0].action, Action::Outside);
     assert!(!entries[1].flags.interrupted_rollover);
+}
+
+#[test]
+fn a_trim_to_one_part_never_deletes_the_part_an_interrupted_rollover_recovers_from() {
+    use crate::history::admission::{TrimStep, TrimTail, trim_oldest};
+    let (mut store, project) = created();
+    let ((_, shape, part, _, _), project) = append_until_not_steady(&mut store, project, 4);
+    assert_eq!((shape, part), (AppendShape::Rollover { grew: true }, 1));
+    // The head listing parts 0 and 1 was written, then the crash: part 1
+    // never was, and part 0 is what the next append recovers from.
+    store.delete(&part_account(VAULT, 1));
+    let head = store.head();
+    assert_eq!(head.parts, vec![0, 1]);
+    assert!(matches!(
+        trim_oldest(&head, 1, TrimTail::Unread),
+        TrimStep::NeedsTail
+    ));
+    let key = store.get(&key_account(VAULT)).expect("key").to_vec();
+    assert!(
+        matches!(
+            trim_oldest(
+                &head,
+                1,
+                TrimTail::Read {
+                    key: &key,
+                    tail: None
+                }
+            ),
+            TrimStep::Keep
+        ),
+        "a trim keeps the part before a tail that isn't the head's"
+    );
+
+    let mut next = project.clone();
+    next.set("default", "B", "b");
+    let (_, shape, ..) = appended(store.record(Action::Set, &project, &next, &[]));
+    assert_eq!(shape, AppendShape::Recovered);
+    let head = store.head();
+    let tail = store
+        .get(&part_account(VAULT, head.tail()))
+        .expect("tail")
+        .to_vec();
+    assert!(
+        matches!(
+            trim_oldest(
+                &head,
+                1,
+                TrimTail::Read {
+                    key: &key,
+                    tail: Some(&tail)
+                }
+            ),
+            TrimStep::Trim(_)
+        ),
+        "once the tail is recovered, the ring may shrink to one part"
+    );
+    assert!(matches!(
+        trim_oldest(&head, 2, TrimTail::Unread),
+        TrimStep::Keep
+    ));
+}
+
+#[test]
+fn a_stale_copy_of_an_earlier_part_reads_as_unreadable_not_as_history() {
+    use crate::history::read::{Filter, Opened, TimelineRow, read_timeline};
+    let mut store = Store::new();
+    store.ring_limit = 2;
+    let base = Project::with(&[("default", &[])]);
+    let first = Project::with(&[("default", &[("A", "1")])]);
+    assert!(matches!(
+        store.record(Action::Set, &base, &first, &[]),
+        Ok(Recorded::Created)
+    ));
+    let mut created_id = None;
+    store.with_entries(0, |entries| created_id = Some(entries[0].id));
+    let created_id = created_id.expect("the creation entry");
+    let ((_, shape, ..), project) = append_until_not_steady(&mut store, first, 4);
+    assert_eq!(shape, AppendShape::Rollover { grew: true });
+    let earlier_part_zero = store.get(&part_account(VAULT, 0)).expect("part 0").to_vec();
+    // Two more rollovers reuse part 0, then part 1.
+    store.growth = Some(false);
+    let (_, project) = append_until_not_steady(&mut store, project, 4);
+    let (_, project) = append_until_not_steady(&mut store, project, 4);
+    assert_eq!(store.head().parts, vec![0, 1]);
+    // An earlier copy of part 0, sealed under the same key, is put back.
+    store
+        .records
+        .insert(part_account(VAULT, 0).name(), earlier_part_zero);
+
+    let opened = Opened::open(
+        VAULT,
+        store.get(&head_account(VAULT)).expect("head"),
+        store.get(&key_account(VAULT)).expect("key"),
+    )
+    .expect("opens");
+    let current = project.values();
+    let timeline = read_timeline(
+        &opened,
+        &mut |part| Ok(store.get(&part_account(VAULT, part)).map(<[u8]>::to_vec)),
+        &current,
+        &Filter::default(),
+        false,
+    )
+    .expect("timeline");
+    assert!(
+        timeline
+            .rows
+            .iter()
+            .any(|row| matches!(row, TimelineRow::Unreadable { part: 0, .. })),
+        "the stale part is unreadable"
+    );
+    assert!(
+        !timeline
+            .rows
+            .iter()
+            .any(|row| matches!(row, TimelineRow::Entry(info) if info.id == created_id)),
+        "entries from an earlier cycle of the ring don't read as current history"
+    );
 }
 
 #[test]
@@ -597,6 +841,49 @@ fn a_sliding_ring_asks_to_grow_again_only_every_interval() {
         (head.parts.len(), head.ring_limit),
         (2, 16),
         "a sliding ring grows again once the service has room"
+    );
+}
+
+#[test]
+fn a_sliding_ring_asks_to_grow_again_even_when_every_append_records_a_gap() {
+    let (mut store, project) = created();
+    store.growth = Some(false);
+    let (_, mut project) = append_until_not_steady(&mut store, project, 4);
+    assert_eq!(store.head().ring_limit, 1);
+    let last_seq = |store: &Store| {
+        let mut seq = 0;
+        store.with_entries(store.head().tail(), |entries| {
+            seq = entries.last().expect("an entry").seq;
+        });
+        seq
+    };
+    if last_seq(&store).is_multiple_of(2) {
+        let mut changed = project.clone();
+        changed.set("default", "A", &big('o', 4));
+        store
+            .record(Action::Set, &project, &changed, &[])
+            .expect("recorded");
+        project = changed;
+    }
+    assert!(!last_seq(&store).is_multiple_of(2));
+    let asked = store.admissions;
+    for round in 0..2 * REGROW_CHECK_INTERVAL as usize {
+        // A change made outside history comes first each time, so every
+        // append records a gap and its change: two entries, and the
+        // change's number stays odd.
+        let mut outside = project.clone();
+        outside.set("default", "A", &format!("outside {round}"));
+        let mut changed = outside.clone();
+        changed.set("default", "A", &format!("{round}{}", big('g', 4)));
+        let (_, _, _, gap, _) = appended(store.record(Action::Set, &outside, &changed, &[]));
+        assert!(gap);
+        project = changed;
+    }
+    assert!(
+        store.admissions - asked >= 2,
+        "{} admissions across {} appends that each recorded a gap",
+        store.admissions - asked,
+        2 * REGROW_CHECK_INTERVAL
     );
 }
 

@@ -17,6 +17,7 @@ use crate::history::codec::{
     Action, Actor, Detail, Entry, EntryHeader, EntryId, Flags, InvalidPart, Part, Summary,
     encode_part, fits_str16, part_len,
 };
+use crate::history::switch::MarkerHistory;
 use crate::history::values::{Rename, Values, gap_changes, net_change};
 use crate::history::{RecordWrite, feature_entry, part_identity};
 use crate::keyring::{self, Approval, KeyRecord, PART_CAPACITY, Random};
@@ -157,6 +158,9 @@ impl fmt::Debug for AppendCache<'_> {
 /// depends on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotRecorded {
+    /// The marker doesn't allow the step: creation needs no history entry
+    /// yet, and an append needs history on.
+    Marker(MarkerHistory),
     /// The head, the key or the tail won't read; Repair removes history.
     Damaged(String),
     /// The key is rotating or a removal is running: finish it first.
@@ -169,6 +173,20 @@ pub enum NotRecorded {
 impl fmt::Display for NotRecorded {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Marker(MarkerHistory::Default) => {
+                formatter.write_str("local history hasn't been created yet")
+            }
+            Self::Marker(MarkerHistory::On) => formatter.write_str("local history already exists"),
+            Self::Marker(MarkerHistory::Off) => formatter.write_str("local history is off"),
+            Self::Marker(MarkerHistory::Removing) => {
+                formatter.write_str("local history is being removed")
+            }
+            Self::Marker(MarkerHistory::Unsupported { .. }) => {
+                formatter.write_str("a newer LPM keeps this env project's history")
+            }
+            Self::Marker(MarkerHistory::Both) => {
+                formatter.write_str("local history is damaged: it's both on and off")
+            }
             Self::Damaged(reason) => write!(formatter, "local history is damaged: {reason}"),
             Self::NeedsMaintenance => {
                 formatter.write_str("local history is finishing a key change")
@@ -203,8 +221,8 @@ pub enum CreationPlan {
     Create(Creation),
 }
 
-/// Plan creating history for `change`, under `marker` (none yet, or one
-/// without a history entry), with the ring limit admission chose.
+/// Plan creating history for `change`, under `marker`, with the ring limit
+/// admission chose. Refused unless the marker holds no history entry yet.
 /// `approval` is the values item's verified access, which the key records.
 pub fn plan_creation(
     vault_id: &str,
@@ -214,6 +232,10 @@ pub fn plan_creation(
     ring_limit: u16,
     random: &mut impl Random,
 ) -> Result<CreationPlan, NotRecorded> {
+    match MarkerHistory::of(marker) {
+        MarkerHistory::Default => {}
+        state => return Err(NotRecorded::Marker(state)),
+    }
     let record = KeyRecord::generate(approval, random)?;
     let keys = record.digest_keys(vault_id);
     let before_summary = change.before.summary(&keys);
@@ -364,16 +386,22 @@ pub enum AppendShape {
     Recovered,
 }
 
-/// Plan appending `change` to the history `stored` holds. `cache` carries
-/// work from an earlier plan of the same append.
+/// Plan appending `change` to the history `stored` holds, under `marker`,
+/// read in the same lock. Refused unless the marker says history is on.
+/// `cache` carries work from an earlier plan of the same append.
 pub fn plan_append<'v>(
     vault_id: &str,
+    marker: Option<&Marker>,
     stored: &Stored<'_>,
     change: &Change<'_, 'v>,
     growth: Growth,
     cache: &mut AppendCache<'v>,
     random: &mut impl Random,
 ) -> Result<AppendPlan, NotRecorded> {
+    match MarkerHistory::of(marker) {
+        MarkerHistory::On => {}
+        state => return Err(NotRecorded::Marker(state)),
+    }
     if !change.changes_values() {
         return Ok(AppendPlan::Unchanged);
     }
@@ -499,7 +527,8 @@ fn finish<'v>(
     summary.apply(&changes);
     check_summary(&summary)?;
     let recovering = matches!(shape, Shape::Recover);
-    let mut seq = last.map_or(0, |header| header.seq);
+    let last_seq = last.map_or(0, |header| header.seq);
+    let mut seq = last_seq;
     let mut entries = Vec::with_capacity(2);
     let gap = !gaps.is_empty();
     if gap {
@@ -570,7 +599,11 @@ fn finish<'v>(
             AppendShape::Steady,
         ),
         Shape::SteadyOrSlide(growth) => match growth {
-            _ if !head.may_regrow(HISTORY) || !seq.is_multiple_of(REGROW_CHECK_INTERVAL) => {
+            // A gap entry takes a number too, so the check is due when the
+            // append passes a multiple of the interval, not only at one.
+            _ if !head.may_regrow(HISTORY)
+                || seq / REGROW_CHECK_INTERVAL == last_seq / REGROW_CHECK_INTERVAL =>
+            {
                 slide(None)
             }
             Growth::Unasked => return Ok(AppendPlan::NeedsGrowthAdmission),

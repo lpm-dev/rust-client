@@ -21,7 +21,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use lpm_env_companion::append_log::{HISTORY, Head};
 use lpm_env_companion::budgets::admission_count;
 use lpm_env_companion::history::RecordWrite;
-use lpm_env_companion::history::admission::{self, CreationAdmission};
+use lpm_env_companion::history::admission::{self, CreationAdmission, TrimStep, TrimTail};
 use lpm_env_companion::history::append::{
     AppendCache, AppendPlan, AppendShape, Change, CreationPlan, Growth, NotRecorded, Stored,
     plan_append, plan_creation,
@@ -68,6 +68,10 @@ struct Frame<'a> {
     blobs: Vec<&'a [u8]>,
 }
 
+/// The most blobs a frame carries: every input names far fewer (a reading
+/// names the head, the key, the values and at most 16 parts).
+const MAX_FRAME_BLOBS: usize = 64;
+
 fn decode_frame(bytes: &[u8]) -> Option<Frame<'_>> {
     let rest = bytes.strip_prefix(&FRAME_MAGIC)?;
     let (&version, rest) = rest.split_first()?;
@@ -76,7 +80,7 @@ fn decode_frame(bytes: &[u8]) -> Option<Frame<'_>> {
     }
     let (count, mut rest) = rest.split_first_chunk::<4>()?;
     let count = u32::from_be_bytes(*count) as usize;
-    if count == 0 || count > rest.len() / 4 + 1 {
+    if count == 0 || count > MAX_FRAME_BLOBS + 1 || count > rest.len() / 4 + 1 {
         return None;
     }
     let mut fields = Vec::with_capacity(count);
@@ -399,7 +403,12 @@ fn renames(requests: &[RenameRequest]) -> Vec<Rename<'_>> {
 
 fn not_recorded(reason: &NotRecorded) -> Value {
     let code = match reason {
-        NotRecorded::Damaged(_) => "damaged",
+        NotRecorded::Marker(MarkerHistory::Default) => "noHistory",
+        NotRecorded::Marker(MarkerHistory::On) => "exists",
+        NotRecorded::Marker(MarkerHistory::Off) => "off",
+        NotRecorded::Marker(MarkerHistory::Removing) => "removing",
+        NotRecorded::Marker(MarkerHistory::Unsupported { .. }) => "newerVersion",
+        NotRecorded::Marker(MarkerHistory::Both) | NotRecorded::Damaged(_) => "damaged",
         NotRecorded::NeedsMaintenance => "needsMaintenance",
         NotRecorded::TooManyValues => "tooManyValues",
         NotRecorded::Random => "random",
@@ -419,6 +428,7 @@ struct CreateRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AppendRequest {
+    marker: usize,
     head: usize,
     key: usize,
     #[serde(default)]
@@ -523,9 +533,12 @@ pub unsafe extern "C" fn lpm_env_history_record(input: *const u8, length: usize)
                     output.finish(&response)
                 }
                 (None, Some(append)) => {
-                    let (Some(head), Some(key)) =
-                        (blob(blobs, append.head), blob(blobs, append.key))
-                    else {
+                    let (Some(marker), Some(head), Some(key)) = (
+                        blob(blobs, append.marker)
+                            .and_then(|bytes| Marker::parse(vault_id, bytes).ok()),
+                        blob(blobs, append.head),
+                        blob(blobs, append.key),
+                    ) else {
                         return failure(2, "history.invalid_input");
                     };
                     let growth = match append.growth.as_str() {
@@ -543,6 +556,7 @@ pub unsafe extern "C" fn lpm_env_history_record(input: *const u8, length: usize)
                     let mut cache = AppendCache::default();
                     let response = match plan_append(
                         vault_id,
+                        Some(&marker),
                         &stored,
                         &change,
                         growth,
@@ -1309,7 +1323,7 @@ fn fingerprint(opened: &Opened, plan: &RollbackPlan) -> String {
             }
         }
     }
-    digest_text(&opened.keys.value(&encoded))
+    digest_text(&opened.keys.binding("rollback", &encoded))
 }
 
 fn unknown_reason(reason: UnknownReason) -> &'static str {
@@ -1668,7 +1682,7 @@ fn review_fingerprint(opened: &Opened, review: &RemovalReview) -> String {
             encoded.extend_from_slice(digest);
         }
     }
-    digest_text(&opened.keys.value(&encoded))
+    digest_text(&opened.keys.binding("removal", &encoded))
 }
 
 fn removal_refusal(error: RemovalError) -> LPMEnvResult {
@@ -1682,6 +1696,7 @@ fn removal_refusal(error: RemovalError) -> LPMEnvResult {
         RemovalError::ChangedSinceReview => "history.changed_since_review",
         RemovalError::GenerationExhausted => "history.generation_exhausted",
         RemovalError::Running => "history.running",
+        RemovalError::PartNotRotated(_) => "history.part_not_rotated",
         RemovalError::Random => "history.random_failed",
     };
     refused(code, Some(error.to_string()))
@@ -1940,13 +1955,15 @@ pub unsafe extern "C" fn lpm_env_history_maintenance(
                             Err(error) => return removal_refusal(error),
                         }
                     }
-                    "finish" => match finish_rotation(opened) {
-                        Ok(writes) => json!({
-                            "journal": true,
-                            "writes": writes.into_iter().map(|write| output.write(write)).collect::<Vec<_>>(),
-                        }),
-                        Err(error) => return removal_refusal(error),
-                    },
+                    "finish" => {
+                        match finish_rotation(opened, |part| opening.parts.get(&part).copied()) {
+                            Ok(writes) => json!({
+                                "journal": true,
+                                "writes": writes.into_iter().map(|write| output.write(write)).collect::<Vec<_>>(),
+                            }),
+                            Err(error) => return removal_refusal(error),
+                        }
+                    }
                     _ => return failure(2, "history.invalid_input"),
                 };
                 output.finish(&response)
@@ -2148,7 +2165,7 @@ pub unsafe extern "C" fn lpm_env_history_admission(
                         .is_none_or(|names| names.contains(vault_id))
                 },
             );
-            let trimmed: usize = trims.iter().map(|(_, count)| count).sum();
+            let trimmed: usize = trims.iter().map(|planned| planned.count).sum();
             let after_trims = existing.saturating_sub(trimmed);
             let creation = match admission::admit_creation(after_trims) {
                 CreationAdmission::Full => "full",
@@ -2157,7 +2174,7 @@ pub unsafe extern "C" fn lpm_env_history_admission(
             };
             Output::default().finish(&json!({
                 "existing": existing,
-                "trims": trims.iter().map(|(vault_id, count)| json!({ "vaultId": vault_id, "count": count })).collect::<Vec<_>>(),
+                "trims": trims.iter().map(|planned| json!({ "vaultId": planned.vault_id, "count": planned.count, "floor": planned.floor })).collect::<Vec<_>>(),
                 "afterTrims": after_trims,
                 "creation": creation,
                 "ringLimit": admission::admit_creation(after_trims).ring_limit(),
@@ -2167,13 +2184,16 @@ pub unsafe extern "C" fn lpm_env_history_admission(
                         // Trims of the growing ring itself leave it at its new
                         // size, which may only grow back below the regrowth
                         // threshold.
-                        let own = trims
-                            .iter()
-                            .find(|(vault_id, _)| *vault_id == head.vault_id)
-                            .map_or(0, |(_, count)| *count);
-                        for _ in 0..own {
-                            if let Some((trimmed, _)) = head.trim_oldest() {
-                                head = trimmed;
+                        if let Some(own) =
+                            trims.iter().find(|planned| planned.vault_id == head.vault_id)
+                        {
+                            for _ in 0..own.count {
+                                match head.trim_oldest() {
+                                    Some((trimmed, _)) if head.parts.len() > own.floor => {
+                                        head = trimmed;
+                                    }
+                                    _ => break,
+                                }
                             }
                         }
                         admission::admit_growth_of(&head, after_trims)
@@ -2185,12 +2205,26 @@ pub unsafe extern "C" fn lpm_env_history_admission(
     }
 }
 
+/// The key and tail a trim to one part reads: `part` is omitted when the
+/// tail's account is absent.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RingTail {
+    key: usize,
+    #[serde(default)]
+    part: Option<usize>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RingRequest {
     vault_id: String,
     head: usize,
     action: String,
+    #[serde(default)]
+    floor: Option<usize>,
+    #[serde(default)]
+    tail: Option<RingTail>,
     #[serde(default)]
     existing: usize,
     #[serde(default)]
@@ -2215,13 +2249,31 @@ pub unsafe extern "C" fn lpm_env_history_ring(input: *const u8, length: usize) -
             };
             let mut output = Output::default();
             let response = match request.action.as_str() {
-                "trim" => match admission::trim_oldest(&head) {
-                    Some(trim) => json!({
-                        "writes": [output.write(trim.head)],
-                        "delete": trim.delete.name(),
-                    }),
-                    None => json!({ "writes": [], "delete": null }),
-                },
+                "trim" => {
+                    let Some(floor) = request.floor else {
+                        return failure(2, "history.invalid_input");
+                    };
+                    let tail = match &request.tail {
+                        None => TrimTail::Unread,
+                        Some(read) => match blob(blobs, read.key) {
+                            Some(key) => TrimTail::Read {
+                                key,
+                                tail: read.part.and_then(|index| blob(blobs, index)),
+                            },
+                            None => return failure(2, "history.invalid_input"),
+                        },
+                    };
+                    match admission::trim_oldest(&head, floor, tail) {
+                        TrimStep::Trim(trim) => json!({
+                            "writes": [output.write(trim.head)],
+                            "delete": trim.delete.name(),
+                        }),
+                        TrimStep::NeedsTail => {
+                            json!({ "needsTail": true, "writes": [], "delete": null })
+                        }
+                        TrimStep::Keep => json!({ "writes": [], "delete": null }),
+                    }
+                }
                 "raiseLimit" => json!({
                     "writes": admission::raise_limit(&head, request.existing)
                         .map(|write| output.write(write))

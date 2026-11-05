@@ -20,6 +20,9 @@ cleanup
 mkdir -p "$root/target"
 git -C "$root" worktree add --quiet --detach "$engine" "$tag"
 # The older release's lockfile pins the engine's dependencies as it shipped.
+# Updating only this workspace adds the harness's own entry; --locked then
+# refuses any other change to it.
 cp "$engine/Cargo.lock" "$harness/Cargo.lock"
-cargo run --quiet --manifest-path "$harness/Cargo.toml" -- \
+cargo update --quiet --workspace --manifest-path "$harness/Cargo.toml"
+cargo run --quiet --locked --manifest-path "$harness/Cargo.toml" -- \
     "$root/crates/lpm-env-companion/tests/fixtures/history.json"

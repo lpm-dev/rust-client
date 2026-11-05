@@ -15,9 +15,11 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap};
 
 use crate::account::CompanionAccount;
-use crate::append_log::{HISTORY, Head};
+use crate::append_log::{self, HISTORY, Head, TailState};
 use crate::budgets::{ADMISSION_CAP, ADMISSION_TARGET};
-use crate::history::{RecordWrite, head_account};
+use crate::history::codec::Part;
+use crate::history::{RecordWrite, head_account, part_identity};
+use crate::keyring::{self, KeyRecord};
 
 /// Accounts creating history adds: the head, the key and part 0.
 pub const CREATION_ACCOUNTS: usize = 3;
@@ -106,24 +108,35 @@ pub fn rings<'a>(accounts: impl IntoIterator<Item = &'a CompanionAccount>) -> Ve
         .collect()
 }
 
+/// The trims admission planned for one project's ring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedTrims {
+    pub vault_id: String,
+    pub count: usize,
+    /// The fewest parts the head may list after them: 2 while past the
+    /// target, 1 while past the cap. The inventory counts parts by name,
+    /// orphans included, so each trim checks this against the head.
+    pub floor: usize,
+}
+
 /// Trims that bring a service holding `existing` records back within its
 /// budget, at most `max` of them: the largest rings first, ties by vault
 /// ID, down to 2 parts each while past the target and 1 part each while
 /// past the cap. `trimmable` says which projects this client may write
-/// without a prompt. Returns how many parts to trim from each project.
+/// without a prompt.
 pub fn plan_trims(
     existing: usize,
     rings: &[Ring],
     max: usize,
     trimmable: impl Fn(&str) -> bool,
-) -> Vec<(String, usize)> {
+) -> Vec<PlannedTrims> {
     let mut remaining = existing;
     let mut heap: BinaryHeap<(usize, Reverse<&str>)> = rings
         .iter()
         .filter(|ring| trimmable(&ring.vault_id))
         .map(|ring| (ring.parts, Reverse(ring.vault_id.as_str())))
         .collect();
-    let mut trims: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut trims: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     let mut made = 0;
     while made < max && remaining > ADMISSION_TARGET {
         let floor = if remaining > ADMISSION_CAP { 1 } else { 2 };
@@ -133,14 +146,20 @@ pub fn plan_trims(
         if parts <= floor {
             break;
         }
-        *trims.entry(vault_id).or_default() += 1;
+        let planned = trims.entry(vault_id).or_insert((0, floor));
+        planned.0 += 1;
+        planned.1 = planned.1.min(floor);
         made += 1;
         remaining -= 1;
         heap.push((parts - 1, Reverse(vault_id)));
     }
     trims
         .into_iter()
-        .map(|(vault_id, count)| (vault_id.to_owned(), count))
+        .map(|(vault_id, (count, floor))| PlannedTrims {
+            vault_id: vault_id.to_owned(),
+            count,
+            floor,
+        })
         .collect()
 }
 
@@ -152,12 +171,67 @@ pub struct Trim {
     pub delete: CompanionAccount,
 }
 
-pub fn trim_oldest(head: &Head) -> Option<Trim> {
-    let (next, oldest) = head.trim_oldest()?;
-    Some(Trim {
-        head: RecordWrite::new(head_account(&head.vault_id), next.encode(HISTORY).ok()?),
+/// What a trim knows of its ring's tail. A trim to one part deletes the
+/// part before the tail, the one an interrupted rollover recovers from, so
+/// it needs the tail.
+#[derive(Debug, Clone, Copy)]
+pub enum TrimTail<'a> {
+    Unread,
+    /// The project's key record, and its tail part as stored (`None` when
+    /// its account is absent).
+    Read {
+        key: &'a [u8],
+        tail: Option<&'a [u8]>,
+    },
+}
+
+#[derive(Debug)]
+pub enum TrimStep {
+    Trim(Trim),
+    /// Read the project's key and tail, and ask again.
+    NeedsTail,
+    /// The head lists `floor` parts or fewer, or its tail isn't the head's
+    /// yet: the project's next append recovers it first.
+    Keep,
+}
+
+/// The next trim of the ring `head` describes, down to `floor` parts.
+pub fn trim_oldest(head: &Head, floor: usize, tail: TrimTail<'_>) -> TrimStep {
+    if head.parts.len() <= floor.max(1) {
+        return TrimStep::Keep;
+    }
+    if head.parts.len() == 2 {
+        match tail {
+            TrimTail::Unread => return TrimStep::NeedsTail,
+            TrimTail::Read { key, tail } if !tail_is_current(head, key, tail) => {
+                return TrimStep::Keep;
+            }
+            TrimTail::Read { .. } => {}
+        }
+    }
+    let Some((next, oldest)) = head.trim_oldest() else {
+        return TrimStep::Keep;
+    };
+    let Ok(bytes) = next.encode(HISTORY) else {
+        return TrimStep::Keep;
+    };
+    TrimStep::Trim(Trim {
+        head: RecordWrite::new(head_account(&head.vault_id), bytes),
         delete: crate::history::part_account(&head.vault_id, oldest),
     })
+}
+
+/// Whether `tail` opens under `key` and holds the head's epoch.
+fn tail_is_current(head: &Head, key: &[u8], tail: Option<&[u8]>) -> bool {
+    let (Ok(record), Some(sealed)) = (KeyRecord::decode(key), tail) else {
+        return false;
+    };
+    let Ok(plaintext) = keyring::open(&record, &part_identity(&head.vault_id, head.tail()), sealed)
+    else {
+        return false;
+    };
+    Part::decode(&plaintext)
+        .is_ok_and(|part| append_log::tail_state(head, Some(part.epoch)) == TailState::Current)
 }
 
 /// The head with a full ring limit again, for a ring shrunk while the
@@ -215,6 +289,14 @@ mod tests {
         assert!(!admit_growth(4_097));
     }
 
+    fn trims(vault_id: &str, count: usize, floor: usize) -> PlannedTrims {
+        PlannedTrims {
+            vault_id: vault_id.to_owned(),
+            count,
+            floor,
+        }
+    }
+
     fn ring(vault_id: &str, parts: usize) -> Ring {
         Ring {
             vault_id: vault_id.to_owned(),
@@ -228,30 +310,26 @@ mod tests {
         assert_eq!(plan_trims(4_096, &rings, 64, |_| true), vec![]);
         assert_eq!(
             plan_trims(4_100, &rings, 64, |_| true),
-            vec![("a".to_owned(), 2), ("b".to_owned(), 2)],
+            vec![trims("a", 2, 2), trims("b", 2, 2)],
             "largest first, ties by vault ID, alternating as they shrink"
         );
-        let trims = plan_trims(4_200, &rings, 64, |_| true);
+        let planned = plan_trims(4_200, &rings, 64, |_| true);
         assert_eq!(
-            trims,
-            vec![
-                ("a".to_owned(), 14),
-                ("b".to_owned(), 14),
-                ("c".to_owned(), 1)
-            ],
+            planned,
+            vec![trims("a", 14, 2), trims("b", 14, 2), trims("c", 1, 2)],
             "rings stop at 2 parts while past the target"
         );
         assert_eq!(
             plan_trims(4_200, &rings, 5, |_| true)
                 .iter()
-                .map(|(_, count)| count)
+                .map(|planned| planned.count)
                 .sum::<usize>(),
             5,
             "at most the given number per pass"
         );
         assert_eq!(
             plan_trims(4_100, &rings, 64, |vault_id| vault_id != "a"),
-            vec![("b".to_owned(), 4)],
+            vec![trims("b", 4, 2)],
             "only projects the client may write"
         );
     }
@@ -261,7 +339,7 @@ mod tests {
         let rings = [ring("a", 2), ring("b", 2), ring("c", 2)];
         assert_eq!(
             plan_trims(8_194, &rings, 64, |_| true),
-            vec![("a".to_owned(), 1), ("b".to_owned(), 1)],
+            vec![trims("a", 1, 1), trims("b", 1, 1)],
             "down to one part until the cap is met, then two is the floor"
         );
     }
@@ -284,6 +362,21 @@ mod tests {
     }
 
     #[test]
+    fn a_trim_never_takes_a_ring_below_its_floor_in_the_parts_its_head_lists() {
+        let mut head = Head::new("other", 2);
+        head.parts = vec![4, 5];
+        // A trim that crashed before its deletion left part 3, so the
+        // names-only inventory counts three parts.
+        let inventory = [3, 4, 5].map(|part| crate::history::part_account("other", part));
+        let planned = plan_trims(5_000, &rings(&inventory), 64, |_| true);
+        assert_eq!(planned, vec![trims("other", 1, 2)]);
+        assert!(matches!(
+            trim_oldest(&head, planned[0].floor, TrimTail::Unread),
+            TrimStep::Keep
+        ));
+    }
+
+    #[test]
     fn a_shrunk_ring_grows_again_only_well_below_the_target() {
         let mut head = Head::new("a", 2);
         head.parts = vec![0, 1];
@@ -292,13 +385,16 @@ mod tests {
         let raised = raise_limit(&head, REGROW_BELOW - 1).expect("raised");
         let parsed = Head::parse(HISTORY, "a", &raised.bytes).expect("head");
         assert_eq!(parsed.ring_limit, 16);
-        let trim = trim_oldest(&head).expect("trim");
+        head.parts = vec![0, 1, 2];
+        let TrimStep::Trim(trim) = trim_oldest(&head, 2, TrimTail::Unread) else {
+            panic!("a trim");
+        };
         assert_eq!(trim.delete, crate::history::part_account("a", 0));
         assert_eq!(
             Head::parse(HISTORY, "a", &trim.head.bytes)
                 .expect("head")
                 .parts,
-            vec![1]
+            vec![1, 2]
         );
     }
 }

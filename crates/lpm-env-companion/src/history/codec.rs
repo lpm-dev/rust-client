@@ -32,6 +32,17 @@ use crate::keyring::{Digest, PART_CAPACITY};
 pub const PART_MAGIC: [u8; 4] = *b"LPMH";
 pub const PART_VERSION: u8 = 1;
 const PART_HEADER_BYTES: usize = 4 + 1 + 8;
+// The fewest bytes each repeated item encodes in, so a count read from a
+// part reserves no more than the bytes left can hold.
+/// An entry with its length: the length, seq, id, time, actor, action,
+/// flags, the detail's length and the environment count.
+const MIN_FRAMED_ENTRY_BYTES: usize = 4 + 8 + 16 + 8 + 1 + 1 + 1 + 2 + 2;
+/// An environment change: a one-byte name with its length, the change and
+/// the key count.
+const MIN_ENVIRONMENT_BYTES: usize = 2 + 1 + 1 + 4;
+/// A key change: a one-byte key with its length, the change and two
+/// one-byte sides.
+const MIN_KEY_CHANGE_BYTES: usize = 2 + 1 + 1 + 1 + 1;
 const MAX_FILE_NAME_BYTES: usize = 255;
 
 pub type EntryId = [u8; 16];
@@ -635,7 +646,8 @@ impl<'a> Entry<'a> {
         let detail_bytes = usize::from(reader.u16()?);
         let detail = decode_detail(reader.bytes(detail_bytes)?)?;
         let environment_count = usize::from(reader.u16()?);
-        let mut environments = Vec::with_capacity(environment_count.min(reader.remaining()));
+        let mut environments =
+            Vec::with_capacity(environment_count.min(reader.remaining() / MIN_ENVIRONMENT_BYTES));
         for _ in 0..environment_count {
             let name = reader.str16()?;
             let kind = match reader.u8()? {
@@ -650,7 +662,8 @@ impl<'a> Entry<'a> {
                 Keys::Count(count)
             } else {
                 let count = count as usize;
-                let mut changes = Vec::with_capacity(count.min(reader.remaining() / 5));
+                let mut changes =
+                    Vec::with_capacity(count.min(reader.remaining() / MIN_KEY_CHANGE_BYTES));
                 for _ in 0..count {
                     let key = reader.str16()?;
                     let kind = match reader.u8()? {
@@ -1009,7 +1022,7 @@ impl<'a> Part<'a> {
             summary.environments.insert(name, keys);
         }
         let entry_count = reader.u32()? as usize;
-        let capacity = entry_count.min(reader.remaining() / 4);
+        let capacity = entry_count.min(reader.remaining() / MIN_FRAMED_ENTRY_BYTES);
         let mut entries = Vec::with_capacity(capacity);
         let mut decoded: Vec<Entry<'a>> = Vec::with_capacity(capacity);
         for _ in 0..entry_count {

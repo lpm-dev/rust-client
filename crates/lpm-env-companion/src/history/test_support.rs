@@ -233,7 +233,16 @@ impl Store {
                 previous: previous.as_deref(),
             };
             let mut random = self.random();
-            match plan_append(VAULT, &stored, &change, growth, &mut cache, &mut random)? {
+            let marker = self.marker();
+            match plan_append(
+                VAULT,
+                marker.as_ref(),
+                &stored,
+                &change,
+                growth,
+                &mut cache,
+                &mut random,
+            )? {
                 AppendPlan::Unchanged => return Ok(Recorded::Unchanged),
                 AppendPlan::AlreadyRecorded => return Ok(Recorded::AlreadyRecorded),
                 AppendPlan::NeedsPrevious { part } => {

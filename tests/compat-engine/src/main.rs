@@ -3,6 +3,9 @@
 //! must be a valid project at level `ignore` that allows writes, with no
 //! damage, and every interrupted step must finish: none may be `Unfinished`,
 //! which only a project-wide discard repairs, and which would lose "off".
+//! Every journal transaction history commits must pass the older engine's
+//! transaction check, which that release's recovery runs before it replays
+//! a journal.
 //!
 //! The source uses only API the older engine has, so it builds against it.
 
@@ -13,6 +16,7 @@ use base64::engine::general_purpose::STANDARD;
 use lpm_env_companion::account::{CompanionAccount, marker_account};
 use lpm_env_companion::assessment::{Observed, assess};
 use lpm_env_companion::gate::Operation;
+use lpm_env_companion::invariants::check_transaction;
 use lpm_env_companion::lifecycle::{self, LifecycleStore, Mutation};
 use lpm_env_companion::marker::{Level, Marker};
 
@@ -79,6 +83,47 @@ fn check(vault_id: &str, name: &str, records: &BTreeMap<String, Vec<u8>>) -> Res
     Ok(())
 }
 
+fn decoded(text: &serde_json::Value) -> Vec<u8> {
+    STANDARD
+        .decode(text.as_str().expect("base64"))
+        .expect("base64")
+}
+
+fn records_of(value: &serde_json::Value) -> BTreeMap<String, Vec<u8>> {
+    value
+        .as_object()
+        .expect("records")
+        .iter()
+        .map(|(account, bytes)| (account.clone(), decoded(bytes)))
+        .collect()
+}
+
+fn replay_check(transaction: &serde_json::Value) -> Result<(), String> {
+    let name = transaction["name"].as_str().expect("name");
+    let records = records_of(&transaction["records"]);
+    let values: Vec<(String, Option<Vec<u8>>)> = transaction["changes"]
+        .as_array()
+        .expect("changes")
+        .iter()
+        .map(|change| {
+            (
+                change["account"].as_str().expect("account").to_owned(),
+                (!change["value"].is_null()).then(|| decoded(&change["value"])),
+            )
+        })
+        .collect();
+    let changes: Vec<(&str, Option<&[u8]>)> = values
+        .iter()
+        .map(|(account, value)| (account.as_str(), value.as_deref()))
+        .collect();
+    check_transaction(
+        &changes,
+        |vault_id| Ok(records.get(&marker_account(vault_id)).cloned()),
+        |_| Ok(inventory(&records)),
+    )
+    .map_err(|refusal| format!("{name}: recovery would refuse it: {refusal}"))
+}
+
 fn main() {
     let path = std::env::args().nth(1).expect("the history fixtures' path");
     let fixture: serde_json::Value =
@@ -89,21 +134,16 @@ fn main() {
     let states = fixture["states"].as_array().expect("states");
     for state in states {
         let name = state["name"].as_str().expect("name");
-        let records: BTreeMap<String, Vec<u8>> = state["records"]
-            .as_object()
-            .expect("records")
-            .iter()
-            .map(|(account, bytes)| {
-                (
-                    account.clone(),
-                    STANDARD
-                        .decode(bytes.as_str().expect("base64"))
-                        .expect("base64"),
-                )
-            })
-            .collect();
+        let records = records_of(&state["records"]);
         match check(vault_id, name, &records) {
             Ok(()) => println!("ok: {name}"),
+            Err(failure) => failures.push(failure),
+        }
+    }
+    let transactions = fixture["transactions"].as_array().expect("transactions");
+    for transaction in transactions {
+        match replay_check(transaction) {
+            Ok(()) => println!("ok: {}", transaction["name"].as_str().expect("name")),
             Err(failure) => failures.push(failure),
         }
     }
@@ -113,5 +153,9 @@ fn main() {
         }
         std::process::exit(1);
     }
-    println!("{} states read by the older engine", states.len());
+    println!(
+        "{} states read and {} transactions accepted by the older engine",
+        states.len(),
+        transactions.len()
+    );
 }

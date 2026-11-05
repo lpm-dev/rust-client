@@ -161,6 +161,40 @@ fn states() -> Value {
         "the ring grew into part 1",
     ));
 
+    let mut trim_interrupted = Store {
+        records: store.records.clone(),
+        ..Store::new()
+    };
+    let (trimmed, _) = trim_interrupted.head().trim_oldest().expect("two parts");
+    trim_interrupted.put(RecordWrite::new(
+        head_account(VAULT),
+        trimmed.encode(HISTORY).expect("head"),
+    ));
+    out.push(state(
+        "trim interrupted",
+        &trim_interrupted,
+        &project,
+        "a trim wrote its head and crashed before deleting the part, which is now an orphan",
+    ));
+
+    let mut rotating = Store {
+        records: store.records.clone(),
+        ..Store::new()
+    };
+    let mut key = rotating.key();
+    key.begin_rotation(Approval::Protected, &mut CountingRandom(180))
+        .expect("rotation");
+    rotating.put(RecordWrite {
+        account: key_account(VAULT),
+        bytes: key.encode(),
+    });
+    out.push(state(
+        "rotation started",
+        &rotating,
+        &project,
+        "raising the approval started a rotation, with no removal; any client finishes it",
+    ));
+
     let mut interrupted = Store {
         records: store.records.clone(),
         ..Store::new()
@@ -265,6 +299,151 @@ fn states() -> Value {
     Value::Array(out)
 }
 
+/// One journal transaction history commits: the records before it, and each
+/// account it writes (with its bytes) or deletes (`null`).
+fn transaction(name: &str, before: &Store, writes: &[RecordWrite], note: &str) -> Value {
+    json!({
+        "name": name,
+        "note": note,
+        "records": records(before),
+        "changes": writes
+            .iter()
+            .map(|write| json!({ "account": write.account.name(), "value": b64(&write.bytes) }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// The journal transactions history commits. Recovery replays a journal only
+/// after its client's engine checks it, so an older client must accept each.
+fn transactions() -> Value {
+    use crate::history::append::{Change, CreationPlan, plan_creation};
+    use crate::history::codec::{Actor, Detail};
+    use crate::history::read::Opened;
+    use crate::history::removal::Chosen;
+
+    let mut out = Vec::new();
+    let empty = Project::with(&[("production", &[]), ("staging", &[])]);
+    let one = Project::with(&[("production", &[("API_KEY", "one")]), ("staging", &[])]);
+    let (empty_values, one_values) = (empty.values(), one.values());
+    let change = Change {
+        id: [1; 16],
+        time: 1_762_000_000_000,
+        actor: Actor::Cli,
+        action: Action::Set,
+        detail: Detail::default(),
+        before: &empty_values,
+        after: &one_values,
+        renames: &[],
+    };
+    let CreationPlan::Create(creation) = plan_creation(
+        VAULT,
+        None,
+        &change,
+        Approval::Automatic,
+        16,
+        &mut CountingRandom(5),
+    )
+    .expect("creation") else {
+        panic!("the change sets a key");
+    };
+    out.push(transaction(
+        "creation",
+        &Store::new(),
+        &creation.writes,
+        "the marker with history, the key, the head and part 0",
+    ));
+
+    let mut store = Store::new();
+    store
+        .record(Action::Set, &empty, &one, &[])
+        .expect("created");
+    let two = Project::with(&[("production", &[("API_KEY", "two")]), ("staging", &[])]);
+    store.record(Action::Set, &one, &two, &[]).expect("changed");
+    let open = |store: &Store| {
+        Opened::open(
+            VAULT,
+            store.get(&head_account(VAULT)).expect("head"),
+            store.get(&key_account(VAULT)).expect("key"),
+        )
+        .expect("opens")
+    };
+
+    let writes =
+        removal::start_rotation(&open(&store), Approval::Protected, &mut CountingRandom(60))
+            .expect("rotation");
+    out.push(transaction(
+        "rotation start",
+        &store,
+        &writes,
+        "the key with a pending key, for raised approval",
+    ));
+    let mut rotating = Store {
+        records: store.records.clone(),
+        ..Store::new()
+    };
+    for write in writes {
+        rotating.put(write);
+    }
+    let opened = open(&rotating);
+    for part in opened.head.parts.clone() {
+        let sealed = rotating.get(&part_account(VAULT, part)).map(<[u8]>::to_vec);
+        if let Some(write) =
+            removal::rotate_part(&opened, part, sealed.as_deref(), &mut CountingRandom(70))
+                .expect("rotates")
+        {
+            rotating.put(write);
+        }
+    }
+    let rotated = open(&rotating);
+    let writes =
+        removal::finish_rotation(&rotated, |part| rotating.get(&part_account(VAULT, part)))
+            .expect("finishes");
+    out.push(transaction(
+        "rotation finish",
+        &rotating,
+        &writes,
+        "the key with only its new key, once every part is under it",
+    ));
+
+    let two_values = two.values();
+    let opened = open(&store);
+    let review = removal::review_removal(
+        &opened,
+        &mut |part| Ok(store.get(&part_account(VAULT, part)).map(<[u8]>::to_vec)),
+        &two_values,
+        Chosen {
+            entry: store_entry_id(1),
+            environment: "production",
+            key: "API_KEY",
+            side: crate::history::codec::RelatedSide::After,
+        },
+    )
+    .expect("review");
+    let writes = removal::start_removal(
+        &opened,
+        &review,
+        &review.default_selection(),
+        &two_values,
+        Approval::Automatic,
+        &mut CountingRandom(80),
+    )
+    .expect("removal");
+    out.push(transaction(
+        "removal start",
+        &store,
+        &writes,
+        "the key rotating and the head naming what to scrub",
+    ));
+    Value::Array(out)
+}
+
+/// The ID the test store gives its `n`th change.
+fn store_entry_id(n: u8) -> crate::history::codec::EntryId {
+    let mut id = [0xa0; 16];
+    id[15] = n;
+    id
+}
+
 fn heads() -> Value {
     let valid = Head::new(VAULT, 16).encode(HISTORY).expect("head");
     let text = String::from_utf8(valid).expect("UTF-8");
@@ -284,6 +463,7 @@ fn generate() -> String {
         "heads": heads(),
         "envelopes": envelopes(),
         "states": states(),
+        "transactions": transactions(),
     });
     let mut text = serde_json::to_string_pretty(&fixture).expect("json");
     text.push('\n');
@@ -349,5 +529,54 @@ fn every_fixture_state_reads_as_its_note_says() {
         {
             crate::lifecycle::plan_resume(marker, inventory).expect("resumable");
         }
+    }
+}
+
+#[test]
+fn every_fixture_transaction_passes_the_check_recovery_replays_it_with() {
+    let fixture: Value = serde_json::from_str(&generate()).expect("json");
+    for transaction in fixture["transactions"].as_array().expect("transactions") {
+        let decode = |text: &Value| {
+            STANDARD
+                .decode(text.as_str().expect("base64"))
+                .expect("base64")
+        };
+        let records: std::collections::BTreeMap<String, Vec<u8>> = transaction["records"]
+            .as_object()
+            .expect("records")
+            .iter()
+            .map(|(account, bytes)| (account.clone(), decode(bytes)))
+            .collect();
+        let values: Vec<(String, Option<Vec<u8>>)> = transaction["changes"]
+            .as_array()
+            .expect("changes")
+            .iter()
+            .map(|change| {
+                (
+                    change["account"].as_str().expect("account").to_owned(),
+                    (!change["value"].is_null()).then(|| decode(&change["value"])),
+                )
+            })
+            .collect();
+        let changes: Vec<(&str, Option<&[u8]>)> = values
+            .iter()
+            .map(|(account, value)| (account.as_str(), value.as_deref()))
+            .collect();
+        crate::invariants::check_transaction(
+            &changes,
+            |vault_id| {
+                Ok(records
+                    .get(&crate::account::marker_account(vault_id))
+                    .cloned())
+            },
+            |_| {
+                Ok(records
+                    .keys()
+                    .filter_map(|name| CompanionAccount::parse(name))
+                    .filter(|account| !matches!(account, CompanionAccount::Marker { .. }))
+                    .collect())
+            },
+        )
+        .unwrap_or_else(|refusal| panic!("{}: {refusal}", transaction["name"]));
     }
 }

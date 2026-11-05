@@ -200,17 +200,50 @@ fn fill_service(storage: &mut MemoryProjectStorage, total: usize) {
                 .is_some_and(|account| !matches!(account, CompanionAccount::Marker { .. }))
         })
         .count();
-    for index in 0..total.saturating_sub(existing) {
-        storage.values.insert(
-            CompanionAccount::Record {
-                kind: "overrides".to_owned(),
-                vault_id: format!("other{index:05}"),
-                part: None,
-            }
-            .name(),
-            b"x".to_vec(),
-        );
+    let mut added = existing;
+    let mut index = 0;
+    while added < total {
+        let name = CompanionAccount::Record {
+            kind: "overrides".to_owned(),
+            vault_id: format!("other{index:05}"),
+            part: None,
+        }
+        .name();
+        index += 1;
+        if !storage.values.contains_key(&name) {
+            storage.values.insert(name, b"x".to_vec());
+            added += 1;
+        }
     }
+}
+
+/// Remove other projects' records that `fill_service` added until the
+/// service holds `total`.
+fn empty_service_to(storage: &mut MemoryProjectStorage, total: usize) {
+    let count = |storage: &MemoryProjectStorage| {
+        storage
+            .values
+            .keys()
+            .filter(|name| {
+                CompanionAccount::parse(name)
+                    .is_some_and(|account| !matches!(account, CompanionAccount::Marker { .. }))
+            })
+            .count()
+    };
+    let fillers: Vec<String> = storage
+        .values
+        .keys()
+        .filter(|name| {
+            matches!(CompanionAccount::parse(name), Some(CompanionAccount::Record { kind, vault_id, .. })
+                if kind == "overrides" && vault_id.starts_with("other"))
+        })
+        .cloned()
+        .collect();
+    let surplus = count(storage).saturating_sub(total);
+    for name in fillers.into_iter().take(surplus) {
+        storage.values.0.remove(&name);
+    }
+    assert_eq!(count(storage), total);
 }
 
 #[test]
@@ -244,6 +277,92 @@ fn trimming_its_own_ring_for_growth_plans_again_on_the_head_as_it_is_now() {
         head.ring_limit as usize,
         head.parts.len(),
         "the ring shrank and couldn't grow: {head:?}"
+    );
+}
+
+#[test]
+fn a_trim_past_the_cap_keeps_the_part_an_interrupted_rollover_recovers_from() {
+    use lpm_env_companion::budgets::{ADMISSION_CAP, ADMISSION_TARGET};
+    let mut storage = MemoryProjectStorage::default();
+    save_vault_data_with_storage(
+        &mut storage,
+        VAULT,
+        "Project",
+        "/project",
+        r#"{"environments":{"default":{"TOKEN":"one"}}}"#,
+    )
+    .expect("create the project");
+    fill_service(&mut storage, ADMISSION_TARGET);
+    let created = record(
+        &mut test_history(&mut storage),
+        VAULT,
+        &change("zero", "one"),
+    );
+    assert!(matches!(created, Outcome::Recorded { .. }), "{created:?}");
+    assert_eq!(
+        head_of(&storage).ring_limit,
+        2,
+        "past the target, two parts"
+    );
+    // Below the target the ring may grow to its limit, and above the
+    // regrowth threshold it may not grow past it.
+    empty_service_to(&mut storage, 3_800);
+    let mut previous = grow_to(&mut storage, 2, "one".to_owned());
+
+    // The full ring's next rollover reuses part 0: the head is written,
+    // then the crash, so part 0 still holds the earlier epoch.
+    let part_zero = lpm_env_companion::history::part_account(VAULT, 0).name();
+    for round in 0..64 {
+        let earlier = storage
+            .values
+            .get_bytes(&part_zero)
+            .expect("part 0")
+            .to_vec();
+        let next = format!("reuse {round}{}", "z".repeat(6 * 1024));
+        record(
+            &mut test_history(&mut storage),
+            VAULT,
+            &change(&previous, &next),
+        );
+        previous = next;
+        if head_of(&storage).parts == [1, 0] {
+            storage.values.insert(part_zero, earlier);
+            break;
+        }
+    }
+    assert_eq!(head_of(&storage).parts, [1, 0]);
+
+    // Past the cap, another project's creation plans a trim of this ring to
+    // one part, which would delete part 1.
+    fill_service(&mut storage, ADMISSION_CAP + 8);
+    save_vault_data_with_storage(
+        &mut storage,
+        "second",
+        "Second",
+        "/second",
+        r#"{"environments":{"default":{"TOKEN":"one"}}}"#,
+    )
+    .expect("create the second project");
+    record(
+        &mut test_history(&mut storage),
+        "second",
+        &change("zero", "one"),
+    );
+    assert_eq!(head_of(&storage).parts, [1, 0], "the ring wasn't trimmed");
+    assert!(
+        storage
+            .values
+            .contains_key(&lpm_env_companion::history::part_account(VAULT, 1).name()),
+        "the part the interrupted rollover recovers from stays"
+    );
+    let recovered = record(
+        &mut test_history(&mut storage),
+        VAULT,
+        &change(&previous, "after the crash"),
+    );
+    assert!(
+        matches!(recovered, Outcome::Recorded { .. }),
+        "history recovers instead of being damaged: {recovered:?}"
     );
 }
 

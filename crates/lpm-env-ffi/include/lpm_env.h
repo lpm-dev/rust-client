@@ -291,7 +291,7 @@ LPMEnvResult lpm_env_companion_check_transaction(const uint8_t *input, size_t in
  *   "LPMF", version 1 (one byte), a big-endian uint32 field count, then each
  *   field as a big-endian uint32 length and its bytes.
  * Field 0 is UTF-8 JSON with everything that isn't secret; the other fields are
- * blobs that JSON names by index (the first blob is 1). Values, values payloads
+ * blobs that JSON names by index (the first blob is 1), at most 64 of them. Values, values payloads
  * and the key record only ever travel as blobs. A values payload is the stored
  * {"environments":{name:{KEY:VALUE}}}. Outputs list records to write as
  * writes: [{account, blob}]; with journal true they commit as one journal
@@ -308,15 +308,18 @@ LPMEnvResult lpm_env_companion_check_transaction(const uint8_t *input, size_t in
  * remoteVersion?, platform?, related?: {id, side, time}}, renames?:
  * [{environment: {from, to}} | {key: {environment, from, to}}]}, before, after
  * (payload blobs), and create: {marker?, approval: "automatic" | "protected" |
- * "fileStore", ringLimit} when no history exists, or append: {head, key, tail?,
- * previous?, growth: "unasked" | "allowed" | "refused"}}. Output {result:
+ * "fileStore", ringLimit} when no history exists, or append: {marker, head,
+ * key, tail?, previous?, growth: "unasked" | "allowed" | "refused"}}, with the
+ * marker read in the same lock. Output {result:
  * "noKeyChanges" | "unchanged" | "alreadyRecorded" | "needsPrevious" (read
  * part, pass it as previous, call again) | "needsGrowthAdmission" (ask
  * lpm_env_history_admission with this vaultId and head, call again; asked when
  * a ring below its limit would grow, at a rollover of a ring shrunk below a
  * full one, and at every 64th entry of a sliding ring) | "write" |
  * "notRecorded" (reason: "damaged" | "needsMaintenance" | "tooManyValues" |
- * "random"), writes, journal, entry, gap, valuesKept, shape?: "steady" | "slid"
+ * "random", or what the marker says when it doesn't allow the step: "off" |
+ * "newerVersion" | "removing" | "exists" (creating) | "noHistory" (appending)),
+ * writes, journal, entry, gap, valuesKept, shape?: "steady" | "slid"
  * | "rollover" | "recovered"}. When admission's trims include this project's
  * own ring, read its head and tail again before calling again. */
 LPMEnvResult lpm_env_history_record(const uint8_t *input, size_t input_length);
@@ -367,8 +370,10 @@ LPMEnvResult lpm_env_history_removal(const uint8_t *input, size_t input_length);
 /* Key upkeep. Input: reading fields and step: "check" (approval: the values
  * item's claimed access) -> {needsFinishing, parts, key: "nothing" | "rotate" |
  * "lower", writes}; "start" (approval) -> {journal: true, writes}; "rotatePart"
- * (part, with its blob in parts) -> {writes}; "finish" -> {journal: true,
- * writes}. Every history operation finishes a running rotation first. */
+ * (part, with its blob in parts) -> {writes}; "finish" (every part, as stored
+ * after its rotatePart) -> {journal: true, writes}, refused with
+ * history.part_not_rotated while a readable part is still under the old key.
+ * Every history operation finishes a running rotation first. */
 LPMEnvResult lpm_env_history_maintenance(const uint8_t *input, size_t input_length);
 /* What the marker says and what's damaged beyond a listing. Input {vaultId,
  * marker?, head?, key?, parts?}. Output {history: "default" | "on" | "off" |
@@ -381,14 +386,18 @@ LPMEnvResult lpm_env_history_check(const uint8_t *input, size_t input_length);
 /* Admission from a names-only listing. Input {names, operation: "creation" |
  * "growth" | "trim", trimmable?: [vaultId], maxTrims?, vaultId?, head?: blob}.
  * For growth, vaultId and head name the growing ring. Output {existing, trims:
- * [{vaultId, count}], afterTrims, creation: "full" | "reduced" | "refused",
+ * [{vaultId, count, floor}], afterTrims, creation: "full" | "reduced" | "refused",
  * ringLimit, growth, regrow}. growth says whether that ring may add a part: a
  * ring below its limit while the service stays within its target, a ring
  * shrunk below a full one once it's back below 3,584 records. */
 LPMEnvResult lpm_env_history_admission(const uint8_t *input, size_t input_length);
-/* One ring's upkeep. Input {vaultId, head, action: "trim" | "raiseLimit"
- * (existing) | "orphans" (inventory)}. Output {writes, delete}: a trim writes the
- * head first, then deletes the part. */
+/* One ring's upkeep. Input {vaultId, head, action: "trim" (floor, tail?: {key,
+ * part?}) | "raiseLimit" (existing) | "orphans" (inventory)}. Output {writes,
+ * delete}: a trim writes the head first, then deletes the part. A trim never
+ * leaves fewer parts than floor, the one admission gave. A trim to one part
+ * deletes the part an interrupted rollover recovers from, so it first answers
+ * {needsTail: true}: read the key and the tail (part omitted when absent) and
+ * call again. It trims nothing while the tail isn't the head's. */
 LPMEnvResult lpm_env_history_ring(const uint8_t *input, size_t input_length);
 /* Release only the output buffer after decoding; the snapshot stays live.
  * Exclusively borrow result. Clears data/length; repeated calls are harmless.

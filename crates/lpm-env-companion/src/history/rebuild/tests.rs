@@ -470,6 +470,124 @@ fn a_gap_resolves_against_a_kept_value_with_the_same_digest() {
     assert!(gaps[0].until.is_some());
 }
 
+/// The ID of the newest entry recorded for a change made outside history.
+fn outside_entry(store: &Store, current: &Values<'_>) -> EntryId {
+    read_timeline(
+        &opened(store),
+        &mut source(store),
+        current,
+        &Filter::default(),
+        false,
+    )
+    .expect("timeline")
+    .rows
+    .iter()
+    .find_map(|row| match row {
+        TimelineRow::Entry(info) if info.action == Action::Outside => Some(info.id),
+        _ => None,
+    })
+    .expect("an outside entry")
+}
+
+#[test]
+fn rolling_back_to_right_after_an_outside_change_keeps_it_and_says_nothing_of_it() {
+    let mut store = Store::new();
+    let base = Project::with(&[("e", &[])]);
+    let one = Project::with(&[("e", &[("A", "1")])]);
+    store
+        .record(Action::Set, &base, &one, &[])
+        .expect("created");
+    // A changed to 2 outside history, then B was added: a gap entry comes
+    // before the change's own entry.
+    let outside = Project::with(&[("e", &[("A", "2")])]);
+    let with_b = Project::with(&[("e", &[("A", "2"), ("B", "x")])]);
+    store
+        .record(Action::Set, &outside, &with_b, &[])
+        .expect("gap and change");
+    let three = Project::with(&[("e", &[("A", "3"), ("B", "x")])]);
+    store
+        .record(Action::Set, &with_b, &three, &[])
+        .expect("three");
+    let current = three.values();
+    let gap = outside_entry(&store, &current);
+    let plan = |side| {
+        plan_environment_rollback(
+            &opened(&store),
+            &mut source(&store),
+            &current,
+            EnvironmentRef::Now("e"),
+            Point { entry: gap, side },
+        )
+        .expect("plan")
+    };
+
+    let after_it = plan(RelatedSide::After);
+    assert_eq!(rows(&after_it), vec![row("A", "= 2"), row("B", "absent")]);
+    assert!(
+        after_it.environments[0].rows[0].gaps.is_empty(),
+        "the rollback keeps the outside change, so it doesn't replace it"
+    );
+    let before_it = plan(RelatedSide::Before);
+    assert_eq!(rows(&before_it), vec![row("A", "= 1"), row("B", "absent")]);
+    assert_eq!(
+        before_it.environments[0].rows[0].gaps.len(),
+        1,
+        "rolling back to before it replaces it"
+    );
+}
+
+#[test]
+fn an_unknown_earlier_value_resolves_from_the_current_value_and_newer_kept_values() {
+    // History starts with B: A was v, but history never kept v.
+    let v_only = Project::with(&[("e", &[("A", "v")])]);
+    let with_b = Project::with(&[("e", &[("A", "v"), ("B", "1")])]);
+    // A changed to u outside history, then B changed, then A was set back
+    // to v, recorded with both values.
+    let outside = Project::with(&[("e", &[("A", "u"), ("B", "1")])]);
+    let b2 = Project::with(&[("e", &[("A", "u"), ("B", "2")])]);
+    let back = Project::with(&[("e", &[("A", "v"), ("B", "2")])]);
+    let mut store = Store::new();
+    store
+        .record(Action::Set, &v_only, &with_b, &[])
+        .expect("created");
+    store
+        .record(Action::Set, &outside, &b2, &[])
+        .expect("gap and change");
+    store.record(Action::Set, &b2, &back, &[]).expect("back");
+
+    let current = back.values();
+    let gap = outside_entry(&store, &current);
+    let to_before_gap = |store: &Store, current: &Values<'_>| {
+        plan_environment_rollback(
+            &opened(store),
+            &mut source(store),
+            current,
+            EnvironmentRef::Now("e"),
+            Point {
+                entry: gap,
+                side: RelatedSide::Before,
+            },
+        )
+        .expect("plan")
+    };
+    assert_eq!(
+        rows(&to_before_gap(&store, &current)),
+        vec![row("B", "= 1")],
+        "A is v now and was v then, so nothing changes it"
+    );
+
+    // Once A changes again, v is only in the newer entries history kept.
+    let later = Project::with(&[("e", &[("A", "w"), ("B", "2")])]);
+    store
+        .record(Action::Set, &back, &later, &[])
+        .expect("later");
+    let current = later.values();
+    assert_eq!(
+        rows(&to_before_gap(&store, &current)),
+        vec![row("A", "= v"), row("B", "= 1")]
+    );
+}
+
 #[test]
 fn a_value_history_never_kept_stays_unknown() {
     let mut store = Store::new();
@@ -1192,6 +1310,61 @@ fn a_rollback_recreates_an_environment_that_was_empty_at_the_point() {
     assert_eq!(
         written(&writes),
         vec![("preview".to_owned(), None, Some(vec![]))]
+    );
+}
+
+#[test]
+fn a_key_an_oversized_change_hid_stays_too_large_across_the_boundary_before_it() {
+    let mut store = Store::new();
+    // A existed before history began, so history never kept its value.
+    let mut project = Project::with(&[("big", &[("A", "before history")])]);
+    let mut next = project.clone();
+    next.set("big", "B", "b");
+    store
+        .record(Action::Set, &project, &next, &[])
+        .expect("created");
+    project = next;
+    let name = |index: usize| format!("{index:03}{}", "K".repeat(197));
+    for step in 0..4 {
+        let mut next = project.clone();
+        for index in step * 95..(step + 1) * 95 {
+            next.set("big", &name(index), "v");
+        }
+        store
+            .record(Action::Set, &project, &next, &[])
+            .expect("added");
+        project = next;
+    }
+    let mut pulled = project.clone();
+    pulled.set("big", "A", "pulled");
+    for index in 0..380 {
+        pulled.set("big", &name(index), "w");
+    }
+    store
+        .record(Action::Pull, &project, &pulled, &[])
+        .expect("pulled");
+    store.with_entries(store.head().tail(), |entries| {
+        assert_eq!(entries[0].id, id(6), "the pull starts its part");
+        assert!(matches!(entries[0].environments[0].keys, Keys::Count(_)));
+    });
+    let current = pulled.values();
+    let plan = plan_environment_rollback(
+        &opened(&store),
+        &mut source(&store),
+        &current,
+        EnvironmentRef::AtPoint("big"),
+        before(6),
+    )
+    .expect("plan");
+    let a = plan.environments[0]
+        .rows
+        .iter()
+        .find(|row| row.key == "A")
+        .expect("A's row");
+    assert!(
+        matches!(a.target, TargetValue::Unknown(UnknownReason::TooLarge)),
+        "the pull was too large to keep, not a change made outside history: {:?}",
+        a.target
     );
 }
 

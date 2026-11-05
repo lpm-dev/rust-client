@@ -425,7 +425,21 @@ impl State {
                         }
                     }
                     Some(slot) => {
-                        if !self.state(*id).agrees_with(*slot) {
+                        let state = self.state(*id);
+                        if !state.agrees_with(*slot) {
+                            // A key an oversized change hid learns its digest
+                            // here and keeps its reason, unless an unreadable
+                            // part came between.
+                            let reason = match (state, reason) {
+                                (
+                                    KeyState::Unknown {
+                                        digest: None,
+                                        reason: hidden @ UnknownReason::TooLarge,
+                                    },
+                                    UnknownReason::NotRecorded,
+                                ) => *hidden,
+                                _ => reason,
+                            };
                             self.set_state(*id, KeyState::unknown(*slot, reason));
                         }
                     }
@@ -612,6 +626,33 @@ impl State {
 
     fn has_unresolved(&self) -> bool {
         self.unresolved > 0
+    }
+
+    /// Resolve wanted digests from `values`, the current ones: a value
+    /// digests the same in any key.
+    fn resolve_from_values(&mut self, values: &Values<'_>, digest_keys: &DigestKeys) {
+        for keys in values.environments().values() {
+            for value in keys.values() {
+                if self.unresolved == 0 {
+                    return;
+                }
+                let digest = digest_keys.value(value.as_bytes());
+                let Some(ids) = self.wanted.remove(&digest) else {
+                    continue;
+                };
+                for id in ids {
+                    if self.state(id).wanted() == Some(digest) {
+                        self.set_state(
+                            id,
+                            KeyState::Known {
+                                value: Zeroizing::new((*value).to_owned()),
+                                digest,
+                            },
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// The live gap against the newest summary: the keys now whose value
@@ -966,7 +1007,11 @@ fn walk<E: From<PlanError>>(
                 if matches!(target, Target::Undo { .. }) {
                     undone = Some(owned(&entry, &mut state));
                 }
-                state.note(&entry, false);
+                // An "after" rollback keeps the point's own change, so only
+                // a rollback to before it, or an undo, replaces it.
+                if side == RelatedSide::Before || matches!(target, Target::Undo { .. }) {
+                    state.note(&entry, false);
+                }
                 if side == RelatedSide::Before {
                     state.undo(&entry);
                     point_at_boundary = oldest == Some(entry.id);
@@ -996,6 +1041,30 @@ fn walk<E: From<PlanError>>(
     }
     let (info, target, point, point_time) =
         found.ok_or_else(|| E::from(PlanError::EntryNotFound))?;
+    // The walk passed the current values and the newer entries before it
+    // knew which digests it would want, so they resolve what's left.
+    if state.has_unresolved() {
+        state.resolve_from_values(current, &opened.keys);
+    }
+    if state.has_unresolved() {
+        opened
+            .walk(source, |read| {
+                let PartRead::Readable { decoded, .. } = read else {
+                    return true;
+                };
+                for entry in decoded.decoded_entries().rev() {
+                    if entry.id == point.entry {
+                        return false;
+                    }
+                    state.resolve(&opened.scrubbed(entry));
+                    if !state.has_unresolved() {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map_err(|error| E::from(PlanError::from(error)))?;
+    }
     Ok(Walked {
         state,
         info,
@@ -1167,7 +1236,7 @@ fn environment_binding(keys: &DigestKeys, values: Option<&BTreeMap<&str, &str>>)
         encoded.extend_from_slice(&(value.len() as u64).to_be_bytes());
         encoded.extend_from_slice(value.as_bytes());
     }
-    Some(keys.value(&encoded))
+    Some(keys.binding("environment", &encoded))
 }
 
 fn key_binding(keys: &DigestKeys, value: Option<&str>) -> Option<Digest> {

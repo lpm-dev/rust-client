@@ -150,6 +150,9 @@ fn record(store: &mut Store, id: u8, before: &[u8], after: &[u8]) -> Value {
             lpm_env_companion::history::head_account(VAULT),
             lpm_env_companion::history::key_account(VAULT),
             lpm_env_companion::history::part_account(VAULT, store.head().tail()),
+            lpm_env_companion::account::CompanionAccount::Marker {
+                vault_id: VAULT.to_owned(),
+            },
         ] {
             owned.push(store.get(&account).expect("record").to_vec());
         }
@@ -158,7 +161,7 @@ fn record(store: &mut Store, id: u8, before: &[u8], after: &[u8]) -> Value {
             "change": change(id, "set"),
             "before": 1,
             "after": 2,
-            "append": { "head": 3, "key": 4, "tail": 5, "growth": "unasked" },
+            "append": { "head": 3, "key": 4, "tail": 5, "marker": 6, "growth": "unasked" },
         })
     };
     let blobs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
@@ -168,6 +171,86 @@ fn record(store: &mut Store, id: u8, before: &[u8], after: &[u8]) -> Value {
     assert_eq!(response["journal"], creating);
     store.apply(&response, &out);
     response
+}
+
+#[test]
+fn history_is_never_created_or_appended_to_where_the_marker_says_it_is_off() {
+    let mut store = Store::default();
+    let empty = payload_bytes(&[("default", &[])]);
+    let first = payload_bytes(&[("default", &[("A", "1")])]);
+    record(&mut store, 1, &empty, &first);
+    let second = payload_bytes(&[("default", &[("A", "2")])]);
+    let mut off = lpm_env_companion::marker::Marker::empty(
+        VAULT,
+        lpm_env_companion::marker::ProjectState::Active,
+    );
+    off.features.insert(
+        lpm_env_companion::history::OFF_FEATURE.to_owned(),
+        lpm_env_companion::history::off_entry(),
+    );
+    let off = off.encode().expect("marker");
+
+    let created = json!({
+        "vaultId": VAULT,
+        "change": change(2, "set"),
+        "before": 1,
+        "after": 2,
+        "create": { "marker": 3, "approval": "automatic", "ringLimit": 16 },
+    });
+    let blobs: Vec<&[u8]> = vec![&first, &second, &off];
+    let (status, response, _) = call(lpm_env_history_record, &created, &blobs);
+    assert_eq!(status, 0, "{response}");
+    assert_eq!(
+        (&response["result"], &response["reason"]),
+        (&json!("notRecorded"), &json!("off")),
+        "{response}"
+    );
+
+    let mut owned: Vec<Vec<u8>> = vec![first.clone(), second];
+    for account in [
+        lpm_env_companion::history::head_account(VAULT),
+        lpm_env_companion::history::key_account(VAULT),
+        lpm_env_companion::history::part_account(VAULT, store.head().tail()),
+    ] {
+        owned.push(store.get(&account).expect("record").to_vec());
+    }
+    owned.push(off);
+    let appended = json!({
+        "vaultId": VAULT,
+        "change": change(2, "set"),
+        "before": 1,
+        "after": 2,
+        "append": { "head": 3, "key": 4, "tail": 5, "marker": 6, "growth": "unasked" },
+    });
+    let blobs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
+    let (status, response, _) = call(lpm_env_history_record, &appended, &blobs);
+    assert_eq!(status, 0, "{response}");
+    assert_eq!(
+        (&response["result"], &response["reason"]),
+        (&json!("notRecorded"), &json!("off")),
+        "{response}"
+    );
+}
+
+#[test]
+fn a_frame_carries_at_most_64_blobs() {
+    let empty = payload_bytes(&[("default", &[])]);
+    let first = payload_bytes(&[("default", &[("A", "1")])]);
+    let request = json!({
+        "vaultId": VAULT,
+        "change": change(1, "set"),
+        "before": 1,
+        "after": 2,
+        "create": { "approval": "automatic", "ringLimit": 16 },
+    });
+    let unused: &[u8] = b"";
+    let mut blobs: Vec<&[u8]> = vec![&empty, &first];
+    blobs.resize(64, unused);
+    let (status, response, _) = call(lpm_env_history_record, &request, &blobs);
+    assert_eq!(status, 0, "{response}");
+    blobs.push(unused);
+    let (status, _, _) = call(lpm_env_history_record, &request, &blobs);
+    assert_eq!(status, 2, "65 blobs is past the limit");
 }
 
 #[test]
@@ -502,6 +585,9 @@ fn a_rollback_onto_a_name_another_environment_holds_is_refused() {
         lpm_env_companion::history::head_account(VAULT),
         lpm_env_companion::history::key_account(VAULT),
         lpm_env_companion::history::part_account(VAULT, store.head().tail()),
+        lpm_env_companion::account::CompanionAccount::Marker {
+            vault_id: VAULT.to_owned(),
+        },
     ] {
         owned.push(store.get(&account).expect("record").to_vec());
     }
@@ -512,7 +598,7 @@ fn a_rollback_onto_a_name_another_environment_holds_is_refused() {
         "change": renaming,
         "before": 1,
         "after": 2,
-        "append": { "head": 3, "key": 4, "tail": 5, "growth": "unasked" },
+        "append": { "head": 3, "key": 4, "tail": 5, "marker": 6, "growth": "unasked" },
     });
     let blobs: Vec<&[u8]> = owned.iter().map(Vec::as_slice).collect();
     let (status, response, out) = call(lpm_env_history_record, &request, &blobs);
@@ -600,6 +686,48 @@ fn a_removal_starts_only_from_the_review_it_was_shown() {
 }
 
 #[test]
+fn a_ring_trim_keeps_its_floor_and_reads_the_tail_before_leaving_one_part() {
+    let mut head = Head::new(VAULT, 2);
+    head.parts = vec![0, 1];
+    let head = head.encode(HISTORY).expect("head");
+    let trim = |extra: Value, blobs: &[&[u8]]| {
+        let mut request = json!({ "vaultId": VAULT, "head": 1, "action": "trim" });
+        for (field, value) in extra.as_object().expect("fields") {
+            request[field] = value.clone();
+        }
+        call(lpm_env_history_ring, &request, blobs)
+    };
+    let (status, kept, _) = trim(json!({ "floor": 2 }), &[&head]);
+    assert_eq!(status, 0, "{kept}");
+    assert_eq!(
+        (&kept["writes"], &kept["delete"]),
+        (&json!([]), &Value::Null)
+    );
+    assert_eq!(
+        kept.get("needsTail"),
+        None,
+        "a ring at its floor needs nothing more"
+    );
+
+    let (status, asked, _) = trim(json!({ "floor": 1 }), &[&head]);
+    assert_eq!(status, 0, "{asked}");
+    assert_eq!(asked["needsTail"], true, "{asked}");
+    assert_eq!(asked["delete"], Value::Null);
+
+    let key: &[u8] = b"not a key record";
+    let (status, kept, _) = trim(json!({ "floor": 1, "tail": { "key": 2 } }), &[&head, key]);
+    assert_eq!(status, 0, "{kept}");
+    assert_eq!(
+        (&kept["writes"], &kept["delete"]),
+        (&json!([]), &Value::Null),
+        "a tail that isn't the head's keeps the part before it"
+    );
+
+    let (status, _, _) = trim(json!({}), &[&head]);
+    assert_eq!(status, 2, "a trim needs the floor admission gave");
+}
+
+#[test]
 fn growth_admission_answers_for_the_ring_its_own_trims_left() {
     let mut names: Vec<String> = (0..4_093)
         .map(|index| {
@@ -626,7 +754,7 @@ fn growth_admission_answers_for_the_ring_its_own_trims_left() {
     assert_eq!(status, 0, "{admission}");
     assert_eq!(
         admission["trims"],
-        json!([{ "vaultId": VAULT, "count": 2 }]),
+        json!([{ "vaultId": VAULT, "count": 2, "floor": 2 }]),
         "{admission}"
     );
     assert_eq!(

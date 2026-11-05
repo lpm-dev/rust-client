@@ -50,6 +50,7 @@ const SLOT_BYTES: usize = 16 + 4 + KEY_BYTES;
 const ASSOCIATED_DATA_LABEL: &[u8] = b"lpm-vault-companion-part\x01";
 const DIGEST_SALT: &[u8] = b"lpm-vault-history-digest\x01";
 const PLACE_SALT: &[u8] = b"lpm-vault-history-place\x01";
+const BINDING_SALT: &[u8] = b"lpm-vault-history-binding\x01";
 
 /// The first 16 bytes of an HMAC-SHA256 under one of a project's digest keys.
 pub type Digest = [u8; 16];
@@ -401,11 +402,13 @@ impl KeyRecord {
 }
 
 /// HMAC keys derived from the digest secret for one project: one for
-/// values, one for places, in separate domains.
+/// values, one for places and one for the bindings a review hands back, in
+/// separate domains.
 #[derive(Clone)]
 pub struct DigestKeys {
     value: Hmac<Sha256>,
     place: Hmac<Sha256>,
+    binding: Hmac<Sha256>,
 }
 
 impl fmt::Debug for DigestKeys {
@@ -419,6 +422,7 @@ impl DigestKeys {
         Self {
             value: derived_mac(digest_secret, DIGEST_SALT, vault_id),
             place: derived_mac(digest_secret, PLACE_SALT, vault_id),
+            binding: derived_mac(digest_secret, BINDING_SALT, vault_id),
         }
     }
 
@@ -428,6 +432,16 @@ impl DigestKeys {
         crate::work::note(crate::work::Work::ValueDigest);
         let mut mac = self.value.clone();
         mac.update(value);
+        truncated(mac)
+    }
+
+    /// The digest that binds a step to what a review showed, never stored:
+    /// `domain` names what it binds, so no binding matches another kind's,
+    /// or a value's digest.
+    pub fn binding(&self, domain: &str, bytes: &[u8]) -> Digest {
+        let mut mac = self.binding.clone();
+        update_str16(&mut mac, domain);
+        mac.update(bytes);
         truncated(mac)
     }
 
@@ -633,6 +647,18 @@ pub(crate) mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_binding_matches_no_value_digest_and_no_other_kind_of_binding() {
+        let record = KeyRecord::generate(Approval::Automatic, &mut CountingRandom(3)).expect("key");
+        let keys = record.digest_keys("proj");
+        let bytes = b"the same bytes";
+        let value = keys.value(bytes);
+        let environment = keys.binding("environment", bytes);
+        assert_ne!(environment, value);
+        assert_ne!(environment, keys.binding("rollback", bytes));
+        assert_eq!(environment, keys.binding("environment", bytes));
     }
 
     struct FailingRandom;

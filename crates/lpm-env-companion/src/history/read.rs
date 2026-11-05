@@ -204,7 +204,10 @@ impl Opened {
     /// Read each listed part, newest first, and hand it to `visit` until it
     /// returns `false`. A tail a rollover's crash left behind (absent, or
     /// from another epoch) holds nothing newer, so it's skipped; any other
-    /// listed part that won't open or decode is unreadable.
+    /// listed part that won't open or decode is unreadable. Every rollover
+    /// raises the epoch by one, so a part holds the tail's epoch less its
+    /// distance from the tail; one that doesn't is an earlier copy of that
+    /// part, and is unreadable too.
     pub fn walk(
         &self,
         source: &mut impl PartSource,
@@ -215,7 +218,7 @@ impl Opened {
         // recovers from, so it won't reading damages history as the tail
         // would; with no part before it, the skipped tail is damage itself.
         let mut recovering = false;
-        for part in self.head.parts.iter().rev().copied() {
+        for (distance, part) in self.head.parts.iter().rev().copied().enumerate() {
             let is_tail = part == tail;
             let unreadable = PartRead::Unreadable {
                 part,
@@ -257,6 +260,15 @@ impl Opened {
             };
             if is_tail && decoded.epoch != self.head.tail_epoch {
                 if skip_tail(&mut recovering) && !visit(PartRead::Unreadable { part, tail: true }) {
+                    break;
+                }
+                continue;
+            }
+            let expected = u64::try_from(distance)
+                .ok()
+                .and_then(|distance| self.head.tail_epoch.checked_sub(distance));
+            if !is_tail && Some(decoded.epoch) != expected {
+                if !visit(unreadable) {
                     break;
                 }
                 continue;

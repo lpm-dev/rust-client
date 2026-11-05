@@ -5,7 +5,7 @@
 
 use lpm_env_companion::append_log::{HISTORY, Head};
 use lpm_env_companion::budgets::ADMISSION_TARGET;
-use lpm_env_companion::history::admission::{self, CreationAdmission};
+use lpm_env_companion::history::admission::{self, CreationAdmission, TrimStep, TrimTail};
 use lpm_env_companion::history::append::{
     AppendCache, AppendPlan, Change, CreationPlan, Growth, NotRecorded as PlanNotRecorded, Stored,
     plan_append, plan_creation, too_many_values,
@@ -77,9 +77,8 @@ pub(crate) fn record(store: &mut impl HistoryStore, vault_id: &str, tracked: &Tr
         }
         MarkerHistory::Default => create(store, vault_id, marker, &change, &mut random)
             .unwrap_or_else(Outcome::NotRecorded),
-        MarkerHistory::On => {
-            append(store, vault_id, &change, &mut random).unwrap_or_else(Outcome::NotRecorded)
-        }
+        MarkerHistory::On => append(store, vault_id, marker, &change, &mut random)
+            .unwrap_or_else(Outcome::NotRecorded),
     }
 }
 
@@ -128,6 +127,7 @@ fn create(
 fn append(
     store: &mut impl HistoryStore,
     vault_id: &str,
+    marker: Option<&crate::companion::marker::Marker>,
     change: &Change<'_, '_>,
     random: &mut impl Random,
 ) -> Result<Outcome, NotRecorded> {
@@ -149,8 +149,10 @@ fn append(
                 tail: tail.as_deref(),
                 previous: previous.as_deref(),
             };
-            match plan_append(vault_id, &stored, change, growth, &mut cache, random)
-                .map_err(NotRecorded::from)?
+            match plan_append(
+                vault_id, marker, &stored, change, growth, &mut cache, random,
+            )
+            .map_err(NotRecorded::from)?
             {
                 AppendPlan::Unchanged => return Ok(Outcome::Nothing),
                 AppendPlan::AlreadyRecorded => {
@@ -308,17 +310,31 @@ pub(super) fn finish_running(
     if !needs_finishing(&opened) {
         return Ok(());
     }
+    // Each part as stored once it's rotated, so finishing checks them
+    // without reading them again.
+    let mut stored: Vec<(u16, Option<Vec<u8>>)> = Vec::with_capacity(opened.head.parts.len());
     for part in opened.head.parts.clone() {
         let sealed = read_part(store, vault_id, part).map_err(NotRecorded::Failed)?;
-        if let Some(write) = rotate_part(&opened, part, sealed.as_deref(), random)
+        let now = match rotate_part(&opened, part, sealed.as_deref(), random)
             .map_err(|error| NotRecorded::Failed(error.to_string()))?
         {
-            store
-                .replace(&write.account, &write.bytes)
-                .map_err(NotRecorded::Failed)?;
-        }
+            Some(write) => {
+                store
+                    .replace(&write.account, &write.bytes)
+                    .map_err(NotRecorded::Failed)?;
+                Some(write.bytes.to_vec())
+            }
+            None => sealed,
+        };
+        stored.push((part, now));
     }
-    let writes = finish_rotation(&opened).map_err(|_| NotRecorded::Damaged)?;
+    let parts = |part| {
+        stored
+            .iter()
+            .find(|(listed, _)| *listed == part)
+            .and_then(|(_, bytes)| bytes.as_deref())
+    };
+    let writes = finish_rotation(&opened, parts).map_err(|_| NotRecorded::Damaged)?;
     commit(store, writes)
 }
 
@@ -365,13 +381,14 @@ fn admit(
             trimmed_own,
         });
     }
-    for (project, count) in admission::plan_trims(
+    for planned in admission::plan_trims(
         existing + adding,
         &inventory.rings,
         MAX_TRIMS_PER_OPERATION,
         |project| inventory.trimmable.contains(project),
     ) {
-        for _ in 0..count {
+        let project = planned.vault_id;
+        for _ in 0..planned.count {
             let head = match store.read_following_values(&head_account(&project)) {
                 Ok(Some(head)) => head,
                 // Another project's damaged history is its own to repair.
@@ -381,7 +398,29 @@ fn admit(
             let Ok(head) = Head::parse(HISTORY, &project, &head) else {
                 break;
             };
-            let Some(trim) = admission::trim_oldest(&head) else {
+            let step = match admission::trim_oldest(&head, planned.floor, TrimTail::Unread) {
+                TrimStep::NeedsTail => {
+                    let key = match store.read_following_values(&key_account(&project)) {
+                        Ok(Some(key)) => key,
+                        Ok(None) | Err(RecordError::Damaged(_)) => break,
+                        Err(RecordError::Store(error)) => {
+                            return Err(NotRecorded::Failed(error));
+                        }
+                    };
+                    let tail =
+                        read_part(store, &project, head.tail()).map_err(NotRecorded::Failed)?;
+                    admission::trim_oldest(
+                        &head,
+                        planned.floor,
+                        TrimTail::Read {
+                            key: &key,
+                            tail: tail.as_deref(),
+                        },
+                    )
+                }
+                step => step,
+            };
+            let TrimStep::Trim(trim) = step else {
                 break;
             };
             store
@@ -419,7 +458,15 @@ pub(super) fn commit(
 impl From<PlanNotRecorded> for NotRecorded {
     fn from(reason: PlanNotRecorded) -> Self {
         match reason {
-            PlanNotRecorded::Damaged(_) => Self::Damaged,
+            PlanNotRecorded::Marker(MarkerHistory::Both) | PlanNotRecorded::Damaged(_) => {
+                Self::Damaged
+            }
+            PlanNotRecorded::Marker(
+                MarkerHistory::Unsupported { .. } | MarkerHistory::Removing,
+            ) => Self::NewerVersion,
+            refused @ PlanNotRecorded::Marker(
+                MarkerHistory::Default | MarkerHistory::On | MarkerHistory::Off,
+            ) => Self::Failed(refused.to_string()),
             PlanNotRecorded::NeedsMaintenance => {
                 Self::Failed("local history is finishing a key change".to_owned())
             }

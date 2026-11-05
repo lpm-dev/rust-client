@@ -108,6 +108,13 @@ pub fn plan_on(marker: &Marker, inventory: &[CompanionAccount]) -> Result<Plan, 
     if needs_resume(marker) {
         return Err("finish the env project's interrupted change first".to_owned());
     }
+    // Removing `history-off` would leave the old history's records live.
+    if MarkerHistory::of(Some(marker)) == MarkerHistory::Both {
+        return Err(
+            "local history is damaged: it's both on and off. Repair it first: lpm env repair"
+                .to_owned(),
+        );
+    }
     let mut next = marker.clone();
     if next.features.remove(OFF_FEATURE).is_none() {
         return Ok(Plan {
@@ -244,6 +251,21 @@ mod tests {
         );
         let result = plan.result.expect("a marker");
         assert_eq!(MarkerHistory::of(Some(&result)), MarkerHistory::Off);
+    }
+
+    #[test]
+    fn turning_on_is_refused_while_history_is_both_on_and_off() {
+        let mut both = history_marker(VERSION);
+        both.features
+            .insert(OFF_FEATURE.to_owned(), crate::history::off_entry());
+        assert_eq!(MarkerHistory::of(Some(&both)), MarkerHistory::Both);
+        let refused = plan_on(&both, &[crate::history::head_account("proj")]);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|error| error.contains("lpm env repair")),
+            "{refused:?}"
+        );
     }
 
     #[test]

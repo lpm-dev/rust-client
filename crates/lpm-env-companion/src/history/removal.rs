@@ -118,6 +118,9 @@ pub enum RemovalError {
     GenerationExhausted,
     /// A rotation or removal is already running.
     Running,
+    /// A readable part is still under the old key, so finishing would make
+    /// it unreadable: rotate every part first.
+    PartNotRotated(u16),
     /// A part opened but its scrubbed form wouldn't encode.
     Damaged(String),
     Random,
@@ -147,6 +150,10 @@ impl fmt::Display for RemovalError {
                 "local history's key can't rotate any more. Turn history off and on to start a new history",
             ),
             Self::Running => formatter.write_str("local history is finishing a key change"),
+            Self::PartNotRotated(part) => write!(
+                formatter,
+                "part {part} of local history isn't under the new key yet; rotate every part before finishing"
+            ),
             Self::Damaged(reason) => write!(formatter, "local history is damaged: {reason}"),
             Self::Random => formatter.write_str("the system's random number generator failed"),
         }
@@ -777,21 +784,13 @@ pub fn rotate_part(
     sealed: Option<&[u8]>,
     random: &mut impl Random,
 ) -> Result<Option<RecordWrite>, RemovalError> {
-    let Some(pending) = opened.record.pending() else {
+    let (Some(pending), Some(plaintext)) = (
+        opened.record.pending(),
+        plaintext_to_rotate(opened, part, sealed),
+    ) else {
         return Ok(None);
     };
-    let Some(sealed) = sealed else {
-        return Ok(None);
-    };
-    match keyring::sealed_key(sealed) {
-        Ok((id, _)) if id == pending.id() => return Ok(None),
-        Err(_) => return Ok(None),
-        Ok(_) => {}
-    }
     let identity = part_identity(&opened.vault_id, part);
-    let Ok(plaintext) = keyring::open(&opened.record, &identity, sealed) else {
-        return Ok(None);
-    };
     let Ok(decoded) = Part::decode(&plaintext) else {
         return Ok(None);
     };
@@ -831,9 +830,47 @@ fn scrubbed_part(
         .map_err(|error| RemovalError::Damaged(error.to_string()))
 }
 
+/// The plaintext of a part a running rotation still has to seal under the
+/// pending key: present, under another key, opening under the record and
+/// decoding. `None` for a part already rotated, absent, or unreadable under
+/// every key, which a rotation can't change.
+fn plaintext_to_rotate(
+    opened: &Opened,
+    part: u16,
+    sealed: Option<&[u8]>,
+) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+    let pending = opened.record.pending()?;
+    let sealed = sealed?;
+    match keyring::sealed_key(sealed) {
+        Ok((id, _)) if id != pending.id() => {}
+        _ => return None,
+    }
+    let plaintext = keyring::open(
+        &opened.record,
+        &part_identity(&opened.vault_id, part),
+        sealed,
+    )
+    .ok()?;
+    Part::decode(&plaintext).ok()?;
+    Some(plaintext)
+}
+
 /// The last journal transaction of a rotation: the key stable with only the
-/// new key, and the head without `removing`.
-pub fn finish_rotation(opened: &Opened) -> Result<Vec<RecordWrite>, RemovalError> {
+/// new key, and the head without `removing`. `part` gives each listed part
+/// as stored now; finishing is refused while a readable one is still under
+/// the old key, which finishing wipes.
+pub fn finish_rotation<'p>(
+    opened: &Opened,
+    part: impl Fn(u16) -> Option<&'p [u8]>,
+) -> Result<Vec<RecordWrite>, RemovalError> {
+    if let Some(unrotated) = opened
+        .head
+        .parts
+        .iter()
+        .find(|&&listed| plaintext_to_rotate(opened, listed, part(listed)).is_some())
+    {
+        return Err(RemovalError::PartNotRotated(*unrotated));
+    }
     let mut record = KeyRecord::decode(&opened.record.encode()).expect("a decoded record encodes");
     record
         .finish_rotation()

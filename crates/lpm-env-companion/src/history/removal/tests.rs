@@ -87,7 +87,9 @@ fn finish(store: &mut Store, random: &mut CountingRandom) {
         }
     }
     let opened = self::opened(store);
-    for write in finish_rotation(&opened).expect("finishes") {
+    let parts = |part| store.get(&part_account(VAULT, part));
+    let writes = finish_rotation(&opened, parts).expect("finishes");
+    for write in writes {
         store.put(write);
     }
 }
@@ -569,6 +571,30 @@ fn raising_approval_rotates_and_lowering_it_only_records_the_access() {
         key_maintenance(&opened(&store), Approval::Protected),
         KeyMaintenance::Rotate
     ));
+}
+
+#[test]
+fn a_rotation_finishes_only_once_every_readable_part_is_under_the_new_key() {
+    let (mut store, _) = shared_value();
+    let mut random = CountingRandom(51);
+    for write in start_rotation(&opened(&store), Approval::Protected, &mut random).expect("starts")
+    {
+        store.put(write);
+    }
+    let rotating = opened(&store);
+    let tail = rotating.head.tail();
+    assert_eq!(
+        finish_rotation(&rotating, |part| store.get(&part_account(VAULT, part))).err(),
+        Some(RemovalError::PartNotRotated(tail)),
+        "finishing now would wipe the only key that opens the tail"
+    );
+    let sealed = store.get(&part_account(VAULT, tail)).map(<[u8]>::to_vec);
+    let write = rotate_part(&rotating, tail, sealed.as_deref(), &mut random)
+        .expect("rotates")
+        .expect("a write");
+    store.put(write);
+    let rotated = opened(&store);
+    assert!(finish_rotation(&rotated, |part| store.get(&part_account(VAULT, part))).is_ok());
 }
 
 #[test]
