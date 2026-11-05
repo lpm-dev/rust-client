@@ -78,8 +78,10 @@ async fn setup_local_json_writes_scoped_config_gitignore_and_read_only_token() {
         ".npmrc must identify the current command name, got:\n{npmrc}"
     );
     assert!(
-        npmrc.contains(&format!("@lpm.dev:registry={}/api/registry", mock.url())),
-        ".npmrc must use scoped routing by default, got:\n{npmrc}"
+        npmrc
+            .lines()
+            .any(|line| line == format!("@lpm.dev:registry={}/api/registry/", mock.url())),
+        ".npmrc must use scoped routing with a trailing slash, which Bun needs to keep the registry path, got:\n{npmrc}"
     );
     assert!(
         npmrc.lines().any(|line| {

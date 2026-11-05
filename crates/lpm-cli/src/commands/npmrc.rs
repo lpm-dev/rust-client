@@ -230,7 +230,7 @@ pub async fn run(
     let today = format!("{days_since_epoch}");
     let token_name = format!("npmrc-{project_name}-{today}");
 
-    let registry_line = format!("@lpm.dev:registry={}", registry.endpoint());
+    let registry_line = format!("@lpm.dev:registry={}/", registry.endpoint());
     if let Some(existing_registry) = local_setup_registry_url(existing_npmrc)
         && existing_registry != registry.endpoint()
     {
