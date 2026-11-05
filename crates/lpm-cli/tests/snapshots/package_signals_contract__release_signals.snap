@@ -1,0 +1,114 @@
+---
+source: crates/lpm-cli/tests/package_signals_contract.rs
+expression: document
+---
+{
+  "lpmVersion": "[version]",
+  "schemaVersion": 1,
+  "rulesVersion": 14,
+  "tags": {
+    "childProcess": true,
+    "copyleftLicense": false,
+    "credentialExfiltration": false,
+    "crypto": false,
+    "customLicense": false,
+    "destructiveFilesystem": false,
+    "downloadedExecution": false,
+    "dynamicRequire": false,
+    "encryptedExecution": false,
+    "environmentVars": false,
+    "eval": true,
+    "filesystem": false,
+    "gitDependency": false,
+    "highEntropyStrings": false,
+    "httpDependency": false,
+    "minified": false,
+    "nativeBindings": true,
+    "network": false,
+    "noLicense": false,
+    "obfuscated": false,
+    "possibleObfuscation": false,
+    "protestware": false,
+    "shell": false,
+    "telemetry": false,
+    "trivial": true,
+    "urlStrings": true,
+    "webSocket": false,
+    "wildcardDependency": true
+  },
+  "testOnlyTags": [
+    "childProcess"
+  ],
+  "tagFiles": {
+    "childProcess": {
+      "files": [
+        "test/run.test.js"
+      ],
+      "fileCount": 1,
+      "testsOnly": true
+    },
+    "eval": {
+      "files": [
+        "lib/index.js"
+      ],
+      "fileCount": 1
+    },
+    "nativeBindings": {
+      "files": [
+        "binding.gyp"
+      ],
+      "fileCount": 1
+    },
+    "urlStrings": {
+      "files": [
+        "lib/index.js"
+      ],
+      "fileCount": 1
+    }
+  },
+  "evidence": [
+    {
+      "ruleId": "child-process",
+      "path": "test/run.test.js",
+      "line": 1,
+      "column": 1,
+      "excerpt": "require(\"child_process\").spawn(\"node\")",
+      "reason": "Source pattern indicates a capability; execution is not established.",
+      "fileContext": "test-or-example"
+    },
+    {
+      "ruleId": "eval",
+      "path": "lib/index.js",
+      "line": 2,
+      "column": 27,
+      "excerpt": "module.exports = input => eval(input)\n",
+      "reason": "Source pattern indicates a capability; execution is not established.",
+      "fileContext": "source"
+    },
+    {
+      "ruleId": "native",
+      "path": "binding.gyp",
+      "reason": "node-gyp builds a native addon from this file when the package is installed.",
+      "fileContext": "source"
+    },
+    {
+      "ruleId": "url-strings",
+      "path": "lib/index.js",
+      "reason": "Source contains a URL literal.",
+      "fileContext": "source"
+    }
+  ],
+  "evalCalls": 1,
+  "urlDomains": [
+    "api.example.com"
+  ],
+  "coverage": {
+    "sourceFiles": 2,
+    "scannedBytes": 117,
+    "unparsedFiles": 0,
+    "sampledFiles": 0,
+    "skippedFiles": 0,
+    "manifest": true,
+    "complete": true
+  }
+}

@@ -212,6 +212,13 @@ async fn async_main(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
+    if let Commands::InternalPackageSignals(args) = &command {
+        if let Err(error) = commands::package_signals::run(args.ecosystem.into()) {
+            exit_with_lpm_error(&error, true);
+        }
+        return Ok(());
+    }
+
     if let Commands::InternalTsTransform(args) = &command {
         let result = if args.persistent {
             lpm_runner::ts_transform::run_persistent_stdio()
@@ -3251,7 +3258,9 @@ async fn async_main(cli: Cli) -> Result<()> {
             update_check::refresh_cache_now().await;
             std::process::exit(0);
         }
-        Commands::InternalTsTransform(_) | Commands::InternalVerifyRelease(_) => {
+        Commands::InternalTsTransform(_)
+        | Commands::InternalVerifyRelease(_)
+        | Commands::InternalPackageSignals(_) => {
             unreachable!("handled before async command dispatch")
         }
         Commands::External(args) => {

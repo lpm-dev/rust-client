@@ -7,7 +7,7 @@
 use super::cache::ProjectAuditCache;
 use super::discovery::{self, DiscoveredPackage, DiscoveryResult, ScanMode};
 use dashmap::mapref::entry::Entry;
-use lpm_security::behavioral::PackageAnalysis;
+use lpm_security::behavioral::{PackageAnalysis, PackageDirectory};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -429,6 +429,12 @@ fn load_behavioral_analyses_with_index(
     }
 
     let project_root = open_project_root(&discovery.project_root).ok();
+    let nested = lpm_security::behavioral::nested_packages(
+        discovery
+            .packages
+            .iter()
+            .map(|package| Path::new(&package.path)),
+    );
     let project_cache_ref = project_cache.as_ref();
     let shared_by_fingerprint = dashmap::DashMap::new();
     let loaded: Vec<LoadedAnalysis> = scannable
@@ -439,6 +445,15 @@ fn load_behavioral_analyses_with_index(
                 open_package_source(project_root.as_ref(), package, lpm_root, baseline_index)
                     .ok()?;
             let package_directory = &package_source.directory;
+            let contents = match package_source.origin {
+                SourceOrigin::Store => PackageDirectory::Published,
+                SourceOrigin::Project => PackageDirectory::Installed(
+                    nested
+                        .get(Path::new(&package.path))
+                        .map_or(&[], Vec::as_slice),
+                ),
+                SourceOrigin::LocalDirectory => PackageDirectory::LocalSource,
+            };
             let key = &analysis_keys[scan_index];
             if let Some(cache) = project_cache_ref
                 && cache.has_candidate(key, package)
@@ -446,6 +461,7 @@ fn load_behavioral_analyses_with_index(
                 let fingerprint =
                     lpm_security::behavioral::package_input_fingerprint_from_open_dir(
                         package_directory,
+                        contents,
                     )
                     .ok();
                 if let Some(cached) = fingerprint
@@ -465,6 +481,7 @@ fn load_behavioral_analyses_with_index(
             let (analysis, cache_fingerprint) =
                 lpm_security::behavioral::analyze_package_from_open_dir_with_fingerprint(
                     package_directory,
+                    contents,
                 );
             let mut analysis = Arc::new(analysis);
             if let Some(fingerprint) = cache_fingerprint.as_ref() {
@@ -533,6 +550,18 @@ pub(crate) fn open_package_source_directory(
 struct OpenedPackageSource {
     directory: cap_std::fs::Dir,
     path: PathBuf,
+    origin: SourceOrigin,
+}
+
+/// Where an opened package directory is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceOrigin {
+    /// The store, which holds the package's published files.
+    Store,
+    /// The project, where a linker may have nested other packages in it.
+    Project,
+    /// The local directory a `file:` or `link:` dependency names.
+    LocalDirectory,
 }
 
 fn open_package_source(
@@ -545,6 +574,7 @@ fn open_package_source(
         return open_absolute_directory_nofollow(source_dir).map(|directory| OpenedPackageSource {
             directory,
             path: source_dir.clone(),
+            origin: SourceOrigin::LocalDirectory,
         });
     }
     let baseline = lpm_root
@@ -559,6 +589,7 @@ fn open_package_source(
                 OpenedPackageSource {
                     directory,
                     path: baseline.package_dir.clone(),
+                    origin: SourceOrigin::Store,
                 }
             });
         }
@@ -566,6 +597,7 @@ fn open_package_source(
             OpenedPackageSource {
                 directory,
                 path: PathBuf::from(&package.path),
+                origin: SourceOrigin::Project,
             }
         });
     }
@@ -576,12 +608,14 @@ fn open_package_source(
         return Ok(OpenedPackageSource {
             directory,
             path: baseline.package_dir.clone(),
+            origin: SourceOrigin::Store,
         });
     }
     open_project_package_directory(project_root, &package.path).map(|directory| {
         OpenedPackageSource {
             directory,
             path: PathBuf::from(&package.path),
+            origin: SourceOrigin::Project,
         }
     })
 }
@@ -736,5 +770,87 @@ mod tests {
 
         assert!(first.source.eval);
         assert!(Arc::ptr_eq(first, second));
+    }
+
+    #[test]
+    fn reads_bundled_dependencies_but_not_the_packages_nested_in_a_package_or_local_installs() {
+        let root = tempfile::tempdir().unwrap();
+        let project_root = root.path().join("project");
+        let source_root = root.path().join("local-source");
+        let files = [
+            (
+                "project/node_modules/kit/package.json",
+                r#"{"name":"kit","version":"1.0.0","license":"MIT"}"#,
+            ),
+            (
+                "project/node_modules/kit/index.js",
+                "module.exports = require('helper')\n",
+            ),
+            (
+                "project/node_modules/kit/node_modules/helper/index.js",
+                "module.exports = input => eval(input)\n",
+            ),
+            (
+                "project/node_modules/kit/node_modules/@scope/runner/package.json",
+                r#"{"name":"@scope/runner","version":"2.0.0","license":"MIT"}"#,
+            ),
+            (
+                "project/node_modules/kit/node_modules/@scope/runner/index.js",
+                "require('child_process').exec('echo runner')\n",
+            ),
+            (
+                "local-source/package.json",
+                r#"{"name":"local","version":"1.0.0","license":"MIT"}"#,
+            ),
+            ("local-source/index.js", "module.exports = 1\n"),
+            (
+                "local-source/node_modules/tool/index.js",
+                "module.exports = input => eval(input)\n",
+            ),
+        ];
+        for (path, content) in files {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        }
+        let package = |name: &str, version: &str, path: &str| DiscoveredPackage {
+            name: name.to_string(),
+            version: version.to_string(),
+            path: path.to_string(),
+            scan_mode: ScanMode::FullLocal,
+            ..discovered_package(None, None)
+        };
+        let local = DiscoveredPackage {
+            local_source_dir: Some(source_root),
+            ..package("local", "1.0.0", "node_modules/local")
+        };
+        let discovery = DiscoveryResult {
+            manager: super::super::discovery::ManagerKind::Npm,
+            lockfile_path: None,
+            project_root,
+            is_degraded: false,
+            is_yarn_pnp: false,
+            packages: vec![
+                package("kit", "1.0.0", "node_modules/kit"),
+                package(
+                    "@scope/runner",
+                    "2.0.0",
+                    "node_modules/kit/node_modules/@scope/runner",
+                ),
+                local,
+            ],
+            lpm_lockfile: None,
+            lpm_lockfile_content: None,
+            workspace_root: None,
+        };
+
+        let (analyses, _) = load_behavioral_analyses_with_index(&discovery, None, None);
+        let [kit, runner, local] = [0, 1, 2].map(|index| analyses[index].as_ref().unwrap());
+
+        assert!(kit.source.eval);
+        assert!(!kit.source.child_process);
+        assert!(runner.source.child_process);
+        assert!(!local.source.eval);
+        assert_eq!(local.meta.files_scanned, 1);
     }
 }

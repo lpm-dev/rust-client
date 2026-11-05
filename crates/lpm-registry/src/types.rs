@@ -676,20 +676,33 @@ impl VersionMetadata {
         })
     }
 
-    /// Returns true if this version has any security concerns.
+    /// Whether the registry found the behavioral tag `key` only in test
+    /// files the package doesn't run, as `_testOnlyTags` lists it.
+    pub fn tag_is_tests_only(&self, key: &str) -> bool {
+        self.test_only_tags
+            .as_deref()
+            .is_some_and(|tags| tags.iter().any(|tag| tag == key))
+    }
+
+    /// Returns true if this version has any security concerns. A dangerous
+    /// tag only the package's tests showed isn't one.
     pub fn has_security_issues(&self) -> bool {
         let has_findings = self
             .security_findings
             .as_ref()
             .is_some_and(|f| !f.is_empty());
         let has_dangerous_tags = self.behavioral_tags.as_ref().is_some_and(|t| {
-            t.eval
-                || t.child_process
-                || t.shell
-                || t.dynamic_require
-                || t.obfuscated
-                || t.protestware
-                || t.high_entropy_strings
+            [
+                (t.eval, "eval"),
+                (t.child_process, "childProcess"),
+                (t.shell, "shell"),
+                (t.dynamic_require, "dynamicRequire"),
+                (t.obfuscated, "obfuscated"),
+                (t.protestware, "protestware"),
+                (t.high_entropy_strings, "highEntropyStrings"),
+            ]
+            .into_iter()
+            .any(|(present, key)| present && !self.tag_is_tests_only(key))
         });
         let has_lifecycle = self
             .lifecycle_scripts
@@ -1871,6 +1884,23 @@ mod tests {
         let older: VersionMetadata =
             serde_json::from_str(r#"{"name":"kit","version":"1.0.0"}"#).unwrap();
         assert_eq!(older.test_only_tags, None);
+    }
+
+    #[test]
+    fn a_dangerous_tag_found_only_in_tests_is_not_a_security_issue() {
+        let tests_only: VersionMetadata = serde_json::from_str(
+            r#"{"name":"kit","version":"1.0.0","_behavioralTags":{"childProcess":true,"network":true},"_testOnlyTags":["childProcess"]}"#,
+        )
+        .unwrap();
+        assert!(tests_only.tag_is_tests_only("childProcess"));
+        assert!(!tests_only.tag_is_tests_only("network"));
+        assert!(!tests_only.has_security_issues());
+
+        let ran: VersionMetadata = serde_json::from_str(
+            r#"{"name":"kit","version":"1.0.0","_behavioralTags":{"childProcess":true}}"#,
+        )
+        .unwrap();
+        assert!(ran.has_security_issues());
     }
 
     #[test]

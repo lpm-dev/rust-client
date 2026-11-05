@@ -4,3 +4,7 @@
 # Signed release manifests must stay byte-exact: their SHA-256 is pinned by
 # the Sigstore attestation that ships next to them.
 crates/lpm-cli/tests/fixtures/release_manifests/*-SHA256SUMS.txt -text
+
+# Lifecycle-script fixtures are the exact script bytes the static gate
+# classifies; a CRLF checkout would hand it a `\r` no package.json string has.
+crates/lpm-security/tests/fixtures/postinstall-scripts/scripts/*.txt -text

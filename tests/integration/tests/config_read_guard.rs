@@ -293,10 +293,6 @@ impl RawReadAudit {
                 "std::fs::read_to_string"
             ) | (
                 "crates/lpm-security/src/behavioral/mod.rs",
-                "analyze_single_file",
-                "std::fs::read"
-            ) | (
-                "crates/lpm-security/src/behavioral/mod.rs",
                 "read_file_chunk",
                 ".read_to_end"
             ) | (

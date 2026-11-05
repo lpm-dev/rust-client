@@ -2723,14 +2723,7 @@ async fn audit_unsupported_syntax_cannot_be_hidden_by_severity_filtering() {
 
 /// Seed a node_modules package with high-confidence obfuscated source.
 fn seed_high_confidence_obfuscated_package(project: &TempProject, name: &str) {
-    seed_node_modules_package(
-        project,
-        name,
-        &[(
-            "index.js",
-            "var _0x1a2b=[\"\\x48\",\"\\x65\",\"\\x6c\",\"\\x6c\",\"\\x6f\"];\nfunction _0x3c4d(_0x5e6f) { return _0x1a2b[_0x5e6f]; }\nmodule.exports = _0x3c4d(0x1);\n",
-        )],
-    );
+    seed_node_modules_package(project, name, &[("index.js", OBFUSCATED_SOURCE)]);
 }
 
 /// Wire `lpm audit` with `LPM_OSV_URL` pointed at a mock returning no
@@ -2788,25 +2781,124 @@ async fn audit_reports_info_behavioral_metadata_without_failing() {
     assert!(combined.contains("URL literals"), "{combined}");
 }
 
-/// `--fail-on=behavior` must fire on a HIGH-severity behavioral finding
-/// like eval(). Pins the positive case for the `Behavior` arm of
-/// `FailPolicy` (audit/mod.rs::should_fail).
-#[tokio::test]
-async fn audit_fail_on_behavior_triggers_on_local_eval_finding() {
-    let project = TempProject::empty(r#"{"name":"eval-host","version":"1.0.0"}"#);
-    seed_eval_package(&project, "eval-pkg");
+const OBFUSCATED_SOURCE: &str = "var _0x1a2b=[\"\\x48\",\"\\x65\",\"\\x6c\",\"\\x6c\",\"\\x6f\"];\nfunction _0x3c4d(_0x5e6f) { return _0x1a2b[_0x5e6f]; }\nmodule.exports = _0x3c4d(0x1);\n";
 
+/// Audits a project with one package of `files` under the default fail
+/// policy. Returns its report and whether audit failed.
+async fn audit_one_seeded_package(files: &[(&str, &str)]) -> (serde_json::Value, bool) {
+    let project = TempProject::empty(r#"{"name":"tests-only-host","version":"1.0.0"}"#);
+    seed_node_modules_package(&project, "kit", files);
     let mock = MockRegistry::start().await;
-    // Audit will query OSV for non-@lpm.dev packages; return empty so
-    // the only failure trigger is the behavioral finding.
     mock.with_osv_querybatch(vec![vec![]]).await;
 
-    let out = run_audit_no_osv(&project, &mock, &["--fail-on=behavior"]);
+    let output = lpm(&project)
+        .env("LPM_OSV_URL", format!("{}/v1/querybatch", mock.url()))
+        .args(["--json", "audit"])
+        .output()
+        .expect("failed to spawn lpm audit");
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("audit JSON must parse: {error}"));
+    (envelope["packages"][0].clone(), !output.status.success())
+}
+
+fn finding<'a>(report: &'a serde_json::Value, list: &str, rule_id: &str) -> &'a serde_json::Value {
+    report[list]
+        .as_array()
+        .and_then(|findings| {
+            findings
+                .iter()
+                .find(|finding| finding["rule_id"] == rule_id)
+        })
+        .unwrap_or_else(|| panic!("no {rule_id} in {list}: {report}"))
+}
+
+#[tokio::test]
+async fn audit_reports_code_only_a_package_s_tests_contain_as_tests_only_and_passes() {
+    let (report, failed) = audit_one_seeded_package(&[
+        ("index.js", "module.exports = (a, b) => a + b\n"),
+        ("test/fixture.js", OBFUSCATED_SOURCE),
+        ("test/run.test.js", "eval(process.argv[2])\n"),
+    ])
+    .await;
+
+    let obfuscated = finding(&report, "issues", "obfuscated");
+    assert_eq!(obfuscated["severity"], "info", "{report}");
+    assert_eq!(obfuscated["tests_only"], true, "{report}");
+    let eval = finding(&report, "capabilities", "eval");
+    assert_eq!(eval["policy_severity"], "info", "{report}");
+    assert_eq!(eval["tests_only"], true, "{report}");
     assert!(
-        !out.status.success(),
-        "--fail-on=behavior must fire when eval() is detected; stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr),
+        !failed,
+        "code only tests contain must not fail audit: {report}"
+    );
+}
+
+#[tokio::test]
+async fn audit_counts_a_test_file_a_lifecycle_script_runs_as_package_code() {
+    let (report, failed) = audit_one_seeded_package(&[
+        (
+            "package.json",
+            r#"{"name":"kit","version":"1.0.0","scripts":{"postinstall":"node test/fixture.js"}}"#,
+        ),
+        ("index.js", "module.exports = (a, b) => a + b\n"),
+        ("test/fixture.js", OBFUSCATED_SOURCE),
+        ("test/run.test.js", "eval(process.argv[2])\n"),
+    ])
+    .await;
+
+    let obfuscated = finding(&report, "issues", "obfuscated");
+    assert_eq!(obfuscated["severity"], "critical", "{report}");
+    assert!(obfuscated.get("tests_only").is_none(), "{report}");
+    assert_eq!(finding(&report, "capabilities", "eval")["tests_only"], true);
+    assert!(
+        failed,
+        "obfuscated code a lifecycle script runs must fail audit"
+    );
+}
+
+/// Whether `--fail-on=behavior` fails an audit of one package of `files`.
+async fn fail_on_behavior_fails(files: &[(&str, &str)]) -> bool {
+    let project = TempProject::empty(r#"{"name":"eval-host","version":"1.0.0"}"#);
+    seed_node_modules_package(&project, "eval-pkg", files);
+    let mock = MockRegistry::start().await;
+    mock.with_osv_querybatch(vec![vec![]]).await;
+    !run_audit_no_osv(&project, &mock, &["--fail-on=behavior"])
+        .status
+        .success()
+}
+
+/// `--fail-on=behavior` fires on a high-severity capability such as
+/// `eval()` in the code a package runs, and on nothing else this package
+/// has: the same package without it passes, and so does `eval()` only a test
+/// file contains.
+#[tokio::test]
+async fn audit_fail_on_behavior_triggers_on_local_eval_finding() {
+    assert!(
+        fail_on_behavior_fails(&[(
+            "index.js",
+            "module.exports = function (src) { return eval(src) }\n"
+        )])
+        .await,
+        "--fail-on=behavior must fire when the package runs eval()"
+    );
+    assert!(
+        !fail_on_behavior_fails(&[(
+            "index.js",
+            "module.exports = function (src) { return src }\n"
+        )])
+        .await,
+        "without eval() the package has nothing --fail-on=behavior fails on"
+    );
+    assert!(
+        !fail_on_behavior_fails(&[
+            (
+                "index.js",
+                "module.exports = function (src) { return src }\n"
+            ),
+            ("test/run.test.js", "eval(process.argv[2])\n"),
+        ])
+        .await,
+        "eval() only a test file contains must not fail --fail-on=behavior"
     );
 }
 

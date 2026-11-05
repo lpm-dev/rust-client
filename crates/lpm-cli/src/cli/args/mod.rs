@@ -607,6 +607,11 @@ pub(crate) enum Commands {
     #[command(name = "internal-ts-transform", hide = true)]
     InternalTsTransform(build::InternalTsTransformArgs),
 
+    /// Hidden registry helper: the code signals of a published release,
+    /// from its gzipped tarball on stdin, as JSON.
+    #[command(name = "internal-package-signals", hide = true)]
+    InternalPackageSignals(security::InternalPackageSignalsArgs),
+
     /// Hidden release-workflow gate: verifies a signed `SHA256SUMS.txt`
     /// from local files with the exact policy `lpm self-update` enforces.
     #[command(name = "internal-verify-release", hide = true)]

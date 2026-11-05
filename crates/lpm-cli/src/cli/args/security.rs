@@ -8,6 +8,32 @@ pub(crate) struct InternalSecurityPolicyArgs {
 }
 
 #[derive(Args)]
+pub(crate) struct InternalPackageSignalsArgs {
+    /// The language whose source files are read.
+    #[arg(long, value_enum, default_value_t = SignalsEcosystem::Js)]
+    pub(crate) ecosystem: SignalsEcosystem,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub(crate) enum SignalsEcosystem {
+    Js,
+    Swift,
+    Rust,
+    Python,
+}
+
+impl From<SignalsEcosystem> for lpm_security::behavioral::release::Ecosystem {
+    fn from(ecosystem: SignalsEcosystem) -> Self {
+        match ecosystem {
+            SignalsEcosystem::Js => Self::Js,
+            SignalsEcosystem::Swift => Self::Swift,
+            SignalsEcosystem::Rust => Self::Rust,
+            SignalsEcosystem::Python => Self::Python,
+        }
+    }
+}
+
+#[derive(Args)]
 pub(crate) struct ConfigArgs {
     /// Action: get, set, delete, list, scripts, triage, sandbox,
     /// sigstore, signatures, trust-policy, typosquat, firewall, integrity,

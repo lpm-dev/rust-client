@@ -95,6 +95,7 @@ fn completions_hide_internal_commands_and_options_in_every_shell() {
         for hidden in [
             "internal-update-check",
             "internal-hosts-file",
+            "internal-package-signals",
             "internal-security-policy",
             "internal-ts-transform",
             "internal-verify-release",

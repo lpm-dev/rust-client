@@ -6,7 +6,7 @@
 //!
 //! SECURITY: All patterns use the `regex` crate (linear-time).
 
-use regex::{Regex, RegexSet};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
@@ -77,12 +77,12 @@ fn supply_patterns() -> &'static [Regex] {
             r"\b_0x[0-9a-f]{4,}\b",
             r"String\.fromCharCode\s*\(",
             r#"Buffer\.from\s*\([^)]*["']base64["']"#,
-            r#"["'](?:@?segment(?:/analytics-node)?|analytics-node)["']"#,
-            r#"["']mixpanel["']"#,
-            r#"["']posthog-node["']"#,
-            r#"["'](?:@amplitude/node|amplitude)["']"#,
-            r#"["']keen-tracking["']"#,
-            r#"["']countly-sdk-nodejs["']"#,
+            r#"(?:\bfrom\s+|\b(?:require|import)\s*\(\s*)["'](?:@?segment(?:/analytics-node)?|analytics-node)["']"#,
+            r#"(?:\bfrom\s+|\b(?:require|import)\s*\(\s*)["']mixpanel["']"#,
+            r#"(?:\bfrom\s+|\b(?:require|import)\s*\(\s*)["']posthog-node["']"#,
+            r#"(?:\bfrom\s+|\b(?:require|import)\s*\(\s*)["'](?:@amplitude/node|amplitude)["']"#,
+            r#"(?:\bfrom\s+|\b(?:require|import)\s*\(\s*)["']keen-tracking["']"#,
+            r#"(?:\bfrom\s+|\b(?:require|import)\s*\(\s*)["']countly-sdk-nodejs["']"#,
             r"\bnavigator\.sendBeacon\s*\(",
             r#"\bnew\s+Image\s*\(\s*\)\s*\.src\s*=\s*["']https?://"#,
             r"(?:Intl\.DateTimeFormat|resolvedOptions\(\)\.(?:timeZone|locale)|os\.networkInterfaces)[\s\S]{0,200}(?:===?|!==?)[\s\S]{0,100}process\.exit",
@@ -137,7 +137,7 @@ fn supply_pattern_summary_with_context(
         dispatcher: detect_dispatcher_pattern_with_context(stripped, context, identifiers != 0),
         telemetry: patterns[TELEMETRY_START..TELEMETRY_END]
             .iter()
-            .any(|pattern| pattern.is_match(stripped)),
+            .any(|pattern| context.find_with_context(pattern, false).is_some()),
         protestware: patterns[PROTESTWARE_START..PROTESTWARE_END]
             .iter()
             .any(|pattern| pattern.is_match(&executable)),
@@ -340,138 +340,123 @@ pub fn shannon_entropy(data: &[u8]) -> f64 {
     entropy
 }
 
-/// Regex for known high-entropy exclusions (UUIDs, hex hashes, data URIs, semver).
-fn entropy_exclusion_regex() -> &'static RegexSet {
-    static INSTANCE: OnceLock<RegexSet> = OnceLock::new();
-    INSTANCE.get_or_init(|| {
-        RegexSet::new([
-            // UUID
-            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-            // Hex hash (MD5, SHA-1, SHA-256, SHA-512)
-            r"^[0-9a-f]{32,128}$",
-            // Base64 data URI
-            r"^data:[a-zA-Z]+/[a-zA-Z0-9.+-]+;base64,",
-            // Semver range
-            r"^[\d.^~>=<|x* -]+$",
-            // File path
-            r"^[./\\]",
-        ])
-        .expect("entropy exclusion patterns must compile")
-    })
+/// Shortest literal that can look random: shorter encoded text is too often
+/// an identifier or a short hash.
+const MIN_RANDOM_LITERAL_BYTES: usize = 32;
+
+fn is_encoded_text_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'_' | b'-')
 }
 
-/// Extract string literals from source and check for high-entropy content.
-///
-/// Uses a two-pass approach:
-/// 1. Fast pre-filter: skip files with no long strings
-/// 2. Targeted extraction: compute entropy on strings > 30 chars
-pub fn detect_high_entropy(stripped: &str) -> bool {
-    // Fast pre-filter: does the source have any string > 30 chars?
-    if !has_long_string_literals(stripped, 30) {
-        return false;
+fn character_class(byte: u8) -> u8 {
+    match byte {
+        b'a'..=b'z' => 0,
+        b'A'..=b'Z' => 1,
+        b'0'..=b'9' => 2,
+        _ => 3,
     }
-
-    let exclusions = entropy_exclusion_regex();
-
-    // Extract string literals and check entropy
-    for literal in extract_string_literals(stripped) {
-        if literal.len() < 30 {
-            continue;
-        }
-
-        // Skip known high-entropy formats
-        if entropy_exclusion_matches(exclusions, literal) {
-            continue;
-        }
-
-        let entropy = shannon_entropy(literal.as_bytes());
-        if entropy > 4.5 {
-            return true;
-        }
-    }
-
-    false
 }
 
-fn entropy_exclusion_matches(exclusions: &RegexSet, literal: &str) -> bool {
-    if exclusions.is_match(literal) {
+/// Whether a string literal looks random: an encoded payload, a token or a
+/// key. It must be one run of base64, base64url or hex characters at least
+/// 32 long, repeat a character (an alphabet or lookup table repeats none),
+/// come close to the most entropy its length allows, and switch between
+/// lower case, upper case and digits as often as random text does, which
+/// identifiers don't. Random base64 of 32 to 200 characters passes over 99%
+/// of the time; generated camelCase identifiers don't. A PEM private key
+/// marker always passes.
+pub fn looks_random(literal: &str) -> bool {
+    if literal.contains("PRIVATE KEY-----") {
         return true;
     }
-    if literal.is_ascii() && !literal.bytes().any(|byte| byte.is_ascii_uppercase()) {
+    let bytes = literal.as_bytes();
+    if bytes.len() < MIN_RANDOM_LITERAL_BYTES
+        || !bytes.iter().all(|&byte| is_encoded_text_byte(byte))
+    {
         return false;
     }
-    exclusions.is_match(&literal.to_lowercase())
+    let mut counts = [0u32; 128];
+    let mut repeats = false;
+    for &byte in bytes {
+        let count = &mut counts[usize::from(byte)];
+        *count += 1;
+        repeats |= *count == 2;
+    }
+    if !repeats {
+        return false;
+    }
+    let length = bytes.len() as f64;
+    let entropy: f64 = counts
+        .iter()
+        .filter(|&&count| count > 0)
+        .map(|&count| {
+            let share = f64::from(count) / length;
+            -share * share.log2()
+        })
+        .sum();
+    let shifts = bytes
+        .windows(2)
+        .filter(|pair| character_class(pair[0]) != character_class(pair[1]))
+        .count();
+    entropy >= 0.82 * length.min(64.0).log2() && shifts as f64 / (length - 1.0) >= 0.4
 }
 
-/// Fast check: does the source contain any string literal longer than `min_len` chars?
-fn has_long_string_literals(src: &str, min_len: usize) -> bool {
-    let bytes = src.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        let b = bytes[i];
-        if b == b'"' || b == b'\'' {
-            let quote = b;
-            let start = i + 1;
-            i += 1;
-            while i < len {
-                if bytes[i] == b'\\' {
-                    i += 2; // skip escaped char
-                    continue;
+/// Whether source the parser couldn't read has a random-looking string
+/// literal (see [`looks_random`]). It reads every literal quoted on one line,
+/// as a regex retrying from each quote would, in linear time: a quote that
+/// finds no partner before the line ends means no later quote of that kind
+/// on the line can.
+pub fn detect_high_entropy(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut unpaired = [false; 3];
+    let mut index = 0;
+    while index < bytes.len() {
+        let quote = bytes[index];
+        let kind = match quote {
+            b'"' => 0,
+            b'\'' => 1,
+            b'`' => 2,
+            b'\n' => {
+                unpaired = [false; 3];
+                index += 1;
+                continue;
+            }
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        if unpaired[kind] {
+            index += 1;
+            continue;
+        }
+        let start = index + 1;
+        let mut cursor = start;
+        let closing = loop {
+            match bytes.get(cursor) {
+                None | Some(b'\n') => break None,
+                Some(b'\\') if bytes.get(cursor + 1).is_some_and(|&next| next != b'\n') => {
+                    cursor += 2;
                 }
-                if bytes[i] == quote {
-                    if i - start >= min_len {
-                        return true;
-                    }
-                    break;
+                Some(b'\\') => break None,
+                Some(&byte) if byte == quote => break Some(cursor),
+                Some(_) => cursor += 1,
+            }
+        };
+        match closing {
+            Some(end) => {
+                if looks_random(&source[start..end]) {
+                    return true;
                 }
-                i += 1;
+                index = end + 1;
+            }
+            None => {
+                unpaired[kind] = true;
+                index += 1;
             }
         }
-        i += 1;
     }
-
     false
-}
-
-/// Extract string literal contents from source code.
-///
-/// Handles `"..."` and `'...'` strings. Skips template literals (too complex
-/// to reliably extract from). Returns the inner content of each string.
-fn extract_string_literals(src: &str) -> Vec<&str> {
-    let bytes = src.as_bytes();
-    let len = bytes.len();
-    let mut literals = Vec::new();
-    let mut i = 0;
-
-    while i < len {
-        let b = bytes[i];
-        if b == b'"' || b == b'\'' {
-            let quote = b;
-            let start = i + 1;
-            i += 1;
-            let mut has_escape = false;
-            while i < len {
-                if bytes[i] == b'\\' {
-                    has_escape = true;
-                    i += 2;
-                    continue;
-                }
-                if bytes[i] == quote {
-                    // Only return literals without escapes for accurate entropy
-                    if !has_escape && i > start {
-                        literals.push(&src[start..i]);
-                    }
-                    break;
-                }
-                i += 1;
-            }
-        }
-        i += 1;
-    }
-
-    literals
 }
 
 // ── Minified code detection ───────────────────────────────────
@@ -585,7 +570,9 @@ pub(super) fn analyze_supply_chain_context(
     SupplyChainTags {
         obfuscated: is_critical_obfuscation(confidence),
         possible_obfuscation: is_possible_obfuscation(confidence),
-        high_entropy_strings: detect_high_entropy(stripped),
+        high_entropy_strings: context
+            .random_literal
+            .unwrap_or_else(|| detect_high_entropy(stripped)),
         minified: is_minified,
         telemetry: patterns.telemetry,
         url_strings: has_url_strings,
@@ -698,7 +685,7 @@ pub(super) fn append_evidence(
         (
             tags.high_entropy_strings,
             "high-entropy",
-            "A long string exceeded the entropy threshold after known data exclusions.",
+            "A string literal looks like random encoded data: a key, token or payload.",
         ),
         (
             tags.minified,
@@ -733,11 +720,7 @@ pub(super) fn append_evidence(
             "telemetry" => {
                 if let Some(offset) = supply_patterns()[TELEMETRY_START..TELEMETRY_END]
                     .iter()
-                    .find_map(|pattern| {
-                        pattern
-                            .find(&context.stripped)
-                            .map(|matched| matched.start())
-                    })
+                    .find_map(|pattern| context.find_with_context(pattern, false))
                 {
                     entry = entry.at(&context.stripped, offset);
                 }
@@ -981,45 +964,89 @@ mod tests {
 
     // ── High entropy strings ──────────────────────────────────
 
-    #[test]
-    fn detect_high_entropy_secret() {
-        let code = r#"const key = "aK3mP9xR2vT8qL5nB7wF4jD6hG1cE0iaK3m""#;
-        assert!(detect_high_entropy(code));
+    const PAYLOAD: &str = "Q8d3mANj0Ko4Q8DyWlMMXG88SXhtH6MWBZobNUKKOOah";
+
+    fn high_entropy(code: &str) -> bool {
+        analyze_supply_chain(code, code.as_bytes()).high_entropy_strings
     }
 
     #[test]
-    fn no_false_positive_uuid() {
-        let code = r#"const id = "550e8400-e29b-41d4-a716-446655440000""#;
-        assert!(!detect_high_entropy(code));
+    fn flags_a_random_looking_literal_an_encoded_payload_a_secret_or_a_private_key() {
+        for code in [
+            format!(r#"const payload = "{PAYLOAD}""#),
+            r#"const key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY""#.to_owned(),
+            r#"const key = "aK3mP9xR2vT8qL5nB7wF4jD6hG1cE0iaK3m""#.to_owned(),
+            "const pem = `-----BEGIN RSA PRIVATE KEY-----\\nMIIEowIBAAKCAQEA\\n-----END RSA PRIVATE KEY-----`".to_owned(),
+        ] {
+            assert!(high_entropy(&code), "{code}");
+        }
     }
 
     #[test]
-    fn no_false_positive_hex_hash() {
-        let code = r#"const hash = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4""#;
-        assert!(!detect_high_entropy(code));
-    }
-
-    #[test]
-    fn no_false_positive_short_string() {
-        let code = r#"const msg = "hello world""#;
-        assert!(!detect_high_entropy(code));
-    }
-
-    #[test]
-    fn entropy_exclusions_preserve_case_insensitive_matching() {
-        let exclusions = entropy_exclusion_regex();
-        assert!(entropy_exclusion_matches(
-            exclusions,
-            "550E8400-E29B-41D4-A716-446655440000"
+    fn reads_only_string_literals_not_the_code_between_two_of_them() {
+        assert!(!high_entropy(
+            r#"const a = "x"; const styles = Object.create(null); const assertValidLevel = level => { if (!Number.isInteger(level)) throw new Error("y") }"#
         ));
-        assert!(entropy_exclusion_matches(
-            exclusions,
-            "data:image/png;base64,ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    }
+
+    #[test]
+    fn passes_over_identifiers_hashes_uuids_alphabets_and_prose() {
+        for literal in [
+            "someVeryLongPropertyNameForConfiguration",
+            "ERR_INVALID_ARGUMENT_TYPE_FOR_THE_HANDLER",
+            "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "550E8400-E29B-41D4-A716-446655440000",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/",
+            "flex items-center justify-between px-4 py-2 text-sm font-medium",
+            "hello world",
+        ] {
+            let code = format!("const value = {}", serde_json::to_string(literal).unwrap());
+            assert!(!high_entropy(&code), "{literal}");
+        }
+    }
+
+    #[test]
+    fn reads_the_quoted_literals_of_source_it_cannot_parse() {
+        assert!(high_entropy(&format!(
+            "let p = '{PAYLOAD}'; let q = \"a\" + b + \"c\"; )("
+        )));
+        assert!(!high_entropy(
+            r#"const a = "x"; const styles = Object.create(null); const ok = level => Number.isInteger(level) || "y"; )("#
         ));
-        assert!(!entropy_exclusion_matches(
-            exclusions,
-            "aK3mP9xR2vT8qL5nB7wF4jD6hG1cE0i"
-        ));
+    }
+
+    // ── Telemetry ─────────────────────────────────────────────
+
+    fn telemetry(code: &str) -> bool {
+        analyze_supply_chain(code, code.as_bytes()).telemetry
+    }
+
+    #[test]
+    fn telemetry_comes_from_an_imported_sdk_or_a_beacon() {
+        for code in [
+            r#"import mixpanel from "mixpanel";"#,
+            r#"const { Analytics } = require('@segment/analytics-node');"#,
+            r#"const posthog = await import("posthog-node");"#,
+            "navigator.sendBeacon(endpoint, payload);",
+            r#"new Image().src = "https://collector.example.com/p.gif?e=load";"#,
+        ] {
+            assert!(telemetry(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn an_sdk_name_used_as_ordinary_data_is_not_telemetry() {
+        for code in [
+            r#"s.setContext({type:"segment",p0:o,p1:r})"#,
+            r#"const attributes = { amplitude: "amplitude", arabicform: "arabicForm" };"#,
+            r#"const keywords = ['segment', 'sin', 'softmax'];"#,
+            r#"// import mixpanel from "mixpanel""#,
+            r#"const usage = 'require("mixpanel")';"#,
+        ] {
+            assert!(!telemetry(code), "{code}");
+        }
     }
 
     // ── Protestware ───────────────────────────────────────────

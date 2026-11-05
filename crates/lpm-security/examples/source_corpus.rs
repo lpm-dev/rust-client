@@ -4,7 +4,7 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use lpm_security::behavioral::analyze_package_from_open_dir;
+use lpm_security::behavioral::{PackageDirectory, analyze_package_from_open_dir};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let request: Request = serde_json::from_str(&line?)?;
         let root = cap_std::fs::Dir::open_ambient_dir(&request.path, cap_std::ambient_authority())?;
         let start = Instant::now();
-        let analysis = analyze_package_from_open_dir(&root);
+        let analysis = analyze_package_from_open_dir(&root, PackageDirectory::Published);
         let elapsed_ns = start.elapsed().as_nanos();
         serde_json::to_writer(
             &mut stdout,

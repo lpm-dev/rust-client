@@ -237,16 +237,27 @@ pub(super) fn package_result_key(manager: ManagerKind, package: &DiscoveredPacka
     }
 }
 
-/// Convert a PackageAnalysis into AuditIssues.
+/// Convert a PackageAnalysis into AuditIssues. A tag only tests showed is
+/// an `info` issue marked tests-only, as a registry's is.
 pub(super) fn analysis_to_issues(
     analysis: &lpm_security::behavioral::PackageAnalysis,
     source: &str,
 ) -> Vec<AuditIssue> {
     behavioral_tag_policies()
         .iter()
-        .filter(|policy| policy.tag.matches_analysis(analysis))
         .filter_map(|policy| {
+            let tests_only = if policy.tag.matches_analysis(analysis) {
+                false
+            } else if policy.tag.tests_only_in_analysis(analysis) {
+                true
+            } else {
+                return None;
+            };
             let mut issue = behavioral_issue(policy.tag, source)?;
+            if tests_only {
+                issue.tests_only = true;
+                issue.severity = "info".to_string();
+            }
             issue.evidence = analysis
                 .meta
                 .evidence
