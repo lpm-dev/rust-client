@@ -201,7 +201,7 @@ impl CoolifyClient {
             return Err(coolify_api_error("list", status, &body));
         }
         serde_json::from_slice(&body)
-            .map_err(|error| LpmError::Script(format!("invalid Coolify response: {error}")))
+            .map_err(|error| LpmError::Env(format!("invalid Coolify response: {error}")))
     }
 
     pub(super) async fn list(&self) -> Result<HashMap<String, PlatformVariable>, LpmError> {
@@ -214,14 +214,14 @@ impl CoolifyClient {
                 continue;
             }
             if variable.uuid.is_empty() {
-                return Err(LpmError::Script(format!(
+                return Err(LpmError::Env(format!(
                     "Coolify value {} has an invalid UUID",
                     variable.key
                 )));
             }
             let metadata = variable.metadata()?;
             if metadata.is_shown_once {
-                return Err(LpmError::Script(format!(
+                return Err(LpmError::Env(format!(
                     "Coolify value {} is shown-once and cannot be read; replace it with a readable application value before syncing",
                     variable.key
                 )));
@@ -232,20 +232,20 @@ impl CoolifyClient {
                 } else {
                     "Coolify hid the value"
                 };
-                LpmError::Script(format!(
+                LpmError::Env(format!(
                     "{visibility} for {}; use a read:sensitive or root API token owned by a team administrator",
                     variable.key
                 ))
             })?;
             if variable.is_shared == Some(true) || is_shared_reference(&raw_value) {
-                return Err(LpmError::Script(format!(
+                return Err(LpmError::Env(format!(
                     "Coolify value {} is a shared-variable reference; convert it to a readable application value before syncing",
                     variable.key
                 )));
             }
             let key = variable.key;
             if result.contains_key(&key) {
-                return Err(LpmError::Script(format!(
+                return Err(LpmError::Env(format!(
                     "Coolify returned multiple values named {key} for the configured application target"
                 )));
             }
@@ -277,7 +277,7 @@ impl CoolifyClient {
         for key in &diff.added {
             let value = local
                 .get(key)
-                .ok_or_else(|| LpmError::Script(format!("missing local value for {key}")))
+                .ok_or_else(|| LpmError::Env(format!("missing local value for {key}")))
                 .map_err(PlatformApplyError::untracked)?;
             mutations.push(CoolifyMutation::Add {
                 key: key.clone(),
@@ -287,11 +287,11 @@ impl CoolifyClient {
         for key in &diff.changed {
             let value = local
                 .get(key)
-                .ok_or_else(|| LpmError::Script(format!("missing local value for {key}")))
+                .ok_or_else(|| LpmError::Env(format!("missing local value for {key}")))
                 .map_err(PlatformApplyError::untracked)?;
             let variable = remote
                 .get(key)
-                .ok_or_else(|| LpmError::Script(format!("missing Coolify value for {key}")))
+                .ok_or_else(|| LpmError::Env(format!("missing Coolify value for {key}")))
                 .map_err(PlatformApplyError::untracked)?;
             let metadata = self
                 .mutation_metadata(key, variable)
@@ -306,7 +306,7 @@ impl CoolifyClient {
         for key in &diff.removed {
             let variable = remote
                 .get(key)
-                .ok_or_else(|| LpmError::Script(format!("missing Coolify value for {key}")))
+                .ok_or_else(|| LpmError::Env(format!("missing Coolify value for {key}")))
                 .map_err(PlatformApplyError::untracked)?;
             self.assert_mutation_scope(key, variable)
                 .map_err(PlatformApplyError::untracked)?;
@@ -330,7 +330,7 @@ impl CoolifyClient {
     ) -> Result<(), LpmError> {
         match &variable.scope {
             VariableScope::Coolify { preview, .. } if *preview == self.config.preview => Ok(()),
-            _ => Err(LpmError::Script(format!(
+            _ => Err(LpmError::Env(format!(
                 "Coolify value {key} does not match the configured application target"
             ))),
         }
@@ -352,7 +352,7 @@ impl CoolifyClient {
                 is_multiline: *is_multiline,
                 is_shown_once: *is_shown_once,
             }),
-            _ => Err(LpmError::Script(format!(
+            _ => Err(LpmError::Env(format!(
                 "Coolify value {key} does not match the configured application target"
             ))),
         }
@@ -447,7 +447,7 @@ impl CoolifyClient {
                 Ok(OwnedCreateResult::Created { id, .. }) => id,
                 Ok(OwnedCreateResult::Existing) => {
                     return Err(CoolifyAddFailure {
-                        error: LpmError::Script(format!(
+                        error: LpmError::Env(format!(
                             "Coolify unexpectedly reported an existing preview value for {key}"
                         )),
                         committed: CoolifyCommitState::NotCommitted,
@@ -495,7 +495,7 @@ impl CoolifyClient {
                 let cleanup = self.cleanup_owned_ids(guard_id.into_iter().collect()).await;
                 return Err(CoolifyAddFailure {
                     error: append_cleanup(
-                        LpmError::Script(format!(
+                        LpmError::Env(format!(
                             "Coolify unexpectedly reported an existing production value for {key}"
                         )),
                         &cleanup,
@@ -702,14 +702,14 @@ impl CoolifyClient {
                     key,
                     value,
                     is_preview,
-                    LpmError::Script(format!("Coolify created {key} but returned no usable UUID")),
+                    LpmError::Env(format!("Coolify created {key} but returned no usable UUID")),
                 )
                 .await
             }
             PostVariableResult::Existing => {
                 if !allow_existing {
                     return Err(OwnedCreateFailure {
-                        error: LpmError::Script(format!(
+                        error: LpmError::Env(format!(
                             "Coolify unexpectedly reported an existing value for {key}"
                         )),
                         owned_ids: Vec::new(),
@@ -718,7 +718,7 @@ impl CoolifyClient {
                 }
                 let preview_ids = self.preview_ids_for_key(key).await.map_err(|error| {
                     OwnedCreateFailure {
-                        error: LpmError::Script(format!(
+                        error: LpmError::Env(format!(
                             "Coolify preview guard conflicted for {key}, but the existing preview value could not be verified: {error}"
                         )),
                         owned_ids: Vec::new(),
@@ -729,7 +729,7 @@ impl CoolifyClient {
                     Ok(OwnedCreateResult::Existing)
                 } else {
                     Err(OwnedCreateFailure {
-                        error: LpmError::Script(format!(
+                        error: LpmError::Env(format!(
                             "Coolify preview guard conflicted for {key}, but verification found {} preview values; refusing an ambiguous production create",
                             preview_ids.len()
                         )),
@@ -849,7 +849,7 @@ impl CoolifyClient {
                 continue;
             }
             if variable.uuid.is_empty() {
-                return Err(LpmError::Script(format!(
+                return Err(LpmError::Env(format!(
                     "Coolify value {} has an invalid UUID",
                     variable.key
                 )));
@@ -871,7 +871,7 @@ impl CoolifyClient {
                 continue;
             }
             if variable.uuid.is_empty() {
-                return Err(LpmError::Script(format!(
+                return Err(LpmError::Env(format!(
                     "Coolify value {} has an invalid UUID",
                     variable.key
                 )));
@@ -895,7 +895,7 @@ impl CoolifyClient {
         };
         let is_preview = required_metadata_flag(variable.is_preview, "is_preview", &variable.key)?;
         if variable.key != key || is_preview != expected_preview {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Env(format!(
                 "Coolify value {id} no longer matches the owned {key} target"
             )));
         }
@@ -1021,14 +1021,14 @@ impl CoolifyVariableResponse {
 
 fn required_metadata_flag(value: Option<bool>, field: &str, key: &str) -> Result<bool, LpmError> {
     value.ok_or_else(|| {
-        LpmError::Script(format!(
+        LpmError::Env(format!(
             "Coolify value {key} is missing {field}; refusing to sync incomplete deployment metadata"
         ))
     })
 }
 
 fn hidden_owned_value_error(key: &str) -> LpmError {
-    LpmError::Script(format!(
+    LpmError::Env(format!(
         "Coolify raw value for {key} is hidden; authoritative ownership reconciliation is unavailable"
     ))
 }
@@ -1070,7 +1070,7 @@ fn cleanup_summary(cleanup: &[OwnedCleanupOutcome]) -> String {
 fn delete_failure_error(context: String, id: &str, outcome: DeleteVariableOutcome) -> LpmError {
     match outcome {
         DeleteVariableOutcome::Removed => {
-            LpmError::Script(format!("{context}; value {id} was already removed"))
+            LpmError::Env(format!("{context}; value {id} was already removed"))
         }
         DeleteVariableOutcome::Present(error) | DeleteVariableOutcome::Unknown(error) => {
             append_error_context(error, context)
@@ -1088,7 +1088,7 @@ fn cleanup_failure_error(context: String, cleanup: Vec<OwnedCleanupOutcome>) -> 
                 Some(error)
             }
         })
-        .unwrap_or_else(|| LpmError::Script(context.clone()));
+        .unwrap_or_else(|| LpmError::Env(context.clone()));
     append_error_context(error, format!("{context}: {summary}"))
 }
 
@@ -1131,7 +1131,9 @@ fn commit_state_after_cleanup(
 fn append_error_context(error: LpmError, context: String) -> LpmError {
     match error {
         LpmError::Network(message) => LpmError::Network(format!("{message}; {context}")),
-        LpmError::Script(message) => LpmError::Script(format!("{message}; {context}")),
+        LpmError::Env(message) | LpmError::Script(message) => {
+            LpmError::Env(format!("{message}; {context}"))
+        }
         other => other,
     }
 }
@@ -1148,21 +1150,19 @@ fn append_cleanup(error: LpmError, cleanup: &[OwnedCleanupOutcome]) -> LpmError 
 
 fn normalize_url(value: &str) -> Result<String, LpmError> {
     let url = reqwest::Url::parse(value)
-        .map_err(|error| LpmError::Script(format!("invalid Coolify URL: {error}")))?;
+        .map_err(|error| LpmError::Env(format!("invalid Coolify URL: {error}")))?;
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "Coolify URL must not contain credentials".into(),
         ));
     }
     if url.query().is_some() || url.fragment().is_some() {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "Coolify URL must not contain a query or fragment".into(),
         ));
     }
     if !matches!(url.path(), "" | "/") {
-        return Err(LpmError::Script(
-            "Coolify URL must not contain a path".into(),
-        ));
+        return Err(LpmError::Env("Coolify URL must not contain a path".into()));
     }
     let acceptance_loopback = cfg!(any(debug_assertions, feature = "acceptance-test-hooks"))
         && std::env::var("ACCEPTANCE_RUN_ID")
@@ -1171,7 +1171,7 @@ fn normalize_url(value: &str) -> Result<String, LpmError> {
         && url.scheme() == "http"
         && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
     if url.scheme() != "https" && !acceptance_loopback {
-        return Err(LpmError::Script("Coolify URL must use HTTPS".into()));
+        return Err(LpmError::Env("Coolify URL must use HTTPS".into()));
     }
     Ok(value.trim_end_matches('/').to_string())
 }
@@ -1184,7 +1184,7 @@ fn coolify_api_error(operation: &str, status: reqwest::StatusCode, body: &[u8]) 
     } else {
         format!(": {}", detail.chars().take(300).collect::<String>())
     };
-    LpmError::Script(format!(
+    LpmError::Env(format!(
         "Coolify {operation} failed with HTTP {status}{suffix}"
     ))
 }
@@ -1415,7 +1415,7 @@ mod tests {
     fn cleanup_context_preserves_network_error_classification() {
         let cleanup = vec![OwnedCleanupOutcome {
             id: "owned-id".into(),
-            outcome: DeleteVariableOutcome::Present(LpmError::Script("cleanup rejected".into())),
+            outcome: DeleteVariableOutcome::Present(LpmError::Env("cleanup rejected".into())),
         }];
 
         let error = append_cleanup(LpmError::Network("connection reset".into()), &cleanup);
@@ -1423,12 +1423,12 @@ mod tests {
         assert_eq!(error.error_code(), "network");
         assert_eq!(
             error.to_string(),
-            "network error: connection reset; owned-value cleanup: owned-id: still present (script error: cleanup rejected)"
+            "network error: connection reset; owned-value cleanup: owned-id: still present (env error: cleanup rejected)"
         );
     }
 
     #[test]
-    fn cleanup_context_does_not_duplicate_script_error_prefix() {
+    fn cleanup_context_does_not_duplicate_env_error_prefix() {
         let cleanup = vec![OwnedCleanupOutcome {
             id: "owned-id".into(),
             outcome: DeleteVariableOutcome::Unknown(LpmError::Network(
@@ -1436,11 +1436,11 @@ mod tests {
             )),
         }];
 
-        let error = append_cleanup(LpmError::Script("create rejected".into()), &cleanup);
+        let error = append_cleanup(LpmError::Env("create rejected".into()), &cleanup);
 
         assert_eq!(
             error.to_string(),
-            "script error: create rejected; owned-value cleanup: owned-id: final state unknown (network error: cleanup disconnected)"
+            "env error: create rejected; owned-value cleanup: owned-id: final state unknown (network error: cleanup disconnected)"
         );
     }
 
@@ -1906,7 +1906,7 @@ mod tests {
             if current.load(Ordering::SeqCst) {
                 Ok(())
             } else {
-                Err(LpmError::Script("env.source_changed".into()))
+                Err(LpmError::Env("env.source_changed".into()))
             }
         }));
         let failure = client
@@ -1952,9 +1952,7 @@ mod tests {
             .await;
         let mut client =
             CoolifyClient::new("coolify-token".into(), config(server.uri())).expect("client");
-        client.source_check = Some(Arc::new(|| {
-            Err(LpmError::Script("env.source_changed".into()))
-        }));
+        client.source_check = Some(Arc::new(|| Err(LpmError::Env("env.source_changed".into()))));
         let outcome = client
             .apply_one(CoolifyMutation::Update {
                 id: "updated-id".into(),

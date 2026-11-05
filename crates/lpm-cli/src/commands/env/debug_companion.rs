@@ -18,7 +18,7 @@ pub(super) fn plant(
 ) -> Result<(), LpmError> {
     let planted = DebugCompanionState::named(state, environment, set, unset)
         .and_then(|state| lpm_vault::plant_debug_companion_state(project_dir, &state))
-        .map_err(LpmError::Script)?;
+        .map_err(LpmError::Env)?;
     if json_output {
         println!(
             "{}",

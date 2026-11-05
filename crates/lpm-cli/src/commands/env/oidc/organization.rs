@@ -8,7 +8,7 @@ pub(super) fn validate_selector(value: &str) -> Result<(), LpmError> {
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "--org must be a lowercase organization slug".into(),
         ));
     }
@@ -20,10 +20,10 @@ pub(super) fn selector<'a>(args: &[&'a str]) -> Result<Option<&'a str>, LpmError
     for arg in args {
         let value = arg
             .strip_prefix("--org=")
-            .ok_or_else(|| LpmError::Script(format!("unknown OIDC argument: {arg}")))?;
+            .ok_or_else(|| LpmError::Env(format!("unknown OIDC argument: {arg}")))?;
         validate_selector(value)?;
         if org.replace(value).is_some() {
-            return Err(LpmError::Script("supply --org only once".into()));
+            return Err(LpmError::Env("supply --org only once".into()));
         }
     }
     Ok(org)
@@ -79,10 +79,10 @@ pub(super) async fn disable(
     let vault_id = manifest
         .vault
         .vault_id()
-        .map_err(LpmError::Script)?
-        .ok_or_else(|| LpmError::Script("no env project configured".into()))?;
-    let principal = manifest.vault.org_sync_principal_for_registry(org, client.base_url()).map_err(LpmError::Script)?
-        .ok_or_else(|| LpmError::Script("this checkout has no authenticated organization binding; pull the env project before disabling CI access".into()))?;
+        .map_err(LpmError::Env)?
+        .ok_or_else(|| LpmError::Env("no env project configured".into()))?;
+    let principal = manifest.vault.org_sync_principal_for_registry(org, client.base_url()).map_err(LpmError::Env)?
+        .ok_or_else(|| LpmError::Env("this checkout has no authenticated organization binding; pull the env project before disabling CI access".into()))?;
     auth::execute_sync_with_bearer(client, |registry_url, token| {
         let principal = &principal;
         async move {

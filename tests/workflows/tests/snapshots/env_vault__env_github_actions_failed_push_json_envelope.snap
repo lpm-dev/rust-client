@@ -5,6 +5,6 @@ expression: failed_json
 {
   "schema_version": 1,
   "success": false,
-  "error": "script error: GitHub Actions variable update failed with HTTP 403 Forbidden: workflow denied",
-  "error_code": "script"
+  "error": "env error: GitHub Actions variable update failed with HTTP 403 Forbidden: workflow denied",
+  "error_code": "env"
 }

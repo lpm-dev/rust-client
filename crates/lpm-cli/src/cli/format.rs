@@ -1007,6 +1007,7 @@ fn slim_error_lines(error: &lpm_common::LpmError) -> Vec<SlimErrorLine> {
             push_diagnostic_help(&mut lines, error);
             lines
         }
+        lpm_common::LpmError::Env(reason) => diagnostic_lines("Env error", Some(reason), error),
         lpm_common::LpmError::EnvValidation(reason) => {
             diagnostic_lines("Environment validation failed", Some(reason), error)
         }
@@ -1567,6 +1568,24 @@ mod tests {
         assert!(
             plain.iter().all(|line| !line.contains("Error:")),
             "slim error rows must not include miette framing: {plain:?}"
+        );
+    }
+
+    #[test]
+    fn slim_error_lines_render_env_errors_without_script_guidance() {
+        let error = lpm_common::LpmError::Env("env keys must match [A-Za-z_][A-Za-z0-9_]*".into());
+
+        let plain: Vec<_> = slim_error_lines(&error)
+            .iter()
+            .map(plain_slim_line)
+            .collect();
+
+        assert_eq!(
+            plain,
+            [
+                "Env error",
+                "  reason env keys must match [A-Za-z_][A-Za-z0-9_]*"
+            ]
         );
     }
 
