@@ -1,0 +1,17 @@
+# Builds against the companion engine of an older release, checked out into
+# `target/compat-engine/` by scripts/ci/check-engine-compatibility.sh, to
+# prove it reads every state this release writes. Its own workspace, outside
+# the repository's; the checkout sits outside this folder so Cargo reads it as
+# a member of its own release's workspace.
+[package]
+name = "lpm-compat-engine"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+base64 = "0.22"
+lpm-env-companion = { path = "../../target/compat-engine/crates/lpm-env-companion" }
+serde_json = "1"

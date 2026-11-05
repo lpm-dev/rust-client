@@ -14,6 +14,8 @@ pub mod switch;
 pub mod values;
 
 #[cfg(test)]
+mod fixtures;
+#[cfg(test)]
 pub(crate) mod test_support;
 
 use std::fmt;
