@@ -12,9 +12,9 @@ pub(super) fn env_repair(
     json_output: bool,
 ) -> Result<(), LpmError> {
     let review = lpm_vault::review_companion_data(project_dir)
-        .map_err(LpmError::Script)?
+        .map_err(LpmError::Env)?
         .ok_or_else(|| {
-            LpmError::Script(
+            LpmError::Env(
                 "this directory has no env project, so there's nothing to repair".to_owned(),
             )
         })?;
@@ -35,14 +35,14 @@ pub(super) fn env_repair(
     } else {
         print_review(&review);
         if repairs.is_empty() {
-            return Err(LpmError::Script(
+            return Err(LpmError::Env(
                 "only LPM Vault can set this env project's CLI approval right; switch it there"
                     .to_owned(),
             ));
         }
         if !yes {
             if !is_interactive() {
-                return Err(LpmError::Script(
+                return Err(LpmError::Env(
                     "repairing deletes the damaged data; run lpm env repair --yes to repair it"
                         .to_owned(),
                 ));
@@ -50,15 +50,14 @@ pub(super) fn env_repair(
             let confirmed = cliclack::confirm("Repair this env project's newer data?")
                 .initial_value(false)
                 .interact()
-                .map_err(|error| LpmError::Script(format!("prompt failed: {error}")))?;
+                .map_err(|error| LpmError::Env(format!("prompt failed: {error}")))?;
             if !confirmed {
                 output::info("nothing was changed");
                 return Ok(());
             }
         }
     }
-    let repaired =
-        lpm_vault::repair_companion_data(project_dir, &review).map_err(LpmError::Script)?;
+    let repaired = lpm_vault::repair_companion_data(project_dir, &review).map_err(LpmError::Env)?;
     if json_output {
         print_json(&review, &repaired);
     } else {

@@ -45,14 +45,14 @@ pub(super) fn vars_example(
     env_input: Option<&str>,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Env)?;
 
     let schema = config
         .as_ref()
         .and_then(|c| c.env_schema.as_ref())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            LpmError::Script(
+            LpmError::Env(
                 "no envSchema defined in lpm.json. Add an envSchema section first.".into(),
             )
         })?;
@@ -64,7 +64,7 @@ pub(super) fn vars_example(
             let env_map = config.as_ref().map_or(&empty, |c| &c.env);
             let environments = config.as_ref().and_then(|c| c.environments.as_ref());
             let resolved = lpm_env::resolver::resolve_checked(input, env_map, environments)
-                .map_err(|e| LpmError::Script(format!("invalid environment name: {e}")))?;
+                .map_err(|e| LpmError::Env(format!("invalid environment name: {e}")))?;
             let filename = format!(".env.{}.example", resolved.canonical);
             let label = resolved.canonical.clone();
             (Some(resolved), label, filename)
@@ -107,7 +107,7 @@ pub(super) fn vars_example(
         content.as_bytes(),
         lpm_common::AtomicWriteOptions::new().sync_file(),
     )
-    .map_err(|e| LpmError::Script(format!("failed to write {example_filename}: {e}")))?;
+    .map_err(|e| LpmError::Env(format!("failed to write {example_filename}: {e}")))?;
 
     output::success_line(install_ui::terminal_line!(
         "generated {} ({} variables)",
@@ -133,7 +133,7 @@ pub(super) fn vars_print(
     json_output: bool,
 ) -> Result<(), LpmError> {
     if json_output && (ci || format.is_some_and(|format| format != lpm_env::PrintFormat::Json)) {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "--json conflicts with --ci or a non-JSON --format".into(),
         ));
     }
@@ -150,14 +150,14 @@ pub(super) fn vars_print(
     } else {
         lpm_env::PrintFormat::Dotenv
     });
-    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    let config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Env)?;
     if (schema_only || client_only)
         && config
             .as_ref()
             .and_then(|config| config.env_schema.as_ref())
             .is_none_or(|schema| schema.is_empty())
     {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "--schema-only and --client-only require a non-empty envSchema in lpm.json".into(),
         ));
     }
@@ -253,14 +253,14 @@ pub(super) fn vars_check(
     scope: &super::arguments::Scope,
     json_output: bool,
 ) -> Result<(), LpmError> {
-    let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Script)?;
+    let lpm_config = lpm_runner::lpm_json::read_lpm_json(project_dir).map_err(LpmError::Env)?;
 
     let schema = lpm_config
         .as_ref()
         .and_then(|config| config.env_schema.as_ref())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            LpmError::Script(
+            LpmError::Env(
                 "no envSchema defined in lpm.json. Add an envSchema section first.".into(),
             )
         })?;
@@ -270,7 +270,7 @@ pub(super) fn vars_check(
     // with legacy vault keys surfaced separately (never collapsed).
     let all_envs = check_environments(env_input, lpm_config.as_ref(), || {
         lpm_vault::try_get_all_environments(project_dir)
-            .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))
+            .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))
     })?;
     struct Checked {
         name: String,
@@ -477,7 +477,7 @@ pub(super) fn vars_validate(
 ) -> Result<(), LpmError> {
     let example_path = project_dir.join(".env.example");
     if !example_path.exists() {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "no .env.example found. Create one with the required variable names.".into(),
         ));
     }
@@ -499,7 +499,7 @@ pub(super) fn vars_validate(
         .collect();
 
     let secrets = lpm_vault::try_get_all(project_dir)
-        .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
+        .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
 
     let mut present = Vec::new();
     let mut missing = Vec::new();

@@ -162,7 +162,7 @@ impl FlyClient {
         validate_identity_field("organization ID", &observed.organization.id)?;
         validate_identity_field("organization slug", &observed.organization.slug)?;
         if observed.name != app {
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Env(format!(
                 "Fly.io returned app {} while {app} was requested",
                 observed.name
             )));
@@ -195,7 +195,7 @@ impl FlyClient {
             }
             validate_secret_name(&secret.name)?;
             if !names.insert(secret.name.clone()) {
-                return Err(LpmError::Script(format!(
+                return Err(LpmError::Env(format!(
                     "Fly.io returned multiple secrets named {}",
                     secret.name
                 )));
@@ -217,7 +217,7 @@ impl FlyClient {
     ) -> Result<PlatformPushResult, PlatformApplyError> {
         let fresh = self.list().await.map_err(PlatformApplyError::untracked)?;
         if fresh.write_only != remote.write_only {
-            return Err(PlatformApplyError::untracked(LpmError::Script(
+            return Err(PlatformApplyError::untracked(LpmError::Env(
                 "Fly.io secrets changed after comparison; rerun the push before mutating the app"
                     .into(),
             )));
@@ -256,7 +256,7 @@ impl FlyClient {
             expected_after_set.extend(local.write_only.keys().cloned());
             if after_set.write_only != expected_after_set {
                 return Err(PlatformApplyError::tracked(
-                    LpmError::Script(
+                    LpmError::Env(
                         "Fly.io secrets changed during synchronization; no removals were attempted"
                             .into(),
                     ),
@@ -300,7 +300,7 @@ impl FlyClient {
             .map_err(|error| PlatformApplyError::tracked(error, applied))?;
         if observed.write_only != desired {
             return Err(PlatformApplyError::tracked(
-                LpmError::Script(
+                LpmError::Env(
                     "Fly.io synchronization verification failed; the authoritative secret names do not match the requested state"
                         .into(),
                 ),
@@ -315,7 +315,7 @@ impl FlyClient {
             || app.id != self.config.app_id
             || app.organization.id != self.config.organization_id
         {
-            return Err(LpmError::Script(
+            return Err(LpmError::Env(
                 "Fly.io app identity changed; reconnect the app before synchronizing env values"
                     .into(),
             ));
@@ -332,7 +332,7 @@ impl FlyClient {
             )
             .await?;
         data.app.ok_or_else(|| {
-            LpmError::Script(format!(
+            LpmError::Env(format!(
                 "Fly.io app '{}' was not found or is not accessible",
                 self.config.app
             ))
@@ -412,7 +412,7 @@ impl FlyClient {
             return Err(fly_http_error(operation, status, &body));
         }
         let response: GraphqlResponse<T> = serde_json::from_slice(&body)
-            .map_err(|error| LpmError::Script(format!("invalid Fly.io response: {error}")))?;
+            .map_err(|error| LpmError::Env(format!("invalid Fly.io response: {error}")))?;
         if !response.errors.is_empty() {
             let detail = response
                 .errors
@@ -420,13 +420,13 @@ impl FlyClient {
                 .map(|error| error.message.as_str())
                 .collect::<Vec<_>>()
                 .join("; ");
-            return Err(LpmError::Script(format!(
+            return Err(LpmError::Env(format!(
                 "Fly.io {operation} failed: {}",
                 detail.chars().take(500).collect::<String>()
             )));
         }
         response.data.ok_or_else(|| {
-            LpmError::Script(format!("Fly.io {operation} response did not include data"))
+            LpmError::Env(format!("Fly.io {operation} response did not include data"))
         })
     }
 }
@@ -445,10 +445,10 @@ pub(super) fn partition_local_values(local: &HashMap<String, String>) -> LocalPl
 pub(super) fn validate_app_name(value: &str) -> Result<(), LpmError> {
     let bytes = value.as_bytes();
     if bytes.is_empty() {
-        return Err(LpmError::Script("--app cannot be empty".into()));
+        return Err(LpmError::Env("--app cannot be empty".into()));
     }
     if bytes.len() > FLY_APP_NAME_MAX_CHARS {
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Env(format!(
             "--app must be at most {FLY_APP_NAME_MAX_CHARS} characters"
         )));
     }
@@ -458,7 +458,7 @@ pub(super) fn validate_app_name(value: &str) -> Result<(), LpmError> {
             .iter()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
     {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "--app must use lowercase letters, digits, and interior hyphens".into(),
         ));
     }
@@ -470,7 +470,7 @@ fn validate_identity_field(field: &str, value: &str) -> Result<(), LpmError> {
         || value.chars().count() > FLY_IDENTITY_MAX_CHARS
         || value.chars().any(char::is_control)
     {
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Env(format!(
             "Fly.io {field} must be a non-empty, control-free value of at most {FLY_IDENTITY_MAX_CHARS} characters"
         )));
     }
@@ -482,7 +482,7 @@ fn validate_secret_name(value: &str) -> Result<(), LpmError> {
         || value.chars().count() > FLY_SECRET_NAME_MAX_CHARS
         || value.chars().any(char::is_control)
     {
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Env(format!(
             "Fly.io returned an invalid secret name; names must be non-empty, control-free, and at most {FLY_SECRET_NAME_MAX_CHARS} characters"
         )));
     }
@@ -504,29 +504,29 @@ pub(super) fn fly_api_url() -> Result<String, LpmError> {
     }
     let candidate = candidate.to_string_lossy();
     let parsed = reqwest::Url::parse(&candidate)
-        .map_err(|error| LpmError::Script(format!("invalid acceptance Fly.io URL: {error}")))?;
+        .map_err(|error| LpmError::Env(format!("invalid acceptance Fly.io URL: {error}")))?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "the acceptance Fly.io URL must not contain credentials".into(),
         ));
     }
     if parsed.query().is_some() || parsed.fragment().is_some() {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "the acceptance Fly.io URL must not contain a query or fragment".into(),
         ));
     }
     if !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost" | "::1")) {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "the acceptance Fly.io URL must use a loopback host".into(),
         ));
     }
     if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "the acceptance Fly.io URL must use HTTP or HTTPS".into(),
         ));
     }
     if parsed.path() != "/graphql" {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "the acceptance Fly.io URL must end with /graphql".into(),
         ));
     }
@@ -542,26 +542,26 @@ fn authorization_header(token: &str) -> Result<HeaderValue, LpmError> {
         token = value.trim();
     }
     if token.is_empty() {
-        return Err(LpmError::Script("Fly.io token cannot be empty".into()));
+        return Err(LpmError::Env("Fly.io token cannot be empty".into()));
     }
     let has_macaroon = token
         .split(',')
         .any(|part| matches!(part.trim().split('_').next(), Some("fm1r" | "fm1a" | "fm2")));
     let scheme = if has_macaroon { "FlyV1" } else { "Bearer" };
     let mut header = HeaderValue::from_str(&format!("{scheme} {token}"))
-        .map_err(|_| LpmError::Script("Fly.io token contains invalid characters".into()))?;
+        .map_err(|_| LpmError::Env("Fly.io token contains invalid characters".into()))?;
     header.set_sensitive(true);
     Ok(header)
 }
 
 fn validate_release(operation: &str, release: Option<FlyRelease>) -> Result<(), LpmError> {
     let Some(release) = release else {
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Env(format!(
             "Fly.io {operation} did not return a release acknowledgement"
         )));
     };
     if release.id.is_empty() {
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Env(format!(
             "Fly.io {operation} returned an empty release ID"
         )));
     }
@@ -577,7 +577,7 @@ fn fly_http_error(operation: &str, status: reqwest::StatusCode, body: &[u8]) -> 
     } else {
         format!(": {}", detail.chars().take(300).collect::<String>())
     };
-    LpmError::Script(format!(
+    LpmError::Env(format!(
         "Fly.io {operation} failed with HTTP {status}{suffix}"
     ))
 }
@@ -1095,7 +1095,7 @@ mod tests {
             if current.load(std::sync::atomic::Ordering::SeqCst) {
                 Ok(())
             } else {
-                Err(LpmError::Script("env.source_changed".into()))
+                Err(LpmError::Env("env.source_changed".into()))
             }
         }));
         let remote = PlatformState {

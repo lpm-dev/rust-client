@@ -57,6 +57,26 @@ pub async fn run(
     extra: &[String],
     json_output: bool,
 ) -> Result<(), LpmError> {
+    run_action(client, project_dir, extra, json_output)
+        .await
+        .map_err(env_error)
+}
+
+/// `lpm env` runs no scripts, so a script error from a helper it shares
+/// with `lpm run`, such as dotenv or `lpm.json` parsing, is an env error.
+fn env_error(error: LpmError) -> LpmError {
+    match error {
+        LpmError::Script(message) => LpmError::Env(message),
+        other => other,
+    }
+}
+
+async fn run_action(
+    client: &RegistryClient,
+    project_dir: &std::path::Path,
+    extra: &[String],
+    json_output: bool,
+) -> Result<(), LpmError> {
     let args: Vec<&str> = extra.iter().map(String::as_str).collect();
     if args.is_empty() {
         return local::env_list(None, false, project_dir, json_output);
@@ -253,7 +273,7 @@ pub async fn run(
             platform::vars_platform_status(client, &args[1..], project_dir, json_output).await
         }
         "pair" => pairing::env_pair(client, &args[1..], json_output).await,
-        unknown => Err(LpmError::Script(format!(
+        unknown => Err(LpmError::Env(format!(
             "unknown env action: '{unknown}'. Available: set, get, list, delete, import, export, push, pull, diff, validate, schema, generate, example, print, check, connect, status, log, history, rollback, share, rotate-key, rotate-sharing-key, pair, unpair, init, ls, list-remote, copy, oidc, repair"
         ))),
     };
@@ -292,6 +312,19 @@ mod tests {
         include_str!("schema.rs"),
         include_str!("sync_payload.rs"),
     ];
+
+    #[test]
+    fn a_script_error_from_a_shared_helper_is_reported_as_an_env_error() {
+        use super::{LpmError, env_error};
+        assert!(matches!(
+            env_error(LpmError::Script("bad .env line".into())),
+            LpmError::Env(message) if message == "bad .env line"
+        ));
+        assert!(matches!(
+            env_error(LpmError::Network("offline".into())),
+            LpmError::Network(_)
+        ));
+    }
 
     #[test]
     fn no_old_command_name_in_source() {

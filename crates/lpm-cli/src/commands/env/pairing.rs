@@ -16,13 +16,13 @@ fn parse_pair_args(args: &[&str]) -> Result<PairArgs, LpmError> {
         match *arg {
             "--yes" | "-y" => yes = true,
             other if other.starts_with('-') => {
-                return Err(LpmError::Script(format!(
+                return Err(LpmError::Env(format!(
                     "unknown flag '{other}' for `lpm env pair`. Supported flags: --yes/-y."
                 )));
             }
             other => {
                 if code.is_some() {
-                    return Err(LpmError::Script(
+                    return Err(LpmError::Env(
                         "usage: lpm env pair <CODE> [--yes]\n  Only one pairing code may be passed."
                             .into(),
                     ));
@@ -32,13 +32,13 @@ fn parse_pair_args(args: &[&str]) -> Result<PairArgs, LpmError> {
         }
     }
     let code = code.ok_or_else(|| {
-        LpmError::Script(
+        LpmError::Env(
             "usage: lpm env pair <CODE> [--yes]\n  The 6-character pairing code shown in the dashboard."
                 .into(),
         )
     })?;
     if code.len() != 6 || !code.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "invalid pairing code. Expected 6 alphanumeric characters (e.g., ABC123).".into(),
         ));
     }
@@ -201,21 +201,21 @@ fn prompt_pair_confirmation() -> Result<(), LpmError> {
         );
         stdout
             .flush()
-            .map_err(|e| LpmError::Script(format!("stdout flush failed: {e}")))?;
+            .map_err(|e| LpmError::Env(format!("stdout flush failed: {e}")))?;
         line.clear();
         let bytes = handle
             .read_line(&mut line)
-            .map_err(|e| LpmError::Script(format!("read from stdin failed: {e}")))?;
+            .map_err(|e| LpmError::Env(format!("read from stdin failed: {e}")))?;
         if bytes == 0 {
             // EOF — treat as decline rather than approve.
-            return Err(LpmError::Script(
+            return Err(LpmError::Env(
                 "pair aborted: no input received (stdin closed before a decision was made)".into(),
             ));
         }
         match parse_pair_decision(&line) {
             Some(PairDecision::Approve) => return Ok(()),
             Some(PairDecision::Decline) => {
-                return Err(LpmError::Script(
+                return Err(LpmError::Env(
                     "pair aborted by user. No wrapping key was sent.".into(),
                 ));
             }
@@ -240,7 +240,7 @@ pub(super) async fn env_pair(
     if !parsed.yes {
         use std::io::IsTerminal;
         if !std::io::stdin().is_terminal() {
-            return Err(LpmError::Script(
+            return Err(LpmError::Env(
                 "`lpm env pair` requires an interactive terminal so you can verify the \
                  browser identity. Re-run from a terminal directly (not from a pipe, \
                  heredoc, or CI), or pass `--yes` to skip the prompt (NOT recommended)."
@@ -270,7 +270,7 @@ pub(super) async fn env_pair(
     .await?;
 
     if session.status != "pending" {
-        return Err(LpmError::Script(format!(
+        return Err(LpmError::Env(format!(
             "pairing session is '{}' (expected 'pending'). The code may have expired or already been used.",
             session.status
         )));
@@ -279,14 +279,14 @@ pub(super) async fn env_pair(
     let browser_pub_b64 = session
         .browser_public_key
         .clone()
-        .ok_or_else(|| LpmError::Script("server did not return browser public key".into()))?;
+        .ok_or_else(|| LpmError::Env("server did not return browser public key".into()))?;
 
     let protocol_version = session.protocol_version;
     let exchange = lpm_vault::crypto::P256PairingKeyExchange::new_for_protocol(
         &browser_pub_b64,
         protocol_version,
     )
-    .map_err(LpmError::Script)?;
+    .map_err(LpmError::Env)?;
     let ephemeral = exchange.ephemeral_public_key_b64().to_string();
     super::auth::execute_sync_with_bearer(client, |registry_url, auth_token| {
         let expected_origin = expected_origin.clone();
@@ -339,13 +339,13 @@ pub(super) async fn env_pair(
 
             let encrypted = exchange.wrap_key(&wrapping_key);
             wrapping_key.fill(0);
-            encrypted.map_err(LpmError::Script)?
+            encrypted.map_err(LpmError::Env)?
         }
         5 => exchange
             .wrap_personal_bundle(&expected_origin, &expected_principal_id)
-            .map_err(LpmError::Script)?,
+            .map_err(LpmError::Env)?,
         _ => {
-            return Err(LpmError::Script(
+            return Err(LpmError::Env(
                 "refresh the dashboard before pairing this browser".into(),
             ));
         }
@@ -491,7 +491,7 @@ mod tests {
     #[test]
     fn parse_pair_args_rejects_duplicate_positional_args() {
         let err = parse_pair_args(&["ABC123", "DEF456"]).unwrap_err();
-        let LpmError::Script(msg) = err else {
+        let LpmError::Env(msg) = err else {
             panic!("expected Script error");
         };
         assert!(msg.contains("Only one pairing code"));
@@ -500,7 +500,7 @@ mod tests {
     #[test]
     fn parse_pair_args_rejects_unknown_flags() {
         let err = parse_pair_args(&["--force", "ABC123"]).unwrap_err();
-        let LpmError::Script(msg) = err else {
+        let LpmError::Env(msg) = err else {
             panic!("expected Script error");
         };
         assert!(msg.contains("unknown flag '--force'"));

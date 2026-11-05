@@ -18,7 +18,7 @@ fn parse_push_target(args: &[&str]) -> Result<PushTarget, LpmError> {
             .iter()
             .any(|argument| *argument == "--oidc" || argument.starts_with("--from"))
         {
-            return Err(LpmError::Script(
+            return Err(LpmError::Env(
                 "platform push cannot be combined with another cloud scope selector".into(),
             ));
         }
@@ -27,9 +27,7 @@ fn parse_push_target(args: &[&str]) -> Result<PushTarget, LpmError> {
 
     for argument in command_args {
         if !matches!(*argument, "--force" | "--yes" | "-y") {
-            return Err(LpmError::Script(format!(
-                "unknown push argument: {argument}"
-            )));
+            return Err(LpmError::Env(format!("unknown push argument: {argument}")));
         }
     }
     Ok(PushTarget::Personal)
@@ -55,29 +53,29 @@ pub(super) async fn vars_push(
     let vault_id = manifest
         .vault
         .vault_id()
-        .map_err(LpmError::Script)?
+        .map_err(LpmError::Env)?
         .map(str::to_owned)
-        .ok_or_else(|| LpmError::Script("no vault configured. Run `lpm env set` first".into()))?;
+        .ok_or_else(|| LpmError::Env("no vault configured. Run `lpm env set` first".into()))?;
 
     let all_envs = lpm_vault::try_get_all_environments_for_vault_id(&vault_id)
-        .map_err(lpm_runner::dotenv::vault_error(LpmError::Script))?;
+        .map_err(lpm_runner::dotenv::vault_error(LpmError::Env))?;
     let environment_count = all_envs.len();
     let total_keys: usize = all_envs.values().map(|e| e.len()).sum();
     if all_envs.is_empty() {
-        return Err(LpmError::Script(
+        return Err(LpmError::Env(
             "no environments configured, nothing to push".into(),
         ));
     }
 
     let schema_snapshot = manifest
         .sources
-        .ok_or_else(|| LpmError::Script("env.source_changed at lpm.json".into()))?;
+        .ok_or_else(|| LpmError::Env("env.source_changed at lpm.json".into()))?;
     let vault_manifest = std::sync::Arc::new(manifest.vault);
 
     let project_name = vault_manifest.project_name(project_dir);
     let expected_principal_id = vault_manifest
         .personal_expected_principal_for_registry(client.base_url())
-        .map_err(LpmError::Script)?;
+        .map_err(LpmError::Env)?;
 
     // Confirmation prompt
     if !yes && !json_output {
@@ -91,7 +89,7 @@ pub(super) async fn vars_push(
         let confirm = cliclack::confirm("Continue?")
             .initial_value(false)
             .interact()
-            .map_prompt_err(|e| LpmError::Script(format!("prompt failed: {e}")))?;
+            .map_prompt_err(|e| LpmError::Env(format!("prompt failed: {e}")))?;
         if !confirm {
             output::info("cancelled");
             return Ok(());
@@ -172,11 +170,11 @@ pub(super) async fn vars_push(
 
     let version = result
         .version
-        .ok_or_else(|| LpmError::Script("sync response omitted the revision".into()))?;
+        .ok_or_else(|| LpmError::Env("sync response omitted the revision".into()))?;
     let principal_id = result
         .principal_id
         .as_deref()
-        .ok_or_else(|| LpmError::Script("sync response omitted the principal ID".into()))?;
+        .ok_or_else(|| LpmError::Env("sync response omitted the principal ID".into()))?;
     let checkpoint_result = super::sync_payload::persist_personal_sync_version(
         &project_dir,
         &vault_id,
