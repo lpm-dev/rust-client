@@ -1,0 +1,30 @@
+--- a/src/scoring.rs
++++ b/src/scoring.rs
+@@ -270,7 +270,7 @@
+ }
+ 
+ fn factorial(n: usize) -> usize {
+-    (1..=n).product()
++    (1..=n).fold(1, usize::saturating_mul)
+ }
+ 
+ fn estimate_guesses(m: &mut Match, password: &str) -> u64 {
+@@ -556,6 +556,18 @@
+         ];
+         for &(n, k, result) in &test_data {
+             assert_eq!(scoring::n_ck(n, k), result);
++        }
++    }
++
++    #[test]
++    fn factorial_saturates_at_usize_max_instead_of_overflowing() {
++        let mut exact: u128 = 1;
++        for n in 0..=40_usize {
++            if n > 0 {
++                exact = exact.saturating_mul(n as u128);
++            }
++            let expected = usize::try_from(exact).unwrap_or(usize::MAX);
++            assert_eq!(scoring::factorial(n), expected, "{n}!");
+         }
+     }
+ 
